@@ -89,13 +89,19 @@ public:
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
+    bool sampler_filter_minmax = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
+    // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
+    bool swapchain_maintenance1 = false;
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
+    bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
+    bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
 
     Device() = default;
@@ -183,9 +189,29 @@ public:
         VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instance_info.pApplicationInfo = &app;
         std::vector<const char*> instance_extensions;
+        bool surface_m1_khr = false, surface_m1_ext = false;
         if (presentation) {
             instance_extensions.push_back("VK_KHR_surface");
             instance_extensions.push_back("VK_KHR_win32_surface");
+            const auto enumerate_instance = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                instance_proc(nullptr, "vkEnumerateInstanceExtensionProperties"));
+            std::uint32_t count = 0;
+            enumerate_instance(nullptr, &count, nullptr);
+            std::vector<VkExtensionProperties> available(count);
+            enumerate_instance(nullptr, &count, available.data());
+            bool caps2 = false;
+            for (const auto& e : available) {
+                caps2 = caps2 || std::strcmp(e.extensionName, "VK_KHR_get_surface_capabilities2") == 0;
+                surface_m1_khr = surface_m1_khr || std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1") == 0;
+                surface_m1_ext = surface_m1_ext || std::strcmp(e.extensionName, "VK_EXT_surface_maintenance1") == 0;
+            }
+            if (caps2 && (surface_m1_khr || surface_m1_ext)) {
+                instance_extensions.push_back("VK_KHR_get_surface_capabilities2");
+                if (surface_m1_khr) instance_extensions.push_back("VK_KHR_surface_maintenance1");
+                if (surface_m1_ext) instance_extensions.push_back("VK_EXT_surface_maintenance1");
+            } else {
+                surface_m1_khr = surface_m1_ext = false;
+            }
         }
         if (validation) {
             std::vector<VkLayerProperties> layers;
@@ -280,7 +306,8 @@ public:
         std::printf("device: %s%s%s\n", chosen.deviceName, v13_.core ? "" : " (Vulkan 1.2 + KHR extensions)",
                     validation ? " (validation on)" : "");
 
-        VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+        VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features11};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         features2_of(physical, &features);
         if (!features12.timelineSemaphore || !features12.separateDepthStencilLayouts ||
@@ -310,10 +337,16 @@ public:
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
         enable_conditional.conditionalRendering = VK_TRUE;
 
-        VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        // shaderDrawParameters, where available: translated vertex shaders will read BaseVertex and BaseInstance once PR 436
+        // (zero-based VS ids) is in; harmless before.
+        VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                                   v13_.enable(conditional_rendering ? &enable_conditional : nullptr)};
+        enable11.shaderDrawParameters = features11.shaderDrawParameters;
+        VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        buffer_device_address = request_buffer_device_address && features12.bufferDeviceAddress == VK_TRUE;
+        enable12.bufferDeviceAddress = buffer_device_address;
         storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;
         enable12.storageBuffer8BitAccess = storage_buffer_8bit;
         // What the bindless set 0 of the translated shaders needs, where the device has it: runtime arrays of
@@ -330,6 +363,8 @@ public:
         enable12.descriptorBindingStorageImageUpdateAfterBind = bindless;
         enable12.descriptorBindingStorageBufferUpdateAfterBind = bindless;
         enable12.descriptorBindingPartiallyBound = partially_bound;
+        sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
+        enable12.samplerFilterMinmax = sampler_filter_minmax;
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const float priority = 1.0f;
@@ -343,6 +378,7 @@ public:
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
+        enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -409,6 +445,27 @@ public:
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
+        if (presentation) {
+            const auto has = [&](const char* name) {
+                return std::any_of(extensions.begin(), extensions.end(),
+                                   [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+            };
+            const char* name = surface_m1_khr && has("VK_KHR_swapchain_maintenance1") ? "VK_KHR_swapchain_maintenance1"
+                               : surface_m1_ext && has("VK_EXT_swapchain_maintenance1") ? "VK_EXT_swapchain_maintenance1"
+                                                                                       : nullptr;
+            if (name) {
+                VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &swapchain_m1};
+                instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+                if (swapchain_m1.swapchainMaintenance1 == VK_TRUE) {
+                    swapchain_m1.pNext = *v13_.next();
+                    *v13_.next() = &swapchain_m1;
+                    device_extensions.push_back(name);
+                    swapchain_maintenance1 = true;
+                }
+            }
+        }
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
@@ -458,24 +515,34 @@ public:
         return image;
     }
 
-    // A host-visible, coherent buffer, mapped.
+    // A host-visible, coherent buffer, mapped; with `mapped` null, a device-local one the host can't see.
     VkBuffer buffer(VkDeviceSize size, VkBufferUsageFlags usage, void** mapped) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
-        info.usage = usage;
+        info.usage = usage | (buffer_device_address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
         VkBuffer buffer = VK_NULL_HANDLE;
         if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &info, nullptr, &buffer) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         VkMemoryRequirements requirements{};
         fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device, buffer, &requirements);
-        const VkDeviceMemory memory =
-            allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        const VkDeviceMemory memory = allocate(requirements, mapped ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                                                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         buffers_.push_back({buffer, memory});
         if (!memory || fn<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device, buffer, memory, 0) != VK_SUCCESS)
             return VK_NULL_HANDLE;
+        if (!mapped) return buffer;
         if (fn<PFN_vkMapMemory>("vkMapMemory")(device, memory, 0, size, 0, mapped) != VK_SUCCESS) return VK_NULL_HANDLE;
         std::memset(*mapped, 0xcd, size_t(size));
         return buffer;
+    }
+
+    // The device address of a buffer from buffer(); 0 unless buffer_device_address is enabled.
+    std::uint64_t device_address(VkBuffer buffer) const {
+        if (!buffer_device_address) return 0;
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = buffer;
+        return fn<PFN_vkGetBufferDeviceAddress>("vkGetBufferDeviceAddress")(device, &info);
     }
 
     // Records `body` into a one-shot command buffer, submits it and waits for the queue.
@@ -540,7 +607,10 @@ private:
         for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i) {
             if (!(requirements.memoryTypeBits & (1u << i))) continue;
             if ((memory_.memoryTypes[i].propertyFlags & flags) != flags) continue;
+            VkMemoryAllocateFlagsInfo address_flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+            address_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
             VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            if (buffer_device_address) info.pNext = &address_flags;
             info.allocationSize = requirements.size;
             info.memoryTypeIndex = i;
             VkDeviceMemory memory = VK_NULL_HANDLE;

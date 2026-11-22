@@ -556,7 +556,8 @@ struct DeviceState {
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
             return {};
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
-            if (desc.SampleDesc.Count != 1 ||
+            if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+                                               (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
                 (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
                 return {};
             if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
@@ -718,7 +719,8 @@ struct DeviceState {
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         const bool supports_lod_clamp = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_2d ||
-                                        image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube;
+                                        image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube ||
+                                        image.type == g::ImageType::image_3d;
         if (!storage && supports_lod_clamp && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
             // Use the clamp in the T# itself: views with identical keys must sample identically.
             clamp.minLod = g::image_min_lod(words);
@@ -821,8 +823,17 @@ struct DeviceState {
             log_once("mirror-once sampler without samplerMirrorClampToEdge; clamped instead, mode", int(*mode));
             *mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         }
-        if (sampler.filter_mode != g::FilterMode::blend)
-            log_once("minimum/maximum filter samplers blend for now; filter mode", int(sampler.filter_mode));
+        VkSamplerReductionModeCreateInfo reduction{VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO};
+        if (sampler.filter_mode != g::FilterMode::blend) {
+            if (info.sampler_filter_minmax && !sampler_info.compareEnable) {
+                reduction.reductionMode = g::vulkan_reduction_mode(sampler.filter_mode);
+                reduction.pNext = sampler_info.pNext;
+                sampler_info.pNext = &reduction;
+            } else {
+                log_once("minimum/maximum filter sampler without samplerFilterMinmax; blended instead, mode",
+                         int(sampler.filter_mode));
+            }
+        }
         if (sampler.border_color == g::BorderColor::table)
             log_once("custom sampler border colours are transparent black for now; index",
                      int(sampler.border_color_index));
@@ -909,6 +920,149 @@ HRESULT castable_view_formats(const Format& format, UINT32 count, const DXGI_FOR
         if (std::find(out.begin(), out.end(), cast.format) == out.end()) out.push_back(cast.format);
     }
     return S_OK;
+}
+
+// Argument checks the host PC runtime makes (without the debug layer) before it creates anything, so the layer
+// returns the same HRESULTs. Each rule was measured against the host runtime by d3d12_vulkan_device_test
+// (compare_invalid_arguments, D3D-49); the texture size, mip, sample-count and alignment rules are in
+// GetResourceAllocationInfo's allocation(), which CreateCommittedResource also applies.
+
+// The typeless format a DXGI format can be cast within, or the format itself when it has no such family.
+DXGI_FORMAT format_family(DXGI_FORMAT format) {
+    const int f = int(format);
+    const auto in = [f](int first, int last) { return f >= first && f <= last; };
+    if (in(1, 4)) return DXGI_FORMAT_R32G32B32A32_TYPELESS;
+    if (in(5, 8)) return DXGI_FORMAT_R32G32B32_TYPELESS;
+    if (in(9, 14)) return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    if (in(15, 18)) return DXGI_FORMAT_R32G32_TYPELESS;
+    if (in(19, 22)) return DXGI_FORMAT_R32G8X24_TYPELESS;
+    if (in(23, 25)) return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    if (in(27, 32)) return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    if (in(33, 38)) return DXGI_FORMAT_R16G16_TYPELESS;
+    if (in(39, 43)) return DXGI_FORMAT_R32_TYPELESS;
+    if (in(44, 47)) return DXGI_FORMAT_R24G8_TYPELESS;
+    if (in(48, 52)) return DXGI_FORMAT_R8G8_TYPELESS;
+    if (in(53, 59)) return DXGI_FORMAT_R16_TYPELESS;
+    if (in(60, 64)) return DXGI_FORMAT_R8_TYPELESS;
+    if (in(70, 72)) return DXGI_FORMAT_BC1_TYPELESS;
+    if (in(73, 75)) return DXGI_FORMAT_BC2_TYPELESS;
+    if (in(76, 78)) return DXGI_FORMAT_BC3_TYPELESS;
+    if (in(79, 81)) return DXGI_FORMAT_BC4_TYPELESS;
+    if (in(82, 84)) return DXGI_FORMAT_BC5_TYPELESS;
+    if (f == 87 || in(90, 91)) return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    if (f == 88 || in(92, 93)) return DXGI_FORMAT_B8G8R8X8_TYPELESS;
+    if (in(94, 96)) return DXGI_FORMAT_BC6H_TYPELESS;
+    if (in(97, 99)) return DXGI_FORMAT_BC7_TYPELESS;
+    return format;
+}
+
+// ALLOW_DEPTH_STENCIL: the host accepts every format of a family with a depth member (R32_FLOAT and R16_FLOAT
+// included) and nothing else.
+bool depth_stencil_family(DXGI_FORMAT format) {
+    const DXGI_FORMAT family = format_family(format);
+    return family == DXGI_FORMAT_R32_TYPELESS || family == DXGI_FORMAT_R16_TYPELESS ||
+           family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS;
+}
+
+// ALLOW_RENDER_TARGET: the host refuses the families below and accepts the rest, D32_FLOAT, D16_UNORM,
+// R9G9B9E5_SHAREDEXP and NV12 among them. R32G32B32 is the driver's answer (refused by both AMD drivers measured,
+// accepted by WARP); it is refused here, since Vulkan drivers rarely render to it.
+bool render_target_family(DXGI_FORMAT format) {
+    switch (format_family(format)) {
+        case DXGI_FORMAT_R32G32B32_TYPELESS:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R1_UNORM:
+        case DXGI_FORMAT_R8G8_B8G8_UNORM:
+        case DXGI_FORMAT_G8R8_G8B8_UNORM:
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC2_TYPELESS:
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC4_TYPELESS:
+        case DXGI_FORMAT_BC5_TYPELESS:
+        case DXGI_FORMAT_BC6H_TYPELESS:
+        case DXGI_FORMAT_BC7_TYPELESS:
+            return false;
+        default:
+            return true;
+    }
+}
+
+// Why the host would refuse these heap properties, or null if it accepts them.
+const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
+    if (heap.Type < D3D12_HEAP_TYPE_DEFAULT || heap.Type > D3D12_HEAP_TYPE_GPU_UPLOAD) return "heap type";
+    // CheckFeatureSupport reports OPTIONS16.GPUUploadHeapSupported FALSE, and a host runtime without GPU upload heaps
+    // (Resizable BAR off) refuses the type.
+    if (heap.Type == D3D12_HEAP_TYPE_GPU_UPLOAD) return "GPU upload heap, which OPTIONS16 reports unsupported";
+    const bool custom = heap.Type == D3D12_HEAP_TYPE_CUSTOM;
+    const bool page_given = heap.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    const bool pool_given = heap.MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN;
+    if (custom ? !(page_given && pool_given) : (page_given || pool_given))
+        return "CPU page property or memory pool (given only, and both, on custom heaps)";
+    if (heap.CreationNodeMask > 1 || heap.VisibleNodeMask > 1) return "node mask (one node)";
+    return nullptr;
+}
+
+// Why the host would refuse this committed resource, or null if these checks pass. The flag and format tables were
+// measured on an RX 9070 XT, an integrated Radeon and WARP, which agree on all of them. Cross-adapter resources
+// (valid there only as a row-major texture on a SHARED | SHARED_CROSS_ADAPTER heap) are refused: this layer has no
+// cross-adapter sharing.
+const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS heap_flags,
+                                       const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state,
+                                       const D3D12_CLEAR_VALUE* clear) {
+    if (const char* why = heap_properties_refusal(heap)) return why;
+    // The DENY flags of a committed resource's heap are the runtime's to choose; most other bits are refused too.
+    constexpr UINT committed_heap_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
+                                          D3D12_HEAP_FLAG_HARDWARE_PROTECTED | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT |
+                                          D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+    if (UINT(heap_flags) & ~committed_heap_flags) return "heap flags of a committed resource";
+
+    const bool buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    // 0x400 is not in this SDK's d3d12.h (10.0.26100), but the host accepts it on buffers and textures; 0x200 and
+    // 0x800 it refuses. RAYTRACING_ACCELERATION_STRUCTURE is accepted on a texture too.
+    constexpr UINT buffer_flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                  D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+                                  D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE | 0x400;
+    constexpr UINT texture_flags =
+        buffer_flags | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    const UINT flags = UINT(desc.Flags);
+    if (flags & ~(buffer ? buffer_flags : texture_flags)) return "resource flags";
+    const bool rt = flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const bool ds = flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    const bool uav = flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // Upload heaps start in (a part of) GENERIC_READ, readback heaps in COPY_DEST; COMMON on both; no UAVs.
+    if (heap.Type == D3D12_HEAP_TYPE_UPLOAD && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_GENERIC_READ))))
+        return "upload heap state or UAV";
+    if (heap.Type == D3D12_HEAP_TYPE_READBACK && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_COPY_DEST))))
+        return "readback heap state or UAV";
+
+    if (buffer) {
+        if (!desc.Width || desc.Height != 1 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+            desc.Format != DXGI_FORMAT_UNKNOWN || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
+            desc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+            return "buffer description";
+        if (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return "buffer alignment";
+        if (clear) return "clear value on a buffer";
+        if (heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) return "display heap for a buffer";
+        return nullptr;
+    }
+    if (desc.Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D || desc.Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        return "resource dimension";
+    if ((rt && ds) || (ds && uav) || ((flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && !ds))
+        return "resource flag combination";
+    if (ds && !depth_stencil_family(desc.Format)) return "depth-stencil format";
+    if (rt && !render_target_family(desc.Format)) return "render-target format";
+    const UINT samples = desc.SampleDesc.Count;
+    if (samples > 1 && !rt && !ds) return "multisampled texture that is not a render target or depth buffer";
+    // Every adapter measured reports one quality level; the two standard patterns are accepted too.
+    if (samples > 1 && desc.SampleDesc.Quality && desc.SampleDesc.Quality != D3D12_STANDARD_MULTISAMPLE_PATTERN &&
+        desc.SampleDesc.Quality != D3D12_CENTER_MULTISAMPLE_PATTERN)
+        return "sample quality";
+    // A clear value is only for render targets and depth buffers, in the resource's format family.
+    if (clear && (!(rt || ds) || clear->Format == DXGI_FORMAT_UNKNOWN ||
+                  format_family(clear->Format) != format_family(desc.Format)))
+        return "clear value";
+    return nullptr;
 }
 
 class DescriptorHeap final
@@ -1298,10 +1452,11 @@ public:
         return D3D12_HEAP_FLAGS((UINT(heap_flags_) & ~creation_only) | deny);
     }
 
-    // Buffers on upload and readback heaps are mapped persistently; the ranges are hints, as on D3D12. A texture
-    // in a CPU-visible heap has no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped
-    // with a null pointer, before WriteToSubresource/ReadFromSubresource.
-    HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE*, void** data) override {
+    // Buffers on upload and readback heaps are mapped persistently; the ranges are hints, as on D3D12, except that
+    // the host runtime refuses a non-empty read range that ends past the buffer. A texture in a CPU-visible heap has
+    // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
+    // WriteToSubresource/ReadFromSubresource.
+    HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
         if (image_) {
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
@@ -1310,6 +1465,7 @@ public:
                        : E_INVALIDARG;
         }
         if (!mapped_ || subresource != 0) return E_INVALIDARG;
+        if (read && read->Begin < read->End && read->End > desc_.Width) return E_INVALIDARG;
         if (data) *data = mapped_;
         return S_OK;
     }
@@ -1735,8 +1891,8 @@ private:
 };
 
 // Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
-// corpus), the one to build: the first that `fits` and declares no set-0 bindings, which pipelines do not bind yet;
-// else the first that fits; else the first without bindings; else the first. Null when there is none.
+// corpus), the one to build: the first that `fits` and declares no set-0 bindings (the cheaper pipeline); else the
+// first that fits; else the first without bindings; else the first. Null when there is none.
 template<typename Fits>
 const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEntry*>& candidates, Fits&& fits) {
     const leonida::ShaderEntry* fitting = nullptr;
@@ -1856,6 +2012,7 @@ public:
             std::vector<std::uint8_t> fssm;
         };
         Stage stages[2] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS}, {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
+        bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
         const Stage* code_stage = nullptr;
         for (Stage& stage : stages) {
@@ -1878,9 +2035,12 @@ public:
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
-                std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; pipelines do not bind set 0 yet\n",
-                             stage.entry->name.c_str());
-                return E_NOTIMPL;
+                if (!device_.bindless) {
+                    std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
+                                 stage.entry->name.c_str());
+                    return E_NOTIMPL;
+                }
+                uses_bindless = true;
             }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
@@ -1917,8 +2077,9 @@ public:
                 log_once("vertex attribute format not supported yet:", element.Format);
                 return E_INVALIDARG;
             }
+            const UINT alignment = std::min(bytes, 4u);
             const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
-                                    ? (slot_end[element.InputSlot] + 3) / 4 * 4
+                                    ? (slot_end[element.InputSlot] + alignment - 1) / alignment * alignment
                                     : element.AlignedByteOffset;
             slot_end[element.InputSlot] = offset + bytes;
             const leonida::SignatureElement* input = nullptr;
@@ -1958,8 +2119,13 @@ public:
             log_once("primitive topology type not supported:", desc.PrimitiveTopologyType);
             return E_INVALIDARG;
         }
-        if (desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED)
-            log_once("index-buffer strip cuts (primitive restart) are not modelled; value", desc.IBStripCutValue);
+        if (desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED &&
+            desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF &&
+            desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF) {
+            log_once("index-buffer strip cut value not supported:", desc.IBStripCutValue);
+            return E_INVALIDARG;
+        }
+        graphics_.strip_cut = desc.IBStripCutValue;
 
         const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -2072,6 +2238,13 @@ public:
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (uses_bindless) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+            graphics_.bindless_set = device_.bindless->set();
+        }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
@@ -2128,10 +2301,10 @@ public:
             std::fprintf(stderr, "[rt] d3d12: no translated compute shader for FSSM sha256 %s\n", hash.c_str());
             return E_INVALIDARG;
         }
-        if (entry->binding_count) {
-            // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, pipelines do not
-            // declare or bind it yet (M2).
-            std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; pipelines do not bind set 0 yet\n",
+        // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
+        // shader declares bindings has it in its layout and has it bound at every dispatch.
+        if (entry->binding_count && !device_.bindless) {
+            std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
                          entry->name.c_str());
             return E_NOTIMPL;
         }
@@ -2150,6 +2323,13 @@ public:
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (entry->binding_count) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+            pipeline_.bindless_set = device_.bindless->set();
+        }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -2194,8 +2374,10 @@ private:
         // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
         // (VUID-vkCmdDraw-pStrides-04913).
         static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,          VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
+            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
@@ -2317,10 +2499,6 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
                                                                D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     if (desc.Dimension != dimension || (line && desc.DepthOrArraySize != 1) || msaa != (desc.SampleDesc.Count > 1)) {
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
-        return false;
-    }
-    if (volume && view.min_lod != 0) {
-        log_once("volume SRV requires a zero ResourceMinLODClamp; format", int(desc.Format));
         return false;
     }
     if (msaa) {
@@ -2664,7 +2842,9 @@ public:
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
-                                                                  info.conditional_rendering, info.ray_tracing);
+                                                                  info.conditional_rendering, info.ray_tracing,
+                                                                  info.xdxr_acceleration_structures &&
+                                                                      info.buffer_device_address);
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -3034,7 +3214,22 @@ public:
                                                  void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandQueue";
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
-        if (!out) return d3d12_trace::result(method, E_POINTER);
+        // As the host runtime: no bundle queues, the three D3D12 priorities (realtime refused, below), one flag and
+        // one node. A valid description without an output is E_UNEXPECTED there, not a capability check.
+        if (desc->Type == D3D12_COMMAND_LIST_TYPE_BUNDLE || UINT(desc->Type) > D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE ||
+            (desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
+             desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
+             desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) ||
+            (desc->Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) || desc->NodeMask > 1) {
+            log_once("CreateCommandQueue refused (type, priority, flags or node mask), type", desc->Type);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        // Global realtime priority needs a privilege the host grants only on request; without it, this answer.
+        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+            log_once("CreateCommandQueue refused (global realtime priority), type", desc->Type);
+            return d3d12_trace::result(method, DXGI_ERROR_ACCESS_DENIED);
+        }
+        if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         *out = nullptr;
         if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
             desc->Type != D3D12_COMMAND_LIST_TYPE_COPY) return d3d12_trace::result(method, E_INVALIDARG);
@@ -3112,7 +3307,18 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateFence(UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateFence";
-        return d3d12_trace::result(method, create_fence(*state_.context, initial, flags, riid, out, identity()));
+        // As the host runtime: known flags only, cross-adapter only when shared, and no non-monitored fences
+        // (refused there even with both sharing flags). A null output is a capability check.
+        constexpr UINT known = D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER |
+                               D3D12_FENCE_FLAG_NON_MONITORED;
+        if ((UINT(flags) & ~known) || (flags & D3D12_FENCE_FLAG_NON_MONITORED) ||
+            ((flags & D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER) && !(flags & D3D12_FENCE_FLAG_SHARED))) {
+            log_once("CreateFence refused, flags", int(flags));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        if (!out) return d3d12_trace::result(method, S_FALSE);
+        return d3d12_trace::result(method, create_fence(*state_.context, initial, flags, riid, out,
+                                                        identity()));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature*,
@@ -3150,6 +3356,34 @@ public:
         if (!out) return;
         *out = {};
         auto& vk = state_.context->vk;
+        if (desc && state_.context->xdxr_acceleration_structures()) {
+            // XDXR records: the layout depends only on the triangle or instance count (xdxr_build.h), so the sizes
+            // are exact. An update rebuilds the structure, so it needs the same scratch.
+            leonida::BuildAccelerationStructure build{};
+            build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+            if (build.is_tlas) {
+                build.instance_count = desc->NumDescs;
+            } else {
+                for (UINT i = 0; i < desc->NumDescs; ++i) {
+                    const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
+                        (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+                            ? (desc->ppGeometryDescs ? desc->ppGeometryDescs[i] : nullptr)
+                            : (desc->pGeometryDescs ? &desc->pGeometryDescs[i] : nullptr);
+                    if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
+                    leonida::RtTriangleGeometry t{};
+                    t.vertex_count = gd->Triangles.VertexCount;
+                    t.index_count = gd->Triangles.IndexCount;
+                    t.index_type = gd->Triangles.IndexFormat == DXGI_FORMAT_UNKNOWN ? 0u : 1u;
+                    build.triangles.push_back(t);
+                }
+            }
+            leonida::XdxrLayout layout;
+            if (!layout.compute(leonida::VulkanContext::xdxr_elements(build), build.is_tlas)) return;
+            out->ResultDataMaxSizeInBytes = layout.size;
+            out->ScratchDataSizeInBytes = layout.scratch;
+            out->UpdateScratchDataSizeInBytes = layout.scratch;
+            return;
+        }
         if (!desc || !state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
 
         const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
@@ -3216,9 +3450,18 @@ public:
     HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,
                                                    void** out) override {
         constexpr auto method = "ID3D12Device::CreateDescriptorHeap";
-        if (!out) return d3d12_trace::result(method, E_POINTER);
-        *out = nullptr;
-        if (!desc || !desc->NumDescriptors) return d3d12_trace::result(method, E_INVALIDARG);
+        if (out) *out = nullptr;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        // As the host runtime: a null output is a capability check, answered before the rules below (S_FALSE even
+        // for a shader-visible RTV heap). Zero descriptors are allowed, RTV and DSV heaps are never shader-visible,
+        // one flag and one node.
+        if (!out) return d3d12_trace::result(method, S_FALSE);
+        if ((desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || desc->NodeMask > 1 ||
+            ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+             (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV))) {
+            log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
         auto* heap = new DescriptorHeap(state_, *desc);
         heap->attach_device(identity());
         if (!heap->ok()) {
@@ -3675,10 +3918,34 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
-                                                      const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
-                                                      const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+                                                      const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                                      const D3D12_CLEAR_VALUE* clear, REFIID riid,
+                                                      void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommittedResource";
-        return d3d12_trace::result(method, create_committed(heap, heap_flags, desc, initial_state, 0, nullptr, riid, out));
+        if (out) *out = nullptr;
+        if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
+        // The host runtime's argument checks (D3D-49). A refusal is logged once per reason and dimension, since a
+        // game that trips one (for example with an Xbox-only flag through slot 76) gets no resource.
+        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear)) {
+            log_once((std::string("CreateCommittedResource refused (") + why + "), dimension").c_str(),
+                     desc->Dimension);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        // The sample quality is checked above as the host does it here: CreateCommittedResource accepts a quality on a
+        // single-sampled texture and the two standard MSAA patterns, which GetResourceAllocationInfo's rules refuse.
+        // The size, mip and alignment checks below run on a copy with quality 0.
+        D3D12_RESOURCE_DESC checked = *desc;
+        if (checked.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) checked.SampleDesc.Quality = 0;
+        if ((desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+             desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) &&
+            allocation(checked).SizeInBytes == UINT64_MAX) {
+            // Extents, mips, samples and alignment, as GetResourceAllocationInfo answers.
+            log_once("CreateCommittedResource refused (texture size, mips, samples or alignment), dimension",
+                     desc->Dimension);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        return d3d12_trace::result(method, create_committed(heap, heap_flags, desc, state, 0, nullptr, riid,
+                                                            out));
     }
 
     // Reserved (tiled) resources, for the first boot (docs/d3d12_vulkan.md section 4.2): the whole resource is
@@ -4429,12 +4696,15 @@ public:
             if ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
                 (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) {
                 s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-                // A typed UAV read is not a storage-image read: the translator reads the texture through its
-                // sampled binding with the T#'s numeric type (rdna2spirv.py image_read_typed), and a typed buffer
-                // through its address. So every typed UAV format can also be read.
+                // A typed UAV texture read is not a storage-image read: the translator reads it through the
+                // texture's sampled binding with the T#'s numeric type (rdna2spirv.py image_read_typed), so a
+                // format that can be stored can be read. Typed buffer UAVs share the store side's limits: the layer
+                // creates no buffer UAV views yet, and rdna2spirv.py FORMATS decodes only some buffer formats.
                 s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE | D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
-                // Image atomics go through the r32ui storage view, which only an R32_UINT texture gets
-                // (StorageViews::r32ui). The translator has no image_atomic_swap, so no exchange.
+                // Image atomics go through the r32ui storage view, which an R32_UINT UAV view gets
+                // (StorageViews::r32ui). Today that is 2D UAVs only: the translator's image atomics cover 2D and 3D,
+                // the bindless set has r32ui slots for those two, and the layer creates no 3D UAV views yet. There
+                // is no image_atomic_swap, so no exchange.
                 if (vk_fmt == VK_FORMAT_R32_UINT && (optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT)) {
                     s2 |= D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
                           D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
@@ -4450,7 +4720,7 @@ public:
                 const bool block_compressed = vk_fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && vk_fmt <= VK_FORMAT_BC7_SRGB_BLOCK;
                 // Gathers read the sampled view like a sample does (OpImageGather); the host reports one with the other.
                 if (s1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) s1 |= D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
-                // A mip chain where the image can have one, with the usage it is created with.
+                // A mip chain where the image can have one (asked with its sampled or depth-stencil usage).
                 if (s1 & (D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D |
                           D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
                           D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL)) {
@@ -4464,14 +4734,16 @@ public:
                                                        &limits) == VK_SUCCESS &&
                         limits.maxMipLevels > 1)
                         s1 |= D3D12_FORMAT_SUPPORT1_MIP;
-                    // Depth formats multisample as depth-stencil targets (MULTISAMPLE_QUALITY_LEVELS already
-                    // reports their counts); the colour-attachment check above never sees them.
+                    // Depth formats multisample as depth-stencil targets; the colour-attachment check above never
+                    // sees them. Same usages as MULTISAMPLE_QUALITY_LEVELS and resource creation ask for.
                     if (depth && !chosen.typeless && (s1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) &&
                         state_.image_format_properties &&
                         state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
                                                        VK_IMAGE_TILING_OPTIMAL,
-                                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
-                                                       &limits) == VK_SUCCESS &&
+                                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                       0, &limits) == VK_SUCCESS &&
                         (limits.sampleCounts & d3d12_multisample_sample_counts))
                         s1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET;
                 }
@@ -4479,12 +4751,17 @@ public:
                 if (DeviceState::numeric_class(vk_fmt) != 0) s1 &= ~D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
                 // Block-compressed textures are 2D, 3D or cubes: 1D has no 4x4 blocks.
                 if (block_compressed) s1 &= ~D3D12_FORMAT_SUPPORT1_TEXTURE1D;
-                // Depth formats are 1D, 2D and cube resources whose shaders read them through a colour view
-                // (R32_FLOAT, R24_UNORM_X8_TYPELESS, ...), not 3D and not shader resources themselves.
-                if (depth)
-                    s1 &= ~(D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+                // Depth formats are 2D and cube resources whose shaders read and write them through a colour view
+                // (R32_FLOAT, R24_UNORM_X8_TYPELESS, ...): not 3D, not shader resources or UAVs themselves (NVIDIA
+                // gives D32_SFLOAT and D16_UNORM STORAGE_IMAGE). Native D3D12 also allows 1D, but the layer refuses
+                // 1D depth-stencil resources (CreateCommittedResource).
+                if (depth) {
+                    s1 &= ~(D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
                             D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
-                            D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER);
+                            D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER |
+                            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW);
+                    s2 = D3D12_FORMAT_SUPPORT2_NONE;
+                }
                 // A TYPELESS format is only storage: views give it a type, so it is a texture with mips and
                 // nothing a view would do (no buffer, shader, render-target or UAV use of its own).
                 if (chosen.typeless) {
@@ -4496,19 +4773,13 @@ public:
             }
             if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && state_.r9g9b9e5_uav_emulated) {
                 s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-                s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
-                VkFormatProperties r32{};
-                state_.format_properties(state_.info.physical, VK_FORMAT_R32_UINT, &r32);
-                if (r32.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT) {
-                    s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
-                }
+                // Reads go through the sampled E5B9G9R9 view, like every typed UAV read (see above).
+                s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE | D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
             }
             if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
-                // The native packed format supports single-sample RTVs on some adapters.
-                // Only that usage has been verified through the shim's render-target path.
-                s1 &= ~(D3D12_FORMAT_SUPPORT1_BLENDABLE |
-                        D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
-                        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD);
+                // Keep the native attachment and resolve bits. Blending and shader multisample loads remain masked.
+                s1 &= ~(D3D12_FORMAT_SUPPORT1_BLENDABLE | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL |
+                        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD);
             }
             fs->Support1 = s1;
             fs->Support2 = s2;
@@ -4771,7 +5042,10 @@ private:
         } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
             hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
         } else if (const UINT samples = desc->SampleDesc.Count;
-                   !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || desc->SampleDesc.Quality != 0 ||
+                   !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
+                   (samples > 1 && desc->SampleDesc.Quality &&
+                    desc->SampleDesc.Quality != D3D12_STANDARD_MULTISAMPLE_PATTERN &&
+                    desc->SampleDesc.Quality != D3D12_CENTER_MULTISAMPLE_PATTERN) ||
                    (samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
                                     desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
                                     !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
@@ -5151,6 +5425,11 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
     return set ? set->layout() : VK_NULL_HANDLE;
 }
 
+std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]) {
+    const leonida::BindlessSet* set = bindless_of(device);
+    return set ? set->table().lookup(key) : 0;
+}
+
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
     : device_(device), presenter_(std::move(presenter)) {
     device_->AddRef();
@@ -5171,13 +5450,19 @@ HRESULT present_result(VkResult result) {
 }
 }  // namespace
 
-HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect) {
+HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect,
+                                 bool tear) {
     if (!back_buffer) return E_INVALIDARG;
     const leonida::PresentRect rect = src_rect ? leonida::PresentRect{src_rect->left, src_rect->top, src_rect->right,
                                                                        src_rect->bottom}
                                                : leonida::PresentRect{};
-    return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr));
+    return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr,
+                                              tear));
 }
+
+bool WindowPresenter::tear_supported() const { return presenter_->tear_supported(); }
+bool WindowPresenter::last_present_tore() const { return presenter_->last_present_tore(); }
+std::uint64_t WindowPresenter::tear_presents() const { return presenter_->tear_presents(); }
 
 HRESULT WindowPresenter::present_blank(UINT sync_interval) {
     return present_result(presenter_->present_blank(sync_interval > 0));
@@ -5210,9 +5495,21 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
     surface_info.hwnd = window;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     if (create_surface(info.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) return nullptr;
+    // LEONIDA_PRESENT_NO_TEAR=1 keeps the swapchain FIFO-only (ImmediateThresholdPercent then does nothing).
+    // Any non-empty value other than "0" turns it off.
+    bool tear_allowed = true;
+    {
+        char* value = nullptr;
+        std::size_t length = 0;
+        if (_dupenv_s(&value, &length, "LEONIDA_PRESENT_NO_TEAR") == 0 && value) {
+            tear_allowed = value[0] == '\0' || std::strcmp(value, "0") == 0;
+            std::free(value);
+        }
+    }
     auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
                                                                 info.instance, info.physical, info.queue,
-                                                                info.queue_family, surface);  // owns the surface
+                                                                info.queue_family, surface,  // owns the surface
+                                                                info.swapchain_maintenance1 && tear_allowed);
     if (!presenter->ok()) {
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
@@ -5261,19 +5558,33 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
         get(nullptr, "vkEnumerateInstanceExtensionProperties"));
     std::vector<const char*> inst_exts;
+    bool surface_maintenance1_khr = false, surface_maintenance1_ext = false;  // enabled on the instance
     if (enum_inst_exts) {
         std::uint32_t ext_cnt = 0;
         enum_inst_exts(nullptr, &ext_cnt, nullptr);
         std::vector<VkExtensionProperties> available(ext_cnt);
         enum_inst_exts(nullptr, &ext_cnt, available.data());
-        bool has_surface = false, has_win32 = false;
+        bool has_surface = false, has_win32 = false, has_caps2 = false;
         for (const auto& e : available) {
             if (!std::strcmp(e.extensionName, VK_KHR_SURFACE_EXTENSION_NAME)) has_surface = true;
             if (!std::strcmp(e.extensionName, VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) has_win32 = true;
+            if (!std::strcmp(e.extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) has_caps2 = true;
+            if (!std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1")) surface_maintenance1_khr = true;
+            if (!std::strcmp(e.extensionName, "VK_EXT_surface_maintenance1")) surface_maintenance1_ext = true;
         }
         if (has_surface && has_win32) {
             inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
             inst_exts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+            // The surface half of VK_*_swapchain_maintenance1 (the present modes a swapchain can switch between).
+            if (has_caps2 && (surface_maintenance1_khr || surface_maintenance1_ext)) {
+                inst_exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+                if (surface_maintenance1_khr) inst_exts.push_back("VK_KHR_surface_maintenance1");
+                if (surface_maintenance1_ext) inst_exts.push_back("VK_EXT_surface_maintenance1");
+            } else {
+                surface_maintenance1_khr = surface_maintenance1_ext = false;
+            }
+        } else {
+            surface_maintenance1_khr = surface_maintenance1_ext = false;
         }
     }
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -5343,6 +5654,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     bool chosen_bc = false;
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
+    bool chosen_draw_params = false;
     leonida::Vulkan13Features v13, candidate13;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
@@ -5350,10 +5662,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         if (!leonida::vulkan_device_wanted(props.deviceName)) continue;
         candidate13.query(candidate, props.apiVersion, vkGetPhysicalDeviceFeatures2, vkEnumerateDeviceExtensionProperties);
         if (!candidate13.usable()) continue;
-        VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+        VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
         vkGetPhysicalDeviceFeatures2(candidate, &features);
         const bool bc = features.features.textureCompressionBC;
+        const bool draw_params = f11.shaderDrawParameters;
         if (!f12.timelineSemaphore || !f12.separateDepthStencilLayouts || !f12.bufferDeviceAddress) continue;
         std::uint32_t family_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, nullptr);
@@ -5368,6 +5682,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 chosen_bc = bc;
                 chosen_features = features.features;
                 chosen12 = f12;
+                chosen_draw_params = draw_params;
                 v13.choose(candidate13);
             }
             break;
@@ -5419,6 +5734,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
             vkGetPhysicalDeviceFeatures2(info.physical, &features);
             info.ray_tracing = as_features.accelerationStructure == VK_TRUE && rq_features.rayQuery == VK_TRUE;
         }
+        // The game's translated RT shaders read XDXR BVH4 records, which a VkAccelerationStructureKHR is not
+        // (docs/d3d12_vulkan.md 4.8): build those, unless LEONIDA_RT_AS=khr asks for #743's KHR builds instead.
+        char rt_as[8] = {};
+        std::size_t rt_as_length = 0;
+        const bool khr = getenv_s(&rt_as_length, rt_as, "LEONIDA_RT_AS") == 0 && rt_as_length > 1 &&
+                         std::strcmp(rt_as, "khr") == 0;
+        if (!khr && chosen12.bufferDeviceAddress) {
+            info.xdxr_acceleration_structures = true;
+            info.ray_tracing = false;  // no KHR extensions: AS resources keep their console VAs
+        }
         if (!info.conditional_rendering)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_conditional_rendering: SetPredication is unsupported\n");
     }
@@ -5442,8 +5767,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         ext_chain = &enable_conditional;
     }
 
-    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    // Translated vertex shaders read BaseVertex / BaseInstance (SPIR-V DrawParameters) to give v0 / v3 the
+    // hardware's zero-based vertex and instance ids (docs/design.md, Inputs and outputs).
+    VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                               v13.enable(ext_chain)};
+    enable11.shaderDrawParameters = chosen_draw_params ? VK_TRUE : VK_FALSE;
+    if (!chosen_draw_params) std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderDrawParameters\n");
+    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
     info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
@@ -5460,12 +5790,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.bindless_partially_bound = info.bindless && chosen12.descriptorBindingPartiallyBound;
     info.sampler_anisotropy = chosen_features.samplerAnisotropy;
     info.sampler_mirror_clamp_to_edge = chosen12.samplerMirrorClampToEdge;
+    info.sampler_filter_minmax = chosen12.samplerFilterMinmax;
     enable12.runtimeDescriptorArray = info.bindless;
     enable12.descriptorBindingSampledImageUpdateAfterBind = info.bindless;
     enable12.descriptorBindingStorageImageUpdateAfterBind = info.bindless;
     enable12.descriptorBindingStorageBufferUpdateAfterBind = info.bindless;
     enable12.descriptorBindingPartiallyBound = info.bindless_partially_bound;
     enable12.samplerMirrorClampToEdge = info.sampler_mirror_clamp_to_edge;
+    enable12.samplerFilterMinmax = info.sampler_filter_minmax;
     if (!info.bindless)
         std::fprintf(stderr, "[rt] d3d12: the GPU lacks a descriptor-indexing feature the bindless set needs\n");
     enable12.bufferDeviceAddress = VK_TRUE;
@@ -5485,6 +5817,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
     enable.shaderSampledImageArrayDynamicIndexing = info.bindless;
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
+    if (!chosen_features.shaderInt64)
+        std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderInt64; translated shaders (all declare Int64) will not load\n");
     enable.samplerAnisotropy = info.sampler_anisotropy;
     enable.occlusionQueryPrecise = chosen_features.occlusionQueryPrecise;  // exact D3D12 occlusion counts
     enable.pipelineStatisticsQuery = chosen_features.pipelineStatisticsQuery;
@@ -5571,6 +5905,35 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         if (calibrated) break;
     }
     info.calibrated_timestamps = calibrated != nullptr;
+
+    // Switching a vsync swapchain to IMMEDIATE or FIFO_RELAXED per present (PresentX's ImmediateThresholdPercent):
+    // the KHR extension (promoted from the EXT one, same structures) with the surface extension of the same name
+    // on the instance, else the EXT one. Only enabled where the instance has the surface half and the GPU the feature.
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
+    const char* swapchain_m1_name = nullptr;
+    if (has_swapchain && instance_has_surface) {
+        const auto device_has = [&](const char* name) {
+            return std::any_of(extensions.begin(), extensions.end(),
+                               [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+        };
+        if (surface_maintenance1_khr && device_has("VK_KHR_swapchain_maintenance1"))
+            swapchain_m1_name = "VK_KHR_swapchain_maintenance1";
+        else if (surface_maintenance1_ext && device_has("VK_EXT_swapchain_maintenance1"))
+            swapchain_m1_name = "VK_EXT_swapchain_maintenance1";
+        if (swapchain_m1_name) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &swapchain_m1};
+            vkGetPhysicalDeviceFeatures2(info.physical, &query);
+            if (swapchain_m1.swapchainMaintenance1 == VK_TRUE) {
+                swapchain_m1.pNext = *v13.next();
+                *v13.next() = &swapchain_m1;
+            } else {
+                swapchain_m1_name = nullptr;
+            }
+        }
+    }
+    info.swapchain_maintenance1 = swapchain_m1_name != nullptr;
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
@@ -5586,6 +5949,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);

@@ -15,12 +15,20 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _make_parent(path: str) -> None:
+    """Create the folder a report lives in: the run is over by the time the summary is written."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def norm(path: str) -> str:
@@ -50,6 +58,11 @@ def properties(test: dict) -> dict:
 def truthy(value) -> bool:
     """A ctest boolean property. The JSON carries it as a string, so "0" must stay false."""
     return str(value).strip().lower() in ("1", "on", "true", "yes")
+
+
+def regex_list(value: str | list[str]) -> list[str]:
+    """Treat a single string as one output expression, like a one-element CTest list."""
+    return [value] if isinstance(value, str) else value
 
 
 def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
@@ -91,8 +104,19 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     skip_code = props.get("SKIP_RETURN_CODE")
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
-    passed = (code != 0) if truthy(props.get("WILL_FAIL")) else (code == 0)
-    return ("pass" if passed else "fail"), f"exit {code} in {elapsed:.1f} s\n{out}"
+    detail = f"exit {code} in {elapsed:.1f} s\n{out}"
+    required = regex_list(props.get("PASS_REGULAR_EXPRESSION", []))
+    forbidden = regex_list(props.get("FAIL_REGULAR_EXPRESSION", []))
+    # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
+    try:
+        passed = any(re.search(pattern, out, re.DOTALL) for pattern in required) if required else code == 0
+        if any(re.search(pattern, out, re.DOTALL) for pattern in forbidden):
+            passed = False
+    except re.error as e:
+        return "fail", f"invalid output regular expression: {e}\n{detail}"
+    if truthy(props.get("WILL_FAIL")):
+        passed = not passed
+    return ("pass" if passed else "fail"), detail
 
 
 def positive_seconds(text: str) -> float:
@@ -171,13 +195,18 @@ def main() -> int:
         print("required tests that did not pass: " + ", ".join(failed_required))
 
     if args.summary:
-        with open(args.summary, "a", encoding="utf-8") as f:
-            f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
-            f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
-            f.write("| Test | Result | Required |\n|---|---|---|\n")
-            for name, status in results.items():
-                f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
-            f.write("\n")
+        try:
+            _make_parent(args.summary)
+            with open(args.summary, "a", encoding="utf-8") as f:
+                f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
+                f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
+                f.write("| Test | Result | Required |\n|---|---|---|\n")
+                for name, status in results.items():
+                    f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write the summary {args.summary}: {e.strerror or e}", file=sys.stderr)
+            return 1
     return 1 if failed_required else 0
 
 

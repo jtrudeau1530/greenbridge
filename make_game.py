@@ -969,15 +969,29 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     for root, _, files in os.walk(game):
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
     settings = ttpf_assets.load_profile(work) if pools else None
-    for p in sorted(pools, key=os.path.getsize):
+    # rpf9dump names each pool's output folder after the source basename. Pools with the same basename
+    # in one destination namespace would share that folder and its manifest, so the second pool would
+    # look already exported and lose all its DDS. Give every member of a colliding group its own
+    # export root, keyed off the relative source path; unique pools keep their current folder.
+    info = []
+    for p in pools:
         name = os.path.splitext(os.path.basename(p))[0]
         parts = os.path.relpath(p, game).replace("\\", "/").split("/")
         dest = os.path.join(out, "ttpf_pack", parts[1]) if parts[0] == "pack" else os.path.join(out, "ttpf")
-        pool_dir = os.path.join(dest, name)
+        info.append((p, name, dest, "/".join(parts)))
+    counts = {}
+    for _, name, dest, _ in info:
+        key = (os.path.normcase(dest), os.path.normcase(name))
+        counts[key] = counts.get(key, 0) + 1
+    for p, name, dest, rel in sorted(info, key=lambda x: os.path.getsize(x[0])):
+        root = dest
+        if counts[(os.path.normcase(dest), os.path.normcase(name))] > 1:
+            root = os.path.join(dest, f"{name}~{hashlib.sha256(rel.encode('utf-8')).hexdigest()[:12]}")
+        pool_dir = os.path.join(root, name)
         manifest = ttpf_manifest(pool_dir)
         if manifest is None:
             log(f"assets: texture pool {os.path.relpath(p, game)}")
-            run([get_exporter(work), "ttpf", p, dest])
+            run([get_exporter(work), "ttpf", p, root])
             manifest = ttpf_manifest(pool_dir)
             if manifest is None:
                 fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")

@@ -11,6 +11,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INDEX = os.path.join(ROOT, "docs", "i18n", "README.md")
+DOCS_README = os.path.join(ROOT, "docs", "README.md")
 
 ROW = re.compile(r"^\|\s*(?P<language>[^|]+?)\s*\|\s*(?P<file>[^|]+?)\s*\|\s*"
                  r"(?P<commit>[^|]+?)\s*\|\s*(?P<maintainer>[^|]+?)\s*\|$")
@@ -71,6 +72,19 @@ class IndexTest(unittest.TestCase):
                 self.assertTrue(os.path.isfile(path), path)
                 self.assertTrue(row["maintainer"].startswith("@"), row)
                 self.assertRegex(row["commit"], COMMIT.pattern, row)
+
+    def test_docs_readme_names_every_language_once(self):
+        codes = [row["code"] for row in self.read_rows()]
+        with open(DOCS_README, encoding="utf-8") as f:
+            lines = [line for line in f.read().splitlines()
+                     if line.startswith("Community quickstarts (stable onboarding text only")]
+        self.assertEqual(len(lines), 1, f"docs/README.md has {len(lines)} 'Other languages' lines")
+        line = lines[0]
+        for code in codes:
+            self.assertEqual(line.count(f"`{code}`"), 1, f"{code} is not named exactly once: {line}")
+        listed = set(re.findall(r"`([A-Za-z]{2,3}(?:-[A-Za-z]+)?)`", line))
+        self.assertEqual(listed - set(codes), set(),
+                         f"docs/README.md names languages without an i18n row: {listed - set(codes)}")
 
     def test_a_duplicate_language_is_reported(self):
         table = ("| Language | File | Synced commit | Maintainer |\n"

@@ -203,7 +203,10 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     blocks, chunk, channels = struct.unpack_from("<III", d, m_at)
     if not (1 <= channels <= 32 and 1 <= blocks and chunk >= 2048 and m_size == 12 + 16 * channels):
         return []
-    if blocks * chunk > d_size:
+    # Every block must start inside the data tag. The last block is usually shorter than `chunk` (game banks
+    # hold e.g. 1 block of a 524,288-byte chunk in a 264,192-byte tag), so `blocks * chunk` is not a bound;
+    # each block's own record table and subblock run are checked against the bytes left below.
+    if (blocks - 1) * chunk >= d_size:
         return []
     info = []
     for c in range(channels):
@@ -214,6 +217,8 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         info.append([cid, samples, rate, d[base + 12], [], 0])
     for b in range(blocks):
         at = d_at + b * chunk
+        if channels * 24 > d_size - b * chunk:
+            return []
         recs = [struct.unpack_from("<III", d, at + 24 * c + 4)[:2] for c in range(channels)]   # (count, skip)
         total = sum(r[0] for r in recs)
         header = (channels * 24 + total * 4 + 2047) & ~2047
@@ -256,6 +261,17 @@ def opus_packets(d: bytes, at: int, size: int):
     return out
 
 
+def export_stems(ids):
+    """The file stem for each stream, in stream-table order: `<id>` (8 hex digits) for the first stream with an
+    id and `<id>~2`, `<id>~3`, ... for later ones. A bank can hold two streams with the same 29-bit id; naming
+    them apart keeps the second from overwriting the first. awc_manifest notes the same stems."""
+    seen, out = {}, []
+    for sid in ids:
+        seen[sid] = seen.get(sid, 0) + 1
+        out.append(f"{sid:08X}" if seen[sid] == 1 else f"{sid:08X}~{seen[sid]}")
+    return out
+
+
 def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
     with open(path, "rb") as f:
         d = f.read()
@@ -271,7 +287,7 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
                 write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48,
                                pre_skip=pre_skip)
                 counts["music"] += 1
-    for s in streams:
+    for s, stem in zip(streams, export_stems([s["id"] for s in streams])):
         at, size = s["data"]
         if s["codec"] == 0x0B and size % 2048 == 0 and s["channels"] in (1, 2):
             pk = opus_packets(d, at, size)
@@ -280,17 +296,17 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
                 # half of it for stereo in all 7,451 measured streams. Fall back to dividing the
                 # interleaved count when a synthetic or malformed block leaves the field zero.
                 frames = s["frames"] or s["samples"] // max(1, s["channels"])
-                write_ogg_opus(os.path.join(od, f"{s['id']:08X}.ogg"), pk, s["channels"], s["id"], frames,
+                write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, s["channels"], s["id"], frames,
                                pre_skip=pre_skip)
                 counts["opus"] += 1
                 continue
         if s["codec"] == 2 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 4:
             # codec 2: 32-bit float PCM (4 bytes per sample; values can exceed +-1, e.g. impulse responses)
-            write_wav(os.path.join(od, f"{s['id']:08X}.wav"), d[at:at + size], s["rate"], s["channels"], True)
+            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"], True)
             counts["pcm"] += 1
             continue
         if s["codec"] == 0 and s["channels"] in (1, 2):
-            write_wav(os.path.join(od, f"{s['id']:08X}.wav"), d[at:at + size], s["rate"], s["channels"])
+            write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"])
             counts["pcm"] += 1
             continue
         counts["other"] += 1

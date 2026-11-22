@@ -43,6 +43,25 @@ std::uint32_t as_bits(float f) {
     return bits;
 }
 
+PFN_vkCmdPipelineBarrier2 real_barrier2 = nullptr;
+std::uint32_t host_barriers = 0;
+VkPipelineStageFlags2 host_src_stages = 0;
+VkAccessFlags2 host_src_access = 0;
+VKAPI_ATTR void VKAPI_CALL observe_host(VkCommandBuffer cb, const VkDependencyInfo* dep) {
+    if (dep) {
+        for (std::uint32_t i = 0; i < dep->memoryBarrierCount; ++i) {
+            const auto& b = dep->pMemoryBarriers[i];
+            if ((b.dstStageMask & VK_PIPELINE_STAGE_2_HOST_BIT) &&
+                (b.dstAccessMask & VK_ACCESS_2_HOST_READ_BIT)) {
+                ++host_barriers;
+                host_src_stages |= b.srcStageMask;
+                host_src_access |= b.srcAccessMask;
+            }
+        }
+    }
+    real_barrier2(cb, dep);
+}
+
 }  // namespace
 
 int main() {
@@ -513,6 +532,86 @@ int main() {
                 if (!in_written(i)) EXPECT(arena_ptr[i] == guard_word);
 
             std::printf("depth24: shared-buffer offsets (CopyResource, RGBA8, depth24 and rgb96 CopyTexture) ok\n");
+
+            // Host-readback barrier observation across logical queue kinds: compute-converted depth24 and rgb96
+            // readbacks must emit COMPUTE_SHADER_BIT / MEMORY_WRITE_BIT -> HOST_BIT / HOST_READ_BIT on direct and
+            // compute queues (and stay within queue_supported_stages on copy queues), and a host_readable buffer UAV
+            // clear must emit a TRANSFER_BIT / TRANSFER_WRITE_BIT -> HOST_BIT / HOST_READ_BIT barrier.
+            real_barrier2 = context.vk.vkCmdPipelineBarrier2;
+            EXPECT(real_barrier2 != nullptr);
+            context.vk.vkCmdPipelineBarrier2 = observe_host;
+
+            CommandList d24_rb_only, rgb96_rb_only, uav_clear_rb;
+            EXPECT(d24_rb_only.copy_texture({fp_d24_rb, 0, 0, 0, loc_d24, false, {}}) && d24_rb_only.close());
+            EXPECT(rgb96_rb_only.copy_texture({fp_rgb96_rb, 0, 0, 0, loc_rgb96, false, {}}) && rgb96_rb_only.close());
+            EXPECT(uav_clear_rb.clear_unordered_access({id_copy, true, 0, 0, slice_bytes, 4, 0, 0, 1}, false,
+                                                       {0x13572468u, 0, 0, 0}, {}) &&
+                   uav_clear_rb.close());
+
+            const CommandList* d24_ptr = &d24_rb_only;
+            const CommandList* rgb96_ptr = &rgb96_rb_only;
+            const CommandList* uav_ptr = &uav_clear_rb;
+            for (const auto kind : {VulkanQueue::QueueKind::direct, VulkanQueue::QueueKind::compute,
+                                    VulkanQueue::QueueKind::copy}) {
+                VulkanQueue typed(context, gpu.queue, gpu.family, kind);
+                EXPECT(typed.ok());
+
+                // depth24_as_float readback
+                for (std::uint32_t i = 0; i < slice_words; ++i) arena_ptr[d24_rb_off / 4 + i] = poison_word;
+                host_barriers = 0;
+                host_src_stages = 0;
+                host_src_access = 0;
+                EXPECT(typed.execute({&d24_ptr, 1}) == ReplayResult::success);
+                EXPECT(typed.idle() && host_barriers == 1);
+                EXPECT((host_src_stages & ~VulkanQueue::queue_supported_stages(kind)) == 0);
+                if (kind == VulkanQueue::QueueKind::copy) {
+                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+                    EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                } else {
+                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+                    EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
+                }
+                for (std::uint32_t i = 0; i < slice_words; ++i)
+                    EXPECT(arena_ptr[d24_rb_off / 4 + i] == (arena_ptr[src_off / 4 + i] & depth24_max));
+
+                // rgb96 readback
+                for (std::uint32_t y = 0; y < rgb96_h; ++y)
+                    for (std::uint32_t x = 0; x < rgb96_w; ++x)
+                        for (std::uint32_t c = 0; c < 3; ++c)
+                            arena_ptr[rgb96_rb_off / 4 + (rgb96_fp_off + std::size_t(y) * rgb96_pitch) / 4 + x * 3 + c] =
+                                poison_word;
+                host_barriers = 0;
+                host_src_stages = 0;
+                host_src_access = 0;
+                EXPECT(typed.execute({&rgb96_ptr, 1}) == ReplayResult::success);
+                EXPECT(typed.idle() && host_barriers == 1);
+                EXPECT((host_src_stages & ~VulkanQueue::queue_supported_stages(kind)) == 0);
+                if (kind == VulkanQueue::QueueKind::copy) {
+                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+                    EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                } else {
+                    EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+                    EXPECT(host_src_access == VK_ACCESS_2_MEMORY_WRITE_BIT);
+                }
+                for (std::uint32_t y = 0; y < rgb96_h; ++y)
+                    for (std::uint32_t x = 0; x < rgb96_w; ++x)
+                        for (std::uint32_t c = 0; c < 3; ++c)
+                            EXPECT(arena_ptr[rgb96_rb_off / 4 + (rgb96_fp_off + std::size_t(y) * rgb96_pitch) / 4 +
+                                             x * 3 + c] == rgb96_word(y, x, c));
+
+                // ClearUnorderedAccess on host_readable buffer
+                for (std::uint32_t i = 0; i < slice_words; ++i) arena_ptr[copy_off / 4 + i] = poison_word;
+                host_barriers = 0;
+                host_src_stages = 0;
+                host_src_access = 0;
+                EXPECT(typed.execute({&uav_ptr, 1}) == ReplayResult::success);
+                EXPECT(typed.idle() && host_barriers == 1);
+                EXPECT(host_src_stages == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+                EXPECT(host_src_access == VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                for (std::uint32_t i = 0; i < slice_words; ++i) EXPECT(arena_ptr[copy_off / 4 + i] == 0x13572468u);
+            }
+            context.vk.vkCmdPipelineBarrier2 = real_barrier2;
+            std::printf("depth24: host-readback visibility barriers (depth24, rgb96, buffer UAV clear) ok\n");
         }
     }
 

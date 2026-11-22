@@ -277,6 +277,16 @@ def stage_map(disasm_dir) -> dict:
         return {}
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -289,6 +299,9 @@ def main():
         print(f"ERROR: {a.src} {what}. Give the folder of .s files shader_disasm.py writes.", file=sys.stderr)
         return 2
     path = a.out or os.path.join(a.src, "..", "profile.json")
+    if os.path.isdir(path):
+        print(f"ERROR: cannot write {path}: destination is a directory, not a file", file=sys.stderr)
+        return 2
     out_dir = os.path.dirname(os.path.abspath(path))
     if not os.path.isdir(out_dir):        # checked before the scan, which takes minutes on the whole corpus
         print(f"ERROR: the folder for {path} does not exist", file=sys.stderr)
@@ -299,6 +312,10 @@ def main():
     except OSError as e:
         print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
+    for entry in shader_files:
+        if same_output_path(entry.path, path):
+            print(f"ERROR: output would overwrite input shader {entry.path}", file=sys.stderr)
+            return 2
     occ, users = Counter(), Counter()
     word_occ, word_users = Counter(), Counter()    # warned-at word -> warnings, shaders
     unresolved = 0

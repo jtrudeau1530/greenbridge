@@ -83,9 +83,11 @@ struct VulkanDeviceInfo {
     // created. bindless_partially_bound: descriptorBindingPartiallyBound is enabled as well.
     bool bindless = false;
     bool bindless_partially_bound = false;
-    // samplerAnisotropy and samplerMirrorClampToEdge enabled; without them such samplers are approximated.
+    // samplerAnisotropy, samplerMirrorClampToEdge and samplerFilterMinmax enabled; without them such samplers are
+    // approximated.
     bool sampler_anisotropy = false;
     bool sampler_mirror_clamp_to_edge = false;
+    bool sampler_filter_minmax = false;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
     bool calibrated_timestamps = false;
     // VK_EXT_conditional_rendering (with its conditionalRendering feature) is enabled: SetPredication works, and
@@ -107,6 +109,11 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
+    // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are
+    // enabled on the device, with VK_KHR_get_surface_capabilities2 and the matching *_surface_maintenance1 on the
+    // instance (only meaningful with `presentation`): a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per
+    // present, which PresentX's ImmediateThresholdPercent uses.
+    bool swapchain_maintenance1 = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
@@ -119,6 +126,11 @@ struct VulkanDeviceInfo {
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
+    // BuildRaytracingAccelerationStructure writes the console's XDXR BVH4 records into the destination buffer
+    // (src/xdxr_build.h), the layout the game's translated traversal shaders read, instead of building a
+    // VkAccelerationStructureKHR; needs buffer_device_address and the GPU address arena. The standalone device sets it
+    // unless LEONIDA_RT_AS=khr (docs/d3d12_vulkan.md 4.8); with it set, ray_tracing is not enabled.
+    bool xdxr_acceleration_structures = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
@@ -179,6 +191,9 @@ bool device_upload_in_vram(ID3D12Device* device);
 // brought up to date at every ExecuteCommandLists.
 VkDescriptorSet bindless_set(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
+// The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
+// 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
+std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be
@@ -204,9 +219,15 @@ public:
     // `back_buffer` is a colour texture in D3D12's PRESENT state. sync_interval 0 presents without vsync.
     // S_OK also covers a skipped present while the window is minimised.
     // `src_rect` (when not null) limits the blit to that part of the texture, which is stretched to the window.
-    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect = nullptr);
+    // `tear` (with sync_interval > 0): present in the tearing mode when the swapchain has one (tear_supported()), so a
+    // frame that missed its vblank is shown at once; last_present_tore() tells whether that happened.
+    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect = nullptr,
+                    bool tear = false);
     // A black frame, nothing read (PresentX with no planes).
     HRESULT present_blank(UINT sync_interval);
+    bool tear_supported() const;
+    bool last_present_tore() const;
+    std::uint64_t tear_presents() const;
     // Screenshot support for tests: every presented frame is also copied to host memory (call before presenting).
     bool enable_capture();
     // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.

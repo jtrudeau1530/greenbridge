@@ -681,6 +681,7 @@ struct ComputePipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::uint64_t code_base = 0;
+    VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every dispatch; null: none
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -690,11 +691,13 @@ struct GraphicsPipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderStageFlags push_stages = 0;   // the layout's push-constant range; vkCmdPushConstants must name the same
     std::uint64_t code_base = 0;
+    VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every draw; null: none
     std::vector<VkFormat> color_formats;  // by render-target slot
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags depth_aspects = 0;
     std::uint32_t vertex_slots = 0;       // bit per input slot the input layout uses
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
+    std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -739,6 +742,7 @@ struct ReplayFunctions {
         sum_occlusion;
     PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
     PFN_vkCmdPushConstants push_constants = nullptr;
+    PFN_vkCmdBindDescriptorSets bind_descriptor_sets = nullptr;  // set 0 of pipelines that declare bindings
     PFN_vkCmdDispatch dispatch = nullptr;
     std::function<const ComputePipeline*(std::uintptr_t)> compute_pipeline;
     PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers2 = nullptr;  // draws
@@ -746,6 +750,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetViewport set_viewport = nullptr;
     PFN_vkCmdSetScissor set_scissor = nullptr;
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
+    PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
@@ -779,6 +784,10 @@ struct ReplayFunctions {
     PFN_vkCmdDispatchIndirect dispatch_indirect = nullptr;
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
+    // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
+    // cannot read while the list is prepared, `xdxr_record` records the build.
+    std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
+    std::function<void(VkCommandBuffer, const BuildAccelerationStructure&)> xdxr_record;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
     // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
     std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
@@ -1510,11 +1519,13 @@ template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, Prepared& p) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
-        !vk.set_primitive_topology || !vk.set_stencil_reference || !vk.set_blend_constants || !vk.draw ||
+        !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
+        !vk.set_blend_constants || !vk.draw ||
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     p.graphics = *pipeline;
     p.area = {UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
@@ -1611,6 +1622,12 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         }
     }
     return ReplayResult::success;
+}
+
+inline bool strip_topology(VkPrimitiveTopology topology) {
+    return topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+           topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ||
+           topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
 }
 
 // D3D_PRIMITIVE_TOPOLOGY -> VkPrimitiveTopology (patch lists are not modelled).
@@ -1933,6 +1950,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
                 if (predicated) ++out.unpredicated_copies;  // fills and copies are transfer commands
                 if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success) return r;
+                if (!p.skip && !p.fills.empty() && p.binding.host_readable) {
+                    out.wrote_readback = true;
+                    out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                }
                 continue;
             }
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
@@ -1961,11 +1982,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
             if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
-            if (p.binding.host_readable) {
-                out.wrote_readback = true;
-                out.readback_src_stages |= predicated && std::holds_alternative<CopyBuffer>(command)
-                    ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT;
-            }
             p.source = *source;
             ReplayResult result = ReplayResult::success;
             if (const auto* buffer_copy = std::get_if<CopyBuffer>(&command)) {
@@ -2025,6 +2041,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
                     p.has_depth24 = true;
                 }
+                // These footprint conversions emit compute dispatches in emit(). Until pipeline-statistics
+                // segmentation can bracket arbitrary helper dispatches, don't let them inflate CSInvocations.
+                if (p.has_depth24 && statistics_active) return ReplayResult::unsupported;
             } else {
                 result = detail::prepare_resource_copy(p);
             }
@@ -2059,6 +2078,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.image_copies.clear();
             }
             if (result != ReplayResult::success) return result;
+            if (p.binding.host_readable) {
+                out.wrote_readback = true;
+                const bool compute_write =
+                    (predicated && std::holds_alternative<CopyBuffer>(command)) || (p.has_depth24 && !p.binding.image);
+                out.readback_src_stages |= compute_write
+                    ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT;
+            }
         } else if (const auto* resolve_command = std::get_if<ResolveSubresource>(&command)) {
             if (!vk.resolve_image) return ReplayResult::unsupported;
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
@@ -2203,19 +2229,24 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::unsupported;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
-            if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
-                return ReplayResult::unsupported;
-            p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
-            if (!p.accel_dst) return ReplayResult::unresolved_resource;
-            if (build->update && build->src_va) {
-                p.accel_src = vk.resolve_acceleration_structure(build->src_va);
-                if (!p.accel_src) return ReplayResult::unresolved_resource;
+            if (vk.xdxr_check) {
+                if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
+            } else {
+                if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
+                    return ReplayResult::unsupported;
+                p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
+                if (!p.accel_dst) return ReplayResult::unresolved_resource;
+                if (build->update && build->src_va) {
+                    p.accel_src = vk.resolve_acceleration_structure(build->src_va);
+                    if (!p.accel_src) return ReplayResult::unresolved_resource;
+                }
             }
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
                 return ReplayResult::unsupported;
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
             if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+            if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) return r;
@@ -2924,6 +2955,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     }
                 }
             }
+        } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command); build && vk.xdxr_record) {
+            vk.xdxr_record(command_buffer, *build);
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.
@@ -2983,6 +3016,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+            if (p.pipeline.bindless_set)
+                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0, 1,
+                                        &p.pipeline.bindless_set, 0, nullptr);
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
@@ -3029,6 +3065,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.heap_base = vk.heap_base;
             data.code_base = p.graphics.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.pipeline);
+            if (p.graphics.bindless_set)
+                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.layout, 0, 1,
+                                        &p.graphics.bindless_set, 0, nullptr);
             vk.push_constants(command_buffer, p.graphics.layout, p.graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
@@ -3040,7 +3079,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
                                     std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
             vk.set_scissor(command_buffer, 0, 1, &scissor);
-            vk.set_primitive_topology(command_buffer, detail::vulkan_topology(draw->topology));
+            const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+            vk.set_primitive_topology(command_buffer, topology);
+            const bool restart = draw->indexed && detail::strip_topology(topology) &&
+                                 ((p.graphics.strip_cut == 1 && p.index_type == VK_INDEX_TYPE_UINT16) ||
+                                  (p.graphics.strip_cut == 2 && p.index_type == VK_INDEX_TYPE_UINT32));
+            vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());

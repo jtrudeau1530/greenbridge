@@ -201,6 +201,34 @@ def test_bad_shaders_folder_is_one_line():
 
 
 
+def test_out_inside_corpus_is_a_usage_error():
+    """--out used to replace the index (or a .dxbc) it had just read, and the next run could not scan."""
+    tool = os.path.join(TOOLS, "feature_scan.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        sh, _ = build(tmp)
+        index_path = os.path.join(sh, "dxbc", "index.json")
+        shader_path = os.path.join(sh, "dxbc", "a_ps.dxbc")
+        spirv_path = os.path.join(sh, "spirv", "index.json")
+        before = {p: open(p, "rb").read() for p in (index_path, shader_path, spirv_path)}
+        out = os.path.join(tmp, "report.json")
+        for bad, what in ((index_path, "the corpus index"), (shader_path, "a scanned .dxbc"),
+                          (os.path.join(sh, "dxbc", "disasm", "new.s"), "a file in dxbc/disasm"),
+                          (spirv_path, "spirv/index.json")):
+            r = subprocess.run([sys.executable, "-I", tool, sh, "--out", bad], capture_output=True, text=True)
+            check(r.returncode == 2 and "--out" in r.stderr and "is not a shader list" not in r.stderr
+                  and "Traceback" not in r.stderr and not r.stdout,
+                  f"--out naming {what}: exit 2 naming the path, got {r.returncode}: {r.stderr.strip()!r}")
+        check(all(open(p, "rb").read() == data for p, data in before.items()),
+              "no input is modified when --out names one")
+        check(not os.path.exists(out), "nothing is written when --out is refused")
+        for good in (out, os.path.join(sh, "report.json"), os.path.join(tmp, "deep", "er", "report.json")):
+            r = subprocess.run([sys.executable, "-I", tool, sh, "--out", good], capture_output=True, text=True)
+            check(r.returncode == 0 and os.path.isfile(good), f"--out {os.path.basename(good)} still writes (rc={r.returncode})")
+        r = subprocess.run([sys.executable, "-I", tool, sh], capture_output=True, text=True)
+        check(r.returncode == 0 and "shaders" in r.stdout, "a run without --out still scans")
+    assert failures == 0, f"{failures} --out guard check(s) failed"
+
+
 def test_duplicate_shader_names_keep_file_stages():
     with tempfile.TemporaryDirectory() as tmp:
         dx = os.path.join(tmp, "dxbc")
@@ -298,6 +326,7 @@ if __name__ == "__main__":
         test_bad_shaders_folder_is_one_line()
         test_v_perm_b32_selectors()
         test_duplicate_shader_names_keep_file_stages()
+        test_out_inside_corpus_is_a_usage_error()
     except AssertionError:
         pass
     print(f"test_feature_scan: {'OK' if not failures else 'FAILED'} ({failures} failure{'s' if failures != 1 else ''})")

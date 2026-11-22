@@ -8,6 +8,11 @@ drawables do not use this 597-name table.
 No game data is reproduced here. Offsets, counts, field layouts and a few short name/hash
 examples are enough to reproduce the measurements against a reader's own package.
 
+The fragment carries the skeleton and a **25-vertex / 32-triangle bounds grid**, not a skin mesh. A
+SixNG fragment-child walk finds no embedded drawables in any of the 2,865 `packs.rpf` character
+fragments, while world fragments do have them; see
+[character_models.md](character_models.md#what-is-not-decoded).
+
 ## The skeleton name table
 
 Source resource: `ambient_femalebody_upper_nohead.#ft` in `packs.rpf`, stream offset
@@ -213,7 +218,7 @@ contains the schedule entry `KeyLento/Perschars/Peds/Unique/Mandy` (pack
 
 | Container | Search | Mandy drawable |
 |---|---|---|
-| `packs.rpf` | 144,364 streams / 9.74 GB; 24,034 decoded models; 12,338 name records | none |
+| `packs.rpf` | 144,364 streams / 9.74 GB; 26,585 decoded models at `e293917` (24,034 at `917e9b9`); 12,338 name records | none |
 | `data.rpf` | 28,509 streams / 1.41 GB | none (localization/UI text only) |
 | `common.rpf` | 954 streams / 50 MB | none (schedule and ped-appearance XML) |
 | `levels.rpf` | 2,051 page-aligned nested archives, every zlib stream's first 4 MiB | none (an iFruit billboard and a house photo prop are the only name hits) |
