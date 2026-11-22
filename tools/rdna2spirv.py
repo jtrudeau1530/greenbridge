@@ -3035,9 +3035,9 @@ class Gen:
                      "s_xnor_b32", "s_cselect_b32")
 
     def sop2_b32_srcs(self, op, a):
-        """The two sources of a 32-bit SOP2. In a wave32 program a bitwise op (or s_cselect) on lane masks, where it
-        writes EXEC / VCC or a source holds a mask (the condition scc_logic uses), reads both through mask_src, so a
-        constant, inline or held in an SGPR, gives each lane its own bit; a mask is read as before. Until 2026-11-22
+        """The two sources of a 32-bit SOP2. In a wave32 program a bitwise op (or s_cselect) that writes EXEC / VCC
+        reads both through mask_src, so a constant, inline or held in an SGPR, gives each lane its own bit; a mask is
+        read as before. Until 2026-11-22
         a constant was used whole: `s_and_b32 exec_lo, exec_lo, 0xff00` (or the same constant in an SGPR) left every
         lane of EXEC on. Data ops, and wave64 programs (a b32 op there is on one half of a mask), are unchanged."""
         if op in self.MASK_SOP2_B32 and not self.wave64 and len(a) >= 3:
@@ -3045,7 +3045,11 @@ class Gen:
             to_mask = d["k"] == "special" and d.get("t", "") in ("exec_lo", "vcc_lo", "exec", "vcc")
             maskable = all(x["k"] in ("sgpr", "imm") or (x["k"] == "special" and
                                                          x.get("t", "").startswith(("exec", "vcc"))) for x in a[1:3])
-            if maskable and (to_mask or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2])):
+            # Only when the result is a mask (EXEC / VCC destination). An SGPR destination is classified by
+            # lane_masks.py, which calls it data when the other operand is a constant; a per-lane bit stored there
+            # would then be counted as data (s_and_b32 s20, exec_lo, 1; s_bcnt1_i32_b32 s21, s20 gave 32 and 0
+            # instead of 1, found by @Pierre-Kookis on #1792), so that case keeps the data read.
+            if maskable and to_mask:
                 return self.mask_src(a[1], wide=False), self.mask_src(a[2], wide=False)
         return self.src_u(a[1]), self.src_u(a[2])
 
