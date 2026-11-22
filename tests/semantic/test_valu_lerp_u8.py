@@ -993,5 +993,86 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(q_zero, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 float bit pattern handling, byte extremes, and boundary limits."""
+
+    def test_ieee754_special_float_bitpatterns_treated_as_raw_bytes(self) -> None:
+        # v_lerp_u8 is an integer byte-packing VALU instruction.
+        # When shaders feed bit-casts of IEEE 754 floats (+0, -0, +inf, -inf, qnan, snan),
+        # hardware treats them strictly as raw byte fields without FPU traps or quietening.
+        pos_zero = 0x0000_0000
+        neg_zero = 0x8000_0000
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        qnan = 0x7FC0_0000
+        snan = 0x7F80_0001
+
+        special_floats = [pos_zero, neg_zero, pos_inf, neg_inf, qnan, snan]
+        for f1 in special_floats:
+            for f2 in special_floats:
+                with self.subTest(f1=hex(f1), f2=hex(f2)):
+                    res0 = oracle_v_lerp_u8(f1, f2, 0x0000_0000)
+                    res1 = oracle_v_lerp_u8(f1, f2, 0x0101_0101)
+
+                    # Verify each byte lane equals integer unpack arithmetic
+                    b1 = unpack_bytes_u32(f1)
+                    b2 = unpack_bytes_u32(f2)
+                    expected0 = pack_bytes_u32(
+                        (b1[0] + b2[0]) >> 1,
+                        (b1[1] + b2[1]) >> 1,
+                        (b1[2] + b2[2]) >> 1,
+                        (b1[3] + b2[3]) >> 1,
+                    )
+                    expected1 = pack_bytes_u32(
+                        (b1[0] + b2[0] + 1) >> 1,
+                        (b1[1] + b2[1] + 1) >> 1,
+                        (b1[2] + b2[2] + 1) >> 1,
+                        (b1[3] + b2[3] + 1) >> 1,
+                    )
+                    self.assertEqual(res0, expected0)
+                    self.assertEqual(res1, expected1)
+
+    def test_subnormal_float_bits_no_flush_to_zero(self) -> None:
+        # Subnormal float 1: 0x00000001 (smallest positive subnormal)
+        # Subnormal float 3: 0x00000003
+        # Should average to 0x00000002 without flushing subnormal bit 0 to 0.
+        sub1 = 0x0000_0001
+        sub3 = 0x0000_0003
+        res = oracle_v_lerp_u8(sub1, sub3, 0)
+        self.assertEqual(res, 0x0000_0002)
+
+    def test_nan_payload_treated_as_raw_byte_data(self) -> None:
+        nan_with_payload = 0x7FA5_5A3C
+        zero = 0x0000_0000
+        # Lerp with 0 and round=0 simply divides each byte by 2
+        res = oracle_v_lerp_u8(nan_with_payload, zero, 0)
+        b = unpack_bytes_u32(nan_with_payload)
+        expected = pack_bytes_u32(b[0] >> 1, b[1] >> 1, b[2] >> 1, b[3] >> 1)
+        self.assertEqual(res, expected)
+
+    def test_extreme_byte_boundary_combinations(self) -> None:
+        extreme_bytes = [0x00, 0x01, 0x02, 0x7E, 0x7F, 0x80, 0x81, 0xFE, 0xFF]
+        for b0 in extreme_bytes:
+            for b1 in extreme_bytes:
+                for r in (0, 1):
+                    val = ref_lerp_u8_byte(b0, b1, r)
+                    self.assertGreaterEqual(val, 0)
+                    self.assertLessEqual(val, 255)
+                    expected = (b0 + b1 + r) >> 1
+                    self.assertEqual(val, expected)
+
+    def test_maximum_intermediate_sum_saturation_boundary(self) -> None:
+        # Max byte 255 in all lanes: 255 + 255 + 1 = 511; 511 >> 1 = 255 (0xFF)
+        s0 = 0xFFFF_FFFF
+        s1 = 0xFFFF_FFFF
+        s2 = 0x0101_0101
+        res = oracle_v_lerp_u8(s0, s1, s2)
+        self.assertEqual(res, 0xFFFF_FFFF)
+
+    def test_minimum_intermediate_sum_boundary(self) -> None:
+        # Min byte 0 in all lanes: (0 + 0 + 0) >> 1 = 0
+        self.assertEqual(oracle_v_lerp_u8(0, 0, 0), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
