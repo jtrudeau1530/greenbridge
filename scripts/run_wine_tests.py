@@ -138,9 +138,20 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     cwd = map_path(cwd, args.windows_root, args.root) if cwd else os.path.dirname(exe)
     if not cwd or not os.path.isdir(cwd):
         cwd = os.path.dirname(exe)
+    assignments = props.get("ENVIRONMENT", [])
+    if not isinstance(assignments, list):
+        return "fail", "invalid CTest ENVIRONMENT: expected a list of NAME=value entries"
+    env = os.environ.copy()
+    for assignment in assignments:
+        if not isinstance(assignment, str):
+            return "fail", "invalid CTest ENVIRONMENT entry: expected NAME=value"
+        key, equals, value = assignment.partition("=")
+        if not key or not equals or "\0" in assignment:
+            return "fail", "invalid CTest ENVIRONMENT entry: expected NAME=value"
+        env[key] = value
     start = time.monotonic()
     try:
-        proc = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=args.timeout)
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
