@@ -1016,6 +1016,12 @@ struct DeviceState {
             if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
                 if (chosen_type) *chosen_type = i;
+                if ((preferred & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                    !(memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                    const std::string msg = "resource allocation spilled from DEVICE_LOCAL to host memory (heap " +
+                                            std::to_string(memory.memoryTypes[i].heapIndex) + "); size in KiB:";
+                    log_once(msg.c_str(), static_cast<int>(requirements.size / 1024));
+                }
                 return out;
             }
         }

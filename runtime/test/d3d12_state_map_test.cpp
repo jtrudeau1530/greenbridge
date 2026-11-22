@@ -584,6 +584,10 @@ int main() {
         CHECK(memory_type_order(memory, 0xF, host, local, 224395264) == (order{3, 1, 2}));  // exactly fits
         CHECK(memory_type_order(memory, 0x7, host, local, 128 * mib) == (order{1, 2}));     // type 3 not allowed
         CHECK(memory_type_order(memory, 0xF, 0, local, 1 * mib) == (order{0, 3, 1, 2}));
+        // D3D-299: types 1 and 2 lack DEVICE_LOCAL; when preferred local fails, allocations fall back to them (host spill).
+        const order spill_order = memory_type_order(memory, 0xF, 0, local, 1 * mib);
+        CHECK((memory.memoryTypes[spill_order[2]].propertyFlags & local) == 0);
+        CHECK((memory.memoryTypes[spill_order[3]].propertyFlags & local) == 0);
         CHECK(memory_type_order(memory, 0xF, host, local, 64ull << 30).empty());           // nothing that large
         memory.memoryHeaps[2].size = 24ull << 30;                                         // Resizable BAR on
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
