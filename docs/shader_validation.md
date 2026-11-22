@@ -315,8 +315,9 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   @aslan2142 on RDNA2 and @AlxcBTW on RDNA3.5 (#374). FI = 1 returns the source lane's value, FI = 0 leaves the
   destination unwritten and FI = 0 with BOUND_CTRL gives 0; #580 (SHADER-74) makes the translator do that. The
   fuzzer has not caught up: its docstring (`tools/crosslane_fuzz.py`) still calls the case unmeasured and
-  `op_permlane` still tags it `hyp`, so a program that hits it is filed as `hyp_only`, not as a mismatch, whatever
-  the translator does. The model (vD kept) already matches the measurement; dropping the tag is a follow-up.
+  `op_permlane` still tags it `hyp`, so a program that hits it and mismatches is filed as `hyp_only` instead of
+  `mismatch`, whatever the translator does (one that matches still counts as `match`). The model (vD kept)
+  already matches the measurement; dropping the tag is a follow-up.
   `--permlane-fetch-inactive` models FI = 1 instead.
 - **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
   which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.

@@ -7,6 +7,8 @@ import contextlib
 import io
 import json
 import os
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -100,6 +102,68 @@ class Resolve(unittest.TestCase):
         text = run(["resolve", self.jsav, "--dict", self.dict, "--compose", "50"])
         self.assertIn("joaat, composed       1 more keys", text)       # SprocketCount from Sprocket + Count
         self.assertIn("total (joaat)         6 of 7 keys", text)
+
+
+class MalformedJsavTest(unittest.TestCase):
+    """A lying JSAV entry count must warn and skip the table, not abort a whole batch."""
+
+    def collect(self, data, name="save.jsav"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            keys = sk.collect_keys([path])
+        return keys, err.getvalue(), path
+
+    def jsav(self, n_code, n_script=0, entries=(), tail=b""):
+        data = bytearray(b"JSAV" + struct.pack("<III", 0, n_code, n_script))
+        for key in entries:
+            data += struct.pack("<I", key) + bytes(16)
+        return bytes(data) + tail
+
+    def test_header_declaring_more_entries_than_present_is_skipped(self):
+        keys, err, _ = self.collect(self.jsav(4))
+        self.assertEqual(keys, {})
+        self.assertIn("JSAV header declares 4 entries", err)
+        self.assertIn("skipping its entry table", err)
+
+    def test_partial_entry_table_is_skipped(self):
+        keys, err, _ = self.collect(self.jsav(1) + bytes(10))
+        self.assertEqual(keys, {})
+        self.assertIn("declares 1 entries", err)
+
+    def test_header_shorter_than_16_bytes_is_skipped(self):
+        keys, err, _ = self.collect(b"JSAV" + bytes(4))
+        self.assertEqual(keys, {})
+        self.assertIn("JSAV header is only 8 bytes", err)
+
+    def test_declared_zero_entries_is_not_a_warning(self):
+        keys, err, _ = self.collect(self.jsav(0))
+        self.assertEqual(keys, {})
+        self.assertEqual(err, "")
+
+    def test_complete_table_is_still_collected(self):
+        keys, err, _ = self.collect(self.jsav(2, entries=(0x12345678, 0xABCDEF01)))
+        self.assertEqual(set(keys), {0x12345678, 0xABCDEF01})
+        self.assertEqual(err, "")
+
+    def test_text_keys_from_a_truncated_file_are_kept(self):
+        keys, err, _ = self.collect(self.jsav(4) + b'\n"$0x0000abcd"\n')
+        self.assertEqual(set(keys), {0xABCD})
+        self.assertIn("skipping its entry table", err)
+
+    def test_cli_reports_a_warning_and_exits_zero(self):
+        _keys, _err, path = self.collect(self.jsav(4))
+        tool = os.path.join(ROOT, "tools", "save_keys.py")
+        r = subprocess.run([sys.executable, "-I", tool, "collect", path],
+                           cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("JSAV header declares 4 entries", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("0 distinct keys", r.stdout)
 
 
 if __name__ == "__main__":

@@ -396,6 +396,33 @@ class RttiScanCoreTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"new": true}')
         self.assertEqual(sorted(os.listdir(self.tmp.name)), ["kept.rtti.json"])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_report_keeps_permission_bits(self):
+        # NamedTemporaryFile creates 0600; the swapped-in report must not lose group/other read (#750 review).
+        out = os.path.join(self.tmp.name, "perm.rtti.json")
+        old = os.umask(0o022)
+        try:
+            rtti_scan.write_report(out, "{}")
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o644)
+            os.chmod(out, 0o640)
+            rtti_scan.write_report(out, "{}")
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
+            os.umask(0o027)
+            os.remove(out)
+            rtti_scan.write_report(out, "{}")
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
+        finally:
+            os.umask(old)
+
+    def test_new_report_is_writable(self):
+        # On Windows os.chmod only sets the read-only flag: a new report must not come out read-only.
+        out = os.path.join(self.tmp.name, "w.rtti.json")
+        rtti_scan.write_report(out, "{}")
+        self.assertTrue(os.access(out, os.W_OK))
+        rtti_scan.write_report(out, '{"again": 1}')
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"again": 1}')
+
     def test_invalid_pe_images_rejected_cleanly(self):
         good = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 16, rdata_bytes=b"\x00" * 16))
         bad_pe32 = bytearray(good)
