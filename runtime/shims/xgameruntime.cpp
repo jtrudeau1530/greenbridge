@@ -156,6 +156,115 @@ uint64_t __stdcall XSystemGetAppMemoryUsage() {
     return 0;
 }
 
+// XVersion: 4-part version structure from GDK XGameRuntimeTypes.h (8 bytes)
+struct XVersion {
+    union {
+        struct {
+            uint16_t major;
+            uint16_t minor;
+            uint16_t build;
+            uint16_t revision;
+        };
+        uint64_t Value;
+    };
+};
+static_assert(sizeof(XVersion) == 8, "XVersion must be 8 bytes");
+
+// XSystemAnalyticsInfo: hardware and OS version telemetry (144 bytes)
+struct XSystemAnalyticsInfo {
+    XVersion osVersion;
+    XVersion hostingOsVersion;
+    char family[64];
+    char form[64];
+};
+static_assert(sizeof(XSystemAnalyticsInfo) == 144, "XSystemAnalyticsInfo must be 144 bytes");
+
+// XSystemAnalyticsInfo XSystemGetAnalyticsInfo()
+// Returned by value per Microsoft GDK specification.
+XSystemAnalyticsInfo __stdcall XSystemGetAnalyticsInfo() {
+    XSystemAnalyticsInfo info{};
+    info.osVersion = {10, 0, 22000, 0};
+    info.hostingOsVersion = {10, 0, 22000, 0};
+    std::strncpy(info.family, "Xbox", sizeof(info.family) - 1);
+
+    const uint32_t dt = XSystemGetDeviceType();
+    if (dt == static_cast<uint32_t>(XSystemDeviceType::XboxScarlettLockhart)) {
+        std::strncpy(info.form, "Xbox Series S", sizeof(info.form) - 1);
+    } else {
+        std::strncpy(info.form, "Xbox Series X", sizeof(info.form) - 1);
+    }
+
+    char form_override[64];
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_ANALYTICS_FORM", form_override, sizeof(form_override));
+    if (n > 0 && n < sizeof(form_override)) {
+        std::strncpy(info.form, form_override, sizeof(info.form) - 1);
+    }
+    return info;
+}
+
+// ---- XPackage ----
+
+constexpr size_t XPACKAGE_IDENTIFIER_MAX_LENGTH = 33;
+constexpr char kDefaultPackageIdentifier[XPACKAGE_IDENTIFIER_MAX_LENGTH] = "LeonidaPackageIdentifier00000000";
+static_assert(sizeof(kDefaultPackageIdentifier) == XPACKAGE_IDENTIFIER_MAX_LENGTH,
+              "default package identifier must match XPACKAGE_IDENTIFIER_MAX_LENGTH");
+
+// HRESULT XPackageGetCurrentProcessPackageIdentifier(size_t bufferSize, char* buffer).
+// Retrieves the package identifier string for the current process.
+HRESULT __stdcall XPackageGetCurrentProcessPackageIdentifier(size_t bufferSize, char* buffer) {
+    if (!buffer || bufferSize == 0) return E_INVALIDARG;
+
+    char id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGE_ID", id, sizeof(id));
+    const char* selected = (n > 0 && n < sizeof(id)) ? id : kDefaultPackageIdentifier;
+    const size_t len = std::strlen(selected);
+
+    if (bufferSize < len + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(buffer, selected, len + 1);
+    return S_OK;
+}
+
+// HRESULT XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path).
+// Retrieves the installed filesystem path for the mounted package.
+// Reads LEONIDA_GAME_DIR when set, otherwise falls back to the current module's directory.
+HRESULT __stdcall XPackageGetMountPath(void* /*mount*/, size_t pathSize, char* path) {
+    if (!path || pathSize == 0) return E_INVALIDARG;
+
+    char buf[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) {
+        const DWORD mod_len = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+        if (mod_len > 0 && mod_len < sizeof(buf)) {
+            char* slash = std::strrchr(buf, '\\');
+            char* fslash = std::strrchr(buf, '/');
+            char* last = slash > fslash ? slash : fslash;
+            if (last) {
+                *last = '\0';
+            } else {
+                return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+            }
+        } else {
+            return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+        }
+    }
+
+    const size_t len = std::strlen(buf);
+    if (pathSize < len + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(path, buf, len + 1);
+    return S_OK;
+}
+
+// bool XPackageIsPackagedProcess().
+// Returns true on Xbox Series console. LEONIDA_PACKAGED=0 overrides it.
+bool __stdcall XPackageIsPackagedProcess() {
+    char s[16];
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGED", s, sizeof(s));
+    if (n > 0 && n < sizeof(s)) {
+        if (std::atoi(s) == 0) return false;
+    }
+    return true;
+}
+
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}
 
 }  // namespace
@@ -173,6 +282,10 @@ SHIM_TABLE(xgameruntime,
     XGR(XSystemGetConsoleId),
     XGR(XSystemGetAppMemoryUsageLimit),
     XGR(XSystemGetAppMemoryUsage),
+    XGR(XSystemGetAnalyticsInfo),
+    XGR(XPackageGetCurrentProcessPackageIdentifier),
+    XGR(XPackageGetMountPath),
+    XGR(XPackageIsPackagedProcess),
     // XTaskQueue (third_party/xtaskqueue)
     XGR(XTaskQueueCreate),
     XGR(XTaskQueueCreateComposite),
