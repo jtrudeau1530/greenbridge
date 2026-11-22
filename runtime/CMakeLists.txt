@@ -838,6 +838,10 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_state_map_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME d3d12_state_map COMMAND d3d12_state_map_test)
+    # A buffer UAV clear writes where its resource starts in a shared VkBuffer (no GPU).
+    add_executable(replay_uav_clear_offset_test test/replay_uav_clear_offset_test.cpp)
+    target_link_libraries(replay_uav_clear_offset_test PRIVATE Vulkan::Headers)
+    add_test(NAME replay_uav_clear_offset COMMAND replay_uav_clear_offset_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
