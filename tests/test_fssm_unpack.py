@@ -124,6 +124,48 @@ class TestPartsParsing(unittest.TestCase):
         self.assertEqual(fssm_unpack.parts(container), {b"DXIL": b""})
 
 
+class TestDirectoryBounds(unittest.TestCase):
+    def test_dxbc_bounds(self):
+        blob = make_dxbc([(b"TEST", b"abc")])
+        table = 32
+        part = table + 4
+        for label, data in [
+            ("header", blob[:31]),
+            ("offset table", blob[:part - 1]),
+            ("part header", blob[:part + 7]),
+            ("part payload", blob[:-1]),
+        ]:
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "DXBC"):
+                fssm_unpack.parts(data)
+
+        for offset in (table, len(blob) + 1):
+            data = bytearray(blob)
+            struct.pack_into("<I", data, table, offset)
+            with self.subTest(offset=offset), self.assertRaisesRegex(ValueError, "DXBC"):
+                fssm_unpack.parts(bytes(data))
+
+    def test_xdat_bounds(self):
+        prefix = b"prefix"
+        blob = make_xdat({7: b"abc"}, pre_padding=prefix)
+        x = len(prefix)
+        for label, data in [
+            ("header", blob[:x + 11]),
+            ("directory", blob[:x + 23]),
+            ("payload", blob[:-1]),
+        ]:
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "XDAT"):
+                fssm_unpack.xdat_entries_all(data)
+
+        for offset, size in [(x + 12, 1), (len(blob) + 1, 0), (len(blob), 1)]:
+            data = bytearray(blob)
+            struct.pack_into("<II", data, x + 16, offset, size)
+            with self.subTest(offset=offset), self.assertRaisesRegex(ValueError, "XDAT"):
+                fssm_unpack.xdat_entries_all(bytes(data))
+
+    def test_empty_payload_at_end_of_dxil(self):
+        self.assertEqual(fssm_unpack.xdat_entries_all(make_xdat({7: b""})), [(7, b"")])
+
+
 class TestXdatEntries(unittest.TestCase):
     def test_missing_xdat_magic(self):
         dxil = b"arbitrary-dxil-bytes-without-magic"

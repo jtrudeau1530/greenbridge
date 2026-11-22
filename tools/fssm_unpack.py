@@ -38,10 +38,22 @@ MAX_FSSM_BYTES = 64 << 20
 
 
 def parts(d: bytes) -> dict:
+    if len(d) < 32:
+        raise ValueError("truncated DXBC header")
+    count = struct.unpack_from("<I", d, 28)[0]
+    table_end = 32 + 4 * count
+    if table_end > len(d):
+        raise ValueError("truncated DXBC offset table")
     out = {}
-    for k in range(struct.unpack_from("<I", d, 28)[0]):
+    for k in range(count):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
-        out[d[off:off + 4]] = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
+        if off < table_end or off + 8 > len(d):
+            raise ValueError(f"invalid DXBC part {k} header offset {off}")
+        size = struct.unpack_from("<I", d, off + 4)[0]
+        end = off + 8 + size
+        if end > len(d):
+            raise ValueError(f"truncated DXBC part {k} payload")
+        out[d[off:off + 4]] = d[off + 8:end]
     return out
 
 
@@ -50,11 +62,21 @@ def xdat_entries_all(dxil: bytes) -> list:
     x = dxil.find(b"XDAT")
     if x < 0:
         return []
-    count, hdr = struct.unpack_from("<II", dxil, x + 4)
+    if x + 12 > len(dxil):
+        raise ValueError("truncated XDAT header")
+    count = struct.unpack_from("<I", dxil, x + 4)[0]
+    table_end = x + 12 + 12 * count
+    if table_end > len(dxil):
+        raise ValueError("truncated XDAT entry table")
     out = []
     for k in range(count):
         tag, off, size = struct.unpack_from("<III", dxil, x + 12 + 12 * k)
-        out.append((tag, dxil[off:off + size]))
+        end = off + size
+        if end > len(dxil):
+            raise ValueError(f"XDAT entry {k} extends past the DXIL part")
+        if size and off < table_end and end > x:
+            raise ValueError(f"XDAT entry {k} overlaps its directory")
+        out.append((tag, dxil[off:end]))
     return out
 
 
