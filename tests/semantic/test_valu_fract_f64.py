@@ -5,7 +5,7 @@ from enum import Enum, auto
 from fractions import Fraction
 import math
 import struct
-from typing import Union
+from typing import Optional, Union
 import unittest
 
 # IEEE 754 binary64 (double precision) architectural constants
@@ -367,6 +367,82 @@ class ScalarInterpreter:
 
 
 # ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: list[list[int]] = field(default_factory=list)
+    sgprs: list[int] = field(default_factory=lambda: [0] * 256)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def get_vgpr64(self, lane: int, index: int) -> int:
+        return words_to_f64_bits(self.vgprs[lane][index], self.vgprs[lane][index + 1])
+
+    def set_vgpr64(self, lane: int, index: int, bits: int) -> None:
+        lo, hi = f64_bits_to_words(bits)
+        self.vgprs[lane][index] = lo
+        self.vgprs[lane][index + 1] = hi
+
+    def get_sgpr64(self, index: int) -> int:
+        return words_to_f64_bits(self.sgprs[index], self.sgprs[index + 1])
+
+    def set_sgpr64(self, index: int, bits: int) -> None:
+        lo, hi = f64_bits_to_words(bits)
+        self.sgprs[index] = lo
+        self.sgprs[index + 1] = hi
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_operand(self, op: VOP3Operand, state: SIMDState, lane: int) -> int:
+        if isinstance(op.source, RegPair):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr64(lane, op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr64(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal64):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VFractF64Instruction, state: SIMDState) -> list[Optional[int]]:
+        results: list[Optional[int]] = [None] * state.num_lanes
+        # Atomic read phase across all lanes
+        s0_vals = [
+            self.resolve_lane_operand(instr.src0, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+
+        # Execution phase
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                res = oracle_v_fract_f64(
+                    src0_bits=s0_vals[lane],
+                    abs0=instr.src0.abs_mod,
+                    neg0=instr.src0.neg_mod,
+                    clamp=instr.clamp,
+                )
+                state.set_vgpr64(lane, instr.dst.index, res)
+                results[lane] = res
+
+        return results
+
+
+# ==============================================================================
 # Unit Tests: Reference Oracle and Architectural Model
 # ==============================================================================
 
@@ -634,6 +710,105 @@ class TestScalarInterpreter(unittest.TestCase):
             )
             runs.append(self.interp.step(instr, st))
         self.assertTrue(all(r == runs[0] for r in runs))
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD execution, lane divergence, and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_wave32_full_exec(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr64(lane, 0, f64_to_bits(float(lane) + 0.25))
+        instr = VFractF64Instruction(
+            dst=RegPair(4, RegType.VGPR),
+            src0=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            self.assertIsNotNone(results[lane])
+            self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 4)), 0.25)
+
+    def test_wave32_divergent_masking(self) -> None:
+        # Alternating mask: even lanes active (0x55555555)
+        sentinel = 0xDEAD_BEEF_CAFE_BABE
+        state = SIMDState(num_lanes=32, exec_mask=0x5555_5555)
+        for lane in range(32):
+            state.set_vgpr64(lane, 0, f64_to_bits(float(lane) + 0.5))
+            state.set_vgpr64(lane, 4, sentinel)
+
+        instr = VFractF64Instruction(
+            dst=RegPair(4, RegType.VGPR),
+            src0=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertIsNotNone(results[lane])
+                self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 4)), 0.5)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr64(lane, 4), sentinel)
+
+    def test_wave64_full_exec(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0xFFFF_FFFF_FFFF_FFFF)
+        for lane in range(64):
+            state.set_vgpr64(lane, 0, f64_to_bits(float(lane) * 2.0 + 0.125))
+        instr = VFractF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        self.interp.step(instr, state)
+        for lane in range(64):
+            self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 0)), 0.125)
+
+    def test_wave64_half_disabled(self) -> None:
+        sentinel = 0x1122_3344_5566_7788
+        state = SIMDState(num_lanes=64, exec_mask=0x0000_0000_FFFF_FFFF)
+        for lane in range(64):
+            state.set_vgpr64(lane, 0, f64_to_bits(10.75))
+            state.set_vgpr64(lane, 4, sentinel)
+
+        instr = VFractF64Instruction(
+            dst=RegPair(4, RegType.VGPR),
+            src0=VOP3Operand(RegPair(0, RegType.VGPR)),
+        )
+        results = self.interp.step(instr, state)
+        for lane in range(64):
+            if lane < 32:
+                self.assertIsNotNone(results[lane])
+                self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 4)), 0.75)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr64(lane, 4), sentinel)
+
+    def test_wave_exec_all_zero(self) -> None:
+        sentinel = 0xAA55_AA55_AA55_AA55
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.set_vgpr64(lane, 0, sentinel)
+        instr = VFractF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand(Literal64.from_float(1.5)),
+        )
+        results = self.interp.step(instr, state)
+        self.assertTrue(all(r is None for r in results))
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr64(lane, 0), sentinel)
+
+    def test_simd_sgpr_uniform_broadcast(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        state.set_sgpr64(10, f64_to_bits(1000.375))
+
+        instr = VFractF64Instruction(
+            dst=RegPair(2, RegType.VGPR),
+            src0=VOP3Operand(RegPair(10, RegType.SGPR)),
+        )
+        self.interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(bits_to_f64(state.get_vgpr64(lane, 2)), 0.375)
 
 
 if __name__ == "__main__":
