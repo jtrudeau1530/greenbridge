@@ -1197,5 +1197,232 @@ class TestFmaF64RegisterAliasing(unittest.TestCase):
                 self.assertEqual(wave.get_lane_vgpr_pair_f64(lane, 0), initial_acc)
 
 
+class StatusFlags:
+    """IEEE 754 exception flags and architectural condition codes for an operation."""
+
+    def __init__(
+        self,
+        *,
+        invalid: bool = False,
+        overflow: bool = False,
+        underflow: bool = False,
+        inexact: bool = False,
+        is_negative: bool = False,
+        is_zero: bool = False,
+        is_inf: bool = False,
+        is_nan: bool = False,
+        is_subnormal: bool = False,
+    ) -> None:
+        self.invalid = invalid
+        self.overflow = overflow
+        self.underflow = underflow
+        self.inexact = inexact
+        self.is_negative = is_negative
+        self.is_zero = is_zero
+        self.is_inf = is_inf
+        self.is_nan = is_nan
+        self.is_subnormal = is_subnormal
+
+    def __repr__(self) -> str:
+        flags = [k for k, v in self.__dict__.items() if v]
+        return f"StatusFlags({', '.join(flags)})"
+
+
+def compute_fma_status_flags(
+    s0: float,
+    s1: float,
+    s2: float,
+    *,
+    neg0: bool = False,
+    neg1: bool = False,
+    neg2: bool = False,
+    abs0: bool = False,
+    abs1: bool = False,
+    abs2: bool = False,
+    clamp: bool = False,
+    omod: int = 0,
+) -> tuple[float, StatusFlags]:
+    """Compute FMA result along with IEEE 754 status flags and condition codes."""
+    u0 = apply_src_mods_u64(f64_to_u64(s0), neg=neg0, abs_=abs0)
+    u1 = apply_src_mods_u64(f64_to_u64(s1), neg=neg1, abs_=abs1)
+    u2 = apply_src_mods_u64(f64_to_u64(s2), neg=neg2, abs_=abs2)
+
+    v0 = u64_to_f64(u0)
+    v1 = u64_to_f64(u1)
+    v2 = u64_to_f64(u2)
+
+    invalid = False
+    overflow = False
+    underflow = False
+    inexact = False
+
+    # Check for invalid operation exceptions
+    if math.isnan(v0) or math.isnan(v1) or math.isnan(v2):
+        # Signaling NaN or NaN arithmetic
+        if (u0 & F64_CANONICAL_QNAN == F64_POS_INF) or (u1 & F64_CANONICAL_QNAN == F64_POS_INF) or (u2 & F64_CANONICAL_QNAN == F64_POS_INF):
+            invalid = True
+
+    if (math.isinf(v0) and v1 == 0.0) or (v0 == 0.0 and math.isinf(v1)):
+        invalid = True
+
+    p_inf = math.isinf(v0) or math.isinf(v1)
+    if p_inf and math.isinf(v2):
+        p_sign = -1.0 if (math.copysign(1.0, v0) * math.copysign(1.0, v1) < 0) else 1.0
+        if p_sign != math.copysign(1.0, v2):
+            invalid = True
+
+    res = ref_fma_f64(
+        s0, s1, s2,
+        neg0=neg0, neg1=neg1, neg2=neg2,
+        abs0=abs0, abs1=abs1, abs2=abs2,
+        clamp=clamp, omod=omod,
+    )
+
+    # Inexact & Overflow/Underflow determination for finite inputs
+    if not math.isnan(res) and math.isfinite(v0) and math.isfinite(v1) and math.isfinite(v2):
+        exact_frac = Fraction(v0) * Fraction(v1) + Fraction(v2)
+        if omod == 1:
+            exact_frac *= Fraction(2)
+        elif omod == 2:
+            exact_frac *= Fraction(4)
+        elif omod == 3:
+            exact_frac /= Fraction(2)
+
+        if math.isinf(res):
+            overflow = True
+            inexact = True
+        else:
+            if Fraction(res) != exact_frac:
+                inexact = True
+            u_res = f64_to_u64(res)
+            # Check subnormal
+            exp_bits = (u_res >> 52) & 0x7FF
+            mant_bits = u_res & 0x000FFFFFFFFFFFFF
+            if exp_bits == 0 and mant_bits != 0:
+                underflow = True
+
+    u_res = f64_to_u64(res)
+    is_neg = (u_res & F64_NEG_ZERO) != 0
+    is_nan = math.isnan(res)
+    is_inf = math.isinf(res)
+    is_zero = (res == 0.0)
+    exp = (u_res >> 52) & 0x7FF
+    mant = u_res & 0x000FFFFFFFFFFFFF
+    is_subnormal = (exp == 0 and mant != 0)
+
+    flags = StatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        is_negative=is_neg,
+        is_zero=is_zero,
+        is_inf=is_inf,
+        is_nan=is_nan,
+        is_subnormal=is_subnormal,
+    )
+    return res, flags
+
+
+def evaluate_vcc_predicate(wave: SIMDWaveState, reg_idx: int, predicate: str) -> int:
+    """Generate 64-bit VCC mask evaluating condition on reg_idx across all active lanes."""
+    vcc = 0
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            val = wave.get_lane_vgpr_pair_f64(lane, reg_idx)
+            cond = False
+            if predicate == "eq_zero":
+                cond = (val == 0.0)
+            elif predicate == "ge_zero":
+                cond = not math.isnan(val) and val >= 0.0
+            elif predicate == "lt_zero":
+                cond = not math.isnan(val) and val < 0.0
+            elif predicate == "is_nan":
+                cond = math.isnan(val)
+            elif predicate == "is_finite":
+                cond = math.isfinite(val)
+            else:
+                raise ValueError(f"Unknown predicate: {predicate}")
+
+            if cond:
+                vcc |= (1 << lane)
+    return vcc
+
+
+class TestFmaF64StatusFlagsAndConditionCodes(unittest.TestCase):
+    """Test suite for IEEE 754 status flags, condition codes, and VCC carry/predicate generation."""
+
+    def test_inexact_flag_detection(self):
+        # Exact calculation: 2.0 * 3.0 + 1.0 = 7.0 (exact in float)
+        _, flags_exact = compute_fma_status_flags(2.0, 3.0, 1.0)
+        self.assertFalse(flags_exact.inexact)
+
+        # Inexact calculation: inputs are exact, but product has term 2**-104 that is rounded
+        a = 1.0 + (2.0 ** -52)
+        _, flags_inexact = compute_fma_status_flags(a, a, 0.0)
+        self.assertTrue(flags_inexact.inexact)
+
+    def test_overflow_flag(self):
+        max_f64 = u64_to_f64(F64_MAX_NORMAL)
+        res, flags = compute_fma_status_flags(max_f64, 2.0, 0.0)
+        self.assertTrue(math.isinf(res))
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+        self.assertTrue(flags.is_inf)
+
+    def test_underflow_flag(self):
+        min_normal = u64_to_f64(F64_MIN_NORMAL)
+        res, flags = compute_fma_status_flags(min_normal, 0.5, 0.0)
+        self.assertTrue(flags.is_subnormal)
+        self.assertTrue(flags.underflow)
+
+    def test_invalid_operation_flags(self):
+        # inf * 0.0 -> invalid
+        res, flags1 = compute_fma_status_flags(float("inf"), 0.0, 1.0)
+        self.assertTrue(math.isnan(res))
+        self.assertTrue(flags1.invalid)
+        self.assertTrue(flags1.is_nan)
+
+        # (+inf) * 1.0 + (-inf) -> invalid
+        res, flags2 = compute_fma_status_flags(float("inf"), 1.0, float("-inf"))
+        self.assertTrue(math.isnan(res))
+        self.assertTrue(flags2.invalid)
+        self.assertTrue(flags2.is_nan)
+
+    def test_condition_codes_signed_zeros(self):
+        # -0.0 * 1.0 + -0.0 -> -0.0
+        res, flags = compute_fma_status_flags(-0.0, 1.0, -0.0)
+        self.assertTrue(flags.is_zero)
+        self.assertTrue(flags.is_negative)
+
+        # 1.0 * 1.0 + -1.0 -> +0.0
+        res, flags2 = compute_fma_status_flags(1.0, 1.0, -1.0)
+        self.assertTrue(flags2.is_zero)
+        self.assertFalse(flags2.is_negative)
+
+    def test_vcc_predicate_mask_generation(self):
+        wave = SIMDWaveState(wave_size=64)
+        # EXEC active for lanes 0..31
+        wave.exec_lo = 0xFFFFFFFF
+        wave.exec_hi = 0x00000000
+
+        # Alternate positive and negative numbers in v[0:1]
+        for lane in range(64):
+            val = 5.0 if (lane % 2 == 0) else -5.0
+            wave.set_lane_vgpr_pair_f64(lane, 0, val)
+
+        # Evaluate ge_zero: should match even lanes in 0..31 (0x55555555)
+        vcc_ge = evaluate_vcc_predicate(wave, 0, "ge_zero")
+        self.assertEqual(vcc_ge, 0x55555555)
+
+        # Evaluate lt_zero: should match odd lanes in 0..31 (0xAAAAAAAA)
+        vcc_lt = evaluate_vcc_predicate(wave, 0, "lt_zero")
+        self.assertEqual(vcc_lt, 0xAAAAAAAA)
+
+        # High lanes 32..63 are inactive in EXEC, so VCC bits 32..63 must be 0
+        self.assertEqual(vcc_ge >> 32, 0)
+        self.assertEqual(vcc_lt >> 32, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
