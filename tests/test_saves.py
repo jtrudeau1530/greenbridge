@@ -5,6 +5,7 @@ save data is used or quoted.
     python -I tests/test_saves.py
 """
 import contextlib
+import errno
 import io
 import json
 import os
@@ -204,6 +205,123 @@ class JsavTest(unittest.TestCase):
         self.assertIn("only in A: code 11111111 17", out)
         self.assertIn("1 blocks identical", out)
         self.assertNotIn("changed:", out)
+
+
+class AtomicPackTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.source = os.path.join(self.root, "source.jsav")
+        self.extracted = os.path.join(self.root, "extracted")
+        self.out = os.path.join(self.root, "packed.jsav")
+        self.old, _, _ = make_jsav(seed=0)
+        self.new, _, _ = make_jsav(seed=1)
+        write(self.source, self.new)
+        quiet(saves.extract, self.source, self.extracted)
+        write(self.out, self.old)
+
+    def fail_writes(self, error, on_close=False):
+        # Inject a failure after real bytes have been written, both for main's direct output and for staging.
+        real_open, real_temporary = open, tempfile.NamedTemporaryFile
+
+        class BrokenWrite:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                result = self.stream.__exit__(*args)
+                if on_close and args[0] is None:
+                    raise error
+                return result
+
+            def write(self, data):
+                if on_close:
+                    return self.stream.write(data)
+                self.stream.write(data[:4])
+                raise error
+
+        def opened(path, mode="r", *args, **kwargs):
+            stream = real_open(path, mode, *args, **kwargs)
+            return BrokenWrite(stream) if mode == "wb" else stream
+
+        def staged(*args, **kwargs):
+            return BrokenWrite(real_temporary(*args, **kwargs))
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(saves, "open", side_effect=opened, create=True))
+        stack.enter_context(mock.patch.object(tempfile, "NamedTemporaryFile", side_effect=staged))
+        return stack
+
+    def test_partial_write_preserves_previous_save_and_removes_staging(self):
+        before = sorted(os.listdir(self.root))
+        with self.fail_writes(OSError(errno.ENOSPC, "simulated disk full")):
+            with self.assertRaises(OSError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_failed_new_output_leaves_no_partial_save(self):
+        os.remove(self.out)
+        before = sorted(os.listdir(self.root))
+        with self.fail_writes(OSError(errno.ENOSPC, "simulated disk full")):
+            with self.assertRaises(OSError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertFalse(os.path.exists(self.out))
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_failed_close_preserves_previous_save_and_removes_staging(self):
+        before = sorted(os.listdir(self.root))
+        with self.fail_writes(OSError(errno.ENOSPC, "simulated flush failure"), on_close=True):
+            with self.assertRaises(OSError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_interruption_preserves_previous_save_and_removes_staging(self):
+        before = sorted(os.listdir(self.root))
+        with self.fail_writes(KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_replace_failure_preserves_previous_save_and_removes_staging(self):
+        before = sorted(os.listdir(self.root))
+        with mock.patch.object(saves.os, "replace", side_effect=PermissionError("destination locked")):
+            with self.assertRaises(PermissionError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_readonly_staging_is_removed_if_replacement_fails(self):
+        before = sorted(os.listdir(self.root))
+        with mock.patch.object(saves, "published_mode", return_value=0o444), \
+                mock.patch.object(saves.os, "replace", side_effect=PermissionError("destination locked")):
+            with self.assertRaises(PermissionError):
+                quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_new_save_is_byte_exact_and_gets_normal_creation_permissions(self):
+        os.remove(self.out)
+        quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.new)
+        self.assertEqual(os.stat(self.out).st_mode & 0o777, os.stat(self.source).st_mode & 0o777)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_replacement_preserves_existing_permission_bits(self):
+        os.chmod(self.out, 0o640)
+        quiet(saves.pack, self.extracted, self.out)
+        self.assertEqual(rd(self.out), self.new)
+        self.assertEqual(os.stat(self.out).st_mode & 0o777, 0o640)
 
 
 class AsavTest(unittest.TestCase):
