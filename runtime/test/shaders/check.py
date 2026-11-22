@@ -77,7 +77,7 @@ CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc0038
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
-                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm")
+                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -102,6 +102,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_movrelsd_2", [11, 33, 33, 55, 1717, 77, 1515, 1717]),
             # SHADER-90: ds_permute_b32, the forward (scatter) permute; unwritten lane 0, EXEC gates the destination
             ("cs_w32_permute", [218, 29, 8, 211, 0, 15, 99, 15]),
+            # integer ops with CPU-only checks until now (derivations in cs_w32_int_ext.asm)
+            ("cs_w32_int_ext", [1, 27, 1, 0x33332222, 0xC0000000, 0x4000, 18, 0x20304050]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
             # constant EXEC: each lane takes its own bit (Intel got 16-bit constants wrong for lanes 16-31)
@@ -143,7 +145,7 @@ CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
 # cs_fmt_xy_xyz.asm (TEST-185): 12 xy/xyz loads, then the 9 store regions read back, as a Radeon 680M (gfx1035) gives
-# them natively. Layout and rules in the .asm header.
+# them natively, with the updated UINT saturation case checked on gfx1036. Layout and rules in the .asm header.
 FMT_XY_XYZ_WORDS = [
     0x3F800000, 0x40000000, 0x5A5A0008, 0x5A5A000C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A001C,
     0x3F800000, 0x40000000, 0x5A5A0028, 0x5A5A002C, 0x3F800000, 0x40000000, 0x40400000, 0x5A5A003C,
@@ -154,7 +156,7 @@ FMT_XY_XYZ_WORDS = [
     0x3F800000, 0x40000000, 0x00000000, 0x00000000, 0x3F800000, 0x40000000, 0x40400000, 0x00000000,
     0x40003C00, 0x00000000, 0xA5A50268, 0xA5A5026C, 0x40003C00, 0x00004200, 0xA5A50278, 0xA5A5027C,
     0x3F800000, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0x0000FFFF, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
-    0x00030201, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0xA5A502B0, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
+    0x0003FF01, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0xA5A502B0, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
     0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
@@ -941,7 +943,8 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_d16", ["load-d16"])):
+    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_d16", ["load-d16"]),
+                       ("cs_sample_lz_int_d16", ["load-d16"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
             m = re.search(r"unsupported: .*", out)

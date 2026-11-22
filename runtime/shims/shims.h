@@ -52,6 +52,9 @@ using ModuleLookup = bool (*)(void* ctx, uint64_t address, std::string& module, 
 void add_module_lookup(void* ctx, ModuleLookup fn);
 void remove_module_lookup(void* ctx);
 
+// The base of the mapped module holding `address`, through the same lookups. False if no live Loader maps it.
+bool mapped_image_base(uint64_t address, uint64_t& base);
+
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).
 using TestHook = void (*)(const void* return_address_slot);

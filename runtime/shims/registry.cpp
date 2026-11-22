@@ -302,6 +302,18 @@ void add_module_lookup(void* ctx, ModuleLookup fn) {
     g_lookups.push_back({ctx, fn});
 }
 
+bool mapped_image_base(uint64_t address, uint64_t& base) {
+    std::string module;
+    uint32_t rva = 0;
+    std::lock_guard lock(g_lookup_mutex);
+    for (auto& l : g_lookups)
+        if (l.fn(l.ctx, address, module, rva)) {
+            base = address - rva;
+            return true;
+        }
+    return false;
+}
+
 void remove_module_lookup(void* ctx) {
     std::lock_guard lock(g_lookup_mutex);
     for (auto it = g_lookups.begin(); it != g_lookups.end(); ++it)

@@ -63,6 +63,7 @@ public:
     std::uint32_t family = 0;
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
+    VkPhysicalDeviceFeatures enabled{};  // the core features enabled on `device`
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
@@ -272,7 +273,7 @@ public:
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
         if (!features13.dynamicRendering || !features13.synchronization2 || !features12.timelineSemaphore ||
-            !features12.separateDepthStencilLayouts) {
+            !features12.separateDepthStencilLayouts || !features12.bufferDeviceAddress) {
             std::fprintf(stderr, "the device lacks dynamicRendering, synchronization2, timelineSemaphore or "
                                  "separateDepthStencilLayouts\n");
             return DeviceStatus::unavailable;
@@ -321,6 +322,7 @@ public:
         enable12.descriptorBindingStorageImageUpdateAfterBind = bindless;
         enable12.descriptorBindingStorageBufferUpdateAfterBind = bindless;
         enable12.descriptorBindingPartiallyBound = partially_bound;
+        enable12.bufferDeviceAddress = VK_TRUE;
 
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -332,6 +334,7 @@ public:
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -390,6 +393,7 @@ public:
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
+        enabled = enable;
         std::vector<const char*> device_extensions;
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);

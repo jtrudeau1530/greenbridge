@@ -64,6 +64,8 @@ class FakeDevice:
     required_subgroup_size_stages: int = (
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
     )
+    fragment_shader_barycentric: bool = True
+    driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
 
 
 class FakeVulkan:
@@ -176,6 +178,8 @@ class FakeVulkan:
                 sg.maxSubgroupSize = dev.max_subgroup_size
                 sg.maxComputeWorkgroupSubgroups = dev.max_compute_workgroup_subgroups
                 sg.requiredSubgroupSizeStages = dev.required_subgroup_size_stages
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES:
+                ctypes.c_uint32.from_address(node_addr + 16).value = dev.driver_id
         if not found_subgroup:
             raise AssertionError("SubgroupProperties missing from vkGetPhysicalDeviceProperties2 pNext chain")
         if not found_sg:
@@ -209,6 +213,8 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(
                     node_addr + vk_info.F13_DYNAMIC_RENDERING
                 ).value = int(dev.dynamic_rendering)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
+                ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
         expected = {
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -552,7 +558,16 @@ class QueryTest(unittest.TestCase):
                     "compute_in_supported_stages": True,
                     "mesh_in_supported_stages": True,
                     "native64": want_native64,
+                    "per_vertex_inputs": True,
                 })
+
+    def test_per_vertex_inputs(self):
+        """PerVertexKHR needs fragmentShaderBarycentric, and MoltenVK can't compile it to MSL either way."""
+        for label, bary, driver, want in (("amd", True, 1, True), ("no_barycentrics", False, 1, False),
+                                          ("moltenvk", True, vk_info.VK_DRIVER_ID_MOLTENVK, False)):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
+                self.assertIs(res["per_vertex_inputs"], want)
 
     def test_native64_uses_default_size_without_required_mesh_stage(self):
         dev = FakeDevice(

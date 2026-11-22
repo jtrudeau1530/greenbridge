@@ -56,6 +56,21 @@ TEXEL_OFFSET_FALLBACK = False
 # in push-constant dwords 36..37 (the block grows from 144 to 152 bytes). The slot layout is mesh_compute_layout();
 # the index records it as "mesh_compute". tools/mesh_compute_vs.py writes the vertex shader that draws the slots.
 MESH_COMPUTE = False
+# --f16-interp-fallback: *_f16 interps without PerVertexKHR, for devices that have VK_KHR_fragment_shader_barycentric
+# but can't use its per-vertex inputs (MoltenVK: SPIRV-Cross has no MSL form of PerVertexKHR). Every VS and mesh
+# `exp paramN` also exports the channel's two f16 halves decoded to f32, low halves at f16_half_location(N, 0) and high
+# halves at f16_half_location(N, 1), and a PS *_f16 read of attrN.c takes component c of that smooth input. The
+# interpolation is linear, so this is the same P0 + i(P1 - P0) + j(P2 - P0) of the decoded halves, rounded by the
+# device's interpolator instead of by explicit arithmetic. The halves sit below location F16_HALF_TOP (30: 31
+# locations is MoltenVK's limit, 124 components), counting down from param 0, so a producer with params 0..P-1 has
+# room for the halves of params 0..(29 - P) / 2; Gen.export skips the ones that would land on its own params.
+F16_HALVES = False
+F16_HALF_TOP = 30
+
+
+def f16_half_location(n, half):
+    """--f16-interp-fallback: the location of param n's decoded low (half 0) or high (half 1) f16 halves."""
+    return F16_HALF_TOP - 2 * n - 1 + half
 
 
 def mesh_compute_layout(maxv, maxp, clip_count, cull_count, params):
@@ -127,6 +142,9 @@ class Gen:
         self.inputs = {}
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
         self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
+        self.f16_halves = set()     # PS, --f16-interp-fallback: the same attributes, read from decoded-half inputs
+        self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
+        self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.uses_psb = False
         self.uses_active = False
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
@@ -139,7 +157,7 @@ class Gen:
         self.uses_tex_3d = False
         self.uses_v4uint = False
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
-        self.uses_int_gather = False    # 2D typed sampled-image types for image_gather4_lz(_o)
+        self.uses_int_sampler = False    # 2D typed sampled-image types for sampling and gathering
         self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
         self.writes_depth = False
         self.uses_smul = False
@@ -1236,8 +1254,9 @@ class Gen:
                 self.emit(f"{i} = OpConvertFToS %int {rd}")
                 self.emit(f"{u} = OpBitcast %uint {i}")
                 field = u
-            else:   # uint
-                field = icomps[c]
+            else:   # Narrow UINT stores saturate to the field width before insertion.
+                field = self.tmp()
+                self.emit(f"{field} = OpExtInst %uint %glsl UMin {icomps[c]} {self.cu((1 << w) - 1)}")
             wi = bit // 32
             ins = self.tmp()
             self.emit(f"{ins} = OpBitFieldInsert %uint {words[wi]} {field} {self.cu(bit % 32)} {self.cu(w)}")
@@ -1594,7 +1613,7 @@ class Gen:
                 self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, rb)
         if d16:
             # d16: two 16-bit results per register (x | y << 16, z | w << 16): f16 for float/normalized formats,
-            # the low 16 bits for integer formats (FORMATS kinds u32/uint).
+            # saturating unsigned conversion for integer formats (FORMATS kinds u32/uint).
             is_int = "%false"
             for code_v, (_, kind, _) in self.FORMATS.items():
                 if kind in ("u32", "uint"):
@@ -1605,8 +1624,8 @@ class Gen:
             for i in range(0, len(outs), 2):
                 dest = {"k": "vgpr", "r": vd["r"] + i // 2, "n": 1}
                 lo = outs[i]
-                il, r = self.tmp(), self.tmp()
-                self.emit(f"{il} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFF)}")
+                il = self.saturate_int16(lo, signed=False)
+                r = self.tmp()
                 if i + 1 == len(outs):
                     # For d16_x and d16_xyz the unaddressed high half keeps its previous bits.
                     fl = self.f16_bits(self.tof(lo))
@@ -1616,7 +1635,8 @@ class Gen:
                 hi = outs[i + 1]
                 ph = self.pack_f16_pair_int(self.tof(lo), self.tof(hi))
                 ih, pi = self.tmp(), self.tmp()
-                self.emit(f"{ih} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
+                high_half = self.saturate_int16(hi, signed=False)
+                self.emit(f"{ih} = OpShiftLeftLogical %uint {high_half} {self.cu(16)}")
                 self.emit(f"{pi} = OpBitwiseOr %uint {il} {ih}")
                 self.emit(f"{r} = OpSelect %uint {is_int} {pi} {ph}")
                 self.dst(dest, r)
@@ -4373,6 +4393,55 @@ class Gen:
                 self.dst(a[0], v)
             else:
                 self.write_lo16(a[0], lo, preserve_high=e64)
+        elif op in ("v_mad_u16", "v_mad_i16"):
+            # D.u16 = S0.u16 * S1.u16 + S2.u16 on the low halves (op_sel picks high halves: bits 0..2 the sources, bit 3 the
+            # destination); VOP3-only, so the high half of the destination is kept (RDNA2 ISA; Mesa ACO can_use_opsel).
+            # The product and sum are formed in 32 bits (no overflow possible), then the low 16 bits are kept. With
+            # `clamp` the full-width result saturates to [0, 0xFFFF] (v_mad_u16) or [-32768, 32767] (v_mad_i16).
+            sb, dhi = self.opsel_bits(mods, 3)
+            vals = []
+            for k, s_ in enumerate(a[1:4]):
+                u = self.src_u(s_)
+                if sb[k]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+                    u = t
+                h = self.tmp()
+                if op == "v_mad_u16":
+                    self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                else:
+                    hi_ = self.tmp()
+                    self.emit(f"{hi_} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
+                    self.emit(f"{h} = OpBitcast %uint {hi_}")
+                vals.append(h)
+            x, y, z = vals
+            prod, tot = self.tmp(), self.tmp()
+            self.emit(f"{prod} = OpIMul %uint {x} {y}")
+            self.emit(f"{tot} = OpIAdd %uint {prod} {z}")
+            r = tot
+            if "clamp" in mods:
+                sat = self.tmp()
+                if op == "v_mad_u16":
+                    ov = self.tmp()
+                    self.emit(f"{ov} = OpUGreaterThan %bool {tot} {self.cu(0xFFFF)}")
+                    self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0xFFFF)} {tot}")
+                else:
+                    ti, lo_c, hi_c = self.as_int(tot), self.tmp(), self.tmp()
+                    self.emit(f"{lo_c} = OpExtInst %int %glsl SMax {ti} {self.as_int(self.cu(0xFFFF8000))}")
+                    self.emit(f"{hi_c} = OpExtInst %int %glsl SMin {lo_c} {self.as_int(self.cu(0x7FFF))}")
+                    self.emit(f"{sat} = OpBitcast %uint {hi_c}")
+                r = sat
+            lo = self.tmp()
+            self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            if dhi:
+                old, keep, sh16, v = (self.tmp() for _ in range(4))
+                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+                self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
+                self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+                self.dst(a[0], v)
+            else:
+                self.write_lo16(a[0], lo)
         elif op == "v_bcnt_u32_b32":
             x, acc = self.src_u(a[1]), self.src_u(a[2])
             c, r = self.tmp(), self.tmp()
@@ -5060,6 +5129,57 @@ class Gen:
                 f = {"v_min_u32": "UMin", "v_max_u32": "UMax", "v_min_i32": "SMin", "v_max_i32": "SMax"}[op]
                 self.emit(f"{r} = OpExtInst %uint %glsl {f} {x} {y}")
             self.dst(a[0], r)
+        elif op in ("v_cvt_f16_u16", "v_cvt_f16_i16", "v_cvt_u16_f16", "v_cvt_i16_f16"):
+            # 16-bit <-> f16 conversions of the low half (op_sel:[src,dst] picks the high half of the source / of the
+            # destination); the other half of the destination is kept, as for the other 16-bit-result ops. No clamp or
+            # output multiplier (rejected rather than guessed). f16 -> int truncates toward zero, saturates to the 16-bit
+            # range (an f16 infinity too) and gives 0 for NaN, as the 32-bit conversions do (docs/design.md,
+            # "Float-to-int saturation"). int -> f16 rounds like every f16 result (f16_out).
+            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+                raise Unsupported(op + " output modifier")
+            sel, dhi = self.opsel_bits(mods, 1)
+            if op in ("v_cvt_f16_u16", "v_cvt_f16_i16"):
+                u = self.src_u({**a[1], "neg": False, "abs": False})
+                if sel[0]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+                    u = t
+                f = self.tmp()
+                if op == "v_cvt_f16_u16":
+                    m = self.tmp()
+                    self.emit(f"{m} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                    self.emit(f"{f} = OpConvertUToF %float {m}")
+                else:
+                    m = self.tmp()
+                    self.emit(f"{m} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
+                    self.emit(f"{f} = OpConvertSToF %float {m}")
+                self.f16_out(a[0], f, dhi)
+            else:
+                x = self.f16_in(a[1], sel[0])
+                nan, xs, tr, cl, conv, lo = (self.tmp() for _ in range(6))
+                self.emit(f"{nan} = OpIsNan %bool {x}")
+                self.emit(f"{xs} = OpSelect %float {nan} %f0 {x}")           # keep the conversion operand representable
+                self.emit(f"{tr} = OpExtInst %float %glsl Trunc {xs}")
+                lo_b, hi_b = (-32768.0, 32767.0) if op == "v_cvt_i16_f16" else (0.0, 65535.0)
+                self.emit(f"{cl} = OpExtInst %float %glsl FClamp {tr} {self.fconst(lo_b)} {self.fconst(hi_b)}")
+                if op == "v_cvt_i16_f16":
+                    ci = self.tmp()
+                    self.emit(f"{ci} = OpConvertFToS %int {cl}")
+                    self.emit(f"{conv} = OpBitcast %uint {ci}")
+                else:
+                    self.emit(f"{conv} = OpConvertFToU %uint {cl}")
+                self.emit(f"{lo} = OpBitwiseAnd %uint {conv} {self.cu(0xFFFF)}")
+                if not dhi:
+                    self.write_lo16(a[0], lo)
+                else:
+                    if a[0]["k"] != "vgpr":
+                        raise Unsupported("op_sel destination")
+                    old, keep, sh16, v = (self.tmp() for _ in range(4))
+                    self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                    self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+                    self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
+                    self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+                    self.dst(a[0], v)
         elif op == "v_cvt_f32_f16":
             u = self.src_h(a[1])
             v2, f = self.tmp(), self.tmp()
@@ -5253,9 +5373,12 @@ class Gen:
                 out = acc
             self.dst(a[0], out)
         elif op in ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64",
-                    "s_and_b32_mask", "s_or_b32_mask"):
+                    "s_nand_b64", "s_nor_b64", "s_xnor_b64", "s_and_b32_mask", "s_or_b32_mask"):
             k = {"and": "OpBitwiseAnd", "or": "OpBitwiseOr", "xor": "OpBitwiseXor", "andn2": "OpBitwiseAnd",
-                 "orn2": "OpBitwiseOr"}[op.split("_")[1]]
+                 "orn2": "OpBitwiseOr", "nand": "OpBitwiseAnd", "nor": "OpBitwiseOr",
+                 "xnor": "OpBitwiseXor"}[op.split("_")[1]]
+            # s_nand/nor/xnor_b64: D = ~(S0 op S1). A lane's mask value is 0 or ~0, so the NOT is per lane too.
+            inv = op in ("s_nand_b64", "s_nor_b64", "s_xnor_b64")
             if op.endswith("_mask") or \
                     (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
                     self.is_mask_op(a[1]) or self.is_mask_op(a[2]):
@@ -5266,6 +5389,9 @@ class Gen:
                     self.emit(f"{n} = OpNot %uint {y}")
                     y = n
                 self.emit(f"{r} = {k} %uint {x} {y}")
+                if inv:
+                    t, r = r, self.tmp()
+                    self.emit(f"{r} = OpNot %uint {t}")
                 self.mask_dst(a[0], r)
                 self.scc_from_mask(r)
             else:
@@ -5283,6 +5409,10 @@ class Gen:
                 rlo, rhi = self.tmp(), self.tmp()
                 self.emit(f"{rlo} = {k} %uint {xlo} {ylo}")
                 self.emit(f"{rhi} = {k} %uint {xhi} {yhi}")
+                if inv:
+                    (tlo, thi), rlo, rhi = (rlo, rhi), self.tmp(), self.tmp()
+                    self.emit(f"{rlo} = OpNot %uint {tlo}")
+                    self.emit(f"{rhi} = OpNot %uint {thi}")
                 self.dst64_data(a[0], rlo, rhi, op, allow_null=True)
                 orr = self.tmp()
                 self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
@@ -6195,7 +6325,15 @@ class Gen:
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{sp} = OpAccessChain %_ptr_UC_smp %samplers {smp_idx}")
             self.emit(f"{smp} = OpLoad %smp {sp}")
-            if op not in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o"):
+            typed_lz = op == "image_sample_lz" and dim == "dim:SQ_RSRC_IMG_2D"
+
+            def sampled_image(image, cls):
+                sampled = self.tmp()
+                sampler_type = f"itxsamp{cls}_0" if cls else stype
+                self.emit(f"{sampled} = OpSampledImage %{sampler_type} {image} {smp}")
+                return sampled
+
+            if not typed_lz and op not in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o"):
                 self.emit(f"{si} = OpSampledImage %{stype} {img} {smp}")
             f = [self.tof(c) for c in coords]
             goff = None
@@ -6300,15 +6438,13 @@ class Gen:
                 offset = f" Offset {goff}" if goff is not None else ""
 
                 def gather(image, cls, ty):
-                    sampled = self.tmp()
-                    sampler_type = f"itxsamp{cls}_0" if cls else stype
-                    self.emit(f"{sampled} = OpSampledImage %{sampler_type} {image} {smp}")
+                    sampled = sampled_image(image, cls)
                     res = self.tmp()
                     self.emit(f"{res} = OpImageGather {ty} {sampled} {uv} {component}{offset}")
                     return res
 
                 if dim == "dim:SQ_RSRC_IMG_2D":
-                    self.uses_int_gather = True
+                    self.uses_int_sampler = True
                     # dmask selects one texture channel; all four taps are written.
                     self.image_read_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), img, img_idx,
                                           0xf, vdata, d16, gather)
@@ -6388,6 +6524,17 @@ class Gen:
             else:
                 uv = self.tmp()
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
+            if typed_lz:
+                def sample(image, cls, ty):
+                    sampled = sampled_image(image, cls)
+                    result = self.tmp()
+                    self.emit(f"{result} = OpImageSampleExplicitLod {ty} {sampled} {uv} Lod %f0")
+                    return result
+
+                self.uses_int_sampler = True
+                self.image_read_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), img, img_idx,
+                                      dmask, vdata, d16, sample)
+                return
             res = self.tmp()
             if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz"):
                 raise Unsupported(op)
@@ -6834,7 +6981,22 @@ class Gen:
         An attribute in per_vertex (read by a *_f16 interp somewhere) is a PerVertexKHR vec4[3] of the producer's
         raw 32-bit words, which hold two f16 (low, high). `half` 0/1 decodes that f16 of each vertex, None keeps the
         word as an f32; the three values are then weighted as AMD does, P0 + i(P1 - P0) + j(P2 - P0) with i, j =
-        BaryCoordKHR.y, .z, or vertex 0's taken when `flat`."""
+        BaryCoordKHR.y, .z, or vertex 0's taken when `flat`.
+
+        --f16-interp-fallback: an f16 read (`half` 0/1) of an attribute in f16_halves is component `comp` of the smooth
+        input at f16_half_location(n, half), which the producer fills with that half decoded to f32 (F16_HALVES).
+        Other reads of such an attribute take the raw word as on any location (smooth, or flat = provoking vertex)."""
+        if half is not None and n in self.f16_halves:
+            loc = f16_half_location(n, half)
+            if loc < 0:
+                raise Unsupported(f"--f16-interp-fallback: attr{n} has no decoded-half location")
+            name = f"%in_f16h{n}_{half}"
+            self.inputs[name] = loc
+            self.interpolated.add(name)
+            p, v = self.tmp(), self.tmp()
+            self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
+            self.emit(f"{v} = OpLoad %float {p}")
+            return v
         name = f"%in_attr{n}"
         self.inputs[name] = n
         if not flat:
@@ -7487,6 +7649,38 @@ class Gen:
         self.emit(f"{old} = OpLoad %v4float {name}")
         self.emit(f"{sel} = OpSelect %v4float {self.active_b()} {v} {old}")
         self.emit(f"OpStore {name} {sel}")
+        if F16_HALVES and tgt.startswith("param") and self.stage == "vs":
+            n = int(tgt[5:])
+            for half, hv in enumerate(self.f16_halves_of(n, v)):
+                hname = f"%out_f16h{n}_{half}"
+                self.outputs[hname] = f"loc{f16_half_location(n, half)}"
+                old, sel = self.tmp(), self.tmp()
+                self.emit(f"{old} = OpLoad %v4float {hname}")
+                self.emit(f"{sel} = OpSelect %v4float {self.active_b()} {hv} {old}")
+                self.emit(f"OpStore {hname} {sel}")
+
+    def f16_halves_of(self, n, v):
+        """--f16-interp-fallback: param n's exported vec4 `v` as two vec4s, the low and the high f16 half of each
+        channel's raw word decoded to f32 (UnpackHalf2x16), or () when their locations would overlap a param this
+        shader exports (or fall below location 0): the PS reading them is then fed by another producer or rejects."""
+        if f16_half_location(n, 0) <= self.param_max:
+            return ()
+        lo, hi = [], []
+        for c in range(4):
+            e, u, h2, a, b = (self.tmp() for _ in range(5))
+            self.emit(f"{e} = OpCompositeExtract %float {v} {c}")
+            self.emit(f"{u} = OpBitcast %uint {e}")
+            self.emit(f"{h2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+            self.emit(f"{a} = OpCompositeExtract %float {h2} 0")
+            self.emit(f"{b} = OpCompositeExtract %float {h2} 1")
+            lo.append(a)
+            hi.append(b)
+        out = []
+        for parts in (lo, hi):
+            r = self.tmp()
+            self.emit(f"{r} = OpCompositeConstruct %v4float {' '.join(parts)}")
+            out.append(r)
+        return tuple(out)
 
 
 _TYPE_DECL = re.compile(r"\s*(%\w+) = (OpTypeVector|OpTypePointer) (.*)$")
@@ -7621,6 +7815,9 @@ def assemble(gen):
     ms = gen.stage == "ms"
     gsx = gen.stage == "gs"
     msc = ms and MESH_COMPUTE
+    # --f16-interp-fallback, mesh: the params whose decoded halves fit clear of this shader's params (Gen.f16_halves_of)
+    ms_halves = [n for n in sorted(gen.ms_params) if F16_HALVES and f16_half_location(n, 0) > gen.param_max] \
+        if ms and not msc else []
     if msc:
         gen.msc_layout = mesh_compute_layout(gen.ms["maxv"], gen.ms["maxp"], gen.clip_count if gen.uses_clip else 0,
                                              gen.cull_count if gen.uses_cull else 0, gen.ms_params)
@@ -7654,7 +7851,8 @@ def assemble(gen):
     iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts"] + ([] if msc else
          [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
-         [f"%ms_out_param{n}" for n in sorted(gen.ms_params)])) if ms else []) + (
+         [f"%ms_out_param{n}" for n in sorted(gen.ms_params)] +
+         [f"%ms_out_f16h{n}_{h}" for n in ms_halves for h in (0, 1)])) if ms else []) + (
         ["%x_buf"] if gen.emulate or gen.bar_rounds else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
@@ -7686,6 +7884,8 @@ def assemble(gen):
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
     # past what drivers with 128 input components accept (#804 review).
     used = set(gen.inputs.values())
+    if len(used) != len(gen.inputs):    # --f16-interp-fallback: a decoded-half location is also an attribute
+        raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
     gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
     bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs or bary:
@@ -7798,6 +7998,8 @@ def assemble(gen):
                     "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT",
                     "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT"]
             dec += [f"OpDecorate %ms_out_param{n} Location {n}" for n in sorted(gen.ms_params)]
+            dec += [f"OpDecorate %ms_out_f16h{n}_{h} Location {f16_half_location(n, h)}" for n in ms_halves
+                    for h in (0, 1)]
     if vs:
         if gen.uses_clip:
             dec.append("OpDecorate %out_clip BuiltIn ClipDistance")
@@ -7957,7 +8159,7 @@ def assemble(gen):
                           f"%rt_itx{cls}_{di} = OpTypeRuntimeArray %itximg{cls}_{di}",
                           f"%_ptr_UC_rt_itx{cls}_{di} = OpTypePointer UniformConstant %rt_itx{cls}_{di}",
                           f"%_ptr_UC_itx{cls}_{di} = OpTypePointer UniformConstant %itximg{cls}_{di}"]
-                if gen.uses_int_gather and di == 0:
+                if gen.uses_int_sampler and di == 0:
                     types.append(f"%itxsamp{cls}_{di} = OpTypeSampledImage %itximg{cls}_{di}")
                 dec += [f"OpDecorate %itx{cls}_{di} DescriptorSet 0",
                         f"OpDecorate %itx{cls}_{di} Binding {Gen.SAMPLED_BINDINGS[di]}"]
@@ -8025,6 +8227,7 @@ def assemble(gen):
                       "%ms_prim_idx = OpVariable %_ptr_Out_ms_arr_idx Output",
                       "%ms_cull = OpVariable %_ptr_Out_ms_arr_cull Output"]
             gvars += [f"%ms_out_param{n} = OpVariable %_ptr_Out_ms_arr_v4 Output" for n in sorted(gen.ms_params)]
+            gvars += [f"%ms_out_f16h{n}_{h} = OpVariable %_ptr_Out_ms_arr_v4 Output" for n in ms_halves for h in (0, 1)]
         if gen.uses_lds:
             types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
@@ -8355,6 +8558,17 @@ def assemble(gen):
         for n in sorted(gen.ms_params):
             L += [f"%mq{n} = OpLoad %v4float %ms_param{n}",
                   f"%mqp{n} = OpAccessChain %_ptr_Out_v4_ms %ms_out_param{n} %mli", f"OpStore %mqp{n} %mq{n}"]
+            if n in ms_halves:      # --f16-interp-fallback: each channel's f16 halves decoded to f32
+                for k in range(4):
+                    L += [f"%mqe{n}_{k} = OpCompositeExtract %float %mq{n} {k}",
+                          f"%mqu{n}_{k} = OpBitcast %uint %mqe{n}_{k}",
+                          f"%mqh{n}_{k} = OpExtInst %v2float %glsl UnpackHalf2x16 %mqu{n}_{k}"]
+                    L += [f"%mqh{n}_{k}_{h} = OpCompositeExtract %float %mqh{n}_{k} {h}" for h in (0, 1)]
+                for h in (0, 1):
+                    L += [f"%mqv{n}_{h} = OpCompositeConstruct %v4float " +
+                          " ".join(f"%mqh{n}_{k}_{h}" for k in range(4)),
+                          f"%mqvp{n}_{h} = OpAccessChain %_ptr_Out_v4_ms %ms_out_f16h{n}_{h} %mli",
+                          f"OpStore %mqvp{n}_{h} %mqv{n}_{h}"]
         L += ["OpBranch %ms_vend", "%ms_vend = OpLabel",
               "%mhp = OpLoad %bool %ms_has_prim", "%mpi = OpULessThan %bool %mli %msp",
               "%mwp = OpLogicalAnd %bool %mhp %mpi",
@@ -8791,7 +9005,10 @@ def translate(path):
         if any(i.get("normalized") for i in insns):
             raise Unsupported("reachable instruction with normalized encoding")
     g = Gen(stage)
-    g.round_mode = any(i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", "") for i in insns)
+    if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
+        g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
+                           (i["args"][0].get("t", ""),) if t.startswith("param") and t[5:].isdigit()), default=-1)
+    g.round_mode =any(i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", "") for i in insns)
     g.wave64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
                    (base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in i["args"]))
                    for i in insns)
@@ -8925,10 +9142,13 @@ def translate(path):
         if unexplained:
             raise Unsupported("PS system inputs")
         g.frag_inputs = layout
-        if not BARY_FALLBACK:
-            g.per_vertex = {x["a"] for i in insns if base_op(i["op"]) in ("v_interp_p1ll_f16", "v_interp_p1lv_f16",
-                                                                          "v_interp_p2_f16")
-                            for x in i["args"] if x["k"] == "attr"}
+        f16_read = {x["a"] for i in insns if base_op(i["op"]) in ("v_interp_p1ll_f16", "v_interp_p1lv_f16",
+                                                                  "v_interp_p2_f16")
+                    for x in i["args"] if x["k"] == "attr"}
+        if F16_HALVES:      # decoded halves from the producer: no per-vertex inputs (and no barycentrics)
+            g.f16_halves = f16_read
+        elif not BARY_FALLBACK:
+            g.per_vertex = f16_read
         for r in layout:
             g.cu(r)
         # FSSM pixel-input table (tools/fssm_header.py): the authoritative interpolant list. Position i of the
@@ -9543,6 +9763,21 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # --bary-fallback: the raw barycentrics are a perspective-interpolated vec3 at this location; the stage
         # before the PS must write (1,0,0), (0,1,0), (0,0,1) at the triangle's vertices (see BARY_FALLBACK).
         m["bary_fallback_input"] = {"location": g.bary_location}
+    if F16_HALVES and g.stage in ("vs", "ms", "ps"):
+        # --f16-interp-fallback: PS = the attributes whose f16 reads take decoded halves, VS/MS = the params that
+        # export them; each as {n: [low-half location, high-half location]}. A pipeline links when every PS entry
+        # is among its producer's (see F16_HALVES).
+        if g.stage == "ps":
+            ns = sorted(g.f16_halves)
+        elif g.stage == "ms":
+            ns = sorted(g.ms_params)
+        else:
+            ns = sorted({int(t[5:]) for t in g.outputs.values() if t.startswith("param")})
+        ns = [n for n in ns if g.stage == "ps" or f16_half_location(n, 0) > g.param_max]
+        if ns:
+            m["f16_halves"] = {str(n): [f16_half_location(n, 0), f16_half_location(n, 1)] for n in ns}
+            if "mesh_compute" in m:     # tools/mesh_compute_vs.py exports them from the slot's raw params
+                m["mesh_compute"] = dict(m["mesh_compute"], f16_halves=m["f16_halves"])
     if g.build_meta:
         m.update(g.build_meta)
     return m
@@ -9635,14 +9870,19 @@ def main():
                          "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
                          "(guaranteed single rounding; needs VK_KHR_shader_fma + shaderFmaFloat32, listed in the "
                          "shader's metadata as capability FMAKHR / feature shaderFmaFloat32)")
+    ap.add_argument("--f16-interp-fallback", action="store_true",
+                    help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
+                         "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
+                         "reads as ordinary interpolated inputs (metadata: f16_halves)")
     a = ap.parse_args()
-    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR
+    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
+    F16_HALVES = a.f16_interp_fallback
     if a.merge:
         import glob as _gl, json as _js
         merged = {}
@@ -9719,4 +9959,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

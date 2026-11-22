@@ -83,6 +83,10 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     elapsed = time.monotonic() - start
     out = proc.stdout.decode("utf-8", "replace")
     code = proc.returncode
+    if code < 0:
+        # A negative return code is a host-signal termination (e.g. SIGSEGV), not a process exit code:
+        # report it as a failure before SKIP_RETURN_CODE or WILL_FAIL can reinterpret it.
+        return "fail", f"killed by signal {-code} in {elapsed:.1f} s\n{out}"
     skip_code = props.get("SKIP_RETURN_CODE")
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"

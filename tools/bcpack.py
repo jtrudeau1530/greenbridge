@@ -358,6 +358,12 @@ def _loose_limit(nblocks):
     return max(2, nblocks // 1024)
 
 
+def _unknown_blocks(e_roots, i_roots, unknown_e, unknown_i):
+    """Blocks whose endpoint or index history root is an unknown entry. A block can depend on one of each, and
+    it is one undetermined block, not two, against `_loose_limit`."""
+    return sum(1 for e, i in zip(e_roots, i_roots) if e in unknown_e or i in unknown_i)
+
+
 def _bc1_blocks(lanes, nblocks, provisional):
     if any(lanes[1]):
         raise BcpackError("BC1 lane 1 is non-zero (unexpected)")
@@ -865,10 +871,7 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
             )
         return bytes(out)
 
-    lost = (
-        sum(c for k, c in ends.items() if eclass[k] == 0)
-        + sum(c for k, c in idxs.items() if iclass[k] == 0)
-    )
+    lost = _unknown_blocks(eroot, iroot, {k for k in ends if eclass[k] == 0}, {k for k in idxs if iclass[k] == 0})
     missing = sorted(
         {f"endpoint {k}" for k in ends if eclass[k] == 0}
         | {f"index {k}" for k in idxs if iclass[k] == 0}
@@ -1238,7 +1241,8 @@ def _bc7_blocks(lanes, nblocks, provisional, *, history=None):
             er[i] = -1 if de == 0 else (256 + i - de if de > i else er[i - de])
             ir[i] = -1 if di == 0 else (256 + i - di if di > i else ir[i - di])
         counts = [(kinds, k, (er if kinds == "endpoint" else ir).count(k)) for kinds, k in unknown]
-        total = sum(c for _, _, c in counts)
+        total = _unknown_blocks(er, ir, {k for kinds, k in unknown if kinds == "endpoint"},
+                                {k for kinds, k in unknown if kinds == "index"})
         if total > _loose_limit(nblocks):
             names = ", ".join(f"{kinds} {k}" for kinds, k, _ in counts[:6])
             if len(counts) > 6:

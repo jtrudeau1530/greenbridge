@@ -1175,6 +1175,54 @@ class BadPoolTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(self.bad, err)
 
+    def test_scan_json_over_an_input_pool_is_refused(self):
+        with open(self.good, "rb") as f:
+            before = f.read()
+        alias = os.path.join(self.tmp.name, ".", "good.ttpf")
+        code, err = self.run_main("scan", self.good, "--json", alias)
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input", err)
+        with open(self.good, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_scan_json_over_a_pool_found_in_a_game_folder_is_refused(self):
+        game = os.path.join(self.tmp.name, "game")
+        os.makedirs(os.path.join(game, "data", "ttdb"))
+        pool = os.path.join(game, "data", "ttdb", "found.ttpf")
+        build_pool(pool)
+        with open(pool, "rb") as f:
+            before = f.read()
+        code, err = self.run_main("scan", game, "--json", pool)
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input", err)
+        with open(pool, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_scan_json_that_is_a_directory_is_refused(self):
+        code, err = self.run_main("scan", self.good, "--json", self.tmp.name)
+        self.assertEqual(code, 2)
+        self.assertIn("is a directory", err)
+
+    def test_scan_json_in_a_missing_folder_is_created(self):
+        out = os.path.join(self.tmp.name, "reports", "ttpf", "scan.json")
+        code, err = self.run_main("scan", self.good, "--json", out)
+        self.assertEqual(code, 0, err)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["total"]["entries"], 1)
+
+    def test_scan_json_that_cannot_be_written_keeps_the_printed_report(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("a file, not a folder")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = ttpf.main(["scan", self.good, "--json", os.path.join(blocker, "scan.json")])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write", err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["total"]["entries"], 1)
+
     def test_index_past_the_pool(self):
         for index in ("1", "-1"):
             code, err = self.run_main("layout", self.good, index)

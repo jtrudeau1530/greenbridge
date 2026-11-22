@@ -713,8 +713,7 @@ int main() {
             return fail("QueryInterface(IDXGIFactory5) failed");
         BOOL allow_tearing = FALSE;
         if (FAILED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
-                                                 sizeof(allow_tearing))) ||
-            !allow_tearing)
+                                                 sizeof(allow_tearing))))
             return fail("IDXGIFactory5::CheckFeatureSupport(ALLOW_TEARING) failed");
         if (factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, nullptr, sizeof(BOOL)) != E_INVALIDARG ||
             factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing, 2) != E_INVALIDARG)

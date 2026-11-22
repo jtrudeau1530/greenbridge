@@ -602,7 +602,26 @@ class NavmeshDecodeTest(unittest.TestCase):
             win = nd.scan(arc, start=offs[0], limit=offs[1] - offs[0], deep=True)
             self.assertEqual(win["resources"]["grid"]["resources"], 1)
             self.assertNotIn("navmesh", win["resources"])
-            self.assertEqual(win["carver_streams"]["streams"], 2)
+            # The continuation starts at the window's end: decoded as part of the grid, but carved past the
+            # window, so the carver counts match navmesh_index.py on the same window (#766).
+            self.assertEqual(win["carver_streams"]["streams"], 1)
+            self.assertEqual(win["carver_streams"]["past_window"], 1)
+            c = win["carver_streams"]
+            self.assertEqual(c["stored"] + c["zero_padding"] + c["unread"], win["span"])
+
+    def test_limit_inside_a_stream_counts_nothing_past_the_window(self):
+        """--limit ending inside the first of two streams: nothing is carved, and the byte classes add up to
+        the span, as navmesh_index.py reports for the same window."""
+        import hashlib
+        noisy = lambda seed: b"".join(hashlib.sha256(bytes([seed, i])).digest() for i in range(128))
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "w.rpf")
+            offs = make_rpf(arc, [noisy(1), noisy(2)])
+            doc = nd.scan(arc, start=offs[0], limit=0x100)
+            c = doc["carver_streams"]
+            self.assertEqual((c["streams"], c["stored"]), (0, 0))
+            self.assertEqual(c["stored"] + c["zero_padding"] + c["unread"], doc["span"])
+            self.assertEqual(c["past_window"], 1)
 
     def test_cli_rejects_shared_report_destination(self):
         with tempfile.TemporaryDirectory() as tmp:

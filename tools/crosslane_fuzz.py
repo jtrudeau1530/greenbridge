@@ -887,11 +887,21 @@ def parse_modes(text):
     return modes
 
 
+def _at_least_one(text):
+    """--programs and --ops: a count below 1 ran nothing (or a program of no ops) and still printed a summary, which
+    reads as a clean pass. Refuse it as a usage error instead, as the other fuzzers do."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1 (got {value})")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--programs", type=int, default=100)
+    ap.add_argument("--programs", type=_at_least_one, default=100,
+                    help="programs per wave (at least 1; default 100)")
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--ops", type=int, default=24, help="ops per program")
+    ap.add_argument("--ops", type=_at_least_one, default=24, help="ops per program (at least 1; default 24)")
     ap.add_argument("--wave", choices=("32", "64", "both"), default="both")
     ap.add_argument("--modes", type=parse_modes, default="native,emulate",
                     help="native, emulate (wave64 only), or both (the default)")
@@ -1145,4 +1155,8 @@ def self_test():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

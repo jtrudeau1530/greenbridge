@@ -103,6 +103,14 @@ through a mapped image are dispatched and stack walks can step over its frames. 
 first (entries in bounds, sorted and non-overlapping) and removed when the loader is destroyed. Modules
 are deduped by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
 
+MSVC C++ exceptions need one more piece. `_CxxThrowException` stores the throwing image's base in the
+exception record, from `RtlPcToFileHeader`, and the catch side adds the throw's RVAs to it; Windows' own
+`RtlPcToFileHeader` only knows images its loader mapped, so for a mapped image the base is 0 and no
+`catch` matches. When the loader binds a host copy of the MSVC runtime (`vcruntime140.dll`,
+`msvcp140.dll` and the rest of that list), it points that DLL's import of `RtlPcToFileHeader` at a
+version that asks Windows first and then the modules a live `Loader` maps. The redirect stays for the
+process lifetime and answers as Windows does when no `Loader` is alive.
+
 `load()` also installs static TLS for the calling thread. `__declspec(thread)` reads `TEB->ThreadLocalStoragePointer[_tls_index]`, which is a
 different index space from the `TlsAlloc` slots, and only the OS loader can allocate a module index.
 The runtime therefore ships a minimal `gta6rt_tls_host.dll`; the loader reuses the index the OS assigns
@@ -116,11 +124,16 @@ Current limits, by design:
 - `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own
   `gta6rt_tls_host.dll`; host imports still load system DLLs as before.
 - `--dry-run` never runs image code. `initialise()` runs TLS callbacks and a DLL's `DllMain`;
-  `run_tls_callbacks()` is the opt-in seam for `DLL_THREAD_ATTACH`/`DETACH` and for callers that do not
-  use `initialise()`. An EXE's entry point is the caller's to run.
-- The loader does not deliver thread attach/detach events. Call `install_tls_for_thread()` before mapped
-  code runs on a thread the runtime created and `uninstall_tls_for_thread()` before it exits; destroy the
-  `Loader` on the thread that called `load()`.
+  `run_tls_callbacks()` is the seam for callers that do not use `initialise()`. An EXE's entry point is
+  the caller's to run.
+- Every thread started after `load()` gets its own copy of the TLS template, from
+  `gta6rt_tls_host.dll`'s `DLL_THREAD_ATTACH`, and gives it back at `DLL_THREAD_DETACH`, also when the
+  thread outlives its `Loader`. From `initialise()` until `~Loader` starts the process detach, those
+  events also run the module's TLS callbacks, with the thread's copy already in place. A thread that
+  existed before `load()` gets nothing:
+  call `install_tls_for_thread()` before mapped code runs on it and `uninstall_tls_for_thread()` before it
+  exits. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
+  called `load()`.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -173,6 +186,12 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
 - GPU tests count only validation-type errors. Loader and layer messages, such as a third-party implicit layer
   that fails to load, are printed but don't fail the run; to silence one, set
   `VK_LOADER_LAYERS_DISABLE=<layer name pattern>`.
+- `d3d12_draw_test` — milestone M1: a VS+PS pipeline found by FSSM hash, the input layout matched by semantic,
+  and five draws plus a culled triangle, compared pixel by pixel. They also cover an unbound render target and
+  DSV, a rebound root signature, instance step rate 0, an unbound vertex slot, and PSOs, buffers and heaps that
+  must be refused. A second pass draws a full-screen triangle with no vertex input and an XOR logic op.
+- `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
+  translator-style index, root arguments through the GPU address arena, and two dispatches.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
   Vulkan, resizes it and presents 10 more, and checks the colour on screen. A driver double then injects an
   out-of-date and a suboptimal present, a failed semaphore during a swapchain recreation and a failed blit

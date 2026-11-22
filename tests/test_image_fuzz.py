@@ -204,3 +204,27 @@ def test_self_test_runs():
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "self-test: ok" in r.stdout
+
+
+def build_dir_main_uses(monkeypatch, argv):
+    """The build folder main() hands run_case for `argv`, with run_case stubbed to a pass."""
+    seen = []
+    monkeypatch.setattr(imf, "run_case", lambda *args, **_kw: seen.append(args[5]) or True)
+    monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--programs", "1"] + argv)
+    assert imf.main() == 0
+    return seen[0]
+
+
+def test_default_build_is_runtime_build_on_every_platform(monkeypatch, tmp_path):
+    # It was runtime/build/linux, which only a Linux build following docs/testing.md has: on Windows (and on Linux
+    # following docs/shader_validation.md) every run stopped with "vk_image_fuzz not found" unless --build was given.
+    monkeypatch.setattr(imf, "find_test_program", lambda build, name: None)
+    assert build_dir_main_uses(monkeypatch, ["--work", str(tmp_path)]) == os.path.join(imf.ROOT, "runtime", "build")
+
+
+def test_visual_studio_config_subfolder_is_found(monkeypatch, tmp_path):
+    build = tmp_path / "build"
+    (build / "RelWithDebInfo").mkdir(parents=True)
+    (build / "RelWithDebInfo" / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
+    got = build_dir_main_uses(monkeypatch, ["--build", str(build), "--work", str(tmp_path / "w")])
+    assert got == str(build / "RelWithDebInfo")
