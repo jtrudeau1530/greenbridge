@@ -30,7 +30,7 @@ Mathematical and Architectural Properties:
     - Bits [7:1] of each byte lane in src2 are strictly ignored by hardware and translator.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
 import unittest
@@ -150,6 +150,68 @@ class VLerpU8Instruction:
 
     def disassemble(self) -> str:
         return f"v_lerp_u8 {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single execution thread."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        self.vgprs[index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        self.sgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_lerp_u8."""
+
+    def resolve_operand(self, op: VLerpOperand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg32):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.value & MASK32
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VLerpU8Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s0 = self.resolve_operand(instr.src0, state)
+        s1 = self.resolve_operand(instr.src1, state)
+        s2 = self.resolve_operand(instr.src2, state)
+
+        # Computation phase
+        result = oracle_v_lerp_u8(s0, s1, s2)
+
+        # Write-back phase
+        state.set_vgpr(instr.dst.index, result)
+        return result
+
 
 
 
@@ -289,6 +351,93 @@ class TestSymbolicAST(unittest.TestCase):
         src = VLerpOperand(Reg32(1, RegType.VGPR))
         with self.assertRaises(TypeError):
             VLerpU8Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_state_get_set(self) -> None:
+        self.assertEqual(self.state.get_vgpr(0), 0)
+        self.assertEqual(self.state.get_sgpr(0), 0)
+
+        self.state.set_vgpr(10, 0x12345678)
+        self.assertEqual(self.state.get_vgpr(10), 0x12345678)
+
+        self.state.set_sgpr(5, 0xABCDEF01)
+        self.assertEqual(self.state.get_sgpr(5), 0xABCDEF01)
+
+        # 32-bit masking
+        self.state.set_vgpr(1, 0x1_0000_0042)
+        self.assertEqual(self.state.get_vgpr(1), 0x42)
+
+        with self.assertRaises(IndexError):
+            self.state.get_vgpr(-1)
+        with self.assertRaises(IndexError):
+            self.state.get_vgpr(256)
+
+    def test_scalar_step_vgpr_sources(self) -> None:
+        self.state.set_vgpr(1, 0x10203040)
+        self.state.set_vgpr(2, 0x30405060)
+        self.state.set_vgpr(3, 0x01000100)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(2, RegType.VGPR)),
+            src2=VLerpOperand(Reg32(3, RegType.VGPR)),
+        )
+
+        res = self.interp.step(instr, self.state)
+        expected = oracle_v_lerp_u8(0x10203040, 0x30405060, 0x01000100)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_vgpr(0), expected)
+
+    def test_scalar_step_mixed_sources_sgpr_and_literal(self) -> None:
+        self.state.set_vgpr(1, 0x02040608)
+        self.state.set_sgpr(4, 0x0406080A)
+
+        instr = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(1, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(4, RegType.SGPR)),
+            src2=VLerpOperand(Literal32(1)),
+        )
+
+        res = self.interp.step(instr, self.state)
+        expected = oracle_v_lerp_u8(0x02040608, 0x0406080A, 1)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_vgpr(0), expected)
+
+    def test_sequential_instruction_flow(self) -> None:
+        # v0 = lerp(0x10101010, 0x20202020, 0) -> 0x18181818
+        # v1 = lerp(v0, 0x30303030, 1) -> lerp(0x18181818, 0x30303030, 1)
+        self.state.set_vgpr(2, 0x10101010)
+        self.state.set_vgpr(3, 0x20202020)
+        self.state.set_vgpr(4, 0x30303030)
+
+        instr1 = VLerpU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VLerpOperand(Reg32(2, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(3, RegType.VGPR)),
+            src2=VLerpOperand(Literal32(0)),
+        )
+        res1 = self.interp.step(instr1, self.state)
+        self.assertEqual(res1, 0x18181818)
+
+        instr2 = VLerpU8Instruction(
+            dst=Reg32(1, RegType.VGPR),
+            src0=VLerpOperand(Reg32(0, RegType.VGPR)),
+            src1=VLerpOperand(Reg32(4, RegType.VGPR)),
+            src2=VLerpOperand(Literal32(1)),
+        )
+        res2 = self.interp.step(instr2, self.state)
+        # (0x18 + 0x30 + 1) >> 1 = (24 + 48 + 1) >> 1 = 73 >> 1 = 36 = 0x24
+        self.assertEqual(res2, 0x24242424)
+        self.assertEqual(self.state.get_vgpr(1), 0x24242424)
 
 
 if __name__ == "__main__":
