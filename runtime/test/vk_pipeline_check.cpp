@@ -289,25 +289,37 @@ struct JsonParser {
     }
 };
 
-std::map<std::string, ShaderMeta> read_index(const std::string& path, std::string& err) {
+std::map<std::string, ShaderMeta> read_index(const std::string& path, std::string& err, bool& unreadable) {
     std::ifstream f(path, std::ios::binary);
     std::map<std::string, ShaderMeta> out;
-    if (!f) { err = "cannot open the file"; return out; }   // a missing index must not read as an empty corpus
-    std::string s((std::istreambuf_iterator<char>(f)), {});
-    if (f.bad()) { err = "read error"; return out; }
+    unreadable = false;
+    if (!f) { err = "cannot open the file"; unreadable = true; return out; }   // a missing index must not read as an empty corpus
+    // Read with read() so that a failure shows in the stream state (istreambuf_iterator bypasses it).
+    f.seekg(0, std::ios::end);
+    const std::streamoff size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (!f || size < 0) { err = "cannot determine the file size"; unreadable = true; return out; }
+    std::string s(static_cast<size_t>(size), '\0');
+    if (size > 0 && (!f.read(s.data(), size) || f.gcount() != size)) { err = "read error"; unreadable = true; return out; }
     JsonParser p{s, 0};
     p.ws();
     if (p.i >= s.size()) { err = "the file is empty (an intentionally empty index is {})"; return out; }
     if (!p.consume('{')) { err = "expected '{' at byte " + std::to_string(p.i); return out; }
+    // After the closing '}' only whitespace may remain ({}garbage is malformed).
+    auto closed = [&] {
+        p.ws();
+        if (p.i != s.size()) { err = "unexpected data after the top-level object at byte " + std::to_string(p.i); return std::map<std::string, ShaderMeta>{}; }
+        return std::move(out);
+    };
     while (!p.error && p.i < s.size()) {
-        if (p.consume('}')) return out;
+        if (p.consume('}')) return closed();
         const size_t before = p.i;
         std::string name = p.parse_string();
         if (p.error) break;
         if (!p.consume(':')) { p.fail("expected ':' after shader name"); break; }
         out[name] = p.parse_meta();
         if (p.error) break;
-        if (p.consume('}')) return out;
+        if (p.consume('}')) return closed();
         if (!p.consume(',') || p.i == before) { p.fail("expected ',' or '}' in index.json"); break; }
     }
     if (p.error) { err = p.error_msg; return {}; }
@@ -578,9 +590,11 @@ int main(int argc, char** argv) {
 #endif
 
     std::string index_err;
-    auto index = read_index(dir + "/index.json", index_err);
+    bool index_unreadable = false;
+    auto index = read_index(dir + "/index.json", index_err, index_unreadable);
     if (!index_err.empty()) {
-        std::fprintf(stderr, "error: cannot use %s/index.json: %s\n", dir.c_str(), index_err.c_str());
+        std::fprintf(stderr, index_unreadable ? "error: cannot read %s/index.json: %s\n" : "error: malformed JSON in %s/index.json: %s\n",
+                     dir.c_str(), index_err.c_str());
         return 2;
     }
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
