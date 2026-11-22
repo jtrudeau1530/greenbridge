@@ -38,10 +38,15 @@ ALLOWLIST = {
     "test_alu_lshl_add.py": "hand-written copy of the emitted SPIR-V run by spirv_mini_interp.py",
     "test_alu_pack_in_place.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
     "test_alu_sad_hi_u32.py": "pure oracle and hand-written SPIR-V run by spirv_mini_interp.py",
-    # Debt from before this guard.  Replace these with translating tests rather than adding to this list.
-    "test_alu_dot2acc_f16.py": "DEBT: private oracle; v_dot2acc_f16 is not implemented in the translator yet",
-    "test_ballot_votes.py": "DEBT: private SPIR-V interpreter; should translate a hand-written listing instead",
-    "test_valu_div_fixup.py": "DEBT: private oracle whose rules RDNA2 disagrees with; TEST-545 replaces it",
+}
+
+# Debt from before this guard: files that model the answer instead of running the translator.  They are
+# expected to be replaced, so an entry here never has to be kept in step with another PR: fixing the file,
+# or deleting it, simply removes it from the debt.  Do not move a file here to silence the guard.
+DEBT = {
+    "test_alu_dot2acc_f16.py": "private oracle; v_dot2acc_f16 is not implemented in the translator yet",
+    "test_ballot_votes.py": "private SPIR-V interpreter; should translate a hand-written listing instead",
+    "test_valu_div_fixup.py": "private oracle whose rules RDNA2 disagrees with; TEST-545 replaces it",
 }
 
 
@@ -128,14 +133,15 @@ def _reaches(path, seen, semantic_dir):
     return False
 
 
-def offenders(semantic_dir=SEMANTIC, allowlist=None):
+def offenders(semantic_dir=SEMANTIC, allowlist=None, debt=None):
     """[(relative path, line, reason)] for test files that do not reach rdna2spirv and are not allowed."""
     allowlist = ALLOWLIST if allowlist is None else allowlist
+    debt = DEBT if debt is None else debt
     found = []
     for name in sorted(os.listdir(semantic_dir)):
         if not (name.startswith("test_") and name.endswith(".py")):
             continue
-        if name in allowlist:
+        if name in allowlist or name in debt:
             continue
         path = os.path.join(semantic_dir, name)
         if _reaches(path, set(), semantic_dir):
@@ -180,7 +186,7 @@ class TranslatorUseTests(unittest.TestCase):
             for name, text in files.items():
                 with open(os.path.join(tmp, name), "w", encoding="utf-8", newline="\n") as f:
                     f.write(text)
-            self.assertEqual(offenders(tmp, allowlist={}), [
+            self.assertEqual(offenders(tmp, allowlist={}, debt={}), [
                 (os.path.join("tests", "semantic", "test_silent.py"), 1,
                  "imports no rdna2spirv and no helper that does"),
                 (os.path.join("tests", "semantic", "test_unused.py"), 1,
