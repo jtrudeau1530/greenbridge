@@ -106,7 +106,7 @@ public:
 
     // Run-time module lookup/loading used by the library_loader shim for bundled package DLLs.
     void* find_loaded_module(const std::string& dll_lower) const;
-    void* load_runtime_module(const std::string& dll_lower, bool& handled);
+    void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
 
