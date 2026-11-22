@@ -131,10 +131,17 @@ void CALLBACK on_device(GameInputCallbackToken token, void*, IGameInputDevice* d
     g_device_events.push_back({device, current, previous, token});
 }
 DWORD g_reading_sleep_ms = 0;  // makes on_reading slow, for the Dispatch quota checks
+SDL_Joystick* g_requeue_pad = nullptr;  // set: on_reading queues one more reading from inside the callback
+bool g_requeue_down = false;
 
 void CALLBACK on_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool) {
     if (reading) ++g_reading_events;
     if (g_reading_sleep_ms) Sleep(g_reading_sleep_ms);
+    if (g_requeue_pad) {
+        g_requeue_down = !g_requeue_down;
+        SDL_SetJoystickVirtualButton(g_requeue_pad, SDL_GAMEPAD_BUTTON_WEST, g_requeue_down);
+        rt::gameinput::poll();
+    }
 }
 void CALLBACK on_guide(GameInputCallbackToken, void*, IGameInputDevice*, uint64_t, bool pressed) {
     g_guide_events.push_back(pressed);
@@ -998,6 +1005,8 @@ int main() {
         if (wait) WaitForSingleObject(wait, 0);  // consume the signal from queueing
         check(dispatcher->Dispatch(0) && g_reading_events == before_quota + 1, "Dispatch(0) runs exactly one event and reports more");
         check(wait && WaitForSingleObject(wait, 0) == WAIT_OBJECT_0, "the wait handle is signalled again while events remain");
+        // The callback sleeps 5 ms, so at least 5 ms have passed after the first event however loaded the machine
+        // is; a slower run only makes the 1 ms quota more clearly spent.
         g_reading_sleep_ms = 5;
         before_quota = g_reading_events;
         check(dispatcher->Dispatch(1000) && g_reading_events == before_quota + 1,
@@ -1007,6 +1016,26 @@ int main() {
         check(!dispatcher->Dispatch(1'000'000) && g_reading_events >= before_quota + 2,
               "a large quota drains the queue and returns false");
         check(!dispatcher->Dispatch(0), "Dispatch on an empty queue returns false");
+
+        // Events queued during a call wait for the next one: each callback here queues another reading, so a
+        // Dispatch that kept draining would never return. With two events queued, each call runs exactly the batch
+        // it started with and reports the readings queued meanwhile.
+        queue_changes(2);
+        g_requeue_pad = xbox.js;
+        before_quota = g_reading_events;
+        check(dispatcher->Dispatch(UINT64_MAX) && g_reading_events == before_quota + 2,
+              "Dispatch runs only the events queued when it started");
+        before_quota = g_reading_events;
+        check(dispatcher->Dispatch(UINT64_MAX) && g_reading_events == before_quota + 2,
+              "the events queued during the call run on the next one");
+        g_requeue_pad = nullptr;
+        while (dispatcher->Dispatch(UINT64_MAX)) {}
+        if (g_requeue_down) {
+            g_requeue_down = false;
+            SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_WEST, false);
+            rt::gameinput::poll();
+            while (dispatcher->Dispatch(UINT64_MAX)) {}
+        }
     }
     if (wait) CloseHandle(wait);
     if (dispatcher) dispatcher->Release();

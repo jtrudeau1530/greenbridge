@@ -463,31 +463,32 @@ bool deliver() {
     return !s.queue.empty();
 }
 
-// IGameInputDispatcher::Dispatch: runs queued events oldest first, at least one even with a quota of 0, and takes no
-// further event once quota_us microseconds have passed (an event already started runs to the end, so the quota is a
-// target, as on Windows). While events remain the wait handle is signalled again, so a title that waits on it before
-// each call comes back for the rest. Returns whether events remain.
+// IGameInputDispatcher::Dispatch: runs the events queued when the call starts, oldest first: at least one even with a
+// quota of 0, and no further event once quota_us microseconds have passed (an event already started runs to the end,
+// so the quota is a target, as on Windows). Events queued during the call wait for the next one, so a busy poll thread
+// cannot keep the title inside Dispatch even with an unlimited quota. Events left over go back to the front of the
+// queue, ahead of newer ones, and the wait handle is signalled again while any remain. Returns whether events remain.
 bool deliver_within(uint64_t quota_us) {
     State& s = g();
     std::lock_guard dl(s.deliver_mu);
     const auto start = std::chrono::steady_clock::now();
+    std::vector<Event> batch;
+    {
+        std::lock_guard lock(s.mu);
+        batch.swap(s.queue);
+    }
     s.delivering_thread = GetCurrentThreadId();
-    for (bool first = true;; first = false) {
-        if (!first) {
+    size_t next = 0;
+    while (next < batch.size()) {
+        if (next > 0) {
             const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
             if (static_cast<uint64_t>(spent.count()) >= quota_us) break;
         }
-        Event e;
-        {
-            std::lock_guard lock(s.mu);
-            if (s.queue.empty()) break;
-            e = s.queue.front();
-            s.queue.erase(s.queue.begin());
-        }
-        deliver_event(e);
+        deliver_event(batch[next++]);
     }
     s.delivering_thread = 0;
     std::lock_guard lock(s.mu);
+    if (next < batch.size()) s.queue.insert(s.queue.begin(), batch.begin() + static_cast<std::ptrdiff_t>(next), batch.end());
     const bool remaining = !s.queue.empty();
     if (remaining && s.wait_event) SetEvent(s.wait_event);
     return remaining;
