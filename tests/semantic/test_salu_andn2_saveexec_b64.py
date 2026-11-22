@@ -637,5 +637,167 @@ class TestSaluAndn2SaveexecB64ScalarInterpreter(unittest.TestCase):
                 self.assertEqual(interp.get_sgpr_u32(i), 0xDEAD0000 | i)
 
 
+# --- SIMD Multi-Lane Divergence and EXEC Masking Engine ---
+
+class WaveEngine:
+    """Multi-lane SIMD wave execution engine modeling RDNA2 wave32 / wave64."""
+
+    def __init__(self, wave_size: int = 64, num_vgprs: int = 256) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Unsupported wave size: {wave_size}")
+        self.wave_size = wave_size
+        self.num_vgprs = num_vgprs
+        self.vgprs = [[0] * wave_size for _ in range(num_vgprs)]
+        self.salu = ScalarSaluInterpreter()
+        self.mask_limit = MASK32 if wave_size == 32 else MASK64
+        self.salu.exec = self.mask_limit
+
+    @property
+    def exec_mask(self) -> int:
+        return self.salu.exec & self.mask_limit
+
+    @exec_mask.setter
+    def exec_mask(self, val: int) -> None:
+        self.salu.exec = val & self.mask_limit
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.wave_size):
+            return False
+        return bool(self.exec_mask & (1 << lane))
+
+    def get_vgpr_lane(self, reg: int, lane: int) -> int:
+        return self.vgprs[reg][lane] & MASK32
+
+    def set_vgpr_lane(self, reg: int, lane: int, val: int) -> None:
+        self.vgprs[reg][lane] = val & MASK32
+
+    def valu_add_u32(self, dst_vgpr: int, src_vgpr: int, addend: int) -> None:
+        """VALU instruction: updates dst_vgpr only in currently ACTIVE lanes."""
+        for lane in range(self.wave_size):
+            if self.is_lane_active(lane):
+                old = self.get_vgpr_lane(src_vgpr, lane)
+                self.set_vgpr_lane(dst_vgpr, lane, (old + addend) & MASK32)
+
+    def valu_set_u32(self, dst_vgpr: int, val: int) -> None:
+        """VALU instruction: sets constant in currently ACTIVE lanes."""
+        for lane in range(self.wave_size):
+            if self.is_lane_active(lane):
+                self.set_vgpr_lane(dst_vgpr, lane, val & MASK32)
+
+
+class TestSaluAndn2SaveexecB64SIMDMultiLane(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_divergent_if_else_execution(self):
+        """Simulate RDNA2 shader conditional branching pattern:
+        if (cond) {
+            v0 += 10
+        } else {
+            v0 += 20
+        }
+        Compiler lowering:
+            s_and_saveexec_b64 s[saved], cond_mask
+            v_add_u32 v0, v0, 10
+            s_andn2_saveexec_b64 s[then], s[saved]
+            v_add_u32 v0, v0, 20
+            s_mov_b64 exec, s[saved]
+        """
+        engine = WaveEngine(wave_size=64)
+        # Initially only lower 32 lanes active
+        initial_exec = 0x00000000FFFFFFFF
+        engine.exec_mask = initial_exec
+
+        # Condition mask: odd lanes within active range
+        cond_mask = 0xAAAAAAAAAAAAAAAA
+
+        # Step 1: then-branch -> EXEC = old_exec & cond_mask
+        # s_and_saveexec_b64 s[0:1], cond_mask
+        saved_exec = engine.exec_mask
+        engine.salu.set_sgpr_u64(0, saved_exec)
+        engine.exec_mask = saved_exec & cond_mask
+        # Then-branch VALU action
+        engine.valu_add_u32(dst_vgpr=0, src_vgpr=0, addend=10)
+
+        # Step 2: else-branch -> EXEC = s[0:1] & ~EXEC
+        # s_andn2_saveexec_b64 s[2:3], s[0:1]
+        engine.salu.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+        # Verify s[2:3] saved the then-branch mask
+        self.assertEqual(engine.salu.get_sgpr_u64(2), initial_exec & cond_mask)
+        # Verify new EXEC is else-branch mask
+        expected_else_mask = initial_exec & (~cond_mask & MASK64)
+        self.assertEqual(engine.exec_mask, expected_else_mask)
+        # Else-branch VALU action
+        engine.valu_add_u32(dst_vgpr=0, src_vgpr=0, addend=20)
+
+        # Step 3: restore original EXEC
+        engine.exec_mask = engine.salu.get_sgpr_u64(0)
+
+        # Verification across all 64 lanes
+        for lane in range(64):
+            val = engine.get_vgpr_lane(0, lane)
+            if lane < 32:
+                if lane % 2 == 1:
+                    # Odd lanes took then-branch
+                    self.assertEqual(val, 10, f"Lane {lane} expected then-branch result")
+                else:
+                    # Even lanes took else-branch
+                    self.assertEqual(val, 20, f"Lane {lane} expected else-branch result")
+            else:
+                # Lanes >= 32 were inactive throughout
+                self.assertEqual(val, 0, f"Lane {lane} was inactive, must be 0")
+
+    def test_simd_inactive_lane_preservation(self):
+        """Verify that inactive lanes under EXEC are untouched before and after saveexec."""
+        engine = WaveEngine(wave_size=64)
+        # Pre-fill all lanes of v1 with distinctive values
+        for lane in range(64):
+            engine.set_vgpr_lane(1, lane, 0x1000 + lane)
+
+        # Set EXEC to only lanes 0, 1, 2
+        engine.exec_mask = 0x7
+        # Invert EXEC against mask 0xF (lanes 0..3)
+        # new_exec = 0xF & ~0x7 = 0x8 (only lane 3)
+        engine.salu.set_sgpr_u64(4, 0xF)
+        engine.salu.execute_asm("s_andn2_saveexec_b64 s[6:7], s[4:5]")
+
+        # Run VALU on v1
+        engine.valu_add_u32(dst_vgpr=1, src_vgpr=1, addend=0x5000)
+
+        # Only lane 3 was modified
+        self.assertEqual(engine.get_vgpr_lane(1, 3), 0x1000 + 3 + 0x5000)
+        # All other lanes strictly unchanged
+        for lane in range(64):
+            if lane != 3:
+                self.assertEqual(engine.get_vgpr_lane(1, lane), 0x1000 + lane)
+
+    def test_simd_all_active_vs_none_active(self):
+        engine = WaveEngine(wave_size=64)
+        engine.exec_mask = MASK64
+        # Invert against MASK64: MASK64 & ~MASK64 = 0
+        engine.salu.execute_asm("s_andn2_saveexec_b64 s[0:1], -1")
+        self.assertEqual(engine.exec_mask, 0)
+        self.assertEqual(engine.salu.scc, 0)
+        for lane in range(64):
+            self.assertFalse(engine.is_lane_active(lane))
+
+        # Now EXEC is 0, invert against MASK64: MASK64 & ~0 = MASK64
+        engine.salu.execute_asm("s_andn2_saveexec_b64 s[2:3], -1")
+        self.assertEqual(engine.exec_mask, MASK64)
+        self.assertEqual(engine.salu.scc, 1)
+        for lane in range(64):
+            self.assertTrue(engine.is_lane_active(lane))
+
+    def test_simd_wave32_masking(self):
+        engine = WaveEngine(wave_size=32)
+        self.assertEqual(engine.exec_mask, MASK32)
+        # Upper 32 bits should never be set in wave32 mode
+        engine.salu.set_sgpr_u64(0, 0xFFFFFFFF00000000)
+        engine.salu.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+        # 0xFFFFFFFF00000000 & ~0x00000000FFFFFFFF = 0xFFFFFFFF00000000
+        # In wave32 mode, active lanes are clamped to 32 bits
+        self.assertEqual(engine.exec_mask, 0)
+        self.assertFalse(engine.is_lane_active(32))
+
+
 if __name__ == "__main__":
     unittest.main()
