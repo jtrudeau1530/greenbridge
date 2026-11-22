@@ -234,6 +234,22 @@ TBUFFER_STORE_WORDS = [
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
                                                  0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE])]
+# cs_heap_init.asm: vk_compute_test's VKC_HEAP_INIT copies this file (zeros, then four words at 0x100) to the start
+# of the heap; the shader copies the four words to 0, and out[4..7] are the file's zeros, not the 0xEE fill.
+HEAP_INIT_WORDS = [0x1BADB002, 0xCAFEF00D, 0x80000001, 0x0000FFFF]
+HEAP_INIT_FILE = bytes(0x100) + struct.pack("<4I", *HEAP_INIT_WORDS)
+HEAP_INIT_EXPECTED = HEAP_INIT_WORDS + [0] * 4
+
+
+def heap_init_env():
+    """vk_compute_test's environment for cs_heap_init: the init file (written to the temp folder) and a buffer big
+    enough to hold it (68 words for its 0x110 bytes; one group's default is 64)."""
+    path = os.path.join(tempfile.gettempdir(), "leonida_cs_heap_init.bin")
+    with open(path, "wb") as f:
+        f.write(HEAP_INIT_FILE)
+    return {"VKC_HEAP_INIT": path, "VKC_OUT_WORDS": str(len(HEAP_INIT_FILE) // 4)}
+
+
 # cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
@@ -1396,6 +1412,8 @@ def main():
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
+    results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
+                                                 expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", compute_test(tools, spirv, "cs_fma_fused", "1", "dump", expected_words=FMA_FUSED,
                                                  env=FMA_FUSED_ENV)))
