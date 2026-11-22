@@ -156,6 +156,7 @@ class Gen:
         self.cur_masks = {}
         self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
         self.write_all_lanes = False
+        self.dpp_guard = None       # per-lane bool: a DPP instruction's row/bank/valid write mask
         self.parked = {}               # (vgpr, lane) a mask is parked in -> the spare SGPR slot that keeps it per lane
         self.uses_lds = False
         self.lds_dwords = 16384        # CS: set from RSRC2 LDS_SIZE (power of two, covers every offset used)
@@ -278,6 +279,8 @@ class Gen:
         elif k == "special" and a["t"] in ("vcc_lo", "vcc"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
+        elif k == "ssa":
+            v = a["v"]                    # a value already in SSA form (DPP's shuffled source)
         else:
             raise Unsupported(f"operand {a.get('t', k)}")
         if "sdwa_sel" in a:
@@ -609,13 +612,22 @@ class Gen:
             self.emit(f"{old} = OpLoad %uint {p}")
             if eager:
                 mask = self.exec_value()
+                if self.dpp_guard is not None:
+                    guarded = self.tmp()
+                    self.emit(f"{guarded} = OpSelect %uint {self.dpp_guard} {mask} {self.cu(0)}")
+                    mask = guarded
                 keep, write, preserve = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{keep} = OpNot %uint {mask}")
                 self.emit(f"{write} = OpBitwiseAnd %uint {val} {mask}")
                 self.emit(f"{preserve} = OpBitwiseAnd %uint {old} {keep}")
                 self.emit(f"{r} = OpBitwiseOr %uint {write} {preserve}")
             else:
-                self.emit(f"{r} = OpSelect %uint {self.active_b()} {val} {old}")
+                active = self.active_b()
+                if self.dpp_guard is not None:
+                    guarded = self.tmp()
+                    self.emit(f"{guarded} = OpLogicalAnd %bool {active} {self.dpp_guard}")
+                    active = guarded
+                self.emit(f"{r} = OpSelect %uint {active} {val} {old}")
             self.emit(f"OpStore {p} {r}")
         elif a["k"] == "sgpr" and a.get("n", 1) == 1:
             self.store_reg(a["k"], a["r"], val)
@@ -1956,6 +1968,13 @@ class Gen:
         self.emit(f"{li} = OpIAdd %uint {lx} {t2}")
         return li
 
+    def subgroup_lane(self):
+        """This invocation's lane within its Vulkan subgroup (0..31 or 0..63)."""
+        self.uses_subgroup = True
+        r = self.tmp()
+        self.emit(f"{r} = OpLoad %uint %sg_lane")
+        return r
+
     def wave_lane(self):
         """This invocation's hardware lane within its wave. Compute and mesh shaders: LocalInvocationIndex mod the
         wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane, which is
@@ -2702,6 +2721,8 @@ class Gen:
         self.write_all_lanes = id(ins) in self.mask_writes
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
+        if ins["op"].endswith("_dpp"):
+            return self.dpp_insn(ins)
         if not ins["op"].endswith("_sdwa"):
             return self._insn(ins)
         op, mods = base_op(ins["op"]), ins["mods"]
@@ -2740,6 +2761,258 @@ class Gen:
         # SEXT: the sign-extended field shifted up leaves sign copies above it; bits below stay zero.
         self.emit(f"{r} = OpShiftLeftLogical %uint {lo} {self.cu(off)}")
         return r
+
+    def dpp_insn(self, ins):
+        """DPP (data-parallel primitives) on a VOP1/VOP2 src0. The source lane follows quad_perm/row_* or dpp8,
+        then row_mask (one bit per 16-lane row) and bank_mask (one bit per 4-lane bank) decide which destination
+        lanes update. A source lane that is out of range or inactive under EXEC is invalid: bound_ctrl 1 reads 0,
+        otherwise the destination keeps its old value. dpp8 instead uses fi: fi 0 reads 0 from an inactive lane,
+        fi 1 reads its pre-existing value. DPP16/8 never reaches beyond its 16/8-lane group, so this is exact on
+        every subgroup at least that wide."""
+        if "_sdwa" in ins["op"]:
+            raise Unsupported("DPP with SDWA")
+        mods = ins["mods"]
+
+        def number(key, default):
+            for m in mods:
+                if m.startswith(key + ":"):
+                    try:
+                        return int(m.split(":", 1)[1], 0)
+                    except ValueError:
+                        raise Unsupported("DPP " + key)
+            return default
+
+        def selectors(key, count, limit):
+            for m in mods:
+                if m.startswith(key + ":"):
+                    try:
+                        vals = [int(x, 0) for x in m.split("[", 1)[1].rstrip("]").split(",")]
+                    except (IndexError, ValueError):
+                        raise Unsupported("DPP " + key)
+                    if len(vals) != count or any(not 0 <= v < limit for v in vals):
+                        raise Unsupported("DPP " + key)
+                    return vals
+            return None
+
+        dpp8 = selectors("dpp8", 8, 8)
+        quad = selectors("quad_perm", 4, 4)
+        ctrl = None
+        for m in mods:
+            if m in ("row_mirror", "row_half_mirror"):
+                if ctrl is not None:
+                    raise Unsupported("DPP controls")
+                ctrl = (m, None)
+                continue
+            for key in ("row_shl", "row_shr", "row_ror", "row_share", "row_xmask"):
+                if m.startswith(key + ":"):
+                    if ctrl is not None:
+                        raise Unsupported("DPP controls")
+                    try:
+                        value = int(m.split(":", 1)[1], 0)
+                    except ValueError:
+                        raise Unsupported("DPP " + key)
+                    if not 0 <= value <= 15 or (key not in ("row_share", "row_xmask") and value == 0):
+                        raise Unsupported("DPP " + key)
+                    ctrl = (key, value)
+                    break
+        if dpp8 is not None and (quad is not None or ctrl is not None):
+            raise Unsupported("DPP controls")
+        if quad is not None and ctrl is not None:
+            raise Unsupported("DPP controls")
+        if dpp8 is None and quad is None and ctrl is None:
+            raise Unsupported("DPP control")
+        fi = number("fi", 0)
+        bound = number("bound_ctrl", 0)
+        if fi not in (0, 1) or bound not in (0, 1):
+            raise Unsupported("DPP flag")
+        fi, bound = bool(fi), bool(bound)
+        row_mask = number("row_mask", 0xF)
+        bank_mask = number("bank_mask", 0xF)
+        if not (0 <= row_mask <= 0xF and 0 <= bank_mask <= 0xF):
+            raise Unsupported("DPP mask")
+
+        args = [dict(a) for a in ins["args"]]
+        if len(args) < 2:
+            raise Unsupported("DPP operands")
+        if args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
+            raise Unsupported("DPP destination")
+        if args[1].get("n", 1) != 1:
+            raise Unsupported("DPP 64-bit source")
+        src = args[1]
+        src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
+
+        lane = self.wave_lane()
+        group_bits = 7 if dpp8 is not None else 15
+        local = self.tmp()
+        self.emit(f"{local} = OpBitwiseAnd %uint {lane} {self.cu(group_bits)}")
+        in_bounds = None
+
+        if dpp8 is not None:
+            packed = sum(v << (3 * i) for i, v in enumerate(dpp8))
+            sh = self.tmp()
+            self.emit(f"{sh} = OpIMul %uint {local} {self.cu(3)}")
+            p = self.tmp()
+            self.emit(f"{p} = OpShiftRightLogical %uint {self.cu(packed)} {sh}")
+            src_local = self.tmp()
+            self.emit(f"{src_local} = OpBitwiseAnd %uint {p} {self.cu(7)}")
+        elif quad is not None:
+            packed = sum(v << (2 * i) for i, v in enumerate(quad))
+            q = self.tmp()
+            self.emit(f"{q} = OpBitwiseAnd %uint {local} {self.cu(3)}")
+            sh = self.tmp()
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {q} {self.cu(1)}")
+            p = self.tmp()
+            self.emit(f"{p} = OpShiftRightLogical %uint {self.cu(packed)} {sh}")
+            perm = self.tmp()
+            self.emit(f"{perm} = OpBitwiseAnd %uint {p} {self.cu(3)}")
+            base = self.tmp()
+            self.emit(f"{base} = OpBitwiseAnd %uint {local} {self.cu(0xFFFFFFFC)}")
+            src_local = self.tmp()
+            self.emit(f"{src_local} = OpBitwiseOr %uint {base} {perm}")
+        else:
+            kind, value = ctrl
+            if kind == "row_shl":
+                src_local = self.tmp()
+                self.emit(f"{src_local} = OpIAdd %uint {local} {self.cu(value)}")
+                in_bounds = self.tmp()
+                self.emit(f"{in_bounds} = OpULessThan %bool {src_local} {self.cu(16)}")
+            elif kind == "row_shr":
+                in_bounds = self.tmp()
+                self.emit(f"{in_bounds} = OpUGreaterThanEqual %bool {local} {self.cu(value)}")
+                src_local = self.tmp()
+                self.emit(f"{src_local} = OpISub %uint {local} {self.cu(value)}")
+            elif kind == "row_ror":
+                t = self.tmp()
+                self.emit(f"{t} = OpISub %uint {local} {self.cu(value)}")
+                src_local = self.tmp()
+                self.emit(f"{src_local} = OpBitwiseAnd %uint {t} {self.cu(15)}")
+            elif kind == "row_share":
+                src_local = self.cu(value)
+            elif kind == "row_xmask":
+                src_local = self.tmp()
+                self.emit(f"{src_local} = OpBitwiseXor %uint {local} {self.cu(value)}")
+            elif kind == "row_mirror":
+                src_local = self.tmp()
+                self.emit(f"{src_local} = OpISub %uint {self.cu(15)} {local}")
+            else:  # row_half_mirror
+                hi = self.tmp()
+                self.emit(f"{hi} = OpBitwiseAnd %uint {local} {self.cu(8)}")
+                lo = self.tmp()
+                self.emit(f"{lo} = OpBitwiseAnd %uint {local} {self.cu(7)}")
+                inv = self.tmp()
+                self.emit(f"{inv} = OpISub %uint {self.cu(7)} {lo}")
+                src_local = self.tmp()
+                self.emit(f"{src_local} = OpBitwiseOr %uint {hi} {inv}")
+
+        if self.emulate:
+            # One workgroup exchange per DPP: every lane publishes src_val and its active bit, and the next round
+            # reads the selected lane. No subgroup operation is used, so this is exact on any subgroup size.
+            global_group = self.tmp()
+            self.emit(f"{global_group} = OpBitwiseAnd %uint {lane} {self.cu(~group_bits & 0xFFFFFFFF)}")
+            src_g = self.tmp()
+            self.emit(f"{src_g} = OpBitwiseOr %uint {global_group} {src_local}")
+            if in_bounds is not None:
+                safe_g = self.tmp()
+                self.emit(f"{safe_g} = OpSelect %uint {in_bounds} {src_g} {self.cu(0)}")
+            else:
+                safe_g = src_g
+            if fi:
+                # fi:1 fetches the inactive source as well; only an out-of-row lane is still invalid.
+                read, _ = self.x_round(data=src_val)
+                shuffled = read(safe_g)
+                src_ok = in_bounds if in_bounds is not None else "%true"
+            else:
+                lo_bit, hi_bit = self.lane_bits(self.active_b())
+                read, (lo_word, hi_word) = self.x_round(data=src_val, bits=(lo_bit, hi_bit))
+                shuffled = read(safe_g)
+                is_low = self.tmp()
+                self.emit(f"{is_low} = OpULessThan %bool {safe_g} {self.cu(32)}")
+                word = self.tmp()
+                self.emit(f"{word} = OpSelect %uint {is_low} {lo_word} {hi_word}")
+                sh = self.tmp()
+                self.emit(f"{sh} = OpBitwiseAnd %uint {safe_g} {self.cu(31)}")
+                bit = self.tmp()
+                self.emit(f"{bit} = OpShiftRightLogical %uint {word} {sh}")
+                one = self.tmp()
+                self.emit(f"{one} = OpBitwiseAnd %uint {bit} {self.cu(1)}")
+                active = self.tmp()
+                self.emit(f"{active} = OpINotEqual %bool {one} {self.cu(0)}")
+                if in_bounds is not None:
+                    both = self.tmp()
+                    self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {active}")
+                    active = both
+                src_ok = active
+        else:
+            sgl = self.subgroup_lane()
+            sg_group = self.tmp()
+            self.emit(f"{sg_group} = OpBitwiseAnd %uint {sgl} {self.cu(~group_bits & 0xFFFFFFFF)}")
+            src_sg = self.tmp()
+            self.emit(f"{src_sg} = OpBitwiseOr %uint {sg_group} {src_local}")
+            if in_bounds is not None:
+                # Clamp an invalid source lane before the shuffle: its value is discarded below, but the lane index
+                # passed to OpGroupNonUniformShuffle must still be in range.
+                safe_sg = self.tmp()
+                self.emit(f"{safe_sg} = OpSelect %uint {in_bounds} {src_sg} {self.cu(0)}")
+            else:
+                safe_sg = src_sg
+
+            if fi:
+                # fi:1 fetches the inactive source as well; only an out-of-row lane is still invalid.
+                src_ok = in_bounds if in_bounds is not None else "%true"
+            else:
+                ballot = self.tmp()
+                self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {self.active_b()}")
+                self.uses_ballot = True
+                active = self.tmp()
+                self.emit(f"{active} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {ballot} {safe_sg}")
+                if in_bounds is not None:
+                    both = self.tmp()
+                    self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {active}")
+                    active = both
+                src_ok = active
+            if src.get("k") == "vgpr":
+                self.uses_subgroup = True
+                shuffled = self.tmp()
+                self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint {self.cu(3)} {src_val} {safe_sg}")
+            else:
+                shuffled = src_val
+
+        row = self.tmp()
+        self.emit(f"{row} = OpShiftRightLogical %uint {lane} {self.cu(4)}")
+        row_bit = self.tmp()
+        self.emit(f"{row_bit} = OpShiftRightLogical %uint {self.cu(row_mask)} {row}")
+        row_one = self.tmp()
+        self.emit(f"{row_one} = OpBitwiseAnd %uint {row_bit} {self.cu(1)}")
+        row_on = self.tmp()
+        self.emit(f"{row_on} = OpINotEqual %bool {row_one} {self.cu(0)}")
+        bank_sh = self.tmp()
+        self.emit(f"{bank_sh} = OpShiftRightLogical %uint {lane} {self.cu(2)}")
+        bank = self.tmp()
+        self.emit(f"{bank} = OpBitwiseAnd %uint {bank_sh} {self.cu(3)}")
+        bank_bit = self.tmp()
+        self.emit(f"{bank_bit} = OpShiftRightLogical %uint {self.cu(bank_mask)} {bank}")
+        bank_one = self.tmp()
+        self.emit(f"{bank_one} = OpBitwiseAnd %uint {bank_bit} {self.cu(1)}")
+        bank_on = self.tmp()
+        self.emit(f"{bank_on} = OpINotEqual %bool {bank_one} {self.cu(0)}")
+        enabled = self.tmp()
+        self.emit(f"{enabled} = OpLogicalAnd %bool {row_on} {bank_on}")
+
+        zero = self.cu(0)
+        src0 = self.tmp()
+        self.emit(f"{src0} = OpSelect %uint {src_ok} {shuffled} {zero}")
+        if dpp8 is not None or bound:
+            write = enabled
+        else:
+            write = self.tmp()
+            self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
+        args[1] = {"k": "ssa", "v": src0}
+        previous = self.dpp_guard
+        self.dpp_guard = write
+        try:
+            return self._insn({**ins, "args": args})
+        finally:
+            self.dpp_guard = previous
 
     def _insn(self, ins):
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
