@@ -1428,7 +1428,13 @@ public:
                 levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
                 (levels->SampleCount & (levels->SampleCount - 1)) != 0)
                 return E_INVALIDARG;
-            const Format format = vulkan_format(levels->Format, false);
+            Format format = vulkan_format(levels->Format, false);
+            if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                D3D12_RESOURCE_DESC depth_desc{};
+                depth_desc.Format = levels->Format;
+                depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                format = state_.texture_format(depth_desc);  // includes the D24-to-D32 fallback used by creation
+            }
             if (format.format == VK_FORMAT_UNDEFINED || !state_.image_format_properties)
                 return DXGI_ERROR_UNSUPPORTED;
 
