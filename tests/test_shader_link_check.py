@@ -167,6 +167,16 @@ class ReflectTest(unittest.TestCase):
         with self.assertRaisesRegex(spv.InterfaceError, "extends beyond its Location"):
             shader.reflect()
 
+    def test_rejects_64_bit_vec2_at_component_2(self):
+        shader = output(width=64, components=2, component=2)
+        with self.assertRaisesRegex(spv.InterfaceError, "Component 0"):
+            shader.reflect()
+
+    def test_allows_64_bit_scalar_at_component_2(self):
+        shader = output(width=64, components=1, component=2)
+        used = list(shader.reflect().outputs[0].varyings[0].occupied())
+        self.assertEqual(used, [spv.Address(0, 2), spv.Address(0, 3)])
+
     def test_rejects_unbounded_expansion(self):
         shader = output(array_count=spv.MAX_EXPANDED_LOCATIONS + 1)
         with self.assertRaisesRegex(spv.InterfaceError, "too many interface locations"):
@@ -426,6 +436,23 @@ class CommandLineTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("shader_link_check: error:", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
+
+    def test_corpus_style_names_are_accepted_and_paths_are_not(self):
+        # make_game's corpus names (shader_carve stems) contain "~", "!", "&", "(", a leading "." and more: 21,043 of
+        # 26,503 on a 1.0.2.1 copy failed the old [a-zA-Z0-9_.-] rule. Only names that leave --shader-dir fail.
+        for stem in ("VS~1", "pixel!2&x", "a(b)c", "x y", "_~-.ok", ".dotted"):
+            with self.subTest(stem=stem):
+                (self.directory / (stem + ".spv")).write_bytes(self.vs.read_bytes())
+                self.write_manifest({"name": "n", "vs": stem, "ps": "pixel"})
+                result = self.run_batch()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for stem in ("../vertex", "..", ".", "sub/vertex", "sub\\vertex", "C:vertex", "a|b", "a\x00b",
+                     " vertex", ""):
+            with self.subTest(stem=stem):
+                self.write_manifest({"name": "n", "vs": stem, "ps": "pixel"})
+                result = self.run_batch()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("expected a shader name without directories", result.stderr)
 
     def test_report_preserves_inputs(self):
         original = self.vs.read_bytes()
