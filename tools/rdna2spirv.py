@@ -694,7 +694,46 @@ class Gen:
                    "ge": "OpSGreaterThanEqual" if s else "OpUGreaterThanEqual",
                    "eq": "OpIEqual", "ne": "OpINotEqual", "lg": "OpINotEqual"}
         elif ty in ("u32", "i32"):
-            x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
+            use_wave_equal = False
+            wave_equal_half = None
+            m0, m1 = self.holds_lane_mask(srcs[0]), self.holds_lane_mask(srcs[1])
+            if scalar and (m0 or m1):
+                h0 = self.mask_half(srcs[0]) if m0 else None
+                h1 = self.mask_half(srcs[1]) if m1 else None
+
+                def _is_u32_zero_or_all_ones(src):
+                    return src["k"] == "imm" and (src["v"] & 0xFFFFFFFF) in (0, 0xFFFFFFFF)
+
+                can_vote = False
+                if cond in ("eq", "ne", "lg"):
+                    if m0 and m1:
+                        if not self.wave64:
+                            can_vote = h0 != "hi" and h1 != "hi"
+                        elif h0 is not None and h0 == h1:
+                            can_vote = True
+                            wave_equal_half = h0
+                    else:
+                        other = srcs[1] if m0 else srcs[0]
+                        mh = h0 if m0 else h1
+                        if _is_u32_zero_or_all_ones(other):
+                            if not self.wave64:
+                                can_vote = mh != "hi"
+                            elif mh is not None:
+                                can_vote = True
+                                wave_equal_half = mh
+
+                if can_vote:
+                    use_wave_equal = True
+                    x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
+                else:
+                    def _mask_word(src, is_mask):
+                        if not is_mask:
+                            return self.src_u(src)
+                        lo, hi = self.wave_mask(src)
+                        return hi if self.mask_half(src) == "hi" else lo
+                    x, y = _mask_word(srcs[0], m0), _mask_word(srcs[1], m1)
+            else:
+                x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
             if ty == "i32":
                 x, y = self.as_int(x), self.as_int(y)
             s = ty == "i32"
@@ -724,10 +763,8 @@ class Gen:
             raise Unsupported(op)
         else:
             self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
-        mask_halves = [self.mask_half(s) for s in srcs if self.holds_lane_mask(s)]
-        if scalar and mask_halves and ty in ("u32", "i32") and cond in ("eq", "ne", "lg"):
-            half = mask_halves[0] if (self.wave64 and len(set(mask_halves)) == 1) else None
-            b = self.wave_equal(b, cond == "eq", half=half)
+        if scalar and ty in ("u32", "i32") and use_wave_equal:
+            b = self.wave_equal(b, cond == "eq", half=wave_equal_half)
         # Lane masks are all-ones/zero per invocation (one lane), SCC is 1/0. A VOPC result bit is 0 for lanes
         # that are off in EXEC (as on hardware), so wave-wide reductions of the mask (s_cbranch_vccz) are exact.
         bm = b
@@ -3737,7 +3774,19 @@ class Gen:
             self.emit(f"OpStore %scc {z}")
         elif op in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
             # 64-bit compare of masks/pointers: equal iff both halves are equal.
-            def halves(s):
+            m0, m1 = self.holds_lane_mask(a[0]), self.holds_lane_mask(a[1])
+
+            def _is_u64_zero_or_all_ones(src):
+                if src["k"] != "imm":
+                    return False
+                v = src["v"] & 0xFFFFFFFFFFFFFFFF
+                return v == 0 or (self.wave64 and v == 0xFFFFFFFFFFFFFFFF)
+
+            use_vote = (m0 and m1) or (m0 and _is_u64_zero_or_all_ones(a[1])) or (m1 and _is_u64_zero_or_all_ones(a[0]))
+
+            def halves(s, is_mask):
+                if is_mask and not use_vote:
+                    return self.wave_mask(s)
                 if s["k"] == "sgpr" and s.get("n") == 2:
                     return self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
                 if s["k"] == "imm":
@@ -3745,12 +3794,13 @@ class Gen:
                     return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
                 m = self.mask_src(s)
                 return m, m
-            (x0, x1), (y0, y1) = halves(a[0]), halves(a[1])
+
+            (x0, x1), (y0, y1) = halves(a[0], m0), halves(a[1], m1)
             e0, e1, eq, r = (self.tmp() for _ in range(4))
             self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
             self.emit(f"{e1} = OpIEqual %bool {x1} {y1}")
             self.emit(f"{eq} = OpLogicalAnd %bool {e0} {e1}")
-            if self.holds_lane_mask(a[0]) or self.holds_lane_mask(a[1]):
+            if use_vote:
                 eq = self.wave_equal(eq, True)
             if op == "s_cmp_lg_u64":
                 ne = self.tmp()
