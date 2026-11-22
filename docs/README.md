@@ -69,4 +69,4 @@ method, scope and caveats. No game data is included.
 
 ## Other languages
 
-Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`pt-BR`, `zh-CN`).
+Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`pt-BR`, `zh-CN`, `pl-PL`).
