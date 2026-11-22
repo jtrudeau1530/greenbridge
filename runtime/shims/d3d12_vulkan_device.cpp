@@ -623,13 +623,22 @@ struct DeviceState {
         subgroups.lane_min = size_control.minSubgroupSize ? size_control.minSubgroupSize : subgroup.subgroupSize;
         subgroups.lane_max = size_control.maxSubgroupSize ? size_control.maxSubgroupSize : subgroups.lane_min;
         if (subgroups.lane_max < subgroups.lane_min) subgroups.lane_max = subgroups.lane_min;
-        // D3D-121: Intel's D3D12 driver answers a fixed 16..16 on its integrated GPUs, where Vulkan reports the
-        // compiler's whole 8..32 choice. Measured on Xe-LP: UHD 770 (32.0.101.6129) and Raptor Lake-S Mobile
-        // (101.7092). Discrete Arc is not measured yet (TEST-57), so it keeps the Vulkan range.
+        // D3D-121: Intel's D3D12 driver answers a fixed 16..16 on its older integrated GPUs, where Vulkan reports
+        // the compiler's whole 8..32 choice. Measured on Xe-LP: UHD 770 (32.0.101.6129), Raptor Lake-S Mobile
+        // (101.7092) and Tiger Lake 0x9a78 (101.7088). Discrete Arc is not measured yet (TEST-57), so it keeps the
+        // Vulkan range. D3D-280: from Xe-LPG on the driver answers what Vulkan reports (Meteor Lake 0x7d55,
+        // 32.0.101.6127: 8..32 on both sides), so there is no fixed answer to mirror and those lines keep the
+        // Vulkan range too.
         constexpr uint32_t kIntelVendorId = 0x8086;
         constexpr UINT kIntelD3D12Lanes = 16;
+        const uint32_t intel_device_id = properties.properties.deviceID;
+        // The Xe-core integrated lines from Xe-LPG on. Device IDs are not generation-ordered (Tiger Lake's 0x9a78
+        // sorts above Meteor Lake's), so the ranges are listed out, not compared as a cutoff.
+        const bool intel_xe_lpg_or_later =
+            (intel_device_id >= 0x7d40 && intel_device_id <= 0x7dc5) ||  // Meteor Lake, Arrow Lake
+            (intel_device_id >= 0x64a0 && intel_device_id <= 0x64b6);    // Lunar Lake
         if (properties.properties.vendorID == kIntelVendorId &&
-            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU &&
+            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !intel_xe_lpg_or_later &&
             subgroups.lane_min <= kIntelD3D12Lanes && kIntelD3D12Lanes <= subgroups.lane_max)
             subgroups.lane_min = subgroups.lane_max = kIntelD3D12Lanes;
         return subgroups;
