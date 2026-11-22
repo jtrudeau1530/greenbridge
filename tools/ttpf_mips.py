@@ -942,13 +942,22 @@ class Pool:
         return bytes(out)
 
     def span(self, index, base):
+        if _is_unmapped_base(base) or base >= self.virtual_size:
+            return None
         for j in range(index + 1, self.textures):
             cand = (u32(self.records, j * 16 + 8) & 0x1FFFFF) * 4096
+            if _is_unmapped_base(cand):
+                continue
             if cand < base:
                 return None
             if cand > base:
                 return cand - base
         return self.virtual_size - base
+
+
+def _is_unmapped_base(base):
+    """True for ETPF unmapped-allocation sentinel bases (0 or 0x1FFFFF pages)."""
+    return base == 0 or (base >> 12) == 0x1FFFFF
 
 
 def compact_row(desc):
@@ -1057,7 +1066,7 @@ def analyze(pool, index, *, allow_bcpack=True):
     """Descriptor + layout + per-mip codec availability for one texture."""
     d = pool.descriptor(index)
     out = dict(descriptor=d, tile_mode=tile_mode(d["mode"]), tile=tile_bytes(d["mode"]))
-    if d["base"] == 0 or (d["base"] >> 12) == 0x1FFFFF:
+    if _is_unmapped_base(d["base"]):
         out["blocked"] = "no mapped allocation"
         return out
     span = pool.span(index, d["base"])
@@ -1296,7 +1305,7 @@ def scan_pools(paths, as_json=None, include_tuples=False):
                 total["entries"] += 1
                 tm = str(tile_mode(d["mode"]))
                 total["tile_modes"][tm] = total["tile_modes"].get(tm, 0) + 1
-                span = pool.span(i, d["base"]) if d["base"] else None
+                span = pool.span(i, d["base"])
                 if span is not None:
                     meta_ok, _ = validate_chunk_metadata(pool, d, span)
                     if meta_ok:

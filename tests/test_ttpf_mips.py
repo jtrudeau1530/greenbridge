@@ -2355,5 +2355,54 @@ class Uncompressed2DTest(unittest.TestCase):
             self.assertEqual(ttpf.export(pool_u, 0, os.path.join(self.tmp.name, "dxgi2.dds")), 2)
 
 
+class UnmappedSentinelSpanTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_span_skips_unmapped_sentinels_and_rejects_unmapped_base(self):
+        # A valid 256x256 BC1 texture followed by unmapped ETPF records (base=0 and base=0x1FFFFF*4096),
+        # and then a second valid texture, must resolve both mapped spans cleanly and return None for
+        # the unmapped records (including in scan_pools, which previously passed a negative span).
+        layout = ttpf.surface_layout(256, 256, 71, 7, ttpf.tile_bytes(4))
+        size = layout["size"]
+        base0 = 4096
+        base1 = base0 + size
+        rec0 = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, base0)
+        rec_zero = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, 0)
+        rec_max = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, 0x1FFFFF * 4096)
+        rec1 = pack_etpf_record(256, 256, 5, 2, 71, 1, 1, 4, base1)
+
+        for label, recs, chunks, mapped_indices in (
+            ("zero_between", [rec0, rec_zero, rec1], [bytes(size), bytes(size)], (0, 2)),
+            ("max_between", [rec0, rec_max, rec1], [bytes(size), bytes(size)], (0, 2)),
+            ("trailing_zero_and_max", [rec0, rec_zero, rec_max], [bytes(size)], (0,)),
+        ):
+            with self.subTest(case=label):
+                path = os.path.join(self.tmp.name, f"{label}.ttpf")
+                write_rds5_pool(path, recs, chunks)
+                pool = ttpf.Pool(path)
+                self.addCleanup(pool.close)
+                for idx in mapped_indices:
+                    d = pool.descriptor(idx)
+                    self.assertEqual(pool.span(idx, d["base"]), size)
+                    a = ttpf.analyze(pool, idx)
+                    self.assertTrue(a["span_matches"], a)
+                    self.assertNotIn("blocked", a)
+                for idx in range(len(recs)):
+                    if idx not in mapped_indices:
+                        d = pool.descriptor(idx)
+                        self.assertIsNone(pool.span(idx, d["base"]))
+                        a = ttpf.analyze(pool, idx)
+                        self.assertEqual(a["blocked"], "no mapped allocation")
+                scan_out = os.path.join(self.tmp.name, f"{label}.json")
+                with redirect_stdout(io.StringIO()):
+                    ttpf.scan_pools([path], scan_out)
+                with open(scan_out, encoding="utf-8") as f:
+                    total = json.load(f)["total"]
+                self.assertEqual(total["chunk_metadata_fail"], 0)
+                self.assertEqual(total["chunk_metadata_ok"], len(mapped_indices))
+
+
 if __name__ == "__main__":
     unittest.main()
