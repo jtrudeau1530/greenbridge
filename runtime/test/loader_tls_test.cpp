@@ -273,6 +273,10 @@ void test_thread_outlives_loader(const fs::path& dll) {
     {
         rt::Loader loader(dll.parent_path());
         rt::Module& m = loader.load(dll);
+        // Initialised, so the module's TLS callbacks take thread events: the thread below ends after ~Loader has
+        // delivered the process detach and unmapped the image, and running its DLL_THREAD_DETACH callback then
+        // would jump into freed memory.
+        loader.initialise();
         const uint32_t index = m.tls_index;
         struct Ctx {
             HANDLE go, ready;
@@ -300,7 +304,7 @@ void test_thread_outlives_loader(const fs::path& dll) {
     CloseHandle(ready);
     MEMORY_BASIC_INFORMATION info{};
     check(VirtualQuery(block, &info, sizeof(info)) == 0 || info.State == MEM_FREE,
-          "its copy is freed when it ends after the Loader (and the process carries on)");
+          "its copy is freed when it ends after the Loader, with no callback into the unmapped image");
 }
 
 void test_second_tls_module_rejected(const fs::path& dll, const fs::path& temp) {
