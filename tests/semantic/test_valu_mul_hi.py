@@ -122,6 +122,122 @@ class VALURegisterFile:
         self.regs[idx] = val & MASK32
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions for v_mul_hi
+# ==============================================================================
+
+class Opcode(enum.Enum):
+    V_MUL_HI_U32 = "v_mul_hi_u32"
+    V_MUL_HI_I32 = "v_mul_hi_i32"
+
+
+class OperandKind(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    LITERAL = "literal"
+    INLINE_INT = "inline_int"
+
+
+@dataclass
+class ASTOperand:
+    kind: OperandKind
+    reg_idx: int = 0
+    imm_val: int = 0
+
+    def format_asm(self) -> str:
+        if self.kind == OperandKind.VGPR:
+            return f"v{self.reg_idx}"
+        elif self.kind == OperandKind.SGPR:
+            return f"s{self.reg_idx}"
+        elif self.kind == OperandKind.LITERAL:
+            return f"0x{self.imm_val:08x}"
+        elif self.kind == OperandKind.INLINE_INT:
+            return str(self.imm_val)
+        return "unknown"
+
+
+@dataclass
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+
+    def validate(self) -> None:
+        if self.opcode not in (Opcode.V_MUL_HI_U32, Opcode.V_MUL_HI_I32):
+            raise ValueError(f"Invalid opcode for v_mul_hi AST: {self.opcode}")
+        if self.dst.kind != OperandKind.VGPR:
+            raise ValueError(f"Destination must be a VGPR, got {self.dst.kind}")
+        if not (0 <= self.dst.reg_idx <= 255):
+            raise ValueError(f"Destination VGPR index out of range: {self.dst.reg_idx}")
+        for name, src in [("src0", self.src0), ("src1", self.src1)]:
+            if src.kind == OperandKind.VGPR:
+                if not (0 <= src.reg_idx <= 255):
+                    raise ValueError(f"{name} VGPR index out of range: {src.reg_idx}")
+            elif src.kind == OperandKind.SGPR:
+                if not (0 <= src.reg_idx <= 105):
+                    raise ValueError(f"{name} SGPR index out of range: {src.reg_idx}")
+
+    def format_asm(self) -> str:
+        return f"{self.opcode.value} {self.dst.format_asm()}, {self.src0.format_asm()}, {self.src1.format_asm()}"
+
+
+class IntegerExpression(abc.ABC):
+    @abc.abstractmethod
+    def evaluate(self, env: dict[str, int]) -> int:
+        pass
+
+
+@dataclass
+class IntConstant(IntegerExpression):
+    val: int
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        return self.val & MASK32
+
+
+@dataclass
+class IntVariable(IntegerExpression):
+    name: str
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        if self.name not in env:
+            raise KeyError(f"Variable {self.name} not found in environment")
+        return env[self.name] & MASK32
+
+
+@dataclass
+class MulHiExpr(IntegerExpression):
+    opcode: Opcode
+    lhs: IntegerExpression
+    rhs: IntegerExpression
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        v_lhs = self.lhs.evaluate(env)
+        v_rhs = self.rhs.evaluate(env)
+        if self.opcode == Opcode.V_MUL_HI_U32:
+            return ref_mul_hi_u32(v_lhs, v_rhs)
+        elif self.opcode == Opcode.V_MUL_HI_I32:
+            return ref_mul_hi_i32(v_lhs, v_rhs)
+        raise ValueError(f"Unsupported opcode in MulHiExpr: {self.opcode}")
+
+
+def instruction_to_expression(inst: ASTInstruction) -> MulHiExpr:
+    """Translate an ASTInstruction to a typed symbolic expression tree."""
+    inst.validate()
+
+    def build_operand_expr(op: ASTOperand, prefix: str) -> IntegerExpression:
+        if op.kind in (OperandKind.VGPR, OperandKind.SGPR):
+            return IntVariable(f"{prefix}_{op.reg_idx}")
+        elif op.kind in (OperandKind.LITERAL, OperandKind.INLINE_INT):
+            return IntConstant(op.imm_val)
+        raise ValueError(f"Unsupported operand kind: {op.kind}")
+
+    lhs = build_operand_expr(inst.src0, "src0")
+    rhs = build_operand_expr(inst.src1, "src1")
+    return MulHiExpr(opcode=inst.opcode, lhs=lhs, rhs=rhs)
+
+
 class TestVMulHiOracleAndModel(unittest.TestCase):
     """Test suite for reference mathematical oracle and architectural model."""
 
@@ -205,6 +321,65 @@ class TestVMulHiOracleAndModel(unittest.TestCase):
             rf.get_vgpr(64)
         with self.assertRaises(IndexError):
             rf.set_vgpr(-1, 0)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST definitions and typed expressions."""
+
+    def test_ast_creation_and_formatting(self) -> None:
+        dst = ASTOperand(kind=OperandKind.VGPR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR, reg_idx=1)
+        src1 = ASTOperand(kind=OperandKind.SGPR, reg_idx=2)
+
+        inst_u = ASTInstruction(opcode=Opcode.V_MUL_HI_U32, dst=dst, src0=src0, src1=src1)
+        inst_u.validate()
+        self.assertEqual(inst_u.format_asm(), "v_mul_hi_u32 v0, v1, s2")
+
+        inst_i = ASTInstruction(opcode=Opcode.V_MUL_HI_I32, dst=dst, src0=src0, src1=src1)
+        inst_i.validate()
+        self.assertEqual(inst_i.format_asm(), "v_mul_hi_i32 v0, v1, s2")
+
+    def test_typed_expression_evaluation(self) -> None:
+        c1 = IntConstant(0x80000000)
+        c2 = IntConstant(2)
+
+        expr_u = MulHiExpr(opcode=Opcode.V_MUL_HI_U32, lhs=c1, rhs=c2)
+        self.assertEqual(expr_u.evaluate({}), 1)
+
+        expr_i = MulHiExpr(opcode=Opcode.V_MUL_HI_I32, lhs=c1, rhs=c2)
+        # -2^31 * 2 = -2^32 -> hi = 0xFFFFFFFF
+        self.assertEqual(expr_i.evaluate({}), 0xFFFFFFFF)
+
+    def test_instruction_to_expression(self) -> None:
+        dst = ASTOperand(kind=OperandKind.VGPR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR, reg_idx=1)
+        src1 = ASTOperand(kind=OperandKind.LITERAL, imm_val=UINT32_MAX)
+        inst = ASTInstruction(opcode=Opcode.V_MUL_HI_U32, dst=dst, src0=src0, src1=src1)
+
+        expr = instruction_to_expression(inst)
+        env = {"src0_1": UINT32_MAX}
+        self.assertEqual(expr.evaluate(env), 0xFFFFFFFE)
+
+    def test_ast_validation_errors(self) -> None:
+        # Invalid destination kind
+        bad_dst = ASTInstruction(
+            opcode=Opcode.V_MUL_HI_U32,
+            dst=ASTOperand(OperandKind.SGPR, reg_idx=0),
+            src0=ASTOperand(OperandKind.VGPR, reg_idx=1),
+            src1=ASTOperand(OperandKind.VGPR, reg_idx=2),
+        )
+        with self.assertRaises(ValueError):
+            bad_dst.validate()
+
+        # Destination VGPR out of bounds
+        oob_dst = ASTInstruction(
+            opcode=Opcode.V_MUL_HI_U32,
+            dst=ASTOperand(OperandKind.VGPR, reg_idx=256),
+            src0=ASTOperand(OperandKind.VGPR, reg_idx=1),
+            src1=ASTOperand(OperandKind.VGPR, reg_idx=2),
+        )
+        with self.assertRaises(ValueError):
+            oob_dst.validate()
 
 
 if __name__ == "__main__":
