@@ -590,7 +590,7 @@ class Gen:
         # 64 used as f32 operands (@Sanonymous01, SHADER-298). The f16 operands widen to normal f32 values.
         return [self.f16_in(src, sb[i]) if hb[i] else self.flush_f32(self.src_f(src)) for i, src in enumerate(a[1:4])]
 
-    def f16_bits(self, f, rtz=False, exact_tiny=False):
+    def f16_bits(self, f, rtz=False, exact_tiny=False, is_z=None):
         """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
 
         GLSL.std.450 PackHalf2x16 leaves the rounding mode to the implementation, and drivers fold a
@@ -601,7 +601,7 @@ class Gen:
         f16 denormals are produced (RDNA2's default FP16 denorm mode keeps them); f32 denormal inputs give +-0.
         NaN -> quiet NaN with the top payload bits kept; +-inf -> +-inf.
         ``exact_tiny``: the caller guarantees that every ``f`` below 2^-14 in magnitude is already an f16 value (a
-        sum of two f16 values, without omod: a multiple of 2^-24), so that range needs no rounding or underflow."""
+        sum of two f16 values, without omod: a multiple of 2^-24), so that range needs no rounding."""
         t = self.tmp
         x, sgn, sg, a = t(), t(), t(), t()
         self.emit(f"{x} = OpBitcast %uint {f}")
@@ -617,6 +617,8 @@ class Gen:
             lsb, bias, mb, = t(), t(), t()
             self.emit(f"{lsb} = OpBitFieldUExtract %uint {m} {self.cu(13)} {self.cu(1)}")
             self.emit(f"{bias} = OpIAdd %uint {lsb} {self.cu(0xFFF)}")
+            if is_z:
+                bias = self.unless_rtz(is_z, bias)
             self.emit(f"{mb} = OpIAdd %uint {m} {bias}")
             self.emit(f"{nh} = OpShiftRightLogical %uint {mb} {self.cu(13)}")
         # subnormal range (2^-25 <= |x| < 2^-14): shift the full mantissa right by 126 - e (14..25)
@@ -628,38 +630,39 @@ class Gen:
         self.emit(f"{short} = OpULessThan %bool {sh} {self.cu(25)}")
         self.emit(f"{shc} = OpSelect %uint {short} {sh} {self.cu(25)}")
         self.emit(f"{sub} = OpShiftRightLogical %uint {man} {shc}")
+        # |x| < 2^-25 needs no test of its own: there shc is 25, and man (plus the bias below) shifts out to 0
         if not rtz and not exact_tiny:
-            one, msk, rem, half, odd, gt, eq, tie, up, upu, sub2 = (t() for _ in range(11))
+            # nearest even, as in the normal range: add half - 1 + the kept low bit, then shift
+            one, half, below, odd, bias2, mb2, sub2 = (t() for _ in range(7))
             self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {shc}")
-            self.emit(f"{msk} = OpISub %uint {one} {self.cu(1)}")
-            self.emit(f"{rem} = OpBitwiseAnd %uint {man} {msk}")
             self.emit(f"{half} = OpShiftRightLogical %uint {one} {self.cu(1)}")
+            self.emit(f"{below} = OpISub %uint {half} {self.cu(1)}")
             self.emit(f"{odd} = OpBitwiseAnd %uint {sub} {self.cu(1)}")
-            self.emit(f"{gt} = OpUGreaterThan %bool {rem} {half}")
-            self.emit(f"{eq} = OpIEqual %bool {rem} {half}")
-            self.emit(f"{tie} = OpLogicalAnd %bool {eq} {self.emit_ne0(odd)}")
-            self.emit(f"{up} = OpLogicalOr %bool {gt} {tie}")
-            self.emit(f"{upu} = OpSelect %uint {up} {self.cu(1)} {self.cu(0)}")
-            self.emit(f"{sub2} = OpIAdd %uint {sub} {upu}")
+            self.emit(f"{bias2} = OpIAdd %uint {below} {odd}")
+            if is_z:
+                bias2 = self.unless_rtz(is_z, bias2)
+            self.emit(f"{mb2} = OpIAdd %uint {man} {bias2}")
+            self.emit(f"{sub2} = OpShiftRightLogical %uint {mb2} {shc}")
             sub = sub2
         # pick the range
-        isn, issub, tiny, big, isinf, isnan = t(), t(), t(), t(), t(), t()
+        isn, big, isinf, isnan = t(), t(), t(), t()
         self.emit(f"{isn} = OpUGreaterThanEqual %bool {a} {self.cu(0x38800000)}")
-        if not exact_tiny:
-            self.emit(f"{tiny} = OpULessThan %bool {e} {self.cu(101)}")
         r1, r2, r3, r4, r5, nanb, res = t(), t(), t(), t(), t(), t(), t()
         self.emit(f"{r1} = OpSelect %uint {isn} {nh} {sub}")
-        if exact_tiny:
-            r2 = r1     # zero shifts out through shc = 25
-        else:
-            self.emit(f"{r2} = OpSelect %uint {tiny} {self.cu(0)} {r1}")
+        r2 = r1
         if rtz:
             self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x47800000)}")
             self.emit(f"{r3} = OpSelect %uint {big} {self.cu(0x7BFF)} {r2}")
+        elif is_z:
+            limit, top = t(), t()
+            self.emit(f"{limit} = OpSelect %uint {is_z} {self.cu(0x47800000)} {self.cu(0x477FF000)}")
+            self.emit(f"{top} = OpSelect %uint {is_z} {self.cu(0x7BFF)} {self.cu(0x7C00)}")
+            self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {limit}")
+            self.emit(f"{r3} = OpSelect %uint {big} {top} {r2}")
         else:
             self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x477FF000)}")
             self.emit(f"{r3} = OpSelect %uint {big} {self.cu(0x7C00)} {r2}")
-        if rtz:
+        if rtz or is_z:
             self.emit(f"{isinf} = OpIEqual %bool {a} {self.cu(0x7F800000)}")
             self.emit(f"{r4} = OpSelect %uint {isinf} {self.cu(0x7C00)} {r3}")
         else:
@@ -682,13 +685,16 @@ class Gen:
         program writes MODE.FP_ROUND[3:2], by the current mode in %mode_r16 (0 nearest even, 3 toward zero with
         f16_bits(rtz=True); 1 and 2 are refused when the setreg is translated). Shaders that never write the field
         get exactly f16_bits. Integer ops only either way (SHADER-56)."""
-        lo = self.f16_bits(f, exact_tiny=exact_tiny)
         if not self.round_mode:
-            return lo
-        z, m, is_z, r = self.f16_bits(f, rtz=True, exact_tiny=exact_tiny), self.tmp(), self.tmp(), self.tmp()
+            return self.f16_bits(f, exact_tiny=exact_tiny)
+        m, is_z = self.tmp(), self.tmp()
         self.emit(f"{m} = OpLoad %uint %mode_r16")
         self.emit(f"{is_z} = OpIEqual %bool {m} {self.cu(3)}")
-        self.emit(f"{r} = OpSelect %uint {is_z} {z} {lo}")
+        return self.f16_bits(f, exact_tiny=exact_tiny, is_z=is_z)
+
+    def unless_rtz(self, is_z, v):
+        r = self.tmp()
+        self.emit(f"{r} = OpSelect %uint {is_z} {self.cu(0)} {v}")
         return r
 
     def f16_omod(self, h, mods):
