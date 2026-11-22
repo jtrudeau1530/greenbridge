@@ -2848,13 +2848,10 @@ int compare_invalid_arguments(ID3D12Device* ours) {
                                                     D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES));
          }},
         {"heap: type 0", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE(0)})); }},
-        // From the D3D12_HEAP_FLAGS documentation, not yet a host run: CreateHeap does not support ALLOW_DISPLAY
-        // (committed resources on a default heap only) or HARDWARE_PROTECTED.
+        // ALLOW_DISPLAY is for committed resources on a default heap only (D3D12_HEAP_FLAGS documentation); the host
+        // refused it on an RTX 4070 SUPER and a UHD 770 (@CowBoYdu76).
         {"heap: ALLOW_DISPLAY", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_DISPLAY));
-         }},
-        {"heap: HARDWARE_PROTECTED", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
          }},
         {"heap: custom heap, unknown pool", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
@@ -3134,6 +3131,11 @@ int compare_heap_neighbours(ID3D12Device* ours) {
          }},
         {"heap: ALLOW_ONLY_BUFFERS (two DENY flags)", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
+         }},
+        // The D3D12_HEAP_FLAGS documentation calls it unsupported, but the host accepts it (RTX 4070 SUPER and
+        // UHD 770, @CowBoYdu76).
+        {"heap: HARDWARE_PROTECTED", [](ID3D12Device* d) {
+             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
          }},
     };
     int mismatches = 0;
@@ -5011,9 +5013,9 @@ int main() {
         upload_heap_desc.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
         EXPECT(SUCCEEDED(standalone->CreateHeap(&upload_heap_desc, IID_PPV_ARGS(&upload_placed_heap.p))));
 
-        // D3D-238: heap descriptions the host refuses (RX 5700 and WARP; ALLOW_DISPLAY and HARDWARE_PROTECTED from
-        // the documentation) and their valid neighbours. compare_invalid_arguments and compare_heap_neighbours check
-        // them against a host.
+        // D3D-238: heap descriptions the host refuses (RX 5700 and WARP; ALLOW_DISPLAY on an RTX 4070 SUPER and a
+        // UHD 770) and their valid neighbours, HARDWARE_PROTECTED among them. compare_invalid_arguments and
+        // compare_heap_neighbours check them against a host.
         {
             const D3D12_HEAP_FLAGS deny_all = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
                                               D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
@@ -5027,7 +5029,6 @@ int main() {
                 heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK}),
                 heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE, 0),
                 heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_DISPLAY),
-                heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED),
             };
             for (const D3D12_HEAP_DESC& hd : refused_heaps) EXPECT(heap_create(standalone.p, hd) == E_INVALIDARG);
             const D3D12_HEAP_DESC accepted_heaps[] = {
@@ -5042,6 +5043,7 @@ int main() {
                 heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
                 heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT},
                              D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES),
+                heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED),
             };
             for (const D3D12_HEAP_DESC& hd : accepted_heaps) EXPECT(heap_create(standalone.p, hd) == S_OK);
             const int heap_mismatches = compare_heap_neighbours(standalone.p);

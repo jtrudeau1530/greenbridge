@@ -1069,8 +1069,8 @@ const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
 // Why the host would refuse this CreateHeap description, or null if these checks pass (D3D-238). A probe on an
 // RX 5700 and WARP refuses an alignment other than 0, 64 KiB and 4 MiB, the heap properties above (a type of 0, a
 // custom heap without a CPU page property), and a heap that denies buffers and both kinds of texture. ALLOW_DISPLAY
-// (CreateCommittedResource on a default heap only) and HARDWARE_PROTECTED are refused because the D3D12_HEAP_FLAGS
-// documentation calls them unsupported by CreateHeap; they await a host run of compare_invalid_arguments.
+// (CreateCommittedResource on a default heap only, per the D3D12_HEAP_FLAGS documentation) is refused too, confirmed
+// on an RTX 4070 SUPER and a UHD 770 host by @CowBoYdu76. Those hosts accept HARDWARE_PROTECTED, so it is not refused.
 const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc) {
     if (!desc.SizeInBytes) return "zero size";
     if (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
@@ -1081,7 +1081,6 @@ const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc) {
                               D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
     if ((UINT(desc.Flags) & deny_all) == deny_all) return "heap flags denying every resource kind";
     if (UINT(desc.Flags) & D3D12_HEAP_FLAG_ALLOW_DISPLAY) return "ALLOW_DISPLAY (committed resources only)";
-    if (UINT(desc.Flags) & D3D12_HEAP_FLAG_HARDWARE_PROTECTED) return "HARDWARE_PROTECTED";
     return nullptr;
 }
 

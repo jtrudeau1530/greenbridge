@@ -677,8 +677,8 @@ The compute path, end to end:
     path's does (D3D-90). `CreateHeap` refuses with `E_INVALIDARG`, as the host does (RX 5700 and WARP, D3D-238),
     an alignment other than 0, 64 KiB and 4 MiB, a heap type outside the enum, a custom heap without a CPU page
     property and memory pool or a non-custom heap with either, and a heap with all three `DENY_*` flags. It also
-    refuses `ALLOW_DISPLAY` and `HARDWARE_PROTECTED`, which the `D3D12_HEAP_FLAGS` documentation says `CreateHeap`
-    does not support (not yet compared on a host).
+    refuses `ALLOW_DISPLAY` (committed resources only), as an RTX 4070 SUPER and a UHD 770 host do. It accepts
+    `HARDWARE_PROTECTED`, as those hosts do, though the `D3D12_HEAP_FLAGS` documentation calls it unsupported.
     (D3D-191). Multisampled 2D placed textures (`UNKNOWN` and `4x` tiled) share that backing with host-matched heap
     and offset alignment checks (`4 MiB` vs `64 KiB`, `D3D-222`). `CreatePlacedResource2`'s castable-format list
     reaches the placed texture's image as the committed path's does (D3D-90).
