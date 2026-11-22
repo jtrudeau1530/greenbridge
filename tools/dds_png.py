@@ -51,11 +51,15 @@ _FOURCC_MAP: dict[bytes, str] = {
 }
 
 _DXGI_MAP: dict[int, str] = {
+    # Typeless byte formats use the same channel layout as their UNORM variants.
+    27: "RGBA8",
     28: "RGBA8",
     29: "RGBA8",
     87: "BGRA8",
+    90: "BGRA8",
     91: "BGRA8",
     88: "BGRX8",
+    92: "BGRX8",
     93: "BGRX8",
     70: "BC1",
     71: "BC1",
