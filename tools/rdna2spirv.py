@@ -6900,27 +6900,21 @@ class Gen:
                 r = r2
             self.dst(a[0], r)
         elif op == "v_lerp_u8":
-            # Per byte: D.b = (S0.b + S1.b + (bit 0 of S2.b)) >> 1, an unsigned average whose rounding comes from
-            # S2 (RDNA ISA pseudocode). The 9-bit sum never reaches past its own byte after the shift.
             if "clamp" in mods:
                 raise Unsupported(op + " clamp")
             x, y, z = (self.src_u(t) for t in a[1:4])
-            r = None
-            for off in (0, 8, 16, 24):
-                xb, yb, zb, t1, t2, avg = (self.tmp() for _ in range(6))
-                self.emit(f"{xb} = OpBitFieldUExtract %uint {x} {self.cu(off)} {self.cu(8)}")
-                self.emit(f"{yb} = OpBitFieldUExtract %uint {y} {self.cu(off)} {self.cu(8)}")
-                self.emit(f"{zb} = OpBitFieldUExtract %uint {z} {self.cu(off)} {self.cu(1)}")
-                self.emit(f"{t1} = OpIAdd %uint {xb} {yb}")
-                self.emit(f"{t2} = OpIAdd %uint {t1} {zb}")
-                self.emit(f"{avg} = OpShiftRightLogical %uint {t2} {self.cu(1)}")
-                if r is None:
-                    r = avg
-                else:
-                    sh, o = self.tmp(), self.tmp()
-                    self.emit(f"{sh} = OpShiftLeftLogical %uint {avg} {self.cu(off)}")
-                    self.emit(f"{o} = OpBitwiseOr %uint {r} {sh}")
-                    r = o
+            # Per byte, x + y = 2*(x & y) + (x ^ y). Clear each low bit before the shift so the
+            # next byte cannot leak in. An odd sum rounds up only when the corresponding bit of z is 1.
+            # Both additions fit in each byte: even the rounded average is at most 255.
+            different, shared, even, half, round_bits, rounding, average, r = (self.tmp() for _ in range(8))
+            self.emit(f"{different} = OpBitwiseXor %uint {x} {y}")
+            self.emit(f"{shared} = OpBitwiseAnd %uint {x} {y}")
+            self.emit(f"{even} = OpBitwiseAnd %uint {different} {self.cu(0xFEFEFEFE)}")
+            self.emit(f"{half} = OpShiftRightLogical %uint {even} {self.cu(1)}")
+            self.emit(f"{round_bits} = OpBitwiseAnd %uint {different} {z}")
+            self.emit(f"{rounding} = OpBitwiseAnd %uint {round_bits} {self.cu(0x01010101)}")
+            self.emit(f"{average} = OpIAdd %uint {shared} {half}")
+            self.emit(f"{r} = OpIAdd %uint {average} {rounding}")
             self.dst(a[0], r)
         elif op == "v_xnor_b32":
             x, y = self.src_u(a[1]), self.src_u(a[2])
