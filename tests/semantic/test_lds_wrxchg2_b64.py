@@ -1117,6 +1117,146 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
         )
 
 
+@dataclass(frozen=True)
+class LDSStatusFlags:
+    """Architectural status flags and condition metrics for ds_wrxchg2_b64."""
+    bank_conflict: bool
+    same_address_collision: bool
+    unaligned_qword: bool
+    val0_zero: bool
+    val0_negative: bool
+    val1_zero: bool
+    val1_negative: bool
+    dword_carry0: int
+    dword_carry1: int
+
+
+def evaluate_lds_status_flags(
+    vaddr: int,
+    offset0: int,
+    offset1: int,
+    is_st64: bool,
+    val0: int,
+    val1: int,
+    lds_size_bytes: int = LDS_DEFAULT_SIZE_BYTES,
+) -> LDSStatusFlags:
+    """Evaluate architectural flags, LDS bank collisions, and numeric condition codes."""
+    unit = UNIT_B64_ST64_BYTES if is_st64 else UNIT_B64_BYTES
+    eff_addr0 = vaddr + offset0 * unit
+    eff_addr1 = vaddr + offset1 * unit
+
+    addr0 = eff_addr0 & (lds_size_bytes - 1)
+    addr1 = eff_addr1 & (lds_size_bytes - 1)
+
+    same_addr = (addr0 == addr1)
+    unaligned = ((addr0 & 7) != 0) or ((addr1 & 7) != 0)
+
+    # LDS has 32 banks of 4 bytes (stride 128 bytes)
+    # A 64-bit access touches dword (addr >> 2) and ((addr + 4) >> 2)
+    b0_lo = (addr0 >> 2) % 32
+    b0_hi = ((addr0 + 4) >> 2) % 32
+    b1_lo = (addr1 >> 2) % 32
+    b1_hi = ((addr1 + 4) >> 2) % 32
+
+    banks0 = {b0_lo, b0_hi}
+    banks1 = {b1_lo, b1_hi}
+    bank_conflict = bool(banks0 & banks1)
+
+    val0_z = (val0 & MASK64) == 0
+    val0_neg = bool((val0 >> 63) & 1)
+    val1_z = (val1 & MASK64) == 0
+    val1_neg = bool((val1 >> 63) & 1)
+
+    # Compute dword carry out of (val_lo + 1)
+    lo0, hi0 = split_u64_to_u32s(val0)
+    lo1, hi1 = split_u64_to_u32s(val1)
+    carry0 = 1 if (lo0 + 1) > MASK32 else 0
+    carry1 = 1 if (lo1 + 1) > MASK32 else 0
+
+    return LDSStatusFlags(
+        bank_conflict=bank_conflict,
+        same_address_collision=same_addr,
+        unaligned_qword=unaligned,
+        val0_zero=val0_z,
+        val0_negative=val0_neg,
+        val1_zero=val1_z,
+        val1_negative=val1_neg,
+        dword_carry0=carry0,
+        dword_carry1=carry1,
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_bank_conflict_detection(self) -> None:
+        # Bank stride is 128 bytes. Offset by 128 bytes hits the same bank.
+        # offset0=0 (addr 0, banks {0, 1}), offset1=16 (addr 128, banks {0, 1})
+        flags = evaluate_lds_status_flags(
+            vaddr=0, offset0=0, offset1=16, is_st64=False, val0=10, val1=20
+        )
+        self.assertTrue(flags.bank_conflict)
+        self.assertFalse(flags.same_address_collision)
+
+    def test_no_bank_conflict_different_banks(self) -> None:
+        # offset0=0 (addr 0, banks {0, 1}), offset1=1 (addr 8, banks {2, 3})
+        flags = evaluate_lds_status_flags(
+            vaddr=0, offset0=0, offset1=1, is_st64=False, val0=10, val1=20
+        )
+        self.assertFalse(flags.bank_conflict)
+        self.assertFalse(flags.same_address_collision)
+
+    def test_same_address_exact_collision(self) -> None:
+        flags = evaluate_lds_status_flags(
+            vaddr=0x100, offset0=2, offset1=2, is_st64=False, val0=0, val1=0
+        )
+        self.assertTrue(flags.bank_conflict)
+        self.assertTrue(flags.same_address_collision)
+
+    def test_unaligned_qword_flag(self) -> None:
+        # vaddr=0x104 (aligned to 4 bytes, unaligned to 8 bytes)
+        flags = evaluate_lds_status_flags(
+            vaddr=0x104, offset0=0, offset1=1, is_st64=False, val0=0, val1=0
+        )
+        self.assertTrue(flags.unaligned_qword)
+
+        # vaddr=0x108 (aligned to 8 bytes)
+        flags_aligned = evaluate_lds_status_flags(
+            vaddr=0x108, offset0=0, offset1=1, is_st64=False, val0=0, val1=0
+        )
+        self.assertFalse(flags_aligned.unaligned_qword)
+
+    def test_zero_and_negative_sign_flags(self) -> None:
+        # val0 = 0 (zero flag True, neg False)
+        # val1 = 0x8000_0000_0000_0000 (zero False, neg True)
+        flags = evaluate_lds_status_flags(
+            vaddr=0,
+            offset0=0,
+            offset1=1,
+            is_st64=False,
+            val0=0,
+            val1=0x8000_0000_0000_0000,
+        )
+        self.assertTrue(flags.val0_zero)
+        self.assertFalse(flags.val0_negative)
+        self.assertFalse(flags.val1_zero)
+        self.assertTrue(flags.val1_negative)
+
+    def test_dword_carry_propagation(self) -> None:
+        # val with lo dword = 0xFFFFFFFF generates carry on +1
+        flags_carry = evaluate_lds_status_flags(
+            vaddr=0,
+            offset0=0,
+            offset1=1,
+            is_st64=False,
+            val0=0x0000_0001_FFFF_FFFF,
+            val1=0x0000_0001_0000_0000,
+        )
+        self.assertEqual(flags_carry.dword_carry0, 1)
+        self.assertEqual(flags_carry.dword_carry1, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
