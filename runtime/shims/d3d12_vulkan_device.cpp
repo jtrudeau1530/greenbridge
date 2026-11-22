@@ -3889,13 +3889,16 @@ public:
                                      r->allows_view_format(vulkan_format(requested, false).format));
                 if (typeless_rgba8 || (requested != rd.Format && listed &&
                                        rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
-                    const bool plain = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
-                    const bool array = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                    const bool msaa = rd.SampleDesc.Count > 1;
+                    const bool plain = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
+                    const bool array = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                    const bool ms = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS;
+                    const bool ms_array = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
                     const UINT plane = plain ? desc->Texture2D.PlaneSlice :
                         array ? desc->Texture2DArray.PlaneSlice : 0;
                     // Subtraction keeps malformed layer ranges from overflowing during validation.
-                    if ((!plain && !array) || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-                        rd.SampleDesc.Count != 1 || plane || !view.resource || view.mip >= rd.MipLevels ||
+                    if ((!plain && !array && !ms && !ms_array) || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                        plane || !view.resource || view.mip >= rd.MipLevels ||
                         !view.layer_count || view.first_layer >= rd.DepthOrArraySize ||
                         view.layer_count > rd.DepthOrArraySize - view.first_layer ||
                         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
