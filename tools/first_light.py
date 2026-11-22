@@ -379,6 +379,8 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
 
 
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
+    if manifest.get("vertex_count") == 0 or manifest.get("index_count") == 0:
+        raise SystemExit("first-light draw requires an OBJ with faces. Prepare this output with --obj before drawing.")
     harness = find_harness(args.harness)
     raw = os.path.join(out_dir, "image.raw")
     if os.path.exists(raw):
