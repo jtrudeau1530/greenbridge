@@ -195,8 +195,8 @@ int main(int argc, char** argv) {
     if (tex_rgba_path) {
         if (const char* va_env = std::getenv("VKH_TSHARP_VA"); va_env && *va_env) {
             const char* p = va_env;
-            if (!parse_u32(p, tsharp_va) || *p || (tsharp_va & 3u) || tsharp_va + 32 > heap_bytes) {
-                std::fprintf(stderr, "VKH_TSHARP_VA: expected 4-byte aligned offset below 0x%x, got \"%s\"\n",
+            if (!parse_u32(p, tsharp_va) || *p || (tsharp_va & 3u) || tsharp_va > heap_bytes - 32) {
+                std::fprintf(stderr, "VKH_TSHARP_VA: expected 4-byte aligned offset at most 0x%x, got \"%s\"\n",
                              heap_bytes - 32, va_env);
                 return 2;
             }

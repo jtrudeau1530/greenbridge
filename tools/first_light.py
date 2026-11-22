@@ -315,6 +315,9 @@ def harness_env(manifest: dict, out_dir: str, base_env: dict | None = None) -> d
         env["VKH_TSHARP_VA"] = hex(tsharp_va)
         env["VKH_SSHARP"] = ",".join(hex(int(w)) for w in ssharp)
         env["VKH_SGPRS"] = ",".join(sgprs)
+        ps_sg = manifest.get("ps", {}).get("subgroup_size")
+        if ps_sg:
+            env["VKH_SUBGROUP_SIZE"] = str(int(ps_sg))
     return env
 
 
@@ -635,6 +638,8 @@ def main(argv=None) -> int:
     game = os.path.abspath(os.path.expanduser(a.game))
     if not a.no_fit and not a.obj:
         raise SystemExit("--obj is required unless --no-fit")
+    if a.dds and not a.obj:
+        raise SystemExit("--dds requires --obj so textured probes can be checked")
 
     index = ensure_carve(game, work)
     ps_name = a.ps if a.ps is not None else (DEFAULT_TEXTURED_PS if a.dds else DEFAULT_PS)
@@ -683,6 +688,7 @@ def main(argv=None) -> int:
         "ps": {
             "name": picked[1]["name"],
             "fssm_sha256": meta["ps"].get("fssm_sha256"),
+            "subgroup_size": meta["ps"].get("subgroup_size"),
             "verified": True,
         },
         "vertex_count": len(vertices),
@@ -748,8 +754,10 @@ def main(argv=None) -> int:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")
     if not (a.run or a.check):
+        env_preview = harness_env(manifest, out_dir, base_env={})
+        env_str = " ".join(f"{k}={v}" for k, v in env_preview.items())
         print(
-            f"run: VKH_DRAW_MESH={os.path.join(out_dir, 'mesh.bin')} VKH_VERTEX_LAYOUT=0:3f,1:2f "
+            f"run: {env_str} "
             f"<vk_harness> {os.path.join(out_dir, 'vs.spv')} {os.path.join(out_dir, 'ps.spv')} "
             f"{os.path.join(out_dir, 'image.raw')} {a.width} {a.height}"
         )

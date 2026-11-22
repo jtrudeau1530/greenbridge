@@ -285,6 +285,7 @@ class TexturedOracleTests(unittest.TestCase):
             "clear_pixel": [0, 0],
             "clear": CLEAR,
             "files": {"mesh": "mesh.bin", "texture": "texture.rgba"},
+            "ps": {"subgroup_size": 32},
             "texture": {
                 "width": 2,
                 "height": 2,
@@ -335,7 +336,31 @@ class TexturedOracleTests(unittest.TestCase):
         sgprs = env["VKH_SGPRS"].split(",")
         self.assertEqual(len(sgprs), 10)
         self.assertEqual(sgprs[9], "0x100")
+        self.assertEqual(env["VKH_SUBGROUP_SIZE"], "32")
         self.assertTrue(env["VKH_TEX_RGBA"].endswith("texture.rgba"))
+
+    def test_harness_rejects_wrapped_tsharp_va_overflow(self):
+        h = harness()
+        if not h:
+            self.skipTest("vk_harness is not built")
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            rgba_path = os.path.join(td, "tex.rgba")
+            fl.write_texture_rgba(rgba_path, 1, 1, bytes([255, 0, 0, 255]))
+            env = dict(
+                os.environ,
+                VKH_TEX_RGBA=rgba_path,
+                VKH_TSHARP_VA="0xFFFFFFE0",
+            )
+            proc = subprocess.run(
+                [h, "unused_vs.spv", "unused_ps.spv", os.path.join(td, "out.raw"), "4", "4"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("VKH_TSHARP_VA", proc.stderr)
 
     def test_decode_synthetic_dds_and_write_rgba(self):
         import tempfile
