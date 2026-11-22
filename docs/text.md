@@ -86,30 +86,33 @@ separately, so nothing is lost.
 
 ### Language from the nested archive
 
-In `data.rpf` and `story000.rpf` every string table sits in one of 13 nested RPF9 archives: `9FPR` headers at 4 KiB-
-aligned offsets, whose data offset at +4 stays inside the file. Each of those archives holds a single language.
-`text_tables.py` therefore gives every table in a nested archive the guess that most of that archive's tables share
-(`xx` left out), when that guess covers more than half of them. A table outside a nested archive, or in an archive with
-no majority, keeps its own guess. The tool finds the archive in an `.rpf` source, or in the archive that an
+In `data.rpf`, `story000.rpf` and `shared_minigame000.rpf` every string table sits in one of 13 nested RPF9 archives:
+`9FPR` headers at 4 KiB-aligned offsets, whose data offset at +4 stays inside the file. Each of those archives holds a
+single language. `text_tables.py` therefore gives every table in a nested archive the guess that most of that archive's
+tables share (`xx` left out), when that guess covers more than half of them. A table outside a nested archive, or in an
+archive with no majority, keeps its own guess. The tool finds the archive in an `.rpf` source, or in the archive that an
 `rpf9_carve.py` directory's `index.json` names. Without it, every table keeps its own guess.
+`story000_restofworld.rpf` has 18 nested archives, but the descriptor search finds no string table in it: none of its
+101 `0DRP` resources matches the table descriptor.
 
 Measured with the per-table guess (counts only):
 
-| | `data.rpf` | `story000.rpf` |
-|---|---:|---:|
-| Nested archives (all) | 41 | 436 |
-| Nested archives holding string tables | 13 | 13 |
-| Tables in them / all tables | 14,440 / 14,440 | 15,831 / 15,831 |
-| Tables per archive | 1,109-1,113 | 1,214-1,220 |
-| Per-table guess equal to its archive's language | 57.7%-99.9% | 72.2%-100% |
-| Tables whose language changes | 2,075 | 849 |
-| `xx` before / after | 869 / 0 | 188 / 0 |
-| Plain `es` before / after | 659 / 0 | 553 / 0 |
-| Plain `zh` before / after | 203 / 0 | 47 / 0 |
+| | `data.rpf` | `story000.rpf` | `shared_minigame000.rpf` | `story000_restofworld.rpf` |
+|---|---:|---:|---:|---:|
+| Nested archives (all) | 41 | 436 | 48 | 18 |
+| Nested archives holding string tables | 13 | 13 | 13 | 0 |
+| Tables in them / all tables | 14,440 / 14,440 | 15,831 / 15,831 | 78 / 78 | 0 / 0 |
+| Tables per archive | 1,109-1,113 | 1,214-1,220 | 6 | - |
+| Per-table guess equal to its archive's language | 57.7%-99.9% | 72.2%-100% | 66.7%-100% | - |
+| Tables whose language changes | 2,075 | 849 | 5 | 0 |
+| `xx` before / after | 869 / 0 | 188 / 0 | 2 / 0 | 0 / 0 |
+| Plain `es` before / after | 659 / 0 | 553 / 0 | 2 / 0 | 0 / 0 |
+| Plain `zh` before / after | 203 / 0 | 47 / 0 | 0 / 0 | 0 / 0 |
 
-Both archives hold the 13 languages in the same order: `en`, `pt`, `zh-Hans`, `zh-Hant`, `fr`, `de`, `it`, `ja`, `ko`,
-`es-419`, `pl`, `ru`, `es-ES`. The lowest agreement is in the two Spanish archives, where 208 to 314 tables per archive
-had no variant marker.
+The three archives that hold tables share the 13 languages in the same order: `en`, `pt`, `zh-Hans`, `zh-Hant`, `fr`,
+`de`, `it`, `ja`, `ko`, `es-419`, `pl`, `ru`, `es-ES`. The lowest agreement is in the Spanish archives: in `data.rpf` and
+`story000.rpf` 208 to 314 tables per archive had no variant marker, and in `shared_minigame000.rpf` the `es-ES` archive
+agrees on 4 of its 6 tables.
 
 Reading `story000.rpf` this way needs the `rpf9_carve.py` that checks a gap in chunks (#2117): one unread gap there is
 9.56 GB, and slicing it whole ran out of memory.
@@ -169,9 +172,10 @@ Standard library only. The four archives above take about 2 minutes on one core 
 
 ## Open questions
 
-- **Language per table.** The nested archive now groups the tables of `data.rpf` and `story000.rpf` by language,
-  but the language code of each archive is still the majority guess of its tables. A field or a naming rule outside
-  the tables (the TOC or the executable) would name it directly. `shared_minigame000.rpf` and
-  `story000_restofworld.rpf` are not measured for nested archives here.
+- **Language per table.** The nested archive now groups the tables of `data.rpf`, `story000.rpf` and
+  `shared_minigame000.rpf` by language, but the language code of each archive is still the majority guess of its
+  tables. A field or a naming rule outside the tables (the TOC or the executable) would name it directly. The
+  descriptor search finds no string table in `story000_restofworld.rpf`, so no nested archive there has a table
+  language to name.
 - **Which text the game picks.** When a label has two texts in one language, which table wins at run time
   (load order, mission scope, the foreign-dialogue subtitle option) is not established.
