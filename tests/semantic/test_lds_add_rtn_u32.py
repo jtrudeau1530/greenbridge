@@ -354,6 +354,53 @@ class SIMDInterpreter:
         return results
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Evaluation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class ArithmeticStatusFlags:
+    """Condition codes and arithmetic status flags for 32-bit addition."""
+    zero: bool
+    sign: bool
+    carry: bool
+    overflow: bool
+
+
+def evaluate_add_status_flags(
+    old_val: int,
+    addend: int,
+    result: int,
+) -> ArithmeticStatusFlags:
+    """Evaluate condition codes, arithmetic flags, and carry/overflow generation for 32-bit add.
+
+    Args:
+        old_val: Original 32-bit memory value before addition.
+        addend: 32-bit integer operand added to memory.
+        result: 32-bit addition result written to memory.
+
+    Returns:
+        ArithmeticStatusFlags: Computed zero, sign, carry, and overflow flags.
+    """
+    a = u32(old_val)
+    b = u32(addend)
+    res = u32(result)
+
+    zero = (res == 0)
+    sign = bool(res & 0x80000000)
+    carry = (a + b) > MASK32
+    sa, sb, sres = s32(a), s32(b), s32(res)
+    overflow = ((sa > 0 and sb > 0 and sres < 0) or (sa < 0 and sb < 0 and sres >= 0))
+
+    return ArithmeticStatusFlags(
+        zero=zero,
+        sign=sign,
+        carry=carry,
+        overflow=overflow,
+    )
+
+
+
 
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
@@ -882,8 +929,83 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.lds.read_dword(lane * 4), 150 + lane)
 
 
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_normal_positive_flags(self) -> None:
+        old_val, new_mem = ref_ds_add_rtn_u32(10, 20)
+        flags = evaluate_add_status_flags(10, 20, new_mem)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry)
+        self.assertFalse(flags.overflow)
+
+    def test_zero_flag(self) -> None:
+        old_val, new_mem = ref_ds_add_rtn_u32(0, 0)
+        flags = evaluate_add_status_flags(0, 0, new_mem)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry)
+        self.assertFalse(flags.overflow)
+
+        # Zero produced by 32-bit overflow wrap
+        old_val2, new_mem2 = ref_ds_add_rtn_u32(MASK32, 1)
+        flags2 = evaluate_add_status_flags(MASK32, 1, new_mem2)
+        self.assertEqual(new_mem2, 0)
+        self.assertTrue(flags2.zero)
+        self.assertFalse(flags2.sign)
+        self.assertTrue(flags2.carry)
+        self.assertFalse(flags2.overflow)
+
+    def test_sign_flag(self) -> None:
+        old_val, new_mem = ref_ds_add_rtn_u32(0x40000000, 0x40000000)
+        self.assertEqual(new_mem, 0x80000000)
+        flags = evaluate_add_status_flags(0x40000000, 0x40000000, new_mem)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry)
+        self.assertTrue(flags.overflow)
+
+    def test_unsigned_carry_flag(self) -> None:
+        old_val, new_mem = ref_ds_add_rtn_u32(MASK32, 10)
+        self.assertEqual(new_mem, 9)
+        flags = evaluate_add_status_flags(MASK32, 10, new_mem)
+        self.assertTrue(flags.carry)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.overflow)
+
+    def test_signed_overflow_positive_to_negative(self) -> None:
+        # 0x7FFFFFFF (+2147483647) + 1 -> 0x80000000 (-2147483648)
+        old_val, new_mem = ref_ds_add_rtn_u32(0x7FFFFFFF, 1)
+        self.assertEqual(new_mem, 0x80000000)
+        flags = evaluate_add_status_flags(0x7FFFFFFF, 1, new_mem)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry)
+
+    def test_signed_overflow_negative_to_positive(self) -> None:
+        # 0x80000000 (-2147483648) + 0x80000000 (-2147483648) -> 0
+        old_val, new_mem = ref_ds_add_rtn_u32(0x80000000, 0x80000000)
+        self.assertEqual(new_mem, 0)
+        flags = evaluate_add_status_flags(0x80000000, 0x80000000, new_mem)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.carry)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+
+    def test_positive_and_negative_no_overflow(self) -> None:
+        # 0x7FFFFFFF (+2147483647) + 0xFFFFFFFF (-1) -> 0x7FFFFFFE (+2147483646)
+        old_val, new_mem = ref_ds_add_rtn_u32(0x7FFFFFFF, MASK32)
+        self.assertEqual(new_mem, 0x7FFFFFFE)
+        flags = evaluate_add_status_flags(0x7FFFFFFF, MASK32, new_mem)
+        self.assertFalse(flags.overflow)
+        self.assertTrue(flags.carry)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.zero)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
