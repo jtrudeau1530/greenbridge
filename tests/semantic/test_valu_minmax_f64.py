@@ -1252,5 +1252,96 @@ class TestValuMinMaxF64ConditionCodes(unittest.TestCase):
         self.assertEqual(simd.vcc, canary_vcc)
 
 
+class TestValuMinMaxF64IEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zero_matrix(self) -> None:
+        # min signed zero permutations
+        self.assertEqual(ref_min_f64(POS_ZERO_F64, POS_ZERO_F64), POS_ZERO_F64)
+        self.assertEqual(ref_min_f64(POS_ZERO_F64, NEG_ZERO_F64), NEG_ZERO_F64)
+        self.assertEqual(ref_min_f64(NEG_ZERO_F64, POS_ZERO_F64), NEG_ZERO_F64)
+        self.assertEqual(ref_min_f64(NEG_ZERO_F64, NEG_ZERO_F64), NEG_ZERO_F64)
+
+        # max signed zero permutations
+        self.assertEqual(ref_max_f64(POS_ZERO_F64, POS_ZERO_F64), POS_ZERO_F64)
+        self.assertEqual(ref_max_f64(POS_ZERO_F64, NEG_ZERO_F64), POS_ZERO_F64)
+        self.assertEqual(ref_max_f64(NEG_ZERO_F64, POS_ZERO_F64), POS_ZERO_F64)
+        self.assertEqual(ref_max_f64(NEG_ZERO_F64, NEG_ZERO_F64), NEG_ZERO_F64)
+
+    def test_subnormals_vs_zeros(self) -> None:
+        # Positive subnormal is strictly greater than both +0.0 and -0.0
+        self.assertEqual(ref_min_f64(SUBNORM_MIN_F64, POS_ZERO_F64), POS_ZERO_F64)
+        self.assertEqual(ref_min_f64(SUBNORM_MIN_F64, NEG_ZERO_F64), NEG_ZERO_F64)
+        self.assertEqual(ref_max_f64(SUBNORM_MIN_F64, POS_ZERO_F64), SUBNORM_MIN_F64)
+        self.assertEqual(ref_max_f64(SUBNORM_MIN_F64, NEG_ZERO_F64), SUBNORM_MIN_F64)
+
+        # Negative subnormal is strictly less than both +0.0 and -0.0
+        self.assertEqual(ref_min_f64(NEG_SUBNORM_MIN_F64, POS_ZERO_F64), NEG_SUBNORM_MIN_F64)
+        self.assertEqual(ref_min_f64(NEG_SUBNORM_MIN_F64, NEG_ZERO_F64), NEG_SUBNORM_MIN_F64)
+        self.assertEqual(ref_max_f64(NEG_SUBNORM_MIN_F64, POS_ZERO_F64), POS_ZERO_F64)
+        self.assertEqual(ref_max_f64(NEG_SUBNORM_MIN_F64, NEG_ZERO_F64), NEG_ZERO_F64)
+
+    def test_subnormals_vs_normal_min(self) -> None:
+        # SUBNORM_MAX is 2^-1022 - 2^-1074, which is strictly less than DBL_MIN (2^-1022)
+        self.assertEqual(ref_min_f64(SUBNORM_MAX_F64, DBL_MIN), SUBNORM_MAX_F64)
+        self.assertEqual(ref_max_f64(SUBNORM_MAX_F64, DBL_MIN), DBL_MIN)
+        self.assertEqual(ref_min_f64(NEG_SUBNORM_MAX_F64, NEG_DBL_MIN), NEG_DBL_MIN)
+        self.assertEqual(ref_max_f64(NEG_SUBNORM_MAX_F64, NEG_DBL_MIN), NEG_SUBNORM_MAX_F64)
+
+    def test_infinities_vs_normal_max(self) -> None:
+        self.assertEqual(ref_min_f64(DBL_MAX, POS_INF_F64), DBL_MAX)
+        self.assertEqual(ref_max_f64(DBL_MAX, POS_INF_F64), POS_INF_F64)
+        self.assertEqual(ref_min_f64(NEG_DBL_MAX, NEG_INF_F64), NEG_INF_F64)
+        self.assertEqual(ref_max_f64(NEG_DBL_MAX, NEG_INF_F64), NEG_DBL_MAX)
+        self.assertEqual(ref_min_f64(NEG_INF_F64, POS_INF_F64), NEG_INF_F64)
+        self.assertEqual(ref_max_f64(NEG_INF_F64, POS_INF_F64), POS_INF_F64)
+
+    def test_nan_suppression_comprehensive(self) -> None:
+        test_values = [
+            POS_ZERO_F64, NEG_ZERO_F64, POS_ONE_F64, NEG_ONE_F64,
+            DBL_MIN, NEG_DBL_MIN, DBL_MAX, NEG_DBL_MAX,
+            SUBNORM_MIN_F64, SUBNORM_MAX_F64, NEG_SUBNORM_MIN_F64, NEG_SUBNORM_MAX_F64,
+            POS_INF_F64, NEG_INF_F64,
+        ]
+        nans = [QNAN_F64, NEG_QNAN_F64, QNAN_PAYLOAD_A, QNAN_PAYLOAD_B, SNAN_F64]
+
+        for val in test_values:
+            for nan in nans:
+                with self.subTest(val=f"{val:#018x}", nan=f"{nan:#018x}"):
+                    # Non-NaN operand is always returned intact
+                    self.assertEqual(ref_min_f64(nan, val), val)
+                    self.assertEqual(ref_min_f64(val, nan), val)
+                    self.assertEqual(ref_max_f64(nan, val), val)
+                    self.assertEqual(ref_max_f64(val, nan), val)
+
+    def test_dual_nan_propagation(self) -> None:
+        nans = [QNAN_F64, NEG_QNAN_F64, QNAN_PAYLOAD_A, QNAN_PAYLOAD_B, SNAN_F64]
+        for nan0 in nans:
+            for nan1 in nans:
+                res_min = ref_min_f64(nan0, nan1)
+                res_max = ref_max_f64(nan0, nan1)
+                self.assertTrue(is_nan_f64(res_min))
+                self.assertTrue(is_nan_f64(res_max))
+                # Canonical quiet NaN bit is set
+                self.assertTrue(is_qnan_f64(res_min))
+                self.assertTrue(is_qnan_f64(res_max))
+
+    def test_modifiers_on_boundary_extremes(self) -> None:
+        # abs on infinities and zeros
+        self.assertEqual(apply_f64_modifiers(NEG_INF_F64, abs_val=True), POS_INF_F64)
+        self.assertEqual(apply_f64_modifiers(NEG_ZERO_F64, abs_val=True), POS_ZERO_F64)
+        # neg on infinities and zeros
+        self.assertEqual(apply_f64_modifiers(POS_INF_F64, neg=True), NEG_INF_F64)
+        self.assertEqual(apply_f64_modifiers(POS_ZERO_F64, neg=True), NEG_ZERO_F64)
+        self.assertEqual(apply_f64_modifiers(NEG_ZERO_F64, neg=True), POS_ZERO_F64)
+
+        # clamp on infinities and subnormals
+        self.assertEqual(apply_f64_clamp(POS_INF_F64), POS_ONE_F64)
+        self.assertEqual(apply_f64_clamp(NEG_INF_F64), POS_ZERO_F64)
+        self.assertEqual(apply_f64_clamp(SUBNORM_MIN_F64), SUBNORM_MIN_F64)
+        self.assertEqual(apply_f64_clamp(NEG_SUBNORM_MIN_F64), POS_ZERO_F64)
+        self.assertEqual(apply_f64_clamp(QNAN_F64), QNAN_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
