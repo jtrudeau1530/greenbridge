@@ -62,6 +62,9 @@ std::vector<Lookup> g_lookups;
 //                            D3D12XboxCreateDevice is matched by exact name: the console-only function has no public
 //                            reference page that could be reached; it is the factory this repo measured (it returns
 //                            an HRESULT with the device in an out parameter, docs/d3d12_vulkan.md), not a documented one.
+//                            D3D12XboxCreateSyntheticDevice is the other console-only factory the sibling export
+//                            inventories list (docs/d3d12_vulkan.md §7); same Create*Device HRESULT shape.
+//                            D3D12XboxSetProcessDebugFlags is left out: nothing measured its return.
 //  dxgi.dll                  CreateDXGIFactory, CreateDXGIFactory1, CreateDXGIFactory2, DXGIGetDebugInterface1 and
 //                            DXGIDeclareAdapterRemovalSupport return HRESULT (win32/api/dxgi/nf-dxgi-createdxgifactory,
 //                            dxgi1_3 and dxgi1_6 pages). Not the whole DXGI* prefix: only these names were verified.
@@ -71,6 +74,13 @@ std::vector<Lookup> g_lookups;
 //                            XGameRuntimeInitialize and XGameEventWrite: HRESULT.
 //                            Mixed families (XSystem*, XGameStreaming*, XThread*, XDisplay*, XGameRuntimeFeature*) are
 //                            left out on purpose.
+//  gameinput.dll             GameInputCreate: HRESULT (gaming/gdk/docs/reference/input/gameinput/functions/
+//                            gameinputcreate). The shim implements it (runtime/shims/gameinput.cpp); the class is
+//                            listed anyway for a build or import it misses.
+//  xaudio2_9.dll             XAudio2Create: HRESULT (learn.microsoft.com/windows/win32/api/xaudio2/
+//  xaudio2_9redist.dll       nf-xaudio2-xaudio2create). xaudio2_9.dll is the console name (docs/d3d12_vulkan.md §7).
+//  dstorage.dll              DStorageGetFactory: HRESULT (learn.microsoft.com/windows/win32/api/dstorage/
+//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory). dstorage_xs.dll is the console name.
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
@@ -91,12 +101,18 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
     if (dll == "d3d12.dll" || dll == "d3d12_xs.dll") {
         if (starts_with(name, "D3D12Create") || starts_with(name, "D3D12Serialize") ||
             name == "D3D12GetDebugInterface" || name == "D3D12EnableExperimentalFeatures" ||
-            name == "D3D12XboxCreateDevice")
+            name == "D3D12XboxCreateDevice" || name == "D3D12XboxCreateSyntheticDevice")
             return ReturnClass::HResult;
     } else if (dll == "dxgi.dll") {
         if (starts_with(name, "CreateDXGIFactory") || name == "DXGIGetDebugInterface1" ||
             name == "DXGIDeclareAdapterRemovalSupport")
             return ReturnClass::HResult;
+    } else if (dll == "xaudio2_9.dll" || dll == "xaudio2_9redist.dll") {
+        if (name == "XAudio2Create") return ReturnClass::HResult;
+    } else if (dll == "gameinput.dll") {
+        if (name == "GameInputCreate") return ReturnClass::HResult;
+    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll") {
+        if (name == "DStorageGetFactory") return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
         for (const char* n : kNotHResult)
