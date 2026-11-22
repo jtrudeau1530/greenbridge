@@ -96,6 +96,9 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_global_neg_offset":
                 self.assertEqual(args[0], "40")
                 return 0, "out[0..7] = " + " ".join(map(str, check.GLOBAL_OFFSET[0][2])) + "\n"
+            if name in dict(check.BOUNDS):    # the SMEM / raw MUBUF rule tests: their words, then the 0xee fill
+                words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
             if name == "cs_smem_soffset_imm":

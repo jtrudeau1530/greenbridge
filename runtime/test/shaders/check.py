@@ -101,7 +101,14 @@ CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-91: two s_barrier sites in wave-uniform branches meet like one barrier; wave 0 reads wave 3
             ("cs_barrier_divergent", [127, 126, 125, 124, 123, 122, 121, 120])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
-BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE])]
+# The SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm header): one thread too.
+# Never run cs_smem_sload_neg with a translator that zero-extends the s_load immediate: it reads 4 GiB past the heap.
+BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
+          ("cs_smem_bounds", [0, 0x5eed0010, 0x5eed000c, 0, 0x5eed000c, 0x5eed0010, 0, 0]),
+          ("cs_smem_stride_align", [0x5eed0010, 0, 0, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0004]),
+          ("cs_smem_sload_neg", [0x5eed0004, 0x5eed0000, 0x5eed0004, 0x5eed0004, 0x5eed0008, 0x5eed000c,
+                                 0xeeeeeeee, 0xeeeeeeee]),
+          ("cs_buf_tail", [0, 0x5eed000c, 0x5eed0008, 0x5eed000c, 0, 0, 0x5eed0010, 0])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,

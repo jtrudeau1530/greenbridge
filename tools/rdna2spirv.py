@@ -860,34 +860,57 @@ class Gen:
 
     def buffer_load(self, op, a, mods):
         """buffer_load_dword[xN] vD, vaddr, s[V#], soffset [offen|idxen] offset:N  -> buffer-device-address loads.
-        addr = V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex * V#.stride : 0)."""
+        addr = V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex * V#.stride : 0), byte exact.
+        Raw buffer (stride 0, no idxen): dword i is loaded when O + 4*i + 4 <= num_records (O = soffset +
+        inst_offset + offen, the byte offset), else it is 0 and memory is not read. Measured on an AMD Radeon RX 6800
+        (gfx1030) for buffer_load_dword/x2/x4 with V# OOB_SELECT 3 (docs/design.md, Buffer bounds checking); x3 gets
+        the same rule. Structured buffers and idxen keep buffer_address's check of the first byte for every dword
+        (not measured). Inactive lanes don't load."""
         if any(m in mods for m in ("lds", "tfe")) or "format" in op:
             raise Unsupported(op + " form")
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
         vd = a[0]
-        addr, _, in_b = self.buffer_address(a, mods)
-        cond = self.tmp()
-        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
-        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
-        pre_label = self.current_label_placeholder()
-        self.emit(f"OpSelectionMerge {lbl_end} None")
-        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
-        self.emit(f"{lbl_do} = OpLabel")
+        addr, _, in_b, raw_parts = self.buffer_address(a, mods, parts=True)
+        act = self.active_b()
         ptr = self.tmp()
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
-        loaded = []
-        for i in range(n):
-            p, v = self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-            self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
-            loaded.append(v)
-        self.emit(f"OpBranch {lbl_end}")
-        self.emit(f"{lbl_end} = OpLabel")
-        phis = []
-        for v_do in loaded:
-            v = self.tmp()
-            self.emit(f"{v} = OpPhi %uint {v_do} {lbl_do} {self.cu(0)} {pre_label}")
-            phis.append(v)
+
+        def guarded(cond, dwords):
+            """One selection construct that loads these dwords when cond holds; the phis give 0 otherwise."""
+            lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+            pre_label = self.current_label_placeholder()
+            self.emit(f"OpSelectionMerge {lbl_end} None")
+            self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+            self.emit(f"{lbl_do} = OpLabel")
+            loaded = []
+            for i in dwords:
+                p, v_do = self.tmp(), self.tmp()
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                self.emit(f"{v_do} = OpLoad %uint {p} Aligned 4")
+                loaded.append(v_do)
+            self.emit(f"OpBranch {lbl_end}")
+            self.emit(f"{lbl_end} = OpLabel")
+            out = []
+            for v_do in loaded:
+                v = self.tmp()
+                self.emit(f"{v} = OpPhi %uint {v_do} {lbl_do} {self.cu(0)} {pre_label}")
+                out.append(v)
+            return out
+
+        if raw_parts is None:               # idxen: one check of the first byte for the whole load, as before
+            cond = self.tmp()
+            self.emit(f"{cond} = OpLogicalAnd %bool {act} {in_b}")
+            phis = guarded(cond, range(n))
+        else:
+            o64, nr64, is_raw = raw_parts
+            phis = []
+            for i in range(n):
+                end, fits, ok, cond = (self.tmp() for _ in range(4))
+                self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
+                self.emit(f"{fits} = OpUGreaterThanEqual %bool {nr64} {end}")
+                self.emit(f"{ok} = OpSelect %bool {is_raw} {fits} {in_b}")
+                self.emit(f"{cond} = OpLogicalAnd %bool {act} {ok}")
+                phis += guarded(cond, [i])
         for i, v in enumerate(phis):
             self.dst({"k": "vgpr", "r": vd["r"] + i, "n": 1}, v)
 
@@ -1392,8 +1415,11 @@ class Gen:
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
 
-    def buffer_address(self, a, mods):
-        """(64-bit element address id, V# word3 id, in_bounds bool id) for a MUBUF instruction: vdata, vaddr, srsrc, soffset."""
+    def buffer_address(self, a, mods, parts=False):
+        """(64-bit element address id, V# word3 id, in_bounds bool id) for a MUBUF instruction: vdata, vaddr, srsrc, soffset.
+        in_bounds is the check of the first byte (raw: offset < num_records; structured: see below), shared by
+        stores, atomics and format loads. parts=True adds a 4th element for buffer_load's per-dword raw bound:
+        (64-bit byte offset, 64-bit num_records, stride == 0 bool) ids, or None with idxen (that path is unchanged)."""
         vaddr, rsrc = a[1], a[2]
         soff = a[3] if len(a) > 3 else {"k": "imm", "v": 0}
         if rsrc["k"] != "sgpr" or rsrc.get("n") != 4:
@@ -1433,6 +1459,7 @@ class Gen:
             idx_ok = self.tmp()
             self.emit(f"{idx_ok} = OpULessThan %bool {idx} {d2}")
             self.emit(f"{in_b} = OpSelect %bool {is_raw} {tot_ok} {idx_ok}")
+            raw_parts = None
         else:
             d2_64, st_64, lim, str_ok = (self.tmp() for _ in range(4))
             self.emit(f"{d2_64} = OpUConvert %ulong {d2}")
@@ -1440,6 +1467,9 @@ class Gen:
             self.emit(f"{lim} = OpIMul %ulong {d2_64} {st_64}")
             self.emit(f"{str_ok} = OpULessThan %bool {o64} {lim}")
             self.emit(f"{in_b} = OpSelect %bool {is_raw} {tot_ok} {str_ok}")
+            raw_parts = (o64, d2_64, is_raw)
+        if parts:
+            return addr, d3, in_b, raw_parts
         return addr, d3, in_b
 
     def buffer_store(self, op, a, mods):
@@ -4796,17 +4826,22 @@ class Gen:
             raise Unsupported(op)
 
     def scalar_load(self, op, a, mods):
-        """s_load_dwordxN sD, s[p:p+1], off   -> N dwords at (64-bit pointer + off)
-        s_buffer_load_dwordxN sD, s[v:v+3], off -> N dwords at (V# base address + off)
+        """s_load_dwordxN sD, s[p:p+1], off   -> N dwords from a 64-bit pointer, no bound
+        s_buffer_load_dwordxN sD, s[v:v+3], off -> N dwords from a V#, each checked against NUM_RECORDS
         Both become PhysicalStorageBuffer loads (Vulkan buffer device address). V# base = dword0 | (dword1 & 0xFFFF) << 32
         (AMD RDNA ISA, buffer resource descriptor).
         off is an immediate or a scalar register. An SMEM load can carry both, which llvm-mc prints as
-        "sOFF offset:IMM" (the immediate arrives in mods); the address is then base + sOFF + IMM. Measured on an
-        RX 6800 (gfx1030) for s_buffer_load_dword/x2/x4/x8: soffset 8 + imm 4 reads +12. s_load_dword* shares the
-        encoding and gets the same rule (not measured). The immediate is zero-extended from 32 bits exactly as the
-        immediate-only form is.
-        Not modelled: for s_buffer_load* the hardware was measured to truncate base, sOFF and IMM each to a multiple
-        of 4 and to return 0 past num_records (docs/design.md, Scalar/buffer memory)."""
+        "sOFF offset:IMM" (the immediate arrives in mods); both are added.
+        Measured on an AMD Radeon RX 6800 (gfx1030) as a raw compute kernel, wave32 and wave64 (docs/design.md,
+        Scalar/buffer memory):
+          off = (sOFF & ~3) + (IMM & ~3); dword i is read at (base & ~3) + off + 4*i  (base, sOFF, IMM truncated
+          each on its own, then added).
+          s_buffer_load*: dword i is 0, and memory is not read, when off + 4*i + 4 > limit, limit = NUM_RECORDS *
+          stride bytes when the V# stride (dword1[29:16]) is not 0, else NUM_RECORDS bytes (V# dword2). The bound
+          is per dword and does not see base & 3; IMM is unsigned.
+          s_load*: IMM is sign-extended from 21 bits and the sum is formed in 64 bits; no bound.
+        Not measured, and inferred: s_load with sOFF + IMM < 0 (the 64-bit signed sum is used), x16 (same rule as
+        x8), an s_buffer_load immediate with bit 20 set or a negative one (kept as the 32-bit value, as before)."""
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
         d, base = a[0], a[1]
         # A single dword may also land in vcc_lo / m0 / vcc_hi (seen: s_buffer_load_dword vcc_lo, ...).
@@ -4814,8 +4849,10 @@ class Gen:
             (n == 2 and d["k"] == "special" and d["t"] == "vcc")
         if (d["k"] != "sgpr" and not single_special) or base["k"] != "sgpr":
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
+        sbuf = op.startswith("s_buffer")
         lo, hi = self.load_reg("sgpr", base["r"]), self.load_reg("sgpr", base["r"] + 1)
-        if op.startswith("s_buffer"):
+        word1 = hi
+        if sbuf:
             if base.get("n") != 4:
                 raise Unsupported("s_buffer_load without V#")
             m = self.tmp()
@@ -4828,32 +4865,78 @@ class Gen:
         inst = [m.split(":", 1)[1] for m in mods if m.startswith("offset:")]
         if len(a) > 3 or len(inst) > 1 or (inst and off["k"] == "imm"):
             raise Unsupported(f"{op} offset form")      # not something llvm-mc prints: don't guess an address
-        imm = None
+        imm = 0
         if inst:
             try:
                 imm = int(inst[0], 0)
             except ValueError:
                 raise Unsupported(f"{op} offset:{inst[0]}") from None
-        offv = self.src_u(off)
-        l64, h64, sh, addr, o64, full = (self.tmp() for _ in range(6))
-        self.emit(f"{l64} = OpUConvert %ulong {lo}")
+        reg = None
+        if off["k"] == "imm":
+            imm = off["v"]                              # immediate-only form
+        else:
+            reg = self.src_u(off)
+        if sbuf:
+            imm &= 0xFFFFFFFF                           # unsigned (measured up to 0xffffc)
+        else:
+            imm = ((imm & 0x1FFFFF) ^ 0x100000) - 0x100000   # 21-bit signed
+        imm &= ~3                                       # two's complement: -1 -> -4, -6 -> -8
+        # Byte offset from the 4-truncated base, in 64 bits: zext(sOFF & ~3) + imm, or the constant alone.
+        if reg is not None:
+            r4, r64 = self.tmp(), self.tmp()
+            self.emit(f"{r4} = OpBitwiseAnd %uint {reg} {self.cu(0xFFFFFFFC)}")
+            self.emit(f"{r64} = OpUConvert %ulong {r4}")
+            if imm:
+                o64 = self.tmp()
+                self.emit(f"{o64} = OpIAdd %ulong {r64} {self.cl(imm)}")
+            else:
+                o64 = r64
+        else:
+            o64 = self.cl(imm)
+        lo4, l64, h64, sh, addr, full = (self.tmp() for _ in range(6))
+        self.emit(f"{lo4} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFFFFFC)}")
+        self.emit(f"{l64} = OpUConvert %ulong {lo4}")
         self.emit(f"{h64} = OpUConvert %ulong {hi}")
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{addr} = OpBitwiseOr %ulong {sh} {l64}")
-        self.emit(f"{o64} = OpUConvert %ulong {offv}")
         self.emit(f"{full} = OpIAdd %ulong {addr} {o64}")
-        if imm is not None:                             # register offset and immediate: both are added
-            i64, both = self.tmp(), self.tmp()
-            self.emit(f"{i64} = OpUConvert %ulong {self.cu(imm)}")
-            self.emit(f"{both} = OpIAdd %ulong {full} {i64}")
-            full = both
         ptr = self.tmp()
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
         self.uses_psb = True
+        lim = None
+        if sbuf:
+            # limit = NUM_RECORDS * stride, or NUM_RECORDS when stride is 0 (bytes, 64-bit so the product can't wrap)
+            stride, nr64, st64, prod, raw, lim = (self.tmp() for _ in range(6))
+            nr = self.load_reg("sgpr", base["r"] + 2)
+            self.emit(f"{stride} = OpBitFieldUExtract %uint {word1} {self.cu(16)} {self.cu(14)}")
+            self.emit(f"{nr64} = OpUConvert %ulong {nr}")
+            self.emit(f"{st64} = OpUConvert %ulong {stride}")
+            self.emit(f"{prod} = OpIMul %ulong {nr64} {st64}")
+            self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
+            self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
         for i in range(n):
             p, v = self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
-            self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
+            if lim is None:
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
+            else:
+                # dword i is in range when off + 4*i + 4 <= limit; outside it memory is not read and the result is 0
+                end, ok, got = self.tmp(), self.tmp(), self.tmp()
+                lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+                if reg is not None:
+                    self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
+                else:
+                    end = self.cl(imm + 4 * i + 4)
+                self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
+                pre = self.current_label_placeholder()
+                self.emit(f"OpSelectionMerge {lbl_end} None")
+                self.emit(f"OpBranchConditional {ok} {lbl_do} {lbl_end}")
+                self.emit(f"{lbl_do} = OpLabel")
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                self.emit(f"{got} = OpLoad %uint {p} Aligned 4")
+                self.emit(f"OpBranch {lbl_end}")
+                self.emit(f"{lbl_end} = OpLabel")
+                self.emit(f"{v} = OpPhi %uint {got} {lbl_do} {self.cu(0)} {pre}")
             if single_special:
                 if n == 2:          # vcc pair: low dword -> vcc_lo, high dword -> vcc_hi
                     self.dst({"k": "special", "t": "vcc_lo" if i == 0 else "vcc_hi"}, v)

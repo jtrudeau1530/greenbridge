@@ -631,10 +631,24 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_bounds", "cs_cmpx_class_f32"):
-            # These per-lane results do not require a particular subgroup width.
+        elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail",
+                      "cs_cmpx_class_f32"):
+            # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
+            # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
+            # cs_cmpx_class_f32 is per-lane and needs no particular subgroup width either.
+            # The other four pin the SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm).
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
-            want = CMPX_CLASS_WORDS if name == "cs_cmpx_class_f32" else [0x12345678, 0x12345678, 0, 0xEEEEEEEE]
+            want = {
+                "cs_bounds": [0x12345678, 0x12345678, 0, 0xEEEEEEEE],
+                "cs_smem_bounds": [0, 0x5EED0010, 0x5EED000C, 0, 0x5EED000C, 0x5EED0010, 0, 0],
+                "cs_smem_stride_align": [0x5EED0010, 0, 0, 0x5EED0000, 0x5EED0000, 0x5EED0000, 0x5EED0000,
+                                         0x5EED0004],
+                # never run with a translator that zero-extends the s_load immediate (reads 4 GiB past the heap)
+                "cs_smem_sload_neg": [0x5EED0004, 0x5EED0000, 0x5EED0004, 0x5EED0004, 0x5EED0008, 0x5EED000C,
+                                      0xEEEEEEEE, 0xEEEEEEEE],
+                "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
+                "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
+            }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
             results.append((name, rc == 0 and vals == want,
