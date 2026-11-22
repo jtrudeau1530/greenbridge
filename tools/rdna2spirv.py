@@ -435,6 +435,28 @@ class Gen:
             return self.sdwa_src(v, s) if "sdwa_sel" in s else v
         return self.src_u({**s, "neg": False, "abs": False})
 
+    def mem_f16(self, f):
+        """f32 ``f`` -> f16 bits as RDNA2's buffer unit narrows a float: toward zero, a finite value past the range
+        -> +-65504, an f32 denormal -> +-0 (f16_bits(rtz=True)), and a NaN keeps its sign and the top 10 bits of its
+        payload without being quieted, 1 if those are all 0 (0x7fa00000 -> 0x7d00, 0x7f800001 -> 0x7c01). Measured
+        natively on gfx1036 for 16_FLOAT stores and 32_FLOAT d16 loads (SHADER-358)."""
+        h = self.f16_bits(f, rtz=True)
+        x, mag, nan, top, one, keep, sg, nb, out = (self.tmp() for _ in range(9))
+        self.emit(f"{x} = OpBitcast %uint {f}")
+        self.emit(f"{mag} = OpBitwiseAnd %uint {x} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{nan} = OpUGreaterThan %bool {mag} {self.cu(0x7F800000)}")
+        self.emit(f"{top} = OpBitFieldUExtract %uint {x} {self.cu(13)} {self.cu(10)}")
+        self.emit(f"{one} = OpIEqual %bool {top} {self.cu(0)}")
+        self.emit(f"{keep} = OpSelect %uint {one} {self.cu(1)} {top}")
+        self.emit(f"{sg} = OpShiftRightLogical %uint {x} {self.cu(16)}")
+        sgm = self.tmp()
+        self.emit(f"{sgm} = OpBitwiseAnd %uint {sg} {self.cu(0x8000)}")
+        kn = self.tmp()
+        self.emit(f"{kn} = OpBitwiseOr %uint {keep} {self.cu(0x7C00)}")
+        self.emit(f"{nb} = OpBitwiseOr %uint {sgm} {kn}")
+        self.emit(f"{out} = OpSelect %uint {nan} {nb} {h}")
+        return out
+
     def pack_f16_pair_int(self, f0, f1):
         """Two f32 values -> one u32 (lo f16 | hi f16 << 16), each narrowed by f16_bits: integer ops only, no
         GLSL.std.450 at all (#489: an amdvlk64 pipeline-creation crash came from PackHalf2x16 on a d16
@@ -1472,7 +1494,9 @@ class Gen:
         bit = 0
         for c, w in enumerate(widths):
             if kind == "f16":
-                field = self.f16_bits(self.tof(fcomps[c]))
+                # f32 -> f16 toward zero, finite values past the range -> +-65504: measured natively on gfx1036 for
+                # 16_FLOAT, 16_16_FLOAT and 16_16_16_16_FLOAT stores (SHADER-358; gfx1150 does the same, #1548).
+                field = self.mem_f16(self.tof(fcomps[c]))
             elif kind == "unorm":
                 field = self.encode_norm_bits(fcomps[c], w, signed=False)
             elif kind == "snorm":
@@ -2047,13 +2071,17 @@ class Gen:
                 self.emit(f"{half} = OpSelect %uint {is_signed} {signed} {unsigned}")
                 return half
 
-            is_norm = "%false"
+            is_norm, is_f32 = "%false", "%false"
             for code_v, (_, kind, _) in self.FORMATS.items():
-                if kind in ("unorm", "snorm") and (fixed_fmt is None or code_v == fixed_fmt):
+                if kind in ("unorm", "snorm", "f32") and (fixed_fmt is None or code_v == fixed_fmt):
                     e, o = self.tmp(), self.tmp()
                     self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
-                    self.emit(f"{o} = OpLogicalOr %bool {is_norm} {e}")
-                    is_norm = o
+                    acc = is_f32 if kind == "f32" else is_norm
+                    self.emit(f"{o} = OpLogicalOr %bool {acc} {e}")
+                    if kind == "f32":
+                        is_f32 = o
+                    else:
+                        is_norm = o
             for i in range(0, len(outs), 2):
                 dest = {"k": "vgpr", "r": vd["r"] + i // 2, "n": 1}
                 lo = outs[i]
@@ -2061,15 +2089,15 @@ class Gen:
                 r = self.tmp()
                 if i + 1 == len(outs):
                     # For d16_x and d16_xyz the unaddressed high half keeps its previous bits.
-                    fl = self.d16_norm_f16(lo, is_norm)
+                    fl = self.d16_norm_f16(lo, is_norm, is_f32)
                     self.emit(f"{r} = OpSelect %uint {is_int_fmt} {il} {fl}")
                     self.write_lo16(dest, r)
                     continue
                 hi = outs[i + 1]
                 ph = self.tmp()
                 fh_s = self.tmp()
-                self.emit(f"{fh_s} = OpShiftLeftLogical %uint {self.d16_norm_f16(hi, is_norm)} {self.cu(16)}")
-                self.emit(f"{ph} = OpBitwiseOr %uint {self.d16_norm_f16(lo, is_norm)} {fh_s}")
+                self.emit(f"{fh_s} = OpShiftLeftLogical %uint {self.d16_norm_f16(hi, is_norm, is_f32)} {self.cu(16)}")
+                self.emit(f"{ph} = OpBitwiseOr %uint {self.d16_norm_f16(lo, is_norm, is_f32)} {fh_s}")
                 ih, pi = self.tmp(), self.tmp()
                 high_half = int_half(hi)
                 self.emit(f"{ih} = OpShiftLeftLogical %uint {high_half} {self.cu(16)}")
@@ -2082,15 +2110,21 @@ class Gen:
     # quotient is below the halfway point each time, and RDNA2 rounds it once, straight to f16 (BUILD-161, RX 6700).
     D16_NORM_HALFWAY = (0x3F7FF000, 0x3F7FB000)
 
-    def d16_norm_f16(self, bits, is_norm):
+    def d16_norm_f16(self, bits, is_norm, is_f32=None):
         """f16 bits of a typed d16 buffer load component from its decoded f32 ``bits``. Round to nearest even
         (f16_bits), except that a UNORM/SNORM quotient (``is_norm``) whose f32 is one of D16_NORM_HALFWAY takes the
         f16 below it. The hardware rounds the exact quotient once; f32 first and then f16 rounds twice, which is 1 ulp
         high on exactly those values (UNORM16 0xffaf and 0xffef, SNORM16 0x7ff7 and 0x8009, the 14- and 15-bit
         twins). Measured on an RX 6700 (gfx1031) for every UNORM8/SNORM8/UNORM10/UNORM16/SNORM16 value, MUBUF and
-        MTBUF, wave32 and wave64 (tools/d16_format_probe.py). A float format keeps the plain rounding: a 32_FLOAT
-        0x3f7ff000 is a real tie."""
+        MTBUF, wave32 and wave64 (tools/d16_format_probe.py). A 32-bit float format (``is_f32``) is narrowed toward
+        zero instead, finite values past the range giving +-65504: measured natively on gfx1036 for 32_FLOAT,
+        32_32_FLOAT and 32_32_32_32_FLOAT, d16_x/xy/xyzw, wave32 and wave64 (SHADER-358)."""
         h = self.f16_bits(self.tof(bits))
+        if is_f32 is not None:
+            hz, sel = self.tmp(), self.tmp()
+            self.emit(f"{hz} = OpCopyObject %uint {self.mem_f16(self.tof(bits))}")
+            self.emit(f"{sel} = OpSelect %uint {is_f32} {hz} {h}")
+            h = sel
         mag, a, b, hit, both, dn, out = (self.tmp() for _ in range(7))
         self.emit(f"{mag} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
         self.emit(f"{a} = OpIEqual %bool {mag} {self.cu(self.D16_NORM_HALFWAY[0])}")
