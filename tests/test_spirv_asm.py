@@ -281,6 +281,19 @@ class SpirvAsmUnitTests(unittest.TestCase):
             with open(dst, "rb") as f:
                 _validate(f.read())
 
+    def test_cli_source_that_is_not_utf8_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "bad.spvasm")
+            dst = os.path.join(d, "bad.spv")
+            with open(src, "wb") as f:
+                f.write(b"OpCapability Shader\n; \xb1\xff\n")
+            r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("ERROR:", r.stderr)
+            self.assertFalse(os.path.exists(dst))
+
 
 if __name__ == "__main__":
     unittest.main()
