@@ -119,8 +119,14 @@ int main(int argc, char** argv) {
     }
     constexpr std::uint32_t W = 64, H = 64, TW = 8;
     constexpr std::uint32_t table_va = 256;  // console VA of the descriptor table: T# at +0, S# at +32
-    const DescriptorKey tsharp{0x11111111, 0x22222222, 0x33333333, 0x44444444,
-                               0x55555555, 0x66666666, 0x77777777, 0x88888888};  // any 8 dwords: only the key matters
+    // Any 8 dwords as the lookup key, except FORMAT (word 1 [28:20]): the translator picks the float, uint or sint
+    // view of the image from it, and every view this test binds is R8G8B8A8_UNORM, so it is 56 (8_8_8_8_UNORM).
+    // 0x22222222 had 34 (10_11_11_UINT): every sample went through the uint alias of a UNORM view, which Vulkan
+    // leaves undefined (VUID-vkCmdDraw-format-07753, reported by GPU-assisted validation).
+    constexpr std::uint32_t tsharp_word1 = (0x22222222u & ~(0x1FFu << 20)) | (56u << 20);
+    static_assert(((tsharp_word1 >> 20) & 0x1FF) == 56, "the T#'s FORMAT must be 8_8_8_8_UNORM");
+    const DescriptorKey tsharp{0x11111111, tsharp_word1, 0x33333333, 0x44444444,
+                               0x55555555, 0x66666666, 0x77777777, 0x88888888};
     const std::array<std::uint32_t, 4> ssharp{0x5a5a0001, 0x00000002, 0x00000003, 0x00000004};
 
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
