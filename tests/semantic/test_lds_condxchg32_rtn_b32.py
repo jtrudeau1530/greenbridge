@@ -16,7 +16,9 @@ Semantics:
 from __future__ import annotations
 
 import unittest
-from typing import Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Tuple, Union
 
 # RDNA2 Local Data Share (LDS) Architectural Constants
 LDS_SIZE_BYTES: int = 65536         # 64 KiB default capacity
@@ -170,6 +172,189 @@ class TestLdsCondxchg32ReferenceOracle(unittest.TestCase):
         self.assertEqual(mem, 0x5555AAAA)
         # Check original addr was preserved
         self.assertEqual(lds.read_dword(addr), 0x5555AAAA)
+
+
+# ==============================================================================
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class VGPR:
+    """Vector General Purpose Register operand (e.g. v[0] .. v[255])."""
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of architectural range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        return f"v[{self.index}]"
+
+
+@dataclass(frozen=True)
+class SGPR:
+    """Scalar General Purpose Register operand (e.g. s[0] .. s[105])."""
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index {self.index} out of architectural range [0, 105]")
+
+    @property
+    def name(self) -> str:
+        return f"s[{self.index}]"
+
+
+@dataclass(frozen=True)
+class Immediate:
+    """32-bit literal or inline integer constant."""
+    value: int
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.value & MASK_32:X}"
+
+
+Operand = Union[VGPR, SGPR, Immediate]
+
+
+class Condition(Enum):
+    """Comparison predicate for conditional exchange."""
+    EQ = auto()
+    NE = auto()
+    GT_U32 = auto()
+    LT_U32 = auto()
+
+
+@dataclass(frozen=True)
+class DSCondxchg32Instruction:
+    """Symbolic AST node for ds_condxchg32_rtn_b32 instruction."""
+    dst: VGPR
+    addr: VGPR
+    cmp_val: Operand
+    new_val: Operand
+    offset: int = 0
+    cond: Condition = Condition.EQ
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dst, VGPR):
+            raise TypeError(f"Destination must be a VGPR, got {type(self.dst).__name__}")
+        if not isinstance(self.addr, VGPR):
+            raise TypeError(f"Address operand must be a VGPR, got {type(self.addr).__name__}")
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"Offset {self.offset} out of 16-bit range [0, 65535]")
+
+    def disassemble(self) -> str:
+        offset_part = f" offset:{self.offset}" if self.offset != 0 else ""
+        return (
+            f"ds_condxchg32_rtn_b32 {self.dst.name}, {self.addr.name}, "
+            f"{self.cmp_val.name}, {self.new_val.name}{offset_part}"
+        )
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_ast_construction(self) -> None:
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(0),
+            addr=VGPR(1),
+            cmp_val=VGPR(2),
+            new_val=VGPR(3),
+            offset=16,
+        )
+        self.assertEqual(instr.dst.index, 0)
+        self.assertEqual(instr.addr.index, 1)
+        self.assertEqual(instr.offset, 16)
+        self.assertEqual(instr.cond, Condition.EQ)
+
+    def test_disassembly_with_and_without_offset(self) -> None:
+        instr_no_off = DSCondxchg32Instruction(
+            dst=VGPR(5),
+            addr=VGPR(6),
+            cmp_val=Immediate(0x1234),
+            new_val=SGPR(10),
+        )
+        self.assertEqual(
+            instr_no_off.disassemble(),
+            "ds_condxchg32_rtn_b32 v[5], v[6], 0x1234, s[10]",
+        )
+
+        instr_off = DSCondxchg32Instruction(
+            dst=VGPR(12),
+            addr=VGPR(13),
+            cmp_val=VGPR(14),
+            new_val=Immediate(0xABCD),
+            offset=64,
+        )
+        self.assertEqual(
+            instr_off.disassemble(),
+            "ds_condxchg32_rtn_b32 v[12], v[13], v[14], 0xABCD offset:64",
+        )
+
+    def test_dst_type_enforcement_rejects_sgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            # Destination cannot be an SGPR in DS operations
+            DSCondxchg32Instruction(
+                dst=SGPR(0),  # type: ignore[arg-type]
+                addr=VGPR(1),
+                cmp_val=Immediate(0),
+                new_val=Immediate(0),
+            )
+
+    def test_addr_type_enforcement_rejects_sgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            # Address operand cannot be an SGPR in DS operations
+            DSCondxchg32Instruction(
+                dst=VGPR(0),
+                addr=SGPR(1),  # type: ignore[arg-type]
+                cmp_val=Immediate(0),
+                new_val=Immediate(0),
+            )
+
+    def test_register_index_out_of_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+        with self.assertRaises(ValueError):
+            SGPR(106)
+        with self.assertRaises(ValueError):
+            SGPR(-1)
+
+    def test_offset_out_of_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSCondxchg32Instruction(
+                dst=VGPR(0),
+                addr=VGPR(1),
+                cmp_val=Immediate(0),
+                new_val=Immediate(0),
+                offset=65536,
+            )
+        with self.assertRaises(ValueError):
+            DSCondxchg32Instruction(
+                dst=VGPR(0),
+                addr=VGPR(1),
+                cmp_val=Immediate(0),
+                new_val=Immediate(0),
+                offset=-1,
+            )
+
+    def test_operand_imm_and_reg_equality(self) -> None:
+        v0_a = VGPR(0)
+        v0_b = VGPR(0)
+        v1 = VGPR(1)
+        self.assertEqual(v0_a, v0_b)
+        self.assertNotEqual(v0_a, v1)
+        imm1 = Immediate(42)
+        imm2 = Immediate(42)
+        self.assertEqual(imm1, imm2)
 
 
 if __name__ == "__main__":
