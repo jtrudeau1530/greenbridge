@@ -265,8 +265,13 @@ What is implemented (all of it testable without the game):
   - Buffers: elements of up to 4 bytes repeat in every aligned word, so `vkCmdFillBuffer` writes the aligned middle
     and `vkCmdCopyBuffer` copies the unaligned ends from it (an 8-bit view at an odd offset, say). 8- and 16-byte
     elements are written with `vkCmdUpdateBuffer` (up to 64 KiB) and doubled with copies. A rectangle is an
-    element range `[left, right)` on row 0. A view with unaligned ends and less than one whole aligned word between
-    them (a few bytes of an 8- or 16-bit format) is refused as `unsupported`.
+    element range `[left, right)` on row 0. If a range contains no complete aligned word, prepare reserves eight
+    transfer-scratch bytes, retained until submission completion. Replay fills that scratch with the repeated
+    element and copies only the requested bytes, preserving neighbouring bytes even at resource boundaries.
+    Rectangles within one clear reuse that pattern with transfer dependencies between them. Ownerless replay
+    callers without `copy_scratch` still refuse these short ranges before emitting anything.
+    `d3d12_short_uav_clear_test` compares Uint/Float whole-view and clipped/overlapping rectangle clears against
+    WARP (CTest) or `LEONIDA_HOST_ADAPTER` (manual runs), checking the entire buffer against literal patterns.
   - Textures: the values become one element of the view's format, and that element is cleared into the image as
     the value that decodes it in the image's own format, so a typeless texture viewed as UINT gets exactly the bits
     asked for. Exact for every typed-UAV format except the SNORM pattern `0x80..` (Vulkan writes -1.0 as `0x81..`)
