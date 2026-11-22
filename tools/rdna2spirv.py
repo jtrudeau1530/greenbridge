@@ -4683,8 +4683,10 @@ class Gen:
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
             self.dst(a[0], r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
-                    "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
-                    "image_sample_c", "image_sample_c_b",
+                    "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
+                    "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
+                    "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
+                    "image_sample_c_b_cl",
                     "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o"):
             self.image_op(op, a, mods)
@@ -8319,6 +8321,7 @@ class Gen:
             extras = op[len("image_sample"):] if op.startswith("image_sample") else ""
             w_off = 1 if extras.endswith("_o") else 0
             extras = extras[:-2] if w_off else extras
+            extras = extras[:-3] if extras.endswith("_cl") else extras      # the clamp is packed with the coordinates
             w_bias = 1 if extras in ("_b", "_c_b") else 0
             w_grad = 2 * min(ncoord, 2) if extras in ("_d", "_d_cl") else 0
             whole = w_off + w_bias + (1 if extras.startswith("_c") else 0) + w_grad
@@ -8543,9 +8546,11 @@ class Gen:
                 if not TEXEL_OFFSET_FALLBACK:
                     self.uses_img_offset = True
             minlod = None
-            clamp = kind == "_d_cl"        # _d plus a min-LOD clamp, read after the gradients
+            clamp = kind.endswith("_cl")   # a min-LOD clamp, read after the coordinates (after the gradients for _d)
             if clamp:
-                kind = "_d"
+                kind = kind[:-3]
+                if kind not in ("", "_b", "_c", "_c_b", "_d"):
+                    raise Unsupported(op)
                 self.uses_minlod = True
             # Address order after the offset: bias, z-compare, gradients, coordinates, LOD, clamp.
             bias = None
@@ -8617,21 +8622,34 @@ class Gen:
                                                       f[ncoord] if kind == "_l" and len(f) > ncoord else None, bias)
                 off = None
 
+            # A min-LOD clamp (_cl): MinLod goes with the implicit-LOD forms and Grad. Without derivatives (outside the
+            # PS) the LOD is 0 and the clamp raises it, so the explicit LOD is max(0, clamp) and no MinLod operand.
+            lod_zero = "%f0"
+            if minlod is not None and not implicit and kind != "_d":
+                lod_zero = self.tmp()
+                self.emit(f"{lod_zero} = OpExtInst %float %glsl FMax %f0 {minlod}")
+
             def opnd(mask, args):
-                """Image operands with the texel offset appended (Offset = 0x10 sorts after Lod/Bias)."""
-                if off is None:
-                    return f" {mask} {args}" if mask else ""
-                return f" {mask + '|' if mask else ''}Offset {args + ' ' if args else ''}{off}"
+                """Image operands in SPIR-V mask order: Bias / Lod, Offset (0x10), MinLod (0x80, implicit forms)."""
+                masks, vals = ([mask], [args]) if mask else ([], [])
+                if off is not None:
+                    masks.append("Offset")
+                    vals.append(off)
+                if minlod is not None and mask in ("", "Bias") and implicit:
+                    masks.append("MinLod")
+                    vals.append(minlod)
+                return f" {'|'.join(masks)} {' '.join(vals)}" if masks else ""
             if kind == "_d":
                 if minlod is not None:
                     self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad|MinLod {grads[0]} {grads[1]} {minlod}")
                 else:
                     self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads[0]} {grads[1]}")
             elif grads_fb is not None and not kind.startswith("_c"):
-                self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads_fb[0]} {grads_fb[1]}")
+                self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad{'|MinLod' if minlod else ''} "
+                          f"{grads_fb[0]} {grads_fb[1]}{' ' + minlod if minlod else ''}")
             elif kind == "":
                 self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('', '')}" if self.stage == "ps" else
-                          f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', '%f0')}")
+                          f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod_zero)}")
             elif kind == "_lz":
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', '%f0')}")
             elif kind == "_l":
@@ -8642,11 +8660,12 @@ class Gen:
                 d = self.tmp()
                 if kind == "_c_lz" or (self.stage != "ps" and kind == "_c"):
                     # _c outside the PS has no derivatives and samples LOD 0, like image_sample
-                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', '%f0')}")
+                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', lod_zero)}")
                 elif self.stage != "ps":
                     raise Unsupported(op)
                 elif grads_fb is not None:
-                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref} Grad {grads_fb[0]} {grads_fb[1]}")
+                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref} Grad{'|MinLod' if minlod else ''} "
+                              f"{grads_fb[0]} {grads_fb[1]}{' ' + minlod if minlod else ''}")
                 elif kind == "_c_b":
                     self.emit(f"{d} = OpImageSampleDrefImplicitLod %float {si} {uv} {ref}{opnd('Bias', bias)}")
                 else:
