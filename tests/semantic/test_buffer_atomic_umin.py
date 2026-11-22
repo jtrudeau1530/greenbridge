@@ -846,5 +846,81 @@ class TestBufferAtomicUminConditionCodes(unittest.TestCase):
         self.assertEqual(interp.vcc, 0x12345678_9ABCDEF0)
 
 
+# ==============================================================================
+# Boundary Extremes, Unsigned Limits, and IEEE 754 Bit Patterns for buffer_atomic_umin
+# ==============================================================================
+
+class TestBufferAtomicUminBoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, and OOB conditions."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 4-byte dword starts at offset 96 (96 + 4 = 100)
+        self.mem.write_u32(96, 42)
+        ret, in_bounds = ref_buffer_atomic_umin(self.mem, desc, soffset=0, vaddr=96, cmp_val=8, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 42)
+        self.assertEqual(self.mem.read_u32(96), 8)
+
+        # Offsets 97, 98, 99, 100 all exceed num_records (e.g. 97 + 4 = 101 > 100)
+        for oob_off in (97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_umin(self.mem, desc, soffset=0, vaddr=oob_off, cmp_val=10, glc=True)
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_umin(self.mem, desc, soffset=0, vaddr=0, cmp_val=1, glc=True)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_unsigned_extremes(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # 0x80000000 vs 0x7FFFFFFF -> min is 0x7FFFFFFF
+        self.mem.write_u32(0, 0x80000000)
+        ret, in_bounds = ref_buffer_atomic_umin(self.mem, desc, soffset=0, vaddr=0, cmp_val=0x7FFFFFFF, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x80000000)
+        self.assertEqual(self.mem.read_u32(0), 0x7FFFFFFF)
+
+        # UINT32_MAX vs 0x80000000 -> min is 0x80000000
+        self.mem.write_u32(4, UINT32_MAX)
+        ret2, in_bounds2 = ref_buffer_atomic_umin(self.mem, desc, soffset=0, vaddr=4, cmp_val=0x80000000, glc=True)
+        self.assertTrue(in_bounds2)
+        self.assertEqual(ret2, UINT32_MAX)
+        self.assertEqual(self.mem.read_u32(4), 0x80000000)
+
+    def test_float_and_nan_bit_patterns_as_raw_uint32(self) -> None:
+        # Buffer atomic umin operates on raw untyped 32-bit words
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        # Comparing +0.0 (0x00000000) vs -0.0 (0x80000000):
+        # In unsigned integer comparison: 0x00000000 < 0x80000000
+        self.mem.write_u32(8, 0x80000000)  # -0.0 bits
+        ret, in_bounds = ref_buffer_atomic_umin(self.mem, desc, soffset=0, vaddr=8, cmp_val=0x00000000, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x80000000)
+        self.assertEqual(self.mem.read_u32(8), 0x00000000)
+
+        # Comparing +1.0f (0x3F800000) vs -1.0f (0xBF800000):
+        # 0x3F800000 < 0xBF800000 -> min is 0x3F800000
+        self.mem.write_u32(12, 0xBF800000)
+        ret2, in_bounds2 = ref_buffer_atomic_umin(self.mem, desc, soffset=0, vaddr=12, cmp_val=0x3F800000, glc=True)
+        self.assertTrue(in_bounds2)
+        self.assertEqual(ret2, 0xBF800000)
+        self.assertEqual(self.mem.read_u32(12), 0x3F800000)
+
+        # Subnormal float (0x00000001) vs QNaN (0x7FC00000):
+        # 0x00000001 < 0x7FC00000 -> min is 0x00000001
+        self.mem.write_u32(16, 0x7FC00000)
+        ret3, in_bounds3 = ref_buffer_atomic_umin(self.mem, desc, soffset=0, vaddr=16, cmp_val=0x00000001, glc=True)
+        self.assertTrue(in_bounds3)
+        self.assertEqual(ret3, 0x7FC00000)
+        self.assertEqual(self.mem.read_u32(16), 0x00000001)
+
+
 if __name__ == "__main__":
     unittest.main()
