@@ -1020,5 +1020,77 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(shift, 2)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Test suite for IEEE-754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_nan_inputs_always_clamp_to_zero(self) -> None:
+        snan = 0x7C01
+        qnan = 0x7E01
+        self.assertTrue(is_f16_snan(snan))
+        self.assertTrue(is_f16_qnan(qnan))
+
+        # NaN in src0
+        self.assertEqual(ref_fma_clamp_f16(snan, F16_POS_ONE, F16_POS_ZERO), F16_POS_ZERO)
+        # NaN in src1
+        self.assertEqual(ref_fma_clamp_f16(F16_POS_ONE, qnan, F16_POS_ZERO), F16_POS_ZERO)
+        # NaN in src2
+        self.assertEqual(ref_fma_clamp_f16(F16_POS_ONE, F16_POS_ONE, snan), F16_POS_ZERO)
+
+        # Packed NaN clamp across both halves
+        s0 = pack_f16x2(snan, F16_POS_ONE)
+        s1 = pack_f16x2(F16_POS_ONE, qnan)
+        s2 = pack_f16x2(F16_POS_ZERO, F16_POS_ZERO)
+        res = ref_v_pk_fma_clamp_f16(s0, s1, s2)
+        self.assertEqual(res, pack_f16x2(F16_POS_ZERO, F16_POS_ZERO))
+
+    def test_signed_zero_combinations(self) -> None:
+        # Negative zero clamped to positive zero
+        res_nz = ref_fma_clamp_f16(F16_NEG_ZERO, F16_POS_ONE, F16_NEG_ZERO)
+        self.assertEqual(res_nz, F16_POS_ZERO)
+
+        # Exact cancellation to zero: 1.0 * 1.0 + (-1.0) = 0.0
+        res_cancel = ref_fma_clamp_f16(F16_POS_ONE, F16_POS_ONE, F16_NEG_ONE)
+        self.assertEqual(res_cancel, F16_POS_ZERO)
+
+    def test_signed_infinities_and_invalid_operations(self) -> None:
+        # +inf * 1.0 + 0.0 -> +inf -> clamped to 1.0
+        self.assertEqual(ref_fma_clamp_f16(F16_POS_INF, F16_POS_ONE, F16_POS_ZERO), F16_POS_ONE)
+        # -inf * 1.0 + 0.0 -> -inf -> clamped to +0.0
+        self.assertEqual(ref_fma_clamp_f16(F16_NEG_INF, F16_POS_ONE, F16_POS_ZERO), F16_POS_ZERO)
+        # +inf + -inf -> invalid -> NaN -> clamped to +0.0
+        self.assertEqual(ref_fma_clamp_f16(F16_POS_INF, F16_POS_ONE, F16_NEG_INF), F16_POS_ZERO)
+        # 0.0 * inf -> invalid -> NaN -> clamped to +0.0
+        self.assertEqual(ref_fma_clamp_f16(F16_POS_ZERO, F16_POS_INF, F16_POS_HALF), F16_POS_ZERO)
+
+    def test_subnormal_precision_and_underflow(self) -> None:
+        # Smallest subnormal * 1.0 + 0.0 = smallest subnormal
+        res_sub = ref_fma_clamp_f16(F16_MIN_SUBNORMAL, F16_POS_ONE, F16_POS_ZERO)
+        self.assertEqual(res_sub, F16_MIN_SUBNORMAL)
+        self.assertTrue(is_f16_subnormal(res_sub))
+
+        # Smallest subnormal * 0.5 + 0.0 -> underflow to +0.0
+        res_under = ref_fma_clamp_f16(F16_MIN_SUBNORMAL, F16_POS_HALF, F16_POS_ZERO)
+        self.assertEqual(res_under, F16_POS_ZERO)
+
+    def test_overflow_saturation(self) -> None:
+        # MAX_NORMAL (65504) * 2.0 + 1.0 -> overflow -> clamped to 1.0
+        res_over = ref_fma_clamp_f16(F16_MAX_NORMAL, F16_POS_TWO, F16_POS_ONE)
+        self.assertEqual(res_over, F16_POS_ONE)
+
+    def test_fused_intermediate_precision(self) -> None:
+        # In FMA, intermediate product is kept with infinite precision:
+        # Let a = 1.0 + 2^-10 = 0x3C01
+        # b = 1.0 - 2^-10 = 0x3BFF
+        # a * b = 1.0 - 2^-20
+        # If we add c = -1.0 + 2^-10 = 0xBBFF,
+        # Exact sum is (1.0 - 2^-20) - 1.0 + 2^-10 = 2^-10 - 2^-20 > 0
+        a = 0x3C01
+        b = 0x3BFF
+        c = 0xBBFF
+        res = ref_fma_clamp_f16(a, b, c)
+        self.assertGreater(u16_to_f16(res), 0.0)
+        self.assertLessEqual(u16_to_f16(res), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
