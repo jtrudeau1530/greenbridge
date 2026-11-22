@@ -136,6 +136,61 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("0DRP@16", lines[1])
 
+    def assert_output_collision(self, *args):
+        r = subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--out and --csv must refer to different files", r.stderr)
+
+    def test_explicit_output_collision_before_scan(self):
+        # A missing input would give a different error if the scan started.
+        self.assert_output_collision("missing.rpf", "--out", "new.json", "--csv", "./new.json")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "new.json")))
+
+    def test_default_output_collision_preserves_report(self):
+        make_rpf(os.path.join(self.root, "nav.rpf"))
+        report = os.path.join(self.root, "nav.navmesh-index.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        self.assert_output_collision("nav.rpf", "--csv", report)
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_hard_link_output_collision(self):
+        report = os.path.join(self.root, "out.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        try:
+            os.link(report, os.path.join(self.root, "out.csv"))
+        except OSError as exc:
+            self.skipTest(f"cannot create a hard link: {exc}")
+        self.assert_output_collision(self.root, "--out", "out.json", "--csv", "out.csv")
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_report_path_cannot_be_scanned_input(self):
+        # Before: --out/--csv naming a file the scan reads replaced that file with the report, exit 0.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page(pages=4))
+        rpf = os.path.join(self.root, "nav.rpf")
+        make_rpf(rpf)
+        originals = {}
+        for path in (carved, rpf):
+            with open(path, "rb") as f:
+                originals[path] = f.read()
+        cases = [((folder, "--out", carved), carved), ((folder, "--csv", carved), carved),
+                 ((rpf, "--out", rpf), rpf), ((rpf, "--csv", rpf), rpf)]
+        for args, path in cases:
+            r = subprocess.run([sys.executable, "-I", TOOL, *args], cwd=ROOT, capture_output=True, text=True,
+                               check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), originals[path], f"{args} touched the input")
+
     def test_not_an_rpf(self):
         path = os.path.join(self.root, "not.rpf")
         with open(path, "wb") as f:

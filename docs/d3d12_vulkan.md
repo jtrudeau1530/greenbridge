@@ -284,7 +284,18 @@ What is implemented (all of it testable without the game):
     2D textures in the common render-target, depth and texture formats (typeless families become mutable-format
     images), plus non-attachment 3D textures with mipmapped upload, image copy and readback, and multisampled 2D
     textures (single-mip render targets or depth-stencils, in the sample counts the GPU has for the format);
-  - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views;
+  - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views.
+    When `ALLOW_UNORDERED_ACCESS` is requested on a GPU whose `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` lacks native
+    `STORAGE_IMAGE` support (for example NVIDIA), the layer backs the texture with a mutable `VK_FORMAT_R32_UINT`
+    image (`MUTABLE_FORMAT | EXTENDED_USAGE` + `VkImageFormatListCreateInfo` `{R32_UINT, E5B9G9R9_UFLOAT_PACK32}`),
+    refusing `ALLOW_RENDER_TARGET`, `ALLOW_DEPTH_STENCIL` and `DENY_SHADER_RESOURCE`: `CheckFeatureSupport` advertises
+    `TYPED_UNORDERED_ACCESS_VIEW` and `UAV_TYPED_STORE` (plus `UAV_TYPED_LOAD` with `R32_UINT` storage atomics) while
+    keeping `RENDER_TARGET` off; SRV and UAV descriptors emit the `E5B9G9R9` T# (`FORMAT 132`, RGB1) and reject
+    incompatible casts, while set 0 creates a `VK_IMAGE_USAGE_SAMPLED_BIT` `E5B9G9R9` sampled view and a
+    `VK_IMAGE_USAGE_STORAGE_BIT` `R32_UINT` storage view (bound in `as_uint` / `r32ui`, never `as_float`);
+    `ClearUnorderedAccessViewFloat` packs RGB9E5 with round-half-up (clamping negative/NaN to 0 and +Inf/overflow to
+    65408, bumping on 512) and `ClearUnorderedAccessViewUint` writes 0, matching WARP (`d3d12_r9g9b9e5_uav_test`,
+    `d3d12_uav_clear_test`);
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
   - `R10G10B10_XR_BIAS_A2_UNORM` maps to `VK_FORMAT_A2B10G10R10_UNORM_PACK32`, the same packed 10:10:10:2
@@ -1224,6 +1235,9 @@ The trace will enumerate them.
   operation group the wave intrinsics map to is present (`BASIC`, `VOTE`, `BALLOT`, `SHUFFLE`, `ARITHMETIC`),
   because D3D12 promises them all behind that one bool. `WaveLaneCountMin`/`Max` are the subgroup size range
   (`VkPhysicalDeviceSubgroupSizeControlProperties`, or the single `subgroupSize` without those 1.3 properties).
+  The exception is an Intel integrated GPU (D3D-121): Vulkan reports 8..32 there, Intel's D3D12 driver a fixed
+  16..16, and the layer answers 16..16 like the host. Measured on Xe-LP: UHD 770 (32.0.101.6129) and Raptor Lake-S
+  Mobile (101.7092). Discrete Arc keeps the Vulkan range until it is measured (TEST-57).
   `TotalLaneCount` has no Vulkan equivalent: D3D12 counts every lane of the device, and the layer answers one full
   wave, so a game that sizes work from it plans for less parallelism than the GPU has, never more. Measured
   against the host PC runtime (616.86) on an RTX 5070: `S_OK` with `WaveOps` 1, lanes 32..32 and a total of 6144,
@@ -1723,7 +1737,7 @@ Not implemented yet:
 - Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
   SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
   `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins
-  conditional rendering on the predicate buffer, plain for `EQUAL_ZERO` (Vulkan discards when the word is 0) and
+  conditional rendering on the captured condition, plain for `EQUAL_ZERO` (Vulkan discards when the word is 0) and
   `VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT` for `NOT_EQUAL_ZERO`, ends it before a new predicate (it cannot
   nest) and at the end of the list (predication does not carry over to the next list). While a predicate is set,
   whole-view clears are replayed as one rectangle with `vkCmdClearAttachments`, because `vkCmdClearColorImage` and
@@ -1738,14 +1752,54 @@ Not implemented yet:
   Checked by part E of `vk_command_replay_test` on an NVIDIA GeForce RTX 3070, and end to end by
   `d3d12_vulkan_device_test` (an occlusion query resolved into a predicate, through legacy and enhanced barriers)
   on an NVIDIA GeForce RTX 5070.
+  The 64-bit value is captured on the GPU at each `SetPredication`: an internal eight-byte copy and a
+    one-invocation compute pass OR the two dwords into a private 32-bit condition. Later writes to the source do
+    not change that snapshot. A null buffer disables predication; rebinding ends the previous conditional scope
+    before the capture, so the internal dispatch is never predicated. Bounds checks require all eight bytes.
+    Capture arenas and descriptors remain alive until their command buffer's timeline ticket completes. No
+    CPU readback or per-predicate wait is used. This helper requires a compute-capable configured queue family;
+    unsupported queues fail preparation instead of falling back to the low word. The synthetic GLSL source and
+    embedded SPIR-V are shipped together; normal builds do not need a shader compiler.
+    Capturing a new predicate inside an active pipeline-statistics query is rejected as unsupported, because the
+    helper's compute invocation would otherwise pollute the application's result; capturing before the query is
+    allowed. Virtualising that query is not part of this change.
+    Integration notes for #291 and D3D-27: the capture helper binds its own compute pipeline, descriptor set 0
+    and push constants. The compute path must restore those bindings afterward, or bind its application state
+    before each dispatch. Copies and compute dispatches cannot execute inside dynamic rendering, so render-pass
+    integration must place the capture outside the rendering scope while preserving capture at `SetPredication`.
+    These are requirements for those future integrations, not compute-dispatch or render-pass support added here.
+  `CopyBufferRegion` under a predicate instead uses a byte-granular compute dispatch inside the captured
+  conditional scope; both operations, unaligned offsets and lengths, and the full 64-bit predicate are covered.
+  Zero-byte copies are no-ops, as checked against native WARP. Unpredicated copies retain `vkCmdCopyBuffer`.
+  The compute helper requires enabled Vulkan 1.2 `storageBuffer8BitAccess` (not `shaderInt8`) and a compute queue;
+  without it, preparation rejects the predicated buffer copy rather than executing it unconditionally.
+  Descriptor windows respect storage-buffer alignment/range and dispatch limits, including arena offsets.
+  Copy descriptors are owned by command-buffer slots until the submission timeline completes. Memory dependencies order prior writes,
+  subsequent reads and successive windows. Direct and compute queues support the helper; copy queues reject
+  active predication. Preparation is serialized under the tracker lock, preserving resource -> tracker -> submit
+  lock order and the copy-then-commit tracker. Readback writes accumulate COMPUTE_SHADER for the helper and COPY
+  for ordinary copies; mixed lists accumulate both before main's queue-specific host-stage filtering.
+  This helper also binds compute pipeline/set 0/push constants, so the
+  application-state restoration requirement above applies. A predicated copy inside an active pipeline-statistics
+  query is rejected to avoid counting internal compute work.
+  Synthetic checks: `predicated_copy_test` covers preparation and rejection paths without a GPU;
+  `d3d12_predicated_copy_test` compares 180 byte-exact cases against WARP and an independent literal oracle,
+  plus 16 query-to-copy cases: real empty ordinary/binary occlusion queries resolve zero into a default-heap
+  predicate at offsets 0/16, both predicate operations govern copies, and executing overwrite copies replace zero
+  with a high-word-only value. Four paired controls verify that recapturing the same address changes exactly one
+  13-byte destination region; without recapture, later copies keep using the captured zero. Predicate-buffer guards
+  and all untouched destination bytes are checked too. These query cases do not cover nonzero visible-draw counts;
+  `vk_predicated_copy_test` forces small windows and dispatches, arena prefixes, dependent copies, offset rebinding,
+  reset, 32 gated plus 32 reused submissions, failed-submit cleanup and host stages on all three queue kinds.
+  Binary and overlapping occlusion fixtures also verify that query results resolve under a false predicate while
+  a dedicated copy destination remains unchanged; disabling predication copies into a separate region.
+  The embedded shader is generated from `predicated_copy.comp`
+  with glslang 16.6.0 (`-V --target-env vulkan1.2 -Os`) and validated for Vulkan 1.2.
+
   Open:
-  - Copies and resolves. D3D12 predicates `CopyBufferRegion`, `CopyTextureRegion`, `CopyResource` and
-    `ResolveSubresource`; Vulkan's conditional rendering does not cover transfer commands, so they run
-    unconditionally. `PreparedList::unpredicated_copies` counts them. A fix replays a predicated copy as a compute
-    dispatch, which conditional rendering does cover.
-  - The 64-bit value. Vulkan reads one 32-bit word, so the low dword of D3D12's value is used: wrong only when the
-    low dword is 0 and the high one is not (an occlusion count that is a non-zero multiple of 2^32). A fix is a small
-    compute pass that ORs both dwords into a condition buffer.
+  - Texture copies, `CopyResource` and resolves. Vulkan's conditional rendering does not cover transfer
+    commands, so these still run unconditionally and `PreparedList::unpredicated_copies` counts them.
+
   - Draws, dispatches and `ExecuteIndirect` are covered by conditional rendering as soon as they are replayed
     (D3D-3, D3D-4, D3D-17); `ClearUnorderedAccessView*` and `ResolveSubresource` need the same check when added.
 
@@ -2378,9 +2432,13 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     refused on an RTX 5080 (616.92), created on an AMD Radeon and on WARP, where typed UAV writes round-trip; and on
     both GPUs one allocation can serve both uses, a mutable `R32_UINT` Vulkan image with `E5B9G9R9_UFLOAT_PACK32` in
     its format list, written through an `R32_UINT` storage view and sampled through an `E5B9G9R9` view.
+    **Implemented** in `d3d12_vulkan_device.cpp` and `src/uav_clear.h` (`d3d12_r9g9b9e5_uav_test`): on an RTX 3060 Ti
+    (driver 621.01, `LEONIDA_FSR_DEVICE=vulkan LEONIDA_FSR_NO_STANDIN=1`, `LEONIDA_VK_VALIDATION=1`),
+    `ffxCreateContext` and `ffxDestroyContext` both return OK without `standin_slot76` and with 0 validation errors.
     Open: a float store to that format rounds differently on PC devices (@Vonsek, #864: AMD Radeon truncates the
     mantissas, WARP rounds to nearest even; 609 of 794 test triples differ). Which rule the console FSR needs, and
-    whether its shaders store floats to that texture at all, waits on decoding its `FSPX` shaders.
+    whether its shaders store floats to that texture at all (requiring shader-side packing into the `R32_UINT` storage
+    view), waits on decoding its `FSPX` shaders.
   - With that one texture created as `R32_UINT` instead (the test's PC stand-in, `standin_slot76`), or as is on
     WARP, `ffxCreateContext` and `ffxDestroyContext` both return OK. Device slots called: 14 (5), 15 (26), 18 (10),
     19 (16), **27

@@ -7,6 +7,7 @@ Windows runs llvm-mc through WSL (the official Windows LLVM build has no AMDGPU 
     python -I tests/test_mc_command.py
 """
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -98,6 +99,62 @@ class SplitCommandTest(unittest.TestCase):
     def test_mc_command_falls_back_to_the_path_name(self):
         with mock.patch.dict(os.environ, {"LLVM_MC": ""}):
             self.assertEqual(mc_command.mc_command(), ["llvm-mc"])
+
+
+class MissingLlvmMcTest(unittest.TestCase):
+    """An llvm-mc that can't be started ends each tool with one line, not a FileNotFoundError traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.missing = os.path.join(self.tmp.name, "no-llvm-mc.exe")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_run_names_the_command_and_how_to_set_it(self):
+        with self.assertRaises(SystemExit) as cm:
+            mc_command.run([self.missing, "-show-encoding"], input="", capture_output=True, text=True)
+        message = str(cm.exception.code)
+        self.assertIn(f"'{self.missing}' could not be started", message)
+        self.assertIn("LLVM_MC", message)
+        self.assertIn("build_llvm_mc.ps1", message)
+        self.assertNotIn("--llvm-mc", message)   # only a tool that has the option names it
+
+    def test_run_names_the_tools_own_option(self):
+        with self.assertRaises(SystemExit) as cm:
+            mc_command.run([self.missing], flag="--llvm-mc", input="", capture_output=True, text=True)
+        self.assertIn("set LLVM_MC (or pass --llvm-mc)", str(cm.exception.code))
+
+    def test_run_passes_a_command_that_starts_through(self):
+        r = mc_command.run([sys.executable, "-c", "import sys; print(sys.stdin.read()); sys.exit(3)"],
+                           input="hi", capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout.strip()), (3, "hi"))
+
+    def test_every_tool_that_assembles_gives_one_line(self):
+        build = os.path.join(self.tmp.name, "build")
+        os.mkdir(build)
+        for name in ("vk_compute_test", "vk_store_test", "vk_harness"):   # run_gpu_tests.py only checks they exist
+            open(os.path.join(build, name + (".exe" if os.name == "nt" else "")), "wb").close()
+        tools = {
+            "run_gpu_tests.py": [os.path.join(ROOT, "scripts", "run_gpu_tests.py"), "--build", build],
+            "valu_fuzz.py": [os.path.join(ROOT, "tools", "valu_fuzz.py"), "--family", "f16", "--programs", "1",
+                             "--build", build],
+            "lds_fuzz.py": [os.path.join(ROOT, "tools", "lds_fuzz.py"), "--programs", "1", "--build", build],
+            "crosslane_fuzz.py": [os.path.join(ROOT, "tools", "crosslane_fuzz.py"), "--programs", "1"],
+            "image_fuzz.py": [os.path.join(ROOT, "tools", "image_fuzz.py"), "--programs", "1", "--build", build],
+            "build.py": [os.path.join(ROOT, "runtime", "test", "shaders", "build.py"),
+                         os.path.join(self.tmp.name, "spirv"), "cs_store"],
+        }
+        env = dict(os.environ, LLVM_MC=self.missing)
+        for name, argv in tools.items():
+            with self.subTest(tool=name):
+                p = subprocess.run([sys.executable, "-I", *argv], capture_output=True, text=True, env=env,
+                                   cwd=self.tmp.name, timeout=300)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertIn("could not be started", p.stderr)
+                # Only run_gpu_tests.py has an --llvm-mc option; the others read LLVM_MC alone.
+                self.assertEqual("--llvm-mc" in p.stderr, name == "run_gpu_tests.py", p.stderr)
 
 
 if __name__ == "__main__":

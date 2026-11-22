@@ -1050,10 +1050,17 @@ public:
             domains[0].timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
             domains[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
             std::uint64_t stamps[2]{}, deviation = 0;
+            LARGE_INTEGER before{}, after{};
+            QueryPerformanceCounter(&before);
             if (clock_.calibrated(context_.device(), 2, domains, stamps, &deviation) == VK_SUCCESS) {
-                *gpu = stamps[0];
-                *cpu = stamps[1];
-                return S_OK;
+                QueryPerformanceCounter(&after);
+                // Wine can expose a host monotonic clock that differs from its Win32 QPC clock.
+                // Keep the GPU and CPU samples paired by taking a fresh GPU sample on fallback.
+                if (stamps[1] >= UINT64(before.QuadPart) && stamps[1] <= UINT64(after.QuadPart)) {
+                    *gpu = stamps[0];
+                    *cpu = stamps[1];
+                    return S_OK;
+                }
             }
         }
         return submitted_calibration(*gpu, *cpu);

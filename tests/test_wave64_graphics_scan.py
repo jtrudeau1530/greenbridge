@@ -2,6 +2,8 @@
 
     python -I tests/test_wave64_graphics_scan.py -v
 """
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -129,10 +131,65 @@ class ScanTests(unittest.TestCase):
             report = scan.scan_directory(directory)
             with open(out, "w", encoding="utf-8") as f:
                 json.dump(report, f)
-            blob = open(out, encoding="utf-8").read()
+            with open(out, encoding="utf-8") as f:
+                blob = f.read()
             self.assertNotIn(".s", blob)
             self.assertNotIn("ps_w64a", blob)
             self.assertNotIn("comment", blob)
+            self.assertIn("v_mbcnt_hi_u32_b32", blob)
+
+
+class CliTests(unittest.TestCase):
+    def test_missing_source_directory_raises_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            with contextlib.redirect_stderr(io.StringIO()):
+                scan.main(["nonexistent_shaders_dir_xyz"])
+        self.assertNotEqual(cm.exception.code, 0)
+
+    def test_out_is_directory_rejected(self):
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as out_dir:
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    scan.main([src, "--out", out_dir])
+        self.assertNotEqual(cm.exception.code, 0)
+
+    def test_out_parent_directory_missing_rejected(self):
+        with tempfile.TemporaryDirectory() as src:
+            missing_dir = os.path.join(src, "no_such_folder", "out.json")
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    scan.main([src, "--out", missing_dir])
+            self.assertNotEqual(cm.exception.code, 0)
+
+    def test_out_same_as_source_rejected(self):
+        with tempfile.TemporaryDirectory() as src:
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    scan.main([src, "--out", src])
+            self.assertNotEqual(cm.exception.code, 0)
+
+    def test_cli_execution_with_out_json(self):
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as outdir:
+            for name, text in (PS_W64_SENSITIVE, VS_W64):
+                with open(os.path.join(src, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+            out = os.path.join(outdir, "report.json")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = scan.main([src, "--out", out])
+            self.assertEqual(code, 0)
+            self.assertIn("ps: 1 shaders, 1 wave64", stdout.getvalue())
+            self.assertIn("wrote " + out, stdout.getvalue())
+            with open(out, encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertIn("per_stage", saved)
+            self.assertIn("other_stages", saved)
+            self.assertEqual(saved["per_stage"]["ps"]["shaders"], 1)
+            self.assertEqual(saved["per_stage"]["vs"]["shaders"], 1)
+            with open(out, encoding="utf-8") as f:
+                blob = f.read()
+            self.assertNotIn(".s", blob)
+            self.assertNotIn("ps_w64a", blob)
             self.assertIn("v_mbcnt_hi_u32_b32", blob)
 
 

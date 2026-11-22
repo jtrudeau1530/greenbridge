@@ -9,7 +9,8 @@ What this covers today: 2D `image_load`, nonzero `dmask` values, `R8G8B8A8_UNORM
 `R32G32B32A32_SFLOAT` and `R32_SFLOAT`, at sizes that divide the 64x64 draw (8/16/32/64), every texel read
 at least once.
 
-Integer coverage uses 8-bit UINT/SINT storage views and converts loaded integers to exactly representable floats.
+Integer coverage uses 8-bit UINT/SINT sampled images (the translator reads them through uint/sint aliases of the
+sampled array) and converts loaded integers to exactly representable floats.
 Not covered yet: wider integer formats, mips, 1D/2D-array/3D/cube, `image_sample`/`gather` with filters and borders, and texel
 offsets with `VK_KHR_maintenance8`.
 
@@ -56,7 +57,7 @@ DMASKS = (0xf, *range(1, 0xf))
 def assemble(asm: str, name: str, work: str) -> None:
     """Assemble with llvm-mc like runtime/test/shaders/build.py, into work/disasm/<name>.s."""
     cmd = mc_command.mc_command() + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
-    r = subprocess.run(cmd, input=asm, capture_output=True, text=True)
+    r = mc_command.run(cmd, input=asm, capture_output=True, text=True)
     if r.returncode or "error:" in r.stderr:
         raise SystemExit(f"llvm-mc rejected {name}:\n{r.stderr}")
     code = "".join(line for line in r.stdout.splitlines(keepends=True)

@@ -4,9 +4,12 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace rt::dxgi {
@@ -101,12 +104,19 @@ private:
 
 class SwapChain final : public IDXGISwapChain3 {
 public:
-    SwapChain(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
-              VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
-        : context_(context),
-          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex()) {}
+    SwapChain(IDXGIFactory4* parent, leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa,
+              VkInstance instance, VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
+              std::uint32_t queue_family)
+        : parent_(parent),
+          context_(context),
+          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex()) {
+        if (parent_) parent_->AddRef();
+    }
 
-    ~SwapChain() { unregister_buffers(); }
+    ~SwapChain() {
+        unregister_buffers();
+        if (parent_) parent_->Release();
+    }
 
     bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc) {
         hwnd_ = hwnd;
@@ -149,7 +159,12 @@ public:
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
-    HRESULT STDMETHODCALLTYPE GetParent(REFIID, void**) override { stub("IDXGISwapChain::GetParent"); return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!parent_) return E_NOINTERFACE;
+        return parent_->QueryInterface(riid, out);
+    }
 
     // IDXGIDeviceSubObject
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void**) override { stub("IDXGISwapChain::GetDevice"); return E_NOTIMPL; }
@@ -160,6 +175,7 @@ public:
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
         const std::uint32_t cur = swapchain_.current_back_buffer_index();
         if (!swapchain_.present(cur)) return E_FAIL;
+        ++present_count_;
         std::uint32_t next = 0;
         return swapchain_.acquire_next_image(next) ? S_OK : E_FAIL;
     }
@@ -215,7 +231,11 @@ public:
     HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; }
     HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* p) override { if (p) *p = 0; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* p) override {
+        if (!p) return E_INVALIDARG;
+        *p = present_count_.load(std::memory_order_relaxed);
+        return S_OK;
+    }
 
     // IDXGISwapChain1
     HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1* desc) override {
@@ -255,8 +275,16 @@ public:
         if (h) *h = swapchain_.extent().height;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* n) override { if (n) *n = 2; return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
+        if (max_latency == 0 || max_latency > 16) return E_INVALIDARG;
+        max_frame_latency_.store(max_latency, std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* n) override {
+        if (!n) return E_INVALIDARG;
+        *n = max_frame_latency_.load(std::memory_order_relaxed);
+        return S_OK;
+    }
     HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override { return nullptr; }
     HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F*) override { return E_NOTIMPL; }
@@ -312,10 +340,285 @@ private:
     }
 
     std::atomic<ULONG> refs_{1};
+    IDXGIFactory4* parent_ = nullptr;
     leonida::VulkanContext& context_;
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
+    std::atomic<UINT> present_count_{0};
+    std::atomic<UINT> max_frame_latency_{2};
+};
+
+struct ReservationState {
+    std::atomic<UINT64> local{0};
+    std::atomic<UINT64> non_local{0};
+};
+
+// Video-memory reservations are scoped per physical adapter in the process (matching native DXGI,
+// where separate IDXGIAdapter3 handles opened for the same LUID observe each other's reservations).
+std::shared_ptr<ReservationState> adapter_reservation_state(LUID luid, VkPhysicalDevice physical) {
+    static std::mutex mutex;
+    static std::map<std::tuple<std::uint32_t, std::int32_t, std::uintptr_t>, std::shared_ptr<ReservationState>> table;
+    const bool has_luid = (luid.LowPart != 0 || luid.HighPart != 0);
+    const auto key =
+        has_luid ? std::make_tuple(std::uint32_t(luid.LowPart), std::int32_t(luid.HighPart), std::uintptr_t(0))
+                 : std::make_tuple(std::uint32_t(0), std::int32_t(0), reinterpret_cast<std::uintptr_t>(physical));
+    std::lock_guard lock(mutex);
+    auto& entry = table[key];
+    if (!entry) entry = std::make_shared<ReservationState>();
+    return entry;
+}
+
+// On discrete GPUs without Resizable BAR, Vulkan exposes a second smaller DEVICE_LOCAL heap for the
+// CPU-visible BAR1 aperture (typically 256 MiB) that aliases the same physical VRAM as the primary heap.
+// Pick the largest DEVICE_LOCAL heap so DedicatedVideoMemory and LOCAL budget/usage match Windows DXGI
+// instead of double-counting BAR1.
+std::uint32_t primary_device_local_heap(const VkPhysicalDeviceMemoryProperties& mem) {
+    std::uint32_t best = UINT32_MAX;
+    VkDeviceSize best_size = 0;
+    for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+        if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
+        if (best == UINT32_MAX || mem.memoryHeaps[i].size > best_size) {
+            best = i;
+            best_size = mem.memoryHeaps[i].size;
+        }
+    }
+    return best;
+}
+
+// Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
+// ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
+class Adapter final : public IDXGIAdapter3 {
+public:
+    Adapter(IDXGIFactory4* parent, PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical)
+        : parent_(parent), gipa_(gipa), instance_(instance), physical_(physical) {
+        if (parent_) parent_->AddRef();
+        populate_desc();
+        reservations_ = adapter_reservation_state(desc_.AdapterLuid, physical_);
+    }
+
+    ~Adapter() {
+        if (parent_) parent_->Release();
+    }
+
+    LUID luid() const { return desc_.AdapterLuid; }
+
+    // IUnknown
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (!left) delete this;
+        return left;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIAdapter) ||
+            riid == __uuidof(IDXGIAdapter1) || riid == __uuidof(IDXGIAdapter2) || riid == __uuidof(IDXGIAdapter3)) {
+            *out = static_cast<IDXGIAdapter3*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    // IDXGIObject
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!parent_) return E_NOINTERFACE;
+        return parent_->QueryInterface(riid, out);
+    }
+
+    // IDXGIAdapter
+    HRESULT STDMETHODCALLTYPE EnumOutputs(UINT, IDXGIOutput** out) override {
+        if (out) *out = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
+    }
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_ADAPTER_DESC* desc) override {
+        if (!desc) return E_INVALIDARG;
+        std::memcpy(desc->Description, desc_.Description, sizeof(desc->Description));
+        desc->VendorId = desc_.VendorId;
+        desc->DeviceId = desc_.DeviceId;
+        desc->SubSysId = desc_.SubSysId;
+        desc->Revision = desc_.Revision;
+        desc->DedicatedVideoMemory = desc_.DedicatedVideoMemory;
+        desc->DedicatedSystemMemory = desc_.DedicatedSystemMemory;
+        desc->SharedSystemMemory = desc_.SharedSystemMemory;
+        desc->AdapterLuid = desc_.AdapterLuid;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE CheckInterfaceSupport(REFGUID interface_name, LARGE_INTEGER* umd_version) override {
+        if (interface_name == __uuidof(IDXGIDevice)) {
+            if (umd_version) umd_version->QuadPart = 0;
+            return S_OK;
+        }
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    // IDXGIAdapter1
+    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_ADAPTER_DESC1* desc) override {
+        if (!desc) return E_INVALIDARG;
+        std::memcpy(desc->Description, desc_.Description, sizeof(desc->Description));
+        desc->VendorId = desc_.VendorId;
+        desc->DeviceId = desc_.DeviceId;
+        desc->SubSysId = desc_.SubSysId;
+        desc->Revision = desc_.Revision;
+        desc->DedicatedVideoMemory = desc_.DedicatedVideoMemory;
+        desc->DedicatedSystemMemory = desc_.DedicatedSystemMemory;
+        desc->SharedSystemMemory = desc_.SharedSystemMemory;
+        desc->AdapterLuid = desc_.AdapterLuid;
+        desc->Flags = desc_.Flags;
+        return S_OK;
+    }
+
+    // IDXGIAdapter2
+    HRESULT STDMETHODCALLTYPE GetDesc2(DXGI_ADAPTER_DESC2* desc) override {
+        if (!desc) return E_INVALIDARG;
+        *desc = desc_;
+        return S_OK;
+    }
+
+    // IDXGIAdapter3
+    HRESULT STDMETHODCALLTYPE RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE, DWORD* cookie) override {
+        if (cookie) *cookie = 0;
+        return E_NOTIMPL;
+    }
+    void STDMETHODCALLTYPE UnregisterHardwareContentProtectionTeardownStatus(DWORD) override {}
+    HRESULT STDMETHODCALLTYPE QueryVideoMemoryInfo(UINT node_index, DXGI_MEMORY_SEGMENT_GROUP group,
+                                                   DXGI_QUERY_VIDEO_MEMORY_INFO* info) override {
+        if (node_index != 0 || !info) return E_INVALIDARG;
+        if (group != DXGI_MEMORY_SEGMENT_GROUP_LOCAL && group != DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)
+            return E_INVALIDARG;
+        std::memset(info, 0, sizeof(*info));
+        const bool want_local = (group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL);
+        if (has_memory_budget_ && gipa_ && instance_ && physical_) {
+            if (const auto get_mem2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+                    gipa_(instance_, "vkGetPhysicalDeviceMemoryProperties2"))) {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+                VkPhysicalDeviceMemoryProperties2 mem2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+                get_mem2(physical_, &mem2);
+                const auto& mem = mem2.memoryProperties;
+                if (want_local) {
+                    const std::uint32_t local_heap = primary_device_local_heap(mem);
+                    if (local_heap != UINT32_MAX) {
+                        info->Budget = budget.heapBudget[local_heap];
+                        info->CurrentUsage = budget.heapUsage[local_heap];
+                    }
+                } else {
+                    for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+                        if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+                            info->Budget += budget.heapBudget[i];
+                            info->CurrentUsage += budget.heapUsage[i];
+                        }
+                    }
+                }
+            }
+        }
+        if (info->Budget == 0) {
+            info->Budget = want_local ? desc_.DedicatedVideoMemory : desc_.SharedSystemMemory;
+        }
+        info->AvailableForReservation = info->Budget / 2;
+        info->CurrentReservation = want_local ? reservations_->local.load(std::memory_order_relaxed)
+                                              : reservations_->non_local.load(std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetVideoMemoryReservation(UINT node_index, DXGI_MEMORY_SEGMENT_GROUP group,
+                                                        UINT64 reservation) override {
+        if (node_index != 0) return E_INVALIDARG;
+        if (group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL) {
+            reservations_->local.store(reservation, std::memory_order_relaxed);
+            return S_OK;
+        }
+        if (group == DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) {
+            reservations_->non_local.store(reservation, std::memory_order_relaxed);
+            return S_OK;
+        }
+        return E_INVALIDARG;
+    }
+    HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE, DWORD* cookie) override {
+        if (cookie) *cookie = 0;
+        return E_NOTIMPL;
+    }
+    void STDMETHODCALLTYPE UnregisterVideoMemoryBudgetChangeNotification(DWORD) override {}
+
+private:
+    void populate_desc() {
+        std::memset(&desc_, 0, sizeof(desc_));
+        desc_.GraphicsPreemptionGranularity = DXGI_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
+        desc_.ComputePreemptionGranularity = DXGI_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
+        if (!gipa_ || !instance_ || !physical_) return;
+
+        VkPhysicalDeviceProperties props{};
+        bool got_props = false;
+        if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                gipa_(instance_, "vkGetPhysicalDeviceProperties2"))) {
+            VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+            VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+            get_props2(physical_, &props2);
+            props = props2.properties;
+            got_props = true;
+            static_assert(sizeof(LUID) == VK_LUID_SIZE);
+            if (id.deviceLUIDValid) std::memcpy(&desc_.AdapterLuid, id.deviceLUID, sizeof(LUID));
+        } else if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                       gipa_(instance_, "vkGetPhysicalDeviceProperties"))) {
+            get_props(physical_, &props);
+            got_props = true;
+        }
+        if (got_props) {
+            MultiByteToWideChar(CP_UTF8, 0, props.deviceName, -1, desc_.Description,
+                                static_cast<int>(std::size(desc_.Description) - 1));
+            desc_.Description[std::size(desc_.Description) - 1] = L'\0';
+            desc_.VendorId = props.vendorID;
+            desc_.DeviceId = props.deviceID;
+            desc_.Revision = props.driverVersion;
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) desc_.Flags = DXGI_ADAPTER_FLAG_SOFTWARE;
+        }
+
+        if (const auto get_mem = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+                gipa_(instance_, "vkGetPhysicalDeviceMemoryProperties"))) {
+            VkPhysicalDeviceMemoryProperties mem{};
+            get_mem(physical_, &mem);
+            const std::uint32_t local_heap = primary_device_local_heap(mem);
+            const std::uint64_t dedicated = (local_heap != UINT32_MAX) ? mem.memoryHeaps[local_heap].size : 0;
+            std::uint64_t shared = 0;
+            for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+                if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0)
+                    shared += mem.memoryHeaps[i].size;
+            }
+            desc_.DedicatedVideoMemory = static_cast<SIZE_T>(dedicated);
+            desc_.SharedSystemMemory = static_cast<SIZE_T>(shared);
+        }
+
+        if (const auto enum_exts = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                gipa_(instance_, "vkEnumerateDeviceExtensionProperties"))) {
+            std::uint32_t count = 0;
+            if (enum_exts(physical_, nullptr, &count, nullptr) == VK_SUCCESS && count > 0) {
+                std::vector<VkExtensionProperties> exts(count);
+                if (enum_exts(physical_, nullptr, &count, exts.data()) == VK_SUCCESS) {
+                    for (const auto& e : exts) {
+                        if (std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
+                            has_memory_budget_ = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::atomic<ULONG> refs_{1};
+    IDXGIFactory4* parent_ = nullptr;
+    PFN_vkGetInstanceProcAddr gipa_ = nullptr;
+    VkInstance instance_ = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_ = VK_NULL_HANDLE;
+    DXGI_ADAPTER_DESC2 desc_{};
+    bool has_memory_budget_ = false;
+    std::shared_ptr<ReservationState> reservations_;
 };
 
 class Factory final : public IDXGIFactory4 {
@@ -351,7 +654,14 @@ public:
     HRESULT STDMETHODCALLTYPE GetParent(REFIID, void**) override { return E_NOTIMPL; }
 
     // IDXGIFactory
-    HRESULT STDMETHODCALLTYPE EnumAdapters(UINT, IDXGIAdapter**) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE EnumAdapters(UINT index, IDXGIAdapter** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (index != 0) return DXGI_ERROR_NOT_FOUND;
+        auto* adapter = new Adapter(this, gipa_, instance_, physical_);
+        *out = static_cast<IDXGIAdapter*>(adapter);
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND hwnd, UINT) override { assoc_hwnd_ = hwnd; return S_OK; }
     HRESULT STDMETHODCALLTYPE GetWindowAssociation(HWND* hwnd) override {
         if (!hwnd) return E_INVALIDARG;
@@ -365,7 +675,14 @@ public:
     HRESULT STDMETHODCALLTYPE CreateSoftwareAdapter(HMODULE, IDXGIAdapter**) override { return E_NOTIMPL; }
 
     // IDXGIFactory1
-    HRESULT STDMETHODCALLTYPE EnumAdapters1(UINT, IDXGIAdapter1**) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE EnumAdapters1(UINT index, IDXGIAdapter1** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (index != 0) return DXGI_ERROR_NOT_FOUND;
+        auto* adapter = new Adapter(this, gipa_, instance_, physical_);
+        *out = static_cast<IDXGIAdapter1*>(adapter);
+        return S_OK;
+    }
     BOOL STDMETHODCALLTYPE IsCurrent() override { return TRUE; }
 
     // IDXGIFactory2
@@ -376,7 +693,7 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
-        auto* sc = new SwapChain(context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
+        auto* sc = new SwapChain(this, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
         if (!sc->init(hwnd, *desc)) {
             sc->Release();
             return E_FAIL;
@@ -404,7 +721,19 @@ public:
     UINT STDMETHODCALLTYPE GetCreationFlags() override { return 0; }
 
     // IDXGIFactory4
-    HRESULT STDMETHODCALLTYPE EnumAdapterByLuid(LUID, REFIID, void**) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE EnumAdapterByLuid(LUID luid, REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        auto* adapter = new Adapter(this, gipa_, instance_, physical_);
+        const LUID actual = adapter->luid();
+        if (actual.LowPart != luid.LowPart || actual.HighPart != luid.HighPart) {
+            adapter->Release();
+            return DXGI_ERROR_NOT_FOUND;
+        }
+        const HRESULT hr = adapter->QueryInterface(riid, out);
+        adapter->Release();
+        return hr;
+    }
     HRESULT STDMETHODCALLTYPE EnumWarpAdapter(REFIID, void**) override { return DXGI_ERROR_NOT_FOUND; }
 
 private:

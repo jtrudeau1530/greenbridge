@@ -16,6 +16,10 @@ VKC_DUMP, and every word every thread stores is compared. docs/shader_validation
                                                          # when tools/hw_oracle's tools are missing. --oracle translator,hw
                                                          # does both. No llvm-mc, Vulkan or vk_compute_test for hw alone.
 
+Exit code: 0 when every program that ran matches (or differs only in a program with a hypothesis op), 1 on a
+mismatch or an untranslated program, 2 when the only failures are harness errors: vk_compute_test timed out or
+gave no dump for a program. Such a program is listed with the others (and kept with --keep) and the run goes on.
+
 Needs LLVM_MC (llvm-mc with AMDGPU, as for the shaders stage), the Vulkan SDK and a built vk_compute_test
 (cmake --build runtime/build --target vk_compute_test). No game files.
 
@@ -48,6 +52,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
+import mc_command  # noqa: E402
 
 M32 = 0xFFFFFFFF
 M64 = (1 << 64) - 1
@@ -726,7 +731,7 @@ def assemble(mc, prog, src, disasm, fssm):
     cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", f"-mattr={mattr}", "-show-encoding"]
     if "@" in src:
         src = resolve_branches(cmd, prog, src)
-    r = subprocess.run(cmd, input=src, capture_output=True, text=True)
+    r = mc_command.run(cmd, input=src, capture_output=True, text=True)
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{src}")
     code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
@@ -746,7 +751,7 @@ def resolve_branches(cmd, prog, src):
     lines = src.splitlines()
     insns = [i for i, ln in enumerate(lines) if ln.strip() and not ln.strip().startswith(";")]
     first = "\n".join(re.sub(r"@\d+$", "0", ln) for ln in lines) + "\n"
-    r = subprocess.run(cmd, input=first, capture_output=True, text=True)
+    r = mc_command.run(cmd, input=first, capture_output=True, text=True)
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{first}")
     sizes = [len(re.findall(r"0x[0-9a-f]{2}", m)) // 4 for m in re.findall(r"encoding: \[([^\]]*)\]", r.stdout)]
@@ -784,14 +789,25 @@ def gpu_env(prog, emulate, dump, base=None):
     return env
 
 
+class HarnessError(RuntimeError):
+    """vk_compute_test did not give a result for one program: it hung, crashed or wrote no dump."""
+
+
+GPU_TIMEOUT = 60    # seconds for one program; a translated program that never ends shows up as this
+
+
 def run_gpu(exe, spv, prog, work, emulate):
     dump = os.path.join(work, "dump.bin")
     if os.path.exists(dump):
         os.remove(dump)                 # never compare a stale dump
     env = gpu_env(prog, emulate, dump)
-    r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=60)
+    try:
+        r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=GPU_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s") from None
     if not os.path.exists(dump):
-        raise RuntimeError(f"vk_compute_test gave no dump for {prog.name}: {r.stdout}{r.stderr}")
+        detail = " ".join(f"{r.stdout}{r.stderr}".split())
+        raise HarnessError(f"vk_compute_test gave no dump (exit {r.returncode}){': ' + detail if detail else ''}")
     with open(dump, "rb") as f:
         data = f.read()
     return list(struct.unpack(f"<{len(data) // 4}I", data))
@@ -843,7 +859,10 @@ def still_fails(prog, ops, mode, ctx):
         spv = os.path.join(spdir, prog.name + ".spv")
         if not os.path.exists(spv):
             return False
-        bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate"), ops)
+        try:
+            bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate"), ops)
+        except HarnessError:
+            return False                # a reduction that hangs or crashes is not the mismatch being reduced
         return bool(bad) and not hyp
 
 
@@ -973,7 +992,9 @@ def main():
     print("summary:")
     for key, st in sorted(stats.items()):
         print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))
-    return 1 if any(st["mismatch"] or st["rejected"] for st in stats.values()) else 0
+    if any(st["mismatch"] or st["rejected"] for st in stats.values()):
+        return 1
+    return 2 if any(st.get("harness_errors") for st in stats.values()) else 0
 
 
 def kept_source(prog, mode, ops, guard):
@@ -1064,14 +1085,21 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
                     continue
                 key = f"wave{p.wave} {mode}"
                 st = stats.setdefault(key, {"programs": 0, "match": 0, "mismatch": 0, "hyp_only": 0,
-                                            "rejected": 0})
+                                            "rejected": 0, "harness_errors": 0})
                 st["programs"] += 1
                 spv = os.path.join(spdir, p.name + ".spv")
                 if not os.path.exists(spv):
                     st["rejected"] += 1
                     fails.append((p, mode, "not translated", None))
                     continue
-                bad, hyp = compare(p, run_gpu(args.exe, spv, p, work, mode == "emulate"))
+                try:
+                    bad, hyp = compare(p, run_gpu(args.exe, spv, p, work, mode == "emulate"))
+                except HarnessError as e:
+                    # One program that hangs or crashes the harness used to end the run with a traceback and
+                    # lose every result before it. It is reported like the other failures and the run goes on.
+                    st["harness_errors"] += 1
+                    fails.append((p, mode, f"harness error: {e}", None))
+                    continue
                 if not bad:
                     st["match"] += 1
                 elif hyp:

@@ -39,6 +39,31 @@ class PixelChecks(unittest.TestCase):
         self.assertIn("3584", detail)
         self.assertIn("(8,0)", detail)
 
+    def test_packed_interpolation_checks_each_decoded_channel(self):
+        def half_word(value: float) -> int:
+            # Only the low 16 bits of the first three exports carry an interpolation result.
+            return 0xffff0000 | struct.unpack("<H", struct.pack("<e", value))[0]
+
+        frame = []
+        for y in range(64):
+            v = (y + 0.5) / 64
+            for x in range(64):
+                u = (x + 0.5) / 64
+                frame.append([half_word(u), half_word(v), half_word(u), struct.unpack("<I", struct.pack("<f", v))[0]])
+        self.assertEqual(rgt.interp_f16_high_problem(frame), "")
+        for pixel in (0, 2071):
+            for channel in range(4):
+                for bits in ((0x7fc00000, 0xff800000) if channel == 3 else (0x7e00, 0xfc00)):
+                    with self.subTest(pixel=pixel, channel=channel, bits=bits):
+                        saved = frame[pixel][channel]
+                        frame[pixel][channel] = bits
+                        problem = rgt.interp_f16_high_problem(frame)
+                        frame[pixel][channel] = saved
+                        self.assertIn("non-finite", problem)
+
+        frame[2071][1] = half_word(0.0)
+        self.assertIn("halves off", rgt.interp_f16_high_problem(frame))
+
     def test_nan_frame_fails(self):
         nan = self.raw(struct.pack("<4f", NAN, NAN, NAN, NAN) * 4096)
         self.assertFalse(rgt.check_bary(nan)[0])
@@ -50,6 +75,26 @@ class PixelChecks(unittest.TestCase):
                             ("wqm", rgt.check_wqm)):
             with self.subTest(check=name):
                 self.assertFalse(check(empty)[0])
+
+    def test_bitmask_perm_narrow_fragment_subgroup_skip(self):
+        import check
+        self.assertIs(rgt.bitmask_perm_narrow_skip, check.bitmask_perm_narrow_skip)
+        simd16 = self.raw(b"".join(struct.pack("<4I", i % 16, (i % 16) ^ 9, 0, 0) for i in range(64 * 64)))
+        ok, detail = rgt.check_bitmask_perm(simd16, "device: Intel ANV (subgroup 8..32)\nok 64x64\n")
+        self.assertIsNone(ok)
+        self.assertIn("16 lanes", detail)
+
+        # Same narrow output on a fixed 32..32 device is a real failure, not a skip.
+        ok, detail = rgt.check_bitmask_perm(simd16, "device: NVIDIA (subgroup 32..32)\nok 64x64\n")
+        self.assertIs(ok, False)
+        self.assertIn("want (9,17,0)", detail)
+
+        # Full 32-lane output on an 8..32 device is still judged.
+        simd32 = self.raw(b"".join(
+            struct.pack("<4I", i % 32, (i % 32) ^ 9, (((i % 32) & 5) | 16) ^ 1, 0) for i in range(64 * 64)))
+        ok, detail = rgt.check_bitmask_perm(simd32, "device: Intel ANV (subgroup 8..32)\nok 64x64\n")
+        self.assertIs(ok, True)
+        self.assertIn("4096/4096", detail)
 
 
 if __name__ == "__main__":

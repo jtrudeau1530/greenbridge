@@ -126,14 +126,25 @@ def scan_directory(disasm):
     return {"per_stage": per_stage, "other_stages": other}
 
 
-def main():
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Count candidate cross-half wave ops in wave64 graphics shaders (counts only, no names)")
     ap.add_argument("src", help="<work>/shaders/dxbc/disasm from the shaders stage")
     ap.add_argument("--out", help="write the same aggregates to a JSON file")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if not os.path.isdir(args.src):
-        raise SystemExit("not a directory: %s" % args.src)
+        ap.error(f"not a directory: {args.src}")
+    if args.out:
+        if os.path.isdir(args.out):
+            ap.error(f"{args.out} is a directory, not a JSON file")
+        out_dir = os.path.dirname(os.path.abspath(args.out))
+        if not os.path.isdir(out_dir):
+            ap.error(f"output directory does not exist: {out_dir}")
+        try:
+            if os.path.samefile(os.path.abspath(args.src), os.path.abspath(args.out)):
+                ap.error("output must not overwrite the source directory")
+        except (FileNotFoundError, OSError):
+            pass
     report = scan_directory(args.src)
     for stage, b in report["per_stage"].items():
         occ = ", ".join("%s x%d" % (op, n) for op, n in b["occurrences"].items()) or "none"
@@ -150,7 +161,8 @@ def main():
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=1)
         print("wrote %s" % args.out)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

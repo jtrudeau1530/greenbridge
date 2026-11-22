@@ -35,11 +35,14 @@ class Limit(unittest.TestCase):
         self.assertIsNone(self.limit("0"))
         self.assertIsNone(self.limit("-1"))
 
-    def test_not_a_number_is_an_error(self):
-        for bad in ("soon", "nan"):
-            with self.subTest(bad=bad), self.assertRaises(SystemExit) as ctx:
-                self.limit(bad)
-            self.assertIn("LEONIDA_GPU_TEST_TIMEOUT", str(ctx.exception.code))
+    def test_non_numeric_or_non_finite_limit_is_an_error(self):
+        for bad in ("soon", "nan", "inf", "-inf", "1e9999"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.limit(bad)
+                message = str(ctx.exception.code)
+                self.assertIn("LEONIDA_GPU_TEST_TIMEOUT", message)
+                self.assertIn(repr(bad), message)
 
 
 class HungProgram(unittest.TestCase):
