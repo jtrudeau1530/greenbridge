@@ -266,6 +266,8 @@ class Gen:
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
+        self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
+        self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
@@ -3307,80 +3309,181 @@ class Gen:
         else:
             self.x_split()
 
-    def x_round(self, data=None, bits=None):
-        """One exchange: this lane's uint `data` goes to its slot, `bits` (lo, hi; None = nothing) are ORed into
-        the wave's two mask words. Returns (read, (lo, hi)): read(lane) loads `data` of a lane (0-63) of this wave,
-        and (lo, hi) is the OR over all 64 lanes. In round-loop mode both are valid in the next segment; in
-        inline structured mode (`emulate_inline`) the barrier runs directly in place with zero x_split."""
-        if self.emulate_inline:
-            w, mask, sched, sink = self.x_sizes()
-            it = self.tmp()
-            self.emit(f"{it} = OpLoad %uint %x_it")
-            n1, sn = self.tmp(), self.tmp()
-            self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
-            self.emit(f"{sn} = OpUMod %uint {n1} {self.cu(3)}")
-            # Clear slot sn's mask words (lane 0 of each wave; other lanes write sink).
-            m0, m1, m2, m3, m4, ml, m5, m6, mp5, mp6 = (self.tmp() for _ in range(10))
-            self.emit(f"{m0} = OpIMul %uint {sn} {self.cu(w)}")
-            self.emit(f"{m1} = OpIAdd %uint {m0} %x_wave")
-            self.emit(f"{m2} = OpIMul %uint {m1} {self.cu(2)}")
+    def _ensure_x_pre_fn(self, kind):
+        """Build (once per module) the barrier-free helper OpFunction for an inline wave64 x_round pre-barrier step.
+
+        Outlines the ~20-30 instructions of ring-buffer slot clearing (`sn = (it + 1) % 3`), mask/data slot indexing,
+        and pre-barrier %x_buf store/OpAtomicOr out of %main while keeping OpControlBarrier directly at the callsite
+        in %main. Returns the helper function's SPIR-V id (`%x_pre_vote_fn`, `%x_pre_mask_fn`, or `%x_pre_data_fn`).
+        """
+        fn_name = f"%x_pre_{kind}_fn"
+        if kind in self.x_round_fns:
+            return fn_name
+        w, mask, sched, sink = self.x_sizes()
+        tail_params = {"vote": ["val"], "data": ["val"], "mask": ["b0", "b1"], "both": ["val", "b0", "b1"]}[kind]
+        if w == 1:
+            p_names = ["it", "li"] + tail_params
+        else:
+            p_names = ["it", "li", "lane", "wave"] + tail_params
+        arity = len(p_names)
+        fn_type = self.x_round_fn_types.setdefault(arity, f"%fn_x_pre{arity}")
+        params = {k: f"%xp_{kind}_{k}" for k in p_names}
+        p_it, p_li = params["it"], params["li"]
+        saved, self.body = self.body, []
+        n1, sn = self.tmp(), self.tmp()
+        self.emit(f"{n1} = OpIAdd %uint {p_it} {self.cu(1)}")
+        self.emit(f"{sn} = OpUMod %uint {n1} {self.cu(3)}")
+        if w == 1:
+            m2, m3, m4, ml, m5, m6, mp5, mp6 = (self.tmp() for _ in range(8))
+            self.emit(f"{m2} = OpIMul %uint {sn} {self.cu(2)}")
             self.emit(f"{m3} = OpIAdd %uint {m2} {self.cu(mask)}")
             self.emit(f"{m4} = OpIAdd %uint {m3} {self.cu(1)}")
-            self.emit(f"{ml} = OpIEqual %bool %x_lane {self.cu(0)}")
+            self.emit(f"{ml} = OpIEqual %bool {p_li} {self.cu(0)}")
             self.emit(f"{m5} = OpSelect %uint {ml} {m3} {self.cu(sink)}")
             self.emit(f"{m6} = OpSelect %uint {ml} {m4} {self.cu(sink)}")
             self.emit(f"{mp5} = OpAccessChain %_ptr_WG_uint_x %x_buf {m5}")
             self.emit(f"OpStore {mp5} {self.cu(0)}")
             self.emit(f"{mp6} = OpAccessChain %_ptr_WG_uint_x %x_buf {m6}")
             self.emit(f"OpStore {mp6} {self.cu(0)}")
-            if w > 1:
-                # Multi-wave hybrid mode: also zero scheduler count slot sn so any following mini/tail scheduler
-                # sees a clean ring-buffer slot.
-                q0, q1, q2, ql, q3, q4, qp3, qp4 = (self.tmp() for _ in range(8))
-                self.emit(f"{q0} = OpIMul %uint {sn} {self.cu(2)}")
-                self.emit(f"{q1} = OpIAdd %uint {q0} {self.cu(sched)}")
-                self.emit(f"{q2} = OpIAdd %uint {q1} {self.cu(1)}")
-                self.emit(f"{ql} = OpIEqual %bool %x_li {self.cu(0)}")
-                self.emit(f"{q3} = OpSelect %uint {ql} {q1} {self.cu(sink)}")
-                self.emit(f"{q4} = OpSelect %uint {ql} {q2} {self.cu(sink)}")
-                self.emit(f"{qp3} = OpAccessChain %_ptr_WG_uint_x %x_buf {q3}")
-                self.emit(f"OpStore {qp3} {self.cu(0)}")
-                self.emit(f"{qp4} = OpAccessChain %_ptr_WG_uint_x %x_buf {q4}")
-                self.emit(f"OpStore {qp4} {self.cu(0)}")
-            data_base = None
-            if data is not None:
-                par, data_base, i, p = (self.tmp() for _ in range(4))
-                self.emit(f"{par} = OpBitwiseAnd %uint {it} {self.cu(1)}")
-                self.emit(f"{data_base} = OpIMul %uint {par} {self.cu(self.x_lanes)}")
-                self.emit(f"{i} = OpIAdd %uint {data_base} %x_li")
-                self.emit(f"{p} = OpAccessChain %_ptr_WG_uint_x %x_buf {i}")
-                self.emit(f"OpStore {p} {data}")
-            rm = None
-            if bits is not None:
-                rm = self.x_mask_slot(it)
-                for k, b in enumerate(bits):
-                    if b is None:
-                        continue
-                    i, p, old = self.tmp(), self.tmp(), self.tmp()
-                    self.emit(f"{i} = OpIAdd %uint {rm} {self.cu(k)}")
-                    self.emit(f"{p} = OpAccessChain %_ptr_WG_uint_x %x_buf {i}")
-                    self.emit(f"{old} = OpAtomicOr %uint {p} {self.cu(2)} {self.cu(0)} {b}")
+        else:
+            p_lane, p_wave = params["lane"], params["wave"]
+            m0, m1, m2, m3, m4, ml, m5, m6, mp5, mp6 = (self.tmp() for _ in range(10))
+            self.emit(f"{m0} = OpIMul %uint {sn} {self.cu(w)}")
+            self.emit(f"{m1} = OpIAdd %uint {m0} {p_wave}")
+            self.emit(f"{m2} = OpIMul %uint {m1} {self.cu(2)}")
+            self.emit(f"{m3} = OpIAdd %uint {m2} {self.cu(mask)}")
+            self.emit(f"{m4} = OpIAdd %uint {m3} {self.cu(1)}")
+            self.emit(f"{ml} = OpIEqual %bool {p_lane} {self.cu(0)}")
+            self.emit(f"{m5} = OpSelect %uint {ml} {m3} {self.cu(sink)}")
+            self.emit(f"{m6} = OpSelect %uint {ml} {m4} {self.cu(sink)}")
+            self.emit(f"{mp5} = OpAccessChain %_ptr_WG_uint_x %x_buf {m5}")
+            self.emit(f"OpStore {mp5} {self.cu(0)}")
+            self.emit(f"{mp6} = OpAccessChain %_ptr_WG_uint_x %x_buf {m6}")
+            self.emit(f"OpStore {mp6} {self.cu(0)}")
+            q0, q1, q2, ql, q3, q4, qp3, qp4 = (self.tmp() for _ in range(8))
+            self.emit(f"{q0} = OpIMul %uint {sn} {self.cu(2)}")
+            self.emit(f"{q1} = OpIAdd %uint {q0} {self.cu(sched)}")
+            self.emit(f"{q2} = OpIAdd %uint {q1} {self.cu(1)}")
+            self.emit(f"{ql} = OpIEqual %bool {p_li} {self.cu(0)}")
+            self.emit(f"{q3} = OpSelect %uint {ql} {q1} {self.cu(sink)}")
+            self.emit(f"{q4} = OpSelect %uint {ql} {q2} {self.cu(sink)}")
+            self.emit(f"{qp3} = OpAccessChain %_ptr_WG_uint_x %x_buf {q3}")
+            self.emit(f"OpStore {qp3} {self.cu(0)}")
+            self.emit(f"{qp4} = OpAccessChain %_ptr_WG_uint_x %x_buf {q4}")
+            self.emit(f"OpStore {qp4} {self.cu(0)}")
+        if kind in ("data", "both"):
+            par, data_base, i, p = (self.tmp() for _ in range(4))
+            self.emit(f"{par} = OpBitwiseAnd %uint {p_it} {self.cu(1)}")
+            self.emit(f"{data_base} = OpIMul %uint {par} {self.cu(self.x_lanes)}")
+            self.emit(f"{i} = OpIAdd %uint {data_base} {p_li}")
+            self.emit(f"{p} = OpAccessChain %_ptr_WG_uint_x %x_buf {i}")
+            self.emit(f"OpStore {p} {params['val']}")
+            ret_id = data_base
+        if kind in ("vote", "mask", "both"):
+            if w == 1:
+                s, c, rm = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{s} = OpUMod %uint {p_it} {self.cu(3)}")
+                self.emit(f"{c} = OpIMul %uint {s} {self.cu(2)}")
+                self.emit(f"{rm} = OpIAdd %uint {c} {self.cu(mask)}")
+            else:
+                s, a, b, c, rm = (self.tmp() for _ in range(5))
+                self.emit(f"{s} = OpUMod %uint {p_it} {self.cu(3)}")
+                self.emit(f"{a} = OpIMul %uint {s} {self.cu(w)}")
+                self.emit(f"{b} = OpIAdd %uint {a} {params['wave']}")
+                self.emit(f"{c} = OpIMul %uint {b} {self.cu(2)}")
+                self.emit(f"{rm} = OpIAdd %uint {c} {self.cu(mask)}")
+            p0, old0 = self.tmp(), self.tmp()
+            self.emit(f"{p0} = OpAccessChain %_ptr_WG_uint_x %x_buf {rm}")
+            self.emit(f"{old0} = OpAtomicOr %uint {p0} {self.cu(2)} {self.cu(0)} {params['b0' if kind in ('mask', 'both') else 'val']}")
+            if kind in ("mask", "both"):
+                rm1, p1, old1 = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{rm1} = OpIAdd %uint {rm} {self.cu(1)}")
+                self.emit(f"{p1} = OpAccessChain %_ptr_WG_uint_x %x_buf {rm1}")
+                self.emit(f"{old1} = OpAtomicOr %uint {p1} {self.cu(2)} {self.cu(0)} {params['b1']}")
+            ret_id = rm
+        lines, self.body = self.body, saved
+        self.x_round_fns[kind] = (
+            [f"{fn_name} = OpFunction %uint None {fn_type}"] +
+            [f"{params[k]} = OpFunctionParameter %uint" for k in p_names] +
+            [f"{fn_name}_entry = OpLabel"] +
+            lines +
+            [f"         OpReturnValue {ret_id}", "OpFunctionEnd"]
+        )
+        return fn_name
+
+    def x_round(self, data=None, bits=None):
+        """One exchange: this lane's uint `data` goes to its slot, `bits` (lo, hi; None = nothing) are ORed into
+        the wave's two mask words. Returns (read, (lo, hi)): read(lane) loads `data` of a lane (0-63) of this wave,
+        and (lo, hi) is the OR over all 64 lanes. In round-loop mode both are valid in the next segment; in
+        inline structured mode (`emulate_inline`) the barrier runs directly in place with zero x_split."""
+        if self.emulate_inline:
+            w, _, _, _ = self.x_sizes()
+            it, n1 = self.tmp(), self.tmp()
+            self.emit(f"{it} = OpLoad %uint %x_it")
+            if data is not None and bits is None:
+                fn = self._ensure_x_pre_fn("data")
+                args = f"{it} %x_li {data}" if w == 1 else f"{it} %x_li %x_lane %x_wave {data}"
+                data_base = self.tmp()
+                self.emit(f"{data_base} = OpFunctionCall %uint {fn} {args}")
+                self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
+                self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
+                self.emit(f"OpStore %x_it {n1}")
+                self.x_dirty = set()
+
+                def read(lane):
+                    if w == 1:
+                        j = self.tmp()
+                        self.emit(f"{j} = OpIAdd %uint {data_base} {lane}")
+                        return self.x_word(j)
+                    i, j = self.tmp(), self.tmp()
+                    self.emit(f"{i} = OpIAdd %uint {data_base} %x_wbase")
+                    self.emit(f"{j} = OpIAdd %uint {i} {lane}")
+                    return self.x_word(j)
+                return read, None
+            if data is None and bits is not None and bits[0] is not None and bits[1] is None:
+                fn = self._ensure_x_pre_fn("vote")
+                args = f"{it} %x_li {bits[0]}" if w == 1 else f"{it} %x_li %x_lane %x_wave {bits[0]}"
+                rm = self.tmp()
+                self.emit(f"{rm} = OpFunctionCall %uint {fn} {args}")
+                self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
+                self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
+                self.emit(f"OpStore %x_it {n1}")
+                self.x_dirty = set()
+                return None, (self.x_word(rm), None)
+            if data is None and bits is not None:
+                fn = self._ensure_x_pre_fn("mask")
+                b0 = bits[0] if bits[0] is not None else self.cu(0)
+                b1 = bits[1] if bits[1] is not None else self.cu(0)
+                args = f"{it} %x_li {b0} {b1}" if w == 1 else f"{it} %x_li %x_lane %x_wave {b0} {b1}"
+                rm, hi_i = self.tmp(), self.tmp()
+                self.emit(f"{rm} = OpFunctionCall %uint {fn} {args}")
+                self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
+                self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
+                self.emit(f"OpStore %x_it {n1}")
+                self.x_dirty = set()
+                self.emit(f"{hi_i} = OpIAdd %uint {rm} {self.cu(1)}")
+                return None, (self.x_word(rm), self.x_word(hi_i))
+            fn = self._ensure_x_pre_fn("both")
+            b0 = bits[0] if bits[0] is not None else self.cu(0)
+            b1 = bits[1] if bits[1] is not None else self.cu(0)
+            args = f"{it} %x_li {data} {b0} {b1}" if w == 1 else f"{it} %x_li %x_lane %x_wave {data} {b0} {b1}"
+            rm, hi_i = self.tmp(), self.tmp()
+            self.emit(f"{rm} = OpFunctionCall %uint {fn} {args}")
             self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x948)}")
+            self.emit(f"{n1} = OpIAdd %uint {it} {self.cu(1)}")
             self.emit(f"OpStore %x_it {n1}")
             self.x_dirty = set()
-            res = None
-            if bits is not None:
-                hi_i = self.tmp()
-                self.emit(f"{hi_i} = OpIAdd %uint {rm} {self.cu(1)}")
-                res = (self.x_word(rm), self.x_word(hi_i))
+            self.emit(f"{hi_i} = OpIAdd %uint {rm} {self.cu(1)}")
+            res = (self.x_word(rm), self.x_word(hi_i))
 
             def read(lane):
-                if data_base is not None:
-                    base = data_base
-                else:
-                    par2, base = self.tmp(), self.tmp()
-                    self.emit(f"{par2} = OpBitwiseAnd %uint {it} {self.cu(1)}")
-                    self.emit(f"{base} = OpIMul %uint {par2} {self.cu(self.x_lanes)}")
+                par2, base = self.tmp(), self.tmp()
+                self.emit(f"{par2} = OpBitwiseAnd %uint {it} {self.cu(1)}")
+                self.emit(f"{base} = OpIMul %uint {par2} {self.cu(self.x_lanes)}")
+                if w == 1:
+                    j = self.tmp()
+                    self.emit(f"{j} = OpIAdd %uint {base} {lane}")
+                    return self.x_word(j)
                 i, j = self.tmp(), self.tmp()
                 self.emit(f"{i} = OpIAdd %uint {base} %x_wbase")
                 self.emit(f"{j} = OpIAdd %uint {i} {lane}")
@@ -10440,6 +10543,8 @@ def assemble(gen):
     if gen.fmt_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
         types.append("%fn_fmt_decode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 5))
+    for arity, fn_type in sorted(gen.x_round_fn_types.items()):
+        types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
     if gen.uses_ballot:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
@@ -10769,6 +10874,8 @@ def assemble(gen):
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or [])
     for function in gen.tbuffer_norm_fns.values():
+        helpers.extend(function)
+    for function in gen.x_round_fns.values():
         helpers.extend(function)
     tree = (cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate and not gen.bar_rounds
             else None)

@@ -64,9 +64,10 @@ def _parse_module(text):
     consts = {}
     id_type = {}
     globals_ = []
-    body = []
-    in_body = False
-    first_fn = None
+    funcs = {}
+    cur_fn = None
+    cur_params = []
+    cur_body = []
 
     def zero_of(tid):
         k = types[tid]
@@ -90,12 +91,19 @@ def _parse_module(text):
             raise AssertionError(f"cannot parse SPIR-V line: {line!r}")
         res, op, rest = m.groups()
         a = rest.split() if rest else []
-        if in_body:
-            body.append((res, op, a, line))
+        if cur_fn is not None:
+            if op == "OpFunctionParameter":
+                cur_params.append(res)
+            elif op == "OpFunctionEnd":
+                funcs[cur_fn] = (cur_params, cur_body)
+                cur_fn = None
+            else:
+                cur_body.append((res, op, a, line))
             continue
         if op == "OpFunction":
-            in_body = True
-            first_fn = res
+            cur_fn = res
+            cur_params = []
+            cur_body = []
             continue
         if op in _SPV_IGNORED:
             continue
@@ -138,15 +146,36 @@ def _parse_module(text):
         else:
             raise NotImplementedError(f"header op {op}: {line}")
 
-    assert in_body and first_fn is not None
+    assert "%main" in funcs
+    # Expand single-block helper OpFunctionCalls inline into %main's instruction stream for lockstep interpretation.
+    body = []
+    call_seq = 0
+    for res, op, a, line in funcs["%main"][1]:
+        if op != "OpFunctionCall":
+            body.append((res, op, a, line))
+            continue
+        call_seq += 1
+        ret_t, fn_name = a[0], a[1]
+        call_args = a[2:]
+        fn_params, fn_insns = funcs[fn_name]
+        assert len(call_args) == len(fn_params)
+        id_map = dict(zip(fn_params, call_args))
+        for fres, fop, fa, fline in fn_insns:
+            if fop == "OpLabel":
+                continue
+            mapped_a = [id_map.get(x, x) for x in fa]
+            if fop == "OpReturnValue":
+                body.append((res, "OpCopyObject", [ret_t, mapped_a[0]], f"{res} = OpCopyObject {ret_t} {mapped_a[0]}"))
+                break
+            new_res = f"%fc{call_seq}_{fres[1:]}" if fres else None
+            if fres:
+                id_map[fres] = new_res
+            body.append((new_res, fop, mapped_a, fline))
+
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
-    fn_start = {first_fn: 0}
-    for idx, (res, op, _, _) in enumerate(body):
-        if op == "OpFunction":
-            fn_start[res] = idx + 1
     return {
         "types": types, "ptr_types": ptr_types, "consts": consts, "id_type": id_type,
-        "globals": globals_, "body": body, "labels": labels, "main_pc": fn_start.get("%main", 0),
+        "globals": globals_, "body": body, "labels": labels, "main_pc": 0,
         "zero_of": zero_of,
     }
 
@@ -167,6 +196,9 @@ def _check_spirv_structure(text):
         if op == "OpFunction":
             in_fn = True
             prev_term = True
+            continue
+        if op == "OpFunctionParameter":
+            assert in_fn and prev_term, f"OpFunctionParameter outside function header: {line}"
             continue
         if op == "OpFunctionEnd":
             assert prev_term, "function ended without block terminator"
@@ -979,7 +1011,8 @@ class LocalExecFoldTests(unittest.TestCase):
             ("s_endpgm", 4),
         ]
         spv2, _ = _translate_encoded("cs_neg_vcc_scc", insns_vcc_scc, (64, 1, 1), emulate=True)
-        self.assertGreaterEqual(spv2.count("OpAtomicOr"), 2)  # branch vote + scc_from_mask vote
+        vote_calls = spv2.count("OpFunctionCall %uint %x_pre_vote_fn") or spv2.count("OpAtomicOr")
+        self.assertGreaterEqual(vote_calls, 2)  # branch vote + scc_from_mask vote
 
     def test_s_cmovk_i32_keeps_scc_live_and_blocks_execz_fold(self):
         # 1) s_cmovk_i32 implicitly reads SCC: s_and_saveexec_b64 must keep its cross-half SCC vote.
@@ -1303,6 +1336,64 @@ class StructuredEmulationTests(unittest.TestCase):
                 for lane in range(lx):
                     partner = lane ^ 32
                     self.assertEqual(mem[512 + lane * 4], (partner + 7) + (lane + 7), f"lx={lx} lane={lane} rev={rev}")
+
+    def test_known_pc_guard_unwrap_and_x_pre_helper_functions(self):
+        # 1) Sequential un-foldable diamonds (live-out scalar s16) in inline_all (64 threads) and inside a loop:
+        #    _unwrap_known_pc_guards must unwrap every post-dominating spine join block (no `if (%pc == join)`
+        #    guard around join blocks), and x_round must outline pre-barrier setup into %x_pre_vote_fn / %x_pre_data_fn.
+        insns = [
+            ("s_mov_b64 exec, -1", 4),
+            ("s_mov_b32 s16, 1", 4),
+            ("v_mov_b32_e32 v4, v0", 4),
+            ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+            # Diamond 1 (live-out s16 -> not folded by find_local_exec_folds; joins at Spine 1)
+            ("v_cmp_le_u32_e64 s[6:7], 16, v0", 8),
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 2", 4),
+            ("s_add_u32 s16, s16, 10", 4),
+            ("v_add_nc_u32_e32 v4, s16, v4", 4),
+            # Spine 1 (block 2): must be unwrapped at top level in inline_all!
+            ("s_or_b64 exec, exec, s[8:9]", 4),
+            ("v_readfirstlane_b32 s17, v4", 4),
+            ("v_readlane_b32 s18, v4, 0", 4),
+            # Diamond 2 (live-out s16 -> joins at Spine 2)
+            ("v_cmp_le_u32_e64 s[6:7], 48, v0", 8),
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 2", 4),
+            ("s_add_u32 s16, s16, 20", 4),
+            ("v_add_nc_u32_e32 v4, s16, v4", 4),
+            # Spine 2 (block 4): must ALSO be unwrapped at top level in inline_all!
+            ("s_or_b64 exec, exec, s[8:9]", 4),
+            ("v_add_nc_u32_e32 v4, s16, v4", 4),
+            ("v_add_nc_u32_e32 v4, s17, v4", 4),
+            ("v_add_nc_u32_e32 v4, s18, v4", 4),
+            ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, gen = _translate_encoded("cs_unwrap_spine", insns, (64, 1, 1), emulate=True)
+        self.assertEqual(gen.emulate_plan["mode"], "inline_all")
+        top_kinds = [(it[0], it[1]) for it in gen.emulate_plan["tree"]]
+        # Blocks 0, 2, 4 are all direct top-level ("block", b) items; only blocks 1 and 3 are guarded!
+        self.assertEqual(top_kinds, [("block", 0), ("guard", 1), ("block", 2), ("guard", 3), ("block", 4)])
+        self.assertIn("%x_pre_vote_fn = OpFunction", spv)
+        self.assertIn("%x_pre_both_fn = OpFunction", spv)
+        self.assertIn("%x_pre_data_fn = OpFunction", spv)
+        self.assertGreaterEqual(spv.count("OpFunctionCall %uint %x_pre_vote_fn"), 2)
+        self.assertEqual(spv.count("OpFunctionCall %uint %x_pre_both_fn"), 1)
+        self.assertEqual(spv.count("OpFunctionCall %uint %x_pre_data_fn"), 1)
+        # Verify binary SPIR-V assembly with tools/spirv_asm.py
+        import spirv_asm
+        binary = spirv_asm.assemble(spv, target_env="vulkan1.2")
+        self.assertEqual(binary[:4], struct.pack("<I", 0x07230203))
+        mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for l in range(64):
+            # After diamond 1: s16 = 11; v4 = l + 11 if l >= 16 else l; s17 = s18 = v4[0] = 0
+            v4 = l + (11 if l >= 16 else 0)
+            # After diamond 2: s16 = 31; v4 += 31 if l >= 48; then spine 2 adds s16 (31) + s17 (0) + s18 (0)
+            if l >= 48:
+                v4 += 31
+            v4 += 31
+            self.assertEqual(mem[l * 4], v4, f"lane {l}")
 
 
 if __name__ == "__main__":
