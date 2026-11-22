@@ -189,11 +189,25 @@ instead of stopping. The header is 0x80 bytes:
 | +0x60..+0x68 | f32 × 3, position bias | all blocks | high (see below) |
 | +0x6C | u32, axis order of the stored position | 0, 1 or 2 in every block | high (see below) |
 | +0x70..+0x78 | f32 × 3, position scale | all positive | high (see below) |
-| +0x7C | u32 | 0x40800000 (4.0f) | high (value), open (meaning) |
+| +0x7C | f32, scale of the type-8 (snorm16) UV slots | 4.0f in every block | high (value); meaning from rpf9-explorer |
 
-Per-vertex stride by slot tag: 0x42 is 8 bytes; 0x21, 0x26, 0x27 and 0x28 are 4 bytes (0x26 also in the `63 30`
-block, where it is RGBA8). The slots used are 0-4 and 11-14. The vertex count is the slot-0 span divided by 8, and
-every stream is stride × count bytes. Of every 16-byte-aligned `42 40 00 00` word in `shared_minigame000.rpf`,
+**The slot tag byte encodes stride and type.** Bits 5-7 times 4 are the stride and the low nibble is the type,
+`tag = (stride / 4) << 5 | type`. This is how `third_party/rpf9-explorer/Core/RageModelDecoder.cs` (lines 700-748)
+reads vertex slots. It sizes all 99,184 slot words of the archive's `63 30` and `42 40` blocks:
+
+| Tag | Type | Stride | Slots (blocks) | Reading |
+|---|---:|---:|---|---|
+| 0x63 | 3 | 12 | `63 30` 0, 2 | 3 × f32 (position, normal) |
+| 0x42 | 2 | 8 | `63 30` 3, 4; `42 40` 0 (13,545), 3, 4, 14, 15 | 2 × f32; in `42 40` slot 0 the packed position |
+| 0x26 | 6 | 4 | `63 30` 1, 12; `42 40` 1, 12, 13 | RGBA8 colour |
+| 0x28 | 8 | 4 | `42 40` 3, 4, 14, 15 | 2 × snorm16 UV × the +0x7C scale (rpf9-explorer) |
+| 0x21 | 1 | 4 | `42 40` 2 (13,119) | not decoded |
+| 0x27 | 7 | 4 | `42 40` 2, 11, 18 | not decoded |
+
+The slots used in `42 40` blocks are 0-4, 11-15 and 18; slot 15 occurs in 78 blocks and slot 18 in 770.
+`tools/meshlet_page.py` sizes slots with this rule (`tag_stride`), for the types above only, and reads the same
+1,569 streams with identical totals. The vertex count is the slot-0 span divided by 8, and every stream is
+stride × count bytes. Of every 16-byte-aligned `42 40 00 00` word in `shared_minigame000.rpf`,
 14,671 have a header that fits this rule exactly. Each of them is followed by another `42 40` block (9,234), a
 meshlet group (5,109), a group that continues in the next stream (216), the end of the stream (110) or a `63 30`
 block (2), so nothing is left between chunks. 246 more hits have slot tags with no stride; they are not block
@@ -276,7 +290,7 @@ The other bits are not decoded:
   together with non-zero w3 bits 12-31.
 - **w0 bits 14-31** are not decoded either; bits 14-15 are clear in all 61,170 records of those streams.
 
-Still open: the +0x5C and +0x7C words, meshlet record bits 14-31 of word 0 and the cone-like bits above, and the
+Still open: the +0x5C word, meshlet record bits 14-31 of word 0 and the cone-like bits above, and the
 `42 40 00 00` attribute encodings.
 
 ### `story000_script.rpf`, full
