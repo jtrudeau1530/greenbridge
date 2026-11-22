@@ -831,6 +831,10 @@ struct ReplayFunctions {
     // rendering: the segments of a statistics query split around resolves (D3D-162).
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> sum_statistics;
+    // Sums `count` binary-occlusion segments and normalizes the total to a 64-bit 0 or 1, outside conditional
+    // rendering: a binary query split over physical segments because it overlaps other occlusion queries (D3D-252).
+    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
+                       VkBuffer dst, VkDeviceSize offset)> sum_binary_occlusion;
     // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
     PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
     PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
@@ -2057,6 +2061,9 @@ public:
     VkQueryPool statistics_pool = VK_NULL_HANDLE;
     std::uint32_t statistics_base = 0;
     std::uint32_t statistics_segment_count = 0;
+    // The list's statistics queries overlap (D3D-252): without a statistics pool they cannot run whole, because
+    // two Vulkan queries of one type may not be active at once; QueryReplay::plan refuses such a list.
+    bool statistics_overlaps = false;
     // Copies, resolves and UAV clears that run as transfers, recorded while a predicate was set. D3D12 skips them
     // when the predicate says so, but Vulkan's conditional rendering does not cover transfer commands, so they run
     // unconditionally (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
@@ -2075,7 +2082,9 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
         const Command& command = out.list->commands()[query.command];
         if (std::holds_alternative<ResolveQueries>(command)) continue;
         const auto range = query_range(command);
-        if (range.type != d3d12_query::occlusion) continue;
+        // Binary occlusion is virtualized alongside the ordinary kind (D3D-252): both are VK_QUERY_TYPE_OCCLUSION,
+        // so one physical query is open at a time and a binary resolve normalizes the summed counts (0 or 1).
+        if (range.type != d3d12_query::occlusion && range.type != d3d12_query::binary_occlusion) continue;
         const auto key = std::pair{range.heap, range.first};
         query.end_segment = current;
         if (std::holds_alternative<BeginQuery>(command)) {
@@ -2135,6 +2144,60 @@ inline void plan_statistics_segments(PreparedList& out) {
             }
         }
     }
+}
+
+// Overlapping pipeline-statistics queries (D3D-252): the same physical-segment layout the occlusion planner
+// builds, in the statistics pool. Each Begin and End of a statistics query — and every non-timestamp resolve
+// while one runs, because its helper dispatch would be counted — closes the one open physical query and opens
+// a new one, so each logical query keeps a contiguous slot range and its result is the sum of that range
+// (statistics_sum.comp). A Begin or End of another query kind leaves the segments alone.
+inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
+    std::map<std::pair<QueryHeapId, std::uint32_t>, std::uint32_t> active;
+    std::uint32_t current = detail::PreparedQuery::no_segment;
+    std::size_t next_query = 0;
+    for (std::size_t i = 0; i < out.commands.size(); ++i) {
+        auto& p = out.commands[i];
+        detail::PreparedQuery* query = nullptr;
+        if (next_query != out.queries.size() && out.queries[next_query].command == i)
+            query = &out.queries[next_query++];
+        if (!query) {
+            // A helper dispatch while a query runs would be counted into it (D3D-162): close the shared physical
+            // segment before it and open a new one after, the way resolves do.
+            if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24)) {
+                p.statistics_end = current;
+                current = out.statistics_segment_count++;
+                p.statistics_begin = current;
+            }
+            continue;
+        }
+        const Command& command = out.list->commands()[i];
+        const auto range = query_range(command);
+        if (!std::holds_alternative<ResolveQueries>(command)) {
+            // A Begin or End of another query kind leaves the shared segment alone.
+            if (range.type != d3d12_query::pipeline_statistics) continue;
+            query->statistics_end = current;
+            const auto key = std::pair{range.heap, range.first};
+            if (std::holds_alternative<BeginQuery>(command)) {
+                // A flattened bundle can reuse a slot already active in the parent list.
+                if (!active.emplace(key, out.statistics_segment_count).second) return ReplayResult::invalid_query;
+            } else {
+                const auto start = active.find(key);
+                if (start == active.end()) return ReplayResult::invalid_query;
+                query->statistics_first = start->second;
+                query->statistics_count = out.statistics_segment_count - start->second;
+                active.erase(start);
+            }
+        } else {
+            if (current == detail::PreparedQuery::no_segment || range.type == d3d12_query::timestamp) continue;
+            query->statistics_end = current;
+            current = out.statistics_segment_count++;
+            query->statistics_begin = current;
+            continue;
+        }
+        current = active.empty() ? detail::PreparedQuery::no_segment : out.statistics_segment_count++;
+        query->statistics_begin = current;
+    }
+    return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
 }
 
 // detail::initialize zero-clears an image piece the tracker holds in UNDEFINED (D3D12 committed resources start
@@ -2216,9 +2279,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.unpredicated_copies = 0;
     const bool queries = vk.reset_query_pool && vk.begin_query && vk.end_query && vk.write_timestamp &&
                          vk.copy_query_pool_results && vk.fill_buffer && vk.query_pool;
-    // Vulkan allows one active query per type. Only ordinary occlusion uses virtual segments.
-    std::size_t ordinary_active = 0;
-    bool overlaps = false, binary_active = false, statistics_active = false;
+    // Vulkan allows one active query per type. Overlapping ordinary and binary occlusion share one physical
+    // segment pool, and overlapping statistics split into the statistics pool (D3D-252); a physical query of a
+    // type is still open at most once at any point, because each event closes the one open slot and opens a new
+    // one. The occlusion kinds share their D3D12 heap, statistics have their own, so their states are separate.
+    std::size_t ordinary_active = 0, binary_active = 0, statistics_active_count = 0;
+    bool overlaps = false, statistics_overlaps = false, statistics_active = false;
     out.wrote_readback = false;
     out.readback_src_stages = 0;
 
@@ -2575,15 +2641,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (range.type != d3d12_query::timestamp && !std::holds_alternative<ResolveQueries>(command)) {
                 const bool begin = std::holds_alternative<BeginQuery>(command);
                 if (range.type == d3d12_query::occlusion) {
-                    if (begin && binary_active) return ReplayResult::unsupported;
-                    if (begin) overlaps |= ordinary_active++ != 0;
-                    else --ordinary_active;
+                    overlaps |= begin && (ordinary_active || binary_active);
+                    if (begin) ++ordinary_active; else --ordinary_active;
                 } else if (range.type == d3d12_query::binary_occlusion) {
-                    if (begin && (binary_active || ordinary_active)) return ReplayResult::unsupported;
-                    binary_active = begin;
+                    overlaps |= begin && (ordinary_active || binary_active);
+                    if (begin) ++binary_active; else --binary_active;
                 } else {
-                    if (begin && statistics_active) return ReplayResult::unsupported;
-                    statistics_active = begin;
+                    statistics_overlaps |= begin && statistics_active_count;
+                    if (begin) ++statistics_active_count; else --statistics_active_count;
+                    statistics_active = statistics_active_count != 0;
                 }
             }
             if (const auto* resolve_queries = std::get_if<ResolveQueries>(&command)) {
@@ -2683,8 +2749,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) return r;
         }
     }
-    if (ordinary_active) return ReplayResult::invalid_query;
-    plan_statistics_segments(out);
+    if (ordinary_active || binary_active) return ReplayResult::invalid_query;
+    out.statistics_overlaps = statistics_overlaps;
+    if (statistics_overlaps) {
+        const auto result = plan_overlapping_statistics_segments(out);
+        if (result != ReplayResult::success) return result;
+    } else {
+        plan_statistics_segments(out);
+    }
     if (overlaps) {
         if (!vk.sum_occlusion || out.queries.size() >= detail::PreparedQuery::no_segment)
             return ReplayResult::unsupported;
@@ -2714,6 +2786,9 @@ public:
                 retain(statistics_pool);
                 list.statistics_pool = statistics_pool->pool;
                 list.statistics_base = statistics_base;
+            } else if (list.statistics_overlaps) {
+                // Whole queries on the heap pool would keep two pipeline-statistics queries active at once.
+                return ReplayResult::unsupported;
             } else {
                 for (const auto& command : list.commands)
                     if (command.statistics_end != detail::PreparedQuery::no_segment)
@@ -2754,11 +2829,14 @@ public:
                     detail::QueryResolveRun run{value.ended ? query.heap->pool : VK_NULL_HANDLE,
                                                 index, 1, offset + VkDeviceSize(i) * size};
                     if (value.occlusion.segments) {
-                        if (resolve.type != d3d12_query::occlusion && !statistics) return ReplayResult::invalid_query;
+                        if (resolve.type != d3d12_query::occlusion && !binary && !statistics)
+                            return ReplayResult::invalid_query;
                         const auto& saved = value.occlusion;
                         run = {saved.segments->pool, saved.first, saved.count, run.offset, saved.count > 1};
                         if (!can_sum || (run.sum && !uncounted)) return ReplayResult::unsupported;
-                        (statistics ? needs_statistics_sum : needs_sum) |= run.sum;
+                        if (statistics) needs_statistics_sum |= run.sum;
+                        else if (binary) (run.sum ? needs_sum_binary : needs_binary) = true;
+                        else needs_sum |= run.sum;
                         retain(saved.segments);
                     }
                     if (!query.resolves.empty() && !run.sum && run.count == 1) {
@@ -2787,6 +2865,7 @@ public:
     bool needs_sum = false;
     bool needs_binary = false;
     bool needs_statistics_sum = false;
+    bool needs_sum_binary = false;  // a binary query whose segments must be summed before the 0/1 normalize
     std::vector<std::shared_ptr<const OcclusionSegmentPool>> retained;
 
 private:
@@ -2870,6 +2949,8 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
             } else if (run.sum && resolve.type == d3d12_query::pipeline_statistics) {
                 vk.sum_statistics(cb, run.pool, run.first, run.count, dst, run.offset);
+            } else if (run.sum && binary) {
+                vk.sum_binary_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else if (run.sum || binary) {
                 const auto& resolve_occlusion = run.sum ? vk.sum_occlusion : vk.resolve_binary_occlusion;
                 resolve_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
