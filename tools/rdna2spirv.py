@@ -5015,6 +5015,57 @@ class Gen:
                 f = {"v_min_u32": "UMin", "v_max_u32": "UMax", "v_min_i32": "SMin", "v_max_i32": "SMax"}[op]
                 self.emit(f"{r} = OpExtInst %uint %glsl {f} {x} {y}")
             self.dst(a[0], r)
+        elif op in ("v_cvt_f16_u16", "v_cvt_f16_i16", "v_cvt_u16_f16", "v_cvt_i16_f16"):
+            # 16-bit <-> f16 conversions of the low half (op_sel:[src,dst] picks the high half of the source / of the
+            # destination); the other half of the destination is kept, as for the other 16-bit-result ops. No clamp or
+            # output multiplier (rejected rather than guessed). f16 -> int truncates toward zero, saturates to the 16-bit
+            # range (an f16 infinity too) and gives 0 for NaN, as the 32-bit conversions do (docs/design.md,
+            # "Float-to-int saturation"). int -> f16 rounds like every f16 result (f16_out).
+            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+                raise Unsupported(op + " output modifier")
+            sel, dhi = self.opsel_bits(mods, 1)
+            if op in ("v_cvt_f16_u16", "v_cvt_f16_i16"):
+                u = self.src_u({**a[1], "neg": False, "abs": False})
+                if sel[0]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+                    u = t
+                f = self.tmp()
+                if op == "v_cvt_f16_u16":
+                    m = self.tmp()
+                    self.emit(f"{m} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                    self.emit(f"{f} = OpConvertUToF %float {m}")
+                else:
+                    m = self.tmp()
+                    self.emit(f"{m} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
+                    self.emit(f"{f} = OpConvertSToF %float {m}")
+                self.f16_out(a[0], f, dhi)
+            else:
+                x = self.f16_in(a[1], sel[0])
+                nan, xs, tr, cl, conv, lo = (self.tmp() for _ in range(6))
+                self.emit(f"{nan} = OpIsNan %bool {x}")
+                self.emit(f"{xs} = OpSelect %float {nan} %f0 {x}")           # keep the conversion operand representable
+                self.emit(f"{tr} = OpExtInst %float %glsl Trunc {xs}")
+                lo_b, hi_b = (-32768.0, 32767.0) if op == "v_cvt_i16_f16" else (0.0, 65535.0)
+                self.emit(f"{cl} = OpExtInst %float %glsl FClamp {tr} {self.fconst(lo_b)} {self.fconst(hi_b)}")
+                if op == "v_cvt_i16_f16":
+                    ci = self.tmp()
+                    self.emit(f"{ci} = OpConvertFToS %int {cl}")
+                    self.emit(f"{conv} = OpBitcast %uint {ci}")
+                else:
+                    self.emit(f"{conv} = OpConvertFToU %uint {cl}")
+                self.emit(f"{lo} = OpBitwiseAnd %uint {conv} {self.cu(0xFFFF)}")
+                if not dhi:
+                    self.write_lo16(a[0], lo)
+                else:
+                    if a[0]["k"] != "vgpr":
+                        raise Unsupported("op_sel destination")
+                    old, keep, sh16, v = (self.tmp() for _ in range(4))
+                    self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                    self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+                    self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
+                    self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+                    self.dst(a[0], v)
         elif op == "v_cvt_f32_f16":
             u = self.src_h(a[1])
             v2, f = self.tmp(), self.tmp()
