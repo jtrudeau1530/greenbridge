@@ -91,13 +91,17 @@ def retag(data: bytes, packet: bytes) -> bytes:
 
 
 def load_names(path, source=None):
-    """{bank label: {29-bit stream id: name}} from awc_names.py CSV."""
+    """{bank label: {29-bit stream id: name}} from awc_names.py CSV. A bank read from an audio_manifest.json is
+    labelled with its archive path, ".awc" included; that is dropped so it matches awc_opus.py's folder."""
     out = collections.defaultdict(dict)
     with open(path, encoding="utf-8", newline="") as fh:
         for row in csv.DictReader(fh):
             if source and row.get("source") != source:
                 continue
-            out[row["bank"].replace("\\", "/")][int(row["stream_id"], 16) & 0x1FFFFFFF] = row["name"]
+            bank = row["bank"].replace("\\", "/")
+            if bank.lower().endswith(".awc"):
+                bank = bank[:-4]
+            out[bank][int(row["stream_id"], 16) & 0x1FFFFFFF] = row["name"]
     return dict(out)
 
 
