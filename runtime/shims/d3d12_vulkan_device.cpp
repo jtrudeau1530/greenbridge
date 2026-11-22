@@ -1746,6 +1746,9 @@ public:
         else if (desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
             deny = deny_buffers | deny_non_rt_ds;
         const UINT creation_only = D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+        // A placed resource reports its heap's flags as they are (an ALLOW_ALL heap reads back 0): the DENY bits
+        // are the runtime's choice only for the implicit heap of a committed resource (d3d12_heap_properties_test).
+        if (placed_) return D3D12_HEAP_FLAGS(UINT(heap_flags_) & ~creation_only);
         return D3D12_HEAP_FLAGS((UINT(heap_flags_) & ~creation_only) | deny);
     }
 
