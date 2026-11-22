@@ -1016,5 +1016,113 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(state.vcc, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """IEEE 754 boundary extremes, subnormals, and NaN handling tests.
+
+    Verifies bit-exact semantics when IEEE 754 binary64 bit-patterns are processed
+    by the SALU without floating-point trapping, denormal flushing, or NaN quietening.
+    """
+
+    # IEEE 754 double-precision bit constants
+    POS_ZERO: int = 0x0000000000000000
+    NEG_ZERO: int = 0x8000000000000000
+    POS_INF: int = 0x7FF0000000000000
+    NEG_INF: int = 0xFFF0000000000000
+    QNAN_CANONICAL: int = 0x7FF8000000000000
+    SNAN_PATTERN: int = 0x7FF0000000000001
+    SUBNORMAL_MIN: int = 0x0000000000000001
+    SUBNORMAL_MAX: int = 0x000FFFFFFFFFFFFF
+    NORMAL_MIN: int = 0x0010000000000000
+    NORMAL_MAX: int = 0x7FEFFFFFFFFFFFFF
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_signed_zero_representation_distinction(self) -> None:
+        """Verify +0.0 and -0.0 differ in sign bit and are not conflated by SALU XNOR.
+
+        While IEEE 754 treats +0.0 == -0.0, SALU bitwise operations distinguish the sign bit:
+        0x0000000000000000 XNOR 0x8000000000000000 -> 0x7FFFFFFFFFFFFFFF.
+        """
+        state = ScalarMachineState()
+        state.exec_mask = self.POS_ZERO
+        state.set_sgpr64(0, self.NEG_ZERO)
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        saved, new_exec, scc = self.interp.step(instr, state)
+
+        self.assertEqual(saved, self.POS_ZERO)
+        self.assertEqual(new_exec, 0x7FFFFFFFFFFFFFFF)
+        self.assertEqual(scc, 1)
+
+    def test_nan_preservation_and_no_quietening(self) -> None:
+        """Verify Signaling NaN is not quietened and payload bits are strictly inverted.
+
+        In VALU, SNAN would trigger invalid operation or be converted to QNAN.
+        In SALU, bits are preserved bitwise without NaN quietening.
+        """
+        state = ScalarMachineState()
+        state.exec_mask = MASK64
+        state.set_sgpr64(0, self.SNAN_PATTERN)
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        _, new_exec, scc = self.interp.step(instr, state)
+
+        # XNOR with MASK64 is identity, preserving SNAN without setting the quiet bit
+        self.assertEqual(new_exec, self.SNAN_PATTERN)
+        self.assertEqual(scc, 1)
+
+    def test_nan_self_xnor_equivalence(self) -> None:
+        """Verify NaN XNOR NaN yields all 1s (unlike IEEE 754 where NaN == NaN is False)."""
+        state = ScalarMachineState()
+        state.exec_mask = self.QNAN_CANONICAL
+        state.set_sgpr64(0, self.QNAN_CANONICAL)
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        _, new_exec, scc = self.interp.step(instr, state)
+
+        self.assertEqual(new_exec, MASK64)
+        self.assertEqual(scc, 1)
+
+    def test_subnormal_no_flush_to_zero(self) -> None:
+        """Verify subnormal/denormal representations are not flushed to zero."""
+        state = ScalarMachineState()
+        state.exec_mask = MASK64
+        state.set_sgpr64(0, self.SUBNORMAL_MIN)
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        _, new_exec, scc = self.interp.step(instr, state)
+
+        # Must not flush to zero
+        self.assertEqual(new_exec, self.SUBNORMAL_MIN)
+        self.assertNotEqual(new_exec, 0)
+        self.assertEqual(scc, 1)
+
+    def test_infinity_combinations(self) -> None:
+        """Verify XNOR with positive and negative infinity representations."""
+        # Same signed infinities -> all 1s
+        saved, new_exec, scc = oracle_s_xnor_saveexec_b64(self.POS_INF, self.POS_INF)
+        self.assertEqual(new_exec, MASK64)
+        self.assertEqual(scc, 1)
+
+        # Opposite signed infinities -> differ only in sign bit (bit 63)
+        saved, new_exec, scc = oracle_s_xnor_saveexec_b64(self.POS_INF, self.NEG_INF)
+        self.assertEqual(new_exec, 0x7FFFFFFFFFFFFFFF)
+        self.assertEqual(scc, 1)
+
+    def test_struct_pack_double_roundtrip_verification(self) -> None:
+        """Verify bit patterns round-trip faithfully through Python struct IEEE 754 packing."""
+        test_floats = [1.0, -1.0, 0.5, -0.5, 2.0, 1e-300, 1e300]
+        for f in test_floats:
+            with self.subTest(f=f):
+                bits = struct.unpack("<Q", struct.pack("<d", f))[0]
+                saved, new_exec, scc = oracle_s_xnor_saveexec_b64(bits, MASK64)
+                self.assertEqual(new_exec, bits)
+                self.assertEqual(scc, 1)
+                # Unpack back to float
+                reconstructed = struct.unpack("<d", struct.pack("<Q", new_exec))[0]
+                self.assertEqual(reconstructed, f)
+
+
 if __name__ == "__main__":
     unittest.main()
