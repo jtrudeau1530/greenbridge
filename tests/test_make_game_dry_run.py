@@ -191,7 +191,10 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
             mock_pipelines.assert_called_once()
 
     def test_skip_assets_preflight_bypasses_dotnet_sdk_and_submodule_checks(self) -> None:
+        # The runtime stage is Windows-only, and preflight refuses it elsewhere before any check this test is
+        # about; with no Windows-only stages the same checks run on every system.
         with mock.patch("sys.version_info", (3, 12, 0)), \
+                mock.patch.object(make_game, "WINDOWS_ONLY", ()), \
                 mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
                 mock.patch.object(make_game, "dotnet_sdk_ok") as mock_dotnet, \
                 mock.patch.object(make_game, "ensure_submodule") as mock_submodule, \
