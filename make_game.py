@@ -1564,6 +1564,13 @@ def crashes_alone(exe: str, spirv: str, cache: str, name: str) -> bool:
     return code not in (0, 1, 2) and not interrupted(code)
 
 
+def path_is_within(path: str, directory: str) -> bool:
+    try:
+        return os.path.commonpath([path, directory]) == directory
+    except ValueError:  # Different Windows drives or UNC shares have no common path.
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
@@ -1642,20 +1649,16 @@ def main() -> int:
         except OSError:
             game_entries = []
     for p in (out, work):
-        try:
-            # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
-            real_destination = os.path.normcase(os.path.realpath(p))
-            if is_game_drive_root:
-                # If the game is at drive root (e.g. D:\), reject the drive root itself and anything
-                # inside the dump's existing top-level entries, but allow separate top-level folders.
-                inside = (real_destination == real_game) or any(
-                    os.path.commonpath([real_destination, entry]) == entry
-                    for entry in game_entries
-                )
-            else:
-                inside = os.path.commonpath([real_destination, real_game]) == real_game
-        except ValueError:          # different drives
-            inside = False
+        # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
+        real_destination = os.path.normcase(os.path.realpath(p))
+        if is_game_drive_root:
+            # If the game is at drive root (e.g. D:\), reject the drive root itself and anything
+            # inside the dump's existing top-level entries, but allow separate top-level folders.
+            inside = (real_destination == real_game) or any(
+                path_is_within(real_destination, entry) for entry in game_entries
+            )
+        else:
+            inside = path_is_within(real_destination, real_game)
         if inside:
             fail("--out and --work must be outside the game folder.")
     runtime_build = os.path.abspath(a.runtime_build) if a.runtime_build else None
