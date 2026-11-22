@@ -1231,5 +1231,217 @@ class TestValuCvtF32F64RegisterAliasing(unittest.TestCase):
             self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), 0x40240000)
 
 
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ConditionCodes:
+    """Architectural condition codes for floating-point conversion operations."""
+    equal: bool
+    less: bool
+    greater: bool
+    unordered: bool
+    zero: bool
+    negative: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class FPStatusFlags:
+    """IEEE 754 floating-point status flags for conversion operations."""
+    invalid: bool       # e.g., sNaN operand
+    denormal: bool      # e.g., subnormal operand or result
+    inexact: bool       # precision loss in conversion
+    overflow: bool      # exponent overflow to infinity
+    underflow: bool     # exponent underflow
+
+
+def compute_condition_codes_f32(result: int) -> ConditionCodes:
+    """Computes condition codes evaluating attributes of a 32-bit floating-point result."""
+    result &= MASK32
+    if is_nan_f32(result):
+        return ConditionCodes(
+            equal=False,
+            less=False,
+            greater=False,
+            unordered=True,
+            zero=False,
+            negative=False,
+        )
+    val = bits_to_f32(result)
+    is_zero = (result in (POS_ZERO_F32, NEG_ZERO_F32))
+    is_neg = bool(result & SIGN_MASK_F32)
+    return ConditionCodes(
+        equal=(val == 0.0),
+        less=(val < 0.0),
+        greater=(val > 0.0),
+        unordered=False,
+        zero=is_zero,
+        negative=is_neg,
+    )
+
+
+def compute_condition_codes_f64(result: int) -> ConditionCodes:
+    """Computes condition codes evaluating attributes of a 64-bit floating-point result."""
+    result &= MASK64
+    if is_nan_f64(result):
+        return ConditionCodes(
+            equal=False,
+            less=False,
+            greater=False,
+            unordered=True,
+            zero=False,
+            negative=False,
+        )
+    val = bits_to_f64(result)
+    is_zero = (result in (POS_ZERO_F64, NEG_ZERO_F64))
+    is_neg = bool(result & SIGN_MASK_F64)
+    return ConditionCodes(
+        equal=(val == 0.0),
+        less=(val < 0.0),
+        greater=(val > 0.0),
+        unordered=False,
+        zero=is_zero,
+        negative=is_neg,
+    )
+
+
+def compute_fp_status_flags_cvt_f32_f64(s64: int, result32: int) -> FPStatusFlags:
+    """Computes IEEE 754 status flags for double to single float conversion."""
+    s64 &= MASK64
+    result32 &= MASK32
+
+    invalid = is_snan_f64(s64)
+    denormal = is_subnormal_f64(s64) or is_subnormal_f32(result32)
+
+    is_s64_inf = (s64 & ~SIGN_MASK_F64) == EXP_MASK_F64
+    is_res_inf = (result32 & ~SIGN_MASK_F32) == EXP_MASK_F32
+    overflow = not is_nan_f64(s64) and not is_s64_inf and is_res_inf
+
+    is_s64_zero = (s64 & ~SIGN_MASK_F64) == 0
+    is_res_zero = (result32 & ~SIGN_MASK_F32) == 0
+    underflow = not is_nan_f64(s64) and not is_s64_zero and (is_subnormal_f32(result32) or is_res_zero)
+
+    if is_nan_f64(s64):
+        inexact = False
+    elif overflow or underflow:
+        inexact = True
+    else:
+        d_val = bits_to_f64(s64)
+        f_val = float(bits_to_f32(result32))
+        inexact = (d_val != f_val)
+
+    return FPStatusFlags(
+        invalid=invalid,
+        denormal=denormal,
+        inexact=inexact,
+        overflow=overflow,
+        underflow=underflow,
+    )
+
+
+def compute_fp_status_flags_cvt_f64_f32(s32: int, result64: int) -> FPStatusFlags:
+    """Computes IEEE 754 status flags for single to double float conversion."""
+    s32 &= MASK32
+    result64 &= MASK64
+
+    invalid = is_snan_f32(s32)
+    # f32 subnormal converted to f64 is a denormal input operand
+    denormal = is_subnormal_f32(s32)
+
+    return FPStatusFlags(
+        invalid=invalid,
+        denormal=denormal,
+        inexact=False,
+        overflow=False,
+        underflow=False,
+    )
+
+
+class TestValuCvtF32F64ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_f32_and_f64(self) -> None:
+        cc_pos = compute_condition_codes_f32(POS_ONE_F32)
+        self.assertTrue(cc_pos.greater)
+        self.assertFalse(cc_pos.less)
+        self.assertFalse(cc_pos.zero)
+        self.assertFalse(cc_pos.negative)
+        self.assertFalse(cc_pos.unordered)
+
+        cc_neg = compute_condition_codes_f64(NEG_TWO_F64)
+        self.assertTrue(cc_neg.less)
+        self.assertFalse(cc_neg.greater)
+        self.assertTrue(cc_neg.negative)
+        self.assertFalse(cc_neg.unordered)
+
+        cc_zero = compute_condition_codes_f32(NEG_ZERO_F32)
+        self.assertTrue(cc_zero.zero)
+        self.assertTrue(cc_zero.equal)
+        self.assertTrue(cc_zero.negative)
+        self.assertFalse(cc_zero.unordered)
+
+        cc_nan = compute_condition_codes_f64(QNAN_F64)
+        self.assertTrue(cc_nan.unordered)
+        self.assertFalse(cc_nan.zero)
+        self.assertFalse(cc_nan.equal)
+
+    def test_status_flags_snan_invalid(self) -> None:
+        flags_f32_f64 = compute_fp_status_flags_cvt_f32_f64(SNAN_F64, QNAN_F32)
+        self.assertTrue(flags_f32_f64.invalid)
+
+        flags_f64_f32 = compute_fp_status_flags_cvt_f64_f32(SNAN_F32, QNAN_F64)
+        self.assertTrue(flags_f64_f32.invalid)
+
+        # Quiet NaN does not trigger invalid flag
+        flags_qnan = compute_fp_status_flags_cvt_f32_f64(QNAN_F64, QNAN_F32)
+        self.assertFalse(flags_qnan.invalid)
+
+    def test_status_flags_denormal(self) -> None:
+        # f32 subnormal converted to f64 normal flags denormal operand
+        flags = compute_fp_status_flags_cvt_f64_f32(SUBNORM_MIN_F32, 0x36A0000000000000)
+        self.assertTrue(flags.denormal)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.inexact)
+
+    def test_status_flags_overflow_inexact(self) -> None:
+        # 1e39 exceeds float32 max (~3.4e38), overflowing to +infinity
+        d_large = f64_to_bits(1e39)
+        res32 = ref_cvt_f32_f64(d_large)
+        self.assertEqual(res32, POS_INF_F32)
+
+        flags = compute_fp_status_flags_cvt_f32_f64(d_large, res32)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_status_flags_f32_to_f64_exact(self) -> None:
+        # Any finite float32 converts to float64 with zero precision loss
+        res64 = ref_cvt_f64_f32(POS_ONE_F32)
+        flags = compute_fp_status_flags_cvt_f64_f32(POS_ONE_F32, res64)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        # In RDNA2 ISA, VALU floating-point conversion instructions never write or disturb VCC
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xAAAAAAAAAAAAAAAA
+        interp.vcc = canary_vcc
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(1.0, is_64bit=True),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.vcc, canary_vcc)
+
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.vcc = canary_vcc
+        simd.step(inst)
+        self.assertEqual(simd.vcc, canary_vcc)
+
+
 if __name__ == "__main__":
     unittest.main()
