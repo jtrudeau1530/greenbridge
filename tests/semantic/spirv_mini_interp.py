@@ -320,6 +320,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     id_type = {}                # constant / result id -> its type id (the width of a signed comparison)
     pc_type = {}                # id -> pointee type id of a PushConstant pointer
     in_body = False
+    first_fn = None
     body = []
     outputs = []
 
@@ -358,6 +359,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             continue
         if op == "OpFunction":
             in_body = True
+            first_fn = res
             continue
         if op in _IGNORED:
             continue
@@ -450,7 +452,20 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         return signed(val(x), t[1] if t else 32)
 
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
-    pc = 0
+    # Every function's first body index and parameter ids. The first OpFunction was consumed by the header parse;
+    # later ones are in the body. Execution starts at %main (the entry point the translator names).
+    fn_start, fn_params = {first_fn: 0}, {}
+    for idx, (res, op, _, _) in enumerate(body):
+        if op == "OpFunction":
+            fn_start[res] = idx + 1
+    for fid, start in list(fn_start.items()):           # parameters come right after OpFunction
+        params, i = [], start
+        while i < len(body) and body[i][1] == "OpFunctionParameter":
+            params.append(body[i][0])
+            i += 1
+        fn_params[fid], fn_start[fid] = params, i
+    calls = []                                          # (return pc, result id, cur_label, prev_label)
+    pc = fn_start.get("%main", 0)
     killed = False
     cur_label = prev_label = None
     while pc < len(body):
@@ -463,6 +478,28 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         if op == "OpLabel":
             prev_label, cur_label = cur_label, res
             continue
+        if op == "OpFunctionCall":
+            fid, args = a[1], a[2:]
+            if fid not in fn_start or len(args) != len(fn_params[fid]) or len(calls) > 16:
+                raise UnsupportedConstruct(f"OpFunctionCall {fid}")
+            for prm, arg in zip(fn_params[fid], args):
+                values[prm] = val(arg)
+                if arg in id_type:
+                    id_type[prm] = id_type[arg]
+            calls.append((pc, res, cur_label, prev_label))
+            pc = fn_start[fid]
+            continue
+        if op == "OpReturnValue":
+            if not calls:
+                raise UnsupportedConstruct("OpReturnValue outside a called function")
+            ret = val(a[0])
+            pc, res_id, cur_label, prev_label = calls.pop()
+            values[res_id] = ret
+            continue
+        if op == "OpReturn" and not calls:
+            break
+        if op in ("OpFunction", "OpFunctionParameter"):
+            raise UnsupportedConstruct(f"{op} reached by falling through")
         if op in _IGNORED:
             continue
         if op == "OpKill":
