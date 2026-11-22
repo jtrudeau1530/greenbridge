@@ -537,6 +537,25 @@ def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader)
     ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
 
 
+
+def test_wave32_bpermute_zeroes_inactive_and_missing_source_lanes(make_shader):
+    """Wave32 ds_bpermute (RDNA ISA 10.4.4): the source value is 0 where the source lane is off in EXEC, and the
+    shuffle result is kept only where the source lane is running, as in the wave64 path."""
+    shader = make_shader("v_lshlrev_b32_e32 v1, 2, v0\nds_bpermute_b32 v2, v1, v0\ns_waitcnt lgkmcnt(0)\ns_endpgm\n",
+                         name="cs_bperm32_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert not rdna2spirv.translate.last_gen.wave64
+    assert re.search(
+        r"(%t\d+) = OpLoad %bool %active\n\s*"
+        r"(%t\d+) = OpSelect %uint \1 %t\d+ %c0\n\s*"
+        r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
+        r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \3 (%t\d+)\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \2 \5\n\s*"
+        r"%t\d+ = OpSelect %uint \4 \6 %c0\n",
+        asm,
+    ), "wave32 ds_bpermute did not zero inactive sources and gate the shuffle on the running source lane"
+
 WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
 WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[20:21]\ns_add_u32 s24, s22, s23\ns_endpgm\n"
 
@@ -864,6 +883,21 @@ def test_pk_and_scalar_f16_ops_emit_no_packhalf2x16(op_asm, make_shader):
         "v_mov_b32 v0, v3"
     )
     shader = make_shader(program(body))
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv
+
+
+@pytest.mark.parametrize("body", [
+    "buffer_load_format_d16_xyzw v[2:3], v1, s[0:3], 0 offen\ns_waitcnt vmcnt(0)\nexp mrt0 v2, v3, v2, v3 done vm",
+    "v_mov_b32 v2, 1.0\nv_mov_b32 v3, 0.5\nv_mov_b32 v4, 0.25\nv_mov_b32 v5, 2.0\n"
+    "buffer_store_format_xyzw v[2:5], v1, s[0:3], 0 offen\nexp mrt0 v2, v3, v4, v5 done vm",
+], ids=["d16-load", "store"])
+def test_buffer_format_f16_narrowing_avoids_packhalf2x16(make_shader, body):
+    """The f16 of a d16 typed buffer load, and of an f16 format a typed buffer store writes, narrow with integer RTE
+    like the d16 image results (#489): PackHalf2x16 rounds toward zero on AMD drivers."""
+    shader = make_shader("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0x100\ns_mov_b32 s3, 0x1fac\n"
+                         "v_mov_b32 v1, 0\n" + body + "\ns_endpgm\n", "ps_buf_f16")
     spv = shader.translate()
     shader.validate(spv)
     assert "PackHalf2x16" not in spv

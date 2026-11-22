@@ -452,6 +452,7 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R10G10B10A2_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, D3D12_RESOURCE_FLAG_NONE, 1), 1},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
@@ -562,6 +563,8 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"16x16 R16G16B16A16_UINT", texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_UINT, none, 1), 16 * 16 * 8},
         {"16x16 R16G16B16A16_SINT", texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_SINT, none, 1), 16 * 16 * 8},
         {"16x16 R10G10B10A2_UINT", texture_desc(16, 16, DXGI_FORMAT_R10G10B10A2_UINT, none, 1), 16 * 16 * 4},
+        {"16x16 R10G10B10_XR_BIAS_A2_UNORM",
+         texture_desc(16, 16, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, none, 1), 16 * 16 * 4},
         {"16x16 R16G16_TYPELESS", texture_desc(16, 16, DXGI_FORMAT_R16G16_TYPELESS, none, 1), 16 * 16 * 4},
         {"16x16 R16G16_UINT", texture_desc(16, 16, DXGI_FORMAT_R16G16_UINT, none, 1), 16 * 16 * 4},
         {"16x16 R16G16_SINT", texture_desc(16, 16, DXGI_FORMAT_R16G16_SINT, none, 1), 16 * 16 * 4},
@@ -1604,6 +1607,45 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     return mismatches;
 }
 
+// A software Vulkan device (llvmpipe on CI) and the host's WARP device answer about different machines, so the
+// OPTIONS1 comparison is skipped there; on a GPU both runtimes see the same hardware.
+bool software_vulkan_device(const vktest::Device& vk) {
+    const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        vk.instance_proc(vk.instance, "vkGetPhysicalDeviceProperties"));
+    if (!get_properties) return true;
+    VkPhysicalDeviceProperties properties{};
+    get_properties(vk.physical, &properties);
+    return properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+}
+
+// D3D12_OPTIONS1 (D3D-86): wave ops and the lane range come from the Vulkan device's subgroup properties, so the
+// host PC runtime on the same GPU is the oracle. Returns the number of mismatches, -2 for a software Vulkan device,
+// or -1 when the host has no D3D12 device.
+int compare_options1(ID3D12Device* ours, const vktest::Device& vk) {
+    if (software_vulkan_device(vk)) return -2;
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 theirs{};
+    if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &theirs, sizeof(theirs)))) return -1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 mine{};
+    if (FAILED(ours->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &mine, sizeof(mine)))) return 1;
+    int mismatches = 0;
+    const auto same = [&](const char* field, UINT got, UINT want) {
+        if (got == want) return;
+        if (mismatches++ < 4)
+            std::fprintf(stderr, "D3D12_OPTIONS1 %s: ours %u, host %u\n", field, got, want);
+    };
+    same("WaveOps", mine.WaveOps, theirs.WaveOps);
+    same("WaveLaneCountMin", mine.WaveLaneCountMin, theirs.WaveLaneCountMin);
+    same("WaveLaneCountMax", mine.WaveLaneCountMax, theirs.WaveLaneCountMax);
+    same("ExpandedComputeResourceStates", mine.ExpandedComputeResourceStates,
+         theirs.ExpandedComputeResourceStates);
+    // TotalLaneCount is deliberately not compared: the host counts every lane of the device (6144 on the RTX 5070)
+    // and the layer answers one full wave (docs section 4.1).
+    std::printf("D3D12_OPTIONS1: lanes %u..%u, total %u (host total %u)\n", mine.WaveLaneCountMin,
+                mine.WaveLaneCountMax, mine.TotalLaneCount, theirs.TotalLaneCount);
+    return mismatches;
+}
 
 }  // namespace
 
@@ -1740,6 +1782,60 @@ int main() {
         D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
         EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
 
+        // D3D-61: XR_BIAS is a display-only format with the R10G10B10A2 bit layout. The layer can create and
+        // copy it, and its views can cast to the ordinary 10:10:10:2 format, but it does not claim display or
+        // video-processor support.
+        {
+            const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT xr{DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &xr, sizeof(xr))));
+            EXPECT(xr.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+            EXPECT(xr.Support1 & D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT);
+            EXPECT(!(xr.Support1 & (D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_MIP |
+                                    D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
+                                    D3D12_FORMAT_SUPPORT1_BLENDABLE)));
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS multsample{DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, 4};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &multsample,
+                                                         sizeof(multsample))));
+            EXPECT(multsample.NumQualityLevels == 0);
+            Ref<ID3D12Resource> tex;
+            const D3D12_RESOURCE_DESC desc = texture_desc(
+                16, 16, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, D3D12_RESOURCE_FLAG_NONE, 1);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&tex.p))));
+            EXPECT(tex.p != nullptr);
+
+            // The host refuses extra mips, multisampling and 3D; the layer must refuse the same descriptions.
+            D3D12_RESOURCE_DESC invalid = desc;
+            invalid.MipLevels = 2;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &invalid,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &invalid).SizeInBytes == UINT64_MAX);
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
+            UINT rows = 0;
+            UINT64 total = 0;
+            device->GetCopyableFootprints(&invalid, 0, 1, 0, &layout, &rows, nullptr, &total);
+            EXPECT(total == UINT64_MAX);
+
+            invalid = desc;
+            invalid.SampleDesc.Count = 4;
+            invalid.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &invalid,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &invalid).SizeInBytes == UINT64_MAX);
+
+            invalid = desc;
+            invalid.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            invalid.DepthOrArraySize = 4;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &invalid,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &invalid).SizeInBytes == UINT64_MAX);
+        }
+
         // D3D-60: CheckFeatureSupport and committed resource creation for integer and typeless formats
         {
             const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -1797,6 +1893,27 @@ int main() {
         EXPECT(!uses_unaligned_blocks(texture_desc(8, 8, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE)));
         EXPECT(!uses_unaligned_blocks(texture_desc(10, 6, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE)));
 
+        // D3D12_OPTIONS1 (D3D-86): the lane range is the Vulkan device's own subgroup range and the device-wide lane
+        // count is deliberately one wave, so those are pinned here rather than only compared. Wave ops can only be
+        // promised by a GPU, and a software Vulkan device has no host GPU to compare with either.
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 wave{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &wave, sizeof(wave))));
+            EXPECT(wave.WaveLaneCountMin >= 1);
+            EXPECT(wave.WaveLaneCountMax >= wave.WaveLaneCountMin);
+            EXPECT(wave.TotalLaneCount == wave.WaveLaneCountMax);
+            EXPECT(wave.ExpandedComputeResourceStates);
+            const int options1 = compare_options1(device.p, d);
+            if (options1 == -2)
+                std::printf("D3D12_OPTIONS1: software Vulkan device, host comparison skipped\n");
+            else if (options1 < 0)
+                std::printf("D3D12_OPTIONS1: no host D3D12 device to compare with, skipped\n");
+            EXPECT(options1 <= 0);
+            if (options1 != -2) EXPECT(wave.WaveOps);
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 shrunk{};
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &shrunk, sizeof(shrunk) - 4)));
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, nullptr, sizeof(shrunk))));
+        }
         const int footprint_mismatches = compare_footprints(device.p);
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");

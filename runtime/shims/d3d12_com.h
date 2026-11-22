@@ -70,6 +70,8 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
+    // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
+    bool image_view_min_lod = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive

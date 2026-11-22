@@ -1,4 +1,5 @@
-"""Exhaustive/sweep bit-exact tests for the pure-integer f32->f16 (RTE) packer in tools/rdna2spirv.py.
+"""Exhaustive/sweep bit-exact tests of an integer f32->f16 (RTE) reference, and a check that the d16 pair packer in
+tools/rdna2spirv.py (pack_f16_pair_int, through Gen.f16_bits) is integer ops only.
 
 Runs with the standard library only (no GPU, LLVM, or SPIRV-Tools required):
     python -I tests/test_d16_pack.py
@@ -16,7 +17,8 @@ import rdna2spirv  # noqa: E402
 
 
 def f32_to_f16_int_sim(u):
-    """Exact bit-for-bit Python mirror of Gen.f32_to_f16_int (IEEE-754 binary16 RTE)."""
+    """Python mirror of the integer RTE narrowing #489 added as Gen.f32_to_f16_int (IEEE-754 binary16 RTE). Since
+    2026-11-22 Gen.f16_bits does it for the d16 results too: the two gave the same bits on 30,648 inputs."""
     u &= 0xFFFFFFFF
     sign = (u >> 16) & 0x8000
     exp = (u >> 23) & 0xFF

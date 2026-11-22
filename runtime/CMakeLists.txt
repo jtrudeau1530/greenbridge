@@ -675,6 +675,12 @@ if(TARGET Vulkan::Headers)
     # Needs a Vulkan GPU and a window; exits 77 (skipped) without a Vulkan device.
     add_test(NAME xbox_present COMMAND xbox_present_test)
     set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77)
+    # ID3D12Resource::GetHeapProperties and ID3D12DescriptorHeap::GetDesc (node masks, resolved heap flags) against the
+    # host runtime and WARP; run explicitly on a Vulkan GPU.
+    add_executable(d3d12_node_mask_test test/d3d12_node_mask_test.cpp)
+    target_link_libraries(d3d12_node_mask_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_node_mask_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_node_mask_test PRIVATE /W4 /permissive- /utf-8)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)

@@ -3,6 +3,7 @@
 
     python -I tests/test_save_keys.py
 """
+import collections
 import contextlib
 import io
 import json
@@ -84,6 +85,18 @@ class Resolve(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             saves.extract(self.jsav, out)
         self.assertEqual(set(sk.collect_keys([out])), set(sk.collect_keys([self.jsav])))
+
+    def test_directory_scan_reads_jsav_files(self):
+        # #844: a folder of .jsav saves counts the same as naming each file
+        with open(self.jsav, "rb") as f:
+            data = f.read()
+        folder = os.path.join(self.dir, "saves")
+        os.makedirs(folder)
+        for name in ("a.jsav", "b.ASAV", "c.bin", "d"):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(data)
+        one = sk.collect_keys([self.jsav])
+        self.assertEqual(sk.collect_keys([folder]), collections.Counter({k: 4 * n for k, n in one.items()}))
 
     def test_resolve_counts_per_family(self):
         res = os.path.join(self.dir, "res.json")

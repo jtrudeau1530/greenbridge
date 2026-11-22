@@ -112,6 +112,8 @@ std::vector<Case> cases() {
         {"full mip chain", D3D12_HEAP_TYPE_DEFAULT,
          texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE, 0, 2)},
         {"BC7 array", D3D12_HEAP_TYPE_DEFAULT, texture_desc(8, 8, DXGI_FORMAT_BC7_UNORM, D3D12_RESOURCE_FLAG_NONE, 1, 3)},
+        {"XR_BIAS texture", D3D12_HEAP_TYPE_DEFAULT,
+         texture_desc(8, 8, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, D3D12_RESOURCE_FLAG_NONE)},
         {"volume", D3D12_HEAP_TYPE_DEFAULT, volume_desc(0)},
         {"multisampled", D3D12_HEAP_TYPE_DEFAULT, ms},
         // Refused by the base method; each variant must refuse them the same way.
