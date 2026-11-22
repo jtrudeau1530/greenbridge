@@ -326,6 +326,45 @@ class SIMDInstructionExecutor:
         return written_vals
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Independence
+# ==============================================================================
+
+@dataclass(frozen=True)
+class SALUStatusFlags:
+    """Condition codes and architectural status flags evaluated after SALU instruction."""
+    scc: int
+    execz: bool
+    execnz: bool
+    active_lane_count: int
+    parity_even: bool
+    carry_borrow_unaltered: bool = True
+
+
+def evaluate_salu_status_flags(
+    new_exec: int,
+    vcc_before: int,
+    vcc_after: int,
+) -> SALUStatusFlags:
+    """Evaluate SALU status flags and verify carry/borrow preservation."""
+    scc = 1 if (new_exec & MASK64) != 0 else 0
+    execz = (new_exec & MASK64) == 0
+    execnz = (new_exec & MASK64) != 0
+    active_lanes = bin(new_exec & MASK64).count("1")
+    parity_even = (active_lanes % 2 == 0)
+    carry_unaltered = (vcc_before == vcc_after)
+
+    return SALUStatusFlags(
+        scc=scc,
+        execz=execz,
+        execnz=execnz,
+        active_lane_count=active_lanes,
+        parity_even=parity_even,
+        carry_borrow_unaltered=carry_unaltered,
+    )
+
+
+
 
 
 # ==============================================================================
@@ -831,6 +870,110 @@ class TestRegisterAliasingAndPreservation(unittest.TestCase):
                     snapshot_before[i],
                     f"SGPR {i} was unexpectedly corrupted!",
                 )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry/borrow independence."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+
+    def test_scc_matches_execnz_truth_table(self) -> None:
+        """SCC is strictly 1 iff EXEC != 0 across exhaustive edge cases."""
+        edge_cases = [
+            (0, 0, 0),                       # 0 ^ 0 -> 0 (SCC=0)
+            (ALL_LANES_W64, ALL_LANES_W64, 0),# all_ones ^ all_ones -> 0 (SCC=0)
+            (0, 1, 1),                       # 0 ^ 1 -> 1 (SCC=1)
+            (0, 1 << 63, 1),                 # 0 ^ (1<<63) -> MSB (SCC=1)
+            (EVEN_LANES_W64, ODD_LANES_W64, 1),
+            (ALL_LANES_W64, 0, 1),
+        ]
+        for init_exec, src_val, expected_scc in edge_cases:
+            with self.subTest(init_exec=hex(init_exec), src_val=hex(src_val)):
+                state = SALUArchitecturalState()
+                state.exec_mask = init_exec
+                state.write_sgpr_u64(0, src_val)
+                inst = SXorSaveExecB64AST(
+                    dst=Register(RegKind.SGPR, 2, count=2),
+                    src0=Register(RegKind.SGPR, 0, count=2),
+                )
+                res = self.interp.step(inst, state)
+                flags = evaluate_salu_status_flags(res.new_exec, 0, 0)
+
+                self.assertEqual(res.scc, expected_scc)
+                self.assertEqual(flags.scc, expected_scc)
+                self.assertEqual(flags.execnz, (expected_scc == 1))
+                self.assertEqual(flags.execz, (expected_scc == 0))
+
+    def test_vcc_carry_borrow_independence(self) -> None:
+        """Logic SALU instructions must leave VCC (carry/borrow) completely unaltered."""
+        state = SALUArchitecturalState()
+        canary_vcc = 0xDEAD_BEEF_CAFE_BABE
+        state.vcc = canary_vcc
+        state.exec_mask = ALL_LANES_W64
+
+        inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=LiteralConstant64(EVEN_LANES_W64),
+        )
+        res = self.interp.step(inst, state)
+        flags = evaluate_salu_status_flags(res.new_exec, canary_vcc, state.vcc)
+
+        self.assertTrue(flags.carry_borrow_unaltered)
+        self.assertEqual(state.vcc, canary_vcc)
+
+    def test_execz_execnz_complementary_duality(self) -> None:
+        """execz and execnz must be strict logical complements."""
+        test_values = [0, 1, 0xFF, ALL_LANES_W32, ALL_LANES_W64, 1 << 62]
+        for val in test_values:
+            flags = evaluate_salu_status_flags(val, 0, 0)
+            self.assertNotEqual(flags.execz, flags.execnz)
+            self.assertTrue(flags.execz or flags.execnz)
+
+    def test_active_lane_count_and_parity(self) -> None:
+        """Active lane count matches popcount and parity is correct."""
+        # Even parity: 0 active lanes
+        flags0 = evaluate_salu_status_flags(0, 0, 0)
+        self.assertEqual(flags0.active_lane_count, 0)
+        self.assertTrue(flags0.parity_even)
+
+        # Odd parity: 1 active lane
+        flags1 = evaluate_salu_status_flags(1, 0, 0)
+        self.assertEqual(flags1.active_lane_count, 1)
+        self.assertFalse(flags1.parity_even)
+
+        # Even parity: 64 active lanes
+        flags64 = evaluate_salu_status_flags(ALL_LANES_W64, 0, 0)
+        self.assertEqual(flags64.active_lane_count, 64)
+        self.assertTrue(flags64.parity_even)
+
+        # Odd parity: 63 active lanes
+        flags63 = evaluate_salu_status_flags(ALL_LANES_W64 ^ 1, 0, 0)
+        self.assertEqual(flags63.active_lane_count, 63)
+        self.assertFalse(flags63.parity_even)
+
+    def test_branch_condition_emulation(self) -> None:
+        """Emulate scalar conditional branches (s_cbranch_scc0 / s_cbranch_scc1 / s_cbranch_execz)."""
+        def should_branch_scc0(scc: int) -> bool:
+            return scc == 0
+
+        def should_branch_scc1(scc: int) -> bool:
+            return scc == 1
+
+        def should_branch_execz(exec_mask: int) -> bool:
+            return exec_mask == 0
+
+        # When EXEC becomes 0
+        _, exec0, scc0 = oracle_s_xor_saveexec_b64(0x1234, 0x1234)
+        self.assertTrue(should_branch_scc0(scc0))
+        self.assertFalse(should_branch_scc1(scc0))
+        self.assertTrue(should_branch_execz(exec0))
+
+        # When EXEC is non-zero
+        _, exec1, scc1 = oracle_s_xor_saveexec_b64(0x1234, 0x5678)
+        self.assertFalse(should_branch_scc0(scc1))
+        self.assertTrue(should_branch_scc1(scc1))
+        self.assertFalse(should_branch_execz(exec1))
 
 
 if __name__ == "__main__":
