@@ -371,6 +371,41 @@ class OutputTest(unittest.TestCase):
         rbf0_tree.write_xml(xml_dir, doc["resources"])  # a rerun overwrites, it does not add -0000 duplicates
         self.assertEqual(len(os.listdir(xml_dir)), 1)
 
+    def test_duplicate_offsets_keep_each_source(self):
+        names = ["000000000100-left.bin", "000000000100-right.bin"]
+        roots = ["RootA", "RootB"]
+        for name, root in zip(names, roots):
+            with open(os.path.join(self.root, name), "wb") as f:
+                f.write(b"RBF0" + _open(0, root.encode("ascii")) + CLOSE)
+        out = os.path.join(self.root, "tree.json")
+        self.assertEqual(rbf0_tree.main([self.root, out, "--quiet"]), 0)
+        with open(out, encoding="utf-8") as f:
+            resources = json.load(f)["resources"]
+        self.assertEqual([(doc["source"], doc["root_name"]) for doc in resources], list(zip(names, roots)))
+
+    def test_deep_tree_preserves_existing_json(self):
+        depth = 600
+        blob = b"RBF0" + _open(0, b"TestRoot") + _open(0) * (depth - 1) + CLOSE * depth
+        doc = rbf0_tree.parse_resource(blob)
+        self.assertEqual((doc["status"], doc["max_depth"]), ("ok", depth))
+        source = os.path.join(self.root, "deep.bin")
+        with open(source, "wb") as f:
+            f.write(blob)
+        out = os.path.join(self.root, "tree.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+        tool = os.path.join(ROOT, "tools", "rbf0_tree.py")
+        result = subprocess.run([sys.executable, "-I", tool, source, out, "--quiet"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        with open(out, "rb") as f:
+            self.assertTrue(f.read() == previous, "existing JSON report changed")
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn(os.path.basename(out), result.stderr)
+        self.assertIn("depth", result.stderr)
+        self.assertCountEqual(os.listdir(self.root), ["deep.bin", "tree.json"])
+
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())
