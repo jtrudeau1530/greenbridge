@@ -22,6 +22,8 @@ Python 3.9+ compatible (from __future__ import annotations).
 """
 from __future__ import annotations
 
+import dataclasses
+import enum
 import math
 import struct
 import unittest
@@ -253,6 +255,249 @@ class TestValuCmpClassOracle(unittest.TestCase):
         # neg(+INF) -> -INF
         self.assertTrue(ref_cmp_class_f64(POS_INF_F64, CLASS_NEG_INF, neg=True))
         self.assertFalse(ref_cmp_class_f64(POS_INF_F64, CLASS_POS_INF, neg=True))
+
+
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+    SPECIAL = "special"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand representing single 32-bit dwords, pairs, or special VCC."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.VGPR:
+            if self.index < 0 or self.index >= 256:
+                raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+            if self.count not in (1, 2):
+                raise ValueError(f"Unsupported VGPR count (must be 1 or 2): {self.count}")
+            if self.count == 2 and self.index + 1 >= 256:
+                raise ValueError(f"Register pair exceeds VGPR file boundary: {self.index}")
+        elif self.kind == RegKind.SGPR:
+            if self.index < 0 or self.index >= 106:
+                raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
+            if self.count not in (1, 2):
+                raise ValueError(f"Unsupported SGPR count (must be 1 or 2): {self.count}")
+            if self.count == 2 and self.index + 1 >= 106:
+                raise ValueError(f"Register pair exceeds SGPR file boundary: {self.index}")
+        elif self.kind == RegKind.SPECIAL:
+            # Special registers like VCC (idx=0)
+            if self.count not in (1, 2):
+                raise ValueError(f"Unsupported special register count: {self.count}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    @property
+    def is_vcc(self) -> bool:
+        return self.kind == RegKind.SPECIAL and self.index == 0
+
+    def format_asm(self) -> str:
+        if self.is_vcc:
+            return "vcc"
+        if self.count == 2:
+            return f"{self.kind.value}[{self.index}:{self.index + 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate:
+    """Symbolic immediate operand (32-bit mask or float pattern)."""
+    bits: int
+
+    def __init__(self, val: int | float) -> None:
+        if isinstance(val, float):
+            b = struct.unpack("<I", struct.pack("<f", val))[0]
+        else:
+            b = int(val) & MASK64
+        object.__setattr__(self, "bits", b)
+
+    def format_asm(self) -> str:
+        if self.bits > MASK32:
+            return f"{self.bits:#018x}"
+        return f"{self.bits:#010x}"
+
+
+@dataclasses.dataclass(frozen=True)
+class OperandModifiers:
+    """Input modifiers for VALU instructions (abs and neg)."""
+    neg: bool = False
+    abs_val: bool = False
+
+    def format_asm(self, base_str: str) -> str:
+        res = base_str
+        if self.abs_val:
+            res = f"|{res}|"
+        if self.neg:
+            res = f"-{res}"
+        return res
+
+
+class Opcode(enum.Enum):
+    """VALU float classification opcodes."""
+    V_CMP_CLASS_F32 = "v_cmp_class_f32"
+    V_CMP_CLASS_F64 = "v_cmp_class_f64"
+
+
+class Encoding(enum.Enum):
+    """Instruction encoding format."""
+    VOPC = "e32"
+    VOP3 = "e64"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a v_cmp_class instruction."""
+    opcode: Opcode
+    dst: Register
+    src0: Register | Immediate
+    src1: Register | Immediate
+    src0_mods: OperandModifiers = dataclasses.field(default_factory=OperandModifiers)
+    encoding: Encoding = Encoding.VOPC
+
+    def __post_init__(self) -> None:
+        # VOPC encoding restrictions
+        if self.encoding == Encoding.VOPC:
+            if not self.dst.is_vcc:
+                raise ValueError(f"VOPC encoding comparison destination must be VCC: {self.dst}")
+            if self.src0_mods.neg or self.src0_mods.abs_val:
+                raise ValueError("VOPC encoding does not support input modifiers (requires VOP3/e64)")
+
+        # Float type register size validation
+        if isinstance(self.src0, Register):
+            if self.opcode == Opcode.V_CMP_CLASS_F32 and self.src0.count != 1:
+                raise ValueError(f"v_cmp_class_f32 src0 must be 32-bit (count=1): {self.src0}")
+            if self.opcode == Opcode.V_CMP_CLASS_F64 and self.src0.count != 2:
+                raise ValueError(f"v_cmp_class_f64 src0 must be 64-bit pair (count=2): {self.src0}")
+
+        # Mask operand validation (src1 is always 32-bit mask)
+        if isinstance(self.src1, Register) and self.src1.count != 1:
+            raise ValueError(f"v_cmp_class src1 mask must be 32-bit (count=1): {self.src1}")
+
+    def to_assembly(self) -> str:
+        s0_str = self.src0.format_asm()
+        s1_str = self.src1.format_asm()
+        s0_fmt = self.src0_mods.format_asm(s0_str)
+        dst_str = self.dst.format_asm()
+        enc_suffix = f"_{self.encoding.value}" if self.encoding == Encoding.VOP3 else ""
+        return f"{self.opcode.value}{enc_suffix} {dst_str}, {s0_fmt}, {s1_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of VALU comparison instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class TestValuCmpClassAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_formatting(self) -> None:
+        v0 = Register(RegKind.VGPR, 0, count=1)
+        v_pair = Register(RegKind.VGPR, 2, count=2)
+        s4 = Register(RegKind.SGPR, 4, count=1)
+        s_pair = Register(RegKind.SGPR, 6, count=2)
+        vcc = Register(RegKind.SPECIAL, 0, count=2)
+
+        self.assertEqual(v0.format_asm(), "v0")
+        self.assertEqual(v_pair.format_asm(), "v[2:3]")
+        self.assertEqual(s4.format_asm(), "s4")
+        self.assertEqual(s_pair.format_asm(), "s[6:7]")
+        self.assertEqual(vcc.format_asm(), "vcc")
+
+    def test_instruction_formatting_vopc(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Register(RegKind.SGPR, 1, count=1),
+            encoding=Encoding.VOPC,
+        )
+        self.assertEqual(inst.to_assembly(), "v_cmp_class_f32 vcc, v0, s1")
+
+    def test_instruction_formatting_vop3(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            src1=Immediate(CLASS_MASK_ZERO),
+            src0_mods=OperandModifiers(neg=True, abs_val=True),
+            encoding=Encoding.VOP3,
+        )
+        self.assertEqual(inst.to_assembly(), f"v_cmp_class_f64_e64 s[0:1], -|v[2:3]|, {CLASS_MASK_ZERO:#010x}")
+
+    def test_ast_validation_errors(self) -> None:
+        # VOPC with non-vcc destination
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CMP_CLASS_F32,
+                dst=Register(RegKind.SGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 0, count=1),
+                src1=Register(RegKind.SGPR, 1, count=1),
+                encoding=Encoding.VOPC,
+            )
+
+        # VOPC with modifiers
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CMP_CLASS_F32,
+                dst=Register(RegKind.SPECIAL, 0, count=2),
+                src0=Register(RegKind.VGPR, 0, count=1),
+                src1=Register(RegKind.SGPR, 1, count=1),
+                src0_mods=OperandModifiers(abs_val=True),
+                encoding=Encoding.VOPC,
+            )
+
+        # v_cmp_class_f64 with single VGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CMP_CLASS_F64,
+                dst=Register(RegKind.SPECIAL, 0, count=2),
+                src0=Register(RegKind.VGPR, 0, count=1),
+                src1=Register(RegKind.SGPR, 1, count=1),
+            )
+
+    def test_program_assembly(self) -> None:
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Register(RegKind.SGPR, 2, count=1),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=Register(RegKind.VGPR, 6, count=2),
+            src1=Immediate(CLASS_MASK_NAN),
+            encoding=Encoding.VOP3,
+        ))
+        expected = (
+            "v_cmp_class_f32 vcc, v0, s2\n"
+            f"v_cmp_class_f64_e64 s[4:5], v[6:7], {CLASS_MASK_NAN:#010x}"
+        )
+        self.assertEqual(prog.to_assembly(), expected)
 
 
 if __name__ == "__main__":
