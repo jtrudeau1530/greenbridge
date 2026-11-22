@@ -202,7 +202,11 @@ public:
         return vk_.vkCreatePipelineLayout(device_, &layout, nullptr, &layout_) == VK_SUCCESS;
     }
 
-    bool prepare(bool needs_sum, bool needs_binary, bool needs_statistics_sum = false) {
+    bool prepare(bool needs_sum, bool needs_binary, bool needs_statistics_sum = false,
+                 bool needs_sum_binary = false) {
+        // The composite (sum then normalize, D3D-252) uses both pipelines.
+        needs_sum = needs_sum || needs_sum_binary;
+        needs_binary = needs_binary || needs_sum_binary;
         return (!needs_sum || sum_pipeline_ || create_pipeline(occlusion_sum_spirv, sum_pipeline_)) &&
                (!needs_binary || binary_pipeline_ || create_pipeline(binary_occlusion_spirv, binary_pipeline_)) &&
                (!needs_statistics_sum || statistics_pipeline_ ||
@@ -247,6 +251,31 @@ public:
             count -= chunk;
             if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
         }
+        copy_result(cb, dst, offset, word_size);
+    }
+
+    // Sums `count` binary-occlusion segments into one value and normalizes that total in place to 0 or 1: the
+    // result of a binary query whose interval spans more than one physical segment (overlapping queries, D3D-252).
+    void sum_binary(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
+                    VkBuffer dst, VkDeviceSize offset) const {
+        begin_scratch_write(cb);
+        vk_.vkCmdFillBuffer(cb, scratch_, 0, word_size, 0);
+        bind(cb, sum_pipeline_);
+        auto tail = first, left = count;
+        while (left) {
+            const auto chunk = std::min(left, sum_capacity);
+            vk_.vkCmdCopyQueryPoolResults(cb, queries, tail, chunk, scratch_, word_size, word_size,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    shader_access);
+            dispatch(cb, chunk, 1);
+            tail += chunk;
+            left -= chunk;
+            if (left) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        barrier(cb, compute, compute, VK_ACCESS_SHADER_WRITE_BIT, shader_access);
+        bind(cb, binary_pipeline_);
+        dispatch(cb, 1, 1);
         copy_result(cb, dst, offset, word_size);
     }
 
@@ -1569,6 +1598,10 @@ public:
                                            std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
                 occlusion_resolve_->sum_statistics(cb, pool, first, count, dst, offset);
             };
+            replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                 std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
+            };
         }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         std::uint32_t segments = 0, statistics_segments = 0;
@@ -1615,13 +1648,14 @@ public:
             base += list.segment_count;
             statistics_base += list.statistics_segment_count;
         }
-        if (queries.needs_sum || queries.needs_binary || queries.needs_statistics_sum) {
+        if (queries.needs_sum || queries.needs_binary || queries.needs_statistics_sum || queries.needs_sum_binary) {
             if (!occlusion_resolve_) {
                 auto helper = std::make_unique<OcclusionResolve>(context_.vk, context_.device());
                 if (!helper->initialize(occlusion_memory)) return ReplayResult::unsupported;
                 occlusion_resolve_ = std::move(helper);
             }
-            if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary, queries.needs_statistics_sum))
+            if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary, queries.needs_statistics_sum,
+                                             queries.needs_sum_binary))
                 return ReplayResult::unsupported;
         }
 
