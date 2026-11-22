@@ -154,10 +154,10 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
-the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
-the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
-the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
+version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl` and `XNetworkingImpl` (below); for any
+other class it logs the class and interface id and returns `0x80070032`, the documented error for a class the runtime
+doesn't provide, so the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives
+this path through the api-set binding `XCurl.dll` uses, and calls the served classes slot by slot.
 
 ### Class layouts, measured
 
@@ -175,11 +175,13 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 |---|---|---|
 | `XThreadingImpl` (`IXThreadingImpl`, 28 methods, slots 3-30) | 3-7 and 9-30 (`libHttpClient.GDK.dll`), 3, 5, 12, 16-18, 22, 29 (`XCurl.dll`) | e.g. 7 `XAsyncBegin` (5 args), 9 `XAsyncSchedule` (pointer, 32-bit), 10 `XAsyncComplete` (pointer, HRESULT, size), 12 `XTaskQueueCreate` (two 32-bit modes, pointer), 16 `XTaskQueueDispatch` (returns a byte), 19 `XTaskQueueSubmitDelayedCallback` (5 args), 22 `XTaskQueueTerminate` (pointer, bool, two pointers), 27 `XThreadSetTimeSensitive` (bool), 30 `XThreadIsTimeSensitive` (returns a byte). Slot 8 (`XAsyncBeginAlloc`, private) is never called; slot 28 (`XTaskQueueIsEmpty`, private) takes no arguments |
 | `XErrorImpl` (`IXErrorImpl`, slots 3-5) | 3 (`XCurl.dll`) | slot 3, the docs' `_unknown_`, takes an HRESULT and a pointer: `XErrorReport(HRESULT, const char*)` |
-| `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool). Not served yet |
+| `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool) |
 
 `XThreadingImpl` forwards each slot to `third_party/xtaskqueue`, the same implementation the named exports use;
 `XThreadSetTimeSensitive`/`XThreadIsTimeSensitive` keep a per-thread flag and the two private slots log once and
-answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetCallback` set.
+answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetCallback` set. `XNetworkingImpl`
+reports an initialized network with unrestricted internet access for connectivity hints offline, succeeds certificate
+verification, and tracks hint-change registration tokens.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
