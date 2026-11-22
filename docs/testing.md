@@ -23,8 +23,9 @@ This page collects the setup steps and the problems testers have run into so far
   On Linux and macOS, the distribution's or Homebrew's `llvm-mc` on `PATH` is enough.
 - **SPIRV-Tools** (`spirv-as`, `spirv-val`): part of the Vulkan SDK, or a distribution package.
 - **A C++20 compiler, CMake and the Vulkan headers** to build the test programs:
-  - Windows: Visual Studio 2022 with "Desktop development with C++", the Windows SDK 10.0.26100 or newer, and the
-    Vulkan SDK.
+  - Windows: the full runtime needs Visual Studio 2022 with "Desktop development with C++" and Windows SDK
+    10.0.26100 or newer. Install the Vulkan SDK for the Vulkan backend headers. The standalone tools also compile
+    with llvm-mingw and the Vulkan headers alone. Running the GPU tests needs a Vulkan loader and a compatible driver.
   - Linux: CMake 3.24+, GCC or Clang, and the Vulkan headers and loader. The headers should be recent enough
     for `VK_KHR_maintenance8`; older ones still build, but skip what needs it.
   - macOS: `brew install llvm molten-vk vulkan-headers vulkan-loader spirv-tools vulkan-tools`. The test programs
@@ -37,6 +38,15 @@ Windows, from a "Developer PowerShell for VS 2022" or a plain shell:
 ```powershell
 scripts\build_runtime.ps1            # CMake + Ninja into runtime\build
 ```
+
+For the Vulkan tools alone, put llvm-mingw on `PATH` and point CMake at the directory containing `vulkan/vulkan.h`:
+
+```powershell
+cmake -S runtime -B runtime/build/vulkan -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF -DVulkan_INCLUDE_DIR=C:/Vulkan-Headers/include
+cmake --build runtime/build/vulkan --parallel --target vk_harness vk_texture_test vk_compute_test vk_store_test vk_bindless_test
+```
+
+Use `--build runtime/build/vulkan` with `scripts/run_gpu_tests.py`.
 
 If you configure with CMake's Visual Studio generator instead, the programs end up in `runtime\build\Release` (or
 `RelWithDebInfo`); pass that folder to `--build` below.

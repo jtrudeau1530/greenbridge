@@ -8,7 +8,8 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "gta6rt must be built for x64 (run from an x64 Native Tools prompt or vcvars64.bat)")
 endif()
 
-if(WIN32)
+option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
+if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # The d3d12_xs shim and its tests use version 1.2 root signatures (D3D12_ROOT_SIGNATURE_DESC2), which the Windows
   # SDK declares from 10.0.26100 on. Stop here with the fix instead of failing halfway through the build.
   include(CheckCXXSourceCompiles)
@@ -185,7 +186,7 @@ if(WIN32)
   target_link_options(xgameruntime_test PRIVATE /OPT:NOREF)
   target_link_libraries(xgameruntime_test PRIVATE gta6rt_xtaskqueue)
 
-else()
+elseif(NOT WIN32)
   message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
 endif()
 
@@ -193,7 +194,7 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
-  if(WIN32)
+  if(TARGET gta6rt)
     # Loader tests. They build their own PE images, so they need neither the game nor any other input.
     add_executable(loader_test
       test/loader_test.cpp
@@ -344,7 +345,7 @@ if(BUILD_TESTING)
   add_test(NAME resource_tiling COMMAND resource_tiling_test)
   add_executable(descriptor_table_test test/descriptor_table_test.cpp)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
-  if(WIN32)
+  if(TARGET gta6rt)
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
     add_executable(bink_decode_test
       test/bink_decode_test.cpp
@@ -427,7 +428,7 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-if(WIN32)
+if(TARGET gta6rt_d3d12_xs_rootsig)
 option(LEONIDA_D3D12_SHIM_TESTS "Build the standalone D3D12 root-signature shim test" OFF)
 if(LEONIDA_D3D12_SHIM_TESTS)
   enable_testing()
@@ -472,7 +473,7 @@ if(TARGET Vulkan::Headers)
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
   # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
   find_package(Python3 COMPONENTS Interpreter QUIET)
-  if(WIN32 AND Python3_FOUND)
+  if(TARGET gta6rt AND Python3_FOUND)
     set(LEONIDA_STUBS ${CMAKE_CURRENT_BINARY_DIR}/generated/d3d12_stubs.h)
     add_custom_command(
       OUTPUT ${LEONIDA_STUBS}
@@ -574,8 +575,8 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(bvh_builder_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(bvh_builder_test PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
-  else()
-    message(STATUS "Python 3 or Windows missing: the D3D12 COM objects and d3d12_com_test are not built")
+  elseif(TARGET gta6rt)
+    message(STATUS "Python 3 missing: the D3D12 COM objects and d3d12_com_test are not built")
   endif()
 
   # Needs only the Vulkan headers, not a GPU.
