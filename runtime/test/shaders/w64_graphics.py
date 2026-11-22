@@ -101,6 +101,21 @@ def _a_one_lane(i):
     return (7777 if on else 1000 + x, 3000 + 11 * on, 4000 + y + 13 * on, x % 4)
 
 
+def _a_permlane(i):
+    x, y = _x(i), _y(i)
+    return ((x ^ 1) + 64 * y, x + 64 * (y ^ 1), 64 * y + x, 64 * y + x)
+
+
+def _a_swizzle(i):
+    x, y = _x(i), _y(i)
+    return ((x ^ 1) + 64 * (y ^ 1), (x ^ 1) + 64 * y, 64 * y + x, (x & ~1) + 64 * (y & ~1))
+
+
+def _a_bpermute(i):
+    x, y = _x(i), _y(i)
+    return ((x ^ 1) + 64 * y, (x ^ 1) + 64 * (y ^ 1), 64 * y + x, (x & ~1) + 64 * (y | 1))
+
+
 def _c_vote_else(i):
     return (7 if _on(i) else None, _on(i), 0, 0)               # r0 of the other pixels: 0 or 5 by the partition
 
@@ -136,6 +151,9 @@ VS_RECORDS = 0x1000 // 4  # heap word of vertex 0's record (4 words per vertex);
 FIXTURES = {
     "ps_w64_a_skip": ("A", _a_skip, {}),
     "ps_w64_a_one_lane": ("A", _a_one_lane, {}),
+    "ps_w64_a_permlane": ("A", _a_permlane, {}),
+    "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
+    "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
     "ps_w64_b_readfirstlane": ("B", _b_readfirstlane, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_readlane_uniform": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),
