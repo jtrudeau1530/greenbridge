@@ -330,9 +330,14 @@ What is implemented (all of it testable without the game):
     and mixed-channel texels check the five-bit color fields;
   - `B8G8R8X8_UNORM`, `_UNORM_SRGB` and `_TYPELESS` (D3D-87) are `B8G8R8A8` images: clears, copies and footprints
     keep all four bytes (WARP writes the clear's alpha into the X byte too), and shader views read alpha as 1. Its
-    typeless family is its own, so views to or from `B8G8R8A8` are refused (a castable-format list that names the
-    other family is not consulted yet). As on the host runtime, the family has no typed UAV, and a typed
-    `B8G8R8X8` texture cannot allow unordered access. Blending into a `B8G8R8X8` render target reads destination
+    typeless family is its own, so views to or from `B8G8R8A8` are refused, unless the texture's castable-format
+    list names the view's format (relaxed casting, which WARP and AMD's D3D12 driver accept both ways). The view's
+    format then decides the alpha: a `B8G8R8X8` view of a `B8G8R8A8` texture reads 1, a `B8G8R8A8` view of a
+    `B8G8R8X8` one the stored byte. It decides the channel order too: an `R8G8B8A8` texture whose list names
+    `B8G8R8A8` or `B8G8R8X8` reads red and blue swapped through those views, as on the host (both orders share one
+    T# format code, so the T#'s swizzle carries the order). As on the host runtime, the family has no typed UAV, and a typed `B8G8R8X8`
+    texture cannot allow unordered access (the host accepts one whose castable-format list names `B8G8R8A8`; the
+    layer doesn't yet). Blending into a `B8G8R8X8` render target reads destination
     alpha as 1, as WARP and AMD's D3D12 driver do: the PSO turns `DEST_ALPHA` into `ONE`, `INV_DEST_ALPHA` into
     `ZERO` and the colour `SRC_ALPHA_SAT` into `ZERO`, where the BGRA8 image would read the X byte. What a draw
     leaves in the X byte is not defined (WARP writes 0, AMD the blended alpha), and no view reads it;
