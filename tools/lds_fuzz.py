@@ -32,6 +32,10 @@ Each mismatch is printed with the words that differ and the op that last wrote t
 prints the program. Exit code: 0 when every program that ran matches, 1 on a mismatch, 2 on a harness error
 (assembler, translator or vk_compute_test failure) or when no program could run (every one skipped), 77 when
 --oracle hw was asked for and the hardware oracle's tools or GPU are missing.
+
+A wave32 program is skipped where vk_compute_test can't pin 32-lane subgroups ("compute subgroup size: 32 not
+available", e.g. Mesa llvmpipe, whose subgroups are 8 wide): its words would come from another wave size. Wave64
+programs translated with --emulate use no subgroup operations, so they are compared at any subgroup size.
 """
 import argparse
 import copy
@@ -51,7 +55,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
-from compute_fixture import compute_header, find_test_program  # noqa: E402
+from compute_fixture import compute_header, find_test_program, unpinned_subgroup  # noqa: E402
 
 THREADS = 64                          # the default group size
 GROUP_SIZES = (32, 64, 128, 256)      # --threads mix
@@ -811,6 +815,15 @@ def run_translator(progs, a, work, tally):
         if rc == 77:
             skipped += 1
             print(f"SKIP {p.name}: {msg.splitlines()[-1] if msg else 'unsupported'}")
+            tally.setdefault("translator", {})[p.name] = "skipped"
+            continue
+        # A wave32 program needs 32-lane subgroups. Where vk_compute_test couldn't pin them, its words come from
+        # another wave size and are no evidence either way. --wave64-emulate output uses no subgroup operations.
+        lanes = unpinned_subgroup(msg) if p.wave == 32 else None
+        if lanes:
+            skipped += 1
+            print(f"SKIP {p.name}: the device can't run it at {lanes} lanes "
+                  f"(vk_compute_test: compute subgroup size: {lanes} not available)")
             tally.setdefault("translator", {})[p.name] = "skipped"
             continue
         data = dump.read_bytes() if dump.is_file() else b""

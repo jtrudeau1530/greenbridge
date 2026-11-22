@@ -242,6 +242,7 @@ def build_rows(rows: list, source) -> list:
 
         if kind in ("rbf0", "psin", "text", "binary"):
             group = [i]
+            chunks = [data] if kind == "text" and b"<" in data else None
             j = i + 1
             while j < n and rows[j - 1]["size"] == 65536:
                 nxt = source.read(rows[j])
@@ -250,13 +251,13 @@ def build_rows(rows: list, source) -> list:
                 nk = stream_kind(nxt, rows[j])
                 if nk in ("decl", "bink2", "rbf0", "psin", "other"):
                     break
+                if chunks is not None:
+                    chunks.append(nxt)
                 group.append(j)
                 j += 1
-            if kind == "text" and b"<" in data and tail_root(b"".join(source.read(rows[x]) for x in group)):
-                root = tail_root(b"".join(source.read(rows[x]) for x in group))
-                out.append(row_for("xml", rows, group, root=root, header=False, complete=True))
-            elif kind == "text" and b"<" in data:
-                out.append(row_for("xml", rows, group, complete=False))
+            if chunks is not None:
+                root = tail_root(b"".join(chunks))
+                out.append(row_for("xml", rows, group, root=root, header=False, complete=bool(root)))
             else:
                 out.append(row_for(kind, rows, group))
             i = j

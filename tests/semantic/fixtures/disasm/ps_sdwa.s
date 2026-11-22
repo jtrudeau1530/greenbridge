@@ -7,5 +7,7 @@
 	v_mov_b32 v5, 1.0
 	v_cvt_f16_f32_sdwa v4, v5 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
 	v_or_b32_sdwa v6, v0, v1 dst_sel:BYTE_2 dst_unused:UNUSED_SEXT src0_sel:BYTE_0 src1_sel:BYTE_0
+	v_xor_b32_e32 v3, 0x40000000, v3
+	v_xor_b32_e32 v6, 0x40000000, v6
 	exp mrt0 v2, v3, v4, v6 done vm
 	s_endpgm

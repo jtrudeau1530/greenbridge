@@ -505,6 +505,35 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["signature"], "0DRPz")
         self.assertEqual(rows[0]["version"], "122")
 
+    def carve(self, parts, gap=0):
+        """A carve folder as rpf9_carve.py writes it: <offset>.bin per stream plus index.json (off, stored)."""
+        folder = os.path.join(self.dir, "carve")
+        os.makedirs(folder)
+        files, off = [], 0x1000
+        for part in parts:
+            stored = len(zlib.compress(part))
+            with open(os.path.join(folder, f"{off:012x}.bin"), "wb") as f:
+                f.write(part)
+            files.append({"off": off, "stored": stored, "size": len(part)})
+            off = ((off + stored + 15) & ~15) + gap
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"summary": {}, "files": files}, f)
+        return folder
+
+    def test_carve_folder_joins_a_resource_split_over_two_files(self):
+        """scan_rpf appends the next contiguous stream while a 0DRPz resource needs a continuation; a carve
+        folder holds the same streams as files, and index.json says which ones were contiguous."""
+        blob = make_resource()
+        rows, stats = WI.scan_path(self.carve([blob[:0x150], blob[0x150:], make_resource(map_file=False)]))
+        maps = [r for r in rows if r["kind"] == "map"]
+        self.assertEqual([(r["file"], r["size"]) for r in maps], [("000000001000.bin", len(blob))])
+        self.assertEqual(len(rows), 2)
+
+    def test_carve_folder_does_not_join_streams_that_were_not_contiguous(self):
+        blob = make_resource()
+        rows, _ = WI.scan_path(self.carve([blob[:0x150], blob[0x150:]], gap=0x10))
+        self.assertEqual(rows, [])
+
     def test_directory_inflate_cap_does_not_exclude_large_archives(self):
         resource = make_resource()
         cap = len(resource)

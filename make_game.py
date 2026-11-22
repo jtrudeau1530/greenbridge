@@ -823,7 +823,7 @@ def runtime_gpu_per_vertex():
 
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
-TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py",
+TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "shader_meta.py", "spirv_stubs.py", "gfx10_formats.json")
 
 

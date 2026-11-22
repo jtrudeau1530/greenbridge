@@ -13,5 +13,6 @@
 	v_cmp_eq_u64_e64 s1, 0, v[6:7]
 	v_cndmask_b32_e64 v8, 0, 7, s1
 	v_cmpx_eq_u64_e32 0, v[6:7]
+	v_xor_b32_e32 v5, 0x40000000, v5
 	exp mrt0 v2, v3, v5, v8 done vm
 	s_endpgm

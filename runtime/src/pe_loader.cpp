@@ -487,12 +487,15 @@ Module& Loader::map_image(const std::filesystem::path& path) {
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
         throw std::runtime_error(name + ": not a PE32+ image");
     auto& oh = nt->OptionalHeader;
-    uint64_t sections = static_cast<uint64_t>(dos->e_lfanew) + 4 + sizeof(IMAGE_FILE_HEADER) +
-                        nt->FileHeader.SizeOfOptionalHeader;
-    if (sections + static_cast<uint64_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER) > file.size())
+    const uint64_t sections = static_cast<uint64_t>(dos->e_lfanew) + 4 + sizeof(IMAGE_FILE_HEADER) +
+                              nt->FileHeader.SizeOfOptionalHeader;
+    const uint64_t headers_end =
+        sections + static_cast<uint64_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+    if (headers_end > file.size())
         throw std::runtime_error(name + ": the section table runs past the end of the file");
-    if (!oh.SizeOfImage || oh.SizeOfHeaders > oh.SizeOfImage || oh.SizeOfHeaders > file.size())
-        throw std::runtime_error(name + ": SizeOfHeaders and SizeOfImage don't fit the file");
+    if (!oh.SizeOfImage || oh.SizeOfHeaders < headers_end || oh.SizeOfHeaders > oh.SizeOfImage ||
+        oh.SizeOfHeaders > file.size())
+        throw std::runtime_error(name + ": SizeOfHeaders and SizeOfImage don't fit the headers and file");
 
     auto* m = new Module;
     m->name = name;
@@ -533,8 +536,9 @@ Module& Loader::map_image(const std::filesystem::path& path) {
         auto* block = at<IMAGE_BASE_RELOCATION>(m->base, dir.VirtualAddress);
         auto* end = reinterpret_cast<uint8_t*>(block) + dir.Size;
         while (reinterpret_cast<uint8_t*>(block) < end) {
-            if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
-                reinterpret_cast<uint8_t*>(block) + block->SizeOfBlock > end)
+            const size_t remaining = static_cast<size_t>(end - reinterpret_cast<uint8_t*>(block));
+            if (remaining < sizeof(IMAGE_BASE_RELOCATION) || block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+                block->SizeOfBlock > remaining)
                 throw std::runtime_error(m->name + ": a relocation block doesn't fit the relocation table");
             auto* entries = reinterpret_cast<uint16_t*>(block + 1);
             size_t count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
