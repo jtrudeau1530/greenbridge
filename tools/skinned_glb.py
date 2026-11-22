@@ -51,6 +51,9 @@ the same RAGE Z-up -> glTF Y-up conversion as positions, ``(x, y, z) -> (x, z, -
 Only skinned primitives are exported, with clay materials. Textures, UV atlas
 data and materials of the source package are not copied. This is a static export
 path: it does not assemble a body or any other unrequested component.
+
+numpy is optional: when present it accelerates the weight pass; without it the
+standard-library path produces the same bytes and is covered by the tests.
 """
 from __future__ import annotations
 
