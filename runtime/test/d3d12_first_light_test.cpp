@@ -298,18 +298,58 @@ int main() {
         const double want[4] = {centre_uv[0], centre_uv[1], 0.0, 1.0};
         for (int c = 0; c < 4; ++c) EXPECT(std::fabs(p[c] - want[c]) <= 2e-3);
     }
+    // first_light.py's probes: pixels where U and V differ, so a swapped or mirrored UV cannot pass (#1906).
+    if (const leonida::Json* probes = manifest.find("uv_probes"); probes && probes->kind == leonida::Json::Kind::array) {
+        for (const leonida::Json& probe : probes->array) {
+            std::array<double, 2> xy{}, uv{};
+            EXPECT(pixel_of(probe, "pixel", xy) && pixel_of(probe, "uv", uv));
+            const Pixel& p = at(UINT(xy[0]), UINT(xy[1]));
+            const double want[4] = {uv[0], uv[1], 0.0, 1.0};
+            for (int c = 0; c < 4; ++c) EXPECT(std::fabs(p[c] - want[c]) <= 2e-3);
+        }
+        std::printf("%zu UV probes match\n", probes->array.size());
+    }
 
-    // vk_harness's own image of the same draw, when first_light.py --run left it in the folder. The PS exports with
-    // v_cvt_pkrtz_f16_f32 (round toward zero to f16), so an f32 interpolant a few ulps apart, which the opposite
-    // viewport direction gives, can land one f16 step lower or higher: measured on an RTX 3060, 1 of 16,384 pixels,
-    // and vk_harness drawing the mesh mirrored in y reproduces this image bit for bit. Coverage (alpha) must match.
+    // vk_harness's own image of the same draw, which first_light.py --run writes; required, so the whole-image check
+    // cannot be skipped silently. The PS exports with v_cvt_pkrtz_f16_f32 (round toward zero to f16), so an f32
+    // interpolant a few ulps apart, which the opposite viewport direction gives, can land on the adjacent f16 value:
+    // measured on an RTX 3060, 1 of 16,384 pixels, and vk_harness drawing the mesh mirrored in y reproduces this
+    // image bit for bit. Coverage (alpha) must match exactly.
     const auto vk_raw = read_file(dir / "image.raw");
-    if (!vk_raw.empty()) {
+    if (vk_raw.empty()) {
+        std::fprintf(stderr, "%s has no image.raw: run tools/first_light.py with --run first\n", dir.string().c_str());
+        return 1;
+    }
+    {
         EXPECT(vk_raw.size() == pixels.size() * sizeof(Pixel));
-        const auto one_f16_step = [](float a, float b) {
-            const float m = std::fmax(std::fabs(a), std::fabs(b));
-            return m == 0.0f || std::fabs(a - b) <= std::ldexp(1.0f, std::ilogb(m) - 10);
+        // Both values must be exact halves (the PS exported f16) and adjacent in half order: ordered index = the
+        // half's bits for +, minus the magnitude bits for -, so 0x3bff and 0x3c00 are one step and so are 0 and 0x0001.
+        const auto half_index = [](float f, int& out) {
+            const float a = std::fabs(f);
+            if (!(a <= 65504.0f)) return false;
+            int e = 0;
+            const float m = std::frexp(a, &e);                       // a = m * 2^e, m in [0.5, 1)
+            int bits;
+            if (a == 0.0f) {
+                bits = 0;
+            } else if (e <= -14) {                                    // subnormal half: a = k * 2^-24
+                const float k = std::ldexp(a, 24);
+                if (k != std::floor(k)) return false;
+                bits = int(k);
+            } else {
+                const float k = std::ldexp(m, 11);                    // 11 significant bits, implicit one included
+                if (k != std::floor(k)) return false;
+                bits = ((e + 14) << 10) | (int(k) & 0x3ff);
+            }
+            out = std::signbit(f) ? -bits : bits;
+            return true;
         };
+        const auto one_f16_step = [&](float a, float b) {
+            int ia = 0, ib = 0;
+            return half_index(a, ia) && half_index(b, ib) && std::abs(ia - ib) <= 1;
+        };
+        EXPECT(one_f16_step(1.0f, 0.99951171875f) && !one_f16_step(1.0f, 0.9990234375f));   // 0x3c00 vs 0x3bff, 0x3bfe
+        EXPECT(one_f16_step(0.0f, 5.9604645e-8f) && !one_f16_step(0.0f, 1.1920929e-7f));     // 0 vs 0x0001, 0x0002
         unsigned exact = 0, f16_step = 0, differ = 0;
         for (UINT y = 0; y < height; ++y) {
             for (UINT x = 0; x < width; ++x) {
