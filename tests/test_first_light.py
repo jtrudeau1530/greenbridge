@@ -213,5 +213,45 @@ class OracleTests(unittest.TestCase):
             check_image(b"", self.manifest)
 
 
+class ReadObjTests(unittest.TestCase):
+    """Wavefront OBJ parsing in tools/first_light.py without a GPU or game package."""
+
+    def _write_obj(self, text: str) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "mesh.obj")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return path
+
+    def test_negative_relative_indices_inline_comments_and_continuations(self):
+        positive = self._write_obj(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+            "vt 0.1 0.2\nvt 0.3 0.4\nvt 0.5 0.6\n"
+            "f 1/1 2/2 3/3\n"
+        )
+        relative = self._write_obj(
+            "v 0 0 0 # origin\n"
+            "v 1 0 0\n"
+            "v 0 1 0\n"
+            "vt 0.1 0.2 # uv0\n"
+            "vt 0.3 0.4\n"
+            "vt 0.5 0.6\n"
+            "f -3/-3 \\\n"
+            "  -2/-2 -1/-1 # trailing comment\n"
+        )
+        self.assertEqual(fl.read_obj(relative), fl.read_obj(positive))
+
+    def test_rejects_zero_and_out_of_range_vertex_indices(self):
+        for bad in (
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 4\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -4 -2 -1\n",
+            "v 0 0\nf 1 1 1\n",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                fl.read_obj(self._write_obj(bad))
+
+
 if __name__ == "__main__":
     sys.exit(unittest.main())
