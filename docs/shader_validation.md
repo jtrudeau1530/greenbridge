@@ -458,6 +458,102 @@ First results on an RTX 4090 (subgroup 32, driver 621.14):
 - **Everything else matches.** On `main`, 1,000 programs (`--seed 8 --ops 28 --no-maskdata --no-w32-hi-lanes`, 500 wave32 native and 500 wave64 emulated) give 0 mismatches. 297 of them are `hyp_only` (permlane with FI = 0 and an inactive source), and with `--permlane-fetch-inactive` all 1,000 match. Native wave64 on the 32-wide card mismatches as documented: `s_bcnt1` of EXEC counts one half, and a `v_readlane` from the other half wraps.
 - **Closed question (#374):** what hardware does for permlane with FI = 0 was measured on RDNA2 and RDNA3.5 (see above).
 
+### 32-bit float VALU on the GPU (`tools/f32_fuzz.py`, FUZZ-3)
+
+`--oracle hw` (or `translator,hw`) runs the same seeded VOP1/VOP2/VOP3 f32 programs natively on the AMD GPU and judges
+the hardware's `v8` and VCC against `F32Model` bit for bit (NaN matches any NaN; an f16 NaN in a `v_cvt_f16_f32` /
+`v_cvt_pkrtz_f16_f32` half too). Setup is the one in "Hardware oracle" above; without it the run prints
+`hardware oracle unavailable: ...` and exits 77. It tests the **model**, on wave32 with one lane; with `translator,hw`
+a hardware mismatch also prints what the translated SPIR-V did.
+
+```
+python -I tools/f32_fuzz.py --oracle hw --programs 5000 --seed 1            # table + informational hardware tables
+python -I tools/f32_fuzz.py --oracle hw --negative-control                   # wrong models must be caught
+python -I tools/f32_fuzz.py --oracle hw --perturb mul_rtz --programs 500     # one wrong model, mismatches must appear
+```
+
+- **Float MODE.** An assembled kernel's descriptor starts with IEEE 1, DX10_CLAMP 1, f32 denormals flushed
+  (`.amdhsa_float_denorm_mode_32 0`), f16/f64 denormals kept (3), round to nearest (MODE `0x3c0`, read back with
+  `s_getreg_b32`). The primary mode, `flush`, is the state inferred for the game's shaders (IEEE off, f32 denormals
+  flushed, DX10_CLAMP on: MODE `0x1c0`). Three more are run for what the model does not judge: `keep` (f32 denormals
+  kept, `0x1f0`), `no_dx10` (`0x0c0`), `ieee` (`0x3c0`). The run reads MODE back in a kernel for each and fails if a
+  directive did not take. Rounding is always to nearest even.
+- **GFX11 against GFX10, handled explicitly** (`tools/hw_oracle/asm.py`, checked by assembling every opcode for gfx1013,
+  gfx1010, gfx1030, gfx1100, gfx1150 and gfx1200):
+  - *Skipped, never substituted:* `v_mad_f32`, `v_mac_f32`, `v_madak_f32` and `v_mad_legacy_f32` exist on GFX10.1 only
+    (gfx1010/1011/1013, the console's family); gfx1030 and every GFX11 part reject them. The fused replacements
+    (`v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fma_dx9_zero_f32`) round once, so they are different instructions. The
+    unfused mad semantics (and SHADER-118's flush) therefore stay unmeasured: no RDNA2 desktop part and no GFX11 part has
+    them. Also not generated: `v_madmk_f32`, `v_min_legacy_f32` (GFX10.1 only), `v_fma_legacy_f32`/`v_fmac_legacy_f32`
+    (new in GFX10.3, not in gfx1013).
+  - *Renamed, run:* `v_mul_legacy_f32` is `v_mul_dx9_zero_f32` in GFX11 (the DX9 rule `0 * x = 0`, inf and NaN included,
+    held in every program) and `v_cvt_pkrtz_f16_f32` is `v_cvt_pk_rtz_f16_f32`; the assembler takes the old spelling.
+  - *Same, with a syntax change:* GFX11's assembler wants `clamp` before `mul:N`/`div:2`; the native kernels print them in
+    that order (the same bits). Opcode numbers differ between the families (`v_cmp_class_f32_e32` is `7d10` on gfx1013 and
+    `7cfc` on gfx1150); only mnemonics are shared. omod and clamp exist in VOP3 on both; no op_sel is used for f32.
+    The transcendental unit is separate on GFX11, so a `s_nop 7` follows the instruction in the native kernel
+    (`--no-hw-guard` leaves it out).
+  - *Not covered:* wave64 (the f32 ALU does not depend on it), `v_fma_mix*`, f16 and f64 arithmetic.
+- **Programs.** The seeded random ones, plus `--probes N` (default 12) per op and kind: denormal operand, denormal
+  result, NaN payloads, clamp of NaN/-0, invalid operations (inf - inf, 0 * inf, ...), and `cancel` (`z = -round(x * y)`,
+  which separates fused from unfused). `v_min/max/min3/max3/med3_f32` are in the table for the hardware only, with the
+  RDNA2 rules measured in #634.
+- **Judged / not judged.** A program is *match* or *mismatch* where the model has an answer. Where it declines (denormal
+  operand or result, clamp of NaN or -0, cube of NaN) the hardware still runs and is recorded in the informational tables,
+  also under the other three modes. A *known deviation* is hardware behaviour already analysed and written down as a model
+  alternative (`KNOWN_DEVIATIONS`); the hardware words must equal the alternative exactly, anything else is a mismatch.
+
+Results (Radeon 880M, gfx1150, driver 26.11.2, AMD clang 23.0.0git), seeds 1 to 6, 5,000 random programs + 24 probes per
+op and kind each, 46,967 programs in all: **30,577 match, 0 mismatch, 57 known deviation**, 5,417 skipped for GFX11,
+5,903 denormal, 5,013 other not judged (clamp of NaN or -0, cube of NaN). Seed 1 by family:
+
+| Family | Programs | Match | Mismatch | Known dev | GFX11 skip | Denormal | Other |
+|---|---|---|---|---|---|---|---|
+| add / sub / mul | 921 | 631 | 0 | 0 | 0 | 176 | 114 |
+| DX9 legacy mul / mad | 453 | 133 | 0 | 0 | 239 | 51 | 30 |
+| mad / mac / madak | 698 | 0 | 0 | 0 | 698 | 0 | 0 |
+| fma / fmac / fmaak | 700 | 509 | 0 | 0 | 0 | 132 | 59 |
+| int to f32 convert | 708 | 708 | 0 | 0 | 0 | 0 | 0 |
+| f16 convert | 478 | 383 | 0 | 0 | 0 | 90 | 5 |
+| `v_cvt_pk_u8_f32` | 183 | 130 | 0 | 0 | 0 | 53 | 0 |
+| floor / ceil / trunc / rndne | 795 | 582 | 0 | 5 | 0 | 96 | 112 |
+| rcp / rsq / sqrt / exp / log | 956 | 704 | 0 | 0 | 0 | 119 | 133 |
+| cube | 786 | 435 | 0 | 1 | 0 | 104 | 246 |
+| `v_cmp_class_f32` | 171 | 147 | 0 | 0 | 0 | 24 | 0 |
+| min / max / med3 (hardware only) | 989 | 732 | 0 | 1 | 0 | 128 | 128 |
+
+Negative control: `--negative-control` re-judges the same hardware words with a deliberately wrong model for six ops
+(`v_add_f32` low bit flipped, `v_mul_f32` rounding toward zero, `v_fma_f32` unfused, `v_mul_legacy_f32` as IEEE multiply,
+`v_rndne_f32` as floor, `v_min_f32` NaN rule changed); every one produced mismatches (1 to 112 per run; the `v_fma_f32` one only after the `cancel` probes were added, a plain random sweep missed it in seed 2;
+the legacy multiply is the weakest, 1 to 4, because `0 * inf` is rare). The `cancel` probes (seeds 2, 7, 8) give 72 of 72 fused-FMA matches. Seeds 1 to 6 ran without them.
+
+What the hardware answered where the model does not judge (gfx1150; RDNA2 is not measured by these runs):
+
+- **No model error found.** The model was right wherever it had an answer, in 30,577 programs; the min/max/med3
+  rules measured on RDNA2 in #634 (one NaN gives the other operand, both NaN give src0, -0 < +0, med3 with a NaN is min3)
+  also hold on gfx1150 for quiet and signalling NaNs with IEEE off.
+- **Output modifiers turn a -0 result into +0** (`mul:2`, `mul:4`, `div:2`; 57 programs, every seed; a flushed denormal
+  result, which is a -0, too). LLVM documents it for every GCN/RDNA part ("omod also does not correctly handle signed
+  zeros", `SIFoldOperands.cpp`). The model and the translator both keep -0: the translator is wrong here (`translator,hw`:
+  all 6 deviations of 2,000 programs are "matches the model, so it shares the model's answer"). It matters for RDNA2 if
+  the console behaves as LLVM says, and nothing here measured it. Not fixed in this change.
+- **omod only acts with MODE.IEEE = 0**, and for the ALU ops only with f32 denormals flushed: with `keep` the omod of
+  add/mul/fma/min/max/cvt/rounding ops is ignored; the transcendental ops and the cube ops still apply it. This supports
+  the corpus inference (omod on 102,365 float instructions, so IEEE off and f32 denormals flushed in the game's shaders).
+- **f32 denormals (SHADER-35's MODE question).** With `denorm_mode_32 = 0` a denormal operand is read as a zero of its sign
+  and a denormal result is written as a zero of its sign, for add/sub/mul/fma/fmac/fmaak, min/max/med3, rounding ops and
+  DX9 mul; with `3` they are exact. `v_rcp/rsq/sqrt/exp/log_f32` flush in both modes (as #634 measured on RDNA2).
+  `v_cmp_class_f32` classifies a denormal as a denormal in both. `v_cubesc/cubetc` pass a denormal operand through.
+- **clamp.** With DX10_CLAMP 1, clamp of a NaN gives +0; with 0 the NaN passes through. clamp of -0 gives +0 in every mode.
+  The model still declines both.
+- **NaN payloads.** With IEEE off a signalling NaN passes through add/mul/fma/rounding/transcendental ops unchanged
+  (payload and sign); with IEEE on it is quieted (bit 22 set). With several NaN operands the first (lowest source) wins
+  in add/mul/fma/fmaak/fmac; for min/max the rule above applies. `v_sub_f32` returns the NaN of src1 with its sign flipped
+  (it computes src0 + -src1). Invalid operations (inf - inf, 0 * inf, sqrt/rsq/log of a negative) give `0xffc00000` in every
+  mode and op, never `0x7fc00000`. `v_cvt_f16_f32` and `v_cvt_pkrtz_f16_f32` turn a NaN into an f16 NaN with the top 10
+  payload bits and the quiet bit set (not the canonical `0x7e00` the model writes; payload not judged, quietness is).
+  `v_cvt_f32_f16` keeps the f16 payload shifted left by 13 and does not quiet it (the model agrees).
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
