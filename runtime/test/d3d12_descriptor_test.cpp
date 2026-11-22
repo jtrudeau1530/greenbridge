@@ -457,10 +457,10 @@ int main() {
         EXPECT(!(support.Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
                                      D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) && !support.Support2);
         for (UINT count : {1u, 4u}) {
-            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{DXGI_FORMAT_A8_UNORM, count};
-            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
-                                                         sizeof(levels))));
-            EXPECT(levels.NumQualityLevels == (count == 1 ? 1u : 0u));
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality_levels{DXGI_FORMAT_A8_UNORM, count};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality_levels,
+                                                         sizeof(quality_levels))));
+            EXPECT(quality_levels.NumQualityLevels == (count == 1 ? 1u : 0u));
         }
         for (auto flag : {D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
