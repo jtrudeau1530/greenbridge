@@ -527,9 +527,8 @@ volume. A nonzero `ResourceMinLODClamp` on a 3D view is logged and leaves a null
 
 Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
-views of 1D textures, 3D storage views and typeless volume SRVs, multisampled depth/stencil and typeless color SRVs, and shader-translator lowering
-for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
-views of 1D and multisampled textures, 3D storage views and other typeless volume formats; depth-plane views (`R24_UNORM_X8_TYPELESS`,
+1D-array SRVs, 1D and 3D storage views, other typeless volume formats, multisampled depth/stencil and typeless
+color SRVs, and shader-translator lowering for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect (the texture's backing format, so X24_8_32_FLOAT for a D24 texture where the layer stores it as
 `D32_SFLOAT_S8_UINT`), each on its own family only (the other family's is a null
@@ -1039,8 +1038,8 @@ The layer's descriptor model:
 - RTV/DSV creation builds a `VkImageView` and stores it in the host-side heap; `OMSetRenderTargets` resolves those
   handles to views for the rendering scope. RTV/DSV descriptors are never shader-visible.
 - View creation maps `D3D12_SRV_DIMENSION`/`D3D12_UAV_DIMENSION` to `VkImageViewType`, the mip and layer ranges,
-  sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. Single-sampled 2D and 2D-array colour SRVs
-  apply the T# minimum LOD in resource mip coordinates. A clamp inside the exposed mip range uses
+  sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. Single-layer 1D textures have default and
+  explicit shader-resource views on sampled binding 5. Single-sampled 1D, 2D and 2D-array colour SRVs apply the T# minimum LOD in resource mip coordinates. A clamp inside the exposed mip range uses
   `VK_EXT_image_view_min_lod`. Vulkan allows the image-view minimum to be rounded down to an integer.
   With nearest mip filtering, the UHD 770 and Arrow Lake Xe-LPG returned mip 0 for a 2D minimum of 0.75.
   The Xe-LPG also returned mip 1 for a 2D-array minimum of 1.75. RTX and Radeon returned mips 1 and 2.

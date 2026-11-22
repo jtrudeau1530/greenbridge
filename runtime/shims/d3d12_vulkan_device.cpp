@@ -717,9 +717,9 @@ struct DeviceState {
         }
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
-        const bool color_2d = (image.type == g::ImageType::image_2d || image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube) &&
-                              (aspects & VK_IMAGE_ASPECT_COLOR_BIT);
-        if (!storage && color_2d) {
+        const bool supports_lod_clamp = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_2d ||
+                                        image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube;
+        if (!storage && supports_lod_clamp && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
             // Use the clamp in the T# itself: views with identical keys must sample identically.
             clamp.minLod = g::image_min_lod(words);
             if (clamp.minLod > float(image.first_mip + image.mip_count - 1)) {
@@ -728,7 +728,7 @@ struct DeviceState {
                     if (channel != g::select_one) channel = g::select_zero;
             } else if (clamp.minLod > float(image.first_mip)) {
                 if (!info.image_view_min_lod) {
-                    log_once("2D SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
+                    log_once("SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
                     return false;
                 }
                 clamp.pNext = view_info.pNext;
@@ -2311,8 +2311,11 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     const bool msaa = g::multisampled(view.type);
-    if ((volume != (view.type == g::ImageType::image_3d)) ||
-        (!volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) || msaa != (desc.SampleDesc.Count > 1)) {
+    const bool line = view.type == g::ImageType::image_1d;
+    const auto dimension = line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
+                           view.type == g::ImageType::image_3d ? D3D12_RESOURCE_DIMENSION_TEXTURE3D :
+                                                               D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    if (desc.Dimension != dimension || (line && desc.DepthOrArraySize != 1) || msaa != (desc.SampleDesc.Count > 1)) {
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
@@ -3484,7 +3487,9 @@ public:
         TextureView view{};
         if (!desc) {
             const bool array = r->desc().DepthOrArraySize > 1;
-            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array)
+                view.type = ImageType::image_1d;
+            else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                 view.type = ImageType::image_3d;
             else if (r->desc().SampleDesc.Count > 1)
                 view.type = array ? ImageType::image_2d_msaa_array : ImageType::image_2d_msaa;
@@ -3494,6 +3499,12 @@ public:
             view.format = desc->Format;
             view.mapping = desc->Shader4ComponentMapping;
             switch (desc->ViewDimension) {
+            case D3D12_SRV_DIMENSION_TEXTURE1D:
+                view.type = ImageType::image_1d;
+                view.first_mip = desc->Texture1D.MostDetailedMip;
+                view.mip_count = desc->Texture1D.MipLevels;
+                view.min_lod = desc->Texture1D.ResourceMinLODClamp;
+                break;
             case D3D12_SRV_DIMENSION_TEXTURE3D:
                 view.type = leonida::gfx10::ImageType::image_3d;
                 view.first_mip = desc->Texture3D.MostDetailedMip;
