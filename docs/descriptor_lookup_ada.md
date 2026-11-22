@@ -22,7 +22,7 @@ Each cell is gross GPU time in **µs per million logical lane lookups**, includi
 
 At 100,000 entries on type 1, a divergent T# dispatch took 2.00 ms and a T#+S# dispatch took 5.61 ms. Each paired iteration resolves two descriptors.
 
-GPU-only is type 1, `DEVICE_LOCAL`, on heap 0 (11,997 MiB). Host-visible is type 2, `HOST_VISIBLE | HOST_COHERENT` without `HOST_CACHED`, on heap 1 (16,243 MiB, not device-local). ReBAR is type 4, `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`, on heap 0. Every allocation on type 4 succeeded, up to the 20 MiB table.
+GPU-only is type 1, `DEVICE_LOCAL`, on heap 0 (11,997 MiB). Host-visible is type 2, `HOST_VISIBLE | HOST_COHERENT` without `HOST_CACHED`, on heap 1 (16,243 MiB, not device-local). ReBAR is type 4, `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`, on heap 0. Every allocation on type 4 succeeded, up to the 20 MiB table. Resizable BAR was enabled: `nvidia-smi` reported a 16,384 MiB BAR1 aperture. On a similar card where the ReBAR type is missing or refuses the allocation, the benchmark skips that placement and the ReBAR rows are absent.
 
 At 100,000 entries, the 12 round medians for GPU-only and ReBAR split into two groups. The four rounds whose process ran the 10,000-entry table first (rounds 3, 6, 7 and 10) measured 293–299 µs per million for divergent misses and 59.6–60.2 for divergent T# hits. The other eight rounds measured 992–1,015 and 118.7–142.9. The table medians follow the eight. The cause was not measured. Host-visible round medians for divergent misses ranged from 1,870–2,810 µs per million, and the spread did not follow the size order. At 1,000 and 10,000 entries, the round medians for each table cell differed by at most 10% on GPU-only and ReBAR, and by up to 37% on host-visible.
 
@@ -60,6 +60,7 @@ Device 0 was the RTX 4070 SUPER, the only Vulkan device. For the full 12-round s
 | GPU | NVIDIA GeForce RTX 4070 SUPER, 12,282 MiB (discrete) |
 | PCI id | `0x10de:0x2783`, subsystem `0x89521043` |
 | Link | PCIe 4.0 x16 (maximum reported by `nvidia-smi`) |
+| Resizable BAR | On (BAR1 aperture 16,384 MiB, `nvidia-smi -q -d MEMORY`) |
 | Subgroup size | 32 |
 | Driver | NVIDIA 621.01 (`nvidia-smi`), Vulkan API 1.4.357 |
 | OS | Windows 11 Home 25H2, build 26200.9974 |
