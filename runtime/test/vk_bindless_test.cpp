@@ -169,6 +169,14 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &props12};
     vkGetPhysicalDeviceProperties2(pd, &props);
     std::printf("device: %s%s\n", props.properties.deviceName, validation ? " (validation on)" : "");
+    // The pipeline layout pushes the 144-byte translated user-data block. A device with fewer push constant bytes
+    // (128 on Intel Arc and some AMD drivers) can't create it: a device limit, not a wrong result (TEST-149).
+    constexpr std::uint32_t push_bytes = 144;
+    if (props.properties.limits.maxPushConstantsSize < push_bytes) {
+        std::printf("unsupported: need %u push constant bytes, device has %u\n", push_bytes,
+                    props.properties.limits.maxPushConstantsSize);
+        return unsupported;
+    }
 
     // The features ps_tex's metadata names (bufferDeviceAddress, runtimeDescriptorArray, shaderInt64), dynamic
     // indexing of the image array, and whichever descriptor-indexing flags the set can use.
@@ -515,7 +523,7 @@ int main(int argc, char** argv) {
         BindlessSet set(vkGetDeviceProcAddr, dev, mp, flags);
         EXPECT(set.ok() && set.layout() && set.set());
 
-        const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 144};
+        const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_bytes};
         const VkDescriptorSetLayout set_layout = set.layout();
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pli.setLayoutCount = 1;
