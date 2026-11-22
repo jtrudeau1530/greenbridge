@@ -230,6 +230,32 @@ These are 32-bit hashes; whether they are type ids is open. Repeated values are 
 
 No name or type string is present in the page; these hashes remain opaque until the TOC or the executable supplies a mapping.
 
+### One page lacks the recurring `0x00000007` tag
+
+A separate Xbox Series 1.0.2.1 export contained 16,977 directory pages. The counts below apply only to that
+export. Each selected tag occurred once per page that contained it.
+
+| Selected `q38` tag | Pages containing it |
+|---|---:|
+| `0xa90b7f7e`, `0x0000004a`, `0x64e8ac67` | 16,977 each |
+| `0x00000007` | 16,976 |
+| `0x00000100` | 16,519 |
+| `0x00000101` | 593 |
+| `0x00000010` | 19 |
+| `0xde5f1345` | 0 |
+
+The one complete page without tag 7 had six `q38` records. The six nearest pages by record count had 10–12
+records and carried tag 7 in positions 2–7 (counting from one). Four shared five of the exceptional page's tags
+and two shared all six. Across the export, all 81 other pages containing all six tags also contained tag 7.
+None preserved the relative order of all six. Tag 7 is therefore optional in this sample. There is no second
+six-record table for a comparison that could distinguish omission from substitution.
+
+Of the 15,775 pages with exported `q28` records, all had at least one `hash_a` equal to a same-page `q38`
+tag. None had a matching `hash_b`. The export also reported 131 pages with `q28_error`. On the exceptional
+page, five of the 26 readable `q28` records each matched a different local tag through `hash_a`. Neither
+field equalled 7. On the six nearest pages, `hash_a` also never equalled 7 even though `q38` contained it.
+These comparisons establish equality of field values. Their role at runtime and the meaning of the tags remain open.
+
 ## The `q28` table (layout measured, semantics partial)
 
 `n = u16@0x48`; table at `q28 = u64@0x28 - 0x50000000`; each record is 32 bytes:
