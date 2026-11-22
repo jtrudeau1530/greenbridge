@@ -30,6 +30,7 @@ Usage:
 --start and --limit apply to a single archive only; with a directory they are an error (exit 2).
 """
 import argparse
+from collections import Counter
 import csv
 import json
 import mmap
@@ -360,8 +361,8 @@ def summarise(pages, mode, source):
                                            if p["resource"]["declared_matches_units"] is False),
         "versions": {str(v): sum(1 for p in pages if p["version"] == v)
                      for v in sorted({p["version"] for p in pages})},
-        "page_counts": {str(v): sum(1 for p in pages if p["page_count"] == v)
-                        for v in sorted({p["page_count"] for p in pages if p["page_count"] is not None})},
+        "page_counts": {str(v): n for v, n in sorted(Counter(
+            p["page_count"] for p in pages if p["page_count"] is not None).items())},
     }
 
 

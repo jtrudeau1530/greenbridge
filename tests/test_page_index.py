@@ -445,6 +445,40 @@ class PageIndexTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 2)
             self.assertIn("output would overwrite an input file", proc.stderr)
 
+    def test_page_counts_histogram_matches_naive_reference(self):
+        def page(count):
+            return {
+                "complete": True,
+                "counts": (0, 0, 0, 0),
+                "q38_records": [],
+                "q28_records": [],
+                "q28_error": "",
+                "continuations": [],
+                "span": 0,
+                "payload_at_0x60": False,
+                "resource": {"streams": [], "page_units": 1, "declared_matches_units": True},
+                "version": 122,
+                "page_count": count,
+            }
+
+        def naive(pages):
+            return {str(v): sum(1 for p in pages if p["page_count"] == v)
+                    for v in sorted({p["page_count"] for p in pages if p["page_count"] is not None})}
+
+        cases = {
+            "high-cardinality": [page(v) for v in range(1200)],
+            "mixed": [page(None if i % 3 == 0 else i % 97) for i in range(1500)],
+            "all-none": [page(None) for _ in range(50)],
+            "zero-count": [page(0) for _ in range(7)],
+            "no-pages": [],
+        }
+        for name, pages in cases.items():
+            with self.subTest(name):
+                actual = page_index.summarise(pages, "directory", "synthetic.rpf")["page_counts"]
+                expected = naive(pages)
+                self.assertEqual(actual, expected)
+                self.assertEqual(list(actual), list(expected))
+
 
 if __name__ == "__main__":
     unittest.main()
