@@ -219,6 +219,9 @@ def main():
     ap.add_argument("image")
     ap.add_argument("--out")
     a = ap.parse_args()
+    if not os.path.exists(a.image):
+        print(f"ERROR: {a.image}: does not exist", file=sys.stderr)
+        return 2
     path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
     same_path = os.path.normcase(os.path.realpath(a.image)) == os.path.normcase(os.path.realpath(path))
     try:

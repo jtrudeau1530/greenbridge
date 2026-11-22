@@ -570,9 +570,9 @@ class TestMainAndCLI(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "nope")
             code, out, err = self._call_main(["bary_fallback_gs.py", missing])
-            self.assertEqual(code, 1)
+            self.assertEqual(code, 2)
             self.assertEqual(out, "")
-            self.assertIn("not a directory", err)
+            self.assertIn("does not exist", err)
 
             file_path = os.path.join(tmp, "not_a_dir.txt")
             with open(file_path, "w", encoding="utf-8") as f:
@@ -698,9 +698,9 @@ class TestMainAndCLI(unittest.TestCase):
 
             missing = os.path.join(tmp, "missing")
             p = run_cli(missing)
-            self.assertEqual(p.returncode, 1)
+            self.assertEqual(p.returncode, 2)
             self.assertEqual(p.stdout, "")
-            self.assertIn("not a directory", p.stderr)
+            self.assertIn("does not exist", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
 
             # Empty directory (no index.json) succeeds silently without spirv-as/spirv-val.

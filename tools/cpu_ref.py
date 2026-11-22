@@ -775,6 +775,9 @@ def main(argv=None):
     ap.add_argument("--parse-only", action="store_true", help="report parsed and modelled instructions only")
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     args = ap.parse_args(argv)
+    if not os.path.exists(args.listing):
+        print(f"ERROR: {args.listing}: does not exist", file=sys.stderr)
+        return 2
 
     inputs = {"lanes": args.lanes, "vcc": args.vcc}
     if args.lanes == 1:

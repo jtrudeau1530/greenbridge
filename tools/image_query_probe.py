@@ -37,9 +37,6 @@ import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.dont_write_bytecode = True
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
 
 TYPE_2D, TYPE_2D_ARRAY = 9, 10                      # SQ_RSRC_IMG_* in T# WORD3 [31:28]
 DIMS = {TYPE_2D: "SQ_RSRC_IMG_2D", TYPE_2D_ARRAY: "SQ_RSRC_IMG_2D_ARRAY"}
@@ -262,6 +259,19 @@ def self_test():
     return 1 if bad else 0
 
 
+def _import_oracle():
+    """The optional hardware oracle, imported only for a GPU run.
+
+    --help and --self-test must not touch it: finding AMD clang, the HIP runtime and a host compiler is the
+    expensive startup work this probe would otherwise pay before argparse can answer --help.
+    """
+    sys.dont_write_bytecode = True
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from hw_oracle import asm, runner
+    return asm, runner
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--waves", default="32,64")
@@ -273,7 +283,7 @@ def main(argv=None):
     waves = [int(w) for w in a.waves.split(",")]
     if any(w not in (32, 64) for w in waves):
         p.error("--waves takes 32 and/or 64")
-    from hw_oracle import asm, runner
+    asm, runner = _import_oracle()
     try:
         oracle = runner.open_oracle()
     except runner.Unavailable as e:

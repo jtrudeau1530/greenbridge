@@ -313,6 +313,9 @@ def main() -> int:
     for flag, path in (("--out", out_path), ("--csv", a.csv)):
         if path and is_scanned_input(path, a.input, a.pattern):
             ap.error(f"{flag} would overwrite the input {path}")
+    if not os.path.exists(a.input):
+        print(f"ERROR: {a.input}: does not exist", file=sys.stderr)
+        return 2
     below_normal()
 
     if is_dir:

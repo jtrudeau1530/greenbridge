@@ -165,6 +165,9 @@ def main():
                                    if entry.name.endswith(".fssm") and entry.is_file())
         except (OSError, ValueError) as e:
             fail(f"cannot list shaders in {a.src}: {e}")
+    elif not os.path.exists(a.src):
+        print(f"ERROR: {a.src}: does not exist", file=sys.stderr)
+        return 2
     else:
         fail(f"{a.src} is not a file or folder")
     if not files:
