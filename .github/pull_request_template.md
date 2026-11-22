@@ -1,7 +1,8 @@
 Claimed in the coordination issue as: <!-- the item ID from the open "Coordinating who works on what" issue,
      for example TEST-17, or a link to your claim -->
 
-Depends on: <!-- #N for every pull request this one builds on (AGENTS.md); delete the line if there is none -->
+Depends on: <!-- #N for every pull request this one builds on or conflicts with (the coordination issue's
+     Commands section, AGENTS.md); delete the line if it builds on none and conflicts with none -->
 
 ### What and why
 
