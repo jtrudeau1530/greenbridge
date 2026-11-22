@@ -1331,12 +1331,13 @@ def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, ma
     si = _load_mini_interp()
     base = 0x1000
     vdata = "v2" if suffix == "x" else "v[2:3]"
+    sel = 0x22C if suffix == "xy" else 0x204  # XY01 for 2-comp, X001 for 1-comp (RDNA2 store COMP_SWAP)
     ps = (
         "; buffer_store_format_f16_rte\n"
         f"s_mov_b32 s0, {base:#x}\n"
         "s_mov_b32 s1, 0\n"
         "s_mov_b32 s2, 0x100\n"
-        f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000:#x}\n"
+        f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000 | sel:#x}\n"
         "v_mov_b32 v1, 0\n"
         "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (tie to even)
         "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c02 (tie to even)
@@ -1412,9 +1413,12 @@ def test_int32_buffer_formats_load_and_store_raw_bits(n, uint_fmt, sint_fmt, mak
         out = si.run_fragment(spv, memory=memory)["%out_mrt0"]
         assert list(out) == [words[c % n] for c in range(4)], fmt
 
+        store_sel = 0x22C if n == 2 else 0xFAC  # XY01 for 2-comp RG (XYZW selects (x, w) on RDNA2 MUBUF stores)
+        store_desc = (f"s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, {4 * n}\n"
+                      f"s_mov_b32 s3, {0x31000000 | store_sel | fmt << 12:#x}\n")
         setup = "".join(f"v_mov_b32 v{4 + i}, {w:#x}\n" for i, w in enumerate(words))
         regs = "v4" if n == 1 else f"v[4:{3 + n}]"
-        store = desc + setup + f"buffer_store_format_{'xyzw'[:n]} {regs}, off, s[0:3], 0\ns_endpgm\n"
+        store = store_desc + setup + f"buffer_store_format_{'xyzw'[:n]} {regs}, off, s[0:3], 0\ns_endpgm\n"
         shader = make_shader(store, name=f"ps_int32_store_{fmt}")
         spv = shader.translate()
         shader.validate(spv)
