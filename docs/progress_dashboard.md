@@ -10,7 +10,8 @@ start ..\leonida_progress\progress.html
 ```
 
 `--out` must be outside the repository; the tool refuses a folder inside it, so its output can't be committed by accident.
-The page is one self-contained HTML file: no network, no packages, it opens from disk.
+The page is one self-contained HTML file: no network, no packages, it opens from disk. The project logo
+(`assets/logo.png`) is embedded in it, and the page follows the system theme until you pick one with its theme button.
 
 ## Sources
 

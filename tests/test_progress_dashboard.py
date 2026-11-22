@@ -224,6 +224,9 @@ class Outputs(unittest.TestCase):
             with open(os.path.join(out, "progress.html"), encoding="utf-8") as f:
                 page = f.read()
             self.assertNotIn("/*__PROGRESS_DATA__*/null", page)
+            self.assertNotIn("/*__PROGRESS_LOGO__*/", page)
+            if os.path.isfile(pd.LOGO):                              # the logo is embedded: the page needs no other file
+                self.assertIn('src="data:image/png;base64,', page)
             self.assertIn('"schema": "leonida.progress/1"', page)
             with open(os.path.join(out, "progress.html"), "rb") as f:
                 self.assertNotIn(b"\r\n", f.read())             # LF on every platform
@@ -232,6 +235,15 @@ class Outputs(unittest.TestCase):
             self.assertEqual(len(os.listdir(os.path.join(out, "snapshots"))), 1)
             with open(os.path.join(out, "history.json"), encoding="utf-8") as f:
                 self.assertEqual(len(json.load(f)), 1)
+
+    def test_missing_logo_leaves_no_image(self):
+        old = pd.LOGO
+        try:
+            pd.LOGO = os.path.join(ROOT, "assets", "no_such_logo.png")
+            self.assertEqual(pd.logo_src(), "")
+            self.assertIn('src=""', pd.render_page({"schema": pd.SCHEMA}, []))
+        finally:
+            pd.LOGO = old
 
     def test_script_element_cannot_be_closed_by_data(self):
         snap = {"schema": pd.SCHEMA, "x": "</script><b>"}

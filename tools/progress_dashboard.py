@@ -25,6 +25,7 @@ No game data leaves the inputs: the page and the JSON carry counts, pass/fail, e
 own document text; never a shader name, a carved file name or a path into the game copy.
 """
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -39,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE = os.path.join(ROOT, "tools", "progress_dashboard.html")
+LOGO = os.path.join(ROOT, "assets", "logo.png")
 SCHEMA = "leonida.progress/1"
 STATUSES = ("verified", "implemented", "partial", "failed", "missing", "blocked", "unknown")
 PYTEST_MARKERS = re.compile(r"^import pytest|^ *HAVE_NUMPY =", re.M)   # the CI selection rule (ci.yml)
@@ -865,11 +867,22 @@ def summary_line(snap):
             "metrics": {m["id"]: {"v": m["value"], "n": m["numerator"], "d": m["denominator"], "f": m["definition"]} for m in snap["metrics"]}}
 
 
+def logo_src():
+    """The project logo (assets/logo.png) as a data: URI, so the page stays one file that opens from disk; empty when
+    the asset is absent, and the page then shows no image."""
+    try:
+        with open(LOGO, "rb") as f:
+            data = f.read()
+    except OSError:
+        return ""
+    return "data:image/png;base64," + base64.b64encode(data).decode("ascii") if data[:8] == b"\x89PNG\r\n\x1a\n" else ""
+
+
 def render_page(snap, history):
     template = read_text(TEMPLATE)
     payload = json.dumps({"snapshot": snap, "history": history}, ensure_ascii=False, sort_keys=True)
     payload = payload.replace("</", "<\\/")       # a document string can never close the script element
-    return template.replace("/*__PROGRESS_DATA__*/null", payload)
+    return template.replace("/*__PROGRESS_LOGO__*/", logo_src()).replace("/*__PROGRESS_DATA__*/null", payload)
 
 
 def write_outputs(snap, out_dir):
