@@ -72,9 +72,10 @@ method, scope and caveats. No game data is included.
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |
 | [fspx.md](fspx.md) | `FSPX`, the FidelityFX DLL's native compute programs (its shaders' `ACCC` part): directory as the DLL reads it, kind-0 dispatch state, the hash prologue, `gfx1030` for its `v_dot4` code; 13 of 29 translate with `tools/fspx_unpack.py`. |
 | [embedded_shaders.md](embedded_shaders.md) | DXBC containers embedded in the package's DLLs: 52 in `XboxBvhBuilder.dll` (console `FSSM` via the `XDAT`/`XBCH` record; 42/52 pass `spirv-val` today) and 29 `ACCC`/`FSPX` in the FidelityFX upscaler; the scan/extract tool and the four rules still missing. |
+| [first_light.md](first_light.md) | The first draw of a real game model with its own translated VS/PS on a GPU: 4,213 vertices / 7,968 triangles, 78.1% coverage on an RTX 2060 SUPER; `tools/first_light.py` and the `vk_harness` mesh mode. |
 | [coder.md](coder.md) | The compressed mass in `story000_script.rpf`: entry framing (`align16(entry+8)` payload), the 32-value tag alphabet, deflate-shaped but proprietary, variable-length 7/8-bit LSB-first codes with no stored table, and the `n7 = 116..127` search that finishes it. |
 | [mission_logic.md](mission_logic.md) | Mission state tables: 0x20 record layout (band counter, byte offsets), the 64-byte pool element with world transforms, case-folding joaat keys, 53.5 % of states named, 113 state-set clusters covering 82.4 % of files. |
 
 ## Other languages
 
-Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`fr`, `pt-BR`, `zh-CN`, `pl-PL`, `tr`, `ru`, `ja`).
+Community quickstarts (stable onboarding text only; English docs remain authoritative): [i18n/README.md](i18n/README.md) (`fr`, `pt-BR`, `zh-CN`, `pl-PL`, `tr`, `ru`, `ja`, `es`).

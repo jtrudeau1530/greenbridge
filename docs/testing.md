@@ -39,8 +39,9 @@ This page collects the setup steps and the problems testers have run into so far
   conda-forge `llvm-tools` 23.1.6 package assembled the same f16 programs.
 - **SPIRV-Tools** (`spirv-as`, `spirv-val`): part of the Vulkan SDK, or a distribution package.
 - **A C++20 compiler, CMake and the Vulkan headers** to build the test programs:
-  - Windows: Visual Studio 2022 with "Desktop development with C++", the Windows SDK 10.0.26100 or newer, and the
-    Vulkan SDK.
+  - Windows: the full runtime needs Visual Studio 2022 with "Desktop development with C++" and Windows SDK
+    10.0.26100 or newer. Install the Vulkan SDK for the backend headers. The standalone tools also compile with llvm-mingw and the Vulkan headers alone.
+    Running the GPU tests needs a Vulkan loader and a compatible driver.
   - Linux: CMake 3.24+, GCC or Clang, and the Vulkan headers and loader. The headers should be recent enough
     for `VK_KHR_maintenance8`; older ones still build, but skip what needs it.
   - macOS: `brew install llvm molten-vk vulkan-headers vulkan-loader spirv-tools vulkan-tools`. The test programs
@@ -53,6 +54,15 @@ Windows, from a "Developer PowerShell for VS 2022" or a plain shell:
 ```powershell
 scripts\build_runtime.ps1            # CMake + Ninja into runtime\build
 ```
+
+For the standalone Vulkan tools, put llvm-mingw on `PATH` and point CMake at the directory containing `vulkan/vulkan.h`:
+
+```powershell
+cmake -S runtime -B runtime/build/vulkan -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF -DVulkan_INCLUDE_DIR=C:/Vulkan-Headers/include
+cmake --build runtime/build/vulkan --parallel --target vk_harness vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_bindless_test
+```
+
+Pass `--build runtime/build/vulkan` to `scripts/run_gpu_tests.py`.
 
 If you configure with CMake's Visual Studio generator instead, the programs end up in `runtime\build\Release` (or
 `RelWithDebInfo`); pass that folder to `--build` below.
@@ -245,9 +255,11 @@ With more than one GPU, pick one through the Vulkan loader, for example
 `vulkaninfo --summary` shows which devices the loader then sees.
 
 Two GPUs of one vendor share one driver, so the loader cannot tell them apart (an RTX 5070 Ti next to an RTX 3060,
-say; without a choice the D3D12 tests take the last discrete GPU). `LEONIDA_VK_DEVICE` names the GPU by part of its
-name, without case: `LEONIDA_VK_DEVICE=5070` or `LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`)
-and the layer's standalone device read it, and a value that matches no device fails the run instead of testing
+say; without a choice the runtime and every test take the same one: a native driver over Microsoft's Dozen, discrete
+over integrated, the first on a tie, `vulkan_device_rank` in `runtime/src/vulkan_device_filter.h`).
+`LEONIDA_VK_DEVICE` names the GPU by part of its name, without case: `LEONIDA_VK_DEVICE=5070` or
+`LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`) and the layer's standalone device read it,
+and a value that matches no device fails the run instead of testing
 another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12 adapter the same way.
 The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
 `vk_device_pick.h`, and fail with a message naming the filter when it matches no device.
@@ -275,7 +287,7 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
 | `ctest` lists `fsr_dispatch` and `bvh_builder` as failed (`Not Run`) after clang-cl hits an internal compiler error in `fsr_dispatch_test.cpp` and `bvh_builder_test.cpp` | clang-cl 22.1.8 on Fedora (Linux cross-build) and Windows, plus 22.1.7 on Windows | Use clang-cl 23.1.6 (both files compile on Windows) |
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |
-| `vulkaninfo` lists `Microsoft Direct3D12 (<gpu>)` next to the real GPU and the tests run on it | The Windows "OpenCL™, OpenGL® and Vulkan® Compatibility Pack" installs Mesa's Dozen, a Vulkan-on-D3D12 layer that reports `DISCRETE_GPU` like the native card | Current `main` prefers a native ICD over Microsoft's vendor (`0x1414`) in every harness; set `LEONIDA_VK_DEVICE=<part of the real GPU name>` to select explicitly. See #915. |
+| `vulkaninfo` lists `Microsoft Direct3D12 (<gpu>)` next to the real GPU and the tests run on it | The Windows "OpenCL™, OpenGL® and Vulkan® Compatibility Pack" installs Mesa's Dozen, a Vulkan-on-D3D12 layer that reports `DISCRETE_GPU` like the native card | Current `main` prefers a native ICD over Microsoft's vendor (`0x1414`) in the runtime and every harness; set `LEONIDA_VK_DEVICE=<part of the real GPU name>` to select explicitly. See #915. |
 | A GPU test that uses `image_load` (or lighting built from real shaders) reads zeros from its image; @Silliana saw every texel except pixel (0,0) come back zero in their own layer (#603, not reproduced here) | In this runtime the shader turns the T# words into an index through the descriptor hash table (`runtime/src/descriptor_table.h`: a miss gives index 0), and index 0 is a 1×1 image of zeros (`runtime/src/vulkan_bindless.h`), so a hand-built or zeroed T# that was never registered reads zeros even at (0,0). The translator does not compare coordinates with the T# size, and `cs_imgload.asm` only uses its T# words as a hash key | Register the descriptor through the runtime (for D3D12, create it with `CreateShaderResourceView`) so its T# hits the table, with the image's real width and height (stored as size − 1, see `runtime/src/gfx10_descriptors.h`) |
 
 ## Posting your result

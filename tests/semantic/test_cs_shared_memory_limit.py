@@ -245,6 +245,14 @@ class SharedMemoryLimitTests(unittest.TestCase):
                           "s_waitcnt lgkmcnt(0)", "ds_read_b32 v7, v1", "s_waitcnt lgkmcnt(0)"] + out(5, 6, 7), 1)
         self.assertEqual((mem.get(0), mem.get(4), mem.get(8)), (0, 0, 7))
 
+    def test_out_of_range_mskor_returns_zero_and_changes_nothing(self):
+        # ds_mskor_rtn_b32 (two atomics on one dword) past the allocation: old value 0, the wrap target untouched
+        _, mem = run_one(["v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 7", "ds_write_b32 v1, v2",
+                          "s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v3, 0xfc00", "v_mov_b32_e32 v4, 0xff",
+                          "v_mov_b32_e32 v5, 0xdead", "ds_mskor_rtn_b32 v5, v3, v4, v4 offset:1024",
+                          "s_waitcnt lgkmcnt(0)", "ds_read_b32 v7, v1", "s_waitcnt lgkmcnt(0)"] + out(5, 7), 1)
+        self.assertEqual((mem.get(0), mem.get(4)), (0, 7))
+
     def test_in_range_shader_emits_no_bounds_check(self):
         # The same accesses inside a 4 KiB allocation: the wrapped power-of-two path, no check (main's SPIR-V)
         spv, mem = run_one(["v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0x5e17", "ds_write_b32 v1, v2",
