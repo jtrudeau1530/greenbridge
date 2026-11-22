@@ -14,6 +14,10 @@ files (it does not import them) and requires each one to reach ``rdna2spirv``:
 ``ALLOWLIST`` is deliberately short and reviewed: it holds the interpreter self-tests, the fixture
 drift check, and the files whose subject is hand-written SPIR-V.  A new entry needs a reason and a
 name that says why the file must not call the translator.
+
+This checks that a file *reaches* the translator, not that every assertion depends on it: a file that
+imports ``support`` and asserts nothing about its output still passes.  The pattern it is meant to
+stop is the one that imports nothing from the repository at all and models the instruction itself.
 """
 import ast
 import os
