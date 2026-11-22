@@ -170,6 +170,9 @@ def _find_lld(clang):
 class Oracle:
     """Assembles batches of scalar programs for one architecture and runs them on device 0."""
 
+    code_object = None   # None: the assembler's default version; 5 after an older HIP runtime refused that
+    true16 = False       # True: this assembler wants v8.l for a 16-bit operand
+
     def __init__(self, arch=None, workdir=None, chunk=500):
         if not os.path.isfile(os.path.join(HERE, "hw_oracle.c")):
             raise Unavailable("hw_oracle.c is missing")
@@ -185,6 +188,7 @@ class Oracle:
         self.workdir = workdir or tempfile.mkdtemp(prefix="leonida-hw-oracle-")
         self.exe = self._build_launcher()
         self.device = self._probe()
+        self.true16 = self._needs_true16()
         self._probe_waves()
 
     def _build_launcher(self):
@@ -212,6 +216,14 @@ class Oracle:
         if co is None:
             raise Unavailable("probe kernel did not assemble: " + err[:300])
         rc, out, err = self._launch(co, names)
+        if rc == 3 and "hip error 209" in err and self.code_object is None:
+            # LLVM 23 writes code object v6, which HIP runtimes from 2024 (amdhip64_6.dll) refuse as "no binary for
+            # this GPU". Ask for v5; a 209 that stays has another cause and is reported below.
+            self.code_object = 5
+            co, why = self._assemble(text)
+            if co is None:
+                raise Unavailable("the HIP runtime refused the code object (209) and v5 did not assemble: " + why[:300])
+            rc, out, err = self._launch(co, names)
         if rc == 77:
             raise Unavailable(err.strip() or "no AMD device")
         if rc:
@@ -220,6 +232,15 @@ class Oracle:
         if "arch=" in head and self.arch not in head:
             raise Unavailable(f"device reports {head!r} but assembling for {self.arch} (set LEONIDA_HW_ARCH)")
         return head.lstrip("# ")
+
+    def _needs_true16(self):
+        """Whether this assembler rejects `v_cvt_f16_f32 v8, v1` and takes `v8.l` (LLVM 23 on GFX11)."""
+        if asm.family(self.arch) == "gfx10":
+            return False
+        bare = "v_cvt_f16_f32 v8, v1\n"
+        if self._assemble(bare)[0] is not None:
+            return False
+        return self._assemble(asm.true16_spelling(bare))[0] is not None
 
     def _probe_waves(self):
         """Each wave size really runs as that size: a 64-thread group stores v_mbcnt lane ids. In a wave64 kernel
@@ -242,7 +263,10 @@ class Oracle:
         co = os.path.join(self.workdir, "k.co")
         with open(s, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-        r = subprocess.run([self.clang, f"--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}", *(["-mwavefrontsize64"] if wave == 64 else []), "-c", s, "-o", o],
+        flags = ["-mwavefrontsize64"] if wave == 64 else []
+        if self.code_object:
+            flags.append(f"-mcode-object-version={self.code_object}")
+        r = subprocess.run([self.clang, "--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}", *flags, "-c", s, "-o", o],
                            capture_output=True, text=True)
         if r.returncode:
             return None, r.stderr
@@ -269,6 +293,8 @@ class Oracle:
         live = list(idx)
         while live:
             text, names, starts = asm.module_text([programs[i] for i in live], self.arch, wave=wave)
+            if self.true16:
+                text = asm.true16_spelling(text)
             co, err = self._assemble(text, wave)
             if co is not None:
                 break

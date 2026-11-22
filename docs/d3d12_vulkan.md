@@ -431,8 +431,13 @@ What is implemented (all of it testable without the game):
   zero-filled, because Vulkan cannot clear them; they start undefined until the application uploads them. Each
   submission ends with a barrier to the host, so a readback buffer holds the GPU's writes once the fence wait
   returns. Children hold a reference to the proxy, not
-  the inner device, so `GetDevice` always returns the Xbox-ABI object. All D3D12 queues share one graphics
-  `VkQueue` behind a submit lock (question 12).
+  the inner device, so `GetDevice` always returns the Xbox-ABI object. Each live D3D12 queue leases a distinct
+  graphics-family `VkQueue`; the standalone device requests up to 16. The queues still share a submit lock for
+  replay state, but Wait-before-Signal between them can make progress (D3D-97). Caller-owned Vulkan devices can
+  supply additional handles through `VulkanDeviceInfo::command_queues`; without them they retain legacy single-queue
+  behavior. When supplied handles are exhausted, `CreateCommandQueue` fails instead of silently sharing a queue.
+  Dedicated compute/transfer
+  *families* would also require resource queue-family ownership handling and remain future work.
 
 Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
 side inwards:
@@ -1045,7 +1050,7 @@ The trace will enumerate them.
 | D3D12 / Xbox object | Vulkan / layer object | Notes |
 |---|---|---|
 | `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
-| `ID3D12CommandQueue` | `Queue` over one or more `VkQueue`s | Start with one graphics+compute+transfer queue; add dedicated queues when the game uses async compute. `PresentX`, `SuspendX`, `ResumeX` are Xbox queue methods, not in the public vtable; public GDKX samples present only through them (§4.5). Call shapes known, slots **Open**. |
+| `ID3D12CommandQueue` | one leased graphics-family `VkQueue` per live queue | Distinct Vulkan queues allow cross-queue waits and signals to make progress. Dedicated compute/transfer families remain open because resource ownership transfers are not yet implemented. `PresentX`, `SuspendX`, `ResumeX` are Xbox queue methods, not in the public vtable; public GDKX samples present only through them (§4.5). Call shapes known, slots **Open**. |
 | `ID3D12CommandAllocator` | IR arena + `VkCommandPool` | Reset only when the previous submission's fence is complete. |
 | `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers; records the GCL8 front/back stencil references (applied only once a pipeline path consumes them). |
 | `ID3D12RootSignature` | `RootSignature` + `VkPipelineLayout` | Deserialize the blob with the host `D3D12CreateVersionedRootSignatureDeserializer` when possible; clear the measured `0x03000000` flag byte on a copy first; fall back to a local parser. Build the user-SGPR map and static samplers. |

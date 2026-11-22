@@ -465,7 +465,25 @@ def file_document(path: str) -> dict:
     }
 
 
+def _make_parent(path: str) -> None:
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def write_csv(path: str, rows: list) -> None:
+    _make_parent(path)
     fields = ["source", "offset_hex", "bytes", "chunks", "root", "category", "header", "complete",
               "well_formed", "fragment", "tail_only", "truncated", "malformed", "element_count",
               "max_depth", "comments", "attributes", "refs", "platform", "platform_total", "filename",
@@ -548,6 +566,18 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="validate well-formedness and report fragments")
     args = parser.parse_args()
 
+    if args.csv and args.json and same_report_path(args.csv, args.json):
+        parser.error("--csv and --json must use different paths")
+    for flag, path in (("--csv", args.csv), ("--json", args.json)):
+        if not path:
+            continue
+        if os.path.isdir(path):
+            parser.error(f"{flag} is a directory: {path}")
+        for target in args.targets:
+            source = os.path.join(target, "index.json") if os.path.isdir(target) else target
+            if same_report_path(path, source):
+                parser.error(f"{flag} would overwrite the input {source}")
+
     rows = []
     mode = document_mode(args.targets)
     try:
@@ -576,6 +606,7 @@ def main() -> int:
         print("wrote", args.csv)
     if args.json:
         public_rows = [{key: value for key, value in row.items() if key != "_scan"} for row in rows]
+        _make_parent(args.json)
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"summary": summary, "roots": agg["roots"], "rows": public_rows}, f, indent=1)
         print("wrote", args.json)

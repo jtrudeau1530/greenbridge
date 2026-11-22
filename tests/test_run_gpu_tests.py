@@ -259,8 +259,9 @@ class UniformBranchCheck(unittest.TestCase):
         import tempfile
         fd, path = tempfile.mkstemp(suffix=".raw")
         try:
-            with os.fdopen(fd, "wb") as f:
-                for s5, bit, bary in rows:
+            with os.fdopen(fd, "wb") as f:   # the rows repeated over a full 64x64 frame (a short one fails, TEST-29)
+                for k in range(64 * 64):
+                    s5, bit, bary = rows[k % len(rows)]
                     f.write(struct.pack("<2I2f", s5, bit, bary, 0.0))
             return rgt.check_uniform_branch(path)
         finally:

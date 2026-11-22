@@ -111,6 +111,38 @@ class Resolve(unittest.TestCase):
         self.assertEqual(got["%08x" % sk.joaat(b"GadgetBlock")], ["GadgetBlock"])
         self.assertNotIn("%08x" % sk.joaat(b"MysteryField"), got)
 
+    def resolve_cli(self, *args):
+        tool = os.path.join(ROOT, "tools", "save_keys.py")
+        return subprocess.run([sys.executable, "-I", tool, "resolve", *args], cwd=ROOT, capture_output=True, text=True)
+
+    def test_out_naming_an_input_is_refused(self):
+        # --out must not replace the user's dictionary, a save, a file found in an input folder, or a hard link to one
+        folder = os.path.join(self.dir, "saves")
+        os.makedirs(folder)
+        inside = os.path.join(folder, "more.json")
+        with open(inside, "w", encoding="utf-8") as f:
+            f.write("{}")
+        link = os.path.join(self.dir, "link.bin")
+        os.link(self.dict, link)
+        for out, inputs in ((self.dict, [self.jsav]), (self.jsav, [self.jsav]), (inside, [folder]),
+                            (link, [self.jsav])):
+            with self.subTest(out=os.path.basename(out)):
+                with open(out, "rb") as f:
+                    before = f.read()
+                r = self.resolve_cli(*inputs, "--dict", self.dict, "--out", out)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn("refusing to overwrite", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                with open(out, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_out_in_a_missing_folder_is_one_error_line(self):
+        r = self.resolve_cli(self.jsav, "--dict", self.dict, "--out", os.path.join(self.dir, "nope", "res.json"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("error: the folder for --out", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.stdout, "")      # refused before the resolve ran
+
     def test_compose_finds_two_word_names(self):
         text = run(["resolve", self.jsav, "--dict", self.dict, "--compose", "50"])
         self.assertIn("joaat, composed       1 more keys", text)       # SprocketCount from Sprocket + Count
