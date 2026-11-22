@@ -482,7 +482,7 @@ def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
         for alias in aliases:
             if alias in ped_set:
                 score += 10
-            elif any(token.startswith(alias) for token in ped_set):
+            elif not alias[-1].isdigit() and any(token.startswith(alias) for token in ped_set):
                 score += 5
         if score:
             candidate = (score, -len(ped_name), -index, index)
