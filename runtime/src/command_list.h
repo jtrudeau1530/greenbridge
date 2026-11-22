@@ -151,7 +151,7 @@ inline constexpr std::uint32_t clear_stencil = 0x2;
 inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
 // Portable color-view interpretation. Other views inherit their resource format as before.
-enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint };
+enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint, rgba8_sint, rgba8_snorm };
 
 // D3D12_QUERY_HEAP_TYPE and D3D12_QUERY_TYPE.
 namespace d3d12_query_heap {

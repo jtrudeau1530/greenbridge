@@ -913,6 +913,8 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     case ColorViewFormat::rgba8_unorm: format = VK_FORMAT_R8G8B8A8_UNORM; break;
     case ColorViewFormat::rgba8_srgb: format = VK_FORMAT_R8G8B8A8_SRGB; break;
     case ColorViewFormat::rgba8_uint: format = VK_FORMAT_R8G8B8A8_UINT; break;
+    case ColorViewFormat::rgba8_sint: format = VK_FORMAT_R8G8B8A8_SINT; break;
+    case ColorViewFormat::rgba8_snorm: format = VK_FORMAT_R8G8B8A8_SNORM; break;
     default: return VK_FORMAT_UNDEFINED;
     }
     if (!resource.rgba8_typeless && !resource.castable_view_formats)
