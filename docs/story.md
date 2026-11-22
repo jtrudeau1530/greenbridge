@@ -341,4 +341,9 @@ An empty archive gives an index with no files.
 
 `story_index.py` is stdlib-only. It classifies the same zlib/Bink walk as `rpf9_carve.py`, parses
 the `PSIN` section chain, and reports `0DRP`/`RSC8`/`9FPR` headers when they start a stream or a
-carved file. It does not recurse into the raw embedded archives.
+carved file. It does not recurse into the raw embedded archives. A `clip-stream` row is the tagged
+auxiliary table of a `0DRP` second system page, checked by the same `aux_table` as `anim_index.py`
+(#2496): u32 count 2 or 3, count {u32 tag, u32 payloadBytes} pairs with first tag `0x101`, and every
+payload inside the stream. Its `count` is the entry count and its detail lists the tags and payload end;
+there is no version and no fixed 24-byte header. The "clip stream" row in the 1 GiB table above was
+counted with the older eight-byte prefix check (u32 2 or 3, then `01 01 00 00`).
