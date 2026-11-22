@@ -472,8 +472,12 @@ def main(argv=None):
                       f"meshlets={p['meshlets']} triangles={p['triangles']}")
         print(json.dumps(total, indent=1))
     if args.json:
-        with open(args.json, "w", encoding="utf-8") as fh:
-            json.dump({"totals": total, "pages": pages}, fh, indent=1)
+        try:
+            with open(args.json, "w", encoding="utf-8") as fh:
+                json.dump({"totals": total, "pages": pages}, fh, indent=1)
+        except OSError as exc:
+            print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
     return 1 if total["pages"] != total["pages_parsed"] else 0
 
 
