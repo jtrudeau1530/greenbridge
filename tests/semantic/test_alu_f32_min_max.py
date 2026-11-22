@@ -1,8 +1,11 @@
-"""Semantic interpreter tests for single-precision floating point min/max (v_min_f32, v_max_f32).
+"""Semantic interpreter tests for single-precision floating point min/max (v_min_f32, v_max_f32, v_min3_f32, v_max3_f32, v_med3_f32).
 
 Models IEEE 754-2008 / 2019 binary32 minNum/maxNum and AMD RDNA2 / GFX10 VALU semantics:
   - v_min_f32: D.f = min(S0.f, S1.f)
   - v_max_f32: D.f = max(S0.f, S1.f)
+  - v_min3_f32: D.f = min(min(S0.f, S1.f), S2.f)
+  - v_max3_f32: D.f = max(max(S0.f, S1.f), S2.f)
+  - v_med3_f32: D.f = median(S0.f, S1.f, S2.f) with fallback to min3 if any operand is NaN.
 
 RDNA2 Floating-Point Rules:
   1. NaN suppression (IEEE 754-2008 minNum/maxNum):
@@ -18,14 +21,16 @@ RDNA2 Floating-Point Rules:
      Input modifiers: neg (-src), abs (|src|), and neg-abs (-|src|).
      Output modifier: clamp to [0.0, 1.0].
   5. Translation lowering:
-     tools/rdna2spirv.py maps v_min_f32 and v_max_f32 to GLSL.std.450 NMin and NMax
-     (OpExtInst %float %glsl NMin/NMax), which enforce identical NaN-skipping and signed-zero rules.
+     tools/rdna2spirv.py maps v_min_f32, v_max_f32, v_min3_f32, and v_max3_f32 to GLSL.std.450
+     NMin and NMax (OpExtInst %float %glsl NMin/NMax), which enforce identical NaN-skipping and
+     signed-zero rules. v_med3_f32 lowers to FClamp with an OpIsNan check selecting NMin(NMin(x, y), z).
 
 Standard library Python only; zero third-party dependencies; zero game data.
 Python 3.9+ compatible (from __future__ import annotations).
 """
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import struct
@@ -64,6 +69,9 @@ TWO = 0x40000000           # 2.0
 NEG_TWO = 0xC0000000       # -2.0
 THREE = 0x40400000         # 3.0
 FOUR = 0x40800000          # 4.0
+FIVE = 0x40A00000          # 5.0
+TEN = 0x41200000           # 10.0
+NEG_TEN = 0xC1200000       # -10.0
 FLT_MIN = 0x00800000       # Smallest positive normal: 2^-126
 NEG_FLT_MIN = 0x80800000   # -2^-126
 FLT_MAX = 0x7F7FFFFF       # (2 - 2^-23) * 2^127
@@ -176,6 +184,30 @@ def ref_max_f32(s0: int, s1: int) -> int:
     return s0 if k0 >= k1 else s1
 
 
+def ref_min3_f32(s0: int, s1: int, s2: int) -> int:
+    """Pure bitwise reference oracle for RDNA2 v_min3_f32: min(min(s0, s1), s2)."""
+    return ref_min_f32(ref_min_f32(s0, s1), s2)
+
+
+def ref_max3_f32(s0: int, s1: int, s2: int) -> int:
+    """Pure bitwise reference oracle for RDNA2 v_max3_f32: max(max(s0, s1), s2)."""
+    return ref_max_f32(ref_max_f32(s0, s1), s2)
+
+
+def ref_med3_f32(s0: int, s1: int, s2: int) -> int:
+    """Pure bitwise reference oracle for RDNA2 v_med3_f32.
+
+    Rules:
+      - If any operand is NaN, hardware evaluates min3(s0, s1, s2).
+      - Otherwise, returns the median with -0.0 < +0.0 tie-breaking.
+    """
+    if is_nan_bits(s0) or is_nan_bits(s1) or is_nan_bits(s2):
+        return ref_min3_f32(s0, s1, s2)
+    triplet = [(bits_to_f32(s), zero_ordered_key(bits_to_f32(s)), s) for s in (s0, s1, s2)]
+    triplet.sort(key=lambda t: t[1])
+    return triplet[1][2]
+
+
 def apply_f32_modifiers(bits: int, neg: bool = False, abs_val: bool = False) -> int:
     """Applies VOP3 input modifiers: abs (|x|) first, then neg (-x)."""
     bits &= MASK32
@@ -265,6 +297,50 @@ def run_f32_2op(
     return si.run_fragment(spv)["%out_mrt0"][0]
 
 
+def run_f32_3op(
+    op: str,
+    s0: int,
+    s1: int,
+    s2: int,
+    neg0: bool = False,
+    abs0: bool = False,
+    neg1: bool = False,
+    abs1: bool = False,
+    neg2: bool = False,
+    abs2: bool = False,
+    clamp: bool = False,
+) -> int:
+    """Translates and runs a 3-operand float min/max/med instruction through rdna2spirv and spirv_mini_interp."""
+    if _TMP_DIR is None or _SRC_PATH is None:
+        setUpModule()
+        assert _SRC_PATH is not None
+
+    def fmt_src(v_name: str, neg: bool, abs_val: bool) -> str:
+        s = v_name
+        if abs_val:
+            s = f"|{s}|"
+        if neg:
+            s = f"-{s}"
+        return s
+
+    clamp_str = " clamp" if clamp else ""
+    lines = [
+        f"\tv_mov_b32 v1, {s0 & MASK32:#x}",
+        f"\tv_mov_b32 v2, {s1 & MASK32:#x}",
+        f"\tv_mov_b32 v3, {s2 & MASK32:#x}",
+        f"\t{op} v0, {fmt_src('v1', neg0, abs0)}, {fmt_src('v2', neg1, abs1)}, {fmt_src('v3', neg2, abs2)}{clamp_str}",
+        "\texp mrt0 v0, v0, v0, v0 done vm",
+        "\ts_endpgm",
+    ]
+    asm = "; ps_f32_min_max3\n" + "\n".join(lines) + "\n"
+    with open(_SRC_PATH, "w", encoding="utf-8") as f:
+        f.write(asm)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        spv = rdna2spirv.translate(_SRC_PATH)
+    return si.run_fragment(spv)["%out_mrt0"][0]
+
+
 class TestF32ReferenceOracle2Op(unittest.TestCase):
     """Verifies the pure-Python reference oracle ref_min_f32 and ref_max_f32."""
 
@@ -306,25 +382,79 @@ class TestF32ReferenceOracle2Op(unittest.TestCase):
         self.assertEqual(ref_max_f32(NEG_FLT_MIN, NEG_SUBNORM_MAX), NEG_SUBNORM_MAX)
 
     def test_nan_suppression(self) -> None:
-        # If one operand is NaN, return the other operand exactly.
         self.assertEqual(ref_min_f32(QNAN, ONE), ONE)
         self.assertEqual(ref_min_f32(ONE, QNAN), ONE)
         self.assertEqual(ref_max_f32(QNAN, ONE), ONE)
         self.assertEqual(ref_max_f32(ONE, QNAN), ONE)
 
-        # Signaling NaN is also suppressed.
         self.assertEqual(ref_min_f32(SNAN, TWO), TWO)
         self.assertEqual(ref_max_f32(TWO, SNAN), TWO)
 
-        # Both NaN returns quiet NaN.
         self.assertTrue(is_nan_bits(ref_min_f32(QNAN, SNAN)))
         self.assertTrue(is_nan_bits(ref_max_f32(QNAN, SNAN)))
 
     def test_nan_payload_preservation(self) -> None:
-        # The non-NaN operand must have its exact bit pattern preserved.
         custom_float = 0x3EAAAAAB  # 0.33333334
         self.assertEqual(ref_min_f32(QNAN_PAYLOAD, custom_float), custom_float)
         self.assertEqual(ref_max_f32(custom_float, QNAN_PAYLOAD), custom_float)
+
+
+class TestF32ReferenceOracle3Op(unittest.TestCase):
+    """Verifies reference oracles for 3-way instructions: min3, max3, med3."""
+
+    def test_min3_permutations(self) -> None:
+        triples = [
+            (ONE, TWO, THREE),
+            (NEG_TEN, POS_ZERO, TEN),
+            (NEG_TWO, NEG_ONE, f32_to_bits(-3.0)),
+        ]
+        for a, b, c in triples:
+            expected = ref_min_f32(ref_min_f32(a, b), c)
+            for p0, p1, p2 in itertools.permutations([a, b, c]):
+                self.assertEqual(ref_min3_f32(p0, p1, p2), expected)
+
+    def test_max3_permutations(self) -> None:
+        triples = [
+            (ONE, TWO, THREE),
+            (NEG_TEN, POS_ZERO, TEN),
+            (NEG_TWO, NEG_ONE, f32_to_bits(-3.0)),
+        ]
+        for a, b, c in triples:
+            expected = ref_max_f32(ref_max_f32(a, b), c)
+            for p0, p1, p2 in itertools.permutations([a, b, c]):
+                self.assertEqual(ref_max3_f32(p0, p1, p2), expected)
+
+    def test_med3_permutations(self) -> None:
+        # All permutations of {1.0, 2.0, 3.0} must have median 2.0
+        for p in itertools.permutations([ONE, TWO, THREE]):
+            self.assertEqual(ref_med3_f32(*p), TWO)
+
+        # All permutations of {-10.0, 0.0, 10.0} must have median 0.0
+        for p in itertools.permutations([NEG_TEN, POS_ZERO, TEN]):
+            self.assertEqual(ref_med3_f32(*p), POS_ZERO)
+
+    def test_signed_zeros_3op(self) -> None:
+        # -0.0 < +0.0 ordered tie breaking:
+        # min3(+0.0, -0.0, 1.0) -> -0.0
+        self.assertEqual(ref_min3_f32(POS_ZERO, NEG_ZERO, ONE), NEG_ZERO)
+        # max3(+0.0, -0.0, -1.0) -> +0.0
+        self.assertEqual(ref_max3_f32(POS_ZERO, NEG_ZERO, NEG_ONE), POS_ZERO)
+        # med3(+0.0, -0.0, 1.0) -> +0.0 (sorted: -0.0, +0.0, 1.0)
+        self.assertEqual(ref_med3_f32(POS_ZERO, NEG_ZERO, ONE), POS_ZERO)
+        # med3(+0.0, -0.0, -1.0) -> -0.0 (sorted: -1.0, -0.0, +0.0)
+        self.assertEqual(ref_med3_f32(POS_ZERO, NEG_ZERO, NEG_ONE), NEG_ZERO)
+
+    def test_med3_nan_fallback_to_min3(self) -> None:
+        # If any operand is NaN, v_med3_f32 evaluates min3(s0, s1, s2).
+        self.assertEqual(ref_med3_f32(QNAN, TWO, THREE), TWO)
+        self.assertEqual(ref_med3_f32(ONE, QNAN, THREE), ONE)
+        self.assertEqual(ref_med3_f32(ONE, TWO, QNAN), ONE)
+        self.assertEqual(ref_med3_f32(QNAN, QNAN, FOUR), FOUR)
+
+    def test_extreme_floats_3op(self) -> None:
+        self.assertEqual(ref_min3_f32(NEG_INF, ONE, POS_INF), NEG_INF)
+        self.assertEqual(ref_max3_f32(NEG_INF, ONE, POS_INF), POS_INF)
+        self.assertEqual(ref_med3_f32(NEG_INF, ONE, POS_INF), ONE)
 
 
 class TestVMinVMaxF32Execution(unittest.TestCase):
@@ -366,6 +496,58 @@ class TestVMinVMaxF32Execution(unittest.TestCase):
                 self.assertEqual(got_e64, expected)
 
 
+class TestVMin3VMax3VMed3Execution(unittest.TestCase):
+    """Executes synthetic shaders testing v_min3_f32, v_max3_f32, and v_med3_f32."""
+
+    TEST_TRIPLES = [
+        (ONE, TWO, THREE),
+        (THREE, ONE, TWO),
+        (TWO, THREE, ONE),
+        (NEG_ONE, NEG_TWO, f32_to_bits(-3.0)),
+        (NEG_TEN, POS_ZERO, TEN),
+        (HALF, ONE_HALF, TWO),
+    ]
+
+    def test_v_min3_f32_execution(self) -> None:
+        for s0, s1, s2 in self.TEST_TRIPLES:
+            expected = ref_min3_f32(s0, s1, s2)
+            with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                got = run_f32_3op("v_min3_f32", s0, s1, s2)
+                self.assertEqual(got, expected)
+
+    def test_v_max3_f32_execution(self) -> None:
+        for s0, s1, s2 in self.TEST_TRIPLES:
+            expected = ref_max3_f32(s0, s1, s2)
+            with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                got = run_f32_3op("v_max3_f32", s0, s1, s2)
+                self.assertEqual(got, expected)
+
+    def test_v_med3_f32_execution(self) -> None:
+        for s0, s1, s2 in self.TEST_TRIPLES:
+            expected = ref_med3_f32(s0, s1, s2)
+            with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                got = run_f32_3op("v_med3_f32", s0, s1, s2)
+                self.assertEqual(got, expected)
+
+    def test_signed_zeros_3op_execution(self) -> None:
+        # min3(+0, -0, 1.0) == -0.0
+        self.assertEqual(run_f32_3op("v_min3_f32", POS_ZERO, NEG_ZERO, ONE), NEG_ZERO)
+        # max3(+0, -0, -1.0) == +0.0
+        self.assertEqual(run_f32_3op("v_max3_f32", POS_ZERO, NEG_ZERO, NEG_ONE), POS_ZERO)
+        # med3(+0, -0, 1.0) == +0.0
+        self.assertEqual(run_f32_3op("v_med3_f32", POS_ZERO, NEG_ZERO, ONE), POS_ZERO)
+        # med3(+0, -0, -1.0) == -0.0
+        self.assertEqual(run_f32_3op("v_med3_f32", POS_ZERO, NEG_ZERO, NEG_ONE), NEG_ZERO)
+
+    def test_extreme_values_3op_execution(self) -> None:
+        # min3(-INF, FLT_MIN, POS_INF) == -INF
+        self.assertEqual(run_f32_3op("v_min3_f32", NEG_INF, FLT_MIN, POS_INF), NEG_INF)
+        # max3(-INF, FLT_MIN, POS_INF) == +INF
+        self.assertEqual(run_f32_3op("v_max3_f32", NEG_INF, FLT_MIN, POS_INF), POS_INF)
+        # med3(-INF, FLT_MIN, POS_INF) == FLT_MIN
+        self.assertEqual(run_f32_3op("v_med3_f32", NEG_INF, FLT_MIN, POS_INF), FLT_MIN)
+
+
 class TestSignedZerosTieBreak(unittest.TestCase):
     """Verifies that RDNA2 -0.0 < +0.0 ordering is strictly preserved by translator and interpreter."""
 
@@ -383,40 +565,57 @@ class TestSignedZerosTieBreak(unittest.TestCase):
 
 
 class TestVALUModifiers2Op(unittest.TestCase):
-    """Verifies VOP3 input modifiers (neg, abs) and output clamp."""
+    """Verifies VOP3 input modifiers (neg, abs) and output clamp for 2-op instructions."""
 
     def test_neg_modifier(self) -> None:
-        # v_min_f32_e64 v0, -v1, v2 with v1=1.0, v2=0.5 -> min(-1.0, 0.5) = -1.0
         got = run_f32_2op("v_min_f32", ONE, HALF, e64=True, neg0=True)
         self.assertEqual(got, NEG_ONE)
-
-        # v_max_f32_e64 v0, -v1, v2 with v1=1.0, v2=0.5 -> max(-1.0, 0.5) = 0.5
         got = run_f32_2op("v_max_f32", ONE, HALF, e64=True, neg0=True)
         self.assertEqual(got, HALF)
 
     def test_abs_modifier(self) -> None:
-        # v_min_f32_e64 v0, |v1|, v2 with v1=-2.0, v2=1.5 -> min(2.0, 1.5) = 1.5
         got = run_f32_2op("v_min_f32", NEG_TWO, ONE_HALF, e64=True, abs0=True)
         self.assertEqual(got, ONE_HALF)
-
-        # v_max_f32_e64 v0, |v1|, |v2| with v1=-2.0, v2=-3.0 -> max(2.0, 3.0) = 3.0
         got = run_f32_2op("v_max_f32", NEG_TWO, f32_to_bits(-3.0), e64=True, abs0=True, abs1=True)
         self.assertEqual(got, THREE)
 
     def test_neg_abs_combination(self) -> None:
-        # -|src|: abs clears sign bit first, neg flips sign bit second -> -|1.0| = -1.0, -|-2.0| = -2.0
         got_min = run_f32_2op("v_min_f32", TWO, ONE, e64=True, neg0=True, abs0=True)
         self.assertEqual(got_min, NEG_TWO)
         got_max = run_f32_2op("v_max_f32", NEG_TWO, ONE, e64=True, neg0=True, abs0=True)
         self.assertEqual(got_max, ONE)
 
     def test_clamp_modifier(self) -> None:
-        # v_max_f32_e64 v0, v1, v2 clamp with v1=2.0, v2=3.0 -> max(2.0, 3.0) = 3.0, clamped to 1.0
         got = run_f32_2op("v_max_f32", TWO, THREE, e64=True, clamp=True)
         self.assertEqual(got, ONE)
-
-        # v_min_f32_e64 v0, v1, v2 clamp with v1=-1.0, v2=-2.0 -> min(-1.0, -2.0) = -2.0, clamped to +0.0
         got = run_f32_2op("v_min_f32", NEG_ONE, NEG_TWO, e64=True, clamp=True)
+        self.assertEqual(got, POS_ZERO)
+
+
+class TestVALUModifiers3Op(unittest.TestCase):
+    """Verifies VOP3 input modifiers (neg, abs) and output clamp for 3-op instructions."""
+
+    def test_min3_modifiers(self) -> None:
+        # min3(-|2.0|, 3.0, 4.0) -> min3(-2.0, 3.0, 4.0) = -2.0
+        got = run_f32_3op("v_min3_f32", TWO, THREE, FOUR, neg0=True, abs0=True)
+        self.assertEqual(got, NEG_TWO)
+
+    def test_max3_modifiers(self) -> None:
+        # max3(-2.0, -3.0, |-4.0|) -> max3(-2.0, -3.0, 4.0) = 4.0
+        got = run_f32_3op("v_max3_f32", NEG_TWO, f32_to_bits(-3.0), f32_to_bits(-4.0), abs2=True)
+        self.assertEqual(got, FOUR)
+
+    def test_med3_modifiers(self) -> None:
+        # med3(|-1.0|, -2.0, 3.0) -> med3(1.0, -2.0, 3.0) = 1.0
+        got = run_f32_3op("v_med3_f32", NEG_ONE, NEG_TWO, THREE, abs0=True)
+        self.assertEqual(got, ONE)
+
+    def test_clamp_modifier_3op(self) -> None:
+        # max3(2.0, 3.0, 4.0) clamp -> 4.0 clamped to 1.0
+        got = run_f32_3op("v_max3_f32", TWO, THREE, FOUR, clamp=True)
+        self.assertEqual(got, ONE)
+        # min3(-1.0, -2.0, -3.0) clamp -> -3.0 clamped to +0.0
+        got = run_f32_3op("v_min3_f32", NEG_ONE, NEG_TWO, f32_to_bits(-3.0), clamp=True)
         self.assertEqual(got, POS_ZERO)
 
 
