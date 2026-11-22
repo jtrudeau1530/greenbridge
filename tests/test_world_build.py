@@ -1249,6 +1249,20 @@ class WorldBuildTest(unittest.TestCase):
                     snapshot[os.path.relpath(path, directory)] = f.read()
         return snapshot
 
+    def test_compute_spawn_keeps_large_chunks_within_viewer_load_radius(self):
+        load_radius = 1400.0  # viewer/index.html LOAD_R
+        floor = [{"bounds": [x, -2.0, -7000.0, x + 4000.0, 0.0, -3000.0]} for x in (1000.0, 5000.0, 9000.0)]
+        tower = [{"bounds": [-500.0, 0.0, -500.0, -490.0, 3000.0, -490.0]}]
+        for chunks, b in ((floor, floor[1]["bounds"]), (tower, tower[0]["bounds"])):
+            with self.subTest(bounds=b):
+                spawn = world_build._compute_spawn(chunks)
+                self.assertEqual(spawn[0], 0.5 * (b[0] + b[3]))
+                nearest = [min(max(p, lo), hi) for p, lo, hi in zip(spawn, b[:3], b[3:])]
+                self.assertLess(math.dist(spawn, nearest), load_radius)
+        small = [{"bounds": [10.0, 0.0, 20.0, 110.0, 5.0, 120.0]}]
+        self.assertEqual(world_build._compute_spawn(small), [60.0, 30.0, 180.0])
+        self.assertEqual(world_build._compute_spawn([]), [0.0, 20.0, 40.0])
+
     def test_unusable_input_preserves_output_and_reports_failure(self):
         cases = ("unrelated_directory", "corrupt_manifest", "invalid_schema", "empty_manifest",
                  "missing_objs", "empty_geometry", "invalid_file_fields")
