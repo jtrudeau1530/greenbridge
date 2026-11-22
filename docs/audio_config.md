@@ -84,7 +84,10 @@ python -I tools/audio_config.py <carve dir or blob> [--json] [--names FILE] [--j
 - `collect(src, names=..., join=...)` scans a blob or a directory and adds `file` and
   `file_offset`; `names` maps hash B to a display string when a NUL-separated local name pool is
   supplied.
-- `joaat` and `normalized_name` are the shared hash helpers.
+- `joaat` and `normalized_name` are the shared hash helpers. `joaat` is the lowercased **latin-1** byte hash
+  that `tools/hashdict.py` and `tools/awc_names.py` use, so a name hashes alike in every tool; a non-ASCII
+  character is one byte (`é` = `0xE9`), not its UTF-8 pair. `tests/test_joaat_agreement.py` holds every copy in
+  `tools/` to that rule.
 - Text output prints one `file:file_offset` line per record and a summary; `--json` writes
   `{records, summary}`.
 

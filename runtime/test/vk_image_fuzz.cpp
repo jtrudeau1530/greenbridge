@@ -9,6 +9,7 @@
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan_bindless.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,14 @@ std::vector<std::uint32_t> read_spv(const char* path) {
 std::string trim(const std::string& s) {
     std::size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
     return b == std::string::npos ? "" : s.substr(b, e - b + 1);
+}
+// LEONIDA_PC_TAIL_UBO=1: shaders were translated with --pc-tail-ubo (128-byte push constants for s0..s31; the
+// image_load fuzz shaders read neither heap base nor code base, so they declare no set-1 block).
+bool pc_tail_requested() {
+    const char* v = std::getenv("LEONIDA_PC_TAIL_UBO");
+    std::string s = trim(v ? v : "");
+    for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return s == "1" || s == "true" || s == "yes" || s == "on";
 }
 // Decimal or 0x-prefixed hex, whole string, no exceptions (strtoul with base 0 handles both).
 bool parse_u32(const std::string& text, std::uint32_t& out) {
@@ -223,9 +232,11 @@ int main(int argc, char** argv) {
         std::printf("unsupported: %s lacks the required image feature\n", spec.format_name.c_str());
         return unsupported;
     }
-    // The pipeline layout pushes the 144-byte translated user-data block. A device with fewer push constant bytes
-    // (128 on Intel Arc and some AMD drivers) can't create it: a device limit, not a wrong result (TEST-149).
-    constexpr std::uint32_t push_bytes = 144;
+    // The pipeline layout pushes the translated user-data block (144 bytes by default, or 128 bytes under
+    // LEONIDA_PC_TAIL_UBO=1 for rdna2spirv.py --pc-tail-ubo). A device with fewer push constant bytes (128 on
+    // Intel Arc and AMD's Windows driver for RDNA2 iGPUs) can't take 144: a device limit, not a wrong result (TEST-149).
+    const bool pc_tail = pc_tail_requested();
+    const std::uint32_t push_bytes = pc_tail ? 128u : 144u;
     if (props.properties.limits.maxPushConstantsSize < push_bytes) {
         std::printf("unsupported: need %u push constant bytes, device has %u\n", push_bytes,
                     props.properties.limits.maxPushConstantsSize);
@@ -561,7 +572,7 @@ int main(int argc, char** argv) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &bound, 0, nullptr);
     std::uint32_t block[36] = {};
     std::memcpy(block + 8, spec.tsharp, sizeof(spec.tsharp)); // s[8:15]: the T# the fragment shader loads
-    vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(block), block);
+    vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, push_bytes, block);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rc{.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {W, H, 1}};

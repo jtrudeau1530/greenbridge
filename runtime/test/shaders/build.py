@@ -22,6 +22,9 @@ With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are trans
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
 inputs, and check.py reports it as SKIP.
+With LEONIDA_PC_TAIL_UBO=1, every shader is translated with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the
+heap base and code base in a uniform block at set 1), for devices whose maxPushConstantsSize is 128; set it for
+check.py too, whose test programs then bind that block (runtime/test/vk_pc_tail.h).
 """
 import json
 import os
@@ -165,6 +168,9 @@ def translate_tests(work, names):
         cmd.append("--f16-interp-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
+    # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
+    if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
+        cmd.append("--pc-tail-ubo")
     return subprocess.run(cmd).returncode
 
 

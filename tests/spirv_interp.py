@@ -103,7 +103,10 @@ def run(spvasm):
             types[res] = (op[6:],) + tuple(args)
         elif op == "OpConstant":
             t = types[args[0]][0]
-            consts[res] = f32(float(args[1])) if t == "Float" else (int(args[1]) & M32 if t == "Int" and types[args[0]][2] == "0" else s32(int(args[1])))
+            if t == "Float":
+                consts[res] = float(args[1]) if types[args[0]][1] == "64" else f32(float(args[1]))
+            else:
+                consts[res] = int(args[1]) & M32 if t == "Int" and types[args[0]][2] == "0" else s32(int(args[1]))
         elif op == "OpConstantTrue":
             consts[res] = True
         elif op == "OpConstantFalse":
@@ -152,9 +155,18 @@ def run(spvasm):
 
     F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b}
 
-    def glsl(fn, a):
-        if fn in ("Fma", "FMin", "FMax", "FClamp") and isinstance(a[0], tuple):      # vector: per component
-            return tuple(glsl(fn, list(c)) for c in zip(*a))
+    def float_bits(rt):
+        t = types.get(rt)
+        if not t:
+            return 32
+        if t[0] == "Vector":
+            t = types.get(t[1], ())
+        return int(t[1]) if t and t[0] == "Float" else 32
+
+    def glsl(fn, a, bits=32):
+        round_out = (lambda v: float(v)) if bits == 64 else f32
+        if fn in ("Fma", "FMin", "FMax", "FClamp", "FAbs", "Sqrt", "InverseSqrt", "Exp2", "Log2", "Sin", "Cos", "Fract") and isinstance(a[0], tuple):      # vector: per component
+            return tuple(glsl(fn, list(c), bits) for c in zip(*a))
         if fn == "UnpackHalf2x16":
             return (f32(half_to_float(a[0])), f32(half_to_float(a[0] >> 16)))
         if fn == "PackHalf2x16":
@@ -162,8 +174,8 @@ def run(spvasm):
         if fn == "Fma":
             from fractions import Fraction
             if any(math.isnan(x) or math.isinf(x) for x in a):
-                return f32(a[0] * a[1] + a[2])
-            return f32(float(Fraction(a[0]) * Fraction(a[1]) + Fraction(a[2])))
+                return round_out(a[0] * a[1] + a[2])
+            return round_out(float(Fraction(a[0]) * Fraction(a[1]) + Fraction(a[2])))
         rounding = {"Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc, "RoundEven": round}
         if fn in rounding:      # a zero result keeps the sign of the operand (IEEE 754; RDNA2 and Vulkan GPUs do)
             return a[0] if math.isnan(a[0]) or math.isinf(a[0]) else math.copysign(float(rounding[fn](a[0])), a[0])
@@ -181,11 +193,11 @@ def run(spvasm):
                 return tuple(pick(x, y) for x, y in zip(a[0], a[1]))
             return pick(a[0], a[1])
         if fn in simple:
-            return f32(float(simple[fn](*a)))
+            return round_out(float(simple[fn](*a)))
         if fn == "Fract":
-            return f32(a[0] - math.floor(a[0]))
+            return round_out(a[0] - math.floor(a[0]))
         if fn == "FClamp":
-            return f32(min(max(a[0], a[1]), a[2]))
+            return round_out(min(max(a[0], a[1]), a[2]))
         if fn in ("SMax", "SMin"):
             return (max if fn == "SMax" else min)(*a)
         if fn in ("UMax", "UMin"):
@@ -247,7 +259,7 @@ def run(spvasm):
             val[res] = get(args[1])[int(args[2])]
         elif op == "OpExtInst":
             fn = args[2]
-            val[res] = glsl(fn, [get(a) for a in args[3:]])
+            val[res] = glsl(fn, [get(a) for a in args[3:]], float_bits(args[0]))
         elif op == "OpBitFieldSExtract":
             v, off, cnt = s32(get(args[1])), get(args[2]), get(args[3])
             x = (v >> off) & ((1 << cnt) - 1)

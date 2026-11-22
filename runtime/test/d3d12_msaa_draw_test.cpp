@@ -10,6 +10,7 @@
 // and 3 samples are E_INVALIDARG. A 4x PSO drawing into a single-sampled target fails the list at execute
 // (invalid_subresource) instead of reaching the driver. Shaders: test/glsl/vs_draw.vert, ps_draw.frag. No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -53,8 +54,8 @@ int main() {
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_msaa_draw_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
@@ -131,7 +132,7 @@ int main() {
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&three.p)) == E_INVALIDARG && !three.p);
         pso_desc.SampleDesc = {samples, 1};  // past NumQualityLevels (1): D3D12 returns E_INVALIDARG
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&three.p)) == E_INVALIDARG && !three.p);
-        pso_desc.SampleDesc = {samples, UINT(D3D12_STANDARD_MULTISAMPLE_PATTERN)};  // accepted natively
+        pso_desc.SampleDesc = {samples, UINT(DXGI_STANDARD_MULTISAMPLE_QUALITY_PATTERN)};  // accepted natively
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&three.p))));
         three.reset();
 
