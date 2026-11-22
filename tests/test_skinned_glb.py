@@ -458,6 +458,123 @@ class SkinnedGlbTest(unittest.TestCase):
         with self.assertRaises(skinned_glb.SkinError):
             skinned_glb.normalise_weights(bytes(broken), j1, w0, w1, 3, 2, [1, 3], 4)
 
+    def test_zero_weight_padding_joint_index_outside_local_palette_is_zeroed(self):
+        j0, j1, w0, w1 = _streams()
+        padded_j1 = bytearray(j1)
+        padded_j1[0] = 255  # w1[0] is 0, so this unused slot must be ignored and zeroed in both paths
+        got_default = skinned_glb.normalise_weights(j0, bytes(padded_j1), w0, w1, 3, 2, [1, 3], 4)
+        self.assertEqual(struct.unpack_from("<4H", got_default["j1"], 0)[0], 0)
+
+        class _FakeArray:
+            def __init__(self, rows):
+                self.rows = [list(r) for r in rows]
+
+            def astype(self, _dtype):
+                return _FakeArray(self.rows)
+
+            def sum(self, axis=1):
+                assert axis == 1
+                return _FakeVec([sum(r) for r in self.rows])
+
+            def __gt__(self, other):
+                return _FakeMask([[v > other for v in r] for r in self.rows])
+
+            def __eq__(self, other):
+                return _FakeMask([[v == other for v in r] for r in self.rows])
+
+            def __ge__(self, other):
+                return _FakeMask([[v >= other for v in r] for r in self.rows])
+
+            def __itruediv__(self, col):
+                for r, d in zip(self.rows, col.vals):
+                    for i in range(len(r)):
+                        r[i] = r[i] / d
+                return self
+
+            def __getitem__(self, key):
+                if isinstance(key, _FakeMask):
+                    return _FakeVec([v for r, mr in zip(self.rows, key.rows) for v, m in zip(r, mr) if m])
+                if isinstance(key, tuple) and len(key) == 2 and key[0] == slice(None):
+                    return _FakeArray([r[key[1]] for r in self.rows])
+                raise TypeError(key)
+
+            def __setitem__(self, key, value):
+                assert isinstance(key, _FakeMask)
+                for r, mr in zip(self.rows, key.rows):
+                    for i, m in enumerate(mr):
+                        if m:
+                            r[i] = value
+
+            def tobytes(self):
+                if self.rows and isinstance(self.rows[0][0], float):
+                    return b"".join(struct.pack("<f", v) for r in self.rows for v in r)
+                return b"".join(struct.pack("<H", int(v)) for r in self.rows for v in r)
+
+        class _FakeMask:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def any(self):
+                return any(any(r) for r in self.rows)
+
+        class _FakeVec:
+            def __init__(self, vals):
+                self.vals = list(vals)
+
+            def __le__(self, other):
+                return _FakeMask([[v <= other for v in self.vals]])
+
+            def __getitem__(self, key):
+                if isinstance(key, _FakeArray):
+                    return _FakeArray([[self.vals[int(idx)] for idx in r] for r in key.rows])
+                return self
+
+            def max(self):
+                return max(self.vals)
+
+            def min(self):
+                return min(self.vals)
+
+        class _FakeNp:
+            uint8 = "u1"
+            uint16 = "u2"
+            int64 = "i8"
+            float64 = "f8"
+
+            @staticmethod
+            def frombuffer(buf, dtype):
+                class _Buf:
+                    def reshape(self_inner, n, k):
+                        return _FakeArray([list(buf[i * k:(i + 1) * k]) for i in range(n)])
+                return _Buf()
+
+            @staticmethod
+            def concatenate(parts, axis=1):
+                assert axis == 1
+                return _FakeArray([r0 + r1 for r0, r1 in zip(parts[0].rows, parts[1].rows)])
+
+            @staticmethod
+            def asarray(seq, dtype):
+                return _FakeVec(seq)
+
+        saved = skinned_glb._np
+        try:
+            skinned_glb._np = _FakeNp
+            got_np = skinned_glb.normalise_weights(j0, bytes(padded_j1), w0, w1, 3, 2, [1, 3], 4)
+        finally:
+            skinned_glb._np = saved
+        self.assertEqual(got_np["j0"], got_default["j0"])
+        self.assertEqual(got_np["j1"], got_default["j1"])
+
+    def test_infer_ped_parent_matches_suffixed_ped_bone_via_prefix_fallback(self):
+        ped = {
+            "SKEL_ROOT": {"name": "SKEL_ROOT", "index": 0},
+            "SKEL_L_UpperArm01": {"name": "SKEL_L_UpperArm01", "index": 1},
+            "SKEL_R_UpperArm01": {"name": "SKEL_R_UpperArm01", "index": 2},
+        }
+        self.assertEqual(skinned_glb.infer_ped_parent("GM_TEST_L_UpperArm_O", ped), 1)
+        self.assertEqual(skinned_glb.infer_ped_parent("GM_TEST_R_UpperArm_O", ped), 2)
+
     def test_cli_returns_nonzero_for_bad_input(self):
         result = subprocess.run(
             [sys.executable, "-I", os.path.join(ROOT, "tools", "skinned_glb.py"),

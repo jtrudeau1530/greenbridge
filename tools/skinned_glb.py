@@ -482,7 +482,7 @@ def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
         for alias in aliases:
             if alias in ped_set:
                 score += 10
-            elif any(token.startswith(alias.lower()) for token in ped_set):
+            elif any(token.startswith(alias) for token in ped_set):
                 score += 5
         if score:
             candidate = (score, -len(ped_name), -index, index)
@@ -575,6 +575,7 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
         zero = weights == 0
         indices[zero] = 0
         mapping = _np.asarray(local_to_joint, dtype=_np.uint16)
+        indices[weights == 0] = 0
         indices = mapping[indices]
         indices[zero] = 0
         if joint_count is not None and bool((indices >= joint_count).any()):
