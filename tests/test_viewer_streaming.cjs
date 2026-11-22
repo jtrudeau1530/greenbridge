@@ -485,3 +485,18 @@ test('LOD sets show one tier per cell by horizontal distance, with slack before 
     assert.equal(f.requests.at(-1).url, 'slod1.glb');
 });
 
+
+// The camera link in the URL hash (#cam=x,y,z,yaw,pitch) must round-trip and reject anything malformed.
+const helperSource = html.slice(html.indexOf('// Camera in the URL hash'), html.indexOf('async function loadWorld()'));
+const camHelpers = vm.runInNewContext(helperSource + '\n({ parseCamHash, formatCamHash })');
+
+test('camera hash round-trips and malformed hashes are ignored', () => {
+    const hash = camHelpers.formatCamHash([12.34, -5, 600], 1.5, -0.25);
+    assert.equal(hash, '#cam=12.3,-5.0,600.0,1.500,-0.250');
+    const cam = camHelpers.parseCamHash(hash);
+    assert.deepEqual(JSON.parse(JSON.stringify(cam)), { pos: [12.3, -5, 600], yaw: 1.5, pitch: -0.25 });
+    for (const bad of ['', '#', '#cam=', '#cam=1,2,3', '#cam=1,2,3,4,x', '#cam=1,2,3,4,Infinity',
+                       '#cam=1,2,,4,5', '#cam=1,2,3,4,5,6', '#other=1,2,3,4,5', undefined, null]) {
+        assert.equal(camHelpers.parseCamHash(bad), null, String(bad));
+    }
+});
