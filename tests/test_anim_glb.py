@@ -452,6 +452,118 @@ class ExportTest(unittest.TestCase):
         for rotation, x in zip(values, clips_fixture.X_INTS):
             self.assertAlmostEqual(rotation[0], 0.002 * x - 0.05, places=5)
 
+    def test_missing_page_leaves_adjacent_dictionary_selectable(self):
+        data = clips_fixture.two_sequence_dictionary("incomplete")
+        first, _ = clips_fixture.split(data, len(data), move_map=False)
+        other = clips_fixture.two_sequence_dictionary("neighbor")
+        selected, neighbor = clips_fixture.write_rpf(self.anim, [first, other])
+        with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+            anim_glb.load_dictionary(self.anim, selected)
+        system, _ = anim_glb.load_dictionary(self.anim, neighbor)
+        self.assertEqual(system.d, other)
+        _, summary = anim_glb.anim_clips.scan(self.anim)
+        self.assertEqual(summary["unresolved"], {"system page not the next stream": 1})
+        self.assertEqual(summary["counts"]["dictionaries"], 1)
+
+    def test_root_like_continuation_with_incidental_name(self):
+        data = clips_fixture.two_sequence_dictionary()
+        first, _ = clips_fixture.split(data, len(data), move_map=False)
+        tail = bytearray(first)
+        tail[0x68] ^= 1  # Root prefix and valid name, but no matching dictionary hash.
+        selected, _ = clips_fixture.write_rpf(self.anim, [first, tail])
+        system, _ = anim_glb.load_dictionary(self.anim, selected)
+        self.assertEqual(system.d, first + tail)
+
+    def test_missing_pack_table_cannot_claim_a_named_neighbor(self):
+        data = clips_fixture.two_sequence_dictionary("incomplete")
+        refs = anim_clips.System(data).ptr(0x70)
+        first, _ = clips_fixture.split(data, refs, move_map=False)
+        other = clips_fixture.two_sequence_dictionary("neighbor")
+        selected, neighbor = clips_fixture.write_rpf(self.anim, [first, other])
+        with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+            anim_glb.load_dictionary(self.anim, selected)
+        self.assertEqual(anim_glb.load_dictionary(self.anim, neighbor)[0].d, other)
+        _, summary = anim_clips.scan(self.anim)
+        self.assertEqual(summary["unresolved"], {"system page not the next stream": 1})
+        self.assertEqual(summary["counts"]["dictionaries"], 1)
+
+    def test_named_pack_at_continuation_boundary(self):
+        data = bytearray(clips_fixture.two_sequence_dictionary("abc"))
+        data.extend(bytes(96))
+        s = anim_clips.System(data)
+        refs = s.ptr(0x70)
+        pack = s.ptr(refs)
+        data[pack + 8:pack + 16] = data[8:16]
+        struct.pack_into("<15sB", data, pack + 0x38, b"abc-0", 0x85)
+        # These layouts parse when the resource extent is known independently.
+        for cuts in ([pack], [pack, refs]):
+            data[s.ptr(8) + 8] = len(cuts) + 1
+            pages = [data[a:b] for a, b in zip([0, *cuts], [*cuts, len(data)])]
+            with self.subTest(ambiguous_cuts=cuts):
+                self.assertEqual(anim_clips.parse_dictionary(s)["packs"][0]["name"], "abc-0")
+                root, *_ = clips_fixture.write_rpf(self.anim, pages)
+                with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+                    anim_glb.load_dictionary(self.anim, root)
+                rows, _ = anim_clips.scan(self.anim)
+                self.assertNotIn(root, [row["offset"] for row in rows])
+
+        # Move the pack header behind its reference table. The table can then
+        # be on the first page or on an already accepted continuation.
+        copied_pack = len(data)
+        data.extend(data[pack:pack + 0x70])
+        struct.pack_into("<Q", data, refs, SYSTEM + copied_pack)
+        for cuts in ([copied_pack], [refs, copied_pack]):
+            with self.subTest(cuts=cuts):
+                data[s.ptr(8) + 8] = len(cuts) + 1
+                pages = [data[a:b] for a, b in zip([0, *cuts], [*cuts, len(data)])]
+                root, *_ = clips_fixture.write_rpf(self.anim, pages)
+                system, dictionary = anim_glb.load_dictionary(self.anim, root)
+                self.assertEqual(system.d, data)
+                self.assertEqual(dictionary["packs"][0]["name"], "abc-0")
+                _, summary = anim_clips.scan(self.anim)
+                self.assertEqual(summary["unresolved"], {})
+                self.assertEqual(summary["counts"]["dictionaries"], 1)
+
+    def test_neighbor_cannot_supply_its_own_pack_reference(self):
+        for later in (False, True):
+            with self.subTest(table_on_later_page=later):
+                owner = bytearray(clips_fixture.two_sequence_dictionary("owner"))
+                neighbor = bytearray(clips_fixture.two_sequence_dictionary("neighbor"))
+                owner[anim_clips.System(owner).ptr(8) + 8] = 3 if later else 2
+                table = len(neighbor) if later else 0x60
+                struct.pack_into("<Q", owner, 0x70, SYSTEM + len(owner) + table)
+                if later:
+                    neighbor[anim_clips.System(neighbor).ptr(8) + 8] = 2
+                    tail = bytearray(96)
+                    struct.pack_into("<QI", tail, 0, SYSTEM + len(owner), joaat32("neighbor"))
+                    pages = [neighbor, tail]
+                else:
+                    # The neighbor's own hash at +0x68 completes the false reference.
+                    struct.pack_into("<Q", neighbor, table, SYSTEM + len(owner))
+                    pages = [neighbor]
+                root, following, *_ = clips_fixture.write_rpf(self.anim, [owner, *pages])
+                with self.assertRaisesRegex(anim_glb.ExportError, "no clip dictionary"):
+                    anim_glb.load_dictionary(self.anim, root)
+                self.assertEqual(anim_glb.load_dictionary(self.anim, following)[0].d, b"".join(pages))
+                rows, summary = anim_clips.scan(self.anim)
+                self.assertEqual([row["offset"] for row in rows], [following])
+                self.assertEqual(summary["unresolved"], {"system page not the next stream": 1})
+
+    def test_middle_dictionary_page_count_straddles_fifth_and_sixth_pages(self):
+        neighbor = clips_fixture.two_sequence_dictionary()
+        data = bytearray(clips_fixture.two_sequence_dictionary("middle"))
+        page_map = len(data)
+        data.extend(bytes(96))
+        struct.pack_into("<Q", data, 8, SYSTEM + page_map)
+        data[page_map + 8] = 6
+        cuts = [0, 256, 512, 768, 1024, page_map + 9, len(data)]
+        pages = [data[a:b] for a, b in zip(cuts, cuts[1:])]
+        offsets = clips_fixture.write_rpf(self.anim, [neighbor, *pages, neighbor])
+        with patch.object(anim_glb.anim_index, "classify", wraps=anim_glb.anim_index.classify) as classify:
+            system, _ = anim_glb.load_dictionary(self.anim, offsets[1])
+        self.assertEqual(system.d, data)
+        self.assertEqual([call.args[1] for call in classify.call_args_list], offsets[1:-1])
+
     def test_no_root_motion_leaves_the_mover_node_out(self):
         (gltf, _binary), _report = self.export("--no-root-motion")
         self.assertNotIn("mover", [n.get("name") for n in gltf["nodes"]])

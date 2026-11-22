@@ -509,6 +509,34 @@ def is_root(head):
             and struct.unpack_from("<Q", head, 8)[0] >> 28 == 5)
 
 
+def _named_root_hash(page):
+    """Return the verified page-local name hash shared by dictionary and pack headers."""
+    if len(page) < 0x6C or not is_root(page):
+        return None
+    s = System(page)
+    try:
+        name = s.string(0x38)
+    except DecodeError:
+        return None
+    stored = s.u32(0x68)
+    return stored if name and anim_index.joaat32(name) == stored else None
+
+
+def _local_packs(data):
+    """Referenced (system pointer, name hash) pairs, or None until the table is available."""
+    if len(data) < 0x7a:
+        return None
+    refs, count = struct.unpack_from("<QH", data, 0x70)
+    if not count or refs < SYSTEM:
+        return set()
+    start = refs - SYSTEM
+    end = start + count * 16
+    if end > len(data):
+        return None
+    return {(ptr, name_hash) for ptr, name_hash in struct.iter_unpack("<QI4x", memoryview(data)[start:end])
+            if ptr}
+
+
 def _inflate(m, row):
     return zlib.decompressobj().decompress(m[row["offset"]:row["offset"] + row["stored"]])
 
@@ -581,6 +609,18 @@ def group(m, rows, *, first_row_only: bool = False, continuation_rows=None):
             continue
         pm = struct.unpack_from("<Q", data, 8)[0] - SYSTEM
         parts, k = [i], i
+        def separate_root(page, offset):
+            name_hash = _named_root_hash(page)
+            if name_hash is None:
+                return None  # Unnamed: use the existing page-map discovery rules.
+            # Only pages already accepted for this owner may establish membership.
+            # The candidate and its successors could belong to a different dictionary.
+            packs = _local_packs(data)
+            if packs is None and len(parts) > 1:
+                prefix = data + b"".join(_inflate(m, rows[j]) for j in parts[1:])
+                packs = _local_packs(prefix)
+            return packs is None or (SYSTEM + offset, name_hash) not in packs
+
         # Only the two count bytes are needed. Locate them by inflated size,
         # including when they straddle a listed stream boundary.
         count_at = pm + 8
@@ -598,7 +638,8 @@ def group(m, rows, *, first_row_only: bool = False, continuation_rows=None):
                 # the original four-page window, check the root name or local map.
                 if is_root(page) and (len(parts) >= 4 or any(page[0x38:0x40])
                                       or struct.unpack_from("<Q", page, 8)[0] - SYSTEM + 10 <= len(page)):
-                    break
+                    if separate_root(page, start) is not False:
+                        break
             k += 1
             parts.append(k)
             if end > count_at:
@@ -613,17 +654,23 @@ def group(m, rows, *, first_row_only: bool = False, continuation_rows=None):
             unresolved["graphics pages"] += 1
             continue
         while len(parts) < pages and has_next(k) and _next_to(rows[k], rows[k + 1]):
+            following = rows[k + 1]
+            if following["signature"] == "zero-prefix" and separate_root(_inflate(m, following), end):
+                break
+            end += following["size"]
             k += 1
             parts.append(k)
-        if len(parts) == pages - 1:
+        # A listed adjacent root cannot also be an unlisted gap page.
+        if len(parts) == pages - 1 and (k + 1 == len(rows) or not _next_to(rows[k], rows[k + 1])):
             joined = b"".join(_inflate(m, rows[j]) for j in parts)
             gap = _gap_page(m, rows[k], joined)
             if gap is not None:
                 parts.append(gap)
-                gaps[gap["kind"]] += 1
         if len(parts) != pages:
             unresolved["system page not the next stream"] += 1
             continue
+        if isinstance(parts[-1], dict):
+            gaps[parts[-1]["kind"]] += 1
         taken.update(p for p in parts if not isinstance(p, dict))
         out.append((i, parts))
     return out, unresolved, gaps
