@@ -322,5 +322,174 @@ class TestF16ModelAndOracle(unittest.TestCase):
         self.assertEqual(res, snan | QNAN_BIT_F16)
 
 
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg:
+    """Represents an architectural 16-bit register operand inside a 32-bit register."""
+    index: int
+    reg_type: RegType
+    hi: bool = False  # False = low 16 bits (.l), True = high 16 bits (.h)
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        half = "h" if self.hi else "l"
+        return f"{prefix}{self.index}.{half}"
+
+
+@dataclass(frozen=True)
+class Literal16:
+    """Represents a 16-bit inline float constant or literal."""
+    bits: int
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal16:
+        return cls(f16_to_bits(val))
+
+    @property
+    def float_value(self) -> float:
+        return bits_to_f16(self.bits)
+
+    @property
+    def name(self) -> str:
+        if self.bits == POS_ZERO_F16:
+            return "0.0"
+        if self.bits == NEG_ZERO_F16:
+            return "-0.0"
+        f = self.float_value
+        if math.isnan(f):
+            return "nan"
+        if math.isinf(f):
+            return "inf" if f > 0 else "-inf"
+        return f"{f:g}"
+
+
+@dataclass(frozen=True)
+class VOP3Operand16:
+    """Typed expression operand with optional input modifiers (abs, neg) and op_sel."""
+    source: Union[Reg, Literal16]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass(frozen=True)
+class VSubF16Instruction:
+    """Symbolic AST node representing a RDNA2 v_sub_f16 instruction."""
+    dst: Reg
+    src0: VOP3Operand16
+    src1: VOP3Operand16
+    clamp: bool = False
+    is_vop3: bool = True
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        if not self.is_vop3 and not self.clamp and not self.dst.hi and not self.src0.abs_mod and not self.src0.neg_mod and not self.src1.abs_mod and not self.src1.neg_mod:
+            # VOP2 format
+            dst_str = f"v{self.dst.index}"
+            src0_str = f"v{self.src0.source.index}" if isinstance(self.src0.source, Reg) and self.src0.source.reg_type == RegType.VGPR else self.src0.source.name
+            src1_str = f"v{self.src1.source.index}" if isinstance(self.src1.source, Reg) and self.src1.source.reg_type == RegType.VGPR else self.src1.source.name
+            return f"v_sub_f16_e32 {dst_str}, {src0_str}, {src1_str}"
+        s = f"v_sub_f16_e64 {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg_validation_and_naming(self) -> None:
+        v0_l = Reg(0, RegType.VGPR, hi=False)
+        self.assertEqual(v0_l.name, "v0.l")
+        self.assertEqual(v0_l.index, 0)
+        self.assertFalse(v0_l.hi)
+
+        v0_h = Reg(0, RegType.VGPR, hi=True)
+        self.assertEqual(v0_h.name, "v0.h")
+        self.assertTrue(v0_h.hi)
+
+        s5_l = Reg(5, RegType.SGPR, hi=False)
+        self.assertEqual(s5_l.name, "s5.l")
+
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+
+    def test_operand_disassembly(self) -> None:
+        v = Reg(2, RegType.VGPR, hi=True)
+        op_plain = VOP3Operand16(v)
+        self.assertEqual(op_plain.disassemble(), "v2.h")
+
+        op_abs = VOP3Operand16(v, abs_mod=True)
+        self.assertEqual(op_abs.disassemble(), "|v2.h|")
+
+        op_neg = VOP3Operand16(v, neg_mod=True)
+        self.assertEqual(op_neg.disassemble(), "-v2.h")
+
+        op_neg_abs = VOP3Operand16(v, abs_mod=True, neg_mod=True)
+        self.assertEqual(op_neg_abs.disassemble(), "-|v2.h|")
+
+        lit = Literal16.from_float(1.5)
+        op_lit = VOP3Operand16(lit)
+        self.assertEqual(op_lit.disassemble(), "1.5")
+
+    def test_v_sub_f16_ast_construction_and_validation(self) -> None:
+        dst = Reg(0, RegType.VGPR, hi=False)
+        src0 = VOP3Operand16(Reg(2, RegType.VGPR, hi=False), neg_mod=True, abs_mod=True)
+        src1 = VOP3Operand16(Reg(4, RegType.SGPR, hi=True))
+        instr = VSubF16Instruction(dst=dst, src0=src0, src1=src1, clamp=True)
+
+        self.assertEqual(instr.disassemble(), "v_sub_f16_e64 v0.l, -|v2.l|, s4.h clamp")
+
+        # Invalid destination type (SGPR)
+        with self.assertRaises(TypeError):
+            VSubF16Instruction(dst=Reg(0, RegType.SGPR), src0=src0, src1=src1)
+
+    def test_vop2_disassembly(self) -> None:
+        dst = Reg(0, RegType.VGPR, hi=False)
+        src0 = VOP3Operand16(Reg(1, RegType.VGPR, hi=False))
+        src1 = VOP3Operand16(Reg(2, RegType.VGPR, hi=False))
+        instr = VSubF16Instruction(dst=dst, src0=src0, src1=src1, is_vop3=False)
+        self.assertEqual(instr.disassemble(), "v_sub_f16_e32 v0, v1, v2")
+
+    def test_structural_equality(self) -> None:
+        i1 = VSubF16Instruction(
+            Reg(0, RegType.VGPR, hi=False),
+            VOP3Operand16(Reg(2, RegType.VGPR, hi=False)),
+            VOP3Operand16(Literal16.from_float(0.0)),
+        )
+        i2 = VSubF16Instruction(
+            Reg(0, RegType.VGPR, hi=False),
+            VOP3Operand16(Reg(2, RegType.VGPR, hi=False)),
+            VOP3Operand16(Literal16.from_float(0.0)),
+        )
+        self.assertEqual(i1, i2)
+
+
 if __name__ == "__main__":
     unittest.main()
