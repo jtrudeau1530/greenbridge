@@ -170,6 +170,124 @@ class Model(unittest.TestCase):
     def test_self_test(self):
         self.assertEqual(X.self_test(), 0)
 
+    def test_dpp_seeds_are_unchanged(self):
+        # dpp_op was split out of Gen.op_dpp keeping the draw order; this program (5 DPP ops) is the one main
+        # generated before the split, so a seed someone reported still means the same program.
+        import hashlib
+        p = X.make_program(77, 64, 28, dpp=True)
+        self.assertEqual(sum("_dpp " in o.text for o in p.ops), 5)
+        self.assertEqual(hashlib.sha1(p.source().encode()).hexdigest(), "7174158b8d064cbddca318d3d7f433afac072691")
+
+
+def run_dpp(op, exec_mask, size=64, old=7):
+    """Apply one DPP op to a wave whose src0 (v3, or v2 in place) is 100 + lane, src1 (v4) 1000 + lane and vD (v2)
+    `old`; returns (vD, hypothesis flag)."""
+    w = X.Wave(size, (1 << size) - 1)
+    w.v[3] = [100 + l for l in range(size)]
+    w.v[4] = [1000 + l for l in range(size)]
+    if op.text.split()[2].rstrip(",") == "v2":      # in place: vD is src0
+        w.v[2] = [100 + l for l in range(size)]
+    else:
+        w.v[2] = [old] * size
+    w.exec = exec_mask
+    hyp = op.fn(w)
+    return w.vr(2), hyp
+
+
+class DppSweep(unittest.TestCase):
+    """dpp_op against values worked out by hand from the RDNA2 DPP rules, and what --dpp-sweep generates."""
+    ODD = 0x5555555555555555
+
+    def test_row_shr_invalid_source_is_unwritten_or_zero(self):
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "mov", control=("row_shr", 1)), X.M64)
+        self.assertEqual((v[0], v[1], v[15], v[16], v[17]), (7, 100, 114, 7, 116))
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "mov", control=("row_shr", 1), bound=True), X.M64)
+        self.assertEqual((v[0], v[16], v[17]), (0, 0, 116))
+
+    def test_inactive_source_fi_and_bound_ctrl(self):
+        # EXEC odd lanes off: lane 2 reads lane 1 (off). fi 0: bound_ctrl decides; fi 1: the inactive value is read.
+        shr = lambda **kw: run_dpp(X.dpp_op(2, 3, 4, "mov", control=("row_shr", 1), **kw), self.ODD)[0]
+        self.assertEqual(shr()[2], 7)
+        self.assertEqual(shr(bound=True)[2], 0)
+        self.assertEqual(shr(fi=True)[2], 101)
+        self.assertEqual(shr(fi=True, bound=True)[2], 101)
+        self.assertEqual(shr(fi=True)[1], 7)                    # lane 1 itself is off: never written
+
+    def test_non_mov_unwritten_lane_keeps_old_vd(self):
+        # #238: an invalid source without bound_ctrl leaves the lane alone, not op(old vD, src1).
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "add", control=("row_shl", 2)), X.M64)
+        self.assertEqual((v[0], v[13], v[14], v[15]), (102 + 1000, 115 + 1013, 7, 7))
+
+    def test_row_and_bank_masks(self):
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "mov", control=("quad_perm", (0, 0, 0, 0)), row_mask=0x2, bank_mask=0x5),
+                       X.M64)
+        written = [l for l in range(64) if v[l] != 7]
+        self.assertEqual(written, [16, 17, 18, 19, 24, 25, 26, 27])
+        self.assertEqual(v[18], 116)
+
+    def test_in_place_reads_every_source_first(self):
+        v, _ = run_dpp(X.dpp_op(2, 2, 4, "mov", control=("row_ror", 1)), X.M64)
+        self.assertEqual((v[0], v[1], v[16]), (115, 100, 131))
+
+    def test_dpp8_inactive_source(self):
+        bcast7 = (7,) * 8
+        v, hyp = run_dpp(X.dpp_op(2, 3, 4, "mov", dpp8=bcast7), self.ODD)
+        self.assertEqual((v[0], v[8], v[1]), (0, 0, 7))            # lane 7 is off: 0 (the #238 hypothesis)
+        self.assertTrue(hyp)
+        v, hyp = run_dpp(X.dpp_op(2, 3, 4, "mov", dpp8=bcast7, fi=True), self.ODD)
+        self.assertEqual((v[0], v[8]), (107, 115))
+        self.assertFalse(hyp)
+
+    def test_row_share_and_xmask_wave32(self):
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "mov", control=("row_share", 5)), X.M32, size=32)
+        self.assertEqual((v[0], v[15], v[16], v[31]), (105, 105, 121, 121))
+        v, _ = run_dpp(X.dpp_op(2, 3, 4, "xor", control=("row_xmask", 3)), X.M32, size=32)
+        self.assertEqual(v[5], (100 + 6) ^ 1005)
+
+    def test_sweep_covers_every_control(self):
+        controls = X.dpp16_sweep_controls()
+        self.assertEqual(len(controls), 335)
+        self.assertEqual(len(set(controls)), 335)
+        for wave in (32, 64):
+            progs = X.dpp_sweep_programs(wave)
+            self.assertEqual(len(progs), 7206)
+            self.assertEqual(len({p.name for p in progs}), len(progs))
+            self.assertEqual({p.family for p in progs}, set(X.DPP16_CONTROLS) | {"masks", "dpp8"})
+            texts = [p.ops[1].text for p in progs]
+            for c, arg in controls:
+                text = X.dpp16_select(c, arg)[0]
+                self.assertTrue(any(f" {text} " in t for t in texts), text)
+            for kind in X.DPP_OPS.values():
+                self.assertTrue(any(t.startswith(kind + "_dpp v2, v2,") or t.startswith(kind + "_dpp v2, v2 ")
+                                    for t in texts), kind)
+            masks = {re.search(r"row_mask:(0x\w+) bank_mask:(0x\w+)", t).groups() for t in texts if "row_mask" in t}
+            self.assertEqual(len(masks), 256)
+            for p in progs:
+                self.assertEqual(p.group, wave)
+                self.assertEqual([o.tag for o in p.ops], ["exec", "dpp"])
+                p.expected()                                     # the model runs every case
+
+    def test_sweep_cli_needs_the_oracle_tools(self):
+        env = dict(os.environ, LEONIDA_AMD_CLANG=os.path.join(TOOLS, "no-such-clang.exe"))
+        r = subprocess.run([sys.executable, "-I", TOOL, "--oracle", "hw", "--dpp-sweep"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
+
+    def test_sweep_on_hardware(self):
+        from hw_oracle import runner
+        try:
+            oracle = runner.open_oracle()
+        except runner.Unavailable as e:
+            self.skipTest(f"hardware oracle unavailable: {e}")
+        try:
+            stats, fails = {}, []
+            progs = [p for wave in (32, 64) for p in X.dpp_sweep_programs(wave)[::97]]
+            X.run_hw(oracle, progs, stats, fails)
+        finally:
+            oracle.close()
+        self.assertEqual([(p.name, p.label, w) for p, _, w, _ in fails], [])
+        self.assertEqual(sum(st["match"] for st in stats.values()), len(progs))
+
 
 class Modes(unittest.TestCase):
     """--modes takes native, emulate or both. Anything else used to run every program natively, wave64 included."""

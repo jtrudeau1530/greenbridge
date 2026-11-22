@@ -652,6 +652,27 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   972 of them `hyp_dpp`. As a control, `--permlane-fetch-inactive` there mismatches in 239 of 1,000 programs. A
   GFX10 assembler has no `global_store_b32`, so `asm.raw_kernel_text` puts the GFX10 name (`global_store_dword`)
   back for `gfx10xx`; nothing else the generator emits needed a change.
+  On a discrete RDNA2 card (RX 6700 XT, gfx1031, Windows, Adrenalin 26.8.1, through the HIP DLL of the driver;
+  BUILD-162): with `--dpp`, seeds 1 to 8, 1,000 programs each (500 per wave size), all 8,000 match, 984 of them
+  `hyp_dpp` and 1,964 `hyp_permlane`.
+- **DPP sweep (`--dpp-sweep`, BUILD-162).** The random `--dpp` programs run full waves, four ops and mostly
+  `row_mask`/`bank_mask` 0xF, so a rare control or mask pair can go untested for many seeds. `--dpp-sweep` replaces
+  the random programs with one short program per case: an EXEC write, then one DPP op. It covers every DPP16 control
+  (335: 256 `quad_perm`, `row_shl/shr/ror` 1 to 15, both mirrors, `row_share` and `row_xmask` 0 to 15) × `bound_ctrl`
+  × `fi` × three EXEC patterns (all lanes; every other lane, so each source is invalid in some lanes; and bank 0 off
+  in some rows, so whole 4-lane groups read inactive sources). It also covers all 256 `row_mask`/`bank_mask` pairs on
+  `row_shr:1`, `quad_perm:[1,0,3,2]` and `row_share:5`, × `bound_ctrl`, under two EXEC patterns. And it covers 19
+  DPP8 select sets (identity, reverse, swaps, the 8 broadcasts and the 7 rotations) × `fi` × the three EXEC patterns.
+  That makes 7,206 cases per wave size. The op rotates through `v_mov`/`v_not`/`v_add_nc_u32`/`v_xor`, and every
+  other group of four writes vD in place (`vD = src0`, as reductions do), so the model has to read every source
+  before it writes. Each case carries its family label, and failures print it. The run ends with a table of cases
+  and failures per family. The random draws of `--dpp` are unchanged: a test pins the program text of seed 77, and
+  800 programs from before and after the change are identical.
+  On the RX 6700 XT (gfx1031), `--dpp-sweep --oracle hw --wave both`: 14,412 cases, match 14,412, mismatch 0 in
+  every family, 40 of them `hyp_dpp` (DPP8 with an inactive source and fi = 0 reads 0). This is the first measured
+  check of every DPP16 control and mask pair on RDNA2 hardware, and it confirms the rules in the model's docstring
+  (and `docs/design.md`): `bound_ctrl` with an invalid source, `fi` on DPP16 and DPP8 inactive sources, an
+  unwritten lane keeping the old vD for non-mov ops, and `row_mask`/`bank_mask` in both wave sizes.
   First results (Radeon 880M, driver 26.11.2): 24,000 programs on the hardware, half wave32 and half native
   wave64, seeds 11 to 16 (4,000 programs each), with and without `--dpp`, 12 to 60 ops, with and without
   `--no-maskdata` and `--no-hw-guard`: match 24,000, mismatch 0, hyp_only 0, rejected 0. 7,652 of them contained
