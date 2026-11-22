@@ -26,8 +26,9 @@ Checks per tag (each one a count over vertices or triangle edges; no value leave
                   the log ratio within a block) is lower for the reading that maps the surface evenly.
     4-byte tags   per byte: share of blocks where the byte is constant, share of vertices with byte 3 = 0 or 255,
                   edge smoothness (mean |difference| over triangle edges / mean |difference| over random vertex
-                  pairs; < 1 means the value follows the surface), and unit length read as snorm8 xyz and as
-                  10:10:10:2 snorm.
+                  pairs; < 1 means the value follows the surface), unit length read as snorm8 xyz and as
+                  10:10:10:2 snorm, and each NORMAL_CANDIDATES decoding against the face normals. Tag 0x21 is
+                  the octahedral normal of normal_0x21 (the mesh shaders' decode, chosen by bit 31).
 
 Usage:
     python -I tools/vertex_types.py <archive.rpf|dir> [...] [--limit N] [--json out.json]
@@ -195,6 +196,17 @@ def _oct(x, y):
     return _norm(x, y, z)
 
 
+def normal_0x21(w):
+    """Unit normal from one tag-0x21 u32, decoded as the mesh shaders decode it (docs/restofworld.md).
+
+    Bit 31 set: octahedral x = bits 0-9, y = bits 10-19, each unorm10 remapped by v * 2 / 1023 - 1.
+    Bit 31 clear: octahedral x = byte 0, y = byte 1, each unorm8 remapped by v / 127.5 - 1.
+    The other bits are not part of the normal."""
+    if w >> 31:
+        return _oct((w & 1023) * 2 / 1023 - 1, ((w >> 10) & 1023) * 2 / 1023 - 1)
+    return _oct((w & 255) / 127.5 - 1, ((w >> 8) & 255) / 127.5 - 1)
+
+
 def _s8(b):
     return max((b - 256 if b > 127 else b) / 127.0, -1.0)
 
@@ -232,6 +244,7 @@ NORMAL_CANDIDATES = {
     "oct_unorm8_b23": lambda r, v: _oct(_u8(r[4 * v + 2]), _u8(r[4 * v + 3])),
     "oct_snorm16": lambda r, v: _oct(*[max(x / 32767.0, -1.0) for x in struct.unpack_from("<2h", r, 4 * v)]),
     "oct_unorm16": lambda r, v: _oct(*[x / 32767.5 - 1 for x in struct.unpack_from("<2H", r, 4 * v)]),
+    "oct_bit31_10_or_8": lambda r, v: normal_0x21(struct.unpack_from("<I", r, 4 * v)[0]),
 }
 
 

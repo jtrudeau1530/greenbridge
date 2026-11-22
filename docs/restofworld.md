@@ -441,19 +441,39 @@ vertices and 0 on 17.2%; each of bytes 0-2 is constant within a block in 36,544 
 change smoothly over edges (block-weighted median edge/random difference ratio 0.18 to 0.27), as a colour or
 blend weight would. As a packed normal it scores no better than random directions (below).
 
-**Tag `0x21` (slot 2) is still unsolved.** For each block the tool reads 256 sampled triangles and counts the
-vertices whose decoded vector is within `|cos| > 0.8` of the face normal; random directions score 0.2. Of the
-19 candidate decodings (snorm8/unorm8 xyz, snorm10/unorm10 10:10:10, six octahedral 8- and 16-bit variants,
-and each column of a quaternion tangent frame in three packings), the best block-weighted medians are unorm10 xyz at 0.479
-(per archive 0.318 to 0.667) and octahedral unorm8 bytes 0-1 at 0.331. Every other candidate is between 0.13
-and 0.31. Only 12.1% of vertices are unit length as snorm10 and 7.7% as snorm8. The stream is smooth over
-edges (block-weighted medians 0.46 to 0.71 for bytes 0-2), so it varies with the surface, but none of these
-encodings is a plain per-vertex normal.
+**Tag `0x21` (slot 2) is an octahedral normal whose width depends on bit 31.** The face-normal check: for each
+block the tool reads 256 sampled triangles and counts the vertices whose decoded vector is within `|cos| > 0.8`
+of the face normal; random directions score 0.2. None of the 19 fixed decodings scores well over the whole
+corpus (best block-weighted medians: unorm10 xyz 0.479, octahedral unorm8 bytes 0-1 0.331, the rest 0.13 to
+0.31), because the stream mixes two encodings. The mesh shaders show which one each vertex uses (6,285 of the
+9,282 mesh shaders contain the octahedral `v_sub_f32 ..., 1.0, |x|`): after
+`buffer_load_dword` of the vertex word they branch on its sign. With bit 31 set they take x = bits 0-9 and
+y = bits 10-19 (`v_and_b32 0x3ff`, `v_bfe_u32 ..., 10, 10`), map each by `v * 2/1023 - 1`, and unfold the
+octahedron (`z = 1 - |x| - |y|`, the `-z` clamp added back with each sign, then `v_rsq_f32`). With bit 31
+clear they take bytes 0 and 1 (`v_cvt_f32_ubyte0/1`), map each by `v / 127.5 - 1`, and unfold the same way.
+`normal_0x21` in `tools/vertex_types.py` is that decode (candidate `oct_bit31_10_or_8`).
+
+Scored separately on the first streams of two archives (core_restofworld: 120 streams, 143 blocks;
+levels: 200 streams, 187 blocks), each class matches the face normals only under its own branch:
+
+| Vertices | Decode | core_restofworld p25 / median / p90 | levels p25 / median / p90 |
+| --- | --- | --- | --- |
+| bit 31 set | 10-bit octahedral | 0.53 / 0.73 / 0.98 | 0.89 / 1.00 / 1.00 |
+| bit 31 set | 8-bit octahedral | 0.19 / 0.20 / 0.30 | 0.12 / 0.23 / 0.57 |
+| bit 31 clear | 8-bit octahedral | 0.44 / 0.61 / 1.00 | 0.67 / 1.00 / 1.00 |
+| bit 31 clear | 10-bit octahedral | 0.00 / 0.16 / 0.26 | 0.00 / 0.00 / 0.75 |
+| all | both, by bit 31 | 0.53 / 0.63 / 0.96 | 0.89 / 1.00 / 1.00 |
+
+Bit 31 is set on 48,046 of the 60,600 sampled core_restofworld vertices (79.3%). Model axis order is the one
+`+0x6C` gives for positions; the other five axis orders and sign flips of the decoded vector score 0.27 to
+0.36 there. Some core_restofworld blocks score lower under the matching decode than levels blocks do; this
+check does not say why. Not decoded: bits 20-30 of the 10-bit form (they vary
+within 142 of 143 blocks) and bytes 2-3 of the 8-bit form.
 
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
-core graphics blocks, final-slot widths remain unresolved, and of the component types only `0x21`
-(see above). The stride check
+core graphics blocks, final-slot widths remain unresolved, and of the component types the non-normal
+bits of `0x21` (see above). The stride check
 also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
 "Unread" in the tables above is not a claim that those bytes are empty: in
 `story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and
