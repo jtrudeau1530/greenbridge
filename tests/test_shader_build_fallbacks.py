@@ -36,13 +36,15 @@ def load_build():
 
 class BuildUnderFallbackTest(unittest.TestCase):
     def setUp(self):
-        self.build = load_build()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.out = Path(self.tmp.name) / "out"
-        self.asked = []
+        self.fresh()
 
-    def tearDown(self):
-        self.tmp.cleanup()
+    def fresh(self):
+        """A new build.py, output folder and record of what the translator was asked for (one per subtest)."""
+        self.build = load_build()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.out = Path(tmp.name) / "out"
+        self.asked = []
 
     def fake_translate(self, work, names):
         """What rdna2spirv.py leaves in <work>/spirv: a module and an index entry per shader it validated."""
@@ -79,7 +81,7 @@ class BuildUnderFallbackTest(unittest.TestCase):
     def test_each_fallback_builds_the_rest_without_ps_ij_computed(self):
         for var in FALLBACKS:
             with self.subTest(fallback=var):
-                self.setUp()
+                self.fresh()
                 status, printed = self.run_build(["cs_store", "ps_ij_computed"], {var: "1"})
                 self.assertEqual(status, 0, printed)
                 self.assertEqual(self.asked, [["cs_store"]])
@@ -87,7 +89,6 @@ class BuildUnderFallbackTest(unittest.TestCase):
                 self.assertFalse((self.out / "spirv" / "ps_ij_computed.spv").exists())
                 self.assertIn("ps_ij_computed", printed)
                 self.assertIn("PerVertexKHR", printed)
-                self.tearDown()
 
     def test_the_whole_list_builds_under_a_fallback(self):
         # Before: "Translation did not produce validated SPIR-V for: ps_ij_computed", and an empty <out>/spirv.
