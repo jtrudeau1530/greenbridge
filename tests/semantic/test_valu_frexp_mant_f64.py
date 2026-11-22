@@ -691,6 +691,75 @@ class SIMDVALUInterpreter:
         return self.execute(ast)
 
 
+class TestValuFrexpMantF64IEEE754Boundaries(unittest.TestCase):
+    """Deep verification of IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_normalization_extremes(self):
+        # MIN_SUBNORMAL_F64 (2^-1074) -> mantissa is 0.5
+        res_min = ref_frexp_mant_f64(MIN_SUBNORMAL_F64)
+        self.assertEqual(bits_to_f64(res_min), 0.5)
+        self.assertEqual(res_min, HALF_F64)
+
+        # Negative MIN_SUBNORMAL -> -0.5
+        res_neg_min = ref_frexp_mant_f64(MIN_SUBNORMAL_F64 | SIGN_MASK_F64)
+        self.assertEqual(bits_to_f64(res_neg_min), -0.5)
+
+        # MAX_SUBNORMAL_F64 (all 52 mantissa bits set, exp=0)
+        # Normalized: implicit 1 at bit 52, leaving 51 ones and lowest bit 0
+        res_max = ref_frexp_mant_f64(MAX_SUBNORMAL_F64)
+        self.assertEqual(res_max, (FREXP_EXP_F64 << 52) | (MANT_MASK_F64 ^ 1))
+        self.assertAlmostEqual(bits_to_f64(res_max), 1.0 - (2.0 ** -52), places=15)
+
+    def test_normal_boundary_extremes(self):
+        # MIN_NORMAL_F64 (2^-1022) -> 0.5
+        res_min_norm = ref_frexp_mant_f64(MIN_NORMAL_F64)
+        self.assertEqual(bits_to_f64(res_min_norm), 0.5)
+
+        # MAX_FINITE_F64 -> mantissa is 1.0 - 2^-53
+        res_max_finite = ref_frexp_mant_f64(MAX_FINITE_F64)
+        self.assertEqual(res_max_finite, (FREXP_EXP_F64 << 52) | MANT_MASK_F64)
+
+    def test_signed_zero_preservation(self):
+        self.assertEqual(ref_frexp_mant_f64(POS_ZERO_F64), POS_ZERO_F64)
+        self.assertEqual(ref_frexp_mant_f64(NEG_ZERO_F64), NEG_ZERO_F64)
+        # With abs: -0.0 becomes +0.0
+        self.assertEqual(ref_frexp_mant_f64(NEG_ZERO_F64, abs_src0=True), POS_ZERO_F64)
+        # With neg: +0.0 becomes -0.0
+        self.assertEqual(ref_frexp_mant_f64(POS_ZERO_F64, neg_src0=True), NEG_ZERO_F64)
+        # With clamp: -0.0 becomes +0.0
+        self.assertEqual(ref_frexp_mant_f64(NEG_ZERO_F64, clamp=True), POS_ZERO_F64)
+
+    def test_signed_infinity_preservation(self):
+        self.assertEqual(ref_frexp_mant_f64(POS_INF_F64), POS_INF_F64)
+        self.assertEqual(ref_frexp_mant_f64(NEG_INF_F64), NEG_INF_F64)
+        # With clamp: +inf -> 1.0, -inf -> +0.0
+        self.assertEqual(ref_frexp_mant_f64(POS_INF_F64, clamp=True), ONE_F64)
+        self.assertEqual(ref_frexp_mant_f64(NEG_INF_F64, clamp=True), POS_ZERO_F64)
+
+    def test_nan_payloads_and_quietening(self):
+        qnan_custom = QNAN_F64 | 0x00000000CAFEBABE
+        res_qnan = ref_frexp_mant_f64(qnan_custom)
+        self.assertTrue(is_nan_f64(res_qnan))
+        self.assertEqual(res_qnan & 0x00000000CAFEBABE, 0x00000000CAFEBABE)
+
+        snan_custom = SNAN_F64 | 0x0000000012345678
+        res_snan = ref_frexp_mant_f64(snan_custom)
+        self.assertTrue(is_nan_f64(res_snan))
+        self.assertFalse(is_snan_f64(res_snan), "Signaling NaN must be quieted")
+
+    def test_clamp_behavior_on_all_special_values(self):
+        self.assertEqual(ref_frexp_mant_f64(QNAN_F64, clamp=True), POS_ZERO_F64)
+        self.assertEqual(ref_frexp_mant_f64(SNAN_F64, clamp=True), POS_ZERO_F64)
+        self.assertEqual(ref_frexp_mant_f64(POS_INF_F64, clamp=True), ONE_F64)
+        self.assertEqual(ref_frexp_mant_f64(NEG_INF_F64, clamp=True), POS_ZERO_F64)
+        self.assertEqual(ref_frexp_mant_f64(NEG_ZERO_F64, clamp=True), POS_ZERO_F64)
+        # Negative normal clamps to +0.0
+        self.assertEqual(ref_frexp_mant_f64(f64_to_bits(-5.0), clamp=True), POS_ZERO_F64)
+        # Positive normal [0.5, 1.0) stays untouched
+        f_pos = f64_to_bits(1.5)
+        self.assertEqual(bits_to_f64(ref_frexp_mant_f64(f_pos, clamp=True)), 0.75)
+
+
 class TestValuFrexpMantF64StatusFlags(unittest.TestCase):
     """Unit tests for condition codes, status flags, and carry/borrow behavior."""
 
