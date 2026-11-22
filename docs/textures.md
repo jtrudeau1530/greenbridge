@@ -7,13 +7,20 @@ field.
 
 ## Outcome
 
-| | Initial baseline | After layout/format fixes (zlib/raw) | With clean-room BCPack (BC1–BC7) |
+| | Initial baseline | After layout/format fixes (zlib/raw) | Projected with BCPack (BC1–BC7)* |
 |---|---:|---:|---:|
 | catalog entries | 357,115 | 357,115 | 357,115 |
 | exported with the complete source mip chain | 98,603 | 305,959 | 357,115 |
 | exported with fewer mips | 210,292 | 16,423 | 0 |
 | exported at least one mip | 308,895 | 322,382 | 357,115 |
 | skipped | 48,220 | 34,733 | 0 |
+
+\* *Codec-availability projection from `tools/ttpf_mips.py scan` across all 57 pools, not a full
+DDS export run. In full-corpus chunk checks with locally calibrated history tables
+(`--allow-provisional --history <path>`), BC6H decodes 268 / 268 chunks (0 strict, 100%
+provisional) and BC7 decodes 5,150 / 5,167 chunks (583 strict, 99.67% provisional), while
+**17 / 5,167 BC7 chunks (0.33%)** still cleanly refuse in provisional mode when unknown built-in
+history references exceed the consistency budget (see §5 below).*
 
 A skipped row has `File: null` and a `Limitation`. Either the catalog marks the texture as
 unextractable, or its content does not decode (`NotSupportedException`, `InvalidDataException`).
@@ -45,9 +52,11 @@ format skips).
 
 Adding all six BCPack codecs (BC1, BC3, BC4, BC5, BC6H and BC7) in `tools/ttpf_mips.py`
 unlocks **51,156** more complete chains across the 57 pools (51,149 2D + 7 multi-slice 2D
-arrays), bringing the projected split to **357,115 complete** (100% of catalog entries),
-**0 partial** and **0 skipped** (**0** remaining BCPack skips, **0** layout/format skips and
-**0** skipped multi-slice descriptors).
+arrays), bringing the codec-availability projection to **357,115 complete** (100% of catalog
+entries), **0 partial** and **0 skipped** (**0** remaining BCPack codec skips, **0**
+layout/format skips and **0** skipped multi-slice descriptors). On actual chunk decode over all
+57 pools, BC6H requires `--allow-provisional --history <path>` (268 / 268 chunks) and
+**17 / 5,167 BC7 chunks (0.33%)** still cleanly refuse in provisional mode (see §5 below).
 
 This is the same 308,895 / 48,220 baseline already recorded in `docs/design.md`. The recount
 splits the 48,220 by cause: the old "(BCPack or unmapped)" label hides 14,713 skips whose
