@@ -641,16 +641,21 @@ if(TARGET Vulkan::Headers)
       find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
     endif()
     if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
-      set(LEONIDA_TEST_CS_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_sample.spv)
-      add_custom_command(
-        OUTPUT ${LEONIDA_TEST_CS_SAMPLE}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_SAMPLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sample.comp
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sample.comp
-        COMMENT "Compiling the descriptor test shader"
-        VERBATIM)
-      target_sources(d3d12_descriptor_test PRIVATE ${LEONIDA_TEST_CS_SAMPLE})
-      target_compile_definitions(d3d12_descriptor_test PRIVATE LEONIDA_TEST_CS_SAMPLE_SPV="${LEONIDA_TEST_CS_SAMPLE}")
+      function(descriptor_test_shader shader definition)
+        set(source ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader})
+        set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/${definition}.spv)
+        add_custom_command(OUTPUT ${binary}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 ${ARGN} -o ${binary} ${source}
+          DEPENDS ${source} COMMENT "Compiling descriptor test shader ${shader}" VERBATIM)
+        target_sources(d3d12_descriptor_test PRIVATE ${binary})
+        target_compile_definitions(d3d12_descriptor_test PRIVATE ${definition}="${binary}")
+      endfunction()
+      descriptor_test_shader(cs_sample.comp LEONIDA_TEST_CS_SAMPLE_SPV)
+      descriptor_test_shader(cs_sample.comp LEONIDA_TEST_MS_FLOAT_SPV -DTEST_MS_FLOAT=1)
+      descriptor_test_shader(cs_sample.comp LEONIDA_TEST_MS_UINT_SPV -DTEST_MS_UINT=1)
+      descriptor_test_shader(cs_sample.comp LEONIDA_TEST_MS_SINT_SPV -DTEST_MS_SINT=1)
+      descriptor_test_shader(msaa_seed.vert LEONIDA_TEST_MSAA_VERT_SPV)
+      descriptor_test_shader(msaa_seed.frag LEONIDA_TEST_MSAA_FRAG_SPV)
     else()
       message(STATUS "glslangValidator not found: d3d12_descriptor_test skips its shader")
     endif()

@@ -431,21 +431,45 @@ int main(int argc, char** argv) {
     }
     CHECK(submit());
 
+    // An adapter at the original 5632 sampled-image limit must keep the original set. The per-stage
+    // resource budget can also leave room for just one class (9985 original resources + 512).
+    constexpr auto ms_classes = [](std::uint32_t sampled, std::uint32_t total) {
+        BindlessFeatures f{};
+        f.ms_samples.fill(VK_SAMPLE_COUNT_4_BIT);
+        bindless::limit_ms_bindings(f, sampled, total);
+        return f.ms_samples;
+    };
+    static_assert(ms_classes(5632, 20000) ==
+                  std::array{VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
+    static_assert(ms_classes(7168, 10497) ==
+                  std::array{VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT});
+
     // Does a set with these flags fit the device? Every binding is visible to every stage.
-    constexpr std::uint32_t sampled_total = 4096 + 1024 + 256 + 256, sampler_total = 1024, storage_total = 1024 + 13 * 256;
+    const auto descriptors = [](VkDescriptorType type, const BindlessFeatures& f) {
+        std::uint32_t count = 0;
+        for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b)
+            if (bindless::bindings[b].type == type && bindless::binding_enabled(b, f))
+                count += bindless::bindings[b].count;
+        return count;
+    };
     const auto fits = [&](const BindlessFeatures& f) {
+        const auto sampled_total = descriptors(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, f);
+        const auto sampler_total = descriptors(VK_DESCRIPTOR_TYPE_SAMPLER, f);
+        const auto storage_total = descriptors(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, f);
+        const auto stage_resources = sampled_total + storage_total + 2;  // table buffer and fragment output
         const VkPhysicalDeviceLimits& l = props.properties.limits;
         if (f.update_after_bind)
             return props12.maxPerStageDescriptorUpdateAfterBindSampledImages >= sampled_total &&
                    props12.maxPerStageDescriptorUpdateAfterBindSamplers >= sampler_total &&
                    props12.maxPerStageDescriptorUpdateAfterBindStorageImages >= storage_total &&
-                   props12.maxPerStageUpdateAfterBindResources >= sampled_total + sampler_total + storage_total + 1 &&
+                   props12.maxPerStageUpdateAfterBindResources >= stage_resources &&
+                   props12.maxUpdateAfterBindDescriptorsInAllPools >= sampled_total + sampler_total + storage_total + 1 &&
                    props12.maxDescriptorSetUpdateAfterBindSampledImages >= sampled_total &&
                    props12.maxDescriptorSetUpdateAfterBindSamplers >= sampler_total &&
                    props12.maxDescriptorSetUpdateAfterBindStorageImages >= storage_total;
         return l.maxPerStageDescriptorSampledImages >= sampled_total && l.maxPerStageDescriptorSamplers >= sampler_total &&
                l.maxPerStageDescriptorStorageImages >= storage_total &&
-               l.maxPerStageResources >= sampled_total + sampler_total + storage_total + 1 &&
+               l.maxPerStageResources >= stage_resources &&
                l.maxDescriptorSetSampledImages >= sampled_total && l.maxDescriptorSetSamplers >= sampler_total &&
                l.maxDescriptorSetStorageImages >= storage_total;
     };
@@ -474,7 +498,9 @@ int main(int argc, char** argv) {
     BindlessFeatures configurations[2] = {device_flags, {}};
     const int configuration_count = (device_flags.update_after_bind || device_flags.partially_bound) ? 2 : 1;
     for (int configuration = 0; configuration < configuration_count; ++configuration) {
-        const BindlessFeatures flags = configurations[configuration];
+        BindlessFeatures flags = configurations[configuration];
+        flags.ms_samples[0] = VK_SAMPLE_COUNT_4_BIT;
+        bindless::limit_ms_bindings(flags, props.properties.limits, props12);
         const char* name = flags.update_after_bind && flags.partially_bound ? "update after bind, partially bound"
                            : flags.update_after_bind ? "update after bind" : flags.partially_bound ? "partially bound" : "no flags";
         if (!fits(flags)) {
