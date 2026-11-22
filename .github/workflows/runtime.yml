@@ -3,29 +3,51 @@
 name: Runtime
 
 on:
+  # A change that can break this build: the runtime and its vendored queue, the scripts the jobs run, this
+  # workflow, and the tools CMake, ctest and those scripts read. Any other file under tools/ used to start a
+  # full Windows and Wine build that a tool-only change cannot break (BUILD-856); paths-ignore cannot say
+  # "everything under tools/ except these", so the event lists what triggers it instead.
   push:
     branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
-      - "viewer/**"
-      - "tests/**"
-      - "assets/**"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/jactionlint.yml"
-      - ".github/workflows/no-game-data.yml"
+    paths:
+      - "runtime/**"
+      - "third_party/**"
+      - "scripts/**"
+      - ".github/workflows/runtime.yml"
+      # runtime/CMakeLists.txt runs gen_d3d12_stubs.py at configure time and xdxr_bvh.py check-build as a
+      # ctest; the shader build and scripts/run_gpu_tests.py read the rest. A new tool they read has to be
+      # listed here, or a change to it will not run this workflow at all.
+      - "tools/bary_fallback_gs.py"
+      - "tools/cf_diff.py"
+      - "tools/f32_fuzz.py"
+      - "tools/fssm_unpack.py"
+      - "tools/gen_d3d12_stubs.py"
+      - "tools/mesh_compute_vs.py"
+      - "tools/rdna2spirv.py"
+      - "tools/shader_meta.py"
+      - "tools/spirv_stubs.py"
+      - "tools/vk_subgroup_info.py"
+      - "tools/xdxr_bvh.py"
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
-      - "viewer/**"
-      - "tests/**"
-      - "assets/**"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/jactionlint.yml"
-      - ".github/workflows/no-game-data.yml"
+    paths:
+      - "runtime/**"
+      - "third_party/**"
+      - "scripts/**"
+      - ".github/workflows/runtime.yml"
+      # runtime/CMakeLists.txt runs gen_d3d12_stubs.py at configure time and xdxr_bvh.py check-build as a
+      # ctest; the shader build and scripts/run_gpu_tests.py read the rest. A new tool they read has to be
+      # listed here, or a change to it will not run this workflow at all.
+      - "tools/bary_fallback_gs.py"
+      - "tools/cf_diff.py"
+      - "tools/f32_fuzz.py"
+      - "tools/fssm_unpack.py"
+      - "tools/gen_d3d12_stubs.py"
+      - "tools/mesh_compute_vs.py"
+      - "tools/rdna2spirv.py"
+      - "tools/shader_meta.py"
+      - "tools/spirv_stubs.py"
+      - "tools/vk_subgroup_info.py"
+      - "tools/xdxr_bvh.py"
   workflow_dispatch:
 
 permissions:
