@@ -298,6 +298,137 @@ class ReferenceOracleTests(unittest.TestCase):
         self.assertEqual(interp.scc, 0)
 
 
+class TestSccCarryAndWrapping(unittest.TestCase):
+    """Validation of SCC carry generation, overflow mechanisms, and 32-bit modulo wrapping."""
+
+    def test_scc_from_shifted_out_bits_exact_boundaries(self):
+        # High bits shifted out of 32-bit range set SCC even when 32-bit sum has no carry.
+        # Boundary cases:
+        # N=1: bit 31 (0x80000000) shifts out -> SCC=1; bit 30 (0x40000000) does not -> SCC=0.
+        # N=2: bit 30 (0x40000000) shifts out -> SCC=1; bit 29 (0x20000000) does not -> SCC=0.
+        # N=3: bit 29 (0x20000000) shifts out -> SCC=1; bit 28 (0x10000000) does not -> SCC=0.
+        # N=4: bit 28 (0x10000000) shifts out -> SCC=1; bit 27 (0x08000000) does not -> SCC=0.
+        for n in (1, 2, 3, 4):
+            boundary_bit = 1 << (32 - n)
+            sub_boundary_bit = boundary_bit >> 1
+
+            # Threshold bit shifted out:
+            want_ovf = ref_s_lshl_add_u32(n, boundary_bit, 0)
+            self.assertEqual(want_ovf, (0, 1))
+            got_ovf = run_op(n, boundary_bit, 0, scc_in=0)
+            self.assertEqual(got_ovf, want_ovf)
+
+            # One bit below threshold (no bits shifted out, so SCC=0):
+            want_no_ovf = ref_s_lshl_add_u32(n, sub_boundary_bit, 0)
+            self.assertEqual(want_no_ovf, (0x80000000, 0))
+            got_no_ovf = run_op(n, sub_boundary_bit, 0, scc_in=1)
+            self.assertEqual(got_no_ovf, want_no_ovf)
+
+            # Max value that does not shift out any bits:
+            max_no_shift = (1 << (32 - n)) - 1
+            want_max_no_shift = ref_s_lshl_add_u32(n, max_no_shift, 0)
+            self.assertEqual(want_max_no_shift[1], 0)
+            got_max_no_shift = run_op(n, max_no_shift, 0, scc_in=1)
+            self.assertEqual(got_max_no_shift, want_max_no_shift)
+
+    def test_scc_from_addition_overflow_exact_boundaries(self):
+        # Shifted value fits completely in 32 bits, but addition with S1 overflows 2^32.
+        for n in (1, 2, 3, 4):
+            sh_val = 1 << n  # s0 = 1, so (s0 << n) = 1 << n
+
+            # Exact wrap to 0: s1 = 2^32 - (1 << n) -> sum is exactly 2^32
+            s1_wrap = (1 << 32) - sh_val
+            want_wrap = ref_s_lshl_add_u32(n, 1, s1_wrap)
+            self.assertEqual(want_wrap, (0, 1))
+            got_wrap = run_op(n, 1, s1_wrap, scc_in=0)
+            self.assertEqual(got_wrap, want_wrap)
+
+            # Maximum sum without carry: s1 = (2^32 - 1) - (1 << n) -> sum is 0xFFFFFFFF
+            s1_no_wrap = ((1 << 32) - 1) - sh_val
+            want_no_wrap = ref_s_lshl_add_u32(n, 1, s1_no_wrap)
+            self.assertEqual(want_no_wrap, (MASK32, 0))
+            got_no_wrap = run_op(n, 1, s1_no_wrap, scc_in=1)
+            self.assertEqual(got_no_wrap, want_no_wrap)
+
+    def test_both_shift_out_and_addition_overflow(self):
+        # Both mechanisms fire simultaneously (S0 shifts out bits AND addition carries)
+        for n in (1, 2, 3, 4):
+            s0 = MASK32
+            s1 = MASK32
+            want = ref_s_lshl_add_u32(n, s0, s1)
+            # tmp = (MASK32 << n) + MASK32 = MASK32 * ((1 << n) + 1)
+            expected_res = ((MASK32 << n) + MASK32) & MASK32
+            self.assertEqual(want, (expected_res, 1))
+            got = run_op(n, s0, s1, scc_in=0)
+            self.assertEqual(got, want)
+
+    def test_scc_input_independence(self):
+        # SCC must be completely overwritten regardless of whether incoming SCC is 0 or 1.
+        test_cases = [
+            (1, 0x80000000, 0),         # SCC becomes 1 (shift-out)
+            (1, 0x1000, 0x2000),         # SCC becomes 0 (no carry)
+            (2, 0x40000000, 0),         # SCC becomes 1
+            (2, 1, 0xFFFFFFFC),         # SCC becomes 1 (add overflow)
+            (3, 0x20000000, 0),         # SCC becomes 1
+            (3, 0x10, 0x20),            # SCC becomes 0
+            (4, 0x10000000, 0),         # SCC becomes 1
+            (4, 0x01, 0x02),            # SCC becomes 0
+        ]
+        for n, s0, s1 in test_cases:
+            want = ref_s_lshl_add_u32(n, s0, s1)
+            with self.subTest(n=n, s0=hex(s0), s1=hex(s1)):
+                # Run with SCC=0 before
+                got0 = run_op(n, s0, s1, scc_in=0)
+                self.assertEqual(got0, want)
+                # Run with SCC=1 before
+                got1 = run_op(n, s0, s1, scc_in=1)
+                self.assertEqual(got1, want)
+
+    def test_scc_chaining_s_addc_all_scales(self):
+        # Multi-word 64-bit pointer/index arithmetic across all four shift scales:
+        # scale index into base pointer with s_lshlN_add_u32, feed carry into high dword via s_addc_u32.
+        for n in (1, 2, 3, 4):
+            idx = 1 << (32 - n)  # generates carry via shift-out
+            base_lo = 0x00000100
+            base_hi = 0x00000005
+            lines = [
+                f"s_mov_b32 s2, {idx:#x}",
+                f"s_mov_b32 s3, {base_lo:#x}",
+                f"s_mov_b32 s5, {base_hi:#x}",
+                f"s_lshl{n}_add_u32 s0, s2, s3",
+                "s_addc_u32 s1, s5, 0",
+                "v_mov_b32 v0, s0",
+                "v_mov_b32 v1, s1",
+            ]
+            got = run_lines(lines)
+            expected_lo = base_lo  # idx << n wraps low bits to 0
+            expected_hi = base_hi + 1  # carry added
+            self.assertEqual(got, (expected_lo, expected_hi))
+
+    def test_deterministic_differential_fuzzing(self):
+        # 500 pure-Python random vectors cross-checked against 64-bit mathematical definition
+        rng = random.Random(0x42A5C)
+        for _ in range(500):
+            n = rng.choice((1, 2, 3, 4))
+            s0 = rng.getrandbits(32)
+            s1 = rng.getrandbits(32)
+            res, scc = ref_s_lshl_add_u32(n, s0, s1)
+            tmp = (s0 << n) + s1
+            self.assertEqual(res, tmp & MASK32)
+            self.assertEqual(scc, int(tmp >= TWO_POW_32))
+
+        # 20 diverse random vectors translated and executed in SPIR-V mini interpreter
+        for _ in range(20):
+            n = rng.choice((1, 2, 3, 4))
+            s0 = rng.getrandbits(32)
+            s1 = rng.getrandbits(32)
+            scc_in = rng.getrandbits(1)
+            want = ref_s_lshl_add_u32(n, s0, s1)
+            with self.subTest(n=n, s0=hex(s0), s1=hex(s1), scc_in=scc_in):
+                got = run_op(n, s0, s1, scc_in)
+                self.assertEqual(got, want)
+
+
 class LshlAddTests(unittest.TestCase):
     def test_reference(self):
         self.assertEqual(ref(2, 3, 4), (16, 0))
