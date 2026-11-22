@@ -92,6 +92,7 @@ public:
     }
 
     leonida::ResourceId resource_id() const { return reinterpret_cast<leonida::ResourceId>(this); }
+    bool held_by_app() const { return refs_ > 1; }
 
 private:
     std::atomic<ULONG> refs_{1};
@@ -109,8 +110,9 @@ public:
 
     bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc) {
         hwnd_ = hwnd;
-        const std::uint32_t w = desc.Width ? desc.Width : 256u;
-        const std::uint32_t h = desc.Height ? desc.Height : 256u;
+        const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
+        const std::uint32_t w = size.width;
+        const std::uint32_t h = size.height;
         const std::uint32_t count = desc.BufferCount ? desc.BufferCount : 2u;
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (desc.Format != DXGI_FORMAT_UNKNOWN) {
@@ -153,7 +155,9 @@ public:
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void**) override { stub("IDXGISwapChain::GetDevice"); return E_NOTIMPL; }
 
     // IDXGISwapChain
-    HRESULT STDMETHODCALLTYPE Present(UINT, UINT) override {
+    HRESULT STDMETHODCALLTYPE Present(UINT sync, UINT flags) override {
+        if (sync > 4) return DXGI_ERROR_INVALID_CALL;
+        if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
         const std::uint32_t cur = swapchain_.current_back_buffer_index();
         if (!swapchain_.present(cur)) return E_FAIL;
         std::uint32_t next = 0;
@@ -195,9 +199,13 @@ public:
             vk_fmt = dxgi_to_vk_format(fmt);
             if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_UNSUPPORTED;
         }
+        // DXGI refuses to resize while the app still holds a back buffer reference.
+        for (auto* bb : buffers_)
+            if (bb->held_by_app()) return DXGI_ERROR_INVALID_CALL;
         unregister_buffers();
-        const std::uint32_t w = width ? width : swapchain_.extent().width;
-        const std::uint32_t h = height ? height : swapchain_.extent().height;
+        const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
+        const std::uint32_t w = size.width;
+        const std::uint32_t h = size.height;
         if (!swapchain_.resize(w, h, vk_fmt, count)) return E_FAIL;
         register_buffers();
         std::uint32_t next = 0;
@@ -266,6 +274,15 @@ public:
     }
 
 private:
+    // DXGI: a zero width or height takes the whole size from the window's client area (host-measured).
+    VkExtent2D size_or_client(UINT width, UINT height, VkExtent2D fallback) const {
+        if (width && height) return {width, height};
+        RECT rc{};
+        if (GetClientRect(hwnd_, &rc) && rc.right > 0 && rc.bottom > 0)
+            return {static_cast<std::uint32_t>(rc.right), static_cast<std::uint32_t>(rc.bottom)};
+        return fallback;
+    }
+
     void register_buffers() {
         const std::uint32_t count = swapchain_.image_count();
         D3D12_RESOURCE_DESC desc{};
