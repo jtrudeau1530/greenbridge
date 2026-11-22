@@ -641,6 +641,264 @@ class TestDeterministicScalarInterpreter(unittest.TestCase):
             self.assertEqual(new_interp, new_oracle)
 
 
+# ============================================================================
+# Section 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ============================================================================
+
+class SIMDState:
+    """Architectural state for a SIMD wavefront (Wave32 or Wave64) with shared LDS."""
+
+    def __init__(
+        self,
+        num_lanes: int = 32,
+        exec_mask: int = 0xFFFF_FFFF,
+        lds_capacity_dwords: int = LDS_SIZE_DWORDS,
+    ) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {num_lanes}")
+        self.num_lanes: int = num_lanes
+        self.max_exec_mask: int = (1 << num_lanes) - 1
+        self.exec_mask: int = exec_mask & self.max_exec_mask
+        self.vgprs: List[List[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(num_lanes)]
+        self.lds: LDSModel = LDSModel(capacity_dwords=lds_capacity_dwords)
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane index out of range: {lane}")
+        return bool(self.exec_mask & (1 << lane))
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane index out of range: {lane}")
+        if not (0 <= reg_idx < DEFAULT_NUM_VGPRS):
+            raise IndexError(f"VGPR index out of range: {reg_idx}")
+        return self.vgprs[lane][reg_idx]
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane index out of range: {lane}")
+        if not (0 <= reg_idx < DEFAULT_NUM_VGPRS):
+            raise IndexError(f"VGPR index out of range: {reg_idx}")
+        self.vgprs[lane][reg_idx] = u32(val)
+
+
+class SIMDInterpreter:
+    """Wavefront SIMD instruction interpreter with divergence, masking, and collision handling."""
+
+    def resolve_lane_operand(
+        self,
+        op: Union[VGPR, Immediate],
+        lane: int,
+        state: SIMDState,
+    ) -> int:
+        if isinstance(op, VGPR):
+            return state.get_vgpr(lane, op.index)
+        elif isinstance(op, Immediate):
+            return op.value
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(
+        self,
+        instr: DSXorRtnB32Instruction,
+        state: SIMDState,
+    ) -> List[Optional[Tuple[int, int]]]:
+        """Execute a ds_xor_rtn_b32 across all lanes in the wavefront.
+
+        Returns a list of length num_lanes where:
+        - Inactive lanes return None and modify no registers or LDS memory.
+        - Active lanes return (old_val, new_val) and update dst VGPR.
+        - Multiple active lanes accessing the same LDS dword serialize deterministically
+          in ascending lane order.
+        """
+        # Step 1: Latch inputs for all active lanes
+        active_lane_data: List[Tuple[int, int, int, int]] = []
+        for lane in range(state.num_lanes):
+            if state.is_lane_active(lane):
+                vaddr = state.get_vgpr(lane, instr.addr.index)
+                data = self.resolve_lane_operand(instr.data0, lane, state)
+                eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                dword_idx = calc_lds_dword_index(eff_addr, state.lds.capacity_dwords)
+                active_lane_data.append((lane, eff_addr, dword_idx, data))
+
+        results: List[Optional[Tuple[int, int]]] = [None] * state.num_lanes
+
+        # Step 2: Execute atomic operations in ascending lane order (hardware serialization)
+        for lane, eff_addr, dword_idx, data in active_lane_data:
+            curr_mem = state.lds.memory[dword_idx]
+            old_val, new_val = oracle_ds_xor_rtn_b32(curr_mem, data)
+            state.lds.memory[dword_idx] = new_val
+            results[lane] = (old_val, new_val)
+
+        # Step 3: Writeback destination registers for active lanes
+        for lane in range(state.num_lanes):
+            res = results[lane]
+            if res is not None:
+                old_val, _ = res
+                state.set_vgpr(lane, instr.dst.index, old_val)
+
+        return results
+
+
+class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
+    """Unit tests for SIMD divergence, 32/64-bit EXEC masking, and intra-wave collision."""
+
+    def test_wave32_all_lanes_active_independent_addresses(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDInterpreter()
+
+        # Each lane accesses its own unique dword address
+        for lane in range(32):
+            addr = lane * 4
+            state.lds.write_dword(addr, 0x1000 + lane)
+            state.set_vgpr(lane, 1, addr)
+            state.set_vgpr(lane, 2, 0x00FF)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            res = results[lane]
+            self.assertIsNotNone(res)
+            old_val, new_val = res  # type: ignore
+            expected_old = 0x1000 + lane
+            expected_new = expected_old ^ 0x00FF
+            self.assertEqual(old_val, expected_old)
+            self.assertEqual(new_val, expected_new)
+            self.assertEqual(state.get_vgpr(lane, 0), expected_old)
+            self.assertEqual(state.lds.read_dword(lane * 4), expected_new)
+
+    def test_wave32_exec_mask_partial_inactivity(self) -> None:
+        # Lanes 0..15 active, lanes 16..31 inactive
+        exec_mask = 0x0000_FFFF
+        state = SIMDState(num_lanes=32, exec_mask=exec_mask)
+        interp = SIMDInterpreter()
+
+        sentinel_reg = 0xDEAD_BEEF
+        for lane in range(32):
+            addr = 0x100 + lane * 4
+            state.lds.write_dword(addr, 0x5555_0000 + lane)
+            state.set_vgpr(lane, 0, sentinel_reg)
+            state.set_vgpr(lane, 1, addr)
+            state.set_vgpr(lane, 2, 0x0000_AAAA)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            addr = 0x100 + lane * 4
+            orig_mem = 0x5555_0000 + lane
+            if lane < 16:
+                self.assertIsNotNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), orig_mem)
+                self.assertEqual(state.lds.read_dword(addr), orig_mem ^ 0x0000_AAAA)
+            else:
+                self.assertIsNone(results[lane])
+                # Destination VGPR unmodified
+                self.assertEqual(state.get_vgpr(lane, 0), sentinel_reg)
+                # LDS memory untouched
+                self.assertEqual(state.lds.read_dword(addr), orig_mem)
+
+    def test_wave32_exec_mask_zero_all_inactive(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        interp = SIMDInterpreter()
+
+        addr = 0x200
+        state.lds.write_dword(addr, 0xCAFE_BABE)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, 0x1111)
+            state.set_vgpr(lane, 1, addr)
+            state.set_vgpr(lane, 2, 0xFFFF)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        results = interp.step(instr, state)
+
+        self.assertTrue(all(r is None for r in results))
+        self.assertEqual(state.lds.read_dword(addr), 0xCAFE_BABE)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr(lane, 0), 0x1111)
+
+    def test_wave64_full_and_partial_masks(self) -> None:
+        # Alternating mask over 64 lanes
+        exec_mask = 0x5555_5555_5555_5555
+        state = SIMDState(num_lanes=64, exec_mask=exec_mask)
+        interp = SIMDInterpreter()
+
+        for lane in range(64):
+            addr = 0x400 + lane * 4
+            state.lds.write_dword(addr, 0)
+            state.set_vgpr(lane, 1, addr)
+            state.set_vgpr(lane, 2, 0xBEEF)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        results = interp.step(instr, state)
+
+        for lane in range(64):
+            addr = 0x400 + lane * 4
+            if (lane % 2) == 0:
+                self.assertIsNotNone(results[lane])
+                self.assertEqual(state.lds.read_dword(addr), 0xBEEF)
+                self.assertEqual(state.get_vgpr(lane, 0), 0)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.lds.read_dword(addr), 0)
+
+    def test_intra_wave_collision_same_address(self) -> None:
+        """Multiple active lanes target the identical LDS address; atomic serialization occurs."""
+        state = SIMDState(num_lanes=32, exec_mask=0x0F)  # Lanes 0, 1, 2, 3 active
+        interp = SIMDInterpreter()
+
+        target_addr = 0x800
+        state.lds.write_dword(target_addr, 0x0000_0000)
+
+        xor_values = [0x0000_0001, 0x0000_0002, 0x0000_0004, 0x0000_0008]
+        for lane in range(4):
+            state.set_vgpr(lane, 1, target_addr)
+            state.set_vgpr(lane, 2, xor_values[lane])
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        results = interp.step(instr, state)
+
+        # Expected serialization order:
+        # Lane 0: sees 0x0000, writes 0x0001
+        # Lane 1: sees 0x0001, writes 0x0003
+        # Lane 2: sees 0x0003, writes 0x0007
+        # Lane 3: sees 0x0007, writes 0x000F
+        self.assertEqual(results[0], (0x0000_0000, 0x0000_0001))
+        self.assertEqual(results[1], (0x0000_0001, 0x0000_0003))
+        self.assertEqual(results[2], (0x0000_0003, 0x0000_0007))
+        self.assertEqual(results[3], (0x0000_0007, 0x0000_000F))
+
+        self.assertEqual(state.get_vgpr(0, 0), 0x0000_0000)
+        self.assertEqual(state.get_vgpr(1, 0), 0x0000_0001)
+        self.assertEqual(state.get_vgpr(2, 0), 0x0000_0003)
+        self.assertEqual(state.get_vgpr(3, 0), 0x0000_0007)
+        self.assertEqual(state.lds.read_dword(target_addr), 0x0000_000F)
+
+    def test_intra_wave_collision_with_inactive_lanes(self) -> None:
+        """Lanes targeting the same address with intermediate inactive lanes."""
+        # Active: Lane 1 (val 0x10), Lane 4 (val 0x20)
+        exec_mask = (1 << 1) | (1 << 4)
+        state = SIMDState(num_lanes=32, exec_mask=exec_mask)
+        interp = SIMDInterpreter()
+
+        target_addr = 0x900
+        state.lds.write_dword(target_addr, 0x100)
+
+        for lane in range(32):
+            state.set_vgpr(lane, 1, target_addr)
+            state.set_vgpr(lane, 2, 0)
+        state.set_vgpr(1, 2, 0x10)
+        state.set_vgpr(4, 2, 0x20)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        interp.step(instr, state)
+
+        self.assertEqual(state.get_vgpr(1, 0), 0x100)
+        self.assertEqual(state.get_vgpr(4, 0), 0x110)
+        self.assertEqual(state.lds.read_dword(target_addr), 0x130)
+
+
+
 
 
 if __name__ == "__main__":
