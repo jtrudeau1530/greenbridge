@@ -164,7 +164,8 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--limit", type=positive_int, help="export only the first N textures (N >= 1)")
     a = ap.parse_args()
-    texs = json.load(open(a.index, encoding="utf-8"))
+    with open(a.index, encoding="utf-8") as f:
+        texs = json.load(f)
     texs.sort(key=lambda t: (t["archive"], t["gpu"]))
     if a.limit is not None:         # 0 used to read as "no limit", and a negative N dropped the last N
         texs = texs[: a.limit]

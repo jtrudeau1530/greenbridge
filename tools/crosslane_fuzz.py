@@ -19,6 +19,7 @@ VKC_DUMP, and every word every thread stores is compared. docs/shader_validation
 Exit code: 0 when every program that ran matches (or differs only in a program with a hypothesis op), 1 on a
 mismatch or an untranslated program, 2 when the only failures are harness errors: vk_compute_test timed out or
 gave no dump for a program. Such a program is listed with the others (and kept with --keep) and the run goes on.
+A missing vk_compute_test for the translator oracle is one line and exit 1, before any program is generated.
 
 Needs LLVM_MC (llvm-mc with AMDGPU, as for the shaders stage), the Vulkan SDK and a built vk_compute_test
 (cmake --build runtime/build --target vk_compute_test). No game files.
@@ -52,6 +53,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
+import mc_command  # noqa: E402
 
 M32 = 0xFFFFFFFF
 M64 = (1 << 64) - 1
@@ -726,7 +728,6 @@ def make_program(seed, wave, n_ops, **kw):
 # ---- running on the GPU ---------------------------------------------------------------------------------
 def assemble(mc, prog, src, disasm, fssm):
     import compute_fixture
-    import mc_command
     mattr = "+wavefrontsize64,-wavefrontsize32" if prog.wave == 64 else "+wavefrontsize32,-wavefrontsize64"
     cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", f"-mattr={mattr}", "-show-encoding"]
     if "@" in src:
@@ -751,7 +752,6 @@ def resolve_branches(cmd, prog, src):
     lines = src.splitlines()
     insns = [i for i, ln in enumerate(lines) if ln.strip() and not ln.strip().startswith(";")]
     first = "\n".join(re.sub(r"@\d+$", "0", ln) for ln in lines) + "\n"
-    import mc_command
     r = mc_command.run(cmd, input=first, capture_output=True, text=True)
     if r.returncode or "error:" in r.stderr:
         raise RuntimeError(f"{prog.name} did not assemble:\n{r.stderr}\n{first}")
@@ -931,6 +931,9 @@ def main():
     backends = tuple(dict.fromkeys(t.strip() for t in args.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
+    if "translator" in backends and not os.path.isfile(args.exe):   # before any program is generated or run
+        sys.exit(f"vk_compute_test not found at {args.exe} or in its RelWithDebInfo/Release folder; build it first "
+                 "(cmake --build <build dir> --target vk_compute_test) or give its path with --exe")
     oracle = None
     if "hw" in backends:
         from hw_oracle import runner

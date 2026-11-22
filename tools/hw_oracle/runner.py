@@ -1,10 +1,15 @@
 """Find the tools, build the launcher, assemble kernels and run them on the GPU. Standard library only.
 
+Two launchers: on Windows the HIP runtime that ships in the AMD driver (hw_oracle.c, this file), on Linux raw
+dispatches through the kernel driver (hw_oracle_drm.c, drm.py, which also lists its own variables). open_oracle()
+picks the one for the platform.
+
 Tools are located through environment variables first, then by looking in the usual places:
     LEONIDA_AMD_CLANG   AMD clang (its folder must also hold ld.lld); default: amdclang / clang on PATH that lists
                         the amdgcn target, %HIP_PATH% / %ROCM_PATH%, a .venv holding the `rocm-sdk-core` wheel
     LEONIDA_HIP_DLL     the HIP runtime (amdhip64_7.dll); default: the one in System32 (it ships with the driver)
-    LEONIDA_HOST_CC     a C compiler for hw_oracle.c (MinGW gcc); default: gcc on PATH, C:\\msys64\\ucrt64\\bin
+    LEONIDA_HOST_CC     a C compiler for hw_oracle.c (MinGW gcc, or cl.exe from a Developer shell); default: gcc on
+                        PATH, C:\\msys64\\ucrt64\\bin, then on Windows a cl on PATH or Visual Studio's (vswhere)
     LEONIDA_HW_ARCH     the GPU architecture to assemble for; default: what amdgpu-arch reports, else gfx1150
 Anything missing raises Unavailable, which callers turn into exit 77 ("skipped").
 """
@@ -77,16 +82,64 @@ def find_hip_dll():
     raise Unavailable("no amdhip64_7.dll in System32 (the AMD Windows driver provides it)")
 
 
+def _is_msvc(cc):
+    """cl.exe (MSVC or clang-cl) takes /Fe, not -o."""
+    return os.path.basename(cc).lower() in ("cl.exe", "cl", "clang-cl.exe", "clang-cl")
+
+
+def find_vcvars():
+    """vcvars64.bat of the newest Visual Studio with the x64 C++ tools, as scripts/build_runtime.ps1 finds it."""
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = os.path.join(pf86, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if not os.path.isfile(vswhere):
+        return None
+    try:
+        out = subprocess.run([vswhere, "-latest", "-products", "*", "-requires",
+                              "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+                             capture_output=True, text=True, timeout=60).stdout.strip().splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    bat = os.path.join(out[0].strip(), "VC", "Auxiliary", "Build", "vcvars64.bat") if out else ""
+    return bat if os.path.isfile(bat) else None
+
+
 def find_cc():
+    """The host compiler for hw_oracle.c: ('gcc', path), ('msvc', cl path) or ('vcvars', vcvars64.bat path)."""
     env = os.environ.get("LEONIDA_HOST_CC")
     if env:
         if not os.path.isfile(env):
             raise Unavailable(f"LEONIDA_HOST_CC={env} does not exist")
-        return env
+        return ("msvc" if _is_msvc(env) else "gcc"), env
     for c in (shutil.which("gcc"), r"C:\msys64\ucrt64\bin\gcc.exe", r"C:\msys64\mingw64\bin\gcc.exe"):
         if c and os.path.isfile(c):
-            return c
-    raise Unavailable("no MinGW gcc for hw_oracle.c (set LEONIDA_HOST_CC)")
+            return "gcc", c
+    if os.name == "nt":
+        # A cl already on PATH (a Developer shell) has its environment; otherwise set it up from vcvars64.bat.
+        cl = shutil.which("cl")
+        if cl:
+            return "msvc", cl
+        bat = find_vcvars()
+        if bat:
+            return "vcvars", bat
+    raise Unavailable("no C compiler for hw_oracle.c: MinGW gcc or Visual Studio's C++ tools (set LEONIDA_HOST_CC)")
+
+
+def build_command(kind, cc, src, out, workdir):
+    """argv that compiles src into out; MSVC's objects and the vcvars script go to workdir."""
+    if kind == "gcc":
+        return [cc, "-O1", src, "-o", out]
+    cl = [cc if kind == "msvc" else "cl", "/nologo", "/O1", src, f"/Fe{out}", f"/Fo{os.path.join(workdir, '')}"]
+    if kind == "msvc":
+        return cl
+    # cmd.exe strips the outer quotes of /c's argument, so the call goes through a script file.
+    # vcvars64.bat runs vswhere itself, so its folder goes on PATH first (as scripts/build_llvm_mc.ps1 does).
+    installer = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                             "Microsoft Visual Studio", "Installer")
+    script = os.path.join(workdir, "build_hw_oracle.cmd")
+    with open(script, "w", encoding="ascii") as f:
+        f.write(f'@echo off\r\nset "PATH={installer};%PATH%"\r\ncall "{cc}" >nul || exit /b 1\r\n'
+                + subprocess.list2cmdline(cl) + "\r\n")
+    return ["cmd.exe", "/d", "/c", script]
 
 
 def detect_arch(clang):
@@ -117,6 +170,9 @@ def _find_lld(clang):
 class Oracle:
     """Assembles batches of scalar programs for one architecture and runs them on device 0."""
 
+    code_object = None   # None: the assembler's default version; 5 after an older HIP runtime refused that
+    true16 = False       # True: this assembler wants v8.l for a 16-bit operand
+
     def __init__(self, arch=None, workdir=None, chunk=500):
         if not os.path.isfile(os.path.join(HERE, "hw_oracle.c")):
             raise Unavailable("hw_oracle.c is missing")
@@ -132,6 +188,7 @@ class Oracle:
         self.workdir = workdir or tempfile.mkdtemp(prefix="leonida-hw-oracle-")
         self.exe = self._build_launcher()
         self.device = self._probe()
+        self.true16 = self._needs_true16()
         self._probe_waves()
 
     def _build_launcher(self):
@@ -140,10 +197,14 @@ class Oracle:
             tag = hashlib.sha1(f.read()).hexdigest()[:10]
         exe = os.path.join(tempfile.gettempdir(), f"leonida_hw_oracle_{tag}{'.exe' if os.name == 'nt' else ''}")
         if not os.path.isfile(exe):
-            tmp = exe + f".{os.getpid()}"
-            r = subprocess.run([find_cc(), "-O1", src, "-o", tmp], capture_output=True, text=True)
+            # cl appends .exe to an /Fe name without one, so the temporary name keeps the extension last
+            tmp = exe[:-4] + f".{os.getpid()}.exe" if os.name == "nt" else exe + f".{os.getpid()}"
+            kind, cc = find_cc()
+            r = subprocess.run(build_command(kind, cc, src, tmp, self.workdir), capture_output=True, text=True,
+                               cwd=self.workdir)
             if r.returncode:
-                raise Unavailable("hw_oracle.c did not build: " + r.stderr.strip()[:300])
+                # cl reports compile errors on stdout
+                raise Unavailable("hw_oracle.c did not build: " + (r.stderr.strip() or r.stdout.strip())[:300])
             os.replace(tmp, exe)
         return exe
 
@@ -155,6 +216,14 @@ class Oracle:
         if co is None:
             raise Unavailable("probe kernel did not assemble: " + err[:300])
         rc, out, err = self._launch(co, names)
+        if rc == 3 and "hip error 209" in err and self.code_object is None:
+            # LLVM 23 writes code object v6, which HIP runtimes from 2024 (amdhip64_6.dll) refuse as "no binary for
+            # this GPU". Ask for v5; a 209 that stays has another cause and is reported below.
+            self.code_object = 5
+            co, why = self._assemble(text)
+            if co is None:
+                raise Unavailable("the HIP runtime refused the code object (209) and v5 did not assemble: " + why[:300])
+            rc, out, err = self._launch(co, names)
         if rc == 77:
             raise Unavailable(err.strip() or "no AMD device")
         if rc:
@@ -163,6 +232,15 @@ class Oracle:
         if "arch=" in head and self.arch not in head:
             raise Unavailable(f"device reports {head!r} but assembling for {self.arch} (set LEONIDA_HW_ARCH)")
         return head.lstrip("# ")
+
+    def _needs_true16(self):
+        """Whether this assembler rejects `v_cvt_f16_f32 v8, v1` and takes `v8.l` (LLVM 23 on GFX11)."""
+        if asm.family(self.arch) == "gfx10":
+            return False
+        bare = "v_cvt_f16_f32 v8, v1\n"
+        if self._assemble(bare)[0] is not None:
+            return False
+        return self._assemble(asm.true16_spelling(bare))[0] is not None
 
     def _probe_waves(self):
         """Each wave size really runs as that size: a 64-thread group stores v_mbcnt lane ids. In a wave64 kernel
@@ -185,7 +263,10 @@ class Oracle:
         co = os.path.join(self.workdir, "k.co")
         with open(s, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-        r = subprocess.run([self.clang, f"--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}", *(["-mwavefrontsize64"] if wave == 64 else []), "-c", s, "-o", o],
+        flags = ["-mwavefrontsize64"] if wave == 64 else []
+        if self.code_object:
+            flags.append(f"-mcode-object-version={self.code_object}")
+        r = subprocess.run([self.clang, "--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}", *flags, "-c", s, "-o", o],
                            capture_output=True, text=True)
         if r.returncode:
             return None, r.stderr
@@ -212,6 +293,8 @@ class Oracle:
         live = list(idx)
         while live:
             text, names, starts = asm.module_text([programs[i] for i in live], self.arch, wave=wave)
+            if self.true16:
+                text = asm.true16_spelling(text)
             co, err = self._assemble(text, wave)
             if co is not None:
                 break
@@ -249,15 +332,28 @@ class Oracle:
 
 
 def open_oracle(**kw):
-    """An Oracle, or raise Unavailable."""
+    """An Oracle for this platform, or raise Unavailable."""
+    if sys.platform.startswith("linux"):
+        try:
+            from . import drm
+        except ImportError:   # run as a script
+            import drm
+        return drm.DrmOracle(**kw)
     return Oracle(**kw)
 
 
-if __name__ == "__main__":
+def main():
     try:
-        o = Oracle()
+        o = open_oracle()
     except Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
-        sys.exit(77)
+        return 77
     print(f"hardware oracle ready: {o.device}; clang {o.clang}")
     o.close()
+    return 0
+
+
+if __name__ == "__main__":
+    # Through the importable module: drm.py imports runner, and both must share one Unavailable and one Oracle.
+    import runner as _runner
+    sys.exit(_runner.main())

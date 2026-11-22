@@ -176,7 +176,7 @@ def scan_pe64_rtti(data: bytes) -> dict:
             if q in col_vas:
                 vt = p + 8
                 n = 0
-                while vt + 8 * (n + 1) <= len(img):
+                while vt + 8 * (n + 1) <= hi:
                     f = struct.unpack_from("<Q", img, vt + 8 * n)[0] - base
                     if not (0 <= f < len(img) and is_exec(f)):
                         break
@@ -219,6 +219,14 @@ def main():
     ap.add_argument("image")
     ap.add_argument("--out")
     a = ap.parse_args()
+    path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
+    same_path = os.path.normcase(os.path.realpath(a.image)) == os.path.normcase(os.path.realpath(path))
+    try:
+        same_path = same_path or os.path.samefile(a.image, path)
+    except OSError:
+        pass  # A missing or inaccessible path is handled by the normal read/write error path.
+    if same_path:
+        ap.error("output must not overwrite the source image")
     try:
         with open(a.image, "rb") as f:
             data = f.read()
@@ -228,7 +236,6 @@ def main():
         return 1
 
     out = {"image": a.image, **scanned}
-    path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
     try:
         write_report(path, json.dumps(out, indent=1))
     except OSError as exc:

@@ -31,7 +31,11 @@ import sys
 import zlib
 
 KEY = re.compile(rb'"\$0x([0-9a-fA-F]{8})"')
-IDENT = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{1,80}")
+# A whole run of identifier characters. With a bound inside the pattern ({1,80}) a longer name was cut after 81
+# characters and the search went on in what was left, so one 89-character name became two names nobody wrote
+# and the real one was never hashed. Runs past IDENT_MAX are not names (encoded blobs) and are left out whole.
+IDENT = re.compile(rb"[A-Za-z_][A-Za-z0-9_]+")
+IDENT_MAX = 255
 WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 M32 = 0xFFFFFFFF
 
@@ -160,20 +164,37 @@ def read(p):
 INPUT_EXTENSIONS = (".jsav", ".asav", ".json", ".bin")
 
 
-def iter_inputs(paths):
-    """Yield (path, bytes) for every save file (.jsav, .asav, .bin or no extension) or .json under the given paths.
-
-    The path lets warnings name the offending file when a batch contains a bad save.
-    """
+def input_files(paths):
+    """Every save file (.jsav, .asav, .bin or no extension) or .json under the given paths, in reading order."""
     for p in paths:
         if os.path.isdir(p):
             for dp, _, fs in os.walk(p):
                 for f in sorted(fs):
                     if f.lower().endswith(INPUT_EXTENSIONS) or "." not in f:
-                        source = os.path.join(dp, f)
-                        yield source, read(source)
+                        yield os.path.join(dp, f)
         else:
-            yield p, read(p)
+            yield p
+
+
+def iter_inputs(paths):
+    """Yield (path, bytes) for every file input_files() lists.
+
+    The path lets warnings name the offending file when a batch contains a bad save.
+    """
+    for source in input_files(paths):
+        yield source, read(source)
+
+
+def out_problem(out, inputs, dicts):
+    """Why --out can't be written, checked before any work: it is one of the files read (the report would replace
+    the user's dictionary or a save), or its folder does not exist. "" when it is fine."""
+    if not os.path.isdir(os.path.dirname(os.path.abspath(out))):
+        return f"the folder for --out {out} does not exist"
+    if os.path.exists(out):
+        for p in list(input_files(inputs)) + list(dicts):
+            if os.path.exists(p) and os.path.samefile(out, p):   # samefile: a hard link or another spelling counts
+                return f"--out {out} is also an input ({p}); refusing to overwrite it"
+    return ""
 
 
 def collect_keys(paths):
@@ -199,13 +220,18 @@ def collect_keys(paths):
     return keys
 
 
+def identifiers(data):
+    """The identifier-like strings in `data`, each a whole run (see IDENT)."""
+    return (m.group(0) for m in IDENT.finditer(data) if m.end() - m.start() <= IDENT_MAX)
+
+
 def harvest(paths):
     """Identifier-like strings from raw bytes and from every zlib stream found in them."""
     out = set()
     zhdr = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
     for p in paths:
         d = read(p)
-        out.update(m.group(0) for m in IDENT.finditer(d))
+        out.update(identifiers(d))
         pos = 0
         while True:
             m = zhdr.search(d, pos)
@@ -215,7 +241,7 @@ def harvest(paths):
                 z = zlib.decompressobj()
                 data = z.decompress(d[m.start():m.start() + (8 << 20)], 64 << 20)
                 if z.eof and data:
-                    out.update(x.group(0) for x in IDENT.finditer(data))
+                    out.update(identifiers(data))
                     pos = m.start() + max(2, len(d[m.start():m.start() + (8 << 20)]) - len(z.unused_data))
                     continue
             except zlib.error:
@@ -259,6 +285,9 @@ def cmd_collect(a):
 
 
 def cmd_resolve(a):
+    if a.out and (problem := out_problem(a.out, a.inputs, a.dict)):
+        print("error:", problem, file=sys.stderr)
+        return 1
     keys = set(collect_keys(a.inputs))
     strings = harvest(a.dict)
     chance = len(strings) * len(keys) / 2 ** 32
@@ -287,9 +316,13 @@ def cmd_resolve(a):
             resolved[k] |= hits[k]
     print(f"  total (joaat)    {len(resolved):6} of {len(keys)} keys ({100 * len(resolved) / max(1, len(keys)):.1f}%)")
     if a.out:
-        with open(a.out, "w", encoding="utf-8") as f:
-            json.dump({"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())},
-                      f, indent=1)
+        try:
+            with open(a.out, "w", encoding="utf-8") as f:
+                json.dump({"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())},
+                          f, indent=1)
+        except OSError as e:
+            print(f"error: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 1
         print(f"wrote {a.out} (local only: it contains game names)")
 
 
@@ -304,8 +337,7 @@ def main(argv=None):
     r.add_argument("--compose", type=int, default=0, metavar="N")
     r.add_argument("--out")
     a = ap.parse_args(argv)
-    {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a)
-    return 0
+    return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
 
 
 if __name__ == "__main__":

@@ -623,8 +623,17 @@ int part_e(vktest::Device& d) {
         l.set_predication({0, 0, 0});
         l.copy_buffer({predicate_id, 16, predicate_id, 0, 8});                  // after it: counted 0
     };
-    EXPECT(prepared_with(copies, vk, scratch) == ReplayResult::success);
-    EXPECT(scratch.unpredicated_copies == 1);
+    EXPECT(prepared_with(copies, vk, scratch) == ReplayResult::unsupported);
+    ReplayFunctions copy_functions = vk;
+    // Preparation-only routing test; no fake descriptor set is ever submitted.
+    copy_functions.prepare_predicated_copy = [](VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize bytes,
+                                                std::vector<PredicatedCopyDispatch>& out) {
+        out.push_back({VK_NULL_HANDLE, 0, 0, static_cast<std::uint32_t>(bytes)});
+        return true;
+    };
+    copy_functions.emit_predicated_copy = [](VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&) {};
+    EXPECT(prepared_with(copies, copy_functions, scratch) == ReplayResult::success);
+    EXPECT(scratch.unpredicated_copies == 0);
 
     const Rect corner{0, 0, 2, 2};
     CommandList list;
@@ -693,14 +702,23 @@ int part_f(vktest::Device& d) {
         r.width = r.height = size;
         return r;
     };
-    constexpr ResourceId a_id = 30, b_id = 31, c_id = 32, rt_id = 33, kept_id = 34;
-    const std::map<ResourceId, ResourceBinding> bindings{
+    constexpr ResourceId a_id = 30, b_id = 31, c_id = 32, rt_id = 33, kept_id = 34, pred_id = 35;
+    std::map<ResourceId, ResourceBinding> bindings{
         {a_id, buffer_binding(a, 0, bytes, va_a)},
         {b_id, buffer_binding(b, 0, c_offset, va_b)},         // the first half of b
         {c_id, buffer_binding(b, c_offset, c_size, va_c)},    // a range at 128 in b
         {rt_id, image_binding(rt)},
         {kept_id, image_binding(kept)},
     };
+    void* pred_words = nullptr;
+    VkBuffer pred_buf = VK_NULL_HANDLE;
+    if (d.conditional_rendering) {
+        pred_buf = d.buffer(16, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                            &pred_words);
+        EXPECT(pred_buf && pred_words);
+        std::memset(pred_words, 0, 16);
+        bindings.emplace(pred_id, buffer_binding(pred_buf, 0, 16, 0));
+    }
     const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
         const auto it = bindings.find(id);
         return it == bindings.end() ? nullptr : &it->second;
@@ -709,10 +727,15 @@ int part_f(vktest::Device& d) {
     tracker.track(rt_id, bindings.at(rt_id), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     tracker.track(kept_id, bindings.at(kept_id), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
+    Views views{d, {}};
     ReplayFunctions vk{};
     vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
     vk.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
     vk.clear_depth_stencil_image = d.fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage");
+    vk.begin_rendering = d.fn<PFN_vkCmdBeginRendering>("vkCmdBeginRendering");
+    vk.end_rendering = d.fn<PFN_vkCmdEndRendering>("vkCmdEndRendering");
+    vk.clear_attachments = d.fn<PFN_vkCmdClearAttachments>("vkCmdClearAttachments");
+    vk.image_view = [&](const ResourceBinding& r, const VkImageSubresourceRange& range) { return views(r, range); };
     vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
     vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
     vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
@@ -720,6 +743,24 @@ int part_f(vktest::Device& d) {
     vk.separate_depth_stencil_layouts = true;
     const ReplayFunctions without_update = vk;
     vk.update_buffer = d.fn<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer");
+    VkPhysicalDeviceMemoryProperties memory{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(d.physical, &memory);
+    VkPhysicalDeviceProperties properties{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
+    PredicateReducer reducer(d.device_proc, d.device, memory, properties.limits.maxStorageBufferRange);
+    std::unique_ptr<PredicateReducer::Batch> conditions;
+    if (d.conditional_rendering) {
+        vk.begin_conditional_rendering =
+            d.fn<PFN_vkCmdBeginConditionalRenderingEXT>("vkCmdBeginConditionalRenderingEXT");
+        vk.end_conditional_rendering = d.fn<PFN_vkCmdEndConditionalRenderingEXT>("vkCmdEndConditionalRenderingEXT");
+        EXPECT(vk.begin_conditional_rendering && vk.end_conditional_rendering);
+        conditions = reducer.batch(4);
+        EXPECT(conditions);
+        vk.prepare_predicate = [&](VkBuffer source, VkDeviceSize offset, PredicateCapture& out) {
+            return conditions->prepare(source, offset, out);
+        };
+        vk.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) { reducer.capture(cb, p); };
+    }
     vk.buffer_at = [&](std::uint64_t va, std::uint64_t length, VkBuffer& buffer, VkDeviceSize& offset) {
         for (const auto& [id, r] : bindings) {
             if (r.image || !r.va || va < r.va || va - r.va >= r.size || length > r.size - (va - r.va)) continue;
@@ -750,6 +791,16 @@ int part_f(vktest::Device& d) {
     EXPECT(list.transition({rt_id, 0, s::render_target, s::copy_source}));
     EXPECT(list.clear_render_target({kept_id, 0, 0, 1}, {1, 0, 0, 1}));
     EXPECT(list.discard({kept_id, 0, 1, true}));
+    if (d.conditional_rendering) {
+        // WriteBufferImmediate is unconditional on hardware D3D12 (all three modes); a subsequent clear under the
+        // same false predicate must stay suppressed so kept remains red.
+        EXPECT(list.set_predication({pred_id, 0, d3d12_predication::equal_zero}));
+        EXPECT(list.write_immediate({va_a + 16, 0x66666666, m::normal}));
+        EXPECT(list.write_immediate({va_a + 20, 0x77777777, m::marker_in}));
+        EXPECT(list.write_immediate({va_a + 24, 0x88888888, m::marker_out}));
+        EXPECT(list.clear_render_target({kept_id, 0, 0, 1}, {0, 0, 1, 1}));
+        EXPECT(list.set_predication({0, 0, 0}));
+    }
     EXPECT(list.transition({kept_id, 0, s::render_target, s::copy_source}));
     EXPECT(list.close());
 
@@ -804,6 +855,11 @@ int part_f(vktest::Device& d) {
     };
     constexpr std::uint32_t untouched = 0xcdcdcdcd;
     std::map<VkDeviceSize, std::uint32_t> want_a{{0, 0x44444444}, {4, 0x22222222}};
+    if (d.conditional_rendering) {
+        want_a[16] = 0x66666666;
+        want_a[20] = 0x77777777;
+        want_a[24] = 0x88888888;
+    }
     std::map<VkDeviceSize, std::uint32_t> want_b{{0, 0x22222222},      {8, 0x11111111},
                                                  {12, 0x22222222},     {16, 0x44444444},
                                                  {c_offset, 0x33333333}, {c_offset + 8, 0x22222222},

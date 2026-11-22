@@ -67,10 +67,20 @@ class Kernel:
     """One program to run. lines: the instructions. raw=False wraps them (output pointer load, v[8:11] store);
     raw=True means the lines already end with their own stores and s_endpgm and only get the output pointer in
     s[2:3]. threads: workgroup size; words: dwords read back; wave: 32 or 64. mode: the float MODE the kernel
-    starts with (raw kernels only), a dict of MODE_FIELDS names to values; None keeps the assembler's defaults."""
+    starts with (raw kernels only), a dict of MODE_FIELDS names to values; None keeps the assembler's defaults.
+    lds: bytes of LDS the kernel allocates (.amdhsa_group_segment_fixed_size and the metadata's
+    .group_segment_fixed_size; without it the hardware gives the group no LDS); vgprs, sgprs: registers the kernel uses
+    (default 32 and 40)."""
 
-    def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None):
+    def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None, lds=0, vgprs=32, sgprs=40):
         self.lines, self.wave, self.threads, self.words, self.raw = list(lines), wave, threads, words, raw
+        self.lds, self.vgprs, self.sgprs = lds, vgprs, sgprs
+        if not 0 <= lds <= 65536 or lds % 4:
+            raise ValueError(f"LDS size {lds} is not a multiple of 4 in 0..65536")
+        if not 1 <= vgprs <= 256:
+            raise ValueError(f"vgprs {vgprs} is not in 1..256")
+        if not 1 <= sgprs <= 104:
+            raise ValueError(f"sgprs {sgprs} is not in 1..104")
         self.mode = dict(mode or {})
         unknown = set(self.mode) - set(MODE_FIELDS)
         if unknown:
@@ -90,11 +100,25 @@ MODE_FIELDS = {
 }
 
 
-def raw_kernel_text(name, lines, arch, wave=32, mode=None):
+# The global memory instructions GFX11 renamed, under their GFX10 names. A raw kernel body is written with the
+# GFX11 ones (crosslane_fuzz stores with global_store_b32); a GFX10 assembler only takes the old spelling.
+_GFX10_NAMES = {f"global_{kind}_b{bits}": f"global_{kind}_dword{suffix}"
+                for kind in ("load", "store") for bits, suffix in ((32, ""), (64, "x2"), (96, "x3"), (128, "x4"))}
+
+
+def gfx10_spelling(line):
+    """A raw kernel line with a renamed memory mnemonic put back to its GFX10 name (the same instruction)."""
+    op, sep, rest = line.partition(" ")
+    return _GFX10_NAMES.get(op, op) + sep + rest
+
+
+def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
     modes = "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
     load = "s_load_b64" if fam == "gfx11" else "s_load_dwordx2"
+    if fam == "gfx10":
+        lines = [gfx10_spelling(ln) for ln in lines]
     body = "\n".join("  " + ln for ln in lines)
     return f""".globl {name}
 .p2align 8
@@ -107,8 +131,9 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None):
 .p2align 6
 .amdhsa_kernel {name}
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
-  .amdhsa_next_free_vgpr 32
-  .amdhsa_next_free_sgpr 40
+  .amdhsa_next_free_vgpr {vgprs}
+  .amdhsa_next_free_sgpr {sgprs}
+  .amdhsa_group_segment_fixed_size {lds}
   .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
   .amdhsa_system_vgpr_workitem_id 0{modes}
 .end_amdhsa_kernel
@@ -146,15 +171,16 @@ def kernel_text(name, lines, arch):
 """
 
 
-def metadata(names, wave=32):
-    """The HSA metadata block. Without it the HIP runtime fails the load with hipErrorNoBinaryForGpu (209)."""
+def metadata(names, wave=32, lds=None, vgprs=None, sgprs=None):
+    """The HSA metadata block. Without it the HIP runtime fails the load with hipErrorNoBinaryForGpu (209).
+    lds / vgprs / sgprs: per kernel (lists as long as names); default 0 bytes of LDS, 32 VGPRs and 40 SGPRs."""
     out = [".amdgpu_metadata", "---", "amdhsa.version: [1, 2]", "amdhsa.kernels:"]
-    for n in names:
+    for i, n in enumerate(names):
         out += [f"  - .name: {n}", f"    .symbol: {n}.kd", "    .args:",
                 "      - {.offset: 0, .size: 8, .value_kind: global_buffer, .address_space: global}",
-                "    .group_segment_fixed_size: 0", "    .private_segment_fixed_size: 0",
-                "    .kernarg_segment_align: 8", "    .kernarg_segment_size: 8", "    .max_flat_workgroup_size: 256",
-                "    .sgpr_count: 40", "    .vgpr_count: 32", f"    .wavefront_size: {wave}"]
+                f"    .group_segment_fixed_size: {lds[i] if lds else 0}", "    .private_segment_fixed_size: 0",
+                "    .kernarg_segment_align: 8", "    .kernarg_segment_size: 8", "    .max_flat_workgroup_size: 1024",
+                f"    .sgpr_count: {sgprs[i] if sgprs else 40}", f"    .vgpr_count: {vgprs[i] if vgprs else 32}", f"    .wavefront_size: {wave}"]
     out.append(".end_amdgpu_metadata")
     return "\n".join(out) + "\n"
 
@@ -163,18 +189,22 @@ def module_text(programs, arch, prefix="k", wave=32):
     """(assembly text, kernel names, first source line of each kernel) for a list of programs. A program is a list
     of lines (wrapped as a scalar test) or a Kernel."""
     parts = [f'.amdgcn_target "amdgcn-amd-amdhsa--{arch}"', ".text"]
-    names, starts, line_no = [], [], 2
+    names, starts, line_no, lds, vgprs, sgprs = [], [], 2, [], [], []
     for i, prog in enumerate(programs):
         name = f"{prefix}{i}"
+        lds.append(prog.lds if isinstance(prog, Kernel) else 0)
+        vgprs.append(prog.vgprs if isinstance(prog, Kernel) else 32)
+        sgprs.append(prog.sgprs if isinstance(prog, Kernel) else 40)
         if isinstance(prog, Kernel):
-            text = raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode) if prog.raw else kernel_text(name, prog.lines, arch)
+            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, prog.vgprs, prog.sgprs) if prog.raw
+                    else kernel_text(name, prog.lines, arch))
         else:
             text = kernel_text(name, prog, arch)
         names.append(name)
         starts.append(line_no + 1)
         parts.append(text.rstrip("\n"))
         line_no += text.count("\n") + 0
-    parts.append(metadata(names, wave).rstrip("\n"))
+    parts.append(metadata(names, wave, lds, vgprs, sgprs).rstrip("\n"))
     return "\n".join(parts) + "\n", names, starts
 
 
@@ -198,11 +228,68 @@ GFX11_VALU_RENAMED = {
 }
 
 
+# ---- LDS (ds_*): GFX11 renamed the loads, stores and two atomics (tools/lds_fuzz.py --oracle hw) ----
+# Checked by assembling every ds_* mnemonic lds_fuzz emits with AMD clang for gfx1030 and gfx1150: the assembler takes
+# the GFX10 spelling of all of them on gfx1150 except ds_cmpst_rtn_b32 ("instruction not supported on this GPU"), and
+# takes the GFX11 spelling on gfx1030 for none. The new spelling is used on GFX11/GFX12 so the program text is what
+# the target names, not what an alias happens to accept. ds_cmpstore_rtn_b32 also takes its two data operands in the
+# other order (ds_line).
+DS_RENAMED_GFX11 = {
+    "ds_wrxchg_rtn_b32": "ds_storexchg_rtn_b32",
+    "ds_cmpst_rtn_b32": "ds_cmpstore_rtn_b32",
+}
+_DS_STEMS_GFX11 = (("ds_read2st64_", "ds_load_2addr_stride64_"), ("ds_read2_", "ds_load_2addr_"),
+                   ("ds_write2st64_", "ds_store_2addr_stride64_"), ("ds_write2_", "ds_store_2addr_"),
+                   ("ds_read_", "ds_load_"), ("ds_write_", "ds_store_"))
+
+
+def ds_mnemonic(op, arch):
+    """The spelling of a ds_* mnemonic for this architecture (GFX10 spellings in, as lds_fuzz writes them)."""
+    if family(arch) == "gfx10" or not op.startswith("ds_"):
+        return op
+    if op in DS_RENAMED_GFX11:
+        return DS_RENAMED_GFX11[op]
+    for old, new in _DS_STEMS_GFX11:
+        if op.startswith(old):
+            return new + op[len(old):]
+    return op
+
+
+def ds_line(line, arch):
+    """A whole instruction line (GFX10 spelling and operand order in) respelled for the architecture. On GFX11
+    (measured on gfx1150; GFX12 is not measured, lds_fuzz skips it) ds_cmpstore_rtn_b32 takes the value to store first and the compare value second, the reverse of GFX10's
+    ds_cmpst_rtn_b32 vdst, vaddr, cmp, store (measured on gfx1150: tools/lds_fuzz.py --oracle hw, and it is what LLVM's
+    cmpxchg selection does for GFX11); llvm-mc encodes both spellings of the same text identically, so only the
+    operand order tells them apart."""
+    op, sep, rest = line.partition(" ")
+    if op == "ds_cmpst_rtn_b32" and family(arch) == "gfx11":
+        m = re.fullmatch(r"(v\d+),\s*(v\d+),\s*(v\d+),\s*(v\d+)(.*)", rest)
+        if not m:
+            raise ValueError(f"cannot swap the operands of {line!r}")
+        dst, addr, cmp_, store, tail = m.groups()
+        rest = f"{dst}, {addr}, {store}, {cmp_}{tail}"
+    return ds_mnemonic(op, arch) + sep + rest
+
+
 def valu_skip_reason(op, arch):
     """Why an f32 VALU opcode cannot be run on this architecture, or None."""
     if op in VALU_REMOVED and arch not in ("gfx1010", "gfx1011", "gfx1012", "gfx1013"):
         return f"{op}: {VALU_REMOVED[op]}"
     return None
+
+
+# ---- true16: LLVM 23 makes GFX11's 16-bit operands half registers (v8.l) and rejects a bare v8 there ----
+# The one-source f16 ops the fuzzers and sweeps run here: the two conversions and f16_trans_sweep's seven.
+_F16_UNARY = "|".join(f"v_{op}_f16" for op in ("exp", "log", "rcp", "rsq", "sqrt", "sin", "cos"))
+_F16_DST = re.compile(rf"^([ \t]*(?:v_cvt_f16_f32|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+)(?=[ \t]*,)", re.M)
+_F16_SRC = re.compile(rf"^([ \t]*(?:v_cvt_f32_f16|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+(?:\.[lh])?[ \t]*,"
+                      r"[-| \ta-z(]*\bv\d+)\b(?!\.[lh])", re.M)
+
+
+def true16_spelling(text):
+    """The f16 operands of those ops written as the low half, which is what a bare register means there on GFX10
+    and to older assemblers. Line numbers don't change, so error lines still map to kernels."""
+    return _F16_SRC.sub(r"\1.l", _F16_DST.sub(r"\1.l", text))
 
 
 def failing_kernels(stderr, starts):

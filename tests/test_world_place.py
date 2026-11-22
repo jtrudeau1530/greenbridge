@@ -177,6 +177,55 @@ class TransformTest(unittest.TestCase):
         self.assertEqual(world_build.place_primitives(prims, [0, 0, 0, 1], 1.0, 1.0, (0, 0, 0))[0]["indices"], [0, 1, 2])
 
 
+class PlacementLoadTest(unittest.TestCase):
+    def load(self, rows, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "entities.jsonl")
+            write_entities(path, rows)
+            return world_build.load_placements(path, **kwargs)
+
+    def test_malformed_values_preserve_valid_neighbors(self):
+        before = entity("test_box", (1, 2, 3), sxy=2.0, sz=3.0)
+        after = entity("test_box", (9, 8, 7), sxy=-1.0, sz=0.5)
+        patches = (
+            {"lod_level": []}, {"lod_level": {}},
+            {"position": [10**400, 0, 0]}, {"rotation": [0, 0, 0, -(10**400)]},
+        )
+        for patch in patches:
+            with self.subTest(field=next(iter(patch))):
+                bad = dict(entity("test_box", (4, 5, 6)), **patch)
+                rows, counts = self.load([before, bad, after])
+                self.assertEqual([row["_pos"] for row in rows], [[1.0, 2.0, 3.0], [9.0, 8.0, 7.0]])
+                self.assertEqual([(row["_sxy"], row["_sz"]) for row in rows], [(2.0, 3.0), (-1.0, 0.5)])
+                self.assertEqual(counts, {"rows": 3, "malformed": 1, "other_lod_level": 0,
+                                          "outside_region": 0, "selected": 2})
+
+    def test_invalid_optional_scales_keep_unit_fallback(self):
+        for field in ("scale_xy", "scale_z"):
+            for value in (None, "2.0", [], {}, float("nan"), float("inf"), -float("inf"), 10**400, -(10**400)):
+                with self.subTest(field=field, value=value):
+                    middle = entity("test_box", (4, 5, 6), sxy=2.0, sz=3.0)
+                    middle[field] = value
+                    rows, counts = self.load([entity("test_box", (0, 0, 0)), middle, entity("test_box", (9, 8, 7))])
+                    self.assertEqual(counts["selected"], 3)
+                    self.assertEqual(counts["malformed"], 0)
+                    self.assertEqual((rows[1]["_sxy"], rows[1]["_sz"]),
+                                     (1.0, 3.0) if field == "scale_xy" else (2.0, 1.0))
+
+    def test_finite_scales_and_filter_counts_unchanged(self):
+        missing_lod = entity("test_box", (1, 1, 0))
+        del missing_lod["lod_level"]
+        rows, counts = self.load([
+            entity("test_box", (1, 1, 0), sxy=0, sz=-2.5),
+            entity("test_box", (2, 2, 0), sxy=-3, sz=0, lod=5),
+            entity("test_box", (1, 1, 0), lod=1), missing_lod,
+            entity("test_box", (10, 10, 0)),
+        ], region=(0, 0, 5, 5))
+        self.assertEqual([(row["_sxy"], row["_sz"]) for row in rows], [(0.0, -2.5), (-3.0, 0.0)])
+        self.assertEqual(counts, {"rows": 5, "malformed": 0, "other_lod_level": 2,
+                                  "outside_region": 1, "selected": 2})
+
+
 class PlacedBuildTest(unittest.TestCase):
     def build(self, rows, extra_lines=(), **kw):
         tmp = tempfile.mkdtemp()
@@ -217,6 +266,20 @@ class PlacedBuildTest(unittest.TestCase):
         rows = [entity("test_box", (10, 10, 0)), entity("test_box", (500, 10, 0)), entity("test_box", (10, 10, 0), lod=1)]
         pl = self.build(rows, region=(0, 0, 100, 100), lod_levels=(0, 1))["stats"]["placements"]
         self.assertEqual((pl["selected"], pl["outside_region"], pl["placed"]), (2, 1, 2))
+
+    def test_build_continues_after_malformed_placement_rows(self):
+        rows = [entity("test_box", (10, 10, 0)),
+                entity("test_box", (0, 0, 0), lod=[]),
+                entity("test_box", (10**400, 0, 0)),
+                entity("test_box", (20, 20, 0), sxy=10**400, sz=-(10**400)),
+                entity("test_box", (30, 30, 0))]
+        doc = self.build(rows)
+        counts = doc["stats"]["placements"]
+        self.assertEqual((counts["rows"], counts["malformed"], counts["selected"], counts["placed"]), (5, 2, 3, 3))
+        # Overflowing optional scales act like the existing missing-scale defaults, including geometry bounds.
+        control = self.build([rows[0], entity("test_box", (20, 20, 0)), rows[-1]])
+        self.assertEqual(doc["stats"]["triangles"], control["stats"]["triangles"])
+        self.assertEqual([chunk["bounds"] for chunk in doc["chunks"]], [chunk["bounds"] for chunk in control["chunks"]])
 
     def test_nothing_placeable_leaves_output_unchanged(self):
         with self.assertRaisesRegex(ValueError, "could be placed"):

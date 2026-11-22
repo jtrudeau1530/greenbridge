@@ -2,9 +2,10 @@
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
 render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears, and query heaps)
-runs behind the Xbox-ABI device proxy (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
-set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the swapchain are not
-implemented.** This is the plan for replacing the console's
+runs behind the Xbox-ABI device proxy, and a presenter puts back buffers in a window (section 3.2). The M0
+milestone passes in a synthetic test (section 6). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
+set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the game's own present
+entry point (DXGI or PresentX) are not implemented.** This is the plan for replacing the console's
 `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
 exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
 [design.md](design.md#translator-status-and-runtime-contract)).
@@ -172,6 +173,13 @@ What is implemented (all of it testable without the game):
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
+  Whole-resource depth/stencil copies issue one `vkCmdCopyImage` per aspect, with a transfer write-to-read/write
+  dependency between them; all mips and layers stay batched within each aspect. This avoids stencil corruption
+  observed on RX 5700 XT, Windows driver 32.0.21045.5002, when both aspects share one multi-region copy command.
+  A standalone synthetic Vulkan multi-mip array reproduces the corruption with validation clean; this is a
+  conservative compatibility measure, not evidence that the Vulkan specification requires this dependency.
+  `d3d12_stencil_copy_test` checks D24S8/D32S8 across mip/layer counts and odd dimensions against WARP (CTest)
+  or `LEONIDA_HOST_ADAPTER` (manual runs), plus the deterministic upload pattern for both planes and sources.
   **D24_UNORM_S8_UINT without a native D24** (the Radeon 880M, AMD hardware generally, RADV): the layer stores
   `D32_SFLOAT_S8_UINT` and makes it behave as D24 (`src/depth24.h`, `src/vulkan_depth24.h`). A footprint
   of the depth plane holds 24-bit UNORM words (bits 0-23; the top byte is unspecified, the PC runtime reads it as
@@ -283,7 +291,18 @@ What is implemented (all of it testable without the game):
     2D textures in the common render-target, depth and texture formats (typeless families become mutable-format
     images), plus non-attachment 3D textures with mipmapped upload, image copy and readback, and multisampled 2D
     textures (single-mip render targets or depth-stencils, in the sample counts the GPU has for the format);
-  - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views;
+  - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views.
+    When `ALLOW_UNORDERED_ACCESS` is requested on a GPU whose `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` lacks native
+    `STORAGE_IMAGE` support (for example NVIDIA), the layer backs the texture with a mutable `VK_FORMAT_R32_UINT`
+    image (`MUTABLE_FORMAT | EXTENDED_USAGE` + `VkImageFormatListCreateInfo` `{R32_UINT, E5B9G9R9_UFLOAT_PACK32}`),
+    refusing `ALLOW_RENDER_TARGET`, `ALLOW_DEPTH_STENCIL` and `DENY_SHADER_RESOURCE`: `CheckFeatureSupport` advertises
+    `TYPED_UNORDERED_ACCESS_VIEW` and `UAV_TYPED_STORE` (plus `UAV_TYPED_LOAD` with `R32_UINT` storage atomics) while
+    keeping `RENDER_TARGET` off; SRV and UAV descriptors emit the `E5B9G9R9` T# (`FORMAT 132`, RGB1) and reject
+    incompatible casts, while set 0 creates a `VK_IMAGE_USAGE_SAMPLED_BIT` `E5B9G9R9` sampled view and a
+    `VK_IMAGE_USAGE_STORAGE_BIT` `R32_UINT` storage view (bound in `as_uint` / `r32ui`, never `as_float`);
+    `ClearUnorderedAccessViewFloat` packs RGB9E5 with round-half-up (clamping negative/NaN to 0 and +Inf/overflow to
+    65408, bumping on 512) and `ClearUnorderedAccessViewUint` writes 0, matching WARP (`d3d12_r9g9b9e5_uav_test`,
+    `d3d12_uav_clear_test`);
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
   - `R10G10B10_XR_BIAS_A2_UNORM` maps to `VK_FORMAT_A2B10G10R10_UNORM_PACK32`, the same packed 10:10:10:2
@@ -360,8 +379,9 @@ What is implemented (all of it testable without the game):
     `D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES` sets `FORCE_UNNORMALIZED` (word 0, bit 15) and changes nothing
     else; `vulkan_sampler` makes it `unnormalizedCoordinates`. The layer answers `D3D12_OPTIONS17` with
     `NonNormalizedCoordinateSamplersSupported` (core Vulkan, with the same restrictions) and no
-    `ManualWriteTrackingResourceSupported`. That is what the RTX 4090 and WARP report, so what the PC runtime does
-    when the feature is unreported was not measured here.
+    `ManualWriteTrackingResourceSupported`. That is what the RTX 4090 and WARP report. The runtime on a Radeon 680M
+    (D3D12 driver 31.0.14084.6002) reports no non-normalized samplers, and leaves every non-normalized description
+    unwritten, including those the table below says are written.
 
     A description the PC runtime refuses leaves the slot as it was. The runtime itself does this, without the
     debug layer, on the RTX 4090 (driver 621.14) and on WARP; the debug layer's message names the rule.
@@ -379,6 +399,31 @@ What is implemented (all of it testable without the game):
 
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it, as it does
   `occlusionQueryPrecise` and `pipelineStatisticsQuery` for the query heaps.
+- **Presentation** (`leonida::VulkanPresenter` in `runtime/src/vulkan_present.h`, which
+  `rt::d3d12::create_window_presenter` makes for a device and a window). This is the part every
+  present front end needs; DXGI or `PresentX` is still open (question 6). It takes a back buffer, an ordinary
+  texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image, scaling when the window
+  size differs. The blit goes on the same `VkQueue` after the application's work, so the frame contains everything
+  submitted before the present. Details:
+  - two frames in flight, and a present semaphore per swapchain image;
+  - FIFO when vsync is asked for, otherwise MAILBOX or IMMEDIATE;
+  - the swapchain is recreated on resize or when the surface reports it out of date or suboptimal, and a minimised
+    window skips presents;
+  - a back buffer that was never written is zero-filled like any other texture;
+  - `presented()` counts the presents the engine took (`VK_SUCCESS` or `VK_SUBOPTIMAL_KHR`), not ones it reported
+    out of date;
+  - a recreation is published only when the swapchain, its images and every per-image semaphore exist. On a
+    failure the partial objects are released and the next present tries again, so no image is acquired without
+    its semaphore;
+  - if the blit's submission fails after an image was acquired, an empty batch takes the acquire semaphore and
+    signals the frame's fence, and the swapchain is recreated next time to get the image back. The next present
+    therefore does not wait forever on a fence nothing signals. If even that batch fails, or a fence wait or reset
+    fails, the presenter stops (`ok()` is false) and its owner makes a new one.
+  - for `PresentX` (section 4.5): a source rectangle, a blank present, an sRGB swapchain format for an sRGB source,
+    and an optional capture of each presented frame to host memory (what `xbox_present_test` reads back).
+
+  The device needs `VK_KHR_swapchain` (and the instance the surface extensions). The standalone device enables
+  them when present.
 
   New textures are not touched at creation. They are tracked as `UNDEFINED`, and the first command that uses a
   part of one zero-fills it (D3D12 committed resources start zeroed; `CREATE_NOT_ZEROED` skips this) and moves it
@@ -386,8 +431,13 @@ What is implemented (all of it testable without the game):
   zero-filled, because Vulkan cannot clear them; they start undefined until the application uploads them. Each
   submission ends with a barrier to the host, so a readback buffer holds the GPU's writes once the fence wait
   returns. Children hold a reference to the proxy, not
-  the inner device, so `GetDevice` always returns the Xbox-ABI object. All D3D12 queues share one graphics
-  `VkQueue` behind a submit lock (question 12).
+  the inner device, so `GetDevice` always returns the Xbox-ABI object. Each live D3D12 queue leases a distinct
+  graphics-family `VkQueue`; the standalone device requests up to 16. The queues still share a submit lock for
+  replay state, but Wait-before-Signal between them can make progress (D3D-97). Caller-owned Vulkan devices can
+  supply additional handles through `VulkanDeviceInfo::command_queues`; without them they retain legacy single-queue
+  behavior. When supplied handles are exhausted, `CreateCommandQueue` fails instead of silently sharing a queue.
+  Dedicated compute/transfer
+  *families* would also require resource queue-family ownership handling and remain future work.
 
 Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
 side inwards:
@@ -646,6 +696,9 @@ and any validation error fails them.
   - the `D3D12_OPTIONS17` answer;
   - the 22 written-or-refused cases behind the table in section 3.2, compared with the host's PC runtime when
     there is one.
+- `xbox_present_test`: `PresentX` and the frame events (section 4.5, "what is implemented"), checked on swapchain pixels.
+    there is one. A host that reports no non-normalized samplers is compared only on the 3 cases without the
+    flag. The other 19 are then checked against their recorded answers only.
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.
@@ -667,6 +720,20 @@ and any validation error fails them.
   - Capacity: 5000 distinct SRVs of that texture and one more, and 2100 distinct wrapping samplers in two
     2048-slot heaps. The last view through the last sampler reads the texture one tile to the right. With the
     sizes of before, both were past their arrays ("array is full") and the shader read the fallback.
+- `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
+  the back buffer `PRESENT` → `RENDER_TARGET`, clear, move it back, execute, present, signal a fence. It then
+  resizes the window and presents 10 more (70 in all), which recreates the swapchain, scales the blit and switches
+  to unsynchronised presents. Last, it reads the colour on screen with GDI when the window is in front.
+  - The device and the presenter get their Vulkan functions through a driver double in the test. It forwards to
+    the real driver, counts the presents the driver reports out of date (the frame counts allow for them), and
+    tracks the binary semaphores alive.
+  - Through the double, the test reports one successful present as out of date (not counted) and one as
+    suboptimal (counted).
+  - It fails the second per-image semaphore of a recreation: only the two acquire semaphores may remain, and a
+    retry at the same vsync must make a complete swapchain.
+  - It fails one blit submission: the next four presents must go through without hanging.
+  - Run against the presenter before these fixes, the test fails at the frame count after the resize, where the
+    driver reported a real out-of-date present (RTX 5060 Ti, driver 621.24).
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
@@ -983,7 +1050,7 @@ The trace will enumerate them.
 | D3D12 / Xbox object | Vulkan / layer object | Notes |
 |---|---|---|
 | `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
-| `ID3D12CommandQueue` | `Queue` over one or more `VkQueue`s | Start with one graphics+compute+transfer queue; add dedicated queues when the game uses async compute. `PresentX`, `SuspendX`, `ResumeX` are Xbox queue methods, not in the public vtable; public GDKX samples present only through them (§4.5). Call shapes known, slots **Open**. |
+| `ID3D12CommandQueue` | one leased graphics-family `VkQueue` per live queue | Distinct Vulkan queues allow cross-queue waits and signals to make progress. Dedicated compute/transfer families remain open because resource ownership transfers are not yet implemented. `PresentX`, `SuspendX`, `ResumeX` are Xbox queue methods, not in the public vtable; public GDKX samples present only through them (§4.5). Call shapes known, slots **Open**. |
 | `ID3D12CommandAllocator` | IR arena + `VkCommandPool` | Reset only when the previous submission's fence is complete. |
 | `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers; records the GCL8 front/back stencil references (applied only once a pipeline path consumes them). |
 | `ID3D12RootSignature` | `RootSignature` + `VkPipelineLayout` | Deserialize the blob with the host `D3D12CreateVersionedRootSignatureDeserializer` when possible; clear the measured `0x03000000` flag byte on a copy first; fall back to a local parser. Build the user-SGPR map and static samplers. |
@@ -1027,6 +1094,9 @@ The trace will enumerate them.
   operation group the wave intrinsics map to is present (`BASIC`, `VOTE`, `BALLOT`, `SHUFFLE`, `ARITHMETIC`),
   because D3D12 promises them all behind that one bool. `WaveLaneCountMin`/`Max` are the subgroup size range
   (`VkPhysicalDeviceSubgroupSizeControlProperties`, or the single `subgroupSize` without those 1.3 properties).
+  The exception is an Intel integrated GPU (D3D-121): Vulkan reports 8..32 there, Intel's D3D12 driver a fixed
+  16..16, and the layer answers 16..16 like the host. Measured on Xe-LP: UHD 770 (32.0.101.6129) and Raptor Lake-S
+  Mobile (101.7092). Discrete Arc keeps the Vulkan range until it is measured (TEST-57).
   `TotalLaneCount` has no Vulkan equivalent: D3D12 counts every lane of the device, and the layer answers one full
   wave, so a game that sizes work from it plans for less parallelism than the GPU has, never more. Measured
   against the host PC runtime (616.86) on an RTX 5070: `S_OK` with `WaveOps` 1, lanes 32..32 and a total of 6144,
@@ -1196,6 +1266,31 @@ The trace will enumerate them.
   texture a barrier has moved, a default-heap texture, which D3D12 does not allow but the layer copies and logs) is
   a `CopyTextureRegion` from or to a host-visible staging buffer, replayed on the device's queue and waited for, so
   the layout tracker and a first use's zero fill behave exactly as for the application's own copies.
+- 96-bit textures (`R32G32B32_FLOAT`/`_UINT`/`_SINT`/`_TYPELESS`, D3D-62) are `R32G32B32A32` images
+  (`ResourceBinding::rgb96`), on every GPU. Most GPUs have no optimal-tiling RGB32 image (an RX 9070 XT reports
+  no optimal features for `R32G32B32_SFLOAT`), and one that has would not avoid the repack: D3D12 places
+  subresources at multiples of 512 bytes and Vulkan requires a copy's buffer offset to be a multiple of the
+  12-byte texel (VUID-vkCmdCopyBufferToImage-dstImage-07975). What the application sees stays D3D12's:
+  `GetCopyableFootprints` gives 12-byte texels (compared with WARP in `d3d12_rgb96_test`), and a view's T# names
+  `GFX10_FORMAT_32_32_32_*`, whose swizzle reads alpha as one, so the image's fourth channel is never read.
+  - `CopyTextureRegion` between a texture and a buffer is repacked by the D24 compute pass
+    (`src/depth24_convert.comp` modes 2 and 3, `Depth24Job::rgb96`): the same scratch buffers, parts and lifetime,
+    with texels of three words in the footprint and four in the scratch, copied as they are (an upload writes the
+    fourth word as 0). The words are not interpreted, so NaN payloads, denormals and integers pass unchanged. On
+    an RX 9070 XT (AMD 26.11.2) an upload and a readback take about 5 and 2 ms at 1024x1024 and about 20 and 45 ms
+    at 4096x4096 (`d3d12_rgb96_test` with `LEONIDA_RGB96_LARGE` set; single runs that vary by a few ms, each the
+    first submission of a new queue). The converter is created on every device for this, whether or not the
+    GPU has a native D24.
+  - Texture-to-texture copies and `CopyResource` are plain image copies, and only between two 96-bit textures.
+  - `WriteToSubresource`/`ReadFromSubresource` always take the staged copy, as a D24 texture stored as D32 does:
+    a host image copy would not repack.
+  - Not done: render targets. WARP creates 96-bit render targets; this layer refuses `ALLOW_RENDER_TARGET` and
+    leaves `RENDER_TARGET` out of `FORMAT_SUPPORT`, since a writable fourth channel changes destination-alpha
+    blending. `ALLOW_UNORDERED_ACCESS` and `ALLOW_DEPTH_STENCIL` are refused, as on WARP (measured in the test).
+    `GetResourceAllocationInfo` gives no size for a description creation refuses. A typed 96-bit texture has
+    views of its own format only; the `TYPELESS` one has `FLOAT`, `UINT` and `SINT` views (sampled in
+    `d3d12_descriptor_test`). `GetResourceTiling` reports nothing for a 96-bit texture: the tile shape of a
+    12-byte texel is not measured.
 - Resource flags map to Vulkan usage: `ALLOW_RENDER_TARGET` → `COLOR_ATTACHMENT`, `ALLOW_DEPTH_STENCIL` →
   `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` → `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` → concurrent
   sharing, `DENY_*` → omit the corresponding usage. Buffers get the union of usages their states and flags imply;
@@ -1386,6 +1481,11 @@ That import must be shimmed. The shim provides:
   toggles borderless/fullscreen; `GetFrameStatistics` is a stub.
 - `DXGI_PRESENT_TEST`/`DO_NOT_WAIT` map to a no-op/`VK_NOT_READY` path.
 
+**What exists.** The back end of this path is `leonida::VulkanPresenter` (section 3.2): surface, swapchain,
+blit, present, resize. A DXGI shim's `Present` and a `PresentX` implementation would both end in its `present()`.
+`GetBuffer(i)` therefore does not need to wrap swapchain images: the buffers can be ordinary committed textures,
+blitted at present time, which also frees the game's buffer count and format from the surface's.
+
 **PresentX and frame events (GDKX).** Public Microsoft samples present on Xbox without a DXGI swapchain. Facts
 below come from MIT/zlib-licensed code and docs, read directly; none is from the game or the SDK. Sources:
 [SimpleDeviceAndSwapChain](https://github.com/microsoft/Xbox-GDK-Samples/tree/main/Samples/IntroGraphics/SimpleDeviceAndSwapChain)
@@ -1451,6 +1551,55 @@ Layer plan:
   timer and hand the token through to the present; `GetFrameStatisticsX` minimal; `SuspendX`/`ResumeX`; 0
   planes = blank screen. Test the methods directly with a fake clock, before slots are known.
 - The DXGI `CreateSwapChain*` path stays as the fallback and for PC-style tests, not as the first-boot target.
+
+**What is implemented (the presentation core).** Everything in the plan above that does not need a slot exists as
+methods of `rt::d3d12::XboxPresentation` (`runtime/shims/xbox_present.h`), on top of the presenter of section 3.2 and
+`leonida::FramePacer` (`runtime/src/frame_pacer.h`, no Vulkan, no Windows headers). The struct layouts, constant
+values, HRESULTs and the 64-bit token are **our own provisional definitions**: the samples give call shapes and field
+names only, so the real slots, layouts and enum values are still unmeasured and the class is the surface the proxy
+will forward to. The queue-side calls ignore which queue they came on (one `VkQueue` behind all of them).
+
+- *Frame pacing* (`FramePacer`, time from an injectable clock; real time is a steady timer, a host vblank source
+  can replace it). `SetFrameIntervalX` takes the interval as a period in microseconds and the latency, and starts
+  the vblank grid. `ScheduleFrameEventX` arms the origin event, delayed by an offset inside the frame.
+  `WaitFrameEventX` returns at the next origin with the next token (1, 2, 3, ...; 0 is the null token) and does not
+  return while `latency` presented frames are still waiting for their vblank. A wait that comes late returns at once
+  with the newest passed origin; the missed ones are skipped. A finite timeout gives
+  `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
+  `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render, not
+  `PercentScanned`); `S_FALSE` with count 0 for what it does not have.
+- *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
+  single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
+  (bilinear, so the rectangle's outer texels blend with their neighbours). The blit converts between formats; an sRGB
+  source gets an sRGB swapchain format and every other source a UNORM one, so the encoded bytes go through unchanged.
+  A source the GPU cannot blit gives `DXGI_ERROR_UNSUPPORTED` and presents nothing: the checks are
+  `vkGetPhysicalDeviceFormatProperties` (`BLIT_SRC` on the source, `BLIT_DST` on the swapchain format, cached per
+  format; the scaling filter is linear only with `SAMPLED_IMAGE_FILTER_LINEAR`, else nearest), plus integer formats,
+  which a UNORM swapchain cannot take. Multisampled planes are refused the same way: resolving one into a temporary
+  image is not done. 2 planes: plane 0 is shown, plane 1 is
+  dropped, and the missing HDR/GameDVR composition is logged once; they must share one token. More than 2 planes,
+  null planes, or an empty/outside rectangle give `E_INVALIDARG`. A missing `ALLOW_DISPLAY` heap flag is logged once
+  and presented anyway. `ImmediateThresholdPercent` is ignored (logged once when non-zero): a late frame waits for
+  its vblank.
+- *Tokens*: what the console does with a null, repeated or out-of-order token is **unmeasured**, and a title that
+  presents a loading screen with `Token = 0`, presents again with one token, or presents from a render thread out of
+  order must not freeze. So those are presented anyway and logged once per kind; only a token that was never handed
+  out gives `E_INVALIDARG` (nothing presented). Skipping a token is fine.
+- *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
+  with `ERROR_INVALID_STATE` and refuses presents (a `PresentX` waiting for a swapchain image polls the suspended
+  state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until
+  `SetFrameIntervalX` and `ScheduleFrameEventX` are called again, as the samples do. Tokens keep counting. Calling
+  `SetFrameIntervalX` again outside suspend keeps the origin event armed and re-bases the vblank grid on that moment.
+- *Not done*: HDR/GameDVR plane composition, resolving multisampled planes, a mutable-format swapchain (an sRGB/UNORM
+  alternation recreates the swapchain; `VK_KHR_swapchain_mutable_format` is not enabled on the device), `ImmediateThresholdPercent`, a host-vblank clock (the timer drifts from the
+  display; with FIFO presents the swapchain holds the queue to the real refresh anyway), render statistics,
+  `PercentScanned`, and the vtable wiring. Slots to measure (all unknown): the device's `SetFrameIntervalX`,
+  `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` and the queue's `PresentX`, `SuspendX`, `ResumeX`
+  (the list is in the header).
+- *Tests*: `frame_pacer_test` (fake clock: interval, offset, late waits, timeouts, latency blocking, tokens,
+  statistics, suspend/resume, a real 10 ms timer; no GPU) and `xbox_present_test` (the Vulkan device, reading the
+  swapchain image back: blank, solid, two colours, source rectangles, RGBA/BGRA/sRGB sources, 2 planes, token errors,
+  statistics, suspend/resume, 30 frames at 60 Hz in real time; skipped, exit 77, without a Vulkan device).
 
 ### 4.6 Queries
 
@@ -1552,11 +1701,37 @@ Not implemented yet:
     before each dispatch. Copies and compute dispatches cannot execute inside dynamic rendering, so render-pass
     integration must place the capture outside the rendering scope while preserving capture at `SetPredication`.
     These are requirements for those future integrations, not compute-dispatch or render-pass support added here.
+  `CopyBufferRegion` under a predicate instead uses a byte-granular compute dispatch inside the captured
+  conditional scope; both operations, unaligned offsets and lengths, and the full 64-bit predicate are covered.
+  Zero-byte copies are no-ops, as checked against native WARP. Unpredicated copies retain `vkCmdCopyBuffer`.
+  The compute helper requires enabled Vulkan 1.2 `storageBuffer8BitAccess` (not `shaderInt8`) and a compute queue;
+  without it, preparation rejects the predicated buffer copy rather than executing it unconditionally.
+  Descriptor windows respect storage-buffer alignment/range and dispatch limits, including arena offsets.
+  Copy descriptors are owned by command-buffer slots until the submission timeline completes. Memory dependencies order prior writes,
+  subsequent reads and successive windows. Direct and compute queues support the helper; copy queues reject
+  active predication. Preparation is serialized under the tracker lock, preserving resource -> tracker -> submit
+  lock order and the copy-then-commit tracker. Readback writes accumulate COMPUTE_SHADER for the helper and COPY
+  for ordinary copies; mixed lists accumulate both before main's queue-specific host-stage filtering.
+  This helper also binds compute pipeline/set 0/push constants, so the
+  application-state restoration requirement above applies. A predicated copy inside an active pipeline-statistics
+  query is rejected to avoid counting internal compute work.
+  Synthetic checks: `predicated_copy_test` covers preparation and rejection paths without a GPU;
+  `d3d12_predicated_copy_test` compares 180 byte-exact cases against WARP and an independent literal oracle,
+  plus 16 query-to-copy cases: real empty ordinary/binary occlusion queries resolve zero into a default-heap
+  predicate at offsets 0/16, both predicate operations govern copies, and executing overwrite copies replace zero
+  with a high-word-only value. Four paired controls verify that recapturing the same address changes exactly one
+  13-byte destination region; without recapture, later copies keep using the captured zero. Predicate-buffer guards
+  and all untouched destination bytes are checked too. These query cases do not cover nonzero visible-draw counts;
+  `vk_predicated_copy_test` forces small windows and dispatches, arena prefixes, dependent copies, offset rebinding,
+  reset, 32 gated plus 32 reused submissions, failed-submit cleanup and host stages on all three queue kinds.
+  Binary and overlapping occlusion fixtures also verify that query results resolve under a false predicate while
+  a dedicated copy destination remains unchanged; disabling predication copies into a separate region.
+  The embedded shader is generated from `predicated_copy.comp`
+  with glslang 16.6.0 (`-V --target-env vulkan1.2 -Os`) and validated for Vulkan 1.2.
+
   Open:
-  - Copies and resolves. D3D12 predicates `CopyBufferRegion`, `CopyTextureRegion`, `CopyResource` and
-    `ResolveSubresource`; Vulkan's conditional rendering does not cover transfer commands, so they run
-    unconditionally. `PreparedList::unpredicated_copies` counts them. A fix replays a predicated copy as a compute
-    dispatch, which conditional rendering does cover.
+  - Texture copies, `CopyResource` and resolves. Vulkan's conditional rendering does not cover transfer
+    commands, so these still run unconditionally and `PreparedList::unpredicated_copies` counts them.
 
   - Draws, dispatches and `ExecuteIndirect` are covered by conditional rendering as soon as they are replayed
     (D3D-3, D3D-4, D3D-17); `ClearUnorderedAccessView*` and `ResolveSubresource` need the same check when added.
@@ -1814,7 +1989,7 @@ M0–M2 do not need the executable.
 
 | # | Scope | What it proves | Done when |
 |---|---|---|---|
-| **M0** | `D3D12XboxCreateDevice` and the measured device overrides (heap start handles in RAX), one direct queue, allocator/list, fence, fake DXGI factory/adapter/output, `ALLOW_DISPLAY` back buffers, frame events + `PresentX` (DXGI swapchain only if the game creates one), clear + present | COM interception, the known Xbox device entry point and ABI overrides, presentation (`PresentX` + frame events, or swapchain), frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced |
+| **M0** | `D3D12XboxCreateDevice` and the measured device overrides (heap start handles in RAX), one direct queue, allocator/list, fence, fake DXGI factory/adapter/output, `ALLOW_DISPLAY` back buffers, frame events + `PresentX` (DXGI swapchain only if the game creates one), clear + present | COM interception, the known Xbox device entry point and ABI overrides, presentation (`PresentX` + frame events, or swapchain), frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced. **Synthetic part met** by `d3d12_present_test`: 60 frames through the proxy on Vulkan, validation clean, colour checked on screen. Still open: the game's present front end (frame events + `PresentX`, or a DXGI swapchain) and the per-call trace |
 | **M1** | Root signature with root constants (mask the measured `0x03000000` flag byte on a copy), one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0 |
 | **M2** | Descriptor heap (heap slots 9/10 return in RAX), `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8×8 gradient or a known texture with error 0; the hash table has the expected entries |
 | **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report |
@@ -2192,9 +2367,13 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     refused on an RTX 5080 (616.92), created on an AMD Radeon and on WARP, where typed UAV writes round-trip; and on
     both GPUs one allocation can serve both uses, a mutable `R32_UINT` Vulkan image with `E5B9G9R9_UFLOAT_PACK32` in
     its format list, written through an `R32_UINT` storage view and sampled through an `E5B9G9R9` view.
+    **Implemented** in `d3d12_vulkan_device.cpp` and `src/uav_clear.h` (`d3d12_r9g9b9e5_uav_test`): on an RTX 3060 Ti
+    (driver 621.01, `LEONIDA_FSR_DEVICE=vulkan LEONIDA_FSR_NO_STANDIN=1`, `LEONIDA_VK_VALIDATION=1`),
+    `ffxCreateContext` and `ffxDestroyContext` both return OK without `standin_slot76` and with 0 validation errors.
     Open: a float store to that format rounds differently on PC devices (@Vonsek, #864: AMD Radeon truncates the
     mantissas, WARP rounds to nearest even; 609 of 794 test triples differ). Which rule the console FSR needs, and
-    whether its shaders store floats to that texture at all, waits on decoding its `FSPX` shaders.
+    whether its shaders store floats to that texture at all (requiring shader-side packing into the `R32_UINT` storage
+    view), waits on decoding its `FSPX` shaders.
   - With that one texture created as `R32_UINT` instead (the test's PC stand-in, `standin_slot76`), or as is on
     WARP, `ffxCreateContext` and `ffxDestroyContext` both return OK. Device slots called: 14 (5), 15 (26), 18 (10),
     19 (16), **27

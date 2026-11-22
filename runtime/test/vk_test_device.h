@@ -22,13 +22,16 @@ inline unsigned& validation_error_count() {
     return count;
 }
 
+// Only validation-type errors fail a test. General messages come from the loader and the layers around the
+// application: a third-party implicit layer that fails to load (an overlay or capture tool, for example) reports a
+// general error that says nothing about this code, so it is printed but not counted.
 inline VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                                     VkDebugUtilsMessageTypeFlagsEXT types,
                                                     const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
-    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
-        (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
-        ++validation_error_count();
-    std::fprintf(stderr, "validation: %s\n", data && data->pMessage ? data->pMessage : "(no message)");
+    const bool validation = (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) ++validation_error_count();
+    std::fprintf(stderr, "%s: %s\n", validation ? "validation" : "vulkan (not counted)",
+                 data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
 }
 
@@ -63,8 +66,10 @@ public:
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
+    bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
@@ -111,9 +116,10 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
 
-    bool create() { return initialize() == DeviceStatus::ready; }
+    // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
+    bool create(bool presentation = false) { return initialize(presentation) == DeviceStatus::ready; }
 
-    DeviceStatus initialize() {
+    DeviceStatus initialize(bool presentation = false) {
         const auto failure = [](const char* call, VkResult result) {
             std::fprintf(stderr, "%s failed (VkResult %d)\n", call, static_cast<int>(result));
             return DeviceStatus::failed;
@@ -151,6 +157,11 @@ public:
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instance_info.pApplicationInfo = &app;
+        std::vector<const char*> instance_extensions;
+        if (presentation) {
+            instance_extensions.push_back("VK_KHR_surface");
+            instance_extensions.push_back("VK_KHR_win32_surface");
+        }
         if (validation) {
             std::vector<VkLayerProperties> layers;
             const VkResult layer_result = enumerate_all(layers, enumerate_layers);
@@ -176,9 +187,10 @@ public:
                 debug_utils = debug_utils || std::strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
         }
         if (debug_utils) {
-            instance_info.enabledExtensionCount = 1;
-            instance_info.ppEnabledExtensionNames = &debug_utils_name;
+            instance_extensions.push_back(debug_utils_name);
         }
+        instance_info.enabledExtensionCount = std::uint32_t(instance_extensions.size());
+        instance_info.ppEnabledExtensionNames = instance_extensions.data();
         VkResult result = create_instance(&instance_info, nullptr, &instance);
         if (result == VK_ERROR_INCOMPATIBLE_DRIVER) return DeviceStatus::unavailable;
         if (result != VK_SUCCESS) return failure("vkCreateInstance", result);
@@ -270,6 +282,8 @@ public:
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;
+        enable12.storageBuffer8BitAccess = storage_buffer_8bit;
         // What the bindless set 0 of the translated shaders needs, where the device has it: runtime arrays of
         // images indexed dynamically, updated while the set is bound; and, to leave slots empty, partially bound
         // bindings.
@@ -330,6 +344,21 @@ public:
             enable13.pNext = &host_copy;
         }
 
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+        // VK_KHR_shader_fma where the device has it: translated shaders built with --fma khr use OpFmaKHR.
+        VkPhysicalDeviceShaderFmaFeaturesKHR fma_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
+        if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_SHADER_FMA_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fma_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            shader_fma = fma_features.shaderFmaFloat32 == VK_TRUE;
+            if (shader_fma) {
+                fma_features.pNext = enable13.pNext;
+                enable13.pNext = &fma_features;
+            }
+        }
+#endif
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
@@ -342,6 +371,11 @@ public:
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+        const char* swapchain = "VK_KHR_swapchain";
+        if (presentation) device_extensions.push_back(swapchain);
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+        if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
+#endif
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

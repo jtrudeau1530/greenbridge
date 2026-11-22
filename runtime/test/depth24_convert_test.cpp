@@ -12,11 +12,14 @@
 // GPU without D24. Steps 3 and 4 use converters with a 1 MiB and a 1 KiB storage range, so copies split into dispatches.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
+#include "../src/vulkan_backend.h"
 #include "../src/vulkan_depth24.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -44,10 +47,12 @@ std::uint32_t as_bits(float f) {
 
 int main() {
     vktest::Device gpu;
-    if (!gpu.create()) {
+    const auto status = gpu.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
         std::printf("depth24_convert_test: no Vulkan device, skipped\n");
-        return 0;
+        return 77;
     }
+    if (status != vktest::DeviceStatus::ready) return 1;
 
     // The converter allocates nothing here (every job brings its scratch buffer), but the callback must exist.
     Depth24Converter converter(gpu.device_proc, gpu.device, [](const VkMemoryRequirements&) { return VK_NULL_HANDLE; });
@@ -65,9 +70,11 @@ int main() {
     EXPECT(app && scratch && app_words && scratch_words);
 
     const auto convert = [&](bool to_float, std::uint32_t width, std::uint32_t height, std::uint32_t slices,
-                             std::uint32_t row_words, std::uint32_t slice_words, std::uint64_t offset, int limited = 0) {
+                             std::uint32_t row_words, std::uint32_t slice_words, std::uint64_t offset, int limited = 0,
+                             bool rgb96 = false) {
         Depth24Job job;
         job.to_float = to_float;
+        job.rgb96 = rgb96;
         job.app = app;
         job.app_offset = offset;
         job.app_size = std::uint64_t(words) * 4 + 4096;
@@ -197,6 +204,316 @@ int main() {
                     EXPECT(scratch_words[(z * h + y) * w + x] == as_bits(depth24_to_float(d)));
                 }
         std::printf("depth24: a pitched copy at an offset touches only its texels\n");
+    }
+
+    // 5. Concurrent VulkanQueue::execute() with enable_depth24 active: one queue runs depth24_as_float
+    //    CopyTexture roundtrips (lazy tracker_mutex_ acquisition + collect/retire), while a second queue
+    //    runs non-depth24 CopyBuffer batches concurrently (parallel prepare()), plus an early-failure batch
+    //    that triggers Depth24Guard retirement.
+    {
+        VkPhysicalDeviceMemoryProperties mem_props{};
+        gpu.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(
+            gpu.physical, &mem_props);
+        const auto alloc_device_local = [&](const VkMemoryRequirements& req) -> VkDeviceMemory {
+            for (std::uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+                if (!(req.memoryTypeBits & (1u << i))) continue;
+                if ((mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) !=
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                    continue;
+                VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                info.allocationSize = req.size;
+                info.memoryTypeIndex = i;
+                VkDeviceMemory mem = VK_NULL_HANDLE;
+                if (gpu.fn<PFN_vkAllocateMemory>("vkAllocateMemory")(gpu.device, &info, nullptr, &mem) == VK_SUCCESS)
+                    return mem;
+                return VK_NULL_HANDLE;
+            }
+            return VK_NULL_HANDLE;
+        };
+
+        VulkanContext context(gpu.device_proc, gpu.device, true);
+        EXPECT(context.loaded());
+        context.enable_depth24(gpu.device_proc, alloc_device_local);
+
+        constexpr int kIters = 16;
+        constexpr std::uint32_t tex_w = 64, tex_h = 16;
+        constexpr std::uint32_t tex_words = tex_w * tex_h;
+        constexpr std::uint64_t tex_bytes = std::uint64_t(tex_words) * 4;
+        const VkImage depth_img =
+            gpu.image(VK_FORMAT_D32_SFLOAT_S8_UINT, tex_w, tex_h, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+        EXPECT(depth_img != VK_NULL_HANDLE);
+
+        std::uint32_t *d24_up_ptr = nullptr, *d24_rb_ptr = nullptr;
+        std::uint32_t *buf_src_ptr = nullptr, *buf_dst_ptr = nullptr;
+        const VkBuffer d24_up = gpu.buffer(tex_bytes, usage, reinterpret_cast<void**>(&d24_up_ptr));
+        const VkBuffer d24_rb = gpu.buffer(tex_bytes * kIters, usage, reinterpret_cast<void**>(&d24_rb_ptr));
+        const VkBuffer buf_src = gpu.buffer(tex_bytes, usage, reinterpret_cast<void**>(&buf_src_ptr));
+        const VkBuffer buf_dst = gpu.buffer(tex_bytes * kIters, usage, reinterpret_cast<void**>(&buf_dst_ptr));
+        EXPECT(d24_up && d24_rb && buf_src && buf_dst);
+
+        for (std::uint32_t i = 0; i < tex_words; ++i) {
+            d24_up_ptr[i] = ((i * 15973u + 13u) & depth24_max) | (0x7eu << 24);
+            buf_src_ptr[i] = 0x12340000u + i;
+        }
+
+        constexpr ResourceId id_depth = 1, id_d24_up = 2, id_d24_rb = 3, id_buf_src = 4, id_buf_dst = 5;
+        ResourceBinding img_b{};
+        img_b.image = depth_img;
+        img_b.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        img_b.aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        img_b.width = tex_w;
+        img_b.height = tex_h;
+        img_b.mip_levels = 1;
+        img_b.array_layers = 1;
+        img_b.depth = 1;
+        img_b.samples = 1;
+        img_b.depth24 = true;
+        img_b.depth24_as_float = true;
+        context.add_resource(id_depth, img_b, VK_IMAGE_LAYOUT_UNDEFINED);
+
+        const auto reg_buf = [&](ResourceId id, VkBuffer buf, VkDeviceSize sz, bool readback) {
+            ResourceBinding b{};
+            b.buffer = buf;
+            b.size = sz;
+            b.host_readable = readback;
+            context.add_resource(id, b);
+        };
+        reg_buf(id_d24_up, d24_up, tex_bytes, false);
+        reg_buf(id_d24_rb, d24_rb, tex_bytes * kIters, true);
+        reg_buf(id_buf_src, buf_src, tex_bytes, false);
+        reg_buf(id_buf_dst, buf_dst, tex_bytes * kIters, true);
+
+        VulkanQueue queue_a(context, gpu.queue, gpu.family);
+        VulkanQueue queue_b(context, gpu.queue, gpu.family);
+        EXPECT(queue_a.ok() && queue_b.ok());
+
+        std::vector<CommandList> d24_lists(kIters);
+        std::vector<CommandList> buf_lists(kIters);
+        for (int iter = 0; iter < kIters; ++iter) {
+            const std::uint64_t off = std::uint64_t(iter) * tex_bytes;
+            CopyLocation fp_up{id_d24_up, true, 0, 0, tex_w, tex_h, 1, tex_w * 4};
+            CopyLocation fp_rb{id_d24_rb, true, 0, off, tex_w, tex_h, 1, tex_w * 4};
+            CopyLocation tex_loc{id_depth, false, 0, 0, 0, 0, 0, 0};
+            EXPECT(d24_lists[iter].copy_texture(CopyTexture{tex_loc, 0, 0, 0, fp_up, false, {}}));
+            EXPECT(d24_lists[iter].copy_texture(CopyTexture{fp_rb, 0, 0, 0, tex_loc, false, {}}));
+            EXPECT(d24_lists[iter].close());
+
+            EXPECT(buf_lists[iter].copy_buffer(CopyBuffer{id_buf_dst, off, id_buf_src, 0, tex_bytes}));
+            EXPECT(buf_lists[iter].close());
+        }
+
+        // Early-failure batch: valid depth24_as_float copy followed by an unknown resource copy must fail cleanly
+        // and retire the uncommitted depth24 scratch via Depth24Guard without corrupting subsequent executions.
+        {
+            CommandList failing_list;
+            CopyLocation fp_up{id_d24_up, true, 0, 0, tex_w, tex_h, 1, tex_w * 4};
+            CopyLocation tex_loc{id_depth, false, 0, 0, 0, 0, 0, 0};
+            EXPECT(failing_list.copy_texture(CopyTexture{tex_loc, 0, 0, 0, fp_up, false, {}}));
+            EXPECT(failing_list.copy_buffer(CopyBuffer{99999, 0, id_buf_src, 0, 4}));
+            EXPECT(failing_list.close());
+            const CommandList* ptrs[] = {&failing_list};
+            EXPECT(queue_a.execute(ptrs) == ReplayResult::unresolved_resource);
+        }
+
+        std::atomic<bool> failed{false};
+        std::thread ta([&] {
+            for (int iter = 0; iter < kIters; ++iter) {
+                const CommandList* ptrs[] = {&d24_lists[iter]};
+                if (queue_a.execute(ptrs) != ReplayResult::success) {
+                    failed.store(true);
+                    break;
+                }
+            }
+        });
+        std::thread tb([&] {
+            for (int iter = 0; iter < kIters; ++iter) {
+                const CommandList* ptrs[] = {&buf_lists[iter]};
+                if (queue_b.execute(ptrs) != ReplayResult::success) {
+                    failed.store(true);
+                    break;
+                }
+            }
+        });
+        ta.join();
+        tb.join();
+        EXPECT(!failed.load());
+        EXPECT(gpu.fn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(gpu.device) == VK_SUCCESS);
+
+        for (int iter = 0; iter < kIters; ++iter) {
+            const std::size_t base = std::size_t(iter) * tex_words;
+            for (std::uint32_t i = 0; i < tex_words; ++i) {
+                EXPECT(d24_rb_ptr[base + i] == (d24_up_ptr[i] & depth24_max));
+                EXPECT(buf_dst_ptr[base + i] == buf_src_ptr[i]);
+            }
+        }
+        std::printf("depth24: concurrent VulkanQueue::execute (lazy depth24 lock + parallel non-d24 prepare) ok\n");
+
+        // Suballocated arena slices (nonzero ResourceBinding::buffer_offset) in a single shared VkBuffer:
+        // CopyResource, ordinary RGBA8 CopyTexture, and depth24_as_float CopyTexture (including a non-256-aligned
+        // buffer_offset) must read/write only their own slices and leave guard sentinels untouched.
+        {
+            constexpr std::uint32_t w = 64, h = 4;
+            constexpr std::uint32_t slice_words = w * h;
+            constexpr VkDeviceSize slice_bytes = VkDeviceSize(slice_words) * 4;  // 1024 bytes
+            constexpr VkDeviceSize src_off = 512;
+            constexpr VkDeviceSize copy_off = 2048;
+            constexpr VkDeviceSize rgba_rb_off = 4096;
+            constexpr VkDeviceSize d24_rb_off = 6148;  // 4-byte aligned, non-256-aligned (exercises app_base_words != 0)
+            constexpr VkDeviceSize arena_bytes = 8192;
+            constexpr std::uint32_t guard_word = 0xA5A5A5A5u;
+            constexpr std::uint32_t poison_word = 0xCDCDCDCDu;
+
+            std::uint32_t* arena_ptr = nullptr;
+            const VkBuffer arena = gpu.buffer(arena_bytes, usage, reinterpret_cast<void**>(&arena_ptr));
+            EXPECT(arena && arena_ptr);
+            for (std::size_t i = 0; i < arena_bytes / 4; ++i) arena_ptr[i] = guard_word;
+            for (std::uint32_t i = 0; i < slice_words; ++i) {
+                arena_ptr[src_off / 4 + i] = ((i * 65521u + 17u) & depth24_max) | ((0x40u + (i & 0x3fu)) << 24);
+                arena_ptr[copy_off / 4 + i] = poison_word;
+                arena_ptr[rgba_rb_off / 4 + i] = poison_word;
+                arena_ptr[d24_rb_off / 4 + i] = poison_word;
+            }
+
+            const VkImage rgba_img = gpu.image(VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+            const VkImage d24_slice_img =
+                gpu.image(VK_FORMAT_D32_SFLOAT_S8_UINT, w, h, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+            EXPECT(rgba_img != VK_NULL_HANDLE && d24_slice_img != VK_NULL_HANDLE);
+
+            constexpr ResourceId id_src = 10, id_copy = 11, id_rgba_rb = 12, id_d24_rb = 13;
+            constexpr ResourceId id_rgba_img = 14, id_d24_img = 15;
+            const auto reg_slice = [&](ResourceId id, VkDeviceSize off, bool readback) {
+                ResourceBinding b{};
+                b.buffer = arena;
+                b.buffer_offset = off;
+                b.size = slice_bytes;
+                b.host_readable = readback;
+                context.add_resource(id, b);
+            };
+            reg_slice(id_src, src_off, false);
+            reg_slice(id_copy, copy_off, true);
+            reg_slice(id_rgba_rb, rgba_rb_off, true);
+            reg_slice(id_d24_rb, d24_rb_off, true);
+
+            ResourceBinding rgba_b{};
+            rgba_b.image = rgba_img;
+            rgba_b.format = VK_FORMAT_R8G8B8A8_UNORM;
+            rgba_b.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+            rgba_b.width = w;
+            rgba_b.height = h;
+            rgba_b.mip_levels = 1;
+            rgba_b.array_layers = 1;
+            rgba_b.depth = 1;
+            rgba_b.samples = 1;
+            context.add_resource(id_rgba_img, rgba_b, VK_IMAGE_LAYOUT_UNDEFINED);
+
+            ResourceBinding d24_b{};
+            d24_b.image = d24_slice_img;
+            d24_b.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+            d24_b.aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            d24_b.width = w;
+            d24_b.height = h;
+            d24_b.mip_levels = 1;
+            d24_b.array_layers = 1;
+            d24_b.depth = 1;
+            d24_b.samples = 1;
+            d24_b.depth24 = true;
+            d24_b.depth24_as_float = true;
+            context.add_resource(id_d24_img, d24_b, VK_IMAGE_LAYOUT_UNDEFINED);
+
+            CommandList slice_list;
+            EXPECT(slice_list.copy_resource({id_copy, id_src}));
+            const CopyLocation fp_src{id_src, true, 0, 0, w, h, 1, w * 4};
+            const CopyLocation fp_rgba_rb{id_rgba_rb, true, 0, 0, w, h, 1, w * 4};
+            const CopyLocation fp_d24_rb{id_d24_rb, true, 0, 0, w, h, 1, w * 4};
+            const CopyLocation loc_rgba{id_rgba_img, false, 0, 0, 0, 0, 0, 0};
+            const CopyLocation loc_d24{id_d24_img, false, 0, 0, 0, 0, 0, 0};
+            EXPECT(slice_list.copy_texture({loc_rgba, 0, 0, 0, fp_src, false, {}}));
+            EXPECT(slice_list.copy_texture({fp_rgba_rb, 0, 0, 0, loc_rgba, false, {}}));
+            EXPECT(slice_list.copy_texture({loc_d24, 0, 0, 0, fp_src, false, {}}));
+            EXPECT(slice_list.copy_texture({fp_d24_rb, 0, 0, 0, loc_d24, false, {}}));
+            EXPECT(slice_list.close());
+
+            const CommandList* ptr = &slice_list;
+            EXPECT(queue_a.execute({&ptr, 1}) == ReplayResult::success);
+            EXPECT(queue_a.idle());
+
+            for (std::uint32_t i = 0; i < slice_words; ++i) {
+                const std::uint32_t src_word = arena_ptr[src_off / 4 + i];
+                EXPECT(arena_ptr[copy_off / 4 + i] == src_word);
+                EXPECT(arena_ptr[rgba_rb_off / 4 + i] == src_word);
+                EXPECT(arena_ptr[d24_rb_off / 4 + i] == (src_word & depth24_max));
+            }
+            const auto in_slice = [&](std::size_t word_idx) {
+                const VkDeviceSize byte_off = VkDeviceSize(word_idx) * 4;
+                const auto within_slot = [&](VkDeviceSize start) {
+                    return byte_off >= start && byte_off < start + slice_bytes;
+                };
+                return within_slot(src_off) || within_slot(copy_off) || within_slot(rgba_rb_off) ||
+                       within_slot(d24_rb_off);
+            };
+            for (std::size_t i = 0; i < arena_bytes / 4; ++i)
+                if (!in_slice(i)) EXPECT(arena_ptr[i] == guard_word);
+
+            std::printf("depth24: shared-buffer offsets (CopyResource, RGBA8 and depth24 CopyTexture) ok\n");
+        }
+    }
+
+    // 6. 96-bit texels (Depth24Job::rgb96, D3D-62): three words a texel in the footprint, four in the scratch, the
+    // words copied as they are. A pitched copy at an offset, split into rows by the 1 KiB range.
+    {
+        constexpr std::uint32_t w = 37, h = 5, s = 3, row = 128, slice = 700;  // a row of texels is 111 words
+        constexpr std::uint64_t offset = 1100;
+        const auto word = [](std::uint32_t z, std::uint32_t y, std::uint32_t x, std::uint32_t c) {
+            // Bit patterns a float conversion would not keep, among others: NaN payloads, a denormal, -0.
+            constexpr std::uint32_t special[] = {0x7fa00001, 0xffc12345, 0x00000001, 0x80000000, 0xffffffff};
+            const std::uint32_t i = ((z * h + y) * w + x) * 3 + c;
+            return i % 7 == 0 ? special[i / 7 % 5] : i * 2654435761u + 12345u;
+        };
+        std::memset(app_words, 0xcd, 4096 * 4);
+        std::memset(scratch_words, 0xee, 4096 * 4);
+        for (std::uint32_t z = 0; z < s; ++z)
+            for (std::uint32_t y = 0; y < h; ++y)
+                for (std::uint32_t x = 0; x < w; ++x)
+                    for (std::uint32_t c = 0; c < 3; ++c) scratch_words[((z * h + y) * w + x) * 4 + c] = word(z, y, x, c);
+        EXPECT(convert(false, w, h, s, row, slice, offset, 2, true));
+        EXPECT(last_parts == 15);  // 1 KiB holds one row of 37 four-word texels: a part a row
+        for (std::uint32_t i = 0; i < 4096; ++i) {
+            const std::uint32_t rel = i - std::uint32_t(offset / 4);
+            const std::uint32_t z = rel / slice, y = (rel % slice) / row, in_row = (rel % slice) % row;
+            const bool inside = i >= offset / 4 && z < s && y < h && in_row < w * 3;
+            const std::uint32_t want = inside ? word(z, y, in_row / 3, in_row % 3) : 0xcdcdcdcdu;
+            if (app_words[i] != want) {
+                std::fprintf(stderr, "rgb96 readback: word %u got %08x want %08x\n", i, app_words[i], want);
+                return 1;
+            }
+        }
+        // The upload from the same layout: three words of each texel in the scratch, the fourth written as 0, and
+        // nothing past the last texel.
+        std::memset(scratch_words, 0xee, 4096 * 4);
+        EXPECT(convert(true, w, h, s, row, slice, offset, 2, true));
+        for (std::uint32_t z = 0; z < s; ++z)
+            for (std::uint32_t y = 0; y < h; ++y)
+                for (std::uint32_t x = 0; x < w; ++x)
+                    for (std::uint32_t c = 0; c < 4; ++c)
+                        EXPECT(scratch_words[((z * h + y) * w + x) * 4 + c] == (c < 3 ? word(z, y, x, c) : 0u));
+        EXPECT(scratch_words[w * h * s * 4] == 0xeeeeeeeeu);
+
+        // Slices too large to share a 1 MiB range: a part a slice (256 x 128 texels are 512 KiB of scratch).
+        constexpr std::uint32_t bw = 256, bh = 128, bs = 6, brow = 800, bslice = brow * bh + 64;
+        const std::uint32_t texels = bw * bh * bs;
+        for (std::uint32_t z = 0; z < bs; ++z)
+            for (std::uint32_t y = 0; y < bh; ++y)
+                for (std::uint32_t x = 0; x < bw * 3; ++x)
+                    app_words[z * bslice + y * brow + x] = (z * bh + y) * bw * 3 + x + 0x9e3779b9u;
+        std::memset(scratch_words, 0xee, std::size_t(texels) * 16);
+        EXPECT(convert(true, bw, bh, bs, brow, bslice, 0, 1, true));
+        EXPECT(last_parts == bs);
+        wrong = 0;
+        for (std::uint32_t t = 0; t < texels; ++t)
+            for (std::uint32_t c = 0; c < 4; ++c)
+                if (scratch_words[t * 4 + c] != (c < 3 ? t * 3 + c + 0x9e3779b9u : 0u)) ++wrong;
+        EXPECT(wrong == 0);
+        std::printf("depth24: 96-bit texels repack both ways, split into rows and into slices\n");
     }
 
     EXPECT(gpu.validation_errors() == 0);

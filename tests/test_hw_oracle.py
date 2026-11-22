@@ -1,16 +1,19 @@
-"""tools/hw_oracle: kernel text, literal and opcode filters, error mapping, and the exit-77 contract. No GPU needed;
-the last test runs on the hardware when the oracle tools are present and is skipped otherwise.
+"""tools/hw_oracle: kernel text, literal and opcode filters, error mapping, the exit-77 contract, and the parts of
+the Linux backend that need no GPU (reading the assembled object, the launcher's tokens, the display check). The
+last tests run on the hardware when the oracle tools are present and are skipped otherwise.
 Standard library only."""
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 import unittest.mock
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
-from hw_oracle import asm, runner  # noqa: E402
+from hw_oracle import asm, drm, runner  # noqa: E402
 
 PROG = ["s_mov_b32 s4, 0x12345678", "s_mov_b32 s5, 7", "s_add_u32 s6, s4, s5", "s_cselect_b32 s30, 1, 0",
         "v_mov_b32 v8, s4", "v_mov_b32 v9, s5", "v_mov_b32 v10, s6", "v_mov_b32 v11, s30"]
@@ -40,6 +43,15 @@ class Text(unittest.TestCase):
             self.assertLess(k.index("s_waitcnt lgkmcnt(0)"), k.index("s_add_u32"))
             self.assertLess(k.index("s_add_u32"), k.index("v[8:11]"))
 
+    def test_raw_kernels_get_the_memory_mnemonics_of_their_family(self):
+        body = ["v_mov_b32 v20, 7", "global_store_b32 v22, v20, s[2:3] offset:4", "s_endpgm"]
+        k10, k11 = asm.raw_kernel_text("k0", body, "gfx1036"), asm.raw_kernel_text("k0", body, "gfx1150")
+        self.assertIn("  global_store_dword v22, v20, s[2:3] offset:4\n", k10)     # GFX10 has no global_store_b32
+        self.assertNotIn("global_store_b32", k10)
+        self.assertIn("  global_store_b32 v22, v20, s[2:3] offset:4\n", k11)
+        self.assertEqual(asm.gfx10_spelling("global_load_b128 v[4:7], v0, s[2:3]"), "global_load_dwordx4 v[4:7], v0, s[2:3]")
+        self.assertEqual(asm.gfx10_spelling("v_mov_b32 v20, 7"), "v_mov_b32 v20, 7")
+
     def test_metadata_is_required_and_lists_every_kernel(self):
         text, names, starts = asm.module_text([PROG, PROG, PROG], "gfx1150")
         self.assertEqual(names, ["k0", "k1", "k2"])
@@ -57,6 +69,114 @@ class Text(unittest.TestCase):
         self.assertEqual(asm.failing_kernels(err, starts), {1})
         err2 = err + f"k.s:{starts[2]}:1: error: x\n"
         self.assertEqual(asm.failing_kernels(err2, starts), {1, 2})
+
+
+class True16(unittest.TestCase):
+    def test_the_low_half_is_named_only_on_the_f16_operand(self):
+        for old, new in (
+                ("v_cvt_f16_f32_e32 v8, v4", "v_cvt_f16_f32_e32 v8.l, v4"),
+                ("  v_cvt_f16_f32_e64 v8, -|v4|", "  v_cvt_f16_f32_e64 v8.l, -|v4|"),
+                ("v_cvt_f16_f32 v8, 0x3f800000", "v_cvt_f16_f32 v8.l, 0x3f800000"),
+                ("v_cvt_f32_f16_e32 v8, v4", "v_cvt_f32_f16_e32 v8, v4.l"),
+                ("v_cvt_f32_f16_e64 v8, -|v14| clamp mul:2", "v_cvt_f32_f16_e64 v8, -|v14.l| clamp mul:2"),
+                ("v_cvt_f32_f16 v8, abs(v4)", "v_cvt_f32_f16 v8, abs(v4.l)"),
+                ("v_exp_f16 v12, v2", "v_exp_f16 v12.l, v2.l"),              # both operands are f16
+                ("v_sqrt_f16_e64 v12, -|v2|", "v_sqrt_f16_e64 v12.l, -|v2.l|"),
+                ("v_rcp_f16 v12, 0x3c00", "v_rcp_f16 v12.l, 0x3c00")):
+            self.assertEqual(asm.true16_spelling(old), new)
+            self.assertEqual(asm.true16_spelling(new), new)        # already spelled that way
+        for same in ("v_cvt_pkrtz_f16_f32 v8, v4, v5", "v_cvt_f32_f16 v8, s4", "v_cvt_f32_f16 v8, 0x3c00",
+                     "v_cvt_f32_f16 v8, v4.h", "v_mov_b32 v8, v4"):
+            self.assertEqual(asm.true16_spelling(same), same)
+
+    def test_error_lines_still_map_back(self):
+        text = "v_mov_b32 v1, 0\nv_cvt_f32_f16 v8, 0x3c00\nv_cvt_f16_f32 v8, v1\nv_mov_b32 v9, 0\n"
+        out = asm.true16_spelling(text)
+        self.assertEqual(out, text.replace("v_cvt_f16_f32 v8,", "v_cvt_f16_f32 v8.l,"))
+
+
+class ToolchainFallbacks(unittest.TestCase):
+    """The two probes, with a stand-in for the assembler and the launcher."""
+
+    def oracle(self, arch="gfx1103"):
+        o = object.__new__(runner.Oracle)      # no tools, no GPU
+        o.arch, o.chunk = arch, 500
+        return o
+
+    def probe(self, loads, error="hipModuleLoadData(&mod, img) -> hip error 209"):
+        o = self.oracle()
+        seen = []
+
+        def launch(co, names, words=4):
+            seen.append(o.code_object)
+            if o.code_object in loads:
+                return 0, "# device=test arch=gfx1103\n", ""
+            return 3, "", error
+        o._assemble = lambda text, wave=32: ("k.co", "")
+        o._launch = launch
+        return o, seen
+
+    def test_a_runtime_that_takes_the_default_keeps_it(self):
+        o, seen = self.probe(loads={None, 5})
+        o._probe()
+        self.assertEqual(seen, [None])
+        self.assertIsNone(o.code_object)
+
+    def test_error_209_retries_as_v5_and_keeps_it(self):
+        o, seen = self.probe(loads={5})
+        self.assertEqual(o._probe(), "device=test arch=gfx1103")
+        self.assertEqual((seen, o.code_object), ([None, 5], 5))
+
+    def test_a_209_that_stays_and_other_errors_are_unavailable(self):
+        o, seen = self.probe(loads=set())
+        with self.assertRaisesRegex(runner.Unavailable, "209"):
+            o._probe()
+        self.assertEqual(seen, [None, 5])
+        o, seen = self.probe(loads={5}, error="hipMalloc -> hip error 2")
+        with self.assertRaisesRegex(runner.Unavailable, "error 2"):
+            o._probe()
+        self.assertEqual(seen, [None])
+
+    def test_v5_that_does_not_assemble_is_unavailable(self):
+        o, _ = self.probe(loads={5})
+        o._assemble = lambda text, wave=32: (None, "unknown argument") if o.code_object else ("k.co", "")
+        with self.assertRaisesRegex(runner.Unavailable, "unknown argument"):
+            o._probe()
+
+    def test_the_chosen_version_reaches_the_assembler(self):
+        o = self.oracle()
+        o.clang, o.lld = "clang", "ld.lld"
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(runner.subprocess, "run", return_value=ok) as run:
+            o.workdir = tmp
+            o._assemble("", 64)
+            self.assertFalse([a for a in run.call_args_list[0].args[0] if "code-object" in a])
+            o.code_object = 5
+            o._assemble("", 64)
+            args = run.call_args_list[2].args[0]
+        self.assertIn("-mcode-object-version=5", args)
+        self.assertIn("-mwavefrontsize64", args)
+
+    def test_true16_is_used_only_where_the_assembler_needs_it(self):
+        bare_only = lambda text, wave=32: (None, "error") if ".l" in text else ("k.co", "")
+        half_only = lambda text, wave=32: ("k.co", "") if ".l" in text else (None, "error")
+        neither = lambda text, wave=32: (None, "error")
+        for arch, assemble, want in (("gfx1150", bare_only, False), ("gfx1103", half_only, True),
+                                     ("gfx1103", neither, False), ("gfx1036", half_only, False)):
+            o = self.oracle(arch)
+            o._assemble = assemble
+            self.assertEqual(o._needs_true16(), want, arch)
+
+    def test_a_chunk_is_assembled_with_that_spelling(self):
+        for true16 in (False, True):
+            o = self.oracle()
+            o.true16, texts = true16, []
+            o._assemble = lambda text, wave=32: (texts.append(text) or "k.co", "")
+            o._launch = lambda co, names, words=4: (0, "k0 00003c00\n", "")
+            kernel = asm.Kernel(["v_cvt_f16_f32 v8, v1", "s_endpgm"], words=1, raw=True)
+            self.assertEqual(o.run([kernel], words=1), [[0x3C00]])
+            self.assertEqual("v8.l" in texts[0], true16)
 
 
 class Filters(unittest.TestCase):
@@ -92,6 +212,49 @@ class Unavailable(unittest.TestCase):
             with self.assertRaises(runner.Unavailable):
                 runner.find_hip_dll()
 
+    def test_host_compiler_choice(self):
+        here = str(Path(__file__))   # any file that exists stands in for a compiler
+        cl = str(Path(here).with_name("cl.exe"))
+        which = {"gcc": None, "cl": None}
+        real_isfile = os.path.isfile
+        no_msys = lambda p: False if "msys64" in p else real_isfile(p)   # noqa: E731 (hide an installed MSYS2)
+        with unittest.mock.patch.object(runner.shutil, "which", side_effect=lambda n: which.get(n)), \
+                unittest.mock.patch.object(runner.os.path, "isfile", side_effect=no_msys), \
+                unittest.mock.patch.object(runner, "find_vcvars", return_value=None), \
+                unittest.mock.patch.dict(os.environ, {"LEONIDA_HOST_CC": ""}):
+            with self.assertRaises(runner.Unavailable) as cm:
+                runner.find_cc()
+            self.assertIn("Visual Studio", str(cm.exception))
+            which["gcc"] = here
+            self.assertEqual(runner.find_cc(), ("gcc", here))                  # gcc stays first
+            if os.name == "nt":
+                which["gcc"], which["cl"] = None, here
+                self.assertEqual(runner.find_cc(), ("msvc", here))             # a Developer shell's cl
+                which["cl"] = None
+                with unittest.mock.patch.object(runner, "find_vcvars", return_value=here):
+                    self.assertEqual(runner.find_cc(), ("vcvars", here))       # VS found through vswhere
+            with unittest.mock.patch.dict(os.environ, {"LEONIDA_HOST_CC": here}):
+                self.assertEqual(runner.find_cc(), ("gcc", here))
+        with unittest.mock.patch.object(runner.os.path, "isfile", return_value=True), \
+                unittest.mock.patch.dict(os.environ, {"LEONIDA_HOST_CC": cl}):
+            self.assertEqual(runner.find_cc(), ("msvc", cl))                   # the override may be cl.exe
+
+    def test_host_compiler_commands(self):
+        work = os.path.join(os.sep, "w")
+        self.assertEqual(runner.build_command("gcc", "gcc", "a.c", "o.exe", work), ["gcc", "-O1", "a.c", "-o", "o.exe"])
+        cl = runner.build_command("msvc", "cl.exe", "a.c", "o.exe", work)
+        self.assertEqual(cl[:4], ["cl.exe", "/nologo", "/O1", "a.c"])
+        self.assertIn("/Feo.exe", cl)
+        self.assertIn("/Fo" + os.path.join(work, ""), cl)                      # objects stay out of the cwd
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = runner.build_command("vcvars", r"C:\VS 2022\vcvars64.bat", "a.c", "o.exe", tmp)
+            self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
+            script = Path(argv[3]).read_text(encoding="ascii")
+            self.assertIn('call "C:\\VS 2022\\vcvars64.bat"', script)          # quoted: the path has a space
+            self.assertIn("cl /nologo /O1 a.c /Feo.exe", script)
+            self.assertIn("Installer", script)                                 # vcvars needs vswhere on PATH
+
     def test_salu_diff_exits_77_without_the_tools(self):
         env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOLS / "no-such-clang.exe"))
         r = subprocess.run([sys.executable, "-I", str(TOOLS / "salu_diff.py"), "--oracle", "hw", "--programs", "3"],
@@ -114,6 +277,128 @@ class Unavailable(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
 
 
+def relocatable(sections, symbols):
+    """A little-endian ELF64 relocatable object: sections is [(name, bytes, address)], symbols [(name, section
+    number from 1, value)]. Only what drm.text_section reads is filled in."""
+    names = [""] + [s[0] for s in sections] + [".symtab", ".strtab", ".shstrtab"]
+    shstr, name_at = b"", []
+    for n in names:
+        name_at.append(len(shstr))
+        shstr += n.encode() + b"\0"
+    strtab, symtab = b"\0", bytes(24)
+    for name, shndx, value in symbols:
+        symtab += struct.pack("<IBBHQQ", len(strtab), 0x12, 0, shndx, value, 0)
+        strtab += name.encode() + b"\0"
+    bodies = [b""] + [s[1] for s in sections] + [symtab, strtab, shstr]
+    addresses = [0] + [s[2] for s in sections] + [0, 0, 0]
+    types = [0] + [1] * len(sections) + [2, 3, 3]
+    out, offsets = bytearray(64), []
+    for body in bodies:
+        offsets.append(len(out))
+        out += body
+    shoff = len(out)
+    strtab_index = len(sections) + 2
+    for i, body in enumerate(bodies):
+        link = strtab_index if types[i] == 2 else 0
+        out += struct.pack("<IIQQQQIIQQ", name_at[i], types[i], 0, addresses[i], offsets[i], len(body), link, 0, 1, 0)
+    out[:6] = b"\x7fELF\x02\x01"
+    struct.pack_into("<Q", out, 0x28, shoff)
+    struct.pack_into("<HHH", out, 0x3A, 64, len(bodies), len(bodies) - 1)
+    return bytes(out)
+
+
+class LinuxBackend(unittest.TestCase):
+    """drm.py without a GPU."""
+
+    def test_text_section_and_kernel_offsets(self):
+        code = bytes(range(256)) * 3
+        elf = relocatable([(".rodata", b"\xaa" * 64, 0), (".text", code, 0)],
+                          [("k0", 2, 0), ("k1", 2, 256), ("k2", 2, 512), ("k0.kd", 1, 0)])
+        text, symbols = drm.text_section(elf)
+        self.assertEqual(text, code)
+        self.assertEqual(symbols, {"k0": 0, "k1": 256, "k2": 512})   # the descriptor in .rodata is not a kernel
+        # a linked object gives addresses: offsets are counted from where .text starts
+        linked = relocatable([(".text", code, 0x1000)], [("k1", 1, 0x1100)])
+        self.assertEqual(drm.text_section(linked)[1], {"k1": 256})
+        with self.assertRaises(ValueError):
+            drm.text_section(b"MZ" + bytes(100))
+        with self.assertRaises(ValueError):
+            drm.text_section(relocatable([(".data", b"x", 0)], []))
+
+    @staticmethod
+    def descriptor(rsrc1=0xE0AC0001, rsrc2=0x84, properties=0x0408, group=0, private=0, rsrc3=0):
+        """A 64-byte kernel descriptor (the amdhsa layout): segment sizes first, RSRC3, RSRC1, RSRC2 and the code
+        properties from byte 44."""
+        return struct.pack("<II", group, private) + bytes(36) + struct.pack("<IIIH", rsrc3, rsrc1, rsrc2, properties) + bytes(6)
+
+    def test_registers_come_from_the_kernel_descriptors(self):
+        rodata = self.descriptor() + self.descriptor(rsrc1=0xE0AC3007, properties=0x0008)
+        elf = relocatable([(".rodata", rodata, 0), (".text", bytes(512), 0)],
+                          [("k0", 2, 0), ("k1", 2, 256), ("k0.kd", 1, 0), ("k1.kd", 1, 64)])
+        # k0: a 32-lane kernel with the assembler's default float mode; k1: 64 lanes, f32 rounding towards zero
+        self.assertEqual(drm.kernel_registers(elf), {"k0": (0xE0AC0001, 0x84, 32), "k1": (0xE0AC3007, 0x84, 64)})
+
+    def test_a_descriptor_the_launcher_cannot_honour_is_refused(self):
+        def registers(**fields):
+            return drm.kernel_registers(relocatable([(".rodata", self.descriptor(**fields), 0), (".text", bytes(256), 0)],
+                                                    [("k0", 2, 0), ("k0.kd", 1, 0)]))
+        self.assertEqual(registers(), {"k0": (0xE0AC0001, 0x84, 32)})
+        for fields in ({"properties": 0x040A},      # also wants the dispatch pointer
+                       {"properties": 0x0400},      # no kernarg pointer
+                       {"group": 1024},             # LDS
+                       {"private": 64},             # scratch memory
+                       {"rsrc3": 1},
+                       {"rsrc2": 0x85},             # the private segment
+                       {"rsrc2": 0x86},             # three user SGPRs
+                       {"rsrc2": 0x84 | 1 << 15}):  # an LDS size
+            with self.assertRaises(RuntimeError, msg=str(fields)):
+                registers(**fields)
+        with self.assertRaises(ValueError):          # a descriptor cut short
+            drm.kernel_registers(relocatable([(".rodata", bytes(32), 0), (".text", bytes(256), 0)], [("k0.kd", 1, 0)]))
+
+    def test_launcher_tokens_carry_the_offset_and_the_registers(self):
+        offsets = {"k0": 0, "k1": 256}
+        registers = {"k0": (0xE0AC0001, 0x84, 32), "k1": (0xE0AC3007, 0x84, 64)}
+        self.assertEqual(drm.launcher_tokens(["k0", "k1"], offsets, registers),
+                         ["k0@0/0xe0ac0001/0x84/32", "k1@256/0xe0ac3007/0x84/64"])
+        self.assertEqual(drm.launcher_tokens(["k1:64:896"], offsets, registers),
+                         ["k1@256/0xe0ac3007/0x84/64:64:896"])                        # name:threads:words
+        with self.assertRaises(RuntimeError):
+            drm.launcher_tokens(["k7"], offsets, registers)
+        with self.assertRaises(RuntimeError):
+            drm.launcher_tokens(["k0"], offsets, {})                                  # a kernel without a descriptor
+
+    def test_a_node_must_be_named_and_must_not_drive_a_display(self):
+        with tempfile.TemporaryDirectory() as root:
+            sysfs = Path(root) / "sys"
+            for card, node, connectors in (("card0", "renderD129", {"DP-1": "disconnected", "Writeback-1": "unknown"}),
+                                           ("card1", "renderD128", {"DP-1": "connected", "HDMI-A-1": "disconnected"})):
+                for name, status in connectors.items():
+                    d = sysfs / node / "device" / "drm" / card / f"{card}-{name}"
+                    d.mkdir(parents=True)
+                    (d / "status").write_text(status + "\n", encoding="ascii")
+            free, busy = Path(root) / "renderD129", Path(root) / "renderD128"
+            free.touch()
+            busy.touch()
+            self.assertEqual(drm.connected_displays(str(free), str(sysfs)), [])
+            self.assertEqual(drm.connected_displays(str(busy), str(sysfs)), ["card1-DP-1"])
+            with self.assertRaisesRegex(runner.Unavailable, "LEONIDA_HW_DRM_NODE"):
+                drm.find_node({}, str(sysfs))                                     # no default device
+            with self.assertRaisesRegex(runner.Unavailable, "does not exist"):
+                drm.find_node({"LEONIDA_HW_DRM_NODE": str(Path(root) / "renderD200")}, str(sysfs))
+            self.assertEqual(drm.find_node({"LEONIDA_HW_DRM_NODE": str(free)}, str(sysfs)), str(free))
+            with self.assertRaisesRegex(runner.Unavailable, "drives a display"):
+                drm.find_node({"LEONIDA_HW_DRM_NODE": str(busy)}, str(sysfs))
+            allowed = {"LEONIDA_HW_DRM_NODE": str(busy), "LEONIDA_HW_DRM_ALLOW_DISPLAY": "1"}
+            self.assertEqual(drm.find_node(allowed, str(sysfs)), str(busy))
+
+    def test_linux_gets_the_kernel_driver_backend(self):
+        with unittest.mock.patch.object(sys, "platform", "linux"), \
+                unittest.mock.patch.dict(os.environ, {"LEONIDA_HW_DRM_NODE": ""}):
+            with self.assertRaisesRegex(runner.Unavailable, "LEONIDA_HW_DRM_NODE"):
+                runner.open_oracle()
+
+
 class OnHardware(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -127,6 +412,8 @@ class OnHardware(unittest.TestCase):
         cls.oracle.close()
 
     def test_the_dll_override_reaches_the_launcher(self):
+        if isinstance(self.oracle, drm.DrmOracle):
+            self.skipTest("the Linux backend loads no HIP runtime")
         with unittest.mock.patch.dict(os.environ, {"LEONIDA_HIP_DLL": str(Path(__file__))}):   # exists, not a DLL
             with self.assertRaises(runner.Unavailable):
                 runner.open_oracle()
@@ -134,6 +421,38 @@ class OnHardware(unittest.TestCase):
     def test_a_chunk_the_assembler_rejects_entirely_is_a_harness_error(self):
         with self.assertRaises(RuntimeError):
             self.oracle.run([["s_add_u32 s4, 0x100, 0x200"] + PROG[-4:]])
+
+    def test_every_kernel_returns_its_own_words(self):
+        # 300 kernels that differ only in what they store. A launcher that ran a neighbour's commands (the Linux
+        # one did, for the second kernel of a process, while it rewrote one command buffer) fails here.
+        programs = [[f"v_mov_b32 v{8 + j}, 0x{0x1000 * (i + 1) + j:x}" for j in range(4)] for i in range(300)]
+        for i, words in enumerate(self.oracle.run(programs)):
+            self.assertEqual(words, [0x1000 * (i + 1) + j for j in range(4)], f"kernel {i}")
+
+    def test_the_float_mode_of_the_kernel_descriptor_reaches_the_hardware(self):
+        # 1.0 + 1.5 * 2^-24 is 0x3f800001 when f32 rounds to nearest or up, 0x3f800000 when it rounds down or
+        # towards zero. The HIP runtime starts a kernel in the mode its descriptor has; the Linux launcher must too.
+        if not isinstance(self.oracle, drm.DrmOracle):
+            self.skipTest("checks the Linux launcher's use of the descriptor")
+        program = ["v_mov_b32 v1, 0x3f800000", "v_mov_b32 v2, 0x33c00000", "v_add_f32 v8, v1, v2",
+                   "v_mov_b32 v9, 0", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"]
+        got = []
+        for mode in range(4):
+            text, names, _ = asm.module_text([program], self.oracle.arch)
+            marker = "  .amdhsa_system_vgpr_workitem_id 0\n"
+            self.assertEqual(text.count(marker), 1)
+            code, err = self.oracle._assemble(text.replace(marker, marker + f"  .amdhsa_float_round_mode_32 {mode}\n"))
+            self.assertIsNotNone(code, err)
+            rc, out, err = self.oracle._launch(code, names)
+            self.assertEqual(rc, 0, err)
+            got.append(int(out.splitlines()[-1].split()[1], 16))
+        self.assertEqual(got, [0x3F800001, 0x3F800001, 0x3F800000, 0x3F800000])
+
+    def test_f16_conversions_run_with_either_assembler_spelling(self):
+        # 1.0 to f16 keeps the high half of the register; the low half back to f32 ignores it.
+        program = ["v_mov_b32 v1, 0x3f800000", "v_mov_b32 v8, 0xabcd0000", "v_cvt_f16_f32 v8, v1",
+                   "v_cvt_f32_f16 v9, v8", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"]
+        self.assertEqual(self.oracle.run([program]), [[0xABCD3C00, 0x3F800000, 0, 0]])
 
     def test_runs_a_program_and_reports_a_rejected_one(self):
         bad = ["s_add_u32 s4, 0x100, 0x200"] + PROG[-4:]     # two literals: the assembler refuses it
@@ -143,5 +462,22 @@ class OnHardware(unittest.TestCase):
         self.assertIn("rejected", rejected)
 
 
+class KernelResources(unittest.TestCase):
+    """Kernel(vgprs=, sgprs=): the register counts reach the descriptor and the metadata; no hardware needed."""
+
+    def test_requested_registers_are_in_the_text(self):
+        k = asm.Kernel(["s_endpgm"], wave=32, threads=64, words=8, raw=True, vgprs=40, sgprs=72)
+        text, names, _ = asm.module_text([k, asm.Kernel(["s_endpgm"], raw=True)], "gfx1150")
+        self.assertIn(".amdhsa_next_free_vgpr 40", text)
+        self.assertIn(".amdhsa_next_free_sgpr 72", text)
+        self.assertIn(".sgpr_count: 72", text)
+        self.assertIn(".vgpr_count: 40", text)
+        self.assertEqual(text.count(".amdhsa_next_free_vgpr"), 2)
+        self.assertIn(".amdhsa_next_free_vgpr 32", text)      # the second kernel keeps the defaults
+        self.assertIn(".amdhsa_next_free_sgpr 40", text)
+        self.assertEqual(names, ["k0", "k1"])
+
+
 if __name__ == "__main__":
     unittest.main()
+

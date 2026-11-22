@@ -193,6 +193,38 @@ class Modes(unittest.TestCase):
         self.assertIn("unknown mode 'emulat'", r.stderr)
 
 
+class MissingHarness(unittest.TestCase):
+    """Without vk_compute_test the translator oracle stops with one line before any program is generated. It used to
+    translate for a while and then end in a FileNotFoundError traceback from the first GPU run."""
+
+    def run_tool(self, *extra, env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "no-such-build", "vk_compute_test.exe")
+            # LLVM_MC points nowhere too: the check has to come before anything that would need llvm-mc.
+            env = dict(os.environ, LLVM_MC=os.path.join(tmp, "no-such-llvm-mc"), **(env or {}))
+            r = subprocess.run([sys.executable, "-I", TOOL, "--exe", exe, "--programs", "2", *extra],
+                               capture_output=True, text=True, env=env, timeout=300)
+        return exe, r
+
+    def test_missing_exe_is_one_line_before_anything_runs(self):
+        exe, r = self.run_tool()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn(f"vk_compute_test not found at {exe}", r.stderr)
+        self.assertIn("--target vk_compute_test", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_hardware_oracle_alone_does_not_need_it(self):
+        _, r = self.run_tool("--oracle", "hw", env={"LEONIDA_AMD_CLANG": os.path.join(TOOLS, "no-such-clang.exe")})
+        self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+
+    def test_self_test_does_not_need_it(self):
+        _, r = self.run_tool("--self-test")
+        self.assertNotIn("vk_compute_test not found", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+
 class GpuEnv(unittest.TestCase):
     """FUZZ-13: vk_compute_test is asked for 32-wide subgroups for wave32 and emulated wave64 programs, as lds_fuzz.py
     and valu_fuzz.py do. On AMD the compute default is 64, and a wave32 group over 32 lanes ran as one subgroup."""
@@ -316,12 +348,15 @@ class HarnessErrors(unittest.TestCase):
 
         names = []
         out = io.StringIO()
-        with mock.patch.object(X, "assemble", side_effect=lambda mc, p, *a: names.append(p.name)), \
-                mock.patch.object(X, "translate", side_effect=translate), \
-                mock.patch.object(X, "run_gpu", side_effect=run_gpu), \
-                mock.patch.object(sys, "argv", ["crosslane_fuzz.py"] + argv), \
-                contextlib.redirect_stdout(out):
-            code = X.main()
+        with tempfile.TemporaryDirectory() as build:
+            exe = os.path.join(build, "vk_compute_test.exe")   # only has to exist: run_gpu is replaced
+            open(exe, "wb").close()
+            with mock.patch.object(X, "assemble", side_effect=lambda mc, p, *a: names.append(p.name)), \
+                    mock.patch.object(X, "translate", side_effect=translate), \
+                    mock.patch.object(X, "run_gpu", side_effect=run_gpu), \
+                    mock.patch.object(sys, "argv", ["crosslane_fuzz.py", "--exe", exe] + argv), \
+                    contextlib.redirect_stdout(out):
+                code = X.main()
         return code, out.getvalue()
 
     @staticmethod

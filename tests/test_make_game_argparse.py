@@ -241,7 +241,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
 
         expected_calls = [
             call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
-                         emulate=unittest.mock.ANY, keep_emulated=True),
+                         emulate=unittest.mock.ANY, keep_emulated=True, fallbacks=unittest.mock.ANY),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
             call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
                          unittest.mock.ANY),
@@ -322,9 +322,9 @@ class JobsHandlingTest(unittest.TestCase):
                                     probe.assert_called_once_with("auto")
                                     mock_preflight.assert_called_once_with(
                                         ["shaders"], os.path.abspath(work), False, None,
-                                        emulate=True, keep_emulated=True, jobs=6)
+                                        emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
-                                                                         emulate=True, keep_emulated=True)
+                                                                         emulate=True, keep_emulated=True, fallbacks=())
 
     def test_custom_jobs_forwarded_to_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -487,6 +487,31 @@ class WavValidationTest(unittest.TestCase):
                     with patch("make_game.py") as mock_py:
                         make_game.assets(game, work, wav=True, jobs=4)
                         mock_py.assert_called_with("audio_wav.py", ogg_dir, "--out", wav_dir, "--jobs", "4")
+
+    def test_assets_passes_jobs_to_the_ogg_opus_step(self):
+        # --jobs reached audio_wav.py only: with --jobs 1 the bank export still started half the CPU count of processes
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            game = os.path.join(tmp, "game")
+            out = os.path.join(work, "assets")
+            for rel in make_game.MODEL_ARCHIVES:
+                name = os.path.splitext(os.path.basename(rel))[0]
+                for mode in ("models", "textures"):
+                    p = os.path.join(out, name, mode)
+                    os.makedirs(p, exist_ok=True)
+                    with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
+                        f.write("{}")
+            audio = os.path.join(out, "audio")
+            os.makedirs(os.path.join(audio, "xma"), exist_ok=True)
+            os.makedirs(game, exist_ok=True)
+            for name in ("audio_manifest.json", "xma.done"):     # no ogg.done: the Ogg Opus step is still to run
+                with open(os.path.join(audio, name), "w", encoding="utf-8") as f:
+                    f.write("{}")
+
+            with patch("make_game.rpf9dump", return_value="fake_dump"), patch("make_game.log"), \
+                    patch("make_game.py") as mock_py:
+                make_game.assets(game, work, wav=False, jobs=3)
+            mock_py.assert_any_call("awc_opus.py", os.path.join(audio, "awc"), os.path.join(audio, "ogg"), "--jobs", "3")
 
     def test_assets_without_wav_skips_audio_wav(self):
         with tempfile.TemporaryDirectory() as tmp:

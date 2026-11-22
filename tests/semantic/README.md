@@ -42,6 +42,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   (10 cases): sentinels in v1..v8, M0 set by `s_mov_b32`, then the indexed register and its neighbours are
   exported, so a write must land only in `VGPR[D.addr + M0]`. A plain-Python register-file model checks the
   hand-written constants. `v_movrelsd_2_b32` is covered by `test_alu_movrelsd_2.py`.
+- `test_andn2_exec_b64.py` runs `s_andn2_saveexec_b64` and `s_andn2_wrexec_b64` on all 64 lanes of a wave64
+  (12 pairs of S0 and EXEC for each): every lane stores whether the instruction left it on, and lane 0 stores SCC
+  and the population count and lowest lane of D, against the ISA's two lines written as integers. Results in the
+  low half only, the high half only, both and neither are all in the table. It also runs the GPU test
+  `cs_w64x_andn2_exec`.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
@@ -52,6 +57,17 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_float_nan_fract.py` runs float min/max/min3/max3/med3 with a quiet NaN and `v_fract` next to 1.0 (f32 and
   f16) with inputs from memory, and the GPU fixtures `ps_fnan_med3` and `ps_fnan_fract`; the expected words were
   measured on an AMD Radeon RX 6800 (gfx1030). A NaN result is asserted as "a NaN", not by its bits.
+- `test_rule_gpu_fixtures.py` runs the GPU fixtures for the `docs/design.md` rules that used to be CPU-only (TEST-175:
+  `v_cmp(x)_nlg`, `v_cvt_off_f32_i4`, the `v_fmac_f16` / `v_interp_p2/mov_f32` output modifiers and VOP3 modifiers on
+  constants) through the interpreter, and checks that the words each `.asm` header derives are the ones `check.py`
+  and `scripts/run_gpu_tests.py` expect. The two interp fixtures get the constants their vertex shader,
+  `vs_interp_consts`, exports.
+- `test_vcmpx_forms.py` runs the 14 `v_cmpx` forms that had no test (`eq`/`gt`/`le`/`lt`/`ngt`/`nle` `_f32`,
+  `f_i32`, `t_u32`, `eq`/`gt`/`le` `_i64`, `ge`/`lt`/`ne` `_u64`) in both encodings: each on a table of
+  operands (NaN, signed zeros, infinities; 64-bit values that only one word or the sign tells apart), where
+  the pixel must survive exactly when Python's comparison of the operands holds, and on a 16-lane wave with
+  one lane switched off beforehand, where the lanes left running and an untouched VCC are checked. It also
+  runs the GPU test `ps_vcmpx_forms` and re-derives its four words.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.
@@ -89,7 +105,7 @@ dynamic-bounds merge; no backward branches, loops, calls or switches), no textur
 Input variables and a flat physical-address `{address: word}` map can be supplied per run. A shift by at least the bit width is an undefined value: arithmetic on it stays
 undefined and any other use (store, branch or select condition, shuffle, output) raises. Values that pass
 through a float op lose NaN payloads (Python floats), so expected output words avoid NaN bit patterns; a
-signalling NaN read back through `OpBitcast` comes out quieted. `Fma` is exact: the product and sum are rationals,
+signalling NaN read back through `OpBitcast` comes out quieted. `Fma` and `OpFmaKHR` (SPV_KHR_fma, `--fma khr`) are exact: the product and sum are rationals,
 rounded once to binary32. `Exp2`/`Log2`/`Sqrt`/`InverseSqrt` are correctly rounded (Vulkan allows a few ULP), and
 inputs GLSL.std.450 or SPIR-V leave undefined (`Log2` of x <= 0, `OpFDiv` by zero, `FMax` of NaN...) raise
 `UnsupportedConstruct`. `Fract` is

@@ -688,6 +688,11 @@ public:
         predicate_family_ = family;
         predicate_reducer_ = std::make_unique<PredicateReducer>(get, device_, memory, max_range);
     }
+    // Configure before submitting work, only when storageBuffer8BitAccess is enabled on the device.
+    void configure_predicated_copy(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceLimits& limits) {
+        std::unique_lock lock(resource_mutex_);
+        predicated_copier_ = std::make_unique<PredicatedBufferCopier>(get, device_, limits);
+    }
     VkDevice device() const { return device_; }
 
     // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
@@ -886,6 +891,7 @@ public:
 
 private:
     friend class VulkanQueue;
+    friend class VulkanPresenter;
 
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
@@ -903,11 +909,12 @@ private:
         info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         info.format = r.format;
         info.subresourceRange = range;
-        // Reinterpreted RTVs need only color-attachment usage. Inheriting STORAGE usage from the resource
-        // would incorrectly require it from an sRGB view, even though this view is never used as storage.
+        // Attachment views need only color-attachment usage. Inheriting STORAGE usage from a mutable/extended
+        // resource (typeless RGBA8 sRGB views, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
         usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (r.rgba8_typeless) info.pNext = &usage;
+        if (r.rgba8_typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
+            info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
         if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
         views_[key] = view;
@@ -938,6 +945,7 @@ private:
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     ReplayFunctions replay_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
+    std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
 };
@@ -1054,15 +1062,21 @@ public:
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         std::function<void(bool)> bindless_commit;
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
-        // Shared read-lock allows concurrent prepare() lookups; when depth24_ is active, tracker_mutex_ is also
-        // acquired before prepare() so Depth24Converter::prepare/collect/retire stay serialized per execution.
-        // Otherwise tracker_mutex_ is held from emit() through submit() so emit order == submit order across queues.
+        // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
+        // prepare() only if a list actually converts a depth24_as_float copy, and otherwise right before
+        // bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and submissions stay in order.
         std::shared_lock resource_lock(context_.resource_mutex_);
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
-        if (context_.depth24_) {
-            tracker_lock.lock();
-            context_.depth24_->collect();
-        }
+        // Declared after tracker_lock so any early return after depth24_->prepare() retires uncommitted scratch/pools
+        // with ticket 0 while tracker_lock is still held.
+        struct Depth24Guard {
+            Depth24Converter* d24 = nullptr;
+            VkSemaphore progress = VK_NULL_HANDLE;
+            bool active = false;
+            ~Depth24Guard() {
+                if (active && d24) d24->retire(progress, 0);
+            }
+        } depth24_guard{context_.depth24_.get(), progress_, false};
         bindless_commit = context_.bindless_commit_;
         std::vector<PreparedList> prepared(lists.size());
         ReplayFunctions replay = context_.replay_;
@@ -1071,6 +1085,7 @@ public:
             for (const auto& command : list->commands())
                 if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
         std::unique_ptr<PredicateReducer::Batch> batch;
+        std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
         if (captures) {
             if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
                 return ReplayResult::unsupported;
@@ -1084,6 +1099,28 @@ public:
             };
             replay.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) {
                 context_.predicate_reducer_->capture(cb, p);
+            };
+            if (context_.predicated_copier_) {
+                copy_batch = context_.predicated_copier_->batch();
+                replay.prepare_predicated_copy = [&](VkBuffer source, VkBuffer destination, VkDeviceSize src,
+                                                     VkDeviceSize dst, VkDeviceSize size,
+                                                     std::vector<PredicatedCopyDispatch>& out) {
+                    return copy_batch->prepare(source, destination, src, dst, size, out);
+                };
+                replay.emit_predicated_copy = [&](VkCommandBuffer cb, const std::vector<PredicatedCopyDispatch>& jobs) {
+                    context_.predicated_copier_->emit(cb, jobs);
+                };
+            }
+        }
+        if (context_.depth24_) {
+            replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
+                                                                           std::vector<Depth24Job>& parts) {
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!depth24_guard.active) {
+                    context_.depth24_->collect();
+                    depth24_guard.active = true;
+                }
+                return context_.depth24_->prepare(job, parts);
             };
         }
         const auto& occlusion_memory = context_.occlusion_resolve_memory_;
@@ -1148,16 +1185,20 @@ public:
             discard();
             return ReplayResult::unsupported;
         }
+        if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
-            if (tracker_lock.owns_lock()) tracker_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
             if (!submitted) discard();
+            if (depth24_guard.active) {
+                context_.depth24_->retire(progress_, 0);
+                depth24_guard.active = false;
+            }
+            tracker_lock.unlock();
             if (bindless_commit) bindless_commit(submitted);
             return ReplayResult::unsupported;
         }
-        if (!tracker_lock.owns_lock()) tracker_lock.lock();
         auto next_tracker = context_.tracker_;
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
@@ -1204,12 +1245,16 @@ public:
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
+            slot->predicated_copy = std::move(copy_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
             discard();
         }
-        if (context_.depth24_) context_.depth24_->retire(progress_, submitted ? submitted_ : 0);
+        if (depth24_guard.active) {
+            context_.depth24_->retire(progress_, submitted ? submitted_ : 0);
+            depth24_guard.active = false;
+        }
         tracker_lock.unlock();
         if (bindless_commit) bindless_commit(submitted);
         return submitted ? ReplayResult::success : ReplayResult::unsupported;
@@ -1255,6 +1300,7 @@ private:
         VkCommandBuffer buffer;
         std::uint64_t ticket;
         std::vector<std::shared_ptr<const OcclusionSegmentPool>> segments;
+        std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
     };
 
@@ -1272,6 +1318,7 @@ private:
         if (reuse) {
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
             reuse->predicate.reset();
+            reuse->predicated_copy.reset();
             reuse->ticket = UINT64_MAX;  // in use until submitted
             return reuse;
         }

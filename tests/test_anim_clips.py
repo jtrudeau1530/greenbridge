@@ -207,7 +207,7 @@ def animation(page, frames, tracks, sequences):
 
 
 def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, external=0, children=(),
-               external_hashes=()):
+               external_hashes=(), parameters=1, times=None, axis=None):
     """One clip dictionary page: one `.clip`, one `.motion`, one `.motionmatcher`, one local pack with one animation."""
     p = Page()
     pm = p.alloc(bytes(16))
@@ -235,11 +235,36 @@ def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, 
     motion = p.alloc(bytes(0x150))
     struct.pack_into("<I", p.b, motion + 0x20, 0x5000)
     p.string(motion + 0x30, "pack:/one.motion")
-    struct.pack_into("<I", p.b, motion + 0x58, 1)                    # one blend parameter
+    struct.pack_into("<I", p.b, motion + 0x58, parameters)          # 1 or 2
     if children:                                                     # {u64 0; u32 clip hash; u32 dictionary hash}
         kids = p.alloc(b"".join(struct.pack("<QII", 0, ch, dh) for ch, dh in children))
         p.ptr(motion + 0x60, kids)
         struct.pack_into("<HH", p.b, motion + 0x68, len(children), len(children))
+    if times is not None:      # +0x70: per child {f32 duration, f32 blend duration, (child time, blend time) curve}
+        table = p.alloc(bytes(0x28 * len(times)))
+        for i, (duration, blend, points) in enumerate(times):
+            e = table + 0x28 * i
+            struct.pack_into("<ff", p.b, e, duration, blend)
+            p.ptr(e + 8, p.alloc(b"".join(struct.pack("<ff", x, y) for x, y in points)))
+            struct.pack_into("<HH", p.b, e + 16, len(points), len(points))
+        p.ptr(motion + 0x70, table)
+        struct.pack_into("<HH", p.b, motion + 0x78, len(times), len(times))
+    if axis is not None:       # a type-3 node: {u64 0, u32 3, u32 0, names, (index, value) samples, f32 min, f32 max}
+        names, samples, lo, hi = axis
+        node = p.alloc(bytes(0x40))
+        struct.pack_into("<I", p.b, node + 8, 3)
+        p.ptr(node + 0x10, p.alloc(b"".join(struct.pack("<I", h) for h in names)))
+        struct.pack_into("<HH", p.b, node + 0x18, len(names), len(names))
+        p.ptr(node + 0x20, p.alloc(b"".join(struct.pack("<If", i, v) for i, v in samples)))
+        struct.pack_into("<HH", p.b, node + 0x28, len(samples), len(samples))
+        struct.pack_into("<ff", p.b, node + 0x30, lo, hi)
+        if parameters == 1:
+            p.ptr(motion + 0x138, node)
+        else:                  # +0x120 points at a block whose +0x18 is the node
+            block = p.alloc(bytes(0x20))
+            p.ptr(block + 0x18, node)
+            p.ptr(motion + 0x120, block)
+            struct.pack_into("<HH", p.b, motion + 0x128, 1, 1)
     matcher = p.alloc(bytes(0x50))
     p.ptr(matcher + 0x20, motion)                     # a pointer at +0x20, like `.motion`
     p.b[matcher + 0x28:matcher + 0x38] = bytes(range(0x80, 0x90))   # 16-byte id; +0x30 is not a pointer
@@ -345,6 +370,32 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual(anim["frames"], NF)
         self.assertEqual(len(anim["sequences"]), 2)
         self.assertEqual(anim["tracks"], TRACKS)
+
+    def test_motion_times_and_axis(self):
+        f32 = lambda x: struct.unpack("<f", struct.pack("<f", x))[0]
+        times = [(1.5, 1.5, [(0.0, 0.0), (1.5, 1.5)]), (2.0, 1.5, [(0.0, 0.0), (1.0, 0.5), (2.0, 1.5)])]
+        samples = [(1, -1.5), (0, 1.5)]
+        for parameters in (1, 2):
+            d = anim_clips.parse_dictionary(anim_clips.System(two_sequence_dictionary(
+                children=[(1, 2), (3, 4)], parameters=parameters, times=times,
+                axis=([joaat32("speed")], samples, -1.5, 1.5))))
+            motion = [c for c in d["clips"] if c["kind"] == "motion"][0]
+            self.assertEqual(motion["parameters"], parameters)
+            self.assertEqual(motion["times"], [(f32(a), f32(b), [(f32(x), f32(y)) for x, y in pts])
+                                               for a, b, pts in times])
+            kind, axis = motion["node"]
+            self.assertEqual((kind, axis["names"], axis["samples"], axis["min"], axis["max"]),
+                             (3, [joaat32("speed")], samples, -1.5, 1.5))
+            stats = anim_clips.new_stats()
+            anim_clips.count_motion_blend(motion, stats)
+            self.assertEqual((stats["motion_child_times_identity"], stats["motion_child_times_warped"],
+                              stats["motion_axes"], stats["motion_axis_sorted"],
+                              stats["motion_axis_range_is_first_last"], stats["motion_axis_name:speed"]),
+                             (1, 1, 1, 1, 1, 1))
+
+    def test_motion_without_blend_data(self):
+        motion = [c for c in self.d["clips"] if c["kind"] == "motion"][0]
+        self.assertEqual((motion["times"], motion["node"]), ([], None))      # null +0x70, null +0x138
 
     def test_delta2_round_trip(self):
         for n in (1, 2, 8, 9, 63, 64, 65, 129, 200):
@@ -466,6 +517,15 @@ class GapPageTest(unittest.TestCase):
         self.assertEqual(summary["counts"]["dictionaries"], 2)
         self.assertEqual(summary["counts"]["animations_decoded"], 2)
 
+    def test_page_map_in_an_unlisted_last_page_stays_unresolved(self):
+        # The tail is tried only after the page map has been read from listed streams (see docs/animation.md).
+        for raw, size in ((False, 16), (True, 32)):
+            page = two_sequence_dictionary("map@dict")
+            a, b = split(page, len(page) + 16 - size)          # move_map: the page map is the last 16 bytes
+            rows, summary = self.scan([(a, True), (b, raw), (two_sequence_dictionary("next@dict"), True)])
+            self.assertEqual(summary["unresolved"], {"page map not in the next stream": 1})
+            self.assertEqual(summary["counts"]["dictionaries"], 1)
+
     def test_gap_that_does_not_parse_stays_unresolved(self):
         page = two_sequence_dictionary("cut@dict")
         a, _b = split(page, 0x400, move_map=False)              # the rest of the page is missing
@@ -480,8 +540,13 @@ class ArchiveTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.rpf = os.path.join(self.tmp.name, "synthetic.rpf")
         second, nowhere = joaat32("second@dict"), joaat32("nowhere@dict")
+        clip_duration = (NF - 1) / 30.0                    # the `.clip` (hash 1) in every synthetic dictionary
         one = two_sequence_dictionary("first@dict", children=[(1, second), (7, second), (1, nowhere)],
-                                      external_hashes=[second, nowhere])
+                                      external_hashes=[second, nowhere],
+                                      times=[(clip_duration, clip_duration, [(0.0, 0.0), (clip_duration,) * 2]),
+                                             (2.0, 2.0, [(0.0, 0.0), (2.0, 2.0)]),
+                                             (2.0, 3.0, [(0.0, 0.0), (1.0, 2.0), (2.0, 3.0)])],
+                                      axis=([joaat32("yawangle")], [(2, -1.0), (0, 0.0), (1, 2.0)], -1.0, 2.0))
         a, b = split(two_sequence_dictionary("second@dict"), 0x400)
         c, d = split(two_sequence_dictionary("third@dict"), 0x400, move_map=False)
         other = bytearray(0x60)
@@ -514,7 +579,14 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual((c["external_refs_to_a_dictionary_here"], c["external_hashes_distinct"],
                           c["external_hashes_distinct_found_here"]), (1, 2, 1))
         self.assertEqual(c["motion_parameters:1"], 2)
+        # +0x70 child times: one per child; the resolved child's duration equals its `.clip`'s
+        self.assertEqual((c["motion_times_one_per_child"], c["motion_child_times"], c["motion_child_times_identity"],
+                          c["motion_child_times_warped"], c["motion_child_duration_equals_clip"]), (2, 3, 2, 1, 1))
+        self.assertEqual((c["motion_node_type:3"], c["motion_axes"], c["motion_axis_samples"],
+                          c["motion_axis_indices_are_0_to_n"], c["motion_axis_name:yawangle"]), (1, 1, 3, 1, 1))
+        self.assertEqual(c["motion_node_unreadable"], 1)                    # the second dictionary has no node
         self.assertNotIn("_children", rows[0])
+        self.assertNotIn("_child_durations", rows[0])
         self.assertEqual(summary["gap_pages"], {})
         self.assertEqual([r["offset"] for r in rows], [self.offsets[0], self.offsets[1]])
         self.assertEqual([r["streams"] for r in rows], [1, 2])

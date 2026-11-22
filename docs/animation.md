@@ -376,7 +376,10 @@ In 36 roots the page map says two pages, but the next listed stream does not sta
 second page is right after the first stream, but `anim_index.py` does not list it: in 28 it is a zlib stream that
 inflates to 16–48 bytes (`anim_index.py` lists streams of 64 bytes or more), and in 8 it is a 16-byte raw page,
 like rpf9-explorer's raw system tail. `anim_clips.py` joins such a last page only when the joined pages then parse
-as a clip dictionary; all 36 do, so no root is left unresolved. Of the joined resources, 61,505 are clip
+as a clip dictionary; all 36 do, so no root is left unresolved. That recovery runs only after the page map itself
+has been read from listed streams: a root whose page map is in such an unlisted last page stays unresolved ("page
+map not in the next stream"). No anim.rpf root has that layout. In `story000.rpf` 5 roots do, with the page map in
+a 32- or 48-byte zlib tail, and none of the 5 is a clip dictionary once that tail is joined. Of the joined resources, 61,505 are clip
 dictionaries. 4 have `RIG` plus a version at +0x70 instead of a pack array (rig dictionaries, not decoded here), and
 1 has some other value there. Together the dictionaries use 87,234 listed streams plus the 36 unlisted pages
 (3,802,124,713 stored / 7,077,351,104 inflated bytes in the listed streams). By `anim_index.py` class those
@@ -415,9 +418,12 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | `.motion` (`+0x20` is a pointer) | `+0x18` pointer | the dictionary root (page offset 0) |
 | | `+0x28` u32, `+0x2C` u32 | the clip hash (the low half of its `atMap` key) and `joaat32` of the dictionary name |
 | | `+0x30` atString | `pack:/<name>.motion` |
-| | `+0x58` u32 | 1 or 2; most likely the number of blend parameters (not verified) |
+| | `+0x58` u32 | 1 or 2; selects where the parameter node is (see `+0x120`, `+0x138`); most likely the number of blend parameters (not verified) |
 | | `+0x60` array, 16-byte items | children `{u64 0; u32 clip hash; u32 dictionary hash}`: the clips it blends |
-| | `+0x70` array, 0x28-byte items | one item per child (same count); a pointer at `+8`; not decoded |
+| | `+0x70` array, 0x28-byte items | one item per child: `{f32 child duration; f32 duration in the blend; {ptr; u16 count} curve of (child time, blend time) f32 pairs; 16 zero bytes}` |
+| | `+0x120` pointer (`+0x58` = 2) | a block whose `+0x18` points at the parameter node |
+| | `+0x138` pointer (`+0x58` = 1) | the parameter node: `{u64 0; u32 type; u32 0; ...}` |
+| parameter node, type 3 | `+0x10` array of u32, `+0x20` array of 8-byte items, `+0x30`/`+0x34` f32 | one sampled axis: its name hash(es), then `{u32 sample index; f32 value}` sorted by value, then min and max |
 | `.motionmatcher` (`+0x20` is a pointer) | `+0x28` 16 bytes, `+0x38` atString | an id, then `pack:/<name>.motionmatcher`; the rest is not decoded |
 | animation | `+0x24` u16 | frame count |
 | | `+0x28` f32 | duration = (frames − 1) / fps |
@@ -551,8 +557,25 @@ fields are in the object table above. Measured on all 17,247 `.motion` clips:
   search of every clip-dictionary-like root page in `levels`, `packs`, `story000`, `story000_script`,
   `story000_restofworld`, `core_restofworld`, `core_restofworld001`, `shared_minigame000`, `data`, `common` and
   `script` found none of those hashes, so this package does not resolve them.
-- `+0x70` has one 0x28-byte item per child on all 17,247. Those items, and the rest of the object from `+0x80` on, are not
-  decoded.
+- **Child times (`+0x70`).** One 0x28-byte item per child on all 17,247: the child's duration, its duration in the
+  blend, and a piecewise-linear curve from child time to blend time. Of the 159,584 items, 158,991 have equal
+  durations and the two points (0, 0) and (d, d), so the child plays at its own speed. 402 have a 5–82 point curve
+  from (0, 0) to (duration, blend duration), increasing in both coordinates, so the child is time-warped. The other
+  191 have two points, but 170 don't start at (0, 0) and 21 don't end at (d, d). For every child that names a
+  `.clip` in anim.rpf, the first float is bit-for-bit that `.clip`'s duration (`+0x78`): 111,948 of 111,948.
+- **Parameter node.** When `+0x58` is 1 the node is at `+0x138`; when it is 2, `+0x120` points at a block whose
+  `+0x18` is the node. Every `.motion` has one, and it starts `{u64 0, u32 type, u32 0}`. By type: 3 on 10,171, 1 on
+  3,557, 4 on 2,644, 5 on 482, 6 on 295, 8 on 98. Only type 3 is decoded here.
+- **Type 3: one sampled axis.** It has one u32 name hash, then 1–16 `{u32 sample index, f32 value}` items and the
+  axis min and max. On all 10,171 (29,123 samples), the items are sorted by value, min and max are the first and
+  last values, and the sample indices are 0..n−1 in some order. They are not child indices: the sample count
+  equals the child count on 4,589 of them. The name hashes are `joaat32` of a lower-case name. 88 distinct hashes
+  occur, and a word-list search resolved 10 of them, covering 5,604 axes: `yawangle` 2,524, `rotationz` 1,691,
+  `facingdirection` 638, `speed` 284, `surfaceincline` 271, `roll` 66, `verticalheight` 58, `pitch` 25,
+  `pitchangle` 25, `height` 22. The ranges fit the names: `speed` is within [0, 1], `surfaceincline` within
+  ±0.698 rad (40°), and `roll` within ±3.14. `anim_clips.py` reports every name as `motion_axis_name:<name or hash>`.
+- Not decoded: parameter node types other than 3, how a type-3 sample index maps to the children, and the rest of
+  the object from `+0x80`, including the `{ptr, count}` lists at `+0x90`.
 
 The 180 `.motionmatcher` clips sit in 142 dictionaries that hold only `.motionmatcher` clips and no local pack.
 The three motion matcher streams in [Bone tables and motion matchers](#bone-tables-and-motion-matchers)

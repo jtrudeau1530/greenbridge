@@ -107,11 +107,39 @@ class CrossBuildMissingTest(unittest.TestCase):
         os.makedirs(os.path.join(self.sdk, "VC", "Tools", "MSVC"))
         os.makedirs(os.path.join(self.sdk, "Windows Kits", "10", "Lib", "10.0.26100", "um", "x64"))
 
-    def missing(self, have=("cmake", *make_game.CROSS_TOOLS), major=23, sdk=None):
-        with mock.patch.object(make_game.shutil, "which", side_effect=lambda t: f"/usr/bin/{t}" if t in have else None), \
-                mock.patch.object(make_game, "clang_cl_major", return_value=major), \
+    def missing(self, have=("cmake", *make_game.CROSS_TOOLS), major=23, sdk=None, configured=None):
+        def which(t):
+            return t if t.startswith("/") and t in have else f"/usr/bin/{t}" if t in have else None
+        majors = major if callable(major) else (lambda exe="clang-cl": major)
+        with mock.patch.object(make_game.shutil, "which", side_effect=which), \
+                mock.patch.object(make_game, "clang_cl_major", side_effect=majors) as self.major, \
+                mock.patch.object(make_game, "configured_cross_tools", return_value=configured or {}), \
                 mock.patch.dict(os.environ, {"XWIN_DIR": sdk if sdk is not None else self.sdk}):
             return make_game.cross_build_missing()
+
+    def test_a_full_versioned_set_counts(self):
+        self.assertEqual(self.missing(have=("cmake", *(f"{t}-21" for t in make_game.CROSS_TOOLS))), [])
+        self.major.assert_called_once_with("clang-cl-21")
+
+    def test_an_old_plain_set_does_not_hide_a_newer_versioned_one(self):
+        have = ("cmake", *make_game.CROSS_TOOLS, *(f"{t}-21" for t in make_game.CROSS_TOOLS))
+        self.assertEqual(self.missing(have=have, major=lambda exe="clang-cl": 18 if exe == "clang-cl" else 21), [])
+
+    def test_versions_are_not_mixed_and_the_missing_one_is_named(self):
+        have = ("cmake", "clang-cl-21", "lld-link-21", "llvm-lib-21", "llvm-rc-21", "llvm-mt-20")
+        (item,) = self.missing(have=have)
+        self.assertTrue(item.startswith("llvm-mt-21: LLVM 19 or newer"), item)
+
+    def test_a_configured_build_folder_needs_only_its_own_tools(self):
+        tools = {"CMAKE_CXX_COMPILER": "/opt/llvm-21/bin/clang-cl", "CMAKE_LINKER": "/opt/llvm-21/bin/lld-link",
+                 "CMAKE_AR": "llvm-lib", "CMAKE_MT": "/opt/llvm-21/bin/llvm-mt", "CMAKE_RC_COMPILER": "llvm-rc"}
+        have = ("cmake", "llvm-lib", "llvm-rc", "/opt/llvm-21/bin/clang-cl", "/opt/llvm-21/bin/lld-link",
+                "/opt/llvm-21/bin/llvm-mt")
+        self.assertEqual(self.missing(have=have, configured=tools), [])
+        self.major.assert_not_called()
+        (item,) = self.missing(have=have[:-1], configured=tools)
+        self.assertTrue(item.startswith("/opt/llvm-21/bin/llvm-mt, which runtime/build/windows was configured with"))
+        self.assertIn("delete runtime/build/windows", item)
 
     def test_everything_there(self):
         self.assertEqual(self.missing(), [])
@@ -216,6 +244,27 @@ class RuntimePackagingTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.out))
 
 
+class ConfiguredCrossToolsTest(unittest.TestCase):
+    def test_reads_cmakes_compiler_files_newest_last(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        files = os.path.join(root, "runtime", "build", "windows", "CMakeFiles")
+        with mock.patch.object(make_game, "ROOT", root):
+            self.assertEqual(make_game.configured_cross_tools(), {})
+        for version, compiler in (("3.31.0", "/old/clang-cl"), ("4.5.1", "/usr/bin/clang-cl")):
+            os.makedirs(os.path.join(files, version))
+            with open(os.path.join(files, version, "CMakeCXXCompiler.cmake"), "w", encoding="utf-8") as f:
+                f.write(f'set(CMAKE_CXX_COMPILER "{compiler}")\nset(CMAKE_CXX_COMPILER_ARG1 "")\n'
+                        'set(CMAKE_AR "llvm-lib")\nset(CMAKE_LINKER "/usr/bin/lld-link")\n'
+                        'set(CMAKE_MT "/usr/bin/llvm-mt")\n')
+            os.utime(os.path.join(files, version, "CMakeCXXCompiler.cmake"), (1, 1 if version == "3.31.0" else 2))
+        with open(os.path.join(files, "4.5.1", "CMakeRCCompiler.cmake"), "w", encoding="utf-8") as f:
+            f.write('set(CMAKE_RC_COMPILER "llvm-rc")\n')
+        with mock.patch.object(make_game, "ROOT", root):
+            self.assertEqual(make_game.configured_cross_tools(), {
+                "CMAKE_CXX_COMPILER": "/usr/bin/clang-cl", "CMAKE_AR": "llvm-lib", "CMAKE_LINKER": "/usr/bin/lld-link",
+                "CMAKE_MT": "/usr/bin/llvm-mt", "CMAKE_RC_COMPILER": "llvm-rc"})
+
+
 class CrossBuildTest(unittest.TestCase):
     def setUp(self):
         self.root = self.enterContext(tempfile.TemporaryDirectory())
@@ -224,7 +273,11 @@ class CrossBuildTest(unittest.TestCase):
         self.out = os.path.join(self.root, "out")
         os.makedirs(self.game)
 
-    def runtime(self, xwin="/sdk", ninja=True):
+    def runtime(self, xwin="/sdk", ninja=True, suffix="", configured=None):
+        def which(t):
+            if t == "ninja":
+                return "/usr/bin/ninja" if ninja else None
+            return f"/usr/bin/{t}" if suffix else None
         def fake_run(args, hint="", **kw):
             if args[1] == "--build":
                 os.makedirs(self.build, exist_ok=True)
@@ -234,7 +287,9 @@ class CrossBuildTest(unittest.TestCase):
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch.object(make_game, "ROOT", self.root), \
                 mock.patch.object(make_game, "xwin_dir", return_value=xwin), \
-                mock.patch.object(make_game.shutil, "which", side_effect=lambda t: "/usr/bin/ninja" if ninja else None), \
+                mock.patch.object(make_game.shutil, "which", side_effect=which), \
+                mock.patch.object(make_game, "cross_tool_suffix", return_value=suffix), \
+                mock.patch.object(make_game, "configured_cross_tools", return_value=configured or {}), \
                 mock.patch.object(make_game, "run", side_effect=fake_run) as self.run_mock, \
                 mock.patch.object(make_game, "log"):
             make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"}, None, 4)
@@ -252,6 +307,16 @@ class CrossBuildTest(unittest.TestCase):
             with open(os.path.join(self.out, name), "rb") as f:
                 self.assertEqual(f.read(), name.encode())
         self.assertTrue(os.path.isfile(os.path.join(self.out, "gta6rt.sh")))
+
+    def test_versioned_tools_are_passed_until_the_folder_records_its_tools(self):
+        for cache in (False, True):
+            if cache:
+                open(os.path.join(self.build, "CMakeCache.txt"), "w").close()
+            configure, _ = self.runtime(suffix="-21")
+            for var, name in make_game.CROSS_VARS.items():
+                self.assertIn(f"-DCMAKE_{var}=/usr/bin/{name}-21", configure)
+        configure, _ = self.runtime(suffix="-21", configured={"CMAKE_CXX_COMPILER": "/usr/bin/clang-cl-21"})
+        self.assertFalse(any(a.startswith("-DCMAKE_CXX_COMPILER") for a in configure))
 
     def test_without_ninja_cmake_picks_the_generator(self):
         configure, _ = self.runtime(ninja=False)
@@ -353,6 +418,42 @@ class PipelineCheckExeTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 make_game.pipelines(os.path.join(self.tmp.name, "work"), os.path.join(self.tmp.name, "out"))
         self.assertIn("cmake -S runtime -B runtime/build/linux", err.getvalue())
+
+
+class RuntimeStageCopyTest(unittest.TestCase):
+    """runtime() with --runtime-build: the build's files go to the output folder, which may be the build folder."""
+
+    def run_stage(self, build, out):
+        for name in make_game.RUNTIME_FILES:
+            with open(os.path.join(build, name), "wb") as f:
+                f.write(name.encode())
+        with mock.patch.object(make_game, "log"), mock.patch.object(make_game.os, "name", "posix"):
+            make_game.runtime(os.path.join(build, "game"), out, {"expected_exe": "game.exe"}, runtime_build=build)
+
+    def test_the_build_is_copied_to_another_folder(self):
+        with tempfile.TemporaryDirectory() as build, tempfile.TemporaryDirectory() as out:
+            self.run_stage(build, out)
+            for name in make_game.RUNTIME_FILES:
+                with open(os.path.join(out, name), "rb") as f:
+                    self.assertEqual(f.read(), name.encode())
+            self.assertTrue(os.path.isfile(os.path.join(out, "game_path.txt")))
+
+    def test_the_build_folder_as_the_output_folder(self):
+        # shutil.copy2 of a file onto itself raises SameFileError, and the stage stopped before game_path.txt
+        with tempfile.TemporaryDirectory() as build:
+            self.run_stage(build, build)
+            for name in make_game.RUNTIME_FILES:
+                with open(os.path.join(build, name), "rb") as f:
+                    self.assertEqual(f.read(), name.encode())
+            self.assertTrue(os.path.isfile(os.path.join(build, "game_path.txt")))
+
+    def test_an_older_copy_in_the_output_folder_is_replaced(self):
+        with tempfile.TemporaryDirectory() as build, tempfile.TemporaryDirectory() as out:
+            with open(os.path.join(out, make_game.RUNTIME_FILES[0]), "wb") as f:
+                f.write(b"old")
+            self.run_stage(build, out)
+            with open(os.path.join(out, make_game.RUNTIME_FILES[0]), "rb") as f:
+                self.assertEqual(f.read(), make_game.RUNTIME_FILES[0].encode())
 
 
 if __name__ == "__main__":

@@ -118,6 +118,12 @@ class MissingLlvmMcTest(unittest.TestCase):
         self.assertIn(f"'{self.missing}' could not be started", message)
         self.assertIn("LLVM_MC", message)
         self.assertIn("build_llvm_mc.ps1", message)
+        self.assertNotIn("--llvm-mc", message)   # only a tool that has the option names it
+
+    def test_run_names_the_tools_own_option(self):
+        with self.assertRaises(SystemExit) as cm:
+            mc_command.run([self.missing], flag="--llvm-mc", input="", capture_output=True, text=True)
+        self.assertIn("set LLVM_MC (or pass --llvm-mc)", str(cm.exception.code))
 
     def test_run_passes_a_command_that_starts_through(self):
         r = mc_command.run([sys.executable, "-c", "import sys; print(sys.stdin.read()); sys.exit(3)"],
@@ -134,7 +140,8 @@ class MissingLlvmMcTest(unittest.TestCase):
             "valu_fuzz.py": [os.path.join(ROOT, "tools", "valu_fuzz.py"), "--family", "f16", "--programs", "1",
                              "--build", build],
             "lds_fuzz.py": [os.path.join(ROOT, "tools", "lds_fuzz.py"), "--programs", "1", "--build", build],
-            "crosslane_fuzz.py": [os.path.join(ROOT, "tools", "crosslane_fuzz.py"), "--programs", "1"],
+            "crosslane_fuzz.py": [os.path.join(ROOT, "tools", "crosslane_fuzz.py"), "--programs", "1", "--exe",
+                                  os.path.join(build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))],
             "image_fuzz.py": [os.path.join(ROOT, "tools", "image_fuzz.py"), "--programs", "1", "--build", build],
             "build.py": [os.path.join(ROOT, "runtime", "test", "shaders", "build.py"),
                          os.path.join(self.tmp.name, "spirv"), "cs_store"],
@@ -147,6 +154,8 @@ class MissingLlvmMcTest(unittest.TestCase):
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
                 self.assertIn("could not be started", p.stderr)
+                # Only run_gpu_tests.py has an --llvm-mc option; the others read LLVM_MC alone.
+                self.assertEqual("--llvm-mc" in p.stderr, name == "run_gpu_tests.py", p.stderr)
 
 
 if __name__ == "__main__":

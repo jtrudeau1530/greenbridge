@@ -12,11 +12,20 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <memory>
+#include <vector>
 
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
 
+#include <functional>
+#include <memory>
 #include <span>
+#include <vector>
+
+namespace leonida {
+class VulkanPresenter;
+}
 
 namespace rt::d3d12 {
 
@@ -33,7 +42,8 @@ struct QueueClock {
 // `device` (optional) is what the object's GetDevice returns; the object holds a reference to it.
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out,
-                             IUnknown* device = nullptr, const QueueClock& clock = {});
+                             IUnknown* device = nullptr, const QueueClock& clock = {},
+                             std::shared_ptr<void> queue_lease = {});
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
                             void** out, IUnknown* device = nullptr);
@@ -56,8 +66,11 @@ struct VulkanDeviceInfo {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
-    VkQueue queue = VK_NULL_HANDLE;  // a graphics queue; every D3D12 queue of the device submits to it
+    VkQueue queue = VK_NULL_HANDLE;  // graphics queue used by staging and legacy single-queue callers
     std::uint32_t queue_family = 0;
+    // Distinct handles from queue_family, when the creator requested more than one queue.
+    // Empty for caller-owned devices that only supplied queue above.
+    std::vector<VkQueue> command_queues;
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
@@ -76,15 +89,21 @@ struct VulkanDeviceInfo {
     // buffers are created with VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT. Without it a predicated list is
     // rejected at ExecuteCommandLists.
     bool conditional_rendering = false;
+    bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled: byte-granular predicated buffer copies.
     // VK_EXT_host_image_copy and its hostImageCopy feature are enabled on `device`: WriteToSubresource and
     // ReadFromSubresource on textures in CPU-visible heaps copy on the CPU instead of through a staging submit.
     bool host_image_copy = false;
+    // VK_KHR_shader_fma and its shaderFmaFloat32 feature are enabled on `device`: translated shaders built with
+    // `rdna2spirv.py --fma khr` (OpFmaKHR, capability FMAKHR in the index) can be created. Without it only the
+    // default `--fma glsl` shaders can.
+    bool shader_fma = false;
     // The caller enabled textureCompressionBC on this logical device.
     bool texture_compression_bc = false;
     // Optional device features the caller enabled. Without occlusionQueryPrecise, D3D12_QUERY_TYPE_OCCLUSION counts
     // are only zero or non-zero; without pipelineStatisticsQuery, pipeline-statistics query heaps are refused.
     bool occlusion_query_precise = false;
     bool pipeline_statistics_query = false;
+    bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
@@ -162,6 +181,37 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
 // Creates a Vulkan-backed IDXGIFactory4 bound to `device`'s VulkanContext, instance, physical device, and queue.
 // Its CreateSwapChainForHwnd registers swapchain backbuffers directly with the device's VulkanContext.
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out);
+
+// Puts back buffers of a device from create_vulkan_device* into a window (leonida::VulkanPresenter), for the
+// presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
+class WindowPresenter {
+public:
+    WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter);
+    ~WindowPresenter();
+    WindowPresenter(const WindowPresenter&) = delete;
+    WindowPresenter& operator=(const WindowPresenter&) = delete;
+
+    // `back_buffer` is a colour texture in D3D12's PRESENT state. sync_interval 0 presents without vsync.
+    // S_OK also covers a skipped present while the window is minimised.
+    // `src_rect` (when not null) limits the blit to that part of the texture, which is stretched to the window.
+    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect = nullptr);
+    // A black frame, nothing read (PresentX with no planes).
+    HRESULT present_blank(UINT sync_interval);
+    // Screenshot support for tests: every presented frame is also copied to host memory (call before presenting).
+    bool enable_capture();
+    // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
+    void set_abort(std::function<bool()> abort);
+    bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format);
+    VkExtent2D extent() const;
+    std::uint64_t presented() const;
+
+private:
+    IUnknown* device_;
+    std::unique_ptr<leonida::VulkanPresenter> presenter_;
+};
+
+// Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);

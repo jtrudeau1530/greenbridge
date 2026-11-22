@@ -405,6 +405,10 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.out and a.csv and same_output_path(a.out, a.csv):
         ap.error("--out and --csv must use different paths")
+    if a.out and same_output_path(a.target, a.out):
+        ap.error("--out must not overwrite the source")
+    if a.csv and same_output_path(a.target, a.csv):
+        ap.error("--csv must not overwrite the source")
     if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()

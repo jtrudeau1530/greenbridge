@@ -46,16 +46,18 @@ def mc_command(raw: str | None = None) -> list:
     return split_command(raw) or ["llvm-mc"]
 
 
-def not_found(exe: str, error: OSError) -> str:
-    """The message for an llvm-mc that can't be started (shader_disasm.py's wording)."""
-    return (f"'{exe}' could not be started: {error}. Put llvm-mc on PATH or set LLVM_MC (or --llvm-mc) to it\n"
+def not_found(exe: str, error: OSError, flag: str | None = None) -> str:
+    """The message for an llvm-mc that can't be started (shader_disasm.py's wording). `flag` is the tool's own
+    option for the command, if it has one (run_gpu_tests.py's --llvm-mc); the others read LLVM_MC only."""
+    where = f"set LLVM_MC (or pass {flag})" if flag else "set LLVM_MC"
+    return (f"'{exe}' could not be started: {error}. Put llvm-mc on PATH or {where} to it\n"
             f"(on Windows, scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
-def run(cmd: list, **kwargs) -> subprocess.CompletedProcess:
+def run(cmd: list, flag: str | None = None, **kwargs) -> subprocess.CompletedProcess:
     """subprocess.run for an llvm-mc command line; one that can't be started ends the tool with not_found()."""
     try:
         return subprocess.run(cmd, **kwargs)
     except OSError as e:
-        raise SystemExit(not_found(cmd[0], e)) from None
+        raise SystemExit(not_found(cmd[0], e, flag)) from None

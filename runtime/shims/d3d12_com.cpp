@@ -4,6 +4,7 @@
 #include "d3d12_com_object.h"
 #include "d3d12_fence_waiter.h"
 #include "d3d12_trace.h"
+#include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
@@ -51,6 +52,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_clear: return "invalid clear";
     case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
     case leonida::ReplayResult::invalid_query: return "invalid query";
+    case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -682,8 +684,9 @@ public:
     }
 
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
-                 const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock)
-        : desc_(desc), context_(context), queue_(context, queue, family, queue_kind_for(desc.Type)),
+                 const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock, std::shared_ptr<void> queue_lease)
+        : desc_(desc), context_(context), queue_lease_(std::move(queue_lease)),
+          queue_(context, queue, family, queue_kind_for(desc.Type)),
           vk_queue_(queue), family_(family), clock_(clock) {}
 
     ~CommandQueue() override {
@@ -813,10 +816,17 @@ public:
             domains[0].timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
             domains[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
             std::uint64_t stamps[2]{}, deviation = 0;
+            LARGE_INTEGER before{}, after{};
+            QueryPerformanceCounter(&before);
             if (clock_.calibrated(context_.device(), 2, domains, stamps, &deviation) == VK_SUCCESS) {
-                *gpu = stamps[0];
-                *cpu = stamps[1];
-                return S_OK;
+                QueryPerformanceCounter(&after);
+                // Wine can expose a host monotonic clock that differs from its Win32 QPC clock.
+                // Keep the GPU and CPU samples paired by taking a fresh GPU sample on fallback.
+                if (stamps[1] >= UINT64(before.QuadPart) && stamps[1] <= UINT64(after.QuadPart)) {
+                    *gpu = stamps[0];
+                    *cpu = stamps[1];
+                    return S_OK;
+                }
             }
         }
         return submitted_calibration(*gpu, *cpu);
@@ -909,6 +919,8 @@ private:
     D3D12_COMMAND_QUEUE_DESC desc_;
     leonida::VulkanContext& context_;
     std::mutex mutex_;
+    // Destroyed after queue_ has waited idle, so the handle cannot be reused prematurely.
+    std::shared_ptr<void> queue_lease_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
     VkQueue vk_queue_;
@@ -930,10 +942,10 @@ private:
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device,
-                             const QueueClock& clock) {
+                             const QueueClock& clock, std::shared_ptr<void> queue_lease) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* object = new CommandQueue(context, queue, queue_family, desc, clock);
+    auto* object = new CommandQueue(context, queue, queue_family, desc, clock, std::move(queue_lease));
     if (!object->ok()) {
         object->Release();
         return E_FAIL;
@@ -1005,6 +1017,7 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
 }
 
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     const CommandQueue* q = CommandQueue::from(queue);
     return q && q->uses_calibrated_timestamps();
 }
@@ -1027,6 +1040,7 @@ bool command_signature_info(ID3D12CommandSignature* signature, leonida::Indirect
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     const CommandQueue* q = CommandQueue::from(queue);
     return q ? q->last_result() : leonida::ReplayResult::unsupported;
 }

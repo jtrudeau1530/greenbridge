@@ -32,11 +32,14 @@ FORMS = [   # (instruction, SPIR-V op that takes the Offset, offset components)
 
 
 def offset_fields(spv, op):
-    """[(first bit, width, signed)] of the fields that make up the Offset operand of the one ``op`` in ``spv``."""
+    """[(first bit, width, signed)] of the Offset operand shared by every numeric path for ``op``."""
     consts = {m[1]: int(m[2]) for m in re.finditer(r"(%\w+) = OpConstant %uint (\d+)", spv)}
-    line, = [ln for ln in spv.splitlines() if f"= {op} " in ln]
-    assert "Offset" in line and "ConstOffset" not in line
-    vec = line.split()[-1]                      # Offset is the last image operand: its id ends the line
+    lines = [ln for ln in spv.splitlines() if f"= {op} " in ln]
+    assert lines and all("Offset" in ln and "ConstOffset" not in ln for ln in lines), lines
+    # Typed gathers have one path per numeric class. Each path must apply the same offset.
+    offsets = {line.split()[-1] for line in lines}
+    assert len(offsets) == 1, lines
+    vec = offsets.pop()
     parts = re.search(rf"{re.escape(vec)} = OpCompositeConstruct %v\dint (.+)", spv)[1].split()
     fields = []
     for part in parts:

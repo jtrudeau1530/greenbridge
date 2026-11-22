@@ -247,6 +247,235 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(rows[-1]["offset"], (end + 15) & ~15)
         self.assertEqual(rows[-1]["size"], len(blob))
 
+    def assert_report_collision(self, args, message):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            WI.main(args)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn(message, err.getvalue())
+
+    def test_reports_cannot_overwrite_a_single_input(self):
+        resource = make_resource()
+        for name, content in (("resource.bin", resource), ("archive.rpf", make_rpf_streams([resource]))):
+            path = os.path.join(self.dir, name)
+            for flag in ("--out", "--csv", "--archetypes-out", "--entities-out"):
+                with self.subTest(name=name, flag=flag):
+                    with open(path, "wb") as f:
+                        f.write(content)
+                    out = os.path.join(self.dir, "summary.json")
+                    args = [path, flag, path]
+                    if flag != "--out":
+                        args.extend(["--out", out])
+                    self.assert_report_collision(args, f"{flag} would overwrite the input")
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), content)
+                    self.assertFalse(os.path.exists(out))
+
+    def test_entities_report_cannot_create_the_missing_input(self):
+        path = os.path.join(self.dir, "missing.bin")
+        out = os.path.join(self.dir, "summary.json")
+        self.assert_report_collision(
+            [path, "--out", out, "--entities-out", path], "--entities-out would overwrite the input")
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(out))
+
+    def test_report_cannot_overwrite_a_nested_input_through_a_hard_link(self):
+        carve = os.path.join(self.dir, "carve")
+        nested = os.path.join(carve, "nested")
+        os.makedirs(nested)
+        resource = make_resource()
+        path = os.path.join(nested, "resource.bin")
+        with open(path, "wb") as f:
+            f.write(resource)
+        report = os.path.join(self.dir, "entities.jsonl")
+        try:
+            os.link(path, report)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        out = os.path.join(self.dir, "summary.json")
+        self.assert_report_collision(
+            [carve, "--out", out, "--entities-out", report], "--entities-out would overwrite the input")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), resource)
+        self.assertFalse(os.path.exists(out))
+
+    def test_report_alias_is_rejected_before_opening_any_output(self):
+        path = os.path.join(self.dir, "resource.bin")
+        with open(path, "wb") as f:
+            f.write(make_resource())
+        out = os.path.join(self.dir, "report")
+        alias = os.path.join(self.dir, ".", "report")
+        entities = os.path.join(self.dir, "new", "entities.jsonl")
+        self.assert_report_collision(
+            [path, "--out", out, "--csv", alias, "--entities-out", entities],
+            "--out and --csv must use different paths")
+        self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.exists(os.path.dirname(entities)))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows path aliases")
+    def test_windows_aliases_for_new_report_paths(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        for i, alias in enumerate((lambda p: p + ".", lambda p: p + " ", lambda p: "\\\\?\\" + p)):
+            with self.subTest(alias=i, case="report"):
+                report = os.path.join(self.dir, f"report-{i}.json")
+                self.assert_report_collision(
+                    [source, "--out", report, "--csv", alias(report)],
+                    "--out and --csv must use different paths")
+                self.assertFalse(os.path.exists(report))
+            with self.subTest(alias=i, case="input"):
+                missing = os.path.join(self.dir, f"missing-{i}.bin")
+                summary = os.path.join(self.dir, f"summary-{i}.json")
+                self.assert_report_collision(
+                    [missing, "--out", summary, "--entities-out", alias(missing)],
+                    "--entities-out would overwrite the input")
+                self.assertFalse(os.path.exists(missing))
+                self.assertFalse(os.path.exists(summary))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows verbatim paths")
+    def test_windows_verbatim_path_can_name_a_distinct_report(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        report = os.path.join(self.dir, "report.json")
+        verbatim = "\\\\?\\" + report + "."
+        try:
+            self.assertEqual(WI.main([source, "--out", report, "--csv", verbatim]), 0)
+            self.assertFalse(os.path.samefile(report, verbatim))
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["resources"], 1)
+            with open(verbatim, encoding="utf-8", newline="") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 1)
+        finally:
+            if os.path.exists(verbatim):
+                os.unlink(verbatim)
+
+    def test_reports_cannot_alias_through_hard_links(self):
+        path = os.path.join(self.dir, "resource.bin")
+        with open(path, "wb") as f:
+            f.write(make_resource())
+        out = os.path.join(self.dir, "summary.json")
+        entities = os.path.join(self.dir, "entities.jsonl")
+        with open(out, "wb") as f:
+            f.write(b"previous report")
+        try:
+            os.link(out, entities)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        self.assert_report_collision(
+            [path, "--out", out, "--entities-out", entities], "--out and --entities-out must use different paths")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_failed_scan_keeps_existing_placement_report(self):
+        archive = os.path.join(self.dir, "archive.rpf")
+        resource = make_resource()
+        with open(archive, "wb") as f:
+            f.write(make_rpf_streams([resource]))
+        carve = os.path.join(self.dir, "carve")
+        os.makedirs(carve)
+        with open(os.path.join(carve, "01-resource.bin"), "wb") as f:
+            f.write(resource)
+        with open(os.path.join(carve, "02-archive.rpf"), "wb") as f:
+            f.write(make_rpf_streams([resource]))
+
+        outputs = os.path.join(self.dir, "outputs")
+        os.makedirs(outputs)
+        summary = os.path.join(outputs, "summary.json")
+        entities = os.path.join(outputs, "entities.jsonl")
+        previous = b'{"previous":true}\n'
+        for source, arguments, diagnostic in (
+            (os.path.join(self.dir, "missing.rpf"), [], "missing.rpf"),
+            (archive, ["--start", "0"], "outside the data area"),
+            # The carved resource emits one row before the archive rejects this window.
+            (carve, ["--start", "0"], "outside the data area"),
+        ):
+            with self.subTest(source=source):
+                with open(entities, "wb") as f:
+                    f.write(previous)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities, *arguments]), 2)
+                self.assertIn(diagnostic, err.getvalue())
+                self.assertEqual(os.listdir(outputs), ["entities.jsonl"])
+                with open(entities, "rb") as f:
+                    self.assertEqual(f.read(), previous)
+
+    def test_summary_write_failure_keeps_existing_placement_report(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        entities = os.path.join(self.dir, "entities.jsonl")
+        with open(entities, "wb") as f:
+            f.write(b"previous report")
+        summary = os.path.join(self.dir, "summary.json")
+        os.makedirs(summary)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities]), 2)
+        self.assertIn("ERROR:", err.getvalue())
+        self.assertCountEqual(os.listdir(self.dir), ["resource.bin", "summary.json", "entities.jsonl"])
+        with open(entities, "rb") as f:
+            self.assertEqual(f.read(), b"previous report")
+
+    def test_success_replaces_existing_placement_report(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        entities = os.path.join(self.dir, "entities.jsonl")
+        with open(entities, "wb") as f:
+            f.write(b"previous report")
+        if os.name != "nt":
+            os.chmod(entities, 0o640)
+        previous_mode = os.stat(entities).st_mode
+        summary = os.path.join(self.dir, "summary.json")
+
+        self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities]), 0)
+        self.assertCountEqual(os.listdir(self.dir), ["resource.bin", "summary.json", "entities.jsonl"])
+        self.assertEqual(os.stat(entities).st_mode, previous_mode)
+        with open(entities, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f]
+        self.assertEqual([row["archetype"] for row in rows], ["deadbeef"])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows verbatim paths")
+    def test_verbatim_placement_report_stays_distinct_from_summary(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        summary = os.path.join(self.dir, "report.json")
+        entities = "\\\\?\\" + summary + "."
+        try:
+            self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities]), 0)
+            with open(summary, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["resources"], 1)
+            with open(entities, encoding="utf-8") as f:
+                self.assertEqual(json.loads(f.readline())["archetype"], "deadbeef")
+            self.assertFalse(os.path.samefile(summary, entities))
+        finally:
+            if os.path.exists(entities):
+                os.unlink(entities)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows verbatim paths")
+    def test_creates_a_verbatim_placement_report_directory(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        summary = os.path.join(self.dir, "summary.json")
+        directory = "\\\\?\\" + os.path.join(self.dir, "reports.")
+        entities = os.path.join(directory, "entities.jsonl")
+        try:
+            self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities]), 0)
+            self.assertFalse(os.path.exists(os.path.join(self.dir, "reports")))
+            with open(entities, encoding="utf-8") as f:
+                self.assertEqual(json.loads(f.readline())["archetype"], "deadbeef")
+        finally:
+            if os.path.exists(entities):
+                os.unlink(entities)
+            if os.path.isdir(directory):
+                os.rmdir(directory)
+
     def test_directory_scan_and_outputs(self):
         with open(os.path.join(self.dir, "map.bin"), "wb") as f:
             f.write(make_resource())
@@ -260,10 +489,14 @@ class WorldIndexTest(unittest.TestCase):
 
         out = os.path.join(self.dir, "out.json")
         csv_out = os.path.join(self.dir, "out.csv")
-        self.assertEqual(WI.main([self.dir, "--out", out, "--csv", csv_out]), 0)
+        entities = os.path.join(self.dir, "entities.jsonl")
+        self.assertEqual(WI.main([self.dir, "--out", out, "--csv", csv_out, "--entities-out", entities]), 0)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
+        self.assertEqual(doc["summary"]["files"], 2)
         self.assertEqual(doc["summary"]["resources"], 2)
+        with open(entities, encoding="utf-8") as f:
+            self.assertEqual(len([json.loads(line) for line in f]), 1)
         self.assertEqual(doc["summary"]["maps"], 1)
         self.assertEqual(doc["summary"]["entities"], 1)
         with open(csv_out, newline="", encoding="utf-8") as f:

@@ -21,6 +21,7 @@
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
+#include "vk_shader_fma.h"
 #include "../src/vulkan_bindless.h"
 
 #include <array>
@@ -30,6 +31,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <vector>
 
 #define CHECK(x)                                                                     \
@@ -73,6 +75,16 @@ std::vector<std::uint32_t> read_spv(const char* path) {
     return words;
 }
 
+// Expected RGBA values in this test are finite. Report the worst channel error per pixel.
+float pixel_error(const float* pixel, const float* want) {
+    float error = 0;
+    for (int c = 0; c < 4; ++c) {
+        if (!std::isfinite(pixel[c])) return std::numeric_limits<float>::infinity();
+        error = std::max(error, std::fabs(pixel[c] - want[c]));
+    }
+    return error;
+}
+
 DescriptorKey numbered(std::uint32_t n) {
     return {n, 0x9e3779b9u * n, n ^ 0x55555555u, n >> 3, 7, n * n, 0x80000000u, ~n};
 }
@@ -95,6 +107,13 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv>\n");
         return 2;
+    }
+    // A bad readback in a single channel must still fail when all three others match.
+    const float black[4]{};
+    for (int c = 0; c < 4; ++c) {
+        float pixel[4]{};
+        pixel[c] = std::numeric_limits<float>::quiet_NaN();
+        EXPECT(std::isinf(pixel_error(pixel, black)));
     }
     constexpr std::uint32_t W = 64, H = 64, TW = 8;
     constexpr std::uint32_t table_va = 256;  // console VA of the descriptor table: T# at +0, S# at +32
@@ -219,9 +238,14 @@ int main(int argc, char** argv) {
     qci.queueFamilyIndex = qi;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
+    leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
+    fma.query(gipa, inst, pd);
+    fma.link_after(&enable);
+    const char* fma_extension = fma.extension();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    if (fma.supported()) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &fma_extension; }
     VkDevice dev = VK_NULL_HANDLE;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LD(n) const auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(dev, #n))
@@ -499,8 +523,7 @@ int main(int argc, char** argv) {
                 const float gradient_texel[4] = {float(x * TW / W * 32) / 255.0f, float(y * TW / H * 32) / 255.0f, 128.0f / 255.0f, 1.0f};
                 const float* want = colour ? colour : gradient_texel;
                 const float* pixel = got + (std::size_t(y) * W + x) * 4;
-                float error = 0;
-                for (int c = 0; c < 4; ++c) error = std::max(error, std::fabs(pixel[c] - want[c]));
+                const float error = pixel_error(pixel, want);
                 worst = std::max(worst, error);
                 if (error <= 1e-6f) continue;
                 if (mismatches++ < 6)

@@ -33,6 +33,10 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_fmaak_f32/madak_f32 D = S0 * S1 + K (printed vdst, src0, vsrc1, K).
   s_ff1_i32_b32 /       index of the lowest set / clear bit of S0, -1 (0xffffffff) when there is none. An inline
   s_ff0_i32_b32           constant or literal source is a 32-bit value, not a lane mask (SHADER-46).
+  s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
+  s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
+  s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
+    into EXEC or VCC
   v_cmp(x)_*_f32        GE/LG/O and the other ordered compares are false when either source is NaN; the N forms
                           (NGE = !(S0 >= S1), NGT, NLE, NLT, NEQ) are their negations, so true on NaN; F = 0, TRU = 1.
   v_cmp(x)_*_u64/_i64   the whole 64-bit values compared unsigned / signed (the low word is never signed).
@@ -46,7 +50,9 @@ the channel order of the 10:10:10:2 typed-buffer formats: the names list the cha
 2_10_10_10 (50) is R10G10B10A2 and 10_10_10_2 (44) has a 2-bit x (Mesa gfx10_format_table.py, ac_formats.c).
 """
 import math
+import os
 import struct
+import sys
 import unittest
 
 import support
@@ -654,6 +660,50 @@ class MeasuredBoundsShaders(unittest.TestCase):
                                      push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
                 self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in want])
                 self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+
+
+class LaneMaskConstants(unittest.TestCase):
+    """runtime/test/shaders/cs_w32_mask_imm.asm and cs_w64_mask_imm.asm: a constant read as a lane mask (saveexec,
+    wrexec, s_and_b64 / s_not_b64 / s_mov_b64 into EXEC or VCC) gives lane L its bit L, not bit 0 for every lane.
+    Run on all lanes of one wave (32 on a 32-wide subgroup, 64 on a 64-wide one, no --wave64-emulate) with a heap
+    of 0xee bytes; the words are the GPU check's (check.py CS_DUMPS), derived by hand in each .asm header."""
+
+    WANT = {"cs_w32_mask_imm": (32, [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
+            "cs_w64_mask_imm": (64, [2056, 1084, 828, 2052, 319, 2104, 516, 2064])}
+    # Bit 0 of the constant for every lane, the translation before the fix (in the .asm headers).
+    OLD = {"cs_w32_mask_imm": [0xFFFFFF00, 32, 32, 0xFFFFFF00, 2072, 0xFFFFFF00, 0xFFFFFF00, 32],
+           "cs_w64_mask_imm": [0xFFFFFF00] * 7 + [2080]}
+
+    def run_words(self, name, lanes):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", name + ".asm"))
+        spv = support.translate_fixture(name, fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        si.run_workgroup(spv, lanes, lanes,
+                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                         push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+        return [memory[4 * i] for i in range(8)]
+
+    def test_words(self):
+        for name, (lanes, want) in self.WANT.items():
+            with self.subTest(shader=name):
+                got = self.run_words(name, lanes)
+                self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in want])
+                self.assertNotEqual(got, self.OLD[name])
+
+    def test_words_follow_from_the_masks(self):
+        # Plain-Python reference: word = set lanes | lowest lane << 8 of each case's resulting mask.
+        def word(m):
+            return 0xFFFFFF00 if m == 0 else bin(m).count("1") | ((m & -m).bit_length() - 1) << 8
+        m32, m64 = 0xFFFFFFFF, (1 << 64) - 1
+        w32 = [word(0xFF00 & m32), word(0x55555555 | 0xFF), word(5 & m32), word(0xFF00FF00 & ~0xFFFF & m32),
+               word(0x3FF & ~0xFF), word(-16 & m32 & ~0xFFFF), word(0x80000002 | 0), word(-1 & m32)]
+        w64 = [word(0xFF00 & m64), word(-16 & m64), word(-8 & m64 & ~0x10), word(0xFF00 & ~0xF0F0 & m64),
+               word(-2 & m64), word(~0xFF & m64), word(0x3C), bin(0xFF00FF).count("1") | 8 << 8]
+        self.assertEqual(w32, self.WANT["cs_w32_mask_imm"][1])
+        self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
 if __name__ == "__main__":

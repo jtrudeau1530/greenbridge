@@ -12,8 +12,8 @@ BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j.
 
     python -I tools/bary_fallback_gs.py <spirv dir> --pair VS PS
 
-The paired helper also forwards the VS's ClipDistance array. Its clip-count suffix distinguishes it from a
-PS-only helper and other clip layouts. Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
+The paired helper forwards a VS ClipDistance or CullDistance array. The suffix identifies the kind and length.
+Mixed clip/cull layouts are rejected. Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
 """
 import argparse
 import json
@@ -24,7 +24,7 @@ import sys
 SUFFIX = ".bary_gs"   # <ps name>.bary_gs.spvasm / .spv next to the pixel shader
 
 
-def gs_spvasm(locations, bary_location, clip_count: int = 0):
+def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0):
     """SPIR-V assembly for a triangle pass-through GS: Position and the vec4 inputs at `locations`, copied per vertex,
     plus the one-hot barycentric vec3 at `bary_location`."""
     locations = sorted(set(int(n) for n in locations))
@@ -34,11 +34,18 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0):
     outs = [f"%out{n}" for n in locations]
     if type(clip_count) is not int or not 0 <= clip_count <= 8:
         raise ValueError("clip distance count must be an integer from 0 to 8")
-    clip_iface = ["%in_clip", "%out_clip"] if clip_count else []
-    iface = " ".join(["%in_pos", "%out_pos", *ins, *outs, "%out_bary", *clip_iface])
+    if type(cull_count) is not int or not 0 <= cull_count <= 8:
+        raise ValueError("cull distance count must be an integer from 0 to 8")
+    if clip_count and cull_count:
+        raise ValueError("paired helper cannot forward mixed ClipDistance and CullDistance")
+    count = clip_count or cull_count
+    kind = "cull" if cull_count else "clip"
+    builtin = kind.title() + "Distance"
+    distance_iface = [f"%in_{kind}", f"%out_{kind}"] if count else []
+    iface = " ".join(["%in_pos", "%out_pos", *ins, *outs, "%out_bary", *distance_iface])
     lines = [
         "OpCapability Geometry",
-        *(["OpCapability ClipDistance"] if clip_count else []),
+        *([f"OpCapability {builtin}"] if count else []),
         "OpMemoryModel Logical GLSL450",
         f'OpEntryPoint Geometry %main "main" {iface}',
         "OpExecutionMode %main Triangles",
@@ -47,8 +54,8 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0):
         "OpExecutionMode %main OutputVertices 3",
         "OpDecorate %in_pos BuiltIn Position",
         "OpDecorate %out_pos BuiltIn Position",
-        *(["OpDecorate %in_clip BuiltIn ClipDistance", "OpDecorate %out_clip BuiltIn ClipDistance"]
-          if clip_count else []),
+        *([f"OpDecorate %in_{kind} BuiltIn {builtin}", f"OpDecorate %out_{kind} BuiltIn {builtin}"]
+          if count else []),
         *[f"OpDecorate %in{n} Location {n}" for n in locations],
         *[f"OpDecorate %out{n} Location {n}" for n in locations],
         f"OpDecorate %out_bary Location {int(bary_location)}",
@@ -65,12 +72,12 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0):
         "%ptr_in_v4 = OpTypePointer Input %v4float",
         "%ptr_out_v4 = OpTypePointer Output %v4float",
         "%ptr_out_v3 = OpTypePointer Output %v3float",
-        *([f"%clip_count = OpConstant %uint {clip_count}",
-           "%clip = OpTypeArray %float %clip_count",
-           "%triangle_clip = OpTypeArray %clip %uint_3",
-           "%ptr_in_triangle_clip = OpTypePointer Input %triangle_clip",
-           "%ptr_in_clip = OpTypePointer Input %clip",
-           "%ptr_out_clip = OpTypePointer Output %clip"] if clip_count else []),
+        *([f"%{kind}_count = OpConstant %uint {count}",
+           f"%{kind} = OpTypeArray %float %{kind}_count",
+           f"%triangle_{kind} = OpTypeArray %{kind} %uint_3",
+           f"%ptr_in_triangle_{kind} = OpTypePointer Input %triangle_{kind}",
+           f"%ptr_in_{kind} = OpTypePointer Input %{kind}",
+           f"%ptr_out_{kind} = OpTypePointer Output %{kind}"] if count else []),
         "%f0 = OpConstant %float 0",
         "%f1 = OpConstant %float 1",
         "%bary0 = OpConstantComposite %v3float %f1 %f0 %f0",
@@ -82,8 +89,8 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0):
         *[f"{v} = OpVariable %ptr_in_arr Input" for v in ins],
         *[f"{v} = OpVariable %ptr_out_v4 Output" for v in outs],
         "%out_bary = OpVariable %ptr_out_v3 Output",
-        *(["%in_clip = OpVariable %ptr_in_triangle_clip Input", "%out_clip = OpVariable %ptr_out_clip Output"]
-          if clip_count else []),
+        *([f"%in_{kind} = OpVariable %ptr_in_triangle_{kind} Input", f"%out_{kind} = OpVariable %ptr_out_{kind} Output"]
+          if count else []),
         "%main = OpFunction %void None %fn",
         "%entry = OpLabel",
     ]
@@ -92,22 +99,22 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0):
             p, x = f"%p{v}_{src[1:]}", f"%x{v}_{src[1:]}"
             lines += [f"{p} = OpAccessChain %ptr_in_v4 {src} %int_{v}", f"{x} = OpLoad %v4float {p}",
                       f"OpStore {dst} {x}"]
-        if clip_count:
-            lines += [f"%clip_ptr{v} = OpAccessChain %ptr_in_clip %in_clip %int_{v}",
-                      f"%distances{v} = OpLoad %clip %clip_ptr{v}", f"OpStore %out_clip %distances{v}"]
+        if count:
+            lines += [f"%{kind}_ptr{v} = OpAccessChain %ptr_in_{kind} %in_{kind} %int_{v}",
+                      f"%distances{v} = OpLoad %{kind} %{kind}_ptr{v}", f"OpStore %out_{kind} %distances{v}"]
         lines += [f"OpStore %out_bary %bary{v}", "OpEmitVertex"]
     lines += ["OpEndPrimitive", "OpReturn", "OpFunctionEnd"]
     return "\n".join(lines) + "\n"
 
 
 def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
-    """Write helpers for all fallback PS entries, or one clip-count-specific helper for an explicit (VS, PS) pair."""
+    """Write helpers for all fallback PS entries, or one distance-layout-specific helper for an explicit (VS, PS) pair."""
     index_path = os.path.join(spirv_dir, "index.json")
     if pair is None and not os.path.isfile(index_path):
         return []
     with open(index_path, encoding="utf-8") as f:
         index = json.load(f)
-    clip_count = 0
+    clip_count = cull_count = 0
     names = sorted(index)
     suffix = ""
     if pair is not None:
@@ -117,15 +124,22 @@ def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
         if producer.get("stage") != "vs" or consumer.get("stage") != "ps" or not consumer.get("bary_fallback_input"):
             raise ValueError("--pair requires a translated VS and a barycentric-fallback PS from the index")
         caps = set(producer.get("capabilities", []))
-        unsupported = caps & {"CullDistance", "ShaderLayer", "ShaderViewportIndex"}
+        unsupported = caps & {"ShaderLayer", "ShaderViewportIndex"}
         if unsupported:
             raise ValueError("paired helper cannot forward " + ", ".join(sorted(unsupported)))
-        if "ClipDistance" in caps:
-            clip_count = producer.get("clip_distance_count")
-            if type(clip_count) is not int or not 1 <= clip_count <= 8:
-                raise ValueError("missing or invalid VS clip_distance_count; regenerate the translation index")
+        def distance_count(kind):
+            if kind.title() + "Distance" not in caps:
+                return 0
+            field = f"{kind}_distance_count"
+            count = producer.get(field)
+            if type(count) is not int or not 1 <= count <= 8:
+                raise ValueError(f"missing or invalid VS {field}; regenerate the translation index")
+            return count
+
+        clip_count = distance_count("clip")
+        cull_count = distance_count("cull")
+        suffix = f".cull{cull_count}" if cull_count else f".clip{clip_count}"
         names = [pixel]
-        suffix = f".clip{clip_count}"
     written = []
     for name in names:
         meta = index[name]
@@ -133,8 +147,9 @@ def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
         if not fb:
             continue
         path = os.path.join(spirv_dir, name + SUFFIX + suffix + ".spvasm")
+        shader = gs_spvasm(meta.get("inputs", []), fb["location"], clip_count, cull_count)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(gs_spvasm(meta.get("inputs", []), fb["location"], clip_count))
+            f.write(shader)
         written.append(path)
     return written
 
@@ -159,6 +174,8 @@ def main(argv):
     parser.add_argument("spirv_dir")
     parser.add_argument("--pair", nargs=2, metavar=("VS", "PS"), help="build for these index entries")
     args = parser.parse_args(argv[1:])
+    if not os.path.isdir(args.spirv_dir):
+        parser.exit(1, f"{args.spirv_dir}: not a directory\n")
     try:
         paths = build_for_index(args.spirv_dir, tuple(args.pair) if args.pair else None)
     except (OSError, ValueError, RuntimeError) as err:
