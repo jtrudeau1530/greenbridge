@@ -251,6 +251,20 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_missing_source_or_out_folder_is_one_line(self):
+        missing = os.path.join(self.root, "missing.rpf")
+        out_in_missing = os.path.join(self.root, "no_dir", "out.json")
+        for source, out, path in ((missing, os.path.join(self.root, "m.json"), missing),
+                                  (self.rpf, out_in_missing, out_in_missing)):
+            with self.subTest(path=os.path.relpath(path, self.root)):
+                p = subprocess.run([sys.executable, "-I", TOOL, source, out, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertTrue(p.stderr.startswith(path + ": "), p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "m.json")))
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
