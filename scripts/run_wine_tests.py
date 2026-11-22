@@ -222,6 +222,20 @@ def wine_command(text: str) -> list[str]:
     return parts
 
 
+def valid_test_row(test) -> bool:
+    if not isinstance(test, dict) or not isinstance(test.get("name"), str):
+        return False
+    # CTest can omit the command for a target that was not built.
+    command = test.get("command", [])
+    if not isinstance(command, list) or not all(isinstance(arg, str) and "\0" not in arg for arg in command):
+        return False
+    entries = test.get("properties", [])
+    return isinstance(entries, list) and all(
+        isinstance(entry, dict) and isinstance(entry.get("name"), str) and "value" in entry
+        for entry in entries
+    )
+
+
 def read_tests(path: str) -> list[dict] | None:
     """The tests in a `ctest --show-only=json-v1` file, or None when it is not one."""
     try:
@@ -231,7 +245,7 @@ def read_tests(path: str) -> list[dict] | None:
         print(f"ERROR: cannot read {path}: {e}", file=sys.stderr)
         return None
     tests = doc.get("tests") if isinstance(doc, dict) else None
-    if not isinstance(tests, list) or not all(isinstance(t, dict) for t in tests):
+    if not isinstance(tests, list) or not all(valid_test_row(t) for t in tests):
         print(f"ERROR: {path} is not the output of ctest --show-only=json-v1", file=sys.stderr)
         return None
     return tests
