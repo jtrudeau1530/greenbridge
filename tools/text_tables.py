@@ -224,6 +224,8 @@ def read_labels(path: str) -> dict:
     if path.lower().endswith(".json") or first == b"{":
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
+        if not isinstance(doc, dict):
+            raise ValueError(f"{path}: expected a JSON object of hash -> label, got {type(doc).__name__}")
         return {int(h, 16): str(v).upper() for h, v in doc.items()}
     out = {}
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -327,7 +329,7 @@ def main(argv=None) -> int:
         names = {}
         for path in a.labels:
             names.update(read_labels(path))
-    except (OSError, ValueError, RuntimeError) as error:
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:   # KeyError/TypeError: index.json of the wrong shape
         print(f"text_tables: error: cannot read input: {error}", file=sys.stderr)
         return 2
     for labels in scan.pairs.values():               # dialogue labels name themselves
