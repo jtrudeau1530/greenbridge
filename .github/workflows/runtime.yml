@@ -121,8 +121,7 @@ jobs:
 
   # Runs the Windows build's tests under Wine, so a change that breaks the loader on Linux (through Wine or Proton)
   # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary
-  # shows the rest. run_tiny_game_exit_code isn't required: under Wine the process now and then exits 0 although
-  # gta6rt calls ExitProcess(1) (#634, finding).
+  # shows the rest.
   # Two Wines: Ubuntu's own (9.0) and WineHQ's current stable, which is closer to what Proton users run.
   wine:
     needs: windows
@@ -178,7 +177,7 @@ jobs:
           --windows-root "$(cat runtime/build/windows-root.txt)"
           --summary "$GITHUB_STEP_SUMMARY" --label "$(wine --version)"
           --require loader --require pe_loader --require loader_tls --require unimplemented_policy
-          --require run_tiny_game
+          --require run_tiny_game --require run_tiny_game_exit_code
 
   # Also runs the hand-written GPU tests (runtime/test/shaders) on Mesa's llvmpipe, a software Vulkan driver, so a
   # translator or harness change that breaks a test result shows up on every pull request, without a GPU.
