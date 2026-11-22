@@ -3,9 +3,10 @@
   - v_cmp_*_u16_e64 / v_cmpx_*_u16_e64 (eq, ne, lg, lt, le, gt, ge)
   - v_cmp_*_i16_e64 / v_cmpx_*_i16_e64 (eq, ne, lg, lt, le, gt, ge, including signed negative high halves)
 
-VOP3 op_sel:[s0,s1] selects bit 15:0 (0) or bit 31:16 (1) of each 16-bit source operand before float
-input modifiers (neg/abs) or integer zero/sign extension. VOPC writes a scalar lane mask (VCC/SGPR
-or EXEC for v_cmpx), so there is no destination op_sel bit.
+RDNA2 ignores VOP3 OPSEL on these compares: each reads bits 15:0 of both sources whatever op_sel says, then
+applies the f16 input modifiers (neg/abs) or the integer zero/sign extension (measured on gfx1036 through two
+launchers, tools/vcmp16_opsel_probe.py, TEST-650). Every listing here still carries op_sel, and the translation must
+give the low-half answer. VOPC writes a scalar lane mask (VCC/SGPR or EXEC for v_cmpx).
 
 Run directly:
     python -I tests/semantic/test_vcmp16_opsel.py -v
@@ -99,6 +100,20 @@ def int_rel(cond: str, x: int, y: int) -> int:
     }[cond])
 
 
+def pick(_sel: int) -> int:
+    """The half a compare reads for an op_sel bit: always the low one on RDNA2 (TEST-650)."""
+    return 0
+
+
+def low_half_pass(tag: str, v1: int, v2: int) -> int:
+    """A tag's ("<type>_<cond>_<op_sel>") compare of v1 with v2 on the low halves."""
+    ty, cond, _ = tag.split("_")
+    if ty == "f16":
+        return f16_rel(cond, f16_half(v1, 0), f16_half(v2, 0))
+    half = u16_half if ty == "u16" else i16_half
+    return int_rel(cond, half(v1, 0), half(v2, 0))
+
+
 _TMP_DIR = None
 _PS_PATH = None
 
@@ -188,7 +203,7 @@ class F16CompareOpSelTests(unittest.TestCase):
         for cond in ("lt", "le", "gt", "ge", "eq", "lg", "neq"):
             for xw, yw in pairs:
                 for s0, s1 in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                    want = f16_rel(cond, f16_half(xw, s0), f16_half(yw, s1))
+                    want = f16_rel(cond, f16_half(xw, pick(s0)), f16_half(yw, pick(s1)))
                     with self.subTest(cond=cond, x=hex(xw), y=hex(yw), opsel=(s0, s1)):
                         got = run_ps_bit(
                             xw, yw,
@@ -212,7 +227,7 @@ class F16CompareOpSelTests(unittest.TestCase):
         for cond in ("o", "u", "lt", "eq", "neq"):
             for a, b in cases:
                 for s0, s1 in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                    want = f16_rel(cond, f16_half(a, s0), f16_half(b, s1))
+                    want = f16_rel(cond, f16_half(a, pick(s0)), f16_half(b, pick(s1)))
                     with self.subTest(cond=cond, a=hex(a), b=hex(b), opsel=(s0, s1)):
                         got = run_ps_bit(
                             a, b,
@@ -222,24 +237,22 @@ class F16CompareOpSelTests(unittest.TestCase):
                         self.assertEqual(got, want)
 
     def test_f16_opsel_neg_abs_modifiers(self):
-        # v1 = (lo=+1.0, hi=-4.0), v2 = (lo=+2.0, hi=+4.0)
-        # Selecting hi of v1 (-4.0):
-        #   -v1 -> +4.0: eq v2.hi (+4.0) is 1, gt v2.lo (+2.0) is 1
-        #   |v1| -> +4.0: eq v2.hi (+4.0) is 1, lt v2.lo (+2.0) is 0
-        #   -|v1| -> -4.0: lt v2.lo (+2.0) is 1
-        # Reading lo of v1 (+1.0) instead would flip every case below.
+        # v1 = (lo=+1.0, hi=-4.0), v2 = (lo=+2.0, hi=+4.0). The modifiers apply to the low halves whatever op_sel
+        # selects; reading a selected high half instead changes every row marked "hi would".
         xw = pack16(H_ONE, H_MFOUR)
         yw = pack16(H_TWO, H_FOUR)
+        lo1, lo2 = f16_half(xw, 0), f16_half(yw, 0)
         cases = [
-            ("v_cmp_eq_f16_e64 s4, -v1, v2 op_sel:[1,1]", 1),
-            ("v_cmp_gt_f16_e64 s4, -v1, v2 op_sel:[1,0]", 1),
-            ("v_cmp_eq_f16_e64 s4, |v1|, v2 op_sel:[1,1]", 1),
-            ("v_cmp_lt_f16_e64 s4, |v1|, v2 op_sel:[1,0]", 0),
-            ("v_cmp_lt_f16_e64 s4, v1, -v2 op_sel:[0,1]", 0),   # +1.0 < -4.0 -> 0 (lo of v2 would give +1.0 < -2.0 -> 0, check gt below)
-            ("v_cmp_lt_f16_e64 s4, -|v1|, v2 op_sel:[1,0]", 1), # -4.0 < +2.0 -> 1
-            ("v_cmp_gt_f16_e64 s4, -|v1|, -v2 op_sel:[1,0]", 0), # -4.0 > -2.0 -> 0 (lo would be -1.0 > -2.0 -> 1!)
-            ("v_cmp_eq_f16_e64 s4, v1, -v2 op_sel:[1,1]", 1),   # -4.0 == -4.0 -> 1
+            ("v_cmp_eq_f16_e64 s4, -v1, v2 op_sel:[1,1]", f16_rel("eq", -lo1, lo2)),          # 0; hi would 1
+            ("v_cmp_gt_f16_e64 s4, -v1, v2 op_sel:[1,0]", f16_rel("gt", -lo1, lo2)),          # 0; hi would 1
+            ("v_cmp_eq_f16_e64 s4, |v1|, v2 op_sel:[1,1]", f16_rel("eq", abs(lo1), lo2)),     # 0; hi would 1
+            ("v_cmp_lt_f16_e64 s4, |v1|, v2 op_sel:[1,0]", f16_rel("lt", abs(lo1), lo2)),     # 1; hi would 0
+            ("v_cmp_lt_f16_e64 s4, v1, -v2 op_sel:[0,1]", f16_rel("lt", lo1, -lo2)),          # 0
+            ("v_cmp_lt_f16_e64 s4, -|v1|, v2 op_sel:[1,0]", f16_rel("lt", -abs(lo1), lo2)),   # 1
+            ("v_cmp_gt_f16_e64 s4, -|v1|, -v2 op_sel:[1,0]", f16_rel("gt", -abs(lo1), -lo2)), # 1; hi would 0
+            ("v_cmp_eq_f16_e64 s4, v1, -v2 op_sel:[1,1]", f16_rel("eq", lo1, -lo2)),          # 0; hi would 1
         ]
+        self.assertEqual([want for _l, want in cases], [0, 0, 0, 1, 0, 1, 1, 0])
         for line, want in cases:
             with self.subTest(line=line):
                 self.assertEqual(run_ps_bit(xw, yw, line, mask="s4"), want)
@@ -258,7 +271,7 @@ class Int16CompareOpSelTests(unittest.TestCase):
         for cond in ("eq", "ne", "lg", "lt", "le", "gt", "ge"):
             for xw, yw in pairs:
                 for s0, s1 in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                    want = int_rel(cond, u16_half(xw, s0), u16_half(yw, s1))
+                    want = int_rel(cond, u16_half(xw, pick(s0)), u16_half(yw, pick(s1)))
                     with self.subTest(cond=cond, x=hex(xw), y=hex(yw), opsel=(s0, s1)):
                         got = run_ps_bit(
                             xw, yw,
@@ -283,7 +296,7 @@ class Int16CompareOpSelTests(unittest.TestCase):
         for cond in ("eq", "ne", "lg", "lt", "le", "gt", "ge"):
             for xw, yw in pairs:
                 for s0, s1 in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                    want = int_rel(cond, i16_half(xw, s0), i16_half(yw, s1))
+                    want = int_rel(cond, i16_half(xw, pick(s0)), i16_half(yw, pick(s1)))
                     with self.subTest(cond=cond, x=hex(xw), y=hex(yw), opsel=(s0, s1)):
                         got = run_ps_bit(
                             xw, yw,
@@ -295,10 +308,10 @@ class Int16CompareOpSelTests(unittest.TestCase):
 
 class CmpxWaveExecOpSelTests(unittest.TestCase):
     def test_cmpx_compute_wave32_and_wave64(self):
-        # For each type (f16, u16, i16) and wave size (32, 64), give even lanes a packed value whose
-        # high half PASSES the compare (low half FAILS), and odd lanes a packed value whose high half
-        # FAILS (low half PASSES). v_cmpx_*_e64 with op_sel:[1,0] must keep even lanes active and
-        # switch off odd lanes, writing lane|0x100 only for even lanes and leaving SENTINEL on odd lanes.
+        # For each type (f16, u16, i16) and wave size (32, 64), even and odd lanes get packed values whose
+        # halves answer the compare differently. v_cmpx_*_e64 with op_sel keeps the lanes whose LOW halves pass
+        # (RDNA2 ignores OPSEL here, TEST-650) and switches the others off: lane|0x100 where a lane stays on,
+        # SENTINEL where it doesn't.
         cases = [
             # (tag, cmp_line, even_v1, odd_v1, v2)
             ("f16_lt_10", "v_cmpx_lt_f16_e64 v1, v2 op_sel:[1,0]",
@@ -334,8 +347,9 @@ class CmpxWaveExecOpSelTests(unittest.TestCase):
                         "buffer_store_dword v5, v4, s[0:3], 0 offen",
                     ]
                     mem = run_cs(f"cs_cmpx_{tag}_w{wave}", body, wave_size=wave)
+                    passes = (low_half_pass(tag, even_v1, v2_word), low_half_pass(tag, odd_v1, v2_word))
                     for lane in range(wave):
-                        want = (0x100 | lane) if (lane % 2 == 0) else SENTINEL
+                        want = (0x100 | lane) if passes[lane % 2] else SENTINEL
                         self.assertEqual(mem.get(lane * 4), want, f"lane {lane}")
 
     def test_cmpx_int16_spirv_wave_interp(self):
@@ -376,8 +390,9 @@ class CmpxWaveExecOpSelTests(unittest.TestCase):
                     spv = translate_ps(lines)
                     self.assertEqual(rdna2spirv.translate.last_gen.wave64, wave == 64)
                     outputs = wi.run_wave(spv, wave=wave)["outputs"]
+                    passes = (low_half_pass(tag, even_v1, v2_word), low_half_pass(tag, odd_v1, v2_word))
                     for lane in range(wave):
-                        if lane % 2 == 0:
+                        if passes[lane % 2]:
                             self.assertIsNotNone(outputs[lane], f"lane {lane} should stay active")
                             self.assertEqual(outputs[lane]["%out_mrt0"][0], 0x40000000 | lane)
                         else:

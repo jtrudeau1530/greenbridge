@@ -1087,15 +1087,15 @@ class Gen:
         if ty in ("f32", "f16"):
             if ty == "f32":
                 x, y = self.src_f(srcs[0]), self.src_f(srcs[1])
-            else:   # f16 compare: op_sel selects lo/hi half of each source, compared as f32 (exact for f16 values)
-                sel, _ = self.opsel_bits(mods, 2)
-                x, y = self.f16_in(srcs[0], sel[0]), self.f16_in(srcs[1], sel[1])
+            else:   # f16 compare: the low half of each source, compared as f32 (exact for f16 values)
+                # RDNA2 ignores VOP3 OPSEL on the 16-bit compares (gfx1036, tools/vcmp16_opsel_probe.py, TEST-650).
+                x, y = self.f16_in(srcs[0], 0), self.f16_in(srcs[1], 0)
             ops = {"lt": "OpFOrdLessThan", "le": "OpFOrdLessThanEqual", "gt": "OpFOrdGreaterThan",
                    "ge": "OpFOrdGreaterThanEqual", "eq": "OpFOrdEqual", "neq": "OpFUnordNotEqual",
                    "lg": "OpFOrdNotEqual", "nlg": "OpFUnordEqual", "nlt": "OpFUnordGreaterThanEqual",
                    "ngt": "OpFUnordLessThanEqual", "nle": "OpFUnordGreaterThan", "nge": "OpFUnordLessThan"}
         elif ty in ("u16", "i16"):
-            sel, _ = self.opsel_bits(mods, 2)
+            sel = (0, 0)   # OPSEL is ignored here as on the f16 compares (TEST-650): the low halves
             x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
             xs, ys = self.tmp(), self.tmp()
             f = "OpBitFieldSExtract" if ty == "i16" else "OpBitFieldUExtract"
