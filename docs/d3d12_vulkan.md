@@ -1416,7 +1416,14 @@ Not implemented yet:
   `vkCmdClearDepthStencilImage` ignore conditional rendering. The standalone device enables the extension and its
   `conditionalRendering` feature when the GPU has them, and then creates buffers with
   `VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT`; without it a predicated list is rejected (`unsupported`).
-  Checked by part E of `vk_command_replay_test` on an NVIDIA GeForce RTX 3070.
+  `D3D12_RESOURCE_STATE_PREDICATION` is the same bit as `INDIRECT_ARGUMENT` (and `SYNC_PREDICATION` /
+  `ACCESS_PREDICATION` the same as `EXECUTE_INDIRECT` / `INDIRECT_ARGUMENT`), so with the extension enabled
+  barriers into and out of that state also cover `VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT` at
+  `VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT`, where the predicate is read: without it a `ResolveQueryData`
+  into the predicate had no dependency on the read (`vulkan_access`, `vulkan_barrier_scope`).
+  Checked by part E of `vk_command_replay_test` on an NVIDIA GeForce RTX 3070, and end to end by
+  `d3d12_vulkan_device_test` (an occlusion query resolved into a predicate, through legacy and enhanced barriers)
+  on an NVIDIA GeForce RTX 5070.
   Open:
   - Copies and resolves. D3D12 predicates `CopyBufferRegion`, `CopyTextureRegion`, `CopyResource` and
     `ResolveSubresource`; Vulkan's conditional rendering does not cover transfer commands, so they run
