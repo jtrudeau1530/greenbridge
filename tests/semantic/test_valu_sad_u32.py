@@ -37,10 +37,12 @@ Standard library Python only: unittest, dataclasses, enum, math, struct.
 Single module scope, zero game data.
 """
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import math
 import struct
 import unittest
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Union
 
 # Architectural 32-bit and 64-bit masks
 MASK8 = 0xFF
@@ -152,6 +154,145 @@ def ref_mqsad_u32(
     return (out[0], out[1], out[2], out[3])
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a register operand or inline literal constant."""
+    reg_type: RegType
+    index: int = 0
+    literal_value: int | None = None
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+            if self.index + self.count > 256:
+                raise ValueError(f"VGPR range [{self.index}:{self.index + self.count - 1}] exceeds 255")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+            if self.index + self.count > 106:
+                raise ValueError(f"SGPR range [{self.index}:{self.index + self.count - 1}] exceeds 105")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_value is None:
+                raise ValueError("Literal operand requires literal_value")
+
+    @classmethod
+    def vgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.VGPR, index=index, count=count)
+
+    @classmethod
+    def sgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.SGPR, index=index, count=count)
+
+    @classmethod
+    def literal(cls, value: int) -> Operand:
+        return cls(RegType.LITERAL, literal_value=u32(value), count=1)
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            if self.count == 1:
+                return f"v{self.index}"
+            return f"v[{self.index}:{self.index + self.count - 1}]"
+        if self.reg_type == RegType.SGPR:
+            if self.count == 1:
+                return f"s{self.index}"
+            return f"s[{self.index}:{self.index + self.count - 1}]"
+        return f"0x{self.literal_value:08X}"
+
+
+@dataclass(frozen=True)
+class VSadU32Instruction:
+    """Symbolic AST node for v_sad_u32."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+        if self.dst.count != 1:
+            raise ValueError(f"Destination must be single dword (count=1), got {self.dst.count}")
+        for idx, src in enumerate([self.src0, self.src1, self.src2]):
+            if src.count != 1:
+                raise ValueError(f"src{idx} must be single dword (count=1), got {src.count}")
+
+    def disassemble(self) -> str:
+        parts = [
+            "v_sad_u32",
+            self.dst.disassemble() + ",",
+            self.src0.disassemble() + ",",
+            self.src1.disassemble() + ",",
+            self.src2.disassemble(),
+        ]
+        if self.clamp:
+            parts.append("clamp")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
+class VSadHiU32Instruction:
+    """Symbolic AST node for v_sad_hi_u32."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+        if self.dst.count != 1:
+            raise ValueError(f"Destination must be single dword (count=1), got {self.dst.count}")
+        for idx, src in enumerate([self.src0, self.src1, self.src2]):
+            if src.count != 1:
+                raise ValueError(f"src{idx} must be single dword (count=1), got {src.count}")
+
+    def disassemble(self) -> str:
+        return f"v_sad_hi_u32 {self.dst.disassemble()}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+
+
+@dataclass(frozen=True)
+class VMqsadU32Instruction:
+    """Symbolic AST node for v_mqsad_u32."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    masked: bool = True
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+        if self.dst.count != 4:
+            raise ValueError(f"Destination must be 4 dwords (count=4), got {self.dst.count}")
+        if self.src0.count != 2:
+            raise ValueError(f"src0 must be 2 dwords (count=2), got {self.src0.count}")
+        if self.src1.count != 1:
+            raise ValueError(f"src1 must be 1 dword (count=1), got {self.src1.count}")
+        if self.src2.count != 4:
+            raise ValueError(f"src2 must be 4 dwords (count=4), got {self.src2.count}")
+
+    def disassemble(self) -> str:
+        suffix = "" if self.masked else " unmasked"
+        return f"v_mqsad_u32 {self.dst.disassemble()}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}{suffix}"
+
+
+# ==============================================================================
+# Unit Tests
+# ==============================================================================
+
 class TestValuSadU32Oracle(unittest.TestCase):
     """Unit tests for reference mathematical oracles of v_sad_u32, v_sad_hi_u32, and v_mqsad_u32."""
 
@@ -252,12 +393,6 @@ class TestValuSadU32Oracle(unittest.TestCase):
         self.assertEqual(ref_quad_byte_sad(win, s1, masked=False), 4)
 
     def test_mqsad_u32_sliding_window(self) -> None:
-        # S0 = 0x0807_0605_0403_0201 (bytes: b0=1, b1=2, b2=3, b3=4, b4=5, b5=6, b6=7, b7=8)
-        # Windows W_k (32-bit):
-        # W_0 = bytes [1, 2, 3, 4] = 0x0403_0201
-        # W_1 = bytes [2, 3, 4, 5] = 0x0504_0302
-        # W_2 = bytes [3, 4, 5, 6] = 0x0605_0403
-        # W_3 = bytes [4, 5, 6, 7] = 0x0706_0504
         s0_64 = 0x0807_0605_0403_0201
         self.assertEqual(byte_window_u32(s0_64, 0), 0x0403_0201)
         self.assertEqual(byte_window_u32(s0_64, 1), 0x0504_0302)
@@ -267,14 +402,105 @@ class TestValuSadU32Oracle(unittest.TestCase):
         s1_32 = 0x0403_0201  # exactly matches W_0
         s2_128 = (10, 20, 30, 40)
         res = ref_mqsad_u32(s0_64, s1_32, s2_128, masked=False)
-        # For W_0: diff is 0, res[0] = 10 + 0 = 10
         self.assertEqual(res[0], 10)
-        # For W_1: bytes are [2, 3, 4, 5] vs [1, 2, 3, 4] -> diff is 1 + 1 + 1 + 1 = 4 -> res[1] = 20 + 4 = 24
         self.assertEqual(res[1], 24)
-        # For W_2: bytes are [3, 4, 5, 6] vs [1, 2, 3, 4] -> diff is 2 + 2 + 2 + 2 = 8 -> res[2] = 30 + 8 = 38
         self.assertEqual(res[2], 38)
-        # For W_3: bytes are [4, 5, 6, 7] vs [1, 2, 3, 4] -> diff is 3 + 3 + 3 + 3 = 12 -> res[3] = 40 + 12 = 52
         self.assertEqual(res[3], 52)
+
+
+class TestValuSadU32SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_operand_creation_and_disassembly(self) -> None:
+        v0 = Operand.vgpr(0)
+        self.assertEqual(v0.disassemble(), "v0")
+        v_pair = Operand.vgpr(4, count=2)
+        self.assertEqual(v_pair.disassemble(), "v[4:5]")
+        v_quad = Operand.vgpr(8, count=4)
+        self.assertEqual(v_quad.disassemble(), "v[8:11]")
+
+        s2 = Operand.sgpr(2)
+        self.assertEqual(s2.disassemble(), "s2")
+        s_pair = Operand.sgpr(10, count=2)
+        self.assertEqual(s_pair.disassemble(), "s[10:11]")
+
+        lit = Operand.literal(0x1234_5678)
+        self.assertEqual(lit.disassemble(), "0x12345678")
+
+    def test_operand_validation_boundaries(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(255, count=2)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(105, count=2)
+
+    def test_v_sad_u32_ast_construction_and_disasm(self) -> None:
+        instr = VSadU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(2),
+            src2=Operand.literal(100),
+            clamp=False,
+        )
+        self.assertEqual(instr.disassemble(), "v_sad_u32 v0, v1, s2, 0x00000064")
+
+        instr_clamped = VSadU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+            clamp=True,
+        )
+        self.assertEqual(instr_clamped.disassemble(), "v_sad_u32 v0, v1, v2, v3 clamp")
+
+    def test_v_sad_hi_u32_ast_construction_and_disasm(self) -> None:
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(5),
+            src0=Operand.vgpr(6),
+            src1=Operand.vgpr(7),
+            src2=Operand.vgpr(8),
+        )
+        self.assertEqual(instr.disassemble(), "v_sad_hi_u32 v5, v6, v7, v8")
+
+    def test_v_mqsad_u32_ast_construction_and_disasm(self) -> None:
+        instr = VMqsadU32Instruction(
+            dst=Operand.vgpr(0, count=4),
+            src0=Operand.vgpr(4, count=2),
+            src1=Operand.vgpr(6, count=1),
+            src2=Operand.vgpr(8, count=4),
+            masked=True,
+        )
+        self.assertEqual(instr.disassemble(), "v_mqsad_u32 v[0:3], v[4:5], v6, v[8:11]")
+
+    def test_ast_type_and_count_validation(self) -> None:
+        # Destination must be VGPR
+        with self.assertRaises(TypeError):
+            VSadU32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        # Destination count must match opcode expectation
+        with self.assertRaises(ValueError):
+            VSadU32Instruction(
+                dst=Operand.vgpr(0, count=2),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        with self.assertRaises(ValueError):
+            VMqsadU32Instruction(
+                dst=Operand.vgpr(0, count=1),  # needs 4
+                src0=Operand.vgpr(4, count=2),
+                src1=Operand.vgpr(6, count=1),
+                src2=Operand.vgpr(8, count=4),
+            )
 
 
 if __name__ == "__main__":
