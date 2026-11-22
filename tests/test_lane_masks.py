@@ -53,8 +53,14 @@ def test_straight_line():
     # Compares that only set SCC, and v_cmpx, read their first operand: the mask in it survives.
     assert masks_at_last([[ins("s_mov_b64", s(6, 2), sp("exec")), ins("s_cmp_eq_u64", s(6, 2), imm(0)),
                            ins("v_cmpx_eq_u32_e32", s(6), v(1)), use]], [[]]) == {6, 7}
-    # Carry out of a 64-bit add is a mask.
+    # Carry out of a 64-bit add, and the carry/sign sdst of 64-bit MAD, are lane masks.
     assert masks_at_last([[ins("v_add_co_u32_e64", v(0), s(6, 2), v(1), v(2)), use]], [[]]) == {6, 7}
+    assert masks_at_last([[ins("v_mad_u64_u32", {"k": "vgpr", "r": 0, "n": 2}, s(6, 2), v(2), v(3),
+                               {"k": "vgpr", "r": 4, "n": 2}), use]], [[]]) == {6, 7}
+    assert masks_at_last([[ins("v_mad_i64_i32", {"k": "vgpr", "r": 0, "n": 2}, sp("vcc"), v(2), v(3),
+                               {"k": "vgpr", "r": 4, "n": 2}), use]], [[]]) == {"vcc"}
+    assert masks_at_last([[ins("v_mad_u64_u32", {"k": "vgpr", "r": 0, "n": 2}, sp("null"), v(2), v(3),
+                               {"k": "vgpr", "r": 4, "n": 2}), use]], [[]]) == set()
 
 
 def test_joins():

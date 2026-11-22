@@ -62,6 +62,37 @@ controller-button array (`GetControllerButtonState`, indexed in SDL's `SDL_Gamep
 - Player LEDs (and SDL's default lightbar colour) follow connection order: the first pad is player 1, and a pad
   plugged in later takes the lowest free slot.
 
+## Keyboard pad
+
+The title reads gamepads only, so keyboard input has to arrive as a gamepad. With `LEONIDA_KEYBOARD_PAD` set, the
+shim attaches one SDL virtual gamepad named `Keyboard pad (Leonida)` and presses its buttons from the keyboard on
+every poll. It then goes through the same path as a real pad: a device object, the next free player slot, readings,
+reading and device callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is off by
+default.
+
+| key | button |
+|---|---|
+| arrow keys | d-pad |
+| Enter | `A` |
+| Backspace | `B` |
+| X | `X` |
+| Y | `Y` |
+| Q / E | left / right shoulder |
+| Esc | `Menu` |
+| Tab | `View` |
+
+This is enough to drive menus and press prompts. The sticks and triggers stay at rest: moving with WASD and aiming
+with the mouse are for a later change. Letters are Windows virtual-key codes, so `Y` is the key labelled Y on the
+active layout (it sits where Z does on a QWERTY keyboard with a German layout).
+
+Keys are read with `GetAsyncKeyState`, which needs no window or message loop (SDL's keyboard is part of its video
+subsystem, which this build leaves out) and works under Wine. With `LEONIDA_KEYBOARD_PAD=1` keys count only while a
+window of this process is in the foreground, so typing in another application presses nothing, and every button is
+released when focus moves away. `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focus; a console tool such as
+`gameinput_probe` needs it, because its console window belongs to the terminal, not to the tool.
+
+To try it by hand: `set LEONIDA_KEYBOARD_PAD=always`, then `gameinput_probe --seconds 20` and press keys.
+
 ## Rumble and triggers
 
 `IGameInputDevice::SetRumbleState` takes four motor levels, 0..1. The two body motors go to `SDL_RumbleGamepad` on
@@ -101,6 +132,7 @@ An effect is sent only when its bytes change, so a steady level costs one report
 | `LEONIDA_DS_LIGHTBAR` | unset | `RRGGBB` (hex) sets the DualSense/DualShock 4 lightbar when the pad connects; `off` turns it dark; unset keeps SDL's player colour |
 | `LEONIDA_RUMBLE` | `1` | `0` turns all rumble and trigger output off |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
+| `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to
 leave a DualSense to the generic driver, or `SDL_GAMECONTROLLERCONFIG` to add a mapping for an unknown pad.
@@ -118,7 +150,7 @@ The API surface:
 
 | interface | implemented | not implemented |
 |---|---|---|
-| `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetPreviousReading` and `GetTemporalReading` (no history kept), `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
+| `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading`, `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
 | `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons | raw report, keyboard, mouse, touch, motion, arcade/flight stick, racing wheel (all return nothing) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch`, `OpenWaitHandle` | the quota (the queue is short) |
@@ -126,6 +158,32 @@ The API surface:
 A device object stays alive for the whole process. When a pad is unplugged its status drops to
 `GameInputDeviceNoStatus` and its device callback runs; when the same pad is plugged in again (matched by SDL GUID and
 serial or device path) the title gets the same object back, connected again.
+
+## Reading history
+
+Each pad keeps the readings the poll took for it, one per change it saw, so `GetNextReading` and `GetPreviousReading`
+can step through input the title has not read yet, such as a button pressed and released between two of its frames.
+A reading leaves the history once the reading after it is more than 500 ms old, so the current state stays reachable
+however long the pad then idles. A pad keeps at most 512 readings, and none once it is unplugged. A reading the title
+holds stays valid after it leaves the history.
+
+- With a device the search covers that pad; with none, every connected pad. Readings of different pads are ordered by
+  when the shim took them, not by timestamp, since pads polled together share one.
+- `GetNextReading` returns the first reading after the reference, `GetPreviousReading` the last one before it.
+- The horizon is the newest reading dropped from the histories searched (with no device, the reference's pad counts
+  too, even unplugged). A step that would cross it fails rather than skip input.
+
+| situation | result |
+|---|---|
+| output null; reference null | `E_POINTER`; `E_INVALIDARG` |
+| no supported kind in the mask | `GAMEINPUT_E_READING_NOT_FOUND` |
+| the device given is unplugged | `GAMEINPUT_E_DEVICE_DISCONNECTED` |
+| next: the horizon is after the reference; previous: it is not before it | `GAMEINPUT_E_REFERENCE_READING_TOO_OLD` |
+| nothing newer, or nothing older after the horizon | `GAMEINPUT_E_READING_NOT_FOUND` |
+
+After a pad is plugged back in, its last reading before the unplug leads to the reconnect snapshot, older ones are
+`REFERENCE_READING_TOO_OLD`, and sequence numbers carry on. Timestamps are poll times, so a change shorter than one poll
+(2 ms with the thread) is not seen.
 
 ## ABI
 
@@ -141,9 +199,13 @@ shim fills (`GameInputDeviceInfo` 320 bytes with `deviceFamily` at 96 and the in
 - `gameinput_test` (CTest, no controller): turns SDL's real backends off and drives the shim through
   `rt::shims::find` with SDL virtual joysticks, an Xbox-style pad with trigger motors, a DualSense (Sony
   `054c:0ce6`) and a pad without trigger motors. It checks enumeration and device callbacks, the button, stick,
-  trigger and UI-navigation mapping, reading callbacks and sequence numbers, the guide button, motor and trigger
+  trigger and UI-navigation mapping, reading callbacks and sequence numbers, the reading history (a tap read after
+  the fact, both directions, two pads interleaved and filtered by device, ageing out, held readings, unplug and
+  replug), the guide button, motor and trigger
   rumble as SDL receives them, the DualSense effect bytes in each `LEONIDA_DS_TRIGGERS` mode, the lightbar, a
-  dispatcher, async and blocking enumeration, unregistering, and unplugging and replugging.
+  dispatcher, async and blocking enumeration, unregistering, and unplugging and replugging. The keyboard pad is
+  driven through `rt::gameinput::set_keyboard_source` with fake keys and focus: every binding, two keys at once, no
+  input out of focus, release on focus loss, the `always` mode, and turning it off and on again.
 - `gameinput_probe [--seconds N] [--rumble]` (by hand, with a pad connected): lists the pads, plays each motor and
   trigger for a second with `--rumble`, then prints the live reading.
 
@@ -155,14 +217,17 @@ These need the game executable or a test on hardware:
   and `xgameruntime.dll`. GameInput v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was
   built against one of those, the vtables need a second set.
 - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
-- **Reading history.** `GetNextReading` returns the newest reading when it is newer than the reference, and
-  `GetPreviousReading` has no history. A title that replays every input frame between two polls would miss the
-  intermediate states.
+- **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)
+  and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices. Changes faster than the poll are not seen, and
+  `GetTemporalReading` is not implemented.
 - **UI navigation mapping** and the **controller-axis convention** (0..1 with sticks at 0.5) are this shim's choice,
   not measured from a console.
 - **Battery capacity** is reported as a fraction (remaining 0..1 of full 1), not in device units.
 - **`UnregisterCallback` timeout** is not honoured; it waits for a callback that is running.
 - **Device family**: every pad is reported as `GameInputFamilyXboxOne`; a title that filters on family sees only
   that.
+- **Keyboard pad as a second pad**: it is one more connected gamepad, so with a controller plugged in the title sees
+  two. A title that follows only the first pad it saw, or asks the player to press a button to pick the active pad,
+  may ignore one of them; whether the game does either is unknown.
 - **DualSense effect parameters**: the `06` (vibration) and `01` (resistance) byte meanings follow SDL's
   `testcontroller.c`; how strong 255 feels and what frequency suits the Xbox signal needs a session on a real pad.

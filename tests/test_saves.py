@@ -271,5 +271,45 @@ class ImportTest(unittest.TestCase):
                 quiet(saves.import_saves, [empty, "--out", os.path.join(tmp, "o")])
 
 
+class MalformedJsavTest(unittest.TestCase):
+    """A truncated or lying JSAV is one error line, not a struct.error traceback."""
+
+    def test_header_shorter_than_16_bytes_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(b"JSAV")
+        self.assertIn("header is only 4 bytes", str(ctx.exception))
+
+    def test_a_short_non_jsav_blob_keeps_the_not_jsav_message(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(b"NOPE")
+        self.assertEqual(str(ctx.exception), "not JSAV")
+
+    def test_entry_table_past_end_is_rejected(self):
+        data = b"JSAV" + struct.pack("<III", 1, 4, 0)
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(data)
+        self.assertIn("declares 4 entries but the file has 16 bytes", str(ctx.exception))
+
+    def test_missing_body_marker_is_rejected(self):
+        # A complete entry table with no JSON body marker after it.
+        data = bytearray(b"JSAV" + struct.pack("<III", 3, 1, 0))
+        data += struct.pack("<IIIII", 0x11111111, 1, 0, 36, 0)
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(bytes(data))
+        self.assertIn("body marker not found", str(ctx.exception))
+
+    def test_cli_reports_an_error_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "truncated.jsav")
+            with open(path, "wb") as f:
+                f.write(b"JSAV" + struct.pack("<III", 1, 4, 0))
+            p = subprocess.run([sys.executable, "-I", TOOL, "info", path],
+                               capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR:", p.stderr)
+        self.assertIn("declares 4 entries", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

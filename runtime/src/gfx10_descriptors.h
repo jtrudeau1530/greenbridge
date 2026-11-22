@@ -146,6 +146,10 @@ inline ImageWords encode(const Image& image) {
 // TYPE names an image, so these eight dwords are a T# and not a V# followed by something else.
 inline constexpr bool is_image(const ImageWords& words) { return detail::get(words[3], 28, 4) >= 8; }
 
+inline constexpr float image_min_lod(const ImageWords& words) {
+    return float(detail::get(words[1], 8, 12)) / 256.0f;
+}
+
 // False when the dwords are not an image descriptor, or a field contradicts another: a reserved DST_SEL, a last
 // level or layer before the first, or a cube whose layers are not whole cubes.
 inline bool decode(const ImageWords& words, Image& out) {
@@ -154,7 +158,7 @@ inline bool decode(const ImageWords& words, Image& out) {
     Image image{};
     image.type = ImageType(get(words[3], 28, 4));
     image.address = ((std::uint64_t(get(words[1], 0, 8)) << 32) | words[0]) << 8;
-    image.min_lod = float(get(words[1], 8, 12)) / 256.0f;
+    image.min_lod = image_min_lod(words);
     image.format = get(words[1], 20, 9);
     image.width = (get(words[1], 30, 2) | (get(words[2], 0, 12) << 2)) + 1;
     image.height = get(words[2], 14, 14) + 1;
@@ -448,6 +452,7 @@ struct Sampler {
     // picks integer or float by the image's format, but Vulkan needs VK_BORDER_COLOR_INT_* in the sampler, so the
     // layer keeps it in the S# words, which are the sampler's key: see kIntegerBorderPtr.
     bool integer_border = false;
+    bool compare_never = false;  // D3D12 comparison filter with DEPTH_COMPARE_FUNC = NEVER
     bool operator==(const Sampler&) const = default;
 };
 
@@ -455,6 +460,11 @@ struct Sampler {
 // (Mesa writes it only for SQ_TEX_BORDER_COLOR_REGISTER), so with the three built-in types the field is free, and
 // the layer marks an integer border there. An integer table colour is not marked: table colours are not kept yet.
 inline constexpr std::uint32_t kIntegerBorderPtr = 0x800;
+
+// With DERIV_ADJUST_EN clear, GFX10 S# WORD3 has BORDER_COLOR_PTR in bits 0..11 and BORDER_COLOR_TYPE
+// in 30..31. Use an otherwise unused bit in layer-created samplers to distinguish a D3D12 NEVER comparison
+// from an ordinary filter: both hardware DEPTH_COMPARE_FUNC fields are zero, but Vulkan needs distinct samplers.
+inline constexpr std::uint32_t kCompareNever = 1u << 12;
 
 // As ac_build_sampler_descriptor fills it for GFX10:
 //   WORD0  CLAMP_X [2:0], CLAMP_Y [5:3], CLAMP_Z [8:6], MAX_ANISO_RATIO [11:9] = log2(anisotropy), at most 4,
@@ -482,6 +492,7 @@ inline SamplerWords encode(const Sampler& sampler) {
     const bool marked = sampler.integer_border && sampler.border_color != BorderColor::table;
     words[3] = field(marked ? kIntegerBorderPtr : sampler.border_color_index, 0, 12) |
                field(std::uint32_t(sampler.border_color), 30, 2);
+    if (sampler.compare == CompareFunction::never && sampler.compare_never) words[3] |= kCompareNever;
     return words;
 }
 
@@ -495,6 +506,9 @@ inline Sampler decode(const SamplerWords& words) {
     sampler.address_w = AddressMode(get(words[0], 6, 3));
     sampler.max_anisotropy = 1u << std::min(get(words[0], 9, 3), 4u);
     sampler.compare = CompareFunction(get(words[0], 12, 3));
+    // DERIV_ADJUST_EN repurposes WORD3, so its bits are not layer markers in that layout.
+    const bool deriv_adjust = get(words[2], 31, 1) != 0;
+    sampler.compare_never = !deriv_adjust && sampler.compare == CompareFunction::never && (words[3] & kCompareNever);
     sampler.unnormalized = get(words[0], 15, 1) != 0;
     sampler.filter_mode = FilterMode(get(words[0], 29, 2));
     sampler.min_lod = float(get(words[1], 0, 12)) / 256.0f;
@@ -565,7 +579,7 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
     info.mipLodBias = sampler.lod_bias;
     info.anisotropyEnable = sampler.max_anisotropy > 1 ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = float(std::max(sampler.max_anisotropy, 1u));
-    info.compareEnable = sampler.compare != CompareFunction::never ? VK_TRUE : VK_FALSE;
+    info.compareEnable = (sampler.compare_never || sampler.compare != CompareFunction::never) ? VK_TRUE : VK_FALSE;
     info.compareOp = VkCompareOp(sampler.compare);
     info.minLod = sampler.min_lod;
     info.maxLod = sampler.max_lod;

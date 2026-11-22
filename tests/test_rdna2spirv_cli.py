@@ -1,16 +1,20 @@
-"""rdna2spirv.py command line: --limit and --shard are checked before anything is translated or written.
+"""rdna2spirv.py command-line validation and SPIR-V output tests.
 
     python -I tests/test_rdna2spirv_cli.py
 
-Standard library only: every case is refused by argparse, so no llvm-mc, spirv-as or shader input is needed. No
-game data.
+Standard library only: the output tests substitute the SPIR-V tools and use synthetic input.
 """
 import argparse
+import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -56,6 +60,64 @@ class CommandLine(unittest.TestCase):
                     self.assertIn(message, p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
                     self.assertFalse(os.path.exists(out))     # 9/8 used to write an empty index.part9.json
+
+
+class ValidatedOutput(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.src = root / "disasm" / "ps_fixture.s"
+        self.src.parent.mkdir()
+        self.src.write_text("\ts_endpgm\n", encoding="utf-8")
+        (root / "ps_fixture.dxbc").write_bytes(b"DXBC" + bytes(28))
+        self.out = root / "spirv"
+        self.out.mkdir()
+        self.module = self.out / "ps_fixture.spv"
+        self.index = self.out / "index.json"
+
+    def translate(self, *, reject_at=None):
+        def spirv_tool(cmd, **kwargs):
+            tool = cmd[0]
+            if tool == "spirv-as":
+                Path(cmd[3]).write_bytes(b"new module")
+            elif tool == "spirv-val":
+                self.assertEqual(Path(cmd[-1]).read_bytes(), b"new module")
+                if reject_at is None:
+                    self.assertFalse(self.module.exists(), "the binary was published before validation")
+            else:
+                self.fail(f"unexpected tool: {tool}")
+            rejected = tool == reject_at
+            return subprocess.CompletedProcess(cmd, int(rejected), "", "synthetic rejection" if rejected else "")
+
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), redirect_stdout(output):
+            rdna2spirv.main()
+        return output.getvalue()
+
+    def test_validator_rejection_does_not_publish_binary(self):
+        self.assertIn("INVALID: synthetic rejection", self.translate(reject_at="spirv-val"))
+        self.assertFalse(self.module.exists())
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+        self.assertTrue((self.out / "ps_fixture.spvasm").is_file())
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
+
+    def test_rejection_clears_retried_shader_but_preserves_unrelated_output(self):
+        other = self.out / "cs_other.spv"
+        other.write_bytes(b"unrelated module")
+        previous = {"cs_other": {"stage": "cs"}}
+        for tool in ("spirv-as", "spirv-val"):
+            with self.subTest(tool=tool):
+                self.module.write_bytes(b"old module")
+                self.index.write_text(json.dumps({**previous, "ps_fixture": {"stage": "ps"}}), encoding="utf-8")
+                self.assertIn("INVALID: synthetic rejection", self.translate(reject_at=tool))
+                self.assertFalse(self.module.exists())
+                self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), previous)
+                self.assertEqual(other.read_bytes(), b"unrelated module")
+
+    def test_validation_success_publishes_binary_and_metadata(self):
+        self.assertIn("1 pass spirv-val", self.translate())
+        self.assertEqual(self.module.read_bytes(), b"new module")
+        self.assertIn("ps_fixture", json.loads(self.index.read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":

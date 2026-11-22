@@ -26,12 +26,12 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 
 # every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, the two-mip draw, the gradient samples and three mesh fixtures (skipped here: build.py
+# tests, pixel tests, the two-mip draws, the gradient samples and three mesh fixtures (skipped here: build.py
 # does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
-         + 9 + len(check.GRADIENT_TESTS))  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, the two-mip draw,
-                                           # cs_user_sgprs, cs_cvt_f32_sat and ps_gather_wrap
+         + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
+         + 8)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat and ps_gather_wrap
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 

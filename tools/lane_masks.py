@@ -155,8 +155,8 @@ def step(state, ins):
             put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else EITHER)
     else:
         put(state, a[0], None)
-        if op.startswith("v_") and "_co_" in op and len(a) > 1:
-            put(state, a[1], MASK)                      # the carry-out of v_add_co_u32 and friends
+        if ((op.startswith("v_") and "_co_" in op) or op in ("v_mad_u64_u32", "v_mad_i64_i32")) and len(a) > 1:
+            put(state, a[1], MASK)                      # carry/sign lane mask of v_add_co_u32, v_mad_u64_u32, etc.
 
 
 def parked(blocks, masks):

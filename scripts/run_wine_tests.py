@@ -2,7 +2,7 @@
 
 Usage:
     python -I scripts/run_wine_tests.py --tests ctest.json --windows-root D:/a/Leonida/Leonida
-        [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--summary FILE]
+        [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--summary FILE] [--label TEXT]
 
 --tests is the output of `ctest --show-only=json-v1` from the Windows build, and --windows-root the checkout it was
 made in (forward slashes, as `cygpath -m` prints it). Paths under it are mapped to --root, the Linux checkout (default:
@@ -52,7 +52,10 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     if not command:
         return "fail", "no command (target not built?)"
     exe = map_path(command[0], args.windows_root, args.root)
-    if exe is None or not os.path.isfile(exe):
+    if exe is None:
+        # A test that runs a tool of the Windows runner (cmake -P, python) rather than one this build made.
+        return "skip", f"runs {command[0]}, not a program from the build"
+    if not os.path.isfile(exe):
         return "fail", f"executable not in the artifact: {command[0]}"
     argv = list(wine) + [exe]
     for a in command[1:]:
@@ -89,6 +92,7 @@ def main() -> int:
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
     ap.add_argument("--timeout", type=float, default=120.0, help="seconds per test (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
+    ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     args = ap.parse_args()
 
     with open(args.tests, encoding="utf-8-sig") as f:
@@ -116,7 +120,7 @@ def main() -> int:
 
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as f:
-            f.write("### Windows tests under Wine\n\n")
+            f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
             f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
             f.write("| Test | Result | Required |\n|---|---|---|\n")
             for name, status in results.items():

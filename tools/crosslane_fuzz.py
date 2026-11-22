@@ -866,6 +866,12 @@ def main():
     ap.add_argument("--translator", help="rdna2spirv.py to test (default: the one next to this file)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
+    if not os.path.isfile(args.exe):   # a Visual Studio build puts it in a configuration subfolder
+        folder, name = os.path.split(args.exe)
+        for config in ("RelWithDebInfo", "Release"):
+            if os.path.isfile(os.path.join(folder, config, name)):
+                args.exe = os.path.join(folder, config, name)
+                break
     global PERMLANE_FETCH_INACTIVE
     PERMLANE_FETCH_INACTIVE = args.permlane_fetch_inactive
     if args.translator:

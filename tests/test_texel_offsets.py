@@ -22,6 +22,11 @@ FORMS = [   # (instruction, SPIR-V op that takes the Offset, offset components)
     (f"image_sample_l_o v[4:5], v[10:13], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D", "OpImageSampleExplicitLod", 2),
     (f"image_sample_o v[4:5], v[10:12], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D", "OpImageSampleImplicitLod", 2),
     (f"image_sample_lz_o v[4:5], v[10:13], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_3D", "OpImageSampleExplicitLod", 3),
+    (f"image_sample_o v[4:5], v[10:11], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleImplicitLod", 2),
+    (f"image_sample_lz_o v[4:5], v[10:11], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleExplicitLod", 2),
+    (f"image_sample_l_o v[4:5], v[10:12], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleExplicitLod", 2),
+    (f"image_sample_b_o v[4:5], v[10:12], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleImplicitLod", 2),
+    (f"image_sample_c_lz_o v4, v[10:12], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleDrefExplicitLod", 2),
     (f"image_gather4_lz_o v[4:7], v[10:12], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D", "OpImageGather", 2),
 ]
 

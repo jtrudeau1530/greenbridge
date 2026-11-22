@@ -17,6 +17,10 @@ carve/
 *.bk2
 *.awc
 *.r9modeldata
+*.obj
+*.glb
+*.ogg
+*.wav
 
 # ---- build output and caches ----
 build/
