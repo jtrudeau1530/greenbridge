@@ -1101,7 +1101,7 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
                                   const ResourceBinding& resource, const VkImageSubresourceRange& range,
                                   VkImageLayout dst_layout) {
     const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
-    if (fmt.block <= 1 || !fmt.bytes || !vk.copy_buffer_to_image) return false;
+    if (fmt.block < 1 || !fmt.bytes || !vk.copy_buffer_to_image) return false;
     const std::uint32_t mip_begin = range.baseMipLevel;
     const std::uint32_t mip_end =
         range.levelCount == VK_REMAINING_MIP_LEVELS ? resource.mip_levels
@@ -1245,8 +1245,10 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
-        const bool compressed = fmt.block > 1;
-        if (resource.not_zeroed) {
+        const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
+        const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
+        const bool compressed = fmt.block > 1 || (!can_clear && color);
+        if (resource.not_zeroed || (!can_clear && !color)) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         } else if (compressed) {
