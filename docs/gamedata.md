@@ -923,8 +923,9 @@ Four representative roots in the world/navigation/map category (826,397 B across
   `o` in `Loopkup`.) Contains four keyed lookup tables (`key=`):
   - `LocationNames/Item` × 2,318 (`Name` on all 2,318; `TextureDictionary` and `Texture` on 46).
   - `InteriorNames/Item` × 1,358, holding `2,280` nested `<Item>` records with `{Name, Pos}`. Their 2,280 3D positions
-    span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — 100% inside the world bounds of the
-    `PAMH` heightmap and `GridAtlasInfo` grids above.
+    span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — their 2D `x`/`y` coordinates fall 100%
+    inside the `x`/`y` extent of the `PAMH` heightmap (`-13,312..5,120`, `-9,728..11,264`) and `GridAtlasInfo` grids
+    above, while `z` reaches `820.9` (above the `PAMH` `404` m ceiling).
   - `RoadNames/Item` × 409 (`Name` on all 409) and `RiverNames/Item` × 66.
 - **`PathingStyleData` (1 document, 5,993 B, 1 stream):** `StyleProfiles/Item` × 12 (`key=`), each defining
   `CurvatureStyle`, `CorneringStyle`, `ApproachStyle`, `ContinuityStyle`, `SlowdownStyle`, `SplineConfig`, and
