@@ -31,6 +31,10 @@
 #include "file_system.h"
 #include "shims.h"
 
+namespace rt::shims {
+bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
+}
+
 namespace {
 
 // ---- XGameRuntime ----
@@ -362,6 +366,8 @@ HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** ou
     if (class_id && out) {
         for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object(), &package_object()})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
+        HRESULT hr = S_OK;
+        if (rt::shims::xgameruntime_user_query(*class_id, interface_id, out, &hr)) return hr;   // xgameruntime_user.cpp
     }
     char cls[40], iid[40];
     print_guid(cls, class_id);

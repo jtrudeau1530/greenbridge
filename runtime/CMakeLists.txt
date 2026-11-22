@@ -97,6 +97,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
+    shims/xgameruntime_user.cpp
     shims/library_loader.cpp
     shims/process.cpp
   )
@@ -226,6 +227,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(xgameruntime_test
     test/xgameruntime_test.cpp
     shims/xgameruntime.cpp
+    shims/xgameruntime_user.cpp
     shims/library_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
@@ -235,6 +237,20 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xgameruntime_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xgameruntime_test PRIVATE /OPT:NOREF)
   target_link_libraries(xgameruntime_test PRIVATE gta6rt_xtaskqueue)
+
+  # XUserImpl (offline local user) through QueryApiImpl, slot by slot as xgameruntime.lib's thunks call it.
+  add_executable(xgameruntime_user_test
+    test/xgameruntime_user_test.cpp
+    shims/xgameruntime.cpp
+    shims/xgameruntime_user.cpp
+    shims/library_loader.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xgameruntime_user_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xgameruntime_user_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xgameruntime_user_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xgameruntime_user_test PRIVATE /OPT:NOREF)
+  target_link_libraries(xgameruntime_user_test PRIVATE gta6rt_xtaskqueue)
 
   # GameInput shim on SDL3 (zlib licence): any controller SDL supports, DualSense trigger effects and lightbar.
   # Nothing is downloaded unless asked. The shim is built when SDL3 is available:
@@ -771,6 +787,12 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
+    add_test(NAME xgameruntime_user COMMAND xgameruntime_user_test)
+    add_test(NAME xgameruntime_user_gamertag COMMAND xgameruntime_user_test --expect-gamertag Tester42)
+    set_tests_properties(xgameruntime_user_gamertag PROPERTIES ENVIRONMENT "LEONIDA_GAMERTAG=Tester42")
+    # Longer than getenv_s's old 64-byte buffer: still the "Player" fallback (and its message), not a silent one.
+    add_test(NAME xgameruntime_user_gamertag_long COMMAND xgameruntime_user_test --expect-gamertag Player)
+    set_tests_properties(xgameruntime_user_gamertag_long PROPERTIES ENVIRONMENT "LEONIDA_GAMERTAG=GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG")
   endif()
   if(WIN32 AND TARGET gameinput_test)
     add_test(NAME gameinput COMMAND gameinput_test)

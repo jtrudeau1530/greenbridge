@@ -158,7 +158,8 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XUserImpl` from xgameruntime-docs' layout
+(below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
@@ -199,6 +200,30 @@ connectivity (level None), the port and URL security-information queries fail wi
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
+
+`XUserImpl` (`runtime/shims/xgameruntime_user.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
+calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table), so its slots are **not measured** yet.
+The executable's first boot confirms them, or names the slots that differ.
+- **Interfaces:** the class id doubles as `IXUserImpl`'s; `IXUserImpl2`-`6` answer with the same 50-slot vtable;
+  `IXUserGamertagImpl` (`XUserGetGamertag`) is a second interface.
+- **The user:** one offline local user, always signed in. `XUserAddAsync` adds it with or without
+  `AddDefaultUserSilently` (with `AllowGuests` as well, it's `E_INVALIDARG`, as documented). It has fixed non-zero user
+  and local ids, is not a guest, is an adult, and has every privilege. Its gamertag comes from `LEONIDA_GAMERTAG` (15
+  printable ASCII characters at most), `Player` otherwise.
+- **Handles:** each one is its own allocation, closed once by `XUserCloseHandle`. `XUserCompare` is 0 for any two
+  handles, since they all name the one user.
+- **Not available offline:** token, gamer-picture, MSA-token and resolve-issue requests fail synchronously before
+  starting (`E_GAMEUSER_FAILED_TO_GET_TOKEN`, `E_FAIL`, `E_GAMEUSER_FAILED_TO_RESOLVE`), so no `XAsyncBlock` waits.
+  `XUserGetSignOutDeferral` is `E_GAMEUSER_DEFERRAL_NOT_AVAILABLE`, and change callbacks are only tracked as tokens,
+  because the user never changes.
+- **Logged on first use:** the docs' unknown slot 15 (answers `E_NOTIMPL`, so nothing reads outputs it didn't
+  write), the PC-only `IXUserImpl5` slots and `IXUserImpl6`'s undocumented sign-out trio (`XUserIsSignOutPresent`, a
+  bool, answers false).
+- **Validity:** handles are looked up in a live set, never read, so a closed or foreign pointer is refused without
+  touching its memory, and a double close does nothing. Unregistering a change callback is never pending, so it
+  returns true for any token. `XUserIsStoreUser` is true, as documented for console.
+
+`xgameruntime_user_test` calls every served slot with the documented arguments.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
