@@ -436,6 +436,62 @@ int main() {
         CHECK(prepare(past, resolve, ReplayFunctions{}, prepared) == ReplayResult::invalid_subresource);
     }
 
+    // Indirect argument and count resources can occupy different slices of one Vulkan buffer.
+    {
+        ResourceBinding arguments{}, counts{};
+        arguments.buffer = counts.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{1});
+        arguments.buffer_offset = 256;
+        arguments.size = 128;
+        counts.buffer_offset = 512;
+        counts.size = 16;
+        const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+            if (id == 1) return &arguments;
+            if (id == 2) return &counts;
+            return nullptr;
+        };
+
+        static std::vector<VkDeviceSize> offsets;
+        ReplayFunctions vk{};
+        vk.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t, std::uint32_t) {
+            offsets.push_back(offset);
+        };
+        vk.draw_indexed_indirect = vk.draw_indirect;
+        vk.draw_indirect_count = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, VkBuffer,
+                                    VkDeviceSize count_offset, std::uint32_t, std::uint32_t) {
+            offsets.push_back(offset);
+            offsets.push_back(count_offset);
+        };
+        vk.draw_indexed_indirect_count = vk.draw_indirect_count;
+        vk.dispatch_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset) {
+            offsets.push_back(offset);
+        };
+
+        CommandList list;
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 8, 0, 0}));
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 12, 2, 4}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 16, 2, 8}));
+        CHECK(list.execute_indirect({IndirectKind::dispatch, 20, 2, 1, 20, 0, 0}));
+        CHECK(list.close());
+        CHECK(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success);
+        const std::vector<VkDeviceSize> expected{260, 264, 268, 516, 272, 520, 276, 296};
+        CHECK(offsets == expected);
+
+        // Reject invalid spans before invoking Vulkan, including after adding the backing-buffer base.
+        const auto rejected = [&](const ExecuteIndirect& command) {
+            CommandList invalid;
+            return invalid.execute_indirect(command) && invalid.close() &&
+                   replay(invalid, VK_NULL_HANDLE, resolve, vk) == ReplayResult::invalid_indirect_arguments;
+        };
+        CHECK(rejected({IndirectKind::draw, 12, 1, 1, 0, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 16, 1, 1, 2, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 16, 2, 1, 112, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 16, 1, 1, 4, 2, 16}));
+        arguments.buffer_offset = UINT64_MAX - 3;
+        CHECK(rejected({IndirectKind::dispatch, 12, 1, 1, 0, 0, 0}));
+        CHECK(offsets == expected);
+    }
+
     // Resizable BAR detection (D3D-96) on the heap layouts real cards report.
     {
         constexpr VkDeviceSize mib = VkDeviceSize(1) << 20;

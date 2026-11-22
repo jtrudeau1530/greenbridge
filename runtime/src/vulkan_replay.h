@@ -704,6 +704,7 @@ enum class ReplayResult {
     invalid_copy,
     invalid_predication,
     invalid_query,
+    invalid_indirect_arguments,
     unsupported
 };
 
@@ -943,6 +944,21 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
 
 inline bool within(std::uint64_t offset, std::uint64_t size, std::uint64_t total) {
     return offset <= total && size <= total - offset;
+}
+
+inline VkDeviceSize indirect_record_size(IndirectKind kind) {
+    switch (kind) {
+    case IndirectKind::draw: return sizeof(VkDrawIndirectCommand);
+    case IndirectKind::draw_indexed: return sizeof(VkDrawIndexedIndirectCommand);
+    case IndirectKind::dispatch: return sizeof(VkDispatchIndirectCommand);
+    }
+    return 0;
+}
+
+inline bool indirect_range(const ResourceBinding& binding, VkDeviceSize offset, VkDeviceSize bytes) {
+    return (binding.buffer_offset | offset) % sizeof(std::uint32_t) == 0 &&
+           within(offset, bytes, binding.size) &&
+           within(binding.buffer_offset, offset + bytes, UINT64_MAX);
 }
 
 // The bytes of a buffer UAV clear, and whether the transfer commands can write them. Elements of up to 4 bytes
@@ -1758,9 +1774,17 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             out.queries.push_back({i, heap, statistics_active});
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
+            const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
+            if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))
+                return ReplayResult::invalid_indirect_arguments;
+            const VkDeviceSize bytes = VkDeviceSize(ind->max_count - 1) * ind->stride + record_size;
+            if (!detail::indirect_range(p.binding, ind->argument_offset, bytes))
+                return ReplayResult::invalid_indirect_arguments;
             if (ind->count_buffer) {
                 const ResourceBinding* cnt = resolve(ind->count_buffer);
                 if (!cnt || !cnt->buffer) return ReplayResult::unresolved_resource;
+                if (!detail::indirect_range(*cnt, ind->count_offset, sizeof(std::uint32_t)))
+                    return ReplayResult::invalid_indirect_arguments;
                 p.source = *cnt;
                 if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
                     (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count) ||
@@ -2378,25 +2402,25 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
+            const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
             if (ind->count_buffer) {
+                const VkDeviceSize count = p.source.buffer_offset + ind->count_offset;
                 if (ind->kind == IndirectKind::draw) {
-                    vk.draw_indirect_count(command_buffer, p.binding.buffer, ind->argument_offset, p.source.buffer,
-                                           ind->count_offset, ind->max_count, ind->stride);
+                    vk.draw_indirect_count(command_buffer, p.binding.buffer, arguments, p.source.buffer,
+                                           count, ind->max_count, ind->stride);
                 } else if (ind->kind == IndirectKind::draw_indexed) {
-                    vk.draw_indexed_indirect_count(command_buffer, p.binding.buffer, ind->argument_offset,
-                                                   p.source.buffer, ind->count_offset, ind->max_count, ind->stride);
+                    vk.draw_indexed_indirect_count(command_buffer, p.binding.buffer, arguments,
+                                                   p.source.buffer, count, ind->max_count, ind->stride);
                 }
             } else {
                 if (ind->kind == IndirectKind::draw) {
-                    vk.draw_indirect(command_buffer, p.binding.buffer, ind->argument_offset, ind->max_count,
-                                     ind->stride);
+                    vk.draw_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
                 } else if (ind->kind == IndirectKind::draw_indexed) {
-                    vk.draw_indexed_indirect(command_buffer, p.binding.buffer, ind->argument_offset, ind->max_count,
-                                             ind->stride);
+                    vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
                 } else if (ind->kind == IndirectKind::dispatch) {
                     for (std::uint32_t k = 0; k < ind->max_count; ++k) {
                         vk.dispatch_indirect(command_buffer, p.binding.buffer,
-                                             ind->argument_offset + std::uint64_t(k) * ind->stride);
+                                             arguments + VkDeviceSize(k) * ind->stride);
                     }
                 }
             }
