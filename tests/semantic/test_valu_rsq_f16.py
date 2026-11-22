@@ -746,5 +746,65 @@ class TestSIMDMultiLaneDivergenceRSQF16(unittest.TestCase):
                 self.assertIsNone(results[lane_id])
 
 
+class TestRegisterAliasingRSQF16(unittest.TestCase):
+    """Unit tests verifying register aliasing and in-place operand preservation."""
+
+    def test_in_place_same_halfword_overwrite(self) -> None:
+        interp = ScalarInterpreter()
+        # Set v0 = [low=16.0 (0x4C00), high=0xBEEF]
+        interp.rf.write_vgpr(0, (0xBEEF << 16) | H_SIXTEEN)
+
+        # In-place overwrite: v0.l = v_rsq_f16 v0.l
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=0, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.VGPR, reg_index=0, half=HalfwordSelect.LOW_16)
+        res = interp.step(ASTRsqF16(dst=dst, src0=src))
+
+        self.assertEqual(res, H_QUARTER)
+        self.assertEqual(interp.rf.read_vgpr_half(0, HalfwordSelect.LOW_16), H_QUARTER)
+        # High halfword untouched
+        self.assertEqual(interp.rf.read_vgpr_half(0, HalfwordSelect.HIGH_16), 0xBEEF)
+
+    def test_cross_halfword_same_vgpr_aliasing(self) -> None:
+        interp = ScalarInterpreter()
+        # Initial v7 = [low=4.0 (0x4400), high=0x1111]
+        interp.rf.write_vgpr(7, (0x1111 << 16) | H_FOUR)
+
+        # v7.h = v_rsq_f16 v7.l
+        dst_h = ASTOperand(op_type=OperandType.VGPR, reg_index=7, half=HalfwordSelect.HIGH_16)
+        src_l = ASTOperand(op_type=OperandType.VGPR, reg_index=7, half=HalfwordSelect.LOW_16)
+        interp.step(ASTRsqF16(dst=dst_h, src0=src_l))
+
+        # Result in v7.h should be 0.5 (0x3800), and v7.l remains 4.0 (0x4400)
+        self.assertEqual(interp.rf.read_vgpr_half(7, HalfwordSelect.HIGH_16), H_HALF)
+        self.assertEqual(interp.rf.read_vgpr_half(7, HalfwordSelect.LOW_16), H_FOUR)
+
+        # Next: v7.l = v_rsq_f16 v7.h (rsq(0.5) = 1/sqrt(0.5) = sqrt(2) ~ 1.4142)
+        dst_l = ASTOperand(op_type=OperandType.VGPR, reg_index=7, half=HalfwordSelect.LOW_16)
+        src_h = ASTOperand(op_type=OperandType.VGPR, reg_index=7, half=HalfwordSelect.HIGH_16)
+        res_l = interp.step(ASTRsqF16(dst=dst_l, src0=src_h))
+        val_l = bits_to_f16(res_l)
+        self.assertTrue(math.isclose(val_l, math.sqrt(2.0), rel_tol=1e-3))
+
+    def test_chain_in_place_recurrence_pipeline(self) -> None:
+        interp = ScalarInterpreter()
+        # Initialize v1.l = 16.0
+        interp.rf.write_vgpr_half(1, HalfwordSelect.LOW_16, H_SIXTEEN)
+
+        # Step 1: v1.l = rsq(16.0) = 0.25
+        dst = ASTOperand(op_type=OperandType.VGPR, reg_index=1, half=HalfwordSelect.LOW_16)
+        src = ASTOperand(op_type=OperandType.VGPR, reg_index=1, half=HalfwordSelect.LOW_16)
+        step1 = interp.step(ASTRsqF16(dst=dst, src0=src))
+        self.assertEqual(step1, H_QUARTER)
+
+        # Step 2: v1.l = rsq(0.25) = 2.0
+        step2 = interp.step(ASTRsqF16(dst=dst, src0=src))
+        self.assertEqual(step2, H_TWO)
+
+        # Step 3: v1.l = rsq(2.0) = 1/sqrt(2) ~ 0.7071
+        step3 = interp.step(ASTRsqF16(dst=dst, src0=src))
+        val3 = bits_to_f16(step3)
+        self.assertTrue(math.isclose(val3, 1.0 / math.sqrt(2.0), rel_tol=1e-3))
+
+
 if __name__ == "__main__":
     unittest.main()
