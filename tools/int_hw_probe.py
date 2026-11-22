@@ -60,34 +60,10 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 SENTINEL = 0x5A5A5A5A
 
 # Live translator divergences confirmed on AMD Radeon 680M (gfx1035, RDNA2, wave32 & wave64).
-# Each entry maps case.name -> (tag, expected_hw_words, reason).
-KNOWN_DIVERGENCES = {
-    "v_add_co_u32_clamp": (
-        "co_clamp_ignored",
-        [0xFFFFFFFF, 0x00000001, 0x00000000, 0x00000001],
-        "translator ignores VOP3 clamp on v_add_co_u32 / v_sub_co_u32",
-    ),
-    "v_subrev_co_u32_clamp": (
-        "co_clamp_ignored",
-        [0x00000000, 0x00000001, 0x00000000, 0x00000001],
-        "translator ignores VOP3 clamp on v_subrev_co_u32 / v_subrev_co_ci_u32",
-    ),
-    "v_add_co_ci_u32_clamp": (
-        "co_clamp_ignored",
-        [0xFFFFFFFF, 0x00000001, 0x00000000, 0x00000001],
-        "translator ignores VOP3 clamp on v_add_co_ci_u32 / v_sub_co_ci_u32",
-    ),
-    "v_cvt_rpi_precision": (
-        "cvt_rpi_exact_half",
-        [0x00000000, 0x00800001, 0x00FFFFFF, 0x00000000],
-        "hardware computes exact floor(x + 0.5); translator rounds x + 0.5 in binary32 first",
-    ),
-    "v_cvt_flr_rpi_nan_inf": (
-        "cvt_flr_rpi_nan_sign",
-        [0x7FFFFFFF, 0x80000000, 0x7FFFFFFF, 0x80000000],
-        "hardware saturates NaN by sign (+NaN -> 0x7fffffff, -NaN -> 0x80000000); translator gives 0",
-    ),
-}
+# Each entry maps case.name -> (tag, expected_hw_words, reason). Empty: the five measured on gfx1035 (VOP3 clamp
+# on the carry-out add/sub ops, v_cvt_rpi_i32_f32's exact floor(x + 0.5), and v_cvt_flr/rpi's NaN saturation by
+# sign) are translated as the hardware does since #1831 and #1856.
+KNOWN_DIVERGENCES = {}
 
 
 class Case:

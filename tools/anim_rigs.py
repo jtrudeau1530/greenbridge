@@ -153,7 +153,7 @@ def main():
         sys.exit(f"{e.filename or a.archive}: {e.strerror or e}")
     rows = [{k: v for k, v in d.items() if k != "entries"} | {"entries": len(d.get("entries", ()))} for d in dicts]
     try:
-        with open(a.out, "w", encoding="utf-8") as f:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "rig_dictionaries": rows}, f, indent=1)
     except OSError as e:
         sys.exit(f"{a.out}: cannot write: {e.strerror or e}")

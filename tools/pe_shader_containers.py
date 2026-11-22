@@ -252,17 +252,21 @@ def main(argv=None) -> int:
             index.extend(extract(data, records, a.extract))
 
     if a.extract:
-        with open(os.path.join(a.extract, "index.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(a.extract, "index.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(index, f, indent=0)
         print(f"  extracted {len(index)} file(s) to {a.extract}")
         print("  these are game data: do not commit them", file=sys.stderr)
 
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(all_records, f, indent=1)
         print(f"wrote {a.json}")
     return status
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -280,16 +280,10 @@ differences** (plus `tools/salu_diff.py --oracle hw,translator --bfe-any --progr
   kept), `v_cvt_f16_u16/i16` and `v_cvt_u16/i16_f16` (`_e64` keeps high half; NaN → 0, ±inf saturates; note GFX10
   does not accept `op_sel` on these opcodes), `v_cvt_i32_f32` (control: all ±qNaN/±sNaN → 0), and
   `v_cvt_pknorm_i16/u16_f32` (±qNaN → 0, ±inf saturation, RNE ties at ±0.5).
-- **Live translator divergences confirmed on gfx1035 (5/87, pinned in `KNOWN_DIVERGENCES`):**
-  1. **`v_add_co_u32`, `v_sub_co_u32`, `v_subrev_co_u32`, `v_add_co_ci_u32`, `v_sub_co_ci_u32`, `v_subrev_co_ci_u32`
-     with `clamp`:** hardware saturates `D` (`0xffffffff` on carry, `0x00000000` on borrow) while still reporting the
-     real carry/borrow (`1`) in `sdst`; the translator currently ignores `clamp` on these ops.
-  2. **`v_cvt_rpi_i32_f32` precision:** hardware computes exact `floor(x + 0.5)` without binary32 rounding of `x + 0.5`
-     (`0x3effffff` → `0`, `0x4b000001` → `0x00800001`, `0x4b7fffff` → `0x00ffffff`), whereas the translator rounds
-     `x + 0.5` in f32 first (`1`, `0x00800002`, `0x01000000`).
-  3. **`v_cvt_flr_i32_f32` / `v_cvt_rpi_i32_f32` on NaN:** hardware saturates by the NaN's sign bit (`0x7fc00000` →
-     `0x7fffffff`, `0xffc00000` → `0x80000000`), whereas `v_cvt_i32_f32` gives `0` for every NaN; the translator gives
-     `0` for both `flr` and `rpi`.
+- **Translator divergences found on gfx1035:** five (VOP3 `clamp` on the six carry-out add/sub ops ignored;
+  `v_cvt_rpi_i32_f32` rounding `x + 0.5` in binary32; `v_cvt_flr/rpi_i32_f32` returning `0` for NaN instead of
+  saturating by its sign). All are fixed (#1831, #1856), so `KNOWN_DIVERGENCES` is empty and all 87 cases
+  match.
 
 Two assembler facts matter when writing edge cases:
 
