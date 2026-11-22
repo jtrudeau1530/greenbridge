@@ -565,7 +565,10 @@ if(BUILD_TESTING)
     )
     # The register-preservation check needs a caller that sets rbx/rbp/rdi/rsi/r12-r15 and xmm6-15, which MSVC x64
     # cannot do inline: test/fixtures/abi_probe.asm (MASM). Without ml64 the rest of the test still runs.
-    find_program(LEONIDA_ML64 ml64)  # CMake would otherwise pick the 32-bit ml with the Ninja generator
+    # Visual Studio locates cl.exe without adding its directory to PATH.
+    # Keep looking for ml64 specifically so Ninja cannot select the 32-bit assembler.
+    get_filename_component(_gta6rt_compiler_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(LEONIDA_ML64 NAMES ml64 HINTS "${_gta6rt_compiler_bin}")
     if(LEONIDA_ML64)
       set(CMAKE_ASM_MASM_COMPILER "${LEONIDA_ML64}")
       enable_language(ASM_MASM)
