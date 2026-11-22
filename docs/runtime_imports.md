@@ -231,8 +231,9 @@ end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMem
   no error callback.
 - Reading a response and `WinHttpWriteData` fail with `ERROR_WINHTTP_INCORRECT_HANDLE_STATE`. Options, timeouts and
   headers are accepted; `WINHTTP_OPTION_CONTEXT_VALUE` and `WINHTTP_OPTION_HANDLE_TYPE` can be queried.
-- A status callback is inherited by child handles, which report `HANDLE_CREATED`; every handle reports
-  `HANDLE_CLOSING` once, last. `WinHttpCrackUrl` only parses, so it is the host's.
+- A status callback is inherited by child handles, and so is the parent's `WINHTTP_OPTION_CONTEXT_VALUE` as it is
+  when the child is made (measured on the host's `winhttp.dll`). Child handles report `HANDLE_CREATED`; every
+  handle reports `HANDLE_CLOSING` once, last. `WinHttpCrackUrl` only parses, so it is the host's.
 - Because the shims own the module, a title's `LoadLibrary("winhttp.dll")` gets a pseudo-handle too, and a WinHTTP
   function outside these 16 resolves to `NULL` (logged), never to the host.
 
