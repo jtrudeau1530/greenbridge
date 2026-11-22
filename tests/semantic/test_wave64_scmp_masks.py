@@ -13,6 +13,8 @@ Covers:
     pair or non-0/-1 immediate.
   - Preservation of the fast wave_equal vote path for same-half and mask-vs-0/-1 equality compares.
 """
+from __future__ import annotations
+
 import gc
 import os
 import struct
@@ -20,6 +22,16 @@ import sys
 import tempfile
 import unittest
 import warnings
+
+if not hasattr(int, "bit_count"):
+    try:
+        import ctypes
+        _mp = vars(int)
+        _d = ctypes.cast(ctypes.c_void_p.from_address(id(_mp) + 16).value, ctypes.py_object).value
+        _d["bit_count"] = lambda self: bin(abs(self)).count("1")
+        ctypes.pythonapi.PyType_Modified(ctypes.py_object(int))
+    except Exception:
+        pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -111,6 +123,41 @@ v_cmp_ne_u32_e64 vcc_lo, 0, v3
 def _s32(u):
     u &= 0xFFFFFFFF
     return u - 0x100000000 if u >= 0x80000000 else u
+
+
+def pack_u64(lo: int, hi: int) -> int:
+    """Pack low and high 32-bit unsigned words into a 64-bit integer."""
+    return ((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF)
+
+
+def unpack_u64(val: int) -> tuple[int, int]:
+    """Unpack a 64-bit integer into (lo, hi) 32-bit unsigned words."""
+    u = val & 0xFFFFFFFFFFFFFFFF
+    return u & 0xFFFFFFFF, (u >> 32) & 0xFFFFFFFF
+
+
+def ref_s_cmp_u64(op: str, src0: int, src1: int) -> int:
+    """Pure Python reference oracle for 64-bit scalar comparison operations.
+
+    Computes expected SCC (1 or 0) according to RDNA2 ISA specifications:
+    - s_cmp_eq_u64: SCC = (src0[63:0] == src1[63:0])
+    - s_cmp_lg_u64: SCC = (src0[63:0] != src1[63:0])
+    """
+    s0 = src0 & 0xFFFFFFFFFFFFFFFF
+    s1 = src1 & 0xFFFFFFFFFFFFFFFF
+    if op == "s_cmp_eq_u64":
+        return int(s0 == s1)
+    if op == "s_cmp_lg_u64":
+        return int(s0 != s1)
+    if op == "s_cmp_lt_u64":
+        return int(s0 < s1)
+    if op == "s_cmp_le_u64":
+        return int(s0 <= s1)
+    if op == "s_cmp_gt_u64":
+        return int(s0 > s1)
+    if op == "s_cmp_ge_u64":
+        return int(s0 >= s1)
+    raise ValueError(f"Unsupported 64-bit comparison op: {op}")
 
 
 class Wave64OppositeHalvesTests(unittest.TestCase):
@@ -359,6 +406,105 @@ class FastPathPreservationTests(unittest.TestCase):
                 self.assertIn("OpGroupNonUniformBitwiseOr", spv)
                 self.assertNotIn("OpGroupNonUniformAll", spv)
                 self.assertNotIn("OpGroupNonUniformAny", spv)
+
+
+
+class Wave64ReferenceOracleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        asm = (
+            WAVE64_BUILD_VCC_AND_SGPR
+            # 0: s_cmp_eq_u64 vcc, s[6:7] (mask vs scalar pair)
+            + "s_cmp_eq_u64 vcc, s[6:7]\n" + emit_store_scc(0)
+            # 1: s_cmp_lg_u64 vcc, s[6:7]
+            + "s_cmp_lg_u64 vcc, s[6:7]\n" + emit_store_scc(1)
+            # 2: s_cmp_eq_u64 s[6:7], vcc (scalar pair vs mask)
+            + "s_cmp_eq_u64 s[6:7], vcc\n" + emit_store_scc(2)
+            # 3: s_cmp_lg_u64 s[6:7], vcc
+            + "s_cmp_lg_u64 s[6:7], vcc\n" + emit_store_scc(3)
+            # 4: s_cmp_eq_u64 vcc, s[12:13] (mask vs mask SGPR copy)
+            + "s_cmp_eq_u64 vcc, s[12:13]\n" + emit_store_scc(4)
+            # 5: s_cmp_lg_u64 vcc, s[12:13]
+            + "s_cmp_lg_u64 vcc, s[12:13]\n" + emit_store_scc(5)
+            # 6: s_cmp_eq_u64 vcc, 0 (mask vs zero immediate)
+            + "s_cmp_eq_u64 vcc, 0\n" + emit_store_scc(6)
+            # 7: s_cmp_lg_u64 vcc, 0
+            + "s_cmp_lg_u64 vcc, 0\n" + emit_store_scc(7)
+            # 8: s_cmp_eq_u64 vcc, 0x55555555 (mask vs 32-bit literal immediate)
+            + "s_cmp_eq_u64 vcc, 0x55555555\n" + emit_store_scc(8)
+            # 9: s_cmp_lg_u64 vcc, 0x55555555
+            + "s_cmp_lg_u64 vcc, 0x55555555\n" + emit_store_scc(9)
+            + "s_endpgm\n"
+        )
+        cls.spv = translate_cs("cs_w64_oracle_u64", asm, threads=64)
+
+    def test_oracle_mathematical_properties(self):
+        """Verify fundamental mathematical invariants of the reference oracle itself."""
+        test_values = [
+            0,
+            0xFFFFFFFFFFFFFFFF,
+            0x5555555555555555,
+            0xAAAAAAAAAAAAAAAA,
+            0x123456789ABCDEF0,
+            1,
+            1 << 31,
+            1 << 32,
+            1 << 63,
+        ]
+        for a in test_values:
+            self.assertEqual(ref_s_cmp_u64("s_cmp_eq_u64", a, a), 1)
+            self.assertEqual(ref_s_cmp_u64("s_cmp_lg_u64", a, a), 0)
+            lo, hi = unpack_u64(a)
+            self.assertEqual(pack_u64(lo, hi), a)
+            for b in test_values:
+                eq = ref_s_cmp_u64("s_cmp_eq_u64", a, b)
+                lg = ref_s_cmp_u64("s_cmp_lg_u64", a, b)
+                self.assertEqual(eq ^ lg, 1)
+                self.assertEqual(eq + lg, 1)
+                self.assertEqual(eq, ref_s_cmp_u64("s_cmp_eq_u64", b, a))
+                self.assertEqual(lg, ref_s_cmp_u64("s_cmp_lg_u64", b, a))
+
+    def test_wave64_mask_vs_oracle(self):
+        """Cross-check simulated wave64 execution against reference oracle predictions."""
+        cases = [
+            # Exact matches
+            (0x12345678, 0x9ABCDEF0, 0x12345678, 0x9ABCDEF0),
+            (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+            (0x55555555, 0x00000000, 0x55555555, 0x00000000),
+            # Low half equal, high half different
+            (0xCAFEBABE, 0x11111111, 0xCAFEBABE, 0x22222222),
+            # High half equal, low half different
+            (0x11111111, 0xCAFEBABE, 0x22222222, 0xCAFEBABE),
+            # Single-bit difference at boundaries
+            (0x00000001, 0x00000000, 0x00000000, 0x00000000),
+            (0x80000000, 0x00000000, 0x00000000, 0x00000000),
+            (0x00000000, 0x00000001, 0x00000000, 0x00000000),
+            (0x00000000, 0x80000000, 0x00000000, 0x00000000),
+            # Inverted patterns
+            (0xAAAAAAAA, 0x55555555, 0x55555555, 0xAAAAAAAA),
+            (0x0F0F0F0F, 0xF0F0F0F0, 0xF0F0F0F0, 0x0F0F0F0F),
+        ]
+        for lo, hi, s6, s7 in cases:
+            with self.subTest(lo=hex(lo), hi=hex(hi), s6=hex(s6), s7=hex(s7)):
+                mask64 = pack_u64(lo, hi)
+                scalar64 = pack_u64(s6, s7)
+                mem = run_cs(self.spv, 64, s4=lo, s5=hi, s6=s6, s7=s7)
+
+                want = [
+                    ref_s_cmp_u64("s_cmp_eq_u64", mask64, scalar64),
+                    ref_s_cmp_u64("s_cmp_lg_u64", mask64, scalar64),
+                    ref_s_cmp_u64("s_cmp_eq_u64", scalar64, mask64),
+                    ref_s_cmp_u64("s_cmp_lg_u64", scalar64, mask64),
+                    ref_s_cmp_u64("s_cmp_eq_u64", mask64, mask64),
+                    ref_s_cmp_u64("s_cmp_lg_u64", mask64, mask64),
+                    ref_s_cmp_u64("s_cmp_eq_u64", mask64, 0),
+                    ref_s_cmp_u64("s_cmp_lg_u64", mask64, 0),
+                    ref_s_cmp_u64("s_cmp_eq_u64", mask64, 0x55555555),
+                    ref_s_cmp_u64("s_cmp_lg_u64", mask64, 0x55555555),
+                ]
+                got = [mem[4 * k] for k in range(10)]
+                self.assertEqual(got, want)
 
 
 if __name__ == "__main__":
