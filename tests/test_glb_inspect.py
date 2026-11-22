@@ -18,6 +18,19 @@ TOOL = os.path.join(ROOT, "tools", "glb_inspect.py")
 
 JSON_CHUNK = 0x4E4F534A
 BIN_CHUNK = 0x004E4942
+EXT_CHUNK = 0x54534554
+
+
+def json_bytes(gltf):
+    raw = json.dumps(gltf, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return raw + b" " * ((-len(raw)) % 4)
+
+
+def raw_glb(chunks):
+    """A GLB from (type, payload) chunks; the caller pads each payload to 4 bytes."""
+    body = b"".join(struct.pack("<II", len(payload), chunk_type) + payload
+                    for chunk_type, payload in chunks)
+    return struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body
 
 
 def container(json_payload, bin_payload=None, *, magic=b"glTF", version=2, length_delta=0):
@@ -31,9 +44,7 @@ def container(json_payload, bin_payload=None, *, magic=b"glTF", version=2, lengt
 
 
 def glb(gltf, bin_payload=None, **kwargs):
-    raw = json.dumps(gltf, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    raw += b" " * ((-len(raw)) % 4)
-    return container(raw, bin_payload, **kwargs)
+    return container(json_bytes(gltf), bin_payload, **kwargs)
 
 
 def triangle_gltf():
@@ -238,6 +249,111 @@ class GlbInspectTests(unittest.TestCase):
 
         truncated = struct.pack("<4sII", b"glTF", 2, 24) + struct.pack("<II", 100, JSON_CHUNK) + b"    "
         self.assert_error(truncated, "truncated JSON chunk")
+
+    def test_extension_chunks_are_ignored_but_bin_stays_second(self):
+        payload = json_bytes({"asset": {"version": "2.0"}})
+        accepted = raw_glb([(JSON_CHUNK, payload), (EXT_CHUNK, b"TEST")])
+        result = self.run_bytes(accepted)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"chunks: JSON {len(payload)} bytes", result.stdout)
+        self.assertIn("0x54534554 4 bytes", result.stdout)
+
+        with_bin = raw_glb([(JSON_CHUNK, payload), (BIN_CHUNK, b"\x00" * 4),
+                             (EXT_CHUNK, b"TEST")])
+        self.assertEqual(self.run_bytes(with_bin).returncode, 0)
+
+        misplaced = raw_glb([(JSON_CHUNK, payload), (EXT_CHUNK, b"TEST"),
+                             (BIN_CHUNK, b"\x00" * 4)])
+        self.assert_error(misplaced, "BIN chunk must immediately follow")
+
+        duplicate = raw_glb([(JSON_CHUNK, payload), (JSON_CHUNK, payload)])
+        self.assert_error(duplicate, "duplicate JSON chunk")
+
+    def test_chunk_and_header_lengths_must_be_4_byte_aligned(self):
+        payload = b'{"asset":{"version":"2.0"}}'
+        self.assertEqual(len(payload) % 4, 3)
+
+        header = struct.pack("<4sII", b"glTF", 2, 48)
+        body = struct.pack("<II", len(payload), JSON_CHUNK) + payload + b" "
+        self.assert_error(header + body, "not a multiple of 4")
+
+        header = struct.pack("<4sII", b"glTF", 2, 47)
+        body = struct.pack("<II", len(payload), JSON_CHUNK) + payload
+        self.assert_error(header + body, "not 4-byte aligned")
+
+    def test_nul_padding_is_accepted_and_counted(self):
+        payload = b'{"asset":{"version":"2.0"}}' + b"\x00"
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "nul.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(raw_glb([(JSON_CHUNK, payload)]))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("padding 1", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            self.assertEqual(report["chunks"][0]["padding"], 1)
+            self.assertEqual(report["chunks"][0]["nul_padding"], 1)
+
+    def test_negative_indices_are_treated_as_missing(self):
+        gltf = {
+            "asset": {"version": "2.0"},
+            "meshes": [{"primitives": [{"attributes": {"POSITION": -1}, "material": -2}]}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": -4}}}],
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "negative.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            primitive = report["meshes"][0]["primitives"][0]
+            self.assertIsNone(primitive["position_accessor"])
+            self.assertIsNone(primitive["material_index"])
+            self.assertIsNone(primitive["material"])
+            self.assertIsNone(report["materials"][0]["base_color_texture_index"])
+            self.assertIsNone(report["position_bbox"])
+            self.assertFalse(report["position_bbox_complete"])
+
+    def test_non_object_entries_are_counted_as_invalid(self):
+        gltf = {
+            "asset": {"version": "2.0"},
+            "meshes": [None, {"primitives": []}],
+            "materials": [None],
+            "skins": [None],
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "invalid.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("invalid entries: meshes=1 materials=1 skins=1", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            self.assertEqual(report["counts"]["meshes"], 2)
+            self.assertEqual(report["counts"]["materials"], 1)
+            self.assertEqual(report["counts"]["skins"], 1)
+            self.assertEqual(len(report["meshes"]), 1)
+            self.assertEqual(len(report["materials"]), 0)
+            self.assertEqual(len(report["skins"]), 0)
+            self.assertEqual(report["invalid_counts"], {"meshes": 1, "materials": 1, "skins": 1})
+
+    def test_json_write_failure_does_not_print_a_partial_report(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "model.glb")
+            out = os.path.join(folder, "missing", "report.json")
+            with open(path, "wb") as handle:
+                handle.write(triangle_glb())
+            result = self.run_tool(path, "--json", out)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot write", result.stderr)
+            self.assertEqual(result.stdout.strip(), "")
 
     def test_json_round_trip_and_input_alias_refusal(self):
         with tempfile.TemporaryDirectory() as folder:

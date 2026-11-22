@@ -18,6 +18,12 @@ import os
 import struct
 import sys
 
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+from report_paths import same_report_path  # noqa: E402
+
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
 GLB_HEADER_SIZE = 12
@@ -42,6 +48,19 @@ class GlbError(ValueError):
 
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _index(value: object) -> int | None:
+    """A non-negative integer index, or None."""
+    return value if _is_int(value) and value >= 0 else None
+
+
+def _chunk_type_name(chunk_type: int) -> str:
+    if chunk_type == CHUNK_TYPE_JSON:
+        return "JSON"
+    if chunk_type == CHUNK_TYPE_BIN:
+        return "BIN"
+    return f"0x{chunk_type:08X}"
 
 
 def _object(value: object) -> dict:
@@ -89,6 +108,8 @@ def parse_glb(data: bytes) -> dict:
     if declared_length != size:
         detail = "file is truncated" if declared_length > size else "file has trailing bytes"
         raise GlbError(f"declared GLB length {declared_length} does not match file size {size} ({detail})")
+    if declared_length % 4:
+        raise GlbError(f"declared GLB length {declared_length} is not 4-byte aligned")
     if size < GLB_HEADER_SIZE + CHUNK_HEADER_SIZE:
         raise GlbError("missing JSON chunk")
 
@@ -99,26 +120,30 @@ def parse_glb(data: bytes) -> dict:
             raise GlbError(f"truncated chunk header at offset {offset}")
         chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
         remaining = size - offset - CHUNK_HEADER_SIZE
+        label = _chunk_type_name(chunk_type)
         if chunk_length > remaining:
-            label = "JSON" if chunk_type == CHUNK_TYPE_JSON else "BIN" if chunk_type == CHUNK_TYPE_BIN else "chunk"
             raise GlbError(
                 f"truncated {label} chunk at offset {offset}: "
                 f"declared {chunk_length} bytes, {remaining} available"
             )
+        if chunk_length % 4:
+            raise GlbError(f"{label} chunk at offset {offset} has length {chunk_length}, not a multiple of 4")
         payload = data[offset + CHUNK_HEADER_SIZE:offset + CHUNK_HEADER_SIZE + chunk_length]
         chunks.append({"type": chunk_type, "length": chunk_length, "payload": payload})
         offset += CHUNK_HEADER_SIZE + chunk_length
 
     if not chunks or chunks[0]["type"] != CHUNK_TYPE_JSON:
-        kind = f"0x{chunks[0]['type']:08X}" if chunks else "none"
+        kind = _chunk_type_name(chunks[0]["type"]) if chunks else "none"
         raise GlbError(f"missing JSON chunk: first chunk is {kind}")
 
     json_payload = chunks[0]["payload"]
-    padding = len(json_payload) - len(json_payload.rstrip(b" "))
+    pad_start = len(json_payload.rstrip(b" \x00"))
+    padding = len(json_payload) - pad_start
+    nul_padding = json_payload[pad_start:].count(b"\x00")
     # Some writers pad with NUL although the spec requires spaces; accept it for
-    # parsing, while the reported padding above still describes the bytes.
+    # parsing, while still reporting exactly how many bytes were padding.
     try:
-        json_text = json_payload.rstrip(b"\x00").decode("utf-8", errors="strict")
+        json_text = json_payload[:pad_start].decode("utf-8", errors="strict")
         gltf = json.loads(json_text, parse_constant=_reject_json_constant)
     except json.JSONDecodeError as exc:
         raise GlbError(f"malformed JSON chunk: {exc.msg} at line {exc.lineno} column {exc.colno}") from exc
@@ -131,21 +156,34 @@ def parse_glb(data: bytes) -> dict:
 
     bin_payload = None
     bin_padding = None
-    if len(chunks) > 2:
-        raise GlbError("unexpected chunk 3: GLB allows only a JSON and an optional BIN chunk")
-    if len(chunks) == 2:
-        if chunks[1]["type"] != CHUNK_TYPE_BIN:
-            raise GlbError(f"second chunk is not BIN: got type 0x{chunks[1]['type']:08X}")
-        bin_payload = chunks[1]["payload"]
+    seen_bin = False
+    for chunk_index, chunk in enumerate(chunks[1:], 1):
+        if chunk["type"] == CHUNK_TYPE_JSON:
+            raise GlbError(f"duplicate JSON chunk at offset {chunk_index}")
+        if chunk["type"] != CHUNK_TYPE_BIN:
+            continue  # extension chunks are allowed and ignored, per glTF 2.0 section 4.4
+        if seen_bin:
+            raise GlbError("duplicate BIN chunk")
+        if chunk_index != 1:
+            raise GlbError("BIN chunk must immediately follow the JSON chunk")
+        seen_bin = True
+        bin_payload = chunk["payload"]
         buffers = _array(gltf.get("buffers"))
         buffer0 = _object(buffers[0]) if buffers else {}
         declared = buffer0.get("byteLength")
         if "uri" not in buffer0 and _is_int(declared) and 0 <= declared <= len(bin_payload):
             bin_padding = len(bin_payload) - declared
 
-    chunk_table = [{"type": "JSON", "byte_length": chunks[0]["length"], "padding": padding}]
-    if bin_payload is not None:
-        chunk_table.append({"type": "BIN", "byte_length": chunks[1]["length"], "padding": bin_padding})
+    chunk_table = []
+    for chunk_index, chunk in enumerate(chunks):
+        entry = {"type": _chunk_type_name(chunk["type"]), "byte_length": chunk["length"]}
+        if chunk_index == 0:
+            entry["padding"] = padding
+            if nul_padding:
+                entry["nul_padding"] = nul_padding
+        elif chunk["type"] == CHUNK_TYPE_BIN:
+            entry["padding"] = bin_padding
+        chunk_table.append(entry)
     return {
         "version": version,
         "json": gltf,
@@ -211,13 +249,13 @@ def _texture_name(gltf: dict, texture_index: object) -> str | None:
 def _material_report(gltf: dict, index: int, material: dict) -> dict:
     pbr = _object(material.get("pbrMetallicRoughness"))
     base_color_texture = _object(pbr.get("baseColorTexture"))
-    texture_index = base_color_texture.get("index")
+    texture_index = _index(base_color_texture.get("index"))
     return {
         "index": index,
         "name": _text(material.get("name")),
         "base_color_factor": pbr.get("baseColorFactor"),
         "base_color_texture": _texture_name(gltf, texture_index),
-        "base_color_texture_index": texture_index if _is_int(texture_index) else None,
+        "base_color_texture_index": texture_index,
         "alpha_mode": material.get("alphaMode"),
         "double_sided": material.get("doubleSided"),
     }
@@ -253,7 +291,7 @@ def _primitive_report(gltf: dict, primitive_index: int, primitive: dict) -> dict
     mode, mode_name, mode_defaulted = _primitive_mode(primitive)
     indices_index = primitive.get("indices")
     element_count = _accessor_count(gltf, indices_index) if indices_index is not None else vertices
-    material_index = primitive.get("material")
+    material_index = _index(primitive.get("material"))
     return {
         "index": primitive_index,
         "mode": primitive.get("mode") if _is_int(primitive.get("mode")) else None,
@@ -261,9 +299,9 @@ def _primitive_report(gltf: dict, primitive_index: int, primitive: dict) -> dict
         "mode_defaulted": mode_defaulted,
         "vertices": vertices,
         "triangles": _triangle_count(mode, element_count),
-        "material_index": material_index if _is_int(material_index) else None,
+        "material_index": material_index,
         "material": _material_name(gltf, material_index),
-        "position_accessor": position_index if _is_int(position_index) else None,
+        "position_accessor": _index(position_index),
         "bbox": _bbox(position_accessor),
     }
 
@@ -314,7 +352,11 @@ def build_report(glb: dict, file_bytes: int) -> dict:
              if primitive["bbox"] is not None]
     position_primitives = sum(1 for mesh in meshes for primitive in mesh["primitives"]
                               if primitive["position_accessor"] is not None)
-    return {
+    invalid_counts = {
+        key: sum(1 for entry in _array(gltf.get(key)) if not isinstance(entry, dict))
+        for key in ("meshes", "materials", "skins")
+    }
+    report = {
         "bytes": file_bytes,
         "asset": {
             "version": asset.get("version"),
@@ -336,6 +378,9 @@ def build_report(glb: dict, file_bytes: int) -> dict:
         "materials": materials,
         "skins": skins,
     }
+    if any(invalid_counts.values()):
+        report["invalid_counts"] = invalid_counts
+    return report
 
 
 def _show(value: object) -> str:
@@ -356,6 +401,10 @@ def _bbox_text(box: dict | None) -> str:
     return f"min {_show(box['min'])} max {_show(box['max'])}"
 
 
+def _padding_text(value: object) -> str:
+    return "n/a" if value is None else _show(value)
+
+
 def format_report(report: dict) -> str:
     """Render the human-readable report."""
     lines = [f"bytes: {report['bytes']:,}"]
@@ -364,8 +413,11 @@ def format_report(report: dict) -> str:
     counts = report["counts"]
     lines.append("counts: " + " ".join(f"{key}={counts[key]}" for key in
                                        ("scenes", "nodes", "meshes", "materials", "images", "skins", "animations")))
+    invalid = report.get("invalid_counts")
+    if invalid:
+        lines.append("invalid entries: " + " ".join(f"{key}={value}" for key, value in invalid.items() if value))
     lines.append("chunks: " + ", ".join(
-        f"{chunk['type']} {chunk['byte_length']} bytes (padding {_show(chunk['padding'])})"
+        f"{chunk['type']} {chunk['byte_length']} bytes (padding {_padding_text(chunk.get('padding'))})"
         for chunk in report["chunks"]))
     bbox = report["position_bbox"]
     suffix = (" (partial: some POSITION accessors have no min/max)"
@@ -410,18 +462,6 @@ def format_report(report: dict) -> str:
     return "\n".join(lines)
 
 
-def same_path(first: str, second: str) -> bool:
-    """True when two spellings name the same file (normcase + realpath, then samefile)."""
-    try:
-        if os.path.samefile(first, second):
-            return True
-    except OSError:
-        pass
-    left = os.path.normcase(os.path.realpath(os.path.abspath(first)))
-    right = os.path.normcase(os.path.realpath(os.path.abspath(second)))
-    return left == right
-
-
 def inspect_file(path: str) -> dict:
     with open(path, "rb") as handle:
         data = handle.read()
@@ -438,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
         if os.path.isdir(args.json_path):
             print(f"error: --json {args.json_path} is a directory", file=sys.stderr)
             return 2
-        if same_path(args.json_path, args.input):
+        if same_report_path(args.json_path, args.input):
             print(f"error: --json {args.json_path} must not overwrite the input {args.input}", file=sys.stderr)
             return 2
 
@@ -451,7 +491,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot read {args.input}: {exc.strerror or exc}", file=sys.stderr)
         return 2
 
-    print(format_report(report))
     if args.json_path:
         try:
             with open(args.json_path, "w", encoding="utf-8", newline="\n") as handle:
@@ -460,6 +499,8 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as exc:
             print(f"error: cannot write {args.json_path}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
             return 2
+    print(format_report(report))
+    if args.json_path:
         print(f"wrote: {args.json_path}")
     return 0
 
