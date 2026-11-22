@@ -8,6 +8,9 @@ game.dll.md), so an exe and a dll with the same stem get separate reports. Image
 different directories get a numbered suffix (x.exe-2.json), and the name used is printed to stderr. The same file
 given twice with the same import search folder is inspected once. Reads the file only; never runs it.
 
+The report also lists run-time load candidates: DLL names the image holds as ASCII or UTF-16 strings without
+importing them, where a LoadLibrary* the import table doesn't show would point (docs/runtime_imports.md).
+
 Standard library only: the headers, the section table, the import, delay-import, export, TLS and relocation
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
 by the same standard-library-only CI job as the other tools.
@@ -18,6 +21,7 @@ import argparse
 import json
 import math
 import os
+import re
 import struct
 import sys
 from collections import Counter
@@ -245,6 +249,15 @@ def _exports(img: PeImage) -> list[str]:
     return names
 
 
+def _export_module_name(img: PeImage) -> str:
+    """The module name the export directory records (its Name field), or "" when there is none."""
+    rva, size = img.directory(DIR_EXPORT)
+    at = img.offset(rva) if rva and size >= 40 else None
+    if at is None or at + 16 > len(img.data):
+        return ""
+    return img.string_at(struct.unpack_from("<I", img.data, at + 12)[0]) or ""
+
+
 def _tls_callbacks(img: PeImage) -> int:
     rva, size = img.directory(DIR_TLS)
     if not rva or size < (40 if img.is64 else 24):
@@ -300,6 +313,30 @@ def _query_apiset(name: str) -> bool:
         return False
 
 
+# A DLL file name as an image stores it for LoadLibrary*: ASCII or UTF-16LE, letters, digits, '_', '-' and '.'.
+# A UTF-16 name starts after a NUL (or at the start), so the tail of an ASCII string followed by one isn't read as one.
+_DLL_ASCII = re.compile(rb"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}\.[dD][lL][lL](?![A-Za-z0-9_])")
+_DLL_WIDE = re.compile(rb"(?<![^\x00])(?:[A-Za-z0-9_]\x00)(?:[A-Za-z0-9_.\-]\x00){0,63}"
+                       rb"\.\x00[dD]\x00[lL]\x00[lL]\x00(?![A-Za-z0-9_]\x00)")
+
+
+def dll_strings(data: bytes, imported: set[str], own_name: str | tuple[str, ...] = "") -> list[dict]:
+    """DLL names the image holds as strings but doesn't import: candidates for a run-time LoadLibrary*, which the
+    import table doesn't show (XCurl.dll and libHttpClient.GDK.dll reach xgameruntime.dll only this way,
+    docs/runtime_imports.md). `imported` is the lower-cased names from the import tables; the image's own names
+    (its file name and the name in its export directory) are left out too. Each entry is {"name", "encoding":
+    "ascii" | "utf-16" | "both"}, sorted by name. A string is not proof of a load, only of where to look."""
+    seen: dict[str, set[str]] = {}
+    for m in _DLL_ASCII.finditer(data):
+        seen.setdefault(m.group().decode("ascii").lower(), set()).add("ascii")
+    for m in _DLL_WIDE.finditer(data):
+        seen.setdefault(m.group().decode("utf-16-le").lower(), set()).add("utf-16")
+    own = (own_name,) if isinstance(own_name, str) else own_name
+    skip = imported | {n.lower() for n in own if n}
+    return [{"name": n, "encoding": "both" if len(e) == 2 else next(iter(e))}
+            for n, e in sorted(seen.items()) if n not in skip]
+
+
 def classify_dll(name: str, game_dir: str | None) -> str:
     """bundled = ships beside the game, system = present on this Windows, shim = must be reimplemented."""
     if game_dir and os.path.isfile(os.path.join(game_dir, name)):
@@ -343,6 +380,10 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         entry["where"] = classify_dll(entry["dll"], game_dir)
 
     exports = _exports(img)
+    own_names = (os.path.basename(path), _export_module_name(img))
+    loads = dll_strings(img.data, {i["dll"].lower() for i in imports}, own_names)
+    for entry in loads:
+        entry["where"] = classify_dll(entry["name"], game_dir)
     pdata_rva, pdata_size = img.directory(DIR_EXCEPTION)
     reloc_rva, reloc_size = img.directory(DIR_BASERELOC)
 
@@ -364,6 +405,7 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "exports": exports,
         "pdata_functions": pdata_size // 12 if pdata_rva and pdata_size >= 12 else 0,
         "tls_callbacks": _tls_callbacks(img),
+        "runtime_load_candidates": loads,
     }
 
 
@@ -386,6 +428,13 @@ def to_markdown(r: dict) -> str:
     out += ["", "| dll | kind | resolves | functions |", "|---|---|---|---|"]
     for imp in sorted(r["imports"], key=lambda i: (i["where"] != "shim", i["dll"].lower())):
         out.append(f"| {imp['dll']} | {imp['kind']} | {imp['where']} | {len(imp['functions'])} |")
+    loads = r.get("runtime_load_candidates", [])
+    if loads:
+        out += ["", "## Run-time load candidates", "",
+                "DLL names held as strings but not imported: a `LoadLibrary*` the import table doesn't show "
+                "(a string is where to look, not proof of a load).", "",
+                "| dll | encoding | resolves |", "|---|---|---|"]
+        out += [f"| {d['name']} | {d['encoding']} | {d['where']} |" for d in loads]
     shims = [i for i in r["imports"] if i["where"] == "shim"]
     if shims:
         out += ["", "## Needs checking or a shim", ""]
