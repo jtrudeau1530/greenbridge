@@ -7,6 +7,7 @@ Every byte here is built by the test. No game file, game asset path or game name
 import csv
 import json
 import os
+import subprocess
 import struct
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import unittest
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "rbf0_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import rbf0_index  # noqa: E402
@@ -199,6 +201,51 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["chunks"], 1)
         self.assertEqual(summary["streams"], 2)
+
+
+class ArgumentTest(unittest.TestCase):
+    """Out-of-range scan arguments are refused before anything is written."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.rpf = os.path.join(self.root, "one.rpf")
+        with open(self.rpf, "wb") as f:
+            f.write(b"RBF0" + struct.pack("<I", 0x20) + bytes(0x20))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_bad_scan_arguments_fail_before_an_index_is_written(self):
+        for flag, value, message in (("--start", "-1", "must be 0 or more"),
+                                     ("--limit", "0", "must be at least 1"),
+                                     ("--limit", "-100", "must be at least 1")):
+            out = os.path.join(self.root, "bad.json")
+            p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet", flag, value],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn(message, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args, "--quiet"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    def test_missing_source_is_an_error_not_a_traceback(self):
+        out = os.path.join(self.root, "missing.json")
+        p = self.run_tool(os.path.join(self.root, "nope.rpf"), out)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("nope.rpf", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_unwritable_output_path_fails_before_the_scan(self):
+        for out in (os.path.join(self.root, "no_such_folder", "x.json"), self.root):
+            p = self.run_tool(self.rpf, out)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
 
 
 class OutputTest(unittest.TestCase):

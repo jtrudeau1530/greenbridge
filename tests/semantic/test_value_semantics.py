@@ -14,6 +14,9 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_pk_ashrrev_i16
   v_add_nc_u16          D.lo = (S0.lo + S1.lo) & 0xffff; the VOP3 form keeps D's high half (carry is dropped).
   v_sin_f16/v_cos_f16   input is a number of turns: sin/cos(S * 2*pi), rounded to binary16; high half kept.
+  v_add/sub/mul_f16,    low halves in, D.lo out, D's high half kept; neg/abs in the VOP3 form apply to the low
+  v_fmac_f16              half that is read. v_fmac_f16: D.lo = S0.lo * S1.lo + D.lo. The ps_f16_vop2 words were
+                          measured on an RX 6800 (gfx1030), wave32 and wave64 (see its .asm header).
   s_buffer_load_dwordx2 with destination vcc: dword 0 -> vcc_lo, dword 1 -> vcc_hi.
   v_interp_mov_f32      reads the flat (provoking-vertex) input attribute; the translator must declare it Flat.
   v_perm_b32            byte i = BYTE_PERMUTE({S0, S1}, S2 byte i) over 8 bytes, S1 = bytes 0-3: selector 0-7 picks
@@ -25,6 +28,9 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_bcnt_u32_b32        D = popcount(S0) + S1.
   v_ffbl_b32/ffbh_u32   index of the lowest set bit / count of leading zeros; 0xffffffff when S0 = 0.
   v_xad_u32/add3_u32    D = (S0 ^ S1) + S2 / D = S0 + S1 + S2, both mod 2^32.
+  s_min/max_i32/u32     D = S0 < S1 ? S0 : S1 (max: >), SCC = 1 when S0 is chosen, so a tie gives S1 and SCC 0.
+  v_fmamk_f32/madmk_f32 D = S0 * K + S1, K the literal (printed vdst, src0, K, vsrc1); fmamk is fused.
+  v_fmaak_f32/madak_f32 D = S0 * S1 + K (printed vdst, src0, vsrc1, K).
 
 The appended cases for ps_ops5/ps_ops6 also pin the op_sel source-half selection for packed shifts, which the
 GPU-checked ps_ops4 does not exercise. cs_bounds (compute) pins the buffer num_records bounds checks: an
@@ -46,7 +52,10 @@ EXPECTED_OPS6 = [0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0]
 EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
 EXPECTED_OPS8 = [0x80000000, 0xFFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
+EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
+EXPECTED_SCC_MINMAX = [0x00030205, 0x00030207, 0x00030209, 0x00030203]
+EXPECTED_FMA_LITERAL = [0x41B80000, 0x41800000, 0x40E00000, 0x41A40000]
 EXPECTED_BOUNDS = {0x00: 0x12345678, 0x04: 0x12345678, 0x08: 0x00000000, 0x0C: 0xEEEEEEEE}
 EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x0C: 0x3F800000,
                         0x10: 0x3F800000, 0x14: 0x00000000, 0x18: 0x3F800000, 0x1C: 0x00000000,
@@ -163,6 +172,36 @@ def reference_ops8():
             (xad + 16 + m) & m]                                  # v_ffbh_u32(0) = 0xffffffff
 
 
+def reference_scc_minmax():
+    def minmax(op, x, y):
+        """(D, SCC) of s_min/s_max _i32/_u32 on 32-bit words: SCC = 1 only when S0 is the one chosen."""
+        kx, ky = (_s(x), _s(y)) if op.endswith("i32") else (x, y)
+        pick = kx < ky if op.startswith("min") else kx > ky
+        return x if pick else y, int(pick)
+
+    words = []
+    m1 = 0xFFFFFFFF                                   # the inline constant -1 as a register word
+    for op, tie, strict in (("min_i32", 5, (m1, 1)), ("max_i32", 7, (1, m1)),
+                            ("min_u32", 9, (1, m1)), ("max_u32", 3, (m1, 1))):
+        d, scc_tie = minmax(op, tie, tie)
+        _, scc_strict = minmax(op, *strict)
+        words.append(d | ((1 if scc_tie else 2) << 8) | ((3 if scc_strict else 4) << 16))
+    return words
+
+
+def reference_fma_literal():
+    # Every product and sum is exact in f32, so fused and unfused give the same bits.
+    k1, k2 = 10.0, 0.5
+    return [_f32_bits(2.0 * k1 + 3.0), _f32_bits(2.0 * 3.0 + k1),     # fmamk, fmaak
+            _f32_bits(4.0 * k2 + 5.0), _f32_bits(4.0 * 5.0 + k2)]     # madmk, madak
+
+
+def reference_f16_vop2():
+    a, b, acc = _unhalf(0x3E00), _unhalf(0x3800), _unhalf(0x3C00)       # low halves: 1.5, 0.5, accumulator 1.0
+    return [0xAAAA0000 | _half(a + b), 0xAAAA0000 | _half(-a - abs(b)), 0xAAAA0000 | _half(a * b),
+            0x42000000 | _half(a * b + acc)]
+
+
 def reference_vcc_x2():
     return [0x11223344, 0x55667788, 0, 0]
 
@@ -246,7 +285,10 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_ops7(), EXPECTED_OPS7)
         self.assertEqual(reference_ops8(), EXPECTED_OPS8)
         self.assertEqual(reference_vcc_x2(), EXPECTED_VCC_X2)
+        self.assertEqual(reference_f16_vop2(), EXPECTED_F16_VOP2)
         self.assertEqual(reference_flat(), EXPECTED_FLAT)
+        self.assertEqual(reference_scc_minmax(), EXPECTED_SCC_MINMAX)
+        self.assertEqual(reference_fma_literal(), EXPECTED_FMA_LITERAL)
         self.assertEqual(reference_bounds(), EXPECTED_BOUNDS)
         self.assertEqual(reference_fmt_1010102(), EXPECTED_FMT_1010102)
 
@@ -286,6 +328,20 @@ class TranslatorValueSemantics(unittest.TestCase):
         # High halves of unsigned and signed products, popcount with an accumulator, lowest/highest set bit,
         # v_ffbh_u32(0) = -1 feeding a wrapping v_add3_u32, and v_xad_u32.
         self.check("ps_ops8", EXPECTED_OPS8)
+
+    def test_s_min_max_scc_on_a_tie(self):
+        # Equal operands give S1 and SCC 0 for s_min/s_max _i32 and _u32; -1 vs 1 sets SCC only when compared
+        # with the op's own signedness. A tie that set SCC turns byte 1 of a word from 2 into 1.
+        self.check("ps_scc_minmax", EXPECTED_SCC_MINMAX)
+    def test_fmamk_madmk_multiply_by_the_literal(self):
+        # fmamk/madmk multiply S0 by the literal and add vsrc1; fmaak/madak multiply S0 by vsrc1 and add the
+        # literal. Swapping K and vsrc1 changes every word (16 and 20.5 instead of 23 and 7, and back).
+        self.check("ps_fma_literal", EXPECTED_FMA_LITERAL)
+
+    def test_f16_vop2_partial_writes(self):
+        # Low halves in (the high halves hold other values), low half out, the destination's high half kept;
+        # v_fmac_f16 accumulates into the low half of its destination.
+        self.check("ps_f16_vop2", EXPECTED_F16_VOP2)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.

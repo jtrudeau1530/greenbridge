@@ -8,9 +8,11 @@ import csv
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -381,6 +383,15 @@ class OutputTest(unittest.TestCase):
         docs, _ = rbf0_tree.decode_source(self.root, limit=1)
         self.assertEqual(len(docs), 1)
 
+    def test_decode_source_validates_selection_before_reading(self):
+        for settings, message in (({"limit": 0}, "--limit must be at least 1"),
+                                  ({"limit": -1}, "--limit must be at least 1"),
+                                  ({"offset": -1}, "--offset must be non-negative")):
+            with self.subTest(settings=settings), patch.object(
+                    rbf0_tree, "_rows", side_effect=AssertionError("invalid selection reached the source reader")):
+                with self.assertRaisesRegex(ValueError, message):
+                    rbf0_tree.decode_source(self.root, **settings)
+
     def test_bad_resource_exit_code(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(WIDE + _open(0, b"TestRoot") + bytes([9, 0x10]) + struct.pack("<Q", 1))
@@ -389,6 +400,19 @@ class OutputTest(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc["summary"]["bad"], 1)
+
+    def test_cli_rejects_invalid_selection_before_writing(self):
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        tool = os.path.join(ROOT, "tools", "rbf0_tree.py")
+        out = os.path.join(self.root, "tree.json")
+        for option, value in (("--limit", "0"), ("--limit", "-1"), ("--offset", "-1")):
+            with self.subTest(option=option, value=value):
+                result = subprocess.run([sys.executable, "-I", tool, self.root, out, option, value],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(option, result.stderr)
+                self.assertFalse(os.path.exists(out))
 
     def test_summary_tree_shape(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:

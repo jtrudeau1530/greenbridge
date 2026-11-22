@@ -339,7 +339,10 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP):
                     mt = ZHDR.match(m, nxt, size)
                     if not mt:
                         break
-                    more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                    try:
+                        more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                    except zlib.error:
+                        break
                     if not meof or not more:
                         break
                     data += more
@@ -367,8 +370,6 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
         for root, _, files in os.walk(path):
             for name in sorted(files):
                 p = os.path.join(root, name)
-                if os.path.getsize(p) > max_inflate:
-                    continue
                 with open(p, "rb") as f:
                     head = f.read(4)
                 if head == b"9FPR":
@@ -376,6 +377,8 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
                     rows.extend(more)
                     stats["files"] += 1
                     stats["scanned_bytes"] += sub["scanned_bytes"]
+                    continue
+                if os.path.getsize(p) > max_inflate:
                     continue
                 with open(p, "rb") as f:
                     b = f.read(max_inflate + 1)

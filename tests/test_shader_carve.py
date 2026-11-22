@@ -437,10 +437,52 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertIsNone(index[5]["sm"])
         self.assertIn("PRIV", index[5]["parts"])
 
+    def test_carve_rejects_incomplete_parts_and_continues(self):
+        valid = make_dxbc([(b"PRIV", bytes(range(32)))])
+        short_directory = bytearray(valid)
+        struct.pack_into("<I", short_directory, 28, len(valid) // 4)
+        short_header = bytearray(valid)
+        struct.pack_into("<I", short_header, 32, len(valid) - 4)
+        short_payload = bytearray(valid)
+        struct.pack_into("<I", short_payload, 40, len(valid))
+        short_dxil = make_dxbc([(b"DXIL", b"\x65\x00"), (b"PRIV", bytes(range(32)))])
+
+        entries = [("short_directory", short_directory), ("short_header", short_header),
+                   ("short_payload", short_payload), ("short_dxil", short_dxil), ("valid", valid)]
+        with open(self.archive, "wb") as f:
+            for name, data in entries:
+                f.write(make_rpf_entry(name, 1, data))
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("1 shaders carved, 4 candidates rejected", res.stdout)
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["file"] for row in json.load(f)], ["valid.dxbc"])
+        self.assertEqual(sorted(os.listdir(self.out)), ["index.json", "valid.dxbc"])
+
     def test_nonexistent_archive_reports_error(self):
         missing = os.path.join(self.dir, "missing.rpf")
         res = self.run_carve(missing, self.out)
         self.assertNotEqual(res.returncode, 0)
+
+    def test_bad_inputs_are_usage_errors_and_leave_no_output_folder(self):
+        empty = os.path.join(self.dir, "empty.rpf")
+        open(empty, "wb").close()
+        cases = ((os.path.join(self.dir, "missing.rpf"), "is not a file"),
+                 (self.dir, "is not a file"),
+                 (empty, "is empty"))
+        for archive, message in cases:
+            res = self.run_carve(archive, self.out)
+            self.assertEqual(res.returncode, 2, res.stderr)
+            self.assertIn(message, res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertFalse(os.path.exists(self.out))
+
+    def test_no_arguments_is_a_usage_error(self):
+        res = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("required", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
 
 
 if __name__ == "__main__":

@@ -239,6 +239,18 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["files"], len(PAYLOADS))
         self.assertEqual(len(doc["files"]), len(PAYLOADS))
 
+    def test_bad_scan_arguments_fail_before_an_index_is_written(self):
+        for flag, value, message in (("--start", "-1", "must be 0 or more"),
+                                     ("--limit", "0", "must be at least 1"),
+                                     ("--limit", "-100", "must be at least 1")):
+            out = os.path.join(self.root, "bad.json")
+            p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet", flag, value],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn(message, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
@@ -248,6 +260,20 @@ class ArchiveTest(unittest.TestCase):
             doc = json.load(f)
         self.assertEqual(doc["summary"]["signatures"]["move"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["page-directory"]["files"], 1)
+
+    def test_cli_rigs_without_rigset_keys_keeps_existing_file(self):
+        # PAYLOADS' RBF0 stream has a schema name but no anim/rigset/ keys, so parse_rbf0 rejects it.
+        out = os.path.join(self.root, "index.json")
+        rigs = os.path.join(self.root, "rigs.json")
+        with open(rigs, "w", encoding="utf-8") as f:
+            f.write('{"previous": true}')
+        p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", rigs, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("no anim/rigset/ keys found", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(rigs, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"previous": True})
 
     def test_directory(self):
         folder = os.path.join(self.root, "carved")

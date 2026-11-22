@@ -7,17 +7,20 @@ Design rules (see tests/semantic/README.md):
   * Strict: any opcode, extended instruction, type or storage class not listed below raises
     UnsupportedConstruct. Nothing is skipped or approximated silently, so a translator change that starts
     emitting something new makes the test error out instead of passing.
-  * One invocation (one lane). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
+  * One invocation (one lane), or with run_workgroup several in lockstep, which meet only at
+    subgroup operations (Shuffle, Ballot, Any, All, BitwiseOr Reduce; BallotBitExtract and BallotFindLSB
+    are per lane). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
     branches the translator emits: OpBranch / OpBranchConditional to a later label plus OpPhi at the merge block.
     Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
-    boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores use a flat
-    address -> word dictionary. Workgroup storage and images are rejected.
+    boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores (and 32-bit
+    atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary. Workgroup
+    storage and images are rejected.
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
 
 Values: uint/int are Python ints in [0, 2**32) or [0, 2**64) for 64-bit types (signedness is applied by the
-operation, as in SPIR-V); float is a Python float rounded to binary32; vectors are tuples; arrays are lists;
-bool is bool.
+operation, as in SPIR-V); float is a Python float rounded to binary32 (one made by OpBitcast also keeps its exact
+32-bit pattern, so a signalling NaN comes back out unchanged); vectors are tuples; arrays are lists; bool is bool.
 """
 import math
 import re
@@ -37,7 +40,33 @@ _IGNORED = frozenset({
     "OpReturn", "OpFunctionEnd", "OpName", "OpSource",
 })
 
+_ATOMICS = frozenset({
+    "OpAtomicIAdd", "OpAtomicISub", "OpAtomicUMin", "OpAtomicUMax", "OpAtomicSMin", "OpAtomicSMax", "OpAtomicAnd",
+    "OpAtomicOr", "OpAtomicXor", "OpAtomicExchange", "OpAtomicCompareExchange",
+})
+
 _LINE = re.compile(r"^(?:(%\S+)\s*=\s*)?(Op\w+)\s*(.*)$")
+
+
+class _Undef:
+    """An undefined value (SPIR-V: a shift by at least the bit width). Pure arithmetic on it gives another
+    undefined value; any other use (a store, a branch or select condition, a subgroup operation, an output)
+    raises, so a result that does not depend on it, such as the unselected side of OpSelect, is still exact."""
+
+    def __repr__(self):
+        return "<undefined>"
+
+
+UNDEF = _Undef()
+
+# Operations whose result is undefined when an operand is (they have no side effect and no control).
+_PURE = frozenset({
+    "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot", "OpShiftLeftLogical", "OpShiftRightLogical",
+    "OpShiftRightArithmetic", "OpIAdd", "OpISub", "OpIMul", "OpUConvert", "OpBitCount", "OpIEqual",
+    "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThan", "OpUGreaterThanEqual", "OpCopyObject",
+    "OpBitcast",
+    "OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert",
+})
 
 
 def f32(x):
@@ -48,7 +77,25 @@ def f32(x):
         return float("inf") if x > 0 else float("-inf")
 
 
+class _F32(float):
+    """A binary32 value that came from a bit pattern (OpBitcast) and still carries that exact pattern.
+
+    struct's binary32 -> double conversion quiets a signalling NaN (it sets bit 22, issue #509), so the float
+    value alone cannot give the word back. OpBitcast, OpCopyObject, loads, stores, composites and outputs pass
+    the value on unchanged and keep `bits`; arithmetic on it returns a plain float, which drops them (SPIR-V
+    leaves the bits of a NaN result open)."""
+
+    __slots__ = ("bits",)
+
+    def __new__(cls, bits):
+        self = super().__new__(cls, struct.unpack("<f", struct.pack("<I", bits))[0])
+        self.bits = bits
+        return self
+
+
 def f32_bits(x):
+    if isinstance(x, _F32):
+        return x.bits
     try:
         return struct.unpack("<I", struct.pack("<f", x))[0]
     except OverflowError:
@@ -56,7 +103,7 @@ def f32_bits(x):
 
 
 def bits_f32(b):
-    return struct.unpack("<f", struct.pack("<I", b & MASK))[0]
+    return _F32(b & MASK)
 
 
 def half_to_float(h):
@@ -124,7 +171,110 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     PhysicalStorageBuffer loads and stores.
 
     Returns {output_variable_name: tuple_of_32bit_words}. Float outputs are returned as their bit patterns.
+    A module with a subgroup operation is rejected here; see run_workgroup.
     """
+    gen = _invocation(text, inputs, push_constants, memory)
+    try:
+        req = next(gen)
+    except StopIteration as done:
+        return done.value
+    gen.close()
+    raise UnsupportedConstruct(f"{req[0]} in a single invocation (use run_workgroup)")
+
+
+class UndefinedResult(Exception):
+    """A subgroup operation whose result SPIR-V leaves undefined (for example a shuffle from a lane that is not in
+    the subgroup). Raised instead of inventing a value."""
+
+
+def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_constants=None, memory=None,
+                  out_of_range="raise"):
+    """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
+
+    Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
+    invocation order). When `invocations` is not a multiple of `subgroup_size` the last subgroup is partial: its
+    missing lanes are not running. `inputs_for(i)` gives invocation i's Input values (see run_fragment); push
+    constants and the physical-address memory are shared. Every invocation must reach every subgroup operation,
+    in the same order (the translator emits them in uniform control flow and models EXEC with a variable, so a
+    lane that is off in EXEC still executes them).
+
+    Subgroup operations (Subgroup scope), over the running lanes of the caller's subgroup:
+      * OpGroupNonUniformShuffle returns the value of lane Id. An Id at or past `subgroup_size` is undefined in
+        SPIR-V: `out_of_range="raise"` raises UndefinedResult; `out_of_range="wrap"` takes lane Id mod
+        subgroup_size instead, a model of one observed driver behaviour and not of the specification (Leonida
+        issue #94: on a 32-wide NVIDIA subgroup lane 40 read lane 8). An Id inside the subgroup whose lane is not
+        running gives an undefined value (raises only if used, see _Undef).
+      * OpGroupNonUniformBallot sets bit l for each running lane l whose predicate is true.
+      * OpGroupNonUniformAny / All: the predicate of any / every running lane.
+      * OpGroupNonUniformBitwiseOr Reduce: the OR of every running lane's value.
+    """
+    if out_of_range not in ("raise", "wrap"):
+        raise ValueError(f"out_of_range: {out_of_range!r}")
+    memory = {} if memory is None else memory
+    gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True)
+            for i in range(invocations)]
+    pending = [None] * invocations             # what each invocation yielded last; None once it has returned
+
+    def advance(i, value):
+        try:
+            pending[i] = gens[i].send(value)
+        except StopIteration:
+            pending[i] = None
+
+    for i in range(invocations):
+        advance(i, None)
+    while True:
+        # One instruction per invocation per round, in invocation order: invocations at the same instruction
+        # execute it one after the other before any goes on, as the lanes of a SIMD wave do, so a load that
+        # follows a store in program order sees every lane's store and none from a later instruction.
+        while any(req is not None and req[0] == "tick" for req in pending):
+            for i in range(invocations):
+                if pending[i] is not None and pending[i][0] == "tick":
+                    advance(i, None)
+        live = [i for i in range(invocations) if pending[i] is not None]
+        if not live:
+            break
+        if len(live) != invocations or len({pending[i][1] for i in live}) != 1:
+            raise UnsupportedConstruct("subgroup operation not reached by every invocation at the same point")
+        results = []
+        for i in range(invocations):
+            kind, _, _value, ident = pending[i]
+            base = (i // subgroup_size) * subgroup_size
+            group = [pending[j] for j in range(base, min(base + subgroup_size, invocations))]
+            if kind == "OpGroupNonUniformBallot":
+                # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
+                bits = sum(1 << l for l, req in enumerate(group) if req[2])
+                results.append(tuple((bits >> (32 * w)) & MASK for w in range(4)))
+            elif kind == "OpGroupNonUniformAny":
+                results.append(any(req[2] for req in group))
+            elif kind == "OpGroupNonUniformAll":
+                results.append(all(req[2] for req in group))
+            elif kind == "OpGroupNonUniformBitwiseOr":
+                acc = 0
+                for req in group:
+                    acc |= req[2]
+                results.append(acc)
+            elif kind == "OpGroupNonUniformShuffle":
+                if not 0 <= ident < subgroup_size:
+                    if out_of_range == "raise":
+                        raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a "
+                                              f"{subgroup_size}-wide subgroup")
+                    ident %= subgroup_size
+                results.append(group[ident][2] if ident < len(group) else UNDEF)
+            else:
+                raise UnsupportedConstruct(kind)
+        for i in range(invocations):
+            advance(i, results[i])
+    return memory
+
+
+_TICK = ("tick", None, None, None)
+
+
+def _invocation(text, inputs, push_constants, memory, step=False):
+    """One invocation as a generator. It yields (opcode, instruction index, value, id) at each subgroup operation
+    and expects that operation's result back; with `step` it also yields _TICK before each instruction. It
+    returns run_fragment's result."""
     inputs = inputs or {}
     push_constants = list(push_constants or [])
     memory = {} if memory is None else memory
@@ -265,6 +415,8 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
     killed = False
     cur_label = prev_label = None
     while pc < len(body):
+        if step:
+            yield _TICK
         res, op, a, line = body[pc]
         pc += 1
         if res and a:
@@ -297,6 +449,12 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 raise UnsupportedConstruct("OpPhi with an unknown predecessor")
             values[res] = val(incoming[0])
             continue
+        if op in _PURE and any(values.get(x) is UNDEF for x in a[1:]):
+            values[res] = UNDEF
+            continue
+        used = a[1:2] if op == "OpSelect" else a      # OpSelect may pass the chosen undefined value on
+        if any(values.get(x) is UNDEF for x in used):
+            raise UnsupportedConstruct(f"{op} uses an undefined value: {line}")
         if op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
             if cls != "Function":
@@ -352,6 +510,25 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                 memory[p[1]] = val(a[1])
             else:
                 p[0][p[1]] = val(a[1])
+        elif op in _ATOMICS:
+            # One invocation, so an atomic is read, combine, write; the result is the original value (SPIR-V spec,
+            # 3.42.18). Operands: result type, pointer, scope, semantics(, unequal semantics), value(, comparator).
+            p = pointers[a[1]]
+            if p[0] != "psb":
+                raise UnsupportedConstruct(f"{op} outside PhysicalStorageBuffer")
+            if types.bits(a[0]) != 32:
+                raise UnsupportedConstruct(f"{op} on a non-32-bit integer")
+            old = memory.get(p[1], 0)
+            if op == "OpAtomicCompareExchange":
+                new = val(a[5]) if old == val(a[6]) & MASK else old
+            else:
+                v = val(a[4]) & MASK
+                new = {"OpAtomicIAdd": old + v, "OpAtomicISub": old - v, "OpAtomicUMin": min(old, v),
+                       "OpAtomicUMax": max(old, v), "OpAtomicSMin": old if _s32(old) <= _s32(v) else v,
+                       "OpAtomicSMax": old if _s32(old) >= _s32(v) else v, "OpAtomicAnd": old & v,
+                       "OpAtomicOr": old | v, "OpAtomicXor": old ^ v, "OpAtomicExchange": v}[op]
+            memory[p[1]] = new & MASK
+            values[res] = old
         elif op == "OpSelect":
             if not isinstance(val(a[1]), bool):
                 raise UnsupportedConstruct("OpSelect with a non-scalar-bool condition")
@@ -386,17 +563,20 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
         elif op == "OpShiftLeftLogical":
             bits = types.bits(a[0])
             if val(a[2]) >= bits:
-                raise UnsupportedConstruct(f"shift amount >= {bits} (undefined in SPIR-V)")
+                values[res] = UNDEF             # undefined in SPIR-V; raises only if it is used
+                continue
             values[res] = (val(a[1]) << val(a[2])) & wmask(a[0])
         elif op == "OpShiftRightLogical":
             bits = types.bits(a[0])
             if val(a[2]) >= bits:
-                raise UnsupportedConstruct(f"shift amount >= {bits} (undefined in SPIR-V)")
+                values[res] = UNDEF             # undefined in SPIR-V; raises only if it is used
+                continue
             values[res] = (val(a[1]) & wmask(a[0])) >> val(a[2])
         elif op == "OpShiftRightArithmetic":
             bits = types.bits(a[0])
             if val(a[2]) >= bits:
-                raise UnsupportedConstruct(f"shift amount >= {bits} (undefined in SPIR-V)")
+                values[res] = UNDEF             # undefined in SPIR-V; raises only if it is used
+                continue
             values[res] = (signed(val(a[1]), bits) >> val(a[2])) & wmask(a[0])
         elif op == "OpIAdd":
             values[res] = (val(a[1]) + val(a[2])) & wmask(a[0])
@@ -406,14 +586,23 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = (val(a[1]) * val(a[2])) & wmask(a[0])
         elif op == "OpUConvert":
             values[res] = val(a[1]) & wmask(a[0])
+        elif op == "OpSConvert":
+            # Sign-extend from the operand's width, then wrap to the result's (SPIR-V spec, OpSConvert).
+            if types.t.get(id_type.get(a[1]), ("?",))[0] != "int":
+                raise UnsupportedConstruct("OpSConvert of an operand with no known integer type")
+            values[res] = sval(a[1]) & wmask(a[0])
         elif op == "OpBitReverse":
             bits = types.bits(a[0])
             values[res] = int(f"{val(a[1]) & wmask(a[0]):0{bits}b}"[::-1], 2)
         elif op in ("OpConvertUToF", "OpConvertSToF"):
             x = val(a[1])
-            if not isinstance(x, int):
-                raise UnsupportedConstruct(f"{op} on non-integer")
-            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x & MASK))
+            # The width comes from the operand's type, as in sval(): a 64-bit value below 2**32 passes the value
+            # check, and _s32() would then give it the wrong sign under OpConvertSToF.
+            t = types.t.get(id_type.get(a[1]))
+            if isinstance(x, bool) or not isinstance(x, int) or x > MASK \
+                    or (t is not None and (t[0] != "int" or t[1] != 32)):
+                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
+            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op == "OpBitCount":
             values[res] = (val(a[1]) & wmask(a[0])).bit_count()
         elif op == "OpISubBorrow":
@@ -445,6 +634,40 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = val(a[1]) > val(a[2])
         elif op == "OpUGreaterThanEqual":
             values[res] = val(a[1]) >= val(a[2])
+        elif op == "OpGroupNonUniformShuffle":
+            # OpGroupNonUniformShuffle <result type> <scope> <value> <id>; the scope must be Subgroup (3).
+            if types.t[a[0]][0] != "int" or val(a[1]) != 3:
+                raise UnsupportedConstruct("OpGroupNonUniformShuffle other than a Subgroup-scope integer")
+            values[res] = yield (op, pc - 1, val(a[2]), val(a[3]))
+        elif op == "OpGroupNonUniformBallot":
+            # OpGroupNonUniformBallot <uvec4 type> <scope> <bool predicate>
+            k = types.t[a[0]]
+            if k[0] != "vec" or k[2] != 4 or val(a[1]) != 3 or not isinstance(val(a[2]), bool):
+                raise UnsupportedConstruct("OpGroupNonUniformBallot other than a Subgroup-scope uvec4")
+            values[res] = yield (op, pc - 1, val(a[2]), None)
+        elif op in ("OpGroupNonUniformAny", "OpGroupNonUniformAll"):
+            # <bool> <scope> <bool predicate>
+            if val(a[1]) != 3 or not isinstance(val(a[2]), bool):
+                raise UnsupportedConstruct(f"{op} other than a Subgroup-scope bool")
+            values[res] = yield (op, pc - 1, val(a[2]), None)
+        elif op == "OpGroupNonUniformBitwiseOr":
+            # <type> <scope> <group operation> <value>: only Reduce over a 32-bit integer.
+            if val(a[1]) != 3 or a[2] != "Reduce" or types.t[a[0]][:2] != ("int", 32):
+                raise UnsupportedConstruct("OpGroupNonUniformBitwiseOr other than a Subgroup-scope 32-bit Reduce")
+            values[res] = yield (op, pc - 1, val(a[3]) & MASK, None)
+        elif op == "OpGroupNonUniformBallotFindLSB":
+            # <uint> <scope> <uvec4 ballot>: the lowest set bit; undefined when no bit is set.
+            ballot = val(a[2])
+            if val(a[1]) != 3:
+                raise UnsupportedConstruct("OpGroupNonUniformBallotFindLSB scope")
+            bits = sum(w << (32 * k) for k, w in enumerate(ballot))
+            values[res] = (bits & -bits).bit_length() - 1 if bits else UNDEF
+        elif op == "OpGroupNonUniformBallotBitExtract":
+            # OpGroupNonUniformBallotBitExtract <bool> <scope> <uvec4 ballot> <index>: needs no other lane.
+            ballot, idx = val(a[2]), val(a[3])
+            if val(a[1]) != 3 or not 0 <= idx < 128:
+                raise UnsupportedConstruct("OpGroupNonUniformBallotBitExtract scope or index")
+            values[res] = bool((ballot[idx // 32] >> (idx % 32)) & 1)
         elif op == "OpLogicalAnd":
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, bool) and isinstance(y, bool)):
@@ -464,6 +687,11 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
+        elif op == "OpQuantizeToF16":
+            # Single-instruction f32 -> f16 -> f32 round to nearest. Emitted by
+            # the translator for 16-bit interpolant reads; a Pack/Unpack
+            # round-trip is observably folded to a no-op by at least one driver.
+            values[res] = half_to_float(float_to_half(val(a[1])))
         elif op in ("OpConvertUToF", "OpConvertSToF"):
             x = val(a[1])
             if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
@@ -478,17 +706,23 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
             if not lo <= n < hi:
                 raise UnsupportedConstruct(f"{op} out of range (undefined in SPIR-V)")
             values[res] = n & wmask(a[0])
-        elif op in ("OpFOrdEqual", "OpFOrdLessThan", "OpFOrdGreaterThan", "OpFOrdGreaterThanEqual",
-                    "OpFOrdLessThanEqual", "OpFUnordNotEqual"):
+        elif op in ("OpFOrdEqual", "OpFOrdNotEqual", "OpFOrdLessThan", "OpFOrdGreaterThan",
+                    "OpFOrdGreaterThanEqual", "OpFOrdLessThanEqual", "OpFUnordEqual", "OpFUnordNotEqual",
+                    "OpFUnordLessThan", "OpFUnordGreaterThan", "OpFUnordGreaterThanEqual", "OpFUnordLessThanEqual"):
             x, y = val(a[1]), val(a[2])
             if not (isinstance(x, float) and isinstance(y, float)):
                 raise UnsupportedConstruct(f"{op} on non-float")
-            if op == "OpFUnordNotEqual":
-                values[res] = not (x == y)          # true when unordered, unlike OpFOrdNotEqual
-            else:
-                values[res] = {"OpFOrdEqual": x == y, "OpFOrdLessThan": x < y,
-                               "OpFOrdGreaterThan": x > y, "OpFOrdGreaterThanEqual": x >= y,
-                               "OpFOrdLessThanEqual": x <= y}[op]
+            # Ordered: false if either operand is NaN. Unordered: true if either is NaN. Python's own comparisons
+            # are already ordered (NaN compares false), and -0.0 == 0.0 as in SPIR-V.
+            unordered = math.isnan(x) or math.isnan(y)
+            rel = {"Equal": x == y, "NotEqual": x != y and not unordered, "LessThan": x < y,
+                   "GreaterThan": x > y, "GreaterThanEqual": x >= y, "LessThanEqual": x <= y}[op.removeprefix("OpFUnord").removeprefix("OpFOrd")]
+            values[res] = (rel or unordered) if op.startswith("OpFUnord") else rel
+        elif op in ("OpIsNan", "OpIsInf"):
+            x = val(a[1])
+            if not isinstance(x, float):
+                raise UnsupportedConstruct(f"{op} on non-float")
+            values[res] = math.isnan(x) if op == "OpIsNan" else math.isinf(x)
         elif op in ("OpBitFieldUExtract", "OpBitFieldSExtract"):
             base, off, cnt = val(a[1]), val(a[2]), val(a[3])
             if off + cnt > 32:
@@ -534,13 +768,19 @@ def run_fragment(text, inputs=None, push_constants=None, memory=None):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
                 v = max(args[0], args[1])
                 values[res] = f32(v if name == "FMax" else min(v, args[2]))
-            elif name == "RoundEven":
+            elif name in ("RoundEven", "Floor", "Ceil", "Trunc"):
+                # round() breaks ties to even. An integral result keeps the operand's sign (IEEE 754
+                # roundToIntegral), so RoundEven(-0.4), Ceil(-0.5) and Trunc(-0.5) are -0.0, not +0.0.
                 x = args[0]
-                values[res] = f32(float(round(x))) if math.isfinite(x) else x    # round() breaks ties to even
-            elif name in ("FMin", "FMax"):
+                fn = {"RoundEven": round, "Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc}[name]
+
+                def integral(v):
+                    return f32(math.copysign(float(fn(v)), v)) if math.isfinite(v) else v
+                values[res] = tuple(integral(v) for v in x) if isinstance(x, tuple) else integral(x)
+            elif name == "FMin":
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
-                values[res] = f32(min(args) if name == "FMin" else max(args))
+                values[res] = f32(min(args))
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "UMax":

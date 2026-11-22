@@ -132,7 +132,7 @@ def scan_xml(data: bytes) -> dict:
         "element_count": 0,
         "max_depth": 0,
         "attributes": [],
-        "comments": data.count(b"<!--"),
+        "comments": 0,
         "elements": Counter(),
         "attrs": Counter(),
         "refs": Counter(),
@@ -148,9 +148,11 @@ def scan_xml(data: bytes) -> dict:
     }
     depth = 0
     try:
-        parser = ET.iterparse(io.BytesIO(data), events=("start", "end"))
+        parser = ET.iterparse(io.BytesIO(data), events=("start", "end", "comment"))
         for event, elem in parser:
-            if event == "start":
+            if event == "comment":
+                report["comments"] += 1
+            elif event == "start":
                 depth += 1
                 report["max_depth"] = max(report["max_depth"], depth)
                 if not report["root"]:

@@ -26,6 +26,7 @@ OpEntryPoint Fragment %main "main" %out
 %c32 = OpConstant %uint 32
 %cF0 = OpConstant %uint 4294967280
 %cFF = OpConstant %uint 4294967295
+%cInf = OpConstant %uint 2139095040
 %c80 = OpConstant %uint 128
 %ch = OpConstant %uint 1073757184
 %f1 = OpConstant %float 1
@@ -34,6 +35,7 @@ OpEntryPoint Fragment %main "main" %out
 %f70000 = OpConstant %float 70000
 %f2p5 = OpConstant %float 2.5
 %f3p5 = OpConstant %float 3.5
+%f0p5 = OpConstant %float 0.5
 %int = OpTypeInt 32 1
 %t = OpConstantTrue %bool
 %f = OpConstantFalse %bool
@@ -118,6 +120,58 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f2p5\n"), 2)
         self.assertEqual(run_word("%res = OpConvertFToU %uint %f70000\n"), 70000)
 
+    def test_floor_ceil_trunc_and_signed_zero(self):
+        def word(name, const, neg=False):
+            pre = f"%n = OpFNegate %float {const}\n" if neg else ""
+            x = "%n" if neg else const
+            return run_word(f"{pre}%x = OpExtInst %float %glsl {name} {x}\n%res = OpBitcast %uint %x\n")
+        self.assertEqual(word("Floor", "%f2p5"), 0x40000000)                 # 2.5 -> 2
+        self.assertEqual(word("Floor", "%f2p5", neg=True), 0xC0400000)       # -2.5 -> -3
+        self.assertEqual(word("Ceil", "%f2p5"), 0x40400000)                  # 2.5 -> 3
+        self.assertEqual(word("Ceil", "%f2p5", neg=True), 0xC0000000)        # -2.5 -> -2
+        self.assertEqual(word("Trunc", "%f3p5"), 0x40400000)                 # 3.5 -> 3
+        self.assertEqual(word("Trunc", "%f3p5", neg=True), 0xC0400000)       # -3.5 -> -3
+        # A zero result keeps the operand's sign: -0.5 rounds to -0.0 (0x80000000), 0.5 to +0.0.
+        self.assertEqual(word("Ceil", "%f0p5", neg=True), 0x80000000)
+        self.assertEqual(word("Trunc", "%f0p5", neg=True), 0x80000000)
+        self.assertEqual(word("RoundEven", "%f0p5", neg=True), 0x80000000)
+        self.assertEqual(word("Floor", "%f0p5"), 0)
+        self.assertEqual(word("Floor", "%f70000"), 0x4788B800)              # already integral: unchanged
+        # A vector operand rounds component by component (the translator emits a %v2float Floor/Ceil).
+        for name, want in (("Floor", (0xC0400000, 0x40000000)), ("Ceil", (0xC0000000, 0x40400000))):
+            got = tuple(run_word(f"%n = OpFNegate %float %f2p5\n%v = OpCompositeConstruct %v2float %n %f2p5\n"
+                                 f"%r = OpExtInst %v2float %glsl {name} %v\n%x = OpCompositeExtract %float %r {i}\n"
+                                 "%res = OpBitcast %uint %x\n") for i in (0, 1))
+            self.assertEqual(got, want, name)
+
+    def test_wide_integer_conversion_is_rejected(self):
+        # A 64-bit operand must not be silently truncated to 32 bits before the conversion.
+        text = HEADER.replace("%c0 = OpConstant %uint 0",
+                              "%ulong = OpTypeInt 64 0\n"
+                              "%c64_big = OpConstant %ulong 4294967296\n"
+                              "%c0 = OpConstant %uint 0")
+        for op in ("OpConvertUToF", "OpConvertSToF"):
+            with self.subTest(op=op):
+                body = text + (f"%x = {op} %float %c64_big\n"
+                               "%res = OpBitcast %uint %x\nOpStore %out %res\n" + FOOTER)
+                with self.assertRaises(si.UnsupportedConstruct):
+                    si.run_fragment(body)
+
+    def test_64bit_operand_below_2_32_is_rejected(self):
+        # A 64-bit operand is rejected by its type width, not its value: signed 2**31 in a 64-bit int would
+        # otherwise convert as -2147483648.0 under OpConvertSToF (follow-up to #346).
+        text = HEADER.replace("%c0 = OpConstant %uint 0",
+                              "%ulong = OpTypeInt 64 0\n%long = OpTypeInt 64 1\n"
+                              "%cl_one = OpConstant %ulong 1\n%cl_2p31 = OpConstant %long 2147483648\n"
+                              "%c0 = OpConstant %uint 0")
+        for op in ("OpConvertUToF", "OpConvertSToF"):
+            for src in ("%cl_one", "%cl_2p31"):
+                with self.subTest(op=op, src=src):
+                    body = text + (f"%x = {op} %float {src}\n"
+                                   "%res = OpBitcast %uint %x\nOpStore %out %res\n" + FOOTER)
+                    with self.assertRaises(si.UnsupportedConstruct):
+                        si.run_fragment(body)
+
     def test_round_even_clamp_max(self):
         # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
         self.assertEqual(run_word("%x = OpExtInst %float %glsl RoundEven %f2p5\n%res = OpBitcast %uint %x\n"),
@@ -161,6 +215,51 @@ class InterpreterTests(unittest.TestCase):
                  "%res = OpLoad %uint %q\n"
                  "OpStore %out %res\n" + FOOTER)
         self.assertEqual(si.run_fragment(text, memory={4100: 0x12345678})["%out"][0], 0x12345678)
+
+    def test_sconvert_sign_extends_and_truncates(self):
+        """OpSConvert: sign-extend from the operand's width, wrap to the result's (the global_* offset path)."""
+        text = HEADER.replace("OpCapability Shader", "OpCapability Shader\nOpCapability Int64")
+        text = text.replace("%main = OpFunction", "%long = OpTypeInt 64 1\n%ulong = OpTypeInt 64 0\n"
+                            "%int = OpTypeInt 32 1\n%neg = OpConstant %int -16\n%main = OpFunction")
+        text += ("%w = OpSConvert %long %neg\n"           # -16 as 64 bits
+                 "%u = OpBitcast %ulong %w\n"
+                 "%hi64 = OpShiftRightLogical %ulong %u %c64_32\n"
+                 "%hi = OpUConvert %uint %hi64\n"
+                 "%back = OpSConvert %int %w\n"           # and back to 32 bits
+                 "%lo = OpBitcast %uint %back\n"
+                 "%res = OpBitwiseXor %uint %hi %lo\n"    # 0xFFFFFFFF ^ 0xFFFFFFF0
+                 "OpStore %out %res\n" + FOOTER)
+        text = text.replace("%main = OpFunction", "%c64_32 = OpConstant %ulong 32\n%main = OpFunction")
+        self.assertEqual(si.run_fragment(text)["%out"][0], 0x0000000F)
+
+    def test_physical_storage_buffer_atomics(self):
+        """Atomics on PhysicalStorageBuffer memory return the original value and write the combined one."""
+        text = HEADER.replace("OpMemoryModel Logical GLSL450",
+                              'OpCapability PhysicalStorageBufferAddresses\n'
+                              'OpExtension "SPV_KHR_physical_storage_buffer"\n'
+                              "OpMemoryModel PhysicalStorageBuffer64 GLSL450")
+        decls = ("%ulong = OpTypeInt 64 0\n"
+                 "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint\n"
+                 "%addr = OpConstant %ulong 4096\n%cm1 = OpConstant %uint 4294967295\n%c5 = OpConstant %uint 5\n")
+        text = text.replace("%main = OpFunction", decls + "%main = OpFunction")
+        cases = [  # (instruction, memory before, expected memory after, expected result)
+            ("OpAtomicIAdd %uint %p %c1 %c0 %cm1", 7, 6, 7),
+            ("OpAtomicISub %uint %p %c1 %c0 %c2", 1, 0xFFFFFFFF, 1),
+            ("OpAtomicSMin %uint %p %c1 %c0 %cm1", 3, 0xFFFFFFFF, 3),
+            ("OpAtomicUMin %uint %p %c1 %c0 %cm1", 3, 3, 3),
+            ("OpAtomicSMax %uint %p %c1 %c0 %c2", 0x80000000, 2, 0x80000000),
+            ("OpAtomicXor %uint %p %c1 %c0 %c5", 6, 3, 6),
+            ("OpAtomicExchange %uint %p %c1 %c0 %c5", 9, 5, 9),
+            ("OpAtomicCompareExchange %uint %p %c1 %c0 %c0 %c5 %c2", 2, 5, 2),   # equal: swapped
+            ("OpAtomicCompareExchange %uint %p %c1 %c0 %c0 %c5 %c2", 3, 3, 3),   # not equal: kept
+        ]
+        for ins, before, after, result in cases:
+            with self.subTest(ins=ins, before=before):
+                body = (text + "%p = OpConvertUToPtr %_ptr_PSB_uint %addr\n"
+                        f"%res = {ins}\nOpStore %out %res\n" + FOOTER)
+                memory = {4096: before}
+                self.assertEqual(si.run_fragment(body, memory=memory)["%out"][0], result)
+                self.assertEqual(memory[4096], after)
 
     def test_inputs_and_push_constants_can_be_seeded(self):
         text = HEADER.replace('OpEntryPoint Fragment %main "main" %out',
@@ -270,6 +369,23 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(si.run_fragment(live)["%out"][0], 1)
         self.assertEqual(si.run_fragment(dead), {})
 
+    def test_float_ordered_unordered_and_classify(self):
+        nan = "%nan = OpBitcast %float %cFF\n"                       # 0xFFFFFFFF is a NaN
+        for op, nan_result, ordered_result in (("OpFOrdNotEqual", 0, 1), ("OpFUnordNotEqual", 1, 1),
+                                               ("OpFUnordLessThan", 1, 1), ("OpFUnordLessThanEqual", 1, 1),
+                                               ("OpFUnordGreaterThan", 1, 0), ("OpFUnordGreaterThanEqual", 1, 0),
+                                               ("OpFUnordEqual", 1, 0)):
+            with self.subTest(op=op):   # 2 vs NaN, then 2 vs 3
+                self.assertEqual(run_word(nan + f"%b = {op} %bool %f2 %nan\n%res = OpSelect %uint %b %c1 %c0\n"),
+                                 nan_result)
+                self.assertEqual(run_word(f"%b = {op} %bool %f2 %f3\n%res = OpSelect %uint %b %c1 %c0\n"),
+                                 ordered_result)
+        self.assertEqual(run_word(nan + "%b = OpIsNan %bool %nan\n%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word("%b = OpIsNan %bool %f2\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
+        self.assertEqual(run_word("%i = OpBitcast %float %cInf\n%b = OpIsInf %bool %i\n"
+                                  "%res = OpSelect %uint %b %c1 %c0\n"), 1)
+        self.assertEqual(run_word(nan + "%b = OpIsInf %bool %nan\n%res = OpSelect %uint %b %c1 %c0\n"), 0)
+
     def test_phi_selects_the_value_from_the_taken_predecessor(self):
         for cond, want in (("%t", 1), ("%f", 2)):
             text = (HEADER + f"OpSelectionMerge %merge None\nOpBranchConditional {cond} %a %b\n"
@@ -307,6 +423,59 @@ class InterpreterTests(unittest.TestCase):
         text = HEADER + "%p = OpAccessChain %_ptr_PC_uint %pc %c0\nOpStore %p %c1\n" + FOOTER
         with self.assertRaises(si.UnsupportedConstruct):
             si.run_fragment(text)
+
+    # Signalling-NaN words (exponent all ones, bit 22 clear, mantissa not zero), a quiet NaN and two ordinary
+    # values. Issue #509: going through a Python float set bit 22 of the first four.
+    SNAN_WORDS = (0xFFA3A095, 0x7F800001, 0x7FBFFFFF, 0xFF800001, 0x7FC00001, 0x3F800000, 0x80000000)
+
+    def test_bitcast_keeps_signalling_nan_bits(self):
+        # SPIR-V OpBitcast: the bit pattern is unchanged. The word goes uint -> float and on through
+        # OpCopyObject, a composite, OpSelect and a Function variable before it comes back as a uint and also
+        # leaves through a float Output; both must be the word that went in.
+        text = HEADER.replace('OpEntryPoint Fragment %main "main" %out',
+                              'OpEntryPoint Fragment %main "main" %out %outf').replace(
+            "%main = OpFunction",
+            "%_ptr_Output_float = OpTypePointer Output %float\n%outf = OpVariable %_ptr_Output_float Output\n"
+            "%_ptr_Function_float = OpTypePointer Function %float\n%main = OpFunction")
+        body = ("%fv = OpVariable %_ptr_Function_float Function\n"
+                "%p = OpAccessChain %_ptr_PC_uint %pc %c0\n"
+                "%w = OpLoad %uint %p\n"
+                "%x = OpBitcast %float %w\n"
+                "%y = OpCopyObject %float %x\n"
+                "%v = OpCompositeConstruct %v2float %f1 %y\n"
+                "%e = OpCompositeExtract %float %v 1\n"
+                "%s = OpSelect %float %t %e %f2\n"
+                "OpStore %fv %s\n"
+                "%l = OpLoad %float %fv\n"
+                "OpStore %outf %l\n"
+                "%res = OpBitcast %uint %l\n"
+                "OpStore %out %res\n")
+        for word in self.SNAN_WORDS:
+            with self.subTest(word=f"{word:#010x}"):
+                out = si.run_fragment(text + body + FOOTER, push_constants=[word])
+                self.assertEqual(out["%out"], (word,))
+                self.assertEqual(out["%outf"], (word,))
+
+    def test_bitcast_signalling_nan_is_still_a_nan(self):
+        # The value keeps its bits but is still a float NaN to the float operations (OpIsNan, OpFOrdEqual).
+        text = HEADER.replace("%main = OpFunction", "%cS = OpConstant %uint 4288913557\n%main = OpFunction")
+        for body, want in (("%x = OpBitcast %float %cS\n%n = OpIsNan %bool %x\n", 1),
+                           ("%x = OpBitcast %float %cS\n%n = OpFOrdEqual %bool %x %x\n", 0)):
+            with self.subTest(body=body.splitlines()[1]):
+                out = si.run_fragment(text + body + "%res = OpSelect %uint %n %c1 %c0\nOpStore %out %res\n"
+                                      + FOOTER)
+                self.assertEqual(out["%out"], (want,))
+
+    def test_float_arithmetic_on_signalling_nan_gives_a_nan(self):
+        # Arithmetic drops the kept pattern: SPIR-V does not fix the bits of a NaN result, so only "a NaN" is
+        # asserted (exponent all ones, mantissa not zero).
+        text = HEADER.replace("%main = OpFunction", "%cS = OpConstant %uint 4288913557\n%main = OpFunction")
+        for op in ("%y = OpFAdd %float %x %f1\n", "%y = OpFMul %float %x %f2\n", "%y = OpFNegate %float %x\n"):
+            with self.subTest(op=op.split()[2]):
+                word = si.run_fragment(text + "%x = OpBitcast %float %cS\n" + op +
+                                       "%res = OpBitcast %uint %y\nOpStore %out %res\n" + FOOTER)["%out"][0]
+                self.assertEqual(word & 0x7F800000, 0x7F800000)
+                self.assertNotEqual(word & 0x007FFFFF, 0)
 
     def test_push_constant_reads_zero(self):
         text = HEADER + "%p = OpAccessChain %_ptr_PC_uint %pc %c0\n%res = OpLoad %uint %p\nOpStore %out %res\n" + FOOTER

@@ -17,7 +17,8 @@
 // Requirements on the device and images:
 // - a queue with graphics support (the stage masks use ALL_GRAPHICS);
 // - images cleared without rectangles have TRANSFER_DST usage; images cleared with rectangles have attachment usage
-//   and image_view must return views for them (dynamicRendering, Vulkan 1.3);
+//   and image_view must return views for them (dynamicRendering, Vulkan 1.3); reinterpreted whole-view clears
+//   use the same attachment path because vkCmdClearColorImage has no view-format argument;
 // - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3).
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
@@ -28,6 +29,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -48,11 +50,16 @@ struct ResourceBinding {
     bool presentable = false;          // a swapchain image: common/present maps to PRESENT_SRC_KHR
     bool simultaneous_access = false;  // D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS: always GENERAL
     bool not_zeroed = false;           // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: first use skips the zero fill
+    // A descriptor in the bindless set 0 has one layout, but D3D12 lets a texture be sampled both in a
+    // shader-resource state and while promoted from common (GENERAL). With this set, the shader-resource states
+    // use GENERAL too, so the descriptor's layout is right in both.
+    bool sampled_in_general = false;
     VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
     VkDeviceSize size = 0;             // its size in bytes
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
+    bool rgba8_typeless = false;       // Original resource was R8G8B8A8_TYPELESS; views may reinterpret it.
 };
 
 struct VulkanAccess {
@@ -225,6 +232,90 @@ inline VkAccessFlags2 vulkan_barrier_access(std::uint32_t access) {
     return out;
 }
 
+// For one VkAccessFlagBits2 that vulkan_barrier_access produces: the stages Vulkan lets perform it (the "supported
+// access types" table of the synchronization2 chapter, with the meta stages that contain them), and the narrowest
+// stage to add when a barrier's stages have none of those. MEMORY_READ/WRITE are valid in every stage.
+struct AccessStages {
+    VkAccessFlags2 access;
+    VkPipelineStageFlags2 supported;
+    VkPipelineStageFlags2 narrowest;
+};
+
+inline constexpr VkPipelineStageFlags2 shader_stages2 =
+    VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+    VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT | VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
+    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+    VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+    VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+inline constexpr AccessStages access_stages[] = {
+    {VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+     VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT},
+    {VK_ACCESS_2_INDEX_READ_BIT,
+     VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT},
+    {VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT,
+     VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT},
+    // Shader accesses: D3D12 does not say which shader stage, so every one that can run (all shading).
+    {VK_ACCESS_2_UNIFORM_READ_BIT, shader_stages2,
+     VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
+    {VK_ACCESS_2_SHADER_READ_BIT, shader_stages2,
+     VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
+    {VK_ACCESS_2_SHADER_WRITE_BIT, shader_stages2,
+     VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
+    {VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
+     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+    {VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+    {VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
+    {VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
+    // Transfers: ALL_GRAPHICS does not contain the transfer stages, and CLEAR only writes.
+    {VK_ACCESS_2_TRANSFER_READ_BIT,
+     VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+         VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT},
+    {VK_ACCESS_2_TRANSFER_WRITE_BIT,
+     VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+         VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT},
+};
+
+// One side of an enhanced barrier: D3D12 sync and access to a Vulkan stage mask and access mask that Vulkan accepts
+// together. D3D12 lets an access be named with a sync scope whose Vulkan stages cannot perform it (SYNC_ALL_SHADING
+// with ACCESS_VERTEX_BUFFER is valid D3D12, but VERTEX_ATTRIBUTE_READ needs VERTEX_ATTRIBUTE_INPUT). The stages are
+// widened by the narrowest stage that can, never the access dropped: the dependency still covers every access the
+// application named, only over a slightly larger scope. With no stages (SYNC_NONE) there is no access either.
+struct BarrierScope {
+    VkPipelineStageFlags2 stages;
+    VkAccessFlags2 access;
+};
+
+inline BarrierScope vulkan_barrier_scope(std::uint32_t sync, std::uint32_t access) {
+    BarrierScope out{vulkan_sync(sync), 0};
+    if (!out.stages) return out;
+    out.access = vulkan_barrier_access(access);
+    for (const AccessStages& entry : access_stages)
+        if ((out.access & entry.access) && !(out.stages & entry.supported)) out.stages |= entry.narrowest;
+    return out;
+}
+
 // D3D12_BARRIER_LAYOUT -> VkImageLayout. Queue-specific layouts map like their generic forms.
 inline VkImageLayout vulkan_layout(std::uint32_t layout, bool presentable) {
     namespace l = d3d12_layout;
@@ -249,10 +340,13 @@ inline VkImageLayout vulkan_layout(std::uint32_t layout, bool presentable) {
     }
 }
 
-// The layout an image actually uses: simultaneous-access images live in GENERAL.
+// The layout an image actually uses: simultaneous-access images live in GENERAL, and so do images in a
+// shader-resource state when set 0 names them (sampled_in_general).
 inline VkImageLayout image_layout(const ResourceBinding& resource, VkImageLayout layout) {
     if (resource.simultaneous_access && layout != VK_IMAGE_LAYOUT_UNDEFINED &&
         layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+        return VK_IMAGE_LAYOUT_GENERAL;
+    if (resource.sampled_in_general && layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
         return VK_IMAGE_LAYOUT_GENERAL;
     return layout;
 }
@@ -268,7 +362,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) return {1, 1};
     switch (format) {
     case VK_FORMAT_R32G32B32A32_SFLOAT:
-    case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
+    case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_R32G32B32A32_SINT: return {16, 1};
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_UNORM:
     case VK_FORMAT_R32G32_SFLOAT: return {8, 1};
@@ -276,12 +371,15 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_R8G8B8A8_SNORM:
     case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R8G8B8A8_SINT:
     case VK_FORMAT_B8G8R8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_R16G16_SFLOAT:
     case VK_FORMAT_R32_SFLOAT:
     case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SINT:
     case VK_FORMAT_D32_SFLOAT:
     case VK_FORMAT_D32_SFLOAT_S8_UINT:  // depth aspect
     case VK_FORMAT_D24_UNORM_S8_UINT: return {4, 1};
@@ -468,6 +566,10 @@ struct ReplayFunctions {
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
     PFN_vkCmdCopyImage copy_image = nullptr;
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
+    // VK_EXT_conditional_rendering: SetPredication. The predicate buffer must have been created with
+    // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
+    PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
+    PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -480,6 +582,7 @@ enum class ReplayResult {
     invalid_subresource,
     invalid_clear,
     invalid_copy,
+    invalid_predication,
     unsupported
 };
 
@@ -489,6 +592,7 @@ struct Prepared {
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
+    VkFormat clear_format = VK_FORMAT_UNDEFINED; // The RTV format, without changing the resource binding.
     std::vector<VkClearRect> rects;   // rectangle clears, clipped to the mip
     bool skip = false;                // every rectangle was empty
     ResourceBinding source;                   // copies: the source resource
@@ -498,6 +602,75 @@ struct Prepared {
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
 };
+
+// ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
+// the device, Windows D3D12 (WARP and AMD) clamps to the component range and truncates fractions. Vulkan
+// instead interprets the matching union member as an integer already; copying float bits changes the value.
+inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
+    // Integer formats convert the float numerically: NaN maps to zero, negatives clamp to the low end, positive
+    // overflow to the high end, and fractions truncate toward zero. Unsigned uses uint32, signed uses int32.
+    std::uint32_t unsigned_maximum = 0;
+    std::int64_t signed_minimum = 0, signed_maximum = 0;
+    bool is_signed = false;
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UINT: unsigned_maximum = 255; break;
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32G32B32A32_UINT: unsigned_maximum = std::numeric_limits<std::uint32_t>::max(); break;
+    case VK_FORMAT_R8G8B8A8_SINT: signed_minimum = -128; signed_maximum = 127; is_signed = true; break;
+    case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_R32G32B32A32_SINT:
+        signed_minimum = std::numeric_limits<std::int32_t>::min();
+        signed_maximum = std::numeric_limits<std::int32_t>::max();
+        is_signed = true;
+        break;
+    default: break;
+    }
+    VkClearColorValue value{};
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        if (is_signed) {
+            const double v = double(input[i]);
+            std::int32_t out;
+            if (v != v) {
+                out = 0;  // NaN
+            } else if (v <= double(signed_minimum)) {
+                out = static_cast<std::int32_t>(signed_minimum);
+            } else if (v >= double(signed_maximum)) {
+                out = static_cast<std::int32_t>(signed_maximum);
+            } else {
+                out = static_cast<std::int32_t>(v);  // truncates toward zero
+            }
+            value.int32[i] = out;
+        } else if (!unsigned_maximum) {
+            value.float32[i] = input[i];
+        } else if (!(input[i] > 0.0f)) {
+            value.uint32[i] = 0; // NaN, negative values and either zero; no out-of-range float-to-int cast.
+        } else if (double(input[i]) >= double(unsigned_maximum)) {
+            value.uint32[i] = unsigned_maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
+        } else {
+            value.uint32[i] = static_cast<std::uint32_t>(input[i]);
+        }
+    }
+    return value;
+}
+
+// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format.
+inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
+    if (target.format == ColorViewFormat::resource)
+        return resource.rgba8_typeless ? VK_FORMAT_UNDEFINED : resource.format;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    switch (target.format) {
+    case ColorViewFormat::rgba8_unorm: format = VK_FORMAT_R8G8B8A8_UNORM; break;
+    case ColorViewFormat::rgba8_srgb: format = VK_FORMAT_R8G8B8A8_SRGB; break;
+    case ColorViewFormat::rgba8_uint: format = VK_FORMAT_R8G8B8A8_UINT; break;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+    if (!resource.rgba8_typeless) return format == resource.format ? format : VK_FORMAT_UNDEFINED;
+    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.mip_levels != 1 || resource.array_layers != 1 ||
+        resource.volume || resource.depth != 1 || resource.samples != 1 ||
+        target.mip || target.first_layer || target.layer_count != 1)
+        return VK_FORMAT_UNDEFINED;
+    return format;
+}
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
                        VkImageSubresourceRange& out) {
@@ -724,9 +897,7 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     return ReplayResult::success;
 }
 
-// ResolveSubresource through vkCmdResolveImage: a multisampled colour subresource into a single-sampled one of
-// the same size and format. Depth-stencil resolves, and resolves between two formats of a typeless family, are
-// not supported yet.
+// Resolve a multisampled colour image into a single-sampled image of the same format.
 inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared& p) {
     VkImageSubresourceRange dst{}, src{};
     if (!copy_subresource(p.binding, resolve.dst_subresource, dst) ||
@@ -734,13 +905,26 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
         return ReplayResult::invalid_subresource;
     if (p.source.samples <= 1 || p.binding.samples != 1 || p.binding.volume) return ReplayResult::invalid_copy;
     const VkExtent2D from = mip_extent(p.source, src.baseMipLevel), to = mip_extent(p.binding, dst.baseMipLevel);
-    if (from.width != to.width || from.height != to.height) return ReplayResult::invalid_copy;
+    VkOffset3D src_offset{}, dst_offset{};
+    VkExtent3D extent{from.width, from.height, 1};
+    if (const auto& region = resolve.region) {
+        dst_offset = {std::int32_t(region->dst_x), std::int32_t(region->dst_y), 0};
+        if (const auto& r = region->src_rect) {
+            if (std::uint32_t(r->right) > from.width || std::uint32_t(r->bottom) > from.height)
+                return ReplayResult::invalid_copy;
+            src_offset = {r->left, r->top, 0};
+            extent = {std::uint32_t(r->right - r->left), std::uint32_t(r->bottom - r->top), 1};
+        }
+        if (!within(region->dst_x, extent.width, to.width) || !within(region->dst_y, extent.height, to.height))
+            return ReplayResult::invalid_copy;
+    } else if (from.width != to.width || from.height != to.height) {
+        return ReplayResult::invalid_copy;
+    }
     if (src.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || dst.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
         p.source.format != p.binding.format)
         return ReplayResult::unsupported;
-    p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, {0, 0, 0},
-                 {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, {0, 0, 0},
-                 {from.width, from.height, 1}};
+    p.resolve = {{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1}, src_offset,
+                 {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1}, dst_offset, extent};
     p.range = dst;
     p.source_range = src;
     return ReplayResult::success;
@@ -807,6 +991,10 @@ class PreparedList {
 public:
     const CommandList* list = nullptr;
     std::vector<detail::Prepared> commands;
+    // Copies and resolves recorded while a predicate was set. D3D12 skips them when the predicate says so, but
+    // Vulkan's conditional rendering does not cover transfer commands, so they run unconditionally
+    // (docs/d3d12_vulkan.md section 4.7). Counted so the caller can report it.
+    std::size_t unpredicated_copies = 0;
 };
 
 // Resolves and checks every command. Nothing is written to a command buffer.
@@ -819,6 +1007,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.commands.assign(commands.size(), {});
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
+    const bool conditional = vk.begin_conditional_rendering && vk.end_conditional_rendering;
+    // While a predicate is set, a whole-view clear is replayed as one rectangle over the view: vkCmdClearColorImage
+    // and vkCmdClearDepthStencilImage ignore conditional rendering, vkCmdClearAttachments does not.
+    bool predicated = false;
+    constexpr Rect whole_view{0, 0, INT32_MAX, INT32_MAX};
+    const auto clear_rects = [&](std::span<const Rect> rects) {
+        return predicated && rects.empty() ? std::span<const Rect>(&whole_view, 1) : rects;
+    };
+    out.unpredicated_copies = 0;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -838,7 +1035,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             VkImageSubresourceRange range = p.range;
             range.aspectMask = view_aspects;
-            p.view = vk.image_view(p.binding, range);
+            ResourceBinding view_binding = p.binding;
+            if (p.clear_format != VK_FORMAT_UNDEFINED) view_binding.format = p.clear_format;
+            p.view = vk.image_view(view_binding, range);
             return p.view ? ReplayResult::success : ReplayResult::unsupported;
         };
 
@@ -864,8 +1063,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
                 return ReplayResult::invalid_subresource;
-            if (const auto r = rect_view(color_clear->rects, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
-                return r;
+            p.clear_format = detail::color_view_format(p.binding, color_clear->target);
+            // Older ownerless replay callers omit the resource format for float-only clears. Preserve
+            // that path; an explicit format or a typeless resource must still resolve a concrete RTV.
+            if (p.clear_format == VK_FORMAT_UNDEFINED &&
+                (p.binding.rgba8_typeless || color_clear->target.format != ColorViewFormat::resource))
+                return ReplayResult::invalid_clear;
+            if (p.clear_format != p.binding.format && color_clear->rects.empty()) {
+                // vkCmdClearColorImage has no view-format parameter. Reinterpreted whole-view clears need
+                // an attachment view too, including sRGB conversion and UINT numeric interpretation.
+                const auto extent = detail::mip_extent(p.binding, color_clear->target.mip);
+                const Rect full{0, 0, std::int32_t(extent.width), std::int32_t(extent.height)};
+                if (const auto r = rect_view(std::span<const Rect>(&full, 1), color_clear->target,
+                                            VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success) return r;
+            } else if (const auto r = rect_view(clear_rects(color_clear->rects), color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
+                       r != ReplayResult::success) return r;
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
             VkImageAspectFlags aspects = 0;
@@ -876,11 +1088,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, depth_clear->target, aspects, p.range))
                 return ReplayResult::invalid_subresource;
-            if (const auto r = rect_view(depth_clear->rects, depth_clear->target, p.binding.aspects); r != ReplayResult::success)
+            if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
+                r != ReplayResult::success)
                 return r;
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return ReplayResult::unsupported;
+            if (predicated) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
             if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
@@ -900,11 +1114,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (result != ReplayResult::success) return result;
         } else if (const auto* resolve_command = std::get_if<ResolveSubresource>(&command)) {
             if (!vk.resolve_image) return ReplayResult::unsupported;
+            if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(resolve_command->src);
             if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
+        } else if (const auto* predication = std::get_if<Predication>(&command)) {
+            predicated = predication->buffer != 0;
+            if (!predicated) continue;
+            if (!conditional) return ReplayResult::unsupported;
+            if (!bind(predication->buffer)) return ReplayResult::unresolved_resource;
+            // Vulkan reads one 32-bit word at a 4-byte aligned offset; D3D12's value is 64 bits at an 8-byte
+            // aligned one, so its low word is read (docs/d3d12_vulkan.md section 4.7).
+            if (!p.binding.buffer || !detail::within(predication->offset, 4, p.binding.size))
+                return ReplayResult::invalid_predication;
         }
     }
     return ReplayResult::success;
@@ -916,10 +1140,27 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const auto commands = prepared.list->commands();
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
+    bool conditional_rendering = false;  // inside vkCmdBeginConditionalRenderingEXT
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        if (const auto* predication = std::get_if<Predication>(&command)) {
+            // Conditional rendering cannot nest, so a new predicate ends the previous one first.
+            if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
+            conditional_rendering = predication->buffer != 0;
+            if (conditional_rendering) {
+                VkConditionalRenderingBeginInfoEXT begin{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+                begin.buffer = p.binding.buffer;
+                begin.offset = predication->offset;
+                // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
+                begin.flags = predication->op == d3d12_predication::not_equal_zero
+                                  ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT
+                                  : 0;
+                vk.begin_conditional_rendering(command_buffer, &begin);
+            }
+            continue;
+        }
         const ResourceId id = std::visit(
             [](const auto& c) -> ResourceId {
                 using T = std::decay_t<decltype(c)>;
@@ -963,11 +1204,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         return {};
                 },
                 command);
+            const BarrierScope src = vulkan_barrier_scope(sync_before, access_before);
+            const BarrierScope dst = vulkan_barrier_scope(sync_after, access_after);
             VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-            barrier.srcStageMask = vulkan_sync(sync_before);
-            barrier.dstStageMask = vulkan_sync(sync_after);
-            barrier.srcAccessMask = barrier.srcStageMask ? vulkan_barrier_access(access_before) : 0;
-            barrier.dstAccessMask = barrier.dstStageMask ? vulkan_barrier_access(access_after) : 0;
+            barrier.srcStageMask = src.stages;
+            barrier.dstStageMask = dst.stages;
+            barrier.srcAccessMask = src.access;
+            barrier.dstAccessMask = dst.access;
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
             dependency.memoryBarrierCount = 1;
             dependency.pMemoryBarriers = &barrier;
@@ -987,13 +1230,15 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 pieces = detail::current(tracker, id, range, before);
                 detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
             }
+            const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before);
+            const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after);
             std::vector<VkImageMemoryBarrier2> barriers;
             for (const auto& piece : pieces) {
                 VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-                b.srcStageMask = vulkan_sync(texture->sync_before);
-                b.dstStageMask = vulkan_sync(texture->sync_after);
-                b.srcAccessMask = b.srcStageMask ? vulkan_barrier_access(texture->access_before) : 0;
-                b.dstAccessMask = b.dstStageMask ? vulkan_barrier_access(texture->access_after) : 0;
+                b.srcStageMask = src.stages;
+                b.dstStageMask = dst.stages;
+                b.srcAccessMask = src.access;
+                b.dstAccessMask = dst.access;
                 b.oldLayout = piece.layout;
                 b.newLayout = new_layout;
                 b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1012,8 +1257,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            VkClearColorValue color{};
-            std::copy(color_clear->color.begin(), color_clear->color.end(), color.float32);
+            const VkClearColorValue color = detail::render_target_clear_color(p.clear_format, color_clear->color);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding.image, pieces, image_layout(p.binding, transfer_dst.layout),
                                    state, transfer_dst.access, transfer_dst.stages, [&] {
@@ -1116,6 +1360,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
         }
     }
+    // Predication does not carry over to the next command list.
+    if (conditional_rendering) vk.end_conditional_rendering(command_buffer);
 }
 
 // prepare + emit for one list. A failed replay leaves the command buffer and the tracker untouched.

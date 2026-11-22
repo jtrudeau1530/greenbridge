@@ -179,6 +179,20 @@ class CliTest(unittest.TestCase):
         self.assertEqual(doc["tally"]["ps_with_table"], 1)
         self.assertEqual(doc["tally"]["entries"], 2)
 
+    def test_local_stage_index_works_with_an_unrelated_parent_index(self):
+        with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"unrelated": []}, f)
+        with open(os.path.join(self.fssm_dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump([{"file": "a.dxbc", "stage": "ps"}], f)
+        self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps"})
+
+    def test_parent_stage_index_is_used_when_local_index_is_empty_or_unrelated(self):
+        for data in ({"unrelated": []}, [], {}):
+            with self.subTest(data=data):
+                with open(os.path.join(self.fssm_dir, "index.json"), "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps", "b": "ps"})
+
 
 class BindingCliTest(unittest.TestCase):
     def test_bindings_flag_reports_the_table(self):

@@ -4,8 +4,65 @@ const { join } = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
 
-// Exercise the viewer's actual streaming code without WebGL, a network or game data.
+// Exercise the viewer's actual loading and streaming code without WebGL, a network or game data.
 const html = readFileSync(join(__dirname, '..', 'viewer', 'index.html'), 'utf8');
+const worldBegin = html.indexOf('// ---------- world description ----------');
+const worldEnd = html.indexOf('// Deterministic test terrain:', worldBegin);
+assert(worldBegin >= 0 && worldEnd > worldBegin, 'viewer world description section must exist');
+const worldSource = html.slice(worldBegin, worldEnd);
+
+function loadWorld(fetch, search = '') {
+    return vm.runInNewContext(worldSource + '\nloadWorld()', { fetch, location: { search }, URLSearchParams });
+}
+
+function manifestResponse(manifest) {
+    return async () => ({ ok: true, json: async () => manifest });
+}
+
+const worldChunk = { id: 'cell', url: 'world/chunks/cell.glb', bounds: [-1, -2, -3, 1, 2, 3] };
+
+test('a valid manifest is used, including an intentionally empty world', async () => {
+    for (const chunks of [[worldChunk], []]) {
+        const world = await loadWorld(manifestResponse({ spawn: [1, 2, 3], chunks }));
+        assert.equal(world.test, false);
+        assert.equal(world.spawn.join(','), '1,2,3');
+        assert.deepEqual(world.chunks, chunks);
+    }
+});
+
+test('malformed manifests keep the viewer usable and identify the invalid field', async t => {
+    const cases = [
+        ['missing spawn', {}, /spawn/],
+        ['non-finite spawn', { spawn: [0, Infinity, 0], chunks: [] }, /spawn/],
+        ['invalid chunks array', { spawn: [0, 0, 0], chunks: {} }, /chunks/],
+        ['missing chunk', { spawn: [0, 0, 0], chunks: [null] }, /chunks\[0\]\.id/],
+        ['missing URL', { spawn: [0, 0, 0], chunks: [{ ...worldChunk, url: '' }] }, /chunks\[0\]\.url/],
+        ['bad bounds', { spawn: [0, 0, 0], chunks: [{ ...worldChunk, bounds: [0, 0, 0, -1, 1, 1] }] },
+            /chunks\[0\]\.bounds/],
+        ['duplicate chunk ID', { spawn: [0, 0, 0], chunks: [worldChunk, worldChunk] }, /chunks\[1\]\.id/],
+    ];
+    for (const [label, manifest, field] of cases) {
+        await t.test(label, async () => {
+            const world = await loadWorld(manifestResponse(manifest));
+            assert.equal(world.test, true);
+            assert.ok(world.chunks.length > 0);
+            assert.match(world.reason, field);
+        });
+    }
+});
+
+test('test mode, a missing manifest, and an unreadable manifest have distinct messages', async () => {
+    const explicit = await loadWorld(async () => assert.fail('test mode must not fetch'), '?test');
+    const missing = await loadWorld(async () => ({ ok: false, status: 404 }));
+    const invalid = await loadWorld(async () => ({ ok: true, json: async () => { throw new SyntaxError(); } }));
+    const unreachable = await loadWorld(async () => { throw new TypeError(); });
+    for (const world of [explicit, missing, invalid, unreachable]) assert.equal(world.test, true);
+    assert.match(explicit.reason, /requested/);
+    assert.match(missing.reason, /not found/);
+    assert.match(invalid.reason, /valid JSON/);
+    assert.match(unreachable.reason, /could not be loaded/);
+});
+
 const begin = html.indexOf('// ---------- chunk streaming ----------');
 const end = html.indexOf('// ---------- main loop ----------', begin);
 assert(begin >= 0 && end > begin, 'viewer streaming section must exist');
@@ -100,6 +157,40 @@ test('leaving pauses retries; returning preserves the exhausted budget', async (
     f.context.camera.position.x = 10000; f.frame(100000);
     f.context.camera.position.x = 0; f.frame(100001);
     assert.equal(f.requests.length, 3);
+});
+
+test('a full load queue skips looking up unloaded chunk bounds until a slot opens', async () => {
+    const f = fixture(8);
+    f.frame();
+    assert.equal(f.state.inflight, 4);
+    const next = f.context.world.chunks[4];
+    const bounds = next.bounds;
+    let reads = 0;
+    Object.defineProperty(next, 'bounds', { get() { reads++; return bounds; } });
+
+    f.frame();
+    assert.equal(reads, 0);
+    assert.equal(f.requests.length, 4);
+
+    await f.succeed(0, f.object());
+    f.frame();
+    assert.equal(reads, 1);
+    assert.equal(f.requests[4].url, '4.glb');
+});
+
+test('candidate distances are computed once and nearest chunks load first', () => {
+    const f = fixture(7);
+    const distances = [100, 5, 20, 20, 10, 1400, 4];
+    const reads = Array(distances.length).fill(0);
+    f.context.world.chunks.forEach((chunk, i) => {
+        const x = distances[i];
+        const bounds = [x, 0, 0, x + 1, 1, 1];
+        Object.defineProperty(chunk, 'bounds', { get() { reads[i]++; return bounds; } });
+    });
+
+    f.frame();
+    assert.deepEqual(f.requests.map(r => r.url), ['6.glb', '1.glb', '4.glb', '2.glb']);
+    assert.deepEqual(reads, Array(distances.length).fill(1));
 });
 
 test('pending requests are not duplicated and retries obey the inflight limit', async () => {

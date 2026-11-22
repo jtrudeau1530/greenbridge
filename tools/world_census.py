@@ -495,6 +495,8 @@ def _audit_gap(m, a, b, result, allow_zlib):
 
 
 def _expected_shards(start, end, shard_size):
+    if shard_size < 1:  # pos would never advance, and the list would grow until memory ran out
+        raise ValueError(f"shard_size must be at least 1, not {shard_size}")
     out = []
     index = 0
     pos = start
@@ -626,12 +628,35 @@ def summarize(archive, outdir, start, end, shard_size, data_start):
     return summary
 
 
+def positive_int(text):
+    """--shard-size 0 or less never finished planning shards, and --jobs 0 made ProcessPoolExecutor raise."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+# ProcessPoolExecutor on Windows raises ValueError above 61 workers (WaitForMultipleObjects' handle limit).
+MAX_JOBS = 61 if os.name == "nt" else None
+
+
+def job_count(text):
+    """--jobs: at least 1, and at most MAX_JOBS where the platform has a limit."""
+    value = positive_int(text)
+    if MAX_JOBS is not None and value > MAX_JOBS:
+        raise argparse.ArgumentTypeError(f"must be at most {MAX_JOBS} on this platform")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("archive")
     ap.add_argument("--out", default=os.path.join("work", "world", "census"))
-    ap.add_argument("--shard-size", type=int, default=2 << 30)
-    ap.add_argument("--jobs", type=int, default=max(1, min(12, (os.cpu_count() or 2) // 2)))
+    ap.add_argument("--shard-size", type=positive_int, default=2 << 30)
+    ap.add_argument("--jobs", type=job_count, default=max(1, min(12, (os.cpu_count() or 2) // 2)))
     ap.add_argument("--start", type=int)
     ap.add_argument("--limit", type=int)
     ap.add_argument("--resume", action="store_true")

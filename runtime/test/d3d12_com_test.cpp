@@ -91,6 +91,106 @@ int main() {
         }
         EXPECT(queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT);
         EXPECT(list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+        // ExecuteBundle: a closed bundle is inlined at the call site, and its recorded sticky state spills back.
+        Ref<ID3D12GraphicsCommandList8> list8;
+        EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list8.p))));
+        list8->OMSetFrontAndBackStencilRef(1, 2);
+        Ref<ID3D12CommandAllocator> bundle_allocator;
+        Ref<ID3D12GraphicsCommandList8> bundle;
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                              IID_PPV_ARGS(&bundle_allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p,
+                                                         IID_PPV_ARGS(&bundle.p))));
+        EXPECT(bundle->GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE);
+
+        // A command list and its allocator must have the same D3D12 type.
+        Ref<ID3D12CommandAllocator> wrong_allocator;
+        Ref<ID3D12GraphicsCommandList8> wrong_bundle;
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                              IID_PPV_ARGS(&wrong_allocator.p))));
+        EXPECT(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, wrong_allocator.p,
+                                               IID_PPV_ARGS(&wrong_bundle.p)) == E_INVALIDARG);
+        EXPECT(!wrong_bundle.p);
+        bundle->OMSetFrontAndBackStencilRef(7, 9);
+        EXPECT(bundle->Close() == S_OK);
+        list8->ExecuteBundle(bundle.p);
+        UINT front = 0, back = 0;
+        EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 7 && back == 9);
+
+        // An untouched bundle inherits the parent's current sticky state; its default values must not overwrite it.
+        Ref<ID3D12CommandAllocator> untouched_allocator;
+        Ref<ID3D12GraphicsCommandList8> untouched_bundle;
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                              IID_PPV_ARGS(&untouched_allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, untouched_allocator.p,
+                                                         IID_PPV_ARGS(&untouched_bundle.p))));
+        EXPECT(untouched_bundle->Close() == S_OK);
+        list8->ExecuteBundle(untouched_bundle.p);
+        EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 7 && back == 9);
+        list8->ExecuteBundle(bundle.p);  // the same closed bundle can be executed repeatedly
+
+        ID3D12CommandList* bundle_submission[] = {bundle.p};
+        queue->ExecuteCommandLists(1, bundle_submission);  // bundles are executed only inside direct lists
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == ReplayResult::unsupported);
+
+        // Runtime validation failures are deferred to Close, matching D3D12.
+        Ref<ID3D12CommandAllocator> bad_parent_allocator, direct_callee_allocator;
+        Ref<ID3D12GraphicsCommandList8> bad_parent, direct_callee;
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                              IID_PPV_ARGS(&bad_parent_allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, bad_parent_allocator.p,
+                                                         IID_PPV_ARGS(&bad_parent.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                              IID_PPV_ARGS(&direct_callee_allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, direct_callee_allocator.p,
+                                                         IID_PPV_ARGS(&direct_callee.p))));
+        EXPECT(direct_callee->Close() == S_OK);
+        bad_parent->ExecuteBundle(direct_callee.p);  // callee must be a bundle
+        EXPECT(bad_parent->Close() == E_INVALIDARG);
+        EXPECT(direct_callee->Reset(bundle_allocator.p, nullptr) == E_INVALIDARG);
+        EXPECT(SUCCEEDED(direct_callee->Reset(direct_callee_allocator.p, nullptr)));
+        EXPECT(direct_callee->Close() == S_OK);
+
+        Ref<ID3D12CommandAllocator> open_parent_allocator, open_bundle_allocator;
+        Ref<ID3D12GraphicsCommandList8> open_parent, open_bundle;
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                              IID_PPV_ARGS(&open_parent_allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, open_parent_allocator.p,
+                                                         IID_PPV_ARGS(&open_parent.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                              IID_PPV_ARGS(&open_bundle_allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, open_bundle_allocator.p,
+                                                         IID_PPV_ARGS(&open_bundle.p))));
+        open_parent->ExecuteBundle(open_bundle.p);  // callee must already be closed
+        EXPECT(open_parent->Close() == E_INVALIDARG);
+        EXPECT(open_bundle->Close() == S_OK);
+
+        Ref<ID3D12CommandAllocator> bundle_parent_allocator;
+        Ref<ID3D12GraphicsCommandList8> bundle_parent;
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                              IID_PPV_ARGS(&bundle_parent_allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_parent_allocator.p,
+                                                         IID_PPV_ARGS(&bundle_parent.p))));
+        bundle_parent->ExecuteBundle(bundle.p);  // caller must be a direct list
+        EXPECT(bundle_parent->Close() == E_INVALIDARG);
+
+        // Clear calls are forbidden in bundles; a failed bundle also invalidates its caller.
+        Ref<ID3D12CommandAllocator> invalid_bundle_allocator, invalid_caller_allocator;
+        Ref<ID3D12GraphicsCommandList8> invalid_bundle, invalid_caller;
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                              IID_PPV_ARGS(&invalid_bundle_allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, invalid_bundle_allocator.p,
+                                                         IID_PPV_ARGS(&invalid_bundle.p))));
+        const FLOAT forbidden_clear[4] = {0, 0, 0, 1};
+        invalid_bundle->ClearRenderTargetView(rtv_handle, forbidden_clear, 0, nullptr);
+        EXPECT(invalid_bundle->Close() == E_INVALIDARG);
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                              IID_PPV_ARGS(&invalid_caller_allocator.p))));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, invalid_caller_allocator.p,
+                                                         IID_PPV_ARGS(&invalid_caller.p))));
+        invalid_caller->ExecuteBundle(invalid_bundle.p);
+        EXPECT(invalid_caller->Close() == E_INVALIDARG);
         constexpr GUID kTestData{0x0badf00d, 0x1, 0x2, {3, 4, 5, 6, 7, 8, 9, 10}};
         const std::uint32_t tag = 0x1234abcd;
         std::uint32_t read = 0;
@@ -129,6 +229,43 @@ int main() {
         group.Type = D3D12_BARRIER_TYPE_TEXTURE;
         group.NumBarriers = 1;
         group.pTextureBarriers = &texture;
+
+        // Each currently implemented bundle-forbidden method independently invalidates the bundle.
+        const FLOAT bundle_clear_color[4] = {0, 1, 0, 1};
+        auto invalid_bundle_call = [&](auto record) {
+            Ref<ID3D12CommandAllocator> test_allocator;
+            Ref<ID3D12GraphicsCommandList8> test_bundle;
+            if (FAILED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                           IID_PPV_ARGS(&test_allocator.p))))
+                return false;
+            if (FAILED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, test_allocator.p,
+                                                      IID_PPV_ARGS(&test_bundle.p))))
+                return false;
+            record(test_bundle.p);
+            return test_bundle->Close() == E_INVALIDARG;
+        };
+        EXPECT(invalid_bundle_call([&](auto* b) { b->ResourceBarrier(1, &transition); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->Barrier(1, &group); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->CopyBufferRegion(rt_resource, 0, ds_resource, 0, 16); }));
+        D3D12_TEXTURE_COPY_LOCATION copy_dst{};
+        copy_dst.pResource = rt_resource;
+        copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION copy_src{};
+        copy_src.pResource = ds_resource;
+        copy_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        EXPECT(invalid_bundle_call([&](auto* b) { b->CopyTextureRegion(&copy_dst, 0, 0, 0, &copy_src, nullptr); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->CopyResource(rt_resource, ds_resource); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->ResolveSubresource(rt_resource, 0, ds_resource, 0,
+                                                                          DXGI_FORMAT_R8G8B8A8_UNORM); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->ResolveSubresourceRegion(rt_resource, 0, 0, 0, ds_resource,
+                                                                               0, nullptr,
+                                                                               DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                                               D3D12_RESOLVE_MODE_AVERAGE); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->ClearRenderTargetView(rtv_handle, bundle_clear_color, 0, nullptr); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH,
+                                                                            0.5f, 0, 0, nullptr); }));
+        EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
+
         list->Barrier(1, &group);
         list->DrawInstanced(3, 1, 0, 0);  // not implemented: reported once by its generated stub, recording continues
         EXPECT(list->Close() == S_OK);

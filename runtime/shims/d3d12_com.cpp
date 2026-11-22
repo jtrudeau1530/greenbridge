@@ -25,6 +25,14 @@ void stub(const char* method) {
 
 namespace {
 
+// Reports a deliberate simplification once (unlike stub, which reports a method not implemented).
+void note_once(const char* what) {
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    std::lock_guard lock(mutex);
+    if (seen.insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s\n", what);
+}
+
 const char* name(leonida::ReplayResult result) {
     switch (result) {
     case leonida::ReplayResult::success: return "success";
@@ -49,6 +57,7 @@ public:
     // lists are still executing; that is the application's job, as on D3D12.
     HRESULT STDMETHODCALLTYPE Reset() override { return S_OK; }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
+    static CommandAllocator* from(IUnknown* object) { return Child::from<CommandAllocator>(object); }
 
 private:
     D3D12_COMMAND_LIST_TYPE type_;
@@ -70,6 +79,7 @@ public:
     UINT back_stencil_ref() const { return back_stencil_ref_; }
 
     D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override { return type_; }
+    D3D12_COMMAND_LIST_TYPE type() const { return type_; }
 
     // E_INVALIDARG when a call during recording was invalid, as D3D12's Close reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
@@ -78,15 +88,34 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator* allocator, ID3D12PipelineState* state) override {
-        if (!allocator) return E_INVALIDARG;
+        CommandAllocator* command_allocator = CommandAllocator::from(allocator);
+        if (!command_allocator || command_allocator->type() != type_) return E_INVALIDARG;
         if (!list_.reset()) return E_FAIL;  // D3D12 resets only closed lists
         invalid_ = false;
         front_stencil_ref_ = back_stencil_ref_ = 0;  // Reset returns every list state to its default
+        stencil_ref_set_ = false;
         if (state) stub("ID3D12GraphicsCommandList::Reset(initial pipeline state)");
         return S_OK;
     }
 
+    void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* command_list) override {
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
+        GraphicsCommandList* bundle = from(command_list);
+        if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->invalid_ ||
+            !bundle->list_.closed())
+            return check(false);
+        if (!list_.execute_bundle(bundle->list_)) return check(false);
+
+        // Only the sticky state currently recorded by this COM layer is carried back from the bundle.
+        if (bundle->stencil_ref_set_) {
+            front_stencil_ref_ = bundle->front_stencil_ref_;
+            back_stencil_ref_ = bundle->back_stencil_ref_;
+            stencil_ref_set_ = true;
+        }
+    }
+
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         for (UINT i = 0; i < count; ++i) {
             const auto& b = barriers[i];
             switch (b.Type) {
@@ -110,6 +139,7 @@ public:
     }
 
     void STDMETHODCALLTYPE Barrier(UINT32 groups, const D3D12_BARRIER_GROUP* group) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         for (UINT32 g = 0; g < groups; ++g) {
             for (UINT32 i = 0; i < group[g].NumBarriers; ++i) {
                 switch (group[g].Type) {
@@ -145,11 +175,13 @@ public:
 
     void STDMETHODCALLTYPE CopyBufferRegion(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
                                             UINT64 src_offset, UINT64 bytes) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         check(list_.copy_buffer({resource_id(dst), dst_offset, resource_id(src), src_offset, bytes}));
     }
 
     void STDMETHODCALLTYPE CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z,
                                              const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!dst || !src) return check(false);
         leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
         if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
@@ -157,17 +189,37 @@ public:
     }
 
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         check(list_.copy_resource({resource_id(dst), resource_id(src)}));
     }
 
     // The format picks the member of a typeless family to resolve as; the textures' own format is used.
     void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* dst, UINT dst_subresource, ID3D12Resource* src,
                                               UINT src_subresource, DXGI_FORMAT) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource}));
+    }
+
+    void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
+                                                     ID3D12Resource* src, UINT src_subresource, D3D12_RECT* rect,
+                                                     DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || mode != D3D12_RESOLVE_MODE_AVERAGE ||
+            !color_resolve_format_matches(format, dst, src))
+            return check(false);
+        leonida::ResolveRegion region{x, y, std::nullopt};
+        if (rect) region.src_rect = leonida::Rect{rect->left, rect->top, rect->right, rect->bottom};
+        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
+    }
+
+    // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles may not set it.
+    void STDMETHODCALLTYPE SetPredication(ID3D12Resource* buffer, UINT64 offset, D3D12_PREDICATION_OP op) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        check(list_.set_predication({resource_id(buffer), offset, u(op)}));
     }
 
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count,
                                                  const D3D12_RECT* rects) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
@@ -176,6 +228,7 @@ public:
     void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
                                                  FLOAT depth, UINT8 stencil, UINT count,
                                                  const D3D12_RECT* rects) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr) return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
                                         stencil, to_rects(count, rects)));
@@ -186,8 +239,10 @@ public:
     // yet. Retain the values for that path and report that nothing consumed them, rather than emit a call whose
     // effect no later command can observe.
     void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT front, UINT back) override {
+        if (list_.closed()) return check(false);
         front_stencil_ref_ = front;
         back_stencil_ref_ = back;
+        stencil_ref_set_ = true;
         stub("ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef (recorded; no pipeline path applies it)");
     }
 
@@ -224,6 +279,7 @@ private:
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
+    bool stencil_ref_set_ = false;
 };
 
 class Fence final
@@ -335,8 +391,8 @@ public:
         std::vector<const leonida::CommandList*> recorded;
         for (UINT i = 0; i < count; ++i) {
             const GraphicsCommandList* list = GraphicsCommandList::from(lists[i]);
-            if (!list) {
-                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u is not one of ours\n", i);
+            if (!list || list->type() == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u is not a direct command list\n", i);
                 last_result_ = leonida::ReplayResult::unsupported;
                 return;
             }
@@ -346,6 +402,22 @@ public:
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
                          name(last_result_));
+    }
+
+    // Reserved resources are fully backed at creation (docs/d3d12_vulkan.md section 4.2), so tile mappings are not
+    // emulated: every tile keeps its own memory. What that loses is reported once each: two resources mapped to the
+    // same heap tiles do not alias, and a tile unmapped (or remapped) keeps its contents.
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
+                                              const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT,
+                                              const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
+                                              D3D12_TILE_MAPPING_FLAGS) override {
+        note_once("ID3D12CommandQueue::UpdateTileMappings ignored: reserved resources are fully backed, mappings are not emulated");
+    }
+
+    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*, ID3D12Resource*,
+                                            const D3D12_TILED_RESOURCE_COORDINATE*, const D3D12_TILE_REGION_SIZE*,
+                                            D3D12_TILE_MAPPING_FLAGS) override {
+        note_once("ID3D12CommandQueue::CopyTileMappings ignored: reserved resources are fully backed, mappings are not emulated");
     }
 
     HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override {
@@ -400,8 +472,10 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (!allocator) return E_INVALIDARG;
-    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT) stub("create_command_list(non-direct type)");
+    CommandAllocator* command_allocator = CommandAllocator::from(allocator);
+    if (!command_allocator || command_allocator->type() != type) return E_INVALIDARG;
+    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE)
+        stub("create_command_list(non-direct type)");
     auto* object = new GraphicsCommandList(type);  // created open, as D3D12 does
     object->attach_device(device);
     return hand_out(object, riid, out);

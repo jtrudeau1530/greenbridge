@@ -117,7 +117,17 @@ static_assert(leonida::d3d12_layout::compute_queue_unordered_access == std::uint
 static_assert(leonida::d3d12_layout::compute_queue_shader_resource == std::uint32_t(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE));
 static_assert(leonida::d3d12_layout::compute_queue_copy_source == std::uint32_t(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE));
 static_assert(leonida::d3d12_layout::compute_queue_copy_dest == std::uint32_t(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST));
-static_assert(leonida::d3d12_layout::video_queue_common == std::uint32_t(D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON));
+
+template <typename SdkLayout>
+constexpr bool video_queue_common_matches_sdk() {
+    if constexpr (requires { SdkLayout::D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON; }) {
+        return leonida::d3d12_layout::video_queue_common ==
+               std::uint32_t(SdkLayout::D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON);
+    }
+    // SDK 10.0.28000.0 omits this legacy enumerator. Its value is 30 in older headers.
+    return leonida::d3d12_layout::video_queue_common == 30;
+}
+static_assert(video_queue_common_matches_sdk<D3D12_BARRIER_LAYOUT>());
 #endif
 
 #include <cstdio>
@@ -255,6 +265,46 @@ int main() {
     CHECK(vulkan_barrier_access(a::common) == (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
     CHECK(vulkan_barrier_access(a::copy_source | a::shader_resource) ==
           (VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT));
+
+    // vulkan_barrier_scope: the stages are widened until every access has one that can perform it; the access is
+    // never dropped. (vk_command_replay_test part C checks every pair against the validation layer.)
+    {
+        const auto scope = [](std::uint32_t sync, std::uint32_t access) { return vulkan_barrier_scope(sync, access); };
+        // Valid D3D12, invalid as mapped before: vertex-buffer reads under SYNC_ALL_SHADING.
+        BarrierScope widened = scope(y::all_shading, a::vertex_buffer);
+        CHECK(widened.access == VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT);
+        CHECK(widened.stages == (vulkan_sync(y::all_shading) | VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT));
+        widened = scope(y::non_pixel_shading, a::index_buffer);
+        CHECK(widened.stages & VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT);
+        widened = scope(y::clear_unordered_access_view, a::copy_source);  // CLEAR only writes
+        CHECK(widened.stages & VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT);
+        widened = scope(y::copy, a::unordered_access);
+        CHECK(widened.stages == (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
+                                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT));
+        // Pairs Vulkan already accepts are left exactly as vulkan_sync / vulkan_barrier_access map them.
+        const std::pair<std::uint32_t, std::uint32_t> unchanged[] = {
+            {y::copy, a::copy_dest},           {y::pixel_shading, a::shader_resource},
+            {y::render_target, a::render_target}, {y::depth_stencil, a::depth_stencil_write},
+            {y::draw, a::vertex_buffer},       {y::vertex_shading, a::vertex_buffer},
+            {y::index_input, a::index_buffer}, {y::execute_indirect, a::indirect_argument},
+            {y::all, a::common},               {y::compute_shading, a::unordered_access},
+            {y::clear_unordered_access_view, a::unordered_access}};
+        for (const auto& [sync, access] : unchanged) {
+            const BarrierScope same = scope(sync, access);
+            CHECK(same.stages == vulkan_sync(sync) && same.access == vulkan_barrier_access(access));
+        }
+        // No stages, no access (SYNC_NONE pairs with ACCESS_NO_ACCESS in D3D12).
+        CHECK(scope(y::none, a::no_access).stages == 0 && scope(y::none, a::no_access).access == 0);
+        CHECK(scope(y::none, a::shader_resource).access == 0);
+        // Every single sync bit against every single access bit: the stages only grow, the access never changes.
+        for (std::uint32_t s_bit = 1; s_bit; s_bit <<= 1) {
+            for (std::uint32_t a_bit = 1; a_bit; a_bit <<= 1) {
+                const BarrierScope any = scope(s_bit, a_bit);
+                CHECK((any.stages & vulkan_sync(s_bit)) == vulkan_sync(s_bit));
+                CHECK(any.access == (vulkan_sync(s_bit) ? vulkan_barrier_access(a_bit) : 0));
+            }
+        }
+    }
     CHECK(vulkan_layout(l::undefined, false) == VK_IMAGE_LAYOUT_UNDEFINED);
     CHECK(vulkan_layout(l::common, false) == VK_IMAGE_LAYOUT_GENERAL);
     CHECK(vulkan_layout(l::present, true) == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);

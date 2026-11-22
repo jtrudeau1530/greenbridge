@@ -72,9 +72,27 @@ def test_translation_is_deterministic(make_shader):
 
 def test_unsupported_instruction_is_reported_not_guessed(make_shader):
     """Anything outside the supported set must raise Unsupported rather than emit a wrong program."""
-    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_sad_u8 v0, v1, v1, v1"))
+    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]"))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
+
+
+@pytest.mark.parametrize("d16", [False, True], ids=["f32", "d16"])
+def test_depth_compare_sample_result_width(make_shader, d16):
+    """image_sample_c_lz returns one value: f32 bits, or with d16 an f16 in the low half like every other d16 sample
+    result. Written as f32 bits under d16, every compare result would read back as 0 (1.0 = 0x3f800000)."""
+    shader = make_shader("v_mov_b32 v0, 0.5\nv_mov_b32 v1, 0.5\nv_mov_b32 v2, 0.25\n"
+                         "image_sample_c_lz v4, v[0:2], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D"
+                         + (" d16" if d16 else "") + "\nexp mrt0 v4, v4, v4, v4 done vm\ns_endpgm\n", "ps_dref")
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    dref = re.search(r"^\s*(%\w+) = OpImageSampleDrefExplicitLod %float ", spvasm, re.M)
+    assert dref, "the depth compare sample is missing"
+    d = re.escape(dref.group(1))
+    as_f16 = re.search(rf"^\s*(%\w+) = OpCompositeConstruct %v2float {d} %f0\n\s*%\w+ = OpExtInst %uint %glsl "
+                       r"PackHalf2x16 \1$", spvasm, re.M)
+    as_f32 = re.search(rf"^\s*%\w+ = OpBitcast %uint {d}$", spvasm, re.M)
+    assert (bool(as_f16), bool(as_f32)) == (d16, not d16)
 
 
 def test_unknown_stage_is_rejected(make_shader):
@@ -86,6 +104,21 @@ def test_unknown_stage_is_rejected(make_shader):
 def test_compute_translates_and_validates(make_shader):
     shader = make_shader("v_mov_b32 v1, 1\ns_endpgm\n", name="cs_test")
     shader.validate(shader.translate())
+
+
+def test_cs_store_packed_atomic_pointers(make_shader):
+    """Packed stores need element zero of the physical dword array for Metal atomics."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_store.asm"), encoding="utf-8") as f:
+        spvasm = make_shader(f.read(), "cs_store").translate()
+    defs = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)", spvasm, re.M))
+    atomics = re.findall(r"= (OpAtomicAnd|OpAtomicOr) %uint (%\w+) ", spvasm)
+    assert {op for op, ptr in atomics} == {"OpAtomicAnd", "OpAtomicOr"}
+    for _, ptr in atomics:
+        access = defs[ptr].split()
+        assert access[:2] == ["OpAccessChain", "%_ptr_PSB_uint"]
+        _, _, base, index = access
+        assert defs[base].startswith("OpConvertUToPtr %_ptr_PSB_arr ")
+        assert defs[index] == "OpConstant %uint 0"
 
 
 def test_compute_thread_group_size_sgpr_is_rejected(make_shader):
@@ -124,6 +157,24 @@ def test_mesh_without_psv0_is_rejected(make_shader):
         shader = make_shader(f.read(), "ms_tri")                   # empty DXBC
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
+
+
+def test_wave32_readlane_writelane_mask_31(make_shader):
+    """SHADER-52: wave32 lane select is & 31; wave64 keeps & 63."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_w32_lane_wrap.asm"), encoding="utf-8") as f:
+        w32 = make_shader(f.read(), name="cs_w32_lane_wrap", cs_header=(0x8088, (32, 1, 1)))
+    w32_spv = w32.translate()
+    w32.validate(w32_spv)
+    assert "OpBitwiseAnd %uint" in w32_spv and "%c1f" in w32_spv  # 31
+    # Every readlane/writelane mask in this wave32 program is 31, never 63.
+    assert not re.search(r"OpBitwiseAnd %uint %\w+ %c3f\b", w32_spv)
+    assert rdna2spirv.translate.last_gen.wave64 is False
+
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_w64x_readlane.asm"), encoding="utf-8") as f:
+        w64 = make_shader(f.read(), name="cs_w64x_readlane")
+    w64_spv = w64.translate()
+    assert rdna2spirv.translate.last_gen.wave64 is True
+    assert re.search(r"OpBitwiseAnd %uint %\w+ %c3f\b", w64_spv)  # 63
 
 
 @pytest.mark.parametrize("threads", [96, 128], ids=["96-threads", "128-threads"])
@@ -442,6 +493,70 @@ def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader)
     ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
 
 
+WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
+WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[20:21]\ns_add_u32 s24, s22, s23\ns_endpgm\n"
+
+
+def test_wqm_on_a_lane_mask_gathers_the_quad_and_votes_scc(make_shader, monkeypatch):
+    """s_wqm on a lane mask ORs the lane's bit with its quad's (two OpGroupNonUniformQuadSwap, horizontal then
+    vertical) and SCC is the wave-wide any. Emulated, the four lanes of the quad come through %x_buf instead."""
+    shader = make_shader(WQM_MASK, name="cs_wqm_mask_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpCapability GroupNonUniformQuad" in asm
+    assert asm.count("OpGroupNonUniformQuadSwap %uint %c3") == 2
+    assert re.search(r"OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c0\n(?:.*\n)*?.*OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c1\n", asm)
+    assert "OpGroupNonUniformAny" in asm                   # SCC: any bit of the result in the wave
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    emulated = shader.translate()
+    shader.validate(emulated)
+    assert "OpGroupNonUniform" not in emulated and "GroupNonUniformQuad" not in emulated
+    assert "%x_buf" in emulated
+
+
+def test_wqm_on_data_is_a_bit_operation(make_shader):
+    """A register that is not a lane mask is data: per 32-bit word (x | x>>1 | x>>2 | x>>3) & 0x11111111, times 15."""
+    shader = make_shader(WQM_DATA, name="cs_wqm_data_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpGroupNonUniform" not in asm
+    for k in (1, 2, 3):                                  # three shifts per word, two words (s_wqm_b64)
+        assert len(re.findall(rf"OpShiftRightLogical %uint %t\d+ %c{k}\n", asm)) == 2
+    assert len(re.findall(r"OpBitwiseAnd %uint %t\d+ %c11111111\n", asm)) == 2
+    assert len(re.findall(r"OpIMul %uint %t\d+ %cf\n", asm)) == 2
+    assert re.search(r"OpBitwiseOr %uint %t\d+ %t\d+\n(?:.*\n)*?.*OpStore %scc", asm)   # SCC = low | high != 0
+
+
+def test_wqm_without_quad_operations_outside_fragment_and_compute(make_shader):
+    """Quad operations are only guaranteed in fragment and compute shaders: a vertex shader shuffles from the four
+    lanes of the quad instead."""
+    shader = make_shader("v_cmp_gt_u32_e32 vcc_lo, 1, v0\ns_wqm_b32 s8, vcc_lo\nv_cndmask_b32_e64 v6, 0, 1, s8\n"
+                         "exp pos0 v6, v6, v6, v6 done\ns_endpgm\n", name="vs_wqm_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "QuadSwap" not in asm and "GroupNonUniformQuad" not in asm
+    assert asm.count("OpGroupNonUniformShuffle") == 4
+
+
+def test_wave64_wqm_b32_changes_and_votes_only_its_half(make_shader):
+    """s_wqm_b32 exec_hi in wave64 writes the lanes 32-63 of EXEC only (exec_half_write) and SCC votes over them."""
+    shader = make_shader("s_mov_b32 exec_hi, 0x102\ns_wqm_b32 exec_hi, exec_hi\ns_cselect_b32 s9, 1, 0\ns_endpgm\n",
+                         name="cs_wqm_half_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.wave64
+    assert re.search(r"(%t\d+) = OpUGreaterThanEqual %bool %t\d+ %c20\n(?:.*\n)*?.*OpLogicalAnd %bool \1 %t\d+\n"
+                     r"(?:.*\n)*?.*OpGroupNonUniformAny", asm)
+
+
+def test_wqm_in_a_pixel_shader_uses_the_fragment_quad(make_shader):
+    shader = make_shader("v_cmp_gt_u32_e32 vcc_lo, 1, v0\ns_wqm_b32 s8, vcc_lo\nv_cndmask_b32_e64 v6, 0, 1, s8\n"
+                         "exp mrt0 v6, v6, v6, v6 done vm\ns_endpgm\n", name="ps_wqm_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert asm.count("OpGroupNonUniformQuadSwap") == 2 and "OpCapability GroupNonUniformQuad" in asm
+
+
 EMULATE_SAMPLES = [p for p in SAMPLES if os.path.basename(p).startswith(("cs_", "ms_"))]
 
 
@@ -626,3 +741,16 @@ def test_wave64_emulate_reuses_a_mask_exchange(make_shader, monkeypatch):
         cmp + "v_mbcnt_lo_u32_b32 v3, s4, 0\nv_cmp_gt_u32_e64 s[6:7], 40, v1\ns_and_b32 s5, s5, s7\n"
         "v_mbcnt_hi_u32_b32 v3, s5, v3\n")
     assert (same, rewritten, same_exec, new_exec, pair, half) == (2, 4, 2, 4, 2, 4)
+
+
+def test_mesh_s3_wave_id_emits_local_index_shift_and_bfe(make_shader):
+    """Mesh shader prologue initializes s3[27:24] from LocalInvocationIndex >> 6 and s_bfe_u32 extracts it."""
+    path = os.path.join(ROOT, "runtime", "test", "shaders", "ms_wave_info_s3.asm")
+    with open(path, encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_wave_info_s3", dxbc=SAMPLE_DXBC["ms_wave_info_s3"])
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "%wave = OpShiftRightLogical %uint %lidx %c6" in asm
+    assert "%mwi = OpShiftLeftLogical %uint %wave %c18" in asm
+    assert "OpStore %s3p %mwi" in asm
+    assert "OpBitFieldUExtract %uint" in asm

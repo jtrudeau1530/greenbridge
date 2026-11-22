@@ -18,12 +18,14 @@ WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS + check.W64X_DUMPS + check.W64X_
                 if n not in (*check.WAVE32_DUMPS, "cs_wave64_ballot")}
 # A group smaller than a wave can't ask for full subgroups: it asks for subgroup size 64 and reads the device's range.
 PARTIAL = {n for n, _ in check.W64X_PARTIAL}
+WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
 # every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
-# tests, pixel tests, and two mesh fixtures (skipped here: build.py does not build mesh shaders)
+# tests, pixel tests, the two-mip draw and three mesh fixtures (skipped here: build.py does not build mesh shaders)
 TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
-         + len(check.PIXEL_TESTS) + 3 + len(check.BOUNDS) + 1)   # + ms_v5_workgroup, ms_w64x_ballot, ps_tex (#230), ps_gather_wrap
+         + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
+         + 7)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, ps_texture_mip0 and ps_gather_wrap
 
 
 class Wave64Checks(unittest.TestCase):
@@ -60,10 +62,17 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_bounds":
                 # 0x12345678, the in-bounds reload, the OOB load's 0, then the untouched 0xEEEEEEEE fill.
                 return 0, "out[0..7] = 305419896 305419896 0 4008636142 4008636142 4008636142 4008636142 4008636142\n"
+            if name == "cs_cmpx_class_f32":
+                return 0, "out[0..7] = " + " ".join(map(str, check.CMPX_CLASS_WORDS)) + "\n"
+            if name == "cs_global_neg_offset":
+                self.assertEqual(args[0], "40")
+                return 0, "out[0..7] = " + " ".join(map(str, check.GLOBAL_OFFSET[0][2])) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
             if name == "cs_smem_soffset_imm":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CS_SMEM)) + "\n"
+            if name in WAVE32_WORDS:           # wave32 dumps run on any subgroup size
+                return 0, "out[0..7] = " + " ".join(map(str, (WAVE32_WORDS[name] + [0] * 8)[:8])) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
             if name in ("cs_imgstore", "cs_imgload"):
@@ -80,7 +89,9 @@ class Wave64Checks(unittest.TestCase):
                 (spirv / "cs_wave64_ballot.spv").touch()
             output = io.StringIO()
             with (patch.object(sys, "argv", ["check.py", tmp]), patch.object(check, "run", side_effect=harness),
-                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "bindless_test", return_value=""),
+                  patch.object(check, "clip_test", return_value=""),
+                  patch.object(check, "pixel_test", return_value=""), patch.object(check, "texture_mip_test", return_value=""),
+                  patch.object(check, "bindless_test", return_value=""),
                   patch.object(check, "gather_wrap_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
@@ -93,7 +104,7 @@ class Wave64Checks(unittest.TestCase):
         self.assertRegex(out, r"cs_wavemask +SKIP")
         self.assertRegex(out, r"cs_wave64_ballot +SKIP")
         self.assertRegex(out, r"cs_exec64 +ok")
-        self.assertIn(f"{TOTAL - 4 - len(WAVE64_DUMPS)} of {TOTAL} pass, {4 + len(WAVE64_DUMPS)} skipped", out)
+        self.assertIn(f"{TOTAL - 5 - len(WAVE64_DUMPS)} of {TOTAL} pass, {5 + len(WAVE64_DUMPS)} skipped", out)
 
     def test_full_wave_checks_pass_with_expected_results(self):
         status, out = self.run_checks(
@@ -102,7 +113,7 @@ class Wave64Checks(unittest.TestCase):
         )
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"cs_wave64_ballot +ok")
-        self.assertIn(f"{TOTAL - 2} of {TOTAL} pass, 2 skipped", out)
+        self.assertIn(f"{TOTAL - 3} of {TOTAL} pass, 3 skipped", out)
 
     def test_emulated_wave64_runs_without_a_64_wide_subgroup(self):
         # LEONIDA_W64_EMULATE=1: the shaders were translated with --wave64-emulate, so no wave64 test asks the
@@ -111,7 +122,7 @@ class Wave64Checks(unittest.TestCase):
         status, out = self.run_checks(unsupported, unsupported, emulated=True)
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"cs_w64x_wg128_branches +ok")
-        self.assertIn(f"{TOTAL - 2} of {TOTAL} pass, 2 skipped", out)
+        self.assertIn(f"{TOTAL - 3} of {TOTAL} pass, 3 skipped", out)
 
     def test_ballot_mismatches_and_harness_errors_fail(self):
         wavemask = 0, "compute subgroup size: 64\n0 mismatches\n"
@@ -125,7 +136,7 @@ class Wave64Checks(unittest.TestCase):
                 status, out = self.run_checks(wavemask, ballot)
                 self.assertEqual(status, 1, out)
                 self.assertRegex(out, rf"cs_wave64_ballot +{detail}")
-                self.assertIn(f"{TOTAL - 3} of {TOTAL} pass, 2 skipped", out)
+                self.assertIn(f"{TOTAL - 4} of {TOTAL} pass, 3 skipped", out)
 
     def test_missing_wave64_fixture_fails_even_on_wave32(self):
         unsupported = 77, "full 64-wide compute subgroups unavailable\n"
@@ -230,6 +241,112 @@ class SeededPixelTests(unittest.TestCase):
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("needs bufferDeviceAddress", problem)
 
+
+
+class SeededPixelTests(unittest.TestCase):
+    """ps_vcc_x2 reads a V# from s[0:3]; check.py hands vk_harness that V# and the heap words behind it (TEST-19)."""
+
+    def run_pixel_test(self, words, code=0, out=""):
+        seen = {}
+
+        def harness(_tool, _vs, _fs, raw, env=None):
+            seen["env"] = env
+            if not code:
+                Path(raw).write_bytes(struct.pack("<4I", *words) * (64 * 64))
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_vcc_x2.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                problem = check.pixel_test(tmp, tmp, "ps_vcc_x2")
+        return problem, seen["env"] or {}
+
+    def test_v_sharp_and_heap_reach_the_harness(self):
+        problem, env = self.run_pixel_test((0x11223344, 0x55667788, 0, 0))
+        self.assertEqual(problem, "")
+        self.assertEqual(env.get("VKH_SGPRS"), "0x1000,0,16,0")
+        self.assertEqual(env.get("VKH_HEAP"), "0x1000=0x11223344,0x1004=0x55667788")
+
+    def test_unseeded_result_fails(self):
+        problem, _ = self.run_pixel_test((0, 0, 0, 0))
+        self.assertIn("4096 of 4096 pixels differ", problem)
+
+    def test_device_without_buffer_addresses_skips(self):
+        problem, _ = self.run_pixel_test((), code=77, out="unsupported: VKH_HEAP needs bufferDeviceAddress\n")
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("needs bufferDeviceAddress", problem)
+
+
+class TextureMipChecks(unittest.TestCase):
+    def test_mip_draw_reports_unsupported_device_and_preserves_other_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / ("vk_texture_test" + check.EXE)).touch()
+            for shader in (check.TEXTURE_MIP_TEST, *check.TEXTURE_MIP_DEPENDENCIES):
+                (directory / (shader + ".spv")).touch()
+            with patch.object(check, "run", return_value=(77, "unsupported device")):
+                self.assertIsInstance(check.texture_mip_test(tmp, tmp), check.Skip)
+            with patch.object(check, "run", return_value=(1, "device lost")):
+                failure = check.texture_mip_test(tmp, tmp)
+                self.assertNotIsInstance(failure, check.Skip)
+                self.assertIn("device lost", failure)
+
+    def test_implicit_mip_checks_every_channel_through_last_pixel(self):
+        pixel = struct.pack("<4f", 0, 1, 1, 1)
+        image = pixel * (64 * 64)
+        self.assertEqual(check.texture_mip_mismatch(image, 1), "")
+        for channel in range(4):
+            damaged = bytearray(image)
+            struct.pack_into("<f", damaged, len(image) - 16 + 4 * channel, 0.5)
+            self.assertTrue(check.texture_mip_mismatch(damaged, 1).startswith("(63,63):"))
+        self.assertTrue(check.texture_mip_mismatch(image[:-1], 1))
+
+
+class TexelOffsetChecks(unittest.TestCase):
+    """ps_texoff (image_sample*_o, image_gather4_lz_o): the judgement of a dump, and the skip without maintenance8."""
+    LIMITS = "device: gpu\ntexel offset limits: -64..63, gather -32..31\n"
+
+    @staticmethod
+    def dump(words=check.texoff_words):
+        return b"".join(struct.pack("<4I", *words(i % 64, i // 64)) for i in range(64 * 64))
+
+    def test_hand_derived_words_of_the_asm_header(self):
+        self.assertEqual(check.texoff_words(0, 0), (0x00, 0x0761, 0x0000, 0x0000))
+        self.assertEqual(check.texoff_words(20, 50), (0x62, 0x0761, 0x1221, 0x5566))
+        self.assertEqual(check.texoff_words(63, 63), (0x77, 0x0761, 0x6776, 0x6677))
+
+    def test_expected_dump_passes_and_wrong_offsets_fail(self):
+        self.assertEqual(check.texoff_problem(self.dump(), self.LIMITS), ("", "offsets +16/-32 judged"))
+        for what, words in (
+            ("offset dropped", lambda x, y: (0x44, *check.texoff_words(x, y)[1:])),
+            ("x and y swapped", lambda x, y: (y >> 3 | x >> 3 << 4, *check.texoff_words(x, y)[1:])),
+            ("constant offset wrong", lambda x, y: (x >> 3 | y >> 3 << 4, 0x0744, *check.texoff_words(x, y)[2:])),
+            ("gather offset dropped", lambda x, y: (*check.texoff_words(x, y)[:2], 0x3443, 0x3344)),
+            ("descriptor miss", lambda x, y: (0x08, 0x0808, 0x8888, 0x0000)),
+        ):
+            with self.subTest(what):
+                self.assertIn("pixels differ", check.texoff_problem(self.dump(words), self.LIMITS)[0])
+        self.assertIn("pixel count", check.texoff_problem(self.dump()[:-16], self.LIMITS)[0])
+
+    def test_wide_offsets_are_judged_only_inside_the_device_limits(self):
+        wide_wrong = self.dump(lambda x, y: (x >> 3 | y >> 3 << 4, 0x4461, *check.texoff_words(x, y)[2:]))
+        self.assertIn("pixels differ", check.texoff_problem(wide_wrong, self.LIMITS)[0])
+        for out in ("texel offset limits: -8..7, gather -8..7\n", "no limits printed\n"):
+            problem, covered = check.texoff_problem(wide_wrong, out)
+            self.assertEqual(problem, "")
+            self.assertIn("not judged", covered)
+            self.assertIn("pixels differ", check.texoff_problem(self.dump(lambda x, y: (0x44, 0x0761, 0, 0)), out)[0])
+
+    def test_device_without_maintenance8_is_a_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_texoff.spv").touch()
+            answer = 77, "unsupported: VK_KHR_maintenance8 (non-constant texel Offset)\n"
+            with patch.object(check, "run", return_value=answer) as run:
+                result = check.pixel_test("tools", tmp, "ps_texoff")
+            self.assertEqual(run.call_args.kwargs["env"]["VKT_NEED_MAINTENANCE8"], "1")
+            self.assertIn("vk_texture_test", run.call_args.args[0])
+        self.assertIsInstance(result, check.Skip)
+        self.assertEqual(result, "SKIP (unsupported: VK_KHR_maintenance8 (non-constant texel Offset))")
 
 
 if __name__ == "__main__":

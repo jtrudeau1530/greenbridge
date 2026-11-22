@@ -2,7 +2,9 @@
 
     python -I runtime/test/shaders/check.py <out dir of build.py> [dir with the test programs]
 
-The test programs are vk_compute_test, vk_store_test, vk_harness and vk_bindless_test (runtime/build by default).
+The test programs are vk_compute_test, vk_store_test, vk_harness, vk_texture_test and vk_bindless_test (runtime/build by default). With
+the Visual Studio generator they are in runtime/build/RelWithDebInfo, Release and so on: that subfolder is found by
+itself (the newest complete one if there are several) and its name is printed.
 Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
 0-31, since a GPU with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
@@ -11,6 +13,7 @@ too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device w
 to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py builds the mesh fixtures and
 fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
 ps_tex is skipped when the device lacks a feature the bindless set or the shader needs.
+ps_texoff (texel offsets, on vk_texture_test's texture) is skipped on a device without VK_KHR_maintenance8.
 """
 import collections
 import json
@@ -27,18 +30,71 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
+# The programs every run needs. Multi-config CMake generators (Visual Studio, Xcode, Ninja Multi-Config) put each of
+# them in build/<Config> instead of build/ (TEST-38).
+TEST_PROGRAMS = ("vk_compute_test", "vk_store_test", "vk_harness")
+CONFIG_DIRS = ("RelWithDebInfo", "Release", "Debug", "MinSizeRel")
+
+
+def complete_build_dirs(build, programs):
+    """`build` and its configuration subfolders, in that order, that hold all of `programs` (file names with extension)."""
+    return [d for d in (build, *(os.path.join(build, c) for c in CONFIG_DIRS))
+            if all(os.path.isfile(os.path.join(d, n)) for n in programs)]
+
+
+def resolve_build_dir(build, programs):
+    """The folder that holds all of `programs`.
+
+    Makefile and Ninja builds leave them in `build`. With the Visual Studio generator they land in build/RelWithDebInfo,
+    build/Release and so on. `build` itself wins when it has them all; otherwise the configuration folder that has them
+    all and was built last. If none has them, `build` is returned, so a "not found" message names the folder given."""
+    found = complete_build_dirs(build, programs)
+    if not found or found[0] == build:
+        return build
+    return max(found, key=lambda d: max(os.path.getmtime(os.path.join(d, n)) for n in programs))
+
+
+def pick_build_dir(build, programs):
+    """resolve_build_dir, and say which folder was picked when it is a configuration subfolder, so a report can name
+    the build it ran and a stale pick is visible."""
+    chosen = resolve_build_dir(build, programs)
+    if chosen != build:
+        names = [os.path.basename(d) for d in complete_build_dirs(build, programs)]
+        print(f"test programs: {chosen}" + (f" (newest of {', '.join(names)})" if len(names) > 1 else ""))
+    return chosen
+
+
+def not_found_message(build, missing):
+    return (f"Test programs not found in {build}: {', '.join(missing)}\n"
+            f"(its {', '.join(CONFIG_DIRS)} subfolders were searched too)\n"
+            "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
+            "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
+            "Vulkan headers (vulkan-headers on Arch) and configure again.")
+
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
-WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm")
-CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM), ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
+WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2")
+CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+            # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
+            ("cs_w32_lane_wrap", [25, 16, 777, 777]),
+            # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
+            ("cs_movrelsd_2", [11, 33, 33, 55, 1717, 77, 1515, 1717]),
+            ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
             # mask-only wave64: s_bcnt1_i32_b64 on ordinary SGPRs, no WAVE64_RE EXEC markers (#210 / SHADER-28)
-            ("cs_w64_mask_detect", [48])]
+            ("cs_w64_mask_detect", [48]),
+            ("cs_wqm_w64", [20, 4, 12, 8, 1, 0, 15728895, 20]), ("cs_wqm_w32", [12, 1, 4, 0, 8, 15728880, 4, 32]),
+            ("cs_wqm_w64_half", [11, 14, 0, 1, 6, 8, 12, 2])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE])]
+CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
+# Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
+# both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
+GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
+                                                 0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE])]
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 W64X_DUMPS = [("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
@@ -65,14 +121,35 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
-              "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0)}
+              "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
+              "ps_med3_mods": (0x3f800000, 0x40400000, 0x40c00000, 0x3f400000),
+              "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
+              "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
+              # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
+              "ps_f16_med3_opsel": (0xaaaa4100, 0xaaaa4200, 0xaaaa3e00, 0x40005555),
+              "ps_f16_med3_mods": (0x41005555, 0x3c005555, 0x41003800, 0xaaaaba00),
+              "ps_f16_vop2": (0xaaaa4000, 0xaaaac000, 0xaaaa3a00, 0x42003f00),
+              "ps_f16_vop2b": (0xaaaa3e00, 0xaaaab800, 0xaaaa3c00, 0x42003400),
+              "ps_f16_vop1": (0xaaaa4000, 0xaaaabc00, 0xaaaac000, 0xaaaa8000),
+              "ps_f16_vop1b": (0xaaaa3400, 0xaaaa4000, 0xaaaab400, 0xaaaa3800),
+              "ps_f16_const": (0xaaaa3d00, 0x38005555, 0xaaaa3800, 0x3f000000),
+              "ps_f16_const2": (0x42003d00, 0x3d004200, 0xaaaabc00, 3),
+              "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"}}
 # ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
 # texture); the expected channels are derived in the .asm header.
 GATHER_WRAP = (5090733.0, 14942181.0, 258623.0, 9702309.0)
+CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
+PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_uniform_branch"))
+PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_uniform_branch",
+                      "ps_wqm"))
+TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch"))
+PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
+TEXTURE_MIP_TEST = "ps_texture_mip0"
+TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
 
 
 # Windows error codes for a program the system refuses to start, and who refused it.
@@ -99,12 +176,8 @@ def run(*cmd, env=None):
         if not isinstance(e, FileNotFoundError):
             return 1, start_failure(cmd[0], e)
         tools = os.path.abspath(os.path.dirname(cmd[0]))
-        missing = [t + EXE for t in ("vk_compute_test", "vk_store_test", "vk_harness", "vk_texture_test")
-                   if not os.path.isfile(os.path.join(tools, t + EXE))]
-        sys.exit(f"Test programs not found in {tools}: {', '.join(missing)}\n"
-                 "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
-                 "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
-                 "Vulkan headers (vulkan-headers on Arch) and configure again.")
+        missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
+        sys.exit(not_found_message(tools, missing))
     return r.returncode, r.stdout + r.stderr
 
 
@@ -295,11 +368,102 @@ def gather_wrap_test(tools, spirv):
     return "" if not wrong else f"{wrong} of 4096 pixels differ from {GATHER_WRAP}"
 
 
+def texoff_words(px, py):
+    """ps_texoff's mrt0 words at pixel (px, py), from the rule in docs/design.md (derivation in ps_texoff.asm)."""
+    bx, by = px >> 3, py >> 3                          # per-pixel offset (bx - 4, by - 4) from texel (4, 4)
+    x0, y0 = max(bx - 1, 0), max(by - 1, 0)            # gather footprint 3..4 moved by the offset, clamped at 0
+    return (bx | by << 4, 0x0761, x0 | bx << 4 | bx << 8 | x0 << 12, by | by << 4 | y0 << 8 | y0 << 12)
+
+
+def texoff_problem(data, output):
+    """Judge ps_texoff's 64x64 RGBA32 dump: (failure text or "", what was covered). The +16 / -32 sample (bits 8-15
+    of .y) is only defined, and so only judged, where vk_texture_test printed texel offset limits that cover it."""
+    m = re.search(r"texel offset limits: (-?\d+)\.\.(-?\d+)", output)
+    wide = bool(m) and int(m.group(1)) <= -32 and int(m.group(2)) >= 16
+    if len(data) != 64 * 64 * 16:
+        return "vk_texture_test returned an unexpected pixel count", ""
+    keep = (0xFFFFFFFF, 0xFFFFFFFF if wide else 0xFFFF00FF, 0xFFFFFFFF, 0xFFFFFFFF)
+    px = list(struct.iter_unpack("<4I", data))
+    bad = [(i, got) for i, got in enumerate(px)
+           if any((g ^ w) & k for g, w, k in zip(got, texoff_words(i % 64, i // 64), keep))]
+    limits = f"{m.group(1)}..{m.group(2)}" if m else "unknown"
+    covered = "offsets +16/-32 judged" if wide else f"offsets +16/-32 not judged (device texel offset limits {limits})"
+    if not bad:
+        return "", covered
+    i, got = bad[0]
+    return (f"{len(bad)} of {len(px)} pixels differ; first at ({i % 64},{i // 64}): got {[hex(x) for x in got]}, "
+            f"want {[hex(x) for x in texoff_words(i % 64, i // 64)]} ({covered})"), covered
+
+
+def texoff_test(tools, spirv, name):
+    """ps_texoff on vk_texture_test (it binds the texture, sampler and descriptor table); vs_ids supplies attr0."""
+    with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), os.path.join(spirv, "vs_ids.spv"),
+                        os.path.join(spirv, name + ".spv"), raw, *TEXOFF_ARGS,
+                        env=dict(os.environ, VKT_NEED_MAINTENANCE8="1"))
+        if code == UNSUPPORTED:   # vk_texture_test: no VK_KHR_maintenance8 (a non-constant Offset outside gather)
+            m = re.search(r"unsupported: .*", out)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+        if code or not raw.is_file():
+            return failure(code, out, 2)
+        return texoff_problem(raw.read_bytes(), out)[0]
+
+
+def texture_mip_mismatch(data: bytes, mip: int, *, transpose_uv: bool = False) -> str:
+    width = 64
+    if len(data) != width**2 * 16:
+        return f"expected {width**2} RGBA32F pixels, got {len(data)} bytes"
+    one = 0x3f800000
+    quadrants = ((one, 0, 0, one), (0, one, 0, one),
+                 (0, 0, one, one), (one, one, 0, 0))
+    for i, actual in enumerate(struct.iter_unpack("<4I", data)):
+        y, x = divmod(i, width)
+        # The normalized UV at each pixel center lies within the same quadrant of mip 0.
+        u, v = (y, x) if transpose_uv else (x, y)
+        expected = (0, one, one, one) if mip == 1 else quadrants[2 * (v >= width // 2) + (u >= width // 2)]
+        if actual != expected:
+            return f"({x},{y}): RGBA32F bits {actual} != {expected}"
+    return ""
+
+
+def texture_mip_test(tools: str, spirv: str) -> str:
+    tool = Path(tools) / ("vk_texture_test" + EXE)
+    if not tool.is_file():
+        return f"missing {tool}"
+    shaders = Path(spirv)
+    vertex = shaders / "vs_ids.spv"
+    with tempfile.TemporaryDirectory(prefix="leonida-mip-") as tmp:
+        for mip, name in enumerate((TEXTURE_MIP_TEST, "ps_texture_sample")):
+            fragment = shaders / (name + ".spv")
+            for shader in (vertex, fragment):
+                if not shader.is_file():
+                    return f"missing {shader}"
+            raw = Path(tmp) / f"mip{mip}.raw"
+            code, output = run(tool, vertex, fragment, raw, "0", "92", "c00000", "14500000", "0", "--two-mip")
+            if code == UNSUPPORTED:
+                return Skip(f"SKIP (texture mip test: {output.strip() or 'unsupported device'})")
+            if code or not raw.is_file():
+                return f"{name}: {failure(code, output, 4)}"
+            data = raw.read_bytes()
+            mismatch = texture_mip_mismatch(data, mip)
+            if mismatch:
+                return f"{name}: {mismatch}"
+            if not texture_mip_mismatch(data, 1 - mip).startswith("(0,0):"):
+                return f"{name}: wrong mip control missed the expected first pixel"
+            if mip == 0 and not texture_mip_mismatch(data, mip, transpose_uv=True).startswith("(32,0):"):
+                return f"{name}: transposed UV control missed the expected first pixel"
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
+    if name == "ps_texoff":
+        return texoff_test(tools, spirv, name)
     px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch") else "<4I")
+    px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I")
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
@@ -333,11 +497,44 @@ def pixel_test(tools, spirv, name):
         low = [p for p in px if p[0] < 32]
         wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
         return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"
-    if name == "ps_uniform_branch":                    # (s5, own VCC bit): 8 wherever the bit is set, never 7 there
+    if name == "ps_wqm":                               # (wqm, own, wqm, own) per pixel, ps_wqm.asm
+        w = int(n ** 0.5)
+        wrong = sum(p != (int(i % w % 4 < 2 and i // w % 4 >= 2), int(i % w % 4 == 1 and i // w % 4 == 2)) * 2 for i, p in
+                    enumerate(px))
+        return "" if not wrong else f"{wrong} of {n} pixels differ from the whole-quad expectation"
+    if name in ("ps_uniform_branch", "ps_scc_mask32"):  # (s5, own VCC bit): 8 wherever the bit is set, never 7 there
         c = collections.Counter((a, b) for a, b, _, _ in px)
         fine = c[(8, 1)] and c[(8, 0)] and c[(7, 0)] and set(c) <= {(8, 1), (8, 0), (7, 0)}
         return "" if fine else f"(s5, bit) counts {dict(c)}"
     return "no check written for this shader"
+
+
+def clip_test(tools, spirv, name):
+    with tempfile.TemporaryDirectory(prefix="leonida-clip-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        for clip_x, clip_y in ((False, False), (True, False), (False, True), (True, True)):
+            code, output = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, name + ".spv"),
+                               os.path.join(spirv, "ps_ops.spv"), raw, "64", "64",
+                               "0" if clip_x else "4", "0" if clip_y else "4")
+            if code == UNSUPPORTED:
+                return Skip("SKIP (shaderClipDistance unavailable)")
+            if code:
+                return failure(code, output, 2)
+            if not raw.is_file():
+                return "missing framebuffer"
+            data = raw.read_bytes()
+            raw.unlink()
+            if len(data) != 64 * 64 * 16:
+                return "incomplete framebuffer"
+            clear = (0xbf800000,) * 4
+            wrong = 0
+            for i, pixel in enumerate(struct.iter_unpack("<4I", data)):
+                inside = (not clip_x or i % 64 < 32) and (not clip_y or i // 64 < 16)
+                drawn = inside or name == "vs_clip_undeclared"
+                wrong += pixel != (PIXEL_BITS["ps_ops"] if drawn else clear)
+            if wrong:
+                return f"x={clip_x} y={clip_y}: {wrong} of 4096 pixels differ"
+    return ""
 
 
 def main():
@@ -345,6 +542,7 @@ def main():
         sys.exit(__doc__)
     spirv = os.path.join(sys.argv[1], "spirv")
     tools = sys.argv[2] if len(sys.argv) > 2 else os.path.join(HERE, "..", "..", "build")
+    tools = pick_build_dir(os.path.abspath(tools), tuple(t + EXE for t in TEST_PROGRAMS))
     results = []
     for name, groups, expect in COMPUTE:
         results.append((name, compute_test(tools, spirv, name, groups, expect)))
@@ -356,12 +554,17 @@ def main():
                                            expected_words=want)))
     for name, want in BOUNDS:
         results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
+    results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
+                                                      expected_words=CMPX_CLASS_WORDS)))
+    for name, groups, want in GLOBAL_OFFSET:
+        results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
     for name, want in W64X_PARTIAL:
         results.append((name, partial_wave_test(tools, spirv, name, want)))
     results.append(("ms_w64x_ballot", mesh_w64x_test(tools, spirv, "ms_w64x_ballot")))
+    results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"])):
@@ -372,10 +575,13 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    for name in CLIP_TESTS:
+        results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:
         results.append((name, pixel_test(tools, spirv, name)))
     results.append(("ps_gather_wrap", gather_wrap_test(tools, spirv)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
+    results.append((TEXTURE_MIP_TEST, texture_mip_test(tools, spirv)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"

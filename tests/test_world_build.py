@@ -704,6 +704,15 @@ class DdsPngTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class GlbWriterTest(unittest.TestCase):
+    def test_negative_obj_scale_preserves_front_faces_and_normals(self):
+        vertices = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\n"
+        for face in ("f 1 2 3", "f 1//1 2//1 3//1"):
+            with self.subTest(face=face):
+                prim, = glb_writer.parse_obj(vertices + face, is_path=False, up_axis="y", scale=-2)
+                corners = [prim["positions"][index] for index in prim["indices"]]
+                self.assertEqual(corners, [(0, 0, 0), (0, -2, 0), (-2, 0, 0)])
+                self.assertEqual(prim["normals"], [(0, 0, -1)] * 3)
+
     def test_parse_obj_quads_negative_indices_normals_uv_flip_zup_and_groups(self):
         # Group 0: quad in XY plane (Z-up) using positive indices, no vn -> auto unit normals.
         # Group 1: single triangle containing (1, 2, 3) using negative indices.
@@ -1289,6 +1298,40 @@ class WorldBuildTest(unittest.TestCase):
                     self.assertEqual(self._output_snapshot(output), before)
                     if not existing_output:
                         self.assertFalse(os.path.exists(output))
+
+    def test_malformed_optional_material_arrays_match_missing_fields(self):
+        cases = (
+            ("MeshShaders", 7),
+            ("MeshShaders", "0"),
+            ("MeshShaders", {"0": 0}),
+            ("Embedded", True),
+            ("Materials", 7),
+            ("Materials", {"0": {}}),
+            ("Textures", 1.5),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            path = _write_synthetic_assets(assets)["models_manifest_path"]
+            with open(path, encoding="utf-8") as f:
+                original = f.read()
+
+            def build(manifest):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f)
+                result = world_build.build_world(assets, output)
+                self.assertEqual(result["stats"]["models"], 2)
+                return self._output_snapshot(output)
+
+            for field, malformed in cases:
+                with self.subTest(field=field, malformed=malformed):
+                    manifest = json.loads(original)
+                    record = manifest["Items"][0]
+                    if field == "Textures":
+                        record = record["Materials"][0]
+                    del record[field]
+                    expected = build(manifest)
+                    record[field] = malformed
+                    self.assertEqual(build(manifest), expected)
 
     def test_limit_zero_explicitly_replaces_world_with_empty_output(self):
         with tempfile.TemporaryDirectory() as tmp:

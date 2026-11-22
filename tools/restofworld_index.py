@@ -328,16 +328,43 @@ def write_output(path, rows, summary):
                              for i, c in enumerate(COLUMNS)])
 
 
+def offset(text):
+    """--start: 0 or more, decimal or 0x hex."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be 0 or more") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
+def byte_count(text):
+    """--limit/--max-inflate: at least 1; 0 used to mean no limit."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be at least 1") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin/.bk2 files")
     ap.add_argument("out", help="output path ending in .csv or .json")
-    ap.add_argument("--start", type=lambda s: int(s, 0), help="first byte to scan (default: RPF data start)")
-    ap.add_argument("--limit", type=lambda s: int(s, 0), help="number of bytes to scan")
-    ap.add_argument("--max-inflate", type=lambda s: int(s, 0), default=MAX_INFLATE,
+    ap.add_argument("--start", type=offset, help="first byte to scan (default: RPF data start)")
+    ap.add_argument("--limit", type=byte_count, help="number of bytes to scan")
+    ap.add_argument("--max-inflate", type=byte_count, default=MAX_INFLATE,
                     help="skip a stream that inflates above this many bytes (default: 512 MiB)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+    if os.path.isdir(args.out):
+        ap.error(f"{args.out} is a folder, not a .csv or .json file")
+    folder = os.path.dirname(os.path.abspath(args.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {args.out} cannot be written")
     try:
         if os.path.isdir(args.source):
             rows, summary = scan_dir(args.source)
@@ -345,6 +372,8 @@ def main():
             rows, summary = scan_rpf(args.source, args.start, args.limit, args.max_inflate)
     except ValueError as e:
         sys.exit(f"{args.source}: {e}")
+    except OSError as e:
+        sys.exit(f"{args.source}: {e.strerror or e}")
     write_output(args.out, rows, summary)
     if not args.quiet:
         print(json.dumps({k: summary[k] for k in

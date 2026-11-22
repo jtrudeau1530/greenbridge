@@ -33,6 +33,11 @@ def signature(streams):
     return body
 
 
+def short_signature():
+    """An OSG1 part whose declared five elements do not fit in the eight payload bytes present."""
+    return struct.pack("<II", 5, 8) + bytes(8)
+
+
 def dxbc(parts):
     """A DXBC container: 32-byte header (part count last), part offsets, then fourcc + size + payload per part."""
     head = 32 + 4 * len(parts)
@@ -110,9 +115,62 @@ def test_feature_scan():
     assert failures == 0, f"{failures} feature_scan check(s) failed"
 
 
+def test_short_signature():
+    """A malformed signature is ignored instead of aborting the count-only scan with struct.error."""
+    check(F.streams(short_signature()) == set(),
+          "a declared element table longer than the part yields no streams")
+    check(F.streams(struct.pack("<II", 1, 0xFFFF)) == set(),
+          "an element offset past the part yields no streams")
+    check(F.streams(struct.pack("<II", 1, 0) + bytes(32)) == set(),
+          "an element offset inside the count/offset header is ignored")
+    check(F.streams(signature([0])) == {0} and F.streams(signature([0, 1])) == {0, 1},
+          "well-formed signatures still report every element's stream")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sh, _ = build(tmp)
+        dx = os.path.join(sh, "dxbc")
+        with open(os.path.join(dx, "bad.dxbc"), "wb") as f:
+            f.write(dxbc([("SFI0", struct.pack("<Q", 0)), ("OSG1", short_signature())]))
+        with open(os.path.join(dx, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        index.append({"name": "bad", "file": "bad.dxbc", "stage": "ps"})
+        with open(os.path.join(dx, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+
+        d = F.scan_dxbc(dx, index)
+        check(d["stages"]["ps"] == 3 and d["unreadable"] == 0,
+              "scan_dxbc still counts a shader whose OSG1 is truncated")
+        check(d["output_on_stream_other_than_0"] == {"gs": 1},
+              "the truncated signature adds no bogus stream and keeps the real one")
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), sh],
+                           capture_output=True, text=True)
+        check(r.returncode == 0 and "SFI0 WAVE_MMA: 1" in r.stdout,
+              "the CLI still prints the summary with a truncated OSG1 present")
+    assert failures == 0, f"{failures} short-signature check(s) failed"
+
+
+def test_part_payload_outside_container_is_unreadable():
+    # Allow the flags to fit physically, while the declared part extends past EOF.
+    data = bytearray(dxbc([("SFI0", struct.pack("<Q", 0x8000000))]))
+    offset, = struct.unpack_from("<I", data, 32)
+    struct.pack_into("<I", data, offset + 4, 16)
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "bad.dxbc"), "wb") as f:
+            f.write(data)
+        with open(os.path.join(tmp, "valid.dxbc"), "wb") as f:
+            f.write(dxbc([("SFI0", struct.pack("<Q", 0x8000000))]))
+        rows = [{"file": "bad.dxbc", "stage": "ps"}, {"file": "valid.dxbc", "stage": "gs"}]
+        result = F.scan_dxbc(tmp, rows)
+        check(result["unreadable"] == 1, "a DXBC part extending past EOF counts as unreadable")
+        check(result["sfi0"] == {"WAVE_MMA": {"gs": 1}}, "only the valid file contributes feature flags")
+    assert failures == 0, f"{failures} DXBC bounds check(s) failed"
+
+
 if __name__ == "__main__":
     try:
         test_feature_scan()
+        test_short_signature()
+        test_part_payload_outside_container_is_unreadable()
     except AssertionError:
         pass
     print(f"test_feature_scan: {'OK' if not failures else 'FAILED'} ({failures} failure{'s' if failures != 1 else ''})")

@@ -66,6 +66,8 @@ static_assert(sizeof(DescriptorEntry) == 40);
 
 class DescriptorTable {
 public:
+    enum class InsertResult { added, unchanged, replaced };
+
     explicit DescriptorTable(std::uint32_t initial_capacity = 16) {
         std::uint32_t cap = 16;
         while (cap < initial_capacity) cap <<= 1;
@@ -77,6 +79,12 @@ public:
     // If the key already exists in one of the 8 probe slots, its index is updated.
     // If insertion would exceed 8 probes or 50% load, the table grows and re-hashes.
     bool insert(const std::uint32_t key[8], std::uint32_t index) {
+        insert_or_update(key, index);
+        return true;
+    }
+
+    // Report the change under the same lock as the insert, so callers can synchronize a replacement.
+    InsertResult insert_or_update(const std::uint32_t key[8], std::uint32_t index) {
         std::lock_guard lock(mutex_);
         return insert_locked(key, index);
     }
@@ -183,7 +191,7 @@ public:
     }
 
 private:
-    bool insert_locked(const std::uint32_t key[8], std::uint32_t index) {
+    InsertResult insert_locked(const std::uint32_t key[8], std::uint32_t index) {
         while (true) {
             const std::uint32_t h = hash_descriptor_key(key);
             int empty_slot = -1;
@@ -193,8 +201,9 @@ private:
                 auto& entry = entries_[slot];
                 if (entry.pad == kSlotOccupiedMarker) {
                     if (std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
+                        if (entry.index == index) return InsertResult::unchanged;
                         entry.index = index;
-                        return true;
+                        return InsertResult::replaced;
                     }
                 } else if (empty_slot < 0) {
                     empty_slot = static_cast<int>(slot);
@@ -208,7 +217,7 @@ private:
                 entry.index = index;
                 entry.pad = kSlotOccupiedMarker;
                 ++occupied_count_;
-                return true;
+                return InsertResult::added;
             }
 
             // Table is full (>50% load) or no slot found in 8 probes: grow and retry

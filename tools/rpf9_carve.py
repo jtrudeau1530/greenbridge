@@ -28,12 +28,34 @@ def below_normal():
         k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)
 
 
+def offset(text):
+    """--start: 0 or more, decimal or 0x hex."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be 0 or more") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
+def byte_count(text):
+    """--limit: at least 1; 0 used to mean no limit and a negative value silently scanned less."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be at least 1") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("archive")
     ap.add_argument("out")
-    ap.add_argument("--start", type=int)
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--start", type=offset)
+    ap.add_argument("--limit", type=byte_count)
     ap.add_argument("--index-only", action="store_true")
     a = ap.parse_args()
     below_normal()
@@ -47,10 +69,17 @@ def main() -> int:
         sys.exit(f"{a.archive}: too short for an RPF9 header ({size} bytes)")
     if a.start is not None and not 0 <= a.start < size:
         sys.exit(f"{a.archive}: --start {a.start} is outside the file (0..{size - 1})")
+    if a.start is None:
+        with open(a.archive, "rb") as fh:
+            base = struct.unpack_from("<I", fh.read(8), 4)[0]
+        if base > size:   # base == size is an empty data area, which is fine
+            sys.exit(f"{a.archive}: header data offset {base} is past the end of the file ({size} bytes)")
+    else:
+        base = a.start
     os.makedirs(a.out, exist_ok=True)
     with open(a.archive, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        pos = a.start if a.start is not None else struct.unpack_from("<I", m, 4)[0]
+        pos = base
         end = min(size, pos + a.limit) if a.limit else size
         rows, last, unread, zero = [], pos, 0, 0
         t0 = time.time()
@@ -120,7 +149,7 @@ def main() -> int:
             unread += len(tail)
     total = sum(r["stored"] for r in rows)
     bink = sum(r["stored"] for r in rows if r.get("type") == "bink2")
-    span = end - (a.start if a.start is not None else struct.unpack_from("<I", open(a.archive, "rb").read(8), 4)[0])
+    span = end - base
     summary = {"archive": a.archive, "files": len(rows), "compressed_bytes": total,
                "inflated_bytes": sum(r["size"] for r in rows), "bink2_bytes": bink,
                "bink2_files": sum(1 for r in rows if r.get("type") == "bink2"),

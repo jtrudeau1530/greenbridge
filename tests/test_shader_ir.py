@@ -4,6 +4,8 @@
 """
 import importlib.util
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -220,6 +222,37 @@ class ParseFileTests(unittest.TestCase):
         self.assertEqual(info["code_start"], 0x1000)
         self.assertEqual(info["insns"], [])
         self.assertEqual(info["invalid"], 0)
+
+
+class CliInputTest(unittest.TestCase):
+    """The tool read sys.argv by hand: no arguments, a bad --limit or a missing folder ended in a traceback."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "shader_ir.py"), *args],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_bad_arguments_are_usage_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_folder = os.path.join(tmp, "one.s")
+            with open(not_a_folder, "w", encoding="utf-8") as f:
+                f.write("s_endpgm\n")
+            cases = ((), (tmp, "--limit", "x"), (tmp, "--limit", "0"),
+                     (os.path.join(tmp, "missing"),), (not_a_folder,))
+            for args in cases:
+                with self.subTest(args=args):
+                    p = self.run_tool(*args)
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertIn("usage:", p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+
+    def test_folder_with_limit_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("a.s", "b.s"):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                    f.write("  s_endpgm  ; encoding: [0x00,0x00,0x81,0xbf]\n")
+            p = self.run_tool(tmp, "--limit", "1")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertTrue(p.stdout.startswith("1 shaders,"), p.stdout)  # --limit 1 of the two files
 
 
 if __name__ == "__main__":

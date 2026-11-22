@@ -7,6 +7,8 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -146,6 +148,46 @@ class MainTests(unittest.TestCase):
         with open(os.path.join(self.root, "types.json"), encoding="utf-8") as f:
             text = f.read()
         self.assertTrue(text.startswith('{\n "overall": {'))
+
+    def test_invalid_index_names_its_path_and_preserves_previous_report(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        self.run_main()
+        before = self.types()
+        index = os.path.join(self.archive("b", []), "index.json")
+        for data, message in (
+            ("{", "invalid JSON"),
+            ('{"files": {}}', '"files" list'),
+            ('{"files": [{"head": "00"}]}', "row 1"),
+            ('{"files": [{"size": 12, "head": 42}]}', "row 1"),
+        ):
+            with self.subTest(data=data):
+                with open(index, "w", encoding="utf-8") as f:
+                    f.write(data)
+                proc = subprocess.run(
+                    [sys.executable, "-I", os.path.join(ROOT, "tools", "classify_carve.py"), self.root],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, 2)
+                self.assertIn(index, proc.stderr)
+                self.assertIn(message, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertEqual(self.types(), before)
+
+    def test_failed_write_preserves_previous_report(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        self.run_main()
+        before = self.types()
+        files = sorted(os.listdir(self.root))
+
+        def fail_dump(_data, handle, **_kwargs):
+            handle.write("{")
+            raise OSError("synthetic write failure")
+
+        with mock.patch.object(carve.json, "dump", side_effect=fail_dump):
+            with self.assertRaisesRegex(OSError, "write failure"):
+                self.run_main()
+        self.assertEqual(self.types(), before)
+        self.assertEqual(sorted(os.listdir(self.root)), files)
 
 
 if __name__ == "__main__":

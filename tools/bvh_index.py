@@ -5,18 +5,24 @@ does not try. It walks the data area, decompresses every zlib stream that decode
 classifies the inflated bytes from their headers. Nothing it writes contains game payload bytes: the rows hold
 offsets, sizes, counts, a header tag and a bounding box.
 
-The one signature it relies on was measured over the whole `*_bvh4` pack: a BVH stream has the 32-bit tag
-0x81020006 at offset 0x100, a size in 64-byte units at 0x104, and pointers at 0x20/0x28 such that
+The one signature it relies on was measured over the whole `*_bvh4` pack: a BVH stream has `flags = 0x81020006`
+at offset 0x100, `totalSizeIn64BNodes` at 0x104, and wrapper words at 0x20/0x28 such that
 
-    0x140 + 64 * size_in_64b_units == u32@0x20  and  u32@0x28 == u32@0x20 - 0x100
+    0x140 + 64 * totalSizeIn64BNodes == u32@0x20  and  u32@0x28 == u32@0x20 - 0x100
 
-A stream is reported as `bvh4` only when all of that holds. A 208-byte instance record is reported separately: it
-has the constant descriptor words listed in INSTANCE_WORDS and a 3x4 float matrix at 0x50.
+A stream is reported as `bvh4` only when all of that holds. The row also carries the exact XboxBvh4Header fields:
+`crc32`, `numElements`, scene bounds, `offsetToNodes`, `offsetToPrimRemap`, `rootNodePtr`, `offsetToElements`,
+`offsetToParents`, `compressionParams`, and the decoded root node index/type. A 208-byte instance record is
+reported separately: it has the constant descriptor words listed in INSTANCE_WORDS and a 3x4 float matrix at 0x50.
 
 Usage:
     python -I tools/bvh_index.py <archive.rpf> [--out index.json] [--csv index.csv]
                                  [--start N] [--limit BYTES] [--max-inflate BYTES]
     python -I tools/bvh_index.py <dir-with-rpf-or-bin> [--out index.json] [--csv index.csv]
+                                 [--max-inflate BYTES]
+
+--start and --limit apply to a single archive only; with a directory they are an error (exit 2).
+--max-inflate applies to every .rpf in the directory.
 
 Exit status is 0 even when nothing is found; the summary says how many streams were read.
 """
@@ -38,8 +44,11 @@ HEAD = 0x140
 TAG_OFF = 0x100
 N_OFF = 0x104
 END_OFF = 0x20
-ROOT_OFF = 0x28
+TAIL_OFF = 0x28
 AABB_OFF = 0x110
+INVALID_NODE = 0xFFFFFFFF
+NODE_TYPE_NAMES = {0: "tri0", 1: "tri1", 2: "tri2", 3: "tri3",
+                    4: "box16", 5: "box32", 6: "instance", 7: "aabb_geometry"}
 INSTANCE_WORDS = ((0x08, 0x50000080), (0x10, 1), (0x18, 0x500000A0), (0x20, 0x60000000),
                   (0x28, 0x500000B0), (0x30, 0x500000C0), (0x38, 0x50000050))
 FILL_BYTES = (0x00, 0x81, 0x94, 0x29)
@@ -50,6 +59,52 @@ def below_normal():
         import ctypes
         k = ctypes.windll.kernel32
         k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)
+
+
+def decode_node_pointer(value):
+    """Decode the low three type bits and the high 29-bit 64-byte node index."""
+    typ = value & 7
+    invalid = value == INVALID_NODE
+    return {"ptr": value, "index": value >> 3, "type": typ,
+            "name": "invalid" if invalid else NODE_TYPE_NAMES[typ], "invalid": invalid}
+
+
+def parse_header(head):
+    """Parse the 64-byte XboxBvh4Header at payload offset 0x100.
+
+    The field names, types and offsets match the public XboxBvh4Header used by the Xbox DXR traversal
+    shaders. The offsets in the header are relative to 0x100, the start of this header. The source
+    declares offsetToPrimRemap as int32_t and offsetToParents as uint32_t, so they are unpacked differently.
+    """
+    if len(head) < HEAD or struct.unpack_from("<I", head, TAG_OFF)[0] != TAG:
+        return None
+    flags = struct.unpack_from("<I", head, 0x100)[0]
+    root = struct.unpack_from("<I", head, 0x130)[0]
+    root_ptr = decode_node_pointer(root)
+    return {
+        "flags": flags,
+        "version": flags & 0xFFFF,
+        "bottom_level": bool(flags & 0x80000000),
+        "offline": bool(flags & 0x00020000),
+        "dehydrated": bool(flags & 0x01000000),
+        "compressed": bool(flags & 0x00010000),
+        "compressed_for_gpu": bool(flags & 0x00080000),
+        "node_count": struct.unpack_from("<I", head, N_OFF)[0],
+        "crc32": struct.unpack_from("<I", head, 0x108)[0],
+        "num_elements": struct.unpack_from("<I", head, 0x10C)[0],
+        "bounds_min": list(struct.unpack_from("<3f", head, AABB_OFF)),
+        "bounds_max": list(struct.unpack_from("<3f", head, AABB_OFF + 12)),
+        "offset_to_nodes": struct.unpack_from("<I", head, 0x128)[0],
+        "offset_to_prim_remap": struct.unpack_from("<i", head, 0x12C)[0],
+        "root_node_ptr": root,
+        "root_node_index": root_ptr["index"],
+        "root_node_type": root_ptr["type"],
+        "root_node_type_name": root_ptr["name"],
+        "root_node_invalid": root_ptr["invalid"],
+        "offset_to_elements": struct.unpack_from("<I", head, 0x134)[0],
+        "offset_to_parents": struct.unpack_from("<I", head, 0x138)[0],
+        "compression_params": struct.unpack_from("<I", head, 0x13C)[0],
+    }
 
 
 def classify(head, size, tail=None):
@@ -94,15 +149,26 @@ def classify(head, size, tail=None):
     if size >= HEAD and len(head) >= HEAD and struct.unpack_from("<I", head, TAG_OFF)[0] == TAG:
         n = struct.unpack_from("<I", head, N_OFF)[0]
         end = struct.unpack_from("<I", head, END_OFF)[0]
-        root = struct.unpack_from("<I", head, ROOT_OFF)[0]
-        if 0x140 + n * 64 == end and root == end - 0x100:
-            common = dict(signature="bvh4:0x81020006", version="0x81020006",
-                          node_count=n, node_bytes=n * 64, root_offset=root, declared_bytes=end,
-                          bounds_min=[round(v, 4) for v in struct.unpack_from("<3f", head, AABB_OFF)],
-                          bounds_max=[round(v, 4) for v in struct.unpack_from("<3f", head, AABB_OFF + 12)],
-                          count_130=struct.unpack_from("<I", head, 0x130)[0],
-                          count_134=struct.unpack_from("<I", head, 0x134)[0],
-                          base_138=struct.unpack_from("<i", head, 0x138)[0])
+        tail = struct.unpack_from("<I", head, TAIL_OFF)[0]
+        hdr = parse_header(head)
+        if hdr is not None and 0x140 + n * 64 == end and tail == end - 0x100:
+            common = dict(signature="bvh4:0x81020006", version=hdr["version"],
+                          node_count=n, node_bytes=n * 64, tail_offset=tail, declared_bytes=end,
+                          bounds_min=[round(v, 4) for v in hdr["bounds_min"]],
+                          bounds_max=[round(v, 4) for v in hdr["bounds_max"]],
+                          flags=hdr["flags"], crc32=hdr["crc32"], num_elements=hdr["num_elements"],
+                          offset_to_nodes=hdr["offset_to_nodes"],
+                          offset_to_prim_remap=hdr["offset_to_prim_remap"],
+                          root_node_ptr=hdr["root_node_ptr"],
+                          root_node_index=hdr["root_node_index"],
+                          root_node_type=hdr["root_node_type"],
+                          root_node_type_name=hdr["root_node_type_name"],
+                          root_node_invalid=hdr["root_node_invalid"],
+                          offset_to_elements=hdr["offset_to_elements"],
+                          offset_to_parents=hdr["offset_to_parents"],
+                          compression_params=hdr["compression_params"],
+                          bottom_level=hdr["bottom_level"], offline=hdr["offline"],
+                          dehydrated=hdr["dehydrated"], compressed=hdr["compressed"])
             if end <= size:
                 row.update(kind="bvh4", chunked=False, **common)
             elif size % 65536 == 0:
@@ -233,13 +299,13 @@ def summarize(rows, source, span, zero, unread, elapsed):
             "elapsed_s": round(elapsed, 2)}
 
 
-def scan_dir(path):
+def scan_dir(path, max_inflate=1 << 28):
     rpfs = sorted(glob.glob(os.path.join(path, "**", "*.rpf"), recursive=True))
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
             try:
-                r, s = scan_rpf(p)
+                r, s = scan_rpf(p, max_inflate=max_inflate)
             except (OSError, ValueError) as e:   # one unreadable archive should not lose the others
                 print(f"{p}: skipped ({e})", file=sys.stderr)
                 continue
@@ -276,7 +342,11 @@ def write_outputs(rows, summaries, out, csv_path):
             json.dump({"summary": payload, "streams": rows}, f, indent=0)
     if csv_path:
         cols = ["source", "offset", "stored", "size", "kind", "signature", "version", "node_count",
-                "node_bytes", "root_offset", "declared_bytes", "chunked", "bounds_min", "bounds_max",
+                "node_bytes", "declared_bytes", "tail_offset", "flags", "crc32", "num_elements",
+                "offset_to_nodes", "offset_to_prim_remap", "root_node_ptr", "root_node_index",
+                "root_node_type", "root_node_type_name", "root_node_invalid", "offset_to_elements",
+                "offset_to_parents",
+                "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -321,9 +391,11 @@ def main(argv=None):
     ap.add_argument("--max-inflate", type=byte_count, default=1 << 28,
                     help="keep at most this many bytes of one stream")
     a = ap.parse_args(argv)
+    if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()
     if os.path.isdir(a.target):
-        rows, summaries = scan_dir(a.target)
+        rows, summaries = scan_dir(a.target, a.max_inflate)
     else:
         try:
             rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)

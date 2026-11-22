@@ -211,22 +211,24 @@ public:
     // T# and S# keys to the indices above: the table of binding 2 (descriptor_table.h). Changes reach the shaders
     // at flush().
     bool insert_key(const DescriptorKey& key, std::uint32_t index) {
-        table_dirty_ = true;
-        return table_.insert(key, index);
+        const auto result = table_.insert_or_update(key.data(), index);
+        table_dirty_ |= result != DescriptorTable::InsertResult::unchanged;
+        existing_entries_changed_ |= result == DescriptorTable::InsertResult::replaced;
+        return true;
     }
     // Erasing compacts the key's probe cluster, so other keys' entries may change slots.
     bool erase_key(const DescriptorKey& key) {
         if (!table_.erase(key)) return false;
-        table_dirty_ = entries_moved_ = true;
+        table_dirty_ = existing_entries_changed_ = true;
         return true;
     }
     const DescriptorTable& table() const { return table_; }
 
-    // True when the next flush() will move entries a running shader may be probing, or replace the table's
+    // True when the next flush() will change entries a running shader may be probing, or replace the table's
     // buffer: the caller then flushes only once no command buffer that uses the set is still executing. Without
     // it the flush only adds entries to the buffer in place, which a running lookup cannot see half done.
     bool flush_needs_idle() const {
-        return table_dirty_ && (entries_moved_ || table_.size_bytes() > table_buffer_.size);
+        return table_dirty_ && (existing_entries_changed_ || table_.size_bytes() > table_buffer_.size);
     }
 
     // Writes the pending descriptor changes and the table: before the commands that use the set are executed.
@@ -250,7 +252,7 @@ public:
             }
             if (written) {
                 std::memcpy(table_buffer_.mapped, words.data(), bytes);
-                table_dirty_ = entries_moved_ = false;
+                table_dirty_ = existing_entries_changed_ = false;
             }
         }
         if (!pending_.empty()) {
@@ -468,7 +470,7 @@ private:
         const VkDeviceSize bytes = words.size() * sizeof(std::uint32_t);
         if (!create(table_buffer_, bytes)) return false;
         std::memcpy(table_buffer_.mapped, words.data(), bytes);
-        table_dirty_ = entries_moved_ = false;
+        table_dirty_ = existing_entries_changed_ = false;
         return true;
     }
 
@@ -572,7 +574,7 @@ private:
     DescriptorTable table_{64};
     TableBuffer table_buffer_;
     bool table_dirty_ = false;    // the table differs from the buffer
-    bool entries_moved_ = false;  // ... and not only by entries added
+    bool existing_entries_changed_ = false;  // ... and not only by entries added
     std::vector<TableBuffer> retired_;
 };
 
