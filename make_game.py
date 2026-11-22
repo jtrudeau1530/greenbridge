@@ -678,6 +678,14 @@ def main() -> int:
                          "32-wide GPUs: NVIDIA, Intel). auto (default) turns it on unless vulkaninfo shows that "
                          "every GPU has 64-wide subgroups")
     a = ap.parse_args()
+    stages = STAGES
+    if a.stages is not None:
+        stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+        if not stages:
+            ap.error("--stages must select at least one stage from: " + ",".join(STAGES))
+        for s in stages:
+            if s not in STAGES:
+                ap.error(f"--stages: unknown stage '{s}' (choose from: {','.join(STAGES)})")
     below_normal()
     if a.find:
         found = find_dumps()
@@ -702,13 +710,7 @@ def main() -> int:
             inside = False
         if inside:
             fail("--out and --work must be outside the game folder.")
-    stages = STAGES
-    if a.stages is not None:
-        stages = [s.strip() for s in a.stages.split(",") if s.strip()]
-        for s in stages:
-            if s not in STAGES:
-                fail(f"unknown stage '{s}'")
-    elif os.name != "nt":
+    if a.stages is None and os.name != "nt":
         stages = [s for s in stages if s not in WINDOWS_ONLY]
         log(f"{', '.join(WINDOWS_ONLY)}: left out, it builds on Windows only for now")
     preflight(stages, work, a.wav)
