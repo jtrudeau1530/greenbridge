@@ -603,5 +603,135 @@ class TestValuSadHiU32SIMDMultiLane(unittest.TestCase):
             self.assertEqual(state.vgprs[lane][0], expected)
 
 
+class TestValuSadHiU32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # |0xFFFFFFFF - 0| + 1 = 0x100000000 -> hi = 1
+        regs.write(Operand.vgpr(0), 0xFFFF_FFFF)
+        regs.write(Operand.vgpr(1), 0x0000_0000)
+        regs.write(Operand.vgpr(2), 0x0000_0001)
+
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),  # Aliased with dst
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, 1)
+        self.assertEqual(regs.read(Operand.vgpr(0)), 1)
+        self.assertEqual(regs.read(Operand.vgpr(1)), 0)
+        self.assertEqual(regs.read(Operand.vgpr(2)), 1)
+
+    def test_dst_aliases_src1(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        regs.write(Operand.vgpr(0), 0x8000_0000)
+        regs.write(Operand.vgpr(1), 0x0000_0000)
+        regs.write(Operand.vgpr(2), 0x8000_0000)
+
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(1),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),  # Aliased with dst
+            src2=Operand.vgpr(2),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, 1)
+        self.assertEqual(regs.read(Operand.vgpr(1)), 1)
+        self.assertEqual(regs.read(Operand.vgpr(0)), 0x8000_0000)
+
+    def test_dst_aliases_src2(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        regs.write(Operand.vgpr(0), 0xFFFF_FFFF)
+        regs.write(Operand.vgpr(1), 0x0000_0000)
+        regs.write(Operand.vgpr(2), 0x0000_0001)
+
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(2),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),  # Aliased with dst
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, 1)
+        self.assertEqual(regs.read(Operand.vgpr(2)), 1)
+        self.assertEqual(regs.read(Operand.vgpr(0)), 0xFFFF_FFFF)
+        self.assertEqual(regs.read(Operand.vgpr(1)), 0)
+
+    def test_dst_aliases_src0_and_src1(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # Self-difference: |v0 - v0| = 0. 0 + v1 = v1 <= 0xFFFFFFFF -> hi = 0
+        regs.write(Operand.vgpr(0), 0xFFFF_FFFF)
+        regs.write(Operand.vgpr(1), 0xFFFF_FFFF)
+
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(1),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, 0)
+        self.assertEqual(regs.read(Operand.vgpr(0)), 0)
+
+    def test_dst_aliases_all_operands(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # |v0 - v0| + v0 = v0 <= 0xFFFFFFFF -> hi = 0
+        regs.write(Operand.vgpr(0), 0x1234_5678)
+
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(0),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, 0)
+        self.assertEqual(regs.read(Operand.vgpr(0)), 0)
+
+    def test_simd_multi_lane_aliased_preservation(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0000FFFF)  # lanes 0..15 active
+        interp = SIMDInterpreter()
+
+        orig = [0x10000000 | lane for lane in range(32)]
+        for lane in range(32):
+            state.vgprs[lane][0] = orig[lane]
+            state.vgprs[lane][1] = 0
+            state.vgprs[lane][2] = 0xFFFF_FFFF
+
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),  # Aliased
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+
+        interp.step(instr, state)
+
+        for lane in range(32):
+            if lane < 16:
+                expected = ref_sad_hi_u32(orig[lane], 0, 0xFFFF_FFFF)
+                self.assertEqual(state.vgprs[lane][0], expected)
+            else:
+                self.assertEqual(state.vgprs[lane][0], orig[lane])
+
+
 if __name__ == "__main__":
     unittest.main()
