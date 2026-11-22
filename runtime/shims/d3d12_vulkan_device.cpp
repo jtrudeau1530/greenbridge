@@ -68,6 +68,7 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color, true};
     case DXGI_FORMAT_R10G10B10A2_UNORM: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color};
     case DXGI_FORMAT_R10G10B10A2_UINT: return {VK_FORMAT_A2B10G10R10_UINT_PACK32, color};
+    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: return {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, color};
     case DXGI_FORMAT_R11G11B10_FLOAT: return {VK_FORMAT_B10G11R11_UFLOAT_PACK32, color};
     case DXGI_FORMAT_R8G8B8A8_TYPELESS: return {VK_FORMAT_R8G8B8A8_UNORM, color, true};
     case DXGI_FORMAT_R8G8B8A8_UNORM: return {VK_FORMAT_R8G8B8A8_UNORM, color};
@@ -77,6 +78,9 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R8G8B8A8_SINT: return {VK_FORMAT_R8G8B8A8_SINT, color};
     case DXGI_FORMAT_B8G8R8A8_TYPELESS: return {VK_FORMAT_B8G8R8A8_UNORM, color, true};
     case DXGI_FORMAT_B8G8R8A8_UNORM: return {VK_FORMAT_B8G8R8A8_UNORM, color};
+    // DXGI names channels from the low bits up, Vulkan from the high bits down: B in bits 0-3, A in 12-15 in both.
+    // Vulkan 1.3 requires sampling it (formerly VK_EXT_4444_formats).
+    case DXGI_FORMAT_B4G4R4A4_UNORM: return {VK_FORMAT_A4R4G4B4_UNORM_PACK16, color};
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return {VK_FORMAT_B8G8R8A8_SRGB, color};
     case DXGI_FORMAT_R16G16_TYPELESS: return {VK_FORMAT_R16G16_SFLOAT, color, true};
     case DXGI_FORMAT_R16G16_FLOAT: return {VK_FORMAT_R16G16_SFLOAT, color};
@@ -84,6 +88,12 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R16G16_SINT: return {VK_FORMAT_R16G16_SINT, color};
     case DXGI_FORMAT_R8G8_TYPELESS: return {VK_FORMAT_R8G8_UNORM, color, true};
     case DXGI_FORMAT_R8G8_UNORM: return {VK_FORMAT_R8G8_UNORM, color};
+    case DXGI_FORMAT_R8G8_SNORM: return {VK_FORMAT_R8G8_SNORM, color};
+    case DXGI_FORMAT_R16_UNORM: return {VK_FORMAT_R16_UNORM, color};
+    // DXGI names packed channels from the high bits down, Vulkan's PACK formats the same way but spelled the other
+    // way round: B5G6R5 (blue in bits 0-4) is R5G6B5_PACK16 and B5G5R5A1 (alpha in bit 15) is A1R5G5B5_PACK16.
+    case DXGI_FORMAT_B5G6R5_UNORM: return {VK_FORMAT_R5G6B5_UNORM_PACK16, color};
+    case DXGI_FORMAT_B5G5R5A1_UNORM: return {VK_FORMAT_A1R5G5B5_UNORM_PACK16, color};
     case DXGI_FORMAT_R8G8_UINT: return {VK_FORMAT_R8G8_UINT, color};
     case DXGI_FORMAT_R8G8_SINT: return {VK_FORMAT_R8G8_SINT, color};
     case DXGI_FORMAT_R16_FLOAT: return {VK_FORMAT_R16_SFLOAT, color};
@@ -135,12 +145,33 @@ UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     return mips;
 }
 
+// A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
+leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC& resource,
+                               const D3D12_RENDER_TARGET_VIEW_DESC* view) {
+    if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) || vulkan_format(resource.Format, false).typeless)
+        return {};
+    if (view && (view->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE3D ||
+                 (view->Format != DXGI_FORMAT_UNKNOWN && view->Format != resource.Format))) return {};
+    const D3D12_TEX3D_RTV slices = view ? view->Texture3D : D3D12_TEX3D_RTV{0, 0, UINT_MAX};
+    if (slices.MipSlice >= resource.MipLevels) return {};
+    const UINT depth = std::max(1u, UINT(resource.DepthOrArraySize) >> slices.MipSlice);
+    if (slices.FirstWSlice >= depth) return {};
+    const UINT remaining = depth - slices.FirstWSlice;
+    const UINT count = slices.WSize == UINT_MAX ? remaining : slices.WSize;
+    if (!count || count > remaining) return {};
+    return {id, slices.MipSlice, slices.FirstWSlice, count};
+}
+
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
 // texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
-VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const Format& format) {
+// attachment_usable: the GPU can render to `format`. A UAV texture then also gets COLOR_ATTACHMENT usage, because
+// ClearUnorderedAccessView* with rectangles clears through an attachment (vkCmdClearAttachments).
+VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    if (volume && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+        info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.format = format.format;
     info.extent = {std::uint32_t(desc.Width), desc.Height, volume ? UINT(desc.DepthOrArraySize) : 1u};
@@ -150,7 +181,11 @@ VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const For
     info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+        info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
+            info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
     if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
     return info;
 }
@@ -179,6 +214,12 @@ struct DeviceState {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
         return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    }
+
+    bool color_attachment_usable(VkFormat format) const {
+        VkFormatProperties properties{};
+        format_properties(info.physical, format, &properties);
+        return properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
     }
 
     // Whether the GPU has this format and usage in this sample count: not every format has every count.
@@ -301,7 +342,11 @@ struct DeviceState {
             log_once("set 0 has no array for this image type (1D array or multisampled):", int(image.type));
             return false;
         }
-        const VkFormat view_format = g::vulkan_view_format(image_format, image.format);
+        // A T# of 8_UINT on a depth-stencil image is a view of its stencil plane (image_descriptor, D3D-75). Vulkan
+        // views it in the image's own format with the stencil aspect, and returns the value in R, as a T# whose
+        // format is 8_UINT reads it from X.
+        const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
+        const VkFormat view_format = stencil ? image_format : g::vulkan_view_format(image_format, image.format);
         if (view_format == VK_FORMAT_UNDEFINED) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
             return false;
@@ -314,8 +359,9 @@ struct DeviceState {
         view_info.components = g::vulkan_swizzle(image.swizzle, view_format);
         // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
         view_info.subresourceRange = {
-            VkImageAspectFlags((aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                                                     : VK_IMAGE_ASPECT_COLOR_BIT),
+            VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
+                               : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                                       : VK_IMAGE_ASPECT_COLOR_BIT),
             image.first_mip, image.mip_count, image.first_layer, image.layer_count};
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
@@ -525,13 +571,14 @@ public:
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
-        VkImageCreateInfo info = texture_create_info(desc_, format);
+        VkImageCreateInfo info =
+            texture_create_info(desc_, format, device_.color_attachment_usable(format.format));
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
         host_transfer_ = cpu_visible() && samples == 1 && device_.host_transfer_format(format.format);
         if (host_transfer_) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-        if (samples > 1 && !device_.samples_usable(info)) {
-            log_once("sample count not supported by the GPU for this format:", int(samples));
+        if ((samples > 1 || (info.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)) && !device_.samples_usable(info)) {
+            log_once("image configuration not supported by the GPU for this format:", int(format.format));
             return E_INVALIDARG;
         }
         if (vk.vkCreateImage(device_.info.device, &info, nullptr, &image_) != VK_SUCCESS) return E_OUTOFMEMORY;
@@ -553,6 +600,7 @@ public:
         binding.depth = depth;
         binding.volume = volume;
         binding.samples = samples;
+        binding.color_attachment = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
         binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
         // With the bindless set, a view's descriptor has one layout for as long as it lives (bind_image).
@@ -736,7 +784,8 @@ private:
         transition.image = image_;
         transition.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         transition.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        transition.subresourceRange = {binding_.aspects, 0, binding_.mip_levels, 0, binding_.array_layers};
+        transition.subresourceRange = {binding_.aspects, 0, binding_.mip_levels, 0,
+                                       binding_.volume ? VK_REMAINING_ARRAY_LAYERS : binding_.array_layers};
         if (device_.transition_image_layout(dev, 1, &transition) != VK_SUCCESS) return false;
         if (binding_.not_zeroed) return true;
         const std::uint32_t planes = leonida::two_planes(binding_) ? 2 : 1;
@@ -862,8 +911,16 @@ struct TextureView {
 bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
     namespace g = leonida::gfx10;
     const D3D12_RESOURCE_DESC& desc = resource.desc();
-    if (view.plane != 0) {
-        log_once("views of the stencil plane are not supported; plane", int(view.plane));
+    // Plane 1 of a depth-stencil texture is its stencil, viewed as X24_TYPELESS_G8_UINT (D24S8) or
+    // X32_TYPELESS_G8X24_UINT (D32S8): eight unsigned bits in G, as D3D12 returns them. The T# is 8_UINT, the
+    // format of the console's separate stencil surface, and bind_image views the stencil aspect for it.
+    const bool stencil = view.plane == 1;
+    if (view.plane > 1 || (stencil && !(resource.aspects() & VK_IMAGE_ASPECT_STENCIL_BIT))) {
+        log_once("no such plane in this texture; plane", int(view.plane));
+        return false;
+    }
+    if (stencil && view.format != DXGI_FORMAT_X24_TYPELESS_G8_UINT && view.format != DXGI_FORMAT_X32_TYPELESS_G8X24_UINT) {
+        log_once("a stencil-plane view needs a stencil view format; format", int(view.format));
         return false;
     }
     // Every view here is a 2D one (plain, array or cube), which a volume or a multisampled image cannot back.
@@ -872,9 +929,18 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         return false;
     }
     VkFormat named = resource.format();
-    if (view.format != DXGI_FORMAT_UNKNOWN) named = vulkan_format(view.format, false).format;
-    const std::uint32_t code = g::format_from_vulkan(named);
-    const VkFormat view_format = code ? g::vulkan_view_format(resource.format(), code) : VK_FORMAT_UNDEFINED;
+    // The depth plane of a depth-stencil texture, as R24_UNORM_X8_TYPELESS (D24S8) or R32_FLOAT_X8X24_TYPELESS
+    // (D32S8): the texture's own depth format, whose T# code is the console's depth format (8_24_UNORM or
+    // X24_8_32_FLOAT) with the depth in R; bind_image views the depth aspect for it.
+    const bool depth_plane = (view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                              view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) &&
+                             (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane)
+        named = vulkan_format(view.format, false).format;
+    const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
+    const VkFormat view_format = stencil ? resource.format()
+                                 : code  ? g::vulkan_view_format(resource.format(), code)
+                                         : VK_FORMAT_UNDEFINED;
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
         return false;
@@ -902,7 +968,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
-    const g::Swizzle channels = g::format_swizzle(view_format);
+    // A stencil view's format has its eight bits in G and no R, B or A of its own (0, 0, 1 when read).
+    const g::Swizzle channels = stencil ? g::Swizzle{g::select_zero, g::select_x, g::select_zero, g::select_one}
+                                        : g::format_swizzle(view_format);
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
         out.swizzle[i] = from < 4 ? channels[from]
@@ -1186,7 +1254,9 @@ public:
         if (const Resource* r = Resource::from<Resource>(resource)) {
             const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
             view = {r->id(), 0, 0, rd.DepthOrArraySize};
-            if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
+            if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                view = volume_rtv(r->id(), rd, desc);
+            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
                 view = {r->id(), desc->Texture2D.MipSlice, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) {
                 view = {r->id(), 0, 0, 1};
@@ -1203,11 +1273,16 @@ public:
             if (typeless_rgba8 || typed_rgba8) {
                 const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
                 if (typeless_rgba8) {
-                    // This first typeless RTV slice deliberately covers only a single 2D subresource.
-                    if (!desc || desc->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D ||
-                        rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd.MipLevels != 1 ||
-                        rd.DepthOrArraySize != 1 || rd.SampleDesc.Count != 1 || desc->Texture2D.MipSlice ||
-                        desc->Texture2D.PlaneSlice || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+                    const bool plain = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
+                    const bool array = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                    const UINT plane = plain ? desc->Texture2D.PlaneSlice :
+                        array ? desc->Texture2DArray.PlaneSlice : 0;
+                    // Subtraction keeps malformed layer ranges from overflowing during validation.
+                    if ((!plain && !array) || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                        rd.SampleDesc.Count != 1 || plane || !view.resource || view.mip >= rd.MipLevels ||
+                        !view.layer_count || view.first_layer >= rd.DepthOrArraySize ||
+                        view.layer_count > rd.DepthOrArraySize - view.first_layer ||
+                        !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
                         view = {};
                     } else {
                         switch (requested) {
@@ -1248,6 +1323,9 @@ public:
             } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY) {
                 view = {r->id(), desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
                         desc->Texture2DArray.ArraySize};
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY) {
+                // Multisample textures have one mip, so only the slice range is chosen.
+                view = {r->id(), 0, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize};
             } else if (desc) {
                 log_once("depth-stencil view dimension not supported:", desc->ViewDimension);
                 view = {};
@@ -1476,8 +1554,8 @@ public:
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
             log_once("committed resource dimension not supported:", desc->Dimension);
         } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
-                   (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
-            log_once("volume attachment views not supported, flags:", int(desc->Flags));
+                   (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+            log_once("volume depth-stencil resources not supported, flags:", int(desc->Flags));
         } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
             hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
         } else if (const UINT samples = desc->SampleDesc.Count;
@@ -1990,7 +2068,8 @@ private:
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
-        if (!state_.memory_requirements(texture_create_info(resolved, format), need)) return kInvalidAllocation;
+        const VkImageCreateInfo image = texture_create_info(resolved, format, state_.color_attachment_usable(format.format));
+        if (!state_.memory_requirements(image, need)) return kInvalidAllocation;
 
         // D3D12's alignment: 64 KiB, or 4 MiB with MSAA, unless the description asks for a small one (4 KiB, 64 KiB
         // with MSAA). 4 KiB needs the resource to fit in 64 KiB and not be a render target or depth buffer; if it
@@ -2025,12 +2104,14 @@ private:
     HRESULT create_reserved(const D3D12_RESOURCE_DESC* desc, REFIID riid, void** out) {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
-        constexpr auto xbox_tiled = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+        // The Xbox tiled layout word. 0x101 is outside D3D12_TEXTURE_LAYOUT's enumerators, so it can't be a
+        // constexpr enum value (clang rejects the cast in a constant expression); compare it as an integer.
+        constexpr UINT xbox_tiled = 0x101;
         D3D12_RESOURCE_DESC backing = *desc;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
         } else {
-            if (desc->Layout == xbox_tiled) {
+            if (static_cast<UINT>(desc->Layout) == xbox_tiled) {
                 log_once("reserved resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          desc->Dimension);
             } else if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {

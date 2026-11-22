@@ -2,8 +2,8 @@
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
-// render-target and depth-stencil clears (whole views or rectangles), copies, resolves, predication and debug
-// markers. It has no Windows or Vulkan dependency.
+// render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
+// predication and debug markers. It has no Windows or Vulkan dependency.
 
 #include <array>
 #include <cstdint>
@@ -310,6 +310,30 @@ struct ClearDepthStencil {
     std::vector<Rect> rects;
 };
 
+// What a UAV descriptor said when ClearUnorderedAccessView* was recorded (the CPU slot may be rewritten after).
+// A buffer view is a byte range of the buffer and an element format; a texture view is one mip and a layer range.
+struct UavView {
+    ResourceId resource;
+    bool buffer;
+    std::uint32_t format;        // the view's VkFormat value; 0 (VK_FORMAT_UNDEFINED): a raw or structured buffer
+    std::uint64_t offset;        // buffer: first byte of the view
+    std::uint64_t size;          // buffer: bytes in the view
+    std::uint32_t element_size;  // buffer: bytes an element (rects count elements), 4 for a raw view
+    std::uint32_t mip;           // texture
+    std::uint32_t first_layer;
+    std::uint32_t layer_count;
+};
+
+// ClearUnorderedAccessViewUint / ...Float; the resource must be in unordered_access state at execution. values are
+// the four UINTs, or the four FLOATs' bits. rects empty: the whole view. A buffer view's rects are element ranges
+// [left, right) (top and bottom must cover row 0).
+struct ClearUnorderedAccess {
+    UavView view;
+    bool is_float;
+    std::array<std::uint32_t, 4> values;
+    std::vector<Rect> rects;
+};
+
 // D3D12_PREDICATION_OP.
 namespace d3d12_predication {
 inline constexpr std::uint32_t equal_zero = 0;      // skip the predicated commands when the value is 0
@@ -337,7 +361,7 @@ struct DebugMarker {
 
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource, ResolveSubresource, Predication,
+                             CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess,
                              DebugMarker>;
 
 class CommandList {
@@ -426,6 +450,17 @@ public:
         if (!flags || (flags & ~(clear_depth | clear_stencil))) return false;
         if ((flags & clear_depth) && !(depth >= 0.0f && depth <= 1.0f)) return false;
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
+    }
+
+    // A view of nothing (no resource, an empty buffer range or no layers) is invalid, as is a rectangle that is
+    // inside out. Ranges against the resource are checked at replay.
+    bool clear_unordered_access(const UavView& view, bool is_float, const std::array<std::uint32_t, 4>& values,
+                                std::span<const Rect> rects = {}) {
+        if (!view.resource) return false;
+        if (view.buffer ? (!view.size || !view.element_size) : !view.layer_count) return false;
+        for (const Rect& r : rects)
+            if (r.right < r.left || r.bottom < r.top) return false;
+        return append(ClearUnorderedAccess{view, is_float, values, {rects.begin(), rects.end()}});
     }
 
     // ExecuteBundle copies the closed bundle's commands at the call site. The COM layer validates D3D12 list

@@ -202,8 +202,12 @@ def main():
 
     out = {"image": a.image, **scanned}
     path = a.out or re.sub(r"\.(exe|dll)$", "", a.image, flags=re.I) + ".rtti.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=1)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=1)
+    except OSError as exc:
+        print(f"ERROR: {path}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
     print(f"{a.image}: {out['type_descriptors']} type descriptors, {len(out['classes'])} classes with RTTI, {len(out['vtables'])} vtables -> {path}")
     for c in out["classes"][:5]:
         print("  ", c["name"], "<-", ", ".join(c["bases"][:4]))

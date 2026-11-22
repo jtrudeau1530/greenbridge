@@ -1,9 +1,8 @@
-"""make_game.py off Windows: the Windows-only runtime stage is left out of the default stages and refused before
-any work when asked for, and the pipelines stage finds the vk_pipeline_check that CMake builds there.
+"""Platform-specific build stages, runtime packaging and vk_pipeline_check discovery.
 
     python -I tests/test_make_game_platform.py
 
-No game data: main() runs with every stage mocked; the vk_pipeline_check binaries are empty files.
+No game data: stage selection uses mocks, and the packaging and discovery tests create synthetic files.
 """
 import io
 import os
@@ -75,6 +74,49 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("runtime stage builds on Windows only", err.getvalue())
         usage.assert_not_called()
         self.assertFalse(os.path.exists(os.path.join(work, "w")))
+
+
+class RuntimePackagingTest(unittest.TestCase):
+    def setUp(self):
+        self.root = self.enterContext(tempfile.TemporaryDirectory())
+        self.build = os.path.join(self.root, "runtime", "build")
+        self.game = os.path.join(self.root, "game")
+        self.out = os.path.join(self.root, "out")
+        os.makedirs(self.build)
+        os.makedirs(self.game)
+        self.write_artifact("gta6rt.exe", b"runtime")
+
+    def write_artifact(self, name, contents):
+        with open(os.path.join(self.build, name), "wb") as f:
+            f.write(contents)
+
+    def package(self):
+        with mock.patch.object(make_game.os, "name", "nt"), \
+                mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch.object(make_game, "run"), \
+                mock.patch.object(make_game, "log"):
+            make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"})
+
+    def test_runtime_copies_executable_and_tls_host_together(self):
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+
+        self.package()
+
+        with open(os.path.join(self.out, "gta6rt.exe"), "rb") as f:
+            self.assertEqual(f.read(), b"runtime")
+        with open(os.path.join(self.out, "gta6rt_tls_host.dll"), "rb") as f:
+            self.assertEqual(f.read(), b"TLS host")
+        with open(os.path.join(self.out, "game_path.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), self.game)
+
+    def test_runtime_rejects_missing_tls_host_before_copying(self):
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err), self.assertRaises(SystemExit) as ctx:
+            self.package()
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("gta6rt_tls_host.dll", err.getvalue())
+        self.assertFalse(os.path.exists(self.out))
 
 
 class PipelineCheckExeTest(unittest.TestCase):

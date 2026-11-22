@@ -61,3 +61,11 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             fn()
             print("ok", name)
+
+
+def test_64k_block_extent_comes_from_the_element_count():
+    # XOR modes have no x/y bit that appears alone, so the old solo-bit guess returned 1x1 or too small.
+    for bpe, bw, bh in ((1, 256, 256), (2, 256, 128), (4, 128, 128), (8, 128, 64), (16, 64, 64)):
+        _, meta = A.offsets([(1, 0), (0, 1)], bpe, 1, 1)
+        assert meta[:2] == (bw, bh), (bpe, meta)
+        assert bw * bh * bpe == 65536

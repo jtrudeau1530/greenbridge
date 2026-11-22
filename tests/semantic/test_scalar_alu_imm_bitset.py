@@ -23,9 +23,9 @@ RDNA2 ISA rules (AMD RDNA2 "Instruction Set Architecture" reference, SOP1/SOP2/S
 
 Translator notes observed in ``tools/rdna2spirv.py``:
   * ``s_mulk_i32``, ``s_bitset0_b32``, and ``s_bitset1_b32`` read their in-place destination
-    with ``load_reg('sgpr', a[0]['r'])`` rather than ``src_u(a[0])``, limiting those three
-    ops to SGPR destinations (non-SGPR targets such as ``m0``/``vcc_lo`` raise KeyError).
-  * ``s_bfm_b32`` has a duplicate unreachable handler at line 3447 shadowed by line 2448.
+    with ``src_u(a[0])`` (matching ``s_addk_i32``), supporting SGPR and non-SGPR targets
+    such as ``m0``, ``vcc_lo``, ``vcc_hi``, and ``null``.
+  * ``s_bfm_b32`` has a duplicate unreachable handler shadowed by its earlier branch.
 
 Run directly:
     python -I tests/semantic/test_scalar_alu_imm_bitset.py
@@ -422,6 +422,56 @@ class TestScalarMulkI32(unittest.TestCase):
         want_s1 = ref_s_mulk_i32(ref_s_mulk_i32(3, -5), 0x7FFF)
         self.assertEqual((w0, w1, w2, w3), (0x11111111, want_s1, 0x22222222, 0))
 
+    def test_special_destinations_and_register_isolation(self):
+        cases = [
+            (0x00000007, -3),
+            (0x00000001, 0x8000),
+            (0xFFFFFFFB, 0x8000),
+            (0x7FFFFFFF, 0x7FFF),
+            (0x80000000, 0xFFFF),
+        ]
+        for dst in ("m0", "vcc_lo", "vcc_hi"):
+            for init, imm in cases:
+                want = ref_s_mulk_i32(init, imm)
+                for pre_scc in (0, 1):
+                    with self.subTest(dst=dst, init=hex(init), imm=imm, pre_scc=pre_scc):
+                        got, got_scc = run_pair([
+                            f"s_mov_b32 {dst}, {init:#x}",
+                            scc_seed_line(pre_scc),
+                            f"s_mulk_i32 {dst}, {fmt_imm16(imm)}",
+                            "s_cselect_b32 s1, 1, 0",
+                            f"s_mov_b32 s0, {dst}",
+                            "v_mov_b32 v0, s0",
+                            "v_mov_b32 v1, s1",
+                        ])
+                        self.assertEqual(got, want)
+                        self.assertEqual(got_scc, pre_scc)
+
+        for target, other1, other2 in (
+            ("m0", "vcc_lo", "vcc_hi"),
+            ("vcc_lo", "m0", "vcc_hi"),
+            ("vcc_hi", "m0", "vcc_lo"),
+        ):
+            with self.subTest(isolated_target=target):
+                w0, w1, w2, w3 = run_quad([
+                    "s_mov_b32 s0, 0x11111111",
+                    f"s_mov_b32 {target}, 3",
+                    f"s_mov_b32 {other1}, 0x22222222",
+                    f"s_mov_b32 {other2}, 0x33333333",
+                    f"s_mulk_i32 {target}, -5",
+                    f"s_mulk_i32 {target}, 0x7fff",
+                    "s_mulk_i32 null, 0x7fff",
+                    f"s_mov_b32 s1, {target}",
+                    f"s_mov_b32 s2, {other1}",
+                    f"s_mov_b32 s3, {other2}",
+                    "v_mov_b32 v0, s0",
+                    "v_mov_b32 v1, s1",
+                    "v_mov_b32 v2, s2",
+                    "v_mov_b32 v3, s3",
+                ])
+                want_target = ref_s_mulk_i32(ref_s_mulk_i32(3, -5), 0x7FFF)
+                self.assertEqual((w0, w1, w2, w3), (0x11111111, want_target, 0x22222222, 0x33333333))
+
 
 class TestScalarBitsetB32(unittest.TestCase):
     """End-to-end semantic tests for s_bitset0_b32 and s_bitset1_b32."""
@@ -533,6 +583,74 @@ class TestScalarBitsetB32(unittest.TestCase):
         self.assertEqual(w1, ref_s_bitset1_b32(0x04, 0x04))
         self.assertEqual(w2, ref_s_bitset0_b32(ref_s_bitset1_b32(0, 7), 0))
         self.assertEqual(w3, 0x55AA55AA)
+
+    def test_special_destinations_and_register_isolation(self):
+        for dst in ("m0", "vcc_lo", "vcc_hi"):
+            for bit_op, init, bit_tok, bit_val in (
+                ("s_bitset0_b32", 0xA5A55A5A, "3", 3),
+                ("s_bitset0_b32", 0xFFFFFFFF, "31", 31),
+                ("s_bitset0_b32", 0xFFFFFFFF, "35", 35),
+                ("s_bitset0_b32", 0xFFFFFFFF, "s2", 0xFFFFFFFF),
+                ("s_bitset1_b32", 0x00000000, "0", 0),
+                ("s_bitset1_b32", 0x00000000, "31", 31),
+                ("s_bitset1_b32", 0x00000000, "35", 35),
+                ("s_bitset1_b32", 0xA5A55A5A, "s2", 2),
+            ):
+                fn = ref_s_bitset0_b32 if bit_op == "s_bitset0_b32" else ref_s_bitset1_b32
+                want = fn(init, bit_val)
+                setup = [f"s_mov_b32 s2, {bit_val & MASK32:#x}"] if bit_tok == "s2" else []
+                for pre_scc in (0, 1):
+                    with self.subTest(dst=dst, op=bit_op, init=hex(init), bit=bit_tok, pre_scc=pre_scc):
+                        got, got_scc = run_pair(setup + [
+                            f"s_mov_b32 {dst}, {init:#x}",
+                            scc_seed_line(pre_scc),
+                            f"{bit_op} {dst}, {bit_tok}",
+                            "s_cselect_b32 s1, 1, 0",
+                            f"s_mov_b32 s0, {dst}",
+                            "v_mov_b32 v0, s0",
+                            "v_mov_b32 v1, s1",
+                        ])
+                        self.assertEqual(got, want)
+                        self.assertEqual(got_scc, pre_scc)
+
+            other1, other2 = [r for r in ("m0", "vcc_lo", "vcc_hi") if r != dst]
+            with self.subTest(alias_and_isolated_target=dst):
+                w0, w1, w2, w3 = run_quad([
+                    "s_mov_b32 s0, 0x11111111",
+                    f"s_mov_b32 {dst}, 0x25",
+                    f"s_mov_b32 {other1}, 0x22222222",
+                    f"s_mov_b32 {other2}, 0x33333333",
+                    f"s_bitset0_b32 {dst}, {dst}",      # 0x25 & 31 = 5 -> clears bit 5 -> 0x05
+                    f"s_bitset1_b32 {dst}, {dst}",      # 0x05 & 31 = 5 -> sets bit 5 back -> 0x25
+                    f"s_bitset1_b32 {dst}, 3",          # sets bit 3 -> 0x2D
+                    "s_bitset0_b32 null, 0",
+                    "s_bitset1_b32 null, 31",
+                    f"s_mov_b32 s1, {dst}",
+                    f"s_mov_b32 s2, {other1}",
+                    f"s_mov_b32 s3, {other2}",
+                    "v_mov_b32 v0, s0",
+                    "v_mov_b32 v1, s1",
+                    "v_mov_b32 v2, s2",
+                    "v_mov_b32 v3, s3",
+                ])
+                want_dst = ref_s_bitset1_b32(ref_s_bitset1_b32(ref_s_bitset0_b32(0x25, 0x25), 0x05), 3)
+                self.assertEqual((w0, w1, w2, w3), (0x11111111, want_dst, 0x22222222, 0x33333333))
+
+        w0, w1, w2, w3 = run_quad([
+            "s_mov_b32 m0, 7",
+            "s_mov_b32 vcc_lo, 0",
+            "s_mov_b32 vcc_hi, 0xffffffff",
+            "s_bitset1_b32 vcc_lo, m0",
+            "s_bitset0_b32 vcc_hi, m0",
+            "s_mov_b32 s0, m0",
+            "s_mov_b32 s1, vcc_lo",
+            "s_mov_b32 s2, vcc_hi",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, s2",
+            "v_mov_b32 v3, 0",
+        ])
+        self.assertEqual((w0, w1, w2, w3), (7, 0x00000080, 0xFFFFFF7F, 0))
 
 
 class TestScalarBfmB32(unittest.TestCase):
