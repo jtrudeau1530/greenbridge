@@ -587,8 +587,7 @@ descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
 aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
 the game writes itself, which need
-the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
-of root signatures, which are not registered yet; the literal S#s of shaders (`literal_samplers` in the index),
+the execute-time scan of section 3.4 (only descriptors made through the device are registered); the literal S#s of shaders (`literal_samplers` in the index),
 which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
 pipeline creation comes with the shader index, #291);
 custom border colours without VK_EXT_custom_border_color, and minimum/maximum filters, anisotropy or mirror-once addressing without the Vulkan
@@ -1435,6 +1434,10 @@ Things that can invalidate this simple model, all **Open**:
 - **Static samplers.** D3D12 static samplers do not consume root parameters. The console driver may place their
   S# values in a fixed table. The layer registers every static sampler's S# in the hash table, so a shader that
   loads it by value works; a shader that expects a driver table needs that table's location (**Open**).
+  `CreateRootSignature` does the registering, for 1.0, 1.1 and 1.2 blobs: each static sampler is encoded as
+  `CreateSampler2` encodes the same description (the five `D3D12_STATIC_BORDER_COLOR` values, two of them UINT, and
+  the 1.2 flags), and gets a sampler in set 0 and a key in the hash table without a heap slot. The entry outlives
+  the root signature. `d3d12_descriptor_test` checks the key before and after and samples with it.
 - **Descriptor-table high-dword truncation.** If a shader forces the high dword of a table pointer to zero, the
   table must be below 4 GB; the layer allocates all shader-visible heaps there. If a shader forces a resource VA's
   high dword to zero, the resource must also be low; that would constrain the arena layout. The disassembly shows
