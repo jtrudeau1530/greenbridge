@@ -120,6 +120,13 @@ struct VulkanDeviceInfo {
     bool swapchain_maintenance1 = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
+    // Pixel-shader extensions translated shaders can declare, each enabled with its feature where the GPU has it:
+    // VK_KHR_fragment_shader_barycentric (BaryCoordKHR / PerVertexKHR reads), VK_EXT_fragment_shader_interlock
+    // (fragmentShaderPixelInterlock: POPS shaders run in PixelInterlockOrderedEXT) and VK_KHR_maintenance8 (texel
+    // offsets outside gathers: the index's needs_maintenance8).
+    bool fragment_shader_barycentric = false;
+    bool fragment_shader_interlock = false;
+    bool maintenance8 = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;

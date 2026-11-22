@@ -6338,6 +6338,49 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
 
+    // The pixel-shader extensions translated shaders can declare (VulkanDeviceInfo::fragment_shader_barycentric and
+    // the two after it). Each is queried, and enabled with its feature where the GPU has it.
+    const auto has_device_extension = [&](const char* name) {
+        return std::any_of(extensions.begin(), extensions.end(),
+                           [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+    };
+    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+    if (has_device_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &barycentric};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.fragment_shader_barycentric = barycentric.fragmentShaderBarycentric == VK_TRUE;
+        if (info.fragment_shader_barycentric) {
+            barycentric.pNext = *v13.next();
+            *v13.next() = &barycentric;
+        }
+    }
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+    if (has_device_extension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &interlock};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.fragment_shader_interlock = interlock.fragmentShaderPixelInterlock == VK_TRUE;
+        if (info.fragment_shader_interlock) {
+            interlock.fragmentShaderSampleInterlock = VK_FALSE;  // the translator only declares the pixel interlock
+            interlock.fragmentShaderShadingRateInterlock = VK_FALSE;
+            interlock.pNext = *v13.next();
+            *v13.next() = &interlock;
+        }
+    }
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
+    VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    if (has_device_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance8};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.maintenance8 = maintenance8.maintenance8 == VK_TRUE;
+        if (info.maintenance8) {
+            maintenance8.pNext = *v13.next();
+            *v13.next() = &maintenance8;
+        }
+    }
+#endif
+
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     // VK_KHR_shader_fma: OpFmaKHR is a single-rounding multiply-add in SPIR-V (GLSL.std.450 Fma may round twice).
     // Translated shaders built with `rdna2spirv.py --fma khr` need it (index capability FMAKHR, feature
@@ -6428,6 +6471,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.fragment_shader_barycentric)
+        device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+    if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
+    if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+#endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
