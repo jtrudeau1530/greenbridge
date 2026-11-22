@@ -242,6 +242,29 @@ test('successful chunks unload and can load again with a fresh attempt budget', 
     assert.equal(f.state.live.get('chunk_0').attempts, 1);
 });
 
+test('clay, wireframe and eviction preserve imported material metadata', async t => {
+    const f = fixture();
+    const materials = [{ dispose: t.mock.fn() }, { dispose: t.mock.fn() }];
+    const userData = { origMaterial: { label: 'imported glTF extras' } };
+    const mesh = { isMesh: true, material: materials, userData };
+
+    f.frame();
+    await f.succeed(0, { traverse: visit => visit(mesh) });
+    assert.equal(mesh.material, materials);
+
+    vm.runInContext('clay = true; applyClay(); wire = true; applyWire()', f.context);
+    assert.notEqual(mesh.material, materials);
+    assert.equal(mesh.material.wireframe, true);
+    for (const material of materials) assert.equal(material.wireframe, true);
+
+    vm.runInContext('clay = false; applyClay()', f.context);
+    assert.equal(mesh.material, materials);
+    vm.runInContext('clay = true; applyClay()', f.context);
+    f.state.drop('chunk_0');
+    for (const material of materials) assert.equal(material.dispose.mock.callCount(), 1);
+    assert.deepEqual(userData, { origMaterial: { label: 'imported glTF extras' } });
+});
+
 test('stale and evicted chunks close each shared bitmap once', async t => {
     const f = fixture();
     class Bitmap { close = t.mock.fn(); }
