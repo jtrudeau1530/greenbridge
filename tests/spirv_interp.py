@@ -4,7 +4,9 @@ without a GPU.
 It only covers the straight-line, one-lane subset the translator produces for branch-free shaders: scalar/vector
 arithmetic, bit ops, bitcasts, the GLSL.std.450 functions used so far, and Function/Output variables. Anything else
 raises NotImplementedError (a test then fails loudly instead of passing on a guess). Floats are rounded to binary32
-after every operation. Texture, buffer and control-flow instructions are out of scope.
+after every operation. An integer is always held as its unsigned 32-bit pattern, whatever the signedness of its
+type; the instructions that read it as signed (OpS*, SMin, SMax) convert with s32() themselves, as SPIR-V defines
+them on the bits and not on the type. Texture, buffer and control-flow instructions are out of scope.
 """
 import math
 import re
@@ -152,7 +154,7 @@ def run(spvasm):
             if t == "Float":
                 consts[res] = float(args[1]) if types[args[0]][1] == "64" else f32(float(args[1]))
             else:
-                consts[res] = int(args[1]) & M32 if t == "Int" and types[args[0]][2] == "0" else s32(int(args[1]))
+                consts[res] = int(args[1]) & M32
         elif op == "OpConstantTrue":
             consts[res] = True
         elif op == "OpConstantFalse":
@@ -188,11 +190,13 @@ def run(spvasm):
         "OpShiftLeftLogical": lambda a, b: (a << (b & 31)) & M32 if b < 32 else 0,
         "OpShiftRightLogical": lambda a, b: a >> b if b < 32 else 0,
         "OpFAdd": lambda a, b: f32(a + b), "OpFSub": lambda a, b: f32(a - b), "OpFMul": lambda a, b: f32(a * b),
-        "OpFDiv": lambda a, b: f32(a / b) if b else math.copysign(math.inf, a) if a else math.nan,
+        # x / +-0: infinity with the sign of x times the sign of the zero; 0 / 0 and NaN / 0 are NaN.
+        "OpFDiv": lambda a, b: f32(a / b) if b else
+        math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b)) if a and not math.isnan(a) else math.nan,
         "OpFOrdGreaterThan": lambda a, b: a > b, "OpFOrdLessThan": lambda a, b: a < b,
         "OpFOrdEqual": lambda a, b: a == b,
         "OpLogicalOr": lambda a, b: a or b, "OpLogicalAnd": lambda a, b: a and b,
-        "OpSLessThanEqual": lambda a, b: a <= b, "OpSGreaterThanEqual": lambda a, b: a >= b,
+        "OpSLessThanEqual": lambda a, b: s32(a) <= s32(b), "OpSGreaterThanEqual": lambda a, b: s32(a) >= s32(b),
         "OpULessThan": lambda a, b: a < b, "OpUGreaterThan": lambda a, b: a > b,
         "OpULessThanEqual": lambda a, b: a <= b, "OpUGreaterThanEqual": lambda a, b: a >= b,
         "OpFUnordNotEqual": lambda a, b: a != b,          # true when either is NaN, as Python's != is
@@ -245,7 +249,7 @@ def run(spvasm):
         if fn == "FClamp":
             return round_out(min(max(a[0], a[1]), a[2]))
         if fn in ("SMax", "SMin"):
-            return (max if fn == "SMax" else min)(*a)
+            return (max if fn == "SMax" else min)(*a, key=s32)
         if fn in ("UMax", "UMin"):
             return (max if fn == "UMax" else min)(*a)
         raise NotImplementedError("GLSL." + fn)
@@ -277,8 +281,7 @@ def run(spvasm):
             elif t == "Float":
                 val[res] = u2f(v) if isinstance(v, int) else v
             else:
-                bits = f2u(v) if isinstance(v, float) else v & M32
-                val[res] = s32(bits) if types[args[0]][2] == "1" else bits
+                val[res] = f2u(v) if isinstance(v, float) else v & M32
         elif op == "OpSelect":
             val[res] = get(args[2]) if get(args[1]) else get(args[3])
         elif op in ARITH:
@@ -309,7 +312,7 @@ def run(spvasm):
         elif op == "OpBitFieldSExtract":
             v, off, cnt = s32(get(args[1])), get(args[2]), get(args[3])
             x = (v >> off) & ((1 << cnt) - 1)
-            val[res] = x - (1 << cnt) if x >> (cnt - 1) else x
+            val[res] = (x - (1 << cnt) if cnt and x >> (cnt - 1) else x) & M32
         elif op == "OpBitFieldUExtract":
             val[res] = (get(args[1]) >> get(args[2])) & ((1 << get(args[3])) - 1)
         elif op == "OpBitCount":
@@ -321,7 +324,8 @@ def run(spvasm):
         elif op == "OpConvertFToU":
             x = get(args[1]); val[res] = 0 if math.isnan(x) or x <= 0 else M32 if x >= 2**32 else int(x)
         elif op == "OpConvertFToS":
-            x = get(args[1]); val[res] = 0 if math.isnan(x) else max(-2**31, min(2**31 - 1, int(x)))
+            x = get(args[1])
+            val[res] = 0 if math.isnan(x) else (-2**31 if x <= -2**31 else 2**31 - 1 if x >= 2**31 else int(x)) & M32
         elif op == "OpIAddCarry":
             t = get(args[1]) + get(args[2]); val[res] = (t & M32, t >> 32)
         elif op == "OpISubBorrow":
