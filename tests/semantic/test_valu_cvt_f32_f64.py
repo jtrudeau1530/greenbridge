@@ -1443,5 +1443,120 @@ class TestValuCvtF32F64ConditionCodes(unittest.TestCase):
         self.assertEqual(simd.vcc, canary_vcc)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestValuCvtF32F64IEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zero_matrix(self) -> None:
+        # v_cvt_f32_f64 signed zeros
+        self.assertEqual(ref_cvt_f32_f64(POS_ZERO_F64), POS_ZERO_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_ZERO_F64), NEG_ZERO_F32)
+        self.assertEqual(ref_cvt_f32_f64(POS_ZERO_F64) & SIGN_MASK_F32, 0)
+        self.assertEqual(ref_cvt_f32_f64(NEG_ZERO_F64) & SIGN_MASK_F32, SIGN_MASK_F32)
+
+        # v_cvt_f64_f32 signed zeros
+        self.assertEqual(ref_cvt_f64_f32(POS_ZERO_F32), POS_ZERO_F64)
+        self.assertEqual(ref_cvt_f64_f32(NEG_ZERO_F32), NEG_ZERO_F64)
+        self.assertEqual(ref_cvt_f64_f32(POS_ZERO_F32) & SIGN_MASK_F64, 0)
+        self.assertEqual(ref_cvt_f64_f32(NEG_ZERO_F32) & SIGN_MASK_F64, SIGN_MASK_F64)
+
+    def test_infinities_matrix(self) -> None:
+        self.assertEqual(ref_cvt_f32_f64(POS_INF_F64), POS_INF_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_INF_F64), NEG_INF_F32)
+        self.assertEqual(ref_cvt_f64_f32(POS_INF_F32), POS_INF_F64)
+        self.assertEqual(ref_cvt_f64_f32(NEG_INF_F32), NEG_INF_F64)
+
+    def test_subnormals_f32_to_f64_exact(self) -> None:
+        # All subnormals in float32 convert to exact normalized floats in float64
+        subnormals_f32 = [
+            SUBNORM_MIN_F32,
+            SUBNORM_MAX_F32,
+            NEG_SUBNORM_MIN_F32,
+            NEG_SUBNORM_MAX_F32,
+            0x00000042,
+            0x80000042,
+        ]
+        for sub in subnormals_f32:
+            with self.subTest(sub=f"{sub:#010x}"):
+                self.assertTrue(is_subnormal_f32(sub))
+                res64 = ref_cvt_f64_f32(sub)
+                # In float64, these exponent bits are non-zero (normalized!)
+                self.assertFalse(is_subnormal_f64(res64))
+                self.assertEqual(bits_to_f32(sub), bits_to_f64(res64))
+
+    def test_subnormals_f64_to_f32(self) -> None:
+        # A double representing 2^-140 converts to a subnormal float32
+        d_val = 2.0 ** -140
+        d_bits = f64_to_bits(d_val)
+        res32 = ref_cvt_f32_f64(d_bits)
+        self.assertTrue(is_subnormal_f32(res32))
+
+        # A double subnormal (magnitude < 2^-1022) is far smaller than f32 min subnormal (2^-149)
+        # and therefore underflows to signed zero under IEEE 754 roundTiesToEven
+        self.assertEqual(ref_cvt_f32_f64(SUBNORM_MIN_F64), POS_ZERO_F32)
+        self.assertEqual(ref_cvt_f32_f64(SUBNORM_MAX_F64), POS_ZERO_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_SUBNORM_MIN_F64), NEG_ZERO_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_SUBNORM_MAX_F64), NEG_ZERO_F32)
+
+    def test_overflow_boundaries_f64_to_f32(self) -> None:
+        # FLT_MAX as double
+        flt_max_as_double = f64_to_bits(bits_to_f32(FLT_MAX))
+        self.assertEqual(ref_cvt_f32_f64(flt_max_as_double), FLT_MAX)
+
+        # Value just below overflow threshold rounds to FLT_MAX
+        val_below_thresh = f64_to_bits(3.4028234e+38)
+        self.assertEqual(ref_cvt_f32_f64(val_below_thresh), FLT_MAX)
+
+        # Value >= overflow threshold rounds to +inf
+        val_at_thresh = f64_to_bits(OVERFLOW_THRESHOLD_F64)
+        self.assertEqual(ref_cvt_f32_f64(val_at_thresh), POS_INF_F32)
+
+        # Negative counterpart rounds to -inf
+        val_neg_thresh = f64_to_bits(-OVERFLOW_THRESHOLD_F64)
+        self.assertEqual(ref_cvt_f32_f64(val_neg_thresh), NEG_INF_F32)
+
+    def test_nan_suppression_and_propagation(self) -> None:
+        f64_nans = [QNAN_F64, NEG_QNAN_F64, QNAN_PAYLOAD_A_F64, QNAN_PAYLOAD_B_F64, SNAN_F64]
+        for nan in f64_nans:
+            with self.subTest(nan=f"{nan:#018x}"):
+                res32 = ref_cvt_f32_f64(nan)
+                self.assertTrue(is_nan_f32(res32))
+                self.assertTrue(is_qnan_f32(res32))
+
+        f32_nans = [QNAN_F32, NEG_QNAN_F32, QNAN_PAYLOAD_A_F32, QNAN_PAYLOAD_B_F32, SNAN_F32]
+        for nan in f32_nans:
+            with self.subTest(nan=f"{nan:#010x}"):
+                res64 = ref_cvt_f64_f32(nan)
+                self.assertTrue(is_nan_f64(res64))
+                self.assertTrue(is_qnan_f64(res64))
+
+    def test_modifiers_on_boundary_values(self) -> None:
+        # abs on negative infinity and negative zero
+        self.assertEqual(ref_cvt_f32_f64(NEG_INF_F64, abs_val=True), POS_INF_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_ZERO_F64, abs_val=True), POS_ZERO_F32)
+        self.assertEqual(ref_cvt_f64_f32(NEG_INF_F32, abs_val=True), POS_INF_F64)
+        self.assertEqual(ref_cvt_f64_f32(NEG_ZERO_F32, abs_val=True), POS_ZERO_F64)
+
+        # neg on positive infinity and positive zero
+        self.assertEqual(ref_cvt_f32_f64(POS_INF_F64, neg=True), NEG_INF_F32)
+        self.assertEqual(ref_cvt_f32_f64(POS_ZERO_F64, neg=True), NEG_ZERO_F32)
+        self.assertEqual(ref_cvt_f64_f32(POS_INF_F32, neg=True), NEG_INF_F64)
+        self.assertEqual(ref_cvt_f64_f32(POS_ZERO_F32, neg=True), NEG_ZERO_F64)
+
+        # clamp on overflow and boundaries
+        self.assertEqual(ref_cvt_f32_f64(POS_INF_F64, clamp=True), POS_ONE_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_INF_F64, clamp=True), POS_ZERO_F32)
+        self.assertEqual(ref_cvt_f32_f64(NEG_ONE_F64, clamp=True), POS_ZERO_F32)
+        self.assertEqual(ref_cvt_f32_f64(QNAN_F64, clamp=True), QNAN_F32)
+
+        self.assertEqual(ref_cvt_f64_f32(POS_INF_F32, clamp=True), POS_ONE_F64)
+        self.assertEqual(ref_cvt_f64_f32(NEG_INF_F32, clamp=True), POS_ZERO_F64)
+        self.assertEqual(ref_cvt_f64_f32(NEG_ONE_F32, clamp=True), POS_ZERO_F64)
+        self.assertEqual(ref_cvt_f64_f32(QNAN_F32, clamp=True), QNAN_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
