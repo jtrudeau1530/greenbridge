@@ -3603,8 +3603,13 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
-        elif op == "v_mad_f32":
-            x, y, z = (self.src_f(t) for t in a[1:4])
+        elif op in ("v_mad_f32", "v_mac_f32"):
+            # Unfused: the product is rounded before the add. v_mac_f32 is the VOP2 form with D as the addend
+            # (LLVM SIInstrInfo.cpp getNewFMAInst: V_MAC_F32 -> V_MAD_F32_e64, V_FMAC_F32 -> V_FMA_F32_e64).
+            if op == "v_mac_f32":
+                x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
+            else:
+                x, y, z = (self.src_f(t) for t in a[1:4])
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{r} = OpFAdd %float {m} {z}")
@@ -3623,7 +3628,7 @@ class Gen:
             v2, f = self.tmp(), self.tmp()
             self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
             self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
-            self.dst(a[0], self.tou(self.modify_f(f, a[1])))
+            self.dst(a[0], self.tou(self.clamp_mods(self.modify_f(f, a[1]), mods)))
         elif op in ("v_interp_p1_f32", "v_interp_p2_f32", "v_interp_mov_f32"):
             # Single-lane model: the barycentric p1/p2 pair yields the interpolated attribute, and the mov of P0
             # the provoking vertex's value. An input only ever read through the mov is declared Flat: such
@@ -3873,7 +3878,7 @@ class Gen:
             x = self.src_f(a[1])
             r = self.tmp()
             self.emit(f"{r} = OpFDiv %float %f1 {x}")
-            self.dst(a[0], self.tou(r))
+            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
             x, y = self.src_f(a[1]), self.src_f(a[2])
             r = self.tmp()
@@ -3887,13 +3892,13 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpFSub %float {y} {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
-        elif op in ("v_fma_f32", "v_fmac_f32", "v_mac_f32", "v_fmaak_f32", "v_fmamk_f32", "v_med3_f32"):
+        elif op in ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32", "v_fmamk_f32", "v_med3_f32"):
             if op in ("v_fma_f32", "v_fmaak_f32", "v_fmamk_f32"):
                 # fmaak D = S0 * S1 + K, printed `vdst, src0, vsrc1, K`; fmamk D = S0 * K + S1, printed
                 # `vdst, src0, K, vsrc1`. In print order both are fma(a[1], a[2], a[3]), like v_fma_f32. Until
                 # 2026-11-21 fmamk read a[3] as the factor, so it computed S0 * S1 + K.
                 x, y, z = (self.src_f(t) for t in a[1:4])
-            elif op in ("v_fmac_f32", "v_mac_f32"):
+            elif op == "v_fmac_f32":
                 x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
             else:
                 x, y, z = (self.src_f(t) for t in a[1:4])
@@ -3919,7 +3924,7 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = {'OpConvertUToF' if op.endswith('u32') else 'OpConvertSToF'} %float "
                       f"{x if op.endswith('u32') else self.as_int(x)}")
-            self.dst(a[0], self.tou(r))
+            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))   # VOP3: clamp, omod
         elif op.startswith("v_cvt_f32_ubyte"):
             n = int(op[-1])
             x = self.src_u(a[1])
@@ -3927,7 +3932,7 @@ class Gen:
             self.emit(f"{s} = OpShiftRightLogical %uint {x} {self.cu(8 * n)}")
             self.emit(f"{m} = OpBitwiseAnd %uint {s} {self.cu(0xFF)}")
             self.emit(f"{r} = OpConvertUToF %float {m}")
-            self.dst(a[0], self.tou(r))
+            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_cvt_u32_f32", "v_cvt_i32_f32"):
             # Compare binary32 words before converting: the raw SPIR-V conversion
             # must only see a representable operand, even when its result is discarded.
