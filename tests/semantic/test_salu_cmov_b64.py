@@ -467,5 +467,113 @@ class ScalarCselectB64RoutingTests(unittest.TestCase):
                 self.assertEqual(words[2:], [want_rev & MASK32, (want_rev >> 32) & MASK32])
 
 
+class ScalarCselectB64AliasingAndControlsTests(unittest.TestCase):
+    DEST = "s_cselect_b64 destination"
+
+    def test_destination_exact_aliasing(self):
+        # D == S0, D == S1, and D == S0 == S1.
+        a64 = 0x55667788_11223344
+        b64 = 0xDDEEFF00_99AABBCC
+        cases = [
+            ("s[4:5]", "s[6:7]", a64, b64),
+            ("s[6:7]", "s[4:5]", b64, a64),
+            ("s[4:5]", "s[4:5]", a64, a64),
+        ]
+        for s0_spec, s1_spec, s0_val, s1_val in cases:
+            for scc in (0, 1):
+                with self.subTest(s0=s0_spec, s1=s1_spec, scc=scc):
+                    want = ref_cselect_b64(s0_val, s1_val, scc)
+                    lines = (
+                        load_pair_lines(4, a64)
+                        + load_pair_lines(6, b64)
+                        + [scc_line(scc), f"s_cselect_b64 s[4:5], {s0_spec}, {s1_spec}"]
+                        + export_pair_lines(4)
+                        + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                    )
+                    words = run_ps(lines)
+                    self.assertEqual(words[:2], [want & MASK32, (want >> 32) & MASK32])
+
+    def test_partial_register_overlap_aliasing(self):
+        # Destination s[4:5] overlaps s[3:4] on s4, and s[5:6] on s5.
+        s3, s4, s5, s6 = 0x10203040, 0x50607080, 0x90A0B0C0, 0xD0E0F001
+        p34 = (s4 << 32) | s3
+        p56 = (s6 << 32) | s5
+        for s0_spec, s1_spec, s0_val, s1_val in (
+            ("s[3:4]", "s[5:6]", p34, p56),
+            ("s[5:6]", "s[3:4]", p56, p34),
+        ):
+            for scc in (0, 1):
+                with self.subTest(s0=s0_spec, s1=s1_spec, scc=scc):
+                    want = ref_cselect_b64(s0_val, s1_val, scc)
+                    words = run_ps([
+                        f"s_mov_b32 s3, {s3:#x}",
+                        f"s_mov_b32 s4, {s4:#x}",
+                        f"s_mov_b32 s5, {s5:#x}",
+                        f"s_mov_b32 s6, {s6:#x}",
+                        scc_line(scc),
+                        f"s_cselect_b64 s[4:5], {s0_spec}, {s1_spec}",
+                        "v_mov_b32 v0, s4",
+                        "v_mov_b32 v1, s5",
+                        "v_mov_b32 v2, 0",
+                        "v_mov_b32 v3, 0",
+                    ])
+                    self.assertEqual(words[:2], [want & MASK32, (want >> 32) & MASK32])
+
+    def test_condition_inversion_equivalence(self):
+        # cselect(A, B, cond) == cselect(B, A, not cond).
+        # We test both external validation and explicit in-shader SCC inversion.
+        a64 = 0x13579BDF_02468ACE
+        b64 = 0xCAFE1234_BEEF5678
+        for scc in (0, 1):
+            with self.subTest(scc=scc):
+                words = run_ps(
+                    load_pair_lines(4, a64)
+                    + load_pair_lines(6, b64)
+                    + [
+                        scc_line(scc),
+                        "s_cselect_b64 s[2:3], s[4:5], s[6:7]",
+                        "s_cselect_b32 s10, 0, 1",
+                        "s_cmp_lg_u32 s10, 0",
+                        "s_cselect_b64 s[8:9], s[6:7], s[4:5]",
+                        "v_mov_b32 v0, s2",
+                        "v_mov_b32 v1, s3",
+                        "v_mov_b32 v2, s8",
+                        "v_mov_b32 v3, s9",
+                    ]
+                )
+                want = ref_cselect_b64(a64, b64, scc)
+                self.assertEqual(words[:2], [want & MASK32, (want >> 32) & MASK32])
+                self.assertEqual(words[2:], [want & MASK32, (want >> 32) & MASK32])
+
+    def test_negative_controls_condition_exclusion(self):
+        # Negative control: verify that when SCC=0, S0 is NOT returned; when SCC=1, S1 is NOT returned.
+        a64 = 0xAAAAAAAAAAAAAAAA
+        b64 = 0x5555555555555555
+        for scc, unselected in ((0, a64), (1, b64)):
+            with self.subTest(scc=scc, unselected=hex(unselected)):
+                words = run_ps(
+                    load_pair_lines(4, a64)
+                    + load_pair_lines(6, b64)
+                    + [scc_line(scc), "s_cselect_b64 s[2:3], s[4:5], s[6:7]"]
+                    + export_pair_lines(2)
+                    + ["v_mov_b32 v2, 0", "v_mov_b32 v3, 0"]
+                )
+                res64 = (words[1] << 32) | words[0]
+                self.assertNotEqual(res64, unselected)
+
+    def test_invalid_destinations_rejected_with_message(self):
+        # Destination must be a 2-SGPR pair for 64-bit scalar data select.
+        for line in (
+            "s_cselect_b64 s4, s[6:7], s[8:9]",
+            "s_cselect_b64 m0, s[6:7], s[8:9]",
+            "s_cselect_b64 null, s[6:7], s[8:9]",
+            "s_cselect_b64 s[4:7], s[8:9], s[10:11]",
+        ):
+            with self.subTest(line=line):
+                full = [line, "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, re.escape(self.DEST)):
+                    translate_ps(full)
+
+
 if __name__ == "__main__":
     unittest.main()
