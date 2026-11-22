@@ -290,8 +290,10 @@ Checks over the 17,507 containers:
   and the used control bytes equal `count` (92,903 slots). In `data`, `levels` and `story000_script`, the control byte of every
   used slot with a u32/u64 hash key (0x4a, 0x4d, 0x4f) is the key's low 7 bits. It is not for other key types. When the target block is larger than `groups` groups, the rest holds further tables. 0x73: on 167 of 167
   the non-zero keys equal `count`, and the capacity is a power of two.
-- **Enums.** 502,303 enum values are listed in their `LENM` enum and 31,624 are not. Of the unlisted ones, 30,577
-  come from three members in `story000_script`, whose values look like 32-bit hashes rather than enum values. 235,486 of 235,489 bit sets (0x65) use only bits their enum defines. 1,431
+- **Enums.** 533,100 of 533,927 enum values are listed in their `LENM` enum, and 827 are not. A 0x62 value is a
+  32-bit field, and `LENM` lists values on both sides of the sign bit for it: of the 33,564 that are negative as `s32`, 2,767
+  are listed only as negative numbers and 30,797 only as values of 2^31 or more, so a value counts as listed under either
+  reading. Reading it only as `s32`, as the first version of this tool did, leaves 31,624 unlisted. 235,486 of 235,489 bit sets (0x65) use only bits their enum defines. 1,431
   values name an enum that is not in their file's `LENM`.
 - **Not decoded.** 0x5a (81 members), 0x76 (12) and 0x77 (1) are counted and skipped. They are the only reason the
   6 partly reached containers are partial: the 0x5a and 0x76 members point at `f32` and u32-hash blocks that

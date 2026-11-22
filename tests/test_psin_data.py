@@ -118,6 +118,16 @@ class TestBlockTable(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fill"):
             D.block_table(blob, struct.unpack_from(">I", blob, 4)[0])
 
+    def test_blocks_past_the_region_are_rejected(self):
+        # A damaged size must not make the walker allocate gigabytes (review on #1077).
+        blob = bytearray(make_container([(0x15, b"\0" * 4), (0x16, b"\0" * 32)], []))
+        struct.pack_into("<I", blob, 8 + 16 + 4, 0xA2000000)       # second row's size
+        with self.assertRaisesRegex(ValueError, "past the first section"):
+            D.block_table(bytes(blob), struct.unpack_from(">I", blob, 4)[0])
+        stats = __import__("collections").Counter()
+        self.assertFalse(D.measure(bytes(blob), stats))
+        self.assertEqual(stats["containers"], 0)
+
     def test_first_row_is_what_psin_index_calls_version(self):
         blob = make_container([(0x16, b"\0" * 0x230)], [])
         record = D.psin_index.parse(blob)
@@ -168,6 +178,17 @@ class TestWalk(unittest.TestCase):
         stats = __import__("collections").Counter()
         D.Walker(D.Container(sample(kind=5)), stats).run()
         self.assertEqual(stats["enum value not listed"], 1)
+
+    def test_32_bit_enum_matches_negative_and_high_values(self):
+        # LENM lists both negative values and values >= 2**31 for 0x62 enums.
+        for listed, stored in ((-1, -1), (0xFFFFFFF0, -16)):
+            c = D.Container(sample(kind=stored))
+            c.enums[KIND]["values"].append({"value": listed, "name": joaat("KIND_X")})
+            stats = __import__("collections").Counter()
+            tree = D.Walker(c, stats, keep=True).run()
+            self.assertEqual(stats["enum value listed"], 1)
+            self.assertEqual(stats["enum value not listed"], 0)
+            self.assertEqual(tree[f"{joaat('kind'):08x}"], listed)
 
     def test_bad_pointer_is_counted_not_followed(self):
         blob = bytearray(sample())

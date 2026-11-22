@@ -33,7 +33,8 @@ Member types (LSCH member +8), with the layouts this tool reads:
     0x40  char[ref]                      0x50, 0x53  fixed array of (ref & 0xffff) elements, in place
     0x5c  {u32 count, u32 capacity, u64 pointer}       0x52  {u64 pointer, u16 count, u16 capacity}
     0x54  {u32 capacity, u32 count, elements[capacity]} in place
-    0x60/0x63 u8, 0x64 u16, 0x62/0x65 u32 enum or enum bit set, 0x68 64-bit enum (ref = LENM enum hash)
+    0x60/0x63 u8, 0x64 u16, 0x62 32-bit enum (LENM values may be negative or >= 2**31, so both readings are
+    checked), 0x65 u32 enum bit set, 0x68 64-bit enum (ref = LENM enum hash)
     0x71  {u64 1, u64 pointer, u16 count, u16 capacity, u32 0}: a sorted array of (key, value) pairs
     0x73  {u32 capacity, u32 count, u64 pointer}: open addressing over `capacity` (key, value) slots; key 0 = empty
     0x75  {u32 groups, u32 count, u64 pointer}: groups of 16 control bytes + 16 (key, value) slots; a control
@@ -102,6 +103,8 @@ def block_table(blob, first):
     at = end
     out = []
     for kind, size in blocks:
+        if at + size > first:  # a damaged table must not make the walker allocate past the region
+            raise ValueError(f"block table declares blocks past the first section at {first}")
         out.append((kind, at, size))
         at += (size + 15) & ~15
     return out, at == first
@@ -321,7 +324,10 @@ class Walker:
                     allowed |= 1 << x["value"]
             st["bit set within its enum" if v & ~allowed == 0 else "bit set outside its enum"] += 1
         else:
-            st["enum value listed" if any(x["value"] == v for x in e["values"]) else "enum value not listed"] += 1
+            values = {x["value"] for x in e["values"]}
+            if t == 0x62 and v not in values and (v & 0xFFFFFFFF) in values:
+                v &= 0xFFFFFFFF  # 32-bit enum: LENM lists both negative values and values >= 2**31
+            st["enum value listed" if v in values else "enum value not listed"] += 1
         return v if self.keep else None
 
     def array(self, m, members, at, depth):
