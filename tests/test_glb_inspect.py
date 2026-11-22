@@ -1,0 +1,343 @@
+"""Tests for tools/glb_inspect.py.
+
+Every GLB here is built by hand from JSON and BIN chunks; no game data, exporter
+or third-party library is involved.
+
+    python -I tests/test_glb_inspect.py
+"""
+import json
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "glb_inspect.py")
+
+JSON_CHUNK = 0x4E4F534A
+BIN_CHUNK = 0x004E4942
+
+
+def container(json_payload, bin_payload=None, *, magic=b"glTF", version=2, length_delta=0):
+    """A GLB with an optional BIN chunk; `length_delta` corrupts the header length."""
+    body = struct.pack("<II", len(json_payload), JSON_CHUNK) + json_payload
+    if bin_payload is not None:
+        bin_payload += b"\x00" * ((-len(bin_payload)) % 4)
+        body += struct.pack("<II", len(bin_payload), BIN_CHUNK) + bin_payload
+    size = 12 + len(body) + length_delta
+    return struct.pack("<4sII", magic, version, size) + body
+
+
+def glb(gltf, bin_payload=None, **kwargs):
+    raw = json.dumps(gltf, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    raw += b" " * ((-len(raw)) % 4)
+    return container(raw, bin_payload, **kwargs)
+
+
+def triangle_gltf():
+    return {
+        "asset": {"version": "2.0", "generator": "synthetic glb_inspect test"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{"name": "Triangle", "primitives": [
+            {"attributes": {"POSITION": 0}, "indices": 1, "material": 0},
+        ]}],
+        "materials": [{
+            "name": "Red",
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [1, 0, 0, 1],
+                "baseColorTexture": {"index": 0},
+            },
+            "alphaMode": "MASK",
+            "doubleSided": True,
+        }],
+        "textures": [{"name": "tex-red", "source": 0}],
+        "images": [{"name": "red.png", "mimeType": "image/png"}],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+             "min": [0, 0, 0], "max": [1, 1, 0]},
+            {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+            {"buffer": 0, "byteOffset": 36, "byteLength": 6},
+        ],
+        "buffers": [{"byteLength": 42}],
+    }
+
+
+def triangle_bin():
+    positions = struct.pack("<9f", 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    indices = struct.pack("<3H", 0, 1, 2)
+    return positions + indices
+
+
+def triangle_glb():
+    return glb(triangle_gltf(), triangle_bin())
+
+
+def skinned_gltf():
+    return {
+        "asset": {"version": "2.0", "generator": "synthetic skinned test"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [
+            {"name": "Armature", "children": [1, 2]},
+            {"name": "JointA"},
+            {"name": "JointB"},
+            {"name": "Body", "mesh": 0, "skin": 0},
+        ],
+        "meshes": [{"name": "Body", "primitives": [{
+            "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},
+            "indices": 3,
+            "material": 0,
+            "mode": 4,
+        }]}],
+        "materials": [{"name": "Skin", "pbrMetallicRoughness": {
+            "baseColorFactor": [0.8, 0.6, 0.5, 1],
+        }}],
+        "skins": [{"name": "Rig", "joints": [1, 2]}],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3",
+             "min": [0, 0, 0], "max": [1, 1, 0]},
+            {"bufferView": 1, "componentType": 5121, "count": 4, "type": "VEC4"},
+            {"bufferView": 2, "componentType": 5126, "count": 4, "type": "VEC4"},
+            {"bufferView": 3, "componentType": 5123, "count": 6, "type": "SCALAR"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": 48},
+            {"buffer": 0, "byteOffset": 48, "byteLength": 16},
+            {"buffer": 0, "byteOffset": 64, "byteLength": 64},
+            {"buffer": 0, "byteOffset": 128, "byteLength": 12},
+        ],
+        "buffers": [{"byteLength": 140}],
+    }
+
+
+def skinned_bin():
+    positions = struct.pack("<12f", 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0)
+    joints = bytes((0, 1, 0, 0)) * 4
+    weights = struct.pack("<16f", *([1.0, 0.0, 0.0, 0.0] * 4))
+    indices = struct.pack("<6H", 0, 1, 2, 2, 1, 3)
+    return positions + joints + weights + indices
+
+
+def bbox_gltf(with_bounds):
+    accessor = {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}
+    if with_bounds:
+        accessor["min"] = [-1.5, -2, -3]
+        accessor["max"] = [4, 5, 6]
+    return {
+        "asset": {"version": "2.0"},
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+        "accessors": [accessor],
+        "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36}],
+        "buffers": [{"byteLength": 36}],
+    }
+
+
+class GlbInspectTests(unittest.TestCase):
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args],
+                              capture_output=True, text=True, timeout=60, errors="replace")
+
+    def run_bytes(self, data):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "input.glb")
+            with open(path, "wb") as handle:
+                handle.write(data)
+            return self.run_tool(path)
+
+    def assert_error(self, data, message):
+        result = self.run_bytes(data)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(message.lower(), result.stderr.lower())
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+
+    def test_minimal_triangle_mesh_and_material(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "triangle.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(triangle_glb())
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('asset: version="2.0" generator="synthetic glb_inspect test"', result.stdout)
+            self.assertIn("counts: scenes=1 nodes=1 meshes=1 materials=1 images=1 skins=0 animations=0",
+                          result.stdout)
+            self.assertIn('name="Triangle" primitives=1 vertices=3 triangles=1 materials=["Red"]',
+                          result.stdout)
+            self.assertIn('baseColorFactor=[1, 0, 0, 1] baseColorTexture="red.png"', result.stdout)
+            self.assertIn('alphaMode="MASK" doubleSided=true', result.stdout)
+            self.assertIn("POSITION bbox: min [0, 0, 0] max [1, 1, 0]", result.stdout)
+
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            self.assertEqual(report["asset"], {"version": "2.0", "generator": "synthetic glb_inspect test"})
+            self.assertEqual(report["counts"], {"scenes": 1, "nodes": 1, "meshes": 1, "materials": 1,
+                                                "images": 1, "skins": 0, "animations": 0})
+            self.assertEqual([chunk["type"] for chunk in report["chunks"]], ["JSON", "BIN"])
+            self.assertEqual(report["chunks"][1]["padding"], 2)
+            self.assertEqual(report["meshes"][0]["vertices"], 3)
+            self.assertEqual(report["meshes"][0]["triangles"], 1)
+            self.assertEqual(report["meshes"][0]["materials"], ["Red"])
+            self.assertEqual(report["meshes"][0]["primitives"][0]["mode_name"], "TRIANGLES")
+            self.assertIsNone(report["meshes"][0]["primitives"][0]["mode"])
+            self.assertTrue(report["meshes"][0]["primitives"][0]["mode_defaulted"])
+            self.assertEqual(report["materials"][0]["base_color_texture"], "red.png")
+            self.assertEqual(report["materials"][0]["base_color_texture_index"], 0)
+            self.assertEqual(report["position_bbox"], {"min": [0, 0, 0], "max": [1, 1, 0]})
+            self.assertTrue(report["position_bbox_complete"])
+
+    def test_skinned_mesh_and_joint_count(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "skinned.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(skinned_gltf(), skinned_bin()))
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('name="Body" primitives=1 vertices=4 triangles=2 materials=["Skin"]', result.stdout)
+            self.assertIn('skins:', result.stdout)
+            self.assertIn('name="Rig" joints=2', result.stdout)
+
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            self.assertEqual(report["counts"]["nodes"], 4)
+            self.assertEqual(report["counts"]["skins"], 1)
+            self.assertEqual(report["skins"], [{"index": 0, "name": "Rig", "joint_count": 2}])
+            primitive = report["meshes"][0]["primitives"][0]
+            self.assertEqual(primitive["vertices"], 4)
+            self.assertEqual(primitive["triangles"], 2)
+            self.assertEqual(primitive["material"], "Skin")
+            self.assertEqual(primitive["mode"], 4)
+            self.assertFalse(primitive["mode_defaulted"])
+
+    def test_bad_magic_version_and_length_are_one_line_errors(self):
+        cases = (
+            ("bad magic", glb(triangle_gltf(), triangle_bin(), magic=b"GLBB"), "bad GLB magic"),
+            ("bad version", glb(triangle_gltf(), triangle_bin(), version=1), "unsupported GLB version 1"),
+            ("bad length", glb(triangle_gltf(), triangle_bin(), length_delta=4), "does not match file size"),
+        )
+        for label, data, message in cases:
+            with self.subTest(label):
+                self.assert_error(data, message)
+
+    def test_missing_json_malformed_json_and_truncated_chunk(self):
+        missing_json = struct.pack("<4sII", b"glTF", 2, 24) + struct.pack("<II", 4, BIN_CHUNK) + b"junk"
+        self.assert_error(missing_json, "missing JSON chunk")
+
+        malformed = container(b"{ nope }")
+        self.assert_error(malformed, "malformed JSON chunk")
+
+        truncated = struct.pack("<4sII", b"glTF", 2, 24) + struct.pack("<II", 100, JSON_CHUNK) + b"    "
+        self.assert_error(truncated, "truncated JSON chunk")
+
+    def test_json_round_trip_and_input_alias_refusal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "model.glb")
+            first = os.path.join(folder, "first.json")
+            second = os.path.join(folder, "second.json")
+            data = triangle_glb()
+            with open(source, "wb") as handle:
+                handle.write(data)
+
+            result = self.run_tool(source, "--json", first)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            again = self.run_tool(source, "--json", second)
+            self.assertEqual(again.returncode, 0, again.stderr)
+            with open(first, "rb") as handle:
+                first_bytes = handle.read()
+            with open(second, "rb") as handle:
+                second_bytes = handle.read()
+            self.assertEqual(first_bytes, second_bytes, "the JSON report is not deterministic")
+            self.assertNotIn(b"\r\n", first_bytes, "--json must use LF on every platform")
+            self.assertTrue(first_bytes.endswith(b"\n"))
+            self.assertEqual(json.loads(first_bytes.decode("utf-8"))["meshes"][0]["name"], "Triangle")
+
+            alias = self.run_tool(source, "--json", source)
+            self.assertNotEqual(alias.returncode, 0)
+            self.assertIn("must not overwrite the input", alias.stderr)
+            with open(source, "rb") as handle:
+                self.assertEqual(handle.read(), data, "the report path overwrote the input")
+
+            dotted = self.run_tool(source, "--json", os.path.join(folder, ".", "model.glb"))
+            self.assertNotEqual(dotted.returncode, 0)
+            self.assertIn("must not overwrite the input", dotted.stderr)
+            with open(source, "rb") as handle:
+                self.assertEqual(handle.read(), data)
+
+    def test_json_only_glb_is_accepted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "empty.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb({"asset": {"version": "2.0"}}))
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("chunks: JSON", result.stdout)
+            self.assertNotIn("BIN", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            self.assertEqual([chunk["type"] for chunk in report["chunks"]], ["JSON"])
+            self.assertEqual(report["counts"], {"scenes": 0, "nodes": 0, "meshes": 0, "materials": 0,
+                                                "images": 0, "skins": 0, "animations": 0})
+            self.assertIsNone(report["position_bbox"])
+
+    def test_position_bbox_from_accessor_bounds(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "bounds.glb")
+            out = os.path.join(folder, "report.json")
+            payload = struct.pack("<9f", -1.5, -2.0, -3.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+            with open(path, "wb") as handle:
+                handle.write(glb(bbox_gltf(with_bounds=True), payload))
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("POSITION bbox: min [-1.5, -2, -3] max [4, 5, 6]", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            self.assertEqual(report["position_bbox"], {"min": [-1.5, -2, -3], "max": [4, 5, 6]})
+            self.assertTrue(report["position_bbox_complete"])
+            self.assertEqual(report["meshes"][0]["primitives"][0]["bbox"], report["position_bbox"])
+
+    def test_missing_bounds_and_material_fields_are_reported_not_guessed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "missing.glb")
+            out = os.path.join(folder, "report.json")
+            gltf = bbox_gltf(with_bounds=False)
+            gltf["materials"] = [{}]
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, bytes(36)))
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("POSITION bbox: (missing)", result.stdout)
+            self.assertIn("baseColorFactor=(missing)", result.stdout)
+            self.assertIn("alphaMode=(missing)", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            self.assertIsNone(report["position_bbox"])
+            self.assertFalse(report["position_bbox_complete"])
+            self.assertIsNone(report["meshes"][0]["name"])
+            self.assertIsNone(report["meshes"][0]["primitives"][0]["bbox"])
+            self.assertEqual(report["materials"][0], {
+                "index": 0,
+                "name": None,
+                "base_color_factor": None,
+                "base_color_texture": None,
+                "base_color_texture_index": None,
+                "alpha_mode": None,
+                "double_sided": None,
+            })
+
+
+if __name__ == "__main__":
+    unittest.main()
