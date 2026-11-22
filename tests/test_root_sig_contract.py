@@ -214,6 +214,16 @@ def test_cluster_preserves_invalid_index_distinctions():
     assert len(ranked) == 2
     assert sum(count for _, count, _ in ranked) == 2
 
+    # Valid SGPRs must keep numeric order even when an invalid index is present.
+    index["mixed"] = {"user_sgpr_reads": [
+        {"sgpr": 10, "kind": "const32"},
+        {"sgpr": "bad", "kind": "const32"},
+        {"sgpr": 2, "kind": "const32"}]}
+    mixed_shape = next(shape for shape, _, names in rsc.cluster(index)
+                       if names == ["mixed"])
+    assert mixed_shape == ((2, "const32"), (10, "const32"),
+                           ("invalid:'bad'", "const32"))
+
 
 def test_cli_rejects_noninteger_sgprs_with_cluster(tmp_path):
     index = {"bad": {"user_sgpr_reads": [
