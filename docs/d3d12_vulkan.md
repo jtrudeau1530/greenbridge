@@ -1346,6 +1346,25 @@ The file is an XVD container, not a PE; PE-oriented import tools do not apply.
 Reproduce: `rea.inspect_native_exports` and `rea.inspect_pe_imports` on the DLL, then a byte scan for the
 little-endian GUIDs from `d3d12.h`.
 
+Constructed by `runtime/test/bvh_builder_test.cpp` (1.0.2.1: `rt::Loader`, `Loader::initialise()` for TLS and
+`DllMain`, `.pdata` registered by the loader (#176), then `XboxBvhBuilder(ID3D12Device11*, bool)`
+on a PC device behind the Xbox-ABI proxy). Measured:
+
+- 0 unimplemented imports; `D3D12SerializeVersionedRootSignature` and `XMemVirtualQuery` bind to shims. The constructor writes 24 bytes of the object (`sizeof(XboxBvhBuilder)` >= 24;
+  the rest of its state is elsewhere). It prints nothing through `OutputDebugString` and never calls
+  `TerminateProcess`. On failure it throws the failing `HRESULT` as a C++ `long`.
+- **Device slot 62 is called as `(desc, 0, 0, &IID_ID3D12PipelineState, out)`**, with a plain
+  `D3D12_COMPUTE_PIPELINE_STATE_DESC` (root signature set, node mask 0, flags 0). The proxy used to read
+  `(desc, riid, out)`, so the first call returned `E_POINTER` and the constructor threw it.
+- With slot 62 read that way, on **WARP** the constructor returns after 62 ms: 17 root signatures (slot 16) and 53
+  compute PSOs (slot 62, 53 of 53 `S_OK`), CS bytecode 4–75 KB each. `~XboxBvhBuilder` returns and makes no device
+  call. Created is not the same as correct: the shaders are Xbox DXIL with `@xbox.*` intrinsics (section 7.2), and
+  nothing has been dispatched yet.
+- On an **RTX 4090** (driver 621.24) the first 48 PSOs return `S_OK`, and creating the 49th ends the process
+  with `0xC0000409` (fail-fast) on repeated runs; one run returned `E_OUTOFMEMORY` for it instead, which the
+  constructor threw. So the NVIDIA driver does not survive the builder's shaders as they are. The layer should not
+  hand Xbox DXIL to the PC driver.
+
 ### A.3 `amd_fidelityfx_upscaler_xbox.dll`
 
 - Size 786,432 bytes; PE32+ x86-64.
@@ -1354,6 +1373,25 @@ little-endian GUIDs from `d3d12.h`.
   `IID_ID3D12RootSignatureDeserializer` (0x047320), `IID_ID3D12PipelineState` (0x047330),
   `IID_ID3D12Heap` (0x047340), `IID_ID3D12RootSignature` (0x047350), `IID_ID3D12DescriptorHeap` (0x0472e0) and
   `IID_ID3D12CommandSignature` (0x047300). Again, presence ≠ use.
+- Run through the public FidelityFX API by `runtime/test/fsr_dispatch_test.cpp` (1.0.2.1: `rt::Loader` and
+  `Loader::initialise()`, with #93's static TLS, which the DLL's thread-safe statics need, and `.pdata` registered by
+  the loader (#176); PC D3D12 device on an RTX 4090 behind the Xbox-ABI proxy). Measured:
+  - It maps with 0 unimplemented imports: `D3D12CreateRootSignatureDeserializer` and `XMemAlloc` /
+    `XMemFree` / `XMemGetWorkingSetStatistics` bind to the shims, 82 imports to host DLLs. Its TLS template is
+    8 bytes with no callbacks. `DllMain(DLL_PROCESS_ATTACH)` returns TRUE.
+  - `ffxConfigure(GLOBALDEBUG)` and the CPU-only upscale queries accept the **PC struct type ids**: the
+    Performance ratio is 2.0 and 3840x2160 Quality renders at 2560x1440. `GET_VERSIONS` for the upscaler lists one
+    provider, `0xf5a5ca1e01001001` "4.1.1".
+  - `ffxCreateContext` reports, through the message callback, that only one configuration is built in:
+    `maxUpscaleSize` 1920x1080 ("only the fixed-resolution Quality shader tables are included", so a 1280x720
+    render size), with `HIGH_DYNAMIC_RANGE`, `DEPTH_INVERTED` and `AUTO_EXPOSURE` all required. It also requires an
+    `ffxCreateContextDescUpscaleVersion` in the chain; 4.1.2 is rejected as invalid, 4.1.1 and 4.0.0 are accepted.
+  - With all of that, `ffxCreateContext` returns `FFX_API_RETURN_ERROR` with no message, no XMem allocation and no
+    call on the device proxy, for the PC DX12 backend descriptor (`0x2`), for the same `{header, device}` layout
+    under the Xbox backend id (`0x02000000`, `0x02000001`, `0x02000002`), and with no backend descriptor at all. So
+    the build does not recognise the PC backend descriptor, and the Xbox one (`FFX_API_BACKEND_ID_XBOX` is declared
+    in the public `ffx_api.h`, its descriptors are not) is unknown. Hypothesis: it is the GDK's Xbox D3D12 backend
+    descriptor; the executable's `ffxCreateContext` call site would show its type and layout.
 
 ### A.4 Other DLLs and the executable
 
