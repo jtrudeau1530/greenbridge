@@ -14,7 +14,15 @@ import os
 import re
 import sys
 
-STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,200}")
+# A whole printable run, however long (one linear scan: a single character class, no nested quantifiers).
+STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,}")
+# A name (a whole run or one piece of it) longer than this is not added: it is a blob of text, not a name.
+# The old pattern cut every run at 201 characters, so no entry was ever longer than this.
+MAX_NAME_LEN = 201
+# The pieces of a path or dotted name, found one at a time (a run can be megabytes: no list of all its parts).
+PART = re.compile(r"[^./:\\]+")
+# Where re.split would yield an empty piece; only matters for --min 0 or less, which keeps "" as a name.
+EMPTY_PART = re.compile(r"[./:\\]{2}|[./:\\]$")
 
 
 def joaat(s: str) -> int:
@@ -32,11 +40,14 @@ def harvest(data: bytes, out: set, minlen: int):
     for m in STR.finditer(data):
         s = m.group(0).decode("latin-1")
         if len(s) >= minlen:
-            out.add(s)
+            if len(s) <= MAX_NAME_LEN:
+                out.add(s)
             # also the pieces of paths and dotted names, which are hashed on their own
-            for part in re.split(r"[./:\\]", s):
-                if len(part) >= minlen:
-                    out.add(part)
+            for pm in PART.finditer(s):
+                if minlen <= pm.end() - pm.start() <= MAX_NAME_LEN:
+                    out.add(pm.group(0))
+            if minlen <= 0 and EMPTY_PART.search(s):
+                out.add("")
 
 
 def main():
