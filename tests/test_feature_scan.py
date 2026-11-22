@@ -441,16 +441,45 @@ def test_a_test_that_raises_fails_the_run_and_the_rest_still_run():
     assert failures == 0, f"{failures} script-runner check(s) failed"
 
 
+def test_a_failed_check_fails_only_its_own_test():
+    """Each test ends in `assert failures == 0` over the module-wide count, so one failed check used to fail every
+    test after it as well. run_tests gives each test its own count and adds it back to the run's total."""
+    global failures
+    reported = []
+
+    def fails_a_check():
+        global failures
+        failures += 1   # what check(False, ...) counts, without printing a FAIL line into this run's output
+        assert failures == 0, f"{failures} check(s) failed"
+
+    def passes():
+        assert failures == 0, f"{failures} check(s) failed"
+
+    before = failures
+    raised = run_tests([fails_a_check, passes], report=reported.append)
+    counted, failures = failures - before, before   # the failure above was staged: keep it out of this run's total
+    check(raised == ["fails_a_check"], f"only the test with the failed check fails ({raised})")
+    check(counted == 1, f"its failed check still counts toward the run's total ({counted})")
+    check(reported == ["FAIL fails_a_check: 1 check(s) failed"], f"with its own count in the message ({reported})")
+    assert failures == 0, f"{failures} script-runner check(s) failed"
+
+
 def run_tests(tests, report=print):
     """Run each test on its own, for the plain-script run (CI's standard-library job): one that raises
-    AssertionError is reported and the rest still run. Returns the names of the tests that raised."""
+    AssertionError is reported and the rest still run. Each test starts from a zero check count, so its closing
+    `assert failures == 0` sees only its own failed checks; the counts are added back to the run's total afterwards.
+    Returns the names of the tests that raised."""
+    global failures
     raised = []
     for test in tests:
+        before, failures = failures, 0
         try:
             test()
         except AssertionError as error:
             raised.append(test.__name__)
             report(f"FAIL {test.__name__}: {error}")
+        finally:
+            failures += before
     return raised
 
 
