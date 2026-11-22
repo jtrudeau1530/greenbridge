@@ -276,20 +276,22 @@ What is implemented (all of it testable without the game):
     and footprints. Format support reports `TEXTURE2D` and `CAST_WITHIN_BIT_LAYOUT`, not the host's display,
     back-buffer-cast or video-processor bits;
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS`,
-    `OPTIONS2`–`5`, `7`–`9`, `11`, `13`–`21`), GPU virtual-address support, format support, format plane counts,
+    `OPTIONS1`–`5`, `7`–`9`, `11`, `13`–`21`), GPU virtual-address support, format support, format plane counts,
     multisample quality levels, shader model and root signature version.
-  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options, GPU virtual-address
-    support, format support, multisample quality levels, shader model and root signature version.
     `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device enables BC texture compression.
-    Other queries, including `OPTIONS1`, `6`, `10` and `12`, are logged and refused until the trace shows what
-    the game asks (question 11);
+    Other queries, including `OPTIONS6`, `10` and `12`, are logged and refused until the trace shows what the
+    game asks (question 11);
   - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
     image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
-    support, format support, format plane counts, multisample quality levels, shader model and root signature
-    version. Other queries are logged and refused until the trace shows what the game asks (question 11);
-    Other queries, including `OPTIONS1`, `6`, `10` and `12`, are logged and refused until the trace shows what
-    the game asks (question 11);
+  - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
+    (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
+    image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format;
+  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS`, `OPTIONS1`–`5`,
+    `7`–`9`, `11`, `13`–`21`, with `OPTIONS8` reporting unaligned block textures when the Vulkan logical device
+    enables BC texture compression), GPU virtual-address support, format support, format plane counts, multisample
+    quality levels, shader model and root signature version. Other queries (including `OPTIONS6`, `10` and `12`)
+    are logged and refused until the trace shows what the game asks (question 11);
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
@@ -302,6 +304,13 @@ What is implemented (all of it testable without the game):
     and the initial state or `D3D12_BARRIER_LAYOUT` is not used, because new textures start `UNDEFINED` and move
     on first use. The newer arguments are answered as the PC runtime answers them. `d3d12_method_variants_test`
     compares each answer below with the host runtime live, measured on an RTX 4090 (driver 621.14):
+
+- **DXGI Swapchain** (`runtime/shims/dxgi_swapchain.h`, `runtime/shims/dxgi_com.{h,cpp}`): `IDXGIFactory4` and
+  `IDXGISwapChain3` over `VK_KHR_win32_surface` + `VkSwapchainKHR`, exposed via `rt::d3d12::create_dxgi_factory`.
+  Swapchain backbuffers are real `ID3D12Resource` COM objects (`BackBufferResource` inheriting from
+  `ID3D12ResourceStubs`) registered directly with `VulkanContext`, supporting `CreateSwapChainForHwnd`,
+  `GetCurrentBackBufferIndex`, `GetBuffer`, `CreateRenderTargetView`, `Present`, and `ResizeBuffers` (preserving
+  explicit buffer dimensions even when the HWND client size is unchanged via an offscreen backbuffer + blit path).
 
     | Argument | Answer |
     |---|---|
@@ -360,10 +369,14 @@ What is implemented (all of it testable without the game):
 
 Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
 side inwards:
-- **`runtime/src/vulkan_bindless.h`**: set 0 itself, the twenty bindings the translator declares, with the array
-  sizes `vk_pipeline_check` uses, and `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1) behind
-  binding 2. One set for the device. Details:
-  - An image has one index in its dimension (2D, 2D array, 3D, 1D), the same in every binding of that dimension.
+- **`runtime/src/vulkan_bindless.h`**: set 0 includes the twenty bindings the translator declares, with the
+  array sizes `vk_pipeline_check` uses, and `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1)
+  behind binding 2. One set for the device. Details:
+  - An image has one index in its dimension (2D, 2D array, 3D, 1D, 2DMS or 2DMS array), shared by the
+    bindings for that dimension. The runtime adds sampled-image bindings in pairs for 2DMS and 2DMS array:
+    20/21 for floating-point and normalized color, 22/23 for unsigned integers, and 24/25 for signed integers.
+    The runtime enables pairs that fit the device's descriptor limits and have a multisampled zero fallback
+    of the matching numeric class. A missed key reads zero at texel (0, 0), layer 0, sample 0.
   - The storage arrays are shorter (256), so an image with a storage view gets an index below 256 and a read-only
     one goes above where there is room.
   - Index 0 of every array is a fallback (a 1x1 image of zeros, a nearest clamping sampler), because a miss is
@@ -389,6 +402,10 @@ side inwards:
     depth comparison field. The layer marks the NEVER comparison in S# word 3, bit 12 (unused with
     DERIV_ADJUST_EN clear) to give it a separate lookup key and a comparison-enabled Vulkan sampler.
   - A view the layer cannot show (below) leaves a null descriptor, all zeros, which finds the fallback.
+  - A typed multisampled color texture has one mip. Its default SRV covers every layer. An explicit
+    `TEXTURE2DMS` view reads layer zero, while `TEXTURE2DMSARRAY` selects a range starting at
+    `FirstArraySlice` (`ArraySize = UINT_MAX` selects the remaining layers). The format-support query
+    advertises `MULTISAMPLE_LOAD` when the format can be sampled with MSAA and its binding pair is available.
   - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
     dereferences; its entries leave the set and the table when it is destroyed.
   - `VulkanDeviceInfo::bindless` says the Vulkan device has the features this needs: `runtimeDescriptorArray`,
@@ -407,19 +424,24 @@ side inwards:
   `DEPTH_STENCIL_READ_ONLY_OPTIMAL` and is not handled.
 
 A typed single-sampled 3D texture can use a default SRV or an explicit `TEXTURE3D` SRV of the same format.
+An `R8G8B8A8_TYPELESS` volume supports explicit `R8G8B8A8_UNORM` and `R8G8B8A8_UNORM_SRGB` SRVs.
+The sRGB view decodes RGB and preserves linear alpha. A typeless volume requires an explicit typed view.
 The T# records the base depth and the view's mip range. Binding 6 holds the 3D Vulkan view, which has one
 array layer. `d3d12_descriptor_test` checks samples at four W coordinates through two views of the same
 volume. A nonzero `ResourceMinLODClamp` on a 3D view is logged and leaves a null descriptor.
 
 Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
-views of 1D and multisampled textures, 3D storage views and typeless volume SRVs; depth-plane views (`R24_UNORM_X8_TYPELESS`,
+views of 1D textures, 3D storage views and typeless volume SRVs, multisampled depth/stencil and typeless color SRVs, and shader-translator lowering
+for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
+views of 1D and multisampled textures, 3D storage views and other typeless volume formats; depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect (the texture's backing format, so X24_8_32_FLOAT for a D24 texture where the layer stores it as
 `D32_SFLOAT_S8_UINT`), each on its own family only (the other family's is a null
 descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
-aspect, in its float-typed sampled arrays like other UINT views; descriptors the game writes itself, which need
+aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
+the game writes itself, which need
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
 of root signatures and the literal S#s of shaders (`literal_samplers` in the index), which are not registered yet;
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
@@ -482,6 +504,10 @@ and any validation error fails them.
   descriptor-indexing flags.
 - `d3d12_com_test`: drives the COM objects through their vtables. It also checks that a queue `Wait` on a fence
   the CPU has not signalled holds the GPU back.
+- `dxgi_swapchain_test`: creates a Win32 HWND and exercises `rt::d3d12::create_dxgi_factory`,
+  `IDXGIFactory4::CreateSwapChainForHwnd`, `IDXGISwapChain3::GetCurrentBackBufferIndex`, `GetBuffer` + `GetDesc()`,
+  backbuffer `CreateRenderTargetView` + clear + readback verification + `Present`, and `ResizeBuffers` with 0
+  validation errors.
 - `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
   `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
   creates only an allocator and a list, so it needs no GPU or Vulkan loader.
@@ -957,7 +983,7 @@ The trace will enumerate them.
     feedback, wave MMA, work graphs, GPU upload heaps) stay `FALSE`/`NOT_SUPPORTED`/`TIER_0`. Checked live against
     the host D3D12 runtime on the same adapter (`NVIDIA GeForce RTX 5080`, driver `616.56`, Windows 11): 15/15 feature
     queries compared with `0` mismatches (`MSAA64KBAlignedTextureSupported = TRUE`,
-    `SupportedSampleCountsWithNoOutputs = 0x1f`, `LEONIDA_VK_VALIDATION=1` with `0` validation errors).
+    `SupportedSampleCountsWithNoOutputs = 0x1d`, `LEONIDA_VK_VALIDATION=1` with `0` validation errors).
 - `D3D12_FEATURE_FORMAT_SUPPORT`: map to `vkGetPhysicalDeviceFormatProperties`; multisample render-target
   and resolve bits also require the format's image-usage/sample-count query to succeed.
 - `D3D12_FEATURE_FORMAT_INFO`: report the DXGI plane count independently of Vulkan texture support. Both
@@ -1506,6 +1532,41 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Enhanced barriers | Public Xbox Series `D3D12_BARRIER_GROUP` | `VK_KHR_synchronization2`; implement directly. |
 | XDXR batched/streaming BVH | `XboxBvhBuilder.dll` exports | See 4.8. |
 
+### 4.10 Debug markers and private data
+
+Games and middleware call these every frame (PIX events), so they must be cheap and never fail. Implemented
+(D3D-24) in `runtime/shims/d3d12_com.cpp`, `runtime/shims/d3d12_com_object.h`, `runtime/src/command_list.h`,
+`runtime/src/vulkan_replay.h` and `runtime/src/vulkan_backend.h`; tested by `runtime/test/d3d12_debug_markers_test.cpp`.
+
+- **Labels, only with `VK_EXT_debug_utils`.** It is an instance extension, so `VulkanDeviceInfo::debug_utils` says
+  whether the instance enabled it; `create_vulkan_device_standalone` enables it when the loader lists it. Without
+  it every marker call is a no-op (nothing logged, nothing recorded on the queue).
+- **Command lists.** `SetMarker`/`BeginEvent`/`EndEvent` are recorded in the IR (`DebugMarker`) in order with the
+  other commands and replayed as `vkCmdInsertDebugUtilsLabelEXT`/`vkCmdBeginDebugUtilsLabelEXT`/
+  `vkCmdEndDebugUtilsLabelEXT` into the submission's command buffer.
+- **Queues.** The same three methods on `ID3D12CommandQueue` call `vkQueueInsert/Begin/EndDebugUtilsLabelEXT` under
+  the device's submit lock, so they fall between the submissions issued before and after them.
+- **Balancing.** D3D12 does not make a list balance its events; Vulkan requires every end to have a begin.
+  One `ExecuteCommandLists` is one command buffer, so a begin in one list may be ended by a later list of the
+  same call. An end with nothing open is dropped, and labels still open when the last list ends are ended
+  before the command buffer is ended. Queue labels are balanced per queue the same way (an unmatched end is
+  dropped; open ones are ended when the queue is destroyed). Command-buffer labels never span two
+  `ExecuteCommandLists` calls.
+- **Labels.** The `Metadata` argument says what the data is, following WinPixEventRuntime's `pix3_win.h`:
+  0 (`PIX_EVENT_UNICODE_VERSION`) a UTF-16 string, 1 (`PIX_EVENT_ANSI_VERSION`) an ANSI string, both cut at the
+  terminator or at `Size` bytes and converted to UTF-8; 2 (`PIX_EVENT_PIX3BLOB_VERSION`) PIX's own encoded event,
+  which is not decoded and gets the fixed label `PIX event` so the nesting is still visible (question 21). Other
+  values get the same label and log once.
+- **Private data, on every object.** `SetPrivateData`, `GetPrivateData`, `SetPrivateDataInterface` and `SetName`
+  live in the shared `Object` base, so the device, queues, allocators, lists, fences, descriptor heaps and
+  resources all have them. `SetPrivateDataInterface` holds a reference until the entry is replaced (by bytes or
+  another interface), removed (a null interface or zero size) or the object is destroyed; `GetPrivateData` returns
+  the pointer with a reference added, as D3D12 does. A buffer too small for the entry gets `DXGI_ERROR_MORE_DATA`,
+  nothing copied and no reference added, and `*pDataSize` set to the size needed, so the caller can retry (as
+  vkd3d-proton's private store does). `SetName` stores the name as `WKPDID_D3DDebugObjectNameW`
+  (terminator included), which is where D3D12 keeps it. Names are not forwarded to `vkSetDebugUtilsObjectNameEXT`
+  yet: one D3D12 object may own several Vulkan objects.
+
 ## 5. Producing the shader contract
 
 The table below is the contract from [design.md](design.md#translator-status-and-runtime-contract) and where the
@@ -1575,11 +1636,34 @@ struct entry {               // 10 uints = 40 bytes
 | 100k | `host_visible` | 151.640 (6.59) | 129.732 (7.71) | 11548.004 (0.09) | 2336.777 (0.43) | 163852.450 (0.01; `4096x15`, n=9) |
 | 100k | `host_device_local` | 5.468 (182.87) | 4.764 (209.93) | 72.233 (13.84) | 99.000 (10.10) | 690.168 (1.45) |
 
-Three consequences for the runtime and table layout (open on AMD/Intel/Apple GPUs via `vk_descriptor_bench`):
+Three consequences for the runtime and table layout (Intel and Apple numbers remain open via `vk_descriptor_bench`; AMD RDNA3 follows):
 
 1. **In `DEVICE_LOCAL` VRAM, the hash probe itself is cheap at all three sizes:** wave-uniform full-table sweeps run at `5.4–6.1 us / 1M` (`3.0–3.7 us / 1M` net after subtracting the `baseline_uniform` key-read dispatch), and divergent lookups hit `25.7–37.7 us / 1M` (`17.2–28.9 us / 1M` net).
 2. **`BindlessSet::create()` currently allocates PCIe `HOST_VISIBLE | HOST_COHERENT` system memory (`runtime/src/vulkan_bindless.h`):** once working sets exceed cache at 10k–100k entries, `host_visible` slows down by **9.6x–28x** even on wave-uniform full sweeps, **202x–335x** on divergent T# hits (`59x–181x` on T#+S# pairs), and **666x–755x** on 8-probe misses. `host_device_local` (ReBAR `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`) matches `device_local` across all 1k–10k cases and 100k uniform sweeps, and is 2.1x–3.2x slower than pure `device_local` on 100k divergent lookups (80 MiB, spilling L2) while staying 24x–237x faster than `host_visible`. Staging binding 2 to `DEVICE_LOCAL` (or preferring `DEVICE_LOCAL | HOST_VISIBLE` when small) avoids this cliff without touching the shader contract.
 3. **Power-of-two linear probing with an 8-probe hard limit inflates large tables:** `DescriptorTable` reaches only `15.3%` load at 10k (`2.50 MiB`) and `4.8%` load at 100k (`80.00 MiB`, `max_probes=5`) because any 9-probe collision forces a full 2x capacity double. Bounded-window displacement (for example Robin Hood / backshift within the existing 8-slot window) can raise load factor without changing translated shaders.
+
+**Measured (D3D-56, AMD RDNA3).** The same benchmark and 64-bit timestamps on an AMD Radeon RX 7900 XTX (discrete, `0x1002:0x744c`, subgroup 64, driver `AMD proprietary 26.10.1 (LLPC)`, Vulkan 1.4.359), Windows 11 build 26200, revision `2aed144`. Dispatches, iterations and reps match the NVIDIA run above, but the table geometry does not: capacity depends on insertion order, and at 100k this run settles at `524,288` slots (`20.00 MiB`, `19.07%` load, `max_probes=8`) instead of the RTX 5080's `2,097,152` (`80.00 MiB`, `4.8%`, `5`). Compare rows within this table, not across the two vendors.
+
+| Entries (cap / load / bytes / mean probes) | Placement | `uniform_tsharp_hit` (us/1M, Glk/s) | `uniform_pair_ts` (us/1M, Glk/s) | `divergent_tsharp_hit` (us/1M, Glk/s) | `divergent_pair_ts` (us/1M, Glk/s) | `divergent_miss` (us/1M, Glk/s) |
+|---|---|---|---|---|---|---|
+| 1k (4,096 / 24.4% / 160 KiB / 1.316) | `device_local` | 6.220 (160.76) | 5.705 (175.27) | 15.285 (65.42) | 14.051 (71.17) | 50.461 (19.82) |
+| 1k | `host_visible` | 9.508 (105.17) | 5.783 (172.93) | 15.869 (63.02) | 13.465 (74.27) | 51.978 (19.24) |
+| 1k | `host_device_local` | 8.783 (113.85) | 5.360 (186.58) | 15.380 (65.02) | 13.974 (71.56) | 49.765 (20.09) |
+| 10k (65,536 / 15.3% / 2.50 MiB / 1.310) | `device_local` | 5.152 (194.09) | 4.880 (204.90) | 27.998 (35.72) | 20.506 (48.77) | 146.217 (6.84) |
+| 10k | `host_visible` | 7.536 (132.69) | 6.236 (160.36) | 72.932 (13.71) | 54.183 (18.46) | 334.096 (2.99) |
+| 10k | `host_device_local` | 5.066 (197.38) | 4.841 (206.57) | 28.322 (35.31) | 20.641 (48.45) | 144.532 (6.92) |
+| 100k (524,288 / 19.1% / 20.00 MiB / 1.416) | `device_local` | 7.618 (131.28) | 6.005 (166.54) | 53.558 (18.67) | 54.927 (18.21) | 290.279 (3.45) |
+| 100k | `host_visible` | 47.905 (20.87) | 29.887 (33.46) | 3492.770 (0.29) | 2240.356 (0.45) | 32108.853 (0.03) |
+| 100k | `host_device_local` | 7.660 (130.54) | 6.040 (165.55) | 53.983 (18.52) | 54.804 (18.25) | 292.561 (3.42) |
+
+On this GPU:
+
+1. **`device_local` is stable and cheap at every size.** Wave-uniform sweeps run `4.9–6.2 us / 1M`, divergent lookups `14.1–54.9 us / 1M`, and the 8-probe miss `50.5–290.3 us / 1M`. Repeating the 10k measurement keeps `divergent_miss` at `141–143 us / 1M` net, so this column is not noise.
+2. **`host_visible` falls off a cliff at 100k, and is unreliable below it.** At 100k it is `5.0x–6.3x` slower than `device_local` on wave-uniform sweeps, `41x–65x` on divergent hits and pairs, and `111x` on 8-probe misses. At 10k the same rows varied by up to 6x between runs (`divergent_miss` net `147–845 us / 1M` over five runs), so the 10k host row above is one representative run; the uniform rows moved much less (`6.1–8.7 us / 1M`). The conclusion does not change: `device_local` is stable, `host_visible` is not.
+3. **`host_device_local` (ReBAR) is a safe fallback on AMD.** It is within 1% of `device_local` at 10k and 100k and within 3% at 1k, except `uniform_tsharp_hit` at 1k (`8.78` vs `6.22 us / 1M`). The `DEVICE_LOCAL | HOST_VISIBLE` allocation succeeds and runs here; it is not guaranteed on every Windows driver.
+4. **The 100k cost is table geometry, not the vendor.** This run's `524,288`-slot table (19.07% load, `max_probes=8`) probes more often than the RTX 5080's `2,097,152`-slot one (4.8%, `max_probes=5`), which is why its 100k `divergent_miss` (`290 us / 1M`) is higher than the NVIDIA `217 us / 1M` even though the 1k–10k numbers are close. That is another argument for the bounded-window displacement in item 3 above.
+
+Raw CSV rows: [D3D-56 report](https://github.com/ItsNotRexed/Leonida/issues/313#issuecomment-7074181793), addendum with the repeatability runs: [same issue](https://github.com/ItsNotRexed/Leonida/issues/313#issuecomment-7074220711).
 
 ### 5.2 Per-stage code base
 
@@ -1803,6 +1887,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 | 18 | Does the game alias buffers/images in a heap, or use reserved/tiled resources? | Trace `CreatePlacedResource` ranges, aliasing barriers, `CreateReservedResource` and tile mappings. If yes, implement shared memory per heap range or fall back to linear allocations with a clear log. Shaders: 30 declare `TILED_RESOURCES` in SFI0 (`tools/feature_scan.py`), so reserved/tiled resources are likely used. Placed resources are D3D-16 and reserved resources D3D-20 (#313). |
 | 19 | What do the `0x03000000` root-signature flag bits mean? | Masking them on a copy works around the PC serializer; the semantics remain unknown. Compare against the public flag enum and observe the game's behaviour with and without the mask. |
 | 20 | Which of the BVH builder's 53 Xbox DXIL shaders does the game actually use, and can the 31 raw-address shaders be lowered without a reference? | Dump the slot-62 compute PSOs on the first RT frame; lower and compile each; compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
+| 21 | Which `Metadata` values and blob format does the console's PIX use for `SetMarker`/`BeginEvent`? The layer reads 0 and 1 as strings and labels 2 (the PC PIX3 blob) `PIX event` (section 4.10). | Log the `Metadata` values the game passes; if it is 2, decode the console blob from the executable's PIX calls rather than assuming the PC WinPixEventRuntime layout. |
 
 ## 9. Risks and non-goals
 
@@ -1818,7 +1903,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 - **The arena.** A single BDA arena is required by the shader contract for buffers, descriptor tables and code; the
   game's buffer working set may exceed `maxBufferSize` or PC VRAM. Host-visible arenas are slow; device-local
   arenas need staging and careful upload/readback handling. This is the main performance risk.
-- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.0–3.7 us/1M` net wave-uniform full sweeps, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory drops 9.6x–28x on uniform full sweeps and 59x–755x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). **The runtime now keeps that table in `DEVICE_LOCAL` memory** and uploads only the slots that changed, from a mapped staging copy, with the copy and its barrier in the command buffer that will read it (D3D-76; 46.2x on a divergent miss at 100k on an RTX 2060 SUPER). Improving slot placement within the 8-probe window is the open optimisation (SHADER-100); AMD/Intel/Apple numbers remain open via `vk_descriptor_bench`.
+- **Hash-table cost.** Every image/sampler access hashes a T#/S# and probes a storage buffer. **Measured (D3D-56, section 5.1)** on an RTX 5080 (driver 616.56): in `DEVICE_LOCAL` VRAM the lookup itself stays fast up to 100k entries (`3.0–3.7 us/1M` net wave-uniform full sweeps, `17.2–28.9 us/1M` net divergent hits), whereas `HOST_VISIBLE | HOST_COHERENT` system memory drops 9.6x–28x on uniform full sweeps and 59x–755x on divergent lookups at 10k–100k entries, and linear probing's 8-probe limit doubles a 100k table to `80.00 MiB` (`4.8%` load). **The runtime now keeps that table in `DEVICE_LOCAL` memory** and uploads only the slots that changed, from a mapped staging copy, with the copy and its barrier in the command buffer that will read it (D3D-76; 46.2x on a divergent miss at 100k on an RTX 2060 SUPER). Improving slot placement within the 8-probe window is the open optimisation (SHADER-100); Intel and Apple numbers remain open via `vk_descriptor_bench`; AMD RDNA3 is measured in section 5.1.
 - **Wave64.** On NVIDIA, wave64 shaders use the translator's 32-wide approximation; cross-half ops are approximate.
   AMD GPUs with 64-wide subgroups are exact. This is a known fidelity gap, not specific to the layer.
 - **Xbox tiling/DCC.** Slot 76 and layout `0x101` are known, but the tiled data layout, detile path and DCC remain
@@ -1997,7 +2082,13 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     `ALLOW_UNORDERED_ACCESS`, which the NVIDIA driver refuses (`E_INVALIDARG`); WARP creates it. The console build
     creates it, so the console takes that format as a UAV. On the same GPU Vulkan has no `STORAGE_IMAGE` support for
     `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` either (vulkaninfo, driver 597.06), so the layer needs an emulation (32-bit
-    storage plus a pack/unpack) where a GPU lacks it.
+    storage plus a pack/unpack) where a GPU lacks it. @Vonsek measured the same texture on more devices (#864):
+    refused on an RTX 5080 (616.92), created on an AMD Radeon and on WARP, where typed UAV writes round-trip; and on
+    both GPUs one allocation can serve both uses, a mutable `R32_UINT` Vulkan image with `E5B9G9R9_UFLOAT_PACK32` in
+    its format list, written through an `R32_UINT` storage view and sampled through an `E5B9G9R9` view.
+    Open: a float store to that format rounds differently on PC devices (@Vonsek, #864: AMD Radeon truncates the
+    mantissas, WARP rounds to nearest even; 609 of 794 test triples differ). Which rule the console FSR needs, and
+    whether its shaders store floats to that texture at all, waits on decoding its `FSPX` shaders.
   - With that one texture created as `R32_UINT` instead (the test's PC stand-in, `standin_slot76`), or as is on
     WARP, `ffxCreateContext` and `ffxDestroyContext` both return OK. Device slots called: 14 (5), 15 (26), 18 (10),
     19 (16), **27

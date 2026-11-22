@@ -111,6 +111,12 @@ def test_feature_scan():
                             os.path.join(tmp, "out.json")], capture_output=True, text=True)
         check(r.returncode == 0 and "SFI0 WAVE_MMA: 1" in r.stdout and "hs 0" in r.stdout, "the CLI prints the summary")
         check(os.path.isfile(os.path.join(tmp, "out.json")), "--out writes the JSON")
+        # --out in a folder that does not exist creates it, instead of losing the scan to a traceback (#934's class).
+        nested = os.path.join(tmp, "nested", "dir", "out.json")
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "feature_scan.py"), sh, "--out", nested],
+                           capture_output=True, text=True)
+        check(r.returncode == 0 and "Traceback" not in r.stderr, "--out creates a missing folder")
+        check(os.path.isfile(nested), "the JSON lands in the created folder")
         check("a_ps" not in r.stdout and "b_gs" not in r.stdout, "the summary prints counts, not shader names")
     assert failures == 0, f"{failures} feature_scan check(s) failed"
 

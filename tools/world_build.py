@@ -208,12 +208,41 @@ def _find_embedded_dds(tex_dir: str, dds_files: list[str], idx: int) -> str | No
     return None
 
 
+_PARAM_HASH_RE = re.compile(r"(?:0[xX])?([0-9A-Fa-f]{8})")
+
+
+def _parse_param_hash(value: object) -> str:
+    """Normalize a 32-bit shader parameter hash ("C8E8C282" or "0xc8e8c282") to uppercase hex."""
+    if isinstance(value, str):
+        match = _PARAM_HASH_RE.fullmatch(value.strip())
+        if match:
+            return match.group(1).upper()
+    raise ValueError(f"base_color_param must be eight hex digits with optional 0x, got {value!r}")
+
+
+def _ref_param_hash(ref: dict) -> str | None:
+    """Return a texture reference's Param as uppercase 8-hex, or None if absent/malformed."""
+    raw = ref.get("Param")
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return f"{raw:08X}" if 0 <= raw <= 0xFFFFFFFF else None
+    if isinstance(raw, str):
+        match = _PARAM_HASH_RE.fullmatch(raw.strip())
+        return match.group(1).upper() if match else None
+    return None
+
+
 def resolve_model_textures(
     models_dir: str,
     item: dict,
     ttpf_index: dict[str, str],
+    base_color_param: str | None = None,
 ) -> dict[int, str]:
-    """Resolve shader_index -> existing absolute .dds path for a model manifest item."""
+    """Resolve shader_index -> existing absolute .dds path for a model manifest item.
+
+    With base_color_param (normalized uppercase 8-hex), only texture references whose Param
+    matches are considered and the empty-Materials fallback is disabled; unmatched shaders
+    are left out so they render as clay.
+    """
     result: dict[int, str] = {}
     file_name = item.get("File")
     stem = os.path.splitext(file_name)[0] if isinstance(file_name, str) and file_name else ""
@@ -268,6 +297,8 @@ def resolve_model_textures(
             for ref in _list_field(mat, "Textures"):
                 if not isinstance(ref, dict):
                     continue
+                if base_color_param is not None and _ref_param_hash(ref) != base_color_param:
+                    continue
                 # 1. Embedded by TextureIndex
                 tidx = ref.get("TextureIndex")
                 if isinstance(tidx, int) and not isinstance(tidx, bool) and tidx >= 0:
@@ -300,8 +331,8 @@ def resolve_model_textures(
 
             if chosen is not None:
                 result[sidx] = chosen
-    elif dds_files:
-        # Fallback when Materials is empty/missing: map embedded indices and 0.
+    elif dds_files and base_color_param is None:
+        # Fallback when Materials is empty/missing and no parameter is selected: map embedded indices and 0.
         for idx, path in emb_by_index.items():
             result[idx] = path
         for idx, path in disk_by_index.items():
@@ -505,6 +536,7 @@ def build_world(
     textures: bool = True,
     limit: int | None = None,
     jobs: int = 1,
+    base_color_param: str | None = None,
 ) -> dict:
     """Build world.json and chunk .glb files from rpf9dump asset exports.
 
@@ -521,6 +553,8 @@ def build_world(
         raise ValueError(f"limit must be non-negative, got {limit!r}")
     if max_tex_size < 0:
         raise ValueError(f"max_tex_size must be non-negative, got {max_tex_size!r}")
+    if base_color_param is not None:
+        base_color_param = _parse_param_hash(base_color_param)
     workers = max(1, int(jobs))
 
     if not os.path.exists(assets_dir):
@@ -568,7 +602,11 @@ def build_world(
         if bounds is None or len(bounds) != 6 or not all(math.isfinite(v) for v in bounds):
             continue
 
-        tex_map = resolve_model_textures(models_dir, item, ttpf_index) if textures else {}
+        tex_map = (
+            resolve_model_textures(models_dir, item, ttpf_index, base_color_param)
+            if textures
+            else {}
+        )
         mesh_shaders = _list_field(item, "MeshShaders")
         mat_to_dds: dict[str, str] = {}
 
@@ -768,6 +806,13 @@ def _positive_float(text: str) -> float:
     return value
 
 
+def _param_hash(text: str) -> str:
+    try:
+        return _parse_param_hash(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid 32-bit hex value: {text!r}") from None
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Build spatial world.json and .glb chunks from rpf9dump asset exports."
@@ -826,6 +871,15 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="Number of worker threads for parallel chunk building (default: %(default)s).",
     )
+    ap.add_argument(
+        "--base-color-param",
+        type=_param_hash,
+        default=None,
+        metavar="HEX",
+        help="Use only texture references with this 32-bit shader parameter hash as base colour "
+        "(e.g. C8E8C282 for character materials); materials without a resolvable match stay clay. "
+        "Default: first resolvable reference.",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -839,6 +893,7 @@ def main(argv: list[str] | None = None) -> int:
             textures=not args.no_textures,
             limit=args.limit,
             jobs=args.jobs,
+            base_color_param=args.base_color_param,
         )
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

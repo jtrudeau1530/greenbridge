@@ -181,14 +181,14 @@ def parse(blob, schema=False):
         "complete": False,
         "error": "",
     }
+    structs = enums = None
     if first < HEADER or first > len(blob):
         record["error"] = f"first section offset {first} is outside the file"
-        return record
+        return _with_schema(record, schema, structs, enums)
     if len(blob) - first < SECTION_HEADER:
         record["error"] = f"missing or truncated first section header at {first}"
-        return record
+        return _with_schema(record, schema, structs, enums)
     offset = first
-    structs = enums = None
     while offset + SECTION_HEADER <= len(blob):
         tag = blob[offset:offset + 4]
         size = _u32_be(blob, offset + 4)
@@ -238,8 +238,32 @@ def parse(blob, schema=False):
     if not record["error"] and offset != len(blob):
         record["error"] = f"section walk ended at {offset} of {len(blob)}"
     record["complete"] = not record["error"] and offset == len(blob)
-    if schema:
-        record["schema"] = _hexed(structs or [], enums or [])
+    return _with_schema(record, schema, structs, enums)
+
+
+def _with_schema(record, schema, structs, enums):
+    """With `schema`, give every record the same "schema" shape, whether or not the sections were reached.
+
+    "lsch" and "lenm" say whether each section was decoded; "reason" says why one was not (a structural error
+    that stopped the walk first, a missing section, or the decode error), and is "" when both were.
+    """
+    if not schema:
+        return record
+    entry = _hexed(structs or [], enums or [])
+    entry["lsch"] = structs is not None
+    entry["lenm"] = enums is not None
+    reasons = []
+    for name, decoded in (("LSCH", entry["lsch"]), ("LENM", entry["lenm"])):
+        if decoded:
+            continue
+        if any(s["tag"] == name for s in record["sections"]):
+            reasons.append(record["schema_error"] or f"{name} not decoded")
+        elif record["error"]:
+            reasons.append(f"no whole {name} section: {record['error']}")
+        else:
+            reasons.append(f"no {name} section")
+    entry["reason"] = "; ".join(dict.fromkeys(reasons))
+    record["schema"] = entry
     return record
 
 
@@ -344,6 +368,8 @@ def main():
             extra += f"  SCHEMA ({r['schema_error']})"
         print(f"{r['file']}  size={r['size']}  v={r['version']}  {state}  {tags}{extra}")
         if a.schema:
+            if r["schema"]["reason"]:
+                print(f"  schema: {r['schema']['reason']}")
             for s in r["schema"]["structs"]:
                 print(f"  struct {s['hash']} sig={s['signature']} size={s['size']} "
                       f"align=2^{s['align_log2']} flags={s['flags']:#x} members={len(s['members'])}")

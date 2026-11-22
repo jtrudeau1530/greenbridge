@@ -238,7 +238,7 @@ def _psin_state(b):
             return False, count, False
         at += size
         count += 1
-    if at == len(b):
+    if count and at == len(b):
         return True, count, False
     return False, count, True
 

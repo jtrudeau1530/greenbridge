@@ -48,6 +48,12 @@ Console.WriteLine("Atomic write tests passed.");
 Check(ScanCounts.Candidates(ScanCounts.Coverage(183801, 149811)) == 183801, "invariant coverage");
 Check(ScanCounts.Candidates("rpf9dump full scan, 183,801 candidates, 149,811 recovered") == 183801, "comma-grouped coverage");
 Check(ScanCounts.Candidates("rpf9dump full scan, 183\u00A0801 candidates, 149\u00A0811 recovered") == 183801, "space-grouped coverage");
+// Every culture's N0 output must read back (de-CH uses U+2019, ar-* U+066C, nqo U+060C, ff-Adlm U+2E41).
+foreach (var culture in System.Globalization.CultureInfo.GetCultures(System.Globalization.CultureTypes.AllCultures))
+{
+    string old = string.Format(culture, "rpf9dump full scan, {0:N0} candidates, {1:N0} recovered", 183801, 149811);
+    Check(ScanCounts.Candidates(old) == 183801, "coverage written under " + culture.Name);
+}
 Check(ScanCounts.Candidates("App scan of the first 16 MiB") is null, "coverage written by another tool");
 Check(ScanCounts.Candidates(null) is null, "no cache");
 Console.WriteLine("Scan count tests passed.");

@@ -245,6 +245,15 @@ class MainTests(unittest.TestCase):
             text = f.read()
         self.assertLess(text.index("class IBaseStubs"), text.index("class IChildStubs"))
 
+    def test_repeated_interface_is_emitted_once(self):
+        self.assertEqual(self.run_main("IChild", "IBase"), 0)
+        with open(self.out, encoding="utf-8") as f:
+            expected = f.read()
+
+        self.assertEqual(self.run_main("IChild", "IBase", "IChild"), 0)
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), expected)
+
     def test_unknown_interface_raises(self):
         with self.assertRaises(SystemExit):
             self.run_main("IWho")

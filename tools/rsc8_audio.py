@@ -582,16 +582,17 @@ def decode_rsc8(data, *, stream_id=None, deep=True):
                     checks["anim_format_v2"] = all_v2
                     checks["anim_track_tag_11"] = all_tag11
                     checks["anim_max_block_size_matches_desc"] = max_blk_sz == max_blk_desc
-                    raw_fps = props.get("fps")
-                    fps = 60 if raw_fps is None else raw_fps
-                    expected_dur = (total_frames - 1) / float(fps) if total_frames > 0 and fps > 0 else 0.0
-                    checks["clip_duration_matches_frames"] = (
-                        math.isfinite(duration)
-                        and fps > 0
-                        and all(b["frame_count"] > 0 for b in blocks)
-                        and total_frames > 0
-                        and abs(duration - expected_dur) < 1e-4
-                    )
+                    if deep:
+                        raw_fps = props.get("fps")
+                        fps = 60 if raw_fps is None else raw_fps
+                        expected_dur = (total_frames - 1) / float(fps) if total_frames > 0 and fps > 0 else 0.0
+                        checks["clip_duration_matches_frames"] = (
+                            math.isfinite(duration)
+                            and fps > 0
+                            and all(b["frame_count"] > 0 for b in blocks)
+                            and total_frames > 0
+                            and abs(duration - expected_dur) < 1e-4
+                        )
 
             # Sorted track directory: count * 12 bytes
             if tr_cnt == 0:
@@ -640,7 +641,6 @@ def decode_rsc8(data, *, stream_id=None, deep=True):
         "clip_in_bounds",
         "clip_name_ok",
         "clip_hash_matches_root",
-        "clip_duration_matches_frames",
         "anim_desc_in_bounds",
         "anim_blocks_in_bounds",
         "anim_payload_plus_32_eq_size",
@@ -652,8 +652,9 @@ def decode_rsc8(data, *, stream_id=None, deep=True):
         "no_embedded_audio_container",
     ]
     if deep:
-        core_checks.extend(("tracks_sorted", "tracks_schema_ok"))
+        core_checks.extend(("clip_duration_matches_frames", "tracks_sorted", "tracks_schema_ok"))
     else:
+        checks.pop("clip_duration_matches_frames", None)
         checks.pop("tracks_sorted", None)
         checks.pop("tracks_schema_ok", None)
     out["valid"] = all(checks[k] for k in core_checks)
@@ -872,6 +873,7 @@ def _new_summary(mode, source):
         "adat_streams": 0,
         "adat_bytes": 0,
         "adat_tag_counts": {},
+        "invalid_files": 0,
         "rsc8_decoded": 0,
         "rsc8_in_adat": 0,
         "rsc8_standalone": 0,
@@ -1119,35 +1121,41 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
     for fp in files:
         if max_banks is not None and summary["adat_banks"] >= max_banks:
             break
-        fsize = os.path.getsize(fp)
-        with open(fp, "rb") as f:
-            head4 = f.read(4)
-        if head4 == ADAT_MAGIC:
-            if fsize > MAX_AWC_FILE_BYTES:
-                raise ValueError(f"{fp}: AWC bank exceeds {MAX_AWC_FILE_BYTES} bytes")
+        try:
+            fsize = os.path.getsize(fp)
             with open(fp, "rb") as f:
-                raw = f.read()
-            bank_res = decode_awc_bank(raw, 0, deep=deep)
-            summary["adat_banks"] += 1
-            summary["adat_streams"] += bank_res["stream_count"]
-            summary["adat_bytes"] += bank_res["bank_size"]
-            summary["rsc8_non_rsc8_0x5c"] += bank_res["non_rsc8_0x5c"]
-            for tk, tv in bank_res["tag_counts"].items():
-                summary["adat_tag_counts"][tk] = summary["adat_tag_counts"].get(tk, 0) + tv
-            for rec in bank_res["records"]:
-                _accumulate_record(summary, rec, in_adat=True, has_audio=rec.get("has_audio_data"))
+                head4 = f.read(4)
+            if head4 == ADAT_MAGIC:
+                if fsize > MAX_AWC_FILE_BYTES:
+                    raise ValueError(f"AWC bank exceeds {MAX_AWC_FILE_BYTES} bytes")
+                with open(fp, "rb") as f:
+                    raw = f.read()
+                bank_res = decode_awc_bank(raw, 0, deep=deep)
+                summary["adat_banks"] += 1
+                summary["adat_streams"] += bank_res["stream_count"]
+                summary["adat_bytes"] += bank_res["bank_size"]
+                summary["rsc8_non_rsc8_0x5c"] += bank_res["non_rsc8_0x5c"]
+                for tk, tv in bank_res["tag_counts"].items():
+                    summary["adat_tag_counts"][tk] = summary["adat_tag_counts"].get(tk, 0) + tv
+                for rec in bank_res["records"]:
+                    _accumulate_record(summary, rec, in_adat=True, has_audio=rec.get("has_audio_data"))
+                    if collect_records:
+                        records.append(rec)
+            elif head4 == RSC8_MAGIC:
+                if fsize > MAX_RSC8_BYTES:
+                    raise ValueError(f"RSC8 file exceeds {MAX_RSC8_BYTES} bytes")
+                with open(fp, "rb") as f:
+                    raw = f.read()
+                dec = decode_rsc8(raw, deep=deep)
+                rec = _make_record(0, 0, None, dec, None)
+                _accumulate_record(summary, rec, in_adat=False, has_audio=None)
                 if collect_records:
                     records.append(rec)
-        elif head4 == RSC8_MAGIC:
-            if fsize > MAX_RSC8_BYTES:
-                raise ValueError(f"{fp}: RSC8 file exceeds {MAX_RSC8_BYTES} bytes")
-            with open(fp, "rb") as f:
-                raw = f.read()
-            dec = decode_rsc8(raw, deep=deep)
-            rec = _make_record(0, 0, None, dec, None)
-            _accumulate_record(summary, rec, in_adat=False, has_audio=None)
-            if collect_records:
-                records.append(rec)
+            else:
+                raise ValueError("not a valid little-endian ADAT (AWC) bank or RSC8 resource")
+        except (OSError, ValueError) as e:
+            summary["invalid_files"] += 1
+            print(f"{fp}: {e}", file=sys.stderr)
 
     summary["elapsed_seconds"] = round(time.time() - t0, 3)
     return records, summary

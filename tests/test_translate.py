@@ -531,8 +531,10 @@ def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader)
     assert re.search(
         r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \1 (%t\d+)\n\s*"
-        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \3\n\s*"
-        r"%t\d+ = OpSelect %uint \2 \4 %c0\n",
+        r"(%t\d+) = OpSelect %uint \2 \3 %t\d+\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \4\n\s*"
+        r"(%t\d+) = OpSelect %uint \2 %cffffffff %c0\n\s*"
+        r"%t\d+ = OpBitwiseAnd %uint \5 \6\n",
         asm,
     ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
 
@@ -546,15 +548,19 @@ def test_wave32_bpermute_zeroes_inactive_and_missing_source_lanes(make_shader):
     asm = shader.translate()
     shader.validate(asm)
     assert not rdna2spirv.translate.last_gen.wave64
-    assert re.search(
+    shuffle = re.search(
         r"(%t\d+) = OpLoad %bool %active\n\s*"
         r"(%t\d+) = OpSelect %uint \1 %t\d+ %c0\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \3 (%t\d+)\n\s*"
-        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \2 \5\n\s*"
-        r"%t\d+ = OpSelect %uint \4 \6 %c0\n",
+        r"(%t\d+) = OpSelect %uint \4 \5 %t\d+\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \2 \6\n\s*"
+        r"(%t\d+) = OpSelect %uint \4 %cffffffff %c0\n\s*"
+        r"(?P<result>%t\d+) = OpBitwiseAnd %uint \7 \8\n",
         asm,
-    ), "wave32 ds_bpermute did not zero inactive sources and gate the shuffle on the running source lane"
+    )
+    assert shuffle, "wave32 ds_bpermute must mask inactive and missing source lanes"
+    assert f"OpBitwiseAnd %uint {shuffle['result']} " in asm, "the destination write must also mask the shuffle"
 
 WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
 WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[20:21]\ns_add_u32 s24, s22, s23\ns_endpgm\n"
@@ -644,11 +650,11 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
 
 
 # SHADER-36: image_gather4_l(_o) runs every texel of its 2x2 footprint through the S#'s CLAMP_X/CLAMP_Y.
-def _gather_l(s_word0, dynamic=False):
+def _gather_l(s_word0, dynamic=False, s_word1=0):
     return program(
         "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
         "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
-        f"s_mov_b32 s16, {s_word0}\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
+        f"s_mov_b32 s16, {s_word0}\ns_mov_b32 s17, {s_word1}\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
         + ("s_add_u32 s16, s16, 0\n" if dynamic else "")
         + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
         "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
@@ -670,6 +676,20 @@ def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, ma
     assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
     assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
     assert "OpBitFieldUExtract" not in text      # the mode is known at translation time
+
+
+def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
+    shader = make_shader(_gather_l(0x12, s_word1=(192 << 12) | 64))  # [0.25, 0.75] in unsigned 4.8
+    text = shader.translate()
+    shader.validate(text)
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
+    rounded, = (expr for expr in defs.values() if " RoundEven " in expr)
+    clamp = defs[rounded.split()[-1]].split()
+    assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FClamp"]
+    for limit, bits in zip(clamp[-2:], (0x3e800000, 0x3f400000)):
+        cast, scalar, value = defs[limit].split()
+        assert (cast, scalar) == ("OpBitcast", "%float")
+        assert defs[value] == f"OpConstant %uint {bits}"
 
 
 def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):

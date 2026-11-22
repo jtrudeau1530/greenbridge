@@ -32,6 +32,8 @@ other vertex formats, not sized here) or at a group that continues past the end 
 
 Usage:
     python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet]
+    python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --geometry-offset <offset> [--json out.json]
+    python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 """
 import argparse
 import json
@@ -337,12 +339,120 @@ def totals(pages):
     return out
 
 
+def _resource_pointer(system, at, base, segment, size):
+    if not 0 <= at <= len(system) - 8:
+        raise PageError("pointer field outside the system segment")
+    address = struct.unpack_from("<Q", system, at)[0] - base
+    if not 0 <= address <= len(segment) - size:
+        raise PageError("buffer or metadata pointer outside its segment")
+    return address
+
+
+def drawable_geometries(system, drawable):
+    """Read the primary LOD geometry list at a caller-identified drawable."""
+    def pointer(at, size):
+        return _resource_pointer(system, at, 0x50000000, system, size)
+
+    def count(at):
+        used, capacity = struct.unpack_from("<HH", system, at)
+        if not 1 <= used <= 256 or used != capacity:
+            raise PageError("invalid drawable array count")
+        return used
+
+    if not 0 <= drawable <= len(system) - 176:
+        raise PageError("drawable outside the system segment")
+    lod = pointer(drawable + 80, 16)
+    models = count(lod + 8)
+    table = pointer(lod, 8 * models)
+    for i in range(models):
+        model = pointer(table + 8 * i, 56)
+        geometries = count(model + 16)
+        if struct.unpack_from("<H", system, model + 54)[0] != geometries:
+            raise PageError("inconsistent model geometry count")
+        entries = pointer(model + 8, 8 * geometries)
+        for j in range(geometries):
+            yield pointer(entries + 8 * j, 160)
+
+
+def draw_binding(system, graphics, geometry):
+    """Resolve a known geometry record in paired, inflated resource segments."""
+
+    def system_pointer(at, size):
+        return _resource_pointer(system, at, 0x50000000, system, size)
+
+    def buffer(at):
+        count, stride = struct.unpack_from("<IH", system, at + 8)
+        if not count or not 1 <= stride <= 32:
+            raise PageError("invalid buffer extent")
+        length = count * stride
+        return _resource_pointer(system, at + 24, 0x60000000, graphics, length), length, stride
+
+    if not 0 <= geometry <= len(system) - 160:
+        raise PageError("geometry outside the system segment")
+    vb = system_pointer(geometry + 8, 80)
+    layout = system_pointer(vb + 64, 320)
+    descriptor = system_pointer(geometry + 64, 16)
+    ib = system_pointer(descriptor, 64)
+    vertex, vertex_bytes, _ = buffer(vb)
+    index, index_bytes, stride = buffer(ib)
+    flags = _u32(system, layout + 0x138)
+    count = flags >> 10
+    if (not flags & 1 or not count or _u32(system, layout) != 128
+            or system[layout + 0xD0] != 8 or system[layout + 0x104] != 16
+            or vertex_bytes < 128 + count * 8 or _u32(graphics, vertex) != OTHER_BLOCK_MAGIC):
+        raise PageError("unsupported vertex layout or invalid position extent")
+    meshlets, triangles, binding = struct.unpack_from("<HHI", system, descriptor + 8)
+    refs = (binding >> 8) & 0x7FFFFF
+    if (stride != 4 or index_bytes < 12 or binding >> 31 or not (meshlets and triangles and refs)
+            or struct.unpack_from("<III", graphics, index) != (0x80000000 | meshlets, triangles, refs)):
+        raise PageError("unsupported or inconsistent meshlet descriptor")
+    data = memoryview(graphics)[index:index + index_bytes]
+    group, end = parse_group(data, 0)
+    if (group["vertex_span"] > count or ((end + 15) & ~15) != index_bytes or any(data[end:])):
+        raise PageError("group references or padded extent exceed the declared layout")
+    return {"vertex_block": vertex, "meshlet_group": index, "vertices": count}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("inputs", nargs="+", help="carved page files, folders of them, or .rpf archives")
     ap.add_argument("--json", help="write per-page records and totals here")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--draw-system", help="inflated system segment paired with one graphics segment")
+    select = ap.add_mutually_exclusive_group()
+    select.add_argument("--geometry-offset", action="append", type=lambda s: int(s, 0),
+                        help="known geometry record offset in the system segment (repeatable)")
+    select.add_argument("--drawable-offset", type=lambda s: int(s, 0),
+                        help="walk primary LOD geometry records from this system-segment drawable")
     args = ap.parse_args(argv)
+    if args.draw_system is not None or args.geometry_offset is not None or args.drawable_offset is not None:
+        if not args.draw_system or (not args.geometry_offset and args.drawable_offset is None) or len(args.inputs) != 1:
+            ap.error("draw binding needs one graphics segment, --draw-system and a geometry or drawable offset")
+        try:
+            with open(args.draw_system, "rb") as source:
+                system = source.read()
+            with open(args.inputs[0], "rb") as source:
+                graphics = source.read()
+            rows = []
+            offsets = args.geometry_offset or drawable_geometries(system, args.drawable_offset)
+            try:
+                for offset in offsets:
+                    try:
+                        rows.append({"geometry": offset, **draw_binding(system, graphics, offset)})
+                    except PageError as exc:
+                        rows.append({"geometry": offset, "unresolved": str(exc)})
+            except PageError as exc:
+                rows.append({"drawable": args.drawable_offset, "unresolved": str(exc)})
+            report = json.dumps({"bindings": rows}, indent=2)
+            if args.json:
+                with open(args.json, "w", encoding="utf-8") as out:
+                    out.write(report + "\n")
+            if not args.quiet:
+                print(report)
+            return int(any("unresolved" in row for row in rows))
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     for path in args.inputs:
         if not os.path.exists(path):
             print(f"error: {path} does not exist", file=sys.stderr)

@@ -94,12 +94,12 @@ def main() -> int:
                 break
             s = mt.start()
             if m[s:s + 3] == b"KB2":
-                if s + 0x1C > size:   # header cut off by the end of the file (a truncated copy): not a video
+                if s + 0x1C > end:   # header cut off by the end of the file or of --limit's window: not a video
                     pos = s + 1
                     continue
                 blen = struct.unpack_from("<I", m, s + 4)[0] + 8
                 w, h = struct.unpack_from("<II", m, s + 0x14)
-                if not (64 <= blen <= size - s and 16 <= w <= 8192 and 16 <= h <= 8192):
+                if not (64 <= blen <= end - s and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
                 gap = m[last:s]
@@ -117,8 +117,10 @@ def main() -> int:
             d = zlib.decompressobj()
             try:
                 chunks, p = [], s
-                while not d.eof and p < size:
-                    chunk = m[p:p + (1 << 20)]
+                # Inflate only inside the scan window (all of the file without --limit): a stream that runs past
+                # its end is left out, so readable + zero + unread add up to the span, as in story_index (#712).
+                while not d.eof and p < end:
+                    chunk = m[p:min(p + (1 << 20), end)]
                     if not chunk:
                         break
                     chunks.append(d.decompress(chunk))

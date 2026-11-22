@@ -6,6 +6,7 @@
 #include "d3d12_trace.h"
 #include "../src/gfx10_descriptors.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -53,6 +54,39 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
+}
+
+// The label of a SetMarker/BeginEvent call, as UTF-8. Metadata says what the data is (WinPixEventRuntime's
+// pix3_win.h: PIX_EVENT_UNICODE_VERSION 0, a UTF-16 string; PIX_EVENT_ANSI_VERSION 1, an ANSI string;
+// PIX_EVENT_PIX3BLOB_VERSION 2, PIX's own encoded event). Strings end at their terminator or at `size` bytes. The
+// PIX3 blob is not decoded (its console form is unmeasured, docs/d3d12_vulkan.md section 4.10); it gets a fixed
+// label, so the event still nests.
+std::string event_label(UINT metadata, const void* data, UINT size) {
+    if (!data || !size) return {};
+    std::wstring wide;
+    if (metadata == 0) {
+        const auto* text = static_cast<const wchar_t*>(data);
+        const std::size_t limit = size / sizeof(wchar_t);
+        std::size_t n = 0;
+        while (n < limit && text[n]) ++n;
+        wide.assign(text, n);
+    } else if (metadata == 1) {
+        const auto* text = static_cast<const char*>(data);
+        std::size_t n = 0;
+        while (n < size && text[n]) ++n;
+        if (!n) return {};
+        const int count = MultiByteToWideChar(CP_ACP, 0, text, int(n), nullptr, 0);
+        wide.resize(std::size_t(std::max(count, 0)));
+        if (count > 0) MultiByteToWideChar(CP_ACP, 0, text, int(n), wide.data(), count);
+    } else {
+        if (metadata != 2) stub("SetMarker/BeginEvent with unknown metadata");
+        return "PIX event";
+    }
+    if (wide.empty()) return {};
+    const int count = WideCharToMultiByte(CP_UTF8, 0, wide.data(), int(wide.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(std::size_t(std::max(count, 0)), '\0');
+    if (count > 0) WideCharToMultiByte(CP_UTF8, 0, wide.data(), int(wide.size()), out.data(), count, nullptr, nullptr);
+    return out;
 }
 
 class CommandAllocator final
@@ -338,6 +372,21 @@ public:
         back_stencil_ref_ = back;
         stencil_ref_set_ = true;
         stub("ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef (recorded; no pipeline path applies it)");
+    }
+
+    // Debug markers, recorded in order with the other commands and replayed as VK_EXT_debug_utils labels. The trace
+    // names the call only, never the label.
+    void STDMETHODCALLTYPE SetMarker(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetMarker");
+        check(list_.marker(leonida::DebugMarker::Kind::set, event_label(metadata, data, size)));
+    }
+    void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::BeginEvent");
+        check(list_.marker(leonida::DebugMarker::Kind::begin, event_label(metadata, data, size)));
+    }
+    void STDMETHODCALLTYPE EndEvent() override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::EndEvent");
+        check(list_.marker(leonida::DebugMarker::Kind::end));
     }
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
@@ -638,6 +687,20 @@ public:
         return S_OK;
     }
 
+    // Queue labels, in order with the submissions around them.
+    void STDMETHODCALLTYPE SetMarker(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12CommandQueue::SetMarker");
+        marker(leonida::DebugMarker::Kind::set, metadata, data, size);
+    }
+    void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12CommandQueue::BeginEvent");
+        marker(leonida::DebugMarker::Kind::begin, metadata, data, size);
+    }
+    void STDMETHODCALLTYPE EndEvent() override {
+        d3d12_trace::record("ID3D12CommandQueue::EndEvent");
+        marker(leonida::DebugMarker::Kind::end, 0, nullptr, 0);
+    }
+
     // The GPU timestamp is in device ticks (what GetTimestampFrequency counts: 1e9 / timestampPeriod per second)
     // and the CPU one is QueryPerformanceCounter's, both read at about the same moment.
     HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* gpu, UINT64* cpu) override {
@@ -733,6 +796,12 @@ private:
         stamp_.destroy_query_pool(device, stamp_.queries, nullptr);
         stamp_.queries = VK_NULL_HANDLE;
         return false;
+    }
+
+    void marker(leonida::DebugMarker::Kind kind, UINT metadata, const void* data, UINT size) {
+        const std::string label = event_label(metadata, data, size);
+        std::lock_guard lock(mutex_);
+        queue_.marker(kind, label.c_str());
     }
 
     D3D12_COMMAND_QUEUE_DESC desc_;

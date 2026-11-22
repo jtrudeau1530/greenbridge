@@ -326,7 +326,7 @@ class F16RoundingExecutionTests(unittest.TestCase):
 
 
 class FractF16TranslationTests(unittest.TestCase):
-    """v_fract_f16 lowers to GLSL.std.450 Fract, which spirv_mini_interp.py does not yet implement."""
+    """v_fract_f16 lowers to GLSL.std.450 Fract (spirv_mini_interp.py computes it exactly, rounded once)."""
 
     def test_fract_f16_emits_glsl_fract_op_sel_mods_and_half_keep(self):
         spv = translate_ps([
@@ -337,8 +337,8 @@ class FractF16TranslationTests(unittest.TestCase):
         self.assertIn("UnpackHalf2x16", spv)
         self.assertRegex(spv, r"OpExtInst %float %glsl Fract %\w+")
         self.assertRegex(spv, r"OpExtInst %float %glsl FClamp %\w+ %f0 %f1")
-        with self.assertRaisesRegex(si.UnsupportedConstruct, r"Fract"):
-            si.run_fragment(spv)
+        # op_sel:[1,1]: fract of the high half (-1.25 -> 0.75 = 0x3a00) into the high half; the low half is kept.
+        self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], (0x3A00 << 16) | (OLD & 0xFFFF))
 
 
 if __name__ == "__main__":

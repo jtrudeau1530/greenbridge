@@ -62,6 +62,7 @@ def make_resource(map_file=True):
         member(WI.FIELD["guid"], 0x20, 0x4F),
         member(WI.FIELD["lodLevel"], 0x7E, 0x60),
         member(WI.FIELD["lodDist"], 0x60, 0x21),
+        member(WI.ARCHETYPE_KEY, 0x20, 0x4F),
     ]
     entity_members = 0x300
     for i, m in enumerate(members):
@@ -253,6 +254,51 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "map")
         self.assertEqual(stats["files"], 1)
+
+    def test_archetypes_out_counts_each_entity_once(self):
+        blob = make_resource()
+        path = os.path.join(self.dir, "sample.rpf")
+        with open(path, "wb") as f:
+            # One resource split over two streams (joined, parsed again) and one whole copy.
+            f.write(make_rpf_streams([blob[:0x150], blob[0x150:], blob, make_resource(map_file=False)]))
+        out = os.path.join(self.dir, "out.json")
+        arch = os.path.join(self.dir, "archetypes.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([path, "--out", out, "--archetypes-out", arch]), 0)
+        with open(arch, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["archetypes"], {"deadbeef": 2})
+        self.assertEqual(doc["keys"], {"deadbeef": "1122334455667788"})
+        self.assertEqual(doc["summary"], {"entities": 2, "archetypes": 1, "with_key": 1, "key_conflicts": 0,
+                                          "incomplete_entities": 0})
+
+    def test_conflicting_keys_leave_the_hash_unverified(self):
+        agg = WI.ArchetypeCounts()
+        agg.append({"complete": True, "archetype": 1, "archetype_key": 5})
+        agg.append({"complete": True, "archetype": 1, "archetype_key": 6})
+        agg.append({"complete": True, "archetype": 2, "archetype_key": 7})
+        agg.append({"complete": True, "archetype": None, "archetype_key": 8})
+        doc = agg.to_json()
+        self.assertEqual(doc["archetypes"], {"00000001": 2, "00000002": 1})
+        self.assertEqual(doc["keys"], {"00000002": "0000000000000007"})
+        self.assertEqual(doc["conflicting_keys"], {"00000001": ["0000000000000005", "0000000000000006"]})
+        self.assertEqual(doc["summary"]["key_conflicts"], 1)
+
+    def test_entity_past_the_inflated_bytes_is_not_aggregated(self):
+        # The entity block starts at 0x400 (0x90 bytes); the bytes end at 0x448, just after archetypeName.
+        agg = WI.ArchetypeCounts()
+        row = WI.parse_resource(make_resource()[:0x448], agg)
+        self.assertIsNotNone(row)
+        self.assertEqual((agg.counts, agg.incomplete), ({}, 1))
+
+    def test_archetypes_out_is_a_world_names_input(self):
+        spec = importlib.util.spec_from_file_location("world_names_for_index", os.path.join(ROOT, "tools", "world_names.py"))
+        WN = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(WN)
+        agg = WI.ArchetypeCounts()
+        WI.parse_resource(make_resource(), agg)
+        stats = WN.resolve_archetypes(agg.to_json(), WN.NameDictionary())
+        self.assertEqual((stats["entities"], stats["unique_hashes"], stats["unresolved_hashes"]), (1, 1, 1))
 
 
 if __name__ == "__main__":

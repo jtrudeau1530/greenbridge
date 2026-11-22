@@ -12,6 +12,10 @@ It does not decrypt the archive table and does not extract models or textures.
 Usage:
     python -I world_index.py <archive.rpf|folder> [--out FILE] [--csv FILE]
                              [--start N] [--limit BYTES] [--max-inflate BYTES]
+                             [--archetypes-out FILE]
+
+``--archetypes-out`` also writes the aggregate archetype file that ``world_names.py resolve --archetypes``
+reads: entity count per ``archetypeName`` hash and the entity's 64-bit archetype key. Counts and hashes only.
 
 For a 76 GB archive, bound the run with --start/--limit. Coverage and the scanned window are written to the
 JSON summary.
@@ -59,6 +63,9 @@ FIELD = {
     "flags_map": 0x67D26872,
     "contentFlags": 0x6A675035,
 }
+# Per-entity 64-bit archetype key (Murmur3-64 of the archetype name, docs/world_names.md); the engine name of
+# this member is not recovered.
+ARCHETYPE_KEY = 0xC8A7B90A
 LOD_NAMES = {0: "HD", 1: "LOD", 2: "SLOD1", 3: "SLOD2", 4: "SLOD3", 5: "ORPHAN_HD", 6: "SLOD4"}
 
 
@@ -209,7 +216,9 @@ def parse_resource(b, collect=None):
                 lod_dists.append(dist)
             if collect is not None:
                 collect.append({
+                    "complete": o + entity_size <= len(b),
                     "archetype": a,
+                    "archetype_key": _value(b, o, em.get(ARCHETYPE_KEY)),
                     "position": pos,
                     "rotation": _value(b, o, em.get(FIELD["rotation"])),
                     "scale_xy": _value(b, o, em.get(FIELD["scaleXY"])),
@@ -301,8 +310,10 @@ def _inflate_stream(m, s, size, max_inflate, keep=False):
     return b"".join(chunks), p - s - len(d.unused_data), True, is_meta
 
 
-def scan_rpf(path, start=None, limit=None, max_inflate=CAP):
-    """Yield rows for every 0x7a resource in an RPF9 data area, plus scan statistics."""
+def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
+    """Yield rows for every 0x7a resource in an RPF9 data area, plus scan statistics.
+
+    ``collect`` is passed to ``parse_resource`` once per accepted resource (after any continuation join)."""
     rows = []
     scanned = streams = 0
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
@@ -350,7 +361,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP):
                     data += more
                     used += mused
                     consumed += 1
-                row = parse_resource(data)
+                row = parse_resource(data, collect)
                 if row is not None:
                     row["offset"] = s
                     row["size"] = len(data)
@@ -365,7 +376,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP):
                       "scan_end": end, "scanned_bytes": scanned, "streams": streams}
 
 
-def scan_path(path, start=None, limit=None, max_inflate=CAP):
+def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None):
     """Scan an RPF9 archive, or every carved file in a directory."""
     if os.path.isdir(path):
         rows, stats = [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
@@ -375,7 +386,7 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
                 with open(p, "rb") as f:
                     head = f.read(4)
                 if head == b"9FPR":
-                    more, sub = scan_rpf(p, start, limit, max_inflate)
+                    more, sub = scan_rpf(p, start, limit, max_inflate, collect)
                     rows.extend(more)
                     stats["files"] += 1
                     stats["scanned_bytes"] += sub["scanned_bytes"]
@@ -384,7 +395,7 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
                     continue
                 with open(p, "rb") as f:
                     b = f.read(max_inflate + 1)
-                row = parse_resource(b)
+                row = parse_resource(b, collect)
                 stats["files"] += 1
                 stats["scanned_bytes"] += len(b)
                 if row is not None:
@@ -396,12 +407,47 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
     with open(path, "rb") as f:
         magic = f.read(4)
     if magic == b"9FPR":
-        return scan_rpf(path, start, limit, max_inflate)
+        return scan_rpf(path, start, limit, max_inflate, collect)
     with open(path, "rb") as f:
         b = f.read(max_inflate + 1)
-    row = parse_resource(b)
+    row = parse_resource(b, collect)
     return ([dict(row, offset=0, size=len(b), file=os.path.basename(path))] if row else [],
             {"path": os.path.abspath(path), "files": 1, "scanned_bytes": len(b)})
+
+
+class ArchetypeCounts:
+    """``collect`` sink for parse_resource: entities per archetype hash and the archetype's 64-bit key.
+
+    Entities whose record extends past the inflated bytes are counted as ``incomplete`` and not aggregated. A hash
+    seen with two different 64-bit keys gets no key in the output (it can then resolve but not verify) and is
+    listed under ``conflicting_keys``."""
+
+    def __init__(self):
+        self.counts = {}
+        self.keys = {}
+        self.incomplete = 0
+
+    def append(self, entity):
+        if not entity.get("complete", True):
+            self.incomplete += 1
+            return
+        a = entity.get("archetype")
+        if a is None:
+            return
+        self.counts[a] = self.counts.get(a, 0) + 1
+        k = entity.get("archetype_key")
+        if k:
+            self.keys.setdefault(a, set()).add(k)
+
+    def to_json(self):
+        single = {a: next(iter(k)) for a, k in self.keys.items() if len(k) == 1}
+        conflicts = {f"{a:08x}": sorted(f"{x:016x}" for x in k) for a, k in sorted(self.keys.items()) if len(k) > 1}
+        return {"archetypes": {f"{a:08x}": n for a, n in sorted(self.counts.items())},
+                "keys": {f"{a:08x}": f"{k:016x}" for a, k in sorted(single.items())},
+                "conflicting_keys": conflicts,
+                "summary": {"entities": sum(self.counts.values()), "archetypes": len(self.counts),
+                            "with_key": len(single), "key_conflicts": len(conflicts),
+                            "incomplete_entities": self.incomplete}}
 
 
 def _count(minimum):
@@ -427,9 +473,12 @@ def main(argv=None):
     ap.add_argument("--limit", type=_count(1), help="window size in bytes (default: to end of archive)")
     ap.add_argument("--max-inflate", type=int, default=CAP,
                     help="stop keeping bytes above this per resource, default 64 MiB")
+    ap.add_argument("--archetypes-out",
+                    help="also write entity counts and 64-bit keys per archetype hash (world_names resolve input)")
     a = ap.parse_args(argv)
+    agg = ArchetypeCounts() if a.archetypes_out else None
     try:
-        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate)
+        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, agg)
     except ValueError as e:                 # a --start outside an archive's data area; nothing is written
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
@@ -460,6 +509,11 @@ def main(argv=None):
                     if isinstance(v, (list, dict)):
                         r[k] = json.dumps(v, sort_keys=True)
                 w.writerow(r)
+    if agg is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(a.archetypes_out)), exist_ok=True)
+        with open(a.archetypes_out, "w", encoding="utf-8") as f:
+            json.dump(agg.to_json(), f, indent=1, sort_keys=True)
+        summary["archetype_file"] = agg.to_json()["summary"]
     print(json.dumps(summary, indent=1))
     return 0
 

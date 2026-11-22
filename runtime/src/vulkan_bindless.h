@@ -9,7 +9,8 @@
 //            3  sampled 2D-array images    1024        8 + 3 * dimension + class     256 each:
 //            4  2D r32ui storage images    1024           storage images by component class
 //   dimension: 0 = 2D, 1 = 2D array, 2 = 3D, 3 = 1D (the translator's STORE_DIMS); class: 0 = float, 1 = uint, 2 = sint.
-// The counts are those of runtime/test/vk_pipeline_check.cpp, which creates every translated shader against them.
+//   bindings 20/21: sampled multisample 2D images / 2D arrays, 256 each (runtime SRVs).
+//   bindings 22/23 and 24/25 are their UINT and SINT equivalents on devices supporting those classes.
 //
 // A shader turns a T# or S# into an index through the hash table (descriptor_table.h) and uses that index in
 // whichever binding the instruction calls for: the sampled array of the image's dimension, or one of its storage
@@ -48,8 +49,8 @@
 
 namespace leonida {
 
-// The translator's image dimensions; the values are its STORE_DIMS indices. A cube is a 2D array of six layers.
-enum class ImageDimension : std::uint32_t { dim_2d = 0, dim_2d_array = 1, dim_3d = 2, dim_1d = 3 };
+// The first four dimensions are the translator's STORE_DIMS indices. A cube is a 2D array of six layers.
+enum class ImageDimension : std::uint32_t { dim_2d, dim_2d_array, dim_3d, dim_1d, dim_2d_ms, dim_2d_ms_array };
 
 // Storage views of one image by the component type a shader reads or writes it with (the translator picks by the
 // T# format at run time). r32ui is for the atomic instructions, whose image type is R32ui (2D and 3D only).
@@ -64,6 +65,9 @@ struct StorageViews {
 struct BindlessFeatures {
     bool update_after_bind = false;
     bool partially_bound = false;
+    // Fallback sample counts for RGBA8_UNORM, R32_UINT, R32_SINT. A single sample omits that class's MS bindings.
+    std::array<VkSampleCountFlagBits, 3> ms_samples{
+        VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT};
 };
 
 namespace bindless {
@@ -76,10 +80,11 @@ struct Binding {
 inline constexpr std::uint32_t table_binding = 2;
 inline constexpr std::uint32_t sampler_binding = 1;
 inline constexpr std::uint32_t storage_indices = 256;  // what every storage array of bindings 8-19 holds
+inline constexpr std::uint32_t first_ms_binding = 20;
 inline constexpr std::uint32_t no_binding = 0xffffffffu;
 
 // Indexed by binding number.
-inline constexpr std::array<Binding, 20> bindings = {{
+inline constexpr std::array<Binding, 26> bindings = {{
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
@@ -90,16 +95,66 @@ inline constexpr std::array<Binding, 20> bindings = {{
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
+    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
+    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
+    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
 }};
 
-constexpr std::uint32_t sampled_binding(ImageDimension dimension) {
-    constexpr std::uint32_t by_dimension[] = {0, 3, 6, 5};
-    return by_dimension[std::uint32_t(dimension)];
+constexpr bool binding_enabled(std::uint32_t binding, const BindlessFeatures& features) {
+    return binding < first_ms_binding || features.ms_samples[(binding - first_ms_binding) / 2] != VK_SAMPLE_COUNT_1_BIT;
+}
+
+// Every binding is visible to every shader stage. Preserve the single-sample layout on devices whose
+// per-stage or per-set limits have no room for additional pairs of MS arrays.
+constexpr void limit_ms_bindings(BindlessFeatures& features, std::uint32_t sampled_limit,
+                                 std::uint32_t resource_limit) {
+    std::uint32_t sampled = 0, total = 0;
+    for (std::uint32_t b = 0; b < first_ms_binding; ++b) {
+        if (bindings[b].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) sampled += bindings[b].count;
+        if (bindings[b].type != VK_DESCRIPTOR_TYPE_SAMPLER) total += bindings[b].count;
+    }
+    for (std::uint32_t c = 0; c < features.ms_samples.size(); ++c) {
+        if (features.ms_samples[c] == VK_SAMPLE_COUNT_1_BIT) continue;
+        const auto b = first_ms_binding + 2 * c;
+        const auto pair = bindings[b].count + bindings[b + 1].count;
+        if (sampled + pair > sampled_limit || total + pair > resource_limit) {
+            features.ms_samples[c] = VK_SAMPLE_COUNT_1_BIT;
+        } else {
+            sampled += pair;
+            total += pair;
+        }
+    }
+}
+
+inline void limit_ms_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimits& limits,
+                              const VkPhysicalDeviceVulkan12Properties& indexed) {
+    const auto sampled = features.update_after_bind
+        ? std::min(indexed.maxPerStageDescriptorUpdateAfterBindSampledImages,
+                   indexed.maxDescriptorSetUpdateAfterBindSampledImages)
+        : std::min(limits.maxPerStageDescriptorSampledImages, limits.maxDescriptorSetSampledImages);
+    auto resources = features.update_after_bind ? indexed.maxPerStageUpdateAfterBindResources : limits.maxPerStageResources;
+    // Fragment outputs count as stage resources. D3D12 allows up to eight render targets.
+    resources -= std::min(resources, std::min(limits.maxColorAttachments, 8u));
+    if (features.update_after_bind) {
+        // Standalone samplers count in the pool, but do not count against the per-stage resource limit.
+        const auto pool = indexed.maxUpdateAfterBindDescriptorsInAllPools;
+        resources = std::min(resources, pool - std::min(pool, bindings[sampler_binding].count));
+    }
+    limit_ms_bindings(features, sampled, resources);
+}
+
+constexpr bool multisampled(ImageDimension dimension) {
+    return dimension == ImageDimension::dim_2d_ms || dimension == ImageDimension::dim_2d_ms_array;
+}
+
+constexpr std::uint32_t sampled_binding(ImageDimension dimension, std::uint32_t component_class = 0) {
+    constexpr std::uint32_t by_dimension[] = {0, 3, 6, 5, first_ms_binding, first_ms_binding + 1};
+    return by_dimension[std::uint32_t(dimension)] + (multisampled(dimension) ? component_class * 2 : 0);
 }
 
 // component_class: 0 = float, 1 = uint, 2 = sint.
 constexpr std::uint32_t storage_binding(ImageDimension dimension, std::uint32_t component_class) {
-    return 8 + 3 * std::uint32_t(dimension) + component_class;
+    return multisampled(dimension) ? no_binding : 8 + 3 * std::uint32_t(dimension) + component_class;
 }
 
 constexpr std::uint32_t r32ui_binding(ImageDimension dimension) {
@@ -136,6 +191,9 @@ public:
     BindlessSet& operator=(const BindlessSet&) = delete;
 
     bool ok() const { return ok_; }
+    bool supports_ms_class(std::uint32_t component_class) const {
+        return component_class < classes && features_.ms_samples[component_class] != VK_SAMPLE_COUNT_1_BIT;
+    }
     // Set 0 of every pipeline layout made for translated shaders.
     VkDescriptorSetLayout layout() const { return layout_; }
     // Bound at set 0. The same set for the life of this object: flush() updates it in place.
@@ -148,6 +206,7 @@ public:
         fallbacks_ready_ = true;
         std::vector<VkImageMemoryBarrier> barriers;
         for (const auto& image : fallback_images_) {
+            if (!image.image) continue;  // unsupported multisample component class
             VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -161,9 +220,9 @@ public:
         vk_.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
                                  nullptr, 0, nullptr, std::uint32_t(barriers.size()), barriers.data());
         const VkClearColorValue zero{};
-        const VkImageSubresourceRange whole{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        for (const auto& image : fallback_images_)
-            vk_.vkCmdClearColorImage(command_buffer, image.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &whole);
+        for (const auto& barrier : barriers)
+            vk_.vkCmdClearColorImage(command_buffer, barrier.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1,
+                                     &barrier.subresourceRange);
         VkMemoryBarrier done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         done.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -173,30 +232,33 @@ public:
 
     // Gives an image an index in its dimension's bindings: 0 when the dimension is full. `sampled` goes to the
     // sampled array in `sampled_layout` (the layout the image is in when shaders read it); the storage views go to
-    // the storage arrays in GENERAL. The caller maps the T# to the index with insert_key(). Takes effect at flush().
+    // the storage arrays in GENERAL. For MS views, sampled_class selects the float, uint or sint sampled array.
+    // The caller maps the T# to the index with insert_key(). Takes effect at flush().
     std::uint32_t add_image(ImageDimension dimension, VkImageView sampled, VkImageLayout sampled_layout,
-                            const StorageViews& storage = {}) {
+                            const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
         const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
+        if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class))) return 0;
         auto& used = image_used_[std::uint32_t(dimension)];
         const std::uint32_t low_end = std::min(std::uint32_t(used.size()), bindless::storage_indices);
         std::uint32_t index = stores ? 0 : allocate(used, low_end, std::uint32_t(used.size()));
         if (!index) index = allocate(used, 1, low_end);
-        if (index) write_image(dimension, index, sampled, sampled_layout, storage);
+        if (index) write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
         return index;
     }
 
     // New views or a new layout for an index add_image returned (a texture's state changed, say).
     void update_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
-                      const StorageViews& storage = {}) {
+                      const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
         const auto& used = image_used_[std::uint32_t(dimension)];
-        if (index && index < used.size() && used[index]) write_image(dimension, index, sampled, sampled_layout, storage);
+        if (index && index < used.size() && used[index])
+            write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
     }
 
     // Returns the index to the fallback and frees it. The caller removes the image's keys with erase_key() first.
     void remove_image(ImageDimension dimension, std::uint32_t index) {
         auto& used = image_used_[std::uint32_t(dimension)];
         if (!index || index >= used.size() || !used[index]) return;
-        write_image(dimension, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {});
+        write_image(dimension, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0);
         used[index] = 0;
     }
 
@@ -335,7 +397,7 @@ private:
         VkDescriptorImageInfo info;
     };
 
-    static constexpr std::uint32_t dimensions = 4, classes = 3;
+    static constexpr std::uint32_t dimensions = 6, classes = 3;
 
     // The first free index in [begin, end), marked used; 0 when there is none.
     static std::uint32_t allocate(std::vector<std::uint8_t>& used, std::uint32_t begin, std::uint32_t end) {
@@ -357,26 +419,29 @@ private:
         std::array<VkDescriptorSetLayoutBinding, bindless::bindings.size()> entries{};
         std::array<VkDescriptorBindingFlags, bindless::bindings.size()> flags{};
         std::array<VkDescriptorPoolSize, bindless::bindings.size()> sizes{};
-        for (std::uint32_t b = 0; b < entries.size(); ++b) {
-            entries[b] = {b, bindless::bindings[b].type, bindless::bindings[b].count, VK_SHADER_STAGE_ALL, nullptr};
-            flags[b] = (features_.update_after_bind ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0) |
-                       (features_.partially_bound ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0);
-            sizes[b] = {bindless::bindings[b].type, bindless::bindings[b].count};
+        std::uint32_t count = 0;
+        for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b) {
+            if (!bindless::binding_enabled(b, features_)) continue;
+            entries[count] = {b, bindless::bindings[b].type, bindless::bindings[b].count, VK_SHADER_STAGE_ALL, nullptr};
+            flags[count] = (features_.update_after_bind ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0) |
+                           (features_.partially_bound ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0);
+            sizes[count] = {bindless::bindings[b].type, bindless::bindings[b].count};
+            ++count;
         }
         VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-        flags_info.bindingCount = std::uint32_t(flags.size());
+        flags_info.bindingCount = count;
         flags_info.pBindingFlags = flags.data();
         VkDescriptorSetLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &flags_info};
         layout_info.flags = features_.update_after_bind ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
-        layout_info.bindingCount = std::uint32_t(entries.size());
+        layout_info.bindingCount = count;
         layout_info.pBindings = entries.data();
         if (vk_.vkCreateDescriptorSetLayout(device_, &layout_info, nullptr, &layout_) != VK_SUCCESS) return false;
 
         VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool_info.flags = features_.update_after_bind ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0;
         pool_info.maxSets = 1;
-        pool_info.poolSizeCount = std::uint32_t(sizes.size());
+        pool_info.poolSizeCount = count;
         pool_info.pPoolSizes = sizes.data();
         if (vk_.vkCreateDescriptorPool(device_, &pool_info, nullptr, &pool_) != VK_SUCCESS) return false;
         VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -396,23 +461,28 @@ private:
 
     // One 1x1 image for each image type and component class, and the views of them every binding needs.
     bool create_fallbacks() {
-        constexpr VkImageType types[] = {VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_1D};
+        // Each MS class shares one sampled-only fallback between its 2D and 2D-array views.
+        constexpr VkImageType types[] = {VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_1D, VK_IMAGE_TYPE_2D};
+        constexpr std::uint32_t ms_type = 3;
         constexpr VkFormat formats[classes] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT};
         // dimension -> (index into types, view type)
-        constexpr std::uint32_t type_of[dimensions] = {0, 0, 1, 2};
+        constexpr std::uint32_t type_of[dimensions] = {0, 0, 1, 2, ms_type, ms_type};
         constexpr VkImageViewType view_types[dimensions] = {VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-                                                            VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_1D};
-        for (std::uint32_t t = 0; t < 3; ++t) {
+                                                            VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_1D,
+                                                            VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY};
+        for (std::uint32_t t = 0; t < std::size(types); ++t) {
             for (std::uint32_t c = 0; c < classes; ++c) {
+                if (t == ms_type && !supports_ms_class(c)) continue;
                 VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
                 info.imageType = types[t];
                 info.format = formats[c];
                 info.extent = {1, 1, 1};
                 info.mipLevels = 1;
                 info.arrayLayers = 1;
-                info.samples = VK_SAMPLE_COUNT_1_BIT;
-                info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                             (c == 0 ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
+                info.samples = t == ms_type ? features_.ms_samples[c] : VK_SAMPLE_COUNT_1_BIT;
+                info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                if (t != ms_type) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+                if (t == ms_type || c == 0) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
                 FallbackImage& image = fallback_images_[t * classes + c];
                 if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
                 VkMemoryRequirements requirements{};
@@ -427,16 +497,23 @@ private:
             }
         }
         for (std::uint32_t d = 0; d < dimensions; ++d) {
+            const ImageDimension dimension{d};
             for (std::uint32_t c = 0; c < classes; ++c) {
                 VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
                 info.image = fallback_images_[type_of[d] * classes + c].image;
+                if (!info.image) continue;
                 info.viewType = view_types[d];
                 info.format = formats[c];
                 info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                 VkImageView view = VK_NULL_HANDLE;
                 if (vk_.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return false;
                 fallback_views_.push_back(view);
-                fallback_view_[d][c] = view;
+                if (c == 0 || bindless::multisampled(dimension))
+                    fallback_by_binding_[bindless::sampled_binding(dimension, c)] = view;
+                const auto storage_at = bindless::storage_binding(dimension, c);
+                if (storage_at != bindless::no_binding) fallback_by_binding_[storage_at] = view;
+                const auto r32ui_at = bindless::r32ui_binding(dimension);
+                if (c == 1 && r32ui_at != bindless::no_binding) fallback_by_binding_[r32ui_at] = view;
             }
         }
         VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -628,17 +705,7 @@ private:
 
     VkDescriptorImageInfo fallback_info(std::uint32_t binding) const {
         if (binding == bindless::sampler_binding) return {fallback_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-        for (std::uint32_t d = 0; d < dimensions; ++d) {
-            const ImageDimension dimension{d};
-            std::uint32_t component_class = classes;  // of the fallback view this binding takes
-            if (binding == bindless::sampled_binding(dimension)) component_class = 0;
-            if (binding == bindless::r32ui_binding(dimension)) component_class = 1;
-            for (std::uint32_t c = 0; c < classes; ++c)
-                if (binding == bindless::storage_binding(dimension, c)) component_class = c;
-            if (component_class < classes)
-                return {VK_NULL_HANDLE, fallback_view_[d][component_class], VK_IMAGE_LAYOUT_GENERAL};
-        }
-        return {};
+        return {VK_NULL_HANDLE, fallback_by_binding_[binding], VK_IMAGE_LAYOUT_GENERAL};
     }
 
     // The table at binding 2 and the fallback at index 0 of every array, or in every element without partially_bound.
@@ -648,7 +715,7 @@ private:
         std::vector<VkWriteDescriptorSet> writes;
         infos.reserve(bindless::bindings.size());
         for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b) {
-            if (b == bindless::table_binding) continue;
+            if (b == bindless::table_binding || !bindless::binding_enabled(b, features_)) continue;
             const std::uint32_t count = features_.partially_bound ? 1 : bindless::bindings[b].count;
             infos.emplace_back(count, fallback_info(b));
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -680,7 +747,17 @@ private:
 
     // Queues every binding of the dimension at `index`: the given views, or the fallback where one is null.
     void write_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
-                     const StorageViews& storage) {
+                     const StorageViews& storage, std::uint32_t sampled_class) {
+        if (bindless::multisampled(dimension)) {
+            for (std::uint32_t c = 0; c < classes; ++c) {
+                if (!supports_ms_class(c)) continue;
+                const auto binding = bindless::sampled_binding(dimension, c);
+                queue(binding, index, c == sampled_class && sampled
+                                          ? VkDescriptorImageInfo{VK_NULL_HANDLE, sampled, sampled_layout}
+                                          : fallback_info(binding));
+            }
+            return;
+        }
         const std::uint32_t sampled_at = bindless::sampled_binding(dimension);
         queue(sampled_at, index,
               sampled ? VkDescriptorImageInfo{VK_NULL_HANDLE, sampled, sampled_layout} : fallback_info(sampled_at));
@@ -703,9 +780,9 @@ private:
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkDescriptorSet set_ = VK_NULL_HANDLE;
-    std::array<FallbackImage, 3 * classes> fallback_images_{};  // [image type: 2D, 3D, 1D][class]
+    std::array<FallbackImage, 4 * classes> fallback_images_{};  // [2D, 3D, 1D, 2D MS][class]
     std::vector<VkImageView> fallback_views_;
-    VkImageView fallback_view_[dimensions][classes] = {};
+    std::array<VkImageView, bindless::bindings.size()> fallback_by_binding_{};
     VkSampler fallback_sampler_ = VK_NULL_HANDLE;
     bool fallbacks_ready_ = false;
     std::array<std::vector<std::uint8_t>, dimensions> image_used_;
