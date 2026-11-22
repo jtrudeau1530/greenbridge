@@ -22,7 +22,7 @@ import struct
 import sys
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
@@ -196,6 +196,22 @@ def _concave_triangles(points: list[tuple[float, float, float]]) -> list[tuple[i
     return triangles
 
 
+def _logical_obj_lines(text: str) -> Iterator[str]:
+    """Yield OBJ logical lines, joining trailing-backslash continuations with a space."""
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1].rstrip() + " "
+            continue
+        yield pending + line
+        pending = ""
+    if pending:
+        yield pending
+
+
 def parse_obj(
     text_or_path: str,
     *,
@@ -246,7 +262,7 @@ def parse_obj(
     # Preserve order of appearance for (group_index, material_name) primitives.
     builders: dict[tuple[int, str], dict] = {}
 
-    for raw_line in text.removeprefix("\ufeff").splitlines():
+    for raw_line in _logical_obj_lines(text.removeprefix("\ufeff")):
         line = raw_line.strip()
         if not line or line[0] == "#":
             continue
