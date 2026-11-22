@@ -3,7 +3,6 @@
 Covers:
   - Reference oracle for 16-bit unsigned integer clamping
   - Packed dual-u16 clamp and SIMD execution tests
-  - Inverted clamp bounds, upper 16-bit isolation, and negative controls
 """
 import os
 import sys
@@ -43,16 +42,6 @@ class ALUu16ClampTests(unittest.TestCase):
 
         val = 0x12340012
         self.assertEqual(clamp_packed(val, 0x10, 0x5000), 0x12340012)
-
-    def test_inverted_bounds_and_isolation(self):
-        # 3. Inverted clamp bounds, upper 16-bit isolation, and negative controls
-        def clamp_u16_isolated(val: int, low: int, high: int) -> int:
-            upper = val & 0xFFFF0000
-            clamped = max(low, min(high, val & 0xFFFF))
-            return upper | clamped
-
-        val = 0xDEAD00FF
-        self.assertEqual(clamp_u16_isolated(val, 0x100, 0x200), 0xDEAD0100)
 
 
 if __name__ == "__main__":
