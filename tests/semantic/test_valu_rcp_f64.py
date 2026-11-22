@@ -790,6 +790,182 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(u64_to_f64(interp.vgpr.get_vgpr_pair(6)), 0.5)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Isolation for v_rcp_f64
+# ==============================================================================
+
+@dataclass
+class StatusFlags:
+    invalid_op: bool = False
+    div_by_zero: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    nan: bool = False
+
+
+def compute_rcp_f64_status_flags(src0: int, result: int) -> StatusFlags:
+    flags = StatusFlags()
+    s0 = src0 & MASK64
+    res = result & MASK64
+
+    # Invalid operation: SNaN operand
+    if is_f64_snan(s0):
+        flags.invalid_op = True
+
+    # Division by zero: 1.0 / +-0.0
+    if is_f64_zero(s0):
+        flags.div_by_zero = True
+
+    if is_f64_nan(res):
+        flags.nan = True
+    else:
+        flags.negative = bool(f64_sign(res))
+        if is_f64_zero(res):
+            flags.zero = True
+            # Finite non-zero input producing zero is underflow
+            if not is_f64_inf(s0):
+                flags.underflow = True
+                flags.inexact = True
+        elif is_f64_inf(res):
+            # Finite non-zero input producing inf is overflow
+            if not is_f64_zero(s0):
+                flags.overflow = True
+                flags.inexact = True
+        else:
+            # Check inexact: test if val0 * res == 1.0 exactly
+            v0 = u64_to_f64(s0)
+            vr = u64_to_f64(res)
+            if v0 * vr != 1.0:
+                flags.inexact = True
+
+    return flags
+
+
+def ref_cmp_f64(op: str, src0: int, src1: int) -> bool:
+    """Evaluate double-precision IEEE-754 comparison condition codes."""
+    if op in ("u", "unordered"):
+        return is_f64_nan(src0) or is_f64_nan(src1)
+
+    if is_f64_nan(src0) or is_f64_nan(src1):
+        return op in ("neq", "ne", "!=")
+
+    v0 = u64_to_f64(src0)
+    v1 = u64_to_f64(src1)
+    if op in ("eq", "=="):
+        return v0 == v1
+    elif op in ("ne", "neq", "!="):
+        return v0 != v1
+    elif op in ("lt", "<"):
+        return v0 < v1
+    elif op in ("le", "<="):
+        return v0 <= v1
+    elif op in ("gt", ">"):
+        return v0 > v1
+    elif op in ("ge", ">="):
+        return v0 >= v1
+    raise ValueError(f"Unknown comparison operator: {op}")
+
+
+def generate_condition_mask_f64(op: str, src0_lanes: list[int], src1_lanes: list[int]) -> int:
+    """Generate a 32-bit or 64-bit condition mask (VCC) from per-lane comparisons."""
+    mask = 0
+    for lane, (s0, s1) in enumerate(zip(src0_lanes, src1_lanes)):
+        if ref_cmp_f64(op, s0, s1):
+            mask |= (1 << lane)
+    return mask
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_status_flags_div_by_zero(self) -> None:
+        # 1.0 / +0.0 = +Inf
+        res = ref_rcp_f64(F64_POS_ZERO)
+        flags = compute_rcp_f64_status_flags(F64_POS_ZERO, res)
+        self.assertTrue(flags.div_by_zero)
+        self.assertFalse(flags.invalid_op)
+        self.assertFalse(flags.negative)
+
+        # 1.0 / -0.0 = -Inf
+        res_neg = ref_rcp_f64(F64_NEG_ZERO)
+        flags_neg = compute_rcp_f64_status_flags(F64_NEG_ZERO, res_neg)
+        self.assertTrue(flags_neg.div_by_zero)
+        self.assertTrue(flags_neg.negative)
+
+    def test_status_flags_invalid_operation(self) -> None:
+        # SNaN input
+        snan = (F64_POS_INF | 0x0001000000000000) & ~F64_QUIET_BIT
+        res_snan = ref_rcp_f64(snan)
+        flags_snan = compute_rcp_f64_status_flags(snan, res_snan)
+        self.assertTrue(flags_snan.invalid_op)
+        self.assertTrue(flags_snan.nan)
+
+    def test_status_flags_overflow(self) -> None:
+        # Subnormal input reciprocal overflows to infinity
+        res = ref_rcp_f64(F64_MIN_SUBNORMAL)
+        flags = compute_rcp_f64_status_flags(F64_MIN_SUBNORMAL, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+        self.assertEqual(res, F64_POS_INF)
+
+    def test_status_flags_zero_and_negative(self) -> None:
+        # 1.0 / -2.0 = -0.5 (negative, non-zero)
+        v0 = f64_to_u64(-2.0)
+        r1 = ref_rcp_f64(v0)
+        flags1 = compute_rcp_f64_status_flags(v0, r1)
+        self.assertTrue(flags1.negative)
+        self.assertFalse(flags1.zero)
+
+        # 1.0 / -Inf = -0.0 (negative zero)
+        r2 = ref_rcp_f64(F64_NEG_INF)
+        flags2 = compute_rcp_f64_status_flags(F64_NEG_INF, r2)
+        self.assertTrue(flags2.negative)
+        self.assertTrue(flags2.zero)
+
+    def test_vcc_and_scc_preserved(self) -> None:
+        # Floating point v_rcp_f64 does not generate carry/borrow and never modifies VCC or SCC
+        interp = ScalarInterpreter()
+        interp.vcc = 0x12345678_9ABCDEF0
+        interp.scc = 1
+        interp.vgpr.set_vgpr_pair(2, F64_FOUR)
+
+        interp.execute_asm("v_rcp_f64 v[0:1], v[2:3]")
+        self.assertEqual(interp.vcc, 0x12345678_9ABCDEF0)
+        self.assertEqual(interp.scc, 1)
+
+        sim = SIMDWavefront(wave_size=32)
+        sim.vcc = 0xCAFEBABE
+        sim.store_vgpr_pair_wave(2, [F64_TWO] * 32)
+        sim.step_v_rcp_f64(0, 2)
+        self.assertEqual(sim.vcc, 0xCAFEBABE)
+
+    def test_condition_code_generation(self) -> None:
+        v_zero = [F64_POS_ZERO] * 4
+        # Four inputs: [-2.0, +Inf, 2.0, NaN]
+        # Their reciprocals: [-0.5, +0.0, 0.5, NaN]
+        s0 = [f64_to_u64(-2.0), F64_POS_INF, f64_to_u64(2.0), F64_CANONICAL_QNAN]
+        rcps = [ref_rcp_f64(x) for x in s0]
+
+        # Compare < 0: only lane 0 (-0.5 < 0) -> bit 0
+        mask_lt = generate_condition_mask_f64("<", rcps, v_zero)
+        self.assertEqual(mask_lt, 0b0001)
+
+        # Compare == 0: only lane 1 (+0.0 == 0) -> bit 1
+        mask_eq = generate_condition_mask_f64("==", rcps, v_zero)
+        self.assertEqual(mask_eq, 0b0010)
+
+        # Compare > 0: only lane 2 (0.5 > 0) -> bit 2
+        mask_gt = generate_condition_mask_f64(">", rcps, v_zero)
+        self.assertEqual(mask_gt, 0b0100)
+
+        # Compare unordered: only lane 3 (NaN) -> bit 3
+        mask_u = generate_condition_mask_f64("u", rcps, v_zero)
+        self.assertEqual(mask_u, 0b1000)
+
+
 class TestScalarInterpreter(unittest.TestCase):
     """Test suite for deterministic scalar instruction interpreter."""
 
