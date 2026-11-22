@@ -468,7 +468,7 @@ def write_output(path, records, summary, all_strings=False):
             json.dump({"summary": summary, "files": docs}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\n")
         writer.writerow(COLUMNS)
         for r in records:
             sample = "; ".join(r["sample"])

@@ -321,7 +321,8 @@ def main(argv=None) -> int:
                     json.dump({"summary": summary, "streams": rows}, fh, indent=1)
             else:
                 with open(a.out, "w", encoding="utf-8", newline="") as fh:
-                    w = csv.DictWriter(fh, fieldnames=["source", "bank", "stream_id", "name", "rule"])
+                    w = csv.DictWriter(fh, fieldnames=["source", "bank", "stream_id", "name", "rule"],
+                                       lineterminator="\n")
                     w.writeheader()
                     w.writerows(rows)
         except OSError as error:

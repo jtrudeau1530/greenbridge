@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <XAsync.h>
@@ -98,6 +99,31 @@ HRESULT CALLBACK provider(XAsyncOp op, const XAsyncProviderData* data) {
     }
 }
 
+HMODULE g_teardown_rt_mod = nullptr;
+FARPROC(WINAPI* g_teardown_get_proc)(HMODULE, LPCSTR) = nullptr;
+BOOL(WINAPI* g_teardown_free_lib)(HMODULE) = nullptr;
+
+// Registered with std::atexit before check_run_time_load() constructs any function-local statics in library_loader.
+// LIFO atexit order means this runs after those statics would have been destroyed, simulating mapped-DLL
+// DLL_PROCESS_DETACH or earlier atexit handlers calling GetProcAddress/FreeLibrary on a pseudo-handle during exit.
+void check_late_teardown() {
+    if (!g_teardown_rt_mod || !g_teardown_get_proc || !g_teardown_free_lib) return;
+    if (g_teardown_get_proc(g_teardown_rt_mod, "UninitializeApiImpl") == nullptr) {
+        std::fprintf(stderr, "FAIL late teardown GetProcAddress on pseudo-handle\n");
+        std::_Exit(1);
+    }
+    SetLastError(0);
+    if (g_teardown_get_proc(g_teardown_rt_mod, "LateTeardownMissingSymbol") != nullptr ||
+        GetLastError() != ERROR_PROC_NOT_FOUND) {
+        std::fprintf(stderr, "FAIL late teardown unserved GetProcAddress on pseudo-handle\n");
+        std::_Exit(1);
+    }
+    if (g_teardown_free_lib(g_teardown_rt_mod) != TRUE) {
+        std::fprintf(stderr, "FAIL late teardown FreeLibrary on pseudo-handle\n");
+        std::_Exit(1);
+    }
+}
+
 // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
 // names (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path through the loader shims,
 // bound by the api set XCurl.dll imports them from, as a mapped image would be.
@@ -136,6 +162,9 @@ void check_run_time_load() {
     SetLastError(0);
     check(get_proc(rt_mod, "NoSuchRuntimeFunction") == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
           "an unserved name is NULL with ERROR_PROC_NOT_FOUND, as from a real module");
+    SetLastError(0);
+    check(get_proc(rt_mod, nullptr) == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
+          "a null proc name is NULL with ERROR_PROC_NOT_FOUND");
 
     struct Options {
         uint32_t unknown;
@@ -162,6 +191,10 @@ void check_run_time_load() {
           "GetProcAddress on a host module is the host's");
     check(free_lib(rt_mod) == TRUE && load_w(L"xgameruntime.dll") == rt_mod,
           "FreeLibrary on the runtime succeeds and keeps it loaded");
+
+    g_teardown_rt_mod = rt_mod;
+    g_teardown_get_proc = get_proc;
+    g_teardown_free_lib = free_lib;
 }
 
 }  // namespace
@@ -262,6 +295,7 @@ int main() {
     check(init() == S_OK, "XGameRuntimeInitialize works again after balanced uninitialize calls");
     uninit();
 
+    std::atexit(check_late_teardown);
     check_run_time_load();
 
     if (g_failures) {

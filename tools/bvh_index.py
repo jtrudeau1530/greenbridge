@@ -363,7 +363,7 @@ def write_outputs(rows, summaries, out, csv_path):
                 "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             for r in rows:
                 r = dict(r)

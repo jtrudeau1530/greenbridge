@@ -396,7 +396,11 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
 
 
 def _directory_files(path):
-    for root, _, files in os.walk(path):
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    # A partial walk must fail before the caller starts writing reports.
+    for root, _, files in os.walk(path, onerror=scan_failed):
         for name in sorted(files):
             yield os.path.join(root, name)
 
@@ -748,7 +752,7 @@ def _write_reports(a, rows, stats, agg):
                 "position_max", "lod", "lod_dist_min", "lod_dist_max"]
         os.makedirs(os.path.dirname(os.path.abspath(a.csv)), exist_ok=True)
         with open(a.csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             for r in rows:
                 r = dict(r)

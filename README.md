@@ -44,6 +44,7 @@ work on booting can start as soon as one is available to a developer.
 
 | What | Status |
 |---|---|
+| Booting, story mode, anything playable | ❌ No |
 | Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
 | Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
 | Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503 translated**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry, with a per-shader metadata index for pipeline creation. All 26,503 passed `spirv-val` in the [LLVM 23.1.5 Linux run at `c432cdc`](https://github.com/ItsNotRexed/Leonida/issues/644#issuecomment-7072972586). A [full-corpus run at `43d4703`](https://github.com/ItsNotRexed/Leonida/issues/881#issuecomment-7075507328) also validated all 26,503 after the SPIR-V ID-bound fix. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD). On 32-wide subgroups (NVIDIA, Intel), compute and mesh shaders are exact with wave64 emulation (`--wave64-emulate`, on by default there); cross-half wave ops in vertex, pixel and geometry shaders are still approximate |
@@ -54,7 +55,7 @@ work on booting can start as soon as one is available to a developer.
 | Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
 | PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Controllers through a GameInput shim on SDL3 (any controller SDL supports, rumble, DualSense trigger effects and lightbar; built when SDL3 is installed or with `-DLEONIDA_SDL3_FETCH=ON`, [notes](docs/gameinput.md)). `--trace-d3d12` logs every D3D12 call and its outcome for the first boot. Untested against the real executable |
 | Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed and reserved resources, render-target and depth views (3D targets included), texture views and samplers (2D, cube and 3D views, the depth and stencil planes of depth-stencil textures, packed formats such as B5G6R5, B4G4R4A4 and R9G9B9E5; they go into the bindless set), and query heaps. Barriers, clears, uploads, copies (BC included), colour resolves, predication, CPU-side texture reads and writes, and occlusion, timestamp and pipeline-statistics queries run on Vulkan, checked on one GPU. No buffer views, root signatures, pipelines, draws, placed resources, 1D textures or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
-| Booting, story mode, anything playable | ❌ No |
+
 
 ## How to build
 
@@ -110,7 +111,10 @@ python -I make_game.py --wave64-emulate off            # auto (default), on or o
 (see "Wave64 emulation" in [docs/design.md](docs/design.md)). NVIDIA and Intel GPUs have 32-wide subgroups and need
 it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns it on unless every GPU reports 64-wide
 subgroups, or when it can't tell; it also turns it on when the GPU the runtime would use can't be made to run
-compute and mesh shaders 64-wide. The mode is saved next to the translated shaders, and changing it translates them
+compute and mesh shaders 64-wide. One exception keeps it off: when the runtime's GPU is an RDNA2 card or iGPU
+(RX 6000, Ryzen 6000/7000/9000 graphics) on AMD's Windows driver and runs wave64 natively, because that driver's
+shader compiler crashes on emulated LDS code (#857); an Intel iGPU next to an RX 6000 card would otherwise turn it on.
+The mode is saved next to the translated shaders, and changing it translates them
 again. With `auto`, a work folder that previously used emulation keeps it for later translations and retries, even if
 the current GPU supports native wave64. Use `--wave64-emulate off` to translate it natively.
 

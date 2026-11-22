@@ -449,6 +449,30 @@ class TranslatorValueSemantics(unittest.TestCase):
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
 
+    def test_signed_typed_buffers(self):
+        spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)
+        memory = {}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)
+        expected = {
+            0x0C: 1,                         # MUBUF integer DST_SEL=1
+            0x18: 0xFFFFFFFD,                # MUBUF 96-bit format, third component
+            0x34: 0x7FFFFFFF, 0x38: 0,       # MTBUF 64-bit format with absent third component
+            0x48: 0xFFFFFFFD, 0x4C: 0,       # MTBUF 96-bit format with absent fourth component
+            0x58: 0xFFFFFFFD, 0x5C: 17,      # MTBUF 128-bit format
+            0x60: 0x7FFF8000, 0x64: 0x0011FFFD,
+            0x68: 0x7FFF8000, 0x6C: 0x0011FFFD,
+            0x70: 0xFFFFFFFD, 0x74: 0xFFFFFFFD,
+            0x90: 0x80000000, 0xA8: 0xFFFFFFFD, 0xBC: 17,
+            0xC0: 0xFFFFFFFD, 0xC4: 0xFFFF8000, 0xC8: 0xFFFFFFFD,
+        }
+        for address, word in expected.items():
+            with self.subTest(address=hex(address)):
+                self.assertEqual(memory.get(address), word)
+        for address in (0x98, 0xAC, 0xCC):
+            self.assertNotIn(address, memory)
+
     def test_s_ff0_s_ff1_read_an_immediate_as_a_value(self):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
         # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
