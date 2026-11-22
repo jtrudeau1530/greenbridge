@@ -113,6 +113,14 @@ To test the wave64 emulation that makes them exact on these GPUs, set `LEONIDA_W
 `check.py`, the shaders are checked against the emulated expectations without being emulated, and every wave64 test
 fails.
 
+## GPUs without mesh shaders (NVIDIA Pascal and older)
+
+Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that
+runs them anyway, set `LEONIDA_MESH_COMPUTE=1` for `run_gpu_tests.py`, together with `LEONIDA_W64_EMULATE=1` on a
+32-wide GPU (every mesh shader is wave64). The mesh shaders are then translated with `--mesh-compute`, dispatched as
+compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders as compute"), so the device needs
+`bufferDeviceAddress` and `shaderInt64` instead.
+
 ## Without a GPU: Mesa llvmpipe
 
 Mesa's llvmpipe is a software Vulkan driver (`mesa-vulkan-drivers` on Debian and Ubuntu). CI runs the suite on it

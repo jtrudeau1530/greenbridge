@@ -327,6 +327,31 @@ def check_mesh_v5(data):
     return f"{len(errors)}/24 mismatches; first {errors[0]}" if errors else ""
 
 
+# LEONIDA_MESH_COMPUTE=1 (for run_gpu_tests.py, which builds the mesh fixtures): the mesh shaders were translated
+# with rdna2spirv.py --mesh-compute, and vk_harness dispatches each as compute and draws its slots with the vertex
+# shader tools/mesh_compute_vs.py wrote (<name>.mesh_vs.spv), so they run without VK_EXT_mesh_shader.
+MESH_COMPUTE = os.environ.get("LEONIDA_MESH_COMPUTE") == "1"
+
+
+def mesh_env(spirv, name, base=None):
+    """vk_harness environment for mesh shader `name`: VKH_MESH=1, or under LEONIDA_MESH_COMPUTE=1 the
+    --mesh-compute variables (vertex shader, slot bytes and primitive count from index.json's mesh_compute)."""
+    env = dict(base if base is not None else os.environ)
+    if MESH_COMPUTE:
+        vs = Path(spirv) / f"{name}.mesh_vs.spv"
+        try:
+            with open(Path(spirv) / "index.json", encoding="utf-8") as f:
+                lay = json.load(f).get(name, {}).get("mesh_compute")
+        except (OSError, ValueError):
+            lay = None
+        if lay and vs.is_file():
+            env.update(VKH_MESH_COMPUTE=str(vs), VKH_MESH_SLOT=str(lay["slot_bytes"]),
+                       VKH_MESH_PRIMS=str(lay["max_primitives"]))
+            return env
+    env["VKH_MESH"] = "1"
+    return env
+
+
 def mesh_v5_test(tools, spirv, raw):
     shader = Path(spirv) / "ms_v5_workgroup.spv"
     if not shader.is_file():
@@ -334,7 +359,8 @@ def mesh_v5_test(tools, spirv, raw):
     fs = Path(spirv) / "fs_passthru.spv"
     if not fs.is_file():
         return "missing fs_passthru.spv"
-    code, out = run(os.path.join(tools, "vk_harness" + EXE), shader, fs, raw, "--mesh-group-readback", "2", "3", "4")
+    code, out = run(os.path.join(tools, "vk_harness" + EXE), shader, fs, raw, "--mesh-group-readback", "2", "3", "4",
+                    env=mesh_env(spirv, "ms_v5_workgroup"))
     if code == UNSUPPORTED:
         return Skip("SKIP (mesh shading unavailable)")
     if code or not raw.is_file():
@@ -443,7 +469,7 @@ def mesh_w64x_test(tools, spirv, name):
     shader, fs = os.path.join(spirv, name + ".spv"), os.path.join(spirv, "fs_passthru.spv")
     if not (os.path.isfile(shader) and os.path.isfile(fs)):
         return Skip("SKIP (mesh shader: build it with scripts/run_gpu_tests.py, build.py does not)")
-    env = dict(os.environ, VKH_MESH="1")
+    env = mesh_env(spirv, name)
     if not W64_EMULATED:
         env["VKH_SUBGROUP_SIZE"] = "64"
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
