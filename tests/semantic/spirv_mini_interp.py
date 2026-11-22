@@ -9,9 +9,10 @@ Design rules (see tests/semantic/README.md):
     emitting something new makes the test error out instead of passing.
   * One invocation (one lane), or with run_workgroup several in lockstep, which meet only at
     subgroup operations (Shuffle, Ballot, Any, All, BitwiseOr Reduce; BallotBitExtract and BallotFindLSB
-    are per lane). Control flow is the forward-only discard test and the forward merge/dynamic-bounds
-    branches the translator emits: OpBranch / OpBranchConditional to a later label plus OpPhi at the merge block.
-    Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
+    are per lane). Control flow is followed one branch at a time: OpBranch / OpBranchConditional to a label
+    of the function (forward, or backward for a loop, up to 10000 backward branches), OpPhi (the phis of a
+    block take their values together) and OpFunctionCall of a function of the module.
+    Switches are rejected. Function/Output/Input variables live in Python
     boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores (and 32-bit
     atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary, so they
     must be 32-bit integers at 4-byte-aligned addresses (anything else raises). Workgroup variables (LDS) are
@@ -658,10 +659,18 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             pc = labels[target]
             continue
         if op == "OpPhi":
-            incoming = [a[i] for i in range(1, len(a) - 1, 2) if a[i + 1] == prev_label]
-            if len(incoming) != 1:
-                raise UnsupportedConstruct("OpPhi with an unknown predecessor")
-            values[res] = val(incoming[0])
+            # The OpPhi of a block all read the values from before the block (a later one that names an earlier
+            # one, as in a swap in a loop header, gets its old value), so the first evaluates the whole run.
+            if body[pc - 2][1] != "OpPhi":
+                phi_new, k = {}, pc - 1
+                while k < len(body) and body[k][1] == "OpPhi":
+                    b = body[k][2]
+                    incoming = [b[i] for i in range(1, len(b) - 1, 2) if b[i + 1] == prev_label]
+                    if len(incoming) != 1:
+                        raise UnsupportedConstruct("OpPhi with an unknown predecessor")
+                    phi_new[body[k][0]] = val(incoming[0])
+                    k += 1
+            values[res] = phi_new.pop(res)
             continue
         if op in _PURE and any(values.get(x) is UNDEF for x in a[1:]):
             values[res] = UNDEF
