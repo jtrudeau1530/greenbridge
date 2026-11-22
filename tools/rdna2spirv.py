@@ -1382,6 +1382,43 @@ class Gen:
                    "and": ("OpAtomicAnd", 0xFFFFFFFF), "or": ("OpAtomicOr", 0), "xor": ("OpAtomicXor", 0),
                    "swap": ("OpAtomicExchange", None), "cmpswap": ("OpAtomicCompareExchange", None)}
 
+    def global_atomic(self, op, a, mods):
+        """global_atomic_<op> [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: a 32-bit atomic at the global_* address
+        (RDNA2 ISA, FLAT/GLOBAL). With glc the pre-op value lands in vdst (the first operand); without it there is no
+        vdst. cmpswap takes vdata as a pair {DATA, CMP}: M = (M == CMP) ? DATA : M. Inactive lanes don't touch memory
+        and keep vdst. The _x2 (64-bit) forms, inc/dec and the float atomics stay Unsupported."""
+        kind = op[len("global_atomic_"):]
+        if kind not in self.BUF_ATOMICS or any(m in mods for m in ("slc", "dlc", "lds")):
+            raise Unsupported(op if kind not in self.BUF_ATOMICS else op + " form")
+        rtn = "glc" in mods
+        if len(a) != (4 if rtn else 3):
+            raise Unsupported(op + " operands")
+        vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != (2 if kind == "cmpswap" else 1) or \
+                (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 1)):
+            raise Unsupported(op + " operands")
+        full = self.global_address(op, vaddr, saddr, mods)
+        val = self.load_reg("vgpr", vdata["r"])
+        cmp = self.load_reg("vgpr", vdata["r"] + 1) if kind == "cmpswap" else None
+        old_d = self.load_reg("vgpr", vdst["r"]) if vdst is not None else self.cu(0)
+        lbl_do, lbl_end, res, old = self.tmp() + "_do", self.tmp() + "_end", self.tmp(), self.tmp()
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {self.active_b()} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        ptr, p = self.tmp(), self.tmp()
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+        self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
+        if kind == "cmpswap":
+            self.emit(f"{res} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmp}")
+        else:
+            self.emit(f"{res} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {val}")
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        self.emit(f"{old} = OpPhi %uint {res} {lbl_do} {old_d} {pre}")
+        if vdst is not None:
+            self.store_reg("vgpr", vdst["r"], old)
+
     def buffer_atomic(self, op, a, mods):
         """buffer_atomic_<op> vdata, vaddr, s[V#], soffset ...: 32-bit atomic at the element address (buffer device
         address). With 'glc' the pre-op value is returned in vdata. Inactive lanes don't touch memory."""
@@ -1648,17 +1685,9 @@ class Gen:
                 self.emit(f"{r} = OpSelect %uint {is_int} {pi} {ph}")
                 self.dst(dest, r)
 
-    def global_mem(self, op, a, mods):
-        """global_load_dword[xN] vD, vaddr, saddr|off offset:N / global_store_dword[xN] vaddr, vD, saddr|off.
-        Address = (saddr: 64-bit SGPR pair + zero-extended 32-bit vaddr | off: 64-bit VGPR pair) + offset,
-        an Xbox GPU VA translated through the heap base. Stores and loads only take effect in active lanes."""
-        load = op.startswith("global_load")
-        if any(m in mods for m in ("lds", "tfe", "d16")):
-            raise Unsupported(op + " form")
-        sub = {"global_load_ushort": (16, False), "global_load_sshort": (16, True),
-               "global_load_ubyte": (8, False), "global_load_sbyte": (8, True)}.get(op)
-        n = 1 if (op.endswith("dword") or sub) else int(op.rsplit("x", 1)[1])
-        data, vaddr, saddr = (a[0], a[1], a[2]) if load else (a[1], a[0], a[2])
+    def global_address(self, op, vaddr, saddr, mods):
+        """The 64-bit Xbox GPU VA a global_* instruction accesses (ulong id): (saddr: 64-bit SGPR pair + zero-extended
+        32-bit vaddr | off: 64-bit VGPR pair) + the signed 12-bit instruction offset."""
         # The instruction offset is a 12-bit signed byte offset, and llvm-mc prints it signed (offset:-4 for the
         # field 0xffc; it rejects offset:0xffc and anything outside -2048..2047), which is the only spelling the
         # disassembler and build.py deliver. RX 6800 (gfx1030): pointer 0x1000, offset:-4 reads byte 0xffc.
@@ -1701,6 +1730,20 @@ class Gen:
         self.emit(f"{o2} = OpBitcast %ulong {off64}")
         self.emit(f"{full} = OpIAdd %ulong {va} {o2}")
         self.uses_long = True
+        return full
+
+    def global_mem(self, op, a, mods):
+        """global_load_dword[xN] vD, vaddr, saddr|off offset:N / global_store_dword[xN] vaddr, vD, saddr|off.
+        Address = (saddr: 64-bit SGPR pair + zero-extended 32-bit vaddr | off: 64-bit VGPR pair) + offset,
+        an Xbox GPU VA translated through the heap base. Stores and loads only take effect in active lanes."""
+        load = op.startswith("global_load")
+        if any(m in mods for m in ("lds", "tfe", "d16")):
+            raise Unsupported(op + " form")
+        sub = {"global_load_ushort": (16, False), "global_load_sshort": (16, True),
+               "global_load_ubyte": (8, False), "global_load_sbyte": (8, True)}.get(op)
+        n = 1 if (op.endswith("dword") or sub) else int(op.rsplit("x", 1)[1])
+        data, vaddr, saddr = (a[0], a[1], a[2]) if load else (a[1], a[0], a[2])
+        full = self.global_address(op, vaddr, saddr, mods)
         act = self.active_b()
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
         if load:
@@ -5100,6 +5143,8 @@ class Gen:
             z = self.tmp()
             self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {z}")
+        elif op.startswith("global_atomic_"):
+            self.global_atomic(op, a, mods)
         elif op.startswith(("global_load_dword", "global_store_dword")) or \
                 op in ("global_load_ushort", "global_load_sshort", "global_load_ubyte", "global_load_sbyte"):
             self.global_mem(op, a, mods)
@@ -8952,7 +8997,8 @@ def read_before_write_vgprs(insns):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(("exp", "buffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write", "global_store"))
+        reads_all = op.startswith(("exp", "buffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write", "global_store")) \
+            or (op.startswith("global_atomic_") and "glc" not in ins["mods"])   # no vdst without glc
         regs = []
         for x in (a if reads_all else a[1:]):
             if x["k"] == "vgpr":
