@@ -1,6 +1,6 @@
 # Following a mesh from its material to a pixel shader
 
-A stored effect can offer several ways to draw the same mesh. On one Xbox 1.0.2.1 drawable, the first geometry selects material slot 0. Its effect has 45 techniques. One vertex/pixel pair writes a packed integer target. Two other techniques pair a mesh shader with a textured pixel shader that reads the material's stored values. The active technique for a particular frame remains unknown.
+A stored effect can offer several ways to draw the same mesh. On one Xbox 1.0.2.1 drawable, the first geometry selects material slot 0. Its effect has 45 techniques. One vertex/pixel pair writes a packed integer target. Two other techniques each pair a mesh shader with a pixel shader that declares textures. The first of those pixel shaders directly reads the drawable's stored material constants. The active technique for a particular frame remains unknown.
 
 ## Identify the draw
 
@@ -27,4 +27,4 @@ Two further cases varied the buffer word and crossed a half-precision quantizati
 
 Compare pixel-stage declarations across the same material's passes. The packed pass has no texture or sampler declaration. The textured sibling declares a 272-byte material constant buffer. Of its 46 authored members, 45 match the program by hash and byte offset. For the last member, the effect's parameter record supplies both the authored and compiled name hashes at the same offset. A different material slot gave only 11 direct matches. The textured shader reads the stored values and uses the first texture handle for a 2-D RGB sample. The drawable supplies four texture references across five declarations. The live handle table, sampler, and the descriptor used for the empty declaration still need independent verification.
 
-Both tested color techniques' mesh and pixel programs translated and passed Vulkan 1.2 SPIR-V validation, including the translator's 32-lane emulation of the mesh stages' 64-lane waves. That check covers the modules. Reproducing final appearance also requires their draw constants, descriptors, transforms, and the frame's pass selection.
+Both tested color techniques' mesh and pixel programs translated and passed Vulkan 1.2 SPIR-V validation, including the translator's 32-lane emulation of the mesh stages' 64-lane waves. The stage-interface checker also found compatible mesh outputs and pixel inputs for each original pair in both modes. Reproducing final appearance still requires their draw constants, descriptors, transforms, and the frame's pass selection.
