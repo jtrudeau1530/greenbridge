@@ -247,6 +247,19 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(mhiu["grid"]["width"], 300)
         self.assertEqual(mhiu["grid"]["height"], 1)
 
+    def test_groups_a_continuation_after_a_128k_first_stream(self):
+        # The header's size bounds the join, so a first stream of any whole number of 64 KiB blocks continues.
+        payload = mhiu_payload(300, 1, [(0, 300, [i % 256 for i in range(300)])], pixels=b"\x07" * 150000)
+        self.assertGreater(len(payload), 2 * 65536)
+        self.add(payload, [payload[:2 * 65536], payload[2 * 65536:]])
+        self.finish()
+
+        p, data = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        mhiu = data["payloads"][0]
+        self.assertEqual(mhiu["chunks"], 2)
+        self.assertEqual(mhiu["grid"]["width"], 300)
+
     def test_reports_an_unwritable_json_destination(self):
         self.finish()
         out = os.path.join(self.root, "missing", "maps.json")
