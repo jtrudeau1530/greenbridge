@@ -485,6 +485,26 @@ class MeshletCentreTests(unittest.TestCase):
         self.assertNotIn("faces_4240_shared_edges", checks)
 
 
+class SlotTagTests(unittest.TestCase):
+    def test_tag_stride(self):
+        self.assertEqual([mp.tag_stride(x) for x in (0x63, 0x42, 0x26, 0x28, 0x21, 0x27)], [12, 8, 4, 4, 4, 4])
+        self.assertIsNone(mp.tag_stride(0x25))   # type 5 is not seen
+        self.assertIsNone(mp.tag_stride(0x02))   # stride 0
+        self.assertEqual(mp.tag_stride(0x46), 8)  # RGBA8-type tag with an 8-byte stride: sized by the rule
+
+    def test_block_sized_by_tag_rule(self):
+        # slot 3 has tag 0x48 (type 8, 8 bytes): not in the old per-tag table, sized by the rule
+        tags = ((0, 0x42, 8), (2, 0x21, 4), (3, 0x48, 8), (1, 0x26, 4))
+        data = page(other_block(10, tags=tags), group([(10, 6)]))
+        chunks = mp.parse_page(data)
+        self.assertEqual([c["kind"] for c in chunks], ["block4240", "group"])
+        self.assertEqual(chunks[1]["offset"] - chunks[0]["offset"], 0x80 + 10 * (8 + 4 + 8 + 4))
+        # a type that is not seen is still not a block: such a page is not a mesh page
+        bad = page(other_block(10, tags=((0, 0x42, 8), (2, 0x25, 4))), group([(10, 6)]))
+        self.assertFalse(mp.is_mesh_page(bad))
+        self.assertIn("error", mp.summarise_page(bad, "x"))
+
+
 class CliTests(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)

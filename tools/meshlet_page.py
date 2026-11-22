@@ -12,7 +12,7 @@ Vertex block (header 0x60 bytes, first u32 is 0x00003063):
     slot 2  tag 0x63  12 bytes/vertex  float3 normal (absent in some blocks)
     slot 3  tag 0x42   8 bytes/vertex  float2
     slot 4  tag 0x42   8 bytes/vertex  float2 (absent in some blocks)
-    a slot past 4 (seen: slot 12, tag 0x26) takes its tag's stride from the `42 40` table below
+    a slot past 4 (seen: slot 12, tag 0x26) takes its tag's stride (the tag rule below)
     The streams are stored in slot order 0, 2, 1, 3, 4. Only slot 0 is required. The vertex count is the span
     from slot 0 to the next stream in offset order, divided by 12; the block ends 8 * count bytes after its last
     slot.
@@ -35,8 +35,9 @@ Meshlet group (first u32 has bit 31 set):
     +0x00..+0x58  23 slot words, encoded as above. Slot 0 is always tag 0x42 at offset 0x80.
     +0x5C         u32, 0x200 (as in the `63 30` block)
     +0x60         f32 x3 bias        +0x6C  u32 axis order, 0, 1 or 2
-    +0x70         f32 x3 scale       +0x7C  4.0f in every block measured
-    per-vertex stride by tag: 0x42 = 8 bytes, 0x21, 0x26, 0x27 and 0x28 = 4 bytes. The vertex count is the span
+    +0x70         f32 x3 scale       +0x7C  f32 UV scale for type-8 slots (4.0f in every block measured)
+    A slot tag byte is (stride / 4) << 5 | type (tag_stride, SLOT_TYPES): 0x42 = 8 bytes, 0x21, 0x26, 0x27 and
+    0x28 = 4 bytes, and 0x63 in the `63 30` block = 12 bytes. The vertex count is the span
     from slot 0 to the next stream divided by 8; every stream is stride * count bytes and the block ends there.
     Measured over every `42 40` block of `shared_minigame000.rpf`: 14,671 fit this exactly, and each one is
     followed by a `42 40` block, a meshlet group, a `63 30` block or the end of the stream.
@@ -73,7 +74,16 @@ SLOT_COUNT = 23
 SLOT_STRIDE = {0: 12, 1: 4, 2: 12, 3: 8, 4: 8}
 SLOT_TAG = {0: 0x63, 1: 0x26, 2: 0x63, 3: 0x42, 4: 0x42}
 OTHER_HEADER_SIZE = 0x80
-OTHER_TAG_STRIDE = {0x42: 8, 0x21: 4, 0x26: 4, 0x27: 4, 0x28: 4}
+# A slot tag byte is (stride / 4) << 5 | type, as rpf9-explorer's RageModelDecoder reads vertex slots. Types seen in
+# shared_minigame000.rpf: 1, 2, 3, 6, 7, 8; a tag of another type is not taken as a slot.
+SLOT_TYPES = {1: "4-byte, not decoded", 2: "2 x f32 or a packed position", 3: "3 x f32", 6: "RGBA8",
+              7: "4-byte, not decoded", 8: "2 x snorm16 UV, scaled by the 42 40 header's +0x7C"}
+
+
+def tag_stride(tag):
+    """Bytes per vertex for a slot tag (bits 5-7 times 4), or None for a type not seen or a zero stride."""
+    stride = ((tag >> 5) & 7) * 4
+    return stride if stride and (tag & 15) in SLOT_TYPES else None
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 
 
@@ -107,7 +117,7 @@ def parse_block(data, at):
         raise PageError(f"block at +0x{at:x}: slot {order[1]} offset is not 12 * count past slot 0")
     count = span // SLOT_STRIDE[0]
     for here, nxt in zip(order, order[1:]):
-        stride = SLOT_STRIDE.get(here, OTHER_TAG_STRIDE.get(slots[here][0]))   # a slot past 4: its tag's stride
+        stride = SLOT_STRIDE.get(here, tag_stride(slots[here][0]))   # a slot past 4: its tag's stride
         if stride is None or slots[nxt][1] - slots[here][1] != stride * count:
             raise PageError(f"block at +0x{at:x}: slot {here} size is not stride * count")
     last = order[-1]
@@ -131,20 +141,20 @@ def parse_other_block(data, at):
     if words[0] != OTHER_BLOCK_MAGIC:
         raise PageError(f"no 42 40 block magic at +0x{at:x}")
     slots = {i: (w & 0xFF, (w >> 8) * 2) for i, w in enumerate(words[:SLOT_COUNT]) if w}
-    if any(tag not in OTHER_TAG_STRIDE for tag, _ in slots.values()):
+    if any(tag_stride(tag) is None for tag, _ in slots.values()):
         raise PageError(f"42 40 block at +0x{at:x} has a slot tag with no known stride")
     order = sorted(slots, key=lambda i: slots[i][1])
     if len(order) < 2 or order[0] != 0 or slots[0][1] != OTHER_HEADER_SIZE:
         raise PageError(f"42 40 block at +0x{at:x}: slot 0 is not at +0x80 or has no stream after it")
     span = slots[order[1]][1] - OTHER_HEADER_SIZE
-    if span <= 0 or span % OTHER_TAG_STRIDE[slots[0][0]]:
+    if span <= 0 or span % tag_stride(slots[0][0]):
         raise PageError(f"42 40 block at +0x{at:x}: slot 0 span is not a whole number of vertices")
-    count = span // OTHER_TAG_STRIDE[slots[0][0]]
+    count = span // tag_stride(slots[0][0])
     for here, nxt in zip(order, order[1:]):
-        if slots[nxt][1] - slots[here][1] != OTHER_TAG_STRIDE[slots[here][0]] * count:
+        if slots[nxt][1] - slots[here][1] != tag_stride(slots[here][0]) * count:
             raise PageError(f"42 40 block at +0x{at:x}: slot {here} size is not stride * count")
     last = order[-1]
-    end = at + slots[last][1] + OTHER_TAG_STRIDE[slots[last][0]] * count
+    end = at + slots[last][1] + tag_stride(slots[last][0]) * count
     if end > len(data):
         raise PageError(f"42 40 block at +0x{at:x} runs past the page end")
     record = {"kind": "block4240", "offset": at, "vertices": count, "flags": words[23], "axis": words[27],
