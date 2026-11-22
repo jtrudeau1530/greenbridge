@@ -177,15 +177,14 @@ silhouette is geometry, not a painted-on atlas.
   index to a drawable plus texture. The first is height and body-shape presets
   (`SCALE_PLAYER_STORY000_00` is 1.62 m); the second lists gameplay components. Slot selection
   from names is a heuristic, not the game's rule.
-- **Lucia's hair.** Her three named hair drawables are 3-vertex / 1-triangle placeholders. Across
-  all characters, 241 of 329 hair rows are 3-vertex placeholders, but 68 have more than 100
-  vertices, so real hair geometry does exist for some characters. A static export of Lucia is bald
-  by design, not by a missing decode.
-- **Lucia's hair.** The `packs.rpf` manifest lists three `player_story000_00` hair drawables, and
-  the decoded export resolves ten unique hair names; all of them are 3-vertex / 1-triangle
-  placeholders. Across all characters, 241 of 329 hair rows are 3-vertex placeholders, but 68
-  have more than 100 vertices, so real hair geometry does exist for some characters. A static
-  export of Lucia is bald by design, not by a missing decode.
+- **Lucia's hair.** The `packs.rpf` manifest lists ten `player_story000_00` hair drawables
+  (`hairbob`, `hairpixie`, `hairponytail`, `hairbuzzcut`); all ten decode to **3 vertices / 1
+  triangle**. Across `packs.rpf`, 219 of the 247 measurable hair entries are <=3 v / 1 t. The 68
+  larger rows are accessories (`hairaccsband`, 7,016 / 7,251 v), SLOD proxies (71-147 v), or the
+  one fused male head `cs_wyman_head_mr1_cau_000_o_hair_alt0` (13,529 v); no stand-alone
+  full-resolution female hair mesh exists. `levels.rpf` and `story000.rpf` have zero character
+  hair rows. A static Lucia export is bald by design; a render needs a clearly labelled
+  placeholder, not a missing decode.
 - **`levels.rpf`.** The full archive was name-enumerated: 1,116,073 streams, 98.32% inflated,
   235,814 named streams, 318,266 unique names. It contains no Lucia, Mandy, `player_story` or
   `ambient_female` drawable; the Lucia and Mandy hits are props (photos, frames, luggage, a
