@@ -971,5 +971,117 @@ class TestSaluAndn2SaveexecB64StatusFlags(unittest.TestCase):
             self.assertEqual(interp.scc, expected_scc)
 
 
+# --- IEEE 754 Boundary Extremes, Subnormals, and NaN Handling ---
+
+class TestSaluAndn2SaveexecB64IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 float/double boundary masks, subnormals, and NaN handling."""
+
+    # IEEE 754 double-precision bit patterns
+    F64_POS_ZERO = 0x0000000000000000
+    F64_NEG_ZERO = 0x8000000000000000
+    F64_POS_INF = 0x7FF0000000000000
+    F64_NEG_INF = 0xFFF0000000000000
+    F64_CANONICAL_QNAN = 0x7FF8000000000000
+    F64_SNAN = 0x7FF0000000000001
+    F64_MIN_SUBNORMAL = 0x0000000000000001
+    F64_MAX_SUBNORMAL = 0x000FFFFFFFFFFFFF
+    F64_MIN_NORMAL = 0x0010000000000000
+    F64_MAX_NORMAL = 0x7FEFFFFFFFFFFFFF
+
+    def test_bitwise_transparency_on_ieee754_bit_patterns(self):
+        """Verify s_andn2_saveexec_b64 preserves IEEE 754 bit patterns bit-for-bit.
+        
+        Shader scalar logic must not treat float bit patterns as numeric floats
+        (no flushing of subnormals, no canonicalizing NaNs, no sign-bit destruction).
+        """
+        ieee_patterns = [
+            self.F64_POS_ZERO,
+            self.F64_NEG_ZERO,
+            self.F64_POS_INF,
+            self.F64_NEG_INF,
+            self.F64_CANONICAL_QNAN,
+            self.F64_SNAN,
+            self.F64_MIN_SUBNORMAL,
+            self.F64_MAX_SUBNORMAL,
+            self.F64_MIN_NORMAL,
+            self.F64_MAX_NORMAL,
+        ]
+        interp = ScalarSaluInterpreter()
+        for p in ieee_patterns:
+            # Set EXEC to 0 (all inverted bits in ~EXEC are 1)
+            interp.exec = 0
+            interp.set_sgpr_u64(0, p)
+            interp.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+            # S0 & ~0 == S0 exactly
+            self.assertEqual(interp.exec, p, f"Failed bitwise transparency on {p:#018x}")
+            self.assertEqual(interp.get_sgpr_u64(2), 0)
+            self.assertEqual(interp.scc, 1 if p != 0 else 0)
+
+    def test_float_comparison_mask_divergence_filtering(self):
+        """Simulate RDNA2 shader routine filtering exceptional float lanes:
+        Lanes evaluate floating-point values.
+        v_cmp_class_f64 produces mask of lanes that are NaN or Subnormal.
+        s_andn2_saveexec_b64 s[nan_saved], s[all_lanes]
+        Masks out NaN/subnormal lanes so normal calculation proceeds only on valid lanes.
+        """
+        engine = WaveEngine(wave_size=64)
+        # All 64 lanes active initially
+        engine.exec_mask = MASK64
+
+        # Assume lanes 5, 12, 33, 47 contain NaNs or subnormals
+        exceptional_lanes = {5, 12, 33, 47}
+        exceptional_mask = 0
+        for lane in exceptional_lanes:
+            exceptional_mask |= (1 << lane)
+
+        # Set up v0 with initial values
+        for lane in range(64):
+            engine.set_vgpr_lane(0, lane, 100)
+
+        # Invert EXEC against exceptional mask:
+        # EXEC_new = MASK64 & ~exceptional_mask (all lanes EXCEPT exceptional lanes)
+        engine.salu.set_sgpr_u64(0, MASK64)
+        # We set EXEC to exceptional_mask first (as if v_cmp wrote EXEC)
+        engine.exec_mask = exceptional_mask
+        # s_andn2_saveexec_b64 s[2:3], s[0:1]
+        # s[2:3] = exceptional_mask
+        # EXEC = MASK64 & ~exceptional_mask
+        engine.salu.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+
+        self.assertEqual(engine.salu.get_sgpr_u64(2), exceptional_mask)
+        expected_valid_mask = MASK64 & ~exceptional_mask
+        self.assertEqual(engine.exec_mask, expected_valid_mask)
+        self.assertEqual(engine.salu.scc, 1)
+
+        # Normal VALU operation
+        engine.valu_add_u32(dst_vgpr=0, src_vgpr=0, addend=50)
+
+        # Verify only valid lanes were updated
+        for lane in range(64):
+            val = engine.get_vgpr_lane(0, lane)
+            if lane in exceptional_lanes:
+                self.assertEqual(val, 100, f"Exceptional lane {lane} should not have run")
+            else:
+                self.assertEqual(val, 150, f"Valid lane {lane} should have updated to 150")
+
+    def test_ieee754_qnan_vs_snan_mask_inversion(self):
+        """Verify distinct bit positions between QNaN and SNaN in mask logic."""
+        interp = ScalarSaluInterpreter()
+        # QNaN: bit 51 set; SNaN: bit 51 clear, bit 0 set
+        qnan_mask = self.F64_CANONICAL_QNAN
+        snan_mask = self.F64_SNAN
+
+        interp.exec = qnan_mask
+        interp.set_sgpr_u64(0, snan_mask)
+        interp.execute_asm("s_andn2_saveexec_b64 s[2:3], s[0:1]")
+
+        # new_exec = snan_mask & ~qnan_mask
+        expected_new = (self.F64_SNAN & (~self.F64_CANONICAL_QNAN & MASK64)) & MASK64
+        self.assertEqual(interp.exec, expected_new)
+        # Since SNaN has bit 0 set and QNaN bit 0 clear:
+        self.assertEqual(interp.exec & 0x1, 0x1)
+        self.assertEqual(interp.scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
