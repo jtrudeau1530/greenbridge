@@ -178,7 +178,15 @@ public:
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        return device_ ? device_->QueryInterface(riid, out) : E_NOINTERFACE;
+        if (!device_) return E_NOINTERFACE;
+
+        ID3D12DeviceChild* device_child = nullptr;
+        if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&device_child)))) {
+            const HRESULT hr = device_child->GetDevice(riid, out);
+            device_child->Release();
+            return hr;
+        }
+        return device_->QueryInterface(riid, out);
     }
 
     // IDXGISwapChain

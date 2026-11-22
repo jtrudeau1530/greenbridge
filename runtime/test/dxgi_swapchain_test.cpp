@@ -318,12 +318,36 @@ int main() {
 
     if (!check_statistics_disjoint(sc)) return fail("initial frame-statistics disjoint notification");
 
-    ID3D12CommandQueue* got_queue = nullptr;
-    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_queue))) || got_queue != queue) {
-        if (got_queue) got_queue->Release();
-        return fail("GetDevice");
+    ID3D12Device* got_device = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_device))) || got_device != dev) {
+        if (got_device) got_device->Release();
+        return fail("GetDevice did not return the command queue's parent device");
     }
-    got_queue->Release();
+    got_device->Release();
+
+    IUnknown* got_unknown = nullptr;
+    IUnknown* expected_device_unknown = nullptr;
+    IUnknown* queue_unknown = nullptr;
+    const HRESULT got_unknown_hr = sc->GetDevice(IID_PPV_ARGS(&got_unknown));
+    if (FAILED(got_unknown_hr) || !got_unknown) {
+        if (got_unknown) got_unknown->Release();
+        return fail("GetDevice(IUnknown) failed");
+    }
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&expected_device_unknown))) || !expected_device_unknown) {
+        got_unknown->Release();
+        return fail("QueryInterface(IUnknown) on device failed");
+    }
+    if (FAILED(queue->QueryInterface(IID_PPV_ARGS(&queue_unknown))) || !queue_unknown) {
+        expected_device_unknown->Release();
+        got_unknown->Release();
+        return fail("QueryInterface(IUnknown) on queue failed");
+    }
+    const bool has_device_identity = got_unknown == expected_device_unknown && got_unknown != queue_unknown;
+    queue_unknown->Release();
+    expected_device_unknown->Release();
+    got_unknown->Release();
+    if (!has_device_identity)
+        return fail("GetDevice(IUnknown) returned the queue identity instead of its parent device");
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen{};
     if (FAILED(sc->GetFullscreenDesc(&fullscreen)) || !fullscreen.Windowed ||
         fullscreen.Scaling != DXGI_MODE_SCALING_UNSPECIFIED ||
