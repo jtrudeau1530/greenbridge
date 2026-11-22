@@ -7056,8 +7056,10 @@ class Gen:
         4 box16, 5 box32. Address = descriptor base + ((node & ~7) << 3); the base is BVH descriptor bits [39:0]
         taken in 256-byte units (ASSUMPTION: RADV only ever uses base 0). Box nodes return the four child ids
         (misses and inactive boxes = 0xFFFFFFFF), sorted by entry distance when the descriptor's box_sort_enable
-        (bit 63) is set. Triangle nodes return (t/|det|, sign(det), v/|det|, w/|det|), or (inf, 1, 0, 0) on a miss:
-        consumers divide by .y, which gives the same values as the hardware's numerator/denominator form."""
+        (bit 63) is set. Triangle nodes read the vertex slots of their type (TRI0 0,1,2; TRI1 1,3,2; TRI2 2,3,4;
+        TRI3 2,4,0) and return (t/|det|, sign(det), b_i/|det|, b_j/|det|), or (inf, 1, 0, 0) on a miss, with i and j
+        chosen by the node type's byte of the triangle-ID word at +60 (AMD GPURT; 0x09 is RADV's v, w). Consumers
+        divide by .y, which gives the same values as the hardware's numerator/denominator form."""
         if "a16" in mods:
             raise Unsupported(op + " a16")
         is64 = op.startswith("image_bvh64")
@@ -7155,7 +7157,29 @@ class Gen:
 
         # ---------------- triangle ----------------
         e(f"{L['tri']} = OpLabel")
-        V = [[self.tof(ldw(3 * j + c)) for c in range(3)] for j in range(3)]
+        # The node type picks the triangle's vertex slots in the 64-byte node (12 bytes each; slot 4 is the
+        # metadata words 12..14): TRI0 (0,1,2), TRI1 (1,3,2), TRI2 (2,3,4), TRI3 (2,4,0). AMD GPURT
+        # CalcTriangleCompressionVertexIndices; the XDXR software path's Read3Verts (docs/bvh.md 7a).
+        def ldw_dyn(i):
+            pp, v = T(), T()
+            e(f"{pp} = OpAccessChain %_ptr_PSB_uint {ptr} {i}")
+            e(f"{v} = OpLoad %uint {pp} Aligned 4")
+            return v
+        nsh = T()
+        e(f"{nsh} = OpShiftLeftLogical %uint {ntype} {self.cu(2)}")
+        V = []
+        for table in (0x2210, 0x4331, 0x0422):         # slot of vertex j for node types 0..3, one nibble each
+            slot, w0 = T(), T()
+            e(f"{slot} = OpBitFieldUExtract %uint {self.cu(table)} {nsh} {self.cu(4)}")
+            e(f"{w0} = OpIMul %uint {slot} {self.cu(3)}")
+            row = []
+            for c in range(3):
+                wc = w0
+                if c:
+                    wc = T()
+                    e(f"{wc} = OpIAdd %uint {w0} {self.cu(c)}")
+                row.append(self.tof(ldw_dyn(wc)))
+            V.append(row)
         ad = [fext("FAbs", d) for d in dirv]
         c01, c02, c12 = bop("OpFOrdGreaterThanEqual", ad[0], ad[1]), bop("OpFOrdGreaterThanEqual", ad[0], ad[2]), \
             bop("OpFOrdGreaterThanEqual", ad[1], ad[2])
@@ -7240,8 +7264,24 @@ class Gen:
         dab = fext("FAbs", det)
         rt = sel(hit, fop("OpFDiv", tt, dab), INF)
         rs = sel(hit, sg, ONE)
-        rv = sel(hit, fop("OpFDiv", vv_, dab), "%f0")
-        rw = sel(hit, fop("OpFDiv", ww, dab), "%f0")
+        # The node's triangle-ID word (byte offset 60) holds one byte per node type: bits [1:0] pick which vertex's
+        # weight is returned first, bits [3:2] the second (0 = vertex 0's, U; 1 = V; 2 = W; 3 is not used by a
+        # builder and reads U, as in the XDXR software path). 0x09 is the plain (V, W). AMD GPURT
+        # SwizzleBarycentrics and TRIANGLE_ID_I/J_SRC_SHIFT; XDXR TestXboxBvh4Leaf (docs/bvh.md 7a).
+        tid, tsh, tby = T(), T(), T()
+        e(f"{tsh} = OpShiftLeftLogical %uint {ntype} {self.cu(3)}")
+        e(f"{tid} = OpShiftRightLogical %uint {ldw(15)} {tsh}")
+        e(f"{tby} = OpBitwiseAnd %uint {tid} {self.cu(0xF)}")
+
+        def pick(shift):
+            s_ = T()
+            e(f"{s_} = OpBitFieldUExtract %uint {tby} {self.cu(shift)} {self.cu(2)}")
+            is1, is2 = T(), T()
+            e(f"{is1} = OpIEqual %bool {s_} {self.cu(1)}")
+            e(f"{is2} = OpIEqual %bool {s_} {self.cu(2)}")
+            return sel(is2, ww, sel(is1, vv_, uu))
+        rv = sel(hit, fop("OpFDiv", pick(0), dab), "%f0")
+        rw = sel(hit, fop("OpFDiv", pick(2), dab), "%f0")
         for k, v in enumerate((rt, rs, rv, rw)):
             out(k, self.tou(v))
         e(f"OpBranch {L['end1']}")

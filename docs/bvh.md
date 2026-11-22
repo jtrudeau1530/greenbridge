@@ -328,12 +328,11 @@ its entry distance is at most the ray extent, and the children are sorted with t
 (1,2). A triangle returns `(t_num, t_denom, i_num, j_num)`, or `(inf, 1, 0, 0)` on a miss. A box miss stays a miss
 for an unbounded ray: the public code's `<=` against an infinite extent would keep it.
 
-**Translator difference (Open).** `image_bvh_intersect_ray` in `tools/rdna2spirv.py` follows RADV's software path.
-RADV builds only one triangle per node. On triangle nodes the translator always reads slots (0, 1, 2) and always
-returns (V, W) as the barycentrics. The public XDXR path selects the vertices by node type (TRI1–TRI3) and the
-barycentrics by the remap byte. A BVH with paired leaves, which the console builder is expected to produce, would
-therefore traverse to the wrong triangle for TRI1 and return permuted barycentrics wherever the remap is not
-`0x09`. Confirm this on RDNA2 hardware or against AMD's GPURT before changing the translator.
+**Translator.** `image_bvh_intersect_ray` in `tools/rdna2spirv.py` used to follow RADV's software path on triangle
+nodes: slots (0, 1, 2) for every type and (V, W) as the barycentrics, because RADV builds only one triangle per
+node. It now reads the slots of the node type and applies the remap byte. AMD GPURT
+(`CalcTriangleCompressionVertexIndices`, `SwizzleBarycentrics`) and the XDXR path agree on both. TRI1 nodes
+therefore traverse to the right triangle (docs/design.md, Ray tracing row; `tests/semantic/test_image_bvh_tri.py`).
 
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force
