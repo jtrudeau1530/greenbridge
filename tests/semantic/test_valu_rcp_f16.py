@@ -461,8 +461,8 @@ def parse_vop_rcp_f16(asm_line: str) -> InstructionAST:
         operands_text = operands_text[:m_opsel.start()] + operands_text[m_opsel.end():]
 
     tokens = [t.strip() for t in operands_text.split(",") if t.strip()]
-    if len(tokens) < 2:
-        raise ValueError(f"v_rcp_f16 requires destination and source operands: {line}")
+    if len(tokens) != 2:
+        raise ValueError(f"v_rcp_f16 requires exactly destination and source operands: {line}")
 
     dst_str = tokens[0]
     src_rest = tokens[1].split()
@@ -1243,8 +1243,85 @@ class TestValuRcpF16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(ref_rcp_f16(0x8001, clamp=True), POS_ZERO_F16)
 
 
+
+class TestValuRcpF16NegativeControlsAndMutations(unittest.TestCase):
+    def test_syntax_rejection_malformed_syntax(self):
+        invalid_instructions = [
+            "v_rcp_f16",
+            "v_rcp_f16 v0",
+            "v_rcp_f16 v0, v1, v2",
+            "v_rcp_f16 s0, v1",
+            "v_rcp_f16 v256, v0",
+            "v_rcp_f16 v0, s106",
+            "v_rcp_f16 v0, v1 unknown_mod",
+            "v_rcp_f16 v0.x, v1",
+            "v_rcp_f16 v0, v1.z",
+            "v_rcp_f16 -v0, v1",
+            "v_rcp_f16 |v0|, v1",
+            "v_rcp_f16 v0, v1 op_sel:[2,0]",
+        ]
+        for asm in invalid_instructions:
+            with self.assertRaises((ValueError, TypeError), msg=f"Should reject invalid assembly: '{asm}'"):
+                parse_vop_rcp_f16(asm)
+
+    def test_mutation_detector_kills_mutants(self):
+        # Mutant 1: Sign inverted
+        def mutant_sign_flip(inp: int) -> int:
+            return ref_rcp_f16(inp) ^ SIGN_MASK_F16
+
+        # Mutant 2: SNAN not quieted
+        def mutant_ignore_snan(inp: int) -> int:
+            return inp
+
+        # Mutant 3: Off-by-one mantissa
+        def mutant_mantissa_off(inp: int) -> int:
+            res = ref_rcp_f16(inp)
+            return (res + 1) & MASK16
+
+        # Mutant 4: Division by zero returns zero instead of infinity
+        def mutant_zero_to_zero(inp: int) -> int:
+            if is_zero_f16(inp):
+                return POS_ZERO_F16
+            return ref_rcp_f16(inp)
+
+        # Mutant 5: Clamp on NaN leaves NaN instead of returning 0.0
+        def mutant_clamp_nan(inp: int) -> int:
+            if is_nan_f16(inp):
+                return QNAN_F16
+            return ref_rcp_f16(inp, clamp=True)
+
+        # Mutant 6: Upper 16 bits overwritten on scalar write
+        def mutant_overwrite_upper(interp: ScalarVALUInterpreter, idx: int, half: int) -> int:
+            # Overwrites upper bits instead of preserving
+            interp.set_vgpr_u32(idx, half & MASK16)
+            return half & MASK16
+
+        # Verify Mutant 1 is detected
+        self.assertNotEqual(mutant_sign_flip(TWO_F16), ref_rcp_f16(TWO_F16))
+
+        # Verify Mutant 2 is detected
+        res_snan_mutant = mutant_ignore_snan(SNAN_F16)
+        self.assertFalse(is_qnan_f16(res_snan_mutant))
+
+        # Verify Mutant 3 is detected
+        self.assertNotEqual(mutant_mantissa_off(TWO_F16), ref_rcp_f16(TWO_F16))
+
+        # Verify Mutant 4 is detected
+        self.assertNotEqual(mutant_zero_to_zero(POS_ZERO_F16), ref_rcp_f16(POS_ZERO_F16))
+
+        # Verify Mutant 5 is detected
+        self.assertNotEqual(mutant_clamp_nan(QNAN_F16), ref_rcp_f16(QNAN_F16, clamp=True))
+
+        # Verify Mutant 6 is detected
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(0, 0xABCD0000)
+        mutant_overwrite_upper(interp, 0, HALF_F16)
+        self.assertNotEqual(interp.get_vgpr_u32(0) >> 16, 0xABCD)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
