@@ -449,6 +449,23 @@ class TranslatorValueSemantics(unittest.TestCase):
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
 
+    def test_narrow_integer_typed_buffers(self):
+        # cs_fmt_int_narrow.asm in the interpreter against the words check.py expects from the GPU, which are the
+        # same program's output on gfx1036 run natively: a 136-word heap filled with 0xee as vk_compute_test's.
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        try:
+            import check
+        finally:
+            sys.path.pop(0)
+        spv = support.translate_fixture("cs_fmt_int_narrow", fssm=CS_BOUNDS_FSSM)
+        memory = {4 * i: 0xEEEEEEEE for i in range(len(check.FMT_INT_NARROW_WORDS))}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        for i, word in enumerate(check.FMT_INT_NARROW_WORDS):
+            with self.subTest(word=i):
+                self.assertEqual(memory[4 * i], word)
+
     def test_signed_typed_buffers(self):
         spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)
         memory = {}
