@@ -116,6 +116,40 @@ class TestRts0(unittest.TestCase):
         self.assertIn("version", err)
 
 
+def asm(*lines):
+    return "\n".join("\t" + line for line in lines) + "\n"
+
+
+class TestReadScan(unittest.TestCase):
+    def test_a_table_pointer_is_zero_extended_into_a_load_base(self):
+        text = asm("s_mov_b32 s10, s4", "s_mov_b32 s11, 0", "s_load_dwordx8 s[16:23], s[10:11], null")
+        got = R.read_scan(text, 8)
+        self.assertEqual(got["table_bases"], [4])
+        self.assertEqual(got["whole_pairs"], [])
+
+    def test_a_root_descriptor_is_copied_as_a_whole_pair(self):
+        text = asm("s_mov_b64 s[8:9], s[6:7]", "s_buffer_load_dword s32, s[8:11], 0x4")
+        got = R.read_scan(text, 14)
+        self.assertEqual(got["whole_pairs"], [6])
+        self.assertEqual(got["table_bases"], [])
+
+    def test_a_user_register_added_into_a_pointer_is_only_read(self):
+        # The shape two of the upscaler programs have: the block below s4 is used, but not as a table pointer.
+        got = R.read_scan(asm("s_add_u32 s26, s3, s4", "v_mul_hi_u32_u24_e32 v0, s0, v60"), 14)
+        self.assertEqual(got["read"], [0, 3, 4])
+        self.assertEqual(got["table_bases"], [])
+
+    def test_scratch_registers_above_the_count_are_not_user_data(self):
+        got = R.read_scan(asm("s_mov_b32 s32, s99", "s_mov_b64 s[40:41], s[30:31]",
+                              "v_pk_mul_f16 v32, v32, s33"), 14)
+        self.assertEqual(got, {"read": [], "table_bases": [], "whole_pairs": []})
+
+    def test_a_copy_that_is_not_zero_extended_is_not_a_base(self):
+        # A 64-bit pair copied whole is a root descriptor; only the zero-extended single dword is a table.
+        got = R.read_scan(asm("s_mov_b32 s10, s5", "s_mov_b32 s11, -1", "s_load_dword s16, s[10:11], null"), 14)
+        self.assertEqual(got["table_bases"], [])
+
+
 class TestContainer(unittest.TestCase):
     def test_parts_finds_rts0(self):
         payload = rts0(params=[("cbv", 0)])
@@ -160,6 +194,36 @@ class TestCensus(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(rows[0]["error"], "no RTS0 part")
         self.assertEqual(rows[0]["user_sgprs"], 8)
+
+    def test_the_disassembly_is_joined(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("table", 0, 1), ("cbv", 0)]))], user_sgprs=8)
+        os.makedirs(os.path.join(self.tmp.name, "disasm"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "disasm", "sig.s"), "w", encoding="utf-8") as fh:
+            fh.write(asm("s_mov_b32 s10, s4", "s_mov_b32 s11, 0", "s_load_dwordx8 s[16:23], s[10:11], null",
+                         "s_mov_b64 s[8:9], s[6:7]"))
+        rows, errors = R.census(self.tmp.name, os.path.join(self.tmp.name, "disasm"))
+        self.assertEqual(errors, [])
+        self.assertEqual(rows[0]["reads"], {"read": [4, 6, 7], "table_bases": [4], "whole_pairs": [6]})
+        self.assertEqual(R.summarize(rows)["read_scan"],
+                         {"programs": 1, "low_read": 0, "table_bases": {4: 1}, "whole_pairs": {6: 1}})
+
+    def test_a_folder_name_with_glob_characters_is_a_path(self):
+        # The root went into glob.glob unescaped, so "[v1]" was read as a character class and the folder came
+        # back empty; the caller saw no rows rather than a failed scan.
+        folder = os.path.join(self.tmp.name, "carve [v1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "sig.dxbc"), "wb") as fh:
+            fh.write(container([(b"RTS0", rts0(params=[("cbv", 0)]))]))
+        rows, errors = R.census(folder)
+        self.assertEqual(errors, [])
+        self.assertEqual([r["name"] for r in rows], ["sig"])
+
+    def test_without_a_disassembly_folder_there_is_no_read_scan(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        rows, errors = R.census(self.tmp.name)
+        self.assertEqual(errors, [])
+        self.assertNotIn("reads", rows[0])
+        self.assertEqual(R.summarize(rows)["read_scan"], {})
 
     def test_cli_writes_the_json_and_exits_zero(self):
         self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
