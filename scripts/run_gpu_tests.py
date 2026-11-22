@@ -37,7 +37,7 @@ from check import gpu_test_timeout, timed_out   # per-program time limit (LEONID
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
-from check import PIXEL_VERTEX, interp_f16_high_problem   # ps_interp_f16_high's producers and check
+from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem   # pixel producers and checks
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 
 
@@ -1063,7 +1063,7 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             if name in PIXEL_VERTEX:
-                if bary_fallback() and name == "ps_interp_f16_high":   # no PerVertexKHR inputs under --bary-fallback
+                if bary_fallback() and name in ("ps_interp_f16_high", "ps_ij_computed"):   # no PerVertexKHR inputs
                     results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
                     continue
                 vs = os.path.join(spirv_dir, PIXEL_VERTEX[name] + ".spv")
@@ -1145,6 +1145,10 @@ def run_suite(a, work: str) -> int:
                 with open(raw, "rb") as source:
                     problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", source.read())))
                 ok, detail = not problem, problem or "f16 low/high halves and f32 control within 2e-3"
+            elif name == "ps_ij_computed":
+                with open(raw, "rb") as source:
+                    problem = ij_computed_problem(list(struct.iter_unpack("<4I", source.read())))
+                ok, detail = not problem, problem or "computed I/J pair words and v/2 within 1e-6"
             else:
                 ok, detail = False, "no checker defined"
             results.append((name, ok, detail))

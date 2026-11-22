@@ -1013,6 +1013,19 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
     return ""
 
 
+def ij_computed_problem(px):
+    """ps_ij_computed.asm: (snapped 0.5, zeroed pair 0.0, v/2 from (i, j/2), 0.5 control) per pixel; "" when right.
+    Shared with scripts/run_gpu_tests.py."""
+    n = len(px)
+    if not n:
+        return "no pixels"
+    w = int(n ** 0.5)
+    f32 = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]      # noqa: E731
+    wrong = sum((a != 0x3F000000 or b != 0 or d != 0x3F000000) for a, b, _, d in px)
+    err = max(abs(f32(c) - (i // w + 0.5) / (2 * w)) for i, (_, _, c, _) in enumerate(px))
+    return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the computed-pair words, v/2 off by {err:.3g}"
+
+
 def interp_f16_high_problem(px):
     """ps_interp_f16_high (drawn with vs_f16_pack or ms_f16_pack): low halves of mrt0.xyz = f16 of u, v, u at the
     pixel centre, read from both halves of packed channels, and mrt0.w = the f32 v. "" when every pixel is close."""
@@ -1077,13 +1090,7 @@ def pixel_test(tools, spirv, name):
     if name == "ps_interp_f16_high":
         return interp_f16_high_problem(px)
     if name == "ps_ij_computed":
-        # ps_ij_computed.asm: (snapped 0.5, zeroed pair 0.0, v/2 from (i, j/2), 0.5 control) per pixel
-        w = int(n ** 0.5)
-        f32 = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]      # noqa: E731
-        wrong = sum((a != 0x3F000000 or b != 0 or d != 0x3F000000) for a, b, _, d in px)
-        err = max(abs(f32(c) - (i // w + 0.5) / (2 * w)) for i, (_, _, c, _) in enumerate(px))
-        return "" if not wrong and err < 1e-6 else \
-            f"{wrong} pixels without the computed-pair words, v/2 off by {err:.3g}"
+        return ij_computed_problem(px)
     if name == "ps_bitmask_perm":
         if skip := bitmask_perm_narrow_skip(out, px):
             return skip
