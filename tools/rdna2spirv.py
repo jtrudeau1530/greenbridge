@@ -3253,6 +3253,100 @@ class Gen:
         m = next((m for m in mods if m.startswith(name + ":")), None)
         return int(m.split(":", 1)[1], 0) if m else default
 
+    def cmp_class_f64(self, op, a, exec_only=False, mods=()):
+        """v_cmp_class_f64 / v_cmpx_class_f64: test IEEE-754 binary64 class against the 10-bit mask using pure 32-bit
+        integer ops (no Float64 capability required).
+        Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf."""
+        if mods:
+            raise Unsupported(op + " modifiers")
+        if exec_only:
+            if not (len(a) == 2 or (len(a) == 3 and a[0]["k"] == "special" and a[0]["t"] in ("exec", "exec_lo"))):
+                raise Unsupported(op + " operands")
+        else:
+            if len(a) not in (2, 3):
+                raise Unsupported(op + " operands")
+            if len(a) == 3:
+                d = a[0]
+                if not (d["k"] == "sgpr" or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"))):
+                    raise Unsupported(op + " destination")
+        src0, mask_op = a[-2], a[-1]
+        if mask_op.get("n", 1) != 1 or mask_op.get("abs") or mask_op.get("neg"):
+            raise Unsupported(op + " mask")
+        if src0["k"] in ("vgpr", "sgpr") and src0.get("n") == 2:
+            lo, hi = self.load_reg(src0["k"], src0["r"]), self.load_reg(src0["k"], src0["r"] + 1)
+        elif src0["k"] == "fimm":
+            bits = struct.unpack("<Q", struct.pack("<d", float(src0["v"])))[0]
+            lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+        elif src0["k"] == "imm":
+            v = src0["v"]
+            # RDNA2 ISA: inline integers (-16..64) sign-extend to 64 bits; a 32-bit literal occupies bits [63:32].
+            if src0.get("literal") or (not (-16 <= v <= 64) and -0x80000000 <= v <= 0xFFFFFFFF):
+                lo, hi = self.cu(0), self.cu(v & 0xFFFFFFFF)
+            else:
+                bits = v & 0xFFFFFFFFFFFFFFFF
+                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+        else:
+            raise Unsupported(op + " operand")
+        if src0.get("abs"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+            hi = t
+        if src0.get("neg"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+            hi = t
+        mask = self.src_u(mask_op)
+
+        def b(cond_line):
+            t = self.tmp()
+            self.emit(f"{t} = {cond_line}")
+            return t
+
+        sign = b(f"OpShiftRightLogical %uint {hi} {self.cu(31)}")
+        exp_s = b(f"OpShiftRightLogical %uint {hi} {self.cu(20)}")
+        exp_ = b(f"OpBitwiseAnd %uint {exp_s} {self.cu(0x7FF)}")
+        man_hi = b(f"OpBitwiseAnd %uint {hi} {self.cu(0xFFFFF)}")
+        man_or = b(f"OpBitwiseOr %uint {man_hi} {lo}")
+        neg = self.tmp_bool_nz(sign)
+        pos = b(f"OpLogicalNot %bool {neg}")
+        exp0 = b(f"OpIEqual %bool {exp_} {self.cu(0)}")
+        expmax = b(f"OpIEqual %bool {exp_} {self.cu(0x7FF)}")
+        man0 = b(f"OpIEqual %bool {man_or} {self.cu(0)}")
+        man_nz = b(f"OpLogicalNot %bool {man0}")
+        is_zero = b(f"OpLogicalAnd %bool {exp0} {man0}")
+        denorm = b(f"OpLogicalAnd %bool {exp0} {man_nz}")
+        normal = b(f"OpLogicalAnd %bool " + b(f"OpLogicalNot %bool {exp0}") + " " + b(f"OpLogicalNot %bool {expmax}"))
+        is_inf = b(f"OpLogicalAnd %bool {expmax} {man0}")
+        is_nan = b(f"OpLogicalAnd %bool {expmax} {man_nz}")
+        qbit = b(f"OpBitwiseAnd %uint {man_hi} {self.cu(0x80000)}")
+        quiet = self.tmp_bool_nz(qbit)
+        snan = b(f"OpLogicalAnd %bool {is_nan} " + b(f"OpLogicalNot %bool {quiet}"))
+        qnan = b(f"OpLogicalAnd %bool {is_nan} {quiet}")
+        classes = [
+            snan, qnan,
+            b(f"OpLogicalAnd %bool {is_inf} {neg}"), b(f"OpLogicalAnd %bool {normal} {neg}"),
+            b(f"OpLogicalAnd %bool {denorm} {neg}"), b(f"OpLogicalAnd %bool {is_zero} {neg}"),
+            b(f"OpLogicalAnd %bool {is_zero} {pos}"), b(f"OpLogicalAnd %bool {denorm} {pos}"),
+            b(f"OpLogicalAnd %bool {normal} {pos}"), b(f"OpLogicalAnd %bool {is_inf} {pos}"),
+        ]
+        acc = "%false"
+        for i, c in enumerate(classes):
+            bit = b(f"OpBitwiseAnd %uint {mask} {self.cu(1 << i)}")
+            on = b(f"OpINotEqual %bool {bit} {self.cu(0)}")
+            hit = b(f"OpLogicalAnd %bool {on} {c}")
+            acc = b(f"OpLogicalOr %bool {acc} {hit}")
+        acc = b(f"OpLogicalAnd %bool {acc} {self.active_b()}")   # inactive lanes write 0
+        if exec_only:
+            self.emit(f"OpStore %active {acc}")
+            self.uses_active = True
+            return
+        r = b(f"OpSelect %uint {acc} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        d = a[0]
+        if len(a) == 2 or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")):
+            self.emit(f"OpStore %vcc {r}")
+        else:
+            self.mask_dst(d, r)
+
     # LDS atomics (non-returning name -> SPIR-V atomic); _rtn_ forms share the entry.
     LDS_ATOMICS = {"ds_add_u32": "OpAtomicIAdd", "ds_sub_u32": "OpAtomicISub", "ds_min_u32": "OpAtomicUMin",
                    "ds_max_u32": "OpAtomicUMax", "ds_min_i32": "OpAtomicSMin", "ds_max_i32": "OpAtomicSMax",
@@ -5934,6 +6028,8 @@ class Gen:
                     raise Unsupported(op + " destination")
                 self.dst({"k": "vgpr", "r": d["r"], "n": 1}, lo)
                 self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, hi)
+        elif op in ("v_cmp_class_f64", "v_cmpx_class_f64"):
+            self.cmp_class_f64(op, a, exec_only=op == "v_cmpx_class_f64", mods=mods)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
             self.image_bvh(op, a, mods)
         elif op == "s_bfm_b64":
