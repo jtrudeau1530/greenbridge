@@ -463,5 +463,139 @@ class TestValuDot4IntSymbolicAST(unittest.TestCase):
         self.assertTrue(expr.clamp)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScalarRegisterFile:
+    """Scalar and vector register storage for architectural simulation."""
+    vgprs: list[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: list[int] = field(default_factory=lambda: [0] * 106)
+    m0: int = 0
+    vcc: int = 0
+
+    def read_operand(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR:
+            if not (0 <= op.reg_num < 256):
+                raise IndexError(f"VGPR index out of bounds: v{op.reg_num}")
+            return self.vgprs[op.reg_num] & MASK32
+        elif op.kind == OperandKind.SGPR:
+            if not (0 <= op.reg_num < 106):
+                raise IndexError(f"SGPR index out of bounds: s{op.reg_num}")
+            return self.sgprs[op.reg_num] & MASK32
+        elif op.kind in (OperandKind.LITERAL, OperandKind.INLINE_INT):
+            return op.literal_value & MASK32
+        raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def write_vgpr(self, reg_num: int, val: int) -> None:
+        if not (0 <= reg_num < 256):
+            raise IndexError(f"VGPR index out of bounds: v{reg_num}")
+        self.vgprs[reg_num] = val & MASK32
+
+    def write_sgpr(self, reg_num: int, val: int) -> None:
+        if not (0 <= reg_num < 106):
+            raise IndexError(f"SGPR index out of bounds: s{reg_num}")
+        self.sgprs[reg_num] = val & MASK32
+
+
+class Dot4IntScalarInterpreter:
+    """Deterministic instruction interpreter for VALU dot4 operations."""
+
+    def __init__(self, rf: Optional[ScalarRegisterFile] = None) -> None:
+        self.rf = rf if rf is not None else ScalarRegisterFile()
+
+    def step(self, instr: ASTInstruction) -> None:
+        if instr.dst.kind != OperandKind.VGPR:
+            raise ValueError(f"VALU instruction destination must be a VGPR, got {instr.dst.kind}")
+
+        if instr.opcode == Opcode.V_MOV_B32:
+            src_val = self.rf.read_operand(instr.src0)
+            self.rf.write_vgpr(instr.dst.reg_num, src_val)
+            return
+
+        s0 = self.rf.read_operand(instr.src0)
+        s1 = self.rf.read_operand(instr.src1)
+        s2 = self.rf.read_operand(instr.src2) if instr.src2 is not None else 0
+
+        if instr.opcode == Opcode.V_DOT4_I32_I8:
+            result = ref_dot4_i32_i8(s0, s1, s2, clamp=instr.clamp)
+        elif instr.opcode in (Opcode.V_DOT4_U32_U8, Opcode.V_DOT4ACC_U32_U8):
+            result = ref_dot4_u32_u8(s0, s1, s2, clamp=instr.clamp)
+        else:
+            raise NotImplementedError(f"Unsupported opcode execution: {instr.opcode}")
+
+        self.rf.write_vgpr(instr.dst.reg_num, result)
+
+    def execute_asm(self, asm_lines: list[str]) -> None:
+        for line in asm_lines:
+            line = line.strip()
+            if not line or line.startswith("//") or line.startswith(";"):
+                continue
+            instr = parse_instruction(line)
+            self.step(instr)
+
+
+class TestValuDot4IntScalarInterpreter(unittest.TestCase):
+    """Deterministic scalar interpreter tests for v_dot4_int."""
+
+    def test_scalar_v_dot4_u32_u8_execution(self) -> None:
+        interp = Dot4IntScalarInterpreter()
+        # Set v1 = [1, 2, 3, 4], v2 = [5, 6, 7, 8], v3 = 100
+        interp.rf.write_vgpr(1, pack_u8(1, 2, 3, 4))
+        interp.rf.write_vgpr(2, pack_u8(5, 6, 7, 8))
+        interp.rf.write_vgpr(3, 100)
+
+        interp.execute_asm(["v_dot4_u32_u8 v0, v1, v2, v3"])
+        # Expected: 70 + 100 = 170
+        self.assertEqual(interp.rf.vgprs[0], 170)
+
+    def test_scalar_v_dot4_i32_i8_execution(self) -> None:
+        interp = Dot4IntScalarInterpreter()
+        # Set v1 = [-1, 2, -3, -4], v2 = [5, -6, -7, 8], v3 = 0
+        interp.rf.write_vgpr(1, pack_i8(-1, 2, -3, -4))
+        interp.rf.write_vgpr(2, pack_i8(5, -6, -7, 8))
+        interp.rf.write_vgpr(3, 0)
+
+        interp.execute_asm(["v_dot4_i32_i8 v0, v1, v2, v3"])
+        expected = (-28) & MASK32
+        self.assertEqual(interp.rf.vgprs[0], expected)
+
+    def test_scalar_v_dot4acc_u32_u8_accumulation_chain(self) -> None:
+        interp = Dot4IntScalarInterpreter()
+        interp.rf.write_vgpr(1, pack_u8(1, 1, 1, 1))
+        interp.rf.write_vgpr(2, pack_u8(10, 20, 30, 40))  # sum = 100
+        interp.rf.write_vgpr(0, 50)  # Initial accumulator
+
+        # Step 1: v0 = 50 + 100 = 150
+        interp.execute_asm(["v_dot4acc_u32_u8 v0, v1, v2, v0"])
+        self.assertEqual(interp.rf.vgprs[0], 150)
+
+        # Step 2: v0 = 150 + 100 = 250
+        interp.execute_asm(["v_dot4acc_u32_u8 v0, v1, v2, v0"])
+        self.assertEqual(interp.rf.vgprs[0], 250)
+
+    def test_scalar_sgpr_and_inline_operands(self) -> None:
+        interp = Dot4IntScalarInterpreter()
+        interp.rf.write_sgpr(5, pack_u8(2, 2, 2, 2))
+        interp.rf.write_vgpr(1, pack_u8(3, 3, 3, 3))
+
+        # v_dot4_u32_u8 v0, s5, v1, 10
+        # 4 * (2 * 3) = 24; 24 + 10 = 34
+        interp.execute_asm(["v_dot4_u32_u8 v0, s5, v1, 10"])
+        self.assertEqual(interp.rf.vgprs[0], 34)
+
+    def test_scalar_clamp_execution(self) -> None:
+        interp = Dot4IntScalarInterpreter()
+        # Max positive product
+        s_min = pack_i8(-128, -128, -128, -128)
+        interp.rf.write_vgpr(1, s_min)
+        interp.rf.write_vgpr(2, s_min)
+        interp.rf.write_vgpr(3, INT32_MAX)
+
+        interp.execute_asm(["v_dot4_i32_i8 v0, v1, v2, v3 clamp"])
+        self.assertEqual(interp.rf.vgprs[0], INT32_MAX & MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
