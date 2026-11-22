@@ -18,8 +18,8 @@ second device stand in for the missing size: W64G_SAVE_REF=<dir> stores each 64-
 it (or that has 64 as its only size: AMD GCN), and W64G_REF=<dir> compares every run of the other device with those
 files (equal for A and B, different for C).
 
-A device whose subgroups are all narrower than 32 lanes (llvmpipe: 8..8) and that could not be held to 32 or 64 skips
-the tier A and B pixel fixtures, which assume subgroups of at least 32 lanes (TEST-433).
+A device whose fragment subgroup can be narrower than 32 (Intel: 8..32, pixel shaders 16 wide) and that could not be
+held to 32 or 64 skips the tier A and B pixel fixtures, which assume subgroups of 32 or more lanes (TEST-433).
 
 The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
@@ -241,7 +241,7 @@ def _draw_heap(tools, spirv, name, size, tmp):
     return [tuple(words[VS_RECORDS + 4 * v:VS_RECORDS + 4 * v + 4]) for v in range(records)], words
 
 
-_device_max = [None]   # the largest subgroup size vk_harness reported for the device
+_device_min = [None]   # the smallest subgroup size vk_harness reported for the device
 
 
 def draw(tools, spirv, name, size, tmp):
@@ -273,7 +273,7 @@ def draw(tools, spirv, name, size, tmp):
         return None, f"{len(data)} bytes of pixels, expected {W * H * 16}", None
     m = re.search(r"subgroup (\d+)\.\.(\d+)", out)
     if m:
-        _device_max[0] = int(m.group(2))
+        _device_min[0] = int(m.group(1))
     applied = None
     if size:
         applied = f"fragment subgroup size: {size}\n" in out.replace("\r", "")
@@ -340,12 +340,13 @@ def check(tools, spirv, name):
             if size is None or applied:
                 runs[size] = (words, heap)
         compared = False
-        # Tiers A and B mean exact on subgroups of 32 or 64 lanes. A device that cannot provide 32 lanes at all (its
-        # largest subgroup is narrower, llvmpipe: 8..8) and that could not be held to 32 or 64 has no such run.
+        # Tiers A and B mean exact on subgroups of 32 or 64 lanes. A device whose fragment subgroup can be narrower
+        # (Intel: 8..32, pixel shaders often 16 wide) and that could not be held to 32 or 64 has no such run: reads
+        # across 16 lanes leave its subgroup there.
         if tier in ("A", "B") and name.startswith("ps_") and 64 not in runs and 32 not in runs \
-                and _device_max[0] is not None and _device_max[0] < 32:
-            return Skip(f"SKIP (the device's subgroups are at most {_device_max[0]} lanes, and 32 or 64 could not be "
-                        "required: tiers A and B assume 32 or 64 lanes)")
+                and _device_min[0] is not None and _device_min[0] < 32:
+            return Skip(f"SKIP (the fragment subgroup can be narrower than 32 here ({_device_min[0]}..) and could not "
+                        "be required: tiers A and B assume 32 or 64 lanes)")
         if save and 64 in runs:
             Path(save).mkdir(parents=True, exist_ok=True)
             (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
