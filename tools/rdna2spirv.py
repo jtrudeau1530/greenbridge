@@ -7292,12 +7292,12 @@ class Gen:
             except ValueError:
                 raise Unsupported(f"{op} offset:{inst[0]}") from None
         reg = None
+        const_off = None
         off_val = self.imm_val(off)
         if off["k"] == "imm":
             imm = off["v"]                              # immediate-only form
         elif off_val is not None:
-            off_trunc = off_val & ~3
-            imm = (imm & ~3) + off_trunc
+            const_off = off_val & 0xFFFFFFFC            # an SGPR offset the translator knows: added below
         else:
             reg = self.src_u(off)
         if sbuf:
@@ -7305,6 +7305,12 @@ class Gen:
         else:
             imm = ((imm & 0x1FFFFF) ^ 0x100000) - 0x100000   # 21-bit signed
         imm &= ~3                                       # two's complement: -1 -> -4, -6 -> -8
+        if const_off is not None:
+            # The same sum as the run-time path below, zext(sOFF & ~3) + imm, kept as a Python int: no 32-bit wrap.
+            # Until 2026-11-22 (#1686) the constant was added before the 32-bit truncation, so s8 = -4 with
+            # offset:20 read byte 16 instead of being out of range (hardware: 0xFFFFFFFC + 20 reads 0, measured by
+            # @Pierre-Kookis on gfx1036; found by @Impre-visible). The address and the s_buffer_load bound use it.
+            imm = const_off + imm
         # Byte offset from the 4-truncated base, in 64 bits: zext(sOFF & ~3) + imm, or the constant alone.
         if reg is not None:
             r4, r64 = self.tmp(), self.tmp()
