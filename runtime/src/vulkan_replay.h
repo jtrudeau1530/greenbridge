@@ -551,6 +551,42 @@ struct LayoutPiece {
     VkImageLayout layout;
 };
 
+// The layout pieces of one range: nearly always one (the tracked layouts agree over the range) or two (depth and
+// stencil apart), so those live inline and a barrier or clear makes no heap allocation; more spill to the heap.
+class LayoutPieces {
+public:
+    LayoutPiece* begin() { return data(); }
+    LayoutPiece* end() { return data() + size_; }
+    const LayoutPiece* begin() const { return data(); }
+    const LayoutPiece* end() const { return data() + size_; }
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    LayoutPiece& operator[](std::size_t i) { return data()[i]; }
+    const LayoutPiece& operator[](std::size_t i) const { return data()[i]; }
+
+    void clear() {
+        size_ = 0;
+        heap_.clear();
+    }
+    void push_back(const LayoutPiece& piece) {
+        if (heap_.empty() && size_ < inline_.size()) {
+            inline_[size_++] = piece;
+            return;
+        }
+        if (heap_.empty()) heap_.assign(inline_.begin(), inline_.begin() + size_);
+        heap_.push_back(piece);
+        ++size_;
+    }
+
+private:
+    LayoutPiece* data() { return heap_.empty() ? inline_.data() : heap_.data(); }
+    const LayoutPiece* data() const { return heap_.empty() ? inline_.data() : heap_.data(); }
+
+    std::array<LayoutPiece, 2> inline_{};
+    std::vector<LayoutPiece> heap_;
+    std::size_t size_ = 0;
+};
+
 // The current Vulkan layout of every tracked image subresource. Shared by all queues of a device; lists are
 // emitted in submission order. Images are tracked from creation (their initial state) until destruction.
 class LayoutTracker {
@@ -582,7 +618,9 @@ public:
     }
 
     // The current layouts over a range: one piece when they all agree, else one per subresource.
-    bool pieces(ResourceId id, const VkImageSubresourceRange& range, std::vector<LayoutPiece>& out) const {
+    // Out is LayoutPieces or std::vector<LayoutPiece>.
+    template<typename Out>
+    bool pieces(ResourceId id, const VkImageSubresourceRange& range, Out& out) const {
         const auto it = entries_.find(id);
         if (it == entries_.end()) return false;
         const Entry& e = it->second;
@@ -1011,8 +1049,9 @@ inline VkExtent2D mip_extent(const ResourceBinding& resource, std::uint32_t mip)
     return {std::max(1u, resource.width >> mip), std::max(1u, resource.height >> mip)};
 }
 
-inline std::vector<VkClearRect> clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t layers) {
-    std::vector<VkClearRect> out;
+// Into `out`, replacing what it held: a kept PreparedList entry reuses the vector's storage.
+inline void clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t layers, std::vector<VkClearRect>& out) {
+    out.clear();
     for (const Rect& r : rects) {
         const std::int64_t left = std::max<std::int64_t>(r.left, 0), top = std::max<std::int64_t>(r.top, 0);
         const std::int64_t right = std::min<std::int64_t>(r.right, extent.width);
@@ -1021,7 +1060,6 @@ inline std::vector<VkClearRect> clip(std::span<const Rect> rects, VkExtent2D ext
         out.push_back({{{std::int32_t(left), std::int32_t(top)}, {std::uint32_t(right - left), std::uint32_t(bottom - top)}},
                        0, layers});
     }
-    return out;
 }
 
 // A D3D12 barrier on a volume mip covers every W slice, including on devices with maintenance9.
@@ -1057,10 +1095,13 @@ inline void memory_barrier(const ReplayFunctions& vk, VkCommandBuffer command_bu
 }
 
 // The current layouts of a range: from the tracker, or `assumed` for an untracked image.
-inline std::vector<LayoutPiece> current(const LayoutTracker* tracker, ResourceId id, const VkImageSubresourceRange& range,
-                                        VkImageLayout assumed) {
-    std::vector<LayoutPiece> out;
-    if (!tracker || !tracker->pieces(id, range, out)) out = {{range, assumed}};
+inline LayoutPieces current(const LayoutTracker* tracker, ResourceId id, const VkImageSubresourceRange& range,
+                            VkImageLayout assumed) {
+    LayoutPieces out;
+    if (!tracker || !tracker->pieces(id, range, out)) {
+        out.clear();
+        out.push_back({range, assumed});
+    }
     return out;
 }
 
@@ -1211,7 +1252,7 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
 // when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
 // expects; with not_zeroed, it is only moved. The tracker records it.
 inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
-                       ResourceId id, std::vector<LayoutPiece>& pieces, VkImageLayout layout, LayoutTracker* tracker) {
+                       ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker) {
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
@@ -1654,7 +1695,7 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
 // back to where they were. Pieces already in `target` need no transition.
 template<typename Body>
 void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
-                const std::vector<LayoutPiece>& pieces, VkImageLayout target, const VulkanAccess& state,
+                const LayoutPieces& pieces, VkImageLayout target, const VulkanAccess& state,
                 VkAccessFlags target_access, VkPipelineStageFlags target_stages, Body&& body) {
     for (const auto& piece : pieces) {
         if (piece.layout == target) {
@@ -2042,7 +2083,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         const auto rect_view = [&](std::span<const Rect> rects, const TargetView& target, VkImageAspectFlags view_aspects) {
             if (rects.empty()) return ReplayResult::success;
             if (!rendering) return ReplayResult::unsupported;
-            p.rects = detail::clip(rects, detail::mip_extent(p.binding, target.mip), target.layer_count);
+            detail::clip(rects, detail::mip_extent(p.binding, target.mip), target.layer_count, p.rects);
             if (p.rects.empty()) {
                 p.skip = true;
                 return ReplayResult::success;
@@ -2772,9 +2813,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                  texture->layout_before == d3d12_layout::undefined;
             const VkImageLayout new_layout =
                 image_layout(p.binding, vulkan_layout(texture->layout_after, p.binding.presentable));
-            std::vector<LayoutPiece> pieces;
+            LayoutPieces pieces;
             if (discard)
-                pieces = {{range, VK_IMAGE_LAYOUT_UNDEFINED}};
+                pieces.push_back({range, VK_IMAGE_LAYOUT_UNDEFINED});
             else {
                 const VkImageLayout before =
                     image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable));
@@ -3103,7 +3144,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             for (const auto& range : p.discards) {
                 if (!tracker || detail::planes_for_layout(p.binding, range, separate).aspectMask != range.aspectMask)
                     continue;
-                std::vector<LayoutPiece> pieces;
+                LayoutPieces pieces;
                 if (!tracker->pieces(id, range, pieces)) continue;
                 for (const auto& piece : pieces)
                     if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED)

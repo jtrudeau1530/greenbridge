@@ -406,6 +406,30 @@ int main() {
     CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, pieces) && pieces.size() == 4);
     CHECK(separate.pieces(1, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 2, 0, 1}, pieces) && pieces.size() == 1);
     CHECK(pieces[0].layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL && pieces[0].range.levelCount == 2);
+    // LayoutPieces (what replay uses): the same pieces, inline for one or two, spilling to the heap for four, and
+    // reused after clear() from either state.
+    {
+        std::vector<LayoutPiece> four;
+        LayoutPieces inline_pieces;
+        CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, four) && four.size() == 4);
+        CHECK(separate.pieces(1, {depth_stencil.aspects, 0, 2, 0, 1}, inline_pieces) && inline_pieces.size() == 4);
+        bool same = true;
+        std::size_t index = 0;
+        for (const LayoutPiece& piece : inline_pieces) {
+            same = same && piece.layout == four[index].layout && piece.range.aspectMask == four[index].range.aspectMask &&
+                   piece.range.baseMipLevel == four[index].range.baseMipLevel;
+            ++index;
+        }
+        CHECK(same && index == 4);
+        CHECK(separate.pieces(1, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 2, 0, 1}, inline_pieces) && inline_pieces.size() == 1);
+        CHECK(inline_pieces[0].range.levelCount == 2 && inline_pieces.end() - inline_pieces.begin() == 1);
+        inline_pieces.clear();
+        CHECK(inline_pieces.empty());
+        for (std::uint32_t i = 0; i < 3; ++i)
+            inline_pieces.push_back({{VK_IMAGE_ASPECT_COLOR_BIT, i, 1, 0, 1}, VK_IMAGE_LAYOUT_GENERAL});
+        CHECK(inline_pieces.size() == 3 && inline_pieces[0].range.baseMipLevel == 0 &&
+              inline_pieces[2].range.baseMipLevel == 2);  // the inline two kept when it spilled
+    }
     merged.set(1, {depth_stencil.aspects, 1, 1, 0, 1}, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     CHECK(merged.layout(1, 1) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && merged.layout(1, 3) == merged.layout(1, 1));
     CHECK(!merged.pieces(2, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, pieces));  // untracked
