@@ -342,9 +342,10 @@ int main() {
             clock.advance_us(period);
             return xbox.WaitFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0, &token) == S_OK;
         };
+        UINT want_w = width, want_h = height;  // the client size the frames are expected at (the resize case changes it)
         const auto grab = [&](Frame& frame) -> bool {
             return xbox.presenter().read_back(frame.bytes, &frame.extent, &frame.format) &&
-                   frame.extent.width == width && frame.extent.height == height;
+                   (want_w == 0 || (frame.extent.width == want_w && frame.extent.height == want_h));
         };
 
         const FLOAT blue_ish[4] = {0.2f, 0.6f, 0.9f, 1.0f};  // 51, 153, 230
@@ -459,9 +460,9 @@ int main() {
         rt::d3d12::XboxPresentPlaneParameters two[2] = {plane_of(rgba, token), plane_of(second, token)};
         const std::uint64_t composed_before = xbox.presenter().composed_presents();
         EXPECT(xbox.PresentX(2, two, nullptr) == S_OK);
-        EXPECT(xbox.presenter().composed_presents() == composed_before + 1);
+        EXPECT(xbox.presenter().composed_presents() == composed_before);  // plane 1 without the overlay flag: not composed
         EXPECT(grab(frame));
-        EXPECT(region_is(frame, 0, 0, width, height, {0, 255, 0}, 0));
+        EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));  // plane 0 only, by the plain blit
         // Planes with different tokens, or more than two planes, are refused.
         EXPECT(next_token(token));
         two[0] = plane_of(rgba, token);
@@ -470,6 +471,24 @@ int main() {
         rt::d3d12::XboxPresentPlaneParameters three[3] = {plane_of(rgba, token), plane_of(second, token), plane_of(second, token)};
         EXPECT(xbox.PresentX(3, three, nullptr) == E_INVALIDARG);
         EXPECT(xbox.PresentX(1, nullptr, nullptr) == E_INVALIDARG);
+        {   // ResourceCount above 1 (either plane, either path) is refused, nothing presented, the frame stays
+            ID3D12Resource* both[2] = {rgba.resource.p, second.resource.p};
+            const std::uint64_t presents_before_count = xbox.presents();
+            const auto count_two = [&](int color_space, UINT flags) {
+                rt::d3d12::XboxPresentPlaneParameters p{token, 2, both, nullptr, 0};
+                p.ColorSpace = color_space;
+                p.Flags = flags;
+                return p;
+            };
+            auto one_count = count_two(0, 0);
+            EXPECT(xbox.PresentX(1, &one_count, nullptr) == DXGI_ERROR_UNSUPPORTED);  // plain blit path
+            one_count = count_two(rt::d3d12::xbox_color_space_g2084_p2020, 0);
+            EXPECT(xbox.PresentX(1, &one_count, nullptr) == DXGI_ERROR_UNSUPPORTED);  // compose path
+            rt::d3d12::XboxPresentPlaneParameters pair_count[2] = {plane_of(rgba, token), count_two(0, rt::d3d12::xbox_plane_flag_overlay)};
+            EXPECT(xbox.PresentX(2, pair_count, nullptr) == DXGI_ERROR_UNSUPPORTED);   // plane 1
+            EXPECT(xbox.presents() == presents_before_count);
+            std::printf("ResourceCount above 1 refused (plain, compose, plane 1): ok\n");
+        }
         std::printf("2 planes (SDR overlay over plane 0) and refused plane sets: ok\n");
 
         // The parameters struct is accepted (ImmediateThresholdPercent is ignored).
@@ -681,17 +700,17 @@ int main() {
             EXPECT(paint(ui, {40, 30, 80, 60}, 0, 0, 64, 64));
             rt::d3d12::XboxPresentPlaneParameters pair[2];
             pair[0] = parameters(solid.source, nullptr, xbox_scale_filter_point);
-            pair[1] = parameters(ui.source, &middle_half, xbox_scale_filter_point);
+            pair[1] = parameters(ui.source, &middle_half, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_overlay);
             EXPECT(present_planes(pair, 2) && composed_ok());
             Ref_plane refs[2] = {model(solid, nullptr, true), model(ui, &middle_half, true)};
             EXPECT(frame_matches(frame, refs, 2, false, 203.0, 1));
             std::printf("compose: 2 planes, premultiplied alpha overlay, point: within 1 level of the model\n");
-            pair[1] = parameters(ui.source, &middle_half, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_straight_alpha);
+            pair[1] = parameters(ui.source, &middle_half, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_overlay | rt::d3d12::xbox_plane_flag_straight_alpha);
             EXPECT(present_planes(pair, 2) && composed_ok());
             refs[1] = model(ui, &middle_half, true, nullptr, false, true);
             EXPECT(frame_matches(frame, refs, 2, false, 203.0, 1));
             std::printf("compose: 2 planes, straight alpha overlay: within 1 level of the model\n");
-            pair[1] = parameters(ui.source, &middle_half, xbox_scale_filter_linear);
+            pair[1] = parameters(ui.source, &middle_half, xbox_scale_filter_linear, 0, rt::d3d12::xbox_plane_flag_overlay);
             EXPECT(present_planes(pair, 2) && composed_ok());
             refs[1] = model(ui, &middle_half, false);
             EXPECT(frame_matches(frame, refs, 2, false, 203.0, 1));
@@ -740,7 +759,7 @@ int main() {
             }
             // SDR planes into PQ: the SDR white of the quad's white corner goes to 203 nits.
             pair[0] = parameters(quad.source, nullptr, xbox_scale_filter_point);
-            pair[1] = parameters(ui.source, &middle_half, xbox_scale_filter_point);
+            pair[1] = parameters(ui.source, &middle_half, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_overlay);
             EXPECT(present_planes(pair, 2) && composed_ok());
             Ref_plane srefs[2] = {model(quad, nullptr, true), model(ui, &middle_half, true)};
             if (!surface_hdr) {
@@ -770,15 +789,22 @@ int main() {
             if (!surface_hdr) EXPECT(frame_matches(frame, &href, 1, false, 203.0, 2));
             std::printf("compose: HDR10 plane 0 + unflagged SDR plane 1 (GameDVR copy) shows plane 0 only: ok\n");
 
-            // E: refused. A placement outside the output (or empty, or NaN); sources the pass cannot read (not sampled,
-            // multisampled). Nothing is presented and the same token still works.
-            const std::uint64_t presents_before = xbox.presents();
+            // E: a placement that is not a sub-rectangle of the output (empty, inverted, outside, NaN), an unknown filter and
+            // extended descriptors are ignored (logged once): the plane is shown over the whole output, point filtered.
             const float nan = std::numeric_limits<float>::quiet_NaN();
             const XboxViewRect bad_places[] = {{0.5f, 0, 0.5f, 1}, {-0.1f, 0, 1, 1}, {0, 0, 1.5f, 1}, {0, 0.75f, 1, 0.25f}, {nan, 0, 1, 1}};
             for (const XboxViewRect& bad : bad_places) {
                 one = parameters(quad.source, &bad, xbox_scale_filter_point);
-                EXPECT(present_planes(&one, 1, E_INVALIDARG));
+                EXPECT(present_planes(&one, 1) && composed_ok());
+                Ref_plane whole = model(quad, nullptr, true);
+                EXPECT(frame_matches(frame, &whole, 1, false, 203.0, 0));
             }
+            one = parameters(quad.source, nullptr, 77);  // unknown filter: default (bilinear), plain blit path
+            one.ExtendedDescCount = 2;
+            EXPECT(present_planes(&one, 1));
+            std::printf("compose: implausible placement, unknown filter, extended descriptors ignored (shown, not refused): ok\n");
+            // Sources the pass cannot read (depth, multisampled) are refused: nothing is presented, the token still works.
+            const std::uint64_t presents_before = xbox.presents();
             {
                 const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
                 const auto make_special = [&](DXGI_FORMAT format, UINT samples, D3D12_RESOURCE_FLAGS flags, Ref<ID3D12Resource>& out) {
@@ -809,6 +835,36 @@ int main() {
             one = parameters(quad.source, &middle_half, xbox_scale_filter_point);
             EXPECT(present_planes(&one, 1) && composed_ok());  // still working after the refusals
             std::printf("compose: bad placements, depth and multisampled sources refused: ok\n");
+
+            // F: the window changes size between composed presents (the swapchain is recreated, possibly in the middle of a
+            // present after an out-of-date acquire): the compose target follows, pixels match the model at the new size.
+            const UINT sizes[][2] = {{400, 300}, {200, 150}, {width, height}};
+            for (const auto& size : sizes) {
+                RECT outer{0, 0, LONG(size[0]), LONG(size[1])};
+                AdjustWindowRect(&outer, WS_OVERLAPPEDWINDOW, FALSE);
+                SetWindowPos(window, nullptr, 0, 0, outer.right - outer.left, outer.bottom - outer.top,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                pump();
+                want_w = want_h = 0;  // the first present after a resize may still be at the old size (suboptimal swapchain)
+                for (int round = 0; round < 3; ++round) {
+                    one = parameters(quad.source, &middle_half, xbox_scale_filter_point);
+                    // (A present the driver reports out of date right after the resize is not counted as shown, so the counter
+                    // is not checked here; the frame is still composed and read back.)
+                    EXPECT(present_planes(&one, 1));
+                    // Whatever size the frame has, it must be the composition at that size (no stale or mis-sized target).
+                    Ref_plane resized = model(quad, &middle_half, true);
+                    resized.dest[0] = middle_half.left * double(frame.extent.width);
+                    resized.dest[1] = middle_half.top * double(frame.extent.height);
+                    resized.dest[2] = middle_half.right * double(frame.extent.width);
+                    resized.dest[3] = middle_half.bottom * double(frame.extent.height);
+                    EXPECT(frame_matches(frame, &resized, 1, false, 203.0, 0));
+                    if (round == 2) EXPECT(frame.extent.width == size[0] && frame.extent.height == size[1]);
+                }
+            }
+            want_w = width;
+            want_h = height;
+            composed_expected = xbox.presenter().composed_presents();
+            std::printf("compose: window resized 320x240 -> 400x300 -> 200x150 -> 320x240 between composed presents: ok\n");
         }
 
         // Skipping a frame (waiting twice, presenting the second token) is fine.

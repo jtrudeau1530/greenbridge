@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -236,6 +237,7 @@ public:
     // VK_ERROR_UNKNOWN. vsync and `tear` as for present().
     VkResult present_planes(const PresentPlanes& planes, bool vsync, bool tear = false) {
         if (planes.count < 1 || planes.count > 2) return VK_ERROR_UNKNOWN;
+        if (!(planes.sdr_white_nits > 0.0f) || !std::isfinite(planes.sdr_white_nits)) return VK_ERROR_UNKNOWN;
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             const PresentPlane& plane = planes.plane[i];
             ResourceBinding binding;
@@ -342,6 +344,8 @@ public:
         }
         if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;  // nothing was acquired
         if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
+        // An out-of-date retry above may have given the swapchain another extent: the compose target follows it.
+        if (planes && !prepare_compose()) return give_back(frame, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
         bool recorded = false;
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
@@ -605,6 +609,9 @@ private:
                        const PresentPlanes& planes, std::uint32_t image) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
+        if (composer_->target() == VK_NULL_HANDLE || composer_->extent().width != extent_.width ||
+            composer_->extent().height != extent_.height)
+            return false;  // the target does not match the swapchain: nothing recorded
         drop_views(frame);
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
