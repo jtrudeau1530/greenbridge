@@ -1454,7 +1454,8 @@ Not implemented yet:
 - **Occlusion resolves during a pipeline-statistics query.** Replay refuses binary resolves and ordinary resolves
   that need a sum while pipeline statistics are active, since the internal dispatch would change the reported
   compute-invocation count. Both dispatch paths need compute support on the graphics queue.
-- `GetClockCalibration` (from `VK_EXT_calibrated_timestamps`), stream-output and mesh-shader statistics.
+- Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
+  queues and frames in flight".)
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
 ### 4.7 Indirect commands and command signatures
