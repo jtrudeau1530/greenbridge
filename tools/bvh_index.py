@@ -36,9 +36,14 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import unicodedata
 import zlib
+from contextlib import suppress
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 TAG = 0x81020006
@@ -304,7 +309,10 @@ def summarize(rows, source, span, zero, unread, elapsed):
 
 
 def scan_dir(path, max_inflate=1 << 28):
-    rpfs = sorted(glob.glob(os.path.join(path, "**", "*.rpf"), recursive=True))
+    # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
+    # class by glob and match nothing. The "**"/"*.rpf"/"*.bin" suffixes stay as glob patterns.
+    root = glob.escape(os.fspath(path))
+    rpfs = sorted(glob.glob(os.path.join(root, "**", "*.rpf"), recursive=True))
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
@@ -316,7 +324,7 @@ def scan_dir(path, max_inflate=1 << 28):
             rows += r
             summaries.extend(s)
         return rows, summaries
-    for p in sorted(glob.glob(os.path.join(path, "**", "*.bin"), recursive=True)):
+    for p in sorted(glob.glob(os.path.join(root, "**", "*.bin"), recursive=True)):
         size = os.path.getsize(p)
         with open(p, "rb") as f:
             head = f.read(HEAD)
@@ -327,7 +335,8 @@ def scan_dir(path, max_inflate=1 << 28):
                 tail = head
         row = classify(head, size, tail)
         row.update(source=p, offset=0, stored=size, size=size)
-        if row["kind"] in ("bvh4", "bvh4-chunk"):
+        # A chunk exposes the header but has only a prefix of the declared node buffer.
+        if row["kind"] == "bvh4":
             with open(p, "rb") as f:
                 body = f.read(HEAD + row["node_count"] * 64)[HEAD:]
             row["fill"] = {("%02x" % b): body.count(bytes([b])) for b in FILL_BYTES}
@@ -347,14 +356,32 @@ def _make_parent(path):
         os.makedirs(parent, exist_ok=True)
 
 
+def _publish(dest, write, newline):
+    """Write a report next to `dest` and swap it in, so a run that fails or is interrupted while writing (a
+    serialization error, a full disk, Ctrl+C) leaves the previous report as it was instead of a truncated one.
+    The result keeps the previous report's permission bits, or gets the usual ones for a new file."""
+    _make_parent(dest)
+    directory = os.path.dirname(os.path.abspath(dest))
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline=newline, dir=directory,
+                                         prefix=".bvh_index-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            write(f)
+        os.chmod(temp, published_mode(dest))
+        os.replace(temp, dest)
+    except BaseException:
+        if temp is not None:
+            with suppress(OSError):
+                os.unlink(temp)
+        raise
+
+
 def write_outputs(rows, summaries, out, csv_path):
     if out:
-        _make_parent(out)
         payload = summaries if len(summaries) > 1 else (summaries[0] if summaries else {})
-        with open(out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": payload, "streams": rows}, f, indent=0)
+        _publish(out, lambda f: json.dump({"summary": payload, "streams": rows}, f, indent=0), "\n")
     if csv_path:
-        _make_parent(csv_path)
         cols = ["source", "offset", "stored", "size", "kind", "signature", "version", "node_count",
                 "node_bytes", "declared_bytes", "tail_offset", "flags", "crc32", "num_elements",
                 "offset_to_nodes", "offset_to_prim_remap", "root_node_ptr", "root_node_index",
@@ -362,7 +389,8 @@ def write_outputs(rows, summaries, out, csv_path):
                 "offset_to_parents",
                 "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+
+        def write_csv(f):
             w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             for r in rows:
@@ -371,6 +399,8 @@ def write_outputs(rows, summaries, out, csv_path):
                     if k in r:
                         r[k] = " ".join(str(v) for v in r[k])
                 w.writerow(r)
+
+        _publish(csv_path, write_csv, "")
 
 
 def byte_count(text):

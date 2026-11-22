@@ -35,7 +35,7 @@ def build_music_bank(toc: int, samples: int, rate: int = 48000, *, duplicate_toc
     """One descriptor and one block, with one packet subblock per channel."""
     tocs = (toc,) if duplicate_toc is None else (toc, duplicate_toc)
     desc = bytearray(12 + 16 * len(tocs))
-    struct.pack_into("<III", desc, 0, 1, 2048, len(tocs))
+    struct.pack_into("<III", desc, 0, 1, 2048 * (1 + len(tocs)), len(tocs))
     data = bytearray(2048 * (1 + len(tocs)))
     for i, packet in enumerate(tocs):
         channel = 12 + 16 * i

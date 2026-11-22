@@ -617,7 +617,9 @@ class Analysis:
                 zero = any(x.get("k") == "imm" and x["v"] == 0 for x in srcs)
                 if op in ("s_cmp_eq_u64", "s_cmp_lg_u64") and zero and not _half(m):
                     T["scc"] = X | (t_src & ELECT)
-                    st["g"]["scc"] = ("vote", _regs(m)[0] if _regs(m) else "exec")
+                    # cmp_eq: SCC = (mask == 0), the opposite sense of every other vote (SCC = mask != 0)
+                    st["g"]["scc"] = ("vote", _regs(m)[0] if _regs(m) else "exec") + \
+                        (("empty",) if op == "s_cmp_eq_u64" else ())
                     if t_src & ~ELECT & ~0:
                         bits_violation(t_src & ~ELECT)
                 else:
@@ -649,8 +651,9 @@ class Analysis:
                 elif r and r[0] in st["g"] and st["g"][r[0]][0] in ("mask", "elect", "wfmask"):
                     tag = st["g"][r[0]]
             put(dests[0], t_src, tag)
-            T["scc"] = X
-            st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
+            if not op.startswith(("s_mov", "s_cselect")):     # those leave SCC as it was: no vote on their dest
+                T["scc"] = X
+                st["g"]["scc"] = ("vote", _regs(dests[0])[0] if _regs(dests[0]) else "exec")
             return
 
         # --- register swap and dynamic indexing
@@ -845,8 +848,9 @@ class Analysis:
                     and mg and mg[0] == "mask" and (op == "s_mov_b64" or self.ancestor(mg[1], old)):
                 st["x"] = mg[1]
                 st["xg"], st["f"] = self.tok.get(mg[1], (None, None, False))[1:]
-                T["scc"] = X
-                st["g"]["scc"] = ("vote", "exec")
+                if op == "s_or_b64":                            # s_mov_b64 leaves SCC as it was
+                    T["scc"] = X
+                    st["g"]["scc"] = ("vote", "exec")
                 return
             if op.startswith("v_cmpx"):
                 self.new_exec(site, old, st, True, mg, mt, violation, idiom)
@@ -910,7 +914,8 @@ class Analysis:
                 self.bad_branch(ev, ins, op, t)
                 return
             if g and g[0] == "vote":
-                self.vote(n, ins, op, g[1], op == "s_cbranch_scc1", ev)
+                # the vote is yes (some lane in the mask) when SCC = 1, or SCC = 0 for an "empty" test
+                self.vote(n, ins, op, g[1], (op == "s_cbranch_scc1") != (g[2:] == ("empty",)), ev)
             return
         reg = "vcc" if "vcc" in op else "exec"
         t = (T.get(reg, 0) | (CTRL if (id(ins), "vcc") in self.stale else 0)) if reg == "vcc" else 0

@@ -267,3 +267,52 @@ def test_visual_studio_config_subfolder_is_found(monkeypatch, tmp_path):
     (build / "RelWithDebInfo" / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
     got = build_dir_main_uses(monkeypatch, ["--build", str(build), "--work", str(tmp_path / "w")])
     assert got == str(build / "RelWithDebInfo")
+
+
+def test_translate_forwards_pc_tail_ubo(monkeypatch, tmp_path):
+    cmds = []
+
+    def fake_run(cmd, **_kw):
+        cmds.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(imf.subprocess, "run", fake_run)
+    imf.translate(str(tmp_path))
+    imf.translate(str(tmp_path), pc_tail=True)
+    assert "--pc-tail-ubo" not in cmds[0]
+    assert "--pc-tail-ubo" in cmds[1]
+
+
+def test_run_case_passes_pc_tail_to_translator_and_harness(monkeypatch, tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
+    seen_translate = []
+    seen_env = []
+    monkeypatch.setattr(imf, "assemble", lambda *_args: None)
+    monkeypatch.setattr(imf, "translate", lambda work, pc_tail=False: seen_translate.append(pc_tail) or str(tmp_path / "spirv"))
+
+    def fake_run(cmd, **kw):
+        seen_env.append(kw.get("env"))
+        return subprocess.CompletedProcess(cmd, 77, "unsupported: test\n", "")
+
+    monkeypatch.setattr(imf.subprocess, "run", fake_run)
+    imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False, pc_tail=True)
+    assert seen_translate == [True]
+    assert seen_env[0]["LEONIDA_PC_TAIL_UBO"] == "1"
+
+
+def test_main_enables_pc_tail_ubo_from_flag_or_env(monkeypatch, tmp_path):
+    for argv, env_val, want in (
+        ([], "", False),
+        (["--pc-tail-ubo"], "", True),
+        ([], "1", True),
+        ([], "true", True),
+        ([], "0", False),
+    ):
+        seen = []
+        monkeypatch.setenv("LEONIDA_PC_TAIL_UBO", env_val)
+        monkeypatch.setattr(imf, "run_case", lambda *args, **kw: seen.append(kw.get("pc_tail", False)) or True)
+        monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--programs", "1", "--work", str(tmp_path)] + argv)
+        assert imf.main() == 0
+        assert seen == [want], (argv, env_val)

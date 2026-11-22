@@ -310,6 +310,36 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertIsNone(rgt.narrow_subgroup_skip(out))
 
 
+class SubgroupPinSkip(unittest.TestCase):
+    """A device that cannot pin the wave size a shader was translated for skips, not fails. GCN3/GCN4 report
+    64..64, so cs_barrier_loop's wave32 fixture runs at 64 lanes and its words say nothing; check.py skips it
+    already (unpinned_subgroup_skip), the runner used to judge it and report a failure."""
+    MSG = "device: X (subgroup 64..64)\ncompute subgroup size: 32 not available\n" + dump(WANT)
+
+    def test_unpinned_size_is_a_skip(self):
+        self.assertEqual(rgt.subgroup_pin_skip(self.MSG, {"VKC_SUBGROUP_SIZE": "32"}),
+                         "SKIP (the device can't run this shader at 32 lanes on request)")
+
+    def test_no_pin_requested_is_judged(self):
+        for env in (None, {}, {"VKC_SGPRS": "0x1"}, {"VKH_SUBGROUP_SIZE": "64"}):
+            with self.subTest(env=env):
+                self.assertIsNone(rgt.subgroup_pin_skip(self.MSG, env))
+
+    def test_a_honoured_pin_is_judged(self):
+        out = "device: X (subgroup 32..64)\ncompute subgroup size: 32\n" + dump(WANT)
+        self.assertIsNone(rgt.subgroup_pin_skip(out, {"VKC_SUBGROUP_SIZE": "32"}))
+        self.assertIsNone(rgt.subgroup_pin_skip("device: X (subgroup 32..64)\n" + dump(WANT),
+                                                {"VKC_SUBGROUP_SIZE": "32"}))
+
+    def test_only_wave_width_fixtures_carry_the_rule(self):
+        self.assertIn("cs_barrier_loop", rgt.WAVE32_PIN_DUMPS)
+        # everything else is judged at the device's own width, as before, so a 64-only device keeps testing it
+        for name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_int_ext", "cs_barrier_divergent",
+                     "cs_barrier_early_end", "cs_w32_lds_u8_d16"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, rgt.WAVE32_PIN_DUMPS)
+
+
 class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
     """ps_ij_computed (SHADER-177): without PerVertexKHR inputs (--bary-fallback, --f16-interp-fallback, the latter on
     by default on MoltenVK) the translator refuses the computed I/J pair, so there is no .spv. Both runners SKIP it
