@@ -56,6 +56,21 @@ TEXEL_OFFSET_FALLBACK = False
 # in push-constant dwords 36..37 (the block grows from 144 to 152 bytes). The slot layout is mesh_compute_layout();
 # the index records it as "mesh_compute". tools/mesh_compute_vs.py writes the vertex shader that draws the slots.
 MESH_COMPUTE = False
+# --f16-interp-fallback: *_f16 interps without PerVertexKHR, for devices that have VK_KHR_fragment_shader_barycentric
+# but can't use its per-vertex inputs (MoltenVK: SPIRV-Cross has no MSL form of PerVertexKHR). Every VS and mesh
+# `exp paramN` also exports the channel's two f16 halves decoded to f32, low halves at f16_half_location(N, 0) and high
+# halves at f16_half_location(N, 1), and a PS *_f16 read of attrN.c takes component c of that smooth input. The
+# interpolation is linear, so this is the same P0 + i(P1 - P0) + j(P2 - P0) of the decoded halves, rounded by the
+# device's interpolator instead of by explicit arithmetic. The halves sit below location F16_HALF_TOP (30: 31
+# locations is MoltenVK's limit, 124 components), counting down from param 0, so a producer with params 0..P-1 has
+# room for the halves of params 0..(29 - P) / 2; Gen.export skips the ones that would land on its own params.
+F16_HALVES = False
+F16_HALF_TOP = 30
+
+
+def f16_half_location(n, half):
+    """--f16-interp-fallback: the location of param n's decoded low (half 0) or high (half 1) f16 halves."""
+    return F16_HALF_TOP - 2 * n - 1 + half
 
 
 def mesh_compute_layout(maxv, maxp, clip_count, cull_count, params):
@@ -127,6 +142,9 @@ class Gen:
         self.inputs = {}
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
         self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
+        self.f16_halves = set()     # PS, --f16-interp-fallback: the same attributes, read from decoded-half inputs
+        self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
+        self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.uses_psb = False
         self.uses_active = False
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
@@ -6851,7 +6869,22 @@ class Gen:
         An attribute in per_vertex (read by a *_f16 interp somewhere) is a PerVertexKHR vec4[3] of the producer's
         raw 32-bit words, which hold two f16 (low, high). `half` 0/1 decodes that f16 of each vertex, None keeps the
         word as an f32; the three values are then weighted as AMD does, P0 + i(P1 - P0) + j(P2 - P0) with i, j =
-        BaryCoordKHR.y, .z, or vertex 0's taken when `flat`."""
+        BaryCoordKHR.y, .z, or vertex 0's taken when `flat`.
+
+        --f16-interp-fallback: an f16 read (`half` 0/1) of an attribute in f16_halves is component `comp` of the smooth
+        input at f16_half_location(n, half), which the producer fills with that half decoded to f32 (F16_HALVES).
+        Other reads of such an attribute take the raw word as on any location (smooth, or flat = provoking vertex)."""
+        if half is not None and n in self.f16_halves:
+            loc = f16_half_location(n, half)
+            if loc < 0:
+                raise Unsupported(f"--f16-interp-fallback: attr{n} has no decoded-half location")
+            name = f"%in_f16h{n}_{half}"
+            self.inputs[name] = loc
+            self.interpolated.add(name)
+            p, v = self.tmp(), self.tmp()
+            self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
+            self.emit(f"{v} = OpLoad %float {p}")
+            return v
         name = f"%in_attr{n}"
         self.inputs[name] = n
         if not flat:
@@ -7504,6 +7537,38 @@ class Gen:
         self.emit(f"{old} = OpLoad %v4float {name}")
         self.emit(f"{sel} = OpSelect %v4float {self.active_b()} {v} {old}")
         self.emit(f"OpStore {name} {sel}")
+        if F16_HALVES and tgt.startswith("param") and self.stage == "vs":
+            n = int(tgt[5:])
+            for half, hv in enumerate(self.f16_halves_of(n, v)):
+                hname = f"%out_f16h{n}_{half}"
+                self.outputs[hname] = f"loc{f16_half_location(n, half)}"
+                old, sel = self.tmp(), self.tmp()
+                self.emit(f"{old} = OpLoad %v4float {hname}")
+                self.emit(f"{sel} = OpSelect %v4float {self.active_b()} {hv} {old}")
+                self.emit(f"OpStore {hname} {sel}")
+
+    def f16_halves_of(self, n, v):
+        """--f16-interp-fallback: param n's exported vec4 `v` as two vec4s, the low and the high f16 half of each
+        channel's raw word decoded to f32 (UnpackHalf2x16), or () when their locations would overlap a param this
+        shader exports (or fall below location 0): the PS reading them is then fed by another producer or rejects."""
+        if f16_half_location(n, 0) <= self.param_max:
+            return ()
+        lo, hi = [], []
+        for c in range(4):
+            e, u, h2, a, b = (self.tmp() for _ in range(5))
+            self.emit(f"{e} = OpCompositeExtract %float {v} {c}")
+            self.emit(f"{u} = OpBitcast %uint {e}")
+            self.emit(f"{h2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+            self.emit(f"{a} = OpCompositeExtract %float {h2} 0")
+            self.emit(f"{b} = OpCompositeExtract %float {h2} 1")
+            lo.append(a)
+            hi.append(b)
+        out = []
+        for parts in (lo, hi):
+            r = self.tmp()
+            self.emit(f"{r} = OpCompositeConstruct %v4float {' '.join(parts)}")
+            out.append(r)
+        return tuple(out)
 
 
 _TYPE_DECL = re.compile(r"\s*(%\w+) = (OpTypeVector|OpTypePointer) (.*)$")
@@ -7638,6 +7703,9 @@ def assemble(gen):
     ms = gen.stage == "ms"
     gsx = gen.stage == "gs"
     msc = ms and MESH_COMPUTE
+    # --f16-interp-fallback, mesh: the params whose decoded halves fit clear of this shader's params (Gen.f16_halves_of)
+    ms_halves = [n for n in sorted(gen.ms_params) if F16_HALVES and f16_half_location(n, 0) > gen.param_max] \
+        if ms and not msc else []
     if msc:
         gen.msc_layout = mesh_compute_layout(gen.ms["maxv"], gen.ms["maxp"], gen.clip_count if gen.uses_clip else 0,
                                              gen.cull_count if gen.uses_cull else 0, gen.ms_params)
@@ -7671,7 +7739,8 @@ def assemble(gen):
     iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts"] + ([] if msc else
          [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
-         [f"%ms_out_param{n}" for n in sorted(gen.ms_params)])) if ms else []) + (
+         [f"%ms_out_param{n}" for n in sorted(gen.ms_params)] +
+         [f"%ms_out_f16h{n}_{h}" for n in ms_halves for h in (0, 1)])) if ms else []) + (
         ["%x_buf"] if gen.emulate or gen.bar_rounds else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
@@ -7703,6 +7772,8 @@ def assemble(gen):
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
     # past what drivers with 128 input components accept (#804 review).
     used = set(gen.inputs.values())
+    if len(used) != len(gen.inputs):    # --f16-interp-fallback: a decoded-half location is also an attribute
+        raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
     gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
     bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs or bary:
@@ -7815,6 +7886,8 @@ def assemble(gen):
                     "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT",
                     "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT"]
             dec += [f"OpDecorate %ms_out_param{n} Location {n}" for n in sorted(gen.ms_params)]
+            dec += [f"OpDecorate %ms_out_f16h{n}_{h} Location {f16_half_location(n, h)}" for n in ms_halves
+                    for h in (0, 1)]
     if vs:
         if gen.uses_clip:
             dec.append("OpDecorate %out_clip BuiltIn ClipDistance")
@@ -8042,6 +8115,7 @@ def assemble(gen):
                       "%ms_prim_idx = OpVariable %_ptr_Out_ms_arr_idx Output",
                       "%ms_cull = OpVariable %_ptr_Out_ms_arr_cull Output"]
             gvars += [f"%ms_out_param{n} = OpVariable %_ptr_Out_ms_arr_v4 Output" for n in sorted(gen.ms_params)]
+            gvars += [f"%ms_out_f16h{n}_{h} = OpVariable %_ptr_Out_ms_arr_v4 Output" for n in ms_halves for h in (0, 1)]
         if gen.uses_lds:
             types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
@@ -8372,6 +8446,17 @@ def assemble(gen):
         for n in sorted(gen.ms_params):
             L += [f"%mq{n} = OpLoad %v4float %ms_param{n}",
                   f"%mqp{n} = OpAccessChain %_ptr_Out_v4_ms %ms_out_param{n} %mli", f"OpStore %mqp{n} %mq{n}"]
+            if n in ms_halves:      # --f16-interp-fallback: each channel's f16 halves decoded to f32
+                for k in range(4):
+                    L += [f"%mqe{n}_{k} = OpCompositeExtract %float %mq{n} {k}",
+                          f"%mqu{n}_{k} = OpBitcast %uint %mqe{n}_{k}",
+                          f"%mqh{n}_{k} = OpExtInst %v2float %glsl UnpackHalf2x16 %mqu{n}_{k}"]
+                    L += [f"%mqh{n}_{k}_{h} = OpCompositeExtract %float %mqh{n}_{k} {h}" for h in (0, 1)]
+                for h in (0, 1):
+                    L += [f"%mqv{n}_{h} = OpCompositeConstruct %v4float " +
+                          " ".join(f"%mqh{n}_{k}_{h}" for k in range(4)),
+                          f"%mqvp{n}_{h} = OpAccessChain %_ptr_Out_v4_ms %ms_out_f16h{n}_{h} %mli",
+                          f"OpStore %mqvp{n}_{h} %mqv{n}_{h}"]
         L += ["OpBranch %ms_vend", "%ms_vend = OpLabel",
               "%mhp = OpLoad %bool %ms_has_prim", "%mpi = OpULessThan %bool %mli %msp",
               "%mwp = OpLogicalAnd %bool %mhp %mpi",
@@ -8808,7 +8893,10 @@ def translate(path):
         if any(i.get("normalized") for i in insns):
             raise Unsupported("reachable instruction with normalized encoding")
     g = Gen(stage)
-    g.round_mode = any(i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", "") for i in insns)
+    if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
+        g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
+                           (i["args"][0].get("t", ""),) if t.startswith("param") and t[5:].isdigit()), default=-1)
+    g.round_mode =any(i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", "") for i in insns)
     g.wave64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
                    (base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in i["args"]))
                    for i in insns)
@@ -8942,10 +9030,13 @@ def translate(path):
         if unexplained:
             raise Unsupported("PS system inputs")
         g.frag_inputs = layout
-        if not BARY_FALLBACK:
-            g.per_vertex = {x["a"] for i in insns if base_op(i["op"]) in ("v_interp_p1ll_f16", "v_interp_p1lv_f16",
-                                                                          "v_interp_p2_f16")
-                            for x in i["args"] if x["k"] == "attr"}
+        f16_read = {x["a"] for i in insns if base_op(i["op"]) in ("v_interp_p1ll_f16", "v_interp_p1lv_f16",
+                                                                  "v_interp_p2_f16")
+                    for x in i["args"] if x["k"] == "attr"}
+        if F16_HALVES:      # decoded halves from the producer: no per-vertex inputs (and no barycentrics)
+            g.f16_halves = f16_read
+        elif not BARY_FALLBACK:
+            g.per_vertex = f16_read
         for r in layout:
             g.cu(r)
         # FSSM pixel-input table (tools/fssm_header.py): the authoritative interpolant list. Position i of the
@@ -9560,6 +9651,21 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # --bary-fallback: the raw barycentrics are a perspective-interpolated vec3 at this location; the stage
         # before the PS must write (1,0,0), (0,1,0), (0,0,1) at the triangle's vertices (see BARY_FALLBACK).
         m["bary_fallback_input"] = {"location": g.bary_location}
+    if F16_HALVES and g.stage in ("vs", "ms", "ps"):
+        # --f16-interp-fallback: PS = the attributes whose f16 reads take decoded halves, VS/MS = the params that
+        # export them; each as {n: [low-half location, high-half location]}. A pipeline links when every PS entry
+        # is among its producer's (see F16_HALVES).
+        if g.stage == "ps":
+            ns = sorted(g.f16_halves)
+        elif g.stage == "ms":
+            ns = sorted(g.ms_params)
+        else:
+            ns = sorted({int(t[5:]) for t in g.outputs.values() if t.startswith("param")})
+        ns = [n for n in ns if g.stage == "ps" or f16_half_location(n, 0) > g.param_max]
+        if ns:
+            m["f16_halves"] = {str(n): [f16_half_location(n, 0), f16_half_location(n, 1)] for n in ns}
+            if "mesh_compute" in m:     # tools/mesh_compute_vs.py exports them from the slot's raw params
+                m["mesh_compute"] = dict(m["mesh_compute"], f16_halves=m["f16_halves"])
     if g.build_meta:
         m.update(g.build_meta)
     return m
@@ -9652,14 +9758,19 @@ def main():
                          "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
                          "(guaranteed single rounding; needs VK_KHR_shader_fma + shaderFmaFloat32, listed in the "
                          "shader's metadata as capability FMAKHR / feature shaderFmaFloat32)")
+    ap.add_argument("--f16-interp-fallback", action="store_true",
+                    help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
+                         "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
+                         "reads as ordinary interpolated inputs (metadata: f16_halves)")
     a = ap.parse_args()
-    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR
+    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
+    F16_HALVES = a.f16_interp_fallback
     if a.merge:
         import glob as _gl, json as _js
         merged = {}
