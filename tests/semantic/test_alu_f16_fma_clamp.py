@@ -295,6 +295,47 @@ def merge_half(val: int, dst_hi: int, old: int = OLD) -> int:
     return (val << 16) | (old & 0xFFFF) if dst_hi else (old & 0xFFFF0000) | val
 
 
+def pack2(lo: int, hi: int) -> int:
+    """Pack two 16-bit half-precision values into a 32-bit dword."""
+    return ((hi & MASK16) << 16) | (lo & MASK16)
+
+
+def ref_pk_fma_f16(
+    v1: int,
+    v2: int,
+    v3: int,
+    *,
+    clamp: bool = False,
+    op_sel: tuple[int, int, int] = (0, 0, 0),
+    op_sel_hi: tuple[int, int, int] = (1, 1, 1),
+    neg_lo: tuple[int, int, int] = (0, 0, 0),
+    neg_hi: tuple[int, int, int] = (0, 0, 0),
+    flush_denorms: bool = False,
+) -> int:
+    """Reference oracle for packed half-precision SIMD FMA (v_pk_fma_f16).
+
+    RDNA2 VOP3P packed half-precision FMA:
+    Result lo: source i takes its half from op_sel[i] (0 = lo, 1 = hi), negated by neg_lo[i].
+    Result hi: source i takes its half from op_sel_hi[i] (0 = lo, 1 = hi), negated by neg_hi[i].
+    Both halves independently evaluate FMA and optional clamp.
+    """
+    def extract_half(val: int, half_sel: int, neg: int) -> int:
+        h = (val >> 16) if half_sel else (val & MASK16)
+        return apply_src_mods(h, neg=bool(neg))
+
+    a_lo = extract_half(v1, op_sel[0], neg_lo[0])
+    b_lo = extract_half(v2, op_sel[1], neg_lo[1])
+    c_lo = extract_half(v3, op_sel[2], neg_lo[2])
+    res_lo = ref_fma_f16(a_lo, b_lo, c_lo, clamp=clamp, flush_denorms=flush_denorms)
+
+    a_hi = extract_half(v1, op_sel_hi[0], neg_hi[0])
+    b_hi = extract_half(v2, op_sel_hi[1], neg_hi[1])
+    c_hi = extract_half(v3, op_sel_hi[2], neg_hi[2])
+    res_hi = ref_fma_f16(a_hi, b_hi, c_hi, clamp=clamp, flush_denorms=flush_denorms)
+
+    return pack2(res_lo, res_hi)
+
+
 _TMP_DIR = None
 _PS_PATH = None
 _CS_PATH = None
@@ -472,6 +513,167 @@ class ScalarFmaClampTests(unittest.TestCase):
         # s4 = 0.5: 0.5 * 1.0 + 0.5 = 1.0 (0x3C00)
         got = run_op("v_fma_f16 v0, s4, 1.0, 0.5 clamp", s4=POS_HALF)
         self.assertEqual(got, merge_half(POS_ONE, dst_hi=0))
+
+
+# -----------------------------------------------------------------------------
+# Commit 2 Tests: Packed Half-Precision v_pk_fma_f16 SIMD Saturation Tests
+# -----------------------------------------------------------------------------
+
+class PackedReferenceOracleTests(unittest.TestCase):
+    """Test unit validation of the packed half-precision SIMD FMA oracle."""
+
+    def test_packed_oracle_basic(self):
+        # lo: 2.0 * 2.0 + 2.0 = 6.0 -> clamped to 1.0 (0x3C00)
+        # hi: 0.5 * 0.5 + 0.25 = 0.5 (0x3800)
+        v1 = pack2(POS_TWO, POS_HALF)
+        v2 = pack2(POS_TWO, POS_HALF)
+        v3 = pack2(POS_TWO, POS_QUARTER)
+        self.assertEqual(ref_pk_fma_f16(v1, v2, v3, clamp=True), pack2(POS_ONE, POS_HALF))
+        self.assertEqual(ref_pk_fma_f16(v1, v2, v3, clamp=False), pack2(0x4600, POS_HALF))
+
+    def test_packed_oracle_swizzle_and_negation(self):
+        # v1: lo=2.0, hi=0.5
+        # v2: lo=1.0, hi=-1.0
+        # v3: lo=0.25, hi=0.75
+        v1 = pack2(POS_TWO, POS_HALF)
+        v2 = pack2(POS_ONE, NEG_ONE)
+        v3 = pack2(POS_QUARTER, POS_THREE_QUARTERS)
+
+        # op_sel:(1, 0, 0): lo takes v1.hi (0.5), v2.lo (1.0), v3.lo (0.25) -> 0.5 * 1.0 + 0.25 = 0.75
+        # op_sel_hi:(0, 1, 1): hi takes v1.lo (2.0), v2.hi (-1.0), v3.hi (0.75) -> 2.0 * (-1.0) + 0.75 = -1.25 -> clamped to 0.0
+        got = ref_pk_fma_f16(v1, v2, v3, clamp=True, op_sel=(1, 0, 0), op_sel_hi=(0, 1, 1))
+        self.assertEqual(got, pack2(POS_THREE_QUARTERS, POS_ZERO))
+
+        # neg_lo:(1, 0, 0): lo takes -v1.lo (-2.0), v2.lo (1.0), v3.lo (0.25) -> -1.75 -> clamped to 0.0
+        got_neg = ref_pk_fma_f16(v1, v2, v3, clamp=True, neg_lo=(1, 0, 0))
+        self.assertEqual(got_neg & MASK16, POS_ZERO)
+
+    def test_packed_oracle_independent_clamp(self):
+        # lo clamps to 0.0; hi clamps to 1.0
+        v1 = pack2(NEG_TWO, POS_TWO)
+        v2 = pack2(POS_ONE, POS_TWO)
+        v3 = pack2(POS_HALF, POS_TWO)
+        self.assertEqual(ref_pk_fma_f16(v1, v2, v3, clamp=True), pack2(POS_ZERO, POS_ONE))
+
+
+class PackedFmaF16ClampTests(unittest.TestCase):
+    """End-to-end tests for packed v_pk_fma_f16 SIMD execution with IEEE clamp saturation."""
+
+    def test_packed_clamp_both_lanes_saturating(self):
+        # lo: 2.0 * (-1.0) + 0.5 = -1.5 -> clamped to 0.0 (0x0000)
+        # hi: 2.0 * 2.0 + 2.0 = 6.0 -> clamped to 1.0 (0x3C00)
+        v1 = pack2(POS_TWO, POS_TWO)
+        v2 = pack2(NEG_ONE, POS_TWO)
+        v3 = pack2(POS_HALF, POS_TWO)
+        got = run_op("v_pk_fma_f16 v0, v1, v2, v3 clamp", v1=v1, v2=v2, v3=v3)
+        self.assertEqual(got, pack2(POS_ZERO, POS_ONE))
+
+        # Inverted saturation: lo clamps to 1.0, hi clamps to 0.0
+        v1_inv = pack2(POS_TWO, POS_TWO)
+        v2_inv = pack2(POS_TWO, NEG_ONE)
+        v3_inv = pack2(POS_TWO, POS_HALF)
+        got_inv = run_op("v_pk_fma_f16 v0, v1, v2, v3 clamp", v1=v1_inv, v2=v2_inv, v3=v3_inv)
+        self.assertEqual(got_inv, pack2(POS_ONE, POS_ZERO))
+
+    def test_packed_clamp_one_lane_interior_one_saturating(self):
+        # lo interior (0.5 * 0.5 + 0.25 = 0.5), hi saturates upper (2.0 * 2.0 + 2.0 = 6.0 -> 1.0)
+        v1 = pack2(POS_HALF, POS_TWO)
+        v2 = pack2(POS_HALF, POS_TWO)
+        v3 = pack2(POS_QUARTER, POS_TWO)
+        got1 = run_op("v_pk_fma_f16 v0, v1, v2, v3 clamp", v1=v1, v2=v2, v3=v3)
+        self.assertEqual(got1, pack2(POS_HALF, POS_ONE))
+
+        # lo interior (0.5 * 0.5 + 0.25 = 0.5), hi saturates lower (2.0 * -1.0 + 0.5 = -1.5 -> 0.0)
+        v1_b = pack2(POS_HALF, POS_TWO)
+        v2_b = pack2(POS_HALF, NEG_ONE)
+        v3_b = pack2(POS_QUARTER, POS_HALF)
+        got2 = run_op("v_pk_fma_f16 v0, v1, v2, v3 clamp", v1=v1_b, v2=v2_b, v3=v3_b)
+        self.assertEqual(got2, pack2(POS_HALF, POS_ZERO))
+
+        # lo saturates upper (1.0), hi interior (0.5)
+        got3 = run_op("v_pk_fma_f16 v0, v1, v2, v3 clamp", v1=pack2(POS_TWO, POS_HALF), v2=pack2(POS_TWO, POS_HALF), v3=pack2(POS_TWO, POS_QUARTER))
+        self.assertEqual(got3, pack2(POS_ONE, POS_HALF))
+
+        # lo saturates lower (0.0), hi interior (0.5)
+        got4 = run_op("v_pk_fma_f16 v0, v1, v2, v3 clamp", v1=pack2(POS_TWO, POS_HALF), v2=pack2(NEG_ONE, POS_HALF), v3=pack2(POS_HALF, POS_QUARTER))
+        self.assertEqual(got4, pack2(POS_ZERO, POS_HALF))
+
+    def test_packed_clamp_both_lanes_interior(self):
+        # lo: 0.5 * 0.5 + 0.0 = 0.25 (0x3400)
+        # hi: 0.75 * 0.5 + 0.125 = 0.5 (0x3800)
+        v1 = pack2(POS_HALF, POS_THREE_QUARTERS)
+        v2 = pack2(POS_HALF, POS_HALF)
+        v3 = pack2(POS_ZERO, 0x3000)
+        got = run_op("v_pk_fma_f16 v0, v1, v2, v3 clamp", v1=v1, v2=v2, v3=v3)
+        self.assertEqual(got, pack2(POS_QUARTER, POS_HALF))
+
+    def test_packed_clamp_both_lanes_same_saturation(self):
+        # Both clamp to 0.0
+        v1 = pack2(NEG_TWO, NEG_THREE)
+        v2 = pack2(POS_ONE, POS_ONE)
+        v3 = pack2(POS_HALF, POS_HALF)
+        got_zero = run_op("v_pk_fma_f16 v0, v1, v2, v3 clamp", v1=v1, v2=v2, v3=v3)
+        self.assertEqual(got_zero, pack2(POS_ZERO, POS_ZERO))
+
+        # Both clamp to 1.0
+        v1_h = pack2(POS_TWO, POS_THREE)
+        v2_h = pack2(POS_TWO, POS_TWO)
+        v3_h = pack2(POS_ONE, POS_ONE)
+        got_one = run_op("v_pk_fma_f16 v0, v1, v2, v3 clamp", v1=v1_h, v2=v2_h, v3=v3_h)
+        self.assertEqual(got_one, pack2(POS_ONE, POS_ONE))
+
+    def test_packed_fma_unclamped_exceeds_range(self):
+        # Without clamp, results must not saturate:
+        # lo: 2.0 * 2.0 + 2.0 = 6.0 (0x4600)
+        # hi: 2.0 * (-1.0) + 0.5 = -1.5 (0xBE00)
+        v1 = pack2(POS_TWO, POS_TWO)
+        v2 = pack2(POS_TWO, NEG_ONE)
+        v3 = pack2(POS_TWO, POS_HALF)
+        got = run_op("v_pk_fma_f16 v0, v1, v2, v3", v1=v1, v2=v2, v3=v3)
+        self.assertEqual(got, pack2(0x4600, 0xBE00))
+
+    def test_packed_fma_opsel_modifiers(self):
+        # Swizzling with op_sel and op_sel_hi under clamp
+        v1 = pack2(POS_TWO, POS_HALF)
+        v2 = pack2(POS_ONE, NEG_ONE)
+        v3 = pack2(POS_QUARTER, POS_THREE_QUARTERS)
+        got = run_op(
+            "v_pk_fma_f16 v0, v1, v2, v3 clamp op_sel:[1,0,0] op_sel_hi:[0,1,1]",
+            v1=v1,
+            v2=v2,
+            v3=v3,
+        )
+        expected = ref_pk_fma_f16(v1, v2, v3, clamp=True, op_sel=(1, 0, 0), op_sel_hi=(0, 1, 1))
+        self.assertEqual(got, expected)
+
+    def test_packed_fma_neg_modifiers(self):
+        # Negation modifiers neg_lo and neg_hi under clamp
+        v1 = pack2(POS_ONE, POS_TWO)
+        v2 = pack2(POS_HALF, POS_HALF)
+        v3 = pack2(POS_THREE_QUARTERS, POS_QUARTER)
+        got = run_op(
+            "v_pk_fma_f16 v0, v1, v2, v3 clamp neg_lo:[1,0,0] neg_hi:[0,1,0]",
+            v1=v1,
+            v2=v2,
+            v3=v3,
+        )
+        expected = ref_pk_fma_f16(v1, v2, v3, clamp=True, neg_lo=(1, 0, 0), neg_hi=(0, 1, 0))
+        self.assertEqual(got, expected)
+
+    def test_packed_fma_inactive_exec_lane(self):
+        # Inactive EXEC lane must preserve existing destination contents
+        lines = [
+            f"v_mov_b32 v0, {OLD:#x}",
+            f"v_mov_b32 v1, {pack2(POS_TWO, POS_TWO):#x}",
+            f"v_mov_b32 v2, {pack2(POS_TWO, POS_TWO):#x}",
+            f"v_mov_b32 v3, {pack2(POS_TWO, POS_TWO):#x}",
+            "s_mov_b32 s10, exec_lo",
+            "s_mov_b32 exec_lo, 0",
+            "v_pk_fma_f16 v0, v1, v2, v3 clamp",
+            "s_mov_b32 exec_lo, s10",
+        ]
+        got = run_ps(lines)
+        self.assertEqual(got, OLD)
 
 
 if __name__ == "__main__":
