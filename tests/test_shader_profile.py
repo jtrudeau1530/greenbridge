@@ -382,6 +382,20 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         self.assertEqual(data["undecoded"], {"warnings": 0, "unresolved": 0, "by_word": []})
         self.assertIn("  undecoded: 0 LLVM warnings, 0 distinct words, 0 unresolved", stdout)
 
+    def test_cli_takes_the_stage_from_the_carve_index(self):
+        """Most corpus names carry no stage prefix; shader_carve.py's index.json (next to the disasm folder) has
+        the stage from each container's program header, so it wins over the name. Names it doesn't list keep
+        the name-prefix fallback."""
+        with open(os.path.join(self.tmp.name, "index.json"), "w", encoding="utf-8") as f:
+            json.dump([{"name": "Foo", "file": "Foo_1.dxbc", "stage": "cs"},
+                       {"name": "CS_Bar", "file": "CS_Bar.dxbc", "stage": "ms"}], f)
+        for name in ("Foo_1", "CS_Bar", "vs_unlisted"):
+            self.write(name, "\tv_mov_b32 v0, 1\n\ts_endpgm\n")
+        _, data = self.run_profile(["--per-shader"])
+        self.assertEqual({row["name"]: row["stage"] for row in data["per_shader"]},
+                         {"Foo_1": "cs", "CS_Bar": "ms", "vs_unlisted": "vs"})
+        self.assertEqual(sorted(data["registers"]), ["cs", "ms", "vs"])
+
     def test_cli_counts_only_instructions(self):
         with open(os.path.join(self.disasm_dir, "ps_001.s"), "w", encoding="utf-8") as f:
             f.write("\t.text\n\t.long 0\n\t; comment with v7\n\t\t\n\tv_mov_b32 v0, 1\n\ts_endpgm\n")

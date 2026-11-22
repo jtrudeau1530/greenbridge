@@ -263,6 +263,20 @@ def register_summary(reg_stage) -> dict:
     return out
 
 
+def stage_map(disasm_dir) -> dict:
+    """{shader file stem: stage} from shader_carve.py's index.json next to the disasm folder (the stage comes from
+    each container's program header), as rdna2spirv.stage_of reads it. Most corpus names carry no stage prefix,
+    so the name is only a fallback for shaders the index doesn't list. Empty when there is no readable index."""
+    path = os.path.join(os.path.dirname(os.path.realpath(disasm_dir)), "index.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            entries = json.load(f)
+        return {os.path.splitext(e["file"])[0]: e["stage"] for e in entries
+                if isinstance(e, dict) and isinstance(e.get("file"), str) and isinstance(e.get("stage"), str)}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -291,11 +305,12 @@ def main():
     per_stage = defaultdict(Counter)
     reg_stage = defaultdict(list)    # stage -> [(vgpr_count, sgpr_count)]
     shaders = []
+    stages = stage_map(a.src)
     n = 0
     for entry in shader_files:
         name = entry.name
         n += 1
-        stage = name[:2].lower() if name[2:3] == "_" else "?"
+        stage = stages.get(name[:-2]) or (name[:2].lower() if name[2:3] == "_" else "?")
         with open(entry.path, encoding="utf-8", errors="replace") as f:
             text = f.read()
         prof = profile_shader(text)
