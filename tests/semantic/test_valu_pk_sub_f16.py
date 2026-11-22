@@ -318,6 +318,68 @@ class VPkSubF16Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane (256 VGPRs, 256 SGPRs)."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & 0xFFFF_FFFF
+
+    def set_vgpr(self, index: int, value: int) -> None:
+        self.vgprs[index] = value & 0xFFFF_FFFF
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & 0xFFFF_FFFF
+
+    def set_sgpr(self, index: int, value: int) -> None:
+        self.sgprs[index] = value & 0xFFFF_FFFF
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_pk_sub_f16."""
+
+    def resolve_operand(self, op: VOP3POperand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg32):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.dword
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VPkSubF16Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s0_raw = self.resolve_operand(instr.src0, state)
+        s1_raw = self.resolve_operand(instr.src1, state)
+
+        # Computation phase
+        result_dword = oracle_v_pk_sub_f16(
+            src0_dword=s0_raw,
+            src1_dword=s1_raw,
+            op_sel=(instr.src0.op_sel_lo, instr.src1.op_sel_lo),
+            op_sel_hi=(instr.src0.op_sel_hi, instr.src1.op_sel_hi),
+            neg_lo=(instr.src0.neg_lo, instr.src1.neg_lo),
+            neg_hi=(instr.src0.neg_hi, instr.src1.neg_hi),
+            abs_lo=(instr.src0.abs_lo, instr.src1.abs_lo),
+            abs_hi=(instr.src0.abs_hi, instr.src1.abs_hi),
+            clamp=instr.clamp,
+        )
+
+        # Write-back phase
+        state.set_vgpr(instr.dst.index, result_dword)
+        return result_dword
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -514,6 +576,95 @@ class TestSymbolicAST(unittest.TestCase):
             VOP3POperand(Literal32(0)),
         )
         self.assertEqual(i1, i2)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_vgpr_subtraction(self) -> None:
+        # v2 = [lo: 5.0, hi: 8.0], v4 = [lo: 1.5, hi: 3.5]
+        s0 = pack_2xf16(f16_to_bits(5.0), f16_to_bits(8.0))
+        s1 = pack_2xf16(f16_to_bits(1.5), f16_to_bits(3.5))
+        self.state.set_vgpr(2, s0)
+        self.state.set_vgpr(4, s1)
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3POperand(Reg32(2, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(4, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        r_lo, r_hi = unpack_2xf16(res)
+        self.assertEqual(bits_to_f16(r_lo), 3.5)
+        self.assertEqual(bits_to_f16(r_hi), 4.5)
+        self.assertEqual(self.state.get_vgpr(0), res)
+
+    def test_scalar_vgpr_sgpr_subtraction(self) -> None:
+        # v1 = [20.0, 30.0], s8 = [5.0, 8.0]
+        self.state.set_vgpr(1, pack_2xf16(f16_to_bits(20.0), f16_to_bits(30.0)))
+        self.state.set_sgpr(8, pack_2xf16(f16_to_bits(5.0), f16_to_bits(8.0)))
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(3, RegType.VGPR),
+            src0=VOP3POperand(Reg32(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg32(8, RegType.SGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        r_lo, r_hi = unpack_2xf16(res)
+        self.assertEqual(bits_to_f16(r_lo), 15.0)
+        self.assertEqual(bits_to_f16(r_hi), 22.0)
+        self.assertEqual(self.state.get_vgpr(3), res)
+
+    def test_scalar_vgpr_literal_subtraction(self) -> None:
+        self.state.set_vgpr(5, pack_2xf16(f16_to_bits(10.0), f16_to_bits(25.0)))
+        lit = Literal32.from_floats(3.0, 5.0)
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(6, RegType.VGPR),
+            src0=VOP3POperand(Reg32(5, RegType.VGPR)),
+            src1=VOP3POperand(lit),
+        )
+        res = self.interp.step(instr, self.state)
+        r_lo, r_hi = unpack_2xf16(res)
+        self.assertEqual(bits_to_f16(r_lo), 7.0)
+        self.assertEqual(bits_to_f16(r_hi), 20.0)
+        self.assertEqual(self.state.get_vgpr(6), res)
+
+    def test_scalar_with_modifiers_and_clamp(self) -> None:
+        # v0 = [lo: -0.5, hi: 1.8], v2 = [lo: 0.2, hi: 0.3]
+        # lo: -|-0.5| - 0.2 = -0.5 - 0.2 = -0.7 -> clamped to +0.0
+        # hi: 1.8 - 0.3 = 1.5 -> clamped to 1.0
+        self.state.set_vgpr(0, pack_2xf16(f16_to_bits(-0.5), f16_to_bits(1.8)))
+        self.state.set_vgpr(2, pack_2xf16(f16_to_bits(0.2), f16_to_bits(0.3)))
+
+        instr = VPkSubF16Instruction(
+            dst=Reg32(4, RegType.VGPR),
+            src0=VOP3POperand(Reg32(0, RegType.VGPR), abs_lo=True, neg_lo=True),
+            src1=VOP3POperand(Reg32(2, RegType.VGPR)),
+            clamp=True,
+        )
+        res = self.interp.step(instr, self.state)
+        r_lo, r_hi = unpack_2xf16(res)
+        self.assertEqual(r_lo, POS_ZERO_F16)
+        self.assertEqual(r_hi, ONE_F16)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(30):
+            st = ScalarMachineState()
+            st.set_vgpr(0, pack_2xf16(0x4500, 0x4800))
+            st.set_vgpr(1, pack_2xf16(0x3800, 0x4200))
+            instr = VPkSubF16Instruction(
+                dst=Reg32(2, RegType.VGPR),
+                src0=VOP3POperand(Reg32(0, RegType.VGPR)),
+                src1=VOP3POperand(Reg32(1, RegType.VGPR)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
 
 
 if __name__ == "__main__":
