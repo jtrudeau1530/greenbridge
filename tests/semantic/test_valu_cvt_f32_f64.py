@@ -1558,5 +1558,268 @@ class TestValuCvtF32F64IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(ref_cvt_f64_f32(QNAN_F32, clamp=True), QNAN_F64)
 
 
+# ---------------------------------------------------------------------------
+# Mutated Oracles and Negative Controls / Syntax Rejection
+# ---------------------------------------------------------------------------
+
+def mutant_drop_sign(src: int, is_f64_to_f32: bool) -> int:
+    """Mutant A: incorrectly clears sign bit regardless of input sign."""
+    if is_f64_to_f32:
+        return ref_cvt_f32_f64(src) & ~SIGN_MASK_F32
+    return ref_cvt_f64_f32(src) & ~SIGN_MASK_F64
+
+
+def mutant_nan_flush_zero(src: int, is_f64_to_f32: bool) -> int:
+    """Mutant B: improperly flushes NaNs to zero instead of returning NaN."""
+    if is_f64_to_f32:
+        if is_nan_f64(src):
+            return POS_ZERO_F32
+        return ref_cvt_f32_f64(src)
+    if is_nan_f32(src):
+        return POS_ZERO_F64
+    return ref_cvt_f64_f32(src)
+
+
+def mutant_no_clamp(src: int, is_f64_to_f32: bool) -> int:
+    """Mutant C: ignores clamp modifier and returns unclamped value."""
+    if is_f64_to_f32:
+        return ref_cvt_f32_f64(src, clamp=False)
+    return ref_cvt_f64_f32(src, clamp=False)
+
+
+def mutant_f64_to_f32_truncation(src64: int) -> int:
+    """Mutant D: uses truncation towards zero instead of roundTiesToEven."""
+    s64_mod = src64 & MASK64
+    if is_nan_f64(s64_mod):
+        return QNAN_F32
+    d_val = bits_to_f64(s64_mod)
+    sign = (s64_mod >> 63) & 1
+    abs_d = abs(d_val)
+    if abs_d >= 2.0 ** 128:
+        return NEG_INF_F32 if sign else POS_INF_F32
+    if abs_d < 2.0 ** -149:
+        return NEG_ZERO_F32 if sign else POS_ZERO_F32
+    m, e = math.frexp(abs_d)  # abs_d = m * 2^e, 0.5 <= m < 1.0
+    scale = 2.0 ** (e - 24)
+    int_mant = int(math.floor(abs_d / scale))
+    bits = (int_mant << (1 - 1)) if e < -125 else int_mant
+    return ((sign << 31) | (bits & 0x7FFFFFFF)) & MASK32
+
+
+def mutant_f32_to_f64_precision_truncate(src32: int) -> int:
+    """Mutant E: corrupts low mantissa bits during f32 to f64 conversion."""
+    res = ref_cvt_f64_f32(src32)
+    # Artificially drop low 8 bits of the 23-bit converted mantissa (bits 36..29)
+    return res & 0xFFFFFFFE00000000
+
+
+def mutant_leak_vcc(interp: ScalarVALUInterpreter, inst: Instruction) -> None:
+    """Mutant F: improperly modifies VCC register during VALU FP execution."""
+    interp.step(inst)
+    interp.vcc ^= 0x1
+
+
+def mutant_exec_leak(sim: SIMDWavefrontInterpreter, inst: Instruction) -> None:
+    """Mutant G: improperly writes inactive lanes under EXEC mask."""
+    sim.step(inst)
+    # Overwrite lane 0 regardless of EXEC
+    if inst.opcode == Opcode.V_CVT_F32_F64:
+        sim.write_lane_reg_u32(0, inst.dst.kind, inst.dst.index, 0x12345678)
+    else:
+        sim.write_lane_reg_u64(0, inst.dst.kind, inst.dst.index, 0x1234567890ABCDEF)
+
+
+def parse_register(tok: str) -> Register:
+    """Parses a register string like 'v0', 'v[2:3]', 's4', 's[4:5]'."""
+    tok = tok.strip()
+    if tok.startswith("v[") or tok.startswith("s["):
+        kind = RegKind.VGPR if tok.startswith("v") else RegKind.SGPR
+        inside = tok[2:-1]
+        lo_str, hi_str = inside.split(":")
+        lo, hi = int(lo_str), int(hi_str)
+        if hi != lo + 1:
+            raise ValueError(f"Non-contiguous register pair: {tok}")
+        return Register(kind=kind, index=lo, count=2)
+    elif tok.startswith("v") or tok.startswith("s"):
+        kind = RegKind.VGPR if tok.startswith("v") else RegKind.SGPR
+        idx = int(tok[1:])
+        return Register(kind=kind, index=idx, count=1)
+    else:
+        raise ValueError(f"Unrecognized register token: {tok}")
+
+
+def parse_vop_cvt(asm_str: str) -> Instruction:
+    """Parses assembly text for v_cvt_f32_f64 or v_cvt_f64_f32."""
+    asm_str = asm_str.strip()
+    tokens = asm_str.split(None, 1)
+    if not tokens:
+        raise ValueError("Empty assembly string")
+    op_str = tokens[0]
+    rest = tokens[1] if len(tokens) > 1 else ""
+
+    encoding = Encoding.VOP3
+    if op_str.endswith("_e32"):
+        encoding = Encoding.VOP1
+        base_op = op_str[:-4]
+    else:
+        base_op = op_str
+
+    if base_op == "v_cvt_f32_f64":
+        opcode = Opcode.V_CVT_F32_F64
+    elif base_op == "v_cvt_f64_f32":
+        opcode = Opcode.V_CVT_F64_F32
+    else:
+        raise ValueError(f"Unsupported opcode: {op_str}")
+
+    clamp = False
+    if rest.endswith(" clamp"):
+        clamp = True
+        rest = rest[:-6].strip()
+
+    args = [a.strip() for a in rest.split(",")]
+    if len(args) != 2:
+        raise ValueError(f"Instruction requires exactly 2 operands, got {len(args)}: {rest}")
+
+    dst = parse_register(args[0])
+
+    s0_str = args[1]
+    neg = False
+    abs_val = False
+    if s0_str.startswith("-"):
+        neg = True
+        s0_str = s0_str[1:].strip()
+    if s0_str.startswith("|") and s0_str.endswith("|"):
+        abs_val = True
+        s0_str = s0_str[1:-1].strip()
+
+    if s0_str.startswith("0x") or s0_str.startswith("-0x"):
+        is_64 = (opcode == Opcode.V_CVT_F32_F64)
+        src0 = Immediate(int(s0_str, 0), is_64bit=is_64)
+    else:
+        src0 = parse_register(s0_str)
+
+    return Instruction(
+        opcode=opcode,
+        dst=dst,
+        src0=src0,
+        src0_mods=OperandModifiers(neg=neg, abs_val=abs_val),
+        inst_mods=InstructionModifiers(clamp=clamp),
+        encoding=encoding,
+    )
+
+
+class TestValuCvtF32F64NegativeControlsAndMutations(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_cvt_f32_f64 and v_cvt_f64_f32."""
+
+    def test_syntax_rejection_invalid_opcode(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_add_f64 v0, v[2:3]")
+
+    def test_syntax_rejection_insufficient_operands(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f32_f64 v0")
+
+    def test_syntax_rejection_dst_type_mismatch(self) -> None:
+        # v_cvt_f32_f64 destination must be 32-bit single VGPR (count=1), rejecting pair v[0:1]
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f32_f64 v[0:1], v[2:3]")
+
+        # v_cvt_f64_f32 destination must be 64-bit pair VGPR (count=2), rejecting single v0
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f64_f32 v0, v2")
+
+    def test_syntax_rejection_src_type_mismatch(self) -> None:
+        # v_cvt_f32_f64 source must be 64-bit pair (count=2), rejecting single v2
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f32_f64 v0, v2")
+
+        # v_cvt_f64_f32 source must be 32-bit single (count=1), rejecting pair v[2:3]
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f64_f32 v[0:1], v[2:3]")
+
+    def test_syntax_rejection_sgpr_destination(self) -> None:
+        # Destination of VALU instruction cannot be SGPR
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f32_f64 s0, v[2:3]")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f64_f32 s[0:1], v2")
+
+    def test_syntax_rejection_vop1_modifiers(self) -> None:
+        # VOP1 encoding (_e32) does not support clamp or modifiers
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f32_f64_e32 v0, v[2:3] clamp")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f32_f64_e32 v0, -v[2:3]")
+
+    def test_syntax_rejection_register_out_of_range(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f32_f64 v256, v[2:3]")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_f32_f64 v0, v[255:256]")
+
+    def test_mutation_detection_drop_sign(self) -> None:
+        # Negative float must retain negative sign bit
+        correct = ref_cvt_f32_f64(NEG_TWO_F64)
+        mutant = mutant_drop_sign(NEG_TWO_F64, is_f64_to_f32=True)
+        self.assertEqual(correct, NEG_TWO_F32)
+        self.assertEqual(mutant, POS_TWO_F32)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_nan_flush_zero(self) -> None:
+        # NaN must propagate, not flush to zero
+        correct = ref_cvt_f32_f64(QNAN_F64)
+        mutant = mutant_nan_flush_zero(QNAN_F64, is_f64_to_f32=True)
+        self.assertTrue(is_nan_f32(correct))
+        self.assertEqual(mutant, POS_ZERO_F32)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_no_clamp(self) -> None:
+        correct = ref_cvt_f32_f64(POS_TWO_F64, clamp=True)
+        mutant = mutant_no_clamp(POS_TWO_F64, is_f64_to_f32=True)
+        self.assertEqual(correct, POS_ONE_F32)
+        self.assertEqual(mutant, POS_TWO_F32)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_truncation_vs_ties_to_even(self) -> None:
+        # 1.0 + 1.5 * 2^-23 in double precision:
+        # Ties to even will round up to 1.0 + 2^-22 in f32
+        d_val = f64_to_bits(1.0 + 1.5 * (2.0 ** -23))
+        correct = ref_cvt_f32_f64(d_val)
+        mutant = mutant_f64_to_f32_truncation(d_val)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_precision_truncate(self) -> None:
+        # 1.0f + 2^-20 has low mantissa bits in f64 that mutant zeroes out
+        f_val = f32_to_bits(1.0 + (2.0 ** -20))
+        correct = ref_cvt_f64_f32(f_val)
+        mutant = mutant_f32_to_f64_precision_truncate(f_val)
+        self.assertEqual(bits_to_f64(correct), 1.0 + (2.0 ** -20))
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_corrupt_vcc(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.vcc = 0x5555555555555555
+        interp.write_reg_u64(RegKind.VGPR, 2, POS_ONE_F64)
+        inst = parse_vop_cvt("v_cvt_f32_f64 v0, v[2:3]")
+
+        interp.step(inst)
+        self.assertEqual(interp.vcc, 0x5555555555555555)
+
+        mutant_leak_vcc(interp, inst)
+        self.assertNotEqual(interp.vcc, 0x5555555555555555)
+
+    def test_mutation_detection_exec_leak(self) -> None:
+        sim = SIMDWavefrontInterpreter(wave_size=32)
+        sim.set_exec_mask(0)  # all lanes disabled
+        sim.write_lane_reg_u32(0, RegKind.VGPR, 0, 0xAAAAAAAA)
+        inst = parse_vop_cvt("v_cvt_f32_f64 v0, v[2:3]")
+
+        sim.step(inst)
+        self.assertEqual(sim.read_lane_reg_u32(0, RegKind.VGPR, 0), 0xAAAAAAAA)
+
+        mutant_exec_leak(sim, inst)
+        self.assertNotEqual(sim.read_lane_reg_u32(0, RegKind.VGPR, 0), 0xAAAAAAAA)
+
+
 if __name__ == "__main__":
     unittest.main()
