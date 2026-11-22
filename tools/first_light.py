@@ -378,6 +378,47 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
     return result
 
 
+def load_json(
+    path: str,
+    kind: str,
+    expect: type,
+    keys: tuple[str, ...] = (),
+    entry_keys: tuple[str, ...] = (),
+):
+    """Read a JSON file from the user's folders; a bad read exits naming it, never a traceback.
+
+    Invalid or truncated JSON, non-UTF-8 bytes, the wrong top-level shape, a missing required
+    key, and an array entry that is not an object or lacks one are the user's broken files, so
+    they fail like the tool's other errors: one SystemExit line with the path and the reason.
+    """
+    wanted = "an object" if expect is dict else "an array"
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except UnicodeDecodeError as e:
+        raise SystemExit(f"the {kind} {path} is not valid UTF-8 ({e.reason})") from e
+    except json.JSONDecodeError as e:
+        raise SystemExit(
+            f"the {kind} {path} is not valid JSON ({e.msg} at line {e.lineno} column {e.colno})"
+        ) from e
+    if not isinstance(data, expect):
+        raise SystemExit(f"the {kind} {path} is a {type(data).__name__}, expected {wanted}")
+    if expect is dict:
+        if gaps := [k for k in keys if k not in data]:
+            raise SystemExit(f"the {kind} {path} has no key {', '.join(repr(k) for k in gaps)}")
+    else:
+        for i, entry in enumerate(data):
+            if not isinstance(entry, dict):
+                raise SystemExit(
+                    f"the {kind} {path} entry {i} is a {type(entry).__name__}, expected an object"
+                )
+            if gaps := [k for k in entry_keys if k not in entry]:
+                raise SystemExit(
+                    f"the {kind} {path} entry {i} has no key {', '.join(repr(k) for k in gaps)}"
+                )
+    return data
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Draw one real game model with its own translated VS/PS."
@@ -433,15 +474,14 @@ def main(argv=None) -> int:
     if a.list:
         if not a.game:
             raise SystemExit("--list needs --game")
-        with open(ensure_carve(os.path.abspath(a.game), work), encoding="utf-8") as f:
-            for e in json.load(f):
-                if e["stage"] in ("vs", "ps"):
-                    print(f"{e['stage']} {e['name']}")
+        index = ensure_carve(os.path.abspath(a.game), work)
+        for e in load_json(index, "carve index", list, entry_keys=("stage", "name")):
+            if e["stage"] in ("vs", "ps"):
+                print(f"{e['stage']} {e['name']}")
         return 0
     existing = os.path.join(out_dir, "manifest.json")
     if a.check and not a.game and os.path.isfile(existing):
-        with open(existing, encoding="utf-8") as f:
-            manifest = json.load(f)
+        manifest = load_json(existing, "first-light manifest", dict, keys=("width", "height"))
         run_draw(a, manifest, out_dir)
         return 0
     if not a.game:
