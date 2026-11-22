@@ -157,7 +157,8 @@ int main() {
     check(rt::d3d12_xs::device_slot_overridden(62), "device slot 62 is the compute-PSO override");
     check(rt::d3d12_xs::device_slot_overridden(76), "device slot 76 is the resource override");
     check(rt::d3d12_xs::device_slot_overridden(67),
-          "device slot 67 is refused (console native-code compute pipeline, not PC CreateProtectedResourceSession1)");
+          "device slot 67 is refused (console DeserializeComputePipelineStateX, "
+          "not PC CreateProtectedResourceSession1)");
 
     void** proxy_vtbl = *reinterpret_cast<void***>(device.Get());
     void** real_vtbl = real ? *reinterpret_cast<void***>(real) : nullptr;

@@ -21,7 +21,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <type_traits>
@@ -325,10 +327,11 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
 // The host PC runtime's D3D12 device to compare answers with: the default adapter, or the one LEONIDA_HOST_ADAPTER
 // names ("warp", or part of an adapter's name); false if there is none.
 // Under Wine there is none (copycmp::create_host).
-bool create_host_device(Ref<ID3D12Device>& host) {
+bool create_host_device(Ref<ID3D12Device>& host, std::string* adapter_name = nullptr) {
     copycmp::Ptr<ID3D12Device> device;
     std::string name;
     if (!copycmp::create_host(device, name)) return false;
+    if (adapter_name) *adapter_name = name;
     host.p = device.p;
     device.p = nullptr;
     return true;
@@ -1053,6 +1056,7 @@ UINT resolve_pixel_size(DXGI_FORMAT format) {
     switch (format) {
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
     case DXGI_FORMAT_R10G10B10A2_UNORM: return 4;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
     case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
@@ -1186,6 +1190,48 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
     const D3D12_RANGE written{0, 0};
     readback->Unmap(0, &written);
 #undef RESOLVE_CHECK
+    return true;
+}
+
+// Compare RGB9E5 capability queries with the sample counts of the actual Vulkan attachment, then
+// resolve green over a red single-sample destination and check its packed shared-exponent texels.
+bool check_rgb9e5_resolves(ID3D12Device* device, const vktest::Device& vk) {
+    constexpr auto format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImageFormatProperties properties{};
+    const auto query = vk.instance_fn<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
+    const auto result = query(vk.physical, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_IMAGE_TYPE_2D,
+                              VK_IMAGE_TILING_OPTIMAL, usage, 0, &properties);
+    if (result != VK_SUCCESS && result != VK_ERROR_FORMAT_NOT_SUPPORTED) return false;
+    const VkSampleCountFlags counts = result == VK_SUCCESS ? properties.sampleCounts : 0;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))) return false;
+    constexpr UINT bits = D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+    const bool multisampled = (counts & (2u | 4u | 8u | 16u | 32u)) != 0;
+    if ((UINT(support.Support1) & bits) != (multisampled ? bits : 0u)) {
+        std::fprintf(stderr, "RGB9E5 Support1=0x%x, Vulkan sample counts=0x%x\n", UINT(support.Support1), counts);
+        return false;
+    }
+    for (UINT samples : {2u, 4u, 8u, 16u, 32u}) {
+        const bool supported = (counts & samples) != 0;
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{format, samples};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality, sizeof(quality))) ||
+            quality.NumQualityLevels != UINT(supported)) return false;
+        if (!supported) continue;
+        std::vector<std::uint8_t> pixels;
+        if (!capture_resolve(device, format, samples, ResolveScenario::full, pixels) || pixels.size() != 8 * 8 * 4)
+            return false;
+        for (size_t i = 0; i < pixels.size(); i += 4) {
+            std::uint32_t packed;
+            std::memcpy(&packed, pixels.data() + i, sizeof(packed));
+            if (packed != 0x80020000u) {  // green mantissa 256, shared exponent 16
+                std::fprintf(stderr, "RGB9E5 %ux resolve: pixel %zu got 0x%08x, expected 0x80020000\n",
+                             samples, i / 4, packed);
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -3253,6 +3299,7 @@ int main() {
             std::printf("Depth/stencil MSAA quality queries: no host D3D12 device to compare with, skipped\n");
         EXPECT(depth_quality_mismatches <= 0);
 
+        EXPECT(check_rgb9e5_resolves(device.p, d));
         const int resolve_mismatches = compare_resolves(device.p, color_sample_counts);
         if (resolve_mismatches < 0)
             std::printf("Resolve comparison: no host D3D12 device to compare with, skipped\n");
@@ -4810,21 +4857,38 @@ int main() {
         bool compared = false;
         const char* source = "no host";
         Ref<ID3D12Device> host_device;
-        const auto host_side = [&](ID3D12Device10* device10) {
+        const auto host_side = [&](ID3D12Device10* device10, bool same_adapter) {
             std::array<HRESULT, 3> host_refusals{};
             if (!placed_cast_scenario(device10, false, host.data())) return false;
             if (!placed_cast_refusals(device10, host_refusals)) return false;
             unsigned differences = 0;
+            // D3D12 does not pin float -> UNORM at a tie: the D3D11.3 functional spec (3.2.3.6 FLOAT -> UNORM)
+            // computes c * (2^n - 1) + 0.5 and drops the fraction, but permits a tolerance of 0.6 ULP on the integer
+            // side, so a value exactly halfway between two codes (0.5 * 255 = 127.5) may map to either. WARP and AMD
+            // give the upper code; NVIDIA's D3D12 driver and its Vulkan driver the lower (RTX 3080 616.64, RTX 3090
+            // 610.88 and RTX 5070 Laptop 617.42). On the layer's own adapter (same LUID) the comparison stays exact;
+            // against another adapter or WARP the plain clear accepts either code on a tie channel.
+            const FLOAT clear_value[4] = {0.25f, 0.5f, 0.75f, 1.0f};  // placed_cast_scenario's clear colour
+            unsigned tie_bytes_other_way = 0;
             for (UINT row = 0; row < 4; ++row)
                 for (UINT i = 0; i < 16; ++i) {
                     const UINT a = row * 256 + i, b = 1024 + row * 256 + i;
+                    const double scaled = double(clear_value[i % 4]) * 255.0;
+                    const bool tie = !same_adapter && scaled - std::floor(scaled) == 0.5;
+                    if (tie && std::abs(int(ours[b]) - int(host[b])) == 1) {
+                        ++tie_bytes_other_way;
+                    } else if (ours[b] != host[b] && differences++ < 8) {
+                        std::fprintf(stderr, "placed plain clear row %u byte %u: ours %02x, host %02x\n", row, i,
+                                     ours[b], host[b]);
+                    }
                     if (ours[a] != host[a] && differences++ < 8)
                         std::fprintf(stderr, "placed SRGB-cast clear row %u byte %u: ours %02x, host %02x\n", row,
                                      i, ours[a], host[a]);
-                    if (ours[b] != host[b] && differences++ < 8)
-                        std::fprintf(stderr, "placed plain clear row %u byte %u: ours %02x, host %02x\n", row, i,
-                                     ours[b], host[b]);
                 }
+            if (tie_bytes_other_way)
+                std::printf("placed plain clear: the host rounds the exact .5 tie the other way in %u bytes (within "
+                            "the 0.6 ULP tolerance of D3D11.3 spec 3.2.3.6)\n",
+                            tie_bytes_other_way);
             for (UINT i = 0; i < 3; ++i)
                 if (our_refusals[i] != host_refusals[i]) {
                     ++differences;
@@ -4841,12 +4905,28 @@ int main() {
                                                         sizeof(options12))) &&
                    options12.RelaxedFormatCastingSupported;
         };
-        if (create_host_device(host_device)) {
+        // The host is the layer's own adapter (matched by LUID, then PCI ids) unless LEONIDA_HOST_ADAPTER names
+        // one: drivers round float -> UNORM ties differently, so the same GPU is the fair reference.
+        std::string host_adapter, host_source;
+        char host_override[8] = {};
+        const bool named = GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", host_override, sizeof(host_override)) > 0;
+        const bool have_host =
+            named ? create_host_device(host_device, &host_adapter)
+                  : create_host_device_for_physical(d.instance, d.physical, d.instance_proc, host_device, host_adapter);
+        if (have_host) {
+            VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+            d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &properties);
+            const LUID host_luid = host_device->GetAdapterLuid();
+            const bool same_adapter =
+                id.deviceLUIDValid && std::memcmp(&host_luid, id.deviceLUID, sizeof(host_luid)) == 0;
             Ref<ID3D12Device10> host10;
             if (can_cast(host_device.p, host10)) {
-                EXPECT(host_side(host10.p));
+                EXPECT(host_side(host10.p, same_adapter));
                 compared = true;
-                source = "the host runtime";
+                host_source = "the host runtime on " + host_adapter +
+                              (same_adapter ? " (the layer's own adapter)" : " (a different adapter from the layer's)");
+                source = host_source.c_str();
             }
         }
         std::string warp_name;
@@ -4860,7 +4940,7 @@ int main() {
 
             Ref<ID3D12Device10> warp10;
             if (copycmp::try_create_host(warp, warp_name) && can_cast(warp.p, warp10)) {
-                EXPECT(host_side(warp10.p));
+                EXPECT(host_side(warp10.p, false));
                 compared = true;
                 source = warp_name.c_str();
             }

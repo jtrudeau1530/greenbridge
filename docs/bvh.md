@@ -334,6 +334,35 @@ node. It now reads the slots of the node type and applies the remap byte. AMD GP
 (`CalcTriangleCompressionVertexIndices`, `SwizzleBarycentrics`) and the XDXR path agree on both. TRI1 nodes
 therefore traverse to the right triangle (docs/design.md, Ray tracing row; `tests/semantic/test_image_bvh_tri.py`).
 
+**GPU builder.** `runtime/src/xdxr_build.comp` with `xdxr_build.h` writes the same layout on the GPU, straight into
+the destination buffer:
+
+1. one thread per triangle (TRI0 leaves, remap `0x09`) or per instance (128-byte records, the world-to-object
+   inverse, the BLAS root and identity-rotation flag);
+2. a 30-bit Morton key of each box centre, then a stable radix sort: 8 passes of 4-bit digits, 24 dispatches
+   whatever the count, with no padding to a power of two;
+3. BOX32 nodes, built level by level from four consecutive sorted children, with the parent table and each
+   instance's `ParentNode`;
+4. the header.
+
+The tree's shape depends only on the element count. `XdxrLayout` therefore computes the result and scratch sizes
+exactly when the build is recorded, and the same numbers can answer `GetRaytracingAccelerationStructurePrebuildInfo`.
+A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So do an instance with mask 0, one with
+no BLAS and one with a singular transform. An instance record holds its BLAS address in 256-byte units in 32 bits,
+so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
+host pointers), the builder takes a bias that is added to the addresses read from instance descs.
+
+The Vulkan layer uses it for `BuildRaytracingAccelerationStructure` unless `LEONIDA_RT_AS=khr`
+(`docs/d3d12_vulkan.md` §4.8); `d3d12_xdxr_rt_test <dir>` builds a BLAS and a TLAS through the D3D12 API and writes
+them the same way.
+
+`vk_xdxr_build_test <dir>` builds nine synthetic cases on the GPU and writes each structure with a description of its
+scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as
+`xdxr_build` and `xdxr_build_check`.
+
+Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, updates, compaction and copies. A higher-quality
+build (SAH) would also come later.
+
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force
 python -I tools/xdxr_bvh.py validate <dumped BVH buffer>    # structural check of a runtime buffer

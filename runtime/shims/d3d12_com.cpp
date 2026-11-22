@@ -200,6 +200,7 @@ public:
         if (!list_.execute_bundle(bundle->list_)) return check(false);
 
         // Only the sticky state currently recorded by this COM layer is carried back from the bundle.
+        if (bundle->blend_factor_set_) blend_factor_ = bundle->blend_factor_;
         if (bundle->stencil_ref_set_) {
             front_stencil_ref_ = bundle->front_stencil_ref_;
             back_stencil_ref_ = bundle->back_stencil_ref_;
@@ -315,6 +316,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
+        blend_factor_set_ = true;
         blend_factor_ = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
                                : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
     }
@@ -623,9 +625,17 @@ public:
                 t.vertex_va = gd->Triangles.VertexBuffer.StartAddress;
                 t.vertex_count = gd->Triangles.VertexCount;
                 t.vertex_stride = static_cast<std::uint32_t>(gd->Triangles.VertexBuffer.StrideInBytes);
-                t.vertex_format = (gd->Triangles.VertexFormat == DXGI_FORMAT_R32G32_FLOAT)
-                                      ? VK_FORMAT_R32G32_SFLOAT
-                                      : VK_FORMAT_R32G32B32_SFLOAT;
+                // The vertex formats D3D12 allows for BLAS builds; any other stays VK_FORMAT_UNDEFINED and the
+                // build is refused at replay instead of reading the wrong layout.
+                switch (gd->Triangles.VertexFormat) {
+                case DXGI_FORMAT_R32G32B32_FLOAT: t.vertex_format = VK_FORMAT_R32G32B32_SFLOAT; break;
+                case DXGI_FORMAT_R32G32_FLOAT: t.vertex_format = VK_FORMAT_R32G32_SFLOAT; break;
+                case DXGI_FORMAT_R16G16B16A16_FLOAT: t.vertex_format = VK_FORMAT_R16G16B16A16_SFLOAT; break;
+                case DXGI_FORMAT_R16G16_FLOAT: t.vertex_format = VK_FORMAT_R16G16_SFLOAT; break;
+                case DXGI_FORMAT_R16G16B16A16_SNORM: t.vertex_format = VK_FORMAT_R16G16B16A16_SNORM; break;
+                case DXGI_FORMAT_R16G16_SNORM: t.vertex_format = VK_FORMAT_R16G16_SNORM; break;
+                default: t.vertex_format = VK_FORMAT_UNDEFINED; break;
+                }
                 t.index_va = gd->Triangles.IndexBuffer;
                 t.index_count = gd->Triangles.IndexCount;
                 if (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
@@ -634,6 +644,7 @@ public:
                     t.index_type = 2;
                 t.transform_va = gd->Triangles.Transform3x4;
                 t.opaque = (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) != 0;
+                t.flags = static_cast<std::uint32_t>(gd->Flags);
                 cmd.triangles.push_back(t);
             }
         }
@@ -816,6 +827,7 @@ private:
     std::vector<leonida::TargetView> render_targets_;
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
+    bool blend_factor_set_ = false;
 
     // The root signatures and pipeline states this recording uses. D3D12 lets an application release them right
     // after Set*RootSignature / SetPipelineState; the list keeps them until Reset or its own release, so the root
@@ -854,6 +866,7 @@ private:
         render_targets_.clear();
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
+        blend_factor_set_ = false;
         set_pipeline(state);
     }
 

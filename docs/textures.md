@@ -37,22 +37,24 @@ The compact layout rule moves 206,661 2D textures into complete exports and 1,21
 partial exports (`305,264` complete, `16,419` partial, `35,432` skipped under zlib/raw).
 Resolving the 697 multi-slice descriptors (127 2D arrays — including the 19 two-slice arrays
 formerly misread as DXGI 156/199/211/226 — 567 cubemaps, and 3 3D volumes; see
-`docs/textures_arrays.md`) adds 690 more complete exports and 4 partials under zlib/raw,
-bringing the zlib/raw totals to **305,954 complete**, **16,423 partial** and **34,738 skipped**
-(33,507 2D reader BCPack, 1,223 compact all-BCPack, 3 array all-BCPack and 5 DXGI 11; **0**
-remaining layout skips).
+`docs/textures_arrays.md`) adds 690 more complete exports and 4 partials under zlib/raw, and
+adding DXGI 11 (`R16G16B16A16_UNORM`, 8 BPP) resolves the last 5 format skips, bringing the
+zlib/raw totals to **305,959 complete**, **16,423 partial** and **34,733 skipped** (33,507 2D
+reader BCPack, 1,223 compact all-BCPack and 3 array all-BCPack; **0** remaining layout or
+format skips).
 
 Adding all six BCPack codecs (BC1, BC3, BC4, BC5, BC6H and BC7) in `tools/ttpf_mips.py`
 unlocks **51,156** more complete chains across the 57 pools (51,149 2D + 7 multi-slice 2D
-arrays), bringing the projected split to **357,110 complete** (99.999% of catalog entries),
-**0 partial** and **5 skipped** (only the 5 DXGI 11 `R16G16B16A16_UNORM` records — **0**
-remaining BCPack skips, **0** layout skips and **0** skipped multi-slice descriptors).
+arrays), bringing the projected split to **357,115 complete** (100% of catalog entries),
+**0 partial** and **0 skipped** (**0** remaining BCPack skips, **0** layout/format skips and
+**0** skipped multi-slice descriptors).
 
 This is the same 308,895 / 48,220 baseline already recorded in `docs/design.md`. The recount
 splits the 48,220 by cause: the old "(BCPack or unmapped)" label hides 14,713 skips whose
 recorded limitation is a layout/format check, not the codec, and overstates unmapped, which
-is zero. Together, the compact 2D and multi-slice layout rules resolve all 697 multi-slice
-descriptors and 14,011 2D compact descriptors, leaving only BCPack and 5 DXGI 11 records.
+is zero. Together, the compact 2D, multi-slice and DXGI 11 rules resolve all 697 multi-slice
+descriptors, 14,011 2D compact descriptors and 5 DXGI 11 descriptors, leaving only BCPack
+under zlib/raw.
 
 ## Skip breakdown
 
@@ -64,9 +66,9 @@ descriptors and 14,011 2D compact descriptors, leaving only BCPack and 5 DXGI 11
 | former "compact element size unknown" (19 two-slice 2D arrays; see `docs/textures_arrays.md`) | — | 0 |
 | 2D array / cubemap / volume descriptor (`dimension != 1` or `depth > 1`; see `docs/textures_arrays.md`) | 678 | 0 |
 | array layout resolved, but every mip is BCPack | — | 3 |
-| element format not in the parser table (DXGI 11, `R16G16B16A16_UNORM`) | 5 | 5 |
+| element format not in the parser table (DXGI 11, `R16G16B16A16_UNORM`) | 5 | 0 |
 | no mapped allocation ("unmapped shard") | 0 | 0 |
-| **total** | **48,220** | **34,738** |
+| **total** | **48,220** | **34,733** |
 
 The "before" compact row becomes the measured rows below it after the layout rules: records
 the rule sizes but cannot decode under zlib/raw because every mip is BCPack. The 1,218 mixed
@@ -206,8 +208,14 @@ measurement and the proposed reader rule cannot drift apart.
 
 The rule is only claimed for 2D descriptors with a 1/2/4/8/16-byte element. The 12-byte DXGI
 formats 6/7/8 do not occur in the measured 2D set, so `compact_surface_layout` rejects them
-rather than guessing a Gfx10 log pattern. Uncompressed tiling is also not validated: the
-allocation size is computed, but no DDS is written for those formats.
+rather than guessing a Gfx10 log pattern. 2D uncompressed tiling is validated across all
+2,911 non-volume uncompressed records in the 57 pools (1/2/4/8 BPP under `SW_4KB_S` and
+RDNA2/RbPlus `SW_64KB_D`, confirmed against Mesa `src/amd/addrlib/src/gfx10/gfx10SwizzlePattern.h`
+`GFX10_SW_4K_S_RBPLUS_PATINFO` and `GFX10_SW_64K_D_RBPLUS_PATINFO`): for 64 KiB 4 BPP
+(`DXGI 28/29/87/91`), RDNA2/RbPlus `SW_64KB_D` swaps intra-tile address bits 6 and 7 relative
+to Navi 1x (`(3, -3)` = `X2, Y2` instead of `(-3, 3)` = `Y2, X2`), while 1/2/8/16 BPP are
+unchanged between Navi 1x and RDNA2. `tools/ttpf_mips.py` decodes and exports the validated
+uncompressed formats (`10/11/28/29/49/54/56/61/65/87/91`) as DX10 DDS with `DDSD_PITCH`.
 
 ### `non_tail` is not the layout boundary
 
@@ -272,17 +280,20 @@ What the layout change does to the 14,030:
 - The 1,223 BCPack skips are compact records whose every mip is BCPack; they were counted in
   the 14,030 before and are not part of the 33,507.
 
-The five DXGI 11 (`R16G16B16A16_UNORM`) records are a separate one-line gap: DXGI 11 is 8
-bytes per element, but the vendored element table has no entry. Their layout then matches,
-but uncompressed tiling is not validated, so they are not exported here.
+The five DXGI 11 (`R16G16B16A16_UNORM`, 8 BPP, all 1-mip `SW_4KB_S`) records (`maps_2_7`
+#11324, `maps_5_7` #2425 and #13651, `maps_7_7` #7490 and #13893) are now mapped in
+`ELEMENT_BYTES` (`11: 8`). All five match `surface_layout` byte-exact, place 100% of their
+active 8-byte elements strictly at the `detile()` addresses (`0` non-zero bytes in padding
+slots across the 4 KiB tiles), and export cleanly as DX10 DDS.
 
 ### Sample validation
 
-`tools/ttpf_mips.py check` detiles one chain, decodes BC1/BC3/BC4/BC5/BC6H/BC7 (pure stdlib;
-HDR BC6H formats 95/96 are compared after a signed Reinhard tone-map `255 * v / (1 + |v|)`)
-and compares each mip with a 2x2 box downsample of its parent at BC-block resolution (one block
-is 4x4 pixels). A correct chain is 0–4 levels, as in the SixNG notes; the control is the first
-tail mip detiled at origin (0,0).
+`tools/ttpf_mips.py check` detiles one chain, decodes BC1/BC3/BC4/BC5/BC6H/BC7 and validated
+2D uncompressed formats (`10/11/28/29/49/54/56/61/65/87/91`; pure stdlib; HDR float16 formats
+`10/54/95/96` are compared after a signed Reinhard tone-map `255 * v / (1 + |v|)`) and compares
+each mip with a 2x2 box downsample of its parent (at 4x4 block resolution for BC, or pixel
+resolution for uncompressed). A correct chain is 0–4 levels, as in the SixNG notes; the
+control is the first tail mip detiled at origin (0,0).
 
 | Pool # | Descriptor | Mips | non_tail / first_tail | Max error | Tail control |
 |---|---|---:|---:|---:|---:|
@@ -300,6 +311,13 @@ tail mip detiled at origin (0,0).
 | `interiors_0_3` #3 | 512×512 BC7 sRGB (`99`) | 8 | 3 / 4 | 1.15 | 68.09 |
 | `interiors_2_3` #3268 | 1024×1024 BC6H UF16 (`95`, 64 KiB) | 9 | 3 / 3 | 0.35 | 110.21 |
 | `lighting` #346 | 512×512 BC6H SF16 (`96`) | 10 | 3 / 4 | 0.68 | 15.41 |
+| `terrain_0_7` #5207 | 512×512 `R8G8B8A8_UNORM` (`28`, 64 KiB) | 8 | 3 / 3 | 0.29 | 160.44 |
+| `peds_3_3` #4922 | 256×256 `R8G8B8A8_UNORM` (`28`, 4 KiB) | 7 | 3 / 3 | 0.28 | 13.23 |
+| `vfx` #654 | 1024×1024 `R8_UNORM` (`61`, 64 KiB) | 3 | 3 / 3 | 0.01 | — |
+| `vfx` #869 | 1024×512 `R8_UNORM` (`61`, 4 KiB) | 3 | 3 / 3 | 0.11 | — |
+| `peds_0_3` #2958 | 512×512 `A8_UNORM` (`65`, 4 KiB) | 8 | 3 / 3 | 0.00 | 255.00 |
+| `interiors_3_3` #1033 | 1024×1024 `A8_UNORM` (`65`, 64 KiB) | 9 | 3 / 3 | 0.50 | 58.31 |
+| `graphics` #647 | 128×128 `B8G8R8A8_UNORM` (`87`, 4 KiB) | 8 | 1 / 2 | 0.00 | 61.09 |
 
 `interiors_0_3` #19 is a partial export: the reader emits one mip, while all seven decode and
 match. `graphics` #43 and `interiors_2_3` #468 are tuples outside the table; `maps_0_7` #3217
@@ -314,6 +332,31 @@ BC7 cubemap, 7 mips) passes all 6 faces (`max_error = 3.46` vs tail control `40.
 Note that prefiltered lighting profiles whose lower mips intentionally fade toward `1.0` or
 convolve with a specular lobe will naturally exceed the box-downsample threshold even when
 detiled accurately.
+
+Across all 57 pools, the 2,911 non-volume uncompressed records break down as `fmt 10` (1),
+`fmt 11` (5), `fmt 28` (1,766 2D + 8 2D arrays), `fmt 29` (1 2D + 1 2D array), `fmt 54`
+(946 2D), `fmt 61` (8 2D), `fmt 65` (121 2D), `fmt 87` (49 2D + 1 cubemap) and `fmt 91` (4 2D);
+`fmt 49` and `fmt 56` have `0` entries in the TTPF pools (both are still decoded in `check`
+and covered by synthetic unit tests). Full-corpus uncompressed validation:
+
+- **64 KiB 4 BPP (`SW_64KB_D @ RbPlus`):** with the Navi 1x bit order `(-3, 3)` at bits 6..7,
+  only 11 of 167 multi-mip 64 KiB `DXGI 28` textures passed (median `12.16` on 2D, `16.40` on
+  2D arrays, max `36.64`). Switching `PATTERNS_64K[2]` to RDNA2/RbPlus `(3, -3)` (Mesa
+  `GFX10_SW_64K_D_RBPLUS_PATINFO`) brings **167 / 167** to pass: 155/155 mode-0 2D (`0.17–0.35`,
+  median `0.26`), 4/4 mode-1 2D (`0.02–0.15`), and 8/8 2D arrays (`0.25–0.30`; e.g. `peds_1_3`
+  #2581 `max_error = 0.30` vs slice-major control `45.28`).
+- **4 KiB 4 BPP (`SW_4KB_S`):** 3/3 multi-mip `DXGI 28` (`0.13–0.28`), 6/6 multi-mip `DXGI 87`
+  (`0.00–5.52`), plus 1-mip `DXGI 87` cubemap `graphics` #597 (3.2× smoother neighbor gradient
+  after detiling).
+- **1 BPP (`DXGI 61/65`, 4 KiB & 64 KiB):** 7/7 multi-mip `DXGI 61` (`0.01–0.12`), 15/15
+  64 KiB `DXGI 65` (`0.00–0.50`), and 82/83 4 KiB `DXGI 65` (`0.00–0.28`; the single outlier
+  `props_1_3` #8392 is an alpha mask whose mip 5 intentionally fades to all zeros, with mip 2
+  tail error `8.65` vs tail-origin control `33.25`).
+- **2 BPP (`DXGI 54`, all 1-mip) and 8 BPP (`DXGI 10/11`, all 1-mip):** `DXGI 54` shows
+  4.7×–13.8× lower neighbor gradient after detiling on both 4 KiB and 64 KiB (with `PATTERNS_64K[1]`
+  matching Mesa `GFX10_SW_64K_D_RBPLUS_PATINFO` and beating alternative bit permutations across
+  8 sampled 64 KiB maps); all 5 `DXGI 11` records and `DXGI 10` (`graphics` #832) have `0`
+  non-zero bytes outside their detiled active-element slots.
 
 For `interiors_0_3` #19 the tool reports the byte layout: mip 0 (512×256, 128×64 blocks) at
 24,576, mip 1 (256×128, 64×32) at 8,192, mip 2 (128×64, 32×16) at 4,096, then the 4 KiB tile
@@ -333,18 +376,19 @@ chunk size, which includes tile padding.
 | compact skips that become complete | 11,570 | 35,727 | 2.91 GiB |
 | **newly complete** | **206,661** | **1,100,865** | **4.59 GiB** |
 
-The total export split before and after the 2D compact and multi-slice layout rules (zlib/raw
-only; see `docs/textures_arrays.md` for the +690 complete / +4 partial multi-slice breakdown):
+The total export split before and after the 2D compact, multi-slice and DXGI 11 rules (zlib/raw
+only; see `docs/textures_arrays.md` for the +690 complete / +4 partial multi-slice breakdown,
+plus +5 DXGI 11 complete):
 
-| | Before | After 2D compact | After + multi-slice | Change |
+| | Before | After 2D compact | After + multi-slice + DXGI 11 | Change |
 |---|---:|---:|---:|---:|
-| complete chain | 98,603 | 305,264 | 305,954 | +207,351 |
+| complete chain | 98,603 | 305,264 | 305,959 | +207,356 |
 | partial | 210,292 | 16,419 | 16,423 | −193,869 |
-| skipped | 48,220 | 35,432 | 34,738 | −13,482 |
+| skipped | 48,220 | 35,432 | 34,733 | −13,487 |
 | **total** | **357,115** | **357,115** | **357,115** | |
 
-The 34,738 remaining zlib/raw skips are exactly 33,507 2D reader BCPack + 1,223 compact
-all-BCPack + 3 array all-BCPack + 5 DXGI 11 (**0** layout skips). The 16,423 partials are
+The 34,733 remaining zlib/raw skips are strictly BCPack: 33,507 2D reader BCPack + 1,223 compact
+all-BCPack + 3 array all-BCPack (**0** layout or format skips). The 16,423 partials are
 1,166 compact records that still miss BCPack mips, 14,035 other partials, 1,218 compact
 records converted from a skip to a partial export, and 4 partial 2D arrays. Nothing in this
 section decodes BCPack.
@@ -860,9 +904,9 @@ via `bcpack.decode_with_info`).
 
 ### 5. Validation on the 57-pool corpus
 
-- **Full-corpus projection (`tools/ttpf_mips.py scan` across all 57 pools, including multi-slice layouts in `docs/textures_arrays.md`):**
-  - Baseline (2D compact + multi-slice layout rules, zlib/raw only): **305,954** complete, **16,423** partial, **34,738** skipped (33,507 2D BCPack + 1,223 compact BCPack + 3 array BCPack + 5 DXGI 11; 0 layout skips).
-  - With all six BCPack codecs (BC1/BC3/BC4/BC5/BC6H/BC7): **357,110** complete (**+51,156**, **99.999%** of catalog entries), **0** partial, **5** skipped (only the 5 DXGI 11 records; 0 BCPack skips, 0 layout skips and 0 multi-slice skips).
+- **Full-corpus projection (`tools/ttpf_mips.py scan` across all 57 pools, including multi-slice layouts in `docs/textures_arrays.md` and DXGI 11):**
+  - Baseline (2D compact + multi-slice + DXGI 11, zlib/raw only): **305,959** complete, **16,423** partial, **34,733** skipped (33,507 2D BCPack + 1,223 compact BCPack + 3 array BCPack; 0 format skips and 0 layout skips).
+  - With all six BCPack codecs (BC1/BC3/BC4/BC5/BC6H/BC7): **357,115** complete (**+51,156**, **100%** of catalog entries), **0** partial, **0** skipped (0 BCPack skips, 0 format skips, 0 layout skips and 0 multi-slice skips).
 - **Previously skipped examples above (`tools/ttpf_mips.py`):**
   - `graphics/ttdb_graphics.ttpf` #309 (128×128 BC1, 8 mips): `check` **pass** in strict mode (`max_error = 0.67`, `tail_origin_control = 102.3`).
   - `ui/ttdb_ui.ttpf` #0 (512×512 BC1, 1 mip): `check` **pass** in strict mode.
@@ -907,12 +951,11 @@ DXGI values (the exact-size match supports it).
    Compact 2D mip tails, multi-slice layouts, DXGI 11, and strict BCPack BC1/BC3/BC4/BC5
    decoding are now live in `rpf9-explorer` (carried by the `e293917` submodule pin,
    `breadbbbb/rpf9-explorer#7`; `ASSET-44`). Remaining C# follow-ups are BC6H/BC7 block
-   rebuilders (plus optional external history tables) and preserving lower-mip zlib/raw
-   fallback when a higher mip is refused in strict mode.
-2. **Add DXGI 11 (`R16G16B16A16_UNORM`, 5 records) and validate 2D uncompressed tiling (formats
-   11, 28, 49, 56).** The 19 records formerly listed as DXGI 156/199/211/226 are resolved as
-   two-slice 2D arrays (`docs/textures_arrays.md`).
-3. **Generate local BCPack history tables from `<work>` (optional follow-up).** Add a local
+   rebuilders (plus optional external history tables), preserving lower-mip zlib/raw
+   fallback when a higher mip is refused in strict mode, and fixing `Core/TtpfReader.cs:70`
+   (`Patterns[2]`), which currently uses Navi 1x's `(-3, 3)` at bits 6..7 instead of
+   RDNA2/RbPlus `(3, -3)` (`GFX10_SW_64K_D_RBPLUS_PATINFO`).
+2. **Generate local BCPack history tables from `<work>` (optional follow-up).** Add a local
    calibration script under `tools/` so players can derive `bc6h.json` / `bc7.json` (and, if
    desired, BC1–BC5 history tables) locally from their own texture pools into `<work>` and
    pass them via `--history <path>`.
@@ -934,16 +977,18 @@ python -I tests/test_tex_headers.py
 python -I tests/test_ttpf_mips.py
 ```
 
-`scan` reproduces the 357,115 / 98,603 / 210,292 / 48,220 baseline split, reports both the
-zlib/raw layout projection (`after_full` / `after_partial` / `after_skip`) and the
+`scan` reproduces the 357,115 / 98,608 / 210,292 / 48,215 baseline split (the pre-DXGI-11
+98,603 / 210,292 / 48,220 split with the 5 DXGI 11 records moved into `reader_full`), reports
+both the zlib/raw layout projection (`after_full` / `after_partial` / `after_skip`) and the
 full 6-codec BCPack projection (`after_bcpack_full` / `after_bcpack_partial` /
 `after_bcpack_skip`), and adds the layout and recovery counters; `--tuples` adds the 84
 known-size rejected tuples. `check` reports the per-mip downsample error. `export` writes a
-full BC chain when every source mip uses a supported codec. None of the tests need game
-files: `tests/test_bcpack.py` builds synthetic rANS BCPack streams from scratch for all six
-codecs (including synthetic external history JSONs for BC6H/BC7), `tests/test_tex_headers.py`
-tests the layout rule on synthetic headers, and `tests/test_ttpf_mips.py` builds synthetic
-zlib and BCPack (BC1 and BC7) RDS5 pools.
+full BC or validated 2D uncompressed chain when every source mip uses a supported codec. None
+of the tests need game files: `tests/test_bcpack.py` builds synthetic rANS BCPack streams from
+scratch for all six codecs (including synthetic external history JSONs for BC6H/BC7),
+`tests/test_tex_headers.py` tests the layout rule on synthetic headers, and
+`tests/test_ttpf_mips.py` builds synthetic zlib, uncompressed 2D, and BCPack (BC1 and BC7) RDS5
+pools.
 
 The earlier BCPack header counts and 200-chunk entropy check came from a read-only
 aggregation over the same `Pool` parser using the public MDU tables from `silicon-rans`;

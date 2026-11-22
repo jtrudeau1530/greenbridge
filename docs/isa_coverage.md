@@ -52,16 +52,18 @@ listed separately ("handled but with operand forms that raise"). Names built by 
 Only the AMD XML defines the denominator: it omits a few gfx1013 instructions that LLVM accepts (below), and lists
 some that a desktop part does not execute.
 
-## Result (translator at `bb2e1842`, AMD XML of 2026-08-06)
+## Result (translator at `41f44826`, AMD XML of 2026-08-06)
 
-1,153 RDNA2 instructions: 418 handled-exact, 411 handled-family, 2 refused (`s_denorm_mode`, `s_round_mode`), 322
+Every new translator rule moves these numbers; rerun the tool for the current ones.
+
+1,153 RDNA2 instructions: 436 handled-exact, 408 handled-family, 2 refused (`s_denorm_mode`, `s_round_mode`), 307
 unknown. The unknown ones cluster in groups the corpus does not need or that are not written yet: the f64
 transcendentals and `v_div_*`, FLAT and SCRATCH memory, the global atomics, the `image_gather4*` variants outside the
 four `_l`/`_lz` forms, packed image formats (`*_pck`, `*_by2`), the 16-bit `v_pk_*` integer forms, `v_dot*`, and the
 `*_saveexec` / `s_nand`/`s_nor`/`s_xnor` scalar forms. `python -I tools/isa_coverage.py --list` has the full list per
 encoding.
 
-Names the translator matches that are not in the RDNA2 XML (15), each checked with
+Names the translator matches that are not in the RDNA2 XML (16), each checked with
 `llvm-mc -arch=amdgcn -mcpu=gfx1013`:
 
 | name | llvm-mc for gfx1013 | verdict |
@@ -70,7 +72,7 @@ Names the translator matches that are not in the RDNA2 XML (15), each checked wi
 | `v_add_u16`, `v_sub_u16` | other GPU only | internal: `v_add_nc_u16` / `v_sub_nc_u16` are re-dispatched under these names |
 | `v_subrev_u16`, `v_and_b16`, `v_or_b16`, `v_xor_b16` | other GPU only | dead GFX9 spellings, harmless |
 | `s_delay_alu` | other GPU only (RDNA3) | deliberate, in `NOOPS` |
-| `v_mac_f32`, `v_mad_f32`, `v_mad_legacy_f32`, `v_madak_f32`, `v_madmk_f32`, `s_get_waveid_in_workgroup` | valid | real gfx1013 instructions that AMD's XML omits |
+| `v_mac_f32`, `v_mac_legacy_f32`, `v_mad_f32`, `v_mad_legacy_f32`, `v_madak_f32`, `v_madmk_f32`, `s_get_waveid_in_workgroup` | valid | real gfx1013 instructions that AMD's XML omits |
 
 None is a typo that breaks translation, so there is nothing to fix in the translator; the two `_mask` names and the
 four dead 16-bit spellings are candidates for removal. No name ends in a suffix `base_op()` strips (`_e32`, `_e64`,

@@ -91,6 +91,35 @@ def test_census_cli_prints_counts_only(tmp_path, capsys):
     assert "ps: C=1" in out and "lane-id x1" in out and "secret_shader_name" not in out
 
 
+def test_a_bad_census_is_one_line_not_a_traceback(tmp_path, capsys):
+    """--census used to traceback: FileNotFoundError, PermissionError on a folder, JSONDecodeError for a file that is
+    not JSON and AttributeError for a JSON list, so the tier census could not say what was wrong with its input."""
+    not_json = tmp_path / "junk.json"
+    not_json.write_text("RSC8 not an index", encoding="utf-8")
+    a_list = tmp_path / "list.json"
+    a_list.write_text("[]", encoding="utf-8")
+    a_number = tmp_path / "num.json"
+    a_number.write_text("7", encoding="utf-8")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    for path in (tmp_path / "missing.json", folder, not_json, a_list, a_number):
+        capsys.readouterr()
+        code = wave64_halves.main(["--census", str(path)])
+        out = capsys.readouterr()
+        assert code == 2, f"{path.name}: exit {code}, {out.err!r}"
+        assert "Traceback" not in out.err, out.err
+        assert len(out.err.strip().splitlines()) == 1 and out.err.startswith("ERROR: "), out.err
+        assert out.out == "", f"{path.name} printed a census: {out.out!r}"
+
+
+def test_an_empty_index_still_reports_no_tier(tmp_path, capsys):
+    path = tmp_path / "index.json"
+    path.write_text("{}", encoding="utf-8")
+    assert wave64_halves.main(["--census", str(path)]) == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "no wave64 VS/PS/GS entry with a wave64_graphics tier" and out.err == ""
+
+
 def test_expected_words_of_the_gpu_fixtures():
     assert w64_graphics._a_skip(1 + 64 * 3) == (7 * 3 + 1, 1, 2000 + 3, 2)
     assert w64_graphics._a_skip(6 + 64 * 2) == (1006, 0, 2000 + 2 + 9, 3)

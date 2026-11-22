@@ -556,7 +556,8 @@ struct DeviceState {
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
             return {};
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
-            if (desc.SampleDesc.Count != 1 ||
+            if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+                                               (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
                 (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
                 return {};
             if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
@@ -718,7 +719,8 @@ struct DeviceState {
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         const bool supports_lod_clamp = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_2d ||
-                                        image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube;
+                                        image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube ||
+                                        image.type == g::ImageType::image_3d;
         if (!storage && supports_lod_clamp && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
             // Use the clamp in the T# itself: views with identical keys must sample identically.
             clamp.minLod = g::image_min_lod(words);
@@ -2075,8 +2077,9 @@ public:
                 log_once("vertex attribute format not supported yet:", element.Format);
                 return E_INVALIDARG;
             }
+            const UINT alignment = std::min(bytes, 4u);
             const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
-                                    ? (slot_end[element.InputSlot] + 3) / 4 * 4
+                                    ? (slot_end[element.InputSlot] + alignment - 1) / alignment * alignment
                                     : element.AlignedByteOffset;
             slot_end[element.InputSlot] = offset + bytes;
             const leonida::SignatureElement* input = nullptr;
@@ -2498,10 +2501,6 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
-    if (volume && view.min_lod != 0) {
-        log_once("volume SRV requires a zero ResourceMinLODClamp; format", int(desc.Format));
-        return false;
-    }
     if (msaa) {
         // The MS bindings expose typed colour SRVs. An MS view has one mip and can name an array slice range.
         const Format format = texture_storage_format(desc.Format, false);
@@ -2843,7 +2842,9 @@ public:
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
-                                                                  info.conditional_rendering, info.ray_tracing);
+                                                                  info.conditional_rendering, info.ray_tracing,
+                                                                  info.xdxr_acceleration_structures &&
+                                                                      info.buffer_device_address);
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -3355,6 +3356,34 @@ public:
         if (!out) return;
         *out = {};
         auto& vk = state_.context->vk;
+        if (desc && state_.context->xdxr_acceleration_structures()) {
+            // XDXR records: the layout depends only on the triangle or instance count (xdxr_build.h), so the sizes
+            // are exact. An update rebuilds the structure, so it needs the same scratch.
+            leonida::BuildAccelerationStructure build{};
+            build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+            if (build.is_tlas) {
+                build.instance_count = desc->NumDescs;
+            } else {
+                for (UINT i = 0; i < desc->NumDescs; ++i) {
+                    const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
+                        (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+                            ? (desc->ppGeometryDescs ? desc->ppGeometryDescs[i] : nullptr)
+                            : (desc->pGeometryDescs ? &desc->pGeometryDescs[i] : nullptr);
+                    if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
+                    leonida::RtTriangleGeometry t{};
+                    t.vertex_count = gd->Triangles.VertexCount;
+                    t.index_count = gd->Triangles.IndexCount;
+                    t.index_type = gd->Triangles.IndexFormat == DXGI_FORMAT_UNKNOWN ? 0u : 1u;
+                    build.triangles.push_back(t);
+                }
+            }
+            leonida::XdxrLayout layout;
+            if (!layout.compute(leonida::VulkanContext::xdxr_elements(build), build.is_tlas)) return;
+            out->ResultDataMaxSizeInBytes = layout.size;
+            out->ScratchDataSizeInBytes = layout.scratch;
+            out->UpdateScratchDataSizeInBytes = layout.scratch;
+            return;
+        }
         if (!desc || !state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
 
         const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
@@ -4748,11 +4777,9 @@ public:
                 s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE | D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
             }
             if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
-                // The native packed format supports single-sample RTVs on some adapters.
-                // Only that usage has been verified through the shim's render-target path.
-                s1 &= ~(D3D12_FORMAT_SUPPORT1_BLENDABLE |
-                        D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
-                        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD);
+                // Keep the native attachment and resolve bits. Blending and shader multisample loads remain masked.
+                s1 &= ~(D3D12_FORMAT_SUPPORT1_BLENDABLE | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL |
+                        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD);
             }
             fs->Support1 = s1;
             fs->Support2 = s2;
@@ -5700,6 +5727,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
             vkGetPhysicalDeviceFeatures2(info.physical, &features);
             info.ray_tracing = as_features.accelerationStructure == VK_TRUE && rq_features.rayQuery == VK_TRUE;
+        }
+        // The game's translated RT shaders read XDXR BVH4 records, which a VkAccelerationStructureKHR is not
+        // (docs/d3d12_vulkan.md 4.8): build those, unless LEONIDA_RT_AS=khr asks for #743's KHR builds instead.
+        char rt_as[8] = {};
+        std::size_t rt_as_length = 0;
+        const bool khr = getenv_s(&rt_as_length, rt_as, "LEONIDA_RT_AS") == 0 && rt_as_length > 1 &&
+                         std::strcmp(rt_as, "khr") == 0;
+        if (!khr && chosen12.bufferDeviceAddress) {
+            info.xdxr_acceleration_structures = true;
+            info.ray_tracing = false;  // no KHR extensions: AS resources keep their console VAs
         }
         if (!info.conditional_rendering)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_conditional_rendering: SetPredication is unsupported\n");
