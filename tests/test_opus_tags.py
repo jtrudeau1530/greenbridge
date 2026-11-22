@@ -157,6 +157,27 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
         self.assertEqual(self.tags("story", "bank_01", "00000123.ogg"), [])
 
+    def test_cli_accepts_a_missing_trailing_subtitle(self):
+        # A CSV row can omit its final optional field rather than end with a comma.
+        with open(self.dialogue, "w", encoding="utf-8", newline="\n") as f:
+            csv.writer(f, lineterminator="\n").writerows([
+                ["wave", "key", "label", "speaker", "text_de", "text_en"],
+                ["heistau_abcd_01", "HEISTAU_ABCD", "HEIST_ZED_1", "ZED", "~z~Los."],
+            ])
+        parts = ("story", "bank_01", "0ABCDEF1.ogg")
+        path = os.path.join(self.opus, *parts)
+        with open(path, "rb") as f:
+            before = f.read()
+        result = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names,
+                                 "--source", "story", "--dialogue", self.dialogue], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tags(*parts), ["TITLE=heistau_abcd_01", "LABEL=HEIST_ZED_1", "SPEAKER=ZED",
+                                             "SUBTITLE=Los.", "SUBTITLE_DE=Los."])
+        with open(path, "rb") as f:
+            after = f.read()
+        self.assertEqual(before[list(T.pages(before))[2][0]:], after[list(T.pages(after))[2][0]:])
+        self.assertTrue(crc_ok(after))
+
     def test_duplicate_id_stream_gets_the_same_tags(self):
         # awc_opus.py names a bank's second stream with an id already used <id>~2 (export_stems); it has the same
         # id, so it is the same name and dialogue line.
