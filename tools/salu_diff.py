@@ -167,11 +167,6 @@ def bfe64(src, ctl, signed):
     return field & M64
 
 
-def sext8(x):
-    x &= 0xFF
-    return (x - 0x100 if x & 0x80 else x) & M32
-
-
 def bfe(src, ctl, signed):
     off, width = ctl & 31, (ctl >> 16) & 0x7F
     # A field that runs past bit 31 stops there: s_bfe_i32 sign-extends from the top bit that exists (LLVM
