@@ -178,7 +178,10 @@ What is implemented (all of it testable without the game):
   block-compressed extents stop at the mip edge (D3D12 pads footprints to whole blocks, Vulkan does not; a
   texture-to-texture box of a block-compressed format is rounded up to whole blocks, as on the PC runtime, must fit
   the destination's padded mip, and the Vulkan extent is cut where it reaches an image's edge; Vulkan wants that per
-  image, so a copy whose cut extent is neither a block multiple nor at the edge of both images is refused). Each
+  image, so when no single cut extent is a block multiple or at the edge of both images, for example a 4x4 box into
+  a 3x3 mip, the copy goes through transfer scratch (`vulkan_scratch.h`, as depth <-> colour copies do):
+  `vkCmdCopyImageToBuffer` with the source's own cut extent into whole blocks, then `vkCmdCopyBufferToImage` with the
+  destination's. The box fits the source's padded mip, so the scratch holds every block the destination reads). Each
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
@@ -871,12 +874,16 @@ and any validation error fails them.
 
     Copies between different mips of one texture are compared too (mips 24, 12, 6, 3, 1; RGBA8, BC1, BC7): sizes that
     are no block multiple, boxes to a padded edge, and boxes that do not fit the destination, which both sides must
-    refuse (the host at `Close` with `E_INVALIDARG`, the layer at execution with `invalid_copy`). Known gaps shown
-    by it and by the formats, not fixed:
-    - **Block-compressed copies into a mip whose size is no block multiple**, for example a 0..8 box into a 6-wide
-      mip, a 6x6 mip into a larger one, or a 4x4 box into a 3x3 mip: the host copies whole blocks, `vkCmdCopyImage`
-      cannot (its extent must be a block multiple or reach each image's edge), so the layer refuses them with
-      `invalid_copy`. A fix needs a staging copy through a buffer. The test prints these as known differences.
+    refuse (the host at `Close` with `E_INVALIDARG`, the layer at execution with `invalid_copy`). It found:
+    - **Block-compressed copies into a mip whose size is no block multiple** (a 0..8 box into a 6-wide mip, a 6x6
+      mip into a larger one, a 4x4 box into a 3x3 mip) were refused with `invalid_copy`: the host copies whole
+      blocks, and one `vkCmdCopyImage` cannot (its extent must be a block multiple or reach each image's edge). They
+      are staged through transfer scratch now (above) and match the host byte for byte, as do a box 4..8 of a 6x6
+      mip into a 3x3 one and a 3x3 mip into a 6x6 one at (4, 4). Measured on an RTX 5070 Ti and an RTX 3060 (driver
+      621.24) and an integrated AMD Radeon(TM) Graphics (`0x1002:0x164e`, Vulkan driver 2.0.353), Windows 11, each
+      against its own host. `d3d12_state_map_test` checks the staged regions on the CPU.
+
+    Known gaps shown by it and by the formats, not fixed:
     - **`TEXTURE1D`** resources are not supported by the layer (creation, footprints and allocation info refuse
       them), so 1D copies are not compared.
     - On a GPU with a native D24, a readback leaves the unspecified `X8` byte of the depth plane untouched where the PC

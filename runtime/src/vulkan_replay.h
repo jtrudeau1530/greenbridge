@@ -1477,21 +1477,46 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         if (block > 1) {
             // D3D12 copies whole blocks: the box is rounded up to blocks and must fit the destination's padded mip.
             // Vulkan takes an extent that is a block multiple or reaches the edge of each image separately, so the
-            // extent is cut where it reaches an edge, and a copy that cannot satisfy both images is refused.
+            // extent is cut where it reaches an edge, and a copy that cannot satisfy both images is staged (below).
             if ((box.left | box.top | copy.x | copy.y) % block || box.left >= from.width || box.top >= from.height ||
                 copy.x >= padded(to.width) || copy.y >= padded(to.height))
                 return ReplayResult::invalid_copy;
             w = padded(w);
             h = padded(h);
             if (w > padded(to.width) - copy.x || h > padded(to.height) - copy.y) return ReplayResult::invalid_copy;
-            w = std::min({w, from.width - box.left, to.width - copy.x});
-            h = std::min({h, from.height - box.top, to.height - copy.y});
+            // Each image's own extent: the whole blocks, cut where they reach that image's edge.
+            const std::uint32_t src_w = std::min(w, from.width - box.left), src_h = std::min(h, from.height - box.top);
+            const std::uint32_t dst_w = std::min(w, to.width - copy.x), dst_h = std::min(h, to.height - copy.y);
+            const std::uint32_t blocks_w = w, blocks_h = h;
+            w = std::min(src_w, dst_w);
+            h = std::min(src_h, dst_h);
             const auto fits = [block](std::uint32_t offset, std::uint32_t extent, std::uint32_t size) {
                 return extent % block == 0 || offset + extent == size;
             };
             if (!fits(box.left, w, from.width) || !fits(copy.x, w, to.width) || !fits(box.top, h, from.height) ||
-                !fits(copy.y, h, to.height))
-                return ReplayResult::invalid_copy;
+                !fits(copy.y, h, to.height)) {
+                // No one extent does for both images: a mip edge inside a block on one side only (a 4x4 box into a
+                // 3x3 mip, a 6x6 mip into a 12x12 one). The source's blocks go into transfer scratch with its own
+                // cut extent and from there into the destination with the destination's (`staged_reads` and
+                // `staged_writes`, offsets from the start of the scratch; prepare allocates it). The box fits the
+                // source's padded mip, so the scratch holds every block the destination reads.
+                if (!within(copy.z, d, to_depth)) return ReplayResult::invalid_copy;
+                VkBufferImageCopy read{};
+                read.bufferRowLength = blocks_w;
+                read.bufferImageHeight = blocks_h;
+                read.imageSubresource = {src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1};
+                read.imageOffset = {std::int32_t(box.left), std::int32_t(box.top), std::int32_t(box.front)};
+                read.imageExtent = {src_w, src_h, d};
+                VkBufferImageCopy write = read;
+                write.imageSubresource = {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1};
+                write.imageOffset = {std::int32_t(copy.x), std::int32_t(copy.y), std::int32_t(copy.z)};
+                write.imageExtent = {dst_w, dst_h, d};
+                p.staged_reads.push_back(read);
+                p.staged_writes.push_back(write);
+                p.range = dst;
+                p.source_range = src;
+                return ReplayResult::success;
+            }
         }
         if (!within(copy.x, w, to.width) || !within(copy.y, h, to.height) || !within(copy.z, d, to_depth))
             return ReplayResult::invalid_copy;
@@ -2283,6 +2308,20 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
+                if (result == ReplayResult::success && !p.staged_reads.empty()) {
+                    // A block-compressed copy staged through transfer scratch (prepare_texture_copy): whole blocks of
+                    // the read's row length and height, one region a copy.
+                    const VkBufferImageCopy& read = p.staged_reads[0];
+                    const BlockFormat f = block_format(p.source.format, read.imageSubresource.aspectMask);
+                    const VkDeviceSize bytes = VkDeviceSize(read.bufferRowLength / f.block) *
+                                               (read.bufferImageHeight / f.block) * read.imageExtent.depth * f.bytes;
+                    VkDeviceSize base = 0;
+                    if (!f.bytes || !vk.copy_image_to_buffer || !vk.copy_buffer_to_image || !vk.copy_scratch ||
+                        !vk.copy_scratch(bytes, p.staged, base))
+                        return ReplayResult::invalid_copy;  // refused as before this path existed
+                    p.staged_reads[0].bufferOffset += base;
+                    p.staged_writes[0].bufferOffset += base;
+                }
                 // A depth plane footprint of a D24 texture stored as D32: words of 24-bit UNORM, floats in the image.
                 const bool upload = texture_copy->src.footprint;
                 const ResourceBinding& image = upload ? p.binding : p.source;
@@ -3061,7 +3100,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
             } else if (p.staged) {
-                // Depth <-> colour: the source into the scratch, then the scratch into the destination.
+                // Depth <-> colour, or a block-compressed copy no one extent fits: the source into the scratch, then
+                // the scratch into the destination. The destination's copy_layout comes after the scratch write, so
+                // its barrier orders every earlier transfer write before the destination's (#860, Vonsek's
+                // synchronization-validation run).
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
