@@ -1006,6 +1006,19 @@ void test_unwind_registration() {
     expect_rejects("unwind data past the image", make_unwind_image({{0x1000, 0x1010, 0x1FFE}}));
 }
 
+// An export whose address-table entry is past SizeOfImage (not a forwarder: outside the export directory) is
+// refused instead of being stored as base + rva, a pointer outside the mapping.
+void test_export_bounds() {
+    auto outside = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    nt_of(outside)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
+    *reinterpret_cast<uint32_t*>(outside.data() + 0x300) = 0x2000;  // funcs[0] == SizeOfImage
+    expect_rejects("an export whose address is past the image", outside);
+    auto last = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    nt_of(last)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
+    *reinterpret_cast<uint32_t*>(last.data() + 0x300) = 0x1FFF;  // the image's last byte: still inside
+    expect_loads("an export at the image's last byte still loads", last);
+}
+
 // The folder the images go to: leonida_loader_test\<process id> in LEONIDA_TEST_DIR when that is set, otherwise in
 // the temporary directory. A folder per run, because security software can hold the previous run's images for a
 // while after they are written (so they can be neither deleted nor overwritten); the fixed parent name is what an
@@ -1095,6 +1108,7 @@ int main() {
         test_process_detach_dependencies();
         test_delay_descriptor_fields();
         test_forwarded_exports();
+        test_export_bounds();
         test_unwind_registration();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
