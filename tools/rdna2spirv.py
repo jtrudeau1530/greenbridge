@@ -904,7 +904,8 @@ class Gen:
                7: (2, "unorm", (16,)), 23: (4, "unorm", (16, 16)), 24: (4, "snorm", (16, 16)),
                65: (8, "unorm", (16, 16, 16, 16)), 66: (8, "snorm", (16, 16, 16, 16)),
                44: (4, "unorm", (2, 10, 10, 10)), 50: (4, "unorm", (10, 10, 10, 2)),
-               69: (8, "uint", (16, 16, 16, 16)), 27: (4, "uint", (16, 16))}
+               69: (8, "uint", (16, 16, 16, 16)), 27: (4, "uint", (16, 16)),
+               2: (1, "snorm", (8,)), 8: (2, "snorm", (16,)), 15: (2, "snorm", (8, 8))}
 
     def encode_format(self, fcomps, icomps, code):
         """Encode one element of format `code` -> list of uint ids (whole dwords; elements under 4 bytes return one
@@ -946,11 +947,51 @@ class Gen:
             bit += w
         return words
 
+    def norm_bits(self, m, n):
+        """f32 bits of m / (2^n - 1), correctly rounded, for an n-bit unsigned id m (1 <= n <= 16), integer ops only.
+
+        In binary, m / (2^n - 1) is m's n bits repeated forever. T = m * sum(2^(64 - n(k+1))) holds the first 64 of
+        them (the partial block at the bottom is dropped, below every bit used here). For 0 < m < 2^n - 1 the top 1 of
+        T is in its high dword (T >= 2^(64-n)), so p = FindUMsb(T >> 32) is 16..31 and the value is in [2^(p-32),
+        2^(p-31)). The mantissa is T >> (p + 9) (24 bits with the hidden one) and the round bit the one below it. The
+        repeating tail is never all zero, so a tie can't happen: round to nearest is "add the round bit". A carry
+        out of the mantissa moves into the exponent through the plain add. 0 and 2^n - 1 are exact (0 and 1.0)."""
+        rep = sum(1 << (64 - n * (k + 1)) for k in range(64 // n))
+        m64, t, h64, hi, pi, p, s, s64, q64, q, s1, s164, r64, rb, e, eb, b0, b1, b2, z, one, b3, b4 = \
+            (self.tmp() for _ in range(23))
+        self.emit(f"{m64} = OpUConvert %ulong {m}")
+        self.emit(f"{t} = OpIMul %ulong {m64} {self.cl(rep)}")
+        self.emit(f"{h64} = OpShiftRightLogical %ulong {t} {self.cl(32)}")
+        self.emit(f"{hi} = OpUConvert %uint {h64}")
+        self.emit(f"{pi} = OpExtInst %int %glsl FindUMsb {hi}")
+        self.emit(f"{p} = OpBitcast %uint {pi}")
+        self.emit(f"{s} = OpIAdd %uint {p} {self.cu(9)}")               # m = 0 gives p = -1: s = 8, result unused
+        self.emit(f"{s64} = OpUConvert %ulong {s}")
+        self.emit(f"{q64} = OpShiftRightLogical %ulong {t} {s64}")
+        self.emit(f"{q} = OpUConvert %uint {q64}")
+        self.emit(f"{s1} = OpISub %uint {s} {self.cu(1)}")
+        self.emit(f"{s164} = OpUConvert %ulong {s1}")
+        self.emit(f"{r64} = OpShiftRightLogical %ulong {t} {s164}")
+        self.emit(f"{rb} = OpUConvert %uint {r64}")
+        self.emit(f"{e} = OpIAdd %uint {p} {self.cu(95)}")              # biased exponent p - 32 + 127
+        self.emit(f"{eb} = OpShiftLeftLogical %uint {e} {self.cu(23)}")
+        self.emit(f"{b0} = OpISub %uint {q} {self.cu(0x800000)}")       # drop the hidden one
+        self.emit(f"{b1} = OpIAdd %uint {eb} {b0}")
+        self.emit(f"{b2} = OpBitwiseAnd %uint {rb} {self.cu(1)}")
+        self.emit(f"{b3} = OpIAdd %uint {b1} {b2}")
+        self.emit(f"{z} = OpIEqual %bool {m} {self.cu(0)}")
+        self.emit(f"{one} = OpIEqual %bool {m} {self.cu((1 << n) - 1)}")
+        self.emit(f"{b4} = OpSelect %uint {one} {self.cu(0x3F800000)} {b3}")
+        res = self.tmp()
+        self.emit(f"{res} = OpSelect %uint {z} {self.cu(0)} {b4}")
+        return res
+
     def decode_format(self, words, code):
         """Decode one element of format `code` from raw dwords -> 4 uint ids holding f32 bits (or uint for *_UINT/uint).
 
         Missing channels repeat the format's own (component c = c mod n): measured on RX 6700 for SHADER-86.
-        UNORM/SNORM use correctly rounded OpFDiv by (2^n-1), not a reciprocal multiply."""
+        UNORM/SNORM give the correctly rounded quotient, as the RX 6700 does, built with integer ops (norm_bits):
+        OpFDiv is allowed 2.5 ULP and the AMD and NVIDIA drivers return the reciprocal-multiply result for it (#599)."""
         try:
             size, kind, widths = self.FORMATS[code]
         except KeyError:
@@ -972,17 +1013,20 @@ class Gen:
                 self.emit(f"{x} = OpCompositeExtract %float {v2} 0")
                 out.append(self.tou(x))
             elif kind == "unorm":
-                c, x = self.tmp(), self.tmp()
-                self.emit(f"{c} = OpConvertUToF %float {f}")
-                self.emit(f"{x} = OpFDiv %float {c} {self.fconst(float((1 << w) - 1))}")
-                out.append(self.tou(x))
+                out.append(self.norm_bits(f, w))
             elif kind == "snorm":
-                si, c, x, cl = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                # magnitude over 2^(w-1)-1 with the same integer rounding; the most negative code is -1.0
+                si, neg, ab, au, sg, sel, lo, res = (self.tmp() for _ in range(8))
                 self.emit(f"{si} = OpBitFieldSExtract %int {self.as_int(src)} {self.cu(bit % 32)} {self.cu(w)}")
-                self.emit(f"{c} = OpConvertSToF %float {si}")
-                self.emit(f"{x} = OpFDiv %float {c} {self.fconst(float((1 << (w - 1)) - 1))}")
-                self.emit(f"{cl} = OpExtInst %float %glsl FMax {x} {self.fconst(-1.0)}")
-                out.append(self.tou(cl))
+                self.emit(f"{neg} = OpSLessThan %bool {si} {self.as_int(self.cu(0))}")
+                self.emit(f"{ab} = OpExtInst %int %glsl SAbs {si}")
+                self.emit(f"{au} = OpBitcast %uint {ab}")
+                mag = self.norm_bits(au, w - 1)
+                self.emit(f"{sg} = OpBitwiseOr %uint {mag} {self.cu(0x80000000)}")
+                self.emit(f"{sel} = OpSelect %uint {neg} {sg} {mag}")
+                self.emit(f"{lo} = OpULessThan %bool {au} {self.cu(1 << (w - 1))}")
+                self.emit(f"{res} = OpSelect %uint {lo} {sel} {self.cu(0xBF800000)}")
+                out.append(res)
             else:   # uint: raw integer
                 out.append(f)
             bit += w
