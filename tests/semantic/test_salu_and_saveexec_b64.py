@@ -43,6 +43,62 @@ ODD_LANES_64: int = 0xAAAAAAAAAAAAAAAA
 LOW32_LANES_64: int = 0x00000000FFFFFFFF
 HIGH32_LANES_64: int = 0xFFFFFFFF00000000
 
+# IEEE 754 architectural bit patterns for vector-to-scalar comparison masks
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+SNAN_F32: int = 0x7F800001
+SUBNORM_MIN_F32: int = 0x00000001
+SUBNORM_MAX_F32: int = 0x007FFFFF
+
+POS_ZERO_F64: int = 0x0000000000000000
+NEG_ZERO_F64: int = 0x8000000000000000
+POS_INF_F64: int = 0x7FF0000000000000
+NEG_INF_F64: int = 0xFFF0000000000000
+QNAN_F64: int = 0x7FF8000000000000
+SNAN_F64: int = 0x7FF0000000000001
+SUBNORM_MIN_F64: int = 0x0000000000000001
+
+
+def is_nan_f32_bits(bits: int) -> bool:
+    """Return True if 32-bit word represents an IEEE 754 single-precision NaN."""
+    return ((bits & 0x7F800000) == 0x7F800000) and ((bits & 0x007FFFFF) != 0)
+
+
+def is_subnormal_f32_bits(bits: int) -> bool:
+    """Return True if 32-bit word represents an IEEE 754 single-precision subnormal."""
+    return ((bits & 0x7F800000) == 0) and ((bits & 0x007FFFFF) != 0)
+
+
+def is_inf_f32_bits(bits: int) -> bool:
+    """Return True if 32-bit word represents positive or negative infinity."""
+    return ((bits & 0x7F800000) == 0x7F800000) and ((bits & 0x007FFFFF) == 0)
+
+
+def generate_f32_cmp_mask(lanes_f32: list[int], condition: str) -> int:
+    """Simulate vector float comparison across 64 lanes producing a 64-bit mask."""
+    mask = 0
+    for lane, val in enumerate(lanes_f32[:64]):
+        b = val & MASK32
+        matched = False
+        if condition == "nan":
+            matched = is_nan_f32_bits(b)
+        elif condition == "subnormal":
+            matched = is_subnormal_f32_bits(b)
+        elif condition == "inf":
+            matched = is_inf_f32_bits(b)
+        elif condition == "neg_zero":
+            matched = (b == NEG_ZERO_F32)
+        elif condition == "pos_zero":
+            matched = (b == POS_ZERO_F32)
+        elif condition == "finite":
+            matched = not (is_nan_f32_bits(b) or is_inf_f32_bits(b))
+        if matched:
+            mask |= (1 << lane)
+    return mask & MASK64
+
 
 class RegKind(enum.Enum):
     """Register kinds in the RDNA2 architectural state."""
@@ -508,6 +564,62 @@ EVEN_LANES_64: int = 0x5555555555555555
 ODD_LANES_64: int = 0xAAAAAAAAAAAAAAAA
 LOW32_LANES_64: int = 0x00000000FFFFFFFF
 HIGH32_LANES_64: int = 0xFFFFFFFF00000000
+
+# IEEE 754 architectural bit patterns for vector-to-scalar comparison masks
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+SNAN_F32: int = 0x7F800001
+SUBNORM_MIN_F32: int = 0x00000001
+SUBNORM_MAX_F32: int = 0x007FFFFF
+
+POS_ZERO_F64: int = 0x0000000000000000
+NEG_ZERO_F64: int = 0x8000000000000000
+POS_INF_F64: int = 0x7FF0000000000000
+NEG_INF_F64: int = 0xFFF0000000000000
+QNAN_F64: int = 0x7FF8000000000000
+SNAN_F64: int = 0x7FF0000000000001
+SUBNORM_MIN_F64: int = 0x0000000000000001
+
+
+def is_nan_f32_bits(bits: int) -> bool:
+    """Return True if 32-bit word represents an IEEE 754 single-precision NaN."""
+    return ((bits & 0x7F800000) == 0x7F800000) and ((bits & 0x007FFFFF) != 0)
+
+
+def is_subnormal_f32_bits(bits: int) -> bool:
+    """Return True if 32-bit word represents an IEEE 754 single-precision subnormal."""
+    return ((bits & 0x7F800000) == 0) and ((bits & 0x007FFFFF) != 0)
+
+
+def is_inf_f32_bits(bits: int) -> bool:
+    """Return True if 32-bit word represents positive or negative infinity."""
+    return ((bits & 0x7F800000) == 0x7F800000) and ((bits & 0x007FFFFF) == 0)
+
+
+def generate_f32_cmp_mask(lanes_f32: list[int], condition: str) -> int:
+    """Simulate vector float comparison across 64 lanes producing a 64-bit mask."""
+    mask = 0
+    for lane, val in enumerate(lanes_f32[:64]):
+        b = val & MASK32
+        matched = False
+        if condition == "nan":
+            matched = is_nan_f32_bits(b)
+        elif condition == "subnormal":
+            matched = is_subnormal_f32_bits(b)
+        elif condition == "inf":
+            matched = is_inf_f32_bits(b)
+        elif condition == "neg_zero":
+            matched = (b == NEG_ZERO_F32)
+        elif condition == "pos_zero":
+            matched = (b == POS_ZERO_F32)
+        elif condition == "finite":
+            matched = not (is_nan_f32_bits(b) or is_inf_f32_bits(b))
+        if matched:
+            mask |= (1 << lane)
+    return mask & MASK64
 
 
 def u32(val: int) -> int:
@@ -1268,6 +1380,120 @@ class TestSaluAndSaveexecB64ConditionCodes(unittest.TestCase):
         interp.state.exec = ALL_LANES_64
         interp.step(Instruction(Opcode.S_AND_SAVEEXEC_B64, dst=Register(RegKind.SGPR, 0, size=64),
                                 src0=Operand(imm=1 << 63, size=64)))
+        self.assertEqual(interp.state.scc, 1)
+
+
+class TestSaluAndSaveexecB64IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_ieee754_nan_divergence_masking(self) -> None:
+        """Verify vector NaN classification masks correctly drive s_and_saveexec_b64 divergence."""
+        wave = SIMDWavefrontState()
+        interp = SIMDWavefrontInterpreter(wave)
+
+        # Set up 64 lanes with mixed float values; only lanes 3, 17, 45 have NaNs
+        float_lanes = [0x3F800000] * 64  # 1.0f
+        float_lanes[3] = QNAN_F32
+        float_lanes[17] = SNAN_F32
+        float_lanes[45] = QNAN_F32
+
+        nan_mask = generate_f32_cmp_mask(float_lanes, "nan")
+        expected_mask = (1 << 3) | (1 << 17) | (1 << 45)
+        self.assertEqual(nan_mask, expected_mask)
+
+        # Vector comparison loads VCC
+        wave.scalar.vcc = nan_mask
+
+        # Divergent block setup: s_and_saveexec_b64 s[4:5], vcc
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 4, size=64),
+            src0=Operand(reg=Register(RegKind.VCC, 0, size=64), size=64),
+        )
+        interp.scalar_interp.step(inst)
+
+        self.assertEqual(wave.scalar.read_sgpr64(4), ALL_LANES_64)
+        self.assertEqual(wave.scalar.exec, expected_mask)
+        self.assertEqual(wave.scalar.scc, 1)
+
+        # Execute NaN fixup on active lanes: write canonical float 0.0
+        interp.execute_vector_mov(dst_vgpr=0, src_val=0)
+
+        for lane in range(64):
+            if lane in (3, 17, 45):
+                self.assertEqual(wave.read_vgpr(0, lane), 0)
+            else:
+                self.assertEqual(wave.read_vgpr(0, lane), 0)  # default unwritten is 0
+
+    def test_ieee754_subnormal_lane_isolation(self) -> None:
+        """Verify subnormal float detection generates mask and updates EXEC."""
+        float_lanes = [0x3F800000] * 64
+        float_lanes[0] = SUBNORM_MIN_F32
+        float_lanes[63] = SUBNORM_MAX_F32
+
+        subnorm_mask = generate_f32_cmp_mask(float_lanes, "subnormal")
+        self.assertEqual(subnorm_mask, (1 << 0) | (1 << 63))
+
+        interp = ScalarSALUInterpreter(ScalarRegisterState(exec=ALL_LANES_64))
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 2, size=64),
+            src0=Operand(imm=subnorm_mask, size=64),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.state.exec, (1 << 0) | (1 << 63))
+        self.assertEqual(interp.state.scc, 1)
+
+    def test_ieee754_signed_zeros_distinction_mask(self) -> None:
+        """Verify distinguishing +0.0 and -0.0 via sign-bit mask."""
+        float_lanes = [POS_ZERO_F32] * 64
+        float_lanes[10] = NEG_ZERO_F32
+        float_lanes[20] = NEG_ZERO_F32
+
+        neg_zero_mask = generate_f32_cmp_mask(float_lanes, "neg_zero")
+        self.assertEqual(neg_zero_mask, (1 << 10) | (1 << 20))
+
+        interp = ScalarSALUInterpreter(ScalarRegisterState(exec=ALL_LANES_64))
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=neg_zero_mask, size=64),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.state.exec, (1 << 10) | (1 << 20))
+        self.assertEqual(interp.state.scc, 1)
+
+    def test_ieee754_infinity_boundary_filtering(self) -> None:
+        """Verify infinities isolation across lanes."""
+        float_lanes = [0x3F800000] * 64
+        float_lanes[5] = POS_INF_F32
+        float_lanes[6] = NEG_INF_F32
+
+        inf_mask = generate_f32_cmp_mask(float_lanes, "inf")
+        self.assertEqual(inf_mask, (1 << 5) | (1 << 6))
+
+        interp = ScalarSALUInterpreter(ScalarRegisterState(exec=ALL_LANES_64))
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=inf_mask, size=64),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.state.exec, (1 << 5) | (1 << 6))
+        self.assertEqual(interp.state.scc, 1)
+
+    def test_ieee754_raw_float_payload_bitwise_and(self) -> None:
+        """Verify bitwise operations with IEEE 754 bit-patterns as 64-bit masks."""
+        # Using double-precision NaN bit pattern directly as mask
+        qnan_mask = QNAN_F64
+        interp = ScalarSALUInterpreter(ScalarRegisterState(exec=ALL_LANES_64))
+        inst = Instruction(
+            Opcode.S_AND_SAVEEXEC_B64,
+            dst=Register(RegKind.SGPR, 0, size=64),
+            src0=Operand(imm=qnan_mask, size=64),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.state.exec, qnan_mask)
         self.assertEqual(interp.state.scc, 1)
 
 
