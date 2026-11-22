@@ -574,13 +574,15 @@ Bit 31 is set on 48,046 of the 60,600 sampled core_restofworld vertices (79.3%).
 check does not say why. Not decoded: bits 20-30 of the 10-bit form (they vary
 within 142 of 143 blocks) and bytes 2-3 of the 8-bit form.
 
-Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the
-`RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
+Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the nested RPF9
+payloads, and the whole `appdata0` data area. The bodies of the nine `RSC8` headers are decoded in
+[rsc8_audio.md](rsc8_audio.md): facial/lip-sync clips. Across the 971
 core graphics blocks, final-slot widths remain unresolved, and of the component types the non-normal
 bits of `0x21` (see above). The stride check
 also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
 "Unread" in the tables above is not a claim that those bytes are empty: in
-`story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and
+`story000_restofworld` the 9.33 MB unread gap contains 15 `ADAT` (AWC) banks (8,908,216 bytes), which hold the
+nine `RSC8` headers as tag `0x5c` clips, and nested RPF9 headers, and
 in `story000_script` the 53 MB unread region contains four nested RPF9 headers.
 
 ## Likely format family
@@ -599,10 +601,13 @@ The bytes support the existing **RPF9/RAGE family**, not a new container:
   big-endian length chain are measured; the `LSNS` block layout is decoded, its record contents are not.
 - `RBF0` records carry schema names (movie subtitles, VFX texture-atlas metadata); XML records carry
   content definitions.
-- `RSC8` appears only as raw headers in the story-rest unread gap. No `RSC7` was found.
+- `RSC8` appears only in the story-rest unread gap, as the tag `0x5c` facial/lip-sync clips of its 15
+  `ADAT` (AWC) banks ([rsc8_audio.md](rsc8_audio.md)). No `RSC7` was found.
 
 Models are present (37 decoded in core, plus 924 name-bearing pages), but the measured bytes do not
-support a claim that these archives hold map placement, compiled scripts, audio banks or UI layout.
+support a claim that these archives hold map placement, compiled scripts or UI layout. Their only audio banks
+are those 15 in story-rest, with 76 streams: 13 carry a streamed-music `0x48` tag and 9 are dialogue lines with
+a clip. A raw `tools/rsc8_audio.py` scan of the other five archives finds no `ADAT` bank.
 The only UI-adjacent evidence is content-manifest XML and text; there is no UI container signature.
 
 ## Content-definition reader (ASSET-149)
