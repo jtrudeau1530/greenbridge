@@ -264,6 +264,27 @@ class ExportBankTest(unittest.TestCase):
                     self.assertEqual(read_wav(out / stem / "00000001.wav")["pcm"], struct.pack("<h", sample))
                 self.assertEqual(previous.read_bytes(), b"previous export")
 
+    def test_cli_bank_limits(self):
+        src = Path(self.tmp.name) / "banks"
+        src.mkdir()
+        fmt = format_block(1, 48000, 0, 1)
+        for stem in ("second", "first"):
+            (src / (stem + ".awc")).write_bytes(build_bank([(1, fmt, struct.pack("<h", 42))]))
+
+        for limit, expected in ((0, []), (1, ["first"]), (9, ["first", "second"])):
+            with self.subTest(limit=limit):
+                out = Path(self.out) / str(limit)
+                result = subprocess.run([sys.executable, "-I", awc.__file__, src, out, "--limit", str(limit),
+                                         "--jobs", "1"], check=True, capture_output=True, text=True)
+                self.assertIn(f"{len(expected)} banks:", result.stdout)
+                self.assertEqual(sorted(wav.parent.name for wav in out.glob("*/00000001.wav")), expected)
+
+        result = subprocess.run([sys.executable, "-I", awc.__file__, src, self.out, "--limit", "-1"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--limit must be non-negative", result.stderr)
+        self.assertFalse((Path(self.out) / "first").exists())
+
     def test_single_bank_cli_keeps_flat_output(self):
         bank, pcm, _ = self.make_bank()
         subprocess.run([sys.executable, "-I", awc.__file__, bank, self.out, "--jobs", "1"],

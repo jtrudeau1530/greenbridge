@@ -14,12 +14,17 @@ VkFormat requested_format = VK_FORMAT_UNDEFINED;
 VkClearColorValue captured{};
 VkClearRect captured_rect{};
 VkRect2D render_area{};
+VkImageSubresourceRange requested_range{};
+unsigned rendering_layers = 0;
 VKAPI_ATTR void VKAPI_CALL barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
     std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
     std::uint32_t, const VkImageMemoryBarrier*) {}
 VKAPI_ATTR void VKAPI_CALL clear(VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue* value,
     std::uint32_t, const VkImageSubresourceRange*) { captured = *value; ++image_clears; }
-VKAPI_ATTR void VKAPI_CALL begin(VkCommandBuffer, const VkRenderingInfo* info) { render_area = info->renderArea; }
+VKAPI_ATTR void VKAPI_CALL begin(VkCommandBuffer, const VkRenderingInfo* info) {
+    render_area = info->renderArea;
+    rendering_layers = info->layerCount;
+}
 VKAPI_ATTR void VKAPI_CALL end(VkCommandBuffer) {}
 VKAPI_ATTR void VKAPI_CALL attachments(VkCommandBuffer, std::uint32_t n, const VkClearAttachment* values,
     std::uint32_t count, const VkClearRect* rects) {
@@ -32,7 +37,8 @@ leonida::ReplayFunctions functions() {
     vk.begin_rendering = begin;
     vk.end_rendering = end;
     vk.clear_attachments = attachments;
-    vk.image_view = [](const auto& binding, const auto&) {
+    vk.image_view = [](const auto& binding, const auto& range) {
+        requested_range = range;
         requested_format = binding.format;
         return reinterpret_cast<VkImageView>(std::uintptr_t{1});
     };
@@ -50,6 +56,7 @@ void reset_counters() {
     image_clears = attachment_clears = 0;
     requested_format = VK_FORMAT_UNDEFINED;
     captured = {}; captured_rect = {}; render_area = {};
+    requested_range = {}; rendering_layers = 0;
 }
 leonida::ReplayResult run(const leonida::CommandList& list, const leonida::ResourceBinding& resource,
                           const leonida::ReplayFunctions& vk) {
@@ -117,10 +124,29 @@ int main() {
         EXPECT(requested_format == expected);
         ++checks;
     }
-    const auto rejects = [&](ResourceBinding r, TargetView view) {
+    auto layered = binding;
+    layered.mip_levels = 3; layered.array_layers = 4;
+    for (const auto& [format, expected] : formats) {
+        for (unsigned mip = 0; mip < 3; ++mip) {
+            CommandList subresources;
+            const Rect oversized{-2, -3, 20, 30};
+            EXPECT(subresources.clear_render_target({1, mip, 1, 2, format}, color, {&oversized, 1}));
+            EXPECT(subresources.close() && run(subresources, layered, vk) == ReplayResult::success);
+            EXPECT(requested_format == expected);
+            EXPECT(requested_range.baseMipLevel == mip && requested_range.levelCount == 1);
+            EXPECT(requested_range.baseArrayLayer == 1 && requested_range.layerCount == 2);
+            EXPECT(rendering_layers == 2 && captured_rect.baseArrayLayer == 0 && captured_rect.layerCount == 2);
+            EXPECT(render_area.extent.width == std::max(1u, 5u >> mip));
+            EXPECT(render_area.extent.height == std::max(1u, 3u >> mip));
+            EXPECT(captured_rect.rect.extent.width == render_area.extent.width);
+            EXPECT(captured_rect.rect.extent.height == render_area.extent.height);
+            ++checks;
+        }
+    }
+    const auto rejects = [&](ResourceBinding r, TargetView view, ReplayResult expected = ReplayResult::invalid_clear) {
         CommandList list;
         if (!list.clear_render_target(view, color) || !list.close()) return false;
-        return run(list, r, vk) == ReplayResult::invalid_clear && !image_clears && !attachment_clears;
+        return run(list, r, vk) == expected && !image_clears && !attachment_clears;
     };
     EXPECT(rejects(binding, {1, 0, 0, 1})); // A typeless resource has no default typed RTV format.
     EXPECT(rejects(binding, {1, 0, 0, 1, static_cast<ColorViewFormat>(99)}));
@@ -129,9 +155,9 @@ int main() {
     wrong = binding; wrong.format = VK_FORMAT_R32_SFLOAT;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_uint}));
     wrong = binding; wrong.mip_levels = 2;
-    EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_uint}));
+    EXPECT(rejects(wrong, {1, 2, 0, 1, ColorViewFormat::rgba8_uint}, ReplayResult::invalid_subresource));
     wrong = binding; wrong.array_layers = 2;
-    EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
+    EXPECT(rejects(wrong, {1, 0, 1, 2, ColorViewFormat::rgba8_srgb}, ReplayResult::invalid_subresource));
     wrong = binding; wrong.volume = true;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
     wrong = binding; wrong.samples = 4;

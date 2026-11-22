@@ -127,9 +127,10 @@ To regenerate a flat export from an earlier version, run `awc_opus.py` with the 
 `Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's
 interleaved sample count is divided by that channel count.
 
-`audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count, and trims to the Ogg
-Opus end granule. Existing `.wav` files are skipped, so a stopped run continues. With no `--out`, a directory writes
-to `<src>/wav` and a single file writes next to itself.
+`audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count. For a single stream
+it trims to the final Ogg Opus granule minus pre-skip. Chained streams have a separate granule timeline for each
+link, so ffmpeg handles their end trimming. Existing `.wav` files are skipped, so a stopped run continues.
+With no `--out`, a directory writes to `<src>/wav` and a single file writes next to itself.
 
 ## How `make_game.py --wav` uses them
 

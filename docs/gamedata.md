@@ -76,39 +76,104 @@ The four non-XML structured payloads are the only readable binary metadata here:
 The two large opaque blobs (1.04 MB and 3.27 MB) have no recognised header and are left as binary. No model,
 texture or audio signature is present in `common.rpf`; the two opaque blobs are not identified.
 
-## MHIU and PAMH arrays
+## MHIU and PAMH heightmaps
 
-`tools/gamedata_maps.py` decodes both map payloads. It reads a carve directory, groups the 64 KiB
-streams and prints or writes header fields and grid dimensions only; the grid bytes stay local.
+`tools/gamedata_maps.py` decodes both payloads. They are **heightmaps**, not
+generic square arrays: each has a 44-byte header, a row table and u8 heights,
+and both scale a value into the header's Z box with
+
+```
+z = bounds.min.z + value / 255 * (bounds.max.z - bounds.min.z)
+```
+
+`common.rpf`'s manifest names `common:/data/levels/americas/heightmap.dat` as a
+`WORLD_HEIGHTMAP_FILE`, and the `PAMH` magic is the GTA V `HMAP` magic stored
+little-endian. The row-table layout matches the published GTA V
+`heightmap.dat` reader (`HMAP`, 44-byte header, 8-byte row headers, max/min
+u8 arrays). The measured file is version 1.2; GTA V writes 1.1.
+
+### `MHIU`: 2048 x 2048 single-layer heightmap
+
+| Header | Offset | Type | Measured |
+|---|---|---|---|
+| magic | 0x00 | 4 bytes | `MHIU` |
+| version | 0x04 | `u16` | 1 |
+| width | 0x06 | `u16` | 2048 |
+| height | 0x08 | `u16` | 2048 |
+| pad | 0x0A | `u16` | 0 |
+| six bounds | 0x0C | 6 x `f32` | `(-13000, -9000, -50)` to `(7000, 11000, 500)` |
+| data size | 0x24 | `u32` | bytes after the 44-byte header |
+| unknown | 0x28 | `u32` | `0x9A99E517` / `0x25B7CF17` |
+
+At 0x2C there are `height` records of eight bytes
+`{u16 start, u16 count, i32 offset}`, then the packed u8 heights. A row with
+`count = 0` keeps the measured default **23**; the other rows fill cells
+`start .. start + count - 1` from `pixels[offset + start + i]`.
+
+| Payload | Filled rows | Empty rows | Packed bytes | Height range |
+|---|---:|---:|---:|---|
+| `0x144000` | 1,724 | 324 | 1,172,743 | 19..209 |
+| `0x16E000` | 1,727 | 321 | 1,194,048 | 0..209 |
+
+The row spans cover the packed bytes exactly: **0 gaps, 0 overlaps** in both
+payloads. The default 23 is `-0.39 m`, and 209 is `400.8 m`, so the default is
+the sea surface.
+
+The earlier "zero-filled prefix plus square byte grid" reading (1,090 x 1,090
+and 1,100 x 1,100) was an artifact. The prefix is the zeroed row headers of
+the empty rows, and the grid is 2048 x 2048. The largest square that ends at
+the payload end happened to fit the byte count, but it is not the format.
+
+### `PAMH`: `HMAP` v1.2, 144 x 164 max/min heightmap
+
+| Header | Offset | Type | Measured |
+|---|---|---|---|
+| magic | 0x00 | 4 bytes | `PAMH` (little-endian `HMAP`) |
+| version | 0x04 | 2 x `u8` | 1.2 |
+| pad | 0x06 | `u16` | 0 |
+| flag word | 0x08 | `u32` | `0x1BBC8CED` (GTA V's `compressed` field) |
+| width, height | 0x0C | 2 x `u16` | 144, 164 |
+| six bounds | 0x10 | 6 x `f32` | `(-13312, -9728, -302)` to `(5120, 11264, 404)` |
+| data size | 0x28 | `u32` | 48,544 |
+
+At 0x2C there are 164 row records, then `width * height` **max** bytes and
+`width * height` **min** bytes. The measured max layer runs 110..255 and the
+min layer 0..238; `min <= max` in all 23,616 cells. The max layer is a flat
+110 (2.5 m) over most of the map - the sea surface - and rises to 255 (404 m)
+on land. The min layer is the ground or sea floor.
+
+The earlier u16 reading interleaved the two arrays: every measured `0x6E6E`
+was a `(110, 110)` max/min pair, not the value 28,270.
+
+### Cross-check and Z mapping
+
+MHIU and PAMH cover slightly different boxes at different resolutions.
+Sampling MHIU at the PAMH cell centres over their overlap gives a Pearson
+correlation of **r = 0.861** for payload `0x144000` and **r = 0.870** for
+`0x16E000` against the PAMH max layer. Mirrored or transposed orientations
+give `r <= 0.64`. The land masks (`MHIU > 23` and `PAMH max > 110`) overlap
+with **IoU 0.61**. Row 0 is therefore `bounds.min.y`, column 0 is
+`bounds.min.x`, and the linear Z formula above is the same for both.
+
+The HMAP header and row-table rules were cross-checked against the public
+[rage-formats](https://github.com/VIRUXE/rage-formats) reader (`Unlicense`)
+and [gta-op/heightmap](https://github.com/gta-op/heightmap) (`MIT`); no code is
+copied. The MHIU field offsets, the span checks and the Z correlation are
+measured on this package.
 
 ```powershell
 python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
 ```
 
-Both payloads start with a 44-byte header. The checksum field is not CRC32 or Adler32 of the payload;
-the algorithm is still unknown.
+### Checksum and unknown fields
 
-| Header field | `MHIU` | `PAMH` |
-|---|---|---|
-| `magic` | 0x00 | 0x00 |
-| `version` / second u16 | 0x04 / 0x06 | 0x04 / 0x06 |
-| checksum | 0x28 | 0x08 |
-| width, height (`u16` each) | not in the header | 0x0C, 0x0E |
-| six `float32` bounds | 0x0C | 0x10 |
-| data size | 0x24 | 0x28 |
-
-`PAMH` stores its grid dimensions in the header. Its data is `height` records of eight bytes
-`{u16 reserved = 0, u16 width, u32 row * width}`, followed by `width * height` little-endian `u16`
-values. The measured payload is 144 x 164, with 164 row records and 23,616 cells.
-
-`MHIU` does not store a grid edge. Its data is a zero-filled prefix followed by a square byte grid
-that ends at the payload end; the reader takes the largest square with an all-zero prefix. The two
-measured payloads resolve to 1090 x 1090 after a 1,027-byte prefix and 1100 x 1100 after a 432-byte
-prefix. The role of that prefix is not decoded.
-
-The grids are stored as raw normalized values. A mapping from the values to the world Z bounds is
-possible but not confirmed, so the reader reports the arrays and dimensions without interpreting
-them as heights.
+- `PAMH` 0x08 is the HMAP `compressed` word (GTA V writes 1). The measured
+  `0x1BBC8CED` is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib digest of
+  the max/min arrays; it is reported as a flag word, not a proven checksum.
+- `MHIU` 0x28 (`0x9A99E517` / `0x25B7CF17`) is not CRC32, Adler32, FNV-1a,
+  joaat32, Murmur3, xxHash32, lookup3, Fletcher32 or a hashlib digest window
+  of the decoded 2048 x 2048 grid, the packed bytes, the row table or the
+  whole payload. It remains unidentified.
 
 ## XML documents
 
@@ -301,9 +366,10 @@ resolved without the table of contents. No XInclude (`xi:include`) elements occu
 
 ## Readable vs binary
 
-Readable: the 266 XML documents, 3 text/INI-like files, and the two `MHIU` blobs plus `PAMH`/`SPS1Z` headers.
-The XML is ordinary text and can be consumed by any parser. `tools/gamedata_maps.py` decodes the `MHIU`
-headers and square byte grids and the `PAMH` header, row table and u16 grid. `SPS1Z` is a NUL-separated
+Readable: the 266 XML documents, 3 text/INI-like files, and the two `MHIU` 2048 x 2048
+heightmaps plus the `PAMH` max/min heightmap and the `SPS1Z` header. The XML is ordinary text
+and can be consumed by any parser. `tools/gamedata_maps.py` decodes the `MHIU` row table and
+packed heights and the `PAMH` row table and max/min arrays. `SPS1Z` is a NUL-separated
 table of path/key strings with per-entry type/length markers; its structure is visible but its consumer is not
 implemented.
 
@@ -324,5 +390,5 @@ it applies to this note as well.
 The most useful next step is a **schema bridge**, not more carving: check whether the 118 XML root tags match
 RTTI class names in the executable, then build a streaming reader that dispatches on root and `type`. That
 turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The `MHIU`/`PAMH`
-arrays are decoded by `tools/gamedata_maps.py`; their checksum algorithm, the MHIU prefix and the value-to-Z
-mapping remain open.
+heightmaps are decoded by `tools/gamedata_maps.py`; the MHIU `0x28` word remains unidentified, while the
+row-table layouts and the value-to-Z mapping are measured.

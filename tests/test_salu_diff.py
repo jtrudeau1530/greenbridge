@@ -1,10 +1,15 @@
 """tools/salu_diff.py: the scalar-ALU reference against hand-worked values, and a short seeded fuzz run (FUZZ-4).
 Standard library only; no GPU."""
+import contextlib
+import io
 from pathlib import Path
+import subprocess
 import sys
 import unittest
+import unittest.mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+TOOL = Path(__file__).resolve().parents[1] / "tools" / "salu_diff.py"
+sys.path.insert(0, str(TOOL.parent))
 import salu_diff as d  # noqa: E402
 
 
@@ -90,6 +95,41 @@ class Translated(unittest.TestCase):
             self.assertIn("word 0 (s4)", d.check(lines))
         finally:
             d.translated = real
+
+
+class CliOps(unittest.TestCase):
+    def test_ops_whitespace_and_duplicates_are_normalized(self):
+        cases = [
+            ("s_add_u32, s_sub_u32", ["s_add_u32", "s_sub_u32"]),
+            ("s_add_u32,s_add_u32", ["s_add_u32"]),
+        ]
+        for raw, expected in cases:
+            with unittest.mock.patch.object(d, "run_suite", wraps=d.run_suite) as spy:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = d.main(["--programs", "2", "--max-ops", "2", "--ops", raw])
+                self.assertEqual(rc, 0, out.getvalue())
+                spy.assert_called_once()
+                self.assertEqual(spy.call_args.args[3], expected)
+
+    def test_ops_unknown_and_empty_tokens_report_on_stderr(self):
+        cases = [
+            ("nope", "unknown ops: nope"),
+            ("s_add_u32,", "--ops must be a comma-separated list of opcodes"),
+            (",", "--ops must be a comma-separated list of opcodes"),
+            (" , ", "--ops must be a comma-separated list of opcodes"),
+            ("", "--ops must be a comma-separated list of opcodes"),
+        ]
+        for raw, message in cases:
+            proc = subprocess.run(
+                [sys.executable, "-I", str(TOOL), "--programs", "1", "--ops", raw],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn(message, proc.stderr)
+            self.assertEqual(proc.stdout, "")
+            self.assertNotIn("Traceback", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

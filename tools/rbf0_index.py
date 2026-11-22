@@ -366,8 +366,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
     rows = []
     if os.path.getsize(path) == 0:
         raise ValueError("empty file")
-    with open(path, "rb") as fh:
-        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
         size = len(mm)
         first = struct.unpack_from("<I", mm, 4)[0] if size >= 8 else 0
         pos = start if start is not None else first
@@ -424,7 +423,6 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
         zero += len(gap) if z else 0
         unread += 0 if z else len(gap)
         mspan = end - span_start
-        mm.close()
     with ArchiveReader(path) as reader:
         records = resources_from_rows(rows, reader.read, check_gap=True, string_limit=string_limit)
     summary = summarise(rows, records, mspan, zero, unread, "rpf9")

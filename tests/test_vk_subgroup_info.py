@@ -271,9 +271,33 @@ class LoadVulkanTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, r"no Vulkan loader found \(vulkan-1\.dll\)"):
                 vk_info.load_vulkan()
 
+    def test_macos_loads_moltenvk(self):
+        with mock.patch.object(vk_info.os, "name", "posix"), mock.patch.object(vk_info.sys, "platform", "darwin"), \
+                mock.patch.dict(vk_info.os.environ, {"LEONIDA_VULKAN_LOADER": ""}):
+            with mock.patch.object(vk_info.ctypes, "CDLL") as cdll:
+                self.assertIs(vk_info.load_vulkan(), cdll.return_value)
+                cdll.assert_called_once_with("libMoltenVK.dylib")
+            sentinel = object()
+            with mock.patch.object(vk_info.ctypes, "CDLL", side_effect=[OSError("missing"), sentinel]) as cdll:
+                self.assertIs(vk_info.load_vulkan(), sentinel)
+                self.assertEqual(cdll.call_args_list, [mock.call("libMoltenVK.dylib"),
+                                                       mock.call("/opt/homebrew/lib/libMoltenVK.dylib")])
+
+    def test_macos_uses_only_the_explicit_loader(self):
+        path = "/custom/libMoltenVK.dylib"
+        with mock.patch.object(vk_info.os, "name", "posix"), mock.patch.object(vk_info.sys, "platform", "darwin"), \
+                mock.patch.dict(vk_info.os.environ, {"LEONIDA_VULKAN_LOADER": path}):
+            with mock.patch.object(vk_info.ctypes, "CDLL") as cdll:
+                self.assertIs(vk_info.load_vulkan(), cdll.return_value)
+                cdll.assert_called_once_with(path)
+            with mock.patch.object(vk_info.ctypes, "CDLL", side_effect=OSError("missing")) as cdll:
+                with self.assertRaisesRegex(RuntimeError, r"no Vulkan loader found \(/custom/libMoltenVK\.dylib\)"):
+                    vk_info.load_vulkan()
+                cdll.assert_called_once_with(path)
+
     def test_posix_prefers_so_and_falls_back_to_dylib(self):
         sentinel = object()
-        with mock.patch.object(vk_info.os, "name", "posix"), \
+        with mock.patch.object(vk_info.os, "name", "posix"), mock.patch.object(vk_info.sys, "platform", "linux"), \
                 mock.patch.object(vk_info.ctypes, "CDLL", return_value=sentinel) as cdll:
             self.assertIs(vk_info.load_vulkan(), sentinel)
         cdll.assert_called_once_with("libvulkan.so.1")
@@ -283,13 +307,13 @@ class LoadVulkanTest(unittest.TestCase):
                 raise OSError("missing linux loader")
             return sentinel
 
-        with mock.patch.object(vk_info.os, "name", "posix"), \
+        with mock.patch.object(vk_info.os, "name", "posix"), mock.patch.object(vk_info.sys, "platform", "linux"), \
                 mock.patch.object(vk_info.ctypes, "CDLL", side_effect=fake_cdll) as cdll:
             self.assertIs(vk_info.load_vulkan(), sentinel)
         self.assertEqual([c.args[0] for c in cdll.call_args_list], ["libvulkan.so.1", "libvulkan.1.dylib"])
 
     def test_posix_failure_lists_all_tried_names(self):
-        with mock.patch.object(vk_info.os, "name", "posix"), \
+        with mock.patch.object(vk_info.os, "name", "posix"), mock.patch.object(vk_info.sys, "platform", "linux"), \
                 mock.patch.object(vk_info.ctypes, "CDLL", side_effect=OSError("missing")):
             with self.assertRaisesRegex(
                 RuntimeError, r"no Vulkan loader found \(libvulkan\.so\.1, libvulkan\.1\.dylib\)"

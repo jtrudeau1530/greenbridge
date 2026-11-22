@@ -7,6 +7,8 @@ OpSelect), so every dword-aligned load here also checks that the merge keeps its
 
 Integer and f16 formats are used: their decode is exact, so the expected words need no rounding model.
 """
+from __future__ import annotations
+
 import os
 import struct
 import sys
@@ -30,7 +32,10 @@ BASE = 0x1000
 MEMORY = {BASE: 0x11223344, BASE + 4: 0xDEADBEEF, BASE + 8: 0xCAFEF00D, BASE + 12: 0x0BADC0DE}
 # V# FORMAT codes (word3 bits 12-18), from rdna2spirv.FORMATS
 FMT_U32, FMT_U32X2, FMT_U32X4, FMT_UINT8X4, FMT_UINT16X2, FMT_UINT16X4, FMT_F16 = 20, 62, 75, 60, 27, 69, 13
+FMT_F32, FMT_F32X2, FMT_F32X3, FMT_UNORM8, FMT_UNORM8X4 = 22, 64, 74, 1, 56
 DST_SEL_XYZW = 4 | 5 << 3 | 6 << 6 | 7 << 9
+# DST_SEL (X, 0, 1, 1): code 4, 0, 1, 1 — SHADER-86 measures float 1.0 vs integer 1
+DST_SEL_X_0_1_1 = 4 | 0 << 3 | 1 << 6 | 1 << 9
 
 _TMP_DIR = None
 _SRC_PATH = None
@@ -53,8 +58,9 @@ def tearDownModule():
         _TMP_DIR = None
 
 
-def load_format(fmt: int, offset: int, ncomp: int = 4) -> tuple:
-    """buffer_load_format_<x..xyzw> of format `fmt` at byte `offset` of MEMORY; returns the four mrt0 words."""
+def load_format(fmt: int, offset: int, ncomp: int = 4, dst_sel: int = DST_SEL_XYZW,
+                memory: dict | None = None) -> tuple:
+    """buffer_load_format_<x..xyzw> of format `fmt` at byte `offset`; returns the four mrt0 words."""
     if _TMP_DIR is None:
         setUpModule()
     suffix = "xyzw"[:ncomp]
@@ -65,7 +71,7 @@ def load_format(fmt: int, offset: int, ncomp: int = 4) -> tuple:
         f"\ts_mov_b32 s0, {BASE:#x}\n"
         "\ts_mov_b32 s1, 0\n"                  # base high bits 0, stride 0 (raw)
         "\ts_mov_b32 s2, 0x100\n"              # num_records (bytes)
-        f"\ts_mov_b32 s3, {fmt << 12 | DST_SEL_XYZW:#x}\n"
+        f"\ts_mov_b32 s3, {fmt << 12 | dst_sel:#x}\n"
         f"\tv_mov_b32 v1, {offset:#x}\n"
         f"\tbuffer_load_format_{suffix} {vdata}, v1, s[0:3], 0 offen\n"
         "\ts_waitcnt vmcnt(0)\n"
@@ -77,7 +83,11 @@ def load_format(fmt: int, offset: int, ncomp: int = 4) -> tuple:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
         spv = rdna2spirv.translate(_SRC_PATH)
-    return si.run_fragment(spv, memory=dict(MEMORY))["%out_mrt0"]
+    return si.run_fragment(spv, memory=dict(memory if memory is not None else MEMORY))["%out_mrt0"]
+
+
+def f32_bits(x: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", x))[0]
 
 
 def f16_word(h: int) -> int:
@@ -134,6 +144,50 @@ class CrossingDwordBoundary(unittest.TestCase):
         self.assertEqual(load_format(FMT_UINT16X4, 6), (0xDEAD, 0xF00D, 0xCAFE, 0xC0DE))
 
 
+class MissingComponentsRepeat(unittest.TestCase):
+    """SHADER-86 / RX 6700: missing channels are c mod n, not 0 or 1."""
+
+    def test_one_component_formats_xxxx(self):
+        self.assertEqual(load_format(FMT_U32, 4), (0xDEADBEEF,) * 4)
+        self.assertEqual(load_format(FMT_F32, 4), (0xDEADBEEF,) * 4)
+        # 8_UNORM at offset 4: low byte 0xEF → 239/255; all four channels match.
+        want = f32_bits(239.0 / 255.0)
+        self.assertEqual(load_format(FMT_UNORM8, 4), (want,) * 4)
+
+    def test_two_and_three_component_xyxy_and_xyzx(self):
+        self.assertEqual(load_format(FMT_U32X2, 4), (0xDEADBEEF, 0xCAFEF00D, 0xDEADBEEF, 0xCAFEF00D))
+        self.assertEqual(load_format(FMT_F32X2, 4), (0xDEADBEEF, 0xCAFEF00D, 0xDEADBEEF, 0xCAFEF00D))
+        self.assertEqual(load_format(FMT_F32X3, 0), (0x11223344, 0xDEADBEEF, 0xCAFEF00D, 0x11223344))
+
+
+class UnormCorrectlyRounded(unittest.TestCase):
+    """SHADER-86: UNORM is OpFDiv by (2^n-1), not a reciprocal multiply. Raw 3 → 0x3c40c0c1."""
+
+    def test_unorm8x4_raw_3(self):
+        mem = {BASE: 0x03030303}
+        want = 0x3C40C0C1
+        self.assertEqual(load_format(FMT_UNORM8X4, 0, memory=mem), (want,) * 4)
+        # f32 reciprocal multiply disagrees (BetterJdue: 504 mismatches on rgba8).
+        recip = f32_bits(struct.unpack("<f", struct.pack("<f", 3.0))[0]
+                         * struct.unpack("<f", struct.pack("<f", 1.0 / 255.0))[0])
+        self.assertNotEqual(want, recip)
+
+
+class DstSelOneByFormat(unittest.TestCase):
+    """SHADER-86: DST_SEL 1 is 1.0f for float/unorm, integer 1 for UINT."""
+
+    def test_dst_sel_one_float_vs_uint(self):
+        # DST_SEL (X, 0, 1, 1): Z and W come from the constant-1 code.
+        f32 = load_format(FMT_F32, 4, dst_sel=DST_SEL_X_0_1_1)
+        self.assertEqual(f32, (0xDEADBEEF, 0, 0x3F800000, 0x3F800000))
+        u32 = load_format(FMT_U32, 4, dst_sel=DST_SEL_X_0_1_1)
+        self.assertEqual(u32, (0xDEADBEEF, 0, 1, 1))
+        unorm = load_format(FMT_UNORM8, 4, dst_sel=DST_SEL_X_0_1_1)
+        self.assertEqual(unorm[2:], (0x3F800000, 0x3F800000))
+        u8 = load_format(FMT_UINT8X4, 4, dst_sel=DST_SEL_X_0_1_1)
+        self.assertEqual(u8[2:], (1, 1))
+
+
 class InterpreterConversions(unittest.TestCase):
     """The ops the format decode needs from spirv_mini_interp: integer to float and GLSL FMin/FMax."""
 
@@ -158,6 +212,10 @@ class InterpreterConversions(unittest.TestCase):
         consts = "%a = OpConstant %float 1.5\n%b = OpConstant %float -2\n"
         self.assertEqual(self.run_expr(consts, "%r = OpExtInst %float %glsl FMax %a %b\n"), 0x3FC00000)
         self.assertEqual(self.run_expr(consts, "%r = OpExtInst %float %glsl FMin %a %b\n"), 0xC0000000)
+
+    def test_fdiv_correctly_rounded(self):
+        consts = "%a = OpConstant %float 3\n%b = OpConstant %float 255\n"
+        self.assertEqual(self.run_expr(consts, "%r = OpFDiv %float %a %b\n"), 0x3C40C0C1)
 
 
 if __name__ == "__main__":

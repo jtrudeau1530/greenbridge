@@ -811,13 +811,34 @@ def still_fails(prog, ops, mode, ctx):
         return bool(bad) and not hyp
 
 
+MODES = ("native", "emulate")
+
+
+def parse_modes(text):
+    """--modes: a comma list of native and emulate, or both. Any other word is an error: the run loop only knows
+    these two, and an unknown one used to run every program natively, wave64 included."""
+    modes = []
+    for word in (w.strip() for w in text.split(",")):
+        if not word:
+            continue
+        for mode in MODES if word == "both" else (word,):
+            if mode not in MODES:
+                raise argparse.ArgumentTypeError(f"unknown mode {word!r} (use native, emulate or both)")
+            if mode not in modes:
+                modes.append(mode)
+    if not modes:
+        raise argparse.ArgumentTypeError("no mode given (use native, emulate or both)")
+    return modes
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--programs", type=int, default=100)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--ops", type=int, default=24, help="ops per program")
     ap.add_argument("--wave", choices=("32", "64", "both"), default="both")
-    ap.add_argument("--modes", default="native,emulate", help="native, emulate (wave64 only), or both")
+    ap.add_argument("--modes", type=parse_modes, default="native,emulate",
+                    help="native, emulate (wave64 only), or both (the default)")
     ap.add_argument("--w64-native", action="store_true",
                     help="also run wave64 programs without --wave64-emulate (on a 32-wide subgroup that is the "
                          "documented cross-half approximation, so mismatches are expected there)")
@@ -842,7 +863,7 @@ def main():
     import mc_command
     mc = mc_command.mc_command()
     waves = (32, 64) if args.wave == "both" else (int(args.wave),)
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    modes = args.modes
     progs = []
     for i in range(args.programs):
         wave = waves[i % len(waves)]
