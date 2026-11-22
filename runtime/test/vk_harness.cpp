@@ -263,8 +263,10 @@ int main(int argc, char** argv) {
     feats.shaderClipDistance = f2q.features.shaderClipDistance;
     feats.shaderCullDistance = f2q.features.shaderCullDistance;
     if (needs_float64) {
-        if (!f2q.features.shaderFloat64) { std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64
-", argv[2]); return 77; }
+        if (!f2q.features.shaderFloat64) {
+            std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[2]);
+            return 77;
+        }
         feats.shaderFloat64 = VK_TRUE;
     }
     if (heap_env) {
