@@ -1367,5 +1367,226 @@ class TestIEEE754BoundaryExtremesAndBitwiseLimits(unittest.TestCase):
             self.assertEqual(self.lds.read_dword(addr), next_val)
 
 
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            SGPR(-1)
+        with self.assertRaises(ValueError):
+            SGPR(106)
+
+    def test_syntax_rejection_invalid_operand_types(self) -> None:
+        with self.assertRaises(TypeError):
+            DSCondxchg32Instruction(
+                dst=SGPR(0),  # type: ignore[arg-type]
+                addr=VGPR(1),
+                cmp_val=Immediate(0),
+                new_val=Immediate(0),
+            )
+        with self.assertRaises(TypeError):
+            DSCondxchg32Instruction(
+                dst=VGPR(0),
+                addr=SGPR(1),  # type: ignore[arg-type]
+                cmp_val=Immediate(0),
+                new_val=Immediate(0),
+            )
+
+    def test_syntax_rejection_invalid_offset(self) -> None:
+        with self.assertRaises(ValueError):
+            DSCondxchg32Instruction(
+                dst=VGPR(0),
+                addr=VGPR(1),
+                cmp_val=Immediate(0),
+                new_val=Immediate(0),
+                offset=-1,
+            )
+        with self.assertRaises(ValueError):
+            DSCondxchg32Instruction(
+                dst=VGPR(0),
+                addr=VGPR(1),
+                cmp_val=Immediate(0),
+                new_val=Immediate(0),
+                offset=65536,
+            )
+
+    def test_syntax_rejection_invalid_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=100)  # non-power of two
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=0)
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        old, mem, swapped = oracle_ds_condxchg32(0x12345678, 0x12345678, 0x9ABCDEF0)
+        self.assertTrue(swapped)
+        self.assertEqual(old, 0x12345678)
+        self.assertEqual(mem, 0x9ABCDEF0)
+
+        # Single bit perturbation of old_val
+        corrupted_old = old ^ 0x1
+        self.assertNotEqual(old, corrupted_old)
+
+        # Single bit perturbation of new_mem
+        corrupted_mem = mem ^ (1 << 31)
+        self.assertNotEqual(mem, corrupted_mem)
+
+        # Inverted swapped status
+        self.assertNotEqual(swapped, not swapped)
+
+    def test_mutation_unconditional_exchange(self) -> None:
+        """Mutant: Memory is overwritten unconditionally regardless of cmp_val."""
+        def mutant_condxchg(curr: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            # Bug: always overwrites curr with new_val
+            return curr, new_val, True
+
+        curr = 0x5555
+        cmp_val = 0x9999  # mismatch!
+        new_val = 0xAAAA
+
+        correct_old, correct_mem, correct_swapped = oracle_ds_condxchg32(curr, cmp_val, new_val)
+        mutant_old, mutant_mem, mutant_swapped = mutant_condxchg(curr, cmp_val, new_val)
+
+        self.assertFalse(correct_swapped)
+        self.assertEqual(correct_mem, curr)
+        # Mutant erroneously swapped
+        self.assertTrue(mutant_swapped)
+        self.assertNotEqual(correct_mem, mutant_mem)
+
+    def test_mutation_inactive_lane_overwritten(self) -> None:
+        """Mutant: Inactive lanes in SIMD are improperly overwritten."""
+        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
+        sentinel = 0xCAFE_BABE
+        for lane in range(32):
+            state.set_vgpr(lane, 5, sentinel)
+
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: DSCondxchg32Instruction, s: SIMDState):
+                # Bug: overwrites destination on all lanes regardless of exec_mask
+                for l in range(s.num_lanes):
+                    s.set_vgpr(l, instr.dst.index, 0x1234)
+                return []
+
+        buggy = BuggySIMDInterpreter()
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(5),
+            addr=VGPR(0),
+            cmp_val=Immediate(0),
+            new_val=Immediate(0),
+        )
+        buggy.step(instr, state)
+
+        # Verify mutation is detected: inactive lane 1 was modified
+        corrupted_lanes = [l for l in range(1, 32) if state.get_vgpr(l, 5) != sentinel]
+        self.assertEqual(len(corrupted_lanes), 31)
+
+    def test_mutation_premature_writeback_aliasing(self) -> None:
+        """Mutant: Destination register written before address/operands are latched."""
+        state = ScalarMachineState()
+        addr = 0x400
+        state.set_vgpr(0, addr)  # v[0] is both dst and addr
+        state.lds.write_dword(addr, 0x1111)
+
+        class PrematureWritebackInterpreter(ScalarInterpreter):
+            def step(self, instr: DSCondxchg32Instruction, s: ScalarMachineState):
+                # Bug: prematurely writes dst before reading addr
+                s.set_vgpr(instr.dst.index, 0x9999)
+                vaddr = s.get_vgpr(instr.addr.index)  # Reads corrupted vaddr 0x9999!
+                eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                curr_mem = s.lds.read_dword(eff_addr)
+                return curr_mem, curr_mem, False
+
+        buggy = PrematureWritebackInterpreter()
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(0),
+            addr=VGPR(0),
+            cmp_val=Immediate(0x1111),
+            new_val=Immediate(0x2222),
+        )
+        old, mem, swapped = buggy.step(instr, state)
+        # Bug caused read from wrong address (0x9999 instead of 0x400), returning 0 instead of 0x1111
+        self.assertNotEqual(old, 0x1111)
+
+    def test_mutation_inverted_lane_collision_order(self) -> None:
+        """Mutant: Serializes colliding lanes in reverse order (lane N before lane 0)."""
+        state = SIMDState(num_lanes=32, exec_mask=0x3)  # Lanes 0 and 1 active
+        common_addr = 0x100
+        state.lds.write_dword(common_addr, 10)
+
+        # Lane 0: expects 10, writes 20
+        state.set_vgpr(0, 1, common_addr)
+        state.set_vgpr(0, 2, 10)
+        state.set_vgpr(0, 3, 20)
+
+        # Lane 1: expects 20, writes 30
+        state.set_vgpr(1, 1, common_addr)
+        state.set_vgpr(1, 2, 20)
+        state.set_vgpr(1, 3, 30)
+
+        # In correct ascending order: lane 0 turns 10->20; lane 1 turns 20->30.
+        # If reverse order executes: lane 1 sees 10 (mismatches 20!), fails; lane 0 sees 10, writes 20.
+        class ReverseCollisionSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: DSCondxchg32Instruction, s: SIMDState):
+                # Bug: iterate lanes in reverse
+                for lane in reversed(range(s.num_lanes)):
+                    if s.is_lane_active(lane):
+                        vaddr = s.get_vgpr(lane, instr.addr.index)
+                        cmp_val = self.resolve_lane_operand(instr.cmp_val, lane, s)
+                        new_val = self.resolve_lane_operand(instr.new_val, lane, s)
+                        eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                        curr_mem = s.lds.read_dword(eff_addr)
+                        if curr_mem == cmp_val:
+                            s.lds.write_dword(eff_addr, new_val)
+                        s.set_vgpr(lane, instr.dst.index, curr_mem)
+                return []
+
+        buggy = ReverseCollisionSIMDInterpreter()
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(0),
+            addr=VGPR(1),
+            cmp_val=VGPR(2),
+            new_val=VGPR(3),
+        )
+        buggy.step(instr, state)
+        # In reverse order, final memory is 20 instead of 30
+        self.assertNotEqual(state.lds.read_dword(common_addr), 30)
+        self.assertEqual(state.lds.read_dword(common_addr), 20)
+
+    def test_mutation_ignore_immediate_offset(self) -> None:
+        """Mutant: Immediate offset is dropped during address calculation."""
+        def buggy_eff_address(vaddr: int, offset: int = 0) -> int:
+            # Bug: drops offset
+            return vaddr & MASK_32
+
+        base = 0x200
+        offset = 0x14
+        correct = calc_lds_effective_address(base, offset)
+        mutant = buggy_eff_address(base, offset)
+        self.assertEqual(correct, 0x214)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_incorrect_capacity_mask(self) -> None:
+        """Mutant: Masking with wrong power of two truncates valid LDS addresses."""
+        eff_addr = 0x8000  # 32 KiB -> dword index 0x2000
+        correct_idx = calc_lds_dword_index(eff_addr, capacity_dwords=16384)
+        mutant_idx = calc_lds_dword_index(eff_addr, capacity_dwords=256)
+        self.assertEqual(correct_idx, 0x2000)
+        self.assertNotEqual(correct_idx, mutant_idx)
+        self.assertEqual(mutant_idx, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
