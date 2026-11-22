@@ -464,5 +464,161 @@ class TestSymbolicAST(unittest.TestCase):
             )
 
 
+# ============================================================================
+# Section 3: Deterministic Scalar Instruction Interpreter
+# ============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register state of an AMD RDNA2 compute unit single thread."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    pc: int = 0
+    cycle_count: int = 0
+
+    def read_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK32
+
+    def write_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+    def read_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def write_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+
+    def read_operand_raw_bits(self, op: VOP1Operand) -> int:
+        if op.literal is not None:
+            return op.literal.bits
+        assert op.reg is not None
+        if op.reg.reg_type == RegType.VGPR:
+            return self.read_vgpr(op.reg.index)
+        elif op.reg.reg_type == RegType.SGPR:
+            return self.read_sgpr(op.reg.index)
+        raise ValueError(f"Unknown register type {op.reg.reg_type}")
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU instructions."""
+
+    def __init__(self, state: Optional[ScalarMachineState] = None) -> None:
+        self.state = state if state is not None else ScalarMachineState()
+
+    def execute(self, instr: VRSQF32Instruction) -> int:
+        """Step a single VRSQF32Instruction against scalar state."""
+        raw_bits = self.state.read_operand_raw_bits(instr.src0)
+        res_bits = oracle_v_rsq_f32(
+            raw_bits,
+            abs_src=instr.src0.abs_mod,
+            neg_src=instr.src0.neg_mod,
+            clamp=instr.clamp,
+            flush_subnormals=instr.flush_denorms,
+        )
+        self.state.write_vgpr(instr.dst.index, res_bits)
+        self.state.pc += 4
+        self.state.cycle_count += 1
+        return res_bits
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution."""
+
+    def test_vgpr_to_vgpr_execution(self) -> None:
+        """Execute v_rsq_f32 reading from VGPR and writing to VGPR."""
+        state = ScalarMachineState()
+        # Set v2 = 4.0
+        state.write_vgpr(2, FOUR_F32)
+
+        instr = VRSQF32Instruction(
+            dst=RegRef(0, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(2),
+        )
+        interp = ScalarInterpreter(state)
+        res = interp.execute(instr)
+
+        self.assertEqual(res, HALF_F32)
+        self.assertEqual(state.read_vgpr(0), HALF_F32)
+        self.assertEqual(state.read_vgpr(2), FOUR_F32)
+        self.assertEqual(state.pc, 4)
+        self.assertEqual(state.cycle_count, 1)
+
+    def test_sgpr_source_execution(self) -> None:
+        """Execute v_rsq_f32 with SGPR as source operand."""
+        state = ScalarMachineState()
+        # Set s4 = 16.0
+        state.write_sgpr(4, SIXTEEN_F32)
+
+        instr = VRSQF32Instruction(
+            dst=RegRef(0, RegType.VGPR),
+            src0=VOP1Operand.from_sgpr(4),
+        )
+        interp = ScalarInterpreter(state)
+        res = interp.execute(instr)
+
+        self.assertEqual(res, QUARTER_F32)
+        self.assertEqual(state.read_vgpr(0), QUARTER_F32)
+
+    def test_literal_source_execution(self) -> None:
+        """Execute v_rsq_f32 with immediate 32-bit constant literal."""
+        state = ScalarMachineState()
+        instr = VRSQF32Instruction(
+            dst=RegRef(10, RegType.VGPR),
+            src0=VOP1Operand.from_lit(QUARTER_F32),
+        )
+        interp = ScalarInterpreter(state)
+        res = interp.execute(instr)
+
+        self.assertEqual(res, TWO_F32)
+        self.assertEqual(state.read_vgpr(10), TWO_F32)
+
+    def test_input_modifiers_in_interpreter(self) -> None:
+        """Execute v_rsq_f32 with abs and neg input modifiers via interpreter."""
+        state = ScalarMachineState()
+        state.write_vgpr(6, NEG_FOUR_F32)
+
+        # abs(-4.0) -> +4.0 -> rsq gives 0.5
+        instr = VRSQF32Instruction(
+            dst=RegRef(0, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(6, abs_mod=True),
+        )
+        interp = ScalarInterpreter(state)
+        self.assertEqual(interp.execute(instr), HALF_F32)
+        self.assertEqual(state.read_vgpr(0), HALF_F32)
+
+    def test_clamp_modifier_in_interpreter(self) -> None:
+        """Execute v_rsq_f32 with clamp modifier via interpreter."""
+        state = ScalarMachineState()
+        state.write_vgpr(2, QUARTER_F32)  # rsq(0.25) = 2.0 -> clamped to 1.0
+
+        instr = VRSQF32Instruction(
+            dst=RegRef(8, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(2),
+            clamp=True,
+        )
+        interp = ScalarInterpreter(state)
+        self.assertEqual(interp.execute(instr), ONE_F32)
+        self.assertEqual(state.read_vgpr(8), ONE_F32)
+
+    def test_register_isolation(self) -> None:
+        """Verify that writing to destination does not modify unaddressed registers."""
+        state = ScalarMachineState()
+        state.write_vgpr(0, 0x1111_1111)
+        state.write_vgpr(1, 0x2222_2222)
+        state.write_vgpr(2, FOUR_F32)
+
+        instr = VRSQF32Instruction(
+            dst=RegRef(1, RegType.VGPR),
+            src0=VOP1Operand.from_vgpr(2),
+        )
+        interp = ScalarInterpreter(state)
+        interp.execute(instr)
+
+        # v0 must remain untouched
+        self.assertEqual(state.read_vgpr(0), 0x1111_1111)
+        # v1 has updated result
+        self.assertEqual(state.read_vgpr(1), HALF_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
