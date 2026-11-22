@@ -8283,9 +8283,12 @@ class Gen:
                 self.emit(f"{r} = OpSelect %uint {isnorm} {scaled} {other}")
                 self.dst(a[0], self.tou(self.clamp_mods(self.tof(r), mods)))
         elif op in ("v_frexp_mant_f64", "v_frexp_exp_i32_f64"):
-            # Binary64 version of v_frexp_mant_f32 / v_frexp_exp_i32_f32, bit-exact on the (lo, hi) dword pair.
-            # Normal inputs have biased exponent 1..2046; zero and denormals give +-0 / exp 0, infinities and NaNs
-            # pass through unchanged / exp 0 (RDNA2 ISA, V_FREXP_MANT_F64 / V_FREXP_EXP_I32_F64).
+            # Binary64 frexp, bit-exact on the (lo, hi) dword pair without requiring Float64/Int64 unless VOP3 output
+            # modifiers are present. Measured natively on gfx1036 (wave32 & wave64, default denorm16_64=3, IEEE=0):
+            # - Normal inputs (biased exponent 1..2046): mant in [0.5, 1) with sign, exp = e - 1022.
+            # - Non-zero subnormals (e == 0, frac != 0): normalized to mant in [0.5, 1) with sign, exp = msb - 1073
+            #   (-1073..-1022), matching v_frexp_mant_f16 / v_frexp_exp_i16_f16.
+            # - Signed zero: +-0 / exp 0. Infinities and NaNs: unchanged / exp 0.
             sv = a[1]
             if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                 lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
@@ -8303,28 +8306,80 @@ class Gen:
                 t = self.tmp()
                 self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
                 hi = t
-            e, em1, isnorm, isden, sgn = (self.tmp() for _ in range(5))
+            e, em1, isnorm, is_e0, sgn = (self.tmp() for _ in range(5))
             self.emit(f"{e} = OpBitFieldUExtract %uint {hi} {self.cu(20)} {self.cu(11)}")
             self.emit(f"{em1} = OpISub %uint {e} {self.cu(1)}")
             self.emit(f"{isnorm} = OpULessThan %bool {em1} {self.cu(2046)}")         # exponent field 1..2046
-            self.emit(f"{isden} = OpIEqual %bool {e} {self.cu(0)}")
+            self.emit(f"{is_e0} = OpIEqual %bool {e} {self.cu(0)}")
             self.emit(f"{sgn} = OpBitwiseAnd %uint {hi} {self.cu(0x80000000)}")
+            f_hi, frac_or, nz_frac, is_sub, has_hi = (self.tmp() for _ in range(5))
+            self.emit(f"{f_hi} = OpBitwiseAnd %uint {hi} {self.cu(0x000FFFFF)}")
+            self.emit(f"{frac_or} = OpBitwiseOr %uint {f_hi} {lo}")
+            self.emit(f"{nz_frac} = OpINotEqual %bool {frac_or} {self.cu(0)}")
+            self.emit(f"{is_sub} = OpLogicalAnd %bool {is_e0} {nz_frac}")           # non-zero subnormal
+            self.emit(f"{has_hi} = OpINotEqual %bool {f_hi} {self.cu(0)}")
+            mh, ml, mhu, mlu = (self.tmp() for _ in range(4))
+            self.emit(f"{mh} = OpExtInst %int %glsl FindUMsb {f_hi}")
+            self.emit(f"{ml} = OpExtInst %int %glsl FindUMsb {lo}")
+            self.emit(f"{mhu} = OpBitcast %uint {mh}")
+            self.emit(f"{mlu} = OpBitcast %uint {ml}")
             if op == "v_frexp_exp_i32_f64":
                 if any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods):
                     raise Unsupported(op + " output modifier")
-                ex, r = self.tmp(), self.tmp()
-                self.emit(f"{ex} = OpISub %uint {e} {self.cu(1022)}")
-                self.emit(f"{r} = OpSelect %uint {isnorm} {ex} {self.cu(0)}")
+                ex_norm, ex_hi, ex_lo, ex_sub, r0, r = (self.tmp() for _ in range(6))
+                self.emit(f"{ex_norm} = OpISub %uint {e} {self.cu(1022)}")
+                self.emit(f"{ex_hi} = OpISub %uint {mhu} {self.cu(1041)}")          # (32 + mhu) - 1073
+                self.emit(f"{ex_lo} = OpISub %uint {mlu} {self.cu(1073)}")
+                self.emit(f"{ex_sub} = OpSelect %uint {has_hi} {ex_hi} {ex_lo}")
+                self.emit(f"{r0} = OpSelect %uint {is_sub} {ex_sub} {self.cu(0)}")
+                self.emit(f"{r} = OpSelect %uint {isnorm} {ex_norm} {r0}")
                 self.dst(a[0], r)
             else:
                 d = a[0]
                 if d["k"] != "vgpr" or d.get("n") != 2:
                     raise Unsupported(op + " destination")
-                keep, m_hi, other_hi, other_lo, r_hi, r_lo = (self.tmp() for _ in range(6))
+                keep, m_hi = self.tmp(), self.tmp()
                 self.emit(f"{keep} = OpBitwiseAnd %uint {hi} {self.cu(0x800FFFFF)}")
                 self.emit(f"{m_hi} = OpBitwiseOr %uint {keep} {self.cu(0x3FE00000)}")  # biased exponent 1022
-                self.emit(f"{other_hi} = OpSelect %uint {isden} {sgn} {hi}")
-                self.emit(f"{other_lo} = OpSelect %uint {isden} {self.cu(0)} {lo}")
+                # Normalize 52-bit subnormal (f_hi, lo) by shifting left (52 - msb) so the leading 1 lands at bit 52.
+                # Mask every shift count with 31 so unselected paths stay strictly in 0..31 (no SPIR-V shift UB).
+                # Case A (f_hi != 0): msb = 32 + mhu (mhu in 0..19), sh = 20 - mhu (1..20), inv = 12 + mhu (12..31).
+                sha0, sha, inva0, inva, a_lo, a_h1, a_h2, a_hi = (self.tmp() for _ in range(8))
+                self.emit(f"{sha0} = OpISub %uint {self.cu(20)} {mhu}")
+                self.emit(f"{sha} = OpBitwiseAnd %uint {sha0} {self.cu(31)}")
+                self.emit(f"{inva0} = OpIAdd %uint {mhu} {self.cu(12)}")
+                self.emit(f"{inva} = OpBitwiseAnd %uint {inva0} {self.cu(31)}")
+                self.emit(f"{a_lo} = OpShiftLeftLogical %uint {lo} {sha}")
+                self.emit(f"{a_h1} = OpShiftLeftLogical %uint {f_hi} {sha}")
+                self.emit(f"{a_h2} = OpShiftRightLogical %uint {lo} {inva}")
+                self.emit(f"{a_hi} = OpBitwiseOr %uint {a_h1} {a_h2}")
+                # Case B (f_hi == 0): msb = mlu (0..31).
+                #   B1 (mlu <= 20): sh >= 32 -> lo = 0, hi_frac = lo << (20 - mlu).
+                #   B2 (mlu >= 21): sh = 52 - mlu (21..31), inv = mlu - 20 (1..11) -> lo = lo << sh, hi_frac = lo >> inv.
+                is_b1, shb1_0, shb1, b1_hi = (self.tmp() for _ in range(4))
+                self.emit(f"{is_b1} = OpULessThanEqual %bool {mlu} {self.cu(20)}")
+                self.emit(f"{shb1_0} = OpISub %uint {self.cu(20)} {mlu}")
+                self.emit(f"{shb1} = OpBitwiseAnd %uint {shb1_0} {self.cu(31)}")
+                self.emit(f"{b1_hi} = OpShiftLeftLogical %uint {lo} {shb1}")
+                shb2_0, shb2, invb2_0, invb2, b2_lo, b2_hi = (self.tmp() for _ in range(6))
+                self.emit(f"{shb2_0} = OpISub %uint {self.cu(52)} {mlu}")
+                self.emit(f"{shb2} = OpBitwiseAnd %uint {shb2_0} {self.cu(31)}")
+                self.emit(f"{invb2_0} = OpISub %uint {mlu} {self.cu(20)}")
+                self.emit(f"{invb2} = OpBitwiseAnd %uint {invb2_0} {self.cu(31)}")
+                self.emit(f"{b2_lo} = OpShiftLeftLogical %uint {lo} {shb2}")
+                self.emit(f"{b2_hi} = OpShiftRightLogical %uint {lo} {invb2}")
+                b_lo, b_hi, sub_lo, sub_hi_raw, sub_hi_frac, sub_hi_exp, sub_hi = (self.tmp() for _ in range(7))
+                self.emit(f"{b_lo} = OpSelect %uint {is_b1} {self.cu(0)} {b2_lo}")
+                self.emit(f"{b_hi} = OpSelect %uint {is_b1} {b1_hi} {b2_hi}")
+                self.emit(f"{sub_lo} = OpSelect %uint {has_hi} {a_lo} {b_lo}")
+                self.emit(f"{sub_hi_raw} = OpSelect %uint {has_hi} {a_hi} {b_hi}")
+                self.emit(f"{sub_hi_frac} = OpBitwiseAnd %uint {sub_hi_raw} {self.cu(0x000FFFFF)}")
+                self.emit(f"{sub_hi_exp} = OpBitwiseOr %uint {sub_hi_frac} {self.cu(0x3FE00000)}")
+                self.emit(f"{sub_hi} = OpBitwiseOr %uint {sub_hi_exp} {sgn}")
+                # Signed zeros (+0/-0) and inf/NaN already pass through (lo, hi) unchanged.
+                other_hi, other_lo, r_hi, r_lo = (self.tmp() for _ in range(4))
+                self.emit(f"{other_hi} = OpSelect %uint {is_sub} {sub_hi} {hi}")
+                self.emit(f"{other_lo} = OpSelect %uint {is_sub} {sub_lo} {lo}")
                 self.emit(f"{r_hi} = OpSelect %uint {isnorm} {m_hi} {other_hi}")
                 self.emit(f"{r_lo} = OpSelect %uint {isnorm} {lo} {other_lo}")
                 if any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods):

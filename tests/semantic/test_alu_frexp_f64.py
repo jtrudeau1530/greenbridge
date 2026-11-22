@@ -1,8 +1,9 @@
 """Semantic interpreter and spirv-val tests for RDNA2 v_frexp_mant_f64 and v_frexp_exp_i32_f64.
 
 v_frexp_mant_f64 returns the binary64 mantissa of S0 in [0.5, 1) with its sign, and v_frexp_exp_i32_f64 returns the
-matching signed 32-bit exponent (S0 = mant * 2^exp). Zero and subnormals give signed zero and exponent 0; infinities
-and NaNs pass through v_frexp_mant_f64 unchanged and give exponent 0 (RDNA2 ISA).
+matching signed 32-bit exponent (S0 = mant * 2^exp). Under default denorm16_64=3 (measured natively on gfx1036,
+wave32 and wave64), non-zero subnormals normalize into [0.5, 1) with exponent -1073..-1022; signed zero gives signed
+zero and exponent 0; infinities and NaNs pass through v_frexp_mant_f64 unchanged and give exponent 0.
 """
 import math
 import os
@@ -32,9 +33,11 @@ INF = 0x7FF0000000000000
 NINF = 0xFFF0000000000000
 QNAN = 0x7FF8000000000001
 NQNAN = 0xFFF8000000000042
+SNAN = 0x7FF0000000000001
 MIN_NORMAL = 0x0010000000000000
 MAX_FINITE = 0x7FEFFFFFFFFFFFFF
 SUBNORMAL = 0x0000000000000001
+MAX_SUBNORMAL = 0x000FFFFFFFFFFFFF
 
 
 def d2u(x: float) -> int:
@@ -49,14 +52,20 @@ def is_normal(u: int) -> bool:
     return 0 < ((u >> 52) & 0x7FF) < 2047
 
 
+def is_finite_nonzero(u: int) -> bool:
+    exp_f = (u >> 52) & 0x7FF
+    frac = u & ((1 << 52) - 1)
+    return exp_f < 2047 and (exp_f > 0 or frac != 0)
+
+
 def ref_mant(u: int) -> int:
-    if not is_normal(u):
-        return (u & 0x8000000000000000) if ((u >> 52) & 0x7FF) == 0 else u
+    if not is_finite_nonzero(u):
+        return u
     return d2u(math.frexp(u2d(u))[0])
 
 
 def ref_exp(u: int) -> int:
-    return math.frexp(u2d(u))[1] & 0xFFFFFFFF if is_normal(u) else 0
+    return math.frexp(u2d(u))[1] & 0xFFFFFFFF if is_finite_nonzero(u) else 0
 
 
 _TMP_DIR = None
@@ -182,15 +191,53 @@ class FrexpF64Tests(unittest.TestCase):
             self.assertTrue(0.5 <= abs(m) < 1.0)
 
     def test_zero_subnormals_and_specials(self):
-        for u in (0x0000000000000000, 0x8000000000000000, SUBNORMAL, SUBNORMAL | (1 << 63)):
-            want_zero = u & (1 << 63)
-            with self.subTest(zero_or_sub=hex(u)):
-                self.assertEqual(run_mant("v_frexp_mant_f64_e32 v[0:1], v[2:3]", u), want_zero)
+        for u in (0x0000000000000000, 0x8000000000000000):
+            with self.subTest(zero=hex(u)):
+                self.assertEqual(run_mant("v_frexp_mant_f64_e32 v[0:1], v[2:3]", u), u)
                 self.assertEqual(run_exp("v_frexp_exp_i32_f64_e32 v0, v[2:3]", u), 0)
-        for u in (INF, NINF, QNAN, NQNAN):
+        for u in (INF, NINF, QNAN, NQNAN, SNAN):
             with self.subTest(special=hex(u)):
                 self.assertEqual(run_mant("v_frexp_mant_f64_e32 v[0:1], v[2:3]", u), u)
                 self.assertEqual(run_exp("v_frexp_exp_i32_f64_e32 v0, v[2:3]", u), 0)
+
+    def test_subnormals_match_gfx1036(self):
+        # All 52 single-bit subnormal positions plus multi-bit patterns crossing bits 19/20/21/31/32/51.
+        # Every case verified natively on gfx1036 (wave32 and wave64 identical, default denorm16_64=3).
+        subnormals = [1 << b for b in range(52)] + [
+            0x00000000FFFFFFFF,
+            0x000FFFFF00000000,
+            MAX_SUBNORMAL,
+            0x0000000180000001,
+            0x0000000000180005,
+            0x0000000080000001,
+            0x0000000100000001,
+            0x0008000000000001,
+            SUBNORMAL | (1 << 63),
+            MAX_SUBNORMAL | (1 << 63),
+            0x8000000180000001,
+        ]
+        for u in subnormals:
+            with self.subTest(sub=hex(u)):
+                got_m = run_mant("v_frexp_mant_f64_e32 v[0:1], v[2:3]", u)
+                got_e = run_exp("v_frexp_exp_i32_f64_e32 v0, v[2:3]", u)
+                self.assertEqual(got_m, ref_mant(u))
+                self.assertEqual(got_e, ref_exp(u))
+                e_signed = got_e - (1 << 32) if got_e & 0x80000000 else got_e
+                self.assertEqual(d2u(math.ldexp(u2d(got_m), e_signed)), u)
+                self.assertTrue(0.5 <= abs(u2d(got_m)) < 1.0)
+        # VOP3 abs/neg on subnormals.
+        self.assertEqual(
+            run_mant("v_frexp_mant_f64_e64 v[0:1], |v[2:3]|", SUBNORMAL | (1 << 63)),
+            0x3FE0000000000000,
+        )
+        self.assertEqual(
+            run_mant("v_frexp_mant_f64_e64 v[0:1], -v[2:3]", SUBNORMAL),
+            0xBFE0000000000000,
+        )
+        self.assertEqual(
+            run_exp("v_frexp_exp_i32_f64_e64 v0, |v[2:3]|", SUBNORMAL | (1 << 63)),
+            (-1073) & 0xFFFFFFFF,
+        )
 
     def test_source_modifiers_sgpr_inline_and_aliasing(self):
         x = d2u(3.0)
