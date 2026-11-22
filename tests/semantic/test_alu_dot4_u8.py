@@ -19,8 +19,10 @@ ISA rule (RDNA2):
   With clamp, the hardware saturates to 0xFFFFFFFF (unsupported by translator).
 
 Standard library Python only; zero game data, zero third-party dependencies.
+Python 3.9+ compatible.
 """
 
+import contextlib
 import os
 import random
 import struct
@@ -36,6 +38,10 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK8 = 0xFF
@@ -138,6 +144,116 @@ def ref_dot4_i32_i8(s0: int, s1: int, s2: int = 0) -> int:
     return ((s2 & MASK32) + prod_sum) & MASK32
 
 
+def build_spirv_dot4_fragment(s0: int, s1: int, acc: int = 0) -> str:
+    """Synthesize valid SPIR-V assembly computing unsigned dot4 via OpBitFieldUExtract/OpIMul/OpIAdd."""
+    s0 &= MASK32
+    s1 &= MASK32
+    acc &= MASK32
+    return f"""OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out_mrt0
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %out_mrt0 Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%v4uint = OpTypeVector %uint 4
+%pout = OpTypePointer Output %v4uint
+%out_mrt0 = OpVariable %pout Output
+
+%c_s0 = OpConstant %uint {s0}
+%c_s1 = OpConstant %uint {s1}
+%c_acc = OpConstant %uint {acc}
+%c0 = OpConstant %uint 0
+%c8 = OpConstant %uint 8
+%c16 = OpConstant %uint 16
+%c24 = OpConstant %uint 24
+
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%x0 = OpBitFieldUExtract %uint %c_s0 %c0 %c8
+%y0 = OpBitFieldUExtract %uint %c_s1 %c0 %c8
+%p0 = OpIMul %uint %x0 %y0
+%t0 = OpIAdd %uint %c_acc %p0
+
+%x1 = OpBitFieldUExtract %uint %c_s0 %c8 %c8
+%y1 = OpBitFieldUExtract %uint %c_s1 %c8 %c8
+%p1 = OpIMul %uint %x1 %y1
+%t1 = OpIAdd %uint %t0 %p1
+
+%x2 = OpBitFieldUExtract %uint %c_s0 %c16 %c8
+%y2 = OpBitFieldUExtract %uint %c_s1 %c16 %c8
+%p2 = OpIMul %uint %x2 %y2
+%t2 = OpIAdd %uint %t1 %p2
+
+%x3 = OpBitFieldUExtract %uint %c_s0 %c24 %c8
+%y3 = OpBitFieldUExtract %uint %c_s1 %c24 %c8
+%p3 = OpIMul %uint %x3 %y3
+%res = OpIAdd %uint %t2 %p3
+
+%out_vec = OpCompositeConstruct %v4uint %res %res %res %res
+OpStore %out_mrt0 %out_vec
+OpReturn
+OpFunctionEnd
+"""
+
+
+@contextlib.contextmanager
+def patch_rdna2spirv_dot4_u8():
+    """Context manager to hook rdna2spirv instruction generator with v_dot4_u32_u8 and v_dot4c_u32_u8."""
+    orig_insn = rdna2spirv.Gen._insn
+    orig_rbw = rdna2spirv.read_before_write_vgprs
+    orig_rrw = rdna2spirv.reg_reads_writes
+
+    def patched_rbw(insns):
+        for ins in insns:
+            if ins.get("op") == "v_dot4c_u32_u8":
+                ins["op"] = "v_dot4c_i32_i8"
+                res = orig_rbw(insns)
+                ins["op"] = "v_dot4c_u32_u8"
+                return res
+        return orig_rbw(insns)
+
+    def patched_rrw(insns):
+        for ins in insns:
+            if ins.get("op") == "v_dot4c_u32_u8":
+                ins["op"] = "v_dot4c_i32_i8"
+                res = orig_rrw(insns)
+                ins["op"] = "v_dot4c_u32_u8"
+                return res
+        return orig_rrw(insns)
+
+    def patched_insn(self, ins):
+        op = ins.get("op", "")
+        if op in ("v_dot4_u32_u8", "v_dot4acc_u32_u8", "v_dot4c_u32_u8"):
+            mods = ins.get("mods", set())
+            if "clamp" in mods or any(m.startswith("op_sel") for m in mods):
+                raise rdna2spirv.Unsupported(op + (" clamp" if "clamp" in mods else " op_sel"))
+            a = ins["args"]
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            acc = self.src_u(a[3]) if len(a) > 3 else (self.src_u(a[0]) if op == "v_dot4c_u32_u8" else self.cu(0))
+            for i in range(4):
+                xb, yb, prod, total = (self.tmp() for _ in range(4))
+                self.emit(f"{xb} = OpBitFieldUExtract %uint {x} {self.cu(8 * i)} {self.cu(8)}")
+                self.emit(f"{yb} = OpBitFieldUExtract %uint {y} {self.cu(8 * i)} {self.cu(8)}")
+                self.emit(f"{prod} = OpIMul %uint {xb} {yb}")
+                self.emit(f"{total} = OpIAdd %uint {acc} {prod}")
+                acc = total
+            self.dst(a[0], acc)
+            return
+        return orig_insn(self, ins)
+
+    rdna2spirv.Gen._insn = patched_insn
+    rdna2spirv.read_before_write_vgprs = patched_rbw
+    rdna2spirv.reg_reads_writes = patched_rrw
+    try:
+        yield
+    finally:
+        rdna2spirv.Gen._insn = orig_insn
+        rdna2spirv.read_before_write_vgprs = orig_rbw
+        rdna2spirv.reg_reads_writes = orig_rrw
+
+
 class ReferenceOracleTests(unittest.TestCase):
     """Verifies reference oracle against known hand-calculated vectors and algebraic laws."""
 
@@ -230,15 +346,10 @@ class ReferenceOracleTests(unittest.TestCase):
 
     def test_unsigned_vs_signed_divergence(self) -> None:
         """Unsigned dot product behaves fundamentally differently from signed dot product."""
-        # When high bit (bit 7) of bytes is set, signed treats as negative, unsigned as >= 128
         divergent_pairs = [
-            # 0xFF * 0x01: unsigned is 255, signed is -1 (0xFFFFFFFF)
             (0x000000FF, 0x00000001, 0),
-            # 0xFF * 0xFF: unsigned is 65025, signed is 1
             (0x000000FF, 0x000000FF, 0),
-            # 0xFFFFFFFF . 0x01010101: unsigned is 1020, signed is -4
             (0xFFFFFFFF, 0x01010101, 0),
-            # 0x80808080 . 0x7F7F7F7F: unsigned is 65024, signed is -65024 (0xFFFF0200)
             (0x80808080, 0x7F7F7F7F, 0),
         ]
         for s0, s1, s2 in divergent_pairs:
@@ -255,14 +366,11 @@ class ReferenceOracleTests(unittest.TestCase):
             s1 = rng.getrandbits(32)
             s2 = rng.getrandbits(32)
 
-            # Commutativity
             self.assertEqual(ref_dot4_u32_u8(s0, s1, s2), ref_dot4_u32_u8(s1, s0, s2))
-            # Distributivity of dot product over individual byte terms
             b0 = unpack_u8(s0)
             b1 = unpack_u8(s1)
             manual_sum = ((s2 & MASK32) + b0[0]*b1[0] + b0[1]*b1[1] + b0[2]*b1[2] + b0[3]*b1[3]) & MASK32
             self.assertEqual(ref_dot4_u32_u8(s0, s1, s2), manual_sum)
-            # Accumulator oracle equivalence
             self.assertEqual(ref_dot4acc_u32_u8(s0, s1, s2), ref_dot4_u32_u8(s0, s1, s2))
 
 
@@ -426,18 +534,15 @@ class WavefrontInterpreterTests(unittest.TestCase):
     def test_v_dot4c_u32_u8_accumulator_reads_destination(self) -> None:
         """v_dot4c_u32_u8 (VOP2) uses destination register's prior value as accumulator."""
         interp = WavefrontDot4Interpreter(wave_size=32)
-        # Initialize v0 destination accumulator to 500 across all lanes
         for lane in range(32):
             interp.set_vgpr(0, lane, 500)
             interp.set_vgpr(1, lane, 0x01020304)
             interp.set_vgpr(2, lane, 0x05060708)
 
-        # First dot product adds 70 to 500 = 570
         interp.execute_line("v_dot4c_u32_u8 v0, v1, v2")
         for lane in range(32):
             self.assertEqual(interp.get_vgpr(0, lane), 570)
 
-        # Second successive dot product adds another 70 = 640
         interp.execute_line("v_dot4c_u32_u8 v0, v1, v2")
         for lane in range(32):
             self.assertEqual(interp.get_vgpr(0, lane), 640)
@@ -468,19 +573,15 @@ class WavefrontInterpreterTests(unittest.TestCase):
         interp = WavefrontDot4Interpreter(wave_size=32)
         sentinel = 0xDEADBEEF
 
-        # Prepopulate destination register v5 with sentinel
         for lane in range(32):
             interp.set_vgpr(5, lane, sentinel)
             interp.set_vgpr(1, lane, 0x01020304)
             interp.set_vgpr(2, lane, 0x05060708)
             interp.set_vgpr(3, lane, 100)
 
-        # Set EXEC to lower 16 lanes only (0x0000FFFF)
         interp.set_exec(0x0000FFFF)
         interp.execute_line("v_dot4_u32_u8 v5, v1, v2, v3")
 
-        # Active lanes (0..15) must be updated to 170 (70 + 100)
-        # Inactive lanes (16..31) must strictly preserve sentinel 0xDEADBEEF
         for lane in range(32):
             if lane < 16:
                 self.assertEqual(interp.get_vgpr(5, lane), 170)
@@ -492,17 +593,15 @@ class WavefrontInterpreterTests(unittest.TestCase):
         interp = WavefrontDot4Interpreter(wave_size=32)
         for lane in range(32):
             interp.set_vgpr(10, lane, 0)
-            interp.set_vgpr(1, lane, 0x01010101)  # dot = 4 * 10 = 40
+            interp.set_vgpr(1, lane, 0x01010101)
             interp.set_vgpr(2, lane, 0x0A0A0A0A)
-            interp.set_vgpr(3, lane, 0x02020202)  # dot = 4 * 40 = 160
+            interp.set_vgpr(3, lane, 0x02020202)
             interp.set_vgpr(4, lane, 0x14141414)
 
-        # Step 1: Execute even lanes with (v1 . v2)
-        interp.set_exec(0x55555555)  # 01010101... (even lanes 0, 2, 4...)
+        interp.set_exec(0x55555555)
         interp.execute_line("v_dot4_u32_u8 v10, v1, v2, 0")
 
-        # Step 2: Execute odd lanes with (v3 . v4)
-        interp.set_exec(0xAAAAAAAA)  # 10101010... (odd lanes 1, 3, 5...)
+        interp.set_exec(0xAAAAAAAA)
         interp.execute_line("v_dot4_u32_u8 v10, v3, v4, 0")
 
         for lane in range(32):
@@ -540,6 +639,182 @@ class WavefrontInterpreterTests(unittest.TestCase):
 
         for lane in range(32):
             self.assertEqual(interp.get_vgpr(0, lane), 5070)
+
+
+class SpirvEmissionAndOverflowTests(unittest.TestCase):
+    """Verifies SPIR-V translation, interpreter execution, and integer overflow wrapping."""
+
+    def test_direct_spirv_emission_against_mini_interp(self) -> None:
+        """Synthesized SPIR-V fragment shaders execute cleanly in spirv_mini_interp."""
+        for s0, s1, s2, expected in KNOWN_VECTORS[:10]:
+            with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                spv = build_spirv_dot4_fragment(s0, s1, s2)
+                res = si.run_fragment(spv)
+                self.assertIn("%out_mrt0", res)
+                self.assertEqual(list(res["%out_mrt0"]), [expected] * 4)
+
+    def test_translated_rdna2spirv_fragment_execution(self) -> None:
+        """Pixel shaders with v_dot4_u32_u8 translated via rdna2spirv and run in si."""
+        with patch_rdna2spirv_dot4_u8():
+            for s0, s1, s2, expected in KNOWN_VECTORS[:8]:
+                with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                    lines = [
+                        f"v_mov_b32_e32 v1, 0x{s0:08x}",
+                        f"v_mov_b32_e32 v2, 0x{s1:08x}",
+                        f"v_mov_b32_e32 v3, 0x{s2:08x}",
+                        "v_dot4_u32_u8 v8, v1, v2, v3",
+                        "exp mrt0 v8, v8, v8, v8 done vm",
+                        "s_endpgm",
+                    ]
+                    spv = support.translate_lines("ps_dot4_u8_test", lines)
+                    self.assertEqual(support.mrt0_words(spv), [expected] * 4)
+
+    def test_translated_rdna2spirv_v_dot4c_accumulator(self) -> None:
+        """v_dot4c_u32_u8 accumulating form translated and executed via support."""
+        with patch_rdna2spirv_dot4_u8():
+            lines = [
+                "v_mov_b32_e32 v1, 0x01020304",
+                "v_mov_b32_e32 v2, 0x05060708",
+                "v_mov_b32_e32 v9, 0x000003E8",  # 1000
+                "v_dot4c_u32_u8 v9, v1, v2",      # 1000 + 70 = 1070
+                "v_dot4c_u32_u8 v9, v1, v2",      # 1070 + 70 = 1140
+                "exp mrt0 v9, v9, v9, v9 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines("ps_dot4c_u8_test", lines)
+            self.assertEqual(support.mrt0_words(spv), [1140] * 4)
+
+    def test_integer_overflow_wrap_around_modulo_32(self) -> None:
+        """Unsigned 32-bit integer arithmetic wraps strictly modulo 2^32."""
+        s0 = 0xFFFFFFFF
+        s1 = 0xFFFFFFFF
+        # Max product = 260100 (0x3F804)
+        dot_prod = ref_dot4_u32_u8(s0, s1, 0)
+        self.assertEqual(dot_prod, 260100)
+
+        # 1. Exact overflow boundary (sum is exactly 2^32 -> wraps to 0)
+        acc_exact = (MASK32 - dot_prod + 1) & MASK32
+        self.assertEqual(ref_dot4_u32_u8(s0, s1, acc_exact), 0)
+
+        # 2. Wrap by 1
+        acc_wrap1 = (acc_exact + 1) & MASK32
+        self.assertEqual(ref_dot4_u32_u8(s0, s1, acc_wrap1), 1)
+
+        # 3. Maximum accumulator 0xFFFFFFFF (wraps to dot_prod - 1)
+        self.assertEqual(ref_dot4_u32_u8(s0, s1, MASK32), dot_prod - 1)
+
+        # Verify wrapping holds through SPIR-V mini interpreter
+        spv = build_spirv_dot4_fragment(s0, s1, acc_exact)
+        res = si.run_fragment(spv)
+        self.assertEqual(list(res["%out_mrt0"]), [0] * 4)
+
+        spv = build_spirv_dot4_fragment(s0, s1, acc_wrap1)
+        res = si.run_fragment(spv)
+        self.assertEqual(list(res["%out_mrt0"]), [1] * 4)
+
+    def test_unsigned_clamping_saturation_model(self) -> None:
+        """Model unsigned clamp saturating at 0xFFFFFFFF on overflow."""
+        s0 = 0xFFFFFFFF
+        s1 = 0xFFFFFFFF
+        acc_overflow = 0xFFFFFFFF
+        # Without clamp, wraps to 260099
+        self.assertEqual(ref_dot4_u32_u8(s0, s1, acc_overflow), 260099)
+        # With clamp, saturates at 0xFFFFFFFF
+        self.assertEqual(ref_dot4_clamp_u32_u8(s0, s1, acc_overflow), 0xFFFFFFFF)
+
+
+class NegativeControlTests(unittest.TestCase):
+    """Negative controls, modifier rejections, and fault injection verification."""
+
+    def test_unpatched_rdna2spirv_raises_unsupported(self) -> None:
+        """Without patch, standard rdna2spirv refuses v_dot4_u32_u8 cleanly."""
+        lines = [
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 1",
+            "v_mov_b32_e32 v3, 0",
+            "v_dot4_u32_u8 v8, v1, v2, v3",
+            "exp mrt0 v8, v8, v8, v8 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_dot4_unpatched", lines)
+        self.assertIn("v_dot4_u32_u8", str(cm.exception))
+
+    def test_clamp_modifier_is_refused(self) -> None:
+        """The translator refuses clamp modifier on v_dot4_u32_u8 rather than guessing."""
+        with patch_rdna2spirv_dot4_u8():
+            lines = [
+                "v_mov_b32_e32 v1, 1",
+                "v_mov_b32_e32 v2, 1",
+                "v_mov_b32_e32 v3, 0",
+                "v_dot4_u32_u8 v8, v1, v2, v3 clamp",
+                "exp mrt0 v8, v8, v8, v8 done vm",
+                "s_endpgm",
+            ]
+            with self.assertRaises(rdna2spirv.Unsupported) as refused:
+                support.translate_lines("ps_dot4_clamp", lines)
+            self.assertEqual(str(refused.exception), "v_dot4_u32_u8 clamp")
+
+    def test_op_sel_modifier_is_refused(self) -> None:
+        """The translator refuses op_sel modifier on v_dot4_u32_u8."""
+        with patch_rdna2spirv_dot4_u8():
+            lines = [
+                "v_mov_b32_e32 v1, 1",
+                "v_mov_b32_e32 v2, 1",
+                "v_mov_b32_e32 v3, 0",
+                "v_dot4_u32_u8 v8, v1, v2, v3 op_sel:[0,1,0] op_sel_hi:[1,0,1]",
+                "exp mrt0 v8, v8, v8, v8 done vm",
+                "s_endpgm",
+            ]
+            with self.assertRaises(rdna2spirv.Unsupported) as refused:
+                support.translate_lines("ps_dot4_op_sel", lines)
+            self.assertEqual(str(refused.exception), "v_dot4_u32_u8 op_sel")
+
+    def test_interpreter_invalid_destination(self) -> None:
+        """VALU instructions cannot write to SGPRs as destinations."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_dot4_u32_u8 s0, v1, v2, v3")
+
+    def test_interpreter_out_of_bounds_registers(self) -> None:
+        """VGPR index >= 256 or SGPR index >= 106 raises IndexError."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        with self.assertRaises(IndexError):
+            interp.execute_line("v_dot4_u32_u8 v0, v256, v1, v2")
+        with self.assertRaises(IndexError):
+            interp.execute_line("v_dot4_u32_u8 v0, v1, s110, v2")
+
+    def test_interpreter_unsupported_opcode(self) -> None:
+        """Unknown opcodes raise NotImplementedError."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        with self.assertRaises(NotImplementedError):
+            interp.execute_line("v_nonexistent_op v0, v1, v2")
+
+    def test_interpreter_invalid_wave_size(self) -> None:
+        """Wave sizes other than 32 or 64 are rejected."""
+        with self.assertRaises(ValueError):
+            WavefrontDot4Interpreter(wave_size=16)
+
+    def test_bit_corruption_sensitivity(self) -> None:
+        """Flipping any bit in multiplier operands must perturb dot product result."""
+        s0 = 0x01020304
+        s1 = 0x05060708
+        acc = 1000
+        golden = ref_dot4_u32_u8(s0, s1, acc)
+
+        for bit in range(32):
+            corrupted_s0 = s0 ^ (1 << bit)
+            corrupted_s1 = s1 ^ (1 << bit)
+            self.assertNotEqual(
+                ref_dot4_u32_u8(corrupted_s0, s1, acc),
+                golden,
+                f"Flipping bit {bit} in S0 produced no change",
+            )
+            self.assertNotEqual(
+                ref_dot4_u32_u8(s0, corrupted_s1, acc),
+                golden,
+                f"Flipping bit {bit} in S1 produced no change",
+            )
 
 
 if __name__ == "__main__":
