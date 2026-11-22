@@ -1771,6 +1771,13 @@ class Gen:
                     self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
                     self.emit(f"{o} = OpLogicalOr %bool {is_int} {e}")
                     is_int = o
+            is_norm = "%false"
+            for code_v, (_, kind, _) in self.FORMATS.items():
+                if kind in ("unorm", "snorm") and (fixed_fmt is None or code_v == fixed_fmt):
+                    e, o = self.tmp(), self.tmp()
+                    self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
+                    self.emit(f"{o} = OpLogicalOr %bool {is_norm} {e}")
+                    is_norm = o
             for i in range(0, len(outs), 2):
                 dest = {"k": "vgpr", "r": vd["r"] + i // 2, "n": 1}
                 lo = outs[i]
@@ -1778,18 +1785,45 @@ class Gen:
                 r = self.tmp()
                 if i + 1 == len(outs):
                     # For d16_x and d16_xyz the unaddressed high half keeps its previous bits.
-                    fl = self.f16_bits(self.tof(lo))
+                    fl = self.d16_norm_f16(lo, is_norm)
                     self.emit(f"{r} = OpSelect %uint {is_int} {il} {fl}")
                     self.write_lo16(dest, r)
                     continue
                 hi = outs[i + 1]
-                ph = self.pack_f16_pair_int(self.tof(lo), self.tof(hi))
+                ph = self.tmp()
+                fh_s = self.tmp()
+                self.emit(f"{fh_s} = OpShiftLeftLogical %uint {self.d16_norm_f16(hi, is_norm)} {self.cu(16)}")
+                self.emit(f"{ph} = OpBitwiseOr %uint {self.d16_norm_f16(lo, is_norm)} {fh_s}")
                 ih, pi = self.tmp(), self.tmp()
                 high_half = self.saturate_int16(hi, signed=False)
                 self.emit(f"{ih} = OpShiftLeftLogical %uint {high_half} {self.cu(16)}")
                 self.emit(f"{pi} = OpBitwiseOr %uint {il} {ih}")
                 self.emit(f"{r} = OpSelect %uint {is_int} {pi} {ph}")
                 self.dst(dest, r)
+
+    # The f32 quotients m / (2^n - 1), 1 <= n <= 16, that land exactly on an f16 halfway point: 0x3f7ff000 is
+    # 16379/16383, 32759/32767 and 65519/65535, 0x3f7fb000 is 65455/65535 (an enumeration of every m and n). The exact
+    # quotient is below the halfway point each time, and RDNA2 rounds it once, straight to f16 (BUILD-161, RX 6700).
+    D16_NORM_HALFWAY = (0x3F7FF000, 0x3F7FB000)
+
+    def d16_norm_f16(self, bits, is_norm):
+        """f16 bits of a typed d16 buffer load component from its decoded f32 ``bits``. Round to nearest even
+        (f16_bits), except that a UNORM/SNORM quotient (``is_norm``) whose f32 is one of D16_NORM_HALFWAY takes the
+        f16 below it. The hardware rounds the exact quotient once; f32 first and then f16 rounds twice, which is 1 ulp
+        high on exactly those values (UNORM16 0xffaf and 0xffef, SNORM16 0x7ff7 and 0x8009, the 14- and 15-bit
+        twins). Measured on an RX 6700 (gfx1031) for every UNORM8/SNORM8/UNORM10/UNORM16/SNORM16 value, MUBUF and
+        MTBUF, wave32 and wave64 (tools/d16_format_probe.py). A float format keeps the plain rounding: a 32_FLOAT
+        0x3f7ff000 is a real tie."""
+        h = self.f16_bits(self.tof(bits))
+        mag, a, b, hit, both, dn, out = (self.tmp() for _ in range(7))
+        self.emit(f"{mag} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{a} = OpIEqual %bool {mag} {self.cu(self.D16_NORM_HALFWAY[0])}")
+        self.emit(f"{b} = OpIEqual %bool {mag} {self.cu(self.D16_NORM_HALFWAY[1])}")
+        self.emit(f"{hit} = OpLogicalOr %bool {a} {b}")
+        self.emit(f"{both} = OpLogicalAnd %bool {hit} {is_norm}")
+        self.emit(f"{dn} = OpISub %uint {h} {self.cu(1)}")             # sign-magnitude: 1 ulp toward zero
+        self.emit(f"{out} = OpSelect %uint {both} {dn} {h}")
+        return out
 
     def global_address(self, op, vaddr, saddr, mods):
         """The 64-bit Xbox GPU VA a global_* instruction accesses (ulong id): (saddr: 64-bit SGPR pair + zero-extended

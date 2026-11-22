@@ -932,6 +932,65 @@ reset in the kernel log.
   inputs is computed once and stored in its own half (`tests/test_f16_trans_sweep.py`). On a GPU the test checks
   exp2 of integers and wave32 = wave64.
 
+### d16 rounding of UNORM/SNORM buffer loads (`tools/d16_format_probe.py`, BUILD-161)
+
+`docs/design.md` ("d16 and f16 format narrowing") narrows the f16 of a typed d16 buffer load the way it narrows an
+image result: the exact binary32 decode, then integer round to nearest even (`Gen.f16_bits`). For buffer loads that
+rounding was inferred, not measured. The probe measures it on a GFX10 GPU (RDNA1/RDNA2) through the hardware
+oracle. Every value of UNORM8, SNORM8, UNORM10 (the x channel of format 50), UNORM16 and SNORM16 is loaded with
+`buffer_load_format_d16_x`, `tbuffer_load_format_d16_x` and, for the f32 stage alone, `buffer_load_format_x`. Each
+runs in wave32 and wave64.
+
+```
+python -I tools/d16_format_probe.py --json d16.json          # about 1,040 kernels of 1,024 threads; exit 77 without the oracle
+python -I tools/d16_format_probe.py --self-test               # the rules against docs/design.md's #489 counts, no GPU
+```
+
+- **The kernels stage their own inputs.** Thread t stores the format bits of one value at dword t of the output
+  buffer and waits for the store (`s_waitcnt_vscnt`). It then builds a GFX10 V# over the buffer: DST_SEL XYZW, the
+  format, RESOURCE_LEVEL 1, OOB_SELECT 3, NUM_RECORDS the 4 KiB staged. It loads its element with `glc dlc` (past
+  L0 and GL1) and stores the VGPR at dword 1024 + t. The host checks that every staged word reads back as written.
+- **Rules compared**, each also with f16 denormal results flushed:
+  - `f32_rte`, the translator's rule;
+  - `f32_rtz`, which is `v_cvt_pkrtz_f16_f32` of the f32 decode, the #489 bug;
+  - `rte` and `rtz`, which round the exact quotient once;
+  - `mul_rte`, the f32 product v · f32(1/(2^n − 1)) rounded to nearest even.
+- **What the formats can separate.** The 8- and 10-bit formats only separate nearest from toward zero: every other rule
+  gives the same bits there. That covers 123 of the 256 UNORM8 values and 110 of the 256 SNORM8 values, the #489
+  counts. Only four 16-bit values separate one rounding from two (`f32_rte` against `rte`): UNORM16 0xffaf and
+  0xffef, SNORM16 0x7ff7 and 0x8009. The smallest UNORM16/SNORM16 values have quotients under 2^-14, so they show
+  a flush of f16 denormals.
+- **Controls:**
+  - a 16_FLOAT d16 load must return its own bits (NaNs may be quieted);
+  - `d16_x` must leave the high half of its VGPR as it was (`docs/design.md` measured this on gfx1036);
+  - wave32 must equal wave64, and MUBUF must equal MTBUF.
+
+  A failed control is exit 2; a wave or MUBUF/MTBUF difference is exit 1. Which rule the hardware follows is
+  reported, not judged.
+
+Measured on an RX 6700 (gfx1031, AMD Windows driver 32.0.21045.29003, ROCm wheel clang), the whole sweep in 36 s:
+
+| Format | Values | d16 `rte` | d16 `f32_rte` | d16 `f32_rtz` | f32 `f32_rte` |
+| --- | --- | --- | --- | --- | --- |
+| UNORM8 | 256 | 256 | 256 | 133 | 256 |
+| SNORM8 | 256 | 256 | 256 | 146 | 256 |
+| UNORM10 | 1,024 | 1,024 | 1,024 | 514 | 1,024 |
+| UNORM16 | 65,536 | 65,536 | 65,534 | 33,796 | 65,536 |
+| SNORM16 | 65,536 | 65,536 | 65,534 | 34,820 | 65,536 |
+
+- The d16 result is the exact quotient rounded once to f16, to nearest even, with f16 denormals kept. The two
+  UNORM16 and two SNORM16 values that separate one rounding from two all came out 1 ulp below the f32-first result:
+  0xffaf gave 0x3bfd (not 0x3bfe), 0xffef gave 0x3bff (not 0x3c00), 0x7ff7 gave 0x3bff, and 0x8009 gave 0xbbff.
+  The translator now follows this (`Gen.d16_norm_f16`, `docs/design.md` "d16 and f16 format narrowing").
+- The f32 result (`buffer_load_format_x`) is the correctly rounded quotient for every value. The reciprocal multiply
+  matched only 130 of 256 UNORM8 values and 65,024 of 65,536 UNORM16 values.
+- 16_FLOAT came back with its own bits for all 65,536 encodings, NaNs included. The high half of the d16_x VGPR was
+  kept. MUBUF matched MTBUF, and wave32 matched wave64, for every value.
+
+`tests/test_d16_format_probe.py` checks the rules against the #489 counts and the descriptor bits. It checks that
+each value is staged once, and that the kernels assemble for gfx1031. A fake oracle plays the GPU to check the exit
+codes. On a GFX10 GPU the test runs UNORM8 and checks the controls.
+
 ### `v_fma_mix*` f16 rounding in nearest mode (`tools/fma_mix_probe.py`)
 
 `docs/design.md` leaves one f16 question open. In round-to-nearest mode, does `v_fma_mixlo_f16` / `v_fma_mixhi_f16`
