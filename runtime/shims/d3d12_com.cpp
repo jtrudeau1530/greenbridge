@@ -2,6 +2,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_fence_waiter.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -281,19 +282,6 @@ private:
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     bool stencil_ref_set_ = false;
-};
-
-// An event waiting for `remaining` fence values: 1 for SetEventOnCompletion and for the ANY flag of
-// SetEventOnMultipleFenceCompletion, the fence count for ALL. Each fence that reaches its value counts down once; the
-// hit that takes it from 1 to 0 sets the event, and later hits (ANY) do nothing.
-struct FenceWaiter {
-    FenceWaiter(HANDLE e, int n) : event(e), remaining(n) {}
-    void hit() {
-        if (remaining.fetch_sub(1) == 1) SetEvent(event);
-    }
-    bool done() const { return remaining.load() <= 0; }
-    HANDLE event;
-    std::atomic<int> remaining;
 };
 
 class Fence final
@@ -658,7 +646,7 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
         return context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX) == VK_SUCCESS ? S_OK : E_FAIL;
     }
     // Each fence's own waiter thread counts the shared waiter down; no thread of its own.
-    const auto waiter = std::make_shared<FenceWaiter>(event, any ? 1 : int(count));
+    const auto waiter = std::make_shared<FenceWaiter>(event, any ? 1u : count);
     for (UINT i = 0; i < count && !waiter->done(); ++i) objects[i]->notify(values[i], waiter);
     return S_OK;
 }

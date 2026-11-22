@@ -973,7 +973,8 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 - `SetEventOnMultipleFenceCompletion` (implemented). With a null event it is one blocking `vkWaitSemaphores` over
   every fence's semaphore, with `VK_SEMAPHORE_WAIT_ANY_BIT` for `D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY` and no flag for
   `ALL`. With an event, each fence's existing wait thread counts down one shared waiter (1 for `ANY`, the fence
-  count for `ALL`) and the hit that reaches zero sets the event, so no thread is added. Values already reached are
+  count for `ALL`, kept as the API's unsigned `UINT`) and the hit that reaches zero sets the event, so no thread is
+  added; later hits stay at zero (`d3d12_fence_waiter_test` checks counts past `INT_MAX`). Values already reached are
   counted before the call returns; zero fences set the event at once. Other flags, a null array with a non-zero
   count, or a fence from elsewhere are `E_INVALIDARG`. A fence released while an event waits on it drops the wait
   and the event is never set.
