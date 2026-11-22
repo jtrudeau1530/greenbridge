@@ -1165,5 +1165,175 @@ class TestPermB32RegisterAliasing(unittest.TestCase):
         self.assertEqual(rf.get_vgpr(6), 0x44444444)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass
+class StatusFlags:
+    """Architectural status flags and condition codes for 32-bit execution."""
+    zero: bool = False
+    negative: bool = False
+    parity_even: bool = False
+    byte_zeros: Tuple[bool, bool, bool, bool] = (False, False, False, False)
+    byte_negatives: Tuple[bool, bool, bool, bool] = (False, False, False, False)
+    carry: bool = False
+    overflow: bool = False
+
+    @classmethod
+    def from_result(cls, res: int, addend: int = 0, is_sub: bool = False) -> StatusFlags:
+        val = res & MASK32
+        zero = (val == 0)
+        negative = bool(val & 0x8000_0000)
+
+        # Bit parity of low byte
+        popcount = bin(val & 0xFF).count("1")
+        parity_even = (popcount % 2 == 0)
+
+        b_zeros = (
+            extract_byte(val, 0) == 0,
+            extract_byte(val, 1) == 0,
+            extract_byte(val, 2) == 0,
+            extract_byte(val, 3) == 0,
+        )
+        b_negs = (
+            bool(extract_byte(val, 0) & 0x80),
+            bool(extract_byte(val, 1) & 0x80),
+            bool(extract_byte(val, 2) & 0x80),
+            bool(extract_byte(val, 3) & 0x80),
+        )
+
+        carry = False
+        overflow = False
+        if is_sub:
+            # Emulate subtraction borrow: addend - val
+            diff = addend - val
+            carry = (diff < 0)  # Borrow
+            sa = (addend >> 31) & 1
+            sb = (val >> 31) & 1
+            sr = ((diff & MASK32) >> 31) & 1
+            overflow = bool((sa ^ sb) & (sa ^ sr))
+        elif addend != 0:
+            # Emulate addition carry: addend + val
+            total = addend + val
+            carry = bool(total > MASK32)
+            sa = (addend >> 31) & 1
+            sb = (val >> 31) & 1
+            sr = ((total & MASK32) >> 31) & 1
+            overflow = bool(not (sa ^ sb) & (sa ^ sr))
+
+        return cls(
+            zero=zero,
+            negative=negative,
+            parity_even=parity_even,
+            byte_zeros=b_zeros,
+            byte_negatives=b_negs,
+            carry=carry,
+            overflow=overflow,
+        )
+
+
+def compute_wave_vcc_mask(wave: SIMDWaveState, reg_idx: int, predicate: str = "ne_zero") -> int:
+    """Evaluate lane condition codes across active lanes to produce a 32/64-bit VCC mask."""
+    vcc_mask = 0
+    for lane in range(wave.num_lanes):
+        if wave.is_lane_active(lane):
+            val = wave.get_lane_vgpr(reg_idx, lane)
+            cond = False
+            if predicate == "ne_zero":
+                cond = (val != 0)
+            elif predicate == "eq_zero":
+                cond = (val == 0)
+            elif predicate == "negative":
+                cond = bool(val & 0x8000_0000)
+            elif predicate == "byte0_zero":
+                cond = (extract_byte(val, 0) == 0)
+            elif predicate == "byte3_neg":
+                cond = bool(extract_byte(val, 3) & 0x80)
+            else:
+                raise ValueError(f"Unknown predicate: {predicate}")
+
+            if cond:
+                vcc_mask |= (1 << lane)
+    return vcc_mask
+
+
+# ==============================================================================
+# Unit Tests: Condition Codes and Status Flags
+# ==============================================================================
+
+class TestPermB32StatusFlagsAndConditionCodes(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow generation."""
+
+    def test_zero_flag_detection(self):
+        # Permutation producing all zero bytes
+        res = oracle_v_perm_b32(0xFFFFFFFF, 0xFFFFFFFF, make_selector(SEL_ZERO, SEL_ZERO, SEL_ZERO, SEL_ZERO))
+        flags = StatusFlags.from_result(res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertEqual(flags.byte_zeros, (True, True, True, True))
+
+    def test_negative_sign_flag_detection(self):
+        # Permutation selecting sign-extended 1s into MSB (byte 3)
+        res = oracle_v_perm_b32(0x80000000, 0, make_selector(0, 0, 0, SEL_SIGN_EXT_SRC0_B3))
+        flags = StatusFlags.from_result(res)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertTrue(flags.byte_negatives[3])
+        self.assertFalse(flags.byte_negatives[0])
+
+    def test_byte_level_flags(self):
+        # Result = 0x8000007F: byte 0=0x7F, byte 1=0x00, byte 2=0x00, byte 3=0x80
+        res = 0x8000007F
+        flags = StatusFlags.from_result(res)
+        self.assertEqual(flags.byte_zeros, (False, True, True, False))
+        self.assertEqual(flags.byte_negatives, (False, False, False, True))
+
+    def test_parity_flag_calculation(self):
+        # Byte 0 = 0x03 (binary 00000011 -> 2 bits set -> even parity)
+        flags_even = StatusFlags.from_result(0x00000003)
+        self.assertTrue(flags_even.parity_even)
+
+        # Byte 0 = 0x07 (binary 00000111 -> 3 bits set -> odd parity)
+        flags_odd = StatusFlags.from_result(0x00000007)
+        self.assertFalse(flags_odd.parity_even)
+
+    def test_wave_vcc_mask_generation(self):
+        # Wave32 where even lanes have non-zero results and odd lanes have zero results
+        wave = SIMDWaveState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        vals = [0x12345678 if i % 2 == 0 else 0 for i in range(32)]
+        wave.set_wave_vgpr(0, vals)
+
+        vcc_ne = compute_wave_vcc_mask(wave, 0, predicate="ne_zero")
+        # Even bits set: 0x55555555
+        self.assertEqual(vcc_ne, 0x55555555)
+
+        vcc_eq = compute_wave_vcc_mask(wave, 0, predicate="eq_zero")
+        # Odd bits set: 0xAAAAAAAA
+        self.assertEqual(vcc_eq, 0xAAAAAAAA)
+
+    def test_wave_vcc_mask_respects_inactive_lanes(self):
+        # EXEC mask has only lower 16 lanes active
+        wave = SIMDWaveState(num_lanes=32, exec_mask=0x0000FFFF)
+        wave.set_wave_vgpr(0, [0xFFFFFFFF] * 32)
+
+        vcc = compute_wave_vcc_mask(wave, 0, predicate="ne_zero")
+        # Upper 16 lanes inactive, so VCC bits must not be set
+        self.assertEqual(vcc, 0x0000FFFF)
+
+    def test_carry_borrow_generation_from_permuted_operands(self):
+        # Unpack byte 0 using v_perm_b32 into a register, then add to trigger carry
+        val = oracle_v_perm_b32(0, 0x000000FF, make_selector(0, SEL_ZERO, SEL_ZERO, SEL_ZERO))
+        self.assertEqual(val, 0x000000FF)
+
+        # Add 0xFFFFFFFF + 0x000000FF -> generates unsigned carry
+        flags_add = StatusFlags.from_result(val, addend=0xFFFFFFFF)
+        self.assertTrue(flags_add.carry)
+
+        # Subtract 0x00000010 - 0x000000FF -> generates borrow
+        flags_sub = StatusFlags.from_result(val, addend=0x00000010, is_sub=True)
+        self.assertTrue(flags_sub.carry)
+
+
 if __name__ == "__main__":
     unittest.main()
