@@ -5329,12 +5329,9 @@ class Gen:
             cmpx = op.startswith("v_cmpx_")
             d, x, y = (None, a[-2], a[-1]) if cmpx else (a[0], a[1], a[2])
             def pair64(sv):
-                if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                if sv["k"] == "vgpr" and sv.get("n") == 2:
                     return self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-                if sv["k"] == "imm":
-                    v = sv["v"] & 0xFFFFFFFFFFFFFFFF
-                    return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-                raise Unsupported(op + " operand")
+                return self.src64_data(sv, op)
             (x0, x1), (y0, y1) = pair64(x), pair64(y)
             cond, signed = op.split("_")[2], op.endswith("_i64")
             hi_op = {"lt": "LessThan", "le": "LessThan", "gt": "GreaterThan", "ge": "GreaterThan"}[cond]
@@ -6065,12 +6062,9 @@ class Gen:
             cmpx = op.startswith("v_cmpx_")
             d, x, y = (None, a[-2], a[-1]) if cmpx else (a[0], a[1], a[2])
             def pair(s):
-                if s["k"] in ("vgpr", "sgpr") and s.get("n") == 2:
+                if s["k"] == "vgpr" and s.get("n") == 2:
                     return self.load_reg(s["k"], s["r"]), self.load_reg(s["k"], s["r"] + 1)
-                if s["k"] == "imm":
-                    v = s["v"] & 0xFFFFFFFFFFFFFFFF
-                    return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-                raise Unsupported(op + " operand")
+                return self.src64_data(s, op)
             (x0, x1), (y0, y1) = pair(x), pair(y)
             e0, e1, eq, r = (self.tmp() for _ in range(4))
             self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
