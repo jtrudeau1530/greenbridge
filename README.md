@@ -111,6 +111,14 @@ compute and mesh shaders 64-wide. The mode is saved next to the translated shade
 again. With `auto`, a work folder that previously used emulation keeps it for later translations and retries, even if
 the current GPU supports native wave64. Use `--wave64-emulate off` to translate it natively.
 
+Four fallback flags are forwarded to the translator the same way, saved next to the translated shaders, and changing
+them translates them again: `--no-float-controls` (drop `SignedZeroInfNanPreserve`, for devices whose pipeline check
+skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's translator flag), `--bary-fallback`
+(read raw barycentrics from an interpolated input, for devices without `VK_KHR_fragment_shader_barycentric`),
+`--texel-offset-fallback` (fold `image_sample*_o` offsets into the coordinate, for devices without
+`VK_KHR_maintenance8`) and `--mesh-compute` (mesh shaders as compute, for devices without `VK_EXT_mesh_shader`).
+Each is documented in [docs/design.md](docs/design.md).
+
 The build records which llvm-mc command and version produced the disassembly. Changing either, or reusing a work
 folder that predates this record, reruns disassembly and translation while keeping the extracted shader inputs.
 
