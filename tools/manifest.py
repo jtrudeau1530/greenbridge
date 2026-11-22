@@ -215,7 +215,7 @@ def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
         elif os.path.getsize(p) != info["size"]:
             problems[rel] = "SIZE"
         else:
-            pending.append((rel, p, info["sha256"]))
+            pending.append((rel, p, info["sha256"].lower()))
 
     if jobs == 1:
         for rel, p, digest in pending:
