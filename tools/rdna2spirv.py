@@ -11492,8 +11492,11 @@ def _read_shard_markers(out):
         m = re.fullmatch(r"shard(\d+)\.json", os.path.basename(path))
         if not m:            # make_game.py's shards.json plan is not a marker
             continue
-        with open(path, encoding="utf-8") as f:
-            doc = _js.load(f)
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = _js.load(f)
+        except (OSError, ValueError) as e:
+            raise ShardSetError(f"cannot read the shard marker {path}: {e}; delete it and run the shard again") from None
         try:
             index, count = int(doc["index"]), int(doc["count"])
         except (KeyError, TypeError, ValueError):
@@ -11511,9 +11514,12 @@ def merge_shard_parts(out):
 
     A --shard i/n run writes index.part<i>.json and shard<i>.json ({"index": i, "count": n}); the markers say how
     many parts the set has. Parts from before the markers existed fall back to make_game.py's shards.json plan.
-    With neither there is no way to know the count, so the old merge-everything behaviour is kept."""
+    When neither exists the count is unknown, so the parts must at least be contiguous from 0: the merge fails
+    closed instead of publishing a partial index that make_game.py would take as a finished translation."""
     import glob as _gl, json as _js
     parts = sorted(_gl.glob(os.path.join(out, "index.part*.json")))
+    if not parts:
+        raise ShardSetError(f"no index.part*.json in {out}; run --shard i/n first, then --merge")
     indices = []
     for part in parts:
         m = re.search(r"index\.part(\d+)\.json$", part)
@@ -11522,6 +11528,18 @@ def merge_shard_parts(out):
         indices.append(int(m.group(1)))
     if len(set(indices)) != len(indices):
         raise ShardSetError(f"index.part*.json has two parts with the same index: {sorted(indices)}")
+    plan_jobs = None
+    plan = os.path.join(out, "shards.json")
+    if os.path.isfile(plan):
+        try:
+            with open(plan, encoding="utf-8") as f:
+                doc = _js.load(f)
+            jobs = doc.get("jobs") if isinstance(doc, dict) else None
+            if type(jobs) is not int or jobs < 1:
+                raise ValueError("no positive integer \"jobs\"")
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            raise ShardSetError(f"cannot read the shard plan {plan}: {e}; fix or remove it before --merge") from None
+        plan_jobs = jobs
     markers = _read_shard_markers(out)
     expected = None
     if markers:
@@ -11529,14 +11547,11 @@ def merge_shard_parts(out):
         if len(counts) != 1:
             raise ShardSetError(f"shard markers disagree on the shard count: {sorted(counts)}")
         expected = counts.pop()
-    else:
-        plan = os.path.join(out, "shards.json")
-        if os.path.isfile(plan):
-            try:
-                with open(plan, encoding="utf-8") as f:
-                    expected = int(_js.load(f).get("jobs") or 0) or None
-            except (OSError, ValueError, TypeError, AttributeError):
-                expected = None
+        if plan_jobs is not None and plan_jobs != expected:
+            raise ShardSetError(f"shard markers say {expected} shards but the plan says {plan_jobs}; "
+                                "delete the stale parts or the plan and run every shard again")
+    elif plan_jobs is not None:
+        expected = plan_jobs
     if expected is not None:
         missing = [i for i in range(expected) if i not in set(indices)]
         extra = [i for i in indices if i >= expected]
@@ -11546,6 +11561,11 @@ def merge_shard_parts(out):
                 + (f", missing {missing}" if missing else "")
                 + (f", unexpected {extra}" if extra else "")
                 + "; let every --shard run finish before --merge")
+    elif indices != list(range(len(indices))):
+        gap = [i for i in range(max(indices) + 1) if i not in set(indices)]
+        raise ShardSetError(f"incomplete shard set: parts {sorted(indices)} are not contiguous from 0"
+                            + (f", missing {gap}" if gap else "")
+                            + "; without a shard count the merge refuses a set with a gap")
     if markers and set(markers) != set(indices):
         raise ShardSetError(f"index parts and shard markers disagree: parts {sorted(set(indices))}, "
                             f"markers {sorted(markers)}")

@@ -95,6 +95,56 @@ class MergeShardPartsTest(unittest.TestCase):
         self.part(1, {"b": {}})
         self.assertEqual(sorted(R.merge_shard_parts(str(self.out))), ["a", "b"])
 
+    def test_plan_and_markers_that_agree_merge(self):
+        self.part(0, {"a": {}})
+        self.part(1, {"b": {}})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        self.plan(2)
+        self.assertEqual(sorted(R.merge_shard_parts(str(self.out))), ["a", "b"])
+
+    def test_markers_must_match_the_plan_count(self):
+        self.part(0, {})
+        self.part(1, {})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        self.plan(3)
+        self.assertIn("shard markers say 2 shards but the plan says 3", self.merge_error())
+
+    def test_malformed_plan_fails_closed(self):
+        self.part(0, {})
+        self.part(1, {})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        (self.out / "shards.json").write_text("not json\n", encoding="utf-8")
+        self.assertIn("cannot read the shard plan", self.merge_error())
+
+    def test_plan_without_a_usable_job_count_fails_closed(self):
+        self.part(0, {})
+        self.plan(0)
+        self.assertIn("cannot read the shard plan", self.merge_error())
+
+    def test_a_gap_is_refused_when_the_count_is_unknown(self):
+        self.part(0, {})
+        self.part(2, {})
+        message = self.merge_error()
+        self.assertIn("not contiguous from 0", message)
+        self.assertIn("missing [1]", message)
+
+    def test_merge_with_no_parts_is_refused(self):
+        self.assertIn("no index.part", self.merge_error())
+
+    def test_a_corrupt_marker_is_refused(self):
+        self.part(0, {})
+        self.marker(0, 2)
+        (self.out / "shard0.json").write_text("not json\n", encoding="utf-8")
+        self.assertIn("cannot read the shard marker", self.merge_error())
+
+    def test_a_marker_without_index_or_count_is_refused(self):
+        self.part(0, {})
+        (self.out / "shard0.json").write_text('{"count": 2}\n', encoding="utf-8")
+        self.assertIn("is not a shard marker", self.merge_error())
+
     def test_unexpected_part_name_is_refused(self):
         (self.out / "index.partx.json").write_text("{}", encoding="utf-8")
         self.assertIn("not an index.part", self.merge_error())
@@ -136,6 +186,41 @@ class MergeCliTest(unittest.TestCase):
         self.assertIn("merged 2 entries", result.stdout)
         merged = json.loads((self.out / "index.json").read_text(encoding="utf-8"))
         self.assertEqual(sorted(merged), ["a", "b"])
+
+
+    def test_cli_refuses_a_marker_count_that_disagrees_with_the_plan(self):
+        self.part(0, {})
+        self.part(1, {})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        (self.out / "shards.json").write_text(json.dumps({"jobs": 3}), encoding="utf-8")
+        result = self.run_merge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("shard markers say 2 shards but the plan says 3", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.out / "index.json").exists())
+
+    def test_cli_refuses_a_malformed_plan(self):
+        self.part(0, {"a": {}})
+        self.part(1, {"b": {}})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        (self.out / "shards.json").write_text("not json\n", encoding="utf-8")
+        result = self.run_merge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot read the shard plan", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.out / "index.json").exists())
+
+    def test_cli_refuses_a_corrupt_marker(self):
+        self.part(0, {"a": {}})
+        self.marker(0, 2)
+        (self.out / "shard0.json").write_text("not json\n", encoding="utf-8")
+        result = self.run_merge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot read the shard marker", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.out / "index.json").exists())
 
 
 class ShardRoundTripTest(unittest.TestCase):
