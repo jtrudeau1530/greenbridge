@@ -1029,5 +1029,239 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(state.read_vgpr_pair(6), CANONICAL_QNAN)
 
 
+# ============================================================================
+# Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ============================================================================
+
+@dataclass
+class FPStatusFlags:
+    """IEEE 754 / RDNA2 floating-point exception sticky flags."""
+    invalid: bool = False       # IOC: Invalid operation (negative operand, sNaN)
+    div_by_zero: bool = False   # DZC: Division by zero (+0.0, -0.0 input)
+    overflow: bool = False      # OFC: Overflow
+    underflow: bool = False     # UFC: Underflow
+    inexact: bool = False       # IXC: Inexact transcendental/rounding result
+
+    def accumulate(self, other: FPStatusFlags) -> None:
+        """Accumulate (bitwise OR) flags into hardware sticky status register."""
+        self.invalid |= other.invalid
+        self.div_by_zero |= other.div_by_zero
+        self.overflow |= other.overflow
+        self.underflow |= other.underflow
+        self.inexact |= other.inexact
+
+    def to_bits(self) -> int:
+        """Encode flags into hardware status register bitmask."""
+        bits = 0
+        if self.invalid:
+            bits |= 1 << 0
+        if self.div_by_zero:
+            bits |= 1 << 1
+        if self.overflow:
+            bits |= 1 << 2
+        if self.underflow:
+            bits |= 1 << 3
+        if self.inexact:
+            bits |= 1 << 4
+        return bits
+
+
+def compute_v_rsq_f64_flags(
+    src_bits: int,
+    abs_src: bool = False,
+    neg_src: bool = False,
+    clamp: bool = False,
+    flush_subnormals: bool = False,
+) -> Tuple[int, FPStatusFlags]:
+    """Compute v_rsq_f64 result along with its architectural FP exception flags."""
+    flags = FPStatusFlags()
+    s = apply_f64_modifiers(src_bits, abs_src, neg_src)
+
+    # Subnormal input under FTZ
+    if flush_subnormals and is_subnormal(s):
+        flags.underflow = True
+        s = NEG_ZERO if (s & SIGN_MASK) else POS_ZERO
+
+    # Signaling NaN input raises Invalid
+    if is_snan(s):
+        flags.invalid = True
+        res = POS_ZERO if clamp else (s | QNAN_BIT)
+        return res, flags
+
+    # Quiet NaN input propagates without Invalid
+    if is_nan(s):
+        res = POS_ZERO if clamp else (s | QNAN_BIT)
+        return res, flags
+
+    # Negative non-zero and -Infinity input raises Invalid
+    if (s & SIGN_MASK) and not is_zero(s):
+        flags.invalid = True
+        res = POS_ZERO if clamp else CANONICAL_QNAN
+        return res, flags
+
+    # Zero input raises Division-by-Zero
+    if is_zero(s):
+        flags.div_by_zero = True
+        res = ONE_F64 if clamp else POS_INF
+        return res, flags
+
+    # Positive Infinity
+    if s == POS_INF:
+        return POS_ZERO, flags
+
+    # Positive finite numbers
+    val = bits_to_f64(s)
+    res_val = 1.0 / math.sqrt(val)
+
+    # Check exact powers of 2/4
+    # An input is an exact power of 4 if log2(val) is an even integer
+    is_exact = False
+    if val > 0.0:
+        log2_val = math.log2(val)
+        if log2_val.is_integer() and (int(log2_val) % 2 == 0):
+            is_exact = True
+
+    if not is_exact:
+        flags.inexact = True
+
+    if clamp:
+        if res_val < 0.0:
+            res_val = 0.0
+        elif res_val > 1.0:
+            res_val = 1.0
+
+    res_bits = f64_to_bits(res_val)
+    if is_subnormal(res_bits):
+        flags.underflow = True
+
+    return res_bits, flags
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, IEEE 754 status flags, and VCC condition masks."""
+
+    def test_invalid_flag_negative_inputs(self) -> None:
+        """Negative operands raise the Invalid Operation (IOC) status flag."""
+        _, flags_neg4 = compute_v_rsq_f64_flags(NEG_FOUR_F64)
+        self.assertTrue(flags_neg4.invalid)
+        self.assertFalse(flags_neg4.div_by_zero)
+
+        _, flags_neginf = compute_v_rsq_f64_flags(NEG_INF)
+        self.assertTrue(flags_neginf.invalid)
+
+    def test_invalid_flag_signaling_nan(self) -> None:
+        """Signaling NaN operand raises the Invalid Operation (IOC) status flag."""
+        snan = POS_INF | 0x0001_0000
+        _, flags = compute_v_rsq_f64_flags(snan)
+        self.assertTrue(flags.invalid)
+
+    def test_quiet_nan_does_not_raise_invalid(self) -> None:
+        """Quiet NaN operand propagates without asserting Invalid Operation."""
+        _, flags = compute_v_rsq_f64_flags(CANONICAL_QNAN)
+        self.assertFalse(flags.invalid)
+
+    def test_div_by_zero_flag_zeros(self) -> None:
+        """Both +0.0 and -0.0 raise Division by Zero (DZC)."""
+        _, flags_pos0 = compute_v_rsq_f64_flags(POS_ZERO)
+        self.assertTrue(flags_pos0.div_by_zero)
+        self.assertFalse(flags_pos0.invalid)
+
+        _, flags_neg0 = compute_v_rsq_f64_flags(NEG_ZERO)
+        self.assertTrue(flags_neg0.div_by_zero)
+
+    def test_inexact_flag_non_perfect_squares(self) -> None:
+        """Non-exact reciprocal square roots (2.0, 3.0, 10.0) assert Inexact (IXC)."""
+        _, flags_two = compute_v_rsq_f64_flags(TWO_F64)
+        self.assertTrue(flags_two.inexact)
+
+        _, flags_three = compute_v_rsq_f64_flags(THREE_F64)
+        self.assertTrue(flags_three.inexact)
+
+    def test_exact_roots_do_not_raise_inexact(self) -> None:
+        """Exact roots of powers of 4 (1.0, 4.0, 16.0, 0.25, 0.0625) do not assert Inexact."""
+        _, flags_1 = compute_v_rsq_f64_flags(ONE_F64)
+        self.assertFalse(flags_1.inexact)
+
+        _, flags_4 = compute_v_rsq_f64_flags(FOUR_F64)
+        self.assertFalse(flags_4.inexact)
+
+        _, flags_16 = compute_v_rsq_f64_flags(SIXTEEN_F64)
+        self.assertFalse(flags_16.inexact)
+
+        _, flags_quarter = compute_v_rsq_f64_flags(QUARTER_F64)
+        self.assertFalse(flags_quarter.inexact)
+
+        _, flags_sixteenth = compute_v_rsq_f64_flags(SIXTEENTH_F64)
+        self.assertFalse(flags_sixteenth.inexact)
+
+    def test_cumulative_sticky_flags_accumulation(self) -> None:
+        """Verify that sticky status register correctly accumulates flags across instructions."""
+        sticky = FPStatusFlags()
+
+        # Step 1: exact operation -> no flags
+        _, f1 = compute_v_rsq_f64_flags(FOUR_F64)
+        sticky.accumulate(f1)
+        self.assertEqual(sticky.to_bits(), 0)
+
+        # Step 2: division by zero -> div_by_zero flag (bit 1)
+        _, f2 = compute_v_rsq_f64_flags(POS_ZERO)
+        sticky.accumulate(f2)
+        self.assertEqual(sticky.to_bits(), 1 << 1)
+
+        # Step 3: negative operand -> invalid flag (bit 0)
+        _, f3 = compute_v_rsq_f64_flags(NEG_FOUR_F64)
+        sticky.accumulate(f3)
+        self.assertEqual(sticky.to_bits(), (1 << 0) | (1 << 1))
+
+        # Step 4: inexact operation -> inexact flag (bit 4)
+        _, f4 = compute_v_rsq_f64_flags(TWO_F64)
+        sticky.accumulate(f4)
+        self.assertEqual(sticky.to_bits(), (1 << 0) | (1 << 1) | (1 << 4))
+
+    def test_vcc_condition_masks(self) -> None:
+        """Compute condition mask across SIMD wave lanes (emulating V_CMP / VCC)."""
+        simd = SIMDState(num_lanes=64, exec_mask=MASK64)
+        # Assign various values across lanes
+        for lane in range(64):
+            if lane % 4 == 0:
+                simd.write_lane_vgpr_pair(lane, 0, POS_ZERO)  # -> +inf
+            elif lane % 4 == 1:
+                simd.write_lane_vgpr_pair(lane, 0, POS_INF)   # -> +0.0
+            elif lane % 4 == 2:
+                simd.write_lane_vgpr_pair(lane, 0, NEG_FOUR_F64)  # -> NaN
+            else:
+                simd.write_lane_vgpr_pair(lane, 0, FOUR_F64)  # -> 0.5 (positive finite)
+
+        instr = VRSQF64Instruction(
+            dst=RegPair(2, RegType.VGPR),
+            src0=VOP3Operand.from_vgpr(0),
+        )
+        interp = SIMDInterpreter(simd)
+        res = interp.execute(instr)
+
+        # Build condition bitmasks
+        vcc_zero = 0
+        vcc_inf = 0
+        vcc_nan = 0
+        vcc_finite_pos = 0
+
+        for lane, r in enumerate(res):
+            assert r is not None
+            if is_zero(r):
+                vcc_zero |= (1 << lane)
+            elif is_inf(r):
+                vcc_inf |= (1 << lane)
+            elif is_nan(r):
+                vcc_nan |= (1 << lane)
+            else:
+                vcc_finite_pos |= (1 << lane)
+
+        # Verify orthogonal bitmasks partition the wave lanes
+        self.assertEqual(vcc_zero | vcc_inf | vcc_nan | vcc_finite_pos, MASK64)
+        self.assertEqual(vcc_zero & vcc_inf, 0)
+        self.assertEqual(vcc_zero & vcc_nan, 0)
+        self.assertEqual(vcc_inf & vcc_nan, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
