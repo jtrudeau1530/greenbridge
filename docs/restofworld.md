@@ -271,11 +271,58 @@ block boundaries.
 
 Readable: the RPF9 header and data offset, zlib streams, Bink 2 headers, XML content definitions,
 `PSIN` tag/length chains, `0DRP` version and count fields, `RBF0` schema strings, and model-name
-strings in system pages. `42 40 00 00` page relocation tables are visible but not decoded.
+strings in system pages.
+
+**Vertex blocks on graphics pages (ASSET-57).** In core rest-of-world, 958 inflated streams
+start with the target header and another 13 reach it after earlier chunks. In all 971, the
+first 23 little-endian words contain tagged stream locations: for a populated slot,
+the low byte is the tag and twice the upper 24 bits gives the byte offset from the block
+start. Slot 0 starts at +0x80. Sorting the populated slots by offset gives positive spans.
+
+The independent check is the meshlet group following the streams. To locate a candidate
+group, take the greatest common divisor of the adjacent stream spans, try one through four
+times that unit for the final span, then round up to 16 bytes across zero padding.
+In 553 blocks the following group fits and validates: meshlet base offsets match the running
+vertex-reference and triangle counts, and every packed triangle identifies its meshlet and
+uses local indices within range. In 535 of these blocks the referenced indices cover
+every integer from zero through the maximum, and each adjacent span divides exactly by
+the size of that range. For all 535 the measured span per referenced vertex is **8 bytes
+for tag 0x42** and **4 bytes for tags 0x21, 0x25, 0x26, 0x27 and 0x28** wherever
+present with a measured successor. This supports separate vertex streams. It leaves the
+component types, final stream width and blocks without an independent count unresolved.
+
+Across all 22 accessible RPF9 archives, a full data-area scan using the four zlib
+headers from #752 accepted 2,241,411 streams at checksum-validated EOF. There were
+309,007 target page starts and 41,342 streams in which a chunk walk reached the
+target later. Each stream contributes at most its first target block. Of these
+350,349 blocks, 350,348 passed the slot bounds and positive-span checks, 108,342
+had a validated following meshlet group, and 62,207 also had dense references and
+integral span quotients. The recurring widths below account for 61,896 of those
+blocks. Each row counts blocks with a measured successor for that tag.
+
+| Slot tag | Bytes per referenced vertex | Supporting blocks |
+|---|---:|---:|
+| 0x42 | 8 | 61,896 |
+| 0x21 | 4 | 59,308 |
+| 0x25 | 4 | 21,837 |
+| 0x26 | 4 | 60,480 |
+| 0x27 | 4 | 18,030 |
+| 0x28 | 4 | 31,164 |
+| 0x8c | 16 | 3,391 |
+
+Of the 61,896, core rest-of-world contributes 535, minigame 263, full story 110,
+story rest-of-world 1 and the other archives 60,987. Full story alone has 5,589
+target starts and 1,523 continuations. The 311 other integral cases give different
+quotients. A dense range measures the vertices used by the following group and can
+miss vertices used elsewhere. Those cases remain unclassified. The survey counts
+stream occurrences, including duplicates, and excludes opaque data and encrypted
+directory contents.
 
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` payloads, the bodies of the
-`RSC8` headers, the 958 graphics pages beyond their header, the nested RPF9 payloads, and the whole
-`appdata0` data area. "Unread" in the tables above is not a claim that those bytes are empty: in
+`RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
+core graphics blocks, component types and final-slot widths remain unresolved. The stride check
+also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
+"Unread" in the tables above is not a claim that those bytes are empty: in
 `story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and
 in `story000_script` the 53 MB unread region contains four nested RPF9 headers.
 
