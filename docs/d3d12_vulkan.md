@@ -245,8 +245,8 @@ What is implemented (all of it testable without the game):
     support, format support and multisample quality levels. Other queries are logged and refused until the trace
     shows what the game asks (question 11);
   - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
-    (0, 0, 0, A) before applying the caller's component mapping. Render-target, depth-stencil and UAV creation
-    are unsupported for this format.
+    (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
+    image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
   - reserved resources and `GetResourceTiling` (section 4.2);
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar

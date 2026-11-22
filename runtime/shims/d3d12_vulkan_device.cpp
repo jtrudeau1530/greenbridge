@@ -1905,6 +1905,14 @@ public:
                                    D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
                     if (optimal & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
                         fs->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
+                    VkImageFormatProperties limits{};
+                    const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                    if (state_.image_format_properties &&
+                        state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
+                                                       VK_IMAGE_TILING_OPTIMAL, usage, 0, &limits) == VK_SUCCESS &&
+                        limits.maxMipLevels > 1)
+                        fs->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
                 }
                 return S_OK;
             }

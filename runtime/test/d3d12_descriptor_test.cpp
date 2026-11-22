@@ -335,6 +335,7 @@ int main() {
         D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_A8_UNORM};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))));
         EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0);
+        EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_MIP) != 0);
         EXPECT(!(support.Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
                                      D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) && !support.Support2);
         for (UINT count : {1u, 4u}) {
@@ -354,10 +355,14 @@ int main() {
             EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX);
         }
         Ref<ID3D12Resource> byte_textures[2];
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT byte_placed[2]{};
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT byte_placed[2]{}, a8_mip_placed{};
         for (UINT f = 0; f < 2; ++f) {
             auto desc = texture_desc;
             desc.Format = byte_formats[f];
+            if (desc.Format == DXGI_FORMAT_A8_UNORM) {
+                desc.MipLevels = 2;
+                device->GetCopyableFootprints(&desc, 1, 1, 24576, &a8_mip_placed, nullptr, nullptr, nullptr);
+            }
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                               IID_PPV_ARGS(&byte_textures[f].p))));
@@ -369,6 +374,13 @@ int main() {
         for (UINT y = 0; y < size; ++y) {
             auto* row = static_cast<std::uint8_t*>(mapped) + byte_placed[0].Offset + y * byte_placed[0].Footprint.RowPitch;
             for (UINT x = 0; x < size; ++x) row[x] = std::uint8_t(1 + 3 * (y * size + x));
+        }
+
+        constexpr UINT mip_size = size / 2;
+        EXPECT(a8_mip_placed.Footprint.Width == mip_size && a8_mip_placed.Footprint.Height == mip_size);
+        for (UINT y = 0; y < mip_size; ++y) {
+            auto* row = static_cast<std::uint8_t*>(mapped) + a8_mip_placed.Offset + y * a8_mip_placed.Footprint.RowPitch;
+            for (UINT x = 0; x < mip_size; ++x) row[x] = std::uint8_t(208 + y * mip_size + x);
         }
 
         // Shader-visible heaps, start handles in the Xbox shape.
@@ -547,7 +559,8 @@ int main() {
         std::memset(view_bytes(null_slot), 0x77, step);
         device->CreateShaderResourceView(volume.p, &flat_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
-        D3D12_DESCRIPTOR_HEAP_DESC byte_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+        constexpr UINT a8_mip_slot = 4, byte_view_count = a8_mip_slot + 1;
+        D3D12_DESCRIPTOR_HEAP_DESC byte_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, byte_view_count,
                                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> byte_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&byte_heap_desc, IID_PPV_ARGS(&byte_heap.p))));
@@ -572,6 +585,10 @@ int main() {
             byte_view.Format = byte_formats[f];
             device->CreateShaderResourceView(byte_textures[f].p, &byte_view, byte_slot(2 * f + 1));
         }
+        byte_view.Format = DXGI_FORMAT_A8_UNORM;
+        byte_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        byte_view.Texture2D.MostDetailedMip = 1;
+        device->CreateShaderResourceView(byte_textures[0].p, &byte_view, byte_slot(a8_mip_slot));
 
         // D3D-75: plane 1 of a depth-stencil texture is its stencil. The T# is 8_UINT at the texture's own address,
         // with the eight bits read as G and R, B, A as 0, 0, 1 (D3D12's X24_TYPELESS_G8_UINT / X32_..._G8X24_UINT).
@@ -671,6 +688,11 @@ int main() {
             from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             from.PlacedFootprint = byte_placed[f];
             list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            if (byte_formats[f] == DXGI_FORMAT_A8_UNORM) {
+                to.SubresourceIndex = 1;
+                from.PlacedFootprint = a8_mip_placed;
+                list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            }
             const auto ready = transition(to.pResource, D3D12_RESOURCE_STATE_COPY_DEST,
                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &ready);
@@ -719,13 +741,13 @@ int main() {
         EXPECT(sample_through_set(d, set0, set0_layout, keys, results.data()));
         sampled_through_set = true;
 
-        SampleKeys byte_keys[4]{};
-        for (UINT k = 0; k < 4; ++k) {
+        SampleKeys byte_keys[byte_view_count]{};
+        for (UINT k = 0; k < byte_view_count; ++k) {
             std::memcpy(byte_keys[k].tsharp, byte_bytes(k), sizeof(byte_keys[k].tsharp));
             std::memcpy(byte_keys[k].ssharp, sampler_bytes, sizeof(byte_keys[k].ssharp));
             byte_keys[k].first = k * texels;
         }
-        std::array<std::uint8_t, 4 * bytes> byte_results{};
+        std::array<std::uint8_t, byte_view_count * bytes> byte_results{};
         EXPECT(sample_through_set(d, set0, set0_layout, byte_keys, byte_results.data()));
         for (UINT i = 0; i < texels; ++i) {
             const auto value = std::uint8_t(1 + 3 * i);
@@ -733,7 +755,11 @@ int main() {
                                                  {value, 0, 0, 255}, {255, value, 255, 0}};
             for (UINT k = 0; k < 4; ++k)
                 EXPECT(std::memcmp(byte_results.data() + k * bytes + 4 * i, expected[k], 4) == 0);
+            const UINT mip_texel = (i / size / 2) * mip_size + (i % size) / 2;
+            const std::uint8_t mip_expected[] = {0, 0, 0, std::uint8_t(208 + mip_texel)};
+            EXPECT(std::memcmp(byte_results.data() + a8_mip_slot * bytes + 4 * i, mip_expected, 4) == 0);
         }
+        std::printf("A8 mip 1: %u samples matched across %u texels\n", texels, mip_size * mip_size);
         std::printf("A8 and R8 default and remapped views: %u texels matched each\n", texels);
 
         // The border samplers, one tile to the right: every texel is the border.
