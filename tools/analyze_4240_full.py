@@ -312,7 +312,6 @@ def main() -> int:
     parser.add_argument("inputs", nargs="+", help="RPF9 archive paths")
     parser.add_argument("--json", help="Write results to JSON file")
     parser.add_argument("--limit", type=positive_int, help="Limit streams per archive")
-    parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
     # Checked before the scan: the report is written after every archive has been read, so a --json naming one of
     # them replaced the archive with the report, and a folder only failed once the whole scan was done.
