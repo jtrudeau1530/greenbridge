@@ -4996,22 +4996,30 @@ class Gen:
         return tuple(out)
 
     def clamp_gather_lod(self, lod: str, word_reg: int) -> str:
-        """Clamp to S# word 1's unsigned 4.8 MIN_LOD and MAX_LOD before choosing the fetch mip."""
+        """Clamp to S# word 1's unsigned 4.8 MIN_LOD and MAX_LOD before choosing the fetch mip.
+
+        A literal S# uses FClamp. A run-time S# clamps with FMax then FMin: LLPC 26.10.1 (32.0.32015.7029)
+        miscompiles the run-time FClamp here and leaves the gather at mip 0 when MIN_LOD should raise it (#1032).
+        The two-instruction form is the FClamp result for min <= max and passes on that driver."""
         literal = self.sgpr_imm.get(word_reg)
         if literal is not None:
             limits = [self.fconst(((literal >> bit) & 0xfff) / 256.0) for bit in (0, 12)]
-        else:
-            word = self.load_reg("sgpr", word_reg)
-            scale = self.fconst(1.0 / 256.0)
-            limits = []
-            for bit in (0, 12):
-                raw, value, scaled = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{raw} = OpBitFieldUExtract %uint {word} {self.cu(bit)} {self.cu(12)}")
-                self.emit(f"{value} = OpConvertUToF %float {raw}")
-                self.emit(f"{scaled} = OpFMul %float {value} {scale}")
-                limits.append(scaled)
+            clamped = self.tmp()
+            self.emit(f"{clamped} = OpExtInst %float %glsl FClamp {lod} {limits[0]} {limits[1]}")
+            return clamped
+        word = self.load_reg("sgpr", word_reg)
+        scale = self.fconst(1.0 / 256.0)
+        limits = []
+        for bit in (0, 12):
+            raw, value, scaled = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{raw} = OpBitFieldUExtract %uint {word} {self.cu(bit)} {self.cu(12)}")
+            self.emit(f"{value} = OpConvertUToF %float {raw}")
+            self.emit(f"{scaled} = OpFMul %float {value} {scale}")
+            limits.append(scaled)
+        lower = self.tmp()
+        self.emit(f"{lower} = OpExtInst %float %glsl FMax {lod} {limits[0]}")
         clamped = self.tmp()
-        self.emit(f"{clamped} = OpExtInst %float %glsl FClamp {lod} {limits[0]} {limits[1]}")
+        self.emit(f"{clamped} = OpExtInst %float %glsl FMin {lower} {limits[1]}")
         return clamped
 
     def gather_addr(self, c, n, mode):
