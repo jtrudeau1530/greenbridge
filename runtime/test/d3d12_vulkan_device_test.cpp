@@ -3086,8 +3086,8 @@ int main() {
         } else {
             Ref<ID3D12QueryHeap> occlusion;
             Ref<ID3D12Resource> predicate, target;
-            const D3D12_QUERY_HEAP_DESC heap_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
-            EXPECT(SUCCEEDED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&occlusion.p))));
+            const D3D12_QUERY_HEAP_DESC query_heap_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_heap_desc, IID_PPV_ARGS(&occlusion.p))));
             EXPECT(SUCCEEDED(create(default_heap, buffer_desc(256), D3D12_RESOURCE_STATE_COPY_DEST, predicate)));
             EXPECT(SUCCEEDED(create(default_heap,
                                     texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM,
