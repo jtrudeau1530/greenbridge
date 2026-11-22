@@ -354,6 +354,52 @@ class PortArgumentTest(unittest.TestCase):
         self.assertIn("--port 0", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_a_second_viewer_on_the_same_port_is_refused(self):
+        """Two real viewers. With SO_REUSEADDR set, Windows let the second one bind the port the first was serving:
+        it printed its URL and never got a request. The test above holds the port with a plain socket, which
+        Windows does refuse to share, so it did not see this."""
+        first = subprocess.Popen([sys.executable, "-I", str(VIEWER / "serve.py"), "--port", "0"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        second = None
+        try:
+            line = first.stdout.readline()                                        # it is serving now
+            self.assertIn("viewer: http://127.0.0.1:", line)
+            port = urllib.parse.urlsplit(line.split()[1]).port
+            second = subprocess.Popen([sys.executable, "-I", str(VIEWER / "serve.py"), "--port", str(port)],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                out, err = second.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.fail(f"a second viewer is serving port {port} next to the first one")
+        finally:
+            for proc in (first, second):
+                if proc is not None:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.communicate()
+        self.assertEqual(second.returncode, 2, err)
+        self.assertEqual(out, "")
+        self.assertIn(f"can't listen on port {port}", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_a_restart_binds_the_port_a_closed_viewer_just_served(self):
+        handler = functools.partial(serve.Handler, directory=str(VIEWER))
+        port = 0
+        with mock.patch.object(serve.Handler, "log_message", lambda *args: None):
+            for _ in range(3):
+                server = serve.ViewerServer(("127.0.0.1", port), handler)
+                port = server.server_address[1]
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
+                        client.sendall(f"GET / HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode("ascii"))
+                        self.assertTrue(client.recv(64).startswith(b"HTTP/1.0 200"))
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(10)
+
     @unittest.skipIf(os.name == "nt", "sends SIGINT, which a Windows child started this way does not get")
     def test_ctrl_c_stops_the_viewer_without_a_traceback(self):
         import signal

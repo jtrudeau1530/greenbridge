@@ -163,6 +163,18 @@ def port_number(text: str) -> int:
     return value
 
 
+class ViewerServer(http.server.ThreadingHTTPServer):
+    """The viewer's server: a port another viewer is serving is an error on every OS.
+
+    `HTTPServer` sets SO_REUSEADDR so a restart can bind while the old connections are still in TIME_WAIT. On
+    POSIX that is all it does: a second listener on the same address still fails. On Windows SO_REUSEADDR lets
+    a second socket bind a port that is being listened on; that viewer printed its URL and then got no requests,
+    while the browser kept showing the first one's world. Windows needs no option for a restart either, so
+    the option is left off there.
+    """
+    allow_reuse_address = os.name != "nt"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--world", help="exported world directory (omit to show test terrain)")
@@ -173,7 +185,7 @@ def main():
         ap.error(f"--world is not a directory: {a.world}")
     Handler.world = a.world
     try:
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
+        srv = ViewerServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
     except OSError as e:
         # The usual cause is a viewer that is still running on the port; this ended in a traceback.
         ap.error(f"can't listen on port {a.port}: {e.strerror or e}. Is a viewer already running? "
