@@ -8,6 +8,7 @@ Run from the repository root:
 """
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -466,6 +467,25 @@ class CpuRefTest(unittest.TestCase):
         """)
         with self.assertRaises(ValueError):
             cpu_ref.run(path, {"sgprs": {0: 1}})
+
+    def test_malformed_register_assignments_are_cli_errors(self):
+        path = self.write("s_endpgm")
+        for option, assignment, flags in (
+            ("--sgpr", "3", []),
+            ("--vgpr", "3", []),
+            ("--sgpr", "x=0", []),
+            ("--sgpr", "3=bad", []),
+            ("--vgpr", "3=0,1", []),
+            ("--sgpr", "3", ["--parse-only"]),
+        ):
+            with self.subTest(option=option, assignment=assignment, flags=flags):
+                result = subprocess.run([sys.executable, "-I", cpu_ref.__file__, path, option, assignment, *flags],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertIn(option, result.stderr)
+                self.assertIn("N=VALUE", result.stderr)
 
 
 if __name__ == "__main__":
