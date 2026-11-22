@@ -663,7 +663,7 @@ class Gen:
         self.store_reg("sgpr", d["r"], lo)
         self.store_reg("sgpr", d["r"] + 1, hi)
 
-    def compare(self, op, a, scalar, exec_only=False):
+    def compare(self, op, a, scalar, exec_only=False, mods=()):
         """v_cmp_* / s_cmp_*: lane result into VCC/SGPR mask (vector), SCC (scalar), or EXEC (v_cmpx)."""
         parts = op.split("_")          # v_cmp_lt_f32 / s_cmp_eq_u32
         cond, ty = parts[2], parts[3]
@@ -672,25 +672,20 @@ class Gen:
         if ty in ("f32", "f16"):
             if ty == "f32":
                 x, y = self.src_f(srcs[0]), self.src_f(srcs[1])
-            else:   # f16 compare: the low half of each source, compared as f32 (exact for f16 values)
-                vals = []
-                for s in srcs:
-                    u = self.src_h(s)
-                    v2, f = self.tmp(), self.tmp()
-                    self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                    self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
-                    vals.append(self.modify_f(f, s))
-                x, y = vals
+            else:   # f16 compare: op_sel selects lo/hi half of each source, compared as f32 (exact for f16 values)
+                sel, _ = self.opsel_bits(mods, 2)
+                x, y = self.f16_in(srcs[0], sel[0]), self.f16_in(srcs[1], sel[1])
             ops = {"lt": "OpFOrdLessThan", "le": "OpFOrdLessThanEqual", "gt": "OpFOrdGreaterThan",
                    "ge": "OpFOrdGreaterThanEqual", "eq": "OpFOrdEqual", "neq": "OpFUnordNotEqual",
                    "lg": "OpFOrdNotEqual", "nlg": "OpFUnordEqual", "nlt": "OpFUnordGreaterThanEqual",
                    "ngt": "OpFUnordLessThanEqual", "nle": "OpFUnordGreaterThan", "nge": "OpFUnordLessThan"}
         elif ty in ("u16", "i16"):
+            sel, _ = self.opsel_bits(mods, 2)
             x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
             xs, ys = self.tmp(), self.tmp()
             f = "OpBitFieldSExtract" if ty == "i16" else "OpBitFieldUExtract"
-            self.emit(f"{xs} = {f} %uint {x} {self.cu(0)} {self.cu(16)}")
-            self.emit(f"{ys} = {f} %uint {y} {self.cu(0)} {self.cu(16)}")
+            self.emit(f"{xs} = {f} %uint {x} {self.cu(16 if sel[0] else 0)} {self.cu(16)}")
+            self.emit(f"{ys} = {f} %uint {y} {self.cu(16 if sel[1] else 0)} {self.cu(16)}")
             x, y = xs, ys
             if ty == "i16":
                 x, y = self.as_int(x), self.as_int(y)
@@ -794,11 +789,11 @@ class Gen:
         else:
             raise Unsupported("v_cmp destination")
 
-    def compare_x(self, op, a):
+    def compare_x(self, op, a, mods=()):
         """v_cmpx_*: like v_cmp but the result ANDs into EXEC. e32 form has only the two sources; e64 also names
         a destination (vcc/sgpr) which gets the compare result too."""
         srcs = a[-2:]
-        self.compare("v_cmp_" + op[len("v_cmpx_"):], [None] + list(srcs), scalar=False, exec_only=True)
+        self.compare("v_cmp_" + op[len("v_cmpx_"):], [None] + list(srcs), scalar=False, exec_only=True, mods=mods)
 
     def bitcmp(self, op, a):
         """s_bitcmp0/1_b32/b64: test if bit (a[1]) of scalar a[0] is 0 or 1, result in SCC."""
@@ -4500,9 +4495,9 @@ class Gen:
             self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(c)} {x} {old}")
             self.dst(a[0], r)
         elif op.startswith("v_cmp_") and not op.startswith("v_cmp_class") and not op.endswith(("_u64", "_i64")):
-            self.compare(op, a, scalar=False)
+            self.compare(op, a, scalar=False, mods=mods)
         elif op.startswith("v_cmpx_") and not op.startswith("v_cmpx_class") and not op.endswith(("_u64", "_i64")):
-            self.compare_x(op, a)
+            self.compare_x(op, a, mods=mods)
         elif op in ("s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
                     "s_or_saveexec_b32", "s_andn2_saveexec_b32"):
             saved = self.exec_value()
