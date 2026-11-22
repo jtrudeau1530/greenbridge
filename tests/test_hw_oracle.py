@@ -52,6 +52,33 @@ class Text(unittest.TestCase):
         self.assertEqual(asm.gfx10_spelling("global_load_b128 v[4:7], v0, s[2:3]"), "global_load_dwordx4 v[4:7], v0, s[2:3]")
         self.assertEqual(asm.gfx10_spelling("v_mov_b32 v20, 7"), "v_mov_b32 v20, 7")
 
+    def test_gfx1170_and_later_reject_the_ieee_and_dx10_clamp_mode_fields(self):
+        body = ["s_endpgm"]
+        for arch in ("gfx1170", "gfx1200", "gfx1201"):
+            for field in ("ieee", "dx10_clamp"):
+                with self.assertRaisesRegex(asm.ModeUnavailable, field, msg=f"{arch} {field}"):
+                    asm.raw_kernel_text("k0", body, arch, mode={field: 0})
+
+    def test_denormal_and_rounding_mode_fields_still_work_on_gfx12(self):
+        text = asm.raw_kernel_text("k0", ["s_endpgm"], "gfx1201",
+                                   mode={"denorm32": 0, "denorm16_64": 3, "round16_64": 3})
+        self.assertIn(".amdhsa_float_denorm_mode_32 0", text)
+        self.assertIn(".amdhsa_float_denorm_mode_16_64 3", text)
+        self.assertIn(".amdhsa_float_round_mode_16_64 3", text)
+        self.assertNotIn(".amdhsa_ieee_mode", text)
+        self.assertNotIn(".amdhsa_dx10_clamp", text)
+
+    def test_gfx1150_still_emits_the_ieee_and_dx10_clamp_mode_fields(self):
+        text = asm.raw_kernel_text("k0", ["s_endpgm"], "gfx1150", mode={"ieee": 0, "dx10_clamp": 1})
+        self.assertIn(".amdhsa_ieee_mode 0", text)
+        self.assertIn(".amdhsa_dx10_clamp 1", text)
+
+    def test_the_runner_reports_an_unavailable_mode_as_a_skip(self):
+        o = object.__new__(runner.Oracle)      # no tools, no GPU
+        o.arch, o.chunk = "gfx1201", 500
+        with self.assertRaisesRegex(runner.Unavailable, "ieee"):
+            o.run([asm.Kernel(["s_endpgm"], raw=True, mode={"ieee": 0})])
+
     def test_metadata_is_required_and_lists_every_kernel(self):
         text, names, starts = asm.module_text([PROG, PROG, PROG], "gfx1150")
         self.assertEqual(names, ["k0", "k1", "k2"])

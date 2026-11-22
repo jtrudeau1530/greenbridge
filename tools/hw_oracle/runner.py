@@ -286,7 +286,10 @@ class Oracle:
         for wave in (32, 64):
             todo = [i for i, p in enumerate(programs) if (p.wave if isinstance(p, asm.Kernel) else 32) == wave]
             for lo in range(0, len(todo), self.chunk):
-                self._run_chunk(programs, todo[lo:lo + self.chunk], results, words, wave)
+                try:
+                    self._run_chunk(programs, todo[lo:lo + self.chunk], results, words, wave)
+                except asm.ModeUnavailable as e:
+                    raise Unavailable(str(e)) from None
         return results
 
     def _run_chunk(self, programs, idx, results, words, wave=32):
