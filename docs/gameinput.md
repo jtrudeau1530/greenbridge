@@ -245,6 +245,39 @@ sensors are enabled when the pad is opened, at SDL's requested rate, and every p
   reading history cap bound the cost.
 - `gameinput_probe` prints the accel and gyro fractions when the pad has sensors (a resting pad shows ~0.5 g).
 
+## Active input
+
+The title is told that every pad is an Xbox One pad, so it cannot know what the player is holding. The shim keeps
+that record itself, for the runtime's own use, such as button prompt glyphs that follow the device in use:
+`rt::gameinput::active_input()` returns the family of the device used last, a generation that goes up by one with each
+change, and whether `LEONIDA_PROMPTS` forced it. It needs no lock and can be read from any thread, every frame.
+
+| SDL gamepad type | family |
+|---|---|
+| `PS5` (DualSense, DualSense Edge) | PlayStation 5 |
+| `PS4` (DualShock 4) | PlayStation 4 |
+| `PS3` (DualShock 3) | PlayStation 3 |
+| `NINTENDO_SWITCH_PRO`, the Joy-Con types | Nintendo |
+| the [keyboard pad](#keyboard-pad) | keyboard and mouse |
+| everything else (Xbox One/Series, Xbox 360, generic, unknown) | Xbox |
+
+SDL takes the type from the pad's vendor and product id. Only deliberate input changes the answer
+(`runtime/src/active_input.h`, tested by `active_input_test` without SDL):
+
+- an edge: a button going down (any of SDL's, the DualSense touchpad included), a trigger rising past 0.3, or a stick
+  leaving a radius of 0.35. A held button, trigger or stick, stick drift inside the radius and analog noise never
+  count. The mouse moves the keyboard pad's right stick, so a real mouse movement counts through the same rule and a
+  jitter of a count or two does not;
+- a pad's first reading after it connects is its baseline, so connecting a pad with a button held, or with a worn
+  stick resting past the radius, changes nothing;
+- after a change, the next one waits `LEONIDA_PROMPTS_SWITCH_MS` (300 ms by default). Input from another family inside
+  that time is ignored, not queued, so two devices used at once cannot make the answer flicker;
+- input from a second device of the family already in use changes nothing.
+
+Before the first deliberate input the answer is Xbox. Each change logs one line, for example
+`input in use: PlayStation 5 (DualSense Wireless Controller, button press)`. `LEONIDA_PROMPTS` forces a family (a
+line is logged when it takes effect); tracking goes on underneath, so clearing it returns at once to the device in use.
+
 ## Environment variables
 
 | variable | default | effect |
@@ -254,6 +287,8 @@ sensors are enabled when the pad is opened, at SDL's requested rate, and every p
 | `LEONIDA_DS_TRIGGER_FREQ` | `30` | vibration frequency of the `rumble` mode, 1..255 |
 | `LEONIDA_DS_LIGHTBAR` | unset | `RRGGBB` (hex) sets the DualSense/DualShock 4 lightbar when the pad connects; `off` turns it dark; unset keeps SDL's player colour |
 | `LEONIDA_RUMBLE` | `1` | `0` turns all rumble, trigger and force-feedback output off |
+| `LEONIDA_PROMPTS` | `auto` | forces the [active input](#active-input) family: `xbox`, `playstation` (or `ps5`), `ps4`, `ps3`, `nintendo` or `keyboard`; `auto` follows the devices |
+| `LEONIDA_PROMPTS_SWITCH_MS` | `300` | shortest time between two changes of the active input family, 0..2000 ms |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
 | `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
@@ -396,6 +431,12 @@ rests on a transcription rather than on a side-by-side compile.
 
 ## Tests
 
+- `active_input_test` (CTest, no SDL): the [active input](#active-input) tracker's rules on synthetic samples with
+  its own clock. `gameinput_test` runs them on a DualSense, a DualShock 4 (Sony `054c:09cc`), an Xbox pad and the
+  keyboard pad: no change when pads connect (one with a button held) or a held button is let go, each family by a
+  button, the touchpad, a trigger or a stick, stick drift and a one-count mouse jitter ignored, a real mouse movement
+  counted, the 300 ms window on the real clock, and `LEONIDA_PROMPTS` forcing, changing, ignoring an unknown value
+  and clearing.
 - `gameinput_test` (CTest, no controller): turns SDL's real backends off and drives the shim through
   `rt::shims::find` with SDL virtual joysticks, an Xbox-style pad with trigger motors, a DualSense (Sony
   `054c:0ce6`) and a pad without trigger motors. It checks enumeration and device callbacks, the button, stick,
@@ -451,6 +492,9 @@ These need the game executable or a test on hardware:
   `GameInputMotionAccuracyUnknown`; whether a title wants a synthesised quaternion there is unknown.
 - **Device family**: every pad is reported as `GameInputFamilyXboxOne`; a title that filters on family sees only
   that.
+- **Active input behind Steam Input**: when Steam turns a PlayStation pad into a virtual Xbox pad, SDL may report the
+  virtual one's type, and the active input then says Xbox; `LEONIDA_PROMPTS` is the way round it until that is
+  checked on a real setup.
 - **Identical pads at start**: twins are numbered in the order the shim opens them. For pads already connected when
   it starts, that is SDL's enumeration order, not measured on Windows for identical pads; if it varies between runs,
   so does which pad gets which id.

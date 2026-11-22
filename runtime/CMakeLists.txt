@@ -813,6 +813,13 @@ if(BUILD_TESTING)
     add_test(NAME xgameruntime_user_gamertag_long COMMAND xgameruntime_user_test --expect-gamertag Player)
     set_tests_properties(xgameruntime_user_gamertag_long PROPERTIES ENVIRONMENT "LEONIDA_GAMERTAG=GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG")
   endif()
+  # The active-input tracker the GameInput shim feeds (src/active_input.h), on synthetic samples: no SDL, no
+  # controller, no GPU, so it builds and runs everywhere, with or without SDL3.
+  add_executable(active_input_test test/active_input_test.cpp)
+  if(MSVC)
+    target_compile_options(active_input_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  add_test(NAME active_input COMMAND active_input_test)
   if(WIN32 AND TARGET gameinput_test)
     add_test(NAME gameinput COMMAND gameinput_test)
   elseif(TARGET gta6rt)
