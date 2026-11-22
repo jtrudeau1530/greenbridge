@@ -4,6 +4,7 @@
 #include "d3d12_com_object.h"
 #include "d3d12_fence_waiter.h"
 #include "d3d12_trace.h"
+#include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
@@ -1012,6 +1013,7 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
 }
 
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     const CommandQueue* q = CommandQueue::from(queue);
     return q && q->uses_calibrated_timestamps();
 }
@@ -1034,6 +1036,7 @@ bool command_signature_info(ID3D12CommandSignature* signature, leonida::Indirect
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     const CommandQueue* q = CommandQueue::from(queue);
     return q ? q->last_result() : leonida::ReplayResult::unsupported;
 }

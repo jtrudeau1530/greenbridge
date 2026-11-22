@@ -158,6 +158,14 @@ if(WIN32)
     else()
       message(STATUS "dxgi.lib not found: device_proxy_test is not built")
     endif()
+    # The queue and fence proxies over synthetic COM objects: no D3D12 runtime, no GPU. Replaces operator new and
+    # patches its own import table to inject failures, so the proxy source is compiled into it alone.
+    add_executable(xs_proxy_mock_test
+      test/xs_proxy_mock_test.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_compile_definitions(xs_proxy_mock_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xs_proxy_mock_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
   else()
     message(STATUS "d3d12.lib not found: root_sig_test and device_proxy_test are not built")
   endif()
@@ -438,6 +446,13 @@ if(BUILD_TESTING)
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
     set_tests_properties(device_proxy PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)
+  endif()
+  if(TARGET xs_proxy_mock_test)
+    add_test(NAME xs_proxy_mock COMMAND xs_proxy_mock_test)
+    # The guard region's setup failing (one process each: the tables are built once per process).
+    add_test(NAME xs_proxy_mock_no_reserve COMMAND xs_proxy_mock_test --fail-virtualalloc)
+    add_test(NAME xs_proxy_mock_no_protect COMMAND xs_proxy_mock_test --fail-virtualprotect)
+    add_test(NAME xs_proxy_mock_no_handler COMMAND xs_proxy_mock_test --fail-veh)
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
@@ -777,6 +792,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_fence_events_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_fence_events COMMAND d3d12_fence_events_test)
     set_tests_properties(d3d12_fence_events PROPERTIES SKIP_RETURN_CODE 77)
+    # Xbox-ABI queue and fence proxies behind the device proxy, on the host runtime (WARP, a hardware adapter) and
+    # on the Vulkan device: forwarding, refusal past the public chain, fence unwrapping. 77: no device at all.
+    add_executable(queue_proxy_test test/queue_proxy_test.cpp)
+    target_link_libraries(queue_proxy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(queue_proxy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(queue_proxy_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME queue_proxy COMMAND queue_proxy_test)
+    set_tests_properties(queue_proxy PROPERTIES SKIP_RETURN_CODE 77)
     # The countdown behind those event-backed waits, with no GPU: the full unsigned count, no wrap past zero.
     add_executable(d3d12_fence_waiter_test test/d3d12_fence_waiter_test.cpp)
     target_compile_definitions(d3d12_fence_waiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
