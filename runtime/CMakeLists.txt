@@ -274,6 +274,20 @@ if(BUILD_TESTING)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
+
+    # LEONIDA_UNIMPLEMENTED=log|fail|stop: builds its own image with two imports that bind to nothing, calls them in
+    # process (log, fail) and in child processes (default/env parsing, stop). No game files, no GPU.
+    add_executable(unimplemented_policy_test
+      test/unimplemented_policy_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(unimplemented_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(unimplemented_policy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(unimplemented_policy_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(unimplemented_policy_test PRIVATE /OPT:NOREF)
+    add_dependencies(unimplemented_policy_test gta6rt_tls_host)
+    add_test(NAME unimplemented_policy COMMAND unimplemented_policy_test)
   endif()
 
   if(WIN32 AND TARGET root_sig_test)
