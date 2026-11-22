@@ -472,7 +472,9 @@ side inwards:
 
     Growth leaves 64 descriptors of each limit to the other sets of a pipeline layout. It also stays within
     `maxPerSetDescriptors`, which never shrinks the default counts, because a layout past it may still be
-    supported. The other arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
+    supported: past it, the device grows only where `vkGetDescriptorSetLayoutSupport` accepts the grown layout.
+    Intel's UHD 770 (101.7092) reports 6159 and accepts the full sizes, so it gets the same set as an RTX (D3D-219).
+    The other arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
     and 4000 samplers) the set has 65536 2D images, 3936 samplers and 4096 storage indices in 2D: 93793
     descriptors, 3-6 MiB at 32-64 bytes a descriptor. The device prints the counts it chose, and
     `bindless_sizing_test` checks the rules on synthetic limits.
@@ -1088,6 +1090,9 @@ The layer's descriptor model:
   `VK_EXT_image_view_min_lod`. Vulkan allows the image-view minimum to be rounded down to an integer.
   With nearest mip filtering, the UHD 770 and Arrow Lake Xe-LPG returned mip 0 for a 2D minimum of 0.75.
   The Xe-LPG also returned mip 1 for a 2D-array minimum of 1.75. RTX and Radeon returned mips 1 and 2.
+  On Intel integrated GPUs the layer therefore passes the clamp rounded to the nearest level
+  (`ceil(minLod + 0.5) - 1`), which point mip filtering selects exactly; linear mip filtering then blends from that
+  whole level instead of the fraction (D3D-219). `LEONIDA_MIN_LOD_INTEGER=1` or `0` forces the rounding on or off.
   See [Vulkan image-level selection](https://docs.vulkan.org/spec/latest/chapters/textures.html#textures-image-level-selection)
   and the [Intel readbacks](https://github.com/ItsNotRexed/Leonida/pull/1015#issuecomment-7075135647).
   If the logical device lacks the feature, the runtime logs the unsupported view
