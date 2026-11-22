@@ -742,16 +742,33 @@ class Gen:
 
     def f64_add_mode(self, x, y, r, lo, hi):
         """v_add_f64 under MODE.FP_ROUND[3:2]: ``r`` = x + y rounded to nearest (bits lo/hi). When the mode is
-        toward zero (3) and the nearest result rounded away from zero, step one ulp back. The rounding error comes
-        from TwoSum (exact: every float op is NoContraction): e = (x - (r - (r - x))) + (y - (r - x)); r was
-        rounded away from zero when e and r have opposite signs. A finite sum that overflowed to inf becomes
-        +-DBL_MAX. Returns the new (lo, hi)."""
-        bb, t1, t2, t3, e = (self.tmp() for _ in range(5))
-        self.emit(f"{bb} = OpFSub %double {r} {x}")
-        self.emit(f"{t1} = OpFSub %double {r} {bb}")
-        self.emit(f"{t2} = OpFSub %double {x} {t1}")
-        self.emit(f"{t3} = OpFSub %double {y} {bb}")
-        self.emit(f"{e} = OpFAdd %double {t2} {t3}")
+        toward zero (3) and the nearest result rounded away from zero, step one ulp back. Ordering the operands so
+        |a| >= |b| keeps FastTwoSum (bb = r - a, e = b - bb; every float op is NoContraction) inside +-DBL_MAX
+        whenever ``r`` is finite (``|r - a| <= max(|r|, |a|) <= DBL_MAX``), whereas unordered TwoSum ``r - x`` can
+        overflow to +-inf and turn ``e`` into NaN when |x| < |y| with opposite signs near +-DBL_MAX; r was rounded
+        away from zero when e and r have opposite signs. A finite sum that overflowed to inf becomes +-DBL_MAX.
+        Returns the new (lo, hi)."""
+        xv, xlo, xhi, yv, ylo, yhi, axhi, ayhi = (self.tmp() for _ in range(8))
+        self.emit(f"{xv} = OpBitcast %v2uint_d {x}")
+        self.emit(f"{xlo} = OpCompositeExtract %uint {xv} 0")
+        self.emit(f"{xhi} = OpCompositeExtract %uint {xv} 1")
+        self.emit(f"{yv} = OpBitcast %v2uint_d {y}")
+        self.emit(f"{ylo} = OpCompositeExtract %uint {yv} 0")
+        self.emit(f"{yhi} = OpCompositeExtract %uint {yv} 1")
+        mask = self.cu(0x7FFFFFFF)
+        self.emit(f"{axhi} = OpBitwiseAnd %uint {xhi} {mask}")
+        self.emit(f"{ayhi} = OpBitwiseAnd %uint {yhi} {mask}")
+        hlt, heq, llt, tie, swap, a, b = (self.tmp() for _ in range(7))
+        self.emit(f"{hlt} = OpULessThan %bool {axhi} {ayhi}")
+        self.emit(f"{heq} = OpIEqual %bool {axhi} {ayhi}")
+        self.emit(f"{llt} = OpULessThan %bool {xlo} {ylo}")
+        self.emit(f"{tie} = OpLogicalAnd %bool {heq} {llt}")
+        self.emit(f"{swap} = OpLogicalOr %bool {hlt} {tie}")
+        self.emit(f"{a} = OpSelect %double {swap} {y} {x}")
+        self.emit(f"{b} = OpSelect %double {swap} {x} {y}")
+        bb, e = self.tmp(), self.tmp()
+        self.emit(f"{bb} = OpFSub %double {r} {a}")
+        self.emit(f"{e} = OpFSub %double {b} {bb}")
         z2, zd = self.tmp(), self.tmp()
         self.emit(f"{z2} = OpCompositeConstruct %v2uint_d {self.cu(0)} {self.cu(0)}")
         self.emit(f"{zd} = OpBitcast %double {z2}")
