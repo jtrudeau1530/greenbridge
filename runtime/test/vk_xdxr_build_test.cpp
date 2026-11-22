@@ -6,7 +6,7 @@
 //
 // Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride;
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
-// triangles; 5000 triangles (three radix-sort tiles); and a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
+// triangles; 5000 triangles (many radix-sort tiles); and a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
 // one submission each, after one warm-up; result and scratch in device-local memory) and writes nothing.
@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
     b.vertex_data[3 * 3 * 7] = std::nanf("");                    // triangle 7 of geometry 1: inactive
     if (build_blas(gpu, builder, dir, "blas_two_geometries", {a, b}, multi)) return 1;
     if (build_blas(gpu, builder, dir, "blas_empty", {}, empty)) return 1;
-    // three radix-sort tiles of 2048, the last one partial (fewer rays: the reference's brute force is slow)
+    // many radix-sort tiles (RADIX_TILE elements each), the last one partial (fewer rays: the brute force is slow)
     Built tiles;
     if (build_blas(gpu, builder, dir, "blas_three_sort_tiles", {soup(5000)}, tiles, 200)) return 1;
 

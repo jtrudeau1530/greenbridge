@@ -41,9 +41,10 @@ struct XdxrLayout {
     std::uint32_t size = 0;            // result data size in bytes, a multiple of 64
     std::uint32_t parent_entries = 0;  // one per 64-byte unit from elements_off on
     std::uint32_t sort_size = 0;       // keys the radix sort orders: one per element
-    static constexpr std::uint32_t radix_tile = 2048;  // xdxr_build.comp RADIX_TILE
+    static constexpr std::uint32_t radix_tile = 256;  // xdxr_build.comp RADIX_TILE
     static constexpr std::uint32_t radix_bins = 16;
     static constexpr std::uint32_t radix_passes = 8;
+    static constexpr std::uint32_t small_sort_max = 1024;  // xdxr_build.comp SMALL_SORT_MAX: one-workgroup sort
     std::uint64_t scratch = 0;         // scratch bytes
 
     // False when the count would overflow the 32-bit offsets of the format.
@@ -157,7 +158,7 @@ public:
 private:
     enum : std::uint32_t {
         mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_level = 5, mode_header = 6,
-        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9
+        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
@@ -198,7 +199,11 @@ private:
         dispatch(cb, m, m.count);
         // stable LSD radix sort, 4 bits a pass; an even pass count leaves the result where the keys started
         static_assert(XdxrLayout::radix_passes % 2 == 0, "the sorted keys must end in the first buffer");
-        if (l.sort_size > 1) {
+        if (l.sort_size > 1 && l.sort_size <= XdxrLayout::small_sort_max) {
+            Push s = p;
+            s.mode = mode_small_sort;
+            dispatch(cb, s, 64);                       // one workgroup, shared memory
+        } else if (l.sort_size > 1) {
             for (std::uint32_t pass = 0; pass < XdxrLayout::radix_passes; ++pass) {
                 Push s = p;
                 s.first = pass;
