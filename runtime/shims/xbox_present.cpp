@@ -2,7 +2,10 @@
 
 #include "../src/vulkan_present.h"
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace rt::d3d12 {
 
@@ -28,9 +31,26 @@ XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, l
       pacer_(clock ? *clock : *own_clock_) {
     // A present waiting for a swapchain image gives up once SuspendX has been called.
     presenter_->set_abort([this] { return pacer_.suspended(); });
+    // LEONIDA_SDR_EOTF=gamma22 (or 2.2) decodes SDR with a pure power of 2.2 instead of piecewise sRGB.
+    char eotf[16] = {};
+    std::size_t eotf_length = 0;
+    if (getenv_s(&eotf_length, eotf, "LEONIDA_SDR_EOTF") == 0 && eotf_length > 1 &&
+        (!std::strcmp(eotf, "gamma22") || !std::strcmp(eotf, "2.2")))
+        sdr_eotf_ = leonida::PresentPlanes::SdrEotf::gamma22;
 }
 
 XboxPresentation::~XboxPresentation() { presenter_->set_abort(nullptr); }
+
+float XboxPresentation::effective_sdr_white_nits() {
+    if (sdr_white_override_ > 0.0f) return sdr_white_override_;
+    if (!presenter_->hdr_active()) return 203.0f;  // the Windows setting belongs to HDR mode
+    const auto now = std::chrono::steady_clock::now();
+    if (display_white_time_ == std::chrono::steady_clock::time_point{} || now - display_white_time_ > std::chrono::seconds(1)) {
+        display_white_ = presenter_->display_sdr_white_nits();
+        display_white_time_ = now;
+    }
+    return display_white_ > 0.0f ? display_white_ : 203.0f;
+}
 
 HRESULT XboxPresentation::SetFrameIntervalX(IUnknown*, UINT interval_period_us, UINT latency, UINT flags) {
     return from_pacer(pacer_.set_frame_interval(interval_period_us, latency, flags));
@@ -150,7 +170,9 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         // Every shown plane: a 2D texture, a source rectangle inside it, a placement inside the output.
         leonida::PresentPlanes composed;
         composed.count = overlay ? 2 : 1;
-        composed.sdr_white_nits = sdr_white_nits_;
+        composed.sdr_white_nits = effective_sdr_white_nits();
+        composed.sdr_eotf = sdr_eotf_;
+        composed.hdr_peak_nits = hdr_peak_nits_;
         for (UINT i = 0; i < composed.count; ++i) {
             const XboxPresentPlaneParameters& p = planes[i];
             ID3D12Resource* source = p.ppResources[0];

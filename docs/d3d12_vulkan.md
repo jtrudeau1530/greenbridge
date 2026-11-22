@@ -2067,10 +2067,10 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   the swapchain's size, and a `vkCmdBlitImage` (same size, nearest) puts it in the swapchain image, which keeps the
   swapchain `TRANSFER_DST`-only and the capture path unchanged. The planes are read with `texelFetch` (no sampler, so any
   sampled float/UNORM/sRGB format works and filtering never reads outside the source rectangle); an sRGB-format source is
-  decoded by the texture unit and encoded again, so its bytes come out as stored. Plane 0: `pSrcViewRects[0]` (else the
+  decoded by the texture unit and encoded again, so its bytes are read as stored. Plane 0: `pSrcViewRects[0]` (else the
   whole texture) scaled to `pDestPlacementBase` (fractions of the output; null is the whole output; outside it is black),
   `ScaleFilter` point (the texel containing the sample) or linear/default (bilinear, clamped inside the source rectangle).
-  Plane 1 is blended over plane 0 (after conversion, in the output's encoded space; alpha premultiplied by default or
+  Plane 1 is blended over plane 0 (in linear light after conversion, see "Linear-light filtering and blending"; alpha premultiplied by default or
   straight with `xbox_plane_flag_straight_alpha`) **only** when it carries our `xbox_plane_flag_overlay`; without it plane 1
   is not composed (logged once), as before, because in the public sample it is the GameDVR copy of the frame and blending
   a plane of unknown alpha would draw the frame twice (hypothesis: whether the console blends a second plane at all is
@@ -2084,26 +2084,98 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `xbox_present_test` resizes the window between composed presents.
 
   Colour. Only `RGB_FULL_G22_NONE_P709` (0, SDR, also the default for a zeroed struct) and `RGB_FULL_G2084_NONE_P2020` (12,
-  HDR10) are composed; any other value is composed as SDR and logged once. SDR is G2.2 Rec.709 (the swapchain is UNORM, so
-  SDR bytes pass through untouched, as the plain blit does). If a plane is HDR10 and the surface lists an ST.2084 format
-  (`VK_COLOR_SPACE_HDR10_ST2084_EXT`, `A2B10G10R10` or `A2R10G10B10`; needs `VK_EXT_swapchain_colorspace` enabled on the
-  instance, the test device does) the swapchain is created in it and an HDR10 plane goes through unchanged; an SDR plane is
-  converted by pow 2.2, the Rec.709 to Rec.2020 matrix, times the SDR white level in nits (203, ITU-R BT.2408's
-  reference white; `XboxPresentation::set_sdr_white_nits`), then PQ. If the surface has no such format (the logged
-  fallback), an HDR10 plane is converted to the SDR swapchain by PQ decode, Rec.2020 to Rec.709, division by the white level,
-  **clipping** to 0..1 and pow 1/2.2: there is no tone mapping, so highlights above SDR white clip (honest, not good looking).
-  Blending is done in the output's encoded values (PQ for an HDR10 output), which is not light-linear; the console's
-  blending space is unmeasured. A plane's own alpha in premultiplied form is divided out before a colour conversion and put
-  back after. Bilinear filtering of a straight-alpha plane is done on premultiplied colour (colour times alpha, then divided
-  by the filtered alpha), so a transparent texel adds no colour of its own (found in review by @Flyander; tested across a
-  transparent edge). The real runtime's instance (`create_vulkan_device_standalone`) enables `VK_EXT_swapchain_colorspace`
-  when the loader has it (it did not before; only the test device did), so the HDR10 surface formats can be listed there;
-  `xbox_present_test` checks this on the standalone path. Filtering (bilinear) of an HDR10 plane is done on its PQ-encoded values, not in linear light (an unmeasured
-  choice; it darkens or brightens edges against a linear-light filter). Limited-range and YCbCr colour spaces are not modelled.
-  *Verified* by `xbox_present_test` against a CPU model written from the above (not from the shader): point filtering
-  between opaque SDR planes is byte exact; bilinear, alpha blending (premultiplied and straight, point and bilinear) are
-  within 1 level of 255; the HDR10 to SDR clip and the PQ encoder (an 8-bit swapchain forced to hold PQ values with
-  `force_hdr_encoding`, a test hook) are within 2 levels (GPU `pow`). The HDR10 swapchain itself (format choice, 10-bit
+  HDR10) are composed; any other value is composed as SDR and logged once. The swapchain is UNORM. If a plane is HDR10 and
+  the surface lists an ST.2084 format (`VK_COLOR_SPACE_HDR10_ST2084_EXT`, `A2B10G10R10` or `A2R10G10B10`; needs
+  `VK_EXT_swapchain_colorspace` enabled on the instance, the test device does) the swapchain is created in it and an HDR10
+  plane goes through the working space unchanged; else the swapchain is SDR (the logged fallback). The real runtime's
+  instance (`create_vulkan_device_standalone`) enables `VK_EXT_swapchain_colorspace` when the loader has it (it did not
+  before; only the test device did), so the HDR10 surface formats can be listed there; `xbox_present_test` checks this on
+  the standalone path. Limited-range and YCbCr colour spaces are not modelled.
+
+  *Linear-light filtering and blending* (decision from the sources below; the console's own blending space is unmeasured).
+  Every texel of a plane is decoded to linear light before it is weighted, the filtered plane is converted to the output's
+  working space, plane 1 is blended over plane 0 there, and the sum is encoded once:
+
+  1. Decode. SDR planes: the SDR EOTF (below) gives linear Rec.709 with 1.0 = SDR white. HDR10 planes: PQ inverse to linear
+     nits (Rec.2020). Premultiplied data is divided by alpha for the decode and multiplied again after, so what is filtered
+     and blended is linear premultiplied colour; straight-alpha colour is premultiplied after the decode, so a transparent
+     texel adds no colour of its own (found in review by @Flyander).
+  2. Convert, still linear. HDR10 output: SDR to Rec.2020 (the Rec.709 to Rec.2020 matrix from the primaries; rows sum to 1)
+     times the SDR white level in nits. SDR output: HDR10 to Rec.709 (the inverse matrix), divided by the SDR white level, then
+     tone mapped (below). A plane already in the output's space is not converted.
+  3. Blend `over + (1 - alpha) * base` (premultiplied; straight alpha was premultiplied in step 1); black outside plane 0.
+  4. Encode once: PQ of the nits for an HDR10 output (argument clamped to 0..10000 nits), the inverse SDR EOTF (clipped to
+     0..1) for an SDR one.
+
+  Why. Microsoft's Advanced Color documentation says DWM composes in linear scRGB (FP16, "excellent precision for linear
+  gamma blend operations"), that an app which puts SDR and HDR content into one surface must apply the SDR boost itself, in
+  linear space (multiply by SdrWhiteLevel / 80), and, for a non-linear space such as HDR10, to "consider converting into
+  linear gamma to apply the adjustment"; it describes no blending in PQ, and a weighted sum of PQ values is not a sum of
+  light. (Some compositors blend in a gamma space to avoid banding; KDE's KWin has since Plasma 6.2. Our intermediate image
+  is RGBA16F, so banding is not what limits us here.) Each plane costs a decode and an encode per texel; a single SDR plane
+  still comes out byte for byte (`xbox_present_test`: within the 8-bit rounding of the RGBA16F intermediate, and equal to the
+  plain blit at 1:1). What changes against the first version of this section: bilinear filtering and alpha now weight light,
+  not encoded values, so a 50% white overlay on black is byte 188 (piecewise sRGB) or 186 (gamma 2.2), not 128, and a
+  bilinear edge between a dark and a bright texel is brighter than the same edge filtered in the encoded values. Whether
+  the title's art expects the encoded-space result (UI is often authored that way on SDR consoles; inference) is unmeasured
+  and is to be settled by a comparison with the title; the blend space is the one place that would then get a switch.
+
+  *SDR EOTF* (selectable). Default: the piecewise sRGB curve (IEC 61966-2-1: `e / 12.92` up to 0.04045, else
+  `((e + 0.055) / 1.055)^2.4`). Option: a pure power of 2.2 (`XboxPresentation::set_sdr_eotf`, or the environment variable
+  `LEONIDA_SDR_EOTF=gamma22` read when the object is made; `PresentPlanes::sdr_eotf` in the presenter). The inverse of the
+  same curve encodes an SDR output, so SDR in an SDR output stays the identity. Why piecewise as the default:
+  **community-sourced**, not a Microsoft statement. KDE developer Xaver Hugl reports that Windows decodes SDR content with
+  the piecewise sRGB curve when HDR is on (raised darks, "washed out") while SDR displays use gamma 2.2
+  (https://planet.kde.org/xavers-blog-2025-03-31-on-brightness-and-calibrating-your-displays/), and the ledoge
+  win11hdr-srgb-to-gamma2.2-icm project exists to make Windows use 2.2 instead
+  (https://github.com/ledoge/win11hdr-srgb-to-gamma2.2-icm). What a PC player compares against is Windows, so that is the
+  default; art mastered on a gamma 2.2 display looks closer to its intent with the option. The Xbox's own SDR-in-HDR decode
+  is unmeasured. An sRGB-format source is encoded again with the sRGB curve first (the texture unit had decoded it), so its
+  stored bytes are decoded by the chosen EOTF exactly as UNORM bytes would be.
+
+  *SDR white level* (the nits that SDR white 1.0 maps to in an HDR10 output, and what HDR10 is divided by for an SDR one).
+  `XboxPresentation::set_sdr_white_nits(n)` with n > 0 overrides everything (n = 0 goes back to automatic). Otherwise, while
+  the swapchain is HDR10, Windows' SDR content brightness for the output the window is on:
+  `DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL)` on the active display path whose GDI source name
+  is the window's monitor, `nits = SDRWhiteLevel / 1000 * 80` (1000 is 80 nits, the scRGB 1.0;
+  https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-displayconfig_sdr_white_level), read at most once a
+  second. Otherwise (an SDR swapchain, or no answer) 203 nits, the HDR reference white of ITU-R BT.2408 (graphics white, 58% PQ;
+  https://www.itu.int/dms_pub/itu-r/opb/rep/R-REP-BT.2408-9-2026-TOC-HTM-E.htm; the W3C CSS Color HDR module uses 203 too,
+  https://www.w3.org/TR/css-color-hdr-1; the report's text itself was not parsed here). Windows' setting is a PC desktop's;
+  the console's is unknown, which is why the override exists. Measured here: the query returns 80.0 nits for the SDR-mode
+  desktop of both test GPUs' output (HDR is off there), and 1000, 2500 and 6000 convert to 80, 200 and 480.
+
+  *HDR10 content on an SDR output*: tone mapped, no longer clipped. After step 2, the luminance Y of the Rec.709 value
+  (0.2126 R + 0.7152 G + 0.0722 B, 1.0 = SDR white) goes through extended Reinhard (Reinhard, Stark, Shirley, Ferwerda,
+  "Photographic Tone Reproduction for Digital Images", SIGGRAPH 2002, eq. 4): `Yd = Y (1 + Y / Lw^2) / (1 + Y)`, the colour
+  scaled by Yd / Y, with the white point `Lw = peak / SDR white`, where `peak` is the content's peak (default 1000 nits,
+  `set_hdr_peak_nits`; no metadata is read, so this is an assumption). Content at `peak` maps to exactly 1.0 and dark colours
+  are unchanged, but everything is compressed on the way: SDR white (203 nits) comes out at `(1 + 1 / Lw^2) / 2`, about half
+  the linear light (byte 191 of 255 at peak 1000, 197 at 600). Per-channel values above 1 after the scaling (saturated
+  highlights) are still clipped; there is no gamut mapping and no dither. Microsoft shows a scaled Reinhard as the simple
+  alternative to DWM's hard clip outside 0..1. A knee (identity up to some level) or the ITU-R BT.2390 EETF would look better
+  and are not done.
+
+  *HDR metadata*: not sent. The presenter never calls `vkSetHdrMetadataEXT`. Microsoft no longer recommends
+  `IDXGISwapChain4::SetHDRMetaData` and says Windows does not guarantee the values reach the display
+  (https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgiswapchain4-sethdrmetadata); vkd3d-proton
+  forwards `SetHDRMetaData` to `vkSetHdrMetadataEXT` only for an explicit `DXGI_HDR_METADATA_TYPE_HDR10` block (libs/vkd3d/
+  swapchain.c in the repository, read as source, not from a release note), so a title that sets none gets none there either.
+  We invent no mastering values (Vulkan treats unknown `VkHdrMetadataEXT` fields as 0). Forwarding a title's explicit HDR10
+  block is possible once a `SetHDRMetaData` slot exists.
+
+  Sources for the PQ chain: the constants are the exact rationals of SMPTE ST 2084 / ITU-R BT.2100 (m1 = 2610/16384,
+  m2 = 2523/4096 x 128, c1 = 3424/4096, c2 = 2413/128, c3 = 2392/128; https://en.wikipedia.org/wiki/Perceptual_quantizer),
+  1.0 = 10,000 nits; the Rec.709 to Rec.2020 matrix is computed from the primaries (ITU-R BT.2087 specifies the same
+  conversion; its PDF was not parsed). Microsoft's Advanced Color document:
+  https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range.
+
+  *Verified* by `xbox_present_test` against a CPU model written from the above (not from the shader; it decodes, converts,
+  blends and encodes in double precision): point filtering between opaque SDR planes is byte exact; bilinear, alpha blending
+  (premultiplied and straight, point and bilinear), the sRGB and gamma 2.2 EOTFs and the linear 50% overlay are within 1
+  level of 255; the HDR10 to SDR tone map (peaks 1000 and 600 nits) and the PQ encoder (an 8-bit swapchain forced to hold
+  PQ values with `force_hdr_encoding`, a test hook) are within 2 levels (GPU `pow`; the PQ codes of the source are 10-bit).
+  The HDR10 swapchain itself (format choice, 10-bit
   capture, pass-through): **verified on an RTX 5080 (driver 616.56, Windows 11) with an HDR10 surface by @JavierBlanco23
   in #2069** (native ST.2084 swapchain within 1 code, GameDVR plane drop, tearing); **not verified on AMD**: the
   author's Radeon 880M and RTX 5070 Laptop (desktop without HDR enabled) list no ST.2084 surface, where the test logs
@@ -2137,7 +2209,7 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until
   `SetFrameIntervalX` and `ScheduleFrameEventX` are called again, as the samples do. Tokens keep counting. Calling
   `SetFrameIntervalX` again outside suspend keeps the origin event armed and re-bases the vblank grid on that moment.
-- *Not done*: tone mapping of HDR10 to an SDR swapchain (clipped), scRGB, limited-range
+- *Not done*: a knee or BT.2390 tone map and gamut mapping for HDR10 on an SDR swapchain (extended Reinhard only), scRGB, limited-range
   and YCbCr colour spaces, `ResourceCount` above 1 (refused with `DXGI_ERROR_UNSUPPORTED` before either path, logged once, since only resource 0 would be read; found in review by @Flyander), extended descriptors (`pExtendedDescs`) and `ViewCount`, capturing a
   second (GameDVR) output, resolving multisampled planes, a mutable-format swapchain (an sRGB/UNORM
   alternation recreates the swapchain; `VK_KHR_swapchain_mutable_format` is not enabled on the device), a host-vblank clock (the timer drifts from the
@@ -2597,7 +2669,7 @@ M0–M2 do not need the executable.
 | **M4** | Compute PSOs, UAVs, storage images, indirect dispatch, copy queues, async streaming | Asset loading and GPU compute | The world's streaming path runs without device loss; compute results match a CPU/reference check. **Synthetic part met** by `d3d12_m4_compute_test`: through the proxy, D3D12 API only, with translator-output compute shaders (`cs_m4_fill.asm` and `cs_m4_indirect.asm`, hand-written RDNA2). A COPY queue streams an input buffer in (`CopyBufferRegion` from an UPLOAD buffer into a DEFAULT buffer created in COMMON), `Signal`; a COMPUTE queue `Wait`s on it and runs one list: a compute root signature (four root constants and a descriptor table of five UAVs: a structured buffer, three raw buffers and an `R32_UINT` `RWTexture2D`), a compute PSO and `Dispatch` (256 threads) that fills the structured buffer and the image from the input and writes the arguments of the next dispatch into a raw buffer; barriers (the argument buffer to `INDIRECT_ARGUMENT`, UAV barriers on the buffer and the image); `ExecuteIndirect` with a dispatch command signature running a second PSO for the 3 groups the first dispatch asked for, which reads the buffer and the image back (`image_load`) and writes a raw output; then everything to COMMON and `Signal`. A COPY queue `Wait`s on that fence, copies the five results (the image through `CopyTextureRegion`) to a readback buffer, and the CPU waits with `SetEventOnCompletion`. Each D3D12 queue has its own `VkQueue` where the family has two (both test GPUs); all 1,924 result words match the CPU reference with error 0; validation (with synchronization validation) clean on the AMD Radeon 880M and the RTX 5070 Laptop. Layer gaps this test found, closed with it: buffer UAVs (structured and raw) were not written (`CreateUnorderedAccessView` stubbed them, now a V# in the slot); `ExecuteIndirect` of a dispatch ran whatever pipeline and root arguments the command buffer had bound instead of the list's (now recorded with the command, as `Dispatch` does); an image created in `UNORDERED_ACCESS` and first used by a shader was zero-filled by the first barrier or copy that named it, losing the shader's writes (now moved to GENERAL, zeroed, by the first submission after its UAV view is created that is not on a copy queue and dispatches or draws; every other queue's next submission waits for that one). **Still open for M4:** the storage-image initialization is tied to the first shader-running submission, not to the list that uses the image, so a list that only reaches an image through a barrier or copy before any dispatch or draw is submitted still zero-fills it first (as before), and an image used by a shader only on a queue that never runs one of its own dispatches or draws first relies on another queue's submission; buffer SRVs and CBVs as V#s (typed buffer UAVs and UAV counters are done: `d3d12_buffer_uav_test`, section 3.4 "Buffer UAVs"), a queue submitted before the queue whose fence it waits on, when a resource's layout is handed over between them (the layout tracker follows submission order, so the copy list was replayed against the layout from before the compute list ran and the run stopped on a validation error; d3d12_queue_wait_test covers Wait-before-Signal without a resource), `ExecuteIndirect` signatures that change root arguments or use count buffers for dispatches, and async streaming itself and the world's streaming path, which need the game |
 | **M5** | Mesh shaders, `ExecuteIndirect`, bindless-table pressure, multi-threaded command lists, pipeline cache | World rendering | A stable open-world frame at any frame rate; then profile and optimise |
 | **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; the builder's 52 console `FSSM` programs (42 pass `spirv-val`, four rules left: [embedded_shaders.md](embedded_shaders.md)) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the `FSSM` translator or a substitute; no unknown XDXR call remains |
-| **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1` on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). **Plane compose** (section 4.5): 1-2 planes scaled from a source rectangle to a destination placement, point or bilinear, plane 1 alpha-blended (premultiplied or straight), SDR and HDR10 (PQ) planes converted to the swapchain, checked against a CPU model on two GPUs with 0 VUIDs (exact for point filtering, within 1-2 levels for bilinear, alpha and PQ conversions); the layouts, flag values and alpha convention are ours, the console's plane semantics are unmeasured, and the public HDR sample's second plane is the GameDVR copy, not an overlay. HDR10 swapchain (ST.2084 surface): verified on an RTX 5080 with an HDR10 display by @JavierBlanco23 in #2069, not on AMD (our test displays list no ST.2084 surface); HDR10 on an SDR swapchain is clipped, not tone mapped. `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; VRS, alt-tab, an AMD HDR10 display run are open |
+| **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1` on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). **Plane compose** (section 4.5): 1-2 planes scaled from a source rectangle to a destination placement, point or bilinear, plane 1 alpha-blended (premultiplied or straight), filtered and blended in linear light, SDR (sRGB or gamma 2.2) and HDR10 (PQ) planes converted to the swapchain, SDR white from Windows' setting when HDR10 is active (else 203 nits), checked against a CPU model on two GPUs with 0 VUIDs (exact for point filtering, within 1-2 levels for bilinear, alpha, tone map and PQ conversions); the layouts, flag values and alpha convention are ours, the console's plane semantics are unmeasured, and the public HDR sample's second plane is the GameDVR copy, not an overlay. HDR10 swapchain (ST.2084 surface): verified on an RTX 5080 with an HDR10 display by @JavierBlanco23 in #2069, not on AMD (our test displays list no ST.2084 surface); HDR10 on an SDR swapchain is tone mapped (extended Reinhard on luminance, then clipped per channel). `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; VRS, alt-tab, an AMD HDR10 display run are open |
 
 **M3 occlusion portability (D3D-209).** Vulkan's [occlusion query specification](https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#queries-occlusion)
 permits a count multiplied by the number of written color outputs, even with `VK_QUERY_CONTROL_PRECISE_BIT`.

@@ -6282,6 +6282,38 @@ bool WindowPresenter::hdr_active() const { return presenter_->hdr_active(); }
 void WindowPresenter::force_hdr_encoding(bool on) { presenter_->force_hdr_encoding(on); }
 std::uint64_t WindowPresenter::composed_presents() const { return presenter_->composed_presents(); }
 
+// DISPLAYCONFIG_SDR_WHITE_LEVEL.SDRWhiteLevel is the white level in units of 80/1000 nits: 1000 is 80 nits (the scRGB 1.0),
+// 2500 is 200 nits (MS Learn, DISPLAYCONFIG_SDR_WHITE_LEVEL). Zero is not a level.
+float sdr_white_nits_from_level(unsigned long level) { return float(level) / 1000.0f * 80.0f; }
+
+float WindowPresenter::display_sdr_white_nits() const {
+    if (!window_) return 0.0f;
+    // The GDI name of the monitor the window is on, matched to a display path's source, whose target has the setting.
+    MONITORINFOEXW monitor{};
+    monitor.cbSize = sizeof(monitor);
+    if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor)) return 0.0f;
+    UINT32 path_count = 0, mode_count = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) return 0.0f;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr) != ERROR_SUCCESS)
+        return 0.0f;
+    for (UINT32 i = 0; i < path_count; ++i) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source), paths[i].sourceInfo.adapterId,
+                        paths[i].sourceInfo.id};
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+            std::wcscmp(source.viewGdiDeviceName, monitor.szDevice) != 0)
+            continue;
+        DISPLAYCONFIG_SDR_WHITE_LEVEL level{};
+        level.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, sizeof(level), paths[i].targetInfo.adapterId,
+                        paths[i].targetInfo.id};
+        if (DisplayConfigGetDeviceInfo(&level.header) != ERROR_SUCCESS || level.SDRWhiteLevel == 0) return 0.0f;
+        return sdr_white_nits_from_level(level.SDRWhiteLevel);
+    }
+    return 0.0f;
+}
+
 bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
 
 void WindowPresenter::set_abort(std::function<bool()> abort) { presenter_->set_abort(std::move(abort)); }
@@ -6342,7 +6374,9 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
     }
-    return std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
+    auto window_presenter = std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
+    window_presenter->set_window(window);
+    return window_presenter;
 }
 
 HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers) {
