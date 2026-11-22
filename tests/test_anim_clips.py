@@ -652,5 +652,34 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn("Traceback", r.stderr)
 
 
+    def test_output_cannot_overwrite_source_archive(self):
+        with open(self.rpf, "rb") as f:
+            data = f.read()
+        other = os.path.join(os.path.dirname(self.rpf), ".", os.path.basename(self.rpf))
+        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, other, "--quiet"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("output must not overwrite the input archive", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), data)
+
+    def test_output_that_is_a_directory_is_refused_before_the_scan(self):
+        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, self.tmp.name, "--quiet"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("is a directory", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_output_in_a_missing_folder_is_created(self):
+        out = os.path.join(self.tmp.name, "reports", "sub", "out.json")
+        r = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["counts"]["animations_decoded"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
