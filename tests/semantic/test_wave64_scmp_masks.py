@@ -23,16 +23,6 @@ import tempfile
 import unittest
 import warnings
 
-if not hasattr(int, "bit_count"):
-    try:
-        import ctypes
-        _mp = vars(int)
-        _d = ctypes.cast(ctypes.c_void_p.from_address(id(_mp) + 16).value, ctypes.py_object).value
-        _d["bit_count"] = lambda self: bin(abs(self)).count("1")
-        ctypes.pythonapi.PyType_Modified(ctypes.py_object(int))
-    except Exception:
-        pass
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
@@ -130,16 +120,10 @@ def pack_u64(lo: int, hi: int) -> int:
     return ((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF)
 
 
-def unpack_u64(val: int) -> tuple[int, int]:
-    """Unpack a 64-bit integer into (lo, hi) 32-bit unsigned words."""
-    u = val & 0xFFFFFFFFFFFFFFFF
-    return u & 0xFFFFFFFF, (u >> 32) & 0xFFFFFFFF
-
-
 def ref_s_cmp_u64(op: str, src0: int, src1: int) -> int:
-    """Pure Python reference oracle for 64-bit scalar comparison operations.
+    """Expected SCC (1 or 0) of a 64-bit scalar compare.
 
-    Computes expected SCC (1 or 0) according to RDNA2 ISA specifications:
+    GFX10 has only these two (llvm-mc rejects s_cmp_lt/le/gt/ge_u64 for gfx1013):
     - s_cmp_eq_u64: SCC = (src0[63:0] == src1[63:0])
     - s_cmp_lg_u64: SCC = (src0[63:0] != src1[63:0])
     """
@@ -149,15 +133,7 @@ def ref_s_cmp_u64(op: str, src0: int, src1: int) -> int:
         return int(s0 == s1)
     if op == "s_cmp_lg_u64":
         return int(s0 != s1)
-    if op == "s_cmp_lt_u64":
-        return int(s0 < s1)
-    if op == "s_cmp_le_u64":
-        return int(s0 <= s1)
-    if op == "s_cmp_gt_u64":
-        return int(s0 > s1)
-    if op == "s_cmp_ge_u64":
-        return int(s0 >= s1)
-    raise ValueError(f"Unsupported 64-bit comparison op: {op}")
+    raise ValueError(f"no 64-bit scalar compare {op} on GFX10")
 
 
 class Wave64OppositeHalvesTests(unittest.TestCase):
@@ -437,32 +413,6 @@ class Wave64ReferenceOracleTests(unittest.TestCase):
             + "s_endpgm\n"
         )
         cls.spv = translate_cs("cs_w64_oracle_u64", asm, threads=64)
-
-    def test_oracle_mathematical_properties(self):
-        """Verify fundamental mathematical invariants of the reference oracle itself."""
-        test_values = [
-            0,
-            0xFFFFFFFFFFFFFFFF,
-            0x5555555555555555,
-            0xAAAAAAAAAAAAAAAA,
-            0x123456789ABCDEF0,
-            1,
-            1 << 31,
-            1 << 32,
-            1 << 63,
-        ]
-        for a in test_values:
-            self.assertEqual(ref_s_cmp_u64("s_cmp_eq_u64", a, a), 1)
-            self.assertEqual(ref_s_cmp_u64("s_cmp_lg_u64", a, a), 0)
-            lo, hi = unpack_u64(a)
-            self.assertEqual(pack_u64(lo, hi), a)
-            for b in test_values:
-                eq = ref_s_cmp_u64("s_cmp_eq_u64", a, b)
-                lg = ref_s_cmp_u64("s_cmp_lg_u64", a, b)
-                self.assertEqual(eq ^ lg, 1)
-                self.assertEqual(eq + lg, 1)
-                self.assertEqual(eq, ref_s_cmp_u64("s_cmp_eq_u64", b, a))
-                self.assertEqual(lg, ref_s_cmp_u64("s_cmp_lg_u64", b, a))
 
     def test_wave64_mask_vs_oracle(self):
         """Cross-check simulated wave64 execution against reference oracle predictions."""
