@@ -387,6 +387,17 @@ $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_resource_desc_test.exe
 ```
 
+`d3d12_placed_dimensions_test` places 1D and 3D textures (arrays, mips, BC1, UAV and render targets, plus a 2D
+control) in heaps big enough for both sides' `GetResourceAllocationInfo`, at offset 0 and at 64 KiB, on the
+Vulkan-backed device and on Windows D3D12 (the default adapter and WARP), and compares the answers and `GetDesc`. A
+dimension outside the enum must be refused alike. It also copies a pattern through a buffer into every subresource of a placed
+3D texture and a placed 1D array and back, and checks the bytes. It needs a Vulkan GPU.
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_placed_dimensions_test.exe
+```
+
 ### Depth and stencil resolves
 
 `d3d12_depth_resolve_test` resolves one plane of a 4x D32 or D24S8 target into a 1x one with
