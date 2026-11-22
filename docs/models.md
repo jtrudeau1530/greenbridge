@@ -504,15 +504,27 @@ are little-endian:
 1. **The effect record.** It starts with a one-byte name length and the name, including its terminator, then a
    u32 whose meaning is not known. Six stage lists follow, each a u32 count and that many u32 ordinals.
 
-   An ordinal is a program's position, in `shaders.rpf` offset order, within its group of the carve index
-   (`<work>/shaders/dxbc/index.json`, sorted by `offset`). The groups are:
+   `shaders.rpf` holds **two shader databases** (SGD5), and an ordinal counts within one of them (found by
+   @jeremygold02). Each database stores six program groups, each a u32 count followed by its programs. A program
+   is a u8-length label including its NUL, one tag byte, a u32-length payload, 152 fixed bytes and a u32-length
+   trailer. The u32 after group 5 is the database's effect count. An ordinal is the zero-based position in the
+   group of the effect's own database, so a lookup needs the database, the group and the ordinal.
 
-   - **List 0:** the VS and MS together, 11,518 programs. The three records' lists hold both kinds: the rim's 41
-     entries are 37 MS and 4 VS.
-   - **List 1:** the PS, 12,101 programs.
-   - **List 5:** the CS. On the rim and the tire its three entries are exactly the effect's own
-     `<effect>:RaytracingResolve` programs, the ones the material hash leads to in the table above.
-   - **Lists 2–4:** empty in all three records, so their stages are not identified.
+   | Database (group walk starts at) | 0: VS + MS | 1: PS | 2: GS | 3 | 4 | 5: CS | Effects declared |
+   |---|---:|---:|---:|---:|---:|---:|---:|
+   | `0x10E39` | 11,018 | 10,944 | 195 | 0 | 0 | 2,647 | 910 |
+   | `0x10289C81` | 500 | 1,157 | 0 | 0 | 0 | 42 | 22 |
+
+   The two databases add up to the whole carve: 11,518 VS + MS, 12,101 PS, 195 GS and 2,689 CS. Groups 3 and 4 are
+   empty and their stages are not identified. The first database's programs come first in the archive, so for its
+   effects the ordinal also equals the program's position among the carve index's programs of that group, sorted
+   by `offset`. The three records here are all in the first database: the wiper's 11017 is the last entry of its
+   group 0.
+
+   On the rim and the tire, list 5's three entries are exactly the effect's own `<effect>:RaytracingResolve`
+   programs, the ones the material hash leads to in the table above. In the second database all 42 group-5
+   references resolve to programs that carry their effect's name; resolved against the archive-wide CS list
+   instead, none of them do (@jeremygold02).
 2. **The technique table.** A u32 count, then one 4-byte entry per technique: the low 15 bits of its first u16 are
    the name's offset in a string block, and byte 3 is the pass count. A u32 pass total follows, then 24-byte pass
    records. Where the table and its string block sit relative to the record is not derived yet: the three
@@ -520,8 +532,11 @@ are little-endian:
 3. **The pass records.** The first six bytes of each pass select an entry of each stage list: 0 is unused,
    otherwise `stage_list[selector - 1]`.
 
-This is checked on **three records** of a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256 `0bc16345…`). It has not
-been counted over all effects, so for the rest it is a **hypothesis** (AGENTS.md: count over the whole corpus):
+The group walk and its counts above were reproduced on a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256
+`0bc16345…`), and the record and pass format on the three records below. @jeremygold02 reports a census of
+both databases' effects found by a validated search, with no per-effect offsets given. 913 effects have one
+matching technique table: 891 + 22 tables, 23,938 + 1,099 techniques and 27,536 + 1,262 passes. Until that
+census is reproduced, the format beyond these three records is reported rather than confirmed here:
 
 | Record | Stage list sizes | Techniques | Passes (total = sum of counts) | First pass list 0 / list 1 ordinal |
 |---|---|---:|---:|---|
@@ -531,8 +546,9 @@ been counted over all effects, so for the rest it is a **hypothesis** (AGENTS.md
 
 Two things are still open:
 
-- **Finding effect records in general.** The three were found by their offsets; there is no general locator for
-  all effects yet, and the format becomes a rule only once it holds for every one of them.
+- **Finding effect records in general.** The three were found by their offsets. The census locates technique
+  tables by a validated search inside each effect, not by a decoded pointer, and the u32 after an effect's name
+  is still opaque.
 - **Which technique and pass the game draws with.** That is a run-time choice; it is presumably made in the
   executable (RT-5).
 
