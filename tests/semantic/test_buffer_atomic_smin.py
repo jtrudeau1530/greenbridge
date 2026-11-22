@@ -444,6 +444,105 @@ class SIMDBufferInterpreter:
                 self.write_lane_vgpr(lane, inst.vdata.index, ret_val)
 
 
+# ==============================================================================
+# Mutated Oracles for Mutation Testing and Negative Controls
+# ==============================================================================
+
+def mutant_unsigned_min(old_val: int, cmp_val: int) -> int:
+    """Mutant A: uses unsigned comparison instead of signed comparison."""
+    return min(u32(old_val), u32(cmp_val))
+
+
+def mutant_signed_max(old_val: int, cmp_val: int) -> int:
+    """Mutant B: computes maximum instead of minimum."""
+    return u32(max(s32(old_val), s32(cmp_val)))
+
+
+class TestBufferAtomicSminNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 4, count=3)
+
+    def test_syntax_rejection_invalid_offset_range(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+
+    def test_syntax_rejection_vgpr_as_soffset(self) -> None:
+        v_soffset = Register(RegKind.VGPR, 10)
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMIN,
+                vdata=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=v_soffset,
+            )
+
+    def test_mutation_detection_unsigned_vs_signed_min(self) -> None:
+        # For 10 vs -5 (0xFFFFFFFB):
+        # Signed min: -5 (0xFFFFFFFB)
+        # Unsigned min: 10 (since 0xFFFFFFFB > 10 unsigned)
+        val_a = 10
+        val_b = u32(-5)
+        correct = u32(min(s32(val_a), s32(val_b)))
+        mutant = mutant_unsigned_min(val_a, val_b)
+        self.assertEqual(s32(correct), -5)
+        self.assertEqual(mutant, 10)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_signed_max_vs_min(self) -> None:
+        val_a = -20
+        val_b = 30
+        correct = u32(min(s32(val_a), s32(val_b)))
+        mutant = mutant_signed_max(val_a, val_b)
+        self.assertEqual(s32(correct), -20)
+        self.assertEqual(s32(mutant), 30)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_oob_leak(self) -> None:
+        mem = BufferMemory(4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # OOB access at 200
+        mem.write_u32(200, 42)
+        _, in_bounds = ref_buffer_atomic_smin(mem, desc, 0, 200, -10, glc=True)
+        self.assertFalse(in_bounds)
+        self.assertEqual(mem.read_u32(200), 42)
+        # Mutant write
+        mem.write_u32(200, u32(-10))
+        self.assertNotEqual(mem.read_u32(200), 42)
+
+    def test_mutation_detection_inactive_lane_leak(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        sim.set_buffer_descriptor(4, desc)
+        sim.exec_mask = 0x0  # All lanes disabled
+        sim.mem.write_u32(0, 100)
+        sim.write_lane_vgpr(0, 0, u32(-50))
+        sim.write_lane_vgpr(0, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+        self.assertEqual(sim.mem.read_u32(0), 100)
+        # Mutant write
+        sim.mem.write_u32(0, u32(-50))
+        self.assertNotEqual(sim.mem.read_u32(0), 100)
+
+
 class TestBufferAtomicSminIEEE754BoundaryExtremes(unittest.TestCase):
     """Unit tests for boundary extremes, integer ranges, and IEEE 754 bit-pattern handling."""
 
