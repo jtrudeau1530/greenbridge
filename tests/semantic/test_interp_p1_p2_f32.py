@@ -1075,5 +1075,214 @@ class TestRegisterAliasingAndPreservation(unittest.TestCase):
             self.assertEqual(state.get_vgpr_f32(lane, 0), float(lane))
 
 
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point status flags per IEEE 754 and RDNA2 shader core."""
+    invalid: bool = False
+    div_by_zero: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    negative: bool = False
+    zero: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def is_subnormal_f32(bits: int) -> bool:
+    return ((bits & EXP_MASK_F32) == 0) and ((bits & FRAC_MASK_F32) != 0)
+
+
+def evaluate_f32_interp_flags(
+    s_bits: int,
+    p_param_bits: int,
+    addend_bits: int,
+    res_bits: int,
+) -> FPStatusFlags:
+    """Evaluate architectural status flags for fused multiply-add (p_param * s + addend)."""
+    s_nan = is_nan_f32(s_bits)
+    p_nan = is_nan_f32(p_param_bits)
+    a_nan = is_nan_f32(addend_bits)
+    s_inf = is_inf_f32(s_bits)
+    p_inf = is_inf_f32(p_param_bits)
+    a_inf = is_inf_f32(addend_bits)
+
+    s_zero = is_zero_f32(s_bits)
+    p_zero = is_zero_f32(p_param_bits)
+
+    # 1. Invalid operation
+    invalid = False
+    if s_nan or p_nan or a_nan:
+        invalid = True
+    elif (s_inf and p_zero) or (p_inf and s_zero):
+        invalid = True
+    elif (s_inf or p_inf) and a_inf:
+        prod_sign = ((s_bits ^ p_param_bits) & SIGN_MASK_F32)
+        add_sign = (addend_bits & SIGN_MASK_F32)
+        if prod_sign != add_sign:
+            invalid = True
+
+    # 2. Infinite & NaN
+    res_nan = is_nan_f32(res_bits)
+    res_inf = is_inf_f32(res_bits)
+
+    # 3. Overflow
+    overflow = False
+    if res_inf and not (s_inf or p_inf or a_inf):
+        overflow = True
+
+    # 4. Denormal & Underflow
+    denormal = (
+        is_subnormal_f32(s_bits)
+        or is_subnormal_f32(p_param_bits)
+        or is_subnormal_f32(addend_bits)
+        or is_subnormal_f32(res_bits)
+    )
+    underflow = is_subnormal_f32(res_bits)
+
+    # 5. Zero & Negative
+    zero = is_zero_f32(res_bits)
+    negative = bool(res_bits & SIGN_MASK_F32) and not res_nan
+
+    # 6. Inexact (approximate check: if overflow, underflow, or fractional rounding occurred)
+    inexact = overflow or underflow
+    if not (invalid or res_nan or res_inf):
+        # Check against high-precision arithmetic
+        s_val = bits_to_f32(s_bits)
+        p_val = bits_to_f32(p_param_bits)
+        a_val = bits_to_f32(addend_bits)
+        exact = p_val * s_val + a_val
+        inexact = inexact or (exact != bits_to_f32(res_bits))
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        negative=negative,
+        zero=zero,
+        denormal=denormal,
+        infinite=res_inf,
+        nan=res_nan,
+    )
+
+
+def compute_f32_mantissa_carry(s0_bits: int, s1_bits: int) -> Tuple[int, int]:
+    """Calculate internal mantissa summation and carry-out for FP normalization."""
+    # Extract mantissas with implicit leading 1 for normalized floats
+    exp0 = (s0_bits & EXP_MASK_F32) >> 23
+    exp1 = (s1_bits & EXP_MASK_F32) >> 23
+
+    m0 = (s0_bits & FRAC_MASK_F32) | (0x0080_0000 if exp0 != 0 else 0)
+    m1 = (s1_bits & FRAC_MASK_F32) | (0x0080_0000 if exp1 != 0 else 0)
+
+    # Align mantissas if exponents differ
+    shift = exp0 - exp1
+    if shift > 0:
+        m1 >>= shift
+    elif shift < 0:
+        m0 >>= (-shift)
+
+    sum_m = m0 + m1
+    carry_out = 1 if (sum_m >= 0x0100_0000) else 0
+    return sum_m, carry_out
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for floating-point status flags, condition codes, and carry generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        s = f32_to_bits(2.0)
+        p = f32_to_bits(3.0)
+        a = f32_to_bits(4.0)
+        res = oracle_v_interp_p1_f32(s, p, a)
+        flags = evaluate_f32_interp_flags(s, p, a, res)
+
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flag(self) -> None:
+        s = f32_to_bits(1.0)
+        p = f32_to_bits(1e-7)
+        a = f32_to_bits(1.0)
+        res = oracle_v_interp_p1_f32(s, p, a)
+        flags = evaluate_f32_interp_flags(s, p, a, res)
+
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+
+    def test_overflow_to_infinity_flag(self) -> None:
+        flt_max = 0x7F7F_FFFF  # ~3.4028235e+38
+        s = f32_to_bits(2.0)
+        p = flt_max
+        a = f32_to_bits(0.0)
+        res = oracle_v_interp_p1_f32(s, p, a)
+        flags = evaluate_f32_interp_flags(s, p, a, res)
+
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.infinite)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_underflow_and_denormal_flags(self) -> None:
+        subnorm = 0x0000_0001
+        s = f32_to_bits(1.0)
+        p = subnorm
+        a = f32_to_bits(0.0)
+        res = oracle_v_interp_p1_f32(s, p, a)
+        flags = evaluate_f32_interp_flags(s, p, a, res)
+
+        self.assertTrue(flags.denormal)
+        self.assertTrue(flags.underflow)
+        self.assertFalse(flags.overflow)
+
+    def test_invalid_operation_flag(self) -> None:
+        # 0.0 * inf is invalid
+        s = f32_to_bits(0.0)
+        p = POS_INF_F32
+        a = f32_to_bits(1.0)
+        res = oracle_v_interp_p1_f32(s, p, a)
+        flags = evaluate_f32_interp_flags(s, p, a, res)
+
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        s = f32_to_bits(0.0)
+        p = f32_to_bits(0.0)
+        a = f32_to_bits(0.0)
+        res = oracle_v_interp_p1_f32(s, p, a)
+        flags = evaluate_f32_interp_flags(s, p, a, res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+
+        # negative result
+        s_neg = f32_to_bits(-5.0)
+        p_neg = f32_to_bits(2.0)
+        a_neg = f32_to_bits(0.0)
+        res_neg = oracle_v_interp_p1_f32(s_neg, p_neg, a_neg)
+        flags_neg = evaluate_f32_interp_flags(s_neg, p_neg, a_neg, res_neg)
+        self.assertFalse(flags_neg.zero)
+        self.assertTrue(flags_neg.negative)
+
+    def test_mantissa_carry_generation(self) -> None:
+        # 1.0 + 1.0 -> mantissas are 1.0 + 1.0 = 2.0 -> carry out = 1
+        _, carry1 = compute_f32_mantissa_carry(f32_to_bits(1.0), f32_to_bits(1.0))
+        self.assertEqual(carry1, 1)
+
+        # 1.0 + 0.25 -> mantissas sum is 1.25 < 2.0 -> carry out = 0
+        _, carry0 = compute_f32_mantissa_carry(f32_to_bits(1.0), f32_to_bits(0.25))
+        self.assertEqual(carry0, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
