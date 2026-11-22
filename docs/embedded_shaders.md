@@ -50,7 +50,19 @@ the **whole container** to the compute-PSO call: at `0x180021330` it loads `DAT_
 `+0x1f0` (slot 62) receives that pointer, its size and two zero words. `FUN_18001d400` adds two more PSOs,
 `XDXR PostBuildInfoQuery` (0x14a4 bytes) and `XDXR GetBVHCompactedSize`. `bvh_builder_test` measures **53** PSO
 creations during construction over the **52** containers ([d3d12_vulkan.md](d3d12_vulkan.md) A.2), so one
-container is created twice; which one is **Open**.
+container is created twice. It is **`GetBVHCompactedSize`** (5,284 bytes = 0x14a4): creations **#47 and #53** pass
+byte-identical containers (RT-182, `LEONIDA_BVH_RECORD62=1`, which now prints each creation's module from its `ILDN`
+part and says when a container repeats). 0x14a4 is also the size this section gives for `XDXR PostBuildInfoQuery`,
+which fits `FUN_18001d400`'s two XDXR PSOs being this one container created twice, once under each name; the test
+does not see the PSO names, so that last step is a hypothesis. The creation order, by module (it is not the table
+order of section 3; `CopyAndCompactBVH` is #52, not the first):
+
+| creations | modules, in the order of the `CreateComputePipelineState` calls |
+|---|---|
+| #1-#13 | `InitPartitionedHeaders`, `PT_WriteOfflinePartition`, `PT_WritePartitions`, `PT_WriteInstances`, `PT_LoadInstances`, `PT_BeginPass`, `ResetCounterValues`, `InitHeaders`, `CopyForBVHUpdate`, `ResetToIndexBuffer`, `CopyCounters`, `CalculateMortonCodes`, `CalculateMortonCodes64` |
+| #14-#29 | `BitonicPreSortCS`, `BitonicOuterSortCS`, `BitonicInnerSortCS`, `BitonicPreSort64CS`, `BitonicOuterSort64CS`, `BitonicInnerSort64CS`, `RadixReset`, `RadixCount`, `PrefixSum64`, `PrefixSum128`, `PrefixSum256`, `PrefixSum512`, `PrefixSum1024`, `PrefixSum2048`, `PrefixSum4096`, `RadixAlloc` |
+| #30-#46 | `RearrangeTriangles`, `RearrangeBVHs`, `LoadInstances`, `SplitInstances`, `LoadTriangles`, `LoadProceduralGeometry`, `ReloadTriangles`, `ReloadProcedurals`, `PT_ConstructBVH4`, `ConstructBVH4`, `RefitBVH4`, `BuildBVHSplits`, `BuildBVHSplits64`, `FindTreelets`, `ResetKDOP`, `BuildKDOP`, `BuildApexPointMap` |
+| #47-#53 | `GetBVHCompactedSize`, `DecompressHeader`, `LeafRehydration`, `Box16Rehydration`, `Box32Rehydration`, `CopyAndCompactBVH`, `GetBVHCompactedSize` (again) |
 
 ## 3. The 52 modules
 
