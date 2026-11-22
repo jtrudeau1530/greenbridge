@@ -15,7 +15,8 @@ Vertex inputs: v0 = VertexIndex (the full-screen-triangle shaders read only that
 
 Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
     python3 -I rdna2spirv.py <disasm dir or .s> --out DIR [--limit N]
-Writes <name>.spvasm and <name>.spv for each translated shader and prints coverage + validation results.
+Writes <name>.spvasm for each translated shader and <name>.spv only for validated modules.
+Prints coverage and validation results.
 """
 import argparse
 import hashlib
@@ -24,7 +25,9 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 from collections import Counter
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 from shader_ir import parse_file  # noqa: E402
@@ -7644,6 +7647,26 @@ def write_index(path, index):
     os.replace(tmp, path)   # ponytail: no retry; add one if a scanner on Windows ever holds the new file open
 
 
+def assemble_spirv(sa, sv):
+    """Keep the assembled module out of the final path until validation succeeds."""
+    with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
+        tmp = Path(f.name)
+    try:
+        result = subprocess.run(["spirv-as", sa, "-o", str(tmp), "--target-env", "vulkan1.2"],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            # Offset on non-gather: VK_KHR_maintenance8
+            result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
+                                     str(tmp)], capture_output=True, text=True)
+        if result.returncode == 0:
+            tmp.replace(sv)
+        else:
+            Path(sv).unlink(missing_ok=True)
+        return result
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _limit_arg(text):
     """--limit N: at least 1. 0 used to mean "no limit" (the whole corpus) and a negative N dropped the last N."""
     try:
@@ -7709,6 +7732,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     why, ok, valid = Counter(), 0, 0
     meta = {}
+    invalid = set()
     for p in files:
         name = os.path.splitext(os.path.basename(p))[0]
         try:
@@ -7724,10 +7748,7 @@ def main():
         sv = os.path.join(a.out, name + ".spv")
         with open(sa, "w") as f:
             f.write(asm)
-        r = subprocess.run(["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"], capture_output=True, text=True)
-        if r.returncode == 0:
-            r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", sv],
-                               capture_output=True, text=True)  # Offset on non-gather: VK_KHR_maintenance8
+        r = assemble_spirv(sa, sv)
         if r.returncode == 0:
             valid += 1
             try:
@@ -7736,6 +7757,7 @@ def main():
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
+            invalid.add(name)
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
         if a.no_asm and os.path.exists(sa):
             os.remove(sa)
@@ -7743,7 +7765,10 @@ def main():
     idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}
     if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
-        old = _js.load(open(idx_path, encoding="utf-8"))      # partial runs merge into an existing index
+        with open(idx_path, encoding="utf-8") as f:
+            old = _js.load(f)  # partial runs merge into an existing index
+        for name in invalid:
+            old.pop(name, None)
     old.update(meta)
     write_index(idx_path, old)
     if shard is None:
