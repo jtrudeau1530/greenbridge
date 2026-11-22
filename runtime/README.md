@@ -310,6 +310,17 @@ lines from synthetic fixtures only.
 Get-Content startup.jsonl | ConvertFrom-Json | Group-Object kind | Select-Object Count, Name
 ```
 
+[tools/boot_trace.py](../tools/boot_trace.py) prints the first-boot summary of this file and of the
+`--trace-d3d12` log (modules, unimplemented calls with their callers, DllMain/TLS results, exceptions with their
+stack, the exit, and the D3D12 calls by outcome and first call per method):
+
+```powershell
+python -I tools\boot_trace.py startup.jsonl --d3d12 d3d12.log
+```
+
+[docs/boot.md](../docs/boot.md) is the runbook around it: the commands, the triage order and the open questions'
+trace signals.
+
 ### Typed clear regression
 
 `clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
