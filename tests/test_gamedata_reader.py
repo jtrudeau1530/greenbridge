@@ -320,6 +320,34 @@ class Run(unittest.TestCase):
         self.assertIn("does not exist", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
 
+    def _cli(self, *args):
+        return subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"), *args],
+                              capture_output=True, text=True)
+
+    def test_cli_bad_index_json_is_one_error_line(self):
+        for name, text in (("notjson", "{bad"), ("wrongshape", "[]"), ("nofiles", "{}")):
+            with self.subTest(name):
+                d = os.path.join(self.tmp.name, name)
+                os.makedirs(d)
+                with open(os.path.join(d, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                r = self._cli(d)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertIn("ERROR: cannot read", r.stderr)
+                self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+
+    def test_cli_out_that_is_a_file_is_refused(self):
+        xml = os.path.join(self.tmp.name, "a.xml")
+        out = os.path.join(self.tmp.name, "afile")
+        for path, data in ((xml, b"<a/>"), (out, b"x")):
+            with open(path, "wb") as f:
+                f.write(data)
+        r = self._cli(xml, "--out", out)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("not a directory", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
