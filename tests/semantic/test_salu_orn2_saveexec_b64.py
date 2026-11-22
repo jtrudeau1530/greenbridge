@@ -329,6 +329,77 @@ class ScalarInterpreter:
 
 
 # -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# -----------------------------------------------------------------------------
+
+class WaveMode(Enum):
+    WAVE32 = 32
+    WAVE64 = 64
+
+
+@dataclass
+class SIMDMultiLaneState:
+    """Multi-lane SIMD wave state capturing lane divergence under EXEC masks."""
+
+    mode: WaveMode = WaveMode.WAVE64
+    exec_mask: int = EXEC_ALL_ONES
+    vgprs: List[List[int]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        num_lanes = self.mode.value
+        if not self.vgprs:
+            self.vgprs = [[0] * 32 for _ in range(num_lanes)]
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        if not (0 <= lane_id < self.mode.value):
+            return False
+        return bool((self.exec_mask >> lane_id) & 1)
+
+    def active_lane_count(self) -> int:
+        mask = MASK32 if self.mode == WaveMode.WAVE32 else MASK64
+        return bin(self.exec_mask & mask).count("1")
+
+    def read_vgpr(self, lane_id: int, vgpr_idx: int) -> int:
+        return self.vgprs[lane_id][vgpr_idx] & MASK32
+
+    def write_vgpr_masked(self, vgpr_idx: int, values_per_lane: List[int]) -> int:
+        """Vector ALU write: only active lanes are modified. Inactive lanes preserve contents."""
+        updated = 0
+        for lane in range(self.mode.value):
+            if self.is_lane_active(lane):
+                self.vgprs[lane][vgpr_idx] = values_per_lane[lane] & MASK32
+                updated += 1
+        return updated
+
+
+class SIMDMultiLaneController:
+    """Coordinates SALU saveexec flow control with VALU multi-lane execution."""
+
+    def __init__(self, wave: SIMDMultiLaneState, scalar: ScalarMachineState) -> None:
+        self.wave = wave
+        self.scalar = scalar
+        self.interp = ScalarInterpreter()
+
+    def execute_orn2_saveexec(self, dst_sgpr: str, src0: Union[int, str]) -> Tuple[int, int, int]:
+        self.scalar.write_exec(self.wave.exec_mask)
+        instr = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst=dst_sgpr, src0=src0)
+        saved_exec, new_exec, scc = self.interp.step(instr, self.scalar)
+        if self.wave.mode == WaveMode.WAVE32:
+            self.wave.exec_mask = new_exec & MASK32
+        else:
+            self.wave.exec_mask = new_exec & MASK64
+        return saved_exec, new_exec, scc
+
+    def restore_exec(self, saved_sgpr: str) -> None:
+        restored = self.interp.parse_src64(saved_sgpr, self.scalar)
+        self.scalar.write_exec(restored)
+        if self.wave.mode == WaveMode.WAVE32:
+            self.wave.exec_mask = restored & MASK32
+        else:
+            self.wave.exec_mask = restored & MASK64
+
+
+# -----------------------------------------------------------------------------
 # Test Suites
 # -----------------------------------------------------------------------------
 
@@ -532,15 +603,12 @@ class TestDeterministicScalarInterpreter(unittest.TestCase):
         saved, new_exec, scc = self.interp.step(instr, self.state)
 
         self.assertEqual(saved, 0xFFFF_0000_FFFF_0000)
-        # s[0:1] remains unchanged
         self.assertEqual(self.state.read_sgpr64(0), 0xCAFE_BABE_DEAD_BEEF)
-        # exec is updated: src0 | ~exec = (0x0000_FFFF_0000_FFFF | 0x0000_FFFF_0000_FFFF) = 0x0000_FFFF_0000_FFFF
         self.assertEqual(self.state.read_exec(), 0x0000_FFFF_0000_FFFF)
         self.assertEqual(self.state.read_scc(), SCC_SET)
 
     def test_interpreter_inline_constants(self) -> None:
         """Verify behavior with inline constants 0, -1, 1."""
-        # src0 = 0, exec = ALL_ONES -> new_exec = 0, scc = 0
         self.state.write_exec(EXEC_ALL_ONES)
         instr0 = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[2:3]", src0=0)
         _, new_exec, scc = self.interp.step(instr0, self.state)
@@ -548,7 +616,6 @@ class TestDeterministicScalarInterpreter(unittest.TestCase):
         self.assertEqual(scc, SCC_CLEARED)
         self.assertEqual(self.state.read_scc(), SCC_CLEARED)
 
-        # src0 = -1 (0xFFFFFFFFFFFFFFFF) -> new_exec = ALL_ONES, scc = 1
         instr_neg1 = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[4:5]", src0=-1)
         _, new_exec, scc = self.interp.step(instr_neg1, self.state)
         self.assertEqual(new_exec, EXEC_ALL_ONES)
@@ -557,31 +624,105 @@ class TestDeterministicScalarInterpreter(unittest.TestCase):
 
     def test_interpreter_sequential_program(self) -> None:
         """Verify a multi-step sequence simulating control flow branching."""
-        # Step 1: Initial branch mask setup
         self.state.write_exec(0xFFFF_FFFF_0000_0000)
         self.state.write_sgpr64(6, 0x0000_0000_FFFF_0000)
 
-        # Step 2: Saveexec to s[8:9]
         instr1 = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[8:9]", src0="s[6:7]")
         self.interp.step(instr1, self.state)
         self.assertEqual(self.state.read_sgpr64(8), 0xFFFF_FFFF_0000_0000)
-        # new_exec = 0x0000_0000_FFFF_0000 | ~0xFFFF_FFFF_0000_0000 = 0x0000_0000_FFFF_0000 | 0x0000_0000_FFFF_FFFF
-        # = 0x0000_0000_FFFF_FFFF
         self.assertEqual(self.state.read_exec(), 0x0000_0000_FFFF_FFFF)
 
-        # Step 3: Second saveexec chaining with literal
         instr2 = ScalarInstruction(opcode="s_orn2_saveexec_b64", dst="s[10:11]", src0=0)
         self.interp.step(instr2, self.state)
         self.assertEqual(self.state.read_sgpr64(10), 0x0000_0000_FFFF_FFFF)
-        # new_exec = 0 | ~0x0000_0000_FFFF_FFFF = 0xFFFF_FFFF_0000_0000
         self.assertEqual(self.state.read_exec(), 0xFFFF_FFFF_0000_0000)
 
     def test_interpreter_alignment_enforcement(self) -> None:
         """Verify unaligned 64-bit SGPR accesses raise ValueError."""
         with self.assertRaises(ValueError):
-            self.state.read_sgpr64(1)  # Odd index
+            self.state.read_sgpr64(1)
         with self.assertRaises(ValueError):
-            self.state.write_sgpr64(3, 123)  # Odd index
+            self.state.write_sgpr64(3, 123)
+
+
+class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking tests."""
+
+    def test_wave64_multi_lane_divergence(self) -> None:
+        """Verify that vector ALU updates strictly follow the EXEC mask derived from s_orn2_saveexec_b64."""
+        wave = SIMDMultiLaneState(mode=WaveMode.WAVE64, exec_mask=0x5555_5555_5555_5555)  # Even lanes active
+        scalar = ScalarMachineState()
+        controller = SIMDMultiLaneController(wave, scalar)
+
+        # Vector write under initial exec: only even lanes should receive 100 + lane
+        values_initial = [100 + i for i in range(64)]
+        updated_lanes = wave.write_vgpr_masked(0, values_initial)
+        self.assertEqual(updated_lanes, 32)
+        for i in range(64):
+            if i % 2 == 0:
+                self.assertEqual(wave.read_vgpr(i, 0), 100 + i)
+            else:
+                self.assertEqual(wave.read_vgpr(i, 0), 0)
+
+        # Apply s_orn2_saveexec_b64 with src0 mask setting low 16 lanes
+        # Old exec = 0x5555_5555_5555_5555
+        # ~Old exec = 0xAAAA_AAAA_AAAA_AAAA
+        # src0 = 0x0000_0000_0000_FFFF
+        # New exec = 0x0000_0000_0000_FFFF | 0xAAAA_AAAA_AAAA_AAAA
+        #          = 0xAAAA_AAAA_AAAA_FFFF
+        src0_mask = 0x0000_0000_0000_FFFF
+        saved, new_exec, scc = controller.execute_orn2_saveexec("s[16:17]", src0_mask)
+
+        self.assertEqual(saved, 0x5555_5555_5555_5555)
+        self.assertEqual(scalar.read_sgpr64(16), 0x5555_5555_5555_5555)
+        self.assertEqual(new_exec, 0xAAAA_AAAA_AAAA_FFFF)
+        self.assertEqual(wave.exec_mask, 0xAAAA_AAAA_AAAA_FFFF)
+        self.assertEqual(scc, SCC_SET)
+
+        # Vector write under new exec
+        values_second = [500 + i for i in range(64)]
+        wave.write_vgpr_masked(1, values_second)
+        for i in range(64):
+            expected_active = bool((0xAAAA_AAAA_AAAA_FFFF >> i) & 1)
+            if expected_active:
+                self.assertEqual(wave.read_vgpr(i, 1), 500 + i)
+            else:
+                self.assertEqual(wave.read_vgpr(i, 1), 0)
+
+    def test_wave32_divergence_masking(self) -> None:
+        """Verify Wave32 restricts execution to lanes 0..31 and limits active count."""
+        wave = SIMDMultiLaneState(mode=WaveMode.WAVE32, exec_mask=0xFFFF_FFFF)
+        scalar = ScalarMachineState()
+        controller = SIMDMultiLaneController(wave, scalar)
+
+        self.assertEqual(wave.active_lane_count(), 32)
+
+        # Saveexec with src0 = 0 -> in 64-bit opcode, exec_in has high 32 bits as 0, so ~exec has high 32 bits as 1!
+        # Thus new_exec = 0xFFFF_FFFF_0000_0000. Wave32 active lanes (low 32 bits) are 0, but 64-bit SCC is 1!
+        controller.execute_orn2_saveexec("s[20:21]", 0)
+        self.assertEqual(wave.active_lane_count(), 0)
+        self.assertEqual(scalar.read_scc(), SCC_SET)
+
+        # Write attempt under empty exec: 0 lanes updated
+        values = [999] * 32
+        updated = wave.write_vgpr_masked(0, values)
+        self.assertEqual(updated, 0)
+
+    def test_reconvergence_after_saveexec(self) -> None:
+        """Simulate shader flow control: saveexec -> diverge -> restore original mask."""
+        initial_exec = 0x1234_5678_9ABC_DEF0
+        wave = SIMDMultiLaneState(mode=WaveMode.WAVE64, exec_mask=initial_exec)
+        scalar = ScalarMachineState()
+        controller = SIMDMultiLaneController(wave, scalar)
+
+        # Saveexec
+        controller.execute_orn2_saveexec("s[30:31]", 0x0000_FFFF_0000_FFFF)
+        self.assertNotEqual(wave.exec_mask, initial_exec)
+
+        # Restore
+        controller.restore_exec("s[30:31]")
+        self.assertEqual(wave.exec_mask, initial_exec)
+        self.assertEqual(scalar.read_exec(), initial_exec)
 
 
 if __name__ == "__main__":
