@@ -296,6 +296,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_ops8": (0x80000000, 0xbfffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_f32_mods": (0xc0256a01, 0x3f800000, 0x41e00000, 0x3fc00000),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xbffefff2, 0x3c003344, 0xbff70000),
+              # 16-bit SDWA results with dst_sel:DWORD zero the high half (.asm header, measured on gfx1036)
+              "ps_sdwa_dword_hi": (0x00004000, 0x00000003, 0x00004700, 0x0000c000),
               "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
               # v_cmpx_{eq,gt,le,lt,ngt,nle}_f32, f_i32, t_u32, {eq,gt,le}_i64, {ge,lt,ne}_u64 (.asm header)
               "ps_vcmpx_forms": (0xf05b2a48, 0xf05e8a12, 0xb174be18, 0x15550000),
