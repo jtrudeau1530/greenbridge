@@ -871,5 +871,181 @@ class TestValuDot4IntRegisterAliasing(unittest.TestCase):
         self.assertEqual(interp.rf.vgprs[0], 44)
 
 
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Dot4StatusFlags:
+    """Architectural status flags and condition codes for dot4 execution."""
+    zero: bool
+    negative: bool
+    carry_out: bool
+    overflow: bool
+    saturated: bool
+
+
+def compute_dot4_u32_status_flags(s0: int, s1: int, s2: int, *, clamp: bool = False) -> Dot4StatusFlags:
+    """Compute status flags and condition codes for unsigned dot4 (v_dot4_u32_u8)."""
+    b0 = unpack_u8(s0)
+    b1 = unpack_u8(s1)
+    prod_sum = sum(x * y for x, y in zip(b0, b1))
+    acc = s2 & MASK32
+    unclamped_sum = acc + prod_sum
+
+    res = min(unclamped_sum, UINT32_MAX) if clamp else (unclamped_sum & MASK32)
+
+    zero = (res == 0)
+    negative = bool(res & 0x8000_0000)
+    carry_out = unclamped_sum > UINT32_MAX
+    overflow = carry_out
+    saturated = clamp and (unclamped_sum > UINT32_MAX)
+
+    return Dot4StatusFlags(
+        zero=zero,
+        negative=negative,
+        carry_out=carry_out,
+        overflow=overflow,
+        saturated=saturated,
+    )
+
+
+def compute_dot4_i32_status_flags(s0: int, s1: int, s2: int, *, clamp: bool = False) -> Dot4StatusFlags:
+    """Compute status flags and condition codes for signed dot4 (v_dot4_i32_i8)."""
+    b0 = unpack_i8(s0)
+    b1 = unpack_i8(s1)
+    prod_sum = sum(x * y for x, y in zip(b0, b1))
+
+    s2_u32 = s2 & MASK32
+    s2_i32 = (s2_u32 - 0x1_0000_0000) if (s2_u32 & 0x8000_0000) else s2_u32
+
+    unclamped_total = s2_i32 + prod_sum
+    clamped_total = max(INT32_MIN, min(unclamped_total, INT32_MAX))
+
+    res = (clamped_total if clamp else unclamped_total) & MASK32
+
+    zero = (res == 0)
+    negative = bool(res & 0x8000_0000)
+
+    # 32-bit unsigned carry from the adder:
+    adder_u32 = (s2 & MASK32) + (prod_sum & MASK32)
+    carry_out = adder_u32 > MASK32
+
+    # Signed overflow occurs if total falls outside 32-bit signed integer range
+    overflow = unclamped_total < INT32_MIN or unclamped_total > INT32_MAX
+    saturated = clamp and overflow
+
+    return Dot4StatusFlags(
+        zero=zero,
+        negative=negative,
+        carry_out=carry_out,
+        overflow=overflow,
+        saturated=saturated,
+    )
+
+
+def evaluate_vcc_predicate(results: list[int], predicate_fn) -> int:
+    """Evaluate a per-lane condition across wavefront lanes, packing into a VCC mask."""
+    vcc = 0
+    for lane, val in enumerate(results):
+        if predicate_fn(val):
+            vcc |= (1 << lane)
+    return vcc
+
+
+class TestValuDot4IntConditionCodesAndStatusFlags(unittest.TestCase):
+    """Status flags, condition codes, and carry/borrow generation unit tests for v_dot4_int."""
+
+    def test_zero_flag_generation(self) -> None:
+        # Zero operand dot product
+        flags_zero = compute_dot4_u32_status_flags(0, 0, 0)
+        self.assertTrue(flags_zero.zero)
+        self.assertFalse(flags_zero.negative)
+        self.assertFalse(flags_zero.carry_out)
+
+        # Non-zero result
+        flags_nonzero = compute_dot4_u32_status_flags(pack_u8(1, 0, 0, 0), pack_u8(1, 0, 0, 0), 0)
+        self.assertFalse(flags_nonzero.zero)
+
+        # Signed cancellation to zero: product = +70, accumulator = -70
+        s0 = pack_i8(1, 2, 3, 4)
+        s1 = pack_i8(5, 6, 7, 8)  # dot = 70
+        acc = (-70) & MASK32
+        flags_cancel = compute_dot4_i32_status_flags(s0, s1, acc)
+        self.assertTrue(flags_cancel.zero)
+
+    def test_negative_flag_generation(self) -> None:
+        # Signed negative product: -28
+        s0 = pack_i8(-1, 2, -3, -4)
+        s1 = pack_i8(5, -6, -7, 8)
+        flags_neg = compute_dot4_i32_status_flags(s0, s1, 0)
+        self.assertTrue(flags_neg.negative)
+        self.assertFalse(flags_neg.zero)
+
+        # Unsigned large value with bit 31 set: e.g. 0x80000000
+        flags_u_high = compute_dot4_u32_status_flags(0, 0, 0x8000_0000)
+        self.assertTrue(flags_u_high.negative)
+
+    def test_unsigned_carry_out_generation(self) -> None:
+        # Accumulator near UINT32_MAX, adding 260100 causes carry_out
+        s0 = 0xFFFF_FFFF
+        s1 = 0xFFFF_FFFF  # product sum = 260100
+        flags_carry = compute_dot4_u32_status_flags(s0, s1, 0xFFFF_FFFF)
+        self.assertTrue(flags_carry.carry_out)
+        self.assertTrue(flags_carry.overflow)
+
+        # No carry out when sum fits in 32 bits
+        flags_no_carry = compute_dot4_u32_status_flags(s0, s1, 1000)
+        self.assertFalse(flags_no_carry.carry_out)
+        self.assertFalse(flags_no_carry.overflow)
+
+    def test_signed_overflow_generation(self) -> None:
+        # Adding positive 65536 to INT32_MAX causes signed overflow
+        s_min = pack_i8(-128, -128, -128, -128)  # (-128)^2 * 4 = 65536
+        flags_pos_overflow = compute_dot4_i32_status_flags(s_min, s_min, INT32_MAX)
+        self.assertTrue(flags_pos_overflow.overflow)
+        self.assertFalse(flags_pos_overflow.saturated)  # clamp was False
+
+        # Adding negative -65024 to INT32_MIN causes signed underflow
+        s_max = pack_i8(127, 127, 127, 127)
+        flags_neg_underflow = compute_dot4_i32_status_flags(s_min, s_max, INT32_MIN)
+        self.assertTrue(flags_neg_underflow.overflow)
+
+        # No overflow during ordinary operations
+        flags_normal = compute_dot4_i32_status_flags(s_min, s_max, 0)
+        self.assertFalse(flags_normal.overflow)
+
+    def test_saturation_flag_generation(self) -> None:
+        # Unsigned clamp saturation
+        flags_u_sat = compute_dot4_u32_status_flags(0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, clamp=True)
+        self.assertTrue(flags_u_sat.saturated)
+
+        # Unsigned clamp without saturation
+        flags_u_unsat = compute_dot4_u32_status_flags(0xFFFF_FFFF, 0xFFFF_FFFF, 100, clamp=True)
+        self.assertFalse(flags_u_unsat.saturated)
+
+        # Signed clamp saturation
+        s_min = pack_i8(-128, -128, -128, -128)
+        flags_i_sat = compute_dot4_i32_status_flags(s_min, s_min, INT32_MAX, clamp=True)
+        self.assertTrue(flags_i_sat.saturated)
+
+    def test_vcc_comparison_predicate_generation(self) -> None:
+        # Multi-lane comparison generating VCC mask
+        wave = SIMDWaveState(wave_size=32)
+        for lane in range(32):
+            wave.write_vgpr_lane(lane, 1, pack_u8(lane, 0, 0, 0))
+            wave.write_vgpr_lane(lane, 2, pack_u8(1, 0, 0, 0))
+            wave.write_vgpr_lane(lane, 3, 0)
+
+        # Each lane computes: lane * 1 = lane
+        wave.execute_asm(["v_dot4_u32_u8 v0, v1, v2, v3"])
+        lane_results = [wave.vgprs[lane][0] for lane in range(32)]
+
+        # Compare result >= 16: lanes 16..31 should be 1 in VCC
+        vcc_ge_16 = evaluate_vcc_predicate(lane_results, lambda v: v >= 16)
+        expected_mask = 0xFFFF_0000
+        self.assertEqual(vcc_ge_16, expected_mask)
+
+
 if __name__ == "__main__":
     unittest.main()
