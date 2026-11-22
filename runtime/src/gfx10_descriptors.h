@@ -223,6 +223,7 @@ inline constexpr Swizzle channels_rgb{select_x, select_y, select_z, select_one};
 inline constexpr Swizzle channels_rgba = identity_swizzle;
 inline constexpr Swizzle channels_bgr{select_z, select_y, select_x, select_one};
 inline constexpr Swizzle channels_bgra{select_z, select_y, select_x, select_w};
+inline constexpr Swizzle channels_abgr{select_w, select_z, select_y, select_x};
 
 inline constexpr FormatRow format_table[] = {
     {1, VK_FORMAT_R8_UNORM, channels_r},                          // GFX10_FORMAT_8_UNORM
@@ -299,6 +300,7 @@ inline constexpr FormatRow format_table[] = {
     {134, VK_FORMAT_A1R5G5B5_UNORM_PACK16, channels_bgra},        // GFX10_FORMAT_1_5_5_5_UNORM
     {136, VK_FORMAT_A4B4G4R4_UNORM_PACK16, channels_rgba},        // GFX10_FORMAT_4_4_4_4_UNORM
     {136, VK_FORMAT_A4R4G4B4_UNORM_PACK16, channels_bgra},        // GFX10_FORMAT_4_4_4_4_UNORM
+    {136, VK_FORMAT_R4G4B4A4_UNORM_PACK16, channels_abgr},        // GFX10_FORMAT_4_4_4_4_UNORM
     {141, VK_FORMAT_D24_UNORM_S8_UINT, channels_r},               // GFX10_FORMAT_8_24_UNORM
     {141, VK_FORMAT_X8_D24_UNORM_PACK32, channels_r},             // GFX10_FORMAT_8_24_UNORM
     {146, VK_FORMAT_D32_SFLOAT_S8_UINT, channels_r},              // GFX10_FORMAT_X24_8_32_FLOAT
@@ -596,8 +598,8 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
         info.maxLod = 0.25f;
     }
     // An integer image sampled with a FLOAT border colour reads it as 0 on NVIDIA (Vonsek, #538), so the type follows
-    // integer_border. A table colour is not kept yet: transparent black.
-    const bool integer = sampler.integer_border && sampler.border_color != BorderColor::table;
+    // integer_border. A table colour falls back to transparent black matching integer_border.
+    const bool integer = sampler.integer_border;
     switch (sampler.border_color) {
     case BorderColor::opaque_black:
         info.borderColor = integer ? VK_BORDER_COLOR_INT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;

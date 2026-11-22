@@ -74,6 +74,7 @@ struct VertexInputMeta {
 struct ShaderMeta {
     std::string stage;
     uint32_t subgroup_size = 0;
+    uint32_t lds_bytes = 0;
     bool writes_depth = false;
     bool needs_maintenance8 = false;
     std::vector<std::string> features;
@@ -267,6 +268,12 @@ struct JsonParser {
                 ws();
                 if (s.compare(i, 4, "null") == 0) { i += 4; m.subgroup_size = 0; }
                 else m.subgroup_size = parse_u32();
+            }
+            else if (k == "lds_bytes") {
+                ws();
+                const auto [end, ec] = std::from_chars(s.data() + i, s.data() + s.size(), m.lds_bytes);
+                if (ec != std::errc{}) fail("expected unsigned 32-bit lds_bytes");
+                else i = static_cast<size_t>(end - s.data());
             }
             else if (k == "writes_depth") m.writes_depth = parse_bool();
             else if (k == "needs_maintenance8") m.needs_maintenance8 = parse_bool();
@@ -1070,6 +1077,14 @@ int main(int argc, char** argv) {
                     std::printf("BIG SKIP %s (%lld bytes, limit %zu)\n",
                                 name.c_str(), static_cast<long long>(file_size), max_bytes);
                 }
+                ++done;
+                continue;
+            }
+            if (stage == "cs" && meta.lds_bytes > props.limits.maxComputeSharedMemorySize) {
+                std::lock_guard<std::mutex> g(mu);
+                modules_bad[stage]++;
+                std::printf("MODULE FAIL %s (workgroup memory %u bytes exceeds maxComputeSharedMemorySize %u)\n",
+                            name.c_str(), meta.lds_bytes, props.limits.maxComputeSharedMemorySize);
                 ++done;
                 continue;
             }
