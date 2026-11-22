@@ -336,8 +336,12 @@ def main():
         name = entry.name
         n += 1
         stage = stages.get(name[:-2]) or (name[:2].lower() if name[2:3] == "_" else "?")
-        with open(entry.path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
+        try:
+            with open(entry.path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            print(f"ERROR: cannot read {entry.path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         prof = profile_shader(text)
         regs = prof["registers"]
         reg_stage[stage].append((regs["vgpr_count"], regs["sgpr_count"]))
