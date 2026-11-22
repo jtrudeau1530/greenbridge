@@ -145,6 +145,66 @@ class DSWrxchg2B64Instruction:
         return line
 
 
+class ScalarRegisterFile:
+    """Models a 256-register 32-bit scalar VGPR file."""
+
+    def __init__(self) -> None:
+        self.regs: List[int] = [0] * 256
+
+    def get_u32(self, reg_idx: int) -> int:
+        return self.regs[reg_idx] & MASK32
+
+    def set_u32(self, reg_idx: int, val: int) -> None:
+        self.regs[reg_idx] = val & MASK32
+
+    def get_u64(self, pair: RegPair) -> int:
+        lo = self.get_u32(pair.index)
+        hi = self.get_u32(pair.index + 1)
+        return combine_u32s_to_u64(lo, hi)
+
+    def set_u64(self, pair: RegPair, val: int) -> None:
+        lo, hi = split_u64_to_u32s(val)
+        self.set_u32(pair.index, lo)
+        self.set_u32(pair.index + 1, hi)
+
+    def set_quad(self, quad: RegQuad, w0: int, w1: int, w2: int, w3: int) -> None:
+        self.set_u32(quad.index, w0)
+        self.set_u32(quad.index + 1, w1)
+        self.set_u32(quad.index + 2, w2)
+        self.set_u32(quad.index + 3, w3)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_wrxchg2_b64."""
+
+    def __init__(self, lds_size_bytes: int = LDS_DEFAULT_SIZE_BYTES) -> None:
+        self.lds_mem: bytearray = bytearray(lds_size_bytes)
+        self.rf: ScalarRegisterFile = ScalarRegisterFile()
+
+    def step(self, instr: DSWrxchg2B64Instruction) -> Tuple[int, int]:
+        """Execute a single ds_wrxchg2_b64 instruction on the scalar state."""
+        vaddr = self.rf.get_u32(instr.vaddr.index)
+        data0 = self.rf.get_u64(instr.data0)
+        data1 = self.rf.get_u64(instr.data1)
+
+        old0, old1 = oracle_ds_wrxchg2_b64(
+            self.lds_mem,
+            vaddr=vaddr,
+            data0=data0,
+            data1=data1,
+            offset0=instr.offset0,
+            offset1=instr.offset1,
+            is_st64=instr.is_st64,
+        )
+
+        if instr.is_rtn and instr.vdst is not None:
+            w0, w1 = split_u64_to_u32s(old0)
+            w2, w3 = split_u64_to_u32s(old1)
+            self.rf.set_quad(instr.vdst, w0, w1, w2, w3)
+
+        return old0, old1
+
+
 def split_u64_to_u32s(val: int) -> Tuple[int, int]:
     """Split 64-bit unsigned integer into (lo, hi) 32-bit words."""
     val &= MASK64
@@ -467,6 +527,138 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
         )
         self.assertEqual(instr1, instr2)
         self.assertEqual(hash(instr1), hash(instr2))
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_execute_basic_rtn(self) -> None:
+        # Seed LDS at 0x20 and 0x28
+        struct.pack_into("<Q", self.interp.lds_mem, 0x20, 0x1111_0000_2222_0000)
+        struct.pack_into("<Q", self.interp.lds_mem, 0x28, 0x3333_0000_4444_0000)
+
+        # Set registers
+        self.interp.rf.set_u32(1, 0x20)  # v1 = vaddr
+        self.interp.rf.set_u64(RegPair(4), 0xAAAA_1111_BBBB_2222)  # v[4:5] = data0
+        self.interp.rf.set_u64(RegPair(6), 0xCCCC_3333_DDDD_4444)  # v[6:7] = data1
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),  # v[8:11]
+            vaddr=RegSingle(1),
+            data0=RegPair(4),
+            data1=RegPair(6),
+            offset0=0,
+            offset1=1,
+            is_st64=False,
+            is_rtn=True,
+        )
+
+        old0, old1 = self.interp.step(instr)
+        self.assertEqual(old0, 0x1111_0000_2222_0000)
+        self.assertEqual(old1, 0x3333_0000_4444_0000)
+
+        # Check vdst receives old values
+        self.assertEqual(self.interp.rf.get_u64(RegPair(8)), old0)
+        self.assertEqual(self.interp.rf.get_u64(RegPair(10)), old1)
+
+        # Check memory updated
+        self.assertEqual(
+            struct.unpack_from("<Q", self.interp.lds_mem, 0x20)[0],
+            0xAAAA_1111_BBBB_2222,
+        )
+        self.assertEqual(
+            struct.unpack_from("<Q", self.interp.lds_mem, 0x28)[0],
+            0xCCCC_3333_DDDD_4444,
+        )
+
+    def test_scalar_execute_st64_rtn(self) -> None:
+        vaddr = 0x40
+        addr0 = vaddr + 0 * 512  # 0x40
+        addr1 = vaddr + 2 * 512  # 0x440
+        struct.pack_into("<Q", self.interp.lds_mem, addr0, 0x0123_4567_89AB_CDEF)
+        struct.pack_into("<Q", self.interp.lds_mem, addr1, 0xFEDC_BA98_7654_3210)
+
+        self.interp.rf.set_u32(2, vaddr)
+        self.interp.rf.set_u64(RegPair(12), 0x9999_8888_7777_6666)
+        self.interp.rf.set_u64(RegPair(14), 0x5555_4444_3333_2222)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(16),
+            vaddr=RegSingle(2),
+            data0=RegPair(12),
+            data1=RegPair(14),
+            offset0=0,
+            offset1=2,
+            is_st64=True,
+            is_rtn=True,
+        )
+
+        old0, old1 = self.interp.step(instr)
+        self.assertEqual(old0, 0x0123_4567_89AB_CDEF)
+        self.assertEqual(old1, 0xFEDC_BA98_7654_3210)
+        self.assertEqual(self.interp.rf.get_u64(RegPair(16)), old0)
+        self.assertEqual(self.interp.rf.get_u64(RegPair(18)), old1)
+
+    def test_scalar_execute_non_return(self) -> None:
+        struct.pack_into("<Q", self.interp.lds_mem, 0x50, 0x1111_1111_1111_1111)
+        struct.pack_into("<Q", self.interp.lds_mem, 0x58, 0x2222_2222_2222_2222)
+
+        self.interp.rf.set_u32(3, 0x50)
+        self.interp.rf.set_u64(RegPair(20), 0x3333_3333_3333_3333)
+        self.interp.rf.set_u64(RegPair(22), 0x4444_4444_4444_4444)
+
+        # Sentinel in registers 24..27
+        for r in range(24, 28):
+            self.interp.rf.set_u32(r, 0xCAFE_BABE)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=None,
+            vaddr=RegSingle(3),
+            data0=RegPair(20),
+            data1=RegPair(22),
+            offset0=0,
+            offset1=1,
+            is_st64=False,
+            is_rtn=False,
+        )
+
+        old0, old1 = self.interp.step(instr)
+        self.assertEqual(old0, 0x1111_1111_1111_1111)
+        self.assertEqual(old1, 0x2222_2222_2222_2222)
+
+        # Verify registers 24..27 are untouched
+        for r in range(24, 28):
+            self.assertEqual(self.interp.rf.get_u32(r), 0xCAFE_BABE)
+
+    def test_scalar_step_determinism(self) -> None:
+        # Run identical sequence in two independent interpreters and compare
+        interp1 = ScalarInterpreter()
+        interp2 = ScalarInterpreter()
+
+        for interp in (interp1, interp2):
+            struct.pack_into("<Q", interp.lds_mem, 0x100, 0xA1B2_C3D4_E5F6_0718)
+            struct.pack_into("<Q", interp.lds_mem, 0x108, 0x1807_F6E5_D4C3_B2A1)
+            interp.rf.set_u32(1, 0x100)
+            interp.rf.set_u64(RegPair(2), 0x1234_0000_5678_0000)
+            interp.rf.set_u64(RegPair(4), 0xABCD_0000_EF01_0000)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(6),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        res1 = interp1.step(instr)
+        res2 = interp2.step(instr)
+        self.assertEqual(res1, res2)
+        self.assertEqual(bytes(interp1.lds_mem), bytes(interp2.lds_mem))
+        self.assertEqual(interp1.rf.regs, interp2.rf.regs)
 
 
 if __name__ == "__main__":
