@@ -6582,7 +6582,10 @@ public:
         case D3D12_FEATURE_ROOT_SIGNATURE: {
             if (size != sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE)) return E_INVALIDARG;
             auto* root = static_cast<D3D12_FEATURE_DATA_ROOT_SIGNATURE*>(data);
-            if (root->HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1_0) return E_INVALIDARG;
+            // 1.0 to 1.2 are defined (1.2 by number: not every SDK names it). The host refuses anything else and leaves
+            // the value alone (RTX 4070 Laptop 621.24 and WARP), so only 1.2 is clamped.
+            const UINT requested = static_cast<UINT>(root->HighestVersion);
+            if (requested < static_cast<UINT>(D3D_ROOT_SIGNATURE_VERSION_1_0) || requested > 0x3) return E_INVALIDARG;
             if (root->HighestVersion > kHighestRootSignatureVersion)
                 root->HighestVersion = kHighestRootSignatureVersion;
             return S_OK;

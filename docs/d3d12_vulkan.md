@@ -1587,9 +1587,10 @@ The trace will enumerate them.
   way.
 - `D3D12_FEATURE_ROOT_SIGNATURE`: 1.1, the version the proxy can always produce. A 1.2 blob is rewritten as 1.1 when
   the host's serializer stops at 1.1 and nothing is lost (`d3d12_xs_rootsig.cpp`), and Windows 10's `d3d12.dll` stops
-  there, so 1.1 is what the game can rely on everywhere. A higher request is clamped down like the shader model, and
-  an undefined value is refused. Measured against the host PC runtime (616.86): 1.0-1.2 echo the request, and a
-  wrong `DataSize` is `E_INVALIDARG`; the host crashed on a null buffer, so the test never gives it one.
+  there, so 1.1 is what the game can rely on everywhere. A 1.2 request is clamped down to 1.1, and an undefined value
+  (0, or anything above 1.2) is `E_INVALIDARG` with the value left as it was. Measured against the host PC runtime
+  (616.86): 1.0-1.2 echo the request, and a wrong `DataSize` is `E_INVALIDARG`; the host crashed on a null buffer, so
+  the test never gives it one. The refusal above 1.2 was measured on an RTX 4070 Laptop (621.24) and WARP.
 - `D3D12_FEATURE_D3D12_OPTIONS1`: answer from the Vulkan device's subgroups. `WaveOps` is true only when every
   operation group the wave intrinsics map to is present (`BASIC`, `VOTE`, `BALLOT`, `SHUFFLE`, `ARITHMETIC`),
   because D3D12 promises them all behind that one bool. `WaveLaneCountMin`/`Max` are the subgroup size range

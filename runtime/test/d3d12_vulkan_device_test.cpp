@@ -5061,6 +5061,15 @@ int main() {
             EXPECT(newer.HighestVersion == D3D_ROOT_SIGNATURE_VERSION_1_1);
             D3D12_FEATURE_DATA_ROOT_SIGNATURE undefined{static_cast<D3D_ROOT_SIGNATURE_VERSION>(0)};
             EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &undefined, sizeof(undefined))));
+            // Anything above 1.2 is undefined: E_INVALIDARG with the value left alone, measured on an RTX 4070 Laptop
+            // (621.24) and WARP. Checked here rather than against the host, which has crashed on undefined values of
+            // the shader model query next to this one.
+            for (const UINT undefined_version : {0x4u, 0x5u, 0x10u, 0xffu, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
+                D3D12_FEATURE_DATA_ROOT_SIGNATURE refused{static_cast<D3D_ROOT_SIGNATURE_VERSION>(undefined_version)};
+                EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &refused, sizeof(refused)) ==
+                       E_INVALIDARG);
+                EXPECT(static_cast<UINT>(refused.HighestVersion) == undefined_version);
+            }
             // A wrong DataSize and a null buffer are refused for both queries.
             D3D12_FEATURE_DATA_SHADER_MODEL short_model{D3D_SHADER_MODEL_6_0};
             D3D12_FEATURE_DATA_ROOT_SIGNATURE short_signature{D3D_ROOT_SIGNATURE_VERSION_1_1};
