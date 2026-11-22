@@ -8,6 +8,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../shims/shims.h"
@@ -1149,6 +1151,58 @@ void test_unwind_registration() {
 
 // An export whose address-table entry is past SizeOfImage (not a forwarder: outside the export directory) is
 // refused instead of being stored as base + rva, a pointer outside the mapping.
+// The address-to-module lookup the shim registry uses (on every C++ throw from a mapped image, and for trace and
+// stop lines) runs on whatever thread asks, while another thread may be inside load(). It used to walk the Loader's
+// module vector with no lock while load() appended to it. Without the fix this fails for certain only under
+// AddressSanitizer; here it checks that every answer given during 300 loads is right.
+void test_lookup_during_loads() {
+    const char* what = "the address lookup is right while another thread loads modules";
+    try {
+        rt::Loader loader(g_dir);
+        auto first = make_image();
+        auto* first_nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(first.data() + 0x80);
+        first_nt->OptionalHeader.ImageBase = 0x200000000ull;
+        rt::Module& anchor = loader.load(write_image(first));
+        const uint64_t inside = reinterpret_cast<uint64_t>(anchor.base) + 0x1004;
+
+        std::atomic<bool> stop{false};
+        std::atomic<unsigned> lookups{0}, wrong{0};
+        std::thread reader([&] {
+            while (!stop.load()) {
+                uint64_t base = 0;
+                if (!rt::shims::mapped_image_base(inside, base) || base != reinterpret_cast<uint64_t>(anchor.base))
+                    ++wrong;
+                if (rt::shims::module_offset(inside).find("+0x1004") == std::string::npos) ++wrong;
+                uint64_t none = 0;
+                if (rt::shims::mapped_image_base(0x10, none)) ++wrong;  // in no image
+                ++lookups;
+            }
+        });
+        unsigned loaded = 0;
+        for (unsigned i = 1; i <= 300; ++i) {
+            auto img = make_image();
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(img.data() + 0x80);
+            nt->OptionalHeader.ImageBase = 0x200000000ull + i * 0x10000ull;
+            rt::Module& m = loader.load(write_image(img));
+            uint64_t base = 0;
+            if (rt::shims::mapped_image_base(reinterpret_cast<uint64_t>(m.base) + 0x1000, base) &&
+                base == reinterpret_cast<uint64_t>(m.base))
+                ++loaded;
+        }
+        while (lookups.load() < 1000) std::this_thread::yield();
+        stop = true;
+        reader.join();
+        if (wrong.load())
+            failed(what, std::to_string(wrong.load()) + " wrong answers in " + std::to_string(lookups.load()) + " lookups");
+        else if (loaded != 300)
+            failed(what, "only " + std::to_string(loaded) + " of 300 new modules were found by address");
+        else
+            pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 void test_export_bounds() {
     auto outside = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
     nt_of(outside)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
@@ -1256,6 +1310,7 @@ int main() {
         test_export_bounds();
         test_tls_directory_count();
         test_unwind_registration();
+        test_lookup_during_loads();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());
