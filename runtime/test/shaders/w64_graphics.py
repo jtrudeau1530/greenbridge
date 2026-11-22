@@ -15,7 +15,8 @@ hardware wave, the reference) and to 32 (the halves) through VKH_SUBGROUP_SIZE o
 A device that can require only one size (NVIDIA: 32 only) cannot run the comparison. There the default-size image is
 checked against the derived words (tiers A, B), the tier C check is skipped, and two environment variables let a
 second device stand in for the missing size: W64G_SAVE_REF=<dir> stores each 64-lane run of a device that can require
-it, and W64G_REF=<dir> compares every run of the other device with those files (equal for A and B, different for C).
+it (or that has 64 as its only size: AMD GCN), and W64G_REF=<dir> compares every run of the other device with those
+files (equal for A and B, different for C).
 
 The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
@@ -105,6 +106,21 @@ def _a_one_lane(i):
     return (7777 if on else 1000 + x, 3000 + 11 * on, 4000 + y + 13 * on, x % 4)
 
 
+def _a_permlane(i):
+    x, y = _x(i), _y(i)
+    return ((x ^ 1) + 64 * y, x + 64 * (y ^ 1), 64 * y + x, 64 * y + x)
+
+
+def _a_swizzle(i):
+    x, y = _x(i), _y(i)
+    return ((x ^ 1) + 64 * (y ^ 1), (x ^ 1) + 64 * y, 64 * y + x, (x & ~1) + 64 * (y & ~1))
+
+
+def _a_bpermute(i):
+    x, y = _x(i), _y(i)
+    return ((x ^ 1) + 64 * y, (x ^ 1) + 64 * (y ^ 1), 64 * y + x, (x & ~1) + 64 * (y | 1))
+
+
 def _c_vote_else(i):
     return (7 if _on(i) else None, _on(i), 0, 0)               # r0 of the other pixels: 0 or 5 by the partition
 
@@ -145,6 +161,9 @@ GS_ENV = {"VKH_SGPRS": "0,0,0,0,0,0,65536,0x30000000", "VKH_HEAP": "0=0"}   # V#
 FIXTURES = {
     "ps_w64_a_skip": ("A", _a_skip, {}),
     "ps_w64_a_one_lane": ("A", _a_one_lane, {}),
+    "ps_w64_a_permlane": ("A", _a_permlane, {}),
+    "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
+    "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
     "ps_w64_b_readfirstlane": ("B", _b_readfirstlane, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_readlane_uniform": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),

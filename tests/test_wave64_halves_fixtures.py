@@ -5,8 +5,11 @@ The fixtures (runtime/test/shaders/{ps,vs}_w64_{a,b,c}_*.asm) are the GPU tests 
 was drawn on an AMD Radeon 880M with the fragment subgroup size required to 64 and to 32, each vertex fixture (TEST-251)
 on an RX 9070 XT and a Ryzen 9800X3D iGPU (RADV) with the VS stage at wave64 and at wave32 (RADV_PERFTEST=gewave32).
 Tier A and B fixtures gave identical words (and the words their header derives), tier C fixtures differed, so this
-test pins the translator's detector to what the hardware showed. Needs llvm-mc with the AMDGPU target and spirv-as / spirv-val, like the other tests that build
-shaders; the pure-Python parts run without them.
+test pins the translator's detector to what the hardware showed. The permute fixtures (TEST-319: ps_w64_a_permlane,
+_a_swizzle, _a_bpermute) gave the words their header derives on an RTX 5070 (32 only), and every fixture's
+RTX 5070 run matched (tiers A, B) or differed from (tier C) a 64-lane RX 580 (GCN, RADV) reference.
+Needs llvm-mc with the AMDGPU target and spirv-as / spirv-val, like the other tests that build shaders; the
+pure-Python parts run without them.
 """
 import json
 import os
@@ -28,6 +31,9 @@ from conftest import LLVM_MC, requires_tools  # noqa: E402
 EXPECT = {
     "ps_w64_a_skip": ("A", [], []),
     "ps_w64_a_one_lane": ("A", [], []),
+    "ps_w64_a_permlane": ("A", [], []),
+    "ps_w64_a_swizzle": ("A", [], []),
+    "ps_w64_a_bpermute": ("A", [], []),
     "ps_w64_b_waterfall": ("B", [], ["waterfall"]),
     "ps_w64_b_readfirstlane": ("B", [], ["readfirstlane-uniform"]),
     "ps_w64_b_readlane_uniform": ("B", [], ["readlane-uniform"]),

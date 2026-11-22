@@ -220,6 +220,43 @@ class Analysis:
                 t |= CTRL
         return t
 
+    LMOD_KEEP = ("v_mov_b32", "v_add_nc_u32", "v_add_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_sub_u32",
+                 "v_subrev_u32", "v_xor_b32", "v_or_b32", "v_and_b32")
+
+    def lmod(self, st, ins, a):
+        """k when the operand is the same in the wave and in a half modulo 2**k: 32 for a partition-invariant value
+        (an immediate, an untainted register), the tag's k for a lane id, -1 for anything else."""
+        if a.get("k") in ("imm", "fimm"):
+            return 32
+        if self.is_mask(ins, a) or a.get("neg") or a.get("abs"):
+            return -1
+        regs = _regs(a)
+        if not regs or self.rd(st, ins, a):
+            if regs and self.rd(st, ins, a) == LANE and all(st["g"].get(r, ("",))[0] == "lmod" for r in regs):
+                return min(st["g"][r][1] for r in regs)
+            return -1
+        return 32
+
+    def lmod_result(self, st, ins, op, a):
+        """k of a VALU result whose only partition-dependent source is a lane id exact modulo 2**k: sums,
+        differences and bitwise ops with invariant values keep k, a left shift by an immediate c raises it to k + c."""
+        # SDWA selects, DPP, op_sel and integer clamp change the value: no tag
+        mods = ins.get("mods") or []
+        if ins["op"].endswith(("_sdwa", "_dpp")) or any(
+                m == "clamp" or m.startswith(("op_sel", "dst_unused")) or "_sel:" in m for m in mods):
+            return None
+        src = a[1:]
+        ks = [self.lmod(st, ins, x) for x in src]
+        if not src or min(ks) < 0:
+            return None
+        if op in self.LMOD_KEEP:
+            return min(ks)
+        if op == "v_lshlrev_b32" and len(src) == 2 and src[0].get("k") == "imm":
+            return min(32, ks[1] + (src[0]["v"] & 31))
+        if op in ("v_lshl_add_u32", "v_lshl_or_b32") and len(src) == 3 and src[1].get("k") == "imm":
+            return min(32, ks[0] + (src[1]["v"] & 31), ks[2])
+        return None
+
     def join(self, a, b, blk=0):
         t = dict(a["t"])
         for k, v in b["t"].items():
@@ -475,7 +512,17 @@ class Analysis:
             m, acc = a[1], a[2]
             tacc = self.rd(st, ins, acc)
             if m.get("k") == "imm" and m["v"] in (-1, 0xFFFFFFFF):
-                put(a[0], LANE | tacc)
+                # v_mbcnt_lo(-1, 0) then v_mbcnt_hi(-1, that) is the lane id: 0..63 in the wave, 0..31 in a half,
+                # so the two differ by a multiple of 32 (tag ("lmod", 5)); the low count alone does not (lanes 32..63
+                # count 32 in the wave)
+                if op == "v_mbcnt_lo_u32_b32" and acc.get("k") == "imm" and acc["v"] == 0:
+                    tag = ("lane_lo",)
+                elif op == "v_mbcnt_hi_u32_b32" and tacc == LANE and _regs(acc) and \
+                        st["g"].get(_regs(acc)[0]) == ("lane_lo",):
+                    tag = ("lmod", 5)
+                else:
+                    tag = None
+                put(a[0], LANE | tacc, tag)
             elif self.is_mask(ins, m):
                 if m.get("k") == "special" and m.get("t", "").startswith("exec"):
                     token = st["x"]
@@ -542,6 +589,12 @@ class Analysis:
                 or any(m.startswith("row_") or m.startswith("quad_perm") for m in mods):
             bad = any(m.startswith(DPP_BAD) for m in mods)
             put_t = t_src | (X if bad else 0)
+            # a wave64 ds_bpermute/ds_permute works on each half (ISA 10.4.4) and uses address bits 2..6 only, so a
+            # lane-id address that is the same modulo 128 in the wave and in a half reads/writes the same lane
+            if op in ("ds_bpermute_b32", "ds_permute_b32") and len(a) >= 3 and self.lmod(st, ins, a[1]) >= 7:
+                put_t = self.rd(st, ins, a[2])
+                for r in uses:
+                    put_t |= T.get(r, 0) | (CTRL if (id(ins), r) in self.stale else 0)
             for d in dests:
                 put(d, put_t)
             return
@@ -699,6 +752,10 @@ class Analysis:
             if op in ("v_mov_b32", "v_mov_b32_e32") and len(srcs) == 1 and tj & CNT and _regs(srcs[0]):
                 ctok = self.cnt_token(st, _regs(srcs[0])[0])
                 tag = ("cnt", ctok) if ctok is not None else None
+            if tag is None and tj == LANE and len(dests) == 1:
+                k = self.lmod_result(st, ins, op, a)
+                if k is not None:
+                    tag = ("lmod", k)
             if st["xg"] and st["xg"][0] == "elect" and dests:
                 tj |= ELECT
                 tag = ("elect", st["xg"][1], ctok)
