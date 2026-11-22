@@ -353,6 +353,156 @@ class TestSymbolicAST(unittest.TestCase):
             VPackB32I16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(2, 0))
 
 
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        self.vgprs[index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        self.sgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_pack_b32_i16."""
+
+    def resolve_operand(self, op: VOP3Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.value & MASK32
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VPackB32I16Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s0_raw = self.resolve_operand(instr.src0, state)
+        s1_raw = self.resolve_operand(instr.src1, state)
+
+        # Computation phase
+        result = oracle_v_pack_b32_i16(
+            src0_bits=s0_raw,
+            src1_bits=s1_raw,
+            op_sel=instr.op_sel,
+            abs0=instr.src0.abs_mod,
+            neg0=instr.src0.neg_mod,
+            abs1=instr.src1.abs_mod,
+            neg1=instr.src1.neg_mod,
+            clamp=instr.clamp,
+        )
+
+        # Write-back phase
+        state.set_vgpr(instr.dst.index, result)
+        return result
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_basic_step_vgprs(self) -> None:
+        self.state.set_vgpr(1, 100)
+        self.state.set_vgpr(2, (-200) & MASK16)
+        instr = VPackB32I16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        expected = ((((-200) & MASK16) << 16) | 100) & MASK32
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_vgpr(0), expected)
+
+    def test_step_with_sgpr_and_literal(self) -> None:
+        # SGPR 4 has [high: 500, low: -300]
+        self.state.set_sgpr(4, (500 << 16) | ((-300) & MASK16))
+        # Literal operand is -1234
+        instr = VPackB32I16Instruction(
+            dst=Reg(5, RegType.VGPR),
+            src0=VOP3Operand(Reg(4, RegType.SGPR)),
+            src1=VOP3Operand(Literal32.from_i16(-1234)),
+            op_sel=(1, 0),
+        )
+        # src0 op_sel 1 extracts high half 500; src1 op_sel 0 extracts low half -1234
+        res = self.interp.step(instr, self.state)
+        expected = ((((-1234) & MASK16) << 16) | 500) & MASK32
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_vgpr(5), expected)
+
+    def test_step_with_modifiers(self) -> None:
+        self.state.set_vgpr(1, (-75) & MASK16)
+        self.state.set_vgpr(2, 120)
+        instr = VPackB32I16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR), abs_mod=True),
+            src1=VOP3Operand(Reg(2, RegType.VGPR), neg_mod=True),
+        )
+        res = self.interp.step(instr, self.state)
+        expected = ((((-120) & MASK16) << 16) | 75) & MASK32
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_vgpr(0), expected)
+
+    def test_step_with_clamp(self) -> None:
+        # abs(-32768) with clamp saturates to 32767
+        self.state.set_vgpr(1, 0x8000)
+        self.state.set_vgpr(2, 0x8000)
+        instr = VPackB32I16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR), abs_mod=True),
+            src1=VOP3Operand(Reg(2, RegType.VGPR), abs_mod=True),
+            clamp=True,
+        )
+        res = self.interp.step(instr, self.state)
+        expected = (0x7FFF << 16) | 0x7FFF
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_vgpr(0), expected)
+
+    def test_deterministic_repeatability(self) -> None:
+        self.state.set_vgpr(10, 0x12345678)
+        self.state.set_vgpr(11, 0x9ABCDEF0)
+        instr = VPackB32I16Instruction(
+            dst=Reg(12, RegType.VGPR),
+            src0=VOP3Operand(Reg(10, RegType.VGPR)),
+            src1=VOP3Operand(Reg(11, RegType.VGPR)),
+            op_sel=(1, 0),
+        )
+        res0 = self.interp.step(instr, self.state)
+        for _ in range(50):
+            res_n = self.interp.step(instr, self.state)
+            self.assertEqual(res0, res_n)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
