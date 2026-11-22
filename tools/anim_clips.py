@@ -550,6 +550,10 @@ def segment(rows, k):
     return rows[k]["offset"], rows[k]["stored"], False
 
 
+# A continuation can start with pack:/ paths or bone names inside the dictionary.
+_MAP_BOUNDARIES = anim_index.STOP_SIGNATURES - {"name-table", "skeleton-names"}
+
+
 def group(m, rows, *, first_row_only: bool = False):
     """-> ([(root index, [stream indices or gap pages])], unresolved count by reason, gap pages by kind). A
     dictionary takes the page map's system page count of back-to-back streams. When the last page is not the next
@@ -571,13 +575,16 @@ def group(m, rows, *, first_row_only: bool = False):
         end = len(data)
         while len(counts) < 2 and len(parts) < 255 and k + 1 < len(rows):
             following = rows[k + 1]
-            if not _next_to(rows[k], following) or following["signature"] in anim_index.STOP_SIGNATURES:
+            if not _next_to(rows[k], following) or following["signature"] in _MAP_BOUNDARIES:
                 break
             start, end = end, end + following["size"]
             page = None
             if following["signature"] == "zero-prefix":
                 page = _inflate(m, following)
-                if is_root(page):
+                # Short continuation pages can resemble an unnamed root. Within
+                # the original four-page window, check the root name or local map.
+                if is_root(page) and (len(parts) >= 4 or any(page[0x38:0x40])
+                                      or struct.unpack_from("<Q", page, 8)[0] - SYSTEM + 10 <= len(page)):
                     break
             k += 1
             parts.append(k)
