@@ -27,7 +27,7 @@ struct Event {
 };
 
 bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, const FLOAT* full, const FLOAT* part,
-                    std::vector<unsigned char>& pixels) {
+                    std::vector<unsigned char>& pixels, bool volume = false) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -39,23 +39,23 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, co
                                              IID_PPV_ARGS(&list.p))));
     CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
-    constexpr UINT width = 5, height = 3; // Odd dimensions expose incorrect treatment of footprint padding.
     Ref<ID3D12Resource> image, readback;
     D3D12_HEAP_PROPERTIES heap_properties{};
     heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC texture{};
-    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texture.Width = width;
-    texture.Height = height;
-    texture.DepthOrArraySize = texture.MipLevels = 1;
+    texture.Dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = volume ? 8 : 5;
+    texture.Height = volume ? 6 : 3;
+    texture.DepthOrArraySize = volume ? 12 : 1;
+    texture.MipLevels = volume ? 2 : 1;
     texture.Format = format;
     texture.SampleDesc.Count = 1;
     texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&image.p))));
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed[2]{};
     UINT64 total = 0;
-    device->GetCopyableFootprints(&texture, 0, 1, 0, &placed, nullptr, nullptr, &total);
+    device->GetCopyableFootprints(&texture, 0, texture.MipLevels, 0, placed, nullptr, nullptr, &total);
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     buffer.Width = total;
@@ -72,7 +72,23 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, co
     device->CreateRenderTargetView(image.p, nullptr, handle);
     list->ClearRenderTargetView(handle, full, 0, nullptr);
     const D3D12_RECT rect{1, 1, 4, 3};
-    list->ClearRenderTargetView(handle, part, 1, &rect);
+    if (volume) {
+        D3D12_RENDER_TARGET_VIEW_DESC view{};
+        view.Format = format;
+        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+        const auto clear = [&](UINT first, UINT count, const FLOAT* color, const D3D12_RECT* area) {
+            view.Texture3D = {1, first, count};
+            device->CreateRenderTargetView(image.p, &view, handle);
+            list->ClearRenderTargetView(handle, color, area ? 1 : 0, area);
+        };
+        const FLOAT blue[4]{0, 0, 1, 1};
+        const FLOAT yellow[4]{1, 1, 0, 0};
+        clear(0, UINT_MAX, blue, nullptr);
+        clear(1, 2, part, nullptr);
+        clear(2, UINT_MAX, yellow, &rect);
+    } else {
+        list->ClearRenderTargetView(handle, part, 1, &rect);
+    }
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = image.p;
@@ -85,8 +101,11 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, co
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dst.pResource = readback.p;
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = placed;
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    for (UINT mip = 0; mip < texture.MipLevels; ++mip) {
+        src.SubresourceIndex = mip;
+        dst.PlacedFootprint = placed[mip];
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
     CHECK(SUCCEEDED(list->Close()));
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
@@ -98,10 +117,14 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, co
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
-    pixels.resize(width * height * bytes);
-    for (UINT y = 0; y < height; ++y)
-        std::memcpy(pixels.data() + y * width * bytes,
-                    static_cast<unsigned char*>(mapped) + y * placed.Footprint.RowPitch, width * bytes);
+    pixels.clear();
+    for (UINT mip = 0; mip < texture.MipLevels; ++mip) {
+        const auto& fp = placed[mip].Footprint;
+        for (UINT row = 0; row < fp.Height * fp.Depth; ++row) {
+            const auto* start = static_cast<unsigned char*>(mapped) + placed[mip].Offset + row * fp.RowPitch;
+            pixels.insert(pixels.end(), start, start + fp.Width * bytes);
+        }
+    }
     const D3D12_RANGE none{};
     readback->Unmap(0, &none);
     return true;
@@ -204,14 +227,46 @@ bool clear_depth_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned dep
     readback->Unmap(0, &none);
     return true;
 }
+bool check_volume_rtvs(ID3D12Device* host, ID3D12Device* ours) {
+    const FLOAT red[4]{1, 0, 0, 1}, green[4]{0, 1, 0, 1};
+    std::vector<unsigned char> expected;
+    // Mip 0 stays red. Mip 1 starts blue; W 1 and 2 are green, with a yellow rectangle on W 2 through 5.
+    for (UINT mip = 0; mip < 2; ++mip)
+        for (UINT z = 0; z < (12u >> mip); ++z)
+            for (UINT y = 0; y < (6u >> mip); ++y)
+                for (UINT x = 0; x < (8u >> mip); ++x) {
+                    if (mip == 0) expected.insert(expected.end(), {255, 0, 0, 255});
+                    else if (z >= 2 && x >= 1 && y >= 1) expected.insert(expected.end(), {255, 255, 0, 0});
+                    else if (z == 1 || z == 2) expected.insert(expected.end(), {0, 255, 0, 255});
+                    else expected.insert(expected.end(), {0, 0, 255, 255});
+                }
+    const auto verify = [&](ID3D12Device* device, const char* backend) {
+        std::vector<unsigned char> pixels;
+        if (!clear_and_read(device, DXGI_FORMAT_R8G8B8A8_UNORM, 4, red, green, pixels, true)) return false;
+        CHECK(pixels.size() == expected.size());
+        size_t wrong = 0;
+        for (size_t offset = 0; offset < pixels.size(); offset += 4)
+            if (std::memcmp(pixels.data() + offset, expected.data() + offset, 4)) ++wrong;
+        if (wrong) std::fprintf(stderr, "%s: %zu of %zu volume texels differ\n", backend, wrong, pixels.size() / 4);
+        return wrong == 0;
+    };
+    if (!verify(host, "WARP") || !verify(ours, "Vulkan")) return false;
+    std::printf("3D RTVs: %zu RGBA texels match WARP and expected slice colours\n", expected.size() / 4);
+    return true;
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool volume_only = argc == 2 && std::strcmp(argv[1], "--volume") == 0;
+    if (argc != 1 && !volume_only) {
+        std::fprintf(stderr, "usage: d3d12_clear_test [--volume]\n");
+        return 2;
+    }
     vktest::Device vk;
     if (!vk.create()) return 1;
     const unsigned errors_before = vk.validation_errors();
     unsigned cases_checked = 0;
-    {
+    const auto compare = [&]() -> int {
         Ref<ID3D12Device> ours, host;
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = vk.instance_proc;
@@ -229,6 +284,8 @@ int main() {
             std::fprintf(stderr, "WARP reference unavailable: differential test cannot run\n");
             return 1;
         }
+        if (!check_volume_rtvs(host.p, ours.p)) return 1;
+        if (volume_only) return 0;
         const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
         // Integer-format values: negatives, fractions, NaN and overflow exercise the numeric float->int conversion.
         const std::array<float, 4> int_values[] = {
@@ -300,8 +357,10 @@ int main() {
                 ++cases_checked;
             }
         }
-    } // Destroy the D3D12 objects before checking the Vulkan validation counter.
-    if (vk.validation_errors() != errors_before) return 1;
+        return 0;
+    }; // Destroy the D3D12 objects before checking the Vulkan validation counter.
+    if (compare() || vk.validation_errors() != errors_before) return 1;
+    if (volume_only) return 0;
     std::printf("RTV and DSV clears: %u full/rectangle readbacks matched WARP\n", cases_checked);
     return 0;
 }
