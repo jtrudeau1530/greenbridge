@@ -271,6 +271,9 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(retire_tickets_test test/retire_tickets_test.cpp)
+  add_test(NAME retire_tickets COMMAND retire_tickets_test)
+
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
   # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
