@@ -7120,6 +7120,63 @@ class Gen:
                 self.emit(f"{scaled} = OpSelect %uint {valid} {norm} {ov}")
                 self.emit(f"{r} = OpSelect %uint {isnorm} {scaled} {other}")
                 self.dst(a[0], self.tou(self.clamp_mods(self.tof(r), mods)))
+        elif op in ("v_frexp_mant_f64", "v_frexp_exp_i32_f64"):
+            # Binary64 version of v_frexp_mant_f32 / v_frexp_exp_i32_f32, bit-exact on the (lo, hi) dword pair.
+            # Normal inputs have biased exponent 1..2046; zero and denormals give +-0 / exp 0, infinities and NaNs
+            # pass through unchanged / exp 0 (RDNA2 ISA, V_FREXP_MANT_F64 / V_FREXP_EXP_I32_F64).
+            sv = a[1]
+            if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+            elif sv["k"] in ("imm", "fimm"):
+                bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
+                        if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+            else:
+                raise Unsupported(op + " operand")
+            if sv.get("abs"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+                hi = t
+            if sv.get("neg"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+                hi = t
+            e, em1, isnorm, isden, sgn = (self.tmp() for _ in range(5))
+            self.emit(f"{e} = OpBitFieldUExtract %uint {hi} {self.cu(20)} {self.cu(11)}")
+            self.emit(f"{em1} = OpISub %uint {e} {self.cu(1)}")
+            self.emit(f"{isnorm} = OpULessThan %bool {em1} {self.cu(2046)}")         # exponent field 1..2046
+            self.emit(f"{isden} = OpIEqual %bool {e} {self.cu(0)}")
+            self.emit(f"{sgn} = OpBitwiseAnd %uint {hi} {self.cu(0x80000000)}")
+            if op == "v_frexp_exp_i32_f64":
+                if any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods):
+                    raise Unsupported(op + " output modifier")
+                ex, r = self.tmp(), self.tmp()
+                self.emit(f"{ex} = OpISub %uint {e} {self.cu(1022)}")
+                self.emit(f"{r} = OpSelect %uint {isnorm} {ex} {self.cu(0)}")
+                self.dst(a[0], r)
+            else:
+                d = a[0]
+                if d["k"] != "vgpr" or d.get("n") != 2:
+                    raise Unsupported(op + " destination")
+                keep, m_hi, other_hi, other_lo, r_hi, r_lo = (self.tmp() for _ in range(6))
+                self.emit(f"{keep} = OpBitwiseAnd %uint {hi} {self.cu(0x800FFFFF)}")
+                self.emit(f"{m_hi} = OpBitwiseOr %uint {keep} {self.cu(0x3FE00000)}")  # biased exponent 1022
+                self.emit(f"{other_hi} = OpSelect %uint {isden} {sgn} {hi}")
+                self.emit(f"{other_lo} = OpSelect %uint {isden} {self.cu(0)} {lo}")
+                self.emit(f"{r_hi} = OpSelect %uint {isnorm} {m_hi} {other_hi}")
+                self.emit(f"{r_lo} = OpSelect %uint {isnorm} {lo} {other_lo}")
+                if any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods):
+                    self.uses_f64 = True
+                    v2, dv, mv2 = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {r_lo} {r_hi}")
+                    self.emit(f"{dv} = OpBitcast %double {v2}")
+                    dv = self.clamp_mods_f64(dv, mods)
+                    self.emit(f"{mv2} = OpBitcast %v2uint_d {dv}")
+                    r_lo, r_hi = self.tmp(), self.tmp()
+                    self.emit(f"{r_lo} = OpCompositeExtract %uint {mv2} 0")
+                    self.emit(f"{r_hi} = OpCompositeExtract %uint {mv2} 1")
+                self.dst({"k": "vgpr", "r": d["r"], "n": 1}, r_lo)
+                self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r_hi)
         elif op in ("v_cvt_f32_u32", "v_cvt_f32_i32"):
             x = self.src_u(a[1])
             r = self.tmp()
