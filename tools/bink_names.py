@@ -131,7 +131,7 @@ def _int(value):
     return int(value, 0) if isinstance(value, str) else int(value)
 
 
-def load_streams(source):
+def load_streams(source, skip_report=None):
     """Stream rows (source, offset, size, width, height, frames) in archive order."""
     lower = source.lower()
     if os.path.isfile(source) and lower.endswith(".json"):
@@ -151,11 +151,13 @@ def load_streams(source):
             rows = list(reader)
         label, start = "row {i}", 2
     else:
-        rows, _summary = bink_index.scan_target(source)
+        rows, _summary = bink_index.scan_target(source, skip_report=skip_report)
         label, start = "stream {i}", 1
     out = []
     for j, row in enumerate(rows):
         try:
+            if not isinstance(row, dict):
+                raise TypeError("row is not an object")
             out.append({"source": row["source"], "offset": _int(row["offset"]), "size": _int(row["size"]),
                         "width": _int(row["width"]), "height": _int(row["height"]), "frames": _int(row["frames"])})
         except (KeyError, ValueError, TypeError, OverflowError) as error:
@@ -173,9 +175,20 @@ def load_pins(path):
     if not path:
         return pins
     with open(path, encoding="utf-8", newline="") as fh:
-        for row in csv.DictReader(fh):
-            key = (row.get("source") or "", _int(row["offset"]))
-            pins.setdefault(key, set()).update(p.strip().lower() for p in row["path"].split("|") if p.strip())
+        reader = csv.DictReader(fh)
+        header = reader.fieldnames or []
+        missing = [f for f in ("offset", "path") if f not in header]
+        if missing:
+            raise ValueError(f"CSV header is missing required fields: {', '.join(missing)}")
+        for j, row in enumerate(reader, start=2):
+            try:
+                key = ((row.get("source") or "").strip(), _int(row["offset"]))
+                raw_path = row["path"]
+                if not isinstance(raw_path, str):
+                    raise TypeError("path is missing")
+            except (KeyError, ValueError, TypeError, OverflowError) as error:
+                raise ValueError(f"row {j} is missing or unusable: {error}") from None
+            pins.setdefault(key, set()).update(p.strip().lower() for p in raw_path.split("|") if p.strip())
     return pins
 
 
@@ -327,15 +340,38 @@ def main(argv=None):
             return 2
     if a.out and any(bink_index.same_output_path(p, a.out) for p in inputs):
         ap.error("--out must not overwrite an input")
+    if a.out and os.path.isdir(a.out):
+        ap.error(f"--out is a folder, not a report file: {a.out}")
+    if a.out:
+        for folder in [p for p in [a.source, *a.mount] if os.path.isdir(p)]:
+            manifest = os.path.join(folder, "index.json")
+            if os.path.isfile(manifest) and bink_index.same_output_path(a.out, manifest):
+                ap.error(f"--out would overwrite the carve manifest: {a.out}")
+            if os.path.isfile(a.out):
+                for root, _dirs, names in os.walk(folder):
+                    for name in names:
+                        if name.lower().endswith((".json", ".csv")):
+                            continue
+                        if bink_index.same_output_path(os.path.join(root, name), a.out):
+                            ap.error(f"--out would overwrite an input file: {a.out}")
 
-    names = read_mount_lists(a.mount)
     try:
-        streams = load_streams(a.source)
+        names = read_mount_lists(a.mount)
+    except (OSError, ValueError) as error:
+        print(f"bink_names: error: {error}", file=sys.stderr)
+        return 1
+    try:
+        streams = load_streams(a.source, skip_report=a.out if a.out and os.path.isfile(a.out) else None)
     except (OSError, csv.Error, ValueError) as error:
         print(f"bink_names: error: {a.source}: {error}", file=sys.stderr)
         return 1
     try:
-        rows, unmatched = name_streams(names, streams, load_pins(a.pins), a.max_skip)
+        pins = load_pins(a.pins)
+    except (OSError, csv.Error, ValueError) as error:
+        print(f"bink_names: error: {a.pins}: {error}", file=sys.stderr)
+        return 1
+    try:
+        rows, unmatched = name_streams(names, streams, pins, a.max_skip)
     except ValueError as error:
         print(f"bink_names: error: {error}", file=sys.stderr)
         return 1

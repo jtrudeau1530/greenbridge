@@ -276,6 +276,30 @@ class TestCli(unittest.TestCase):
             with open(pins, "rb") as fh:
                 self.assertEqual(fh.read(), before, "the pins CSV must not be modified")
 
+    def test_refuses_to_overwrite_input_inside_source_or_mount_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = os.path.join(tmp, "streams")
+            mount_dir = os.path.join(tmp, "mounts")
+            os.mkdir(src_dir)
+            os.mkdir(mount_dir)
+            stream_file = os.path.join(src_dir, "one.bk2")
+            stream_bytes = make_stream(1280, 720, 40)
+            with open(stream_file, "wb") as fh:
+                fh.write(stream_bytes)
+            xml_text = mount_xml(["f/a.bk2"])
+            xml_file = os.path.join(mount_dir, "list.xml")
+            with open(xml_file, "w", encoding="utf-8") as fh:
+                fh.write(xml_text)
+            for target in (stream_file, xml_file, src_dir):
+                with self.subTest(target=target):
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+                        names_mod.main([src_dir, "--mount", mount_dir, "--out", target])
+                    self.assertEqual(cm.exception.code, 2)
+            with open(stream_file, "rb") as fh:
+                self.assertEqual(fh.read(), stream_bytes)
+            with open(xml_file, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), xml_text)
+
 
 class TestReportErrors(unittest.TestCase):
     """Bad bink_index.csv/.json sources fail with a one-line, path-specific error and no report."""
@@ -299,6 +323,7 @@ class TestReportErrors(unittest.TestCase):
         cases = [
             ("index.json", '{"summary": {}, "target": "x.rpf"}', "streams"),
             ("index.json", '[]', "streams"),
+            ("index.json", '{"streams": [null]}', "stream 1"),
             ("index.json", '{"streams": [{"source": "a", "offset": 0}]}', "stream 1"),
             ("index.json", '{"streams": [', None),
             ("index.csv", "source,offset,size,width,height\n", "frames"),
@@ -317,6 +342,38 @@ class TestReportErrors(unittest.TestCase):
                     if needle is not None:
                         self.assertIn(needle, err)
                     self.assertFalse(os.path.exists(out))
+
+    def test_bad_pins_are_rejected(self):
+        cases = [
+            ("pins.csv", "", "offset, path"),
+            ("pins.csv", "offset,source\n0,a.rpf\n", "path"),
+            ("pins.csv", "offset,path\nbogus,f/a.bk2\n", "row 2"),
+            ("pins.csv", "offset,path\n0\n", "row 2"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self.write(tmp, "index.json", '{"streams": []}')
+            xml = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
+            for name, text, needle in cases:
+                with self.subTest(text=text):
+                    pins = self.write(tmp, name, text)
+                    out = os.path.join(tmp, "names.csv")
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        code = names_mod.main([source, "--mount", xml, "--pins", pins, "--out", out])
+                    self.assertEqual(code, 1)
+                    self.assertIn(pins, err.getvalue())
+                    self.assertIn(needle, err.getvalue())
+                    self.assertFalse(os.path.exists(out))
+            # A directory passed as --pins must also report a clean error rather than an uncaught OSError.
+            pins_dir = os.path.join(tmp, "pins_dir")
+            os.mkdir(pins_dir)
+            out = os.path.join(tmp, "names.csv")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = names_mod.main([source, "--mount", xml, "--pins", pins_dir, "--out", out])
+            self.assertEqual(code, 1)
+            self.assertIn(pins_dir, err.getvalue())
+            self.assertFalse(os.path.exists(out))
 
     def test_empty_sources_are_accepted(self):
         cases = [
