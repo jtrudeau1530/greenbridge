@@ -4,7 +4,7 @@ awc_opus.py writes <out>/<bank>/<stream id>.ogg with an empty OpusTags header. T
 from two local work products:
 
 ``--names``     awc_names.py CSV (source, bank, stream_id, name, rule). A file is matched by its stream id (the file
-                name) and its bank (the folder path below the Opus folder; if that has no match, the path with its
+                name; awc_opus.py's ``<id>~2.ogg`` for a second stream with the same id gets the same name) and its bank (the folder path below the Opus folder; if that has no match, the path with its
                 leading folders removed one at a time, so the Opus folder may hold several archives' outputs).
 ``--dialogue``  text_tables.py dialogue CSV (wave, key, label, speaker, text_<lang> ...). A named stream whose name is
                 a dialogue wave gets that line's label, speaker and subtitles.
@@ -40,7 +40,7 @@ from awc_opus import ogg_page, write_file  # noqa: E402
 VENDOR = b"leonida "
 MARKUP = re.compile(r"~[^~]*~")
 SPACES = re.compile(r"\s+")
-STREAM_FILE = re.compile(r"^([0-9A-Fa-f]{8})\.ogg$")
+STREAM_FILE = re.compile(r"^([0-9A-Fa-f]{8})(?:~\d+)?\.ogg$")   # <id>~2 ...: a later stream with the same id
 MAX_PACKET = 255 * 255 - 1          # lacing values of one page: 254 full segments and a final short one
 
 
