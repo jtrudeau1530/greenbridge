@@ -15,9 +15,9 @@ report says how many words each one changed. A run passes when it exits 0, the K
 installed) reports no error, and a second run writes the same heap bytes.
 
 --checked also runs the programs whose effect reads straight off their code with inputs chosen for them, and compares
-every byte they write (CHECKED below). Each takes a count and writes that many 16- or 8-byte entries from thread
-index 0 up; 32 threads per group, so one group with a count of 20 also shows that entries past the count are left
-alone.
+every byte they write (CHECKED below). Five take a count and write that many 16- or 8-byte entries from thread index 0
+up; 32 threads per group, so one group with a count of 20 also shows that entries past the count are left alone.
+PrefixSum64 scans 64 words in place into their exclusive prefix sum and stores the total.
 
 The three rehydration programs (Box16Rehydration, Box32Rehydration, LeafRehydration) belong to TEST-376, which checks
 them against tools/bvh_rehydrate.py; --include-rehydration runs them too.
@@ -111,7 +111,7 @@ def smoke(spirv_dir, vkc, *, table_qword, heap_bytes, validation, timeout, inclu
 #
 # Root-table fields as each program reads them (offsets in the table at s[0:1]; addresses are 64-bit, counts and
 # values 32-bit), and what it writes. FILL marks the bytes a program must leave alone.
-DST, SRC = 0x2000, 0x6000          # regions past the 4 KiB table
+DST, SRC, SUMS = 0x2000, 0x6000, 0x4000   # regions past the 4 KiB table
 FILL = 0xAA
 COUNT = 20                          # within one 32-thread group
 
@@ -141,6 +141,29 @@ def _expect_entries(heap, base, stride, count, entry):
     return problems
 
 
+# PrefixSum64's input: 64 words large enough that the sums wrap past 2^32.
+PREFIX_INPUT = [(0x01000193 * (i + 1) ^ (i << 20)) & 0xFFFFFFFF for i in range(64)]
+
+
+def _prefix_setup(heap):
+    struct.pack_into("<64I", heap, DST, *PREFIX_INPUT)
+
+
+def _prefix_expect(heap):
+    """The exclusive prefix sum of the 64 words, in place, and their total (mod 2^32) as group 0's block sum."""
+    problems, run = [], 0
+    for i, x in enumerate(PREFIX_INPUT):
+        got = _u32(heap, DST + 4 * i)
+        if got != run:
+            problems.append(f"element {i}: {got:#x} != {run:#x}")
+        run = (run + x) & 0xFFFFFFFF
+    if _u32(heap, SUMS) != run:
+        problems.append(f"block sum: {_u32(heap, SUMS):#x} != {run:#x}")
+    if bytes(heap[DST + 256:DST + 512]) != bytes([FILL]) * 256:
+        problems.append("bytes past the 64 elements changed")
+    return problems
+
+
 def _source_pattern(i):
     return struct.pack("<4I", 0x10000 + 4 * i, 0x20000 + 4 * i, 0x30000 + 4 * i, 0x40000 + 4 * i)
 
@@ -162,6 +185,9 @@ CHECKED = {
     # the value at +0x18, four times per 16-byte entry, at table+0x8 (count at +0x14)
     "ResetCounterValues": ([(0x8, 8, DST), (0x14, 4, COUNT), (0x18, 4, 0xC0FFEE11)],
                            lambda h: _expect_entries(h, DST, 16, COUNT, lambda i: struct.pack("<4I", *[0xC0FFEE11] * 4))),
+    # one group scans 64 words (32 lanes, two words each) in place at table+0x0 into their exclusive prefix sum; with
+    # bit 0 of +0x10 set, lane 31 stores the group's total at table+0x8 + 4 * group
+    "PrefixSum64": ([(0x0, 8, DST), (0x8, 8, SUMS), (0x10, 4, 1)], _prefix_expect, _prefix_setup),
 }
 
 
@@ -178,13 +204,16 @@ def run_checked(spirv_dir, vkc, *, heap_bytes, validation, timeout, runner=run_p
     results = []
     with tempfile.TemporaryDirectory(prefix="bvh_gpu_checked_") as tmp:
         tmp = Path(tmp)
-        for name, (fields, expect) in CHECKED.items():
+        for name, (fields, expect, *setup) in CHECKED.items():
             spv = Path(spirv_dir) / (name + ".spv")
             if not spv.is_file():
                 results.append({"name": name, "status": "missing", "detail": f"{spv.name} not translated"})
                 continue
             init, dump = tmp / (name + ".in"), tmp / (name + ".out")
-            init.write_bytes(checked_heap(fields, heap_bytes))
+            heap = bytearray(checked_heap(fields, heap_bytes))
+            for prepare in setup:
+                prepare(heap)
+            init.write_bytes(bytes(heap))
             status, detail = runner(vkc, spv, init, dump, heap_bytes // 4, validation, timeout)
             if status == "ok":
                 problems = expect(dump.read_bytes()) if dump.is_file() else ["no heap dump"]

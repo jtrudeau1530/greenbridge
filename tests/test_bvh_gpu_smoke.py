@@ -131,6 +131,13 @@ class Checked(unittest.TestCase):
             elif name == "ResetCounterValues":
                 for i in range(n):
                     struct.pack_into("<4I", heap, fields[8] + 16 * i, *[fields[0x18]] * 4)
+            elif name == "PrefixSum64":
+                values = struct.unpack_from("<64I", heap, fields[0])
+                run = 0
+                for i, x in enumerate(values):
+                    struct.pack_into("<I", heap, fields[0] + 4 * i, run)
+                    run = (run + x) & 0xFFFFFFFF
+                struct.pack_into("<I", heap, fields[8], run)
 
         def runner_for(corrupt):
             def run(vkc, spv, init, dump, heap_words, validation, timeout):
