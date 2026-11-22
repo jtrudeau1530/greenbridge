@@ -790,6 +790,99 @@ int compare_allocation_info(ID3D12Device* ours) {
     return mismatches;
 }
 
+struct Rule {
+    const char* name;
+    HRESULT result;
+};
+
+constexpr const char* kOpenListExecuted = "device after executing an open list";
+
+// Command-list and allocator misuse (D3D-51), in one fixed order on one device; each entry is what that call
+// returned. Run on the PC runtime and on ours, the two lists must agree. The queue waits on a fence the CPU signals
+// later, so "in flight" really is: the GPU cannot have finished the list yet.
+std::vector<Rule> command_list_rules(ID3D12Device* device) {
+    std::vector<Rule> out;
+    const auto add = [&](const char* name, HRESULT hr) { out.push_back({name, hr}); };
+    constexpr D3D12_COMMAND_LIST_TYPE direct = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Ref<ID3D12CommandAllocator> alloc, other, compute;
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12Fence> gate, done;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = direct;
+    if (FAILED(device->CreateCommandAllocator(direct, IID_PPV_ARGS(&alloc.p))) ||
+        FAILED(device->CreateCommandAllocator(direct, IID_PPV_ARGS(&other.p))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&compute.p))) ||
+        FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done.p)))) {
+        add("setup", E_FAIL);
+        return out;
+    }
+    Ref<ID3D12GraphicsCommandList> list, second, third;
+    add("CreateCommandList", device->CreateCommandList(0, direct, alloc.p, nullptr, IID_PPV_ARGS(&list.p)));
+    if (!list.p) return out;
+    add("Reset while recording", list->Reset(alloc.p, nullptr));
+    add("allocator Reset while a list records into it", alloc->Reset());
+    add("CreateCommandList on an allocator a list records into",
+        device->CreateCommandList(0, direct, alloc.p, nullptr, IID_PPV_ARGS(&second.p)));
+    add("Close", list->Close());
+    add("Close twice", list->Close());
+    // Not compared: Reset with no allocator. The PC runtime dereferences the null pointer (an access violation);
+    // ours returns E_INVALIDARG.
+    add("Reset with a compute allocator", list->Reset(compute.p, nullptr));
+    add("Reset", list->Reset(alloc.p, nullptr));
+    add("CreateCommandList on another allocator",
+        device->CreateCommandList(0, direct, other.p, nullptr, IID_PPV_ARGS(&third.p)));
+    if (third.p) {
+        add("Close the other list", third->Close());
+        add("Reset onto an allocator another list records into", third->Reset(alloc.p, nullptr));
+    }
+    add("Close", list->Close());
+    add("allocator Reset with its lists closed", alloc->Reset());
+
+    // In flight: the queue first waits for `gate`, which only the CPU signals, after the checks below.
+    add("Reset", list->Reset(alloc.p, nullptr));
+    add("Close", list->Close());
+    add("queue Wait", queue->Wait(gate.p, 1));
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    add("allocator Reset while its list is in flight", alloc->Reset());
+    add("Reset the in-flight list onto another allocator", list->Reset(other.p, nullptr));
+    add("Close", list->Close());
+    add("fence Signal from the CPU", gate->Signal(1));
+    add("queue Signal", queue->Signal(done.p, 1));
+    add("SetEventOnCompletion (blocking)", done->SetEventOnCompletion(1, nullptr));
+    add("allocator Reset after the GPU finished", alloc->Reset());
+
+    // Last, since the PC runtime removes the device for it: executing a list that is still open.
+    add("Reset", list->Reset(alloc.p, nullptr));
+    queue->ExecuteCommandLists(1, lists);
+    add(kOpenListExecuted, device->GetDeviceRemovedReason());
+    return out;
+}
+
+// Returns the number of rules where ours differs from the PC runtime, or -1 without a host device. One difference
+// is known and allowed: the PC runtime removes the device (DXGI_ERROR_INVALID_CALL) for executing an open list,
+// while this layer submits nothing and keeps the device (docs/d3d12_vulkan.md).
+int compare_command_list_rules(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    const std::vector<Rule> a = command_list_rules(ours), b = command_list_rules(host.p);
+    int mismatches = a.size() == b.size() ? 0 : 1;
+    for (size_t i = 0; i < a.size() || i < b.size(); ++i) {
+        const Rule* x = i < a.size() ? &a[i] : nullptr;
+        const Rule* y = i < b.size() ? &b[i] : nullptr;
+        const bool same = x && y && x->result == y->result;
+        const bool known = x && y && std::strcmp(x->name, kOpenListExecuted) == 0 && x->result == S_OK &&
+                           y->result == DXGI_ERROR_INVALID_CALL;
+        if (!same && !known) ++mismatches;
+        std::printf("command-list rule %-55s ours 0x%08lx host 0x%08lx%s\n", (x ? x : y)->name,
+                    x ? static_cast<unsigned long>(x->result) : 0ul, y ? static_cast<unsigned long>(y->result) : 0ul,
+                    same ? "" : known ? "  (known: an invalid call does not remove our device)" : "  <-- differs");
+    }
+    return mismatches;
+}
+
 D3D12_RESOURCE_DESC reserved_desc(D3D12_RESOURCE_DIMENSION dimension, UINT64 width, UINT height, UINT16 depth,
                                   UINT16 mips, DXGI_FORMAT format) {
     D3D12_RESOURCE_DESC desc = dimension == D3D12_RESOURCE_DIMENSION_BUFFER
@@ -2237,6 +2330,9 @@ int main() {
         if (allocation_mismatches < 0)
             std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
         EXPECT(allocation_mismatches <= 0);
+        const int rule_mismatches = compare_command_list_rules(device.p);
+        if (rule_mismatches < 0) std::printf("command-list rules: no host D3D12 device to compare with, skipped\n");
+        EXPECT(rule_mismatches <= 0);
 
         // D3D-46: copies against the host runtime (d3d12_copy_compare.h).
         const int copy_mismatches = copycmp::compare_copies(device.p, d.bc);

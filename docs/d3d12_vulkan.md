@@ -121,6 +121,15 @@ The design is therefore an **IR per command list**:
   descriptor ranges and the hash table, and emitting barriers. Bundles are inlined at record time.
 - `Reset` on a command list discards its IR; the allocator owns the memory. D3D12 already requires the application
   not to reset an allocator whose lists are in flight; the layer can rely on that and assert in debug builds.
+- Command-list and allocator misuse returns what the PC runtime returns (D3D-51). `d3d12_vulkan_device_test` runs
+  the same 25 calls on the host runtime and on this layer and compares the HRESULTs. One list at a time records into
+  an allocator: creating or resetting a second list onto it gives `E_INVALIDARG`, and resetting the allocator while
+  a list records into it gives `E_FAIL`. `Close` twice and `Reset` of an open list give `E_FAIL`. Resetting an
+  allocator whose lists are still executing gives `S_OK` on the PC runtime too (keeping that safe is the
+  application's job). Two differences remain. `Reset` with a null allocator crashes the PC runtime, while ours
+  returns `E_INVALIDARG`, so that call is not compared. Executing a list that is still open removes the PC device
+  (`GetDeviceRemovedReason` gives `DXGI_ERROR_INVALID_CALL`), while this layer submits nothing and keeps the device:
+  an invalid call does not remove it.
 - `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle IR is copied by value at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
 - Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves, `SetPredication`, `DiscardResource` and the atomic copies; `WriteBufferImmediate` is allowed in a bundle); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. The currently implemented sticky front/back stencil reference is carried back to the parent when the bundle sets it. Draw and other graphics-state commands are still stubs, so this establishes validation and the IR insertion point but does not yet render bundle geometry.
 - A queue's `ExecuteCommandLists` submits in order with one timeline semaphore signal. `Wait`/`Signal` become
