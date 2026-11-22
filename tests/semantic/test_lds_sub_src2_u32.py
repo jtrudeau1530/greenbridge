@@ -234,6 +234,147 @@ class ScalarInterpreter:
         state.lds.write_dword(idx_a, new_a)
 
 
+class SIMDState:
+    """Multi-lane SIMD machine state supporting Wave32 and Wave64."""
+
+    def __init__(
+        self,
+        num_lanes: int = DEFAULT_NUM_LANES,
+        exec_mask: int = MASK64,
+        lds_dwords: int = DEFAULT_LDS_DWORDS,
+    ) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"Unsupported lane count: {num_lanes} (must be 32 or 64)")
+        self.num_lanes = num_lanes
+        self.exec_mask = exec_mask & ((1 << num_lanes) - 1)
+        self.vgprs = [[0] * DEFAULT_NUM_VGPRS for _ in range(num_lanes)]
+        self.sgprs = [0] * DEFAULT_NUM_SGPRS
+        self.vcc = 0
+        self.lds = LDSMemory(lds_dwords)
+
+    def get_lane_vgpr(self, lane: int, reg_index: int) -> int:
+        return self.vgprs[lane][reg_index]
+
+    def set_lane_vgpr(self, lane: int, reg_index: int, val: int) -> None:
+        self.vgprs[lane][reg_index] = u32(val)
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling lane divergence and EXEC masking."""
+
+    def execute(self, instr: DSSrc2Instruction, state: SIMDState) -> None:
+        if instr.opcode != DSOpcode.DS_SUB_SRC2_U32:
+            raise NotImplementedError(f"Unsupported opcode: {instr.opcode}")
+
+        for lane in range(state.num_lanes):
+            if not ((state.exec_mask >> lane) & 1):
+                continue
+
+            base_addr = state.get_lane_vgpr(lane, instr.addr.base_reg.index)
+            _, _, idx_a, idx_b = calc_lds_src2_addresses(
+                vaddr=base_addr,
+                offset0=instr.addr.offset0,
+                offset1=instr.addr.offset1,
+                lds_dwords=state.lds.size_dwords,
+            )
+
+            val_a = state.lds.read_dword(idx_a)
+            val_b = state.lds.read_dword(idx_b)
+            new_a = ref_ds_sub_src2_u32(val_a, val_b)
+            state.lds.write_dword(idx_a, new_a)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD execution, lane divergence, and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_wave32_full_exec(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=MASK32, lds_dwords=1024)
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, lane * 8)
+            state.lds.write_dword(lane * 2, 100)
+            state.lds.write_dword(lane * 2 + 1, lane)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, state)
+        for lane in range(32):
+            self.assertEqual(state.lds.read_dword(lane * 2), 100 - lane)
+            self.assertEqual(state.lds.read_dword(lane * 2 + 1), lane)
+
+    def test_wave32_divergent_masking(self) -> None:
+        # Alternating mask (0x55555555): even lanes active, odd lanes inactive
+        state = SIMDState(num_lanes=32, exec_mask=0x55555555, lds_dwords=1024)
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, lane * 8)
+            state.lds.write_dword(lane * 2, 100)
+            state.lds.write_dword(lane * 2 + 1, 5)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(state.lds.read_dword(lane * 2), 95)
+            else:
+                self.assertEqual(state.lds.read_dword(lane * 2), 100)
+
+    def test_wave64_full_exec(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=MASK64, lds_dwords=2048)
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 1, lane * 8)
+            state.lds.write_dword(lane * 2, 200)
+            state.lds.write_dword(lane * 2 + 1, lane)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(1), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, state)
+        for lane in range(64):
+            self.assertEqual(state.lds.read_dword(lane * 2), 200 - lane)
+
+    def test_wave64_divergent_masking(self) -> None:
+        # Low 32 lanes active, high 32 lanes inactive
+        mask = 0x00000000FFFFFFFF
+        state = SIMDState(num_lanes=64, exec_mask=mask, lds_dwords=2048)
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 0, lane * 8)
+            state.lds.write_dword(lane * 2, 50)
+            state.lds.write_dword(lane * 2 + 1, 10)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, state)
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(state.lds.read_dword(lane * 2), 40)
+            else:
+                self.assertEqual(state.lds.read_dword(lane * 2), 50)
+
+    def test_exec_mask_zero_no_modification(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0, lds_dwords=512)
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 0, lane * 8)
+            state.lds.write_dword(lane * 2, 42)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_SUB_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, state)
+        for lane in range(64):
+            self.assertEqual(state.lds.read_dword(lane * 2), 42)
+
+
 class TestScalarInterpreter(unittest.TestCase):
     """Unit tests for the deterministic scalar interpreter."""
 
