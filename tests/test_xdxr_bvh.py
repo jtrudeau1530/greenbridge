@@ -48,7 +48,7 @@ class Layout(unittest.TestCase):
         data, info = X.build_blas([TRI])
         flags, units, crc, n, *rest = struct.unpack_from("<4I6fIiIIII", data, 0)
         self.assertEqual(flags, X.FLAG_BOTTOM_LEVEL | X.VERSION_2403)
-        self.assertEqual(units * 64, len(data))
+        self.assertEqual((units + 1) * 64, len(data))
         self.assertEqual(n, 1)
         self.assertEqual(rest[0:6], [0.0, 0.0, 0.0, 1.0, 1.0, 0.0])
         nodes, _remap, root, elements, parents, cp = rest[6:]

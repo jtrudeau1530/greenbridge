@@ -256,7 +256,7 @@ int main(int argc, char** argv) {
         if (FAILED(rb->Map(0, nullptr, &p))) return false;
         std::uint32_t units = 0;
         std::memcpy(&units, static_cast<char*>(p) + 4, 4);    // header totalSizeIn64BNodes
-        const UINT64 used = UINT64(units) * 64;
+        const UINT64 used = (UINT64(units) + 1) * 64;   // the field does not count the 64-byte header
         const bool ok = used && used <= size && write_file(dir + "/" + name + ".bin", p, std::size_t(used)) &&
                         write_file(dir + "/" + name + ".json", json.data(), json.size());
         rb->Unmap(0, nullptr);
