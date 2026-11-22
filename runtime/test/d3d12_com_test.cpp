@@ -282,7 +282,8 @@ int main(int argc, char** argv) {
             b->WriteBufferImmediate(1, &write, nullptr); }));
 
         list->Barrier(1, &group);
-        list->SetMarker(0, nullptr, 0);  // not implemented: reported once by its generated stub, recording continues
+        // Not implemented: reported once by its generated stub, recording continues.
+        list->SetProtectedResourceSession(nullptr);
         EXPECT(list->Close() == S_OK);
         EXPECT(list->Close() == E_FAIL);  // already closed
 

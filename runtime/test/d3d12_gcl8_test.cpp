@@ -67,10 +67,12 @@ int main(int argc, char** argv) {
         EXPECT(front_back_stencil_ref(list8.p, front, back));
         EXPECT(front == 3 && back == 4);
 
-        // The generated stub is still invoked for each call, even when the legacy diagnostic is deduplicated.
+        // A marker is traced by name, never by its label. A method still unsupported (protected sessions) goes
+        // through its generated stub on each call, even when the legacy diagnostic is deduplicated.
         constexpr char marker[] = "synthetic-marker-argument";
-        list8.p->SetMarker(0, marker, static_cast<UINT>(sizeof(marker)));
-        list8.p->SetMarker(0, marker, static_cast<UINT>(sizeof(marker)));
+        list8.p->SetMarker(1, marker, static_cast<UINT>(sizeof(marker)));
+        list8.p->SetProtectedResourceSession(nullptr);
+        list8.p->SetProtectedResourceSession(nullptr);
         EXPECT(list8.p->Close() == S_OK);
         EXPECT(list8.p->Close() == E_FAIL);
         EXPECT(SUCCEEDED(list7.p->Reset(allocator.p, nullptr)));

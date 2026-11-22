@@ -608,6 +608,12 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_uav_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_uav_clear_test PRIVATE /W4 /permissive- /utf-8)
 
+    # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
+    add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
+    target_link_libraries(d3d12_debug_markers_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_debug_markers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_debug_markers_test PRIVATE /W4 /permissive- /utf-8)
+
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
     add_executable(d3d12_fence_timing_test test/d3d12_fence_timing_test.cpp)
     target_link_libraries(d3d12_fence_timing_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

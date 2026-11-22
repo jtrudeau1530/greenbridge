@@ -3,13 +3,16 @@
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
 // render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
-// predication, discards, immediate buffer writes, atomic copies and queries. It has no Windows or Vulkan dependency.
+// predication, discards, immediate buffer writes, atomic copies, queries and debug markers. It has no Windows or
+// Vulkan dependency.
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -474,10 +477,19 @@ struct ResolveQueries {
     std::uint64_t offset;
 };
 
+// SetMarker, BeginEvent and EndEvent, replayed as VK_EXT_debug_utils labels when the device has them (and skipped
+// when it does not). The label is UTF-8; an end has none.
+struct DebugMarker {
+    enum class Kind : std::uint8_t { set, begin, end };
+    Kind kind;
+    std::string label;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries>;
+                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries,
+                             DebugMarker>;
 
 class CommandList {
 public:
@@ -654,6 +666,13 @@ public:
 
     // A query begun and not ended. Such a list still closes (D3D12's Close reports the error), but is not replayed.
     bool queries_open() const { return !active_.empty(); }
+
+    // Debug markers. D3D12 does not ask a list to balance its events (one list may end what another began), so
+    // they are recorded as given; the replay balances them per submission (vulkan_replay.h, emit).
+    bool marker(DebugMarker::Kind kind, std::string label = {}) {
+        if (kind == DebugMarker::Kind::end) label.clear();
+        return append(DebugMarker{kind, std::move(label)});
+    }
 
     bool close() {
         if (closed_) return false;

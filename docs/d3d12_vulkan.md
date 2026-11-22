@@ -1506,6 +1506,41 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Enhanced barriers | Public Xbox Series `D3D12_BARRIER_GROUP` | `VK_KHR_synchronization2`; implement directly. |
 | XDXR batched/streaming BVH | `XboxBvhBuilder.dll` exports | See 4.8. |
 
+### 4.10 Debug markers and private data
+
+Games and middleware call these every frame (PIX events), so they must be cheap and never fail. Implemented
+(D3D-24) in `runtime/shims/d3d12_com.cpp`, `runtime/shims/d3d12_com_object.h`, `runtime/src/command_list.h`,
+`runtime/src/vulkan_replay.h` and `runtime/src/vulkan_backend.h`; tested by `runtime/test/d3d12_debug_markers_test.cpp`.
+
+- **Labels, only with `VK_EXT_debug_utils`.** It is an instance extension, so `VulkanDeviceInfo::debug_utils` says
+  whether the instance enabled it; `create_vulkan_device_standalone` enables it when the loader lists it. Without
+  it every marker call is a no-op (nothing logged, nothing recorded on the queue).
+- **Command lists.** `SetMarker`/`BeginEvent`/`EndEvent` are recorded in the IR (`DebugMarker`) in order with the
+  other commands and replayed as `vkCmdInsertDebugUtilsLabelEXT`/`vkCmdBeginDebugUtilsLabelEXT`/
+  `vkCmdEndDebugUtilsLabelEXT` into the submission's command buffer.
+- **Queues.** The same three methods on `ID3D12CommandQueue` call `vkQueueInsert/Begin/EndDebugUtilsLabelEXT` under
+  the device's submit lock, so they fall between the submissions issued before and after them.
+- **Balancing.** D3D12 does not make a list balance its events; Vulkan requires every end to have a begin.
+  One `ExecuteCommandLists` is one command buffer, so a begin in one list may be ended by a later list of the
+  same call. An end with nothing open is dropped, and labels still open when the last list ends are ended
+  before the command buffer is ended. Queue labels are balanced per queue the same way (an unmatched end is
+  dropped; open ones are ended when the queue is destroyed). Command-buffer labels never span two
+  `ExecuteCommandLists` calls.
+- **Labels.** The `Metadata` argument says what the data is, following WinPixEventRuntime's `pix3_win.h`:
+  0 (`PIX_EVENT_UNICODE_VERSION`) a UTF-16 string, 1 (`PIX_EVENT_ANSI_VERSION`) an ANSI string, both cut at the
+  terminator or at `Size` bytes and converted to UTF-8; 2 (`PIX_EVENT_PIX3BLOB_VERSION`) PIX's own encoded event,
+  which is not decoded and gets the fixed label `PIX event` so the nesting is still visible (question 21). Other
+  values get the same label and log once.
+- **Private data, on every object.** `SetPrivateData`, `GetPrivateData`, `SetPrivateDataInterface` and `SetName`
+  live in the shared `Object` base, so the device, queues, allocators, lists, fences, descriptor heaps and
+  resources all have them. `SetPrivateDataInterface` holds a reference until the entry is replaced (by bytes or
+  another interface), removed (a null interface or zero size) or the object is destroyed; `GetPrivateData` returns
+  the pointer with a reference added, as D3D12 does. A buffer too small for the entry gets `DXGI_ERROR_MORE_DATA`,
+  nothing copied and no reference added, and `*pDataSize` set to the size needed, so the caller can retry (as
+  vkd3d-proton's private store does). `SetName` stores the name as `WKPDID_D3DDebugObjectNameW`
+  (terminator included), which is where D3D12 keeps it. Names are not forwarded to `vkSetDebugUtilsObjectNameEXT`
+  yet: one D3D12 object may own several Vulkan objects.
+
 ## 5. Producing the shader contract
 
 The table below is the contract from [design.md](design.md#translator-status-and-runtime-contract) and where the
@@ -1803,6 +1838,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 | 18 | Does the game alias buffers/images in a heap, or use reserved/tiled resources? | Trace `CreatePlacedResource` ranges, aliasing barriers, `CreateReservedResource` and tile mappings. If yes, implement shared memory per heap range or fall back to linear allocations with a clear log. Shaders: 30 declare `TILED_RESOURCES` in SFI0 (`tools/feature_scan.py`), so reserved/tiled resources are likely used. Placed resources are D3D-16 and reserved resources D3D-20 (#313). |
 | 19 | What do the `0x03000000` root-signature flag bits mean? | Masking them on a copy works around the PC serializer; the semantics remain unknown. Compare against the public flag enum and observe the game's behaviour with and without the mask. |
 | 20 | Which of the BVH builder's 53 Xbox DXIL shaders does the game actually use, and can the 31 raw-address shaders be lowered without a reference? | Dump the slot-62 compute PSOs on the first RT frame; lower and compile each; compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
+| 21 | Which `Metadata` values and blob format does the console's PIX use for `SetMarker`/`BeginEvent`? The layer reads 0 and 1 as strings and labels 2 (the PC PIX3 blob) `PIX event` (section 4.10). | Log the `Metadata` values the game passes; if it is 2, decode the console blob from the executable's PIX calls rather than assuming the PC WinPixEventRuntime layout. |
 
 ## 9. Risks and non-goals
 
