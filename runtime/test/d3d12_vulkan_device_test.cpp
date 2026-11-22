@@ -452,6 +452,7 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R10G10B10A2_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, D3D12_RESOURCE_FLAG_NONE, 1), 1},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
@@ -562,6 +563,8 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"16x16 R16G16B16A16_UINT", texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_UINT, none, 1), 16 * 16 * 8},
         {"16x16 R16G16B16A16_SINT", texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_SINT, none, 1), 16 * 16 * 8},
         {"16x16 R10G10B10A2_UINT", texture_desc(16, 16, DXGI_FORMAT_R10G10B10A2_UINT, none, 1), 16 * 16 * 4},
+        {"16x16 R10G10B10_XR_BIAS_A2_UNORM",
+         texture_desc(16, 16, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, none, 1), 16 * 16 * 4},
         {"16x16 R16G16_TYPELESS", texture_desc(16, 16, DXGI_FORMAT_R16G16_TYPELESS, none, 1), 16 * 16 * 4},
         {"16x16 R16G16_UINT", texture_desc(16, 16, DXGI_FORMAT_R16G16_UINT, none, 1), 16 * 16 * 4},
         {"16x16 R16G16_SINT", texture_desc(16, 16, DXGI_FORMAT_R16G16_SINT, none, 1), 16 * 16 * 4},
@@ -1739,6 +1742,60 @@ int main() {
 
         D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
         EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
+
+        // D3D-61: XR_BIAS is a display-only format with the R10G10B10A2 bit layout. The layer can create and
+        // copy it, and its views can cast to the ordinary 10:10:10:2 format, but it does not claim display or
+        // video-processor support.
+        {
+            const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT xr{DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &xr, sizeof(xr))));
+            EXPECT(xr.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+            EXPECT(xr.Support1 & D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT);
+            EXPECT(!(xr.Support1 & (D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_MIP |
+                                    D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
+                                    D3D12_FORMAT_SUPPORT1_BLENDABLE)));
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS multsample{DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, 4};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &multsample,
+                                                         sizeof(multsample))));
+            EXPECT(multsample.NumQualityLevels == 0);
+            Ref<ID3D12Resource> tex;
+            const D3D12_RESOURCE_DESC desc = texture_desc(
+                16, 16, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, D3D12_RESOURCE_FLAG_NONE, 1);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&tex.p))));
+            EXPECT(tex.p != nullptr);
+
+            // The host refuses extra mips, multisampling and 3D; the layer must refuse the same descriptions.
+            D3D12_RESOURCE_DESC invalid = desc;
+            invalid.MipLevels = 2;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &invalid,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &invalid).SizeInBytes == UINT64_MAX);
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
+            UINT rows = 0;
+            UINT64 total = 0;
+            device->GetCopyableFootprints(&invalid, 0, 1, 0, &layout, &rows, nullptr, &total);
+            EXPECT(total == UINT64_MAX);
+
+            invalid = desc;
+            invalid.SampleDesc.Count = 4;
+            invalid.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &invalid,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &invalid).SizeInBytes == UINT64_MAX);
+
+            invalid = desc;
+            invalid.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            invalid.DepthOrArraySize = 4;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &invalid,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &invalid).SizeInBytes == UINT64_MAX);
+        }
 
         // D3D-60: CheckFeatureSupport and committed resource creation for integer and typeless formats
         {
