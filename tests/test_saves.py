@@ -159,6 +159,51 @@ class JsavTest(unittest.TestCase):
         self.assertIn("changed: code 10000002", out)
         self.assertIn("4 blocks identical", out)
 
+    def test_diff_keeps_duplicate_group_hash_blocks(self):
+        # Two blocks can share a (group, hash) pair; the second must not overwrite the first in diff's table.
+        hashes = [0x11111111, 0x11111111]
+        blocks = [b'{"$0x11111111":1}', b'{"$0x11111111":2}']
+        a = saves.build_jsav(3, 2, hashes, [1, 1], blocks)
+        b = saves.build_jsav(3, 2, hashes, [1, 1], [blocks[0], b'{"$0x11111111":3}'])
+        with tempfile.TemporaryDirectory() as tmp:
+            pa, pb = os.path.join(tmp, "a"), os.path.join(tmp, "b")
+            write(pa, a)
+            write(pb, b)
+            out = quiet(saves.diff, pa, pb)
+        self.assertIn("changed: code 11111111", out)
+        self.assertIn('"$0x11111111":2', out)
+        self.assertIn('"$0x11111111":3', out)
+        self.assertIn("1 blocks identical", out)
+        self.assertNotIn("only in", out)
+
+    def test_diff_reports_one_sided_duplicate_with_the_same_label_format(self):
+        hashes = [0x11111111, 0x11111111]
+        blocks = [b'{"$0x11111111":1}', b'{"$0x11111111":2}']
+        a = saves.build_jsav(3, 1, hashes[:1], [1], blocks[:1])
+        b = saves.build_jsav(3, 2, hashes, [1, 1], blocks)
+        with tempfile.TemporaryDirectory() as tmp:
+            pa, pb = os.path.join(tmp, "a"), os.path.join(tmp, "b")
+            write(pa, a)
+            write(pb, b)
+            out = quiet(saves.diff, pa, pb)
+        self.assertIn("only in B: code 11111111 17", out)
+        self.assertIn("1 blocks identical", out)
+        self.assertNotIn("changed:", out)
+
+    def test_diff_matches_identical_duplicate_blocks_by_content(self):
+        hashes = [0x11111111, 0x11111111]
+        blocks = [b'{"$0x11111111":1}', b'{"$0x11111111":2}']
+        a = saves.build_jsav(3, 2, hashes, [1, 1], blocks)
+        b = saves.build_jsav(3, 1, hashes[1:], [1], blocks[1:])
+        with tempfile.TemporaryDirectory() as tmp:
+            pa, pb = os.path.join(tmp, "a"), os.path.join(tmp, "b")
+            write(pa, a)
+            write(pb, b)
+            out = quiet(saves.diff, pa, pb)
+        self.assertIn("only in A: code 11111111 17", out)
+        self.assertIn("1 blocks identical", out)
+        self.assertNotIn("changed:", out)
+
 
 class AsavTest(unittest.TestCase):
     def test_header_fields(self):
