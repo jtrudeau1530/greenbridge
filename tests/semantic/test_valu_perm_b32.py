@@ -1456,5 +1456,177 @@ class TestPermB32IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(mask_nan, 0xFFFF_FFFF)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def mutated_perm_off_by_one(src0: int, src1: int, selector: int) -> int:
+    """Mutant 1: shifts selector index by +1."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    sel = selector & MASK32
+    b0 = permute_single_byte(s0, s1, (extract_byte(sel, 0) + 1) & 0xFF)
+    b1 = permute_single_byte(s0, s1, (extract_byte(sel, 1) + 1) & 0xFF)
+    b2 = permute_single_byte(s0, s1, (extract_byte(sel, 2) + 1) & 0xFF)
+    b3 = permute_single_byte(s0, s1, (extract_byte(sel, 3) + 1) & 0xFF)
+    return pack_bytes(b0, b1, b2, b3)
+
+
+def mutated_perm_inverted_sources(src0: int, src1: int, selector: int) -> int:
+    """Mutant 2: inverts src0 and src1 mapping."""
+    return oracle_v_perm_b32(src1, src0, selector)
+
+
+def mutated_perm_ignore_zero_fill(src0: int, src1: int, selector: int) -> int:
+    """Mutant 3: treats selector 12 as picking from src1 byte 0 instead of 0x00."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    sel = selector & MASK32
+    bytes_out = []
+    for i in range(4):
+        b = extract_byte(sel, i)
+        if b == SEL_ZERO:
+            bytes_out.append(extract_byte(s1, 0))  # Buggy replacement
+        else:
+            bytes_out.append(permute_single_byte(s0, s1, b))
+    return pack_bytes(bytes_out[0], bytes_out[1], bytes_out[2], bytes_out[3])
+
+
+def mutated_perm_ignore_ones_fill(src0: int, src1: int, selector: int) -> int:
+    """Mutant 4: returns 0x00 instead of 0xFF for selector >= 13."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    sel = selector & MASK32
+    bytes_out = []
+    for i in range(4):
+        b = extract_byte(sel, i)
+        if b >= SEL_ONES_MIN:
+            bytes_out.append(0x00)  # Buggy replacement
+        else:
+            bytes_out.append(permute_single_byte(s0, s1, b))
+    return pack_bytes(bytes_out[0], bytes_out[1], bytes_out[2], bytes_out[3])
+
+
+def mutated_perm_wrong_endianness(src0: int, src1: int, selector: int) -> int:
+    """Mutant 5: packs output bytes in big-endian order instead of little-endian."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    sel = selector & MASK32
+    b0 = permute_single_byte(s0, s1, extract_byte(sel, 0))
+    b1 = permute_single_byte(s0, s1, extract_byte(sel, 1))
+    b2 = permute_single_byte(s0, s1, extract_byte(sel, 2))
+    b3 = permute_single_byte(s0, s1, extract_byte(sel, 3))
+    # Big-endian packing
+    return ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & MASK32
+
+
+class TestPermB32NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_negative_sgpr_destination_rejected(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_negative_multiple_literals_rejected(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.literal(0x11111111),
+            src1=ASTOperand.literal(0x22222222),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_negative_register_index_bounds(self):
+        rf = ScalarRegisterFile()
+        with self.assertRaises(IndexError):
+            rf.get_vgpr(256)
+        with self.assertRaises(IndexError):
+            rf.set_vgpr(-1, 0)
+        with self.assertRaises(IndexError):
+            rf.get_sgpr(106)
+        with self.assertRaises(IndexError):
+            rf.set_sgpr(-1, 0)
+
+    def test_negative_byte_index_bounds(self):
+        with self.assertRaises(ValueError):
+            extract_byte(0x12345678, 4)
+        with self.assertRaises(ValueError):
+            extract_byte(0x12345678, -1)
+
+    def test_negative_wave_size_rejected(self):
+        with self.assertRaises(ValueError):
+            SIMDWaveState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(num_lanes=128)
+
+    def test_mutation_off_by_one_detected(self):
+        src0 = 0xAABBCCDD
+        src1 = 0x11223344
+        sel = PermSelectorWord.identity_src1().raw
+        expected = oracle_v_perm_b32(src0, src1, sel)
+        mutated = mutated_perm_off_by_one(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_inverted_sources_detected(self):
+        src0 = 0xAABBCCDD
+        src1 = 0x11223344
+        sel = PermSelectorWord.identity_src1().raw
+        expected = oracle_v_perm_b32(src0, src1, sel)
+        mutated = mutated_perm_inverted_sources(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_constant_zero_ignored_detected(self):
+        src0 = 0xFFFFFFFF
+        src1 = 0x55667788
+        sel = make_selector(SEL_ZERO, SEL_ZERO, SEL_ZERO, SEL_ZERO)
+        expected = oracle_v_perm_b32(src0, src1, sel)
+        mutated = mutated_perm_ignore_zero_fill(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_constant_ones_ignored_detected(self):
+        src0 = 0x00000000
+        src1 = 0x00000000
+        sel = make_selector(SEL_ONES_MIN, SEL_ONES_MIN, SEL_ONES_MIN, SEL_ONES_MIN)
+        expected = oracle_v_perm_b32(src0, src1, sel)
+        mutated = mutated_perm_ignore_ones_fill(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_exec_mask_ignored_detected(self):
+        # A buggy execution engine that ignores EXEC mask writes all lanes
+        wave = SIMDWaveState(num_lanes=32, exec_mask=0x00000001)  # Only lane 0 active
+        wave.set_wave_vgpr(0, [0xCAFE0000] * 32)
+        wave.set_wave_vgpr(1, [0x12345678] * 32)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.literal(0),
+        )
+        wave.execute_instruction(instr)
+
+        # Inactive lanes (1..31) must remain 0xCAFE0000
+        for lane in range(1, 32):
+            self.assertEqual(wave.get_lane_vgpr(0, lane), 0xCAFE0000)
+
+    def test_mutation_wrong_endianness_detected(self):
+        src0 = 0x12345678
+        src1 = 0x9ABCDEF0
+        sel = make_selector(0, 1, 2, 3)
+        expected = oracle_v_perm_b32(src0, src1, sel)
+        mutated = mutated_perm_wrong_endianness(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+
 if __name__ == "__main__":
     unittest.main()
