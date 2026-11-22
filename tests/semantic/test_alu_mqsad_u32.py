@@ -460,5 +460,113 @@ class MqsadSimdDivergenceTests(unittest.TestCase):
                 self.assertEqual(u32_res[k] & M16, pk_res[k])
 
 
+class MqsadBoundaryMatricesTests(unittest.TestCase):
+    """Boundary conditions, extreme byte patterns, and accumulator wrap matrices."""
+
+    def test_extremes_all_zeros_and_all_ones(self):
+        self.assertEqual(run_op(0, 0, [0, 0, 0, 0]), [0, 0, 0, 0])
+        self.assertEqual(run_op(M64, 0xFFFFFFFF, [0, 0, 0, 0]), [0, 0, 0, 0])
+        self.assertEqual(run_op(0, 0xFFFFFFFF, [0, 0, 0, 0]), [1020, 1020, 1020, 1020])
+        self.assertEqual(run_op(M64, 0x01010101, [0, 0, 0, 0]), [1016, 1016, 1016, 1016])
+
+    def test_sign_bit_boundary_differences(self):
+        s0_msb = 0x8080808080808080
+        s1_pre = 0x7F7F7F7F
+        self.assertEqual(run_op(s0_msb, s1_pre, [0, 0, 0, 0]), [4, 4, 4, 4])
+        self.assertEqual(run_op_pk_u16(s0_msb, s1_pre, 0), (0x00040004, 0x00040004))
+
+    def test_sparse_mask_permutations(self):
+        s0 = 0x1122334455667788
+        single_byte_masks = [0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000]
+        for mask in single_byte_masks:
+            with self.subTest(mask=hex(mask)):
+                self.assertEqual(run_op(s0, mask, [0, 0, 0, 0]), ref_mqsad_u32_u8(s0, mask, [0, 0, 0, 0]))
+
+        multi_byte_masks = [0x00FF00FF, 0xFF00FF00, 0x00FFFFFF, 0xFFFFFF00]
+        for mask in multi_byte_masks:
+            with self.subTest(mask=hex(mask)):
+                self.assertEqual(run_op(s0, mask, [0, 0, 0, 0]), ref_mqsad_u32_u8(s0, mask, [0, 0, 0, 0]))
+
+    def test_accumulator_boundary_transitions(self):
+        accs_wrapping = [M32, M32 - 1019, 0x7FFFFFFF, 0x80000000]
+        res = run_op(0, 0xFFFFFFFF, accs_wrapping)
+        self.assertEqual(res[0], 1019)
+        self.assertEqual(res[1], 0)
+        self.assertEqual(res[2], 0x7FFFFFFF + 1020)
+        self.assertEqual(res[3], 0x80000000 + 1020)
+
+
+class MqsadByteShiftingExtremesTests(unittest.TestCase):
+    """Selective matching, dword boundary crossings, and unused byte invariance."""
+
+    def test_sliding_window_offsets_selective_match(self):
+        target = 0x2468ACE0
+        for target_offset in range(4):
+            s0 = (target << (8 * target_offset)) & M64
+            res = run_op(s0, target, [0, 0, 0, 0])
+            self.assertEqual(res[target_offset], 0)
+            for other in range(4):
+                if other != target_offset:
+                    self.assertGreater(res[other], 0)
+
+    def test_dword_boundary_crossing_windows(self):
+        s0 = 0x0807060504030201
+        res = run_op(s0, 0x06050403, [0, 0, 0, 0])
+        self.assertEqual(res[0], 2 + 2 + 2 + 2)
+        self.assertEqual(res[1], 1 + 1 + 1 + 1)
+        self.assertEqual(res[2], 0)
+        self.assertEqual(res[3], 1 + 1 + 1 + 1)
+
+    def test_unused_byte_7_invariance(self):
+        base_s0 = 0x0007060504030201
+        mutated_s0 = 0xFF07060504030201
+        target = 0x04030201
+        res_base_u32 = run_op(base_s0, target, [10, 20, 30, 40])
+        res_mut_u32 = run_op(mutated_s0, target, [10, 20, 30, 40])
+        self.assertEqual(res_base_u32, res_mut_u32)
+
+        res_base_pk = run_op_pk_u16(base_s0, target, 0x0004000300020001)
+        res_mut_pk = run_op_pk_u16(mutated_s0, target, 0x0004000300020001)
+        self.assertEqual(res_base_pk, res_mut_pk)
+
+
+class MqsadNegativeControlsTests(unittest.TestCase):
+    """Negative controls, operand validations, and semantic sensitivity."""
+
+    def test_clamp_modifier_rejection_all_forms(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            run_lines(["v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7] clamp"])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            run_lines_pk_u16(["v_mqsad_pk_u16_u8 v[8:9], v[2:3], v1, v[4:5] clamp"])
+
+    def test_invalid_register_groupings_rejected(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            run_lines(["v_mqsad_u32_u8 v[8:9], v[2:3], v1, v[4:7]"])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            run_lines(["v_mqsad_u32_u8 v8, v[2:3], v1, v[4:7]"])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            run_lines(["v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:5]"])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            run_lines_pk_u16(["v_mqsad_pk_u16_u8 v[8:11], v[2:3], v1, v[4:5]"])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            run_lines_pk_u16(["v_mqsad_pk_u16_u8 v8, v[2:3], v1, v[4:5]"])
+        with self.assertRaises(rdna2spirv.Unsupported):
+            run_lines_pk_u16(["v_mqsad_pk_u16_u8 v[8:9], v[2:3], v1, v[4:7]"])
+
+    def test_semantic_sensitivity_controls(self):
+        base_x = 0x0807060504030201
+        base_y = 0x04030201
+        base_acc = [0, 0, 0, 0]
+        base_res = run_op(base_x, base_y, base_acc)
+
+        mutated_y = base_y ^ 0x00000001
+        mutated_res_y = run_op(base_x, mutated_y, base_acc)
+        self.assertNotEqual(base_res, mutated_res_y)
+
+        mutated_x = base_x ^ 0x0000000000000100
+        mutated_res_x = run_op(mutated_x, base_y, base_acc)
+        self.assertNotEqual(base_res, mutated_res_x)
+
+
 if __name__ == "__main__":
     unittest.main()
