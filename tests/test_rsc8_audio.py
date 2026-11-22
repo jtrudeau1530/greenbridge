@@ -730,6 +730,162 @@ class AwcAndArchiveScanTest(unittest.TestCase):
                     rep = json.load(f)
                 self.assertEqual(rep["records"], [])
 
+# The packed blocks are anim_clips sequences, so the synthetic ones come from that tool's test encoder.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_anim_clips import encode_sequence  # noqa: E402
+
+
+def build_synthetic_curve_clip(sequences, frames, formats, pad=()):
+    """A synthetic RSC8 clip whose blocks are real encoded sequences.
+
+    `sequences` are `encode_sequence` outputs (each grown by its `pad` bytes so the builder's block sizes
+    fit), `frames` their frame counts and `formats` the value format of each track-directory entry.
+    """
+    pad = list(pad) or [0] * len(sequences)
+    blocks = []
+    for seq, extra in zip(sequences, pad):
+        seq = bytearray(seq) + bytes(extra)
+        struct.pack_into("<I", seq, 0x04, len(seq) - 0x20)
+        struct.pack_into("<I", seq, 0x10, len(seq))
+        blocks.append(bytes(seq))
+    clip = bytearray(build_synthetic_rsc8(
+        block_frames=list(frames), track_count=len(formats), anim_payload_len=len(blocks[0]) - 0x20,
+    ))
+    dec = rsc8_audio.decode_rsc8(bytes(clip))
+    base = rsc8_audio.RSC8_VIRTUAL_BASE
+    for seq, block in zip(blocks, dec["anim"]["blocks"]):
+        assert block["anim_size"] == len(seq), (block["anim_size"], len(seq))
+        clip[base + block["voff"]:base + block["voff"] + len(seq)] = seq
+    at = base + dec["anim_desc"]["track_ptr"]
+    for i, fmt in enumerate(formats):
+        struct.pack_into("<III", clip, at + 12 * i, 0x01000000 + i, rsc8_audio.TRACK_SCHEMA_HASH, fmt)
+    return bytes(clip)
+
+
+class FacialCurvesTest(unittest.TestCase):
+    NF = 70                                              # more than 64 frames: two type-10 chunks, one boundary
+    RAMP = [3 * f + (f * f) // 7 for f in range(NF)]     # track 2, component 0 (type 10)
+    STEPS = [(5 * f) % 16 for f in range(NF)]            # track 1 (type 4, 4 bits)
+    FORMATS = (4, 4, 3)                                  # two one-value tracks and one two-value track
+
+    def clip(self):
+        seq = encode_sequence(self.NF, [
+            (2, 0, 0, 0.25),
+            (4, 1, 0, (4, 0.5, -1.0, self.STEPS)),
+            (10, 2, 0, (0.125, 2.0, self.RAMP)),
+            (2, 2, 1, -0.75),
+        ])
+        return build_synthetic_curve_clip([seq], [self.NF], self.FORMATS)
+
+    def test_track_type_hash_is_facialtranslation(self):
+        from anim_index import joaat32
+        self.assertEqual(joaat32("facialtranslation"), rsc8_audio.TRACK_SCHEMA_HASH)
+        self.assertIn(rsc8_audio.TRACK_SCHEMA_HASH, rsc8_audio.anim_clips.TRACK_TYPES)
+
+    def test_block_decodes_to_the_encoded_values(self):
+        clip = self.clip()
+        dec = rsc8_audio.decode_rsc8(clip, curves=True)
+        self.assertTrue(dec["valid"], dec["checks"])
+        self.assertEqual(dec["curves"], {
+            "decoded": True,
+            "error": None,
+            "frames": self.NF,
+            "frames_match": True,
+            "quantize_bits_match": True,
+            "tracks_with_values": 3,
+            "channels": {"02_static_float": 2, "04_quantize_float": 1, "10_delta2_float": 1},
+            "delta2_boundaries": 1,
+            "delta2_boundaries_closed": 1,
+            "components": {"4:1": 2, "3:2": 1},
+        })
+        values, frames, tracks = rsc8_audio.decode_facial_curves(
+            memoryview(clip)[rsc8_audio.RSC8_VIRTUAL_BASE:], dec["anim"], dec["anim_desc"])
+        self.assertEqual(frames, self.NF)
+        self.assertEqual([t[2] for t in tracks], list(self.FORMATS))
+        self.assertEqual(values[0], [(0.25,)] * self.NF)
+        self.assertEqual(values[1], [(x * 0.5 - 1.0,) for x in self.STEPS])
+        self.assertEqual(values[2], [(x * 0.125 + 2.0, -0.75) for x in self.RAMP])
+
+    def test_curves_are_opt_in(self):
+        clip = self.clip()
+        self.assertIsNone(rsc8_audio.decode_rsc8(clip)["curves"])
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 56000}])
+        res = rsc8_audio.decode_awc_bank(bank)
+        self.assertIsNone(res["records"][0]["curves"])
+
+    def test_two_blocks_share_their_boundary_frame(self):
+        def seq(lo):
+            ints = [(lo + f) % 16 for f in range(33)]
+            return encode_sequence(33, [(4, 0, 0, (4, 1.0, 0.0, ints)), (2, 1, 0, 0.5)])
+
+        clip = build_synthetic_curve_clip([seq(0), seq(32)], [33, 33], (4, 4), pad=(0, 16))
+        dec = rsc8_audio.decode_rsc8(clip, curves=True)
+        self.assertTrue(dec["valid"], dec["checks"])
+        self.assertEqual(dec["anim"]["frame_count"], 65)
+        self.assertTrue(dec["curves"]["decoded"])
+        self.assertEqual(dec["curves"]["frames"], 65)
+        self.assertTrue(dec["curves"]["frames_match"])
+        values, _frames, _tracks = rsc8_audio.decode_facial_curves(
+            memoryview(clip)[rsc8_audio.RSC8_VIRTUAL_BASE:], dec["anim"], dec["anim_desc"])
+        self.assertEqual(values[0], [(float(f % 16),) for f in range(65)])
+
+    def test_block_that_does_not_decode_is_counted_not_raised(self):
+        clip = bytearray(self.clip())
+        dec = rsc8_audio.decode_rsc8(bytes(clip))
+        block = rsc8_audio.RSC8_VIRTUAL_BASE + dec["anim"]["blocks"][0]["voff"]
+        frame_offset = struct.unpack_from("<I", clip, block + 0x0C)[0]
+        struct.pack_into("<I", clip, block + 0x0C, frame_offset - 4)     # definitions no longer end at the frames
+        bad = rsc8_audio.decode_rsc8(bytes(clip), curves=True)
+        self.assertTrue(bad["valid"], bad["checks"])                     # the structural checks still pass
+        self.assertFalse(bad["curves"]["decoded"])
+        self.assertTrue(bad["curves"]["error"])
+
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": self.clip(), "samples": 56000},
+            {"id": 0x00112233, "rsc8": bytes(clip), "samples": 56000},
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                f.write(bank)
+                f.write(bytes(0x40))
+            _records, plain = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual(plain["curve_clips"], 0)
+            records, summary = rsc8_audio.scan_rpf(rpf, curves=True)
+            self.assertEqual(summary["curve_clips"], 2)
+            self.assertEqual(summary["curve_clips_decoded"], 1)
+            self.assertEqual(sum(summary["curve_errors"].values()), 1)
+            self.assertEqual(summary["curve_frames_mismatch"], 0)
+            self.assertEqual(summary["curve_quantize_bits_mismatch"], 0)
+            self.assertEqual(summary["curve_channels"],
+                             {"02_static_float": 2, "04_quantize_float": 1, "10_delta2_float": 1})
+            self.assertEqual(summary["curve_components"], {"4:1": 2, "3:2": 1})
+            self.assertEqual(summary["curve_delta2_boundaries"], 1)
+            self.assertEqual(summary["curve_delta2_boundaries_closed"], 1)
+            self.assertEqual([r["curves"]["decoded"] for r in records], [True, False])
+
+            # The CLI flag reaches bank, directory and archive scans, and the report holds counts, not values.
+            awc = os.path.join(tmp, "bank.awc")
+            with open(awc, "wb") as f:
+                f.write(bank)
+            for source in (rpf, awc, tmp):
+                out_json = os.path.join(tmp, "report.json")
+                if os.path.exists(out_json):
+                    os.remove(out_json)
+                cp = subprocess.run(
+                    [sys.executable, "-I", TOOL, source, out_json, "--curves", "--quiet"],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(cp.returncode, 0, cp.stderr)
+                with open(out_json, encoding="utf-8") as f:
+                    rep = json.load(f)
+                self.assertEqual(rep["summary"]["curve_clips"], 2, source)
+                self.assertEqual(rep["summary"]["curve_clips_decoded"], 1, source)
+                for rec in rep["records"]:
+                    self.assertFalse([k for k, v in rec["curves"].items() if isinstance(v, list)], source)
+
+
 def build_synthetic_empty_bank(flags=0xFF210001, hdr_sz=20):
     """Build a synthetic zero-stream ADAT bank whose flag-selected tables fill the header exactly.
 
