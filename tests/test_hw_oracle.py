@@ -543,6 +543,60 @@ class KernelResources(unittest.TestCase):
         self.assertIn(".amdhsa_next_free_sgpr 40", text)
         self.assertEqual(names, ["k0", "k1"])
 
+    def test_registers_the_lines_name_are_allocated(self):
+        self.assertEqual(asm.regs_used(["v_mov_b32 v200, s7", "s_mov_b64 s[40:41], -1", "v_mad_u64_u32 v[8:9], "
+                                        "s20, v1, v1, v[2:3] ; v250 in a comment", "v_add_co_u32 v3, vcc_lo, v4, s0"]),
+                         (201, 42))
+        self.assertEqual(asm.regs_used(["s_endpgm"]), (0, 0))
+        self.assertEqual(asm.register_counts(["v_mov_b32 v1, 0"], 16, 32), (16, 32))     # never lowered
+        self.assertEqual(asm.register_counts(["v_mov_b32 v255, s103"], 16, 32), (256, 104))
+        k = asm.raw_kernel_text("k0", ["v_mov_b32 v40, 0", "s_endpgm"], "gfx1036", vgprs=8, sgprs=16)
+        self.assertIn(".amdhsa_next_free_vgpr 41", k)
+        self.assertIn(".amdhsa_next_free_sgpr 16", k)
+
+    def test_wrapped_kernels_take_the_wave_and_registers_of_the_kernel(self):
+        # The wrapped kernel's descriptor was fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036 v16 and up read
+        # back 0 and Kernel(wave=64) ran as wave32.
+        lines = ["v_mov_b32 v40, 1", "s_mov_b32 s60, 2"] + PROG[-4:]
+        text, _, _ = asm.module_text([asm.Kernel(lines, wave=64)], "gfx1036", wave=64)
+        self.assertIn(".amdhsa_wavefront_size32 0", text)
+        self.assertIn(".amdhsa_next_free_vgpr 41", text)
+        self.assertIn(".amdhsa_next_free_sgpr 61", text)
+        self.assertIn(".vgpr_count: 41", text)          # the metadata says what the descriptor says
+        self.assertIn(".sgpr_count: 61", text)
+        text, _, _ = asm.module_text([asm.Kernel(PROG)], "gfx1036")
+        self.assertIn(".amdhsa_wavefront_size32 1", text)
+        self.assertIn(".amdhsa_next_free_vgpr 32", text)                # Kernel's default counts
+        text, _, _ = asm.module_text([PROG], "gfx1036")
+        self.assertIn(".amdhsa_next_free_vgpr 16", text)                # a plain program keeps the old ones
+        self.assertIn(".amdhsa_next_free_sgpr 32", text)
+
+
+class WrappedKernelsOnHardware(unittest.TestCase):
+    """A wrapped kernel runs at the wave size it asks for and keeps every register it names."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.oracle = runner.open_oracle()
+        except runner.Unavailable as e:
+            raise unittest.SkipTest(f"hardware oracle unavailable: {e}") from None
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.oracle.close()
+
+    def test_wave_size_and_high_registers(self):
+        # Lane 40 of the lane ids of a full EXEC is 40 in a wave64 and lane 8 (40 mod 32) in a wave32.
+        ids = ["s_mov_b64 exec, -1", "v_mbcnt_lo_u32_b32 v1, -1, 0", "v_mbcnt_hi_u32_b32 v1, -1, v1",
+               "v_readlane_b32 s4, v1, 40", "s_mov_b64 exec, 1"]
+        regs = ["s_mov_b32 s90, 0x5a", "v_mov_b32 v16, 0x16", "v_mov_b32 v200, 0x200", "v_mov_b32 v9, s90",
+                "v_mov_b32 v10, v16", "v_mov_b32 v11, v200", "v_mov_b32 v8, s4"]
+        for wave, lane in ((32, 8), (64, 40)):
+            with self.subTest(wave=wave):
+                got = self.oracle.run([asm.Kernel(ids + regs, wave=wave)])
+                self.assertEqual(got, [[lane, 0x5A, 0x16, 0x200]])
+
 
 if __name__ == "__main__":
     unittest.main()
