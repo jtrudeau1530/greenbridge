@@ -744,6 +744,14 @@ public:
                         xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va, from);
                     }
                 };
+                replay_.xdxr_copy = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t bytes) {
+                    const std::uint64_t base = replay_.heap_base;
+                    xdxr_->record_copy(cb, base + src, base + dst, bytes);
+                };
+                replay_.xdxr_postbuild = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dest) {
+                    const std::uint64_t base = replay_.heap_base;
+                    xdxr_->record_postbuild(cb, base + src, base + dest);
+                };
             } else {
                 xdxr_.reset();
             }
