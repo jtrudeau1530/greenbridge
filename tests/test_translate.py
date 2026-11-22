@@ -1316,6 +1316,40 @@ def test_unnormalized_buffer_store_keeps_nan_bits(fmt, make_shader):
     assert memory[0x1000] == 0xFFC01000
 
 
+# GFX10 32-bit integer formats by component count: UINT code, SINT code (gfx10_formats.json).
+INT32_FORMATS = [(1, 20, 21), (2, 62, 63), (3, 72, 73), (4, 75, 76)]
+
+
+@pytest.mark.parametrize("n, uint_fmt, sint_fmt", INT32_FORMATS)
+def test_int32_buffer_formats_load_and_store_raw_bits(n, uint_fmt, sint_fmt, make_shader):
+    """SHADER-257: the 32-bit SINT typed-buffer formats (and 32_32_32_UINT) load and store each dword unchanged, as
+    their UINT twins do. Negative values and NaN-like patterns must survive both ways; a load's missing channels
+    repeat the format's own, as for every other format (SHADER-86)."""
+    si = _load_mini_interp()
+    words = [0xFFFFFFFF, 0x80000000, 0x7FC01000, 0x00000005][:n]
+    for fmt in (uint_fmt, sint_fmt):
+        desc = (f"s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, {4 * n}\n"
+                f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n")
+        load = desc + ("buffer_load_format_xyzw v[4:7], off, s[0:3], 0\ns_waitcnt vmcnt(0)\n"
+                       "exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n")
+        shader = make_shader(load, name=f"ps_int32_load_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: w for i, w in enumerate(words)}
+        out = si.run_fragment(spv, memory=memory)["%out_mrt0"]
+        assert list(out) == [words[c % n] for c in range(4)], fmt
+
+        setup = "".join(f"v_mov_b32 v{4 + i}, {w:#x}\n" for i, w in enumerate(words))
+        regs = "v4" if n == 1 else f"v[4:{3 + n}]"
+        store = desc + setup + f"buffer_store_format_{'xyzw'[:n]} {regs}, off, s[0:3], 0\ns_endpgm\n"
+        shader = make_shader(store, name=f"ps_int32_store_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: 0xDEADBEEF for i in range(5)}
+        si.run_fragment(spv, memory=memory)
+        assert [memory[0x1000 + 4 * i] for i in range(5)] == words + [0xDEADBEEF] * (5 - n), fmt
+
+
 @pytest.mark.parametrize("fmt, shifts, channels", [(56, (0, 8, 16, 24), (64, 128, 191, 255)),
                                                 (50, (0, 10, 20, 30), (256, 512, 767, 3))])
 @pytest.mark.parametrize("packed", [False, True])

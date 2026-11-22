@@ -47,7 +47,11 @@ struct XboxPresentPlaneParameters {
 
 // Provisional (ours): D3D12XBOX_PRESENT_PARAMETERS. The samples show at least this field.
 struct XboxPresentParameters {
-    float ImmediateThresholdPercent;      // not used yet: a late frame is never shown mid-scan
+    // 0 (the default): a frame that missed its vblank waits for the next one. Above 0: a frame that missed it is shown
+    // at once, mid-scan, when the scan is not further than this percentage down the screen (100: wherever it is).
+    // Needs VK_KHR/EXT_swapchain_maintenance1 and an IMMEDIATE or FIFO_RELAXED mode the swapchain can switch to;
+    // without them it is ignored (logged once). What late means: see FramePacer::present_timing.
+    float ImmediateThresholdPercent;
 };
 
 class XboxPresentation {
@@ -87,7 +91,8 @@ public:
     // (multisampled, integer, block-compressed) give DXGI_ERROR_UNSUPPORTED and present nothing; resolving a
     // multisampled plane into a temporary is not done. While suspended: HRESULT_FROM_WIN32(ERROR_INVALID_STATE), also
     // for a present that was waiting for a swapchain image when SuspendX came.
-    // `params` may be null; ImmediateThresholdPercent is ignored (logged once).
+    // `params` may be null (threshold 0). ImmediateThresholdPercent: see XboxPresentParameters; a frame that was shown
+    // at once has its display statistic's percent_scanned set and is counted in immediate_presents().
     HRESULT PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
     // SuspendX drops the interval, the origin event and the frames in flight, and refuses presents. ResumeX allows
     // presents again; SetFrameIntervalX and ScheduleFrameEventX must be called again before the next wait.
@@ -97,6 +102,8 @@ public:
     leonida::FramePacer& pacer() { return pacer_; }
     WindowPresenter& presenter() { return *presenter_; }
     std::uint64_t presents() const { return presents_; }
+    // Frames shown mid-scan because of ImmediateThresholdPercent.
+    std::uint64_t immediate_presents() const { return pacer_.immediate_presents(); }
 
 private:
     std::unique_ptr<WindowPresenter> presenter_;
