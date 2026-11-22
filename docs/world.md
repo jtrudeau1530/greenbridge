@@ -605,6 +605,12 @@ placements had a recovered model at `917e9b9`. The additional archetypes recover
 fragments. The pinned explorer (`e2939175`) includes both changes. Its fragment check accepts null pointers
 at header offsets 16, 32 and 40 and requires system pointers at offsets 8, 24 and 168.
 [Fragment check at the pinned revision](https://github.com/breadbbbb/rpf9-explorer/blob/e2939175c36a02d6ed25fa2c217b9d6ddcb8b516/Core/RageModelDecoder.cs#L66-L84)
+The 41.3% at the earlier pin (917e9b9) was a model-recovery gap, not a naming gap: almost every archetype name
+resolves (99.85%, see *What is readable* above), but only recovered models can be placed. The archetypes that
+#8/#10 add are `.#ft` fragments, whose headers `LooksLikeFragment` rejected before breadbbbb/rpf9-explorer#8 (it
+now accepts null optional pointers at `+16`/`+32`/`+40` and range-checks the 16-bit fields at `+48..+54`).
+Leonida's pin is now e2939175, which contains #8 and #10, so the pinned `LooksLikeFragment` accepts these headers;
+the 99.96% was measured on 917e9b9 with both applied and has not been recounted at e2939175.
 
 **Not verified or limited:**
 - Nothing here was looked at in a browser. The checks above are structural and numeric.
