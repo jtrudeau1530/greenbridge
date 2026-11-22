@@ -688,5 +688,150 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(len(state.active_lane_indices()), expected_pop)
 
 
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+        self.simd_executor = SIMDInstructionExecutor(self.interp)
+
+    def test_dst_identical_to_src0(self) -> None:
+        """When dst == src0, dst receives old EXEC; EXEC receives old_exec ^ old_src."""
+        state = SALUArchitecturalState()
+        init_exec = 0xAAAA_AAAA_5555_5555
+        init_src = 0x1234_5678_9ABC_DEF0
+        state.exec_mask = init_exec
+        state.write_sgpr_u64(4, init_src)
+
+        inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=Register(RegKind.SGPR, 4, count=2),
+        )
+        res = self.interp.step(inst, state)
+
+        # Result verification
+        self.assertEqual(res.saved_exec, init_exec)
+        self.assertEqual(res.new_exec, init_exec ^ init_src)
+
+        # Architectural state verification: s[4:5] must hold saved_exec, NOT new_exec!
+        self.assertEqual(state.read_sgpr_u64(4), init_exec)
+        self.assertEqual(state.exec_mask, init_exec ^ init_src)
+
+    def test_dst_partial_overlap_low(self) -> None:
+        """dst s[4:5] overlaps low register of src0 s[3:4] at s[4]."""
+        state = SALUArchitecturalState()
+        val_s3 = 0x1111_1111
+        val_s4 = 0x2222_2222
+        val_s5 = 0x3333_3333
+        state.write_sgpr_u32(3, val_s3)
+        state.write_sgpr_u32(4, val_s4)
+        state.write_sgpr_u32(5, val_s5)
+
+        init_exec = 0xF0F0_F0F0_0F0F_0F0F
+        state.exec_mask = init_exec
+
+        # src0 is s[3:4] -> lo=s3, hi=s4
+        src0_val = words_to_u64(val_s3, val_s4)
+
+        inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=Register(RegKind.SGPR, 3, count=2),
+        )
+        res = self.interp.step(inst, state)
+
+        self.assertEqual(res.saved_exec, init_exec)
+        self.assertEqual(res.new_exec, init_exec ^ src0_val)
+
+        # Check register preservation: s[3] must remain val_s3
+        self.assertEqual(state.read_sgpr_u32(3), val_s3)
+        # s[4:5] must hold init_exec (lo in s4, hi in s5)
+        self.assertEqual(state.read_sgpr_u64(4), init_exec)
+
+    def test_dst_partial_overlap_high(self) -> None:
+        """dst s[4:5] overlaps high register of src0 s[5:6] at s[5]."""
+        state = SALUArchitecturalState()
+        val_s4 = 0x4444_4444
+        val_s5 = 0x5555_5555
+        val_s6 = 0x6666_6666
+        state.write_sgpr_u32(4, val_s4)
+        state.write_sgpr_u32(5, val_s5)
+        state.write_sgpr_u32(6, val_s6)
+
+        init_exec = 0x00FF_00FF_FF00_FF00
+        state.exec_mask = init_exec
+
+        src0_val = words_to_u64(val_s5, val_s6)
+
+        inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=Register(RegKind.SGPR, 5, count=2),
+        )
+        res = self.interp.step(inst, state)
+
+        self.assertEqual(res.saved_exec, init_exec)
+        self.assertEqual(res.new_exec, init_exec ^ src0_val)
+
+        # Check register preservation: s[6] must remain val_s6
+        self.assertEqual(state.read_sgpr_u32(6), val_s6)
+        # s[4:5] holds init_exec
+        self.assertEqual(state.read_sgpr_u64(4), init_exec)
+
+    def test_inplace_mask_inversion_loop(self) -> None:
+        """Sequential loop with dst == src0 repeatedly toggling and saving."""
+        state = SALUArchitecturalState()
+        state.exec_mask = ALL_LANES_W64
+        # Register s[0:1] holds inversion mask
+        invert_mask = EVEN_LANES_W64
+        state.write_sgpr_u64(0, invert_mask)
+
+        inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 0, count=2),
+            src0=Register(RegKind.SGPR, 0, count=2),
+        )
+
+        # Iteration 1:
+        # EXEC was ALL_LANES, src was EVEN_LANES
+        # saved -> ALL_LANES (written to s[0:1])
+        # new EXEC -> ALL_LANES ^ EVEN_LANES = ODD_LANES
+        res1 = self.interp.step(inst, state)
+        self.assertEqual(res1.saved_exec, ALL_LANES_W64)
+        self.assertEqual(state.read_sgpr_u64(0), ALL_LANES_W64)
+        self.assertEqual(state.exec_mask, ODD_LANES_W64)
+
+        # Iteration 2:
+        # EXEC is ODD_LANES, src is ALL_LANES (from s[0:1])
+        # saved -> ODD_LANES (written to s[0:1])
+        # new EXEC -> ODD_LANES ^ ALL_LANES = EVEN_LANES
+        res2 = self.interp.step(inst, state)
+        self.assertEqual(res2.saved_exec, ODD_LANES_W64)
+        self.assertEqual(state.read_sgpr_u64(0), ODD_LANES_W64)
+        self.assertEqual(state.exec_mask, EVEN_LANES_W64)
+
+    def test_unrelated_sgpr_preservation(self) -> None:
+        """Verify that all 104 un-targeted SGPRs remain strictly unaltered."""
+        state = SALUArchitecturalState()
+        # Seed all 106 SGPRs with distinct canary values
+        for i in range(106):
+            state.write_sgpr_u32(i, 0xA000_0000 | (i * 0x101))
+
+        snapshot_before = list(state.sgprs)
+
+        # Modify s[20:21] using s[30:31]
+        inst = SXorSaveExecB64AST(
+            dst=Register(RegKind.SGPR, 20, count=2),
+            src0=Register(RegKind.SGPR, 30, count=2),
+        )
+        self.interp.step(inst, state)
+
+        # Verify untouched registers
+        for i in range(106):
+            if i not in (20, 21):
+                self.assertEqual(
+                    state.read_sgpr_u32(i),
+                    snapshot_before[i],
+                    f"SGPR {i} was unexpectedly corrupted!",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
