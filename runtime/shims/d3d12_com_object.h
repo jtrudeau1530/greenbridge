@@ -51,7 +51,8 @@ public:
 
     // Private data (ID3D12Object): bytes, or with SetPrivateDataInterface an interface the object holds a reference
     // to until the entry is replaced, removed or the object dies. GetPrivateData hands such an interface back with a
-    // reference added, as D3D12 does. SetName stores the name as WKPDID_D3DDebugObjectNameW, which is where D3D12
+    // reference added, as D3D12 does. A buffer too small for the entry gets DXGI_ERROR_MORE_DATA and the size it
+    // needs, so the caller can retry. SetName stores the name as WKPDID_D3DDebugObjectNameW, which is where D3D12
     // keeps it, so GetPrivateData reads it back.
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
         if (!size) return E_INVALIDARG;
@@ -59,8 +60,11 @@ public:
         for (const auto& entry : data_) {
             if (entry.key != guid) continue;
             const UINT bytes = entry.object ? UINT(sizeof(IUnknown*)) : UINT(entry.bytes.size());
+            if (data && *size < bytes) {
+                *size = bytes;  // the size to retry with, as vkd3d-proton does
+                return DXGI_ERROR_MORE_DATA;
+            }
             if (data) {
-                if (*size < bytes) return DXGI_ERROR_MORE_DATA;
                 if (entry.object) {
                     entry.object->AddRef();
                     std::memcpy(data, &entry.object, sizeof(IUnknown*));

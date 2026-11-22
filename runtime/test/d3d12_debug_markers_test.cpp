@@ -192,9 +192,9 @@ int check_private_data(ID3D12Object* object, const char* what) {
     UINT size = 0;
     EXPECT(object->GetPrivateData(kKey, &size, nullptr) == S_OK && size == sizeof(IUnknown*));
     IUnknown* got = nullptr;
-    size = 4;
+    size = 4;  // too small: no reference added, and the size to retry with comes back
     EXPECT(object->GetPrivateData(kKey, &size, &got) == DXGI_ERROR_MORE_DATA && !got && counted.refs == 2);
-    size = sizeof(got);
+    EXPECT(size == sizeof(IUnknown*));
     EXPECT(object->GetPrivateData(kKey, &size, &got) == S_OK && got == &counted && counted.refs == 3);
     got->Release();
 
@@ -204,6 +204,12 @@ int check_private_data(ID3D12Object* object, const char* what) {
     std::uint32_t read = 0;
     size = sizeof(read);
     EXPECT(object->GetPrivateData(kKey, &size, &read) == S_OK && size == sizeof(read) && read == value);
+    std::uint16_t small = 0;
+    size = sizeof(small);  // too small for the bytes: nothing copied, the size to retry with comes back
+    EXPECT(object->GetPrivateData(kKey, &size, &small) == DXGI_ERROR_MORE_DATA && small == 0);
+    EXPECT(size == sizeof(value));
+    read = 0;
+    EXPECT(object->GetPrivateData(kKey, &size, &read) == S_OK && size == sizeof(value) && read == value);
     EXPECT(object->SetPrivateData(kKey, 4, nullptr) == E_INVALIDARG);
     EXPECT(object->SetPrivateDataInterface(kKey, &counted) == S_OK && counted.refs == 2);
     EXPECT(object->SetPrivateDataInterface(kKey, &counted) == S_OK && counted.refs == 2);  // same one again

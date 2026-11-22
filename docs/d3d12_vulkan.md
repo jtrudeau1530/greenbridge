@@ -1181,7 +1181,9 @@ Games and middleware call these every frame (PIX events), so they must be cheap 
   live in the shared `Object` base, so the device, queues, allocators, lists, fences, descriptor heaps and
   resources all have them. `SetPrivateDataInterface` holds a reference until the entry is replaced (by bytes or
   another interface), removed (a null interface or zero size) or the object is destroyed; `GetPrivateData` returns
-  the pointer with a reference added, as D3D12 does. `SetName` stores the name as `WKPDID_D3DDebugObjectNameW`
+  the pointer with a reference added, as D3D12 does. A buffer too small for the entry gets `DXGI_ERROR_MORE_DATA`,
+  nothing copied and no reference added, and `*pDataSize` set to the size needed, so the caller can retry (as
+  vkd3d-proton's private store does). `SetName` stores the name as `WKPDID_D3DDebugObjectNameW`
   (terminator included), which is where D3D12 keeps it. Names are not forwarded to `vkSetDebugUtilsObjectNameEXT`
   yet: one D3D12 object may own several Vulkan objects.
 
