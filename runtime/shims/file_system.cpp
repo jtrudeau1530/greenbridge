@@ -325,9 +325,11 @@ Target write_target(const std::wstring& path, bool copy_up) {
     return t;
 }
 
+// MAXIMUM_ALLOWED names no right and grants every one the file allows, write included, so it is a write-open: opened
+// as a read it handed out a handle to the package file itself, and a WriteFile through it changed the package.
 bool writes(DWORD access, DWORD disposition) {
-    constexpr DWORD kWriteAccess = GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
-                                   FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
+    constexpr DWORD kWriteAccess = GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED | FILE_WRITE_DATA | FILE_APPEND_DATA |
+                                   FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
     if ((access & kWriteAccess) != 0) return true;
     return disposition == CREATE_NEW || disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS ||
            disposition == TRUNCATE_EXISTING;
