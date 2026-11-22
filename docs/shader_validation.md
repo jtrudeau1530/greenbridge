@@ -577,6 +577,81 @@ What the hardware answered where the model does not judge (gfx1150; RDNA2 is not
   payload bits and the quiet bit set (not the canonical `0x7e00` the model writes; payload not judged, quietness is).
   `v_cvt_f32_f16` keeps the f16 payload shifted left by 13 and does not quiet it (the model agrees).
 
+
+### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
+
+The `16-bit results` row of `docs/design.md` listed `v_exp_f16`/`v_log_f16` and the NaN and denormal operands as
+unverified. f16 has only 65,536 bit patterns, so instead of sampling, this tool runs every one of them through
+`v_exp_f16`, `v_log_f16`, `v_rcp_f16`, `v_rsq_f16`, `v_sqrt_f16`, `v_sin_f16` and `v_cos_f16` on the hardware
+oracle (setup above; exit 77 without it). Each op is 8 raw kernels of 1,024 threads. Each thread computes 8 inputs
+and stores them packed two to a dword, which is 4,096 words per kernel, the launcher's limit. The op runs in wave32
+and wave64 and under five MODEs, and MODE is read back with `s_getreg_b32` first:
+
+| Mode | IEEE | f16 denormals | f16 rounding |
+|---|---|---|---|
+| `keep16` | 0 | kept (3) | nearest |
+| `flush16` | 0 | flushed (0) | nearest |
+| `ieee_keep16` | 1 | kept | nearest |
+| `ieee_flush16` | 1 | flushed | nearest |
+| `keep16_rtz` | 0 | kept | toward zero |
+
+All modes have DX10_CLAMP 1 and f32 denormals flushed.
+
+```
+python -I tools/f16_trans_sweep.py                                  # all ops and modes, about 5 minutes
+python -I tools/f16_trans_sweep.py --ops v_exp_f16 --modes keep16 --json out.json
+python -I tools/f16_trans_sweep.py --self-test                      # the reference, no GPU
+```
+
+The reference is the exact result correctly rounded to f16, computed with `decimal` at 60 digits: for sin/cos that is
+sin/cos(2πx), reduced in turns. That reference is the translator's rule (widen, the GLSL.std.450 function in f32,
+round to nearest even) with an exact f32 function, the best a driver can do. Inputs where the translated SPIR-V is
+undefined are tabulated, not judged. For each mode the tool counts:
+- bit-exact results, 1 ulp and more than 1 ulp;
+- denormal operands that give the hardware's own word for a zero of the same sign, and denormal results written as zero;
+- NaN results, with signalling NaNs kept, quieted or changed.
+
+It also counts the inputs on which each mode differs from `keep16`, and lists the word for 23 special inputs. For
+sin/cos a second table compares the hardware with Sin/Cos of the f32 product 6.2831855 · x, by |x| band.
+
+Result on an RX 6700 XT (gfx1031, Navi 22; the Linux launcher from #1265, Linux 7.3.5, amdgpu, clang 23.1.5).
+wave32 and wave64 gave the same word for every input of every op in every mode. There was no GPU fault, timeout or
+reset in the kernel log.
+
+| Op (`keep16`) | Inputs that are not NaN | Bit-exact | 1 ulp | Undefined in SPIR-V |
+|---|---|---|---|---|
+| `v_exp_f16` | 63,490 | 63,490 | 0 | 0 |
+| `v_log_f16` | 63,490 | 31,744 | 0 | 31,746 (≤ 0) |
+| `v_rcp_f16` | 63,490 | 63,488 | 0 | 2 (±0) |
+| `v_rsq_f16` | 63,490 | 31,744 | 0 | 31,746 (≤ 0) |
+| `v_sqrt_f16` | 63,490 | 31,746 | 0 | 31,744 (< 0, -0 excluded) |
+| `v_sin_f16` | 63,490 | 63,474 | 14 | 2 (±inf) |
+| `v_cos_f16` | 63,490 | 63,484 | 4 | 2 (±inf) |
+
+- **Correctly rounded.** The five non-trigonometric ops never differ from the correctly rounded result. sin/cos differ
+  by 1 ulp on 14 and 4 inputs, all with |x| ≤ 1. For |x| > 1 every result is bit-exact, up to 65,504 turns: the f16
+  ops have no ±256 domain limit.
+- **The f32 product loses the turn.** Against Sin/Cos(f32 6.2831855 · x), which is what the translator computes before
+  #594 is fixed, 16,366 sin and 2,036 cos inputs are more than 1 ulp off, up to 9,944 ulp. Nearly all of them have
+  |x| > 1 (sin: 1,010 inputs at 1 < |x| ≤ 256 and 15,354 above 256). Reducing in turns first, as #1283 and #616
+  propose, is what the hardware does; for f16 the reduction must not stop at ±256.
+- **f16 denormals follow `denorm_mode_16_64`, for operands and results alike.** With 0, a denormal operand gives the
+  word of a zero of its sign (`v_log_f16` -inf, `v_rcp_f16` and `v_rsq_f16` ±inf, `v_sqrt_f16` and `v_sin_f16` ±0).
+  Denormal results become ±0 (831 for `v_exp_f16`, 4,094 for `v_rcp_f16`). With 3, both are kept. The f32
+  transcendentals behave differently: they flush in both modes.
+- **The f16 field of FP_ROUND is ignored.** Under round toward zero every op gives the same word as under round to
+  nearest, on all 65,536 inputs.
+- **IEEE only changes signalling NaNs.** With IEEE 0, all 1,022 f16 signalling NaNs pass through unchanged. With IEEE 1
+  they are quieted (bit 9 set) with payload and sign kept. Quiet NaNs pass through unchanged in every mode. This is the
+  f32 behaviour of the previous section.
+- **Undefined in SPIR-V, defined on the hardware.** log(±0) = -inf; rcp(±0) = ±inf; rsq(+0) = +inf; rsq(-0) = -inf;
+  sqrt(-0) = -0. log, rsq and sqrt of a negative (-inf included), and sin/cos(±inf), give `0xfe00`, the negative quiet
+  NaN (`0xffc00000` in f32).
+- **Controls.** `keep16_rtz` also judges against a round-toward-zero reference, so it shows what a wrong rounding
+  model produces: about half the results 1 ulp off. The kernel layout is checked without a GPU: each of the 65,536
+  inputs is computed once and stored in its own half (`tests/test_f16_trans_sweep.py`). On a GPU the test checks
+  exp2 of integers and wave32 = wave64.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
