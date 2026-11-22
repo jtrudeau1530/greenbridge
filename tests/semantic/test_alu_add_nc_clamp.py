@@ -28,6 +28,7 @@ sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import spirv_wave_interp as wi  # noqa: E402
 
 M32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
@@ -88,23 +89,62 @@ VALUES = [0, 1, 2, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFFFFFFFF, 0xFFFFFFFE, 0
 
 _TMP_DIR = None
 _SRC_PATH = None
+_VS_SRC_PATH = None
 
 
 def setUpModule():
-    global _TMP_DIR, _SRC_PATH
+    global _TMP_DIR, _SRC_PATH, _VS_SRC_PATH
     _TMP_DIR = tempfile.TemporaryDirectory()
     disasm_dir = os.path.join(_TMP_DIR.name, "disasm")
     os.mkdir(disasm_dir)
     _SRC_PATH = os.path.join(disasm_dir, "ps_add_nc_clamp.s")
+    _VS_SRC_PATH = os.path.join(disasm_dir, "vs_add_nc_clamp.s")
     with open(os.path.join(_TMP_DIR.name, "ps_add_nc_clamp.dxbc"), "wb") as f:
+        f.write(STUB_DXBC)
+    with open(os.path.join(_TMP_DIR.name, "vs_add_nc_clamp.dxbc"), "wb") as f:
         f.write(STUB_DXBC)
 
 
 def tearDownModule():
-    global _TMP_DIR
+    global _TMP_DIR, _SRC_PATH, _VS_SRC_PATH
     if _TMP_DIR is not None:
         _TMP_DIR.cleanup()
         _TMP_DIR = None
+        _SRC_PATH = None
+        _VS_SRC_PATH = None
+
+
+def run_wave_vs(lines: list[str], wave: int = 32, base_lane: int = 0) -> list[int | None]:
+    """Run a synthetic vertex shader on a wave of lanes, returning param0 word 0 for each lane."""
+    if _TMP_DIR is None:
+        setUpModule()
+    body = ["s_mov_b64 s[10:11], exec"] + list(lines) + [
+        "v_mov_b32_e32 v5, 0",
+        "exp pos0 v5, v5, v5, v5 done",
+        "exp param0 v6, v5, v5, v5",
+        "s_endpgm",
+    ]
+    asm = "; vs_add_nc_clamp\n" + "".join(f"\t{ln}\n" for ln in body)
+    with open(_VS_SRC_PATH, "w", encoding="utf-8") as f:
+        f.write(asm)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        spv = rdna2spirv.translate(_VS_SRC_PATH)
+    res = wi.run_wave(
+        spv,
+        wave=wave,
+        builtins={
+            "VertexIndex": lambda lane, b=base_lane: b + lane,
+            "InstanceIndex": lambda _lane: 0,
+        },
+    )
+    outputs: list[int | None] = []
+    for out in res["outputs"]:
+        if out is None:
+            outputs.append(None)
+        else:
+            outputs.append(out["%out_param0"][0])
+    return outputs
 
 
 def run_lines(lines) -> int:
@@ -263,6 +303,131 @@ class TestAddNcU32ReferenceOracle(unittest.TestCase):
                     got = run_op("v_add_nc_u32", a, b, clamp)
                     want = ref_add_nc_u32(a, b, clamp)
                     self.assertEqual(got, want)
+
+
+class TestAddNcU32SimdDivergence(unittest.TestCase):
+    """Multi-lane SIMD divergence and clamp boundary verification for v_add_nc_u32."""
+
+    def test_wave32_clamp_boundary_divergence(self) -> None:
+        """In wave32, lanes cross the clamp boundary: non-saturating lanes match wrapped, saturated lanes clamp."""
+        # Operands: v0 = lane index (0..31), v1 = 0xFFFFFFF0
+        # Lanes 0..15: sums 0xFFFFFFF0..0xFFFFFFFF (below or at 2^32 boundary). Clamped == Wrapped == sum.
+        # Lanes 16..31: sums 0x100000000..0x10000000F. Clamped == 0xFFFFFFFF, Wrapped == lane - 16.
+        lines_clamped = [
+            "v_mov_b32_e32 v1, 0xfffffff0",
+            "v_add_nc_u32_e64 v6, v0, v1 clamp",
+        ]
+        lines_wrapped = [
+            "v_mov_b32_e32 v1, 0xfffffff0",
+            "v_add_nc_u32_e64 v6, v0, v1",
+        ]
+        clamped_outs = run_wave_vs(lines_clamped, wave=32)
+        wrapped_outs = run_wave_vs(lines_wrapped, wave=32)
+
+        self.assertEqual(len(clamped_outs), 32)
+        self.assertEqual(len(wrapped_outs), 32)
+
+        for lane in range(32):
+            expected_clamped = ref_add_nc_u32(lane, 0xFFFFFFF0, clamp=True)
+            expected_wrapped = ref_add_nc_u32(lane, 0xFFFFFFF0, clamp=False)
+            self.assertEqual(clamped_outs[lane], expected_clamped, f"Mismatch at clamped lane {lane}")
+            self.assertEqual(wrapped_outs[lane], expected_wrapped, f"Mismatch at wrapped lane {lane}")
+
+            if lane <= 15:
+                # Sub-saturation: clamp and wrap must be identical
+                self.assertEqual(clamped_outs[lane], wrapped_outs[lane])
+                self.assertEqual(clamped_outs[lane], 0xFFFFFFF0 + lane)
+            else:
+                # Saturation: clamp is 0xFFFFFFFF while wrap rolls over
+                self.assertEqual(clamped_outs[lane], M32)
+                self.assertEqual(wrapped_outs[lane], lane - 16)
+                self.assertNotEqual(clamped_outs[lane], wrapped_outs[lane])
+
+    def test_wave64_clamp_boundary_divergence(self) -> None:
+        """In wave64, verify multi-lane divergence across the 64-lane wavefront."""
+        # Operands: v0 = lane index (0..63), v1 = 0xFFFFFFE0
+        # Lanes 0..31: sums 0xFFFFFFE0..0xFFFFFFFF (clamped == wrapped == 0xFFFFFFE0 + lane)
+        # Lanes 32..63: sums 0x100000000..0x10000001F (clamped == 0xFFFFFFFF, wrapped == lane - 32)
+        lines_clamped = [
+            "v_mov_b32_e32 v1, 0xffffffe0",
+            "v_add_nc_u32_e64 v6, v0, v1 clamp",
+        ]
+        lines_wrapped = [
+            "v_mov_b32_e32 v1, 0xffffffe0",
+            "v_add_nc_u32_e64 v6, v0, v1",
+        ]
+        clamped_outs = run_wave_vs(lines_clamped, wave=64)
+        wrapped_outs = run_wave_vs(lines_wrapped, wave=64)
+
+        self.assertEqual(len(clamped_outs), 64)
+        self.assertEqual(len(wrapped_outs), 64)
+
+        for lane in range(64):
+            expected_clamped = ref_add_nc_u32(lane, 0xFFFFFFE0, clamp=True)
+            expected_wrapped = ref_add_nc_u32(lane, 0xFFFFFFE0, clamp=False)
+            self.assertEqual(clamped_outs[lane], expected_clamped, f"Wave64 mismatch at clamped lane {lane}")
+            self.assertEqual(wrapped_outs[lane], expected_wrapped, f"Wave64 mismatch at wrapped lane {lane}")
+
+            if lane <= 31:
+                self.assertEqual(clamped_outs[lane], wrapped_outs[lane])
+            else:
+                self.assertEqual(clamped_outs[lane], M32)
+                self.assertEqual(wrapped_outs[lane], lane - 32)
+                self.assertNotEqual(clamped_outs[lane], wrapped_outs[lane])
+
+    def test_wave32_inactive_exec_mask(self) -> None:
+        """Disabled lanes under EXEC mask must not update their destination register."""
+        sentinel = 0xDEADBEEF
+        lines = [
+            f"v_mov_b32_e32 v6, {sentinel:#x}",
+            "s_mov_b32 exec_lo, 0x0000ffff",  # only lanes 0..15 active
+            "v_mov_b32_e32 v1, 0xffffffe0",
+            "v_add_nc_u32_e64 v6, v0, v1 clamp",
+            "s_mov_b32 exec_lo, 0xffffffff",  # restore exec for export
+        ]
+        outs = run_wave_vs(lines, wave=32)
+        for lane in range(16):
+            # Active lanes: v0 + 0xffffffe0 with clamp
+            self.assertEqual(outs[lane], ref_add_nc_u32(lane, 0xFFFFFFE0, clamp=True))
+        for lane in range(16, 32):
+            # Inactive lanes: destination register retains sentinel value
+            self.assertEqual(outs[lane], sentinel, f"Lane {lane} was overwritten despite inactive EXEC")
+
+    def test_simd_dual_divergent_operands(self) -> None:
+        """Simultaneous per-lane variation on both source operands across clamp threshold."""
+        # Lane v0 in 0..31
+        # Let v1 = 0x80000000 + lane (ranges 0x80000000..0x8000001F)
+        # Let v2 = 0x7FFFFFF0 + lane (ranges 0x7FFFFFF0..0x8000000F)
+        # Total sum = 0xFFFFFFF0 + 2 * lane
+        # Lanes 0..7: sums 0xFFFFFFF0..0xFFFFFFFE (below 2^32, clamped == wrapped)
+        # Lanes 8..31: sums 0x100000000..0x10000002E (exceeds 2^32, clamped == 0xFFFFFFFF, wrapped == 2 * (lane - 8))
+        lines_clamped = [
+            "v_add_nc_u32_e32 v1, 0x80000000, v0",
+            "v_add_nc_u32_e32 v2, 0x7ffffff0, v0",
+            "v_add_nc_u32_e64 v6, v1, v2 clamp",
+        ]
+        lines_wrapped = [
+            "v_add_nc_u32_e32 v1, 0x80000000, v0",
+            "v_add_nc_u32_e32 v2, 0x7ffffff0, v0",
+            "v_add_nc_u32_e64 v6, v1, v2",
+        ]
+        clamped_outs = run_wave_vs(lines_clamped, wave=32)
+        wrapped_outs = run_wave_vs(lines_wrapped, wave=32)
+
+        for lane in range(32):
+            v1_val = 0x80000000 + lane
+            v2_val = 0x7FFFFFF0 + lane
+            exp_clamped = ref_add_nc_u32(v1_val, v2_val, clamp=True)
+            exp_wrapped = ref_add_nc_u32(v1_val, v2_val, clamp=False)
+            self.assertEqual(clamped_outs[lane], exp_clamped, f"Clamped mismatch at lane {lane}")
+            self.assertEqual(wrapped_outs[lane], exp_wrapped, f"Wrapped mismatch at lane {lane}")
+            if lane < 8:
+                self.assertEqual(clamped_outs[lane], wrapped_outs[lane])
+                self.assertEqual(clamped_outs[lane], 0xFFFFFFF0 + 2 * lane)
+            else:
+                self.assertEqual(clamped_outs[lane], M32)
+                self.assertEqual(wrapped_outs[lane], (lane - 8) * 2)
+                self.assertNotEqual(clamped_outs[lane], wrapped_outs[lane])
 
 
 if __name__ == "__main__":
