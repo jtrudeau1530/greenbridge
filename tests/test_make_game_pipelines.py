@@ -62,6 +62,20 @@ class PipelinesJobsTest(unittest.TestCase):
         want = str(max(1, (os.cpu_count() or 2) // 2))
         self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with())), want)
 
+    def test_the_stage_log_names_compute_and_graphics_pipelines(self):
+        # The stage runs vk_pipeline_check without --stage, and its default is all: cs become compute pipelines,
+        # ps/vs/ms/gs become graphics pipelines with partner stubs, so the announce line must not claim compute only.
+        logs = []
+        with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
+                mock.patch.object(make_game, "checker_supports", return_value=False), \
+                mock.patch.object(make_game, "run", return_value=0), \
+                mock.patch.object(make_game, "log", logs.append):
+            make_game.pipelines(self.work, self.out)
+        announce = [m for m in logs if "creating" in m]
+        self.assertEqual(len(announce), 1, logs)
+        self.assertIn("graphics", announce[0])
+        self.assertIn("compute", announce[0])
+
 
 ABORT = 0x80000003   # how Windows reports the driver's LLVM abort (#884)
 

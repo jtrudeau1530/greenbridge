@@ -1392,7 +1392,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
              "loader installed, run: cmake -S runtime -B runtime/build/linux && "
              "cmake --build runtime/build/linux --parallel")
     spirv = require_translated_shaders(work)
-    log("pipelines: creating every shader module and compute pipeline on this GPU")
+    log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
     os.makedirs(out, exist_ok=True)
     cache = os.path.join(out, "pipeline_cache.bin")
     inflight = os.path.join(out, "pipeline_inflight.txt")
