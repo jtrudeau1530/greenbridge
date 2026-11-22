@@ -1167,6 +1167,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(allocator_proxy_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME allocator_proxy COMMAND allocator_proxy_test)
     set_tests_properties(allocator_proxy PROPERTIES SKIP_RETURN_CODE 77)
+    # IDXGIDevice1 on the device proxy (the GDKX boot step: QueryInterface, GetAdapter, EnumOutputs), on the host
+    # runtime and on the Vulkan device: COM identity with the device, the adapter's LUID. 77: no device at all.
+    add_executable(dxgi_device_test test/dxgi_device_test.cpp)
+    target_link_libraries(dxgi_device_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(dxgi_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_device_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_device COMMAND dxgi_device_test)
+    set_tests_properties(dxgi_device PROPERTIES SKIP_RETURN_CODE 77)
     # The countdown behind those event-backed waits, with no GPU: the full unsigned count, no wrap past zero.
     add_executable(d3d12_fence_waiter_test test/d3d12_fence_waiter_test.cpp)
     target_compile_definitions(d3d12_fence_waiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
