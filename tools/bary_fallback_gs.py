@@ -125,6 +125,9 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
         vertex, pixel = pair
         producer = index.get(vertex, {})
         consumer = index.get(pixel, {})
+        for name, entry in ((vertex, producer), (pixel, consumer)):
+            if not isinstance(entry, dict):
+                raise ValueError(f"{index_path}: index entry {name!r} must be a JSON object")
         if producer.get("stage") != "vs" or consumer.get("stage") != "ps" or not consumer.get("bary_fallback_input"):
             raise ValueError("--pair requires a translated VS and a barycentric-fallback PS from the index")
         caps = set(producer.get("capabilities", []))
