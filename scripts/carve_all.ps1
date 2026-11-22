@@ -26,12 +26,24 @@ foreach ($archive in $archives) {
     $f = $archive.file
     $rel = $archive.relative
     $dest = $archive.destination
-    if (-not (Test-Path -LiteralPath (Join-Path $dest "index.json"))) {
+    $index = Join-Path $dest "index.json"
+    if (-not (Test-Path -LiteralPath $index)) {
         Write-Host ("{0:HH:mm:ss} carving {1} ({2:N1} GiB)" -f (Get-Date), $rel, ($f.Length / 1GB))
         python -I $tool $f.FullName $dest | Select-Object -Last 1
         if ($LASTEXITCODE -ne 0) { throw "Carving $rel failed (exit $LASTEXITCODE)" }
     }
-    $s = (Get-Content -LiteralPath (Join-Path $dest "index.json") -Raw | ConvertFrom-Json).summary
+    try {
+        $s = (Get-Content -LiteralPath $index -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).summary
+        foreach ($field in 'files', 'bink2_files', 'span', 'compressed_bytes', 'unread_bytes', 'inflated_bytes') {
+            $value = $s.$field
+            if ((($value -isnot [int]) -and ($value -isnot [long])) -or $value -lt 0) {
+                throw "summary.$field must be a non-negative integer."
+            }
+        }
+        if ($s.span -eq 0) { throw 'summary.span must be positive.' }
+    } catch {
+        throw "Invalid carve index '$index': $($_.Exception.Message)"
+    }
     $rows += [pscustomobject]@{ archive = $rel; files = $s.files; bink2 = $s.bink2_files; span = $s.span
                                readable = [math]::Round(($s.compressed_bytes) / $s.span, 4)
                                unread = [math]::Round($s.unread_bytes / $s.span, 4); inflated = $s.inflated_bytes }
