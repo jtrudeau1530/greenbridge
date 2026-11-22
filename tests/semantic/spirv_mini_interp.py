@@ -548,7 +548,11 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = int(f"{val(a[1]) & wmask(a[0]):0{bits}b}"[::-1], 2)
         elif op in ("OpConvertUToF", "OpConvertSToF"):
             x = val(a[1])
-            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
+            # The width comes from the operand's type, as in sval(): a 64-bit value below 2**32 passes the value
+            # check, and _s32() would then give it the wrong sign under OpConvertSToF.
+            t = types.t.get(id_type.get(a[1]))
+            if isinstance(x, bool) or not isinstance(x, int) or x > MASK \
+                    or (t is not None and (t[0] != "int" or t[1] != 32)):
                 raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
             values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op == "OpBitCount":
