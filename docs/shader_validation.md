@@ -313,11 +313,13 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   EXEC constants only enable lanes that exist. Every mask register is zero-initialised, as compiled code does,
   so a branch that skips the `v_cmp` writing a mask leaves a defined mask after the join.
 - **Hypotheses are reported apart.** `v_permlane16/x16` with op_sel FI = 0 reading a lane that is off in
-  EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured on RDNA2 and RDNA3.5 (@aslan2142,
-  #374): FI = 1 returns the source lane's value, FI = 0 leaves the destination unwritten and FI = 0 with BOUND_CTRL
-  gives 0; #580 (SHADER-74) makes the translator do that. Where the translator still always reads the lane, a
-  program that hits the case counts as `hyp_only`, not as a mismatch. `--permlane-fetch-inactive` models FI = 1
-  instead.
+  EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured, with the same result on both:
+  @aslan2142 on RDNA2 and @AlxcBTW on RDNA3.5 (#374). FI = 1 returns the source lane's value, FI = 0 leaves the
+  destination unwritten and FI = 0 with BOUND_CTRL gives 0; #580 (SHADER-74) makes the translator do that. The
+  fuzzer has not caught up: its docstring (`tools/crosslane_fuzz.py`) still calls the case unmeasured and
+  `op_permlane` still tags it `hyp`, so a program that hits it is filed as `hyp_only`, not as a mismatch, whatever
+  the translator does. The model (vD kept) already matches the measurement; dropping the tag is a follow-up.
+  `--permlane-fetch-inactive` models FI = 1 instead.
 - **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
   which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.
 - **Reports.** The thread, wave, lane and register of the first differences. `--minimize` drops ops while the
