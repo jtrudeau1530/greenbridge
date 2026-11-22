@@ -5015,7 +5015,7 @@ class Gen:
             # getAddrSizeMIMGOp: the extra arguments' words, the gradients, then the packed halves; llvm-mc wants
             # v[0:2] for a 2D image_sample_c_b ... a16). A bias is an f16 in the low half of its VGPR, a z-compare
             # an f32. Until 2026-11-21 those were unpacked as pairs too, and the coordinates after them were read a
-            # half early. A texel offset comes first; samples with one stop under a16 further down.
+            # half early. A texel offset comes first and keeps its full dword under a16.
             extras = op[len("image_sample"):] if op.startswith("image_sample") else ""
             w_off = 1 if extras.endswith("_o") else 0
             extras = extras[:-2] if w_off else extras
@@ -5167,8 +5167,6 @@ class Gen:
                 # _o: the first address dword packs signed 6-bit texel offsets, x = [5:0], y = [13:8], z = [21:16]
                 # (GFX10 MIMG address order: offset, bias, z-compare, derivatives, coordinates). Mapped to the
                 # SPIR-V Offset operand; Vulkan only guarantees offsets within minTexelOffset..maxTexelOffset.
-                if a16:
-                    raise Unsupported(op + " a16")
                 kind = kind[:-2]
                 raw, f = coords[0], f[1:]
                 n_off = 3 if is3d else (1 if ncoord == 1 else 2)
