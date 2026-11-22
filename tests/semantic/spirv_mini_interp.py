@@ -635,6 +635,16 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
+        elif op == "OpQuantizeToF16":
+            # Single-instruction f32 -> f16 -> f32 round to nearest. Emitted by
+            # the translator for 16-bit interpolant reads; a Pack/Unpack
+            # round-trip is observably folded to a no-op by at least one driver.
+            values[res] = half_to_float(float_to_half(val(a[1])))
+        elif op in ("OpConvertUToF", "OpConvertSToF"):
+            x = val(a[1])
+            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
+                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
+            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op in ("OpConvertFToU", "OpConvertFToS"):
             x, bits = val(a[1]), types.bits(a[0])
             if not isinstance(x, float) or not math.isfinite(x):
