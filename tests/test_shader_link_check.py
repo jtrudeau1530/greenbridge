@@ -422,6 +422,19 @@ class CommandLineTest(unittest.TestCase):
         result = self.run_batch()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_duplicate_manifest_key_is_rejected_with_path_and_key(self):
+        # The last stage value would produce a valid pipeline if the duplicate were ignored.
+        self.manifest.write_text(
+            '{"version": 1, "pipelines": ['
+            '{"name": "dup", "vs": "missing", "vs": "vertex", "ps": "pixel"}]}',
+            encoding="utf-8",
+        )
+        result = self.run_batch("--report", self.report)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(str(self.manifest), result.stderr)
+        self.assertIn("duplicate key 'vs'", result.stderr)
+        self.assertFalse(self.report.exists())
+
     def test_bad_manifest_fields_return_clean_error(self):
         cases = [
             {"version": True, "pipelines": []},
