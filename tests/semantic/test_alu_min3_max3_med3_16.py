@@ -476,20 +476,29 @@ class Float16SpecialsAndModsTests(unittest.TestCase):
         self.assertEqual(got_neg_clamp, merge_half(0x0000, 1))
 
 
-class UnsupportedTests(unittest.TestCase):
-    """Reject unmodelled integer clamp and non-VGPR op_sel destinations."""
+class ClampSupportTests(unittest.TestCase):
+    """Verify that integer and float min3/max3/med3 accept VOP3 clamp."""
 
-    def test_int_clamp_rejected(self):
+    def test_int_clamp_supported(self):
         for op in INT_OPS:
             with self.subTest(op=op):
-                asm = (
-                    "; test_unsupported_clamp\n"
-                    "\tv_mov_b32 v1, 1\n\tv_mov_b32 v2, 2\n\tv_mov_b32 v3, 3\n"
-                    f"\t{op} v0, v1, v2, v3 clamp\n"
-                    "\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n"
-                )
-                with self.assertRaises(rdna2spirv.Unsupported):
-                    translate_asm(asm)
+                w1, w2, w3 = (0x0005, 0x0010, 0xFFFF)
+                got_noclamp = run_insn(op, (w1, w2, w3))
+                got_clamp = run_insn(op, (w1, w2, w3), tail_mods="clamp")
+                self.assertEqual(got_noclamp, got_clamp)
+                got_dhi_clamp = run_insn(op, (w1, w2, w3), tail_mods="op_sel:[0,0,0,1] clamp")
+                self.assertEqual(got_dhi_clamp, merge_half(got_clamp & MASK16, 1))
+
+    def test_f16_med3_clamp(self):
+        w1, w2, w3 = float_to_f16_bits(0.5), float_to_f16_bits(2.0), float_to_f16_bits(-2.0)
+        got = run_insn("v_med3_f16", (w1, w2, w3), tail_mods="clamp")
+        self.assertEqual(got, merge_half(float_to_f16_bits(0.5), 0))
+        w1_hi, w2_hi, w3_hi = float_to_f16_bits(2.5), float_to_f16_bits(3.0), float_to_f16_bits(1.5)
+        got_hi = run_insn("v_med3_f16", (w1_hi, w2_hi, w3_hi), tail_mods="clamp")
+        self.assertEqual(got_hi, merge_half(float_to_f16_bits(1.0), 0))
+
+class UnsupportedTests(unittest.TestCase):
+    """Reject non-VGPR op_sel destinations."""
 
     def test_non_vgpr_opsel_dst_rejected(self):
         for op in ALL_OPS:

@@ -5877,9 +5877,7 @@ class Gen:
         elif op in ("v_min3_i16", "v_min3_u16", "v_max3_i16", "v_max3_u16", "v_med3_i16", "v_med3_u16"):
             # Three-operand 16-bit integer min/max/median on the low halves (op_sel bits 0..2 pick the high half of
             # S0..S2, bit 3 writes the high half of D); VOP3-only, so the other half of D is kept (RDNA2 ISA; Mesa
-            # ACO can_use_opsel). clamp is not modelled on integer min/max/med3.
-            if "clamp" in mods:
-                raise Unsupported(op + " clamp")
+            # ACO can_use_opsel). clamp is accepted on hardware and is a no-op on the 16-bit bounded integer word.
             sb, dhi = self.opsel_bits(mods, 3)
             if dhi and a[0]["k"] != "vgpr":
                 raise Unsupported("op_sel destination")
