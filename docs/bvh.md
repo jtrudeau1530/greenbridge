@@ -411,9 +411,10 @@ counts contain that signature as an ordered subsequence, and checks the survivor
 `tools/bvh_geometry_check.py` from the model's exported OBJ and the 3x4 at `+0x50` of the instance descriptor. The
 geometries of the two shaders the BVH leaves out are filtered with `--skip-shaders`: those name hashes are game data,
 as §4a says, so the rule is off unless the user passes them. A geometry whose shader index the manifest cannot resolve
-keeps its place and the checks decide. Measured on the ten BLAS of the sample pack, against one 1 GiB window of
-`levels.rpf`: 1,228 models exported, 1 to 374 candidates from the signature per BLAS, and exactly one consistent
-candidate each.
+keeps its place and the checks decide. Measured on the ten BLAS of the sample pack, against the first 1 GiB window of
+`levels.rpf` cut at 3 GB (exported as a whole slice): 1,228 models, 1 to 374 candidates from the signature per BLAS,
+and exactly one consistent candidate each. A window holds one region's drawables, so a BLAS whose drawable is
+elsewhere in the archive finds no candidate in it at all, and the tool says so instead of reporting a rejection.
 
 `rpf9dump models` and `rpf9dump textures` take `--start`/`--length` to export a window of a file. A window need not be a
 valid archive - a slice of `levels.rpf` cut at an offset has no `9FPR` header - because both modes read every resource
@@ -425,6 +426,25 @@ dotnet tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll models <levels.rpf> <out> 
 python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json --descriptor <instance208.bin> [--skip-shaders H,H]
 python -I tests/test_bvh_match.py
 ```
+
+The sample set §4a was measured on can be rebuilt from any copy of the package, and nothing of it enters this
+repository:
+
+1. `tools/bvh_index.py` on `core_bvh4.rpf` lists each `bvh4` stream and its descriptor row; the 3x4 at `+0x50` is
+   the transform the matching needs, and a carved stream is passed to the next tools with `--header-offset 256`
+   (or `0` when the structure was carved from its own header);
+2. export a window of `levels.rpf` that holds that region's drawables (`rpf9dump models`, `--start`/`--length`);
+3. `tools/bvh_match.py` identifies the drawable's geometries against it, and `--write <dir>` stores exactly those
+   geometries as the float3 and uint32 buffers the next step takes, with the transform recorded in `export.json`;
+4. `tools/bvh_rehydrate.py` on the same stream with those buffers and `--transform` gives the runtime layout,
+   byte-identical to what `XboxBvhBuilder.dll` writes on these samples (§4a).
+
+With the two excluded shader hashes the run answers with one consistent candidate per sample; without them every
+candidate is checked and the checks decide. Measured on the window above: 1,228 models in the export, 1 to 374
+candidates from the signature per sample, and a rehydrated structure of `64 * (totalSizeIn64BNodes + 1)` bytes from
+the header. Its root parent-table entry is `0xFFFFFFFF` in all eight identified samples (the entry at
+`offsetToParents` read signed, plus `4 * ((root - offsetToElements) / 64)`), which is what the GPU builder writes
+for a root and what `tools/xdxr_bvh.py validate` requires since #2625.
 
 ## 7a. Building runtime BVHs: `tools/xdxr_bvh.py`
 
