@@ -129,7 +129,7 @@ def main(argv=None) -> int:
         os.makedirs(out, exist_ok=True)
     except OSError as e:
         print(f"ERROR: cannot create output directory {out}: {e.strerror or e}", file=sys.stderr)
-        return 1
+        return 2
     rows, problems = [], Counter()
     for shader in shaders:
         with open(shader.path, "rb") as f:

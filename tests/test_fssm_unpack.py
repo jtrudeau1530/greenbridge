@@ -426,7 +426,7 @@ class TestMainBadOutput(unittest.TestCase):
 
             res = subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True)
 
-            self.assertEqual(res.returncode, 1)
+            self.assertEqual(res.returncode, 2)
             self.assertEqual(res.stdout, "")
             self.assertEqual(len(res.stderr.splitlines()), 1, res.stderr)
             self.assertIn(f"cannot create output directory {out}", res.stderr)
@@ -443,7 +443,7 @@ class TestMainBadOutput(unittest.TestCase):
                 with self.subTest(error=error), mock.patch.object(fssm_unpack.os, "makedirs",
                                                                  side_effect=error) as mkdir, \
                         mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
-                    self.assertEqual(fssm_unpack.main([src]), 1)
+                    self.assertEqual(fssm_unpack.main([src]), 2)
                     mkdir.assert_called_once_with(out, exist_ok=True)
                     self.assertEqual(stderr.getvalue().splitlines(),
                                      [f"ERROR: cannot create output directory {out}: {error.strerror}"])
