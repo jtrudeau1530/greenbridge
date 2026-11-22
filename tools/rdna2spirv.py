@@ -3629,6 +3629,17 @@ class Gen:
                 return "hi"
         return None
 
+    def lane_mask_word(self, a):
+        """The 32-bit word of the lane mask in `a` as real bits, for a b32 scalar op that reads it as a number
+        (s_flbit_i32_b32 of vcc_lo): the whole wave's lanes 0-31, or for the high half of a wave64 mask lanes
+        32-63. A register holds only this lane's 0 / ~0, so reading it as data gave every lane its own answer."""
+        lo, hi = self.wave_mask(a)
+        if self.wave64:
+            half = self.mask_half(a)
+            if half is not None:
+                return hi if half == "hi" else lo
+        return lo
+
     def wave_equal(self, mine, equal, half=None):
         """s_cmp_eq / s_cmp_lg of a lane mask (with 0, or with another mask): the masks are equal when every lane's
         bit is, so the lanes vote. `mine` is this lane's result for the comparison asked (equal, or not equal).
@@ -4941,7 +4952,7 @@ class Gen:
             self.cmp_class(a, exec_only=op == "v_cmpx_class_f32")
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
                 (op == "s_ff1_i32_b32" and not self.holds_lane_mask(a[1])):       # of a lane mask: further down
-            x = self.src_u(a[1])
+            x = self.lane_mask_word(a[1]) if op == "s_flbit_i32_b32" and self.holds_lane_mask(a[1]) else self.src_u(a[1])
             r = self.tmp()
             if op in ("v_ffbl_b32", "s_ff1_i32_b32"):
                 # Index of lowest set bit, -1 (0xFFFFFFFF) if none: FindILsb has the same convention.
@@ -5621,7 +5632,8 @@ class Gen:
         elif op in ("v_ffbh_i32", "s_flbit_i32"):
             # bit position counted from the MSB of the first bit that differs from the sign bit; -1 if none.
             # s_flbit_i32 is the scalar form (it does not write SCC).
-            x = self.as_int(self.src_u(a[1]))
+            x = self.as_int(self.lane_mask_word(a[1]) if op == "s_flbit_i32" and self.holds_lane_mask(a[1])
+                            else self.src_u(a[1]))
             f, none, sub, r = (self.tmp() for _ in range(4))
             self.emit(f"{f} = OpExtInst %int %glsl FindSMsb {x}")
             self.emit(f"{none} = OpSLessThan %bool {f} {self.as_int(self.cu(0))}")
