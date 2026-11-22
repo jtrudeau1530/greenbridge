@@ -72,10 +72,12 @@ pages are a larger upper bound on the page population, not 924 decoded models.
   resources, so this page does not raise that count.
 - **Metadata.** One standalone `0DRP` resource at offset 53,899,280 has version 122 and 16 at +0x20.
   `world_index.py` classifies it as `meta`, not a map: 1 resource, 0 maps, 0 entities. Six `PSIN` streams
-  follow: five complete six-section chains and one partial `LSCH`+`LENM` stream. Their `LRSC` payload
-  is 80 bytes of `0DRP` + 122, with page counts 7, 5, 7, 2 and 2. The `u32` at `PSIN+8` is 257 on four
-  of the six; it is not called a version because it varies and the story report already found it
-  unstable.
+  follow: five complete six-section chains and one partial `LSCH`+`LENM` stream before an unread gap.
+  Joining the standalone resource's continuation stream completes its `0x7a` tables (18 structs, 2 enums,
+  18 blocks), while the five `LRSC` payloads are 80-byte `0DRP` + 122 summary records with zero at
+  `+0x08..+0x0f`, `0xbb`-filled pointer slots and 1-based `root_block` indices 7, 5, 7, 2 and 2 at `+0x10`
+  (within block counts 7, 5, 8, 3 and 2). The `u32` at `PSIN+8` is 257 on four of the six; it is not called
+  a version because it varies and the story report already found it unstable.
 - **Schemas and text.** The three `RBF0` records name `CMovieSubtitleContainer` (2) and
   `VfxTextureAtlasMetadataInfoMgr` (1). The 10 XML streams have the roots
   `CDataFileMgr__ContentChangeSetDef` (8), `CDataFileMgr__ContentDef` (1) and `SSetupData` (1). They are
@@ -107,10 +109,12 @@ pages are a larger upper bound on the page population, not 924 decoded models.
   pages. `world_index.py` classifies all 101 as `meta`, not maps: 101 resources, 0 maps, 0 entities.
   The 400 zero-prefix system pages account for 92.7 MB inflated. Only one page has model-name strings
   (3 `.#dr` names), so this is not a model archive.
-- The three `PSIN` streams are 2 complete chains and 1 stream with no parseable chain. Two complete
-  `LRSC` payloads are present. The 13 XML streams are again content definitions (11 change-set, 1
-  content-def, 1 `SSetupData`); the three text streams are 59,848, 146 and 70 bytes; the three clip
-  streams have the measured `u32 2/3 + 01 01 00 00` header.
+- The three `PSIN` stream starts are 2 single-stream chains and 1 multi-stream container that completes
+  across four contiguous continuation streams (321,992 inflated bytes total), giving 3 complete `LRSC`
+  payloads alongside the 101 standalone `meta` resources (36 single-stream, 65 joined with one continuation
+  stream). The 13 XML streams are again content definitions (11 change-set, 1 content-def, 1 `SSetupData`);
+  the three text streams are 59,848, 146 and 70 bytes; the three clip streams have the measured
+  `u32 2/3 + 01 01 00 00` header.
 - The 19 `9FPR` headers are the outer archive plus 18 nested headers on 4 KiB boundaries. The 9.33 MB
   unread region holds nine `RSC8` headers (version 8001, flags 1, declared size 4,852-13,764, sum
   71,380) between offsets 70,697,336 and 70,877,704, but no `RSC7`. In these nine headers the bytes at
@@ -145,9 +149,11 @@ record: 4-byte tag + big-endian u32 total size (includes the 8-byte record heade
 | `LRSC` | 2,118 | 88 | 88 |
 | `CHKS` | 2,118 | 20 | 20 |
 
-Of the 2,309 containers, 2,118 have all six sections, 38 have `LSCH`+`LENM`, 4 have `LSCH` only and
-149 have no parseable chain. An all-offset scan finds 2,275 `0DRP` occurrences in the inflated set: the
-2,118 `LRSC` payloads plus 157 in page payloads. The tag/length chain is contiguous and ends at `CHKS`,
+Of the 2,309 containers, 2,118 have all six sections in a single stream, 38 have `LSCH`+`LENM`, 4 have
+`LSCH` only and 149 cross a stream boundary before their first section. An all-offset scan finds 2,275
+`0DRP` occurrences in the inflated set, and all 2,275 are `PSIN` `LRSC` records (0 standalone `0x7a`
+resources): 2,118 in single-stream containers, 152 in contiguous multi-stream `PSIN` continuations and 5
+in `LRSC`+`CHKS` stream tails after an unread gap. The tag/length chain is contiguous and ends at `CHKS`,
 which is the same layout measured for `script.rpf`. The `LSNS` payload is high-entropy (5.228-7.990
 bits/byte, median 7.888) and none of the 2,118 payloads decompresses with zlib; its block layout (a block table
 and 16-byte records) is decoded in [psin.md](psin.md#lsns), the record contents are not. No `SCRP`, `YSC`,
@@ -187,7 +193,7 @@ text is recorded as a substring, not as a container.
 | zlib `78 01/5e/9c/da` | +0 | inflates cleanly to the stream end | 2,370 core, 624 story-rest, 2,632 script, 33 core001, 3 licenses |
 | `KB2[a-z]` (Bink 2) | +0 | size u32 +4, width +0x14, height +0x18, valid bounds | 11 core (all `KB2n`), 7 story-rest (all `KB2n`) |
 | `PSIN` | +0 | tag/length chain below EOF, six measured tags | 6 core, 3 story-rest, 2,309 script |
-| `0DRP` | +0x10 or +0 | version 122 at magic+4; count at +0x20 (at +0x10) or +0x0C (at +0) | 1 core, 101 story-rest; plus 5 `LRSC` payloads in core, 2 in story-rest, 2,118 in script |
+| `0DRP` | +0x10 or +0 | version 122 at magic+4; `0x50xxxxxx` pointers + `root_objects` at +0x20 (standalone `+0x10`), or `0xbb` pointer fill + `root_block` at +0x10 (`LRSC` `+0`) | 1 core, 101 story-rest standalone; plus 5 `LRSC` records in core, 3 in story-rest, 2,275 in script |
 | `RBF0` | +0 | printable schema string after the 8-byte header | 3 core |
 | `RSC8` | +0 | version 8001 at +4, flags 1 at +12, declared size below EOF | 0 at stream starts; 9 raw headers in the story-rest unread gap |
 | `RSC7` | +0 | - | 0 everywhere |
@@ -267,6 +273,43 @@ No inflated stream SHA-256 is shared across `core_restofworld`, `story000_restof
 `story000_script`, `script.rpf`, `core_restofworld001` and `core_licenses_data`. The core and story-rest
 Bink sets also have 0 common stored-body SHA-256. These are distinct corpora, not copies at different
 block boundaries.
+
+### Standalone `0DRP`/`0x7a` versus `PSIN` `LRSC` (ASSET-156)
+
+Both placements serialize the same 80-byte (`0x50`-byte) `0DRP` + `u32 122` (`0x7a`) header frame in two
+mutually exclusive forms:
+
+| Frame offset (`magic+`) | Standalone `0x7a` resource (`stream +0x10`, `0x60` B header) | `PSIN` `LRSC` record (`LRSC +0x08`, `88` B section) |
+|---|---|---|
+| prefix (`stream +0x00..+0x0f`) | `8` zero bytes + `0x50000000`-based page-map pointer at `+0x08` | none (`"LRSC"` + big-endian `88` precedes `magic+0x00`) |
+| `+0x00..+0x07` | `"0DRP"` + `u32 122` (`0x7a`) | `"0DRP"` + `u32 122` (`0x7a`) |
+| `+0x08..+0x0f` | `8` zero bytes (`stream +0x18..+0x1f`) | `8` zero bytes (`LRSC` payload `+0x0c` is always `0`) |
+| `+0x10..+0x17` | `u32 root_objects` (`stream +0x20`), `u32 0` | `u32 root_block` (`1 <= root_block <= blocks`), `u32 0` |
+| `+0x18..+0x37` | four `u64` table slots (`+0x28` structs, `+0x30` enums, `+0x38` blocks, `+0x40`): `0` or `0x50000000`-based virtual pointers | `32` bytes of `0xbb` (`0xbbbbbbbbbbbbbbbb` x 4); schemas and blocks live in `LSCH`, `LENM` and `PSIN+0x08` |
+| `+0x38..+0x3f` | four `u16`: `(structs, enums, blocks, unknown_4e)` (`stream +0x48`) | four `u16`: `(structs, enums, blocks, 0)` matching `(len(LSCH), len(LENM), len(block_table), 0)` |
+| `+0x40..+0x47` | `0` or `0x50000000`-based virtual pointer (`stream +0x50`) | `8` bytes of `0xbb` (`0xbbbbbbbbbbbbbbbb`) |
+| `+0x48..+0x4f` | `8` zero bytes (`stream +0x58..+0x5f`) | `8` zero bytes, followed by `CHKS` (`20` bytes) |
+
+`tools/odrp_7a.py` validates both placements, joins contiguous 16-byte-aligned continuation streams when a
+standalone `0x7a` resource or `PSIN` container crosses a stream boundary, and detects unjoined `PSIN` tail
+streams ending with `LRSC` (`88` bytes) + `CHKS` (`20` bytes) after an unread gap. Across the six archives
+in this note plus `script.rpf`, `data.rpf` and `shared_minigame000.rpf`, all 22,235 records validate as
+complete (`0` incomplete):
+
+| Archive | Records | Standalone (`meta` / `map`) | Standalone joined | `PSIN` `LRSC` | `LRSC` joined / `psin_tail` |
+|---|---:|---:|---:|---:|---:|
+| `core_restofworld.rpf` | 6 | 1 (`1` / `0`) | 1 | 5 | 0 / 0 |
+| `story000_restofworld.rpf` | 104 | 101 (`101` / `0`) | 65 | 3 | 1 / 0 |
+| `story000_script.rpf` | 2,275 | 0 | 0 | 2,275 | 152 / 5 |
+| `core_restofworld001.rpf`, `appdata0.rpf`, `core_licenses_data.rpf` | 0 | 0 | 0 | 0 | 0 / 0 |
+| `script.rpf` (cross-check) | 1,012 | 0 | 0 | 1,012 | 3 / 0 |
+| `data.rpf` (cross-check) | 17,978 | 15,768 (`15,768` / `0`) | 159 | 2,210 | 118 / 11 |
+| `shared_minigame000.rpf` (cross-check) | 860 | 787 (`685` / `102`, 20,339 entities) | 13 | 73 | 3 / 0 |
+
+```powershell
+python -I tools/odrp_7a.py <archive.rpf> <work>\odrp.json
+python -I tests/test_odrp_7a.py
+```
 
 ## Readable versus opaque
 
@@ -467,9 +510,10 @@ The bytes support the existing **RPF9/RAGE family**, not a new container:
   story-rest, 4 in script; most sit on 4 KiB boundaries).
 - Bink 2 video is `KB2n` and is separate from the resource pages; core is video-first, story-rest is
   video plus metadata/pages.
-- `0DRP` version 122 is the metadata/page-directory family. In a standalone stream it is a `0x7a`
-  metadata resource; in a `PSIN` `LRSC` payload it is an 80-byte page-directory record. Neither form
-  carries map-placement structs here.
+- `0DRP` version 122 reuses one 80-byte header frame across two distinct placements: in a standalone
+  stream (`+0x10` after the 16-byte system prefix) it is a `0x7a` metadata resource with `0x50000000`
+  table pointers, while in a `PSIN` `LRSC` section it is an 80-byte root/count summary record with
+  `0xbb`-filled pointer slots. Neither form carries map-placement structs in these six archives.
 - `PSIN` is a sectioned metadata container, not a compiled-script container. The six tags and the
   big-endian length chain are measured; the `LSNS` block layout is decoded, its record contents are not.
 - `RBF0` records carry schema names (movie subtitles, VFX texture-atlas metadata); XML records carry
@@ -487,9 +531,11 @@ The only UI-adjacent evidence is content-manifest XML and text; there is no UI c
 2. A recursive RPF9 walker. The flat carve crosses 10/18/4 embedded archives; a decoder needs their
    spans and TOCs to group pages into resources.
 3. A Bink 2 decoder for the 11 core and 7 story-rest videos (`KB2n`; see `docs/movies.md`).
-4. An `0DRP`/`0x7a` parser that distinguishes a standalone metadata resource from a `PSIN` `LRSC`
-   page-directory record. `docs/world.md` already validates the `0x7a` header and schema tables; this
-   page adds the two placements.
+4. An `0DRP`/`0x7a` parser (`tools/odrp_7a.py`, ASSET-156) now distinguishes and validates standalone
+   `0x7a` metadata/map resources (`0x50000000` table pointers at stream `+0x10`) against `PSIN` `LRSC`
+   root/count summary records (`0xbb`-filled pointer slots at `LRSC+0x08`) across single and
+   continuation-joined streams (see [world.md](world.md) and [psin.md](psin.md)); decoding resource payload
+   fields beyond schema/block layout still needs per-type definitions.
 5. A `PSIN` section walker for `LSCH`, `LENM`, `LSNS`, `LGID`, `LRSC` and `CHKS`. The chain is
    measured; `LSNS` is a block table and 16-byte records ([psin.md](psin.md#lsns)), not zlib. Do not call it
    bytecode without evidence.
