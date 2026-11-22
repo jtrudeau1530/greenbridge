@@ -72,6 +72,37 @@ python -I runtime/test/shaders/build.py <out dir>
 python -I runtime/test/shaders/check.py <out dir> <folder with the test programs>
 ```
 
+## The Windows runtime on Linux, under Wine or Proton
+
+The Linux build above makes only the Vulkan programs. The loader (`gta6rt`), its shims and their tests are Windows
+programs; `runtime/cmake/clang-cl-xwin.cmake` cross-compiles them on Linux with clang-cl and lld-link (LLVM 19+: the
+MSVC STL that xwin lays out rejects older Clang; versioned names go in with `-DCMAKE_CXX_COMPILER=clang-cl-19` etc.)
+against an MSVC CRT and Windows SDK that [xwin](https://github.com/Jake-Shadle/xwin) downloads from Microsoft
+(running it means accepting Microsoft's licence), and `ctest` runs them through Wine:
+
+```sh
+xwin --accept-license --sdk-version 10.0.26100 splat --use-winsysroot-style --preserve-ms-arch-notation \
+     --output ~/.local/share/xwin-sdk
+cmake -S runtime -B runtime/build/windows --toolchain "$PWD/runtime/cmake/clang-cl-xwin.cmake" \
+      -DXWIN_DIR="$HOME/.local/share/xwin-sdk"
+cmake --build runtime/build/windows --parallel
+WINEPREFIX="$HOME/.local/share/leonida-wine" ctest --test-dir runtime/build/windows
+```
+
+The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
+`make_game.py --runtime-build runtime/build/windows` takes this folder like a Windows build. CMake packages are
+looked up only inside the SDK folder, so a Windows SDL3 for the GameInput shim is passed as `-DSDL3_DIR=<its
+cmake folder>` (`CMAKE_PREFIX_PATH` is not searched here).
+
+For Proton, start any program once with `proton run` (with `STEAM_COMPAT_DATA_PATH` and
+`STEAM_COMPAT_CLIENT_INSTALL_PATH` set), so that it puts vkd3d-proton and DXVK into the prefix, then configure with
+`-DCMAKE_CROSSCOMPILING_EMULATOR="<Proton>/files/bin/wine"` and run `ctest` with
+`WINEPREFIX=$STEAM_COMPAT_DATA_PATH/pfx WINEDLLOVERRIDES="d3d12=n;d3d12core=n;dxgi=n"`. `proton run` itself doesn't
+pass the program's output on, so the tests can't run through it.
+
+The tests that compare with the host's D3D12 (`root_sig_test`, `root_sig`, `device_proxy`, `d3d12_vulkan_device`)
+check against Wine's vkd3d or vkd3d-proton here, not Microsoft's runtime, so some of them fail for that reason.
+
 ## GPUs with 32-wide subgroups (NVIDIA, Intel, Apple)
 
 The game's shaders are mostly wave64. A GPU that can't run 64-wide compute subgroups skips the wave64 tests
