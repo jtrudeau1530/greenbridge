@@ -215,6 +215,42 @@ class TestMeasure(unittest.TestCase):
         self.assertTrue(D.measure(blob, stats))
         self.assertEqual(stats["root out of range"], 1)
 
+    def test_inline_and_fixed_arrays_are_bounded_to_enclosing_block(self):
+        # 16-byte block with 0x54 inline array of char[4] claiming count=capacity=50000:
+        # must be rejected as out of bounds rather than performing 50,000 OOB reads.
+        inline_schema = [(0xAAAA0002, 0, 16, 2, [
+            (0x22222222, 0, 0x54, 0, 1, 0),
+            (0x00000100, 0, 0x40, 0, 0, 4),
+        ])]
+        blob = make_container([(0xAAAA0002, struct.pack("<II", 50000, 50000) + bytes(8))], inline_schema, [])
+        stats = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob, stats))
+        self.assertEqual(stats["inline array out of bounds"], 1)
+        self.assertEqual(stats["char arrays"], 0)
+
+        # 16-byte block with 0x50 fixed array of 100 char[4] elements (400 bytes > 16).
+        fixed_schema = [(0xAAAA0003, 0, 16, 2, [
+            (0x33333333, 0, 0x50, 0, 1, 100),
+            (0x00000100, 0, 0x40, 0, 0, 4),
+        ])]
+        blob2 = make_container([(0xAAAA0003, bytes(16))], fixed_schema, [])
+        stats2 = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob2, stats2))
+        self.assertEqual(stats2["fixed array out of bounds"], 1)
+        self.assertEqual(stats2["char arrays"], 0)
+
+    def test_map_75_zero_groups_is_not_power_of_two(self):
+        map_schema = [(0xAAAA0001, 0, 16, 2, [
+            (0x11111111, 0, 0x75, 0, 0, (2 << 16) | 1),
+            (0x00000100, 0, 0x15, 0, 0, 0),
+            (0x00000100, 0, 0x15, 0, 0, 0),
+        ])]
+        blob = make_container([(0xAAAA0001, struct.pack("<IIQ", 0, 1, 1))], map_schema, [])
+        stats = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob, stats))
+        self.assertEqual(stats["map 75 groups a power of two"], 0)
+        self.assertEqual(stats["map 75 groups not a power of two"], 1)
+
 
 class TestCli(unittest.TestCase):
     def run_tool(self, *args):
