@@ -16,7 +16,6 @@ import os
 import struct
 import subprocess
 import sys
-import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,9 +29,12 @@ write_ppm = fl.write_ppm
 
 
 def harness() -> str | None:
+    exe = ".exe" if os.name == "nt" else ""
     for path in (
         os.environ.get("LEONIDA_VK_HARNESS"),
-        os.path.join(ROOT, "runtime", "build", "linux", "vk_harness"),
+        os.path.join(ROOT, "runtime", "build", "linux", f"vk_harness{exe}"),
+        os.path.join(ROOT, "runtime", "build", "windows", f"vk_harness{exe}"),
+        os.path.join(ROOT, "runtime", "build", f"vk_harness{exe}"),
     ):
         if path and os.path.isfile(path):
             return path
@@ -50,17 +52,18 @@ class FirstLightTests(unittest.TestCase):
         self.harness = harness()
         if not self.harness:
             self.skipTest(
-                "vk_harness is not built (runtime/build/linux, target vk_harness)"
+                "vk_harness is not built (runtime/build/linux or runtime/build/windows, target "
+                "vk_harness); set LEONIDA_VK_HARNESS"
             )
         with open(os.path.join(self.out, "manifest.json"), encoding="utf-8") as f:
             self.manifest = json.load(f)
 
     def test_draw_matches_the_manifest(self):
-        fd, raw = tempfile.mkstemp(prefix="first_light_", suffix=".raw", dir=self.out)
-        os.close(fd)
-        os.unlink(
-            raw
-        )  # a fresh path: a harness that writes nothing cannot pass on a stale file
+        raw = os.path.join(self.out, "image_first_light.raw")
+        if os.path.exists(raw):
+            os.unlink(
+                raw
+            )  # a fresh run: a harness that writes nothing cannot pass on a stale file
         env = dict(
             os.environ,
             VKH_DRAW_MESH=os.path.join(self.out, "mesh.bin"),

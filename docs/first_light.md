@@ -8,7 +8,9 @@ screenshot.
 ## 1. What was drawn
 
 The model is one static drawable exported from `data.rpf` by `rpf9dump models`: one mesh, 4,213 vertices and
-7,968 triangles, with positions and UVs and no bones or fragments. The tool that
+7,968 triangles, with positions and UVs and no bones or fragments. Its OBJ is the only `data.rpf` export with
+those counts and has SHA-256
+`a7178cf4b7a00c9df838fb072c59e2c048ceed52306620d859faae4d3991d6b9`; `manifest.json` records it. The tool that
 assembles it, `tools/first_light.py`, centres and fits X/Y to NDC and flattens Z (the chosen VS applies no
 matrix), so the draw is an orthographic projection of the model's own geometry.
 
@@ -55,6 +57,7 @@ DOTNET_ROLL_FORWARD=Major tools/rpf9dump/bin/Release/net8.0/rpf9dump models \
 python -I tools/first_light.py --game "<package>" --work ~/leonida-work --list
 python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
     --obj ~/leonida-work/assets/data/models/<model>.obj --no-fit --run
+# <model>.obj: 4,213 vertices, 7,968 triangles; the manifest records its SHA-256
 LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/out python -I tests/test_first_light.py -v
 python -I tools/first_light.py --check --out ~/leonida-work/first_light/out
 ```

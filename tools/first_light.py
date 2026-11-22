@@ -30,13 +30,13 @@ Standard library only; the project's tools run with `python -I`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
@@ -255,15 +255,19 @@ def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> lis
 
 
 def find_harness(explicit: str | None) -> str:
+    exe = ".exe" if os.name == "nt" else ""
     for candidate in (
         explicit,
         os.environ.get("LEONIDA_VK_HARNESS"),
-        os.path.join(ROOT, "runtime", "build", "linux", "vk_harness"),
+        os.path.join(ROOT, "runtime", "build", "linux", f"vk_harness{exe}"),
+        os.path.join(ROOT, "runtime", "build", "windows", f"vk_harness{exe}"),
+        os.path.join(ROOT, "runtime", "build", f"vk_harness{exe}"),
     ):
         if candidate and os.path.isfile(candidate):
             return candidate
     raise SystemExit(
-        "vk_harness not found: build runtime/build/linux (target vk_harness) or set --harness"
+        "vk_harness not found: build runtime/build/linux or runtime/build/windows (target vk_harness), "
+        "or set --harness/LEONIDA_VK_HARNESS"
     )
 
 
@@ -330,11 +334,11 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
 
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
     harness = find_harness(args.harness)
-    fd, raw = tempfile.mkstemp(prefix="first_light_", suffix=".raw", dir=out_dir)
-    os.close(fd)
-    os.unlink(
-        raw
-    )  # a harness that exits 0 without writing must not pass on a stale file
+    raw = os.path.join(out_dir, "image.raw")
+    if os.path.exists(raw):
+        os.unlink(
+            raw
+        )  # a harness that exits 0 without writing must not pass on a stale file
     env = dict(
         os.environ,
         VKH_DRAW_MESH=os.path.join(out_dir, "mesh.bin"),
@@ -459,6 +463,10 @@ def main(argv=None) -> int:
         os.path.join(out_dir, "ps.spv"),
     )
     vertices, indices = read_obj(a.obj) if a.obj else ([], [])
+    obj_sha256 = None
+    if a.obj:
+        with open(a.obj, "rb") as f:
+            obj_sha256 = hashlib.sha256(f.read()).hexdigest()
     if vertices:
         if not a.no_fit:
             vertices = fit(vertices, a.width, a.height, True, not a.keep_z)
@@ -485,6 +493,7 @@ def main(argv=None) -> int:
         "vertex_count": len(vertices),
         "index_count": len(indices),
         "triangle_count": len(indices) // 3,
+        "obj_sha256": obj_sha256,
         "width": a.width,
         "height": a.height,
         "min_coverage": a.min_coverage,
