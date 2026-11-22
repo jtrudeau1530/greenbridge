@@ -163,6 +163,75 @@ class TestAlign(unittest.TestCase):
     def test_no_streams(self):
         self.assertEqual(names_mod.name_streams(["f/a.bk2"], [], max_skip=0), ([], ["f/a.bk2"]))
 
+    def test_family_strips_4k_suffix_for_sibling_anchoring(self):
+        self.assertEqual(names_mod.family("f/clip_01_4k.bk2"), "f/clip")
+        self.assertEqual(names_mod.family("f/clip_4k.bk2"), "f/clip")
+        self.assertEqual(names_mod.family("f/clip_02_1080.bk2"), "f/clip")
+        names = ["f/clip_01.bk2", "f/clip_02_4k.bk2", "f/extra.bk2"]
+        streams = [stream(0, 3840, 2160, 30), stream(1, 3840, 2160, 30)]
+        paths, conf, unmatched = self.run_names(names, streams)
+        self.assertEqual(paths, ["f/clip_01.bk2", "f/clip_02_4k.bk2"])
+        self.assertEqual(conf, ["anchored", "anchored"])
+        self.assertEqual(unmatched, ["f/extra.bk2"])
+
+    def test_contradicted_pairs_stay_positional(self):
+        # A contradicted height hint must not anchor either itself or a neutral family sibling.
+        paths, conf, _ = self.run_names(
+            ["f/c_01_720.bk2", "f/c_02_1080.bk2"],
+            [stream(0, 1280, 720, 30), stream(1, 1280, 720, 30)],
+        )
+        self.assertEqual(paths, ["f/c_01_720.bk2", "f/c_02_1080.bk2"])
+        self.assertEqual(conf, ["anchored", "positional"])
+
+        paths, conf, _ = self.run_names(
+            ["f/c_01.bk2", "f/c_02_1080.bk2", "f/extra_1080.bk2"],
+            [stream(0, 1280, 720, 30), stream(1, 1280, 720, 30)],
+        )
+        self.assertEqual(paths, ["f/c_01.bk2", "f/c_02_1080.bk2"])
+        self.assertEqual(conf, ["positional", "positional"])
+
+        # Contradicted height/orientation/tv hints must not become "bracketed" between valid anchors.
+        for mid, h in (("f/m_1080.bk2", (1280, 720)),
+                       ("snapmatic/s.bk2", (1280, 720)),
+                       ("tv/sprt/s.bk2", (640, 480))):
+            with self.subTest(mid=mid):
+                paths, conf, _ = self.run_names(
+                    ["f/a_1080.bk2", mid, "f/z_1080.bk2"],
+                    [stream(0, 1920, 1080), stream(1, *h), stream(2, 1920, 1080)],
+                )
+                self.assertEqual(paths, ["f/a_1080.bk2", mid, "f/z_1080.bk2"])
+                self.assertEqual(conf, ["anchored", "positional", "anchored"])
+
+        # A contradicted pin must not become "anchored" (via family), anchor a neutral sibling, or become "bracketed".
+        _, conf_fam, _ = self.run_names(
+            ["f/x_1.bk2", "f/x_2.bk2"],
+            [stream(0, 1280, 720, 10), stream(1, 1280, 720, 10)],
+            pins={("", 1): {"f/other.bk2"}},
+        )
+        self.assertEqual(conf_fam, ["bracketed", "positional"])
+
+        _, conf_fam_hinted, _ = self.run_names(
+            ["f/x_1_720.bk2", "f/x_2.bk2"],
+            [stream(0, 1280, 720, 10), stream(1, 1280, 720, 10)],
+            pins={("", 1): {"f/other.bk2"}},
+        )
+        self.assertEqual(conf_fam_hinted, ["anchored", "positional"])
+
+        _, conf_brk, _ = self.run_names(
+            ["f/a_1080.bk2", "f/m.bk2", "f/z_1080.bk2"],
+            [stream(0, 1920, 1080), stream(1, 640, 480), stream(2, 1920, 1080)],
+            pins={("", 1): {"f/other.bk2"}},
+        )
+        self.assertEqual(conf_brk, ["anchored", "positional", "anchored"])
+
+        # Positive pin still overrides a contradicting filename hint.
+        _, conf_pin, _ = self.run_names(
+            ["f/m_1080.bk2"],
+            [stream(0, 1280, 720)],
+            pins={("", 0): {"f/m_1080.bk2"}},
+        )
+        self.assertEqual(conf_pin, ["verified"])
+
 
 class TestLoadPins(unittest.TestCase):
     def test_repeated_rows_union_and_sources_stay_separate(self):
@@ -197,6 +266,39 @@ class TestLoadPins(unittest.TestCase):
                     w.writeheader()
                     w.writerows(rows)
             self.assertEqual(names_mod.load_pins(split), names_mod.load_pins(pipe))
+
+    def test_normalizes_backslashes_and_movies_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "pins.csv")
+            with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("offset,path\n0,$(common)/movies/F\\A.bk2|$(COMMON)\\MOVIES\\f\\b.bk2\n")
+            pins = names_mod.load_pins(csv_path)
+        self.assertEqual(pins[("", 0)], {"f/a.bk2", "f/b.bk2"})
+        rows, unmatched = names_mod.name_streams(
+            ["f/a.bk2", "f/b.bk2", "f/c.bk2"],
+            [stream(0), stream(1)],
+            pins={("", 0): pins[("", 0)] & {"f/a.bk2"}},
+        )
+        self.assertEqual(rows[0]["confidence"], "verified")
+        self.assertEqual(unmatched, ["f/c.bk2"])
+
+    def test_rejects_empty_and_invalid_pin_rows(self):
+        bad_rows = [
+            "0,\n",
+            "0,   \n",
+            "0,| \n",
+            "0,$(common)/movies/\n",
+            "-1,f/a.bk2\n",
+            "1.5,f/a.bk2\n",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "pins.csv")
+            for row in bad_rows:
+                with self.subTest(row=row.strip()):
+                    with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+                        fh.write("offset,path\n" + row)
+                    with self.assertRaisesRegex(ValueError, "row 2"):
+                        names_mod.load_pins(csv_path)
 
 
 class TestCli(unittest.TestCase):
@@ -413,6 +515,65 @@ class TestReportErrors(unittest.TestCase):
                         code = names_mod.main([source, "--mount", xml, "--out", out])
                     self.assertEqual(code, 0)
                     self.assertIn("1 list entries, 0 streams", log.getvalue())
+
+    def test_empty_pin_path_fails_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self.write(tmp, "index.json", '{"streams": []}')
+            xml = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
+            pins = self.write(tmp, "pins.csv", "offset,path\n0, | \n")
+            out = os.path.join(tmp, "names.csv")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = names_mod.main([source, "--mount", xml, "--pins", pins, "--out", out])
+            self.assertEqual(code, 1)
+            self.assertIn(pins, err.getvalue())
+            self.assertIn("row 2", err.getvalue())
+            self.assertFalse(os.path.exists(out))
+
+    def test_rejects_invalid_stream_numbers_and_keeps_zero_offset(self):
+        base = {"source": "a.rpf", "offset": 0, "size": 1, "width": 1, "height": 1, "frames": 1}
+        with tempfile.TemporaryDirectory() as tmp:
+            good_json = self.write(tmp, "good.json", json.dumps({"streams": [base]}))
+            self.assertEqual(names_mod.load_streams(good_json), [base])
+
+            bad_mutations = [
+                ("offset", True),
+                ("offset", False),
+                ("offset", -1),
+                ("size", 0),
+                ("width", 0),
+                ("height", -1),
+                ("frames", 1.5),
+                ("frames", 0),
+            ]
+            for field, val in bad_mutations:
+                row = dict(base)
+                row[field] = val
+                with self.subTest(field=field, val=val):
+                    bad_json = self.write(tmp, "index.json", json.dumps({"streams": [row]}))
+                    code, err, out = self.run_cli(bad_json, tmp)
+                    self.assertEqual(code, 1)
+                    self.assertIn(bad_json, err)
+                    self.assertIn("stream 1", err)
+                    self.assertFalse(os.path.exists(out))
+
+            for csv_row in (
+                "a.rpf,-1,256,1280,720,100\n",
+                "a.rpf,0,0,1280,720,100\n",
+                "a.rpf,0,256,0,720,100\n",
+                "a.rpf,0,256,1280,720,1.5\n",
+            ):
+                with self.subTest(csv_row=csv_row.strip()):
+                    bad_csv = self.write(
+                        tmp,
+                        "index.csv",
+                        "source,offset,size,width,height,frames\n" + csv_row,
+                    )
+                    code, err, out = self.run_cli(bad_csv, tmp)
+                    self.assertEqual(code, 1)
+                    self.assertIn(bad_csv, err)
+                    self.assertIn("row 2", err)
+                    self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":
