@@ -5619,7 +5619,7 @@ class Gen:
                               + (" d16" if "d16" in mods else ""))
         di, _, _, nc = self.STORE_DIMS[dim]
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0xf")
-        ncomp = bin(int(dm.split(":")[1], 0)).count("1")
+        dmask = int(dm.split(":")[1], 0)
         vdata, addr = a[0], self.addr_regs(a[1])
         raw = [self.load_reg("vgpr", r) for r in addr]
         if "a16" in mods:
@@ -5633,7 +5633,9 @@ class Gen:
             raw = halves
         if len(raw) < nc:
             raise Unsupported("image_store coords")
-        vals = [self.load_reg("vgpr", vdata["r"] + i) for i in range(ncomp)] + [self.cu(0)] * (4 - ncomp)
+        # The enabled components come from consecutive VGPRs, in component order (dmask 0x9: R = vD, A = vD+1).
+        regs = iter(range(vdata["r"], vdata["r"] + 4))
+        vals = [self.load_reg("vgpr", next(regs)) if dmask >> c & 1 else self.cu(0) for c in range(4)]
         coords = [self.as_int(c) for c in raw[:nc]]
         idx = self.desc_lookup_sgpr(a[2], 8)
         t1 = self.load_reg("sgpr", a[2]["r"] + 1)
