@@ -636,7 +636,16 @@ public:
         return S_OK;
     }
 
-    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
+    // D3D12 reports the placement alignment of a description that left it 0: 64 KiB, or 4 MiB for a multisampled
+    // texture. One the description asked for is kept. Measured on the PC runtime and WARP (d3d12_resource_desc_test).
+    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
+        D3D12_RESOURCE_DESC desc = desc_;
+        if (!desc.Alignment) {
+            desc.Alignment = desc.SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                                                       : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        }
+        return desc;
+    }
 
     // A reserved resource is a committed one underneath (docs/d3d12_vulkan.md section 4.2); it reports the layout it
     // was created with and has no heap of its own.
