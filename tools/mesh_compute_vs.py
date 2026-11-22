@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 SUFFIX = ".mesh_vs"   # <ms name>.mesh_vs.spvasm / .spv next to the mesh shader
 USER_SGPRS = 32       # push constants: s0..s31, heap base, code base, then the output address (rdna2spirv.py)
@@ -211,12 +212,15 @@ def build_for_index(spirv_dir):
     built = []
     for asm in write_for_index(spirv_dir):
         spv = asm[: -len(".spvasm")] + ".spv"
-        for name, tool in steps:
-            args = [asm, "-o", spv] if name == "spirv-as" else [spv]
-            cmd = [tool, "--target-env", "vulkan1.2"] + args
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode:
-                raise RuntimeError(f"{name} failed for {asm}:\n{r.stdout}{r.stderr}")
+        with tempfile.TemporaryDirectory(prefix=".mesh-vs-", dir=os.path.dirname(spv)) as staging:
+            staged_spv = os.path.join(staging, os.path.basename(spv))
+            for name, tool in steps:
+                args = [asm, "-o", staged_spv] if name == "spirv-as" else [staged_spv]
+                cmd = [tool, "--target-env", "vulkan1.2"] + args
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode:
+                    raise RuntimeError(f"{name} failed for {asm}:\n{r.stdout}{r.stderr}")
+            os.replace(staged_spv, spv)
         built.append(spv)
     return built
 

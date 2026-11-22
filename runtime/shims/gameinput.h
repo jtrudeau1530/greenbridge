@@ -15,6 +15,7 @@ enum class KeyboardPadMode { Off, Focused, Always };
 struct Config {
     DsTriggerMode ds_triggers = DsTriggerMode::Rumble;  // LEONIDA_DS_TRIGGERS=off|rumble|resistance
     float ds_trigger_gain = 1.0f;                       // LEONIDA_DS_TRIGGER_GAIN, 0..4, scales the effect strength
+    float mouse_sensitivity = 1.0f;                     // LEONIDA_MOUSE_SENSITIVITY, 0.1..10, scales mouse movement
     uint8_t ds_trigger_frequency = 30;                  // LEONIDA_DS_TRIGGER_FREQ, Hz for the rumble mode, 1..255
     bool lightbar_set = false;                          // LEONIDA_DS_LIGHTBAR=RRGGBB|off; unset keeps SDL's
     uint8_t lightbar[3] = {0, 0, 0};                    //   player colour

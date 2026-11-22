@@ -118,7 +118,7 @@ The design is therefore an **IR per command list**:
   are consumed while recording, so their view contents go into the IR. An application can reuse the CPU
   descriptor slot after the call. See Microsoft's [descriptor overview][descriptor-overview].
 - `ExecuteCommandLists` replays the IR into a fresh `VkCommandBuffer`, resolving descriptors, uploading dirty
-  descriptor ranges and the hash table, and emitting barriers. Bundles are inlined at record time.
+  descriptor ranges and the hash table, and emitting barriers. Bundles are inlined when they are executed (see `ExecuteBundle` below).
 - `Reset` on a command list discards its IR; the allocator owns the memory. D3D12 already requires the application
   not to reset an allocator whose lists are in flight; the layer can rely on that and assert in debug builds.
 - Command-list and allocator misuse returns what the PC runtime returns (D3D-51). `d3d12_vulkan_device_test` runs
@@ -130,8 +130,8 @@ The design is therefore an **IR per command list**:
   returns `E_INVALIDARG`, so that call is not compared. Executing a list that is still open removes the PC device
   (`GetDeviceRemovedReason` gives `DXGI_ERROR_INVALID_CALL`), while this layer submits nothing and keeps the device:
   an invalid call does not remove it.
-- `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle IR is copied by value at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
-- Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves, `SetPredication`, `DiscardResource` and the atomic copies; `WriteBufferImmediate` is allowed in a bundle); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. The currently implemented sticky front/back stencil reference is carried back to the parent when the bundle sets it. Draw and other graphics-state commands are still stubs, so this establishes validation and the IR insertion point but does not yet render bundle geometry.
+- `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle's recorded commands and calls are replayed at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
+- Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves, `SetPredication`, `DiscardResource` and the atomic copies; `WriteBufferImmediate` is allowed in a bundle); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. A bundle has no render targets, viewport or root signature of its own, so its state calls (pipeline state, root signature and arguments, vertex and index buffers, topology, blend factor, stencil references) and its draws and dispatches are kept as they were called, and `ExecuteBundle` plays them on the parent through the same members the application would have called. A draw then snapshots the parent's state plus what the bundle set, and what the bundle set stays on the parent afterwards. Commands that need no state (markers, immediate writes) are copied between them in order. `d3d12_bundle_test` measured the rule on the PC runtime, where the default adapter (an RTX 4060 Ti) and WARP drew the same picture in every case it ran. A bundle's draws see the parent's render targets, viewport and scissor, root signature and arguments (also when the bundle sets the same root signature first, so those arguments stay), and vertex and index buffers. A bundle starts with the pipeline state it was created or reset with, not the parent's. After `ExecuteBundle` the parent has that pipeline state and whatever else the bundle set: topology, root arguments, vertex and index buffers, and a different root signature with the bundle's arguments in place of the parent's. Topology: the default adapter takes the parent's when the bundle sets none. That is more lenient than Microsoft's stated rule (topology is undefined when a bundle begins), and WARP follows the rule by removing the device when a bundle draws or hands back without one, so a bundle should set it; the layer follows the default adapter. A bundle that sets a root argument before any root signature crashes the NVIDIA driver (the layer applies it to the parent's signature). The deferred calls are checked when they play, against the parent's root signature, so a bad one makes the parent's `Close` fail, not the bundle's. A per-list state setter must go through the deferred path (`defer()` in `d3d12_com.cpp`, replaying through a private member that does not trace) to work in a bundle. Not deferred yet: `ClearState` and `ExecuteIndirect` in a bundle, and bundle `Dispatch` has no GPU test.
 - A queue's `ExecuteCommandLists` submits in order with one timeline semaphore signal. `Wait`/`Signal` become
   timeline-semaphore waits/signals. `Present` queues after the frame's work.
 
@@ -154,7 +154,7 @@ The command-list surface maps to the IR as follows:
 | `BeginQuery` / `EndQuery` / `ResolveQueryData` | query commands |
 | `ExecuteIndirect` | command; signature + argument buffer |
 | `BeginRenderPass` / `EndRenderPass` | rendering scope |
-| `ExecuteBundle` | inline the bundle's IR at the current state |
+| `ExecuteBundle` | play the bundle's state calls and draws on this list, copy its state-free commands in order |
 
 The IR is the place to add the trace, validation and "unsupported call" reporting. It also lets the layer replay a
 frame deterministically from a capture, which is valuable for comparing against the game.
@@ -220,7 +220,8 @@ What is implemented (all of it testable without the game):
   a depth write by the rasteriser works on D32 and may differ from D24 by up to the 24-bit step, and a depth
   texture sampled in a shader sees the float; only copies, clears and readbacks are bit-exact.
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
-  subresource into a single-sampled one of the same size and format. `ResolveSubresourceRegion` uses the same
+  subresource into a single-sampled one of the same size and format. Integer colour formats in the requested
+  format or either resource are refused at recording; `Close` fails. `ResolveSubresourceRegion` uses the same
   Vulkan operation for non-integer colour with average mode, taking a source rectangle (or the entire subresource)
   and a destination offset. A `ResolveSubresourceRegion` of one depth or stencil plane (the subresource's plane
   slice, the same on both sides) runs in a rendering scope of its own with no draws: the multisampled plane is the
@@ -495,6 +496,15 @@ side inwards:
     `maxPerSetDescriptors`, which never shrinks the default counts, because a layout past it may still be
     supported: past it, the device grows only where `vkGetDescriptorSetLayoutSupport` accepts the grown layout.
     Intel's UHD 770 (101.7092) reports 6159 and accepts the full sizes, so it gets the same set as an RTX (D3D-219).
+    MoltenVK (1.4.2 and 1.4.3 on an M3 Max) reports 1212 and accepts only layouts with fewer descriptors than that
+    (`MVKDevice::getDescriptorSetLayoutSupport` compares the sum with it), although it creates and samples a set of
+    65536 2D images and 4096 samplers correctly (a native repro, and `d3d12_descriptor_test` under Wine with the set
+    grown). So on MoltenVK the D3D12 device doesn't ask: the per-type update-after-bind limits, which MoltenVK takes
+    from Metal's argument-buffer limits (500000 samplers on an M3 Max), decide alone, and the set grows as on other
+    GPUs. Where a set still ends up short of a full 2048-sampler D3D12 heap, the device logs that at startup. Past
+    the last free index, `CreateShaderResourceView` and `CreateSampler` log once that the array is full, and a
+    shader reads the fallback. `d3d12_descriptor_test` then fills each short array to its last index and checks that
+    the next view and sampler are refused.
     The other arrays keep their default counts. On an RTX 5070 (driver 621.24, 1048576 of each type
     and 4000 samplers) the set has 65536 2D images, 3936 samplers and 4096 storage indices in 2D: 93793
     descriptors, 3-6 MiB at 32-64 bytes a descriptor. The device prints the counts it chose, and
@@ -1113,6 +1123,24 @@ adds `heap_base` to the truncated 48-bit value, which is a wild address: the dra
 behind a descriptor) must therefore be an arena range, whatever the allocator happens to do, upload and readback heaps included. Until the layer does that, the
 translated-draw test fetches from a DEFAULT-heap buffer and does not draw from the upload buffer.
 
+**Measured (static, `XboxBvhBuilder.dll`): the BVH builder only takes destination addresses below 2^40.** Its
+validation function at `0xc8f0` loads `DestAccelerationStructureData` (the first field of the build description it
+reaches through `[rcx+0x68]`) and checks it twice:
+
+| Check | Instruction | On failure |
+|---|---|---|
+| 256-byte alignment | `test r8b,r8b` | message "…must be 256-byte aligned…" |
+| below 2^40 | `cmp r8,10000000000h` / `jae` | message "…can not have more than 40b of address set" |
+
+On a failed check it prints its message through `OutputDebugStringW` after a "D3D12 XDXR Error: " prefix, and then
+throws `E_INVALIDARG`: a C++ exception out of the DLL, not an `HRESULT` return.
+- The alignment rule is the public `D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT`.
+- The 40-bit rule has no PC counterpart.
+
+Arena VAs (at most 4095 MiB, so 32-bit) pass. A VA biased from outside the arena does not: the negative upload-heap
+VAs above are at or above 2^40 as unsigned values. That is one more reason for the rule above that every buffer
+a console client can address is an arena range, whichever heap it comes from.
+
 Why not give each buffer its own BDA and set `heap_base = 0`? Because many shaders truncate descriptor-table
 pointers to 32 bits, and host BDAs are not guaranteed to be below 4 GB. The arena keeps console VAs low and stable.
 
@@ -1439,8 +1467,14 @@ Pipeline creation:
 - Request the subgroup size each shader was translated for (`requiredSubgroupSize` 64 or 32) where the device lists the stage
   in `requiredSubgroupSizeStages`, and say so in the log where it cannot (section 3.2, "Subgroup size").
 - Pipeline caches: use a `VkPipelineCache` keyed by driver/pipeline-cache UUID; the `pipelines` build stage already
-  produces one. D3D12 `CachedPSO` blobs are driver-specific and are ignored (the PSO is rebuilt from its
-  descriptors). `ID3D12PipelineLibrary` is an in-memory map plus the Vulkan cache.
+  produces one. The PSO is always rebuilt from its descriptors: `GetCachedBlob` returns a small blob that holds no
+  pipeline, only what the PC runtime checks before it accepts one in `CachedPSO` (`runtime/src/cached_pso.h`:
+  vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description without `Flags`, sealed by a
+  checksum). The answers are the host's, measured on an RTX 3060 and WARP: the same description is accepted; another
+  shader, root signature content or state, a changed byte, a truncated blob or a pointer with size 0 give
+  `E_INVALIDARG`; a null pointer with a size is ignored; another adapter gives `D3D12_ERROR_ADAPTER_NOT_FOUND` and
+  another driver `D3D12_ERROR_DRIVER_VERSION_MISMATCH`. `ID3D12PipelineLibrary` is an in-memory map plus the Vulkan
+  cache.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
@@ -1495,9 +1529,12 @@ The trace will enumerate them.
   operation group the wave intrinsics map to is present (`BASIC`, `VOTE`, `BALLOT`, `SHUFFLE`, `ARITHMETIC`),
   because D3D12 promises them all behind that one bool. `WaveLaneCountMin`/`Max` are the subgroup size range
   (`VkPhysicalDeviceSubgroupSizeControlProperties`, or the single `subgroupSize` without those 1.3 properties).
-  The exception is an Intel integrated GPU (D3D-121): Vulkan reports 8..32 there, Intel's D3D12 driver a fixed
-  16..16, and the layer answers 16..16 like the host. Measured on Xe-LP: UHD 770 (32.0.101.6129) and Raptor Lake-S
-  Mobile (101.7092). Discrete Arc keeps the Vulkan range until it is measured (TEST-57).
+  The exception is an Intel integrated GPU of the pre-Xe-LPG lines (D3D-121): Vulkan reports 8..32 there, Intel's
+  D3D12 driver a fixed 16..16, and the layer answers 16..16 like the host. Measured on Xe-LP: UHD 770
+  (32.0.101.6129), Raptor Lake-S Mobile (101.7092) and Tiger Lake 0x9a78 (101.7088). From Xe-LPG on the driver
+  answers the same range Vulkan reports (D3D-280, measured Meteor Lake 0x7d55 on 32.0.101.6127: 8..32 on both
+  sides), so those lines keep the Vulkan range (Meteor/Arrow Lake device IDs 0x7d40-0x7dc5, Lunar Lake
+  0x64a0-0x64b6). Discrete Arc keeps the Vulkan range until it is measured (TEST-57).
   `TotalLaneCount` has no Vulkan equivalent: D3D12 counts every lane of the device, and the layer answers one full
   wave, so a game that sizes work from it plans for less parallelism than the GPU has, never more. Measured
   against the host PC runtime (616.86) on an RTX 5070: `S_OK` with `WaveOps` 1, lanes 32..32 and a total of 6144,
@@ -1800,14 +1837,32 @@ The trace will enumerate them.
   On an RX 5700 XT, 13 synthetic full/rectangle readbacks match Windows WARP (UINT exact, normalized
   channels within one byte), including descriptor rewrites, format switches and an SRGB RTV on a UAV resource.
   The same tests fail without this change and when the cache ignores format. CPU replay covers 31 scenarios;
-  17 unsupported/invalid frontend views fail `Close` without submission. Other typeless families,
-  typed-resource casts, MSAA and 3D typeless RTVs remain unsupported.
+  17 unsupported/invalid frontend views fail `Close` without submission. Typed-resource casts, MSAA and 3D
+  typeless RTVs remain unsupported.
   Phase 2 adds 54 mip/array and 12 non-array higher-mip readbacks against WARP, including untouched sentinels.
   D3D-161 adds SINT and SNORM views when the Vulkan format supports color attachments. SINT uses the existing
   integer clear conversion, and SNORM passes floating-point values to the attachment. Signed channels matched
   WARP byte for byte in full and rectangular clears on an RX 9070 XT (driver 32.0.32029.2010) and the integrated
   Radeon in a Ryzen 5 9600X (32.0.21045.29003), including mip and array selections. The SNORM vectors avoid
   half-step rounding ties.
+- **Typed RTVs of the other typeless families (D3D-275):** an RTV of any TYPELESS color texture (B8G8R8A8,
+  R16G16B16A16, R32G32B32A32, R32G32, R16G16, R10G10B10A2, R8G8, R32, R16, and R8 once it is mapped) names a typed
+  format of its family; `TargetView` carries that view's VkFormat (`ColorViewFormat` holds VkFormat numbers) and
+  `color_view_format` accepts any format of the resource's family (`typeless_view_family`), so the clear writes
+  through a view in that format. Typeless images are already mutable without a format list. Before, only RGBA8 was
+  reinterpreted and the others cleared through the resource's own format (an `R8_UINT` RTV cleared to 7 wrote 0xff).
+  `d3d12_typeless_families_test` clears every typed RTV format of each family with two value sets and compares the
+  bytes with the host D3D12 on the same adapter: 62 of 62 equal on an RTX 3060 (NVIDIA 32.0.16.1714) with
+  `LEONIDA_VK_VALIDATION=1`; WARP differs from that host in 8 (rounding of 0.5 to UNORM/SNORM and the
+  R10G10B10A2_UNORM alpha). Formats the layer does not map yet (R16G16B16A16_SNORM, R16G16_UNORM/SNORM,
+  R16_UINT/SNORM/SINT, the R8 family; #1914) are reported and skipped. Draws need no change: the replay builds a
+  draw's attachment view in the PSO's `RTVFormats[slot]` (`GraphicsPipeline::color_formats`, applied in
+  `vulkan_replay.h`'s draw setup), which D3D12 requires to equal the RTV's format, so pipeline and attachment
+  already agree and the mutable image is written in the typed format. The same test draws a full-screen pass (GLSL
+  stand-ins for translated shaders found by FSSM hash; HLSL through d3dcompiler_47 on the host) writing
+  `uint4(7, 300, 1000, 3)` or `float4(0.5, -2, 1.5, 0.25)` into R16G16B16A16_UINT/FLOAT/UNORM, R32_UINT/FLOAT,
+  R10G10B10A2_UINT/UNORM and R8G8B8A8_UINT views of the matching TYPELESS textures: 8 of 8 equal the host, with no
+  validation error, before and after the clear fix.
 - **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For every integer RTV format the device
   exposes (`R8G8`, `R8G8B8A8`, `R16G16`, `R16G16B16A16`, `R32`, `R32G32` and `R32G32B32A32` in `_UINT` and `_SINT`,
   plus `R10G10B10A2_UINT`; `R8`/`R16` `_UINT`/`_SINT` are handled in replay too) convert those values numerically
@@ -2722,7 +2777,7 @@ nothing is copied from their trees.
 | 16 | Does the game use append/consume UAV counters or typed buffer formats the translator does not model? | Trace UAV descs and shader `buffer_*` ops; extend the translator/runtime together. **Runtime side done, console side open:** the layer writes typed buffer V#s and a counter V# (a hypothesis for where the shader finds it, section 3.4 "Buffer UAVs"); whether the game uses either is for the trace. |
 | 17 | Do upload/readback resources ever reach shaders (as vertex/index buffers or descriptors), and does the `-heap_base` bias work for them? | Trace `CreateCommittedResource` heap types and every VB/IB/descriptor that points at an upload resource; test the bias with a synthetic draw. |
 | 18 | Does the game alias buffers/images in a heap, or use reserved/tiled resources? | Trace `CreatePlacedResource` ranges, aliasing barriers, `CreateReservedResource` and tile mappings. If yes, implement shared memory per heap range or fall back to linear allocations with a clear log. Shaders: 30 declare `TILED_RESOURCES` in SFI0 (`tools/feature_scan.py`), so reserved/tiled resources are likely used. Placed resources are D3D-16 and reserved resources D3D-20 (#313). |
-| 19 | What do the `0x03000000` root-signature flag bits mean? | Masking them on a copy works around the PC serializer; the semantics remain unknown. Compare against the public flag enum and observe the game's behaviour with and without the mask. |
+| 19 | What do the `0x03000000` root-signature flag bits mean? | Masking them on a copy works around the PC serializer; the semantics remain unknown. **Origin measured** (section "Root-signature flag quirk"): in the package only `XboxBvhBuilder.dll` sets them, in its 52 compiled `RTS0` parts and unconditionally at `0xc30e` before serialising; the FSR DLL's 29 `RTS0` parts carry 0. Compare against the public flag enum and observe the game's behaviour with and without the mask; check whether the executable's root signatures carry them. |
 | 20 | Which of the BVH builder's 52 `FSSM` programs does the game actually use, and do the translated programs match a reference? | Dump the slot-62 compute PSOs on the first RT frame and map each to its container by the `ILDN` name; 42/52 pass `spirv-val` today and the four missing rules are named in [embedded_shaders.md](embedded_shaders.md); compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
 | 19 | What do the `0x03000000` root-signature flag bits mean? | Masking them on a copy works around the PC serializer; the semantics remain unknown. **Origin measured** (section "Root-signature flag quirk"): in the package only `XboxBvhBuilder.dll` sets them, in its 52 compiled `RTS0` parts and unconditionally at `0xc30e` before serialising; the FSR DLL's 29 `RTS0` parts carry 0. Compare against the public flag enum and observe the game's behaviour with and without the mask; check whether the executable's root signatures carry them. |
 | 20 | Which of the BVH builder's 53 Xbox DXIL shaders does the game actually use, and can the 31 raw-address shaders be lowered without a reference? | Dump the slot-62 compute PSOs on the first RT frame; lower and compile each; compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
