@@ -621,8 +621,22 @@ def main() -> int:
             shutil.rmtree(work, ignore_errors=True)
 
 
+def _w64_graphics_only() -> frozenset:
+    try:
+        import w64_graphics
+    except ImportError:
+        return frozenset()
+    return frozenset(w64_graphics.FIXTURES)
+
+
+W64_GRAPHICS_ONLY = _w64_graphics_only()
+
+
 def run_suite(a, work: str) -> int:
     asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
+    # The wave64 pixel fixtures of runtime/test/shaders/w64_graphics.py (tiers A-C, #1541) are checked by that
+    # runner, not here: they need a 64-wide fragment subgroup or the halves-aware lowering it drives.
+    asm_files = [f for f in asm_files if f[:-4] not in W64_GRAPHICS_ONLY]
     if a.filter:
         asm_files = [f for f in asm_files if a.filter in f]
         if not asm_files:

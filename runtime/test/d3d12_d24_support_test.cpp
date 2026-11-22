@@ -83,11 +83,14 @@ int main() {
         const bool reported_ds = SUCCEEDED(hr) && (fs.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL);
         std::printf("format %d: FORMAT_SUPPORT hr=0x%08lx Support1=0x%08x Support2=0x%08x\n", static_cast<int>(format),
                     static_cast<unsigned long>(hr), fs.Support1, fs.Support2);
-        // R24G8_TYPELESS is a depth texture by its clear format and DSV; native D3D12 reports DEPTH_STENCIL for
-        // the typeless member too (0x003110b0 on an RX 9070 XT).
+        // A TYPELESS member can be created with ALLOW_DEPTH_STENCIL, but D3D12 reports DEPTH_STENCIL only for its
+        // typed depth format: on an RTX 4060 Ti and WARP, R24G8_TYPELESS gives Support1 0x001010b0 and
+        // D24_UNORM_S8_UINT 0x003110b0 (the DEPTH_STENCIL bit is 0x00010000).
+        const bool typeless = format == DXGI_FORMAT_R24G8_TYPELESS;
         const bool made = creatable(device, format, 1);
         check(made, "a 1x ALLOW_DEPTH_STENCIL texture is created", format);
-        check(reported_ds == made, "FORMAT_SUPPORT reports DEPTH_STENCIL exactly when creation succeeds", format);
+        check(reported_ds == (made && !typeless),
+              "FORMAT_SUPPORT reports DEPTH_STENCIL exactly when creation succeeds, for the typed format only", format);
         if (made) check((fs.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) != 0, "FORMAT_SUPPORT reports TEXTURE2D", format);
 
         for (const UINT samples : {2u, 4u, 8u}) {
