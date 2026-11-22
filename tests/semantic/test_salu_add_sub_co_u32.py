@@ -669,5 +669,153 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
                 self.assertEqual(state.read_lane_vgpr(lane, 6), 0x1111_1111)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Verification of atomic read-before-write semantics and register aliasing."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarModel()
+
+    def test_in_place_accumulator_dst_equals_src0(self) -> None:
+        # s0 = s0 + s1
+        self.state.write_sgpr(0, 100)
+        self.state.write_sgpr(1, 50)
+        instr_add = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_CO_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(0),
+            src1=SGPROperand(1),
+        )
+        res, cc = self.interp.step(instr_add, self.state)
+        self.assertEqual(res, 150)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(0), 150)
+        self.assertEqual(self.state.read_sgpr(1), 50)  # src1 preserved
+
+        # s0 = s0 - s1
+        instr_sub = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_SUB_CO_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(0),
+            src1=SGPROperand(1),
+        )
+        res_sub, cc_sub = self.interp.step(instr_sub, self.state)
+        self.assertEqual(res_sub, 100)
+        self.assertEqual(cc_sub, 0)
+        self.assertEqual(self.state.read_sgpr(0), 100)
+
+    def test_in_place_accumulator_dst_equals_src1(self) -> None:
+        # s1 = s0 + s1
+        self.state.write_sgpr(0, 200)
+        self.state.write_sgpr(1, 80)
+        instr_add = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_CO_U32,
+            dst=SGPROperand(1),
+            src0=SGPROperand(0),
+            src1=SGPROperand(1),
+        )
+        res, cc = self.interp.step(instr_add, self.state)
+        self.assertEqual(res, 280)
+        self.assertEqual(self.state.read_sgpr(1), 280)
+        self.assertEqual(self.state.read_sgpr(0), 200)  # src0 preserved
+
+        # s1 = s0 - s1 => 200 - 280 = -80 (mod 2^32), borrow = 1
+        instr_sub = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_SUB_CO_U32,
+            dst=SGPROperand(1),
+            src0=SGPROperand(0),
+            src1=SGPROperand(1),
+        )
+        res_sub, cc_sub = self.interp.step(instr_sub, self.state)
+        self.assertEqual(res_sub, (200 - 280) & MASK_U32)
+        self.assertEqual(cc_sub, 1)
+        self.assertEqual(self.state.read_sgpr(1), (200 - 280) & MASK_U32)
+        self.assertEqual(self.state.read_sgpr(0), 200)
+
+    def test_self_referential_source_aliasing(self) -> None:
+        # s2 = s0 + s0 (doubling)
+        self.state.write_sgpr(0, 0x4000_0000)
+        instr_double = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_CO_U32,
+            dst=SGPROperand(2),
+            src0=SGPROperand(0),
+            src1=SGPROperand(0),
+        )
+        res_double, cc_double = self.interp.step(instr_double, self.state)
+        self.assertEqual(res_double, 0x8000_0000)
+        self.assertEqual(cc_double, 0)
+        self.assertEqual(self.state.read_sgpr(0), 0x4000_0000)  # Preserved
+
+        # Doubling with carry: 0x8000_0000 + 0x8000_0000 = 0, carry = 1
+        self.state.write_sgpr(0, 0x8000_0000)
+        res_double2, cc_double2 = self.interp.step(instr_double, self.state)
+        self.assertEqual(res_double2, 0)
+        self.assertEqual(cc_double2, 1)
+
+        # s3 = s0 - s0 (always 0, borrow = 0)
+        instr_zero = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_SUB_CO_U32,
+            dst=SGPROperand(3),
+            src0=SGPROperand(0),
+            src1=SGPROperand(0),
+        )
+        res_zero, cc_zero = self.interp.step(instr_zero, self.state)
+        self.assertEqual(res_zero, 0)
+        self.assertEqual(cc_zero, 0)
+        self.assertEqual(self.state.read_sgpr(3), 0)
+
+    def test_tri_aliasing_dst_src0_src1(self) -> None:
+        # In-place self-addition: s0 = s0 + s0
+        self.state.write_sgpr(0, 0x0000_0008)
+        instr_tri_add = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_CO_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(0),
+            src1=SGPROperand(0),
+        )
+        res, cc = self.interp.step(instr_tri_add, self.state)
+        self.assertEqual(res, 16)
+        self.assertEqual(cc, 0)
+        self.assertEqual(self.state.read_sgpr(0), 16)
+
+        # In-place self-subtraction: s0 = s0 - s0
+        instr_tri_sub = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_SUB_CO_U32,
+            dst=SGPROperand(0),
+            src0=SGPROperand(0),
+            src1=SGPROperand(0),
+        )
+        res_sub, cc_sub = self.interp.step(instr_tri_sub, self.state)
+        self.assertEqual(res_sub, 0)
+        self.assertEqual(cc_sub, 0)
+        self.assertEqual(self.state.read_sgpr(0), 0)
+
+    def test_unreferenced_register_preservation(self) -> None:
+        # Populate all SGPRs with distinct sentinel values
+        for i in range(NUM_SGPRS):
+            self.state.write_sgpr(i, (i * 0x0101_0101) & MASK_U32)
+
+        # Perform operation modifying only s42
+        instr = SAddSubCoU32Instruction(
+            opcode=SOPOpcode.S_ADD_CO_U32,
+            dst=SGPROperand(42),
+            src0=SGPROperand(10),
+            src1=InlineConstant(7),
+        )
+        self.interp.step(instr, self.state)
+
+        # Verify all registers except s42 maintain exact original value
+        for i in range(NUM_SGPRS):
+            if i == 42:
+                expected = ((10 * 0x0101_0101) + 7) & MASK_U32
+                self.assertEqual(self.state.read_sgpr(i), expected)
+            else:
+                self.assertEqual(self.state.read_sgpr(i), (i * 0x0101_0101) & MASK_U32)
+
+
 if __name__ == "__main__":
     unittest.main()
