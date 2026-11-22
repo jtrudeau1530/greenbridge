@@ -748,6 +748,25 @@ class TestObjParserAndBounds(unittest.TestCase):
                     for actual, target in zip(normals[position, uv], expected_normal):
                         self.assertAlmostEqual(actual, target)
 
+    def test_parse_obj_explicit_faces_preserve_generated_hard_edge(self):
+        # A top face without normals shares two positions with a fully normaled side.
+        vertices = ["v 0 1 0", "v 1 1 0", "v 1 1 1", "v 0 1 1", "v 0 0 1", "v 1 0 1"]
+        top = "f 1 4 3 2"
+        side = "f 5//1 6//1 3//1 4//1"
+        for faces in ((top, side), (side, top)):
+            with self.subTest(first_face=faces[0]):
+                obj_text = "\n".join([*vertices, "vn 0 0 1", *faces])
+                prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+                normals_by_face = [
+                    {(0.0, 1.0, 0.0)} if face == top else {(0.0, 0.0, 1.0)}
+                    for face in faces
+                ]
+                self.assertEqual(len(prim["positions"]), 8)
+                self.assertEqual(len(prim["indices"]), 12)
+                for start, expected in zip((0, 6), normals_by_face):
+                    actual = {prim["normals"][i] for i in prim["indices"][start:start + 6]}
+                    self.assertEqual(actual, expected)
+
     def test_parse_obj_quad_fan_triangulation(self):
         obj_text = "\n".join([
             "v 0 0 0",
