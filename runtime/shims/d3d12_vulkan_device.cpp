@@ -1306,6 +1306,9 @@ public:
             } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY) {
                 view = {r->id(), desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
                         desc->Texture2DArray.ArraySize};
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY) {
+                // Multisample textures have one mip, so only the slice range is chosen.
+                view = {r->id(), 0, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize};
             } else if (desc) {
                 log_once("depth-stencil view dimension not supported:", desc->ViewDimension);
                 view = {};
