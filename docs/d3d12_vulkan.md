@@ -731,6 +731,23 @@ The trace will enumerate them.
     further measured differences: on array slices after the first, the PC runtime
     writes a tile index into packed subresources instead of the documented `D3D12_PACKED_TILE` (ours follows the
     documentation), and a resource that is not reserved has no tiles (all outputs zero), as on the PC runtime.
+  - **Measured on AMD** (RX 9070 XT, RDNA4, driver 32.0.31041.1004, Windows 11, `main` `91b36cf`): the AMD PC
+    runtime splits standard and packed mips differently, so `d3d12_vulkan_device_test`'s tiling comparison fails
+    there. Tile shapes agree in all 17 texture layouts, and 11 of them match exactly; in the other 6, AMD keeps more
+    mips as standard tiles before the packed tail:
+
+    | Layout | Tile | Standard mips: ours | AMD |
+    |---|---|---|---|
+    | 1000x300 RGBA8 sRGB, 3 slices | 128x128 | 2 | 4 |
+    | 2048x1024 BC7, 2 slices | 256x256 | 3 | 4 |
+    | 1000x600 BC3 | 256x256 | 2 | 3 |
+    | 100x100 RGBA8 | 128x128 | 0 | 1 |
+    | 4096x64 BGRA8 | 128x128 | 0 | 6 |
+    | 256x256x64 RGBA8 volume | 32x32x16 | 3 | 4 |
+
+    All 17 AMD results fit "a mip is packed once every axis is at most half the tile's largest side"
+    (**Hypothesis**: one driver, one GPU). Which split the console's runtime uses, and so which one the layer should
+    follow, is **Open** ([#374](https://github.com/ItsNotRexed/Leonida/issues/374#issuecomment-7071680820)).
   - `UpdateTileMappings` / `CopyTileMappings` log once and do nothing. What that loses: two resources mapped to the
     same heap tiles do not alias, and a tile unmapped or remapped keeps its contents. If the trace shows the game
     relies on either, the next step is sparse binding (`sparseBinding`, `sparseResidencyImage2D`) with the heaps
