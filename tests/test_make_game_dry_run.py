@@ -337,8 +337,8 @@ class PipelineStageIsolationTest(unittest.TestCase):
             make_game.pipelines(self.work_dir, self.out_dir)
 
         self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache, "--inflight-file",
-                                            os.path.join(self.out_dir, "pipeline_inflight.txt")])
+        # The dummy can't print a usage line, so it is treated as a checker without --inflight-file.
+        self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache])
 
     def test_pipelines_stage_alone_invokes_no_asset_or_shader_compilers(self) -> None:
         game_dir = os.path.join(self.tmp.name, "game")

@@ -567,7 +567,15 @@ int main(int argc, char** argv) {
             valid = number(isolate_batch);
             isolate_batch = std::max<size_t>(1, isolate_batch);
         }
-        else cache_path = a;
+        else if (a.starts_with("--")) {   // not a cache path: an option this build doesn't know
+            std::fprintf(stderr, "unknown option %s\n", a.c_str());
+            return 2;
+        } else if (cache_path.empty()) cache_path = a;
+        else {
+            std::fprintf(stderr, "unexpected argument %s (the cache path is already %s)\n", a.c_str(),
+                         cache_path.c_str());
+            return 2;
+        }
         if (!valid) {
             std::fprintf(stderr, "%s requires a valid value\n", a.c_str());
             return 2;

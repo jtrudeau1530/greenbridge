@@ -1256,7 +1256,16 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
     skip = os.path.join(out, "pipeline_crashes.txt")
     drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
-    base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else []), "--inflight-file", inflight]
+    base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
+    if not checker_supports(exe, "--inflight-file", "--skip-file"):
+        # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
+        # pipeline_inflight.txt and exit 0. Run it as before: a module that kills it stops the stage.
+        log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
+            "crashes the driver is skipped instead of stopping the stage")
+        run(base)
+        log("pipelines: done")
+        return
+    base += ["--inflight-file", inflight]
     crashed: "list[str]" = []
     code = 0
     for _ in range(PIPELINE_CRASH_RETRIES + 1):
@@ -1302,6 +1311,18 @@ def exit_label(code: int) -> str:
     if code < 0:
         return f"signal {-code}"
     return f"{code} ({code:#010x})" if code > 255 else str(code)
+
+
+def checker_supports(exe: str, *options: str) -> bool:
+    """Whether this vk_pipeline_check build knows the options: run without arguments, it prints its usage (and exits
+    2) before touching Vulkan. Builds before --inflight-file don't reject unknown arguments, so asking is the only way
+    to tell."""
+    try:
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    usage = (r.stdout or "") + (r.stderr or "")
+    return all(o in usage for o in options)
 
 
 def read_names(path: str) -> "list[str]":

@@ -82,14 +82,18 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.skip = os.path.join(self.out, "pipeline_crashes.txt")
         self.calls = []
 
-    def stage(self, script):
+    def stage(self, script, supports=True):
         """script(args, call_number) -> exit code; it may write the in-flight file first."""
         def fake_run(args, hint="", check=True, **kw):
             args = [str(a) for a in args]
             self.calls.append(args)
-            return script(args, len(self.calls))
+            code = script(args, len(self.calls))
+            if check and code != 0:   # as run() does
+                raise SystemExit(1)
+            return code
         logs = []
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
+                mock.patch.object(make_game, "checker_supports", return_value=supports), \
                 mock.patch.object(make_game, "run", side_effect=fake_run), \
                 mock.patch.object(make_game, "log", logs.append):
             try:
@@ -182,6 +186,32 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertIsNone(self.skipped(self.calls[0]))
         self.assertFalse(os.path.exists(self.skip))
         self.assertIn("pipelines: done", logs)
+
+
+    def test_an_older_checker_gets_the_old_invocation(self):
+        # Before --inflight-file the checker took unknown arguments as the cache path (it would write the cache into
+        # pipeline_inflight.txt), so an older build runs as before: one call, no new flags, a crash stops the stage.
+        def script(args, n):
+            self.inflight_is("b_mod")
+            return ABORT
+        with mock.patch("sys.stderr", io.StringIO()):
+            failed, logs = self.stage(script, supports=False)
+        self.assertIsNotNone(failed)
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn("--inflight-file", self.calls[0])
+        self.assertNotIn("--skip-file", self.calls[0])
+        self.assertTrue(any("has no --inflight-file" in m for m in logs), logs)
+
+    def test_support_is_read_from_the_usage_line(self):
+        new = "usage: vk_pipeline_check <spirv dir> ... [--inflight-file F] [--skip-file F]\n"
+        old = "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--isolate [--isolate-batch N]]\n"
+        for usage, want in ((new, True), (old, False)):
+            done = mock.Mock(stdout="", stderr=usage, returncode=2)
+            with mock.patch.object(make_game.subprocess, "run", return_value=done) as sp:
+                self.assertEqual(make_game.checker_supports("vk.exe", "--inflight-file", "--skip-file"), want)
+            self.assertEqual(sp.call_args.args[0], ["vk.exe"])   # no arguments: usage only, no Vulkan
+        with mock.patch.object(make_game.subprocess, "run", side_effect=OSError("not an executable")):
+            self.assertFalse(make_game.checker_supports("vk.exe", "--inflight-file"))
 
 
 if __name__ == "__main__":
