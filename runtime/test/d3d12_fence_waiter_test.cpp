@@ -4,6 +4,7 @@
 
 #include <climits>
 #include <cstdio>
+#include <initializer_list>
 
 using rt::d3d12::FenceWaiter;
 
