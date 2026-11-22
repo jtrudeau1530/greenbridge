@@ -212,6 +212,9 @@ if(BUILD_TESTING)
     add_library(tiny_dll SHARED test/fixtures/tiny_dll.cpp)
     target_compile_definitions(tiny_dll PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_dll PRIVATE /W4 /permissive- /utf-8 /GS-)
+    # tiny_fault_caught faults inside its own __try. MSVC always catches that; clang-cl only with asynchronous
+    # exceptions, otherwise the access violation escapes and the unwind-registration check fails.
+    target_compile_options(tiny_dll PRIVATE $<$<CXX_COMPILER_ID:Clang>:/EHa>)
     set_target_properties(tiny_dll PROPERTIES
       OUTPUT_NAME tiny_dll
       PREFIX ""
