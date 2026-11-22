@@ -160,3 +160,18 @@ $env:LEONIDA_VK_VALIDATION = '1'
 $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 .\runtime\build\RelWithDebInfo\d3d12_uint_clear_test.exe
 ```
+
+### RGBA8 typeless RTV clear regression (phase 1)
+
+`typeless_rtv_test` checks typed-view recording and replay without a GPU. It is registered in CTest.
+`d3d12_typeless_rtv_test` compares synthetic full and rectangular clears with Windows WARP through explicit
+UNORM/SRGB/UINT RTVs on a one-mip, one-layer, single-sample 2D RGBA8 typeless resource. It checks descriptor
+snapshots, alternating view formats, SRGB with UAV resource usage, and invalid view rejection.
+Other typeless families, typed-resource casts, SINT/SNORM, mip/array expansion, MSAA and 3D views are not added.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^typeless_rtv$' --output-on-failure
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_typeless_rtv_test.exe
+```
