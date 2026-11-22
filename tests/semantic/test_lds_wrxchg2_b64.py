@@ -931,5 +931,192 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<Q", state.lds_mem, 0x108)[0], 40)
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_vdst_with_data0(self) -> None:
+        # vdst = v[4:7], data0 = v[4:5], data1 = v[8:9]
+        # data0 VGPRs are overwritten by old0, but memory must receive the ORIGINAL data0 value.
+        interp = ScalarInterpreter()
+        struct.pack_into("<Q", interp.lds_mem, 0x100, 0x1111_1111_1111_1111)
+        struct.pack_into("<Q", interp.lds_mem, 0x108, 0x2222_2222_2222_2222)
+
+        interp.rf.set_u32(1, 0x100)  # vaddr
+        orig_data0 = 0xAAAA_AAAA_AAAA_AAAA
+        orig_data1 = 0xBBBB_BBBB_BBBB_BBBB
+        interp.rf.set_u64(RegPair(4), orig_data0)
+        interp.rf.set_u64(RegPair(8), orig_data1)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(4),  # v[4:7] aliases data0 v[4:5]
+            vaddr=RegSingle(1),
+            data0=RegPair(4),
+            data1=RegPair(8),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = interp.step(instr)
+        self.assertEqual(old0, 0x1111_1111_1111_1111)
+        self.assertEqual(old1, 0x2222_2222_2222_2222)
+
+        # vdst[0:1] (v[4:5]) got old0
+        self.assertEqual(interp.rf.get_u64(RegPair(4)), old0)
+        # vdst[2:3] (v[6:7]) got old1
+        self.assertEqual(interp.rf.get_u64(RegPair(6)), old1)
+
+        # Memory MUST contain orig_data0 (not old0) and orig_data1
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, 0x100)[0], orig_data0
+        )
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, 0x108)[0], orig_data1
+        )
+
+    def test_alias_vdst_with_data1(self) -> None:
+        # vdst = v[4:7], data0 = v[8:9], data1 = v[6:7]
+        # data1 VGPRs are overwritten by old1, but memory must receive the ORIGINAL data1 value.
+        interp = ScalarInterpreter()
+        struct.pack_into("<Q", interp.lds_mem, 0x200, 0x3333_3333_3333_3333)
+        struct.pack_into("<Q", interp.lds_mem, 0x208, 0x4444_4444_4444_4444)
+
+        interp.rf.set_u32(1, 0x200)
+        orig_data0 = 0xCCCC_CCCC_CCCC_CCCC
+        orig_data1 = 0xDDDD_DDDD_DDDD_DDDD
+        interp.rf.set_u64(RegPair(8), orig_data0)
+        interp.rf.set_u64(RegPair(6), orig_data1)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(4),  # v[4:7] aliases data1 at v[6:7]
+            vaddr=RegSingle(1),
+            data0=RegPair(8),
+            data1=RegPair(6),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = interp.step(instr)
+        self.assertEqual(old0, 0x3333_3333_3333_3333)
+        self.assertEqual(old1, 0x4444_4444_4444_4444)
+
+        self.assertEqual(interp.rf.get_u64(RegPair(4)), old0)
+        self.assertEqual(interp.rf.get_u64(RegPair(6)), old1)
+
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, 0x200)[0], orig_data0
+        )
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, 0x208)[0], orig_data1
+        )
+
+    def test_alias_vdst_with_both_data_operands(self) -> None:
+        # Complete alias: vdst = v[4:7], data0 = v[4:5], data1 = v[6:7]
+        interp = ScalarInterpreter()
+        struct.pack_into("<Q", interp.lds_mem, 0x300, 0x5555_5555_5555_5555)
+        struct.pack_into("<Q", interp.lds_mem, 0x308, 0x6666_6666_6666_6666)
+
+        interp.rf.set_u32(2, 0x300)
+        orig_d0 = 0xEEEE_EEEE_EEEE_EEEE
+        orig_d1 = 0xFFFF_FFFF_FFFF_FFFF
+        interp.rf.set_u64(RegPair(4), orig_d0)
+        interp.rf.set_u64(RegPair(6), orig_d1)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(4),
+            vaddr=RegSingle(2),
+            data0=RegPair(4),
+            data1=RegPair(6),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = interp.step(instr)
+        self.assertEqual(old0, 0x5555_5555_5555_5555)
+        self.assertEqual(old1, 0x6666_6666_6666_6666)
+
+        self.assertEqual(interp.rf.get_u64(RegPair(4)), old0)
+        self.assertEqual(interp.rf.get_u64(RegPair(6)), old1)
+        self.assertEqual(struct.unpack_from("<Q", interp.lds_mem, 0x300)[0], orig_d0)
+        self.assertEqual(struct.unpack_from("<Q", interp.lds_mem, 0x308)[0], orig_d1)
+
+    def test_alias_vdst_with_vaddr(self) -> None:
+        # vdst = v[0:3], vaddr = v0
+        # vaddr register is overwritten by low word of old0, but memory access used the original address
+        interp = ScalarInterpreter()
+        vaddr = 0x400
+        struct.pack_into("<Q", interp.lds_mem, vaddr, 0x7777_7777_7777_7777)
+        struct.pack_into("<Q", interp.lds_mem, vaddr + 8, 0x8888_8888_8888_8888)
+
+        interp.rf.set_u32(0, vaddr)
+        interp.rf.set_u64(RegPair(4), 0x1212_1212_1212_1212)
+        interp.rf.set_u64(RegPair(6), 0x3434_3434_3434_3434)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(0),  # v[0:3] aliases vaddr (v0)
+            vaddr=RegSingle(0),
+            data0=RegPair(4),
+            data1=RegPair(6),
+            offset0=0,
+            offset1=1,
+        )
+
+        old0, old1 = interp.step(instr)
+        self.assertEqual(old0, 0x7777_7777_7777_7777)
+        self.assertEqual(old1, 0x8888_8888_8888_8888)
+
+        # v0 now holds the low word of old0 (0x77777777), not vaddr (0x400)
+        self.assertEqual(interp.rf.get_u32(0), 0x7777_7777)
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, vaddr)[0], 0x1212_1212_1212_1212
+        )
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, vaddr + 8)[0], 0x3434_3434_3434_3434
+        )
+
+    def test_repeated_in_place_ping_pong_exchange(self) -> None:
+        # Repeated in-place exchange: vdst=v[4:7], data0=v[4:5], data1=v[6:7]
+        # Step 1 swaps (A, B) with (M0, M1).
+        # Step 2 swaps them back, restoring original values in registers and memory.
+        interp = ScalarInterpreter()
+        struct.pack_into("<Q", interp.lds_mem, 0x500, 0x1010_1010_1010_1010)
+        struct.pack_into("<Q", interp.lds_mem, 0x508, 0x2020_2020_2020_2020)
+
+        interp.rf.set_u32(1, 0x500)
+        interp.rf.set_u64(RegPair(4), 0x3030_3030_3030_3030)
+        interp.rf.set_u64(RegPair(6), 0x4040_4040_4040_4040)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(4),
+            vaddr=RegSingle(1),
+            data0=RegPair(4),
+            data1=RegPair(6),
+            offset0=0,
+            offset1=1,
+        )
+
+        # Step 1
+        interp.step(instr)
+        self.assertEqual(interp.rf.get_u64(RegPair(4)), 0x1010_1010_1010_1010)
+        self.assertEqual(interp.rf.get_u64(RegPair(6)), 0x2020_2020_2020_2020)
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, 0x500)[0], 0x3030_3030_3030_3030
+        )
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, 0x508)[0], 0x4040_4040_4040_4040
+        )
+
+        # Step 2: swaps back
+        interp.step(instr)
+        self.assertEqual(interp.rf.get_u64(RegPair(4)), 0x3030_3030_3030_3030)
+        self.assertEqual(interp.rf.get_u64(RegPair(6)), 0x4040_4040_4040_4040)
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, 0x500)[0], 0x1010_1010_1010_1010
+        )
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, 0x508)[0], 0x2020_2020_2020_2020
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+
