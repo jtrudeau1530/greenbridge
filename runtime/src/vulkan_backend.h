@@ -746,7 +746,7 @@ public:
     }
     // The heap's d3d12_query_heap type, or ~0u for a heap that is not registered.
     std::uint32_t query_heap_type(QueryHeapId id) {
-        std::lock_guard lock(mutex_);
+        std::shared_lock lock(resource_mutex_);   // query_pools_ is guarded by resource_mutex_, like add/remove
         const auto it = query_pools_.find(id);
         return it == query_pools_.end() ? ~0u : it->second.heap_type;
     }
