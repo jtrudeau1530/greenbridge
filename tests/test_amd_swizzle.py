@@ -69,3 +69,11 @@ def test_64k_block_extent_comes_from_the_element_count():
         _, meta = A.offsets([(1, 0), (0, 1)], bpe, 1, 1)
         assert meta[:2] == (bw, bh), (bpe, meta)
         assert bw * bh * bpe == 65536
+
+
+def test_uncompressed_feature_uses_raw_rgb_bytes():
+    import numpy as np
+    raw = np.arange(8, dtype=np.uint8).reshape(-1, 4)
+    got = A.feature(raw, 4)
+    assert got.shape == (2, 3)
+    assert got.tolist() == [[0, 1, 2], [4, 5, 6]]

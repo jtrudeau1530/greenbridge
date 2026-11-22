@@ -103,11 +103,12 @@ u8 arrays). The measured file is version 1.2; GTA V writes 1.1.
 | pad | 0x0A | `u16` | 0 |
 | six bounds | 0x0C | 6 x `f32` | `(-13000, -9000, -50)` to `(7000, 11000, 500)` |
 | data size | 0x24 | `u32` | bytes after the 44-byte header |
-| unknown | 0x28 | `u32` | `0x9A99E517` / `0x25B7CF17` |
+| default height | 0x28 | `u8` | 23 in both (0 m quantised) |
+| pad | 0x29 | 3 bytes | differ per file; not a checksum |
 
 At 0x2C there are `height` records of eight bytes
 `{u16 start, u16 count, i32 offset}`, then the packed u8 heights. A row with
-`count = 0` keeps the measured default **23**; the other rows fill cells
+`count = 0` keeps the default height from byte 0x28 (**23** in both payloads); the other rows fill cells
 `start .. start + count - 1` from `pixels[offset + start + i]`.
 
 | Payload | Filled rows | Empty rows | Packed bytes | Height range |
@@ -117,7 +118,15 @@ At 0x2C there are `height` records of eight bytes
 
 The row spans cover the packed bytes exactly: **0 gaps, 0 overlaps** in both
 payloads. The default 23 is `-0.39 m`, and 209 is `400.8 m`, so the default is
-the sea surface.
+the sea surface: `(0 - min.z) / (max.z - min.z) * 255 = 23.18`, so 23 is 0 m
+quantised to the header's Z box.
+
+The encoder crops each row to its first and last non-default cell. Over the
+3,451 filled rows of both payloads, **0 of the 6,902 span ends** hold 23,
+although 23 is 82% of all cells and occurs 849,544 times *inside* spans. The
+ends are 24 (6,402), 22 (343) and other neighbours of 23. Empty rows are rows
+that are entirely default. The decoder reads the default from byte 0x28 and
+reports `span_ends_at_default` so a different build can be checked the same way.
 
 The earlier "zero-filled prefix plus square byte grid" reading (1,090 x 1,090
 and 1,100 x 1,100) was an artifact. The prefix is the zeroed row headers of
@@ -170,10 +179,19 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
 - `PAMH` 0x08 is the HMAP `compressed` word (GTA V writes 1). The measured
   `0x1BBC8CED` is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib digest of
   the max/min arrays; it is reported as a flag word, not a proven checksum.
-- `MHIU` 0x28 (`0x9A99E517` / `0x25B7CF17`) is not CRC32, Adler32, FNV-1a,
-  joaat32, Murmur3, xxHash32, lookup3, Fletcher32 or a hashlib digest window
-  of the decoded 2048 x 2048 grid, the packed bytes, the row table or the
-  whole payload. It remains unidentified.
+- `MHIU` 0x28 is a `u8` default height, not a 32-bit word (ASSET-48). Its
+  value is 23 in both payloads, the same value the empty rows were measured
+  to hold, and the row cropping above uses it. A full scan of all 12 archives
+  of package 1.0.2.1 (every zlib stream inflated far enough to read its magic)
+  finds **2 MHIU payloads**, both in `common.rpf`, so N = 2 for the header
+  values; the cropping rule is measured over all 6,902 span ends.
+- `MHIU` 0x29..0x2B differ between the two files and match none of CRC32,
+  Adler32, FNV-1/FNV-1a, joaat32 or an MD5/SHA-1/SHA-256/SHA3/BLAKE2 digest
+  (any 3-byte window, either byte order, or a 24-bit slice of the 32-bit
+  hashes) over the grid, the packed bytes, the row table, the header, the
+  body or the payload with 0x28..0x2B zeroed. They do not equal any count or
+  sum of the grid. They are most likely uninitialised struct padding after the
+  `u8` and are reported as `pad_29`; with N = 2 this is a hypothesis.
 
 ## XML documents
 
@@ -390,5 +408,5 @@ it applies to this note as well.
 The most useful next step is a **schema bridge**, not more carving: check whether the 118 XML root tags match
 RTTI class names in the executable, then build a streaming reader that dispatches on root and `type`. That
 turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The `MHIU`/`PAMH`
-heightmaps are decoded by `tools/gamedata_maps.py`; the MHIU `0x28` word remains unidentified, while the
-row-table layouts and the value-to-Z mapping are measured.
+heightmaps are decoded by `tools/gamedata_maps.py`; every MHIU header field is identified (0x28 is the
+default height), and the row-table layouts and the value-to-Z mapping are measured.

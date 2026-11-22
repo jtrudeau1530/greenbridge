@@ -161,7 +161,7 @@ class MissingComponentsRepeat(unittest.TestCase):
 
 
 class UnormCorrectlyRounded(unittest.TestCase):
-    """SHADER-86: UNORM is OpFDiv by (2^n-1), not a reciprocal multiply. Raw 3 → 0x3c40c0c1."""
+    """SHADER-86: UNORM is the correctly rounded quotient by (2^n-1), not a reciprocal multiply. Raw 3 → 0x3c40c0c1."""
 
     def test_unorm8x4_raw_3(self):
         mem = {BASE: 0x03030303}
