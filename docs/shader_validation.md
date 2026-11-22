@@ -163,7 +163,8 @@ Setup on Windows, about 800 MB and no admin rights:
   temp folder. By hand: `gcc -O1 tools/hw_oracle/hw_oracle.c -o hw_oracle.exe`.
 - `LEONIDA_HW_ARCH` overrides the detected architecture (`amdgpu-arch`, else `gfx1150`). GFX10 spellings
   (`s_load_dwordx2`, `global_store_dwordx4`) are used for `gfx10xx`, so the same kernels assemble for an RDNA2 card
-  (checked by assembling for gfx1030 with clang and gfx1013 with `llvm-mc`; not run on one).
+  (checked by assembling for gfx1030 with clang and gfx1013 with `llvm-mc`; not run on one). `gfx12xx` (RDNA4) uses
+  the GFX11 spellings. An architecture outside gfx10, gfx11 and gfx12 is `unavailable` (exit 77), like a missing tool.
 
 How it works: each program becomes one kernel (`tools/hw_oracle/asm.py`: load the output pointer, run the program,
 store `v[8:11]`), 500 kernels per code object. The code object needs an `.amdgpu_metadata` block; without it the HIP
@@ -180,6 +181,9 @@ What it can and cannot say:
   find-first-zero), and programs with two different 32-bit literals in one instruction (not encodable). Renamed
   opcodes (`s_andn2_*` to `s_and_not1_*`, `s_ff1_*` to `s_ctz_*`, `s_flbit_i32_b32` to `s_clz_i32_u32`, ...) are
   accepted by LLVM under their old names with the same behaviour and are run.
+- Skipped on gfx12 as well: the twelve SOPK compares `s_cmpk_{eq,lg,gt,ge,lt,le}_{i32,u32}`, which AMD clang
+  assembles for gfx1150 and rejects for gfx1201. They are about a third of the programs there (seed 1: 870 of 2000
+  skipped in all, 1130 run).
 - Only the scalar unit is observed, on one lane with EXEC = 1; nothing about wave64 or the other stages.
 
 Result of the first runs (Radeon 880M, driver 26.11.2, AMD clang 23.0.0git): about 40,000 seeded programs
@@ -191,6 +195,10 @@ control words, including bits 23 to 31 of the control word (ignored), fit that r
 did this (0 of 600 differ), so the reference was the one that was wrong, and it now follows the measured rule. The
 rule rests on that gfx1150 measurement (4000 control words). LLVM's `constantFoldBFE` does the same for the VOP3
 `v_bfe` nodes, but with a 5-bit width, so it is only analogous; RDNA2 is unmeasured.
+
+RDNA4 (Radeon RX 9070, gfx1201, driver 26.11.2, `rocm-sdk-core` 10.0.0 clang): 10,000 programs (seeds 1, 2, 3 and
+500, 2000 each, and seed 500 with `--bfe-any`) gave 0 mismatches, so gfx1201 follows the same `s_bfe` rule. With
+`--oracle translator,hw`, 200 of 200 programs matched (seed 1).
 
 Two assembler facts matter when writing edge cases:
 

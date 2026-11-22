@@ -15,15 +15,22 @@ GFX11_REMOVED = {
     "s_ff0_i32_b32": "removed in GFX11 (no find-first-zero; the ISA has only s_ctz = ff1)",
     "s_ff0_i32_b64": "removed in GFX11 (no find-first-zero; the ISA has only s_ctz = ff1)",
 }
+# GFX12 also drops the SOPK compares: AMD clang (rocm-sdk-core 10.0.0) assembles all twelve for gfx1150 and rejects
+# every one for gfx1201 ("instruction not supported on this GPU").
+GFX12_REMOVED = dict(GFX11_REMOVED, **{
+    f"s_cmpk_{cond}_{ty}": "removed in GFX12 (no SOPK compares; s_cmp with a literal is the replacement)"
+    for cond in ("eq", "lg", "gt", "ge", "lt", "le") for ty in ("i32", "u32")
+})
 
 _LITERAL_FREE = ("s_movk_i32", "s_addk_i32", "s_mulk_i32")
 
 
 def family(arch):
-    """'gfx10' for gfx10xx, 'gfx11' for gfx11xx (the only two flavours the mnemonics differ between)."""
+    """'gfx10', 'gfx11' or 'gfx12' for gfx10xx, gfx11xx and gfx12xx. GFX12 uses GFX11's spellings for everything
+    the kernels here emit; it differs only in which SALU opcodes exist (GFX12_REMOVED)."""
     m = re.fullmatch(r"gfx(\d+?)[0-9a-f]{2}", arch)
-    if not m or m.group(1) not in ("10", "11"):
-        raise ValueError(f"unsupported GPU architecture {arch!r} (expected gfx10xx or gfx11xx)")
+    if not m or m.group(1) not in ("10", "11", "12"):
+        raise ValueError(f"unsupported GPU architecture {arch!r} (expected gfx10xx, gfx11xx or gfx12xx)")
     return "gfx" + m.group(1)
 
 
@@ -46,7 +53,7 @@ def literals(line):
 
 def skip_reason(lines, arch):
     """Why a program cannot be run on this architecture, or None. Hardware allows one literal per instruction."""
-    removed = GFX11_REMOVED if family(arch) == "gfx11" else {}
+    removed = {"gfx10": {}, "gfx11": GFX11_REMOVED, "gfx12": GFX12_REMOVED}[family(arch)]
     for line in lines:
         op = line.partition(" ")[0]
         if op in removed:
@@ -59,8 +66,8 @@ def skip_reason(lines, arch):
 def kernel_text(name, lines, arch):
     """Assembly for one kernel."""
     fam = family(arch)
-    load = "s_load_b64" if fam == "gfx11" else "s_load_dwordx2"
-    store = "global_store_b128" if fam == "gfx11" else "global_store_dwordx4"
+    load = "s_load_dwordx2" if fam == "gfx10" else "s_load_b64"
+    store = "global_store_dwordx4" if fam == "gfx10" else "global_store_b128"
     body = "\n".join("  " + line for line in lines)
     return f""".globl {name}
 .p2align 8
