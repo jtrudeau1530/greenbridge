@@ -3476,6 +3476,14 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        if (info.physical && state_.format_properties) {
+            state_.context->set_color_attachment_format(
+                [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
+                    VkFormatProperties properties{};
+                    get_props(physical, format, &properties);
+                    return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+                });
+        }
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {

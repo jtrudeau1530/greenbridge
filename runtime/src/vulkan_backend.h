@@ -1017,6 +1017,12 @@ public:
         replay_.zero_offset = offset;
         replay_.zero_size = size;
     }
+
+    // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
+    void set_color_attachment_format(std::function<bool(VkFormat)> check) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.color_attachment_format = std::move(check);
+    }
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
         return replay_.heap_base;

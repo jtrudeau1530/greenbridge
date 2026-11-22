@@ -855,6 +855,9 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&)> emit_predicated_copy;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
+    // Optional format check for color-attachment reinterpretation on mutable UAV clears; unset assumes every format
+    // except E5B9G9R9_UFLOAT_PACK32 supports COLOR_ATTACHMENT.
+    std::function<bool(VkFormat)> color_attachment_format;
     // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
     // for a job while the list is checked, `depth24_run` records its dispatch. Without them such a copy is unsupported.
     std::function<bool(Depth24Job&, std::vector<Depth24Job>&)> depth24_prepare;  // whole copy in, dispatches out
@@ -917,7 +920,7 @@ struct Prepared {
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
-    VkFormat clear_format = VK_FORMAT_UNDEFINED; // The RTV format, without changing the resource binding.
+    VkFormat clear_format = VK_FORMAT_UNDEFINED; // The clear view format (RTV or reinterpreted UAV), without changing the resource binding.
     std::vector<VkClearRect> rects;   // rectangle clears, clipped to the mip
     bool skip = false;                // every rectangle was empty
     ResourceBinding source;                   // copies: the source resource
@@ -2234,18 +2237,35 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const TargetView target{view.resource, view.mip, view.first_layer, view.layer_count};
             if (!detail::view_range(p.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
                 return ReplayResult::invalid_subresource;
-            // The view's format turns the values into bytes; the image's own format clears them in.
+            // The view's format turns the values into bytes. When the view format differs from the image's backing
+            // format (a typeless or castable texture) and can be cleared as a color attachment, clear through a view of
+            // view_format instead of decoding into the backing format (which turns non-float bit patterns like
+            // R16G16_UNORM 1.0 = 0xffff or R32_UINT 0x7f800001 into SFLOAT NaNs that vkCmdClearColorImage quiets).
+            // Emulated R9G9B9E5_SHAREDEXP images (backed by R32_UINT) lack COLOR_ATTACHMENT on E5B9G9R9 and keep the
+            // bit-exact R32_UINT backing path.
             const VkFormat view_format = view.format ? VkFormat(view.format) : p.binding.format;
-            if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element) ||
-                !uav_clear::decode(p.binding.format, p.element, p.clear_color))
+            if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element))
                 return ReplayResult::unsupported;
-            if (!uav->rects.empty() && (!p.binding.color_attachment || p.binding.volume))
+            const auto* image_layout = uav_clear::layout(p.binding.format);
+            if (!image_layout || image_layout->bytes != p.element.size)
+                return ReplayResult::unsupported;
+            const bool attachment = p.binding.color_attachment && !p.binding.volume;
+            const bool view_attachable = vk.color_attachment_format
+                                             ? vk.color_attachment_format(view_format)
+                                             : view_format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+            const bool reinterpret = view_format != p.binding.format && attachment && view_attachable;
+            const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
+            if (!uav_clear::decode(clear_format, p.element, p.clear_color))
+                return ReplayResult::unsupported;
+            if (reinterpret) p.clear_format = view_format;
+            if (!uav->rects.empty() && !attachment)
                 return ReplayResult::unsupported;
             // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
             // render targets are; otherwise vkCmdClearColorImage runs unconditionally and is counted.
-            const bool attachment = p.binding.color_attachment && !p.binding.volume;
             if (predicated && uav->rects.empty() && !attachment) ++out.unpredicated_copies;
-            const auto rects = attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
+            const auto rects = (reinterpret && uav->rects.empty())
+                                   ? std::span<const Rect>(&whole_view, 1)
+                                   : attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
             if (const auto r = rect_view(rects, target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
                 return r;
             if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
