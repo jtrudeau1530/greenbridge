@@ -361,8 +361,14 @@ them the same way.
 scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as
 `xdxr_build` and `xdxr_build_check`.
 
-Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, updates, compaction and copies. A higher-quality
-build (SAH) would also come later.
+**Updates** (D3D12 `PERFORM_UPDATE`) refit: the source structure is copied to the destination unless it is the
+destination, the elements are rewritten at their slots, and each node's boxes are recomputed bottom-up from the
+children it already points to. The tree is kept, so a refit is valid for any motion and skips the Morton pass and
+the sort. It takes 0.07 ms for 1,000 triangles and 9.8 ms for 1,000,000 on an RTX 2050, against 0.19 ms and 22 ms for
+a build, but the tree traverses more slowly as the geometry moves away from where it was built.
+
+Not done yet: pairing triangles into TRI1 leaves, BOX16 nodes, compaction and copies. A higher-quality build (SAH)
+would also come later.
 
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force

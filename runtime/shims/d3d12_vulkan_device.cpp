@@ -3530,7 +3530,7 @@ public:
         auto& vk = state_.context->vk;
         if (desc && state_.context->xdxr_acceleration_structures()) {
             // XDXR records: the layout depends only on the triangle or instance count (xdxr_build.h), so the sizes
-            // are exact. An update rebuilds the structure, so it needs the same scratch.
+            // are exact. An update refits (no sort); the build's scratch size covers it.
             leonida::BuildAccelerationStructure build{};
             build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
             if (build.is_tlas) {
