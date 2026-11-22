@@ -185,11 +185,43 @@ def test_export_picks_the_top_mip_placement_and_writes_dds(eq, tmp_path, fmt, na
     place = "first" if top_first else "last"
     assert r == "ok:" + place
     assert t["export"]["place"] == place
+    assert t["export"]["heuristic"] is True
     assert t["export"]["file"] == f"{0xABC:012x}_3_64x64_{name}.dds"
     with open(os.path.join(out, "x.rpf", t["export"]["file"]), "rb") as f:
         dds = f.read()
     assert struct.unpack_from("<I", dds, 128)[0] == fmt
     assert dds[148:] == expected
+
+
+def test_fmt_reuses_the_indexer_table_without_12_byte_rgb32():
+    from tex_headers import FMT_INFO
+    assert T.FMT == {f: v for f, v in FMT_INFO.items() if f not in (6, 7, 8)}
+    assert len(T.FMT) == 56
+
+
+@pytest.mark.parametrize("fmt", sorted(T.FMT))
+def test_every_tileable_format_exports_exact_top_mip_and_header(eq, tmp_path, fmt):
+    bpe, blk = T.FMT[fmt]
+    eq(bpe)
+    w, h = 43, 37  # not a whole number of tiles or BC blocks
+    we, he = (w + blk - 1) // blk, (h + blk - 1) // blk
+    offs, bw, bh = T.detile_offsets(bpe, we, he)
+    top = np.frombuffer(noise(we * he * bpe, seed=fmt), np.uint8).reshape(-1, bpe)
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, tile(top, offs, T.level_bytes(we, he, bpe, bw, bh)))
+    t = texture(fmt, "F", w, h, mips=1)
+    out = str(tmp_path / "out")
+    assert T.export_one(t, carve, out, {}) == "ok:first"
+    assert t["export"]["heuristic"] is False  # one mip: both placements are the same offset
+    with open(os.path.join(out, "x.rpf", t["export"]["file"]), "rb") as f:
+        dds = f.read()
+    flags, pitch = struct.unpack_from("<I", dds, 8)[0], struct.unpack_from("<I", dds, 20)[0]
+    if blk == 1:
+        assert (flags, pitch) == (0x1007 | 0x8, w * bpe)
+    else:
+        assert (flags, pitch) == (0x1007 | 0x80000, we * he * bpe)
+    assert struct.unpack_from("<I", dds, 128)[0] == fmt
+    assert dds[148:] == top.tobytes()
 
 
 def test_gpu_chain_parts_are_read_in_order(eq, tmp_path):
@@ -218,8 +250,9 @@ def test_blob_cache_is_reused_for_the_same_blob(eq, tmp_path):
     assert T.export_one(t2, carve, str(tmp_path / "out"), cache) == "ok:first"
 
 
-def test_unsupported_format_is_reported():
-    assert T.export_one(texture(9999, "X", 4, 4, 1), "unused", "unused", {}) == "unsupported format"
+@pytest.mark.parametrize("fmt", [9999, 6, 7, 8])  # 6-8: 12-byte R32G32B32 has no SW_4K_S equation
+def test_unsupported_format_is_reported(fmt):
+    assert T.export_one(texture(fmt, "X", 4, 4, 1), "unused", "unused", {}) == "unsupported format"
 
 
 @pytest.mark.parametrize("fmt,bpe", [(61, 1), (56, 2), (10, 8), (28, 4)])
@@ -234,6 +267,12 @@ def test_score_prefers_a_smooth_gradient(fmt, bpe, w, h):
     ramp = b"".join(bytes([value]) * bpe for value in values * copies)
     rough = b"".join(bytes([value]) * bpe for value in zigzag * copies)
     assert T.score_image(w, h, fmt, ramp, bpe) < T.score_image(w, h, fmt, rough, bpe)
+
+
+def test_bc2_srgb_is_scored_as_bc2():
+    pytest.importorskip("PIL")
+    payload = noise(4 * 4 * 16)
+    assert T.score_image(16, 16, 75, payload, 16) == T.score_image(16, 16, 74, payload, 16)
 
 
 def test_single_element_has_no_edge_transitions():
