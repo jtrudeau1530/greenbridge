@@ -389,6 +389,13 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         with open(out, encoding="utf-8") as f:
             summary = json.load(f)
+        limited = os.path.join(self.tmp.name, "limited.json")
+        limited_lights = os.path.join(self.tmp.name, "limited.jsonl")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(T.main([self.rpf, "--limit", "0x1000", "--out", limited,
+                                     "--entities", self.entities, "--lights-out", limited_lights]), 0)
+        with open(limited, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), summary)
         with open(lights, encoding="utf-8") as f:
             rows = [json.loads(line) for line in f]
         self.assertEqual(len(rows), 1 + 4)                            # one entity light, 2 x 2 archetype lights
