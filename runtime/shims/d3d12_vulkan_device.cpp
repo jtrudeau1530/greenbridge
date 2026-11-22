@@ -1900,7 +1900,8 @@ public:
         };
         Stage stages[2] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS}, {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[2] = {};  // chained from stage_infos
+        // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
+        auto& required_sizes = recipe_.required_sizes;
         const Stage* code_stage = nullptr;
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
@@ -2223,6 +2224,7 @@ private:
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[2]{};  // what `stages` chain
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
         VkPipelineInputAssemblyStateCreateInfo assembly{};

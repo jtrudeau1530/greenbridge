@@ -305,6 +305,24 @@ class PixelDeviceLimits(unittest.TestCase):
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("no subgroup width", problem)
 
+    @staticmethod
+    def readlane_pixels(words=(0x40000079, 0x40000010, 0x40000064, 0x400000be)):
+        return struct.pack("<4I", *words) * (64 * 64)
+
+    def test_wave64_pixel_shader_skips_where_64_cannot_be_required(self):
+        out = "device: fake (subgroup 8..8)\nok 64x64\n"
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("64-wide fragment subgroup", problem)
+        self.assertIn("8..8", problem)
+
+    def test_wave64_pixel_shader_is_judged_when_64_was_required(self):
+        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64 required\nok 64x64\n"
+        self.assertEqual(self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels()), "")
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("pixels differ", problem)
+
     def test_bitmask_perm_skips_when_variable_device_runs_narrow_fragment_subgroup(self):
         out = "device: Intel(R) HD Graphics 530 (subgroup 8..32)\nok 64x64\n"
         for width in (8, 16):

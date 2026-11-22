@@ -235,9 +235,9 @@ Result run(vktest::Device& d, const std::filesystem::path& library, const leonid
     CASE_EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
     // The V# the shaders read from s[0:3]: base = the buffer's console VA (the shader adds the heap base), stride 0,
-    // num_records unlimited, no format bits.
+    // num_records unlimited, OOB_SELECT 3 (raw: a stride of 0 is a bounds check in the other modes).
     list->SetComputeRootSignature(root.p);
-    const std::uint32_t vsharp[4] = {std::uint32_t(va), std::uint32_t(va >> 32) & 0xffff, 0xffffffffu, 0};
+    const std::uint32_t vsharp[4] = {std::uint32_t(va), std::uint32_t(va >> 32) & 0xffff, 0xffffffffu, 0x31016FACu};
     list->SetComputeRoot32BitConstants(0, 4, vsharp, 0);
     list->Dispatch(1, 1, 1);
     D3D12_RESOURCE_BARRIER barrier{};
@@ -526,7 +526,9 @@ const Pixel readlane_expected = {0x40000079u, 0x40000010u, 0x40000064u, 0x400000
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     const leonida::SubgroupSizeCaps& caps = d.subgroup;
     leonida::SubgroupSizeCaps off = caps;  // the control: the layer knows nothing of the device's sizes
     off.min_size = off.max_size = off.default_size = 0;

@@ -1142,6 +1142,8 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_subgroup_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_SUBGROUP_SHADERS="${LEONIDA_SG_DIR}")
       target_compile_options(d3d12_subgroup_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_subgroup COMMAND d3d12_subgroup_test)
+      set_tests_properties(d3d12_subgroup PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "llvm-mc (set LLVM_MC) or glslangValidator not found: d3d12_subgroup_test is not built")
     endif()

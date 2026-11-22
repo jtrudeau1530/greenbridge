@@ -37,6 +37,7 @@ from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shader
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem   # ps_interp_f16_high's producers and check
+from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -1056,7 +1057,11 @@ def run_suite(a, work: str) -> int:
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
+                "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
             }
+            if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge
+                results.append((name, None, str(skip)))
+                continue
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
             elif name == "ps_bary":
