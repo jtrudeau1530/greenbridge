@@ -112,6 +112,13 @@ def main():
                 print(f"ERROR: --out {a.out} is one of the inputs ({x}); choose another output file",
                       file=sys.stderr)
                 return 2
+    # A report can also alias a harvested <offset>.bin, including through a hard link.
+    # Snapshot its file identity once; compare against the input's already-open handle
+    # rather than statting every carve path (there may be millions of entries).
+    try:
+        output_stat = os.stat(a.out)
+    except OSError:
+        output_stat = None
     strings = set()
     full = set(a.archives.split(","))
     missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
@@ -136,6 +143,10 @@ def main():
                 blob = os.path.join(arch_dir, f"{r['off']:012x}.bin")
                 try:
                     with open(blob, "rb") as f:
+                        if output_stat is not None and os.path.samestat(os.fstat(f.fileno()), output_stat):
+                            print(f"ERROR: --out {a.out} is one of the inputs ({blob}); choose another output file",
+                                  file=sys.stderr)
+                            return 2
                         data = f.read()
                 except OSError:
                     missing.append(blob)
