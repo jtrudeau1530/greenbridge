@@ -990,5 +990,173 @@ class TestRegisterAliasingAndPreservation(unittest.TestCase):
             self.assertEqual(state.lds.read_dword(0x300 + lane * 4), 0x1000 + lane)
 
 
+# ==============================================================================
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class AtomicStatusFlags:
+    """Architectural condition codes and status flags for ds_condxchg32_rtn_b32."""
+    success: bool
+    zero: bool
+    negative: bool
+    diff: int
+    borrow: bool
+    carry: bool
+    overflow: bool
+    unaligned_addr: bool
+
+
+def evaluate_condxchg32_flags(
+    old_val: int,
+    cmp_val: int,
+    new_val: int,
+    eff_addr: int,
+    exchanged: bool,
+) -> AtomicStatusFlags:
+    """Evaluate condition codes, status flags, and arithmetic carry/borrow."""
+    u_old = old_val & MASK_32
+    u_cmp = cmp_val & MASK_32
+    u_new = new_val & MASK_32
+
+    # Zero flag: returned value is zero
+    zero = (u_old == 0)
+
+    # Negative flag: MSB of returned value is set
+    negative = bool(u_old & 0x8000_0000)
+
+    # Unsigned difference and borrow
+    diff = (u_old - u_cmp) & MASK_32
+    borrow = u_old < u_cmp
+
+    # Carry generation on new value write
+    carry = ((u_old + u_new) > MASK_32) if exchanged else False
+
+    # Signed comparison overflow for (old_val - cmp_val)
+    s_old = (u_old ^ 0x8000_0000) - 0x8000_0000
+    s_cmp = (u_cmp ^ 0x8000_0000) - 0x8000_0000
+    s_diff = s_old - s_cmp
+    overflow = s_diff < -0x8000_0000 or s_diff > 0x7FFF_FFFF
+
+    # Unaligned address check (low 2 bits must be zero for 4-byte dword alignment)
+    unaligned = bool(eff_addr & 0x3)
+
+    return AtomicStatusFlags(
+        success=exchanged,
+        zero=zero,
+        negative=negative,
+        diff=diff,
+        borrow=borrow,
+        carry=carry,
+        overflow=overflow,
+        unaligned_addr=unaligned,
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_exact_match_flags(self) -> None:
+        flags = evaluate_condxchg32_flags(
+            old_val=0x1234,
+            cmp_val=0x1234,
+            new_val=0x5678,
+            eff_addr=0x100,
+            exchanged=True,
+        )
+        self.assertTrue(flags.success)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertEqual(flags.diff, 0)
+        self.assertFalse(flags.borrow)
+        self.assertFalse(flags.carry)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.unaligned_addr)
+
+    def test_zero_flag_on_zero_return(self) -> None:
+        flags = evaluate_condxchg32_flags(
+            old_val=0,
+            cmp_val=0,
+            new_val=100,
+            eff_addr=0x200,
+            exchanged=True,
+        )
+        self.assertTrue(flags.success)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertEqual(flags.diff, 0)
+        self.assertFalse(flags.borrow)
+
+    def test_negative_flag_when_msb_set(self) -> None:
+        flags = evaluate_condxchg32_flags(
+            old_val=0x8000_0001,
+            cmp_val=0x10,
+            new_val=0x20,
+            eff_addr=0x300,
+            exchanged=False,
+        )
+        self.assertFalse(flags.success)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertFalse(flags.borrow)
+
+    def test_borrow_generation_when_old_below_cmp(self) -> None:
+        flags = evaluate_condxchg32_flags(
+            old_val=10,
+            cmp_val=25,
+            new_val=50,
+            eff_addr=0x400,
+            exchanged=False,
+        )
+        self.assertFalse(flags.success)
+        self.assertTrue(flags.borrow)
+        self.assertEqual(flags.diff, (10 - 25) & MASK_32)
+
+    def test_no_borrow_when_old_above_cmp(self) -> None:
+        flags = evaluate_condxchg32_flags(
+            old_val=50,
+            cmp_val=25,
+            new_val=100,
+            eff_addr=0x500,
+            exchanged=False,
+        )
+        self.assertFalse(flags.borrow)
+        self.assertEqual(flags.diff, 25)
+
+    def test_signed_overflow_flag(self) -> None:
+        # 0x7FFF_FFFF (max positive) - 0x8000_0000 (min negative) -> +0xFFFFFFFF (overflows 32-bit signed)
+        flags = evaluate_condxchg32_flags(
+            old_val=0x7FFF_FFFF,
+            cmp_val=0x8000_0000,
+            new_val=0,
+            eff_addr=0x600,
+            exchanged=False,
+        )
+        self.assertTrue(flags.overflow)
+
+    def test_carry_generation_on_sum_overflow(self) -> None:
+        flags = evaluate_condxchg32_flags(
+            old_val=0xFFFF_FFFF,
+            cmp_val=0xFFFF_FFFF,
+            new_val=0x0000_0002,
+            eff_addr=0x700,
+            exchanged=True,
+        )
+        self.assertTrue(flags.success)
+        self.assertTrue(flags.carry)
+
+    def test_unaligned_address_flag_detection(self) -> None:
+        flags_aligned = evaluate_condxchg32_flags(0, 0, 0, eff_addr=0x1000, exchanged=True)
+        self.assertFalse(flags_aligned.unaligned_addr)
+
+        for unaligned_off in (1, 2, 3):
+            flags_unaligned = evaluate_condxchg32_flags(
+                0, 0, 0,
+                eff_addr=0x1000 + unaligned_off,
+                exchanged=True,
+            )
+            self.assertTrue(flags_unaligned.unaligned_addr)
+
+
 if __name__ == "__main__":
     unittest.main()
