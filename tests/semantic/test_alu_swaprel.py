@@ -174,5 +174,44 @@ class TestSwaprelInterpreterBasic(unittest.TestCase):
         self._verify_case(4, 6, 0x0003_0001)
 
 
+
+
+class TestSwaprelChainedSequencesAndPreservation(unittest.TestCase):
+    """Multi-step chained swap permutations and register state preservation."""
+
+    def test_involution_two_swaps_restore_identity(self) -> None:
+        oracle = SwaprelOracle()
+        orig = list(oracle.regs)
+        # Swap 3 and 7 twice
+        oracle.step(1, 2, 0x0002_0005)
+        self.assertNotEqual(oracle.regs, orig)
+        oracle.step(1, 2, 0x0002_0005)
+        self.assertEqual(oracle.regs, orig)
+
+    def test_three_way_cyclic_permutation(self) -> None:
+        # A=v2, B=v5, C=v8
+        oracle = SwaprelOracle()
+        vA, vB, vC = oracle.regs[2], oracle.regs[5], oracle.regs[8]
+        # Step 1: swap A and B -> A has vB, B has vA
+        oracle.step(2, 5, 0)
+        # Step 2: swap B and C -> B has vC, C has vA
+        oracle.step(5, 8, 0)
+        self.assertEqual(oracle.regs[2], vB)
+        self.assertEqual(oracle.regs[5], vC)
+        self.assertEqual(oracle.regs[8], vA)
+
+    def test_disjoint_parallel_swaps(self) -> None:
+        oracle = SwaprelOracle()
+        oracle.step(1, 2, 0)
+        oracle.step(3, 4, 0)
+        oracle.step(5, 6, 0)
+        self.assertEqual(oracle.regs[1], sentinel(2))
+        self.assertEqual(oracle.regs[2], sentinel(1))
+        self.assertEqual(oracle.regs[3], sentinel(4))
+        self.assertEqual(oracle.regs[4], sentinel(3))
+        self.assertEqual(oracle.regs[5], sentinel(6))
+        self.assertEqual(oracle.regs[6], sentinel(5))
+
+
 if __name__ == "__main__":
     unittest.main()
