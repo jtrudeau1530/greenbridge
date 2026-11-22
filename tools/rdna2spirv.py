@@ -3873,7 +3873,7 @@ class Gen:
             x = self.src_f(a[1])
             r = self.tmp()
             self.emit(f"{r} = OpFDiv %float %f1 {x}")
-            self.dst(a[0], self.tou(r))
+            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
             x, y = self.src_f(a[1]), self.src_f(a[2])
             r = self.tmp()
