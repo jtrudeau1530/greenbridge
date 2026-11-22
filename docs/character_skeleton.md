@@ -239,10 +239,28 @@ companions; there is no `psp_*` archive, so the `PSP_KeyLento_perschars_peds` pa
 schedule is not present in this build. Mandy is therefore not disproven: her appearance is either
 a generic ped assembled at runtime or in a pack this package does not include.
 
-Caveats: `levels.rpf` was prefix-bounded at 4 MiB per inflated stream, raw RSC8 bodies and
-Bink/opaque regions were not decoded, and the encrypted RPF9 table of contents prevents a full
-path enumeration (27 top-level entries remain). The evidence supports a shared ped-appearance
-actor assembled from existing components, not a unique `mandy` resource.
+The mission binding is now measured. `COM_KBOS_NEIGHB` is the internal id of the "Pipework"
+mission: the replay table carries that `<MissionId>`, and the mission text names "Mandy's
+house", "Follow Mandy" and "Bert died". Five PSIN state tables in
+`pack/story000/story000_script.rpf` (`03fe4000`, `03fe8000`, `03feb000`, `03fee000`,
+`03ff0000`) contain both characters as entity link hashes: `0x03A885E6` (`Mandy`) and
+`0xE34ACBC8` (`Bert`); the schedule pack hash is `0x865F0DA9`
+(`PSP_KeyLento_perschars_peds`).
+
+The entities linked to Mandy carry three different per-state archetype hashes
+(`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not
+three models. None of those hashes resolves through the package name dictionary, any drawable
+or prop name pool, the `packs.rpf` PSOs, or a `0x7a` meta hash scan, so they are state/archetype
+ids, not model names. The archetype-to-component-set table is not in the readable archives;
+whether it is in the missing executable or an undecoded store is not established.
+
+`Mandy_FirstTingle`, `Mandy_ComingUp` and `Drug_Mandy_*` in `common.rpf` are MDMA drug effects,
+not the character. They are a red herring in any `mandy` name search.
+
+Caveats: the RPF9 table of contents is still not decoded; names come from carving and recovery
+(318,266 unique `levels.rpf` names, 24,034 `packs.rpf` names), and raw RSC8 bodies and
+Bink/opaque regions were not decoded. The evidence supports a shared ped-appearance actor
+assembled from existing components, not a unique `mandy` resource.
 
 ## Reproduction
 
