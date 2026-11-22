@@ -38,7 +38,7 @@ from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: tex
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
-                   vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
+                   unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
@@ -315,6 +315,22 @@ def dump_words(msg: str) -> list[int] | None:
     check.py): trailing text, a missing word or a non-number is a malformed dump, not a result."""
     m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", msg, re.MULTILINE)
     return [int(x) for x in m.group(1).split()] if m else None
+
+
+def subgroup_pin_skip(msg: str, cs_env: dict | None) -> Skip | None:
+    """A Skip when the runner asked for a subgroup size (VKC_SUBGROUP_SIZE) and vk_compute_test says this device
+    cannot pin it, so the dispatched words are not the ones the fixture was written for. Only for the dumps in
+    WAVE32_PIN_DUMPS: everything else the runner judges at the device's own width, which is how cs_store and the
+    cs_w32_* fixtures keep being tested on a 64-only device (check.py is conservative and skips all of them)."""
+    if cs_env and "VKC_SUBGROUP_SIZE" in cs_env:
+        return unpinned_subgroup_skip(msg)
+    return None
+
+
+# Dumps whose expected words depend on the wave width but are not lane-mask dumps (those are WAVE32_LANE_DUMPS):
+# cs_barrier_loop's trip count is 4 waves of 32, so at 64 lanes it writes a different pattern and the words would
+# report a failure that is really an unpinnable wave size (GCN3/GCN4 expose 64..64 only).
+WAVE32_PIN_DUMPS = ("cs_barrier_loop",)
 
 
 def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: bool, emulated: bool,
@@ -1019,6 +1035,10 @@ def run_suite(a, work: str) -> int:
                 cs_env = dict(os.environ, **WAVE32_LANE_ENV)
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
             skip = wave32_lane_skip(msg) if name in WAVE32_LANE_DUMPS else None
+            if skip is None and name in WAVE32_PIN_DUMPS:
+                # the device may not be able to run the wave size this fixture was written for (a 64-only device
+                # can't pin 32, so cs_barrier_loop's words mean nothing); check.py skips it too
+                skip = subgroup_pin_skip(msg, cs_env)
             if skip:   # e.g. Mesa llvmpipe's 8-wide subgroups: these 32-lane masks can't come out right
                 ok, detail = None, str(skip)
             else:
