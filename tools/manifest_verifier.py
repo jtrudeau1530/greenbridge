@@ -159,10 +159,19 @@ class ManifestReport:
     problems: dict[str, str] = field(default_factory=dict)
     bytes_verified: int = 0
     elapsed_seconds: float = 0.0
+    strict: bool = False
+
+    def count_problems(self, *, strict: Optional[bool] = None) -> int:
+        count = len(self.missing) + len(self.size_mismatch) + len(self.hash_mismatch) + len(self.unreadable)
+        if strict is None:
+            strict = self.strict
+        if strict:
+            count += len(self.untracked)
+        return count
 
     @property
     def problem_count(self) -> int:
-        return len(self.missing) + len(self.size_mismatch) + len(self.hash_mismatch) + len(self.unreadable)
+        return self.count_problems()
 
     def to_dict(self) -> dict:
         return {
@@ -317,6 +326,7 @@ def verify_manifest(
         problems={rel: problems[rel] for rel in sorted(problems.keys())},
         bytes_verified=completed_bytes,
         elapsed_seconds=elapsed_total,
+        strict=strict,
     )
 
 
@@ -324,7 +334,7 @@ def print_report(
     report: ManifestReport,
     out: TextIO = sys.stdout,
     verbose: bool = False,
-    strict: bool = False,
+    strict: Optional[bool] = None,
 ) -> None:
     for rel in sorted(report.problems.keys()):
         kind = report.problems[rel]
@@ -332,9 +342,7 @@ def print_report(
     for rel in report.untracked:
         out.write(f"{'NEW':<10}{rel}\n")
 
-    bad = report.problem_count
-    if strict and report.untracked:
-        bad += len(report.untracked)
+    bad = report.count_problems(strict=strict)
 
     if bad == 0:
         if verbose:
@@ -406,7 +414,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
     else:
-        print_report(report, out=sys.stdout, verbose=args.verbose, strict=args.strict)
+        print_report(report, out=sys.stdout, verbose=args.verbose)
 
     return 0 if report.passed else 1
 
