@@ -85,6 +85,8 @@ def retag(data: bytes, packet: bytes) -> bytes:
     segments = data[tags_at + 27:tags_at + 27 + data[tags_at + 26]]
     if not segments or segments[-1] == 255:
         raise ValueError("the OpusTags packet continues past page 1")
+    if any(segment != 255 for segment in segments[:-1]):
+        raise ValueError("the OpusTags page contains another packet")
     serial, seq = struct.unpack_from("<II", data, tags_at + 14)
     if seq != 1:
         raise ValueError("the OpusTags page is not page 1")
