@@ -730,6 +730,9 @@ def main(argv=None):
     if a.jobs < 1:
         print("ERROR: --jobs must be at least 1", file=sys.stderr)
         return 2
+    if a.limit is not None and a.limit < 1:
+        print("ERROR: --limit must be at least 1", file=sys.stderr)
+        return 2
     if not os.path.isfile(a.archive):
         print(f"ERROR: {a.archive}: no such file", file=sys.stderr)
         return 2
