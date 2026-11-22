@@ -580,5 +580,153 @@ class TestSymbolicAST(unittest.TestCase):
                 self.assertEqual(inst, parsed)
 
 
+class ScalarThreadState:
+    """Architectural state of a single scalar thread executing LDS instructions."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        """Read a 32-bit register value."""
+        return self.vgprs[reg.index] & MASK32
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        """Write a 32-bit register value."""
+        self.vgprs[reg.index] = val & MASK32
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 DS min/max f32 opcodes."""
+
+    def execute(self, state: ScalarThreadState, inst: DSMinMaxInstruction) -> Optional[int]:
+        """Execute a single DS min/max instruction on the scalar thread state."""
+        addr = state.get_vgpr(inst.vaddr)
+        data = state.get_vgpr(inst.vdata)
+
+        if inst.opcode.is_min:
+            old_val = state.lds.atomic_min_f32(addr, data, offset=inst.offset.value)
+        elif inst.opcode.is_max:
+            old_val = state.lds.atomic_max_f32(addr, data, offset=inst.offset.value)
+        else:
+            raise ValueError(f"Unsupported opcode: {inst.opcode}")
+
+        if inst.opcode.is_return:
+            assert inst.vdst is not None
+            state.set_vgpr(inst.vdst, old_val)
+            return old_val
+        return None
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution of DS min/max f32."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_ds_min_f32_non_returning(self) -> None:
+        # Initial LDS value at dword 5 is 10.0
+        self.lds.write_dword(5, TEN_F32)
+        # v1 holds byte address 20 (dword 5), v2 holds 2.0
+        self.state.set_vgpr(VGPR(1), 20)
+        self.state.set_vgpr(VGPR(2), TWO_F32)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_F32, vaddr=VGPR(1), vdata=VGPR(2))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(res)
+        # LDS at dword 5 should now be 2.0
+        self.assertEqual(self.lds.read_dword(5), TWO_F32)
+        # Registers v1 and v2 unchanged
+        self.assertEqual(self.state.get_vgpr(VGPR(1)), 20)
+        self.assertEqual(self.state.get_vgpr(VGPR(2)), TWO_F32)
+
+    def test_scalar_ds_max_f32_non_returning(self) -> None:
+        self.lds.write_dword(8, ONE_F32)
+        self.state.set_vgpr(VGPR(1), 32)  # dword 8
+        self.state.set_vgpr(VGPR(2), THREE_F32)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MAX_F32, vaddr=VGPR(1), vdata=VGPR(2))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(res)
+        self.assertEqual(self.lds.read_dword(8), THREE_F32)
+
+    def test_scalar_ds_min_rtn_f32_returning(self) -> None:
+        self.lds.write_dword(12, FIVE_F32 := f32_to_bits(5.0))
+        self.state.set_vgpr(VGPR(1), 48)  # dword 12
+        self.state.set_vgpr(VGPR(2), TWO_F32)
+        self.state.set_vgpr(VGPR(0), 0xDEADBEEF)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_RTN_F32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(0))
+        res = self.interp.execute(self.state, inst)
+
+        # Returns old LDS value 5.0
+        self.assertEqual(res, FIVE_F32)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), FIVE_F32)
+        # LDS updated to min(5.0, 2.0) = 2.0
+        self.assertEqual(self.lds.read_dword(12), TWO_F32)
+
+    def test_scalar_ds_max_rtn_f32_returning(self) -> None:
+        self.lds.write_dword(15, TWO_F32)
+        self.state.set_vgpr(VGPR(1), 60)  # dword 15
+        self.state.set_vgpr(VGPR(2), TEN_F32)
+        self.state.set_vgpr(VGPR(5), 0)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MAX_RTN_F32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(5))
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, TWO_F32)
+        self.assertEqual(self.state.get_vgpr(VGPR(5)), TWO_F32)
+        self.assertEqual(self.lds.read_dword(15), TEN_F32)
+
+    def test_scalar_offset_and_unaligned_address(self) -> None:
+        # Target dword 20 (byte 80). Pass base addr 65 (dword 16 unaligned) with offset 15 -> 80
+        self.lds.write_dword(20, TEN_F32)
+        self.state.set_vgpr(VGPR(1), 65)
+        self.state.set_vgpr(VGPR(2), ONE_F32)
+
+        inst = DSMinMaxInstruction(
+            DSOpcode.DS_MIN_RTN_F32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            vdst=VGPR(3),
+            offset=OffsetImmediate(15),
+        )
+        self.interp.execute(self.state, inst)
+
+        self.assertEqual(self.state.get_vgpr(VGPR(3)), TEN_F32)
+        self.assertEqual(self.lds.read_dword(20), ONE_F32)
+
+    def test_sequential_atomic_chain(self) -> None:
+        # Chain several min/max operations on the same LDS dword
+        self.lds.write_dword(0, f32_to_bits(10.0))
+        self.state.set_vgpr(VGPR(1), 0)  # addr
+
+        # Step 1: min with 15.0 -> remains 10.0
+        self.state.set_vgpr(VGPR(2), f32_to_bits(15.0))
+        self.interp.execute(self.state, DSMinMaxInstruction(DSOpcode.DS_MIN_F32, VGPR(1), VGPR(2)))
+        self.assertEqual(self.lds.read_dword(0), f32_to_bits(10.0))
+
+        # Step 2: min with 3.0 -> becomes 3.0
+        self.state.set_vgpr(VGPR(2), f32_to_bits(3.0))
+        self.interp.execute(self.state, DSMinMaxInstruction(DSOpcode.DS_MIN_F32, VGPR(1), VGPR(2)))
+        self.assertEqual(self.lds.read_dword(0), f32_to_bits(3.0))
+
+        # Step 3: max with 7.0 -> becomes 7.0
+        self.state.set_vgpr(VGPR(2), f32_to_bits(7.0))
+        self.interp.execute(self.state, DSMinMaxInstruction(DSOpcode.DS_MAX_F32, VGPR(1), VGPR(2)))
+        self.assertEqual(self.lds.read_dword(0), f32_to_bits(7.0))
+
+        # Step 4: max rtn with 2.0 -> remains 7.0, returns 7.0
+        self.state.set_vgpr(VGPR(2), f32_to_bits(2.0))
+        ret = self.interp.execute(self.state, DSMinMaxInstruction(DSOpcode.DS_MAX_RTN_F32, VGPR(1), VGPR(2), vdst=VGPR(4)))
+        self.assertEqual(ret, f32_to_bits(7.0))
+        self.assertEqual(self.state.get_vgpr(VGPR(4)), f32_to_bits(7.0))
+        self.assertEqual(self.lds.read_dword(0), f32_to_bits(7.0))
+
+
 if __name__ == "__main__":
     unittest.main()
