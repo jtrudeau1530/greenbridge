@@ -1941,6 +1941,15 @@ class Gen:
                 self.emit(f"{nan} = OpIsNan %bool {float_value}")
                 self.emit(f"{value} = OpSelect %uint {nan} {self.cu(0)} {component}")
                 normalized.append(value)
+            # The runtime names B8G8R8A8 and A2R10G10B10 UNORM with V# selectors Z,Y,X,W.
+            # Pad the input first: even store_format_x must put its red value in the third field.
+            unorm_rgba = normalized + [self.cu(0)] * (4 - n)
+            selectors, bgra, red, blue = (self.tmp() for _ in range(4))
+            self.emit(f"{selectors} = OpBitwiseAnd %uint {d3} {self.cu(0xfff)}")
+            self.emit(f"{bgra} = OpIEqual %bool {selectors} {self.cu(0xf2e)}")
+            self.emit(f"{red} = OpSelect %uint {bgra} {unorm_rgba[2]} {unorm_rgba[0]}")
+            self.emit(f"{blue} = OpSelect %uint {bgra} {unorm_rgba[0]} {unorm_rgba[2]}")
+            unorm_view = [red, unorm_rgba[1], blue, unorm_rgba[3]]
             for code, (size, kind, widths) in self.FORMATS.items():
                 e = self.tmp()
                 self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
@@ -1951,6 +1960,8 @@ class Gen:
                 ncomp = min(len(widths), n)
                 source = normalized if kind in ("unorm", "snorm") else fc
                 fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
+                if code in (50, 56):
+                    fcs = unorm_view
                 ics = ic[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
                 words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
                 if size >= 4:
