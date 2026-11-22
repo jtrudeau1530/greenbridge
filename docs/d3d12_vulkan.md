@@ -1,7 +1,7 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
-render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears)
+render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears, and query heaps)
 runs behind the Xbox-ABI device proxy (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
 set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the swapchain are not
 implemented.** This is the plan for replacing the console's
@@ -155,8 +155,9 @@ What is implemented (all of it testable without the game):
   half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
   replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles,
   `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, colour resolves,
-  `ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat` (whole view or rectangles), and (D3D-26)
-  `DiscardResource`, `WriteBufferImmediate` and `AtomicCopyBufferUINT` / `AtomicCopyBufferUINT64`.
+  `ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat` (whole view or rectangles), (D3D-26)
+  `DiscardResource`, `WriteBufferImmediate` and `AtomicCopyBufferUINT` / `AtomicCopyBufferUINT64`, and `BeginQuery` /
+  `EndQuery` / `ResolveQueryData` (section 4.6).
   Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
@@ -253,7 +254,16 @@ What is implemented (all of it testable without the game):
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS` and `OPTIONS2`–`5`, `7`, `9`, `11`, `13`–`21`), GPU virtual-address
     support, format support and multisample quality levels. Other queries (including `OPTIONS1`/`6`/`8`/`10`/`12`, `FORMAT_INFO`, `SHADER_MODEL`, and `ROOT_SIGNATURE` left to sibling PRs) are logged and refused until the trace
     shows what the game asks (question 11);
+    support, format support, multisample quality levels, shader model and root signature version. Other queries are
+    logged and refused until the trace shows what the game asks (question 11);
+  - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
+    (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
+    image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
+    support, format support, format plane counts, multisample quality levels, shader model and root signature
+    version. Other queries are logged and refused until the trace shows what the game asks (question 11);
   - reserved resources and `GetResourceTiling` (section 4.2);
+  - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
+    (section 4.6);
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
@@ -306,7 +316,8 @@ What is implemented (all of it testable without the game):
     | non-normalized, a point filter with `MaxAnisotropy` or `ComparisonFunc` set | written; both are ignored (the debug layer warns about `ComparisonFunc`) |
     | both flags | written |
 
-  BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
+  BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it, as it does
+  `occlusionQueryPrecise` and `pipelineStatisticsQuery` for the query heaps.
 
   New textures are not touched at creation. They are tracked as `UNDEFINED`, and the first command that uses a
   part of one zero-fills it (D3D12 committed resources start zeroed; `CREATE_NOT_ZEROED` skips this) and moves it
@@ -380,19 +391,18 @@ of root signatures and the literal S#s of shaders (`literal_samplers` in the ind
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
 feature, each logged and approximated; the storage arrays hold 255 images a dimension; nothing writes through a
 storage view in a D3D12-level test yet (`vk_bindless_test` goes through the storage bindings at the Vulkan
-level); the set is flushed at every `ExecuteCommandLists` whether or not earlier lists are still running, and a
-flush that erases keys or moves the table to a larger buffer should wait for them, or one of their lookups can
-miss: `BindlessSet::flush_needs_idle()` says when, but the queue cannot yet tell the device that it is idle.
+level). The set is flushed at every `ExecuteCommandLists`; a flush that erases keys or moves the table to a larger
+buffer (`BindlessSet::flush_needs_idle()`) first waits for the device to be idle and then frees the retired table
+buffers, so no running lookup misses (D3D-76). That wait stalls every queue, which is correct but slow if the game
+destroys textures every frame; a per-queue wait is open.
 
-Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
-creation), root signatures, PSOs, draws, volume attachment
-views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
 A typed 3D color target supports default and explicit RTVs. The default covers mip 0; `FirstWSlice` and
 `WSize` select the depth slices in an explicit view's mip. `d3d12_clear_test --volume` checks full and
 rectangular clears of overlapping slice ranges against both Windows WARP and expected RGBA bytes.
 
-Known gaps: buffer and constant-buffer views, root signatures, PSOs, draws, typeless volume RTVs,
-placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
+Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
+creation), root signatures, PSOs, draws, typeless volume RTVs,
+placed resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
 1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); the GCL8
@@ -585,6 +595,13 @@ uses an image VA as a raw pointer.
   through a host-visible staging buffer, copied before the commands that use them. The hash table is not in the
   arena either: it is a normal storage buffer in `DEVICE_LOCAL` memory, uploaded from a mapped staging copy before
   the commands that read it (D3D-76).
+- Upload-heap buffers prefer `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` memory when the GPU has Resizable BAR
+  (D3D-96): the CPU writes them through the BAR and the GPU reads them from VRAM. `leonida::resizable_bar`
+  (`runtime/src/vulkan_memory.h`) calls it Resizable BAR when such a type sits in a device-local heap larger than
+  256 MiB. Without Resizable BAR that type lives in a window of 256 MiB or less (214 MiB on an RTX 3090) that every
+  upload buffer would share, so they stay in system memory. If VRAM is full, the allocation falls back to system
+  memory. The device logs which one it uses (`[rt] d3d12: upload heaps in ...`), and `LEONIDA_UPLOAD_SYSMEM=1`
+  keeps them in system memory to compare the two. Readback buffers keep preferring `HOST_CACHED`.
 
 **Capacity.** The arena is sized by buffers, descriptor heaps and shader code, not by textures. The allocator
 tracks the high-water mark; start with a configurable capacity (for example 4 GiB for the loading/menu path) and
@@ -886,6 +903,11 @@ The trace will enumerate them.
     `SupportedSampleCountsWithNoOutputs = 0x1f`, `LEONIDA_VK_VALIDATION=1` with `0` validation errors).
 - `D3D12_FEATURE_FORMAT_SUPPORT`: map to `vkGetPhysicalDeviceFormatProperties`; multisample render-target
   and resolve bits also require the format's image-usage/sample-count query to succeed.
+- `D3D12_FEATURE_FORMAT_INFO`: report the DXGI plane count independently of Vulkan texture support. Both
+  depth/stencil families (including their view formats), NV12, P010, P016 and NV11 have two planes. The
+  device test compares counts and HRESULTs with native D3D12 on the same adapter. If an older host rejects the
+  sampler-feedback formats or `A4B4G4R4_UNORM` with `E_INVALIDARG`, the test still requires the layer to return
+  `S_OK` and one plane for them.
 - `D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS`: query `vkGetPhysicalDeviceImageFormatProperties` for the matching
   colour or depth/stencil attachment usage, plus the transfer and sampled usages used by the resource implementation.
   Vulkan exposes one standard sample pattern, so a supported sample count reports one quality level (quality index 0);
@@ -1064,15 +1086,22 @@ The trace will enumerate them.
   17 unsupported/invalid frontend views fail `Close` without submission. Other typeless families, SINT/SNORM,
   typed-resource casts, MSAA and 3D typeless RTVs remain unsupported.
   Phase 2 adds 54 mip/array and 12 non-array higher-mip readbacks against WARP, including untouched sentinels.
-- **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For integer formats (`R8G8B8A8_UINT`,
-  `R32_UINT`, `R32G32B32A32_UINT`, `R8G8B8A8_SINT`, `R32_SINT`) convert those values numerically into
-  `VkClearColorValue` for both image and rectangle clears; copying float bits gives incorrect stored integers
+- **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For every integer RTV format the device
+  exposes (`R8G8`, `R8G8B8A8`, `R16G16`, `R16G16B16A16`, `R32`, `R32G32` and `R32G32B32A32` in `_UINT` and `_SINT`,
+  plus `R10G10B10A2_UINT`; `R8`/`R16` `_UINT`/`_SINT` are handled in replay too) convert those values numerically
+  into `VkClearColorValue` for both image and rectangle clears; copying float bits gives incorrect stored integers
   without a Vulkan validation error. **Measured:** Windows D3D12 on WARP clamps negatives/NaN to zero, positive
   overflow/infinity to the component maximum (and signed below the minimum), and truncates fractions; signed formats
-  use `int32` with the same NaN/overflow rules. `d3d12_clear_test` compares full and rectangular D3D12 readbacks with
-  WARP across UNORM, SNORM, FLOAT, UINT and SINT render targets and depth/stencil; `clear_color_test` checks both
-  replay paths without a GPU, including unchanged float values. SRGB clears are omitted from the comparison: the
+  use `int32` with the same NaN/overflow rules. `R10G10B10A2_UINT` clamps RGB to 1023 and alpha to 3 (inputs 4, 4.5
+  and 2^32 in alpha match WARP). `d3d12_clear_test` compares full and rectangular D3D12 readbacks with WARP across
+  UNORM, SNORM, FLOAT, all 15 exposed UINT/SINT render targets (11 value vectors, including 8-/16-/10-/2-bit range
+  boundaries) and depth/stencil; `clear_color_test` checks both replay paths for 19 integer formats without a GPU,
+  including unchanged float values. SRGB clears are omitted from the comparison: the
   linear→sRGB encoding rounds differently at the `.5` boundary on WARP vs Vulkan (a 1-ulp driver difference).
+  **Open:** on NVIDIA RTX 5080 (driver 616.56) clears that land exactly on a `.5` UNORM/SNORM step round down where
+  WARP rounds up: `R8G8B8A8_UNORM`/`SNORM` 0.5 store `7f`/`3f` vs WARP `80`/`40`, and a `D16_UNORM` 0.5 depth clear
+  stores `0x7fff` vs WARP `0x8000` (all on `main` before this change; same 1-ulp class as SRGB, not addressed here).
+  `D32_FLOAT` and `D32_FLOAT_S8X24_UINT` match WARP.
   This does not add typed-view reinterpretation of typeless resources.
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
@@ -1241,15 +1270,48 @@ Layer plan:
 
 ### 4.6 Queries
 
-- Occlusion: `D3D12_QUERY_TYPE_OCCLUSION` → `VK_QUERY_TYPE_OCCLUSION` with `VK_QUERY_CONTROL_PRECISE_BIT`;
-  `BINARY_OCCLUSION` → the same pool without the precise bit, clamping the result to 0/1. `ResolveQueryData` →
-  `vkCmdCopyQueryPoolResults` with `VK_QUERY_RESULT_64_BIT` (D3D12 returns UINT64).
-- Pipeline statistics: `VK_QUERY_TYPE_PIPELINE_STATISTICS` with the flags implied by
-  `D3D12_QUERY_DATA_PIPELINE_STATISTICS`; map the fields one-to-one.
-- Timestamps: `VK_QUERY_TYPE_TIMESTAMP`; `GetTimestampFrequency` from the Vulkan timestamp period; calibration
-  from `VK_EXT_calibrated_timestamps`.
-- D3D12 query resolve destinations must be in `COPY_DEST`; honour the game's offsets and alignment.
-- Xbox-specific query heap types (if any) are **Open**; log unknown enum values.
+Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query commands in `command_list.h` and
+`vulkan_replay.h`), checked on one GPU by `d3d12_vulkan_device_test` under the validation layer:
+
+- **Heaps.** One `VkQueryPool` per `ID3D12QueryHeap`, registered with the `VulkanContext` by its pointer, as
+  resources are. `OCCLUSION` heaps are `VK_QUERY_TYPE_OCCLUSION` pools and hold both `OCCLUSION` and
+  `BINARY_OCCLUSION` queries, as in D3D12. `TIMESTAMP` and `COPY_QUEUE_TIMESTAMP` heaps are
+  `VK_QUERY_TYPE_TIMESTAMP` pools; they are refused when the queue family's `timestampValidBits` is 0.
+  `PIPELINE_STATISTICS` heaps count all eleven Vulkan statistics (`0x7ff`), whose result order is the field order
+  of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
+  clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
+  `pipelineStatisticsQuery`. `SO_STATISTICS`, `VIDEO_DECODE_STATISTICS` and `PIPELINE_STATISTICS1` (mesh and
+  amplification counts) are logged and refused with `E_NOTIMPL`.
+- **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
+  begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
+  it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and
+  is refused at execution. Heap types, index ranges and the destination buffer are checked at
+  `ExecuteCommandLists`, when the heap and buffer are known (`ReplayResult::invalid_query`).
+- **Replay.** D3D12 queries need no reset; a Vulkan query does. Each `BeginQuery` and each timestamp `EndQuery` is
+  preceded by `vkCmdResetQueryPool` of that one query. Nothing in the layer runs inside a render pass yet, so the
+  reset is legal where it stands; a draw path that opens a render pass around queries must reset them before it.
+  `OCCLUSION` begins with `VK_QUERY_CONTROL_PRECISE_BIT` when `occlusionQueryPrecise` is enabled. A timestamp is
+  `vkCmdWriteTimestamp` at `BOTTOM_OF_PIPE` (every earlier command finished). `ResolveQueryData` is
+  `vkCmdCopyQueryPoolResults` with `VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT`. A query keeps its result
+  across executions until it is begun or written again, as in D3D12.
+- **Queries never ended.** D3D12 leaves their result undefined; a Vulkan copy with `WAIT_BIT` would wait for them
+  forever. Each heap records on the host which queries were ended, in submission order, and a resolve writes zeros
+  (`vkCmdFillBuffer`) for the ones that were not.
+- **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
+  shares one `VkQueue` for now (question 12), so they share one frequency.
+
+Not implemented yet:
+
+- **Overlapping queries.** Vulkan allows one active query of each type in a command buffer
+  (`VUID-vkCmdBeginQuery-queryPool-01922`); D3D12 lets occlusion queries overlap. A list that begins an occlusion
+  query (either kind) or a pipeline-statistics query while another of the same kind runs is refused with
+  `ReplayResult::unsupported`. The fix is virtual queries: end the running Vulkan query, start another, and sum the
+  pieces when resolving (a compute pass). The trace will show whether the game overlaps them.
+- **Binary occlusion** is not clamped: Vulkan writes the sample count (or, without the precise bit, any non-zero
+  value) where D3D12 writes 1. Predication only compares with zero, but a game that reads the value needs the clamp,
+  a small compute pass over the resolved range once the compute path (D3D-3) exists.
+- `GetClockCalibration` (from `VK_EXT_calibrated_timestamps`), stream-output and mesh-shader statistics.
+- Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
 ### 4.7 Indirect commands and command signatures
 

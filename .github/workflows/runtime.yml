@@ -5,27 +5,35 @@ name: Runtime
 on:
   push:
     branches: [main]
-    paths:
-      - "runtime/**"
-      - "third_party/xtaskqueue/**"
-      - "tools/**"
-      - "scripts/run_gpu_tests.py"
-      - ".github/workflows/runtime.yml"
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "viewer/**"
+      - "tests/**"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/jactionlint.yml"
+      - ".github/workflows/no-game-data.yml"
   pull_request:
-    paths:
-      - "runtime/**"
-      - "third_party/xtaskqueue/**"
-      - "tools/**"
-      - "scripts/run_gpu_tests.py"
-      - ".github/workflows/runtime.yml"
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "viewer/**"
+      - "tests/**"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/jactionlint.yml"
+      - ".github/workflows/no-game-data.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: runtime-${{ github.ref }}
-  cancel-in-progress: true
+  group: runtime-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows:

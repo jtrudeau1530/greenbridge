@@ -24,10 +24,10 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import Skip, clip_test
+from check import Skip, clip_test, fmt_1010102_test
 from compute_fixture import compute_header
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
-                   TEXTURE_MIP_TEST, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
+                   TEXTURE_MIP_TEST, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import WAVE32_LANE_DUMPS, narrow_subgroup_skip   # wave32 lane-mask dumps skip below 32 lanes, as in check.py
@@ -627,6 +627,9 @@ def run_suite(a, work: str) -> int:
             vals = words[:len(want)] if words else []
             results.append((name, rc == 0 and vals == want,
                             " ".join(hex(x) for x in vals) if vals else msg))
+        elif name == "cs_fmt_1010102":
+            problem = fmt_1010102_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "64/64 dumped words exact"))
         elif name == "cs_global_neg_offset":
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
@@ -785,6 +788,22 @@ def run_suite(a, work: str) -> int:
                 results.append((name, ok, f"center(32,32)=({r:.6f}, {g:.6f}, {b:.6f}, {alpha:.1f})"))
             else:
                 results.append((name, rc == 0 and "PASSED" in msg, msg.splitlines()[-1] if msg else ""))
+        elif name == "ps_gather_wrap":
+            # SHADER-36: image_gather4_l_o under wrap/mirror/clamp/mirror-once S#s; every pixel holds GATHER_WRAP.
+            tool = os.path.join(a.build, "vk_texture_test" + ext)
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            try:
+                p = subprocess.run([tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "92", "c00000",
+                                    "14500000", "0"], capture_output=True, text=True, cwd=spirv_dir)
+                rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
+            except FileNotFoundError:
+                rc, msg = 1, f"missing {tool}"
+            bad = 4096
+            if rc == 0 and os.path.isfile(raw):
+                data = Path(raw).read_bytes()
+                bad = 4096 if len(data) != 64 * 64 * 16 else sum(q != GATHER_WRAP for q in struct.iter_unpack("<4f", data))
+            results.append((name, rc == 0 and bad == 0, "4096/4096 pixels exact" if bad == 0 else
+                            f"{bad} pixels differ from {GATHER_WRAP}: {msg.splitlines()[-1] if msg else ''}"))
         elif name == "ps_tex":
             # A texture through the descriptor hash table and the bindless set. vk_bindless_test compares the
             # pixels itself, and exits 77 where the device lacks a feature the set or the shader needs.

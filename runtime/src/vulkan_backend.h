@@ -34,13 +34,16 @@ struct VulkanDeviceFunctions {
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
     X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)     \
-    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT)
+    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)            \
+    X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) \
+    X(vkCmdCopyQueryPoolResults)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
 
-    // The Vulkan 1.3 entry points may be null on older devices, and the extension ones (conditional rendering)
-    // when the extension is not enabled; everything else is required.
+    // The Vulkan 1.3 entry points may be null on older devices, the extension ones (conditional rendering) when the
+    // extension is not enabled, and the query functions are optional (a list that uses queries without them is
+    // unsupported); everything else is required.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
@@ -95,8 +98,17 @@ public:
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
             replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;
         }
+        replay_.reset_query_pool = vk.vkCmdResetQueryPool;
+        replay_.begin_query = vk.vkCmdBeginQuery;
+        replay_.end_query = vk.vkCmdEndQuery;
+        replay_.write_timestamp = vk.vkCmdWriteTimestamp;
+        replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
+        };
+        replay_.query_pool = [this](QueryHeapId id) -> QueryPool* {  // called with mutex_ held
+            const auto it = query_pools_.find(id);
+            return it == query_pools_.end() ? nullptr : &it->second;
         };
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
     }
@@ -138,6 +150,22 @@ public:
         tracker_.forget(id);
         resources_.erase(it);
     }
+
+    // A query heap, by its stable ID (the COM query heap pointer). The pool stays the caller's to destroy, after
+    // remove_query_pool.
+    void add_query_pool(QueryHeapId id, const QueryPool& pool) {
+        std::lock_guard lock(mutex_);
+        query_pools_[id] = pool;
+    }
+    void remove_query_pool(QueryHeapId id) {
+        std::lock_guard lock(mutex_);
+        query_pools_.erase(id);
+    }
+
+    // VkPhysicalDeviceLimits::timestampPeriod (nanoseconds per tick), or 0 when the queue writes no timestamps
+    // (timestampValidBits 0). Set by the device before any queue uses it.
+    double timestamp_period() const { return timestamp_period_; }
+    void set_timestamp_period(double period) { timestamp_period_ = period; }
 
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
@@ -204,6 +232,8 @@ private:
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::function<void(bool)> bindless_commit_;
+    std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
+    double timestamp_period_ = 0;
     ReplayFunctions replay_;
 };
 
