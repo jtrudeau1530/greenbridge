@@ -339,7 +339,10 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP):
                     mt = ZHDR.match(m, nxt, size)
                     if not mt:
                         break
-                    more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                    try:
+                        more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                    except zlib.error:
+                        break
                     if not meof or not more:
                         break
                     data += more
