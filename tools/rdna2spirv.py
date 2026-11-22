@@ -2741,8 +2741,9 @@ class Gen:
             self.emit(f"{nz} = OpINotEqual %bool {m} {self.cu(0)}")
             self.emit(f"{r} = OpSelect %uint {nz} {r0} {lo_}")
             self.dst(a[0], r)
-        elif op == "v_lshlrev_b64":
-            # v[d:d+1] = v[s:s+1] << (src0 & 63)
+        elif op in ("v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64"):
+            # v[d:d+1] = v[s:s+1] << / >> (src0 & 63): logical left, logical right, or arithmetic right (the sign
+            # bit 63 is copied in).
             sh, src = a[1], a[2]
             if a[0].get("n") != 2:
                 raise Unsupported(op + " operands")
@@ -2762,7 +2763,9 @@ class Gen:
             self.emit(f"{x} = OpBitwiseOr %ulong {t} {l64}")
             self.emit(f"{m} = OpBitwiseAnd %uint {s} {self.cu(63)}")
             self.emit(f"{sh64} = OpUConvert %ulong {m}")
-            self.emit(f"{res} = OpShiftLeftLogical %ulong {x} {sh64}")
+            shop = {"v_lshlrev_b64": "OpShiftLeftLogical", "v_lshrrev_b64": "OpShiftRightLogical",
+                    "v_ashrrev_i64": "OpShiftRightArithmetic"}[op]
+            self.emit(f"{res} = {shop} %ulong {x} {sh64}")
             self.emit(f"{rlo} = OpUConvert %uint {res}")
             hs = self.tmp()
             self.emit(f"{hs} = OpShiftRightLogical %ulong {res} %c64_32")
