@@ -3747,6 +3747,64 @@ class Gen:
             f = "OpBitFieldSExtract" if op.endswith("i32") else "OpBitFieldUExtract"
             self.emit(f"{r} = {f} %uint {x} {om} {wc}")
             self.dst(a[0], r)
+        elif op in ("v_mad_u64_u32", "v_mad_i64_i32"):
+            # {sdst, v[d:d+1]} = S0 * S1 + S2 as a 65-bit result (RDNA ISA pseudocode): 32 x 32 -> 64-bit product,
+            # unsigned or signed, plus the 64-bit S2. sdst (a lane mask) gets bit 64: the carry out for u64; for i64
+            # the sign of the exact sum, which a 65-bit two's-complement value always holds.
+            if a[0].get("n") != 2 or "clamp" in mods:
+                raise Unsupported(op + " operands")
+            vd, sd, s0, s1, s2 = a[0], a[1], a[2], a[3], a[4]
+            signed = op == "v_mad_i64_i32"
+            if s2["k"] in ("vgpr", "sgpr") and s2.get("n") == 2:
+                c_lo, c_hi = self.load_reg(s2["k"], s2["r"]), self.load_reg(s2["k"], s2["r"] + 1)
+            elif s2["k"] == "imm":
+                v = s2["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended from 32 bits
+                c_lo, c_hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            else:
+                raise Unsupported(op + " operands")
+            x, y = self.src_u(s0), self.src_u(s1)
+            pm, p_lo, p_hi = self.tmp(), self.tmp(), self.tmp()
+            if signed:
+                ph = self.tmp()
+                self.emit(f"{pm} = OpSMulExtended %smul {self.as_int(x)} {self.as_int(y)}")
+                pl = self.tmp()
+                self.emit(f"{pl} = OpCompositeExtract %int {pm} 0")
+                self.emit(f"{ph} = OpCompositeExtract %int {pm} 1")
+                self.emit(f"{p_lo} = OpBitcast %uint {pl}")
+                self.emit(f"{p_hi} = OpBitcast %uint {ph}")
+                self.uses_smul = True
+            else:
+                self.emit(f"{pm} = OpUMulExtended %umul {x} {y}")
+                self.emit(f"{p_lo} = OpCompositeExtract %uint {pm} 0")
+                self.emit(f"{p_hi} = OpCompositeExtract %uint {pm} 1")
+            s_lo, r_lo, c0, s_h1, h1, c1, s_h2, r_hi, c2 = (self.tmp() for _ in range(9))
+            self.emit(f"{s_lo} = OpIAddCarry %umul {p_lo} {c_lo}")
+            self.emit(f"{r_lo} = OpCompositeExtract %uint {s_lo} 0")
+            self.emit(f"{c0} = OpCompositeExtract %uint {s_lo} 1")
+            self.emit(f"{s_h1} = OpIAddCarry %umul {p_hi} {c_hi}")
+            self.emit(f"{h1} = OpCompositeExtract %uint {s_h1} 0")
+            self.emit(f"{c1} = OpCompositeExtract %uint {s_h1} 1")
+            self.emit(f"{s_h2} = OpIAddCarry %umul {h1} {c0}")
+            self.emit(f"{r_hi} = OpCompositeExtract %uint {s_h2} 0")
+            self.emit(f"{c2} = OpCompositeExtract %uint {s_h2} 1")
+            if signed:
+                # Sign of the exact sum: the operands' common sign if they agree, else the wrapped sum's sign.
+                sp, sc, sr, same, neg = (self.tmp() for _ in range(5))
+                self.emit(f"{sp} = OpShiftRightLogical %uint {p_hi} {self.cu(31)}")
+                self.emit(f"{sc} = OpShiftRightLogical %uint {c_hi} {self.cu(31)}")
+                self.emit(f"{sr} = OpShiftRightLogical %uint {r_hi} {self.cu(31)}")
+                self.emit(f"{same} = OpIEqual %bool {sp} {sc}")
+                self.emit(f"{neg} = OpSelect %uint {same} {sp} {sr}")
+                bit64 = neg
+            else:
+                bit64 = self.tmp()
+                self.emit(f"{bit64} = OpBitwiseOr %uint {c1} {c2}")
+            self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, r_lo)
+            self.dst({"k": "vgpr", "r": vd["r"] + 1, "n": 1}, r_hi)
+            if not (sd["k"] == "special" and sd["t"] == "null"):
+                m = self.tmp()
+                self.emit(f"{m} = OpSelect %uint {self.tmp_bool_nz(bit64)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                self.mask_dst(sd, m)
         elif op == "v_mad_u32_u24":
             x, y, z = (self.src_u(t) for t in a[1:4])
             xm, ym, p, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
