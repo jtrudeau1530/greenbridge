@@ -325,6 +325,35 @@ class CliTest(unittest.TestCase):
             self.assertIn(maps, err.getvalue())
             self.assertFalse(os.path.exists(out))
 
+    def test_resolve_requires_a_recognized_archetype_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dictionary = os.path.join(tmp, "names.json")
+            archetypes = os.path.join(tmp, "archetypes.json")
+            out = os.path.join(tmp, "report.json")
+            with open(dictionary, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(WN.NameDictionary().to_json(), f)
+
+            args = ["resolve", "--dict", dictionary, "--archetypes", archetypes, "--out", out]
+            for wrong in ([], {"summary": {}}, {"archetypes": []}):
+                with self.subTest(report=wrong):
+                    with open(archetypes, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump(wrong, f)
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        self.assertEqual(WN.main(args), 1)
+                    self.assertIn(archetypes, stderr.getvalue())
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertFalse(os.path.exists(out))
+
+            for field in ("archetypes", "hashes"):
+                with self.subTest(field=field):
+                    with open(archetypes, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump({field: {}}, f)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(WN.main(args), 0)
+                    with open(out, encoding="utf-8") as f:
+                        self.assertEqual(json.load(f)["archetypes"]["entities"], 0)
+
     def test_resolve_out_refuses_to_overwrite_an_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             dictionary = os.path.join(tmp, "names.json")
