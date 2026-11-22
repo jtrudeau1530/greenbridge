@@ -771,5 +771,111 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(ref_ds_add_src2_u32(0x7FFFFFFF, 1), 0x80000000)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(500, RegType.SGPR)
+
+    def test_syntax_rejection_offsets(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset0=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset0=256)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset1=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset1=256)
+
+    def test_syntax_rejection_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=-100)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=1000)  # Not a power of 2
+
+    def test_syntax_rejection_simd_lanes(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_perturbation(self) -> None:
+        val_a, val_b = 100, 200
+        correct = ref_ds_add_src2_u32(val_a, val_b)
+        self.assertEqual(correct, 300)
+        perturbed = correct ^ 1
+        self.assertNotEqual(correct, perturbed)
+
+    def test_mutation_detection_add_to_sub(self) -> None:
+        # Mutant: replaces addition with subtraction
+        def mutant_add(a: int, b: int) -> int:
+            return u32(u32(a) - u32(b))
+
+        val_a, val_b = 50, 20
+        correct = ref_ds_add_src2_u32(val_a, val_b)
+        mutant = mutant_add(val_a, val_b)
+        self.assertEqual(correct, 70)
+        self.assertEqual(mutant, 30)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_missing_wrap(self) -> None:
+        # Mutant: does not truncate to 32 bits
+        def mutant_add_no_wrap(a: int, b: int) -> int:
+            return a + b
+
+        val_a, val_b = MASK32, 1
+        correct = ref_ds_add_src2_u32(val_a, val_b)
+        mutant = mutant_add_no_wrap(val_a, val_b)
+        self.assertEqual(correct, 0)
+        self.assertEqual(mutant, 0x100000000)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_offset_dropped(self) -> None:
+        # Mutant: drops offset0
+        def mutant_calc_addresses(vaddr: int, offset0: int, offset1: int) -> int:
+            return u32(vaddr)
+
+        byte_a, _, _, _ = calc_lds_src2_addresses(0x100, offset0=4, offset1=8)
+        mutant_a = mutant_calc_addresses(0x100, offset0=4, offset1=8)
+        self.assertEqual(byte_a, 0x110)
+        self.assertEqual(mutant_a, 0x100)
+        self.assertNotEqual(byte_a, mutant_a)
+
+    def test_mutation_detection_simd_exec_leak(self) -> None:
+        # Mutant interpreter that executes regardless of EXEC mask
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def execute(self, instr: DSSrc2Instruction, state: SIMDState) -> None:
+                for lane in range(state.num_lanes):
+                    base_addr = state.get_lane_vgpr(lane, instr.addr.base_reg.index)
+                    _, _, idx_a, _ = calc_lds_src2_addresses(
+                        vaddr=base_addr,
+                        offset0=instr.addr.offset0,
+                        offset1=instr.addr.offset1,
+                        lds_dwords=state.lds.size_dwords,
+                    )
+                    state.lds.write_dword(idx_a, 999)
+
+        state = SIMDState(num_lanes=32, exec_mask=0, lds_dwords=1024)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        state.lds.write_dword(0, 42)
+
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(instr, state)
+        self.assertEqual(state.lds.read_dword(0), 999)
+        self.assertNotEqual(state.lds.read_dword(0), 42)
+
+
 if __name__ == "__main__":
     unittest.main()
