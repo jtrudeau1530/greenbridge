@@ -464,6 +464,60 @@ class SeededPixelTests(unittest.TestCase):
         self.assertIn("needs bufferDeviceAddress", problem)
 
 
+class SignedZeroUnjudgedWords(unittest.TestCase):
+    """cs_signed_zero_nan's -0 products (words 0, 2 and 3) aren't judged on Apple GPUs, which return +0 for them with
+    or without SignedZeroInfNanPreserve (#1203), and its 0 * inf NaN check (word 5) isn't judged on Mesa llvmpipe,
+    which returns 0 there with or without it (#664). Their other words still are, and every other device judges all."""
+    APPLE_WORDS = [0, 0x80000000, 0, 0, 1, 1, 1, 0x7C00]   # what MoltenVK returned in #664
+    LLVMPIPE = "llvmpipe (LLVM 21.1.8, 256 bits)"
+    LLVMPIPE_WORDS = [0x80000000, 0x80000000, 0x80008000, 0x8000, 1, 0, 1, 0x7C00]   # what llvmpipe returned in #664
+
+    def compute(self, device, words, subgroup="32..32"):
+        out = f"device: {device} (subgroup {subgroup})\nout[0..7] = " + " ".join(map(str, words)) + "\n"
+        with patch.object(check, "run", return_value=(0, out)):
+            return check.compute_test("tools", "spirv", "cs_signed_zero_nan", "1", "dump",
+                                      expected_words=check.SIGNED_ZERO_NAN)
+
+    def test_apple_does_not_judge_the_minus_zero_products(self):
+        self.assertEqual(self.compute("Apple M1 Max", self.APPLE_WORDS), "")
+
+    def test_apple_still_judges_the_nan_checks(self):
+        words = list(self.APPLE_WORDS)
+        words[4] = 0   # an x != x NaN check folded to false, as without the execution mode
+        self.assertNotEqual(self.compute("Apple M1 Max", words), "")
+
+    def test_llvmpipe_does_not_judge_the_zero_times_inf_check(self):
+        self.assertEqual(self.compute(self.LLVMPIPE, self.LLVMPIPE_WORDS, "8..8"), "")
+
+    def test_llvmpipe_still_judges_the_other_words(self):
+        for i, wrong in ((4, 0), (6, 0), (0, 0), (7, 0)):   # a folded NaN check, a lost -0, a lost NaN conversion
+            words = list(self.LLVMPIPE_WORDS)
+            words[i] = wrong
+            self.assertNotEqual(self.compute(self.LLVMPIPE, words, "8..8"), "", i)
+
+    def test_other_devices_judge_every_word(self):
+        self.assertNotEqual(self.compute("AMD Radeon RX 9070 XT", self.APPLE_WORDS), "")
+        self.assertNotEqual(self.compute("AMD Radeon RX 9070 XT", self.LLVMPIPE_WORDS), "")
+        self.assertEqual(self.compute("AMD Radeon RX 9070 XT", check.SIGNED_ZERO_NAN), "")
+
+    def test_only_cs_signed_zero_nan_has_unjudged_words(self):
+        out = "device: Apple M1 Max (subgroup 32..32)\n"
+        self.assertEqual(check.judged_words("cs_store", out, check.CS_STORE), check.CS_STORE)
+
+    def test_run_gpu_tests_uses_the_same_rule(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import run_gpu_tests
+        for device, words in (("Apple M1 Max (subgroup 32..32)", self.APPLE_WORDS),
+                              (self.LLVMPIPE + " (subgroup 8..8)", self.LLVMPIPE_WORDS)):
+            msg = f"device: {device}\nout[0..7] = " + " ".join(map(str, words)) + "\n"
+            want = check.judged_words("cs_signed_zero_nan", msg, check.SIGNED_ZERO_NAN)
+            ok, _ = run_gpu_tests.judge_cs_dump(0, msg, want, wave64=False, partial=False, emulated=False)
+            self.assertTrue(ok, device)
+            ok, _ = run_gpu_tests.judge_cs_dump(0, msg, check.SIGNED_ZERO_NAN, wave64=False, partial=False,
+                                                emulated=False)
+            self.assertFalse(ok, device)
+
+
 class TextureMipChecks(unittest.TestCase):
     def test_mip_draw_reports_unsupported_device_and_preserves_other_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -781,7 +835,6 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
 
 
-
 class SamplerMipChecks(unittest.TestCase):
     """The S#/T# oracle check.py judges vk_sampler_test with, against hand-worked levels."""
 
@@ -818,6 +871,7 @@ class SamplerMipChecks(unittest.TestCase):
         swapped = b"".join(struct.pack("<4f", *check.sampler_texel(0, y, x), *check.sampler_texel(1, y, x))
                            for y in range(64) for x in range(64))
         self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
+
 
 if __name__ == "__main__":
     unittest.main()

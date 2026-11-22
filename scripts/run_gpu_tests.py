@@ -32,6 +32,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIEN
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST
+from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
@@ -325,7 +326,7 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     if rc != 0 or words is None:
         return False, msg
     vals = words[:len(want)]
-    return vals == want, " ".join((hex if hexwords else str)(x) for x in vals)
+    return words_match(vals, want), " ".join((hex if hexwords else str)(x) for x in vals)
 
 
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
@@ -878,7 +879,7 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_w64",
                       "cs_w64_mask_detect",
@@ -926,6 +927,9 @@ def run_suite(a, work: str) -> int:
                 "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
                 "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
                 "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
+                # SHADER-99: -0 and NaN survive (SignedZeroInfNanPreserve, cs_signed_zero_nan.asm); 0 in out[4..7]
+                # without it
+                "cs_signed_zero_nan": [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007C00],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
                 "cs_wm_half_ops": [32, 16, 16, 0, 16],
                 "cs_wm_half_cmp": [1, 0, 1, 1],
@@ -967,7 +971,7 @@ def run_suite(a, work: str) -> int:
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
-            # cs_w32_lds_u8_d16 / cs_w32_sincos / cs_w32_int_ext / cs_w32_salu64 / cs_w32_misc_ext / cs_w32_new_ops, the wave32
+            # cs_w32_lds_u8_d16 / cs_w32_sincos / cs_w32_int_ext / cs_w32_salu64 / cs_w32_misc_ext / cs_w32_new_ops / cs_signed_zero_nan, the wave32
             # cs_wqm_w32 / cs_bpermute32 and the DPP tests is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip,
             # as check.py does, where the device has none
             # (vk_compute_test exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were
@@ -976,7 +980,7 @@ def run_suite(a, work: str) -> int:
             # size 64 without them.
             emulated = w64_emulated()
             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
-            wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
+            wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
@@ -992,9 +996,13 @@ def run_suite(a, work: str) -> int:
             if skip:   # e.g. Mesa llvmpipe's 8-wide subgroups: these 32-lane masks can't come out right
                 ok, detail = None, str(skip)
             else:
+                want = judged_words(name, msg, want)   # cs_signed_zero_nan on Apple and llvmpipe (check.py)
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16",
-                                                             "cs_lds_b64_cmpst"))
+                                                             "cs_lds_b64_cmpst", "cs_signed_zero_nan"))
+                if ok and None in want:
+                    unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
+                    detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])

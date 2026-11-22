@@ -78,6 +78,7 @@ struct ShaderMeta {
     bool writes_depth = false;
     bool needs_maintenance8 = false;
     std::vector<std::string> features;
+    std::vector<std::string> float_controls;   // VkPhysicalDeviceFloatControlsProperties members that must be true
     std::vector<uint32_t> inputs;
     std::vector<uint32_t> outputs;
     std::vector<uint32_t> params;
@@ -278,6 +279,7 @@ struct JsonParser {
             else if (k == "writes_depth") m.writes_depth = parse_bool();
             else if (k == "needs_maintenance8") m.needs_maintenance8 = parse_bool();
             else if (k == "features") m.features = parse_str_array();
+            else if (k == "float_controls") m.float_controls = parse_str_array();
             else if (k == "inputs") m.inputs = parse_u32_array();
             else if (k == "outputs") m.outputs = parse_u32_array();
             else if (k == "params") m.params = parse_u32_array();
@@ -753,8 +755,10 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceFloatControlsProperties fcProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &sgProps;
+    sgProps.pNext = &fcProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
 
@@ -874,6 +878,14 @@ int main(int argc, char** argv) {
 #else
             return "no VK_KHR_maintenance8";
 #endif
+        }
+        // Execution modes the translator declares (SignedZeroInfNanPreserve 32) need a device property, not a feature.
+        for (const auto& fc : meta.float_controls) {
+            if (fc == "shaderSignedZeroInfNanPreserveFloat32") {
+                if (!fcProps.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
+            } else {
+                return "unknown float control " + fc;
+            }
         }
         for (const auto& feat : meta.features) {
             if (feat == "meshShader" && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";
