@@ -91,6 +91,20 @@ def main():
         what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
         print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
         return 2
+    # The dictionary is written after the harvest: an --out naming one of the inputs would replace it.
+    # samefile also catches a case-only difference on Windows and macOS's default volume.
+    if os.path.exists(a.out):
+        inputs = [x for x in a.extra if os.path.isfile(x)]
+        inputs += [os.path.join(a.carve, d, "index.json") for d in os.listdir(a.carve)]
+        for x in inputs:
+            try:
+                same = os.path.isfile(x) and os.path.samefile(a.out, x)
+            except OSError:
+                same = False
+            if same:
+                print(f"ERROR: --out {a.out} is one of the inputs ({x}); choose another output file",
+                      file=sys.stderr)
+                return 2
     strings = set()
     full = set(a.archives.split(","))
     missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
