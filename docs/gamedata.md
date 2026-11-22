@@ -635,8 +635,9 @@ So `common.rpf` is the XML/config layer that mounts levels content and reference
 of its `<filename>` entries use the `script` token. It may still reference script content through non-path
 content names, which this count does not cover. The 587 `$(common)/` entries are mostly movie paths (537 end
 in `.bk2`), not XML. Of the 57 `.xml` path entries, 50 are under `$(common)/` and 7 are relative/other; none
-are under `data/` or `script/`. A further 40 `parentPath` attributes are relative references that cannot be
-resolved without the table of contents. No XInclude (`xi:include`) elements occur.
+are under `data/` or `script/`. A further 40 `parentPath` attributes are XPath-style
+`../Item[@key='...']` steps that all resolve to sibling items inside their own document, so they need no table
+of contents (see [gamedata_graph.md](gamedata_graph.md#what-the-locators-point-at)). No XInclude (`xi:include`) elements occur.
 
 ## Shore wave placement
 
