@@ -1229,6 +1229,24 @@ def mandelbrot_problem(px):
     return f"{len(wrong)} of {len(px)} iteration counts differ, e.g. pixel ({i % w}, {i // w}) {got} instead of {e}"
 
 
+def barycentric_problem(px: list[tuple[float, float, float, float]], abs_tol: float) -> str:
+    """Check ps_bary over the 64-by-64 frame covered by the vs_ids triangle."""
+    if len(px) != 64 * 64:
+        return f"expected 4096 pixels, got {len(px)}"
+    for index, pixel in enumerate(px):
+        a, b, _, _ = pixel
+        if not all(math.isfinite(v) for v in pixel):
+            return "barycentrics contain non-finite values"
+        y, x = divmod(index, 64)
+        # vs_ids exports (0,0), (2,0), (0,2) at the vertices. Check that gradient
+        # independently so a failure that zeros both interpolation paths is visible.
+        u, v = (x + 0.5) / 64, (y + 0.5) / 64
+        expected = (u, v, a / 2, b / 2)
+        if any(abs(got - want) > abs_tol for got, want in zip(pixel, expected)):
+            return f"at ({x},{y}): got {pixel}, expected {expected}"
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
@@ -1264,11 +1282,8 @@ def pixel_test(tools, spirv, name):
     if name in PIXEL_BITS:
         wrong = sum(p != PIXEL_BITS[name] for p in px)
         return "" if not wrong else f"{wrong} of {n} pixels differ, e.g. {[hex(x) for x in next(p for p in px if p != PIXEL_BITS[name])]}"
-    if name == "ps_bary":                              # raw i, j against the interpolated attr0.xy / 2
-        if any(not math.isfinite(v) for p in px for v in p):
-            return "barycentrics contain non-finite values"
-        err = max(max(abs(a / 2 - i), abs(b / 2 - j)) for a, b, i, j in px)
-        return "" if err < 1e-6 else f"barycentrics off by {err:.3g}"
+    if name == "ps_bary":
+        return barycentric_problem(px, 1e-6)
     if name == "ps_flat":
         if any(not math.isfinite(v) for p in px for v in p[2:]):
             return "UVs contain non-finite values"
