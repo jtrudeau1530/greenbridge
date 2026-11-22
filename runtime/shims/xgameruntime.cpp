@@ -36,9 +36,10 @@ std::atomic<int> g_runtime_refs{0};
 // "xgameruntime.dll" and GetProcAddress these five names (measured in the package's libHttpClient.GDK.dll and
 // XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
-// XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl and
-// XErrorImpl are served (their layouts are measured, below); for any other class QueryApiImpl logs the class and
-// interface id and refuses it, so the first boot with the executable lists the interfaces to implement next.
+// XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
+// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below); for any other class QueryApiImpl
+// logs the class and interface id and refuses it, so the first boot with the executable lists the interfaces to
+// implement next.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -116,14 +117,15 @@ constexpr GUID kIUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00,
 // The runtime's objects are process-wide singletons: AddRef/Release count but never free.
 struct RuntimeObject {
     const void* const* vtable;
-    const GUID* class_id;
+    const GUID* class_id;    // also the id of the class's first interface (xgameruntime-docs lists them as one)
+    const GUID* newer_iid;   // a later interface the same vtable serves (IXNetworkingImpl2), or null
     std::atomic<long> refs{1};
 };
 
 HRESULT STDMETHODCALLTYPE object_query_interface(void* self, REFIID iid, void** out) {
     if (!out) return E_POINTER;
     auto* o = static_cast<RuntimeObject*>(self);
-    if (iid == kIUnknown || iid == *o->class_id) {
+    if (iid == kIUnknown || iid == *o->class_id || (o->newer_iid && iid == *o->newer_iid)) {
         o->refs.fetch_add(1);
         *out = self;
         return S_OK;
@@ -220,13 +222,112 @@ const void* const kErrorVtable[] = {
     reinterpret_cast<const void*>(&error_set_options),   // 5
 };
 
-RuntimeObject g_threading{kThreadingVtable, &kThreadingClass};
-RuntimeObject g_error{kErrorVtable, &kErrorClass};
+// ---- XNetworkingImpl (IXNetworkingImpl, IXNetworkingImpl2), offline ----
+//
+// XCurl.dll asks for the class with IXNetworkingImpl2's interface id and calls slots 11-17 (docs/runtime_imports.md,
+// "Class layouts, measured"): the UTF-16 security-information query for a URL, the server certificate check, the
+// connectivity hint and its change registration. Signatures follow Microsoft's public XNetworking documentation.
+// Offline there is no network: the hint says so (initialized, no connectivity), every query that would need the
+// network fails with kNoNetwork (asynchronously, through XAsync, for the *Async calls), change registrations hand
+// out tokens whose callbacks never fire, and the IXNetworkingImpl2 additions are E_NOTIMPL.
+
+constexpr GUID kNetworkingClass = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+constexpr GUID kNetworking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
+constexpr HRESULT kNoNetwork = HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE);
+
+// XNetworkingConnectivityHint: level, cost, IANA interface type (u32 each), then four bools.
+struct ConnectivityHint {
+    uint32_t connectivity_level;   // XNetworkingConnectivityLevelHint: Unknown 0, None 1, LocalAccess 2, Internet 3
+    uint32_t connectivity_cost;    // XNetworkingConnectivityCostHint: Unknown 0, Unrestricted 1, Fixed 2, Variable 3
+    uint32_t iana_interface_type;
+    bool network_initialized;
+    bool approaching_data_limit;
+    bool over_data_limit;
+    bool roaming;
+};
+static_assert(sizeof(ConnectivityHint) == 16, "XNetworkingConnectivityHint is 16 bytes");
+
+HRESULT STDMETHODCALLTYPE net_query_port(void*, uint16_t* port) {
+    if (!port) return E_POINTER;
+    *port = 0;
+    return kNoNetwork;
+}
+// Completes `async` with kNoNetwork on its queue, as the GDK does for a query that fails.
+HRESULT start_failed_async(XAsyncBlock* async) {
+    if (!async) return E_POINTER;
+    return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return kNoNetwork; });
+}
+HRESULT STDMETHODCALLTYPE net_query_port_async(void*, XAsyncBlock* async) { return start_failed_async(async); }
+HRESULT STDMETHODCALLTYPE net_query_port_result(void*, XAsyncBlock* async, uint16_t* port) {
+    if (!async || !port) return E_POINTER;
+    *port = 0;
+    return XAsyncGetStatus(async, false);
+}
+std::atomic<uint64_t> g_net_tokens{0};
+HRESULT STDMETHODCALLTYPE net_register(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken* token) {
+    if (!token) return E_POINTER;
+    token->token = g_net_tokens.fetch_add(1) + 1;  // never fires offline: nothing changes
+    return S_OK;
+}
+bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
+HRESULT STDMETHODCALLTYPE net_security_async(void*, const void* url, XAsyncBlock* async) {
+    if (!url) return E_INVALIDARG;
+    return start_failed_async(async);
+}
+HRESULT STDMETHODCALLTYPE net_security_result_size(void*, XAsyncBlock* async, size_t* size) {
+    if (!async || !size) return E_POINTER;
+    *size = 0;
+    return XAsyncGetStatus(async, false);
+}
+HRESULT STDMETHODCALLTYPE net_security_result(void*, XAsyncBlock* async, size_t, void*, void** info, size_t* used) {
+    if (!async) return E_POINTER;
+    if (info) *info = nullptr;
+    if (used) *used = 0;
+    return XAsyncGetStatus(async, false);
+}
+HRESULT STDMETHODCALLTYPE net_verify_certificate(void*, void*, const void*) { return kNoNetwork; }
+HRESULT STDMETHODCALLTYPE net_connectivity_hint(void*, ConnectivityHint* hint) {
+    if (!hint) return E_POINTER;
+    *hint = {};
+    hint->connectivity_level = 1;   // None: the stack is up, nothing is reachable
+    hint->network_initialized = true;
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE net_not_implemented(void*) { return E_NOTIMPL; }
+
+#define NM(fn) reinterpret_cast<const void*>(&fn)
+const void* const kNetworkingVtable[] = {
+    NM(object_query_interface), NM(object_add_ref), NM(object_release),
+    NM(net_query_port),            // 3  XNetworkingQueryPreferredLocalUdpMultiplayerPort
+    NM(net_query_port_async),      // 4  ...Async
+    NM(net_query_port_result),     // 5  ...AsyncResult
+    NM(net_register),              // 6  XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged
+    NM(net_unregister),            // 7  XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged
+    NM(net_security_async),        // 8  XNetworkingQuerySecurityInformationForUrlAsync
+    NM(net_security_result_size),  // 9  ...AsyncResultSize
+    NM(net_security_result),       // 10 ...AsyncResult
+    NM(net_security_async),        // 11 XNetworkingQuerySecurityInformationForUrlUtf16Async (XCurl)
+    NM(net_security_result_size),  // 12 ...Utf16AsyncResultSize (XCurl)
+    NM(net_security_result),       // 13 ...Utf16AsyncResult (XCurl)
+    NM(net_verify_certificate),    // 14 XNetworkingVerifyServerCertificate (XCurl)
+    NM(net_connectivity_hint),     // 15 XNetworkingGetConnectivityHint (XCurl)
+    NM(net_register),              // 16 XNetworkingRegisterConnectivityHintChanged (XCurl)
+    NM(net_unregister),            // 17 XNetworkingUnregisterConnectivityHintChanged (XCurl)
+    NM(net_not_implemented),       // 18 XNetworkingQueryConfigurationSetting (IXNetworkingImpl2)
+    NM(net_not_implemented),       // 19 XNetworkingSetConfigurationSetting
+    NM(net_not_implemented),       // 20 XNetworkingQueryStatistics
+};
+#undef NM
+static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl's 15 + IXNetworkingImpl2's 3");
+
+RuntimeObject g_threading{kThreadingVtable, &kThreadingClass, nullptr};
+RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
+RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, &kNetworking2};
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error})
+        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
     }
     char cls[40], iid[40];

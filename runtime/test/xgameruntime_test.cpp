@@ -293,6 +293,50 @@ void check_run_time_load() {
         check(reinterpret_cast<SetOptions>(slot(e, 5))(e, 0, 0) == S_OK, "slot 5 is XErrorSetOptions");
         release(e);
     }
+
+    // XNetworkingImpl, asked for as XCurl.dll does: the class id with IXNetworkingImpl2's interface id.
+    const GUID networking = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+    const GUID networking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
+    const HRESULT no_network = HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE);
+    void* n = nullptr;
+    check(query(&networking, networking2, &n) == S_OK && n, "QueryApiImpl hands out XNetworkingImpl for IXNetworkingImpl2");
+    void* n1 = nullptr;
+    check(query(&networking, networking, &n1) == S_OK && n1 == n, "and the same object for IXNetworkingImpl");
+    if (n1) release(n1);
+    if (n) {
+        struct Hint {
+            uint32_t level, cost, iana;
+            bool initialized, approaching, over, roaming;
+        } hint{9, 9, 9, false, true, true, true};
+        using GetHint = HRESULT(STDMETHODCALLTYPE*)(void*, Hint*);
+        check(reinterpret_cast<GetHint>(slot(n, 15))(n, &hint) == S_OK && hint.level == 1 && hint.cost == 0 &&
+                  hint.initialized && !hint.approaching && !hint.over && !hint.roaming,
+              "slot 15 (XNetworkingGetConnectivityHint): initialized, no connectivity");
+        XAsyncBlock block{};
+        using SecurityAsync = HRESULT(STDMETHODCALLTYPE*)(void*, const wchar_t*, XAsyncBlock*);
+        using ResultSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t*);
+        size_t size = 99;
+        check(reinterpret_cast<SecurityAsync>(slot(n, 11))(n, L"https://example.invalid/", &block) == S_OK &&
+                  XAsyncGetStatus(&block, true) == no_network &&
+                  reinterpret_cast<ResultSize>(slot(n, 12))(n, &block, &size) == no_network && size == 0,
+              "slots 11/12 (UTF-16 URL security info): the async call completes with no network");
+        using Verify = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const void*);
+        check(reinterpret_cast<Verify>(slot(n, 14))(n, nullptr, nullptr) == no_network,
+              "slot 14 (XNetworkingVerifyServerCertificate) fails offline");
+        XTaskQueueRegistrationToken token{};
+        using Register = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+        using Unregister = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
+        check(reinterpret_cast<Register>(slot(n, 16))(n, nullptr, nullptr, nullptr, &token) == S_OK && token.token &&
+                  reinterpret_cast<Unregister>(slot(n, 17))(n, token, true),
+              "slots 16/17 register and unregister a connectivity-hint callback");
+        uint16_t port = 7;
+        using QueryPort = HRESULT(STDMETHODCALLTYPE*)(void*, uint16_t*);
+        using NotImpl = HRESULT(STDMETHODCALLTYPE*)(void*);
+        check(reinterpret_cast<QueryPort>(slot(n, 3))(n, &port) == no_network && port == 0 &&
+                  reinterpret_cast<NotImpl>(slot(n, 20))(n) == E_NOTIMPL,
+              "slot 3 (preferred UDP port) has no answer offline; slot 20 (IXNetworkingImpl2) is E_NOTIMPL");
+        release(n);
+    }
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
     HMODULE k32 = load_w(L"kernel32.dll");
