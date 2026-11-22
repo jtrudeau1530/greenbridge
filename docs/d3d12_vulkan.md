@@ -1,7 +1,7 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
-render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers)
+render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears)
 runs behind the Xbox-ABI device proxy (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
 set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the swapchain are not
 implemented.** This is the plan for replacing the console's
@@ -327,8 +327,12 @@ level); the set is flushed at every `ExecuteCommandLists` whether or not earlier
 flush that erases keys or moves the table to a larger buffer should wait for them, or one of their lookups can
 miss: `BindlessSet::flush_needs_idle()` says when, but the queue cannot yet tell the device that it is idle.
 
-Known gaps: buffer and constant-buffer views, root signatures, PSOs, draws, volume attachment
-views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
+A typed 3D color target supports default and explicit RTVs. The default covers mip 0; `FirstWSlice` and
+`WSize` select the depth slices in an explicit view's mip. `d3d12_clear_test --volume` checks full and
+rectangular clears of overlapping slice ranges against both Windows WARP and expected RGBA bytes.
+
+Known gaps: buffer and constant-buffer views, root signatures, PSOs, draws, typeless volume RTVs,
+placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
 1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); the GCL8

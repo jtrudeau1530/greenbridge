@@ -207,6 +207,18 @@ int main() {
     CHECK(range.baseMipLevel == 2 && range.baseArrayLayer == 3);
     CHECK(!image_range(color, 12, range));  // no plane 1 on a colour image
 
+    // A volume attachment can select slices inside a single mip. Its tracked layout covers the whole mip.
+    ResourceBinding volume = color;
+    volume.volume = true;
+    volume.array_layers = 1;
+    volume.depth = 8;
+    CHECK(detail::view_range(volume, {1, 1, 2, 2}, VK_IMAGE_ASPECT_COLOR_BIT, range));
+    CHECK(range.baseMipLevel == 1 && range.baseArrayLayer == 0 && range.layerCount == 1);
+    CHECK(!detail::view_range(volume, {1, 1, 2, 3}, VK_IMAGE_ASPECT_COLOR_BIT, range));
+    CHECK(!detail::view_range(volume, {1, 1, 4, 1}, VK_IMAGE_ASPECT_COLOR_BIT, range));
+    CHECK(!detail::view_range(volume, {1, 1, 0, 0}, VK_IMAGE_ASPECT_COLOR_BIT, range));
+    CHECK(!detail::view_range(volume, {1, 3, 0, 1}, VK_IMAGE_ASPECT_COLOR_BIT, range));
+
     // Validate the last byte of the last volume slice before recording an upload.
     detail::Prepared upload{};
     upload.binding.image = color.image;

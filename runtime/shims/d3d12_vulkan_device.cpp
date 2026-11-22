@@ -134,12 +134,31 @@ UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     return mips;
 }
 
+// A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
+leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC& resource,
+                               const D3D12_RENDER_TARGET_VIEW_DESC* view) {
+    if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) || vulkan_format(resource.Format, false).typeless)
+        return {};
+    if (view && (view->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE3D ||
+                 (view->Format != DXGI_FORMAT_UNKNOWN && view->Format != resource.Format))) return {};
+    const D3D12_TEX3D_RTV slices = view ? view->Texture3D : D3D12_TEX3D_RTV{0, 0, UINT_MAX};
+    if (slices.MipSlice >= resource.MipLevels) return {};
+    const UINT depth = std::max(1u, UINT(resource.DepthOrArraySize) >> slices.MipSlice);
+    if (slices.FirstWSlice >= depth) return {};
+    const UINT remaining = depth - slices.FirstWSlice;
+    const UINT count = slices.WSize == UINT_MAX ? remaining : slices.WSize;
+    if (!count || count > remaining) return {};
+    return {id, slices.MipSlice, slices.FirstWSlice, count};
+}
+
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
 // texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
 VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const Format& format) {
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    if (volume && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+        info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.format = format.format;
     info.extent = {std::uint32_t(desc.Width), desc.Height, volume ? UINT(desc.DepthOrArraySize) : 1u};
@@ -529,8 +548,8 @@ public:
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
         host_transfer_ = cpu_visible() && samples == 1 && device_.host_transfer_format(format.format);
         if (host_transfer_) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-        if (samples > 1 && !device_.samples_usable(info)) {
-            log_once("sample count not supported by the GPU for this format:", int(samples));
+        if ((samples > 1 || (info.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)) && !device_.samples_usable(info)) {
+            log_once("image configuration not supported by the GPU for this format:", int(format.format));
             return E_INVALIDARG;
         }
         if (vk.vkCreateImage(device_.info.device, &info, nullptr, &image_) != VK_SUCCESS) return E_OUTOFMEMORY;
@@ -735,7 +754,8 @@ private:
         transition.image = image_;
         transition.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         transition.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        transition.subresourceRange = {binding_.aspects, 0, binding_.mip_levels, 0, binding_.array_layers};
+        transition.subresourceRange = {binding_.aspects, 0, binding_.mip_levels, 0,
+                                       binding_.volume ? VK_REMAINING_ARRAY_LAYERS : binding_.array_layers};
         if (device_.transition_image_layout(dev, 1, &transition) != VK_SUCCESS) return false;
         if (binding_.not_zeroed) return true;
         const std::uint32_t planes = leonida::two_planes(binding_) ? 2 : 1;
@@ -1170,7 +1190,9 @@ public:
         if (const Resource* r = Resource::from<Resource>(resource)) {
             const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
             view = {r->id(), 0, 0, rd.DepthOrArraySize};
-            if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
+            if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                view = volume_rtv(r->id(), rd, desc);
+            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
                 view = {r->id(), desc->Texture2D.MipSlice, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) {
                 view = {r->id(), 0, 0, 1};
@@ -1460,8 +1482,8 @@ public:
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
             log_once("committed resource dimension not supported:", desc->Dimension);
         } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
-                   (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
-            log_once("volume attachment views not supported, flags:", int(desc->Flags));
+                   (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+            log_once("volume depth-stencil resources not supported, flags:", int(desc->Flags));
         } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
             hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
         } else if (const UINT samples = desc->SampleDesc.Count;
