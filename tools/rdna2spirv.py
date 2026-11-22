@@ -8763,6 +8763,12 @@ class Gen:
             r = self.tmp()
             if F2[op] in ("max", "min"):
                 self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if F2[op] == 'max' else 'NMin'} {x} {y}")
+                # RDNA2 returns S0 when S1 is NaN, including S0's payload when both are NaNs.
+                # NMin/NMax alone allow any NaN in that case.
+                nan_y, selected = self.tmp(), self.tmp()
+                self.emit(f"{nan_y} = OpIsNan %bool {y}")
+                self.emit(f"{selected} = OpSelect %float {nan_y} {x} {r}")
+                r = selected
             else:
                 self.emit(f"{r} = {F2[op]} %float {x} {y}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
