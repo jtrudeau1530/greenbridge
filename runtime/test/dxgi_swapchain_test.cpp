@@ -9,6 +9,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/dxgi_com.h"
 #include "vulkan_loader.h"
+#include "../src/vulkan_device_filter.h"
 
 #include <cmath>
 #include <cstdint>
@@ -184,17 +185,21 @@ int main() {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     std::uint32_t family = 0;
     VkPhysicalDeviceProperties chosen{};
+    int best_rank = -1;
     for (auto cand : physicals) {
         VkPhysicalDeviceProperties props{};
         get_props(cand, &props);
-        if (props.apiVersion < VK_API_VERSION_1_3) continue;
+        if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
         std::uint32_t fcnt = 0;
         get_qf(cand, &fcnt, nullptr);
         std::vector<VkQueueFamilyProperties> fams(fcnt);
         get_qf(cand, &fcnt, fams.data());
         for (std::uint32_t i = 0; i < fcnt; ++i) {
             if (!(fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-            if (!physical || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            // the runtime's pick: the first usable device of the highest rank (native driver over Dozen, #915)
+            if (const int rank = leonida::vulkan_device_rank(static_cast<int>(props.deviceType), props.vendorID);
+                rank > best_rank) {
+                best_rank = rank;
                 physical = cand;
                 family = i;
                 chosen = props;
@@ -203,9 +208,12 @@ int main() {
         }
     }
     if (!physical) {
-        std::printf("SKIP: no Vulkan 1.3 GPU found\n");
+        const std::string filter = leonida::vulkan_device_filter();
+        if (filter.empty()) std::printf("SKIP: no Vulkan 1.3 GPU found\n");
+        else std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 GPU matches\n", filter.c_str());
         if (messenger && destroy_dbg) destroy_dbg(instance, messenger, nullptr);
         destroy_inst(instance, nullptr);
+        if (!filter.empty()) return 1;  // a filter matching nothing fails, never skips
         return 77;  // ctest skips
     }
 

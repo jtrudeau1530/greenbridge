@@ -12,6 +12,7 @@
 // Exit 77 with "unsupported: ..." when the device lacks a feature the shader or sampler needs.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "../src/vulkan_device_filter.h"
 
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
@@ -93,11 +94,23 @@ int main(int argc, char** argv) {
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties props{};
+    int best_rank = -1;
     for (auto d : pds) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d, &p);
-        if (p.apiVersion < VK_API_VERSION_1_2) continue;
-        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { pd = d; props = p; }
+        if (p.apiVersion < VK_API_VERSION_1_2 || !leonida::vulkan_device_wanted(p.deviceName)) continue;
+        // the runtime's pick: the first device of the highest rank (native driver over Dozen, #915)
+        if (const int rank = leonida::vulkan_device_rank(static_cast<int>(p.deviceType), p.vendorID);
+            rank > best_rank) {
+            best_rank = rank;
+            pd = d;
+            props = p;
+        }
+    }
+    if (!pd && !leonida::vulkan_device_filter().empty()) {  // a filter matching nothing fails, never skips
+        std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.2 device matches\n",
+                     leonida::vulkan_device_filter().c_str());
+        return 1;
     }
     if (!pd) { std::printf("unsupported: no Vulkan 1.2 device\n"); return unsupported; }
     std::printf("device: %s, driver 0x%x, Vulkan %u.%u.%u\n", props.deviceName, props.driverVersion,

@@ -6311,6 +6311,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceVulkan12Features chosen12{};
     bool chosen_draw_params = false;
     leonida::Vulkan13Features v13, candidate13;
+    // The first usable device of the highest vulkan_device_rank: a native driver over Microsoft's Dozen (which says
+    // it is a discrete GPU, #915), then discrete over integrated; the test harnesses (vk_device_pick.h) pick the same.
+    int chosen_rank = -1;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
@@ -6330,7 +6333,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, families.data());
         for (std::uint32_t i = 0; i < family_count; ++i) {
             if (!(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-            if (!info.physical || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            if (const int rank = leonida::vulkan_device_rank(static_cast<int>(props.deviceType), props.vendorID);
+                rank > chosen_rank) {
+                chosen_rank = rank;
                 info.physical = candidate;
                 info.queue_family = i;
                 chosen = props;
