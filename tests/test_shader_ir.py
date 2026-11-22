@@ -213,6 +213,26 @@ class ParseLineTests(unittest.TestCase):
         )
         self.assertEqual(len(ins["args"]), 2)
 
+    def test_ds_swizzle_offset_modifier_with_spaces_stays_intact(self):
+        for mod in (
+            "offset:swizzle(QUAD_PERM, 3, 2, 1, 0)",
+            'offset:swizzle(BITMASK_PERM, "00p01")',
+            "offset:swizzle(BROADCAST, 4, 0)",
+            "offset:swizzle(SWAP, 1)",
+            "offset:swizzle(REVERSE, 4)",
+        ):
+            with self.subTest(mod=mod):
+                ins = shader_ir.parse_line(f"\tds_swizzle_b32 v0, v1 {mod} gds")
+                self.assertEqual(ins["op"], "ds_swizzle_b32")
+                self.assertEqual(ins["mods"], [mod, "gds"])
+                self.assertEqual(
+                    ins["args"],
+                    [
+                        {"k": "vgpr", "r": 0, "n": 1, "neg": False, "abs": False},
+                        {"k": "vgpr", "r": 1, "n": 1, "neg": False, "abs": False},
+                    ],
+                )
+
     def test_exp_target_is_split_from_its_operands(self):
         ins = shader_ir.parse_line("\texp mrt0 v0, v1, v2, v3")
         self.assertEqual(len(ins["args"]), 5)
