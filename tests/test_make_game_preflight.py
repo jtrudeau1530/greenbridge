@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -649,7 +650,29 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch.object(make_game, "ROOT", tmp), \
                  mock.patch("shutil.which", return_value=None):
                 self.assert_fails(make_game.ensure_submodule,
-                                  match="third_party/rpf9-explorer is missing. Download the project with:")
+                                  match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+
+    def test_ensure_submodule_zip_with_git_does_not_say_install_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_repo = subprocess.CompletedProcess([], 128)
+            with mock.patch.object(make_game, "ROOT", tmp), \
+                 mock.patch("shutil.which", return_value="/usr/bin/git"), \
+                 mock.patch("subprocess.run", return_value=not_a_repo):
+                err = self.assert_fails(make_game.ensure_submodule,
+                                        match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+                self.assertNotIn("Install Git", err)
+
+    def test_ensure_submodule_failed_fetch_in_clone_names_the_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]
+            with mock.patch.object(make_game, "ROOT", tmp), \
+                 mock.patch("shutil.which", return_value="/usr/bin/git"), \
+                 mock.patch("subprocess.run", side_effect=results), \
+                 mock.patch.object(make_game, "log"):
+                err = self.assert_fails(make_game.ensure_submodule,
+                                        match="fetching third_party/rpf9-explorer failed")
+                self.assertIn("git submodule update --init --recursive", err)
+                self.assertNotIn("Download ZIP", err)
 
 
 class GameDiscoveryTest(unittest.TestCase):

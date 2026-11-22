@@ -762,15 +762,21 @@ def ensure_submodule() -> None:
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if os.path.isdir(core) and os.listdir(core):
         return
+    clone = "git clone --recursive https://github.com/ItsNotRexed/Leonida"
     git = shutil.which("git")
-    if git and subprocess.run([git, "-C", ROOT, "rev-parse", "--resolve-git-dir", ".git"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-        log("fetching third_party/rpf9-explorer")
-        r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
-        if r.returncode == 0 and os.path.isdir(core):
-            return
-    fail("third_party/rpf9-explorer is missing. Download the project with: "
-         "git clone --recursive <this repository's URL>")
+    if not git:
+        fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). Install Git "
+             f"(https://git-scm.com/downloads) and download the project with: {clone}")
+    if subprocess.run([git, "-C", ROOT, "rev-parse", "--resolve-git-dir", ".git"],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). "
+             f"Download the project with: {clone}")
+    log("fetching third_party/rpf9-explorer")
+    r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
+    if r.returncode == 0 and os.path.isdir(core):
+        return
+    fail("fetching third_party/rpf9-explorer failed. Check your network connection, then run "
+         "\"git submodule update --init --recursive\" in this folder and build again.")
 
 
 def check(game: str, full: bool) -> dict:
