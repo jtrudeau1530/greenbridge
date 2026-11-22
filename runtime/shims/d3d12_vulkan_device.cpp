@@ -1150,9 +1150,7 @@ public:
     bool reserved() const { return reserved_; }
 
     // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors).
-    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
-        return gpu_va_ ? gpu_va_ : va_;  // gpu_va_: the device address, with ray tracing on (acceleration structures)
-    }
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return va_; }
 
     // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
     // runtime).
