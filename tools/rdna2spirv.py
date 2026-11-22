@@ -4216,16 +4216,6 @@ class Gen:
             self.compare("s_cmp_" + op[len("s_cmpk_"):], [a[0], {"k": "imm", "v": v}], scalar=True)
         elif op.startswith("s_bitcmp"):
             self.bitcmp(op, a)
-        elif op == "s_bfm_b32":
-            # Bitfield mask: ((1 << width) - 1) << offset, width/offset from the low 5 bits of the sources.
-            w, o = self.src_u(a[1]), self.src_u(a[2])
-            wm, om, one, m1, r = (self.tmp() for _ in range(5))
-            self.emit(f"{wm} = OpBitwiseAnd %uint {w} {self.cu(31)}")
-            self.emit(f"{om} = OpBitwiseAnd %uint {o} {self.cu(31)}")
-            self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {wm}")
-            self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
-            self.emit(f"{r} = OpShiftLeftLogical %uint {m1} {om}")
-            self.dst(a[0], r)
         elif op == "s_mul_hi_u32":
             x, y = self.src_u(a[1]), self.src_u(a[2])
             s, r = self.tmp(), self.tmp()
