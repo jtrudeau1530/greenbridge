@@ -54,6 +54,7 @@ import os
 import struct
 import sys
 import unittest
+from unittest import mock
 
 import support
 import spirv_mini_interp as si
@@ -450,6 +451,17 @@ class TranslatorValueSemantics(unittest.TestCase):
         # 1.0 in v_add_f16_sdwa is 0x00003c00, so src0_sel:WORD_1 reads +0.0 and BYTE_1 of 2.0 is the denormal
         # 0x0040; an SGPR source and v_cvt_f16_u16 reading the f32 bits of 1.0 are narrowed the same way.
         self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
+
+    def test_f16_denormal_operand_does_not_rely_on_unpack_half(self):
+        # NVIDIA's UnpackHalf2x16 reads f16 denormals as 0 (RTX 5060 Ti, 610.88). Word y multiplies the denormal
+        # 0x0040 by 1024.0, so it stays 0x1c00 only if the translator widens denormals without UnpackHalf2x16.
+        real = si.half_to_float
+
+        def flushing(h):
+            return math.copysign(0.0, -1.0 if h & 0x8000 else 1.0) if (h & 0x7C00) == 0 else real(h)
+
+        with mock.patch.object(si, "half_to_float", flushing):
+            self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
