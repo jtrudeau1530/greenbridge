@@ -122,6 +122,13 @@ class LdsAtomicValues(unittest.TestCase):
                 got = run_atomic("ds_cmpst_rtn_b32 v5, v1, v3, v4", m, data=(cmp_, new))
                 self.assertEqual(got, (m, new if m == cmp_ else m))
 
+    def test_cmpst_without_return(self):
+        # ds_cmpst_b32 vaddr, data0, data1: the same compare-and-store, vdst untouched.
+        for m, cmp_, new in ((5, 5, 9), (5, 6, 9), (0x80000000, 0x80000000, 1)):
+            with self.subTest(m=hex(m), cmp=hex(cmp_), new=hex(new)):
+                got = run_atomic("ds_cmpst_b32 v1, v3, v4", m, data=(cmp_, new))
+                self.assertEqual(got, (0xDEAD, new if m == cmp_ else m))
+
     def test_offset_addresses_the_same_dword(self):
         self.assertEqual(run_atomic("ds_add_rtn_u32 v5, v1, v3", 40, addr=0x20, offset=0x24, data=(2,)), (40, 42))
 
