@@ -198,7 +198,7 @@ class SkipAssetsAndStageIsolationTest(unittest.TestCase):
                 mock.patch.object(make_game, "tool_available", return_value=True), \
                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                 mock.patch("shutil.disk_usage", return_value=mock.Mock(free=100 * (2**30))):
-            make_game.preflight(["shaders", "runtime", "pipelines"], self.work_dir, wav=True)
+            make_game.preflight(["shaders", "pipelines"], self.work_dir, wav=True)  # no runtime: Windows-only
             mock_dotnet.assert_not_called()
             mock_submodule.assert_not_called()
 
