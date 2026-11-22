@@ -180,16 +180,23 @@ def parse_awc(d: bytes):
         raise ValueError("not a little-endian AWC")
     flags, n, header_size = struct.unpack_from("<III", d, 4)
     p = 16 + (4 if flags & 0x400000 else 0)
-    if flags & 0x10000:
+    index_at = p if flags & 0x10000 else -1
+    if index_at >= 0:
         p += n * 2
     if flags & 0x200000:
         p += (n + 1) * 4
     info = p
     p += n * 4
     streams, music = [], []
+    tags = 0
     for i in range(n):
         v = struct.unpack_from("<I", d, info + 4 * i)[0]
         sid, ntags = v & 0x1FFFFFFF, v >> 29
+        if index_at >= 0:
+            index, = struct.unpack_from("<H", d, index_at + 2 * i)
+            if index != tags:
+                raise ValueError(f"AWC index entry {i} does not match the cumulative tag count")
+        tags += ntags
         data = fmt = mus = None
         for _ in range(ntags):
             t = struct.unpack_from("<Q", d, p)[0]
