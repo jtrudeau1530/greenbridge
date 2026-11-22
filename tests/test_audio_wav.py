@@ -4,6 +4,8 @@
 
 The decode tests use synthetic audio and skip when ffmpeg is not on PATH.
 """
+import contextlib
+import io
 import os
 from pathlib import Path
 import shutil
@@ -427,6 +429,8 @@ class SameStemTest(unittest.TestCase):
             c = chr(n)
             self.assertEqual(audio_wav.fold_name(c), audio_wav.fold_name(os.path.normcase(c)), hex(n))
 
+
+class FakeFfmpegDecodeTest(unittest.TestCase):
     def test_every_input_gets_its_own_wav(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in")
@@ -462,6 +466,79 @@ class SameStemTest(unittest.TestCase):
             p = subprocess.run(run, capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("0 WAV written, 3 already present", p.stdout)
+
+
+class AudioWavCliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.src_dir = os.path.join(self.dir, "in")
+        os.makedirs(self.src_dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_cli_rejects_jobs_below_one(self):
+        for val in ("0", "-1", "-5"):
+            with self.subTest(val=val):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    audio_wav.main([self.src_dir, "--jobs", val])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("--jobs must be at least 1", err.getvalue())
+
+    def test_cli_subprocess_rejects_jobs_below_one(self):
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src_dir, "--jobs", "0"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--jobs must be at least 1", p.stderr)
+
+    def test_cli_rejects_out_file(self):
+        out_file = os.path.join(self.dir, "out_file")
+        with open(out_file, "wb") as f:
+            f.write(b"content")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            audio_wav.main([self.src_dir, "--out", out_file])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is a file, not a folder", err.getvalue())
+
+    def test_cli_subprocess_rejects_out_file(self):
+        out_file = os.path.join(self.dir, "out_file")
+        with open(out_file, "wb") as f:
+            f.write(b"content")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src_dir, "--out", out_file],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("is a file, not a folder", p.stderr)
+
+    def test_cli_rejects_missing_source(self):
+        missing = os.path.join(self.dir, "nonexistent")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = audio_wav.main([missing])
+        self.assertEqual(code, 2)
+        self.assertIn(f"source not found: {missing}", err.getvalue())
+
+    def test_cli_rejects_non_opus_file_extension(self):
+        txt_file = os.path.join(self.dir, "test.txt")
+        with open(txt_file, "wb") as f:
+            f.write(b"hello")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = audio_wav.main([txt_file])
+        self.assertEqual(code, 2)
+        self.assertIn("is not an .ogg/.opus file", err.getvalue())
+
+    def test_cli_rejects_file_not_opus(self):
+        bogus_ogg = os.path.join(self.dir, "test.ogg")
+        with open(bogus_ogg, "wb") as f:
+            f.write(b"NotOpusData" * 10)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = audio_wav.main([bogus_ogg])
+        self.assertEqual(code, 2)
+        self.assertIn("is not Ogg Opus", err.getvalue())
 
 
 if __name__ == "__main__":
