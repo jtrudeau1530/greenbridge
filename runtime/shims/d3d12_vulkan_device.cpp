@@ -19,6 +19,7 @@
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
+#include "../src/cached_pso.h"
 #include "../src/shader_library.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
@@ -382,6 +383,7 @@ struct DeviceState {
     PFN_vkGetPhysicalDeviceImageFormatProperties2 image_format_properties2 = nullptr;
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
     LUID luid{};       // VkPhysicalDeviceIDProperties::deviceLUID; zero when the driver reports none
+    leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
     QueueClock clock;  // what every queue's GetClockCalibration uses
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
@@ -2010,12 +2012,138 @@ class RootSignature final
 public:
     // {3e9b4a61-2d7c-4f18-b5a0-c71e8d92f036}
     static constexpr GUID kTag{0x3e9b4a61, 0x2d7c, 0x4f18, {0xb5, 0xa0, 0xc7, 0x1e, 0x8d, 0x92, 0xf0, 0x36}};
-    explicit RootSignature(RootArgumentLayout layout) : layout_(std::move(layout)) {}
+    RootSignature(RootArgumentLayout layout, std::string content)
+        : layout_(std::move(layout)), content_(std::move(content)) {}
     const RootArgumentLayout& layout() const { return layout_; }
+    // SHA-256 of the serialized root signature: a cached PSO matches root signatures with the same content.
+    const std::string& content() const { return content_; }
 
 private:
     RootArgumentLayout layout_;
+    std::string content_;
 };
+
+// The ID3DBlob GetCachedBlob returns.
+class CachedBlob final : public ID3DBlob {
+public:
+    explicit CachedBlob(std::vector<std::uint8_t> bytes) : bytes_(std::move(bytes)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D10Blob)) {
+            AddRef();
+            *out = static_cast<ID3DBlob*>(this);
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (!left) delete this;
+        return left;
+    }
+    LPVOID STDMETHODCALLTYPE GetBufferPointer() override { return bytes_.data(); }
+    SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return bytes_.size(); }
+
+private:
+    std::vector<std::uint8_t> bytes_;
+    std::atomic<ULONG> refs_{1};
+};
+
+// A shader as the key sees it, without reading the whole program on every PSO: a DXBC container already carries a
+// checksum of its contents (bytes 4..19), so that and the size stand for it. A container without one (all zero, as
+// hand-built test containers have) or other bytecode is hashed with FNV-1a.
+void key_shader(leonida::cached_pso::KeyBuilder& key, const char* stage, const D3D12_SHADER_BYTECODE& code) {
+    const auto* bytes = static_cast<const std::uint8_t*>(code.pShaderBytecode);
+    const std::size_t size = bytes ? code.BytecodeLength : 0;
+    key.tag(stage).u32(std::uint32_t(size)).u32(std::uint32_t(std::uint64_t(size) >> 32));
+    if (size >= 20 && std::memcmp(bytes, "DXBC", 4) == 0 &&
+        std::any_of(bytes + 4, bytes + 20, [](std::uint8_t b) { return b != 0; })) {
+        key.bytes(bytes + 4, 16);
+        return;
+    }
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    for (std::size_t i = 0; i < size; ++i) h = (h ^ bytes[i]) * 0x100000001b3ull;
+    key.u32(std::uint32_t(h)).u32(std::uint32_t(h >> 32));
+}
+
+void key_root_signature(leonida::cached_pso::KeyBuilder& key, ID3D12RootSignature* signature);
+
+// The parts of a compute description the PC runtime matches a cached PSO against (not Flags, measured).
+leonida::cached_pso::Key pipeline_key(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
+    leonida::cached_pso::KeyBuilder key;
+    key.tag("compute");
+    key_root_signature(key, desc.pRootSignature);
+    key_shader(key, "cs", desc.CS);
+    key.u32(desc.NodeMask);
+    return leonida::sha256_hex(key.data());
+}
+
+leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    leonida::cached_pso::KeyBuilder key;
+    key.tag("graphics");
+    key_root_signature(key, desc.pRootSignature);
+    key_shader(key, "vs", desc.VS);
+    key_shader(key, "ps", desc.PS);
+    key_shader(key, "ds", desc.DS);
+    key_shader(key, "hs", desc.HS);
+    key_shader(key, "gs", desc.GS);
+    const D3D12_STREAM_OUTPUT_DESC& so = desc.StreamOutput;
+    key.u32(so.pSODeclaration ? so.NumEntries : 0);
+    for (UINT i = 0; so.pSODeclaration && i < so.NumEntries; ++i) {
+        const D3D12_SO_DECLARATION_ENTRY& e = so.pSODeclaration[i];
+        key.u32(e.Stream).text(e.SemanticName).u32(e.SemanticIndex).u32(e.StartComponent).u32(e.ComponentCount);
+        key.u32(e.OutputSlot);
+    }
+    key.u32(so.pBufferStrides ? so.NumStrides : 0);
+    for (UINT i = 0; so.pBufferStrides && i < so.NumStrides; ++i) key.u32(so.pBufferStrides[i]);
+    key.u32(so.RasterizedStream);
+    const D3D12_BLEND_DESC& blend = desc.BlendState;
+    key.u32(blend.AlphaToCoverageEnable).u32(blend.IndependentBlendEnable);
+    for (const D3D12_RENDER_TARGET_BLEND_DESC& t : blend.RenderTarget)
+        key.u32(t.BlendEnable).u32(t.LogicOpEnable).u32(t.SrcBlend).u32(t.DestBlend).u32(t.BlendOp).u32(t.SrcBlendAlpha)
+            .u32(t.DestBlendAlpha).u32(t.BlendOpAlpha).u32(t.LogicOp).u32(t.RenderTargetWriteMask);
+    key.u32(desc.SampleMask);
+    const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
+    std::uint32_t bias_clamp = 0, slope = 0;
+    std::memcpy(&bias_clamp, &r.DepthBiasClamp, 4);
+    std::memcpy(&slope, &r.SlopeScaledDepthBias, 4);
+    key.u32(r.FillMode).u32(r.CullMode).u32(r.FrontCounterClockwise).u32(std::uint32_t(r.DepthBias)).u32(bias_clamp);
+    key.u32(slope).u32(r.DepthClipEnable).u32(r.MultisampleEnable).u32(r.AntialiasedLineEnable);
+    key.u32(r.ForcedSampleCount).u32(r.ConservativeRaster);
+    const D3D12_DEPTH_STENCIL_DESC& d = desc.DepthStencilState;
+    key.u32(d.DepthEnable).u32(d.DepthWriteMask).u32(d.DepthFunc).u32(d.StencilEnable).u32(d.StencilReadMask);
+    key.u32(d.StencilWriteMask);
+    for (const D3D12_DEPTH_STENCILOP_DESC& face : {d.FrontFace, d.BackFace})
+        key.u32(face.StencilFailOp).u32(face.StencilDepthFailOp).u32(face.StencilPassOp).u32(face.StencilFunc);
+    const D3D12_INPUT_LAYOUT_DESC& input = desc.InputLayout;
+    key.u32(input.pInputElementDescs ? input.NumElements : 0);
+    for (UINT i = 0; input.pInputElementDescs && i < input.NumElements; ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& e = input.pInputElementDescs[i];
+        key.text(e.SemanticName).u32(e.SemanticIndex).u32(e.Format).u32(e.InputSlot).u32(e.AlignedByteOffset);
+        key.u32(e.InputSlotClass).u32(e.InstanceDataStepRate);
+    }
+    key.u32(desc.IBStripCutValue).u32(desc.PrimitiveTopologyType).u32(desc.NumRenderTargets);
+    for (const DXGI_FORMAT format : desc.RTVFormats) key.u32(format);
+    key.u32(desc.DSVFormat).u32(desc.SampleDesc.Count).u32(desc.SampleDesc.Quality).u32(desc.NodeMask);
+    return leonida::sha256_hex(key.data());
+}
+
+// CachedPSO as the PC runtime checks it before creating the PSO (src/cached_pso.h has the measured answers).
+HRESULT check_cached_pso(const leonida::cached_pso::Identity& identity, const leonida::cached_pso::Key& key,
+                         const D3D12_CACHED_PIPELINE_STATE& cached) {
+    if (!cached.pCachedBlob) return S_OK;
+    if (!cached.CachedBlobSizeInBytes) return E_INVALIDARG;
+    using leonida::cached_pso::Check;
+    switch (leonida::cached_pso::check(identity, key,
+                                       {static_cast<const std::uint8_t*>(cached.pCachedBlob), cached.CachedBlobSizeInBytes})) {
+    case Check::accepted: return S_OK;
+    case Check::other_adapter: return D3D12_ERROR_ADAPTER_NOT_FOUND;
+    case Check::other_driver: return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    default: return E_INVALIDARG;
+    }
+}
 
 // A pipeline state. Compute only for now: the shader is found by the SHA-256 of its FSSM program in the
 // translator's index, and the FSSM blob is copied into the arena as the shader's code base.
@@ -2067,6 +2195,15 @@ public:
     }
 
     std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
+    void set_cache_key(leonida::cached_pso::Key key) { cache_key_ = std::move(key); }
+
+    // A null pointer is accepted with S_OK, as by the PC runtime (measured on an RTX 3060 and WARP).
+    HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob** blob) override {
+        if (!blob) return S_OK;
+        *blob = new CachedBlob(leonida::cached_pso::encode(device_.pso_identity, cache_key_));
+        return S_OK;
+    }
+
     bool compute() const { return registered_ && !is_graphics_; }
     bool graphics() const { return registered_ && is_graphics_; }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
@@ -2609,7 +2746,19 @@ private:
     bool registered_ = false;
     bool is_graphics_ = false;
     std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
+    leonida::cached_pso::Key cache_key_;
 };
+
+void key_root_signature(leonida::cached_pso::KeyBuilder& key, ID3D12RootSignature* signature) {
+    if (!signature) {
+        key.tag("no root signature");
+    } else if (const RootSignature* own = RootSignature::from<RootSignature>(signature)) {
+        key.tag("root signature").text(own->content().c_str());
+    } else {
+        const auto address = reinterpret_cast<std::uintptr_t>(signature);
+        key.tag("foreign root signature").bytes(&address, sizeof(address));
+    }
+}
 
 // A view of a texture as Create*View describes it, before the resource's own shape is applied.
 struct TextureView {
@@ -3071,6 +3220,10 @@ public:
             if (get_props) {
                 VkPhysicalDeviceProperties props{};
                 get_props(info.physical, &props);
+                state_.pso_identity.vendor = props.vendorID;
+                state_.pso_identity.device = props.deviceID;
+                state_.pso_identity.driver = props.driverVersion;
+                std::memcpy(state_.pso_identity.cache_uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
                 if (state_.info.max_push_constants_size == 0) {
                     state_.info.max_push_constants_size = props.limits.maxPushConstantsSize;
                     state_.info.push_constants_need_fallback = (state_.info.max_push_constants_size < 144);
@@ -3784,7 +3937,8 @@ public:
                 }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values});
         }
-        auto* signature = new RootSignature(std::move(layout));
+        auto* signature = new RootSignature(
+            std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));
         signature->attach_device(identity());
         return hand_out(signature, riid, out);
     }
@@ -3795,12 +3949,15 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!desc) return E_INVALIDARG;
+        leonida::cached_pso::Key key = pipeline_key(*desc);
+        if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, desc->CachedPSO); FAILED(hr)) return hr;
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         if (const HRESULT hr = pipeline->create_compute(*desc); FAILED(hr)) {
             pipeline->Release();
             return hr;
         }
+        pipeline->set_cache_key(std::move(key));
         return hand_out(pipeline, riid, out);
     }
 
@@ -3809,12 +3966,15 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!desc) return E_INVALIDARG;
+        leonida::cached_pso::Key key = pipeline_key(*desc);
+        if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, desc->CachedPSO); FAILED(hr)) return hr;
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         if (const HRESULT hr = pipeline->create_graphics(*desc); FAILED(hr)) {
             pipeline->Release();
             return hr;
         }
+        pipeline->set_cache_key(std::move(key));
         return hand_out(pipeline, riid, out);
     }
 
