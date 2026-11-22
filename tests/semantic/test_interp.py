@@ -172,6 +172,46 @@ class InterpreterTests(unittest.TestCase):
                     with self.assertRaises(si.UnsupportedConstruct):
                         si.run_fragment(body)
 
+    WIDE = HEADER.replace("%c0 = OpConstant %uint 0",
+                          "%ulong = OpTypeInt 64 0\n"
+                          "%cl_1 = OpConstant %ulong 1\n"
+                          "%cl_2p31 = OpConstant %ulong 2147483648\n"
+                          "%cl_2p32 = OpConstant %ulong 4294967296\n"
+                          "%cl_2p32_5 = OpConstant %ulong 4294967301\n"
+                          "%cl_hi = OpConstant %ulong 18446744069414584320\n"       # 0xFFFFFFFF00000000 = -2**32
+                          "%cl_m1 = OpConstant %ulong 18446744073709551615\n"
+                          "%c0 = OpConstant %uint 0")
+
+    def test_bit_count_counts_every_bit_of_a_64bit_operand(self):
+        # OpBitCount counts the set bits of its operand, whatever the width of the (32-bit) result.
+        for src, want in (("%cl_hi", 32), ("%cl_m1", 64), ("%cl_2p32_5", 3), ("%cl_1", 1)):
+            with self.subTest(src=src):
+                out = si.run_fragment(self.WIDE + f"%res = OpBitCount %uint {src}\nOpStore %out %res\n" + FOOTER)
+                self.assertEqual(out["%out"], (want,))
+        self.assertEqual(run_word("%res = OpBitCount %uint %cF0\n"), 28)
+
+    def test_signed_min_max_clamp_abs_use_the_width_of_a_64bit_type(self):
+        # GLSL.std.450 SMin/SMax/SClamp/SAbs read their operands as signed at the width of their type. 2**31 is
+        # positive in a 64-bit integer and 0xFFFFFFFF00000000 is -2**32; a 32-bit reading takes them as
+        # -2**31 and 0.
+        for inst, want in (("SMin %cl_2p31 %cl_1", "%cl_1"), ("SMax %cl_2p31 %cl_1", "%cl_2p31"),
+                           ("SMin %cl_hi %cl_1", "%cl_hi"), ("SMax %cl_hi %cl_m1", "%cl_m1"),
+                           ("SClamp %cl_2p31 %cl_1 %cl_2p32", "%cl_2p31"), ("SClamp %cl_hi %cl_m1 %cl_1", "%cl_m1"),
+                           ("SAbs %cl_hi", "%cl_2p32"), ("SAbs %cl_2p32_5", "%cl_2p32_5"), ("SAbs %cl_m1", "%cl_1")):
+            with self.subTest(inst=inst):
+                out = si.run_fragment(self.WIDE + f"%r = OpExtInst %ulong %glsl {inst}\n"
+                                      f"%eq = OpIEqual %bool %r {want}\n%res = OpSelect %uint %eq %c1 %c0\n"
+                                      "OpStore %out %res\n" + FOOTER)
+                self.assertEqual(out["%out"], (1,))
+
+    def test_find_bit_of_a_64bit_operand_is_rejected(self):
+        # GLSL.std.450 limits FindILsb, FindSMsb and FindUMsb to 32-bit components.
+        for name in ("FindILsb", "FindSMsb", "FindUMsb"):
+            with self.subTest(name=name):
+                with self.assertRaises(si.UnsupportedConstruct):
+                    si.run_fragment(self.WIDE + f"%r = OpExtInst %ulong %glsl {name} %cl_2p32\n"
+                                    "%res = OpUConvert %uint %r\nOpStore %out %res\n" + FOOTER)
+
     def test_round_even_clamp_max(self):
         # RoundEven sends halves to the even neighbour: 2.5 -> 2, 3.5 -> 4.
         self.assertEqual(run_word("%x = OpExtInst %float %glsl RoundEven %f2p5\n%res = OpBitcast %uint %x\n"),

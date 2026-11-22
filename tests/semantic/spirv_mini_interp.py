@@ -790,7 +790,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
             values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op == "OpBitCount":
-            values[res] = (val(a[1]) & wmask(a[0])).bit_count()
+            # Every bit of the operand counts: its width, not the result's (a 64-bit operand with a 32-bit result).
+            t = types.t.get(id_type.get(a[1]))
+            values[res] = (val(a[1]) & wmask(id_type[a[1]] if t is not None and t[0] == "int" else a[0])).bit_count()
         elif op == "OpISubBorrow":
             x, y = val(a[1]) & MASK, val(a[2]) & MASK
             values[res] = ((x - y) & MASK, 1 if x < y else 0)
@@ -982,7 +984,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = 1.0 if x > 0 else -1.0 if x < 0 else x
             elif name == "SAbs":
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
-                values[res] = abs(_s32(args[0])) & MASK
+                values[res] = abs(signed(args[0], types.bits(a[0]))) & wmask(a[0])
             elif name in ("FMax", "FClamp"):
                 def fmax_clamp(*xs):
                     if any(math.isnan(v) for v in xs) or (name == "FClamp" and xs[1] > xs[2]):
@@ -1044,16 +1046,18 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name == "UMax":
                 values[res] = max(args)
             elif name == "SMax":
-                values[res] = max(args, key=_s32)
+                values[res] = max(args, key=lambda v: signed(v, types.bits(a[0])))
             elif name == "SMin":
-                values[res] = min(args, key=_s32)
+                values[res] = min(args, key=lambda v: signed(v, types.bits(a[0])))
             elif name in ("UClamp", "SClamp"):
                 # min(max(x, minVal), maxVal) (GLSL.std.450; undefined if minVal > maxVal, which raises here).
-                key = _s32 if name == "SClamp" else (lambda v: v)
+                key = (lambda v: signed(v, types.bits(a[0]))) if name == "SClamp" else (lambda v: v)
                 x, lo, hi = args
                 if key(lo) > key(hi):
                     raise UnsupportedConstruct(f"{name} with minVal > maxVal (undefined)")
                 values[res] = min(max(x, lo, key=key), hi, key=key)
+            elif name in ("FindILsb", "FindUMsb", "FindSMsb") and types.bits(a[0]) != 32:
+                raise UnsupportedConstruct(f"GLSL.std.450 {name} on a non-32-bit integer (32-bit components only)")
             elif name == "FindILsb":
                 # Bit number of the least significant 1 bit, -1 if the value is 0 (GLSL.std.450).
                 x = args[0] & MASK

@@ -770,7 +770,9 @@ class _Wave:
                 x = _signed(x, src_bits)
             return x & w
         if op == "OpBitCount":
-            return (self.int_of(lane, a[1]) & MASK).bit_count()
+            # Every bit of the operand counts: its width, not 32 (a 64-bit operand with a 32-bit result).
+            src_bits = m.bits(m.id_type[a[1]]) if a[1] in m.id_type else 32
+            return (self.int_of(lane, a[1]) & ((1 << src_bits) - 1)).bit_count()
         if op == "OpBitReverse":
             return int(f"{self.int_of(lane, a[1]) & w:0{bits}b}"[::-1], 2)
         if op in ("OpUDiv", "OpUMod"):
@@ -815,7 +817,8 @@ class _Wave:
             raise UnsupportedConstruct(f"extended instruction set {a[1]}")
         name = a[2]
         args = [self.int_of(lane, x) for x in a[3:]]
-        s = lambda v: _signed(v, 32)  # noqa: E731
+        bits = self.m.bits(a[0])        # the operands have the result's type (GLSL.std.450)
+        s = lambda v: _signed(v, bits)  # noqa: E731
         if name == "UMin":
             return min(args)
         if name == "UMax":
@@ -825,13 +828,15 @@ class _Wave:
         if name == "SMax":
             return max(args, key=s)
         if name == "SAbs":
-            return abs(s(args[0])) & MASK
+            return abs(s(args[0])) & ((1 << bits) - 1)
         if name in ("UClamp", "SClamp"):
             key = s if name == "SClamp" else (lambda v: v)
             x, lo, hi = args
             if key(lo) > key(hi):
                 raise UnsupportedConstruct(f"{name} with minVal > maxVal (undefined)")
             return min(max(x, lo, key=key), hi, key=key)
+        if name in ("FindILsb", "FindUMsb", "FindSMsb") and bits != 32:
+            raise UnsupportedConstruct(f"GLSL.std.450 {name} on a {bits}-bit integer (limited to 32-bit components)")
         if name == "FindILsb":
             x = args[0] & MASK
             return ((x & -x).bit_length() - 1) & MASK if x else MASK

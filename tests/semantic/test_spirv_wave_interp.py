@@ -163,6 +163,54 @@ OpStore %out %v
             outs(body)
 
 
+class WideIntegers(unittest.TestCase):
+    """OpBitCount and the GLSL.std.450 signed integer operations on a 64-bit type."""
+    HEAD64 = (HEAD.replace("OpMemoryModel", '%glsl = OpExtInstImport "GLSL.std.450"\nOpMemoryModel')
+              .replace("%c0 = OpConstant %uint 0",
+                       "%ulong = OpTypeInt 64 0\n"
+                       "%cl_1 = OpConstant %ulong 1\n"
+                       "%cl_2p31 = OpConstant %ulong 2147483648\n"
+                       "%cl_2p32 = OpConstant %ulong 4294967296\n"
+                       "%cl_2p32_5 = OpConstant %ulong 4294967301\n"
+                       "%cl_hi = OpConstant %ulong 18446744069414584320\n"      # 0xFFFFFFFF00000000 = -2**32
+                       "%cl_m1 = OpConstant %ulong 18446744073709551615\n"
+                       "%c0 = OpConstant %uint 0"))
+
+    def lane0(self, body):
+        return run_wave(self.HEAD64 + body + "%v = OpCompositeConstruct %v4uint %res %c0 %c0 %c0\n"
+                        "OpStore %out %v\n" + TAIL, wave=32)["outputs"][0]["%out"][0]
+
+    def test_bit_count_counts_every_bit_of_a_64bit_operand(self):
+        for src, want in (("%cl_hi", 32), ("%cl_m1", 64), ("%cl_2p32_5", 3), ("%cl_1", 1), ("%c3", 2)):
+            with self.subTest(src=src):
+                self.assertEqual(self.lane0(f"%res = OpBitCount %uint {src}\n"), want)
+
+    def test_signed_min_max_clamp_abs_use_the_width_of_a_64bit_type(self):
+        # 2**31 is positive in a 64-bit integer and 0xFFFFFFFF00000000 is -2**32; a 32-bit reading takes them
+        # as -2**31 and 0.
+        for inst, want in (("SMin %cl_2p31 %cl_1", "%cl_1"), ("SMax %cl_2p31 %cl_1", "%cl_2p31"),
+                           ("SMin %cl_hi %cl_1", "%cl_hi"), ("SMax %cl_hi %cl_m1", "%cl_m1"),
+                           ("SClamp %cl_2p31 %cl_1 %cl_2p32", "%cl_2p31"), ("SClamp %cl_hi %cl_m1 %cl_1", "%cl_m1"),
+                           ("SAbs %cl_hi", "%cl_2p32"), ("SAbs %cl_2p32_5", "%cl_2p32_5"), ("SAbs %cl_m1", "%cl_1")):
+            with self.subTest(inst=inst):
+                self.assertEqual(self.lane0(f"%r = OpExtInst %ulong %glsl {inst}\n"
+                                            f"%eq = OpIEqual %bool %r {want}\n"
+                                            "%res = OpSelect %uint %eq %c1 %c0\n"), 1)
+
+    def test_32bit_signed_operations_are_unchanged(self):
+        self.assertEqual(self.lane0("%m1 = OpISub %uint %c0 %c1\n%res = OpExtInst %uint %glsl SMin %m1 %c1\n"),
+                         0xFFFFFFFF)
+        self.assertEqual(self.lane0("%m1 = OpISub %uint %c0 %c1\n%res = OpExtInst %uint %glsl SAbs %m1\n"), 1)
+        self.assertEqual(self.lane0("%res = OpExtInst %uint %glsl FindUMsb %c8\n"), 3)
+
+    def test_find_bit_of_a_64bit_operand_is_rejected(self):
+        # GLSL.std.450 limits FindILsb, FindSMsb and FindUMsb to 32-bit components.
+        for name in ("FindILsb", "FindSMsb", "FindUMsb"):
+            with self.subTest(name=name):
+                with self.assertRaises(UnsupportedConstruct):
+                    self.lane0(f"%r = OpExtInst %ulong %glsl {name} %cl_2p32\n%res = OpUConvert %uint %r\n")
+
+
 class Strictness(unittest.TestCase):
     def test_float_arithmetic_is_rejected(self):
         body = """%f = OpBitcast %uint %c1
