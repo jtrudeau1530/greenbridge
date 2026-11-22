@@ -66,17 +66,23 @@ class _Writer:
         if index > self.emitted:
             raise EncodeError("descriptor", f"descriptor {index} is used before descriptor {self.emitted}")
         self.out += bytes((index, kind))
+        name = node.get("name", "")
         if index == self.emitted:
-            name = node.get("name", "")
             if index in self.bad_names:
                 raise EncodeError("utf8", f"descriptor {index} name had invalid UTF-8")
             if index < len(self.names) and self.names[index] not in (None, name):
                 raise EncodeError("descriptor", f"descriptor {index} is named both {self.names[index]!r} and {name!r}")
+            if index == len(self.names):
+                self.names.append(name)
+            else:
+                self.names[index] = name
             raw = name.encode("utf-8")
             if len(raw) > 0xFFFF:
                 raise EncodeError("length", f"descriptor {index} name is {len(raw)} bytes")
             self.out += struct.pack("<H", len(raw)) + raw
             self.emitted += 1
+        elif index < len(self.names) and self.names[index] not in (None, name):
+            raise EncodeError("descriptor", f"descriptor {index} is named both {self.names[index]!r} and {name!r}")
 
     def float_bits(self, value, special):
         if special is not None:
