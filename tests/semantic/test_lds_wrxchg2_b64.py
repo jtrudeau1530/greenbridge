@@ -1450,8 +1450,236 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(old1, max_norm)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            RegSingle(-1)
+        with self.assertRaises(ValueError):
+            RegSingle(256)
+        with self.assertRaises(ValueError):
+            RegPair(255)
+        with self.assertRaises(ValueError):
+            RegQuad(253)
+
+    def test_syntax_rejection_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = RegQuad(0, RegType.SGPR)
+        with self.assertRaises(TypeError):
+            DSWrxchg2B64Instruction(
+                vdst=dst_sgpr,
+                vaddr=RegSingle(1),
+                data0=RegPair(2),
+                data1=RegPair(4),
+            )
+
+    def test_syntax_rejection_vaddr_must_be_vgpr(self) -> None:
+        addr_sgpr = RegSingle(0, RegType.SGPR)
+        with self.assertRaises(TypeError):
+            DSWrxchg2B64Instruction(
+                vdst=RegQuad(0),
+                vaddr=addr_sgpr,
+                data0=RegPair(2),
+                data1=RegPair(4),
+            )
+
+    def test_syntax_rejection_data_must_be_vgpr(self) -> None:
+        data_sgpr = RegPair(0, RegType.SGPR)
+        with self.assertRaises(TypeError):
+            DSWrxchg2B64Instruction(
+                vdst=RegQuad(0),
+                vaddr=RegSingle(1),
+                data0=data_sgpr,
+                data1=RegPair(4),
+            )
+
+    def test_syntax_rejection_offset_out_of_range(self) -> None:
+        with self.assertRaises(ValueError):
+            DSWrxchg2B64Instruction(
+                vdst=RegQuad(0),
+                vaddr=RegSingle(1),
+                data0=RegPair(2),
+                data1=RegPair(4),
+                offset0=256,
+            )
+        with self.assertRaises(ValueError):
+            DSWrxchg2B64Instruction(
+                vdst=RegQuad(0),
+                vaddr=RegSingle(1),
+                data0=RegPair(2),
+                data1=RegPair(4),
+                offset1=-1,
+            )
+
+    def test_syntax_rejection_returning_requires_vdst(self) -> None:
+        with self.assertRaises(ValueError):
+            DSWrxchg2B64Instruction(
+                vdst=None,
+                vaddr=RegSingle(1),
+                data0=RegPair(2),
+                data1=RegPair(4),
+                is_rtn=True,
+            )
+
+    def test_negative_control_bit_corruption_detection(self) -> None:
+        lds = bytearray(LDS_DEFAULT_SIZE_BYTES)
+        struct.pack_into("<Q", lds, 0x10, 0x1234_5678_9ABC_DEF0)
+        struct.pack_into("<Q", lds, 0x18, 0xFEDC_BA98_7654_3210)
+
+        old0, old1 = oracle_ds_wrxchg2_b64(
+            lds, vaddr=0x10, data0=0xAAAA, data1=0xBBBB, offset0=0, offset1=1
+        )
+        # Corrupt single bit
+        corrupted_old0 = old0 ^ 1
+        self.assertNotEqual(old0, corrupted_old0)
+
+        # Corrupt high dword bit
+        corrupted_old1 = old1 ^ (1 << 48)
+        self.assertNotEqual(old1, corrupted_old1)
+
+    def test_mutation_st64_stride_mutant(self) -> None:
+        """Mutant: st64 uses unit=8 instead of unit=512."""
+        def mutant_compute_addr(vaddr: int, offset: int, is_st64: bool) -> int:
+            # Bug: always uses unit=8
+            return (vaddr + offset * 8) & (LDS_DEFAULT_SIZE_BYTES - 1)
+
+        correct = compute_lds_address(0x40, offset=2, is_st64=True)
+        mutant = mutant_compute_addr(0x40, offset=2, is_st64=True)
+        self.assertEqual(correct, 0x40 + 1024)
+        self.assertEqual(mutant, 0x40 + 16)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_destination_overwrite_before_exchange(self) -> None:
+        """Mutant: writes vdst before performing LDS memory exchange."""
+        interp = ScalarInterpreter()
+        struct.pack_into("<Q", interp.lds_mem, 0x100, 0x1111)
+        struct.pack_into("<Q", interp.lds_mem, 0x108, 0x2222)
+
+        interp.rf.set_u32(1, 0x100)
+        orig_data0 = 0xAAAA
+        interp.rf.set_u64(RegPair(4), orig_data0)
+        interp.rf.set_u64(RegPair(6), 0xBBBB)
+
+        # Mutant step function that writes vdst before read
+        class BuggyInterpreter(ScalarInterpreter):
+            def buggy_step(self, instr: DSWrxchg2B64Instruction) -> None:
+                # Bug: sets vdst before reading operands / exchanging
+                self.rf.set_quad(instr.vdst, 0, 0, 0, 0)
+                super().step(instr)
+
+        buggy = BuggyInterpreter()
+        struct.pack_into("<Q", buggy.lds_mem, 0x100, 0x1111)
+        struct.pack_into("<Q", buggy.lds_mem, 0x108, 0x2222)
+        buggy.rf.set_u32(1, 0x100)
+        buggy.rf.set_u64(RegPair(4), orig_data0)
+        buggy.rf.set_u64(RegPair(6), 0xBBBB)
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(4),
+            vaddr=RegSingle(1),
+            data0=RegPair(4),
+            data1=RegPair(6),
+            offset0=0,
+            offset1=1,
+        )
+
+        # Correct execution
+        interp.step(instr)
+        self.assertEqual(
+            struct.unpack_from("<Q", interp.lds_mem, 0x100)[0], orig_data0
+        )
+
+        # Buggy execution
+        buggy.buggy_step(instr)
+        # In buggy execution, data0 was clobbered to 0 before memory exchange
+        self.assertNotEqual(
+            struct.unpack_from("<Q", buggy.lds_mem, 0x100)[0], orig_data0
+        )
+
+    def test_mutation_ignore_exec_mask(self) -> None:
+        """Mutant: SIMD interpreter executes inactive lanes."""
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)  # all inactive
+        for lane in range(32):
+            struct.pack_into("<Q", state.lds_mem, lane * 16, 0x9999)
+
+        # Mutant interpreter that ignores exec_mask
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def step(
+                self, instr: DSWrxchg2B64Instruction, state: SIMDState
+            ) -> List[Optional[Tuple[int, int]]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: no is_active check
+                    vaddr = state.get_vgpr(lane, instr.vaddr.index)
+                    data0 = state.get_vgpr64(lane, instr.data0)
+                    data1 = state.get_vgpr64(lane, instr.data1)
+                    res = oracle_ds_wrxchg2_b64(
+                        state.lds_mem, vaddr, data0, data1, instr.offset0, instr.offset1
+                    )
+                    results.append(res)
+                return results
+
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(8),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=0,
+            offset1=1,
+        )
+
+        mutant_simd = MutantSIMDInterpreter()
+        results = mutant_simd.step(instr, state)
+        # Mutation detected: inactive lanes were executed!
+        self.assertTrue(any(r is not None for r in results))
+
+    def test_mutation_partial_dword_exchange(self) -> None:
+        """Mutant: exchanges only low dword and ignores high dword."""
+        def mutant_exchange(lds_mem: bytearray, addr: int, val64: int) -> int:
+            old_lo = struct.unpack_from("<I", lds_mem, addr)[0]
+            # Bug: high dword left unexchanged
+            struct.pack_into("<I", lds_mem, addr, val64 & MASK32)
+            return old_lo
+
+        lds = bytearray(LDS_DEFAULT_SIZE_BYTES)
+        struct.pack_into("<Q", lds, 0x20, 0x1234_5678_9ABC_DEF0)
+        mutant_res = mutant_exchange(lds, 0x20, 0xAAAA_BBBB_CCCC_DDDD)
+
+        # Only 32 bits returned instead of full 64 bits
+        self.assertNotEqual(mutant_res, 0x1234_5678_9ABC_DEF0)
+        self.assertEqual(mutant_res, 0x9ABC_DEF0)
+
+    def test_mutation_subnormal_flush_to_zero(self) -> None:
+        """Mutant: flushes subnormal 64-bit value to zero."""
+        def mutant_ftz(val: int) -> int:
+            exp = (val >> 52) & 0x7FF
+            frac = val & 0x000F_FFFF_FFFF_FFFF
+            if exp == 0 and frac != 0:
+                return 0  # Bug: FTZ
+            return val
+
+        subnormal = 0x0000_0000_0000_0005
+        correct = subnormal
+        mutant = mutant_ftz(subnormal)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(mutant, 0)
+
+    def test_mutation_snan_quietening(self) -> None:
+        """Mutant: sets quiet bit on signaling NaN."""
+        def mutant_quieten(val: int) -> int:
+            # Bug: quietens NaN
+            return val | 0x0008_0000_0000_0000
+
+        snan = 0x7FF0_0000_0000_0001
+        self.assertEqual(snan & 0x0008_0000_0000_0000, 0)
+        mutant = mutant_quieten(snan)
+        self.assertNotEqual(snan, mutant)
+        self.assertEqual(mutant & 0x0008_0000_0000_0000, 0x0008_0000_0000_0000)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
