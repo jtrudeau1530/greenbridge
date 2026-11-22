@@ -63,13 +63,17 @@ def sha256_file(path: str, chunk_size: int = CHUNK) -> str:
 
 def walk(target_dir: str, *, exclude: str | None = None):
     """Yields (relative_path, absolute_path) using forward slashes, excluding the selected manifest."""
+    def scan_failed(error: OSError) -> None:
+        raise error
+
     excluded_dir = excluded_name = None
     if exclude is not None:
         directory, name = os.path.split(os.path.abspath(exclude))
         excluded_dir = os.path.normcase(os.path.realpath(directory))
         excluded_name = os.path.normcase(name)
 
-    for root, _, files in os.walk(target_dir):
+    # os.walk otherwise treats missing or unreadable directories as empty.
+    for root, _, files in os.walk(target_dir, onerror=scan_failed):
         contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
         for name in sorted(files):
             if contains_manifest and os.path.normcase(name) == excluded_name:
@@ -102,13 +106,17 @@ def load_manifest(path: str) -> dict[str, dict]:
     if not isinstance(doc, dict):
         raise ManifestError(f"{path}: root must be a JSON object")
 
-    raw_files = doc.get("files") if "files" in doc and isinstance(doc["files"], dict) else doc
-    if not isinstance(raw_files, dict):
-        raise ManifestError(f"{path} has no valid files table")
+    nested = "files" in doc
+    if nested:
+        raw_files = doc["files"]
+        if not isinstance(raw_files, dict):
+            raise ManifestError(f"{path}: 'files' must be a JSON object")
+    else:
+        raw_files = doc
 
     entries: dict[str, dict] = {}
     for raw_rel, info in raw_files.items():
-        if raw_rel in ("created", "title", "version", "note"):
+        if not nested and raw_rel in ("created", "title", "version", "note"):
             continue
         rel = str(raw_rel).replace("\\", "/")
         if isinstance(info, dict):
@@ -116,7 +124,7 @@ def load_manifest(path: str) -> dict[str, dict]:
             digest = info.get("sha256")
             if not isinstance(digest, str):
                 raise ManifestError(f"{path}: entry {rel!r} missing 'sha256' string")
-            if size is not None and not (isinstance(size, int) and size >= 0):
+            if size is not None and not (isinstance(size, int) and not isinstance(size, bool) and size >= 0):
                 raise ManifestError(f"{path}: entry {rel!r} has invalid integer 'size'")
             entries[rel] = {"size": size, "sha256": digest.lower()}
         elif isinstance(info, str):

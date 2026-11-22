@@ -714,8 +714,14 @@ def interp_f16_high_problem(px):
     w = 64
     half = lambda b: struct.unpack("<e", struct.pack("<H", b & 0xFFFF))[0]      # noqa: E731
     f32 = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]                 # noqa: E731
-    err = max(max(abs(half(a) - u), abs(half(b) - v), abs(half(c) - u), abs(f32(d) - v))
-              for i, (a, b, c, d) in enumerate(px) for u, v in [((i % w + 0.5) / w, (i // w + 0.5) / w)])
+    err = 0.0
+    for i, (a, b, c, d) in enumerate(px):
+        values = half(a), half(b), half(c), f32(d)
+        x, y = i % w, i // w
+        if not all(math.isfinite(v) for v in values):
+            return f"non-finite interpolation result at ({x},{y}): {values}"
+        u, v = (x + 0.5) / w, (y + 0.5) / w
+        err = max(err, abs(values[0] - u), abs(values[1] - v), abs(values[2] - u), abs(values[3] - v))
     return "" if err < 2e-3 else f"f16 halves off by {err:.3g}"
 
 

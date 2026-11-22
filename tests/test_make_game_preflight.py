@@ -323,6 +323,28 @@ class ToolchainDetectionTest(PreflightTestBase):
         self.assertFalse(make_game.tool_available("   "))
         self.assertFalse(make_game.tool_available('""'))
 
+    APPDATA_ENV = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local", "APPDATA": r"C:\Users\u\AppData\Roaming"}
+
+    def test_appdata_hint_names_the_folder_llvm_mc_is_in(self):
+        with mock.patch("os.name", "nt"), mock.patch.dict(os.environ, self.APPDATA_ENV):
+            for cmd, var in ((r"C:\Users\u\AppData\Local\Leonida\llvm-mc\llvm-mc.exe", "LOCALAPPDATA"),
+                             (r'"c:\users\U\appdata\roaming\llvm\llvm-mc.exe"', "APPDATA")):
+                with self.subTest(cmd=cmd):
+                    hint = make_game.appdata_hint(cmd)
+                    self.assertIn(f"LLVM_MC points into %{var}%", hint)
+                    self.assertIn(r"%USERPROFILE%\.leonida\llvm-mc", hint)
+
+    def test_appdata_hint_is_empty_outside_appdata(self):
+        with mock.patch("os.name", "nt"), mock.patch.dict(os.environ, self.APPDATA_ENV):
+            for cmd in ("llvm-mc", r"D:\Tools\llvm-mc\llvm-mc.exe", r"C:\Users\u\.leonida\llvm-mc\llvm-mc.exe",
+                        r"C:\Users\u\AppData\LocalLow\llvm-mc.exe", "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"):
+                with self.subTest(cmd=cmd):
+                    self.assertEqual(make_game.appdata_hint(cmd), "")
+
+    def test_appdata_hint_is_empty_off_windows(self):
+        with mock.patch("os.name", "posix"), mock.patch.dict(os.environ, self.APPDATA_ENV):
+            self.assertEqual(make_game.appdata_hint(r"C:\Users\u\AppData\Local\llvm-mc.exe"), "")
+
     def test_need_success_returns_tool(self):
         self.assertEqual(make_game.need(sys.executable, "Install python"), sys.executable)
 
@@ -348,7 +370,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("make_game.ensure_submodule", return_value=None), \
                  mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
-                # runtime is refused before any check off Windows (tests/test_make_game_platform.py)
+                # off Windows runtime checks the cross-build instead (tests/test_make_game_platform.py)
                 stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
                 make_game.preflight(stages, tmp_work, wav=True)
 
@@ -368,6 +390,19 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn("spirv-val:", err)
                 self.assertIn(".NET 8 SDK", err)
                 self.assertIn("Visual Studio 2022", err)
+
+    def test_preflight_explains_llvm_mc_hidden_in_appdata(self):
+        env = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local",
+               "LLVM_MC": r"C:\Users\u\AppData\Local\Leonida\llvm-mc\llvm-mc.exe"}
+        with tempfile.TemporaryDirectory() as tmp_work, \
+             mock.patch.dict(os.environ, env), \
+             mock.patch("os.name", "nt"), \
+             mock.patch("sys.version_info", (3, 12, 0)), \
+             mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+             mock.patch("make_game.tool_available", return_value=False):
+            err = self.assert_fails(make_game.preflight, ["shaders"], tmp_work,
+                                    match="llvm-mc (LLVM 21+ with the AMDGPU target)")
+        self.assertIn("LLVM_MC points into %LOCALAPPDATA%", err)
 
     def test_preflight_rejects_visual_studio_installer_without_cpp_tools(self):
         with tempfile.TemporaryDirectory() as tmp_work, \

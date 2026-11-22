@@ -38,6 +38,9 @@ from spirv_mini_interp import run_fragment  # noqa: E402
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 FP16_FLAG = 0x10
+# Interpolation mode, flags bits 0-1 (SHADER-181): every corpus record carries 1 (flat) or 2 (linear).
+FLAT = 1
+LINEAR = 2
 
 
 def fssm_blob(records):
@@ -122,7 +125,7 @@ MOV_ATTR1 = (
 
 def test_table_predeclares_unread_interpolants(tmp_path):
     """Positions the code never reads are still declared (Location = table position)."""
-    table = fssm_blob([(4, 0xF, 0, 0, 0), (4, 0xF, 1, 1, 0), (4, 0xF, 2, 2, 0)])
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, LINEAR), (4, 0xF, 2, 2, LINEAR)])
     spv = translate(write_case(tmp_path, "ps_pix_table", READ_ATTR0, fssm=table))
     lines = [line.strip() for line in spv.splitlines()]
     for n in (0, 1, 2):
@@ -135,14 +138,14 @@ def test_table_predeclares_unread_interpolants(tmp_path):
 
 def test_table_position_not_slot_is_the_attr_number(tmp_path):
     """The record's position is the v_interp attr number even when the slot bytes disagree."""
-    table = fssm_blob([(4, 0xF, 0, 7, 0), (4, 0xF, 1, 3, FP16_FLAG)])
+    table = fssm_blob([(4, 0xF, 0, 7, LINEAR), (4, 0xF, 1, 3, LINEAR | FP16_FLAG)])
     spv = translate(write_case(tmp_path, "ps_pix_slots", READ_ATTR1, fssm=table))
     assert "OpQuantizeToF16" in spv  # attr1 = table position 1 = flagged, whatever its slot says
 
 
 def test_fp16_read_rounds_to_nearest(tmp_path):
     """A 32-bit v_interp read of a flagged position sees the f16-rounded value."""
-    table = fssm_blob([(4, 0xF, 0, 0, 0), (4, 0xF, 1, 1, FP16_FLAG)])
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, LINEAR | FP16_FLAG)])
     spv = translate(write_case(tmp_path, "ps_pix_fp16", READ_ATTR1, fssm=table))
     assert "OpQuantizeToF16" in spv  # single quantize, not a pack/unpack round-trip (folded by drivers)
     assert "PackHalf2x16" not in spv
@@ -159,7 +162,7 @@ def test_fp16_subnormal_read_flushes_to_zero(tmp_path):
     SPIR-V's OpQuantizeToF16 returns signed zero below the smallest normal f16 (6.1e-5);
     keeping the subnormal (struct.pack('<e') does) would be more precise than a driver.
     """
-    table = fssm_blob([(4, 0xF, 0, 0, 0), (4, 0xF, 1, 1, FP16_FLAG)])
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, LINEAR | FP16_FLAG)])
     spv = translate(write_case(tmp_path, "ps_pix_subnormal", READ_ATTR1, fssm=table))
     zero = struct.unpack("<I", struct.pack("<f", 0.0))[0]
     neg_zero = struct.unpack("<I", struct.pack("<f", -0.0))[0]
@@ -170,7 +173,7 @@ def test_fp16_subnormal_read_flushes_to_zero(tmp_path):
 
 def test_fp16_mov_read_also_rounds(tmp_path):
     """v_interp_mov_f32 of a flagged position rounds too, and stays Flat."""
-    table = fssm_blob([(4, 0xF, 0, 0, 0), (4, 0xF, 1, 1, FP16_FLAG)])
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, FLAT | FP16_FLAG)])
     spv = translate(write_case(tmp_path, "ps_pix_fmov", MOV_ATTR1, fssm=table))
     lines = [line.strip() for line in spv.splitlines()]
     assert "OpDecorate %in_attr1 Flat" in lines  # mov-only: Flat, as before
@@ -203,7 +206,7 @@ def test_empty_table_is_the_old_path(tmp_path):
 
 def test_agreeing_shader_is_byte_identical_with_table(tmp_path):
     """A shader reading exactly the table's attrs with no fp16 flags translates as before."""
-    table = fssm_blob([(4, 0xF, 0, 0, 0), (4, 0xF, 1, 1, 0)])
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, LINEAR)])
     with_table = translate(write_case(tmp_path, "ps_pix_same", READ_ATTR0_THEN_ATTR1, fssm=table))
     import pathlib
 
@@ -215,7 +218,7 @@ def test_agreeing_shader_is_byte_identical_with_table(tmp_path):
 
 def test_out_of_table_read_still_declares(tmp_path):
     """A read past the table declares an input instead of failing (no new rejections)."""
-    table = fssm_blob([(4, 0xF, 0, 0, 0), (4, 0xF, 1, 1, 0)])
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, LINEAR)])
     body = (
         "\tv_interp_p1_f32_e32 v2, v0, attr5.x\n"
         "\tv_interp_p2_f32_e32 v2, v1, attr5.x\n"
@@ -228,7 +231,7 @@ def test_out_of_table_read_still_declares(tmp_path):
 
 def test_metadata_records_table(tmp_path):
     """shader_meta carries the interpolant count and the flagged positions; absent without a table."""
-    table = fssm_blob([(4, 0xF, 0, 0, 0), (4, 0xF, 1, 1, FP16_FLAG), (4, 0xF, 2, 2, 0)])
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, LINEAR | FP16_FLAG), (4, 0xF, 2, 2, LINEAR)])
     spv = translate(write_case(tmp_path, "ps_pix_meta", READ_ATTR0, fssm=table))
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
     assert meta["ps_interpolants"] == 3
@@ -242,3 +245,65 @@ def test_metadata_records_table(tmp_path):
     meta_plain = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv_plain)
     assert "ps_interpolants" not in meta_plain
     assert "ps_fp16_interpolants" not in meta_plain
+
+
+# SHADER-181: the FSSM mode bits must agree with how the code reads each position.
+
+FLAT_THEN_INTERP = (
+    "\tv_interp_mov_f32_e32 v2, p0, attr0.x\n"
+    "\tv_interp_p1_f32_e32 v3, v0, attr1.y\n"
+    "\tv_interp_p2_f32_e32 v3, v1, attr1.y\n"
+    "\texp mrt0 v2, v3, v2, v3 done vm\n"
+    "\ts_endpgm\n"
+)
+
+F16_READ = (
+    "\tv_interp_p1ll_f16 v2, v0, attr0.x\n"
+    "\tv_interp_p2_f16 v2, v1, attr0.x, v2\n"
+    "\tv_cvt_f32_f16_e32 v2, v2\n"
+    "\texp mrt0 v2, v2, v2, v2 done vm\n"
+    "\ts_endpgm\n"
+)
+
+
+def test_modes_agreeing_with_the_code_translate(tmp_path):
+    """Mode 1 read by v_interp_mov and mode 2 read by p1/p2 is the corpus case (12,101 of 12,101 PS)."""
+    table = fssm_blob([(4, 0xF, 0, 0, FLAT), (4, 0xF, 1, 1, LINEAR)])
+    spv = translate(write_case(tmp_path, "ps_mode_ok", FLAT_THEN_INTERP, fssm=table))
+    lines = [line.strip() for line in spv.splitlines()]
+    assert "OpDecorate %in_attr0 Flat" in lines
+    assert "OpDecorate %in_attr1 Flat" not in lines
+
+
+def test_f16_interp_of_a_linear_position_translates(tmp_path):
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR | FP16_FLAG)])
+    translate(write_case(tmp_path, "ps_mode_f16", F16_READ, fssm=table))
+
+
+@pytest.mark.parametrize("flags, body", [
+    (LINEAR, MOV_ATTR1),            # flat read of a linear position
+    (FLAT, READ_ATTR1),             # interpolated read of a flat position
+    (0, READ_ATTR1),                # mode 0: never seen, meaning unknown
+    (3, READ_ATTR1),                # mode 3: never seen, meaning unknown
+    (3, MOV_ATTR1),
+])
+def test_disagreeing_or_unknown_mode_is_refused(tmp_path, flags, body):
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, flags)])
+    with pytest.raises(rdna2spirv.Unsupported, match="PS input 1 interpolation mode"):
+        translate(write_case(tmp_path, "ps_mode_bad", body, fssm=table))
+
+
+def test_unknown_mode_on_an_unread_position_is_not_refused(tmp_path):
+    """Only positions the code reads are checked; an unread record with mode 0 changes nothing."""
+    table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, LINEAR), (4, 0xF, 2, 2, 0)])
+    translate(write_case(tmp_path, "ps_mode_unread", READ_ATTR1, fssm=table))
+
+
+def test_mode_check_unit():
+    def ins(op, a):
+        return {"op": op, "args": [{"k": "vgpr", "r": 2}, {"k": "attr", "a": a, "c": 0}], "mods": {}}
+    rdna2spirv.check_interpolation_modes([1, 2], [ins("v_interp_mov_f32_e32", 0), ins("v_interp_p1_f32_e32", 1),
+                                                  ins("v_interp_p1ll_f16", 1), ins("v_interp_p1_f32_e32", 7)])
+    rdna2spirv.check_interpolation_modes([], [ins("v_interp_p1_f32_e32", 0)])
+    with pytest.raises(rdna2spirv.Unsupported):
+        rdna2spirv.check_interpolation_modes([1, 2], [ins("v_interp_p2_f16", 0)])
