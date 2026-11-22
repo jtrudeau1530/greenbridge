@@ -516,5 +516,286 @@ class TestDivScaleReferenceOracle(unittest.TestCase):
         self.assertEqual(rp.hi, 0x3FF00000)
 
 
+import abc
+from dataclasses import dataclass
+
+
+class Opcode(Enum):
+    V_DIV_SCALE_F32 = "v_div_scale_f32"
+    V_DIV_SCALE_F64 = "v_div_scale_f64"
+
+
+class OperandKind(Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    VGPR_PAIR = "vgpr_pair"
+    SGPR_PAIR = "sgpr_pair"
+    VCC = "vcc"
+    LITERAL = "literal"
+    INLINE_CONST = "inline_const"
+
+
+class OMod(Enum):
+    NONE = 0
+    MUL2 = 1
+    MUL4 = 2
+    DIV2 = 3
+
+
+class TypeKind(Enum):
+    F32 = "f32"
+    F64 = "f64"
+
+
+@dataclass
+class ASTOperand:
+    kind: OperandKind
+    reg_idx: int = 0
+    imm_val: float = 0.0
+    neg: bool = False
+    abs_: bool = False
+
+    @classmethod
+    def vgpr(cls, idx: int, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.VGPR, reg_idx=idx, neg=neg, abs_=abs_)
+
+    @classmethod
+    def sgpr(cls, idx: int, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.SGPR, reg_idx=idx, neg=neg, abs_=abs_)
+
+    @classmethod
+    def vgpr_pair(cls, idx: int, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.VGPR_PAIR, reg_idx=idx, neg=neg, abs_=abs_)
+
+    @classmethod
+    def sgpr_pair(cls, idx: int, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.SGPR_PAIR, reg_idx=idx, neg=neg, abs_=abs_)
+
+    @classmethod
+    def vcc(cls) -> ASTOperand:
+        return cls(OperandKind.VCC)
+
+    @classmethod
+    def inline_const(cls, val: float, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.INLINE_CONST, imm_val=val, neg=neg, abs_=abs_)
+
+    def format_asm(self) -> str:
+        if self.kind == OperandKind.VGPR:
+            s = f"v{self.reg_idx}"
+        elif self.kind == OperandKind.SGPR:
+            s = f"s{self.reg_idx}"
+        elif self.kind == OperandKind.VGPR_PAIR:
+            s = f"v[{self.reg_idx}:{self.reg_idx + 1}]"
+        elif self.kind == OperandKind.SGPR_PAIR:
+            s = f"s[{self.reg_idx}:{self.reg_idx + 1}]"
+        elif self.kind == OperandKind.VCC:
+            s = "vcc"
+        elif self.kind == OperandKind.INLINE_CONST:
+            s = f"{self.imm_val}"
+        else:
+            s = f"0x{int(self.imm_val):x}"
+        if self.abs_:
+            s = f"|{s}|"
+        if self.neg:
+            s = f"-{s}"
+        return s
+
+
+@dataclass
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    sdst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    src2: ASTOperand
+    clamp: bool = False
+    omod: OMod = OMod.NONE
+
+    def validate(self) -> None:
+        if not isinstance(self.opcode, Opcode):
+            raise TypeError(f"Invalid opcode type: {type(self.opcode)}")
+
+        is_f64 = (self.opcode == Opcode.V_DIV_SCALE_F64)
+        expected_dst_kind = OperandKind.VGPR_PAIR if is_f64 else OperandKind.VGPR
+        if self.dst.kind != expected_dst_kind:
+            raise TypeError(f"{self.opcode.value} destination must be {expected_dst_kind.value}, got {self.dst.kind.value}")
+
+        if self.dst.neg or self.dst.abs_:
+            raise ValueError("Destination operand cannot have neg or abs modifiers")
+
+        max_vgpr = 254 if is_f64 else 255
+        if not (0 <= self.dst.reg_idx <= max_vgpr):
+            raise ValueError(f"Destination register index out of range: {self.dst.reg_idx}")
+
+        if self.sdst.kind not in (OperandKind.VCC, OperandKind.SGPR, OperandKind.SGPR_PAIR):
+            raise TypeError(f"Scalar destination must be VCC or SGPR, got {self.sdst.kind.value}")
+
+        for name, src in [("src0", self.src0), ("src1", self.src1), ("src2", self.src2)]:
+            if src.kind in (OperandKind.VGPR, OperandKind.VGPR_PAIR):
+                limit = 254 if src.kind == OperandKind.VGPR_PAIR else 255
+                if not (0 <= src.reg_idx <= limit):
+                    raise ValueError(f"{name} VGPR index out of range: {src.reg_idx}")
+            elif src.kind in (OperandKind.SGPR, OperandKind.SGPR_PAIR):
+                limit = 104 if src.kind == OperandKind.SGPR_PAIR else 105
+                if not (0 <= src.reg_idx <= limit):
+                    raise ValueError(f"{name} SGPR index out of range: {src.reg_idx}")
+
+    def format_asm(self) -> str:
+        s = f"{self.opcode.value} {self.dst.format_asm()}, {self.sdst.format_asm()}, {self.src0.format_asm()}, {self.src1.format_asm()}, {self.src2.format_asm()}"
+        if self.clamp:
+            s += " clamp"
+        if self.omod == OMod.MUL2:
+            s += " mul:2"
+        elif self.omod == OMod.MUL4:
+            s += " mul:4"
+        elif self.omod == OMod.DIV2:
+            s += " div:2"
+        return s
+
+
+class TypedExpr(abc.ABC):
+    @abc.abstractmethod
+    def evaluate(self, env: dict[str, float]) -> tuple[float, int]:
+        pass
+
+
+@dataclass
+class VariableExpr(TypedExpr):
+    name: str
+
+    def evaluate(self, env: dict[str, float]) -> tuple[float, int]:
+        if self.name not in env:
+            raise KeyError(f"Variable {self.name} not found in environment")
+        return env[self.name], 0
+
+
+@dataclass
+class ConstantExpr(TypedExpr):
+    val: float
+
+    def evaluate(self, env: dict[str, float]) -> tuple[float, int]:
+        return self.val, 0
+
+
+@dataclass
+class UnaryOpExpr(TypedExpr):
+    op: str  # "neg", "abs"
+    sub_expr: TypedExpr
+
+    def evaluate(self, env: dict[str, float]) -> tuple[float, int]:
+        val, _ = self.sub_expr.evaluate(env)
+        if self.op == "abs":
+            return abs(val), 0
+        elif self.op == "neg":
+            return -val, 0
+        raise ValueError(f"Unknown unary op: {self.op}")
+
+
+@dataclass
+class DivScaleExpr(TypedExpr):
+    is_f64: bool
+    s0: TypedExpr
+    s1: TypedExpr
+    s2: TypedExpr
+    clamp: bool = False
+    omod: int = 0
+
+    def evaluate(self, env: dict[str, float]) -> tuple[float, int]:
+        v0, _ = self.s0.evaluate(env)
+        v1, _ = self.s1.evaluate(env)
+        v2, _ = self.s2.evaluate(env)
+        if self.is_f64:
+            return ref_div_scale_f64(v0, v1, v2, clamp=self.clamp, omod=self.omod)
+        else:
+            return ref_div_scale_f32(v0, v1, v2, clamp=self.clamp, omod=self.omod)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_f32_formatting(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        inst.validate()
+        self.assertEqual(inst.format_asm(), "v_div_scale_f32 v0, vcc, v1, v1, v2")
+
+    def test_ast_f64_formatting_with_modifiers(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr_pair(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr_pair(2, neg=True, abs_=True),
+            src1=ASTOperand.vgpr_pair(2),
+            src2=ASTOperand.sgpr_pair(4),
+            clamp=True,
+            omod=OMod.MUL2,
+        )
+        inst.validate()
+        self.assertEqual(inst.format_asm(), "v_div_scale_f64 v[0:1], vcc, -|v[2:3]|, v[2:3], s[4:5] clamp mul:2")
+
+    def test_typed_expression_evaluation(self):
+        expr = DivScaleExpr(
+            is_f64=False,
+            s0=VariableExpr("y"),
+            s1=VariableExpr("y"),
+            s2=VariableExpr("x"),
+        )
+        # Normal inputs: 10.0 / 2.0 -> no scale
+        res, vcc = expr.evaluate({"y": 2.0, "x": 10.0})
+        self.assertEqual(res, 2.0)
+        self.assertEqual(vcc, 0)
+
+        # Small denominator -> scale up by 2^64
+        small = 2.0 ** -100
+        res_scaled, vcc_scaled = expr.evaluate({"y": small, "x": 1.0})
+        self.assertEqual(vcc_scaled, 1)
+        self.assertAlmostEqual(res_scaled, small * (2.0 ** 64))
+
+    def test_ast_validation_errors(self):
+        # f32 with pair dst
+        with self.assertRaises(TypeError):
+            bad_inst = ASTInstruction(
+                opcode=Opcode.V_DIV_SCALE_F32,
+                dst=ASTOperand.vgpr_pair(0),
+                sdst=ASTOperand.vcc(),
+                src0=ASTOperand.vgpr(1),
+                src1=ASTOperand.vgpr(1),
+                src2=ASTOperand.vgpr(2),
+            )
+            bad_inst.validate()
+
+        # Destination with neg modifier
+        with self.assertRaises(ValueError):
+            bad_dst = ASTInstruction(
+                opcode=Opcode.V_DIV_SCALE_F32,
+                dst=ASTOperand.vgpr(0, neg=True),
+                sdst=ASTOperand.vcc(),
+                src0=ASTOperand.vgpr(1),
+                src1=ASTOperand.vgpr(1),
+                src2=ASTOperand.vgpr(2),
+            )
+            bad_dst.validate()
+
+        # Destination out of bounds
+        with self.assertRaises(ValueError):
+            bad_oob = ASTInstruction(
+                opcode=Opcode.V_DIV_SCALE_F32,
+                dst=ASTOperand.vgpr(256),
+                sdst=ASTOperand.vcc(),
+                src0=ASTOperand.vgpr(1),
+                src1=ASTOperand.vgpr(1),
+                src2=ASTOperand.vgpr(2),
+            )
+            bad_oob.validate()
+
+
 if __name__ == "__main__":
     unittest.main()
+
