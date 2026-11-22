@@ -270,6 +270,22 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(result["sum_max"], 1.0)
         self.assertAlmostEqual(struct.unpack_from("<4f", result["w0"], 0)[0], 64 / 255, delta=1e-6)
 
+    def test_full_export_without_numpy(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        saved = skinned_glb._np
+        try:
+            skinned_glb._np = None
+            payload, stats = skinned_glb.build_skinned_glb(skeleton, [component])
+        finally:
+            skinned_glb._np = saved
+        gltf, binary = skinned_glb.read_glb(self._write(payload))
+        self.assertEqual(stats["joints"], 4)
+        primitive = gltf["meshes"][0]["primitives"][0]
+        w0, _ = _accessor(gltf, binary, primitive["attributes"]["WEIGHTS_0"])
+        for vertex in range(3):
+            self.assertAlmostEqual(sum(struct.unpack_from("<4f", w0, 16 * vertex)), 1.0, places=6)
+
     def test_missing_joint_stream_is_rejected(self):
         component = _component(self.root, omit_slot=8)
         skeleton = _skeleton_dir(self.root)
