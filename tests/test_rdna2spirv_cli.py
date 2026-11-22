@@ -223,3 +223,26 @@ class ValidatedOutput(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmptyShader(unittest.TestCase):
+    """A .s with no tab-indented instruction parses to an empty shader.
+
+    It used to translate to a module that passes spirv-val, lands in index.json and does no work at all, which is
+    what a hand-written or re-indented .s looks like: found while writing a fixture with spaces instead of tabs.
+    """
+
+    def test_no_instructions_is_reported_and_no_module_is_published(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "disasm")
+            os.mkdir(src)
+            with open(os.path.join(src, "ps_empty.s"), "w", encoding="utf-8") as f:
+                f.write("; ps_empty  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words\n    s_endpgm\n")
+            with open(os.path.join(tmp, "ps_empty.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            out = os.path.join(tmp, "spirv")
+            p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("0 translated", p.stdout, p.stdout)
+            self.assertIn("no instructions (nothing tab-indented?)", p.stdout, p.stdout)
+            self.assertFalse(os.path.exists(os.path.join(out, "ps_empty.spv")))
