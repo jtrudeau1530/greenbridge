@@ -434,7 +434,7 @@ public:
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         leonida::IndirectKind kind = leonida::IndirectKind::draw;
         UINT stride = 0;
-        if (!command_signature_info(signature, kind, stride) || !argument_buffer || !max_command_count)
+        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
             return check(false);
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;

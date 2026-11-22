@@ -728,7 +728,8 @@ public:
     }
 
     bool execute_indirect(const ExecuteIndirect& indirect) {
-        if (!indirect.argument_buffer || !indirect.stride || !indirect.max_count) return false;
+        if (!indirect.argument_buffer || !indirect.stride) return false;
+        if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }
 
