@@ -100,10 +100,13 @@ def find_rage_textures(data):
         w = int.from_bytes(d[0:2], "little")
         h = int.from_bytes(d[2:4], "little")
         depth = int.from_bytes(d[4:6], "little")
-        if not (4 <= w <= 16384 and 4 <= h <= 16384 and 1 <= depth <= 2048):
+        if not (1 <= w <= 16384 and 1 <= h <= 16384 and 1 <= depth <= 2048):
             continue
         fword = q[k + 5]
-        out.append((w, h, depth, DXGI_FORMATS[fmt], fword & 0xFFFF, (fword >> 16) & 0xFF))
+        mips = (fword >> 16) & 0xFF
+        if min(w, h) < 4 and not 1 <= mips <= max(w, h, depth).bit_length():
+            continue
+        out.append((w, h, depth, DXGI_FORMATS[fmt], fword & 0xFFFF, mips))
     return out
 
 
