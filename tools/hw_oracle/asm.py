@@ -97,11 +97,25 @@ MODE_FIELDS = {
 }
 
 
+# The global memory instructions GFX11 renamed, under their GFX10 names. A raw kernel body is written with the
+# GFX11 ones (crosslane_fuzz stores with global_store_b32); a GFX10 assembler only takes the old spelling.
+_GFX10_NAMES = {f"global_{kind}_b{bits}": f"global_{kind}_dword{suffix}"
+                for kind in ("load", "store") for bits, suffix in ((32, ""), (64, "x2"), (96, "x3"), (128, "x4"))}
+
+
+def gfx10_spelling(line):
+    """A raw kernel line with a renamed memory mnemonic put back to its GFX10 name (the same instruction)."""
+    op, sep, rest = line.partition(" ")
+    return _GFX10_NAMES.get(op, op) + sep + rest
+
+
 def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
     modes = "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
     load = "s_load_b64" if fam == "gfx11" else "s_load_dwordx2"
+    if fam == "gfx10":
+        lines = [gfx10_spelling(ln) for ln in lines]
     body = "\n".join("  " + ln for ln in lines)
     return f""".globl {name}
 .p2align 8
@@ -238,13 +252,13 @@ def ds_mnemonic(op, arch):
 
 
 def ds_line(line, arch):
-    """A whole instruction line (GFX10 spelling and operand order in) respelled for the architecture. On GFX11 and
-    GFX12 ds_cmpstore_rtn_b32 takes the value to store first and the compare value second, the reverse of GFX10's
+    """A whole instruction line (GFX10 spelling and operand order in) respelled for the architecture. On GFX11
+    (measured on gfx1150; GFX12 is not measured, lds_fuzz skips it) ds_cmpstore_rtn_b32 takes the value to store first and the compare value second, the reverse of GFX10's
     ds_cmpst_rtn_b32 vdst, vaddr, cmp, store (measured on gfx1150: tools/lds_fuzz.py --oracle hw, and it is what LLVM's
     cmpxchg selection does for GFX11); llvm-mc encodes both spellings of the same text identically, so only the
     operand order tells them apart."""
     op, sep, rest = line.partition(" ")
-    if op == "ds_cmpst_rtn_b32" and family(arch) != "gfx10":
+    if op == "ds_cmpst_rtn_b32" and family(arch) == "gfx11":
         m = re.fullmatch(r"(v\d+),\s*(v\d+),\s*(v\d+),\s*(v\d+)(.*)", rest)
         if not m:
             raise ValueError(f"cannot swap the operands of {line!r}")

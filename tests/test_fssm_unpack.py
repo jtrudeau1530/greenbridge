@@ -249,6 +249,78 @@ class TestXbchContainerCarvingAndUnpack(unittest.TestCase):
             fssm_unpack.unpack(dxbc)
         self.assertIn("size mismatch", str(ctx.exception))
 
+    def test_unpack_rejects_declared_size_over_fixed_limit_before_inflating(self):
+        fssm_payload = make_fssm(pad_to=64)
+        xbch_blob = make_xbch(fssm_payload, unpacked_override=65)
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+        real_decompressobj = zlib.decompressobj
+
+        with mock.patch.object(fssm_unpack, "MAX_FSSM_BYTES", 64, create=True), \
+                mock.patch.object(fssm_unpack.zlib, "decompressobj", wraps=real_decompressobj) as decompressobj:
+            with self.assertRaisesRegex(ValueError, "exceeds limit"):
+                fssm_unpack.unpack(dxbc)
+            decompressobj.assert_not_called()
+
+    def test_unpack_caps_expansion_at_declared_size_plus_one(self):
+        fssm_payload = make_fssm(pad_to=4096)
+        xbch_blob = make_xbch(fssm_payload, unpacked_override=32)
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+        real_decompressobj = zlib.decompressobj
+        observed = []
+
+        class RecordingDecompressor:
+            def __init__(self, *args, **kwargs):
+                self.inner = real_decompressobj(*args, **kwargs)
+
+            def decompress(self, data, max_length=0):
+                output = self.inner.decompress(data, max_length)
+                observed.append((max_length, len(output)))
+                return output
+
+            @property
+            def eof(self):
+                return self.inner.eof
+
+        with mock.patch.object(fssm_unpack, "MAX_FSSM_BYTES", 64, create=True), \
+                mock.patch.object(fssm_unpack.zlib, "decompressobj", side_effect=RecordingDecompressor):
+            with self.assertRaisesRegex(ValueError, "exceeds declared size"):
+                fssm_unpack.unpack(dxbc)
+
+        self.assertEqual(observed, [(33, 33)])
+
+    def test_unpack_rejects_truncated_zlib_stream(self):
+        fssm_payload = make_fssm()
+        compressed = zlib.compress(fssm_payload)[:-4]
+        header = struct.pack("<4sIIIII", b"XBCH", 0, len(compressed), 0, len(fssm_payload), 0)
+        xbch_blob = header + compressed
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+
+        with self.assertRaisesRegex(ValueError, "truncated XBCH zlib stream"):
+            fssm_unpack.unpack(dxbc)
+
+    def test_unpack_rejects_trailing_data_after_zlib_stream(self):
+        fssm_payload = make_fssm()
+        compressed = zlib.compress(fssm_payload) + b"trailing"
+        header = struct.pack("<4sIIIII", b"XBCH", 0, len(compressed), 0, len(fssm_payload), 0)
+        xbch_blob = header + compressed
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+
+        with self.assertRaisesRegex(ValueError, "trailing data after XBCH zlib stream"):
+            fssm_unpack.unpack(dxbc)
+
+    def test_unpack_rejects_mismatched_stored_size(self):
+        fssm_payload = make_fssm()
+        xbch_blob = make_xbch(fssm_payload, stored_override=1)
+        dxil = make_xdat({0x0D: xbch_blob})
+        dxbc = make_dxbc([(b"DXIL", dxil)])
+
+        with self.assertRaisesRegex(ValueError, "stored size"):
+            fssm_unpack.unpack(dxbc)
+
     def test_unpack_corrupt_zlib_raises_error(self):
         fssm_payload = make_fssm()
         xbch_blob = make_xbch(fssm_payload, corrupt_zlib=True)

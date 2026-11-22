@@ -32,7 +32,7 @@ if (mode == "ttpf")
                 // cancellation and anything unexpected stay failures.
                 byte[]? dds = null;
                 try { dds = TtpfReader.CreateDds(src, t.Index); }
-                catch (Exception e) when (e.GetType() == typeof(NotSupportedException) || e.GetType() == typeof(InvalidDataException))
+                catch (Exception e) when (e is NotSupportedException or InvalidDataException)
                 { skip++; file = null; limitation = e.Message; }
                 if (dds != null) { Util.WriteAllBytes(path, dds); ok++; }
             }

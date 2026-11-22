@@ -38,6 +38,7 @@ import copy
 import json
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
@@ -849,10 +850,14 @@ def run_translator(progs, a, work, tally):
 # ---- the hardware oracle ----
 
 def hw_skip_reason(p, arch):
-    """Why a program cannot run natively on this GPU, or None. GFX11 renamed the ds_* loads and stores, which asm.py
-    respells; ds_cmpst's operand order is measured (asm.DS_CMPSTORE_SWAPPED). Nothing else the generator emits is
-    missing or different on GFX10, GFX11 or GFX12 at the instruction level (assembled for gfx1030, gfx1100, gfx1150
-    and gfx1201), so the only skips are the assembler's own rejections, which the runner reports."""
+    """Why a program cannot run natively on this GPU, or None. GFX11 renamed the ds_* loads and stores, which
+    asm.ds_line respells, and swaps ds_cmpstore's data operands (measured on gfx1150). The swap is not measured on
+    GFX12, so a program with a ds_cmpst is skipped there; everything else the generator emits is spelled the same
+    on GFX10, GFX11 and GFX12 (assembled for gfx1030, gfx1100, gfx1150 and gfx1201), so the other skips are the
+    assembler's own rejections, which the runner reports."""
+    from hw_oracle import asm
+    if asm.family(arch) == "gfx12" and any(op["kind"] == "cmpst" for op in p.ops):
+        return "ds_cmpstore_rtn_b32 operand order is only measured on GFX11 (gfx1150)"
     return None
 
 
@@ -880,7 +885,15 @@ def run_hw(oracle, progs, a, tally, results):
         kernels.append(hw_kernel(p, oracle.arch))
         which.append(p)
     harness = 0
-    for p, got in zip(which, oracle.run(kernels)):
+    try:
+        ran = oracle.run(kernels)
+    except RuntimeError as e:
+        if re.search(r"LDS|group segment|words", str(e)):
+            print("hardware oracle unavailable: this backend cannot run the LDS programs (no LDS support, or more "
+                  f"than 4096 words of output): {str(e)[:200]}")
+            return 77
+        raise
+    for p, got in zip(which, ran):
         st = stats[f"wave{p.wave} hw"]
         if isinstance(got, str):
             st["rejected"] += 1
@@ -1102,8 +1115,6 @@ def main():
             print(f"hardware oracle unavailable: {e}")
             return 77
         print(f"hardware oracle: {oracle.device}")
-    if a.perturb and "hw" in backends:
-        PERTURB.add(a.perturb)
     tally, rcs, results = {}, [], []
     try:
         if "translator" in backends:
@@ -1112,7 +1123,13 @@ def main():
             work.mkdir(parents=True, exist_ok=True)
             rcs.append(run_translator(progs, a, work, tally))
         if oracle:
-            rcs.append(run_hw(oracle, progs, a, tally, results))
+            if a.perturb:
+                PERTURB.add(a.perturb)      # the hardware side only: the translator is judged by the right model
+            hw_rc = run_hw(oracle, progs, a, tally, results)
+            PERTURB.discard(a.perturb)
+            if hw_rc == 77:
+                return 77
+            rcs.append(hw_rc)
             if "translator" in backends:
                 for p in progs:
                     if tally["hw"].get(p.name) == "mismatch":
@@ -1132,8 +1149,8 @@ def main():
                     n_bad = sum(v == "mismatch" for v in tally["hw"].values())
                     print(f"perturbed model '{a.perturb}' ({PERTURBATIONS[a.perturb][1]}): {n_bad} of "
                           f"{len(results)} programs mismatch" + ("" if n_bad else " -- NOT DETECTED"))
-                    PERTURB.discard(a.perturb)
-                    rcs[:] = [0 if n_bad else 1]
+                    if hw_rc != 2:          # a harness error stays one; otherwise a mismatch is the pass
+                        rcs[-1] = 0 if n_bad else 1
                 if a.negative_control:
                     print("negative control (wrong models judged against the same hardware words):")
                     silent = []

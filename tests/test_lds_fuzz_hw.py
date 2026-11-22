@@ -281,6 +281,27 @@ class RunHw(unittest.TestCase):
                                                                            f.LDS_BYTES, True))
             self.assertGreaterEqual(k.vgprs, max(f.POOL) + 1)
 
+    def test_a_backend_without_lds_support_is_unavailable_not_a_mismatch(self):
+        progs = f.programs(1, 2, (32,))
+
+        class NoLds(FakeOracle):
+            def run(self, kernels):
+                raise RuntimeError("k0: LDS, scratch memory and COMPUTE_PGM_RSRC3 are not supported by the launcher")
+        rc, out, *_ = self.run_hw(NoLds(progs), progs)
+        self.assertEqual(rc, 77)
+        self.assertIn("unavailable", out)
+
+        class Broken(FakeOracle):
+            def run(self, kernels):
+                raise RuntimeError("hw_oracle exited 3: something else")
+        with self.assertRaises(RuntimeError):
+            self.run_hw(Broken(progs), progs)
+
+    def test_gfx12_skips_cmpst_programs(self):
+        with_cmpst = next(p for p in f.programs(1, 60, (32,)) if any(o["kind"] == "cmpst" for o in p.ops))
+        self.assertIn("GFX11", f.hw_skip_reason(with_cmpst, "gfx1201"))
+        self.assertIsNone(f.hw_skip_reason(with_cmpst, "gfx1150"))
+
     def test_a_flipped_word_is_a_mismatch(self):
         progs = f.programs(1, 4, (32,))
 

@@ -38,7 +38,7 @@ from spirv_mini_interp import run_fragment  # noqa: E402
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 FP16_FLAG = 0x10
-# Interpolation mode, flags bits 0-1 (SHADER-181): every corpus record carries 1 (flat) or 2 (linear).
+# Read method, flags bits 0-1 (SHADER-181): every corpus record carries 1 (v_interp_mov) or 2 (v_interp_p1/p2).
 FLAT = 1
 LINEAR = 2
 
@@ -236,6 +236,7 @@ def test_metadata_records_table(tmp_path):
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
     assert meta["ps_interpolants"] == 3
     assert meta["ps_fp16_interpolants"] == [1]
+    assert meta["ps_flat_interpolants"] == []
 
     import pathlib
 
@@ -247,7 +248,7 @@ def test_metadata_records_table(tmp_path):
     assert "ps_fp16_interpolants" not in meta_plain
 
 
-# SHADER-181: the FSSM mode bits must agree with how the code reads each position.
+# SHADER-181: the FSSM read-method bits must agree with how the code reads each position.
 
 FLAT_THEN_INTERP = (
     "\tv_interp_mov_f32_e32 v2, p0, attr0.x\n"
@@ -266,13 +267,15 @@ F16_READ = (
 )
 
 
-def test_modes_agreeing_with_the_code_translate(tmp_path):
+def test_read_methods_agreeing_with_the_code_translate(tmp_path):
     """Mode 1 read by v_interp_mov and mode 2 read by p1/p2 is the corpus case (12,101 of 12,101 PS)."""
     table = fssm_blob([(4, 0xF, 0, 0, FLAT), (4, 0xF, 1, 1, LINEAR)])
     spv = translate(write_case(tmp_path, "ps_mode_ok", FLAT_THEN_INTERP, fssm=table))
     lines = [line.strip() for line in spv.splitlines()]
     assert "OpDecorate %in_attr0 Flat" in lines
     assert "OpDecorate %in_attr1 Flat" not in lines
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+    assert meta["ps_flat_interpolants"] == [0]
 
 
 def test_f16_interp_of_a_linear_position_translates(tmp_path):
@@ -287,23 +290,23 @@ def test_f16_interp_of_a_linear_position_translates(tmp_path):
     (3, READ_ATTR1),                # mode 3: never seen, meaning unknown
     (3, MOV_ATTR1),
 ])
-def test_disagreeing_or_unknown_mode_is_refused(tmp_path, flags, body):
+def test_disagreeing_or_unknown_read_method_is_refused(tmp_path, flags, body):
     table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, flags)])
-    with pytest.raises(rdna2spirv.Unsupported, match="PS input 1 interpolation mode"):
+    with pytest.raises(rdna2spirv.Unsupported, match="PS input 1 read method"):
         translate(write_case(tmp_path, "ps_mode_bad", body, fssm=table))
 
 
-def test_unknown_mode_on_an_unread_position_is_not_refused(tmp_path):
+def test_unknown_read_method_on_an_unread_position_is_not_refused(tmp_path):
     """Only positions the code reads are checked; an unread record with mode 0 changes nothing."""
     table = fssm_blob([(4, 0xF, 0, 0, LINEAR), (4, 0xF, 1, 1, LINEAR), (4, 0xF, 2, 2, 0)])
     translate(write_case(tmp_path, "ps_mode_unread", READ_ATTR1, fssm=table))
 
 
-def test_mode_check_unit():
+def test_read_method_check_unit():
     def ins(op, a):
         return {"op": op, "args": [{"k": "vgpr", "r": 2}, {"k": "attr", "a": a, "c": 0}], "mods": {}}
-    rdna2spirv.check_interpolation_modes([1, 2], [ins("v_interp_mov_f32_e32", 0), ins("v_interp_p1_f32_e32", 1),
+    rdna2spirv.check_read_methods([1, 2], [ins("v_interp_mov_f32_e32", 0), ins("v_interp_p1_f32_e32", 1),
                                                   ins("v_interp_p1ll_f16", 1), ins("v_interp_p1_f32_e32", 7)])
-    rdna2spirv.check_interpolation_modes([], [ins("v_interp_p1_f32_e32", 0)])
+    rdna2spirv.check_read_methods([], [ins("v_interp_p1_f32_e32", 0)])
     with pytest.raises(rdna2spirv.Unsupported):
-        rdna2spirv.check_interpolation_modes([1, 2], [ins("v_interp_p2_f16", 0)])
+        rdna2spirv.check_read_methods([1, 2], [ins("v_interp_p2_f16", 0)])

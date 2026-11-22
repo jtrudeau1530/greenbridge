@@ -40,6 +40,12 @@ test('malformed manifests keep the viewer usable and identify the invalid field'
         ['bad bounds', { spawn: [0, 0, 0], chunks: [{ ...worldChunk, bounds: [0, 0, 0, -1, 1, 1] }] },
             /chunks\[0\]\.bounds/],
         ['duplicate chunk ID', { spawn: [0, 0, 0], chunks: [worldChunk, worldChunk] }, /chunks\[1\]\.id/],
+        ['LOD tier without a band', { spawn: [0, 0, 0], chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 1, 1] }] },
+            /chunks\[0\]\.lod/],
+        ['LOD band out of order', { spawn: [0, 0, 0], lod_bands: { hd: [5, 1] },
+            chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 1, 1] }] }, /chunks\[0\]\.lod/],
+        ['LOD chunk without a cell', { spawn: [0, 0, 0], lod_bands: { hd: [0, 10] },
+            chunks: [{ ...worldChunk, lod: 'hd' }] }, /chunks\[0\]\.cell/],
     ];
     for (const [label, manifest, field] of cases) {
         await t.test(label, async () => {
@@ -419,3 +425,38 @@ test('generated test terrain loads without network requests', () => {
     assert(f.state.live.get('chunk_0').obj);
     assert.equal(f.state.live.get('chunk_0').loading, false);
 });
+
+test('a valid LOD manifest is accepted', async () => {
+    const manifest = { spawn: [0, 0, 0], lod_bands: { hd: [0, 130], lod: [130, 450] },
+        chunks: [{ ...worldChunk, lod: 'hd', cell: [0, 0, 256, 256] }] };
+    const world = await loadWorld(manifestResponse(manifest));
+    assert.equal(world.test, false);
+});
+
+test('LOD sets show one tier per cell by horizontal distance, with slack before unloading', async () => {
+    const f = fixture(0);
+    const cell = [0, 0, 256, 256];
+    f.context.world = { test: false, lod_bands: { hd: [0, 130], lod: [130, 450], slod1: [450, 1000] }, chunks: [
+        { id: 'hd', url: 'hd.glb', bounds: [0, 0, 0, 256, 50, 256], lod: 'hd', cell },
+        { id: 'lod', url: 'lod.glb', bounds: [0, 0, 0, 256, 80, 256], lod: 'lod', cell },
+        { id: 'slod1', url: 'slod1.glb', bounds: [0, 0, 0, 256, 90, 256], lod: 'slod1', cell },
+    ] };
+    const pos = f.context.camera.position;
+    Object.assign(pos, { x: 300, y: 500, z: 100 });          // 44 m east of the cell, high up: still HD
+    f.frame();
+    assert.deepEqual(f.requests.map(r => r.url), ['hd.glb']);
+    await f.succeed(0, f.object());
+    Object.assign(pos, { x: 256 + 150, y: 0, z: 100 });      // 150 m: LOD replaces HD (HD kept inside the slack)
+    f.frame();
+    assert.deepEqual(f.requests.map(r => r.url), ['hd.glb', 'lod.glb']);
+    assert.ok(f.state.live.has('hd'));
+    Object.assign(pos, { x: 256 + 200, y: 0, z: 100 });      // past the slack: HD unloads
+    f.frame();
+    assert.ok(!f.state.live.has('hd'));
+    assert.ok(f.state.live.has('lod'));
+    Object.assign(pos, { x: 256 + 600, y: 0, z: 100 });      // 600 m: SLOD1 only
+    f.frame();
+    assert.ok(!f.state.live.has('lod'));
+    assert.equal(f.requests.at(-1).url, 'slod1.glb');
+});
+
