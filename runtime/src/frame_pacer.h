@@ -82,12 +82,9 @@ public:
     }
     void advance_us(std::uint64_t microseconds) {
         now_ += microseconds;
-        std::function<void()> wake;
-        {
-            std::lock_guard guard(wake_mutex_);
-            wake = wake_;
-        }
-        if (wake) wake();
+        // Called under the lock, so a pacer that is being destroyed (set_wake({})) is never woken after it is gone.
+        std::lock_guard guard(wake_mutex_);
+        if (wake_) wake_();
     }
 
 private:
@@ -135,8 +132,9 @@ public:
     FramePacer& operator=(const FramePacer&) = delete;
 
     // SetFrameIntervalX(output, interval, latency, flags). `period_us` is the interval as a period; `latency` is
-    // the number of frames allowed in flight (0 counts as 1). The epoch of the vblank grid is now. Drops a
-    // scheduled origin event: it has to be scheduled again, as after ResumeX.
+    // the number of frames allowed in flight (0 counts as 1). The vblank grid is re-based: its epoch is now. A
+    // scheduled origin event stays armed (with its offset, kept below the new period) and its next origin is one
+    // new period from now; waiters blocked on the old grid pick the new one up.
     std::int32_t set_frame_interval(std::uint32_t period_us, std::uint32_t latency, std::uint32_t flags) {
         (void)flags;
         if (period_us == 0) return pacer_hr::invalid_arg;
@@ -146,7 +144,7 @@ public:
         latency_ = std::max(latency, 1u);
         epoch_us_ = clock_.now_us();
         interval_set_ = true;
-        armed_ = false;
+        offset_us_ = std::min(offset_us_, period_us - 1);
         last_origin_ = 0;  // origin 0 is the epoch itself, which has passed
         cv_.notify_all();
         return pacer_hr::ok;
@@ -161,7 +159,9 @@ public:
         if (offset_us >= period_us_) return pacer_hr::invalid_arg;
         offset_us_ = offset_us;
         armed_ = true;
-        last_origin_ = std::int64_t((clock_.now_us() - epoch_us_) / period_us_);  // the first origin is the next one
+        // The first origin is the next one that has not come yet: origin n is due at epoch + n * period + offset.
+        const std::uint64_t now = clock_.now_us();
+        last_origin_ = now >= epoch_us_ + offset_us_ ? std::int64_t((now - epoch_us_ - offset_us_) / period_us_) : 0;
         cv_.notify_all();
         return pacer_hr::ok;
     }
@@ -220,13 +220,22 @@ public:
     }
 
     // Queue side. check_present_token before the frame is presented, commit_present_token after it was queued.
-    // A token is valid once: it must have been issued by a wait and be newer than the last presented one (frames
-    // whose token was never presented are skipped, which is fine). invalid_arg otherwise (null, unknown, stale or
-    // repeated), invalid_state while suspended.
-    std::int32_t check_present_token(std::uint64_t token) {
+    // What real hardware does with a null, repeated or out-of-order token is unmeasured, and a title that presents
+    // with Token = 0 (a loading screen), re-presents with one token, or presents from a render thread out of order
+    // must not freeze. So the only refusal is a token that was never handed out (invalid_arg, which is a bug in the
+    // caller); null, stale (older than the last presented) and repeated tokens return ok and say which kind they
+    // were in `issue`, so the caller can log it. invalid_state while suspended.
+    enum class TokenIssue { none, null_token, stale, repeated };
+    std::int32_t check_present_token(std::uint64_t token, TokenIssue* issue = nullptr) {
         std::lock_guard guard(mutex_);
+        if (issue) *issue = TokenIssue::none;
         if (suspended_) return pacer_hr::invalid_state;
-        if (token == 0 || token > issued_ || token <= last_presented_) return pacer_hr::invalid_arg;
+        if (token > issued_) return pacer_hr::invalid_arg;
+        if (issue) {
+            if (token == 0) *issue = TokenIssue::null_token;
+            else if (token == last_presented_) *issue = TokenIssue::repeated;
+            else if (token < last_presented_) *issue = TokenIssue::stale;
+        }
         return pacer_hr::ok;
     }
     void commit_present_token(std::uint64_t token, std::uint32_t plane_count) {

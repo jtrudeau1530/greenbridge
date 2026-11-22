@@ -60,9 +60,9 @@ int main() {
         EXPECT(pacer.wait_frame_event(3, 0, 0, &token) == pacer_hr::invalid_arg);
         EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, nullptr) == pacer_hr::invalid_arg);
         EXPECT(pacer.registered());
-        // Setting the interval again drops the scheduled event, as after a resume.
+        // Setting the interval again keeps the scheduled event armed (it is re-based, not dropped).
         EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
-        EXPECT(!pacer.registered());
+        EXPECT(pacer.registered());
     }
 
     // The origin event: each wait returns at the next vblank, with the next token.
@@ -211,8 +211,10 @@ int main() {
         EXPECT(pacer.frames_in_flight() == 1);
     }
 
-    // Tokens: null, unknown, stale and repeated tokens are rejected; skipping a token is fine.
+    // Tokens: only one that was never handed out is refused. Null, stale and repeated ones are accepted and reported
+    // as such, so a title that presents with Token = 0, twice with one token, or out of order does not freeze.
     {
+        using Issue = FramePacer::TokenIssue;
         ManualFrameClock clock;
         FramePacer pacer(clock);
         EXPECT(setup(pacer, 4));
@@ -222,14 +224,67 @@ int main() {
             EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
         }
         EXPECT(t[0] == 1 && t[1] == 2 && t[2] == 3);
-        EXPECT(pacer.check_present_token(0) == pacer_hr::invalid_arg);   // the null token
-        EXPECT(pacer.check_present_token(4) == pacer_hr::invalid_arg);   // never issued
-        EXPECT(pacer.check_present_token(1000) == pacer_hr::invalid_arg);
-        EXPECT(pacer.check_present_token(2) == pacer_hr::ok);            // 1 is skipped
+        Issue issue = Issue::stale;
+        EXPECT(pacer.check_present_token(4, &issue) == pacer_hr::invalid_arg);     // never issued
+        EXPECT(pacer.check_present_token(1000, &issue) == pacer_hr::invalid_arg);
+        EXPECT(pacer.check_present_token(0, &issue) == pacer_hr::ok && issue == Issue::null_token);
+        EXPECT(pacer.check_present_token(2, &issue) == pacer_hr::ok && issue == Issue::none);  // 1 is skipped
         pacer.commit_present_token(2, 1);
-        EXPECT(pacer.check_present_token(2) == pacer_hr::invalid_arg);   // repeated
-        EXPECT(pacer.check_present_token(1) == pacer_hr::invalid_arg);   // stale: older than the last presented
-        EXPECT(pacer.check_present_token(3) == pacer_hr::ok);
+        EXPECT(pacer.check_present_token(2, &issue) == pacer_hr::ok && issue == Issue::repeated);
+        EXPECT(pacer.check_present_token(1, &issue) == pacer_hr::ok && issue == Issue::stale);
+        EXPECT(pacer.check_present_token(3, &issue) == pacer_hr::ok && issue == Issue::none);
+        // Presenting a stale or null token does not move the last presented token back.
+        pacer.commit_present_token(1, 1);
+        pacer.commit_present_token(0, 1);
+        EXPECT(pacer.check_present_token(2, &issue) == pacer_hr::ok && issue == Issue::repeated);
+        EXPECT(pacer.check_present_token(3, nullptr) == pacer_hr::ok);
+    }
+
+    // Changing the interval while the origin event is armed and a waiter is blocked: the event stays armed, the grid
+    // is re-based on the change, and the waiter comes back at the first origin of the new grid.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1));
+        auto waiter = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(waiter));
+        clock.advance_us(period / 2);
+        EXPECT(pacer.set_frame_interval(2 * period, 1, 0) == pacer_hr::ok);  // now = period / 2; new grid from here
+        EXPECT(pacer.registered() && pacer.period_us() == 2 * period);
+        clock.advance_us(period);  // the old grid's first origin has passed: still blocked
+        EXPECT(blocked(waiter));
+        clock.advance_us(period - 1);
+        EXPECT(blocked(waiter));
+        clock.advance_us(1);  // period / 2 + 2 * period: the first origin of the new grid
+        Result r = waiter.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == 1);
+        std::uint32_t count = 1;
+        FrameStatistic stat;
+        EXPECT(pacer.get_frame_statistics(1, stat_frame_event, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == period / 2 + 2 * period);
+        // An offset larger than the new, shorter period is cut to fit.
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, period + 1000, 0) == pacer_hr::ok);
+        EXPECT(pacer.set_frame_interval(period / 2, 1, 0) == pacer_hr::ok);
+        EXPECT(pacer.registered());
+    }
+
+    // Scheduling inside a period, before the offset has passed: that period's origin is still to come.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
+        clock.advance_us(period * 2 + 2000);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, 5000, 0) == pacer_hr::ok);
+        auto wait = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(wait));
+        clock.advance_us(2999);
+        EXPECT(blocked(wait));
+        clock.advance_us(1);  // 2 * period + 5000
+        EXPECT(wait.get().token == 1);
+        std::uint32_t count = 1;
+        FrameStatistic stat;
+        EXPECT(pacer.get_frame_statistics(1, stat_frame_event, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == period * 2 + 5000);
     }
 
     // Statistics: unknown tokens and types the pacer cannot give report S_FALSE and count 0.
