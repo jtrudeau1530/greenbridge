@@ -1155,5 +1155,75 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(mask_u, 0b1000)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling for v_interp_p2_f16
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Test suite for IEEE-754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zero_rules(self):
+        # +0.0 + +0.0 = +0.0
+        r1 = ref_interp_p2_f16(0.0, pack_f16_pair(H_POS_ZERO, 0), 0.0)
+        self.assertEqual(unpack_f16_pair(r1)[0], H_POS_ZERO)
+
+        # -0.0 + -0.0 = -0.0
+        r2 = ref_interp_p2_f16(1.0, pack_f16_pair(H_NEG_ZERO, 0), -0.0)
+        self.assertEqual(unpack_f16_pair(r2)[0], H_NEG_ZERO)
+
+    def test_nan_generation_and_propagation(self):
+        # 0.0 * inf -> NaN
+        r_nan1 = ref_interp_p2_f16(0.0, pack_f16_pair(H_POS_INF, 0), 0.0)
+        self.assertTrue(is_nan_f16(unpack_f16_pair(r_nan1)[0]))
+
+        # NaN input in p1_accum
+        r_nan2 = ref_interp_p2_f16(0.5, pack_f16_pair(f16_to_u16(1.0), 0), float("nan"))
+        self.assertTrue(is_nan_f16(unpack_f16_pair(r_nan2)[0]))
+
+        # SNaN input quiets to QNaN
+        snan_val = u16_to_f16(H_SNAN)
+        r_snan = ref_interp_p2_f16(0.0, pack_f16_pair(0, 0), snan_val)
+        out_u16 = unpack_f16_pair(r_snan)[0]
+        self.assertTrue(is_nan_f16(out_u16))
+        # Quiet bit (bit 9) must be set
+        self.assertTrue(bool(out_u16 & 0x0200))
+
+    def test_clamp_nan_to_pos_zero(self):
+        # In RDNA2, clamping any NaN results in +0.0 (0x0000)
+        r = ref_interp_p2_f16(0.0, pack_f16_pair(H_POS_INF, 0), 0.0, clamp=True)
+        self.assertEqual(unpack_f16_pair(r)[0], H_POS_ZERO)
+
+        r_snan_clamped = ref_interp_p2_f16(1.0, pack_f16_pair(H_SNAN, 0), 0.0, clamp=True)
+        self.assertEqual(unpack_f16_pair(r_snan_clamped)[0], H_POS_ZERO)
+
+    def test_subnormal_precision_and_gradual_underflow(self):
+        # Min subnormal: 2**-24 (0x0001)
+        # Min subnormal * 2.0 = 2**-23 (0x0002)
+        sub_min_f = u16_to_f16(H_SUB_MIN)
+        r_sub = ref_interp_p2_f16(2.0, pack_f16_pair(H_SUB_MIN, 0), 0.0)
+        self.assertEqual(unpack_f16_pair(r_sub)[0], 0x0002)
+
+        # Max subnormal: 0x03FF
+        r_max_sub = ref_interp_p2_f16(1.0, pack_f16_pair(H_SUB_MAX, 0), 0.0)
+        self.assertEqual(unpack_f16_pair(r_max_sub)[0], H_SUB_MAX)
+
+        # Underflow below 2**-24 rounds to 0.0
+        r_underflow = ref_interp_p2_f16(0.25, pack_f16_pair(H_SUB_MIN, 0), 0.0)
+        self.assertEqual(unpack_f16_pair(r_underflow)[0], H_POS_ZERO)
+
+    def test_normal_max_overflow(self):
+        # H_MAX_NORMAL = 65504.0 (0x7BFF)
+        r_max = ref_interp_p2_f16(1.0, pack_f16_pair(H_MAX_NORMAL, 0), 0.0)
+        self.assertEqual(unpack_f16_pair(r_max)[0], H_MAX_NORMAL)
+
+        # Overflow beyond 65504.0 produces +inf (0x7C00)
+        r_over = ref_interp_p2_f16(2.0, pack_f16_pair(H_MAX_NORMAL, 0), 0.0)
+        self.assertEqual(unpack_f16_pair(r_over)[0], H_POS_INF)
+
+        # Clamped overflow saturates to 1.0 (0x3C00)
+        r_over_clamped = ref_interp_p2_f16(2.0, pack_f16_pair(H_MAX_NORMAL, 0), 0.0, clamp=True)
+        self.assertEqual(unpack_f16_pair(r_over_clamped)[0], H_ONE)
+
+
 if __name__ == "__main__":
     unittest.main()
