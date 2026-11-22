@@ -1078,5 +1078,184 @@ class TestValuAlignbyteB32ConditionCodes(unittest.TestCase):
         self.assertEqual(simd.vcc, canary_vcc)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Single-Precision Floating-Point Architectural Constants & Boundaries
+# ---------------------------------------------------------------------------
+
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_ONE_F32: int = 0x3F800000
+NEG_ONE_F32: int = 0xBF800000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+SNAN_F32: int = 0x7F800001
+QNAN_PAYLOAD_F32: int = 0x7FC01234
+SNAN_PAYLOAD_F32: int = 0x7F804321
+SUBNORM_MIN_F32: int = 0x00000001
+SUBNORM_MAX_F32: int = 0x007FFFFF
+NEG_SUBNORM_MIN_F32: int = 0x80000001
+NEG_SUBNORM_MAX_F32: int = 0x807FFFFF
+FLT_MIN_F32: int = 0x00800000
+FLT_MAX_F32: int = 0x7F7FFFFF
+
+
+def f32_to_bits(val: float) -> int:
+    """Encode float to IEEE 754 single-precision 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Decode 32-bit unsigned integer to IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def is_nan_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision NaN."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0
+
+
+def is_subnormal_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision subnormal."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0 and (bits & 0x007FFFFF) != 0
+
+
+class TestValuAlignbyteB32IEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_unaligned_float_reconstruction_all_shifts(self) -> None:
+        """Verify unaligned IEEE 754 floats in byte streams are reconstructed bit-exactly."""
+        floats_to_test = [
+            POS_ZERO_F32,
+            NEG_ZERO_F32,
+            POS_ONE_F32,
+            NEG_ONE_F32,
+            POS_INF_F32,
+            NEG_INF_F32,
+            QNAN_F32,
+            SNAN_F32,
+            QNAN_PAYLOAD_F32,
+            SNAN_PAYLOAD_F32,
+            SUBNORM_MIN_F32,
+            SUBNORM_MAX_F32,
+            FLT_MIN_F32,
+            FLT_MAX_F32,
+        ]
+
+        canary_pad = 0x5A  # padding byte
+
+        for flt_bits in floats_to_test:
+            flt_bytes = unpack_bytes(flt_bits)
+            for shift in (0, 1, 2, 3):
+                with self.subTest(flt=f"{flt_bits:#010x}", shift=shift):
+                    # Create an 8-byte buffer where flt_bytes start at byte offset `shift`
+                    buf = [canary_pad] * 8
+                    for i in range(4):
+                        buf[shift + i] = flt_bytes[i]
+
+                    # S1 is bytes 0..3, S0 is bytes 4..7
+                    s1 = pack_bytes(buf[0], buf[1], buf[2], buf[3])
+                    s0 = pack_bytes(buf[4], buf[5], buf[6], buf[7])
+
+                    # Align byte by `shift` extracts bytes `shift..shift+3`
+                    extracted = ref_alignbyte_b32(s0, s1, shift)
+                    self.assertEqual(extracted, flt_bits)
+
+                    # Float bitcast preservation
+                    if not is_nan_f32(flt_bits):
+                        orig_f = bits_to_f32(flt_bits)
+                        extr_f = bits_to_f32(extracted)
+                        if flt_bits in (POS_ZERO_F32, NEG_ZERO_F32):
+                            # Ensure sign of zero is preserved
+                            self.assertEqual(flt_bits & SIGN_BIT32, extracted & SIGN_BIT32)
+                        else:
+                            self.assertEqual(orig_f, extr_f)
+                    else:
+                        self.assertTrue(is_nan_f32(extracted))
+
+    def test_subnormals_bit_preservation_no_ftz(self) -> None:
+        """Verify that subnormal float bit patterns are NEVER flushed to zero during alignment."""
+        subnormals = [
+            SUBNORM_MIN_F32,
+            SUBNORM_MAX_F32,
+            NEG_SUBNORM_MIN_F32,
+            NEG_SUBNORM_MAX_F32,
+            0x00000042,
+            0x00012345,
+            0x800055AA,
+        ]
+        for sub in subnormals:
+            self.assertTrue(is_subnormal_f32(sub))
+            # Shift 0: returns sub directly
+            self.assertEqual(ref_alignbyte_b32(0, sub, 0), sub)
+            # Shift 2: pack across dwords
+            b0, b1, b2, b3 = unpack_bytes(sub)
+            s1 = pack_bytes(0, 0, b0, b1)
+            s0 = pack_bytes(b2, b3, 0, 0)
+            res = ref_alignbyte_b32(s0, s1, 2)
+            self.assertEqual(res, sub)
+            self.assertTrue(is_subnormal_f32(res))
+
+    def test_nan_payload_preservation_no_quietization(self) -> None:
+        """Verify signaling NaNs and quiet NaNs preserve their payloads without mutation."""
+        nans = [
+            QNAN_F32,
+            SNAN_F32,
+            QNAN_PAYLOAD_F32,
+            SNAN_PAYLOAD_F32,
+            0x7F800002,  # sNaN
+            0x7FC00001,  # qNaN
+            0xFF800001,  # negative sNaN
+            0xFFC00001,  # negative qNaN
+        ]
+        for nan in nans:
+            self.assertTrue(is_nan_f32(nan))
+            # Across all shifts, bit pattern must be 100% invariant
+            for shift in (0, 1, 2, 3):
+                flt_bytes = unpack_bytes(nan)
+                buf = [0] * 8
+                for i in range(4):
+                    buf[shift + i] = flt_bytes[i]
+                s1 = pack_bytes(buf[0], buf[1], buf[2], buf[3])
+                s0 = pack_bytes(buf[4], buf[5], buf[6], buf[7])
+                res = ref_alignbyte_b32(s0, s1, shift)
+                self.assertEqual(res, nan)
+                self.assertEqual(res & 0x007FFFFF, nan & 0x007FFFFF)  # payload intact
+                self.assertEqual(res & SIGN_BIT32, nan & SIGN_BIT32)  # sign intact
+
+    def test_signed_zeros_distinction(self) -> None:
+        """Verify +0.0 and -0.0 maintain their respective sign bits when aligned."""
+        # Positive zero
+        self.assertEqual(ref_alignbyte_b32(0, POS_ZERO_F32, 0), POS_ZERO_F32)
+        self.assertEqual(ref_alignbyte_b32(0, POS_ZERO_F32, 0) & SIGN_BIT32, 0)
+
+        # Negative zero
+        self.assertEqual(ref_alignbyte_b32(0, NEG_ZERO_F32, 0), NEG_ZERO_F32)
+        self.assertEqual(ref_alignbyte_b32(0, NEG_ZERO_F32, 0) & SIGN_BIT32, SIGN_BIT32)
+
+        # Negative zero shifted by 1 byte: sign bit was bit 31 of S1 (byte 3).
+        # Shifting by 1 byte places byte 3 into byte 2 of result (bit 23).
+        res_shift1 = ref_alignbyte_b32(0, NEG_ZERO_F32, 1)
+        self.assertEqual(res_shift1, 0x00800000)
+
+    def test_infinities_preservation(self) -> None:
+        """Verify positive and negative infinities remain bit-identical."""
+        self.assertEqual(ref_alignbyte_b32(0, POS_INF_F32, 0), POS_INF_F32)
+        self.assertEqual(ref_alignbyte_b32(0, NEG_INF_F32, 0), NEG_INF_F32)
+
+    def test_dual_packed_f16_half_swapping(self) -> None:
+        """Verify alignbyte can exchange high/low 16-bit halves (packed float16)."""
+        # Pack two f16 values: low=1.0 (0x3C00), high=2.0 (0x4000) -> 0x40003C00
+        packed_f16 = 0x40003C00
+        # Rotate by 2 bytes (shift 2 with S0 == S1) exchanges the two halves
+        swapped = ref_alignbyte_b32(packed_f16, packed_f16, 2)
+        self.assertEqual(swapped, 0x3C004000)
+        # Low half is now 2.0 (0x4000) and high half is 1.0 (0x3C00)
+        self.assertEqual(swapped & 0xFFFF, 0x4000)
+        self.assertEqual((swapped >> 16) & 0xFFFF, 0x3C00)
+
+
 if __name__ == "__main__":
     unittest.main()
