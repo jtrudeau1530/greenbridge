@@ -244,12 +244,40 @@ stream. 520 streams end inside a group that continues in the next one; 5 stop at
 doesn't fit. The `63 30` checks are unchanged on the 3 extra blocks: all positions finite and all normals of unit
 length.
 
-Still open: the +0x5C and +0x7C words, meshlet record bits 14-31 and words +8/+12, and the `42 40 00 00`
-attribute encodings. The record words +8/+12 keep their default
-(0x007FF7FF / 0x7FF) in 2,453 of the 9,134 meshlets of the earlier scope. The rest stay close to 0x7FF/0x800 per
-12-bit field, which looks like a quantised vector. They don't correlate with the mean normal or the centre of the
-meshlet's vertices in a `63 30` block (|r| < 0.13 on the 2,449 meshlets that have one). The `42 40` positions
-above make that test possible on the other 150,000 meshlets.
+**Meshlet record words +8/+12 hold the meshlet's centre.** Three 12-bit fields give x, y and z: w2 bits 0-11,
+w2 bits 12-23 and w3 bits 0-11. Each is in 1/16 m steps around 2047, so the centre is `(field − 2047) / 16`, over
+±128 m, and the default `0x007FF7FF / 0x7FF` is the origin. `tools/meshlet_page.py --centres` compares each stored
+centre with the centre of its meshlet's vertex box, using the `42 40` positions above. Over all 1,569 streams:
+
+| Meshlets | Default words | Axes | Same 1/16 m step | Within one step |
+|---:|---:|---:|---:|---:|
+| 142,613 | 68 | 427,839 | 213,052 (49.8%) | 305,545 (71.4%) |
+
+The rest are further off. The stored centre may be a bounding-sphere centre rather than the box centre: the mean
+of the vertices fits worse (about 30% in the same step on the first 400 streams, against 51.8% for the box).
+Within a block of 40 or more meshlets, the fields are almost perfectly ordered by the box centre: median rank
+correlation 0.997 (x), 0.997 (y) and 0.983 (z) over 387 blocks. Readings that are deliberately wrong fit far worse on the first 400 streams:
+
+| Reading | Same step |
+|---|---:|
+| the rule | 51.8% |
+| offset 2048 | 11.3% |
+| 1/8 m steps | 0.9% |
+| x and y swapped | 17.0% |
+
+The earlier test on `63 30` blocks found no correlation, and the reason is that their records hardly vary: the
+groups matched to a `63 30` block keep the default words in 2,417 of 2,452 meshlets.
+
+The other bits are not decoded:
+- **w3 bits 12-31** are non-zero in 24% of the `42 40` meshlets of the first 400 streams (14,594 of 61,156), and
+  bits 12-13 are clear in every one of them. They follow how closely the meshlet's face normals agree (r ≈ 0.7 with the smallest dot product to the mean normal), which
+  suggests a normal cone.
+- **w2 bits 24-31** are 0 or 16. 16 is set on 1,225 of 61,156 meshlets of the first 400 streams, nearly always
+  together with non-zero w3 bits 12-31.
+- **w0 bits 14-31** are not decoded either; bits 14-15 are clear in all 61,170 records of those streams.
+
+Still open: the +0x5C and +0x7C words, meshlet record bits 14-31 of word 0 and the cone-like bits above, and the
+`42 40 00 00` attribute encodings.
 
 ### `story000_script.rpf`, full
 

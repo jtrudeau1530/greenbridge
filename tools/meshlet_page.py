@@ -24,7 +24,10 @@ Meshlet group (first u32 has bit 31 set):
     +12  K * 16-byte meshlet records:
          u32 w0: bits 0-6 = vertices - 1, bits 7-13 = triangles - 1, bits 14-31 not decoded
          u32 w1: low u16 = first vertex reference, high u16 = first triangle (running sums)
-         u32 w2, w3: not decoded (0x007FF7FF and 0x7FF in most records)
+         u32 w2, w3: bits 0-11 and 12-23 of w2 and bits 0-11 of w3 are the meshlet's centre in x, y and z as
+                     12-bit steps of 1/16 m around 2047, (field - 2047) / 16 (measured on `42 40` geometry; the
+                     default 0x007FF7FF / 0x7FF is the origin). w2 bits 24-31 (0 or 16) and w3 bits 12-31
+                     (non-zero when the meshlet's faces point roughly one way) are not decoded.
     then T u32 triangles: three 7-bit meshlet-local indices (bits 0-6, 7-13, 14-20), meshlet index in bits 21-31
     then V u16 vertex references into a vertex block
 
@@ -49,7 +52,7 @@ error, at a `42 40` block whose layout doesn't fit the rule above or at a group 
 the stream. Only counts and layout checks are written; no vertex, index or float value leaves this tool.
 
 Usage:
-    python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet] [--faces]
+    python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet] [--faces] [--centres]
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --geometry-offset <offset> [--json out.json]
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 """
@@ -209,6 +212,34 @@ def face_agreement(positions, triangles):
     return out
 
 
+def meshlet_centre(w2, w3):
+    """The centre stored in a meshlet record's words +8 and +12, in metres (see the module docstring)."""
+    return ((w2 & 0xFFF) - 2047) / 16, (((w2 >> 12) & 0xFFF) - 2047) / 16, ((w3 & 0xFFF) - 2047) / 16
+
+
+def centre_agreement(data, group, positions):
+    """Compare each meshlet's stored centre with the centre of its vertices' box. Counts axes whose difference
+    rounds to 0 or to at most one 1/16 m step."""
+    at, k = group["offset"], group["meshlets"]
+    rec_at = at + 12
+    refs_at = rec_at + 16 * k + 4 * group["triangles"]
+    refs = struct.unpack_from(f"<{group['vertex_refs']}H", data, refs_at)
+    out = {"meshlets": k, "default_words": 0, "axes": 3 * k, "axes_exact": 0, "axes_within_step": 0}
+    for m in range(k):
+        w0, w1, w2, w3 = struct.unpack_from("<4I", data, rec_at + 16 * m)
+        out["default_words"] += w2 == 0x007FF7FF and w3 == 0x7FF
+        vb, vc = w1 & 0xFFFF, (w0 & 0x7F) + 1
+        pts = [positions[r] for r in refs[vb:vb + vc] if r < len(positions)]
+        if len(pts) != vc:
+            raise PageError("meshlet references a vertex past its block")
+        stored = meshlet_centre(w2, w3)
+        for i in range(3):
+            step = round(((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) * 16)
+            out["axes_exact"] += step == 0
+            out["axes_within_step"] += abs(step) <= 1
+    return out
+
+
 def block4240_checks(data, block):
     """Count-only plausibility checks for one `42 40` block's decoded positions."""
     pos = positions_4240(data, block)
@@ -350,9 +381,10 @@ def block_checks(data, block):
     return out
 
 
-def summarise_page(data, name, faces=False):
-    """Counts for one page. faces=True also runs face_agreement on every group whose vertex span matches a `42 40`
-    block in the page (the nearest such block before it, else the first after it)."""
+def summarise_page(data, name, faces=False, centres=False):
+    """Counts for one page. faces=True also runs face_agreement, and centres=True centre_agreement, on every group
+    whose vertex span matches a `42 40` block in the page (the nearest such block before it, else the first after
+    it)."""
     try:
         chunks = parse_page(data)
     except PageError as exc:
@@ -368,7 +400,7 @@ def summarise_page(data, name, faces=False):
         for b in others:
             for k, v in block4240_checks(data, b).items():
                 checks[k] = checks.get(k, 0) + v
-        if faces:
+        if faces or centres:
             decoded = {}
             for g in groups:
                 same = [b for b in others if b["vertices"] == g["vertex_span"]]
@@ -378,8 +410,12 @@ def summarise_page(data, name, faces=False):
                 b = before[-1] if before else same[0]
                 if b["offset"] not in decoded:
                     decoded[b["offset"]] = positions_4240(data, b)
-                for k, v in face_agreement(decoded[b["offset"]], list(group_triangles(data, g))).items():
-                    checks["faces_4240_" + k] = checks.get("faces_4240_" + k, 0) + v
+                if faces:
+                    for k, v in face_agreement(decoded[b["offset"]], list(group_triangles(data, g))).items():
+                        checks["faces_4240_" + k] = checks.get("faces_4240_" + k, 0) + v
+                if centres:
+                    for k, v in centre_agreement(data, g, decoded[b["offset"]]).items():
+                        checks["centres_4240_" + k] = checks.get("centres_4240_" + k, 0) + v
     except PageError as exc:
         return {"name": name, "size": len(data), "error": str(exc)}
     counts = {b["vertices"] for b in blocks}
@@ -608,6 +644,8 @@ def main(argv=None):
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--faces", action="store_true",
                     help="also count how often neighbouring faces of 42 40 geometry agree (slower)")
+    ap.add_argument("--centres", action="store_true",
+                    help="also compare meshlet records' stored centres with their 42 40 vertices (slower)")
     ap.add_argument("--draw-system", help="inflated system segment paired with one graphics segment")
     select = ap.add_mutually_exclusive_group()
     select.add_argument("--geometry-offset", action="append", type=lambda s: int(s, 0),
@@ -662,7 +700,7 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"error: {path} does not exist", file=sys.stderr)
             return 2
-    pages = [summarise_page(data, name, args.faces) for name, data in iter_inputs(args.inputs)]
+    pages = [summarise_page(data, name, args.faces, args.centres) for name, data in iter_inputs(args.inputs)]
     total = totals(pages)
     if not args.quiet:
         for p in pages:
