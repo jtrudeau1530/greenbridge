@@ -4862,33 +4862,48 @@ int main() {
             if (!placed_cast_scenario(device10, false, host.data())) return false;
             if (!placed_cast_refusals(device10, host_refusals)) return false;
             unsigned differences = 0;
-            // D3D12 does not pin float -> UNORM at a tie: the D3D11.3 functional spec (3.2.3.6 FLOAT -> UNORM)
-            // computes c * (2^n - 1) + 0.5 and drops the fraction, but permits a tolerance of 0.6 ULP on the integer
-            // side, so a value exactly halfway between two codes (0.5 * 255 = 127.5) may map to either. WARP and AMD
-            // give the upper code; NVIDIA's D3D12 driver and its Vulkan driver the lower (RTX 3080 616.64, RTX 3090
-            // 610.88 and RTX 5070 Laptop 617.42). On the layer's own adapter (same LUID) the comparison stays exact;
-            // against another adapter or WARP the plain clear accepts either code on a tie channel.
+            // D3D12 does not pin float -> UNORM or float -> SRGB to one code: the D3D11.3 functional spec
+            // (3.2.3.6 FLOAT -> UNORM, 3.2.3.8 FLOAT -> SRGB) permits a tolerance of 0.6 ULP on the integer side, so
+            // a value near halfway between two codes may map to either. The plain clear's 0.5 * 255 = 127.5 is a
+            // tie: WARP and AMD give the upper code, NVIDIA's D3D12 driver and its Vulkan driver the lower (RTX 3080
+            // 616.64, RTX 3090 610.88 and RTX 5070 Laptop 617.42). The SRGB-cast clear's 0.5 encodes to 187.516:
+            // WARP and NVIDIA's Vulkan driver give 188, Intel's Vulkan driver 187 (UHD 770 101.7092), both within
+            // 0.6 ULP. On the layer's own adapter (same LUID) the comparison stays exact; against another adapter
+            // or WARP a byte may differ when both sides are within 0.6 ULP of the ideal value.
             const FLOAT clear_value[4] = {0.25f, 0.5f, 0.75f, 1.0f};  // placed_cast_scenario's clear colour
-            unsigned tie_bytes_other_way = 0;
+            const auto ideal_srgb = [](double c) {  // 3.2.3.8's ideal FLOAT -> SRGB, before scaling to 255
+                return c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055;
+            };
+            const auto within_tolerance = [&](std::uint8_t ours_byte, std::uint8_t host_byte, double ideal) {
+                return !same_adapter && std::abs(double(ours_byte) - ideal) <= 0.6 &&
+                       std::abs(double(host_byte) - ideal) <= 0.6;
+            };
+            unsigned plain_within = 0, srgb_within = 0;
             for (UINT row = 0; row < 4; ++row)
                 for (UINT i = 0; i < 16; ++i) {
                     const UINT a = row * 256 + i, b = 1024 + row * 256 + i;
-                    const double scaled = double(clear_value[i % 4]) * 255.0;
-                    const bool tie = !same_adapter && scaled - std::floor(scaled) == 0.5;
-                    if (tie && std::abs(int(ours[b]) - int(host[b])) == 1) {
-                        ++tie_bytes_other_way;
-                    } else if (ours[b] != host[b] && differences++ < 8) {
-                        std::fprintf(stderr, "placed plain clear row %u byte %u: ours %02x, host %02x\n", row, i,
-                                     ours[b], host[b]);
+                    const double c = clear_value[i % 4];
+                    const double plain_ideal = c * 255.0;
+                    const double srgb_ideal = (i % 4 == 3 ? c : ideal_srgb(c)) * 255.0;  // alpha stays linear
+                    if (ours[b] != host[b]) {
+                        if (within_tolerance(ours[b], host[b], plain_ideal))
+                            ++plain_within;
+                        else if (differences++ < 8)
+                            std::fprintf(stderr, "placed plain clear row %u byte %u: ours %02x, host %02x\n", row, i,
+                                         ours[b], host[b]);
                     }
-                    if (ours[a] != host[a] && differences++ < 8)
-                        std::fprintf(stderr, "placed SRGB-cast clear row %u byte %u: ours %02x, host %02x\n", row,
-                                     i, ours[a], host[a]);
+                    if (ours[a] != host[a]) {
+                        if (within_tolerance(ours[a], host[a], srgb_ideal))
+                            ++srgb_within;
+                        else if (differences++ < 8)
+                            std::fprintf(stderr, "placed SRGB-cast clear row %u byte %u: ours %02x, host %02x\n",
+                                         row, i, ours[a], host[a]);
+                    }
                 }
-            if (tie_bytes_other_way)
-                std::printf("placed plain clear: the host rounds the exact .5 tie the other way in %u bytes (within "
-                            "the 0.6 ULP tolerance of D3D11.3 spec 3.2.3.6)\n",
-                            tie_bytes_other_way);
+            if (plain_within || srgb_within)
+                std::printf("placed clears: %u plain and %u SRGB-cast bytes differ from the host by one code, both "
+                            "within the 0.6 ULP tolerance of D3D11.3 spec 3.2.3.6 and 3.2.3.8\n",
+                            plain_within, srgb_within);
             for (UINT i = 0; i < 3; ++i)
                 if (our_refusals[i] != host_refusals[i]) {
                     ++differences;
