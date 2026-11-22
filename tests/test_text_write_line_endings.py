@@ -3,9 +3,10 @@
 `open(path, "w")` with no `newline=` turns each "\\n" into "\\r\\n" on Windows, so the same JSON report, manifest or
 assembly listing is CRLF there and LF on Linux and macOS: the same input gives byte-different output per platform
 (checksums and diffs differ). The CSV writers were fixed in #1573; this covers the other text writers. This test reads
-the source with `ast` (standard library, no game data, no GPU) and fails for any `open` / `os.fdopen` in a text write
-mode (`w`, `a`, `x`) or any `Path.write_text` under tools/, scripts/, make_game.py and runtime/test/shaders/ that has
-no `newline=` argument. Pass `newline="\\n"` for LF output (or `newline=""` when the text carries its own line ends,
+the source with `ast` (standard library, no game data, no GPU) and fails for any `open`, `io.open`, `Path.open`,
+`os.fdopen` or `tempfile.NamedTemporaryFile` (and `TemporaryFile`, `SpooledTemporaryFile`) in a text write mode (`w`,
+`a`, `x`), or any `Path.write_text`, under tools/, scripts/, make_game.py and runtime/test/shaders/ that has no
+`newline=` argument. `codecs.open` is left alone: it never translates line ends and takes no `newline=`. Pass `newline="\\n"` for LF output (or `newline=""` when the text carries its own line ends,
 like a csv writer).
 """
 import ast
@@ -31,26 +32,61 @@ def python_files():
                     yield os.path.join(base, name)
 
 
+MODE_CHARS = set("rwaxbt+")
+# Where each call takes its mode: open(file, mode), io/gzip/bz2/lzma.open(file, mode), os.fdopen(fd, mode),
+# Path.open(mode) and tempfile.*TemporaryFile(mode) (binary unless the mode says otherwise).
+MODULE_OPENS = {"io", "gzip", "bz2", "lzma"}
+TEMPFILES = {"NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile"}
+# open() calls that never write translated text: codecs.open writes "\n" as it is and takes no newline=; os.open
+# takes flags; tarfile, zipfile and webbrowser open archives or URLs.
+NOT_TEXT_OPENS = {"codecs", "os", "tarfile", "zipfile", "webbrowser"}
+
+
+def text_write_mode(mode) -> bool:
+    """True for a constant mode string that opens a text file for writing ("w", "a+", "xt", ...)."""
+    return (isinstance(mode, str) and bool(mode) and set(mode) <= MODE_CHARS and "b" not in mode
+            and any(c in mode for c in "wax"))
+
+
+def call_mode(node: ast.Call, index: int):
+    mode = None
+    if len(node.args) > index and isinstance(node.args[index], ast.Constant):
+        mode = node.args[index].value
+    for k in node.keywords:
+        if k.arg == "mode" and isinstance(k.value, ast.Constant):
+            mode = k.value.value
+    return mode
+
+
+def mode_index(func):
+    """Position of the mode argument for the file-opening calls this test knows, or None for any other call."""
+    name = getattr(func, "attr", getattr(func, "id", None))
+    if name in TEMPFILES:
+        return 0
+    if name == "fdopen":
+        return 1
+    if name != "open":
+        return None
+    if isinstance(func, ast.Name):
+        return 1   # the builtin open
+    owner = func.value.id if isinstance(func.value, ast.Name) else None
+    if owner in NOT_TEXT_OPENS:
+        return None
+    return 1 if owner in MODULE_OPENS else 0   # anything else is taken as Path.open(mode)
+
+
 def unpinned_text_writes(source: str):
     """Line numbers of text-mode writes in `source` that pass no `newline=`."""
     found = []
     for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call):
+        if not isinstance(node, ast.Call) or any(k.arg == "newline" for k in node.keywords):
             continue
-        func = node.func
-        name = getattr(func, "attr", getattr(func, "id", None))
-        if any(k.arg == "newline" for k in node.keywords):
+        name = getattr(node.func, "attr", getattr(node.func, "id", None))
+        if name == "write_text":
+            found.append(node.lineno)
             continue
-        if name in ("open", "fdopen"):
-            mode = None
-            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
-                mode = node.args[1].value
-            for k in node.keywords:
-                if k.arg == "mode" and isinstance(k.value, ast.Constant):
-                    mode = k.value.value
-            if isinstance(mode, str) and "b" not in mode and any(c in mode for c in "wax"):
-                found.append(node.lineno)
-        elif name == "write_text":
+        index = mode_index(node.func)
+        if index is not None and text_write_mode(call_mode(node, index)):
             found.append(node.lineno)
     return found
 
@@ -69,8 +105,24 @@ class TextWriteLineEndings(unittest.TestCase):
             "open('a')\n"                                          # read
             "open('a', 'r', encoding='utf-8')\n"                   # read
             "p.write_text('x', newline='\\n')\n"                   # pinned
+            "pathlib.Path('a').open('w', encoding='utf-8')\n"     # 12
+            "p.open(mode='a')\n"                                   # 13
+            "io.open('out.txt', 'w')\n"                            # 14
+            "tempfile.NamedTemporaryFile('w', delete=False)\n"     # 15
+            "NamedTemporaryFile(mode='w+', encoding='utf-8')\n"    # 16
+            "tempfile.SpooledTemporaryFile(mode='wt')\n"           # 17
+            "gzip.open('out.txt.gz', 'wt')\n"                      # 18
+            "tempfile.NamedTemporaryFile(mode='w', newline='\\n')\n"  # pinned
+            "tempfile.NamedTemporaryFile()\n"                      # binary (the default w+b)
+            "tempfile.NamedTemporaryFile('w+b')\n"                 # binary
+            "p.open()\n"                                           # read
+            "p.open('rb')\n"                                       # read
+            "zf.open('words.txt')\n"                               # a member name, not a mode
+            "codecs.open('a', 'w', 'utf-8')\n"                     # no newline translation in codecs
+            "tarfile.open('a', 'w:gz')\n"                          # an archive mode, binary
+            "os.open('a', os.O_WRONLY)\n"                          # flags, not a mode string
         )
-        self.assertEqual(unpinned_text_writes(src), [1, 2, 3, 4, 5])
+        self.assertEqual(unpinned_text_writes(src), [1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17, 18])
 
     def test_every_text_write_pins_its_newline(self):
         bad = []

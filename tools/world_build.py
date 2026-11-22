@@ -1184,7 +1184,7 @@ def _write_json_atomic(path: str, data: dict, replace=None) -> None:
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=parent, prefix=".world-", suffix=".tmp", delete=False,
+            mode="w", encoding="utf-8", newline="\n", dir=parent, prefix=".world-", suffix=".tmp", delete=False,
         ) as f:
             tmp_path = f.name
             json.dump(data, f, indent=2, allow_nan=False)

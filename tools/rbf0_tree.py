@@ -657,7 +657,7 @@ def write_json(path, docs, summary):
     directory = os.path.dirname(os.path.abspath(path))
     temp = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=directory,
                                          prefix=".rbf0_tree-", suffix=".tmp", delete=False) as f:
             temp = f.name
             json.dump({"tool": "rbf0_tree", "format": 1, "summary": summary, "resources": docs},

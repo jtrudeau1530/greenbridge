@@ -199,8 +199,8 @@ def write_report(path, text):
     parent = os.path.dirname(os.path.abspath(path))
     tmp = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=parent, prefix=".rtti-", suffix=".tmp",
-                                         delete=False) as f:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent, prefix=".rtti-",
+                                         suffix=".tmp", delete=False) as f:
             tmp = f.name
             f.write(text)
         os.chmod(tmp, published_mode(path))
