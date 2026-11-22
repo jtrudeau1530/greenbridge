@@ -26,6 +26,9 @@ NOT_YET_GUARDED = {
     "scripts/run_wine_tests.py",  # open Wine runner pull requests change this file
 }
 MARK = ""
+# Python 3.15 turns UTF-8 mode on by default, even under -I, and then a redirected stdout cannot fail this way.
+# -X utf8=0 keeps the code page these tests are about, so they still catch a missing guard there.
+PYTHON = [sys.executable, "-I", "-X", "utf8=0"]
 
 
 class EveryToolGuardsStdout(unittest.TestCase):
@@ -61,7 +64,7 @@ class MeasuredCrashes(unittest.TestCase):
             for tool, with_out in self.CASES:
                 with self.subTest(tool=tool):
                     argv = [src] + (["--out", out] if with_out else [])
-                    r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, tool)] + argv,
+                    r = subprocess.run(PYTHON + [os.path.join(TOOLS, tool)] + argv,
                                        capture_output=True, cwd=ROOT, timeout=300)
                     err = r.stderr.decode("utf-8", "replace")
                     self.assertNotIn("UnicodeEncodeError", err)
@@ -75,8 +78,9 @@ class ScriptsAndViewer(unittest.TestCase):
             disasm = os.path.join(tmp, "disasm-" + MARK)
             os.makedirs(disasm)
             report = os.path.join(tmp, "rep-" + MARK + ".json")
-            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "audit_shader4_regs.py"),
-                                disasm, "--json", report], capture_output=True, cwd=ROOT, timeout=300)
+            audit = os.path.join(ROOT, "scripts", "audit_shader4_regs.py")
+            r = subprocess.run(PYTHON + [audit, disasm, "--json", report],
+                               capture_output=True, cwd=ROOT, timeout=300)
             err = r.stderr.decode("utf-8", "replace")
             self.assertNotIn("Traceback", err)
             self.assertEqual(r.returncode, 0, err)
@@ -87,8 +91,8 @@ class ScriptsAndViewer(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             world = os.path.join(tmp, "world-" + MARK)
             os.makedirs(world)
-            proc = subprocess.Popen([sys.executable, "-I", os.path.join(ROOT, "viewer", "serve.py"),
-                                     "--world", world, "--port", "0"],
+            serve = os.path.join(ROOT, "viewer", "serve.py")
+            proc = subprocess.Popen(PYTHON + [serve, "--world", world, "--port", "0"],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT)
             try:
                 line = proc.stdout.readline()   # the viewer prints this line once it is listening
