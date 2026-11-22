@@ -199,9 +199,37 @@ def start_failure(exe, err):
             "allow it, or turn Smart App Control off (Windows Security > App & browser control), and run again")
 
 
-def run(*cmd, env=None):
+# A test program that hangs (a driver deadlock, e.g. a barrier not every invocation reaches) must not stall the whole
+# suite: each run gets a time limit, is killed when it runs out, and counts as a failure. LEONIDA_GPU_TEST_TIMEOUT
+# sets the limit in seconds; 0 turns it off.
+DEFAULT_GPU_TEST_TIMEOUT = 120.0
+
+
+def gpu_test_timeout():
+    """Seconds one GPU test program may run (LEONIDA_GPU_TEST_TIMEOUT), or None for no limit."""
+    text = (os.environ.get("LEONIDA_GPU_TEST_TIMEOUT") or "").strip()
+    if not text:
+        return DEFAULT_GPU_TEST_TIMEOUT
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        limit = float(text)
+    except ValueError:
+        sys.exit(f"LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not {text!r}")
+    if math.isnan(limit):
+        sys.exit("LEONIDA_GPU_TEST_TIMEOUT must be a number of seconds (0 = no limit), not nan")
+    return None if limit <= 0 else limit
+
+
+def timed_out(name, limit):
+    return (f"timed out after {limit:g} s: {os.path.basename(str(name))} was killed (a GPU hang?); "
+            "LEONIDA_GPU_TEST_TIMEOUT sets the limit")
+
+
+def run(*cmd, env=None):
+    limit = gpu_test_timeout()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
+    except subprocess.TimeoutExpired:
+        return 1, timed_out(cmd[0], limit)
     except OSError as e:
         if not isinstance(e, FileNotFoundError):
             return 1, start_failure(cmd[0], e)
@@ -365,8 +393,11 @@ def mesh_w64x_test(tools, spirv, name):
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         harness = os.path.join(tools, "vk_harness" + EXE)
+        limit = gpu_test_timeout()
         try:
-            r = subprocess.run([harness, shader, fs, raw], capture_output=True, text=True, env=env)
+            r = subprocess.run([harness, shader, fs, raw], capture_output=True, text=True, env=env, timeout=limit)
+        except subprocess.TimeoutExpired:
+            return timed_out(harness, limit)
         except OSError as e:
             return start_failure(harness, e)
         if r.returncode == UNSUPPORTED:   # vk_harness: the device has no VK_EXT_mesh_shader
