@@ -84,6 +84,8 @@ int main() {
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256);
     std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
+    std::vector<std::uint8_t> msaa_full_pixels(size * 256), msaa_half_pixels(size * 256);
+    bool ran_msaa = false;
     const bool logic_op = d.enabled.logicOp == VK_TRUE;
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -467,6 +469,102 @@ int main() {
             }
         }
 
+        // Multisampled graphics pipeline (4x MSAA): draw the top-left red quad into a 4x MSAA target and resolve.
+        // Full SampleMask (0xFFFFFFFF) writes all 4 samples red; half SampleMask (0x5) writes 2 of 4 samples so the
+        // resolved top-left quadrant shifts from (255, 0, 0, 255) to ~50/50 purple (128, 0, 128, 255).
+        {
+            // SampleDesc.Count == 0, non-power-of-two/out-of-range counts, and non-zero quality must all be rejected.
+            auto bad_desc = pso_desc;
+            Ref<ID3D12PipelineState> bad_pso;
+            for (const DXGI_SAMPLE_DESC sd : {DXGI_SAMPLE_DESC{0, 0}, DXGI_SAMPLE_DESC{3, 0}, DXGI_SAMPLE_DESC{64, 0},
+                                              DXGI_SAMPLE_DESC{4, 1}, DXGI_SAMPLE_DESC{1, 1}}) {
+                bad_desc.SampleDesc = sd;
+                EXPECT(device->CreateGraphicsPipelineState(&bad_desc, IID_PPV_ARGS(&bad_pso.p)) == E_INVALIDARG &&
+                       !bad_pso.p);
+            }
+            // Any power-of-two sample count not supported by the attachment format must also be rejected.
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS ms32{DXGI_FORMAT_R8G8B8A8_UNORM, 32,
+                                                               D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+            if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &ms32, sizeof(ms32))) &&
+                ms32.NumQualityLevels == 0) {
+                bad_desc.SampleDesc = {32, 0};
+                EXPECT(device->CreateGraphicsPipelineState(&bad_desc, IID_PPV_ARGS(&bad_pso.p)) == E_INVALIDARG &&
+                       !bad_pso.p);
+            }
+
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS ms_levels{DXGI_FORMAT_R8G8B8A8_UNORM, 4,
+                                                                    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+            if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &ms_levels,
+                                                      sizeof(ms_levels))) &&
+                ms_levels.NumQualityLevels > 0) {
+                auto ms_rt_desc = rt_desc;
+                ms_rt_desc.SampleDesc.Count = 4;
+                Ref<ID3D12Resource> ms_target;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ms_rt_desc,
+                                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                                 IID_PPV_ARGS(&ms_target.p))));
+                D3D12_DESCRIPTOR_HEAP_DESC ms_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+                Ref<ID3D12DescriptorHeap> ms_rtv_heap;
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&ms_heap_desc, IID_PPV_ARGS(&ms_rtv_heap.p))));
+                const D3D12_CPU_DESCRIPTOR_HANDLE ms_rtv{
+                    SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(ms_rtv_heap.p, 9))(ms_rtv_heap.p))};
+                device->CreateRenderTargetView(ms_target.p, nullptr, ms_rtv);
+
+                auto ms_pso_desc = pso_desc;
+                ms_pso_desc.SampleDesc.Count = 4;
+                Ref<ID3D12PipelineState> ms_full_pso, ms_half_pso;
+                ms_pso_desc.SampleMask = 0xFFFFFFFFu;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ms_pso_desc, IID_PPV_ARGS(&ms_full_pso.p))));
+                ms_pso_desc.SampleMask = 0x5u;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ms_pso_desc, IID_PPV_ARGS(&ms_half_pso.p))));
+
+                struct MsaaPass {
+                    ID3D12PipelineState* pso;
+                    std::vector<std::uint8_t>* out;
+                };
+                const MsaaPass ms_passes[] = {{ms_full_pso.p, &msaa_full_pixels}, {ms_half_pso.p, &msaa_half_pixels}};
+                UINT64 ms_fence = 20;
+                for (UINT pass = 0; pass < std::size(ms_passes); ++pass) {
+                    EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, ms_passes[pass].pso)));
+                    if (pass > 0) {
+                        const auto ms_to_rt = transition(ms_target.p, D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        list->ResourceBarrier(1, &ms_to_rt);
+                    }
+                    list->ClearRenderTargetView(ms_rtv, blue, 0, nullptr);
+                    list->SetGraphicsRootSignature(root.p);
+                    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    list->IASetVertexBuffers(0, 1, &vbv);
+                    list->IASetIndexBuffer(&ibv);
+                    list->RSSetViewports(1, &viewport);
+                    list->RSSetScissorRects(1, &scissor);
+                    list->OMSetRenderTargets(1, &ms_rtv, FALSE, nullptr);
+                    list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                    list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+                    list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                    const D3D12_RESOURCE_BARRIER pre_resolve[] = {
+                        transition(ms_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
+                        transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST),
+                    };
+                    list->ResourceBarrier(2, pre_resolve);
+                    list->ResolveSubresource(target.p, 0, ms_target.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+                    const auto post_resolve =
+                        transition(target.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list->ResourceBarrier(1, &post_resolve);
+                    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                    EXPECT(list->Close() == S_OK);
+                    queue->ExecuteCommandLists(1, lists);
+                    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                    ++ms_fence;
+                    EXPECT(SUCCEEDED(queue->Signal(fence.p, ms_fence)) &&
+                           SUCCEEDED(fence->SetEventOnCompletion(ms_fence, nullptr)));
+                    std::memcpy(ms_passes[pass].out->data(), mapped, ms_passes[pass].out->size());
+                }
+                ran_msaa = true;
+            }
+        }
+
         // A draw with no viewport (never set, or unbound with a count of 0) rasterizes nothing in D3D12. It is not
         // recorded, so the list closes and executes cleanly (Vulkan forbids a 0x0 viewport).
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -479,7 +577,7 @@ int main() {
         EXPECT(list->Close() == S_OK);
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 20)) && SUCCEEDED(fence->SetEventOnCompletion(20, nullptr)));
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 30)) && SUCCEEDED(fence->SetEventOnCompletion(30, nullptr)));
 
         // Each parent draw starts with a 0.25 blend factor, then executes one of four bundles.
         // Empty and reset bundles preserve it. Explicit zero and nullptr replace it with zero and one.
@@ -630,6 +728,38 @@ int main() {
     std::printf("strip cut (0xFFFF & 0xFFFFFFFF): 4096/4096 pixels matched each (no-cut negative control painted %u "
                 "bridge pixels in bottom-left)\n",
                 nocut_bl_red);
+    if (ran_msaa) {
+        UINT half_changed = 0;
+        for (UINT row = 0; row < size; ++row) {
+            for (UINT col = 0; col < size; ++col) {
+                const bool top_left = row < size / 2 && col < size / 2;
+                const std::uint8_t* got_full = msaa_full_pixels.data() + row * 256 + col * 4;
+                const std::uint8_t* got_half = msaa_half_pixels.data() + row * 256 + col * 4;
+                const std::uint8_t want_full[4] = {std::uint8_t(top_left ? 255 : 0), 0,
+                                                   std::uint8_t(top_left ? 0 : 255), 255};
+                if (std::memcmp(got_full, want_full, 4) != 0 && mismatches++ < 6)
+                    std::fprintf(stderr, "4x MSAA full mask (%u,%u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
+                                 got_full[0], got_full[1], got_full[2], got_full[3], want_full[0], want_full[1],
+                                 want_full[2], want_full[3]);
+                if (top_left) {
+                    const bool ok = std::abs(int(got_half[0]) - 128) <= 1 && got_half[1] == 0 &&
+                                    std::abs(int(got_half[2]) - 128) <= 1 && got_half[3] == 255;
+                    if (!ok && mismatches++ < 6)
+                        std::fprintf(stderr, "4x MSAA half mask (%u,%u): got %u,%u,%u,%u want ~128,0,128,255\n", col,
+                                     row, got_half[0], got_half[1], got_half[2], got_half[3]);
+                    if (std::memcmp(got_half, got_full, 4) != 0) ++half_changed;
+                } else if (std::memcmp(got_half, want_full, 4) != 0 && mismatches++ < 6) {
+                    std::fprintf(stderr, "4x MSAA half mask bg (%u,%u): got %u,%u,%u,%u want 0,0,255,255\n", col, row,
+                                 got_half[0], got_half[1], got_half[2], got_half[3]);
+                }
+            }
+        }
+        EXPECT(!mismatches);
+        EXPECT(half_changed == (size / 2) * (size / 2));
+        std::printf("4x MSAA graphics pipeline: 4096/4096 resolved pixels matched (SampleMask 0x5 changed %u/%u "
+                    "top-left pixels to purple)\n",
+                    half_changed, (size / 2) * (size / 2));
+    }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

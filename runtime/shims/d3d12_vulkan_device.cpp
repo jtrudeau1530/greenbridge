@@ -2059,9 +2059,14 @@ public:
             log_once("graphics pipeline stage not supported yet (hull/domain/geometry/stream output):", 0);
             return E_NOTIMPL;
         }
-        if (desc.SampleDesc.Count > 1) {
-            log_once("multisampled graphics pipelines not supported yet; samples", int(desc.SampleDesc.Count));
-            return E_NOTIMPL;
+        const UINT samples = desc.SampleDesc.Count;
+        if (!samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || (samples & (samples - 1))) {
+            log_once("invalid graphics pipeline sample count:", int(samples));
+            return E_INVALIDARG;
+        }
+        if (desc.SampleDesc.Quality != 0) {
+            log_once("invalid graphics pipeline sample quality:", int(desc.SampleDesc.Quality));
+            return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) return E_FAIL;
@@ -2210,7 +2215,7 @@ public:
         raster.depthClampEnable = r.DepthClipEnable ? VK_FALSE : VK_TRUE;
 
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisample.rasterizationSamples = VkSampleCountFlagBits(samples);
         const VkSampleMask sample_mask = desc.SampleMask;
         multisample.pSampleMask = &sample_mask;
         multisample.alphaToCoverageEnable = desc.BlendState.AlphaToCoverageEnable;
@@ -2295,6 +2300,55 @@ public:
                 f.format = VK_FORMAT_D32_SFLOAT_S8_UINT;  // as CreateCommittedResource does
             graphics_.depth_format = f.format;
             graphics_.depth_aspects = f.aspects;
+        }
+        if (samples > 1) {
+            const auto& dinfo = device_.info;
+            const bool has_color = std::any_of(graphics_.color_formats.begin(), graphics_.color_formats.end(),
+                                               [](VkFormat f) { return f != VK_FORMAT_UNDEFINED; });
+            const bool has_depth = graphics_.depth_format != VK_FORMAT_UNDEFINED;
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    dinfo.get_instance_proc ? dinfo.get_instance_proc(dinfo.instance, "vkGetPhysicalDeviceProperties")
+                                            : nullptr)) {
+                VkPhysicalDeviceProperties props{};
+                get_props(dinfo.physical, &props);
+                VkSampleCountFlags supported = ~VkSampleCountFlags(0);
+                if (has_color) supported &= props.limits.framebufferColorSampleCounts;
+                if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+                    supported &= props.limits.framebufferDepthSampleCounts;
+                if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
+                    supported &= props.limits.framebufferStencilSampleCounts;
+                if (!has_color && !has_depth) supported &= props.limits.framebufferNoAttachmentsSampleCounts;
+                if (!(supported & samples)) {
+                    log_once("multisample count not supported by framebuffer limits; samples", int(samples));
+                    return E_INVALIDARG;
+                }
+            }
+            if ((has_color || has_depth) && !device_.image_format_properties) {
+                log_once("cannot query per-format multisample support; samples", int(samples));
+                return E_INVALIDARG;
+            }
+            for (const VkFormat fmt : graphics_.color_formats) {
+                if (fmt == VK_FORMAT_UNDEFINED) continue;
+                VkImageFormatProperties img_props{};
+                if (device_.image_format_properties(dinfo.physical, fmt, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &img_props) != VK_SUCCESS ||
+                    !(img_props.sampleCounts & samples)) {
+                    log_once("multisample count not supported by color attachment format; samples", int(samples));
+                    return E_INVALIDARG;
+                }
+            }
+            if (has_depth) {
+                VkImageFormatProperties img_props{};
+                if (device_.image_format_properties(dinfo.physical, graphics_.depth_format, VK_IMAGE_TYPE_2D,
+                                                    VK_IMAGE_TILING_OPTIMAL,
+                                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
+                                                    &img_props) != VK_SUCCESS ||
+                    !(img_props.sampleCounts & samples)) {
+                    log_once("multisample count not supported by depth/stencil attachment format; samples",
+                             int(samples));
+                    return E_INVALIDARG;
+                }
+            }
         }
         // Every stage this path accepts reads the user SGPRs, so the range covers the whole stage table, not only the
         // stages present. A stage added to the table (geometry, mesh) is covered without touching this.
