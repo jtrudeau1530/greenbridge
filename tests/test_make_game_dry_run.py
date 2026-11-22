@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -466,6 +467,49 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             exporter.assert_not_called()
             mock_run.assert_not_called()
             mock_py.assert_not_called()
+
+    def test_texture_pools_resume_only_when_their_listed_dds_files_exist(self) -> None:
+        assets = Path(self.work_dir, "assets")
+        audio = assets / "audio"
+        audio.mkdir(parents=True)
+        for marker in ("audio_manifest.json", "ogg.done", "xma.done"):
+            (audio / marker).touch()
+
+        # Identically named pools in the base game and a pack have distinct completion markers.
+        game = Path(self.game_dir)
+        base_source = game / "data" / "ttdb" / "sample.ttpf"
+        pack_source = game / "pack" / "story" / "data" / "ttdb" / "sample.ttpf"
+        base_dest = assets / "ttpf"
+        pack_dest = assets / "ttpf_pack" / "story"
+        for src, dest in ((base_source, base_dest), (pack_source, pack_dest)):
+            src.parent.mkdir(parents=True)
+            src.touch()
+            (dest / "sample").mkdir(parents=True)
+            (dest / "sample" / "first.dds").write_bytes(b"completed sibling")
+        (pack_dest / "sample" / "second.dds").mkdir()
+
+        valid = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": None}]})
+        legacy = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": "second.dds"}]})
+        base_call = mock.call(["rpf9dump", "ttpf", str(base_source), str(base_dest)])
+        pack_call = mock.call(["rpf9dump", "ttpf", str(pack_source), str(pack_dest)])
+        for case, base_manifest, pack_manifest, expected in (
+            ("complete including skipped rows", valid, valid, []),
+            ("listed DDS is missing", legacy, valid, [base_call]),
+            ("listed DDS is a directory", valid, legacy, [pack_call]),
+            ("missing texture list", "{}", valid, [base_call]),
+            ("incomplete row list", '{"Count": 2, "Textures": [{"File": "first.dds"}]}', valid, [base_call]),
+            ("missing File field", valid, '{"Count": 1, "Textures": [{}]}', [pack_call]),
+            ("incomplete JSON", valid, "{", [pack_call]),
+        ):
+            with self.subTest(case=case):
+                (base_dest / "sample" / "manifest.json").write_text(base_manifest, encoding="utf-8")
+                (pack_dest / "sample" / "manifest.json").write_text(pack_manifest, encoding="utf-8")
+                with mock.patch.object(make_game, "MODEL_ARCHIVES", ()), \
+                        mock.patch.object(make_game, "rpf9dump", return_value="rpf9dump"), \
+                        mock.patch.object(make_game, "run") as run, mock.patch.object(make_game, "log"), \
+                        mock.patch("shutil.which", return_value=None):
+                    make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
+                self.assertEqual(run.call_args_list, expected)
 
     def test_pending_exports_refresh_the_existing_helper_once(self) -> None:
         output = os.path.join(self.work_dir, "tools", "rpf9dump")

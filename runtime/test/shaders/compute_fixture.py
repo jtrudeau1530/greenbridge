@@ -26,7 +26,8 @@ def compute_header(asm_path):
 
 def find_test_program(build, name):
     """The folder holding test program `name`: `build` itself (Ninja, Makefiles) or the RelWithDebInfo/Release
-    subfolder a Visual Studio build puts it in, as run_gpu_tests.py's find_test_programs looks. None if not built."""
+    subfolder a Visual Studio build puts it in, as run_gpu_tests.py's find_test_programs looks. None if not built.
+    A Debug configuration isn't searched (neither does run_gpu_tests.py): GPU fuzzing wants an optimized harness."""
     exe = name + (".exe" if os.name == "nt" else "")
     for folder in (build, os.path.join(build, "RelWithDebInfo"), os.path.join(build, "Release")):
         if os.path.isfile(os.path.join(folder, exe)):

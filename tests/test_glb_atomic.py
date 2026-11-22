@@ -197,31 +197,20 @@ class GlbAtomicTests(unittest.TestCase):
                 os.umask(old)
 
     def test_concurrent_new_files_leave_the_umask_alone(self):
-        # Reading the umask means setting it to 0 and back. A fake umask makes two threads meet between the two
-        # calls (the interleaving that left the process at umask 0); the lock must keep them apart.
-        state = {"mask": 0o022}
-        meet = threading.Barrier(2, timeout=0.5)
-
-        def fake_umask(new):
-            old, state["mask"] = state["mask"], new
-            if new == 0:
-                try:
-                    meet.wait()   # times out when the other thread can't get here (the lock holds it)
-                except threading.BrokenBarrierError:
-                    pass
-            return old
-
+        # A new file's mode comes from a probe file (file_mode.published_mode), never from setting the umask to 0
+        # and back, which could leave a threaded process at umask 0.
+        import file_mode
         modes = []
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(glb_writer.os, "umask", side_effect=fake_umask):
+        with tempfile.TemporaryDirectory() as directory,                 mock.patch.object(file_mode.os, "umask", side_effect=AssertionError("umask touched")) as umask:
             threads = [threading.Thread(target=lambda i=i: modes.append(
-                glb_writer._output_mode(os.path.join(directory, f"new{i}.glb")))) for i in range(2)]
+                file_mode.published_mode(os.path.join(directory, f"new{i}.glb")))) for i in range(2)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
-        self.assertEqual(state["mask"], 0o022)
-        self.assertEqual(modes, [0o644, 0o644])
+        umask.assert_not_called()
+        self.assertEqual(len(modes), 2)
+        self.assertEqual(modes[0], modes[1])
 
     def test_published_glb_is_writable(self):
         with tempfile.TemporaryDirectory() as directory:

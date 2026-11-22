@@ -63,6 +63,45 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     assert.match(unreachable.reason, /could not be loaded/);
 });
 
+test('the bounds overlay creates helpers on the first G press and reuses them', async () => {
+    const viewerModule = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1].replace(/^import .*;$/gm, '');
+    const chunks = [worldChunk, { id: 'other', url: 'other.glb', bounds: [5, 6, 7, 8, 9, 10] }];
+    const handlers = new Map();
+    const boundsGroup = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn boundsGroup; })()`, {
+        THREE: {
+            WebGLRenderer: class { domElement = { addEventListener() {} }; setPixelRatio() {} setSize() {} setAnimationLoop() {} },
+            Scene: class { add() {} },
+            PerspectiveCamera: class { position = { fromArray() {} }; },
+            DirectionalLight: class { position = { set() {} }; },
+            Color: class {}, Fog: class {}, HemisphereLight: class {}, Clock: class {}, MeshStandardMaterial: class {},
+            Vector3: class { constructor(...xyz) { this.xyz = xyz; } },
+            Box3: class { constructor(min, max) { Object.assign(this, { min, max }); } },
+            Box3Helper: class { constructor(box, color) { Object.assign(this, { box, color }); } },
+            Group: class { children = []; add(child) { this.children.push(child); } },
+        },
+        document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
+        addEventListener: (type, handler) => handlers.set(type, handler),
+        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
+        fetch: manifestResponse({ spawn: [0, 0, 0], chunks }), GLTFLoader: class {},
+    });
+    const pressG = (repeat = false) => handlers.get('keydown')({ code: 'KeyG', repeat });
+    assert.equal(boundsGroup.visible, false);
+    assert.equal(boundsGroup.children.length, 0);
+    pressG();
+    assert.equal(boundsGroup.visible, true);
+    const helpers = [...boundsGroup.children];
+    assert.deepEqual(helpers.map(({ box }) => [...box.min.xyz, ...box.max.xyz]), chunks.map(c => c.bounds));
+    assert.ok(helpers.every(helper => helper.color === 0x5fb3ff));
+    pressG(true);
+    assert.equal(boundsGroup.visible, true);
+    pressG();
+    assert.equal(boundsGroup.visible, false);
+    pressG();
+    assert.equal(boundsGroup.visible, true);
+    assert.equal(boundsGroup.children.length, helpers.length);
+    helpers.forEach((helper, i) => assert.equal(boundsGroup.children[i], helper));
+});
+
 const begin = html.indexOf('// ---------- chunk streaming ----------');
 const end = html.indexOf('// ---------- main loop ----------', begin);
 assert(begin >= 0 && end > begin, 'viewer streaming section must exist');

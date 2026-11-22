@@ -63,21 +63,65 @@ class OperandTests(unittest.TestCase):
         self.assertEqual(shader_ir.operand("08"), {"k": "imm", "v": 8})
         self.assertEqual(shader_ir.operand("-010"), {"k": "imm", "v": -10})
 
-    def test_hardware_negation_of_constants(self):
-        # The disassembler prints VOP3 inline negation as neg(0) / neg(5).
-        self.assertEqual(shader_ir.operand("neg(0)"), {"k": "fimm", "v": -0.0, "abs": False})
-        self.assertEqual(shader_ir.operand("neg(5)"), {"k": "imm", "v": -5})
-        self.assertEqual(shader_ir.operand("neg(1.0)"), {"k": "fimm", "v": -1.0, "abs": False})
+    def test_hardware_fp_modifiers_on_constants(self):
+        # LLVM AMDGPUInstPrinter::printOperandAndFPInputMods emits neg(<imm>), |<imm>|, -|<imm>| and the
+        # assembler also accepts abs(<imm>) / neg(abs(<imm>)). Keep abs/neg as VOP3 FP modifier flags rather
+        # than folding neg into two's-complement negation (neg(1) is bit-31 flip 0x80000001, not -1 = 0xffffffff)
+        # or folding outer '-' of -|x| into v before FAbs.
+        self.assertEqual(shader_ir.operand("neg(0)"), {"k": "imm", "v": 0, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(1)"), {"k": "imm", "v": 1, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(-1)"), {"k": "imm", "v": -1, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(5)"), {"k": "imm", "v": 5, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(0x3f800000)"), {"k": "imm", "v": 0x3F800000, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(1.0)"), {"k": "fimm", "v": 1.0, "abs": False, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(-1.0)"), {"k": "fimm", "v": -1.0, "abs": False, "neg": True})
+        self.assertEqual(shader_ir.operand("-|1.0|"), {"k": "fimm", "v": 1.0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("-|-2.0|"), {"k": "fimm", "v": -2.0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("-|0.15915494|"), {"k": "fimm", "v": 0.15915494, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(|1.0|)"), {"k": "fimm", "v": 1.0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("|0xbf800000|"), {"k": "imm", "v": 0xBF800000, "abs": True})
+        self.assertEqual(shader_ir.operand("-|0x3f800000|"), {"k": "imm", "v": 0x3F800000, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("-|0|"), {"k": "imm", "v": 0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("|-0x10|"), {"k": "imm", "v": -16, "abs": True})
+        self.assertEqual(shader_ir.operand("abs(0xbf800000)"), {"k": "imm", "v": 0xBF800000, "abs": True})
+        self.assertEqual(shader_ir.operand("neg(abs(0x3f800000))"), {"k": "imm", "v": 0x3F800000, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("abs(1.0)"), {"k": "fimm", "v": 1.0, "abs": True})
+        self.assertEqual(shader_ir.operand("-abs(1.0)"), {"k": "fimm", "v": 1.0, "abs": True, "neg": True})
+        self.assertEqual(shader_ir.operand("neg(neg(1.0))"), {"k": "fimm", "v": 1.0, "abs": False})
+        self.assertEqual(shader_ir.operand("-neg(0x3f800000)"), {"k": "imm", "v": 0x3F800000})
 
-    def test_negation_of_registers_toggles(self):
+    def test_negation_and_abs_of_registers_compose(self):
         self.assertTrue(shader_ir.operand("neg(v1)")["neg"])
         self.assertFalse(shader_ir.operand("neg(neg(v1))")["neg"])
+        self.assertFalse(shader_ir.operand("-neg(v1)")["neg"])
+        self.assertEqual(
+            shader_ir.operand("|neg(v1)|"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": False, "abs": True},
+        )
+        self.assertEqual(
+            shader_ir.operand("-|neg(v1)|"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": True, "abs": True},
+        )
+        self.assertEqual(
+            shader_ir.operand("abs(v1)"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": False, "abs": True},
+        )
+        self.assertEqual(
+            shader_ir.operand("-abs(v1)"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": True, "abs": True},
+        )
+        self.assertEqual(
+            shader_ir.operand("abs(neg(v1))"),
+            {"k": "vgpr", "r": 1, "n": 1, "neg": False, "abs": True},
+        )
 
     def test_sign_extension(self):
         self.assertTrue(shader_ir.operand("sext(v1)")["sext"])
         self.assertFalse(shader_ir.operand("sext(v1)")["neg"])
         self.assertTrue(shader_ir.operand("-sext(v1)")["neg"])
         self.assertTrue(shader_ir.operand("sext(neg(v1))")["neg"])
+        self.assertTrue(shader_ir.operand("|sext(v1)|")["abs"])
+        self.assertTrue(shader_ir.operand("|sext(v1)|")["sext"])
 
     def test_ttmp_registers(self):
         self.assertEqual(shader_ir.operand("ttmp5"), {"k": "ttmp", "t": "ttmp5"})

@@ -247,7 +247,7 @@ dword aligned (sub-dword loads at their natural alignment), with no format in wo
 results, `OOB_SELECT`, swizzling and the `s_buffer_load` alignment truncation depend on descriptor
 fields the translator does not model yet, so they need a GPU-confirmed rule before they are fuzzed.
 `spirv_mini_interp` gained `OpSConvert` and the 32-bit atomics on PhysicalStorageBuffer memory for
-this. Not covered yet: images.
+this. Images have their own fuzzer (`tools/image_fuzz.py`, below).
 
 The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
 random DST_SEL of 0/1/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
@@ -263,6 +263,31 @@ Over 5,000 programs the reference and translator match bit for bit; breaking the
 
 A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
 76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
+
+### Images on the GPU (`tools/image_fuzz.py`)
+
+`tools/image_fuzz.py` starts on the image path, where the T# format, the view type and the binding layout
+meet the driver. Each case assembles a pixel shader that reads one texel with `image_load` (`dmask:0xf`, the
+T# in `s[8:15]`), runs it through `runtime/test/vk_image_fuzz.cpp` against a synthetic texture of a chosen
+format, and compares every RGBA32F pixel with an oracle that models the RDNA2 texel fetch for that format: a
+fetch is a memory read, so there is no filter, border or LOD to model.
+
+```sh
+cmake --build runtime/build --target vk_image_fuzz
+python -I tools/image_fuzz.py --programs 8 --seed 1 [--show]
+python -I tools/image_fuzz.py --self-test
+python -m pytest tests/test_image_fuzz.py
+```
+
+Covered: 2D `image_load`, `R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`, `R32G32B32A32_SFLOAT` and `R32_SFLOAT`,
+at sizes that divide the 64x64 draw (8/16/32/64), every texel read at least once.
+
+Devices: the harness needs `fragmentStoresAndAtomics` and both without-format storage-image features, because the
+translated `image_load` declares the uint/sint storage path even when the case reads a float format (the choice is
+made from the T# FORMAT at run time). An Intel UHD 770 (Xe-LP) lacks `shaderStorageImageReadWithoutFormat` and
+skips every case; the harness names the missing feature. Not covered yet: `dmask`
+variants, UINT/SINT formats (they read through the storage views), mips, 1D/2D-array/3D/cube,
+`image_sample`/`gather` with filters and borders, and texel offsets with `VK_KHR_maintenance8`.
 
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 

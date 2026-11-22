@@ -215,7 +215,9 @@ bool rejects_view(ID3D12Device* device, DXGI_FORMAT resource_format, const D3D12
 
 int main() {
     vktest::Device vk;
-    if (!vk.create()) return 1;
+    const auto device_status = vk.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     unsigned comparisons = 0, mismatches = 0, rejected = 0;
     {
         Ref<ID3D12Device> ours, host;

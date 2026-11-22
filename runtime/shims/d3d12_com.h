@@ -81,6 +81,9 @@ struct VulkanDeviceInfo {
     bool pipeline_statistics_query = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
+    // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
+    // do nothing.
+    bool debug_utils = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -123,6 +126,10 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // True when GetClockCalibration on `queue` reads calibrated timestamps, false when it submits a timestamp query
 // (or `queue` is not one of this module's queues). For tests.
 bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
+
+// Creates a Vulkan-backed IDXGIFactory4 bound to `device`'s VulkanContext, instance, physical device, and queue.
+// Its CreateSwapChainForHwnd registers swapchain backbuffers directly with the device's VulkanContext.
+HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);

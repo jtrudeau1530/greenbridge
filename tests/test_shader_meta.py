@@ -346,5 +346,15 @@ class ShaderMetaIntegrationTests(unittest.TestCase):
         })
 
 
+    def test_imm_u32_applies_vop3_abs_before_neg(self):
+        import shader_ir
+        self.assertEqual(M._imm_u32(shader_ir.operand("-|1.0|")), 0xBF800000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("-|-2.0|")), 0xC0000000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("neg(0x3f800000)")), 0xBF800000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("|0xbf800000|")), 0x3F800000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("-|0|")), 0x80000000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("neg(1)")), 0x80000001)
+
+
 if __name__ == "__main__":
     unittest.main()

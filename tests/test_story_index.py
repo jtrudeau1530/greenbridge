@@ -244,6 +244,20 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["signature"] for r in rows], ["psin", "page-directory", "rsc8"])
         self.assertEqual(summary["mode"], "directory")
 
+    def test_directory_skips_the_carvers_index_and_reports(self):
+        """rpf9_carve.py writes index.json next to the streams; it and a report are not payloads."""
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        for i, payload in enumerate((psin(), page(), rsc8())):
+            with open(os.path.join(folder, f"{0x1000 + i * 0x100:012x}.bin"), "wb") as f:
+                f.write(payload)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            f.write('[{"off": 4096, "stored": 16}]')
+        with open(os.path.join(folder, "report.csv"), "w", encoding="utf-8") as f:
+            f.write("offset,size\n")
+        rows, summary = story_index.scan_dir(folder)
+        self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200])
+
     def test_cli_directory_excludes_its_report_on_rerun(self):
         folder = os.path.join(self.root, "carved")
         os.makedirs(folder)

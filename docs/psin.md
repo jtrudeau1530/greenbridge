@@ -230,7 +230,10 @@ code 2). Leave it out to index every container.
   values) laid out above, and raise `ValueError` when no header count fills the payload. `parse()` adds
   `structs`, `members`, `enums`, `enum_values` and `schema_error` (an undecodable section, a member past its
   struct's size, or an array whose element index is not an element descriptor) to every record; with
-  `--schema` (or `parse(blob, schema=True)`) the decoded schema is included, hashes as hex.
+  `--schema` (or `parse(blob, schema=True)`) the decoded schema is included, hashes as hex. Every record
+  then has the same `schema` entry, `{structs, enums, lsch, lenm, reason}`, also when the walk stopped before
+  reaching the sections (a truncated stream): `lsch`/`lenm` say whether each was decoded and `reason` why
+  not ("" when both were); text mode prints the reason as a `schema:` line.
 - `collect(src)` scans a single file or every `.bin` in a carve directory; non-PSIN files are
   skipped.
 - Text output prints one line per container and a tag summary; `--json` writes `{files, summary}`.

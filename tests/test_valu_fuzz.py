@@ -158,10 +158,31 @@ def _mc():
         return None
 
 
+def _mc_accepts_f16_opsel(mc):
+    """llvm-mc 21+ is needed for op_sel on 16-bit VOP3 (docs/testing.md); older builds reject the modifier.
+
+    Probe a fixed instruction rather than a generated program, so a generator bug can never turn into a skip.
+    """
+    probe = "v_add_f16_e64 v0, v1, v2 op_sel:[0,0,0]\n"
+    r = subprocess.run(mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"], input=probe,
+                       capture_output=True, text=True)
+    return r.returncode == 0 and "error:" not in r.stderr
+
+
+def test_f16_opsel_probe_distinguishes_old_assemblers():
+    # A fake assembler that rejects everything stands in for LLVM < 21; one that accepts stdin stands in for 21+.
+    reject = [sys.executable, "-c", "import sys; sys.exit(1)"]
+    accept = [sys.executable, "-c", "import sys; sys.stdin.read()"]
+    assert _mc_accepts_f16_opsel(reject) is False
+    assert _mc_accepts_f16_opsel(accept) is True
+
+
 @pytest.mark.skipif(_mc() is None, reason="llvm-mc with the AMDGPU target not found")
 @pytest.mark.parametrize("family", sorted(vf.FAMILIES))
 def test_programs_assemble_for_gfx1013(family):
     mc = _mc()
+    if family == "f16" and not _mc_accepts_f16_opsel(mc):
+        pytest.skip("llvm-mc 21+ is needed for op_sel on 16-bit VOP3 (docs/testing.md); set LLVM_MC")
     for p in vf.programs(family, 1, 6, (32, 64)):
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:

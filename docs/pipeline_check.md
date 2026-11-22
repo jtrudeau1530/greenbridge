@@ -68,6 +68,16 @@ overlay layers (a missing Epic JSON, three non-conforming layer names, one dupli
 22,092 full-shard modules were not re-run through the validation layer; their result is driver
 acceptance only.
 
+## Limiting concurrent compilation of large modules
+
+By default, a SPIR-V module larger than 4 MiB compiles alone. Smaller modules continue to use
+`--jobs`. The gate covers module creation and both compute and graphics pipelines. The size
+cutoff is a heuristic for [#884](https://github.com/ItsNotRexed/Leonida/issues/884), where several
+compiles that each needed gigabytes of host RAM ran at the same time. The pipeline cache still
+checkpoints during the run, and isolated modules count towards the regular results.
+
+`--large-module-bytes N` changes the cutoff in bytes. Set it to `0` to disable isolation.
+
 ## Skipping huge modules
 
 `vk_pipeline_check` now accepts `--max-bytes N`:

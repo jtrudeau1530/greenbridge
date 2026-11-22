@@ -26,6 +26,18 @@
 
 namespace leonida {
 
+// VK_EXT_debug_utils labels: an instance extension, so a device has them only when its instance enabled it.
+struct DebugLabelFunctions {
+    PFN_vkCmdInsertDebugUtilsLabelEXT cmd_insert = nullptr;
+    PFN_vkCmdBeginDebugUtilsLabelEXT cmd_begin = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT cmd_end = nullptr;
+    PFN_vkQueueInsertDebugUtilsLabelEXT queue_insert = nullptr;
+    PFN_vkQueueBeginDebugUtilsLabelEXT queue_begin = nullptr;
+    PFN_vkQueueEndDebugUtilsLabelEXT queue_end = nullptr;
+
+    bool complete() const { return cmd_insert && cmd_begin && cmd_end && queue_insert && queue_begin && queue_end; }
+};
+
 struct VulkanDeviceFunctions {
 #define LEONIDA_VK_DEVICE_FUNCTIONS(X)                                                                         \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer)         \
@@ -270,6 +282,17 @@ public:
     bool loaded() const { return loaded_; }
     VkDevice device() const { return device_; }
 
+    // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
+    // are ignored, so markers stay no-ops.
+    void enable_debug_labels(const DebugLabelFunctions& labels) {
+        if (!labels.complete()) return;
+        labels_ = labels;
+        replay_.insert_label = labels.cmd_insert;
+        replay_.begin_label = labels.cmd_begin;
+        replay_.end_label = labels.cmd_end;
+    }
+    bool debug_labels() const { return labels_.complete(); }
+
     // Registers a resource in its D3D12 initial state (a legacy state; images get the matching layout).
     // The image must already be in that layout, e.g. transitioned from UNDEFINED at creation.
     void add_resource(ResourceId id, const ResourceBinding& binding) {
@@ -321,6 +344,11 @@ public:
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(mutex_);
         return tracker_.layout(id, subresource);
+    }
+
+    bool has_resource(ResourceId id) {
+        std::lock_guard lock(mutex_);
+        return resources_.find(id) != resources_.end();
     }
 
     // `prepare` is called with the context locked, at the start of the command buffer of every
@@ -403,6 +431,7 @@ private:
     double timestamp_period_ = 0;
     bool occlusion_sums_ = false;
     ReplayFunctions replay_;
+    DebugLabelFunctions labels_;
 };
 
 // A Vulkan timeline semaphore with D3D12 fence semantics for the host side.
@@ -474,6 +503,7 @@ public:
         auto& vk = context_.vk;
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
+            for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
             vk.vkQueueWaitIdle(queue_);
         }
         if (progress_) {
@@ -556,7 +586,9 @@ public:
             if (context_.bindless_commit_) context_.bindless_commit_(submitted);
             return ReplayResult::unsupported;
         }
-        for (const auto& list : prepared) emit(list, command_buffer, replay, &context_.tracker_);
+        std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
+        for (const auto& list : prepared) emit(list, command_buffer, replay, &context_.tracker_, &open_labels);
+        close_labels(command_buffer, replay, open_labels);
         // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
         // readback buffers are read through Map once the application has waited.
         VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -585,6 +617,26 @@ public:
     void wait(VkSemaphore fence, std::uint64_t value) {
         waits_.push_back(fence);
         wait_values_.push_back(value);
+    }
+
+    // ID3D12CommandQueue::SetMarker/BeginEvent/EndEvent: queue labels, between the submissions around them. An end
+    // with no begin open on this queue is dropped, as Vulkan requires a matching begin. No-ops without the extension.
+    void marker(DebugMarker::Kind kind, const char* label) {
+        const DebugLabelFunctions& f = context_.labels_;
+        if (!f.complete()) return;
+        if (kind == DebugMarker::Kind::end && !open_labels_) return;
+        VkDebugUtilsLabelEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+        info.pLabelName = label ? label : "";
+        std::lock_guard lock(context_.submit_mutex());
+        if (kind == DebugMarker::Kind::set) {
+            f.queue_insert(queue_, &info);
+        } else if (kind == DebugMarker::Kind::begin) {
+            f.queue_begin(queue_, &info);
+            ++open_labels_;
+        } else {
+            f.queue_end(queue_);
+            --open_labels_;
+        }
     }
 
     bool idle() {
@@ -667,6 +719,7 @@ private:
     std::unique_ptr<OcclusionSum> occlusion_sum_;
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
+    std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
 };
 

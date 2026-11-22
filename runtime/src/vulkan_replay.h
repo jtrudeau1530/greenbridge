@@ -656,6 +656,10 @@ struct ReplayFunctions {
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize)>
         sum_occlusion;
+    // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
+    PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
+    PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT end_label = nullptr;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
@@ -1300,6 +1304,54 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
     return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
 }
 
+// detail::initialize zero-clears an image piece the tracker holds in UNDEFINED (D3D12 committed resources start
+// zeroed) the first time a command touches it, with vkCmdClearColorImage or vkCmdClearDepthStencilImage. True when
+// a command of the list would need one of those and it is unset; replay() then refuses the list as unsupported, as
+// prepare() does for every other optional function, rather than emit calling a null pointer.
+inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFunctions& vk,
+                                   const LayoutTracker& tracker) {
+    if (vk.clear_color_image && vk.clear_depth_stencil_image) return false;
+    std::vector<LayoutPiece> pieces;
+    const auto missing = [&](ResourceId id, const ResourceBinding& resource, const VkImageSubresourceRange& range) {
+        if (!id || !resource.image || resource.not_zeroed ||
+            block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT).block > 1)   // only moved, never cleared
+            return false;
+        pieces.clear();
+        if (!tracker.pieces(id, range, pieces)) return false;
+        for (const auto& piece : pieces)
+            if (piece.layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                ((piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) ? !vk.clear_color_image
+                                                                      : !vk.clear_depth_stencil_image))
+                return true;
+        return false;
+    };
+    const auto commands = prepared.list->commands();
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+        const auto& command = commands[i];
+        const auto& p = prepared.commands[i];
+        if (p.skip) continue;
+        if (const auto [dst, src] = copy_ids(command); dst || src) {
+            if (missing(dst, p.binding, p.range) || missing(src, p.source, p.source_range)) return true;
+            continue;
+        }
+        const ResourceId id = std::visit(
+            [](const auto& c) -> ResourceId {
+                using T = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<T, ClearRenderTarget> || std::is_same_v<T, ClearDepthStencil>)
+                    return c.target.resource;
+                else if constexpr (std::is_same_v<T, ClearUnorderedAccess>)
+                    return c.view.resource;
+                else if constexpr (requires { c.resource; })
+                    return c.resource;
+                else
+                    return 0;
+            },
+            command);
+        if (missing(id, p.binding, p.range)) return true;
+    }
+    return false;
+}
+
 // Resolves and checks every command. Nothing is written to a command buffer.
 // Resolve maps a ResourceId to a const ResourceBinding* (nullptr: unknown).
 template<typename Resolve>
@@ -1397,6 +1449,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                             VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success) return r;
             } else if (const auto r = rect_view(clear_rects(color_clear->rects), color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT);
                        r != ReplayResult::success) return r;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
             if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
             VkImageAspectFlags aspects = 0;
@@ -1410,6 +1463,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
                 r != ReplayResult::success)
                 return r;
+            if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
             if (!bind(view.resource)) return ReplayResult::unresolved_resource;
@@ -1437,6 +1491,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const auto rects = attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
             if (const auto r = rect_view(rects, target, VK_IMAGE_ASPECT_COLOR_BIT); r != ReplayResult::success)
                 return r;
+            if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return ReplayResult::unsupported;
@@ -1708,9 +1763,20 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
     }
 }
 
+// Ends the debug labels a submission left open, so every command buffer is balanced as Vulkan requires.
+inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& vk, std::uint32_t& open_labels) {
+    for (; open_labels && vk.end_label; --open_labels) vk.end_label(command_buffer);
+    open_labels = 0;
+}
+
 // Writes a prepared list. With a tracker, barriers start from the tracked layouts and update them.
+// `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
+// is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
+// (close_labels). Without it, the list's own events are balanced at its end.
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
-                 LayoutTracker* tracker = nullptr) {
+                 LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr) {
+    std::uint32_t own_labels = 0;
+    std::uint32_t& labels = open_labels ? *open_labels : own_labels;
     const auto commands = prepared.list->commands();
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
@@ -2034,6 +2100,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
+        } else if (const auto* marker = std::get_if<DebugMarker>(&command)) {
+            if (!vk.insert_label || !vk.begin_label || !vk.end_label) continue;
+            VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+            label.pLabelName = marker->label.c_str();
+            if (marker->kind == DebugMarker::Kind::set) {
+                vk.insert_label(command_buffer, &label);
+            } else if (marker->kind == DebugMarker::Kind::begin) {
+                vk.begin_label(command_buffer, &label);
+                ++labels;
+            } else if (labels) {
+                vk.end_label(command_buffer);
+                --labels;
+            }
         } else if (std::holds_alternative<DiscardResource>(command)) {
             // oldLayout = UNDEFINED tells the driver the contents may go; the image stays in the layout the tracker
             // has for it, so later commands see no change. Without a tracker the layout is unknown, and a part
@@ -2075,6 +2154,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     }
     // Predication does not carry over to the next command list.
     if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
+    if (!open_labels) close_labels(command_buffer, vk, own_labels);
 }
 
 // prepare + emit for one list. A failed replay leaves the command buffer and the tracker untouched.
@@ -2085,6 +2165,7 @@ ReplayResult replay(const CommandList& list, VkCommandBuffer command_buffer, Res
         return ReplayResult::unsupported;
     PreparedList prepared;
     if (const auto result = prepare(list, resolve, vk, prepared); result != ReplayResult::success) return result;
+    if (tracker && zero_clear_unavailable(prepared, vk, *tracker)) return ReplayResult::unsupported;
     QueryReplay queries;
     if (const auto result = queries.plan(prepared); result != ReplayResult::success) return result;
     emit(prepared, command_buffer, vk, tracker);

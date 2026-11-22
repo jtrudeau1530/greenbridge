@@ -238,6 +238,9 @@ def scan_dir(path, progress=None, output=None):
             continue
         if not stat.S_ISREG(info.st_mode) or (report is not None and os.path.samestat(info, report)):
             continue
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if name.lower().endswith((".json", ".csv")):
+            continue
         with open(full, "rb") as f:
             data = f.read()
         m = re.match(r"([0-9a-fA-F]{6,})", name)

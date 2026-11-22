@@ -414,11 +414,21 @@ class DecodeRsc8Test(unittest.TestCase):
         self.assertEqual(res_f["version_base"], 8001)
         self.assertEqual(res_f["version_flags"], 0x0100)
 
-        # Non-deep mode omits skipped track checks rather than reporting True
+        # Non-deep mode omits skipped track and property-dependent duration checks rather than reporting False/True
         res_nd = rsc8_audio.decode_rsc8(multi, deep=False)
         self.assertTrue(res_nd["valid"], res_nd["checks"])
+        self.assertNotIn("clip_duration_matches_frames", res_nd["checks"])
         self.assertNotIn("tracks_sorted", res_nd["checks"])
         self.assertNotIn("tracks_schema_ok", res_nd["checks"])
+
+        # Non-60 fps clip (fps=30, 61 frames -> 2.0s) validates in both deep and shallow (--no-deep) modes
+        clip_30fps = build_synthetic_rsc8(frames=61, fps=30)
+        res_30_deep = rsc8_audio.decode_rsc8(clip_30fps, deep=True)
+        res_30_shallow = rsc8_audio.decode_rsc8(clip_30fps, deep=False)
+        self.assertTrue(res_30_deep["valid"], res_30_deep["checks"])
+        self.assertAlmostEqual(res_30_deep["clip"]["duration"], 2.0, places=5)
+        self.assertTrue(res_30_shallow["valid"], res_30_shallow["checks"])
+        self.assertNotIn("clip_duration_matches_frames", res_30_shallow["checks"])
 
     def test_reject_truncated_props_and_zero_fps(self):
         blob = bytearray(build_synthetic_rsc8(frames=60))
@@ -542,9 +552,23 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             with open(json_out, encoding="utf-8") as f:
                 rep = json.load(f)
             self.assertEqual(rep["summary"]["adat_banks"], 1)
+            self.assertEqual(rep["summary"]["invalid_files"], 0)
             self.assertEqual(rep["summary"]["rsc8_in_adat"], 2)
             self.assertEqual(rep["summary"]["rsc8_standalone"], 1)
             self.assertEqual(rep["summary"]["rsc8_valid"], 3)
+
+            # A truncated/malformed .awc in the directory is counted and named on stderr without aborting the scan
+            bad_awc = os.path.join(tmp, "truncated.awc")
+            with open(bad_awc, "wb") as f:
+                f.write(bank[:20])
+            cp_bad = subprocess.run([sys.executable, "-I", TOOL, tmp, json_out, "--quiet"], capture_output=True, text=True)
+            self.assertEqual(cp_bad.returncode, 0, cp_bad.stderr)
+            self.assertIn("truncated.awc", cp_bad.stderr)
+            with open(json_out, encoding="utf-8") as f:
+                rep_bad = json.load(f)
+            self.assertEqual(rep_bad["summary"]["adat_banks"], 1)
+            self.assertEqual(rep_bad["summary"]["invalid_files"], 1)
+            self.assertEqual(rep_bad["summary"]["rsc8_valid"], 3)
 
             cp2 = subprocess.run([sys.executable, "-I", TOOL, rpf, csv_out, "--quiet"], capture_output=True, text=True)
             self.assertEqual(cp2.returncode, 0, cp2.stderr)
