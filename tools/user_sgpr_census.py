@@ -24,6 +24,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 
@@ -92,6 +93,12 @@ def main(argv=None):
     ap.add_argument("--base", nargs="*", default=[], metavar="STAGE=SGPR",
                     help="report the reads below this first root-argument SGPR per stage")
     a = ap.parse_args(argv)
+    if a.json:
+        try:
+            if os.path.samefile(a.index, a.json):
+                ap.error("--json must not overwrite the input index")
+        except FileNotFoundError:
+            pass
     with open(a.index, encoding="utf-8") as f:
         index = json.load(f)
     base = {k: int(v) for k, _, v in (b.partition("=") for b in a.base)}
