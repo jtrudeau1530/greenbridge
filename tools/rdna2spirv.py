@@ -35,9 +35,12 @@ import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
+import wave64_halves  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
+WAVE64_GRAPHICS = "warn"   # --wave64-graphics: tier C wave64 VS/PS/GS (not exact on 32-wide subgroups): warn | error | off
+W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for the summary line
 # --bary-fallback: raw barycentric reads come from an ordinary perspective-interpolated vec3 input (the location is
 # in the metadata as "bary_fallback_input") instead of BuiltIn BaryCoordKHR, for devices without
 # VK_KHR_fragment_shader_barycentric. Whatever feeds the stage before the PS (a pass-through geometry shader) writes
@@ -196,6 +199,8 @@ class Gen:
         self.uses_viewport = False # VS: True once pos1 misc writes BuiltIn ViewportIndex
         self.gs = None             # GS: {"in": [(reg, sv)], "out": [(reg, sv)], "nreg": n, "maxv": n}
         self.wave64 = False        # compiled for 64-lane waves (64-bit EXEC writes, exec_hi, v_mbcnt_hi, ...)
+        self.cur_uniform_readlane = False
+        self.w64g = None           # wave64 VS/PS/GS: wave64_halves.analyse() result (tier, reasons, rewrite sites)
         self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
         self.x_seg = 0             # emulate: number of the next continuation segment (past the block numbers)
         self.x_marks = []          # emulate: (index into body, segment) where a segment of the current block ends
@@ -3049,6 +3054,7 @@ class Gen:
         dst_sel; v_cmpx (GFX10) has no written destination operand."""
         self.cur_masks = self.lane_masks.get(id(ins), {})
         self.write_all_lanes = id(ins) in self.mask_writes
+        self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
         if ins["op"].endswith("_dpp"):
@@ -4000,6 +4006,12 @@ class Gen:
             self.emit(f"OpControlBarrier {self.cu(2)} {self.cu(2)} {self.cu(0x108)}")
         elif op == "v_readlane_b32":
             # sD = vS[lane]: a subgroup shuffle from that lane (the result is uniform).
+            if self.cur_uniform_readlane:
+                # SHADER-10: wave64_halves proved the VGPR holds one value in every lane (written from scalars
+                # and constants while EXEC was the launch mask), so any lane has it: this lane's own copy. The
+                # shuffle would index a lane the 32-lane subgroup of a VS/PS/GS may not have (lane >= 32).
+                self.dst(a[0], self.src_u(a[1]))
+                return
             slot = lane_masks.lane_slot(a[1], a[2])
             if slot in self.cur_masks:
                 # A lane mask parked there by v_writelane (a saved EXEC, when the shader ran out of SGPRs): this
@@ -8696,6 +8708,21 @@ WAVE64_RE = re.compile(
 )
 
 
+def halves_analysis(g, blocks, succ):
+    """SHADER-10: tier of a wave64 VS/PS/GS on 32-wide subgroups (tools/wave64_halves.py); tier C is refused under
+    --wave64-graphics=error. Runs after the lane-mask analysis, which it reads."""
+    if not g.wave64 or g.stage not in ("vs", "ps", "gs") or g.emulate or WAVE64_GRAPHICS == "off":
+        return
+    try:
+        g.w64g = wave64_halves.analyse(blocks, succ, g.lane_masks, g.stage)
+    except Exception as e:      # the analysis must never cost a translation; what it could not decide is tier C
+        g.w64g = {"tier": "C", "reasons": ["analysis-error"], "idioms": [], "uniform_readlane": set(),
+                  "sites": [("analysis-error", None, type(e).__name__)]}
+    W64G_COUNTS[g.w64g["tier"]] += 1
+    if g.w64g["tier"] == "C" and WAVE64_GRAPHICS == "error":
+        raise Unsupported("wave64 graphics tier C: " + ", ".join(g.w64g["reasons"]))
+
+
 def fold_far_branches(insns):
     """s_getpc_b64 s[a:a+1]; s_add_u32 sa, sa, K; s_addc_u32 sa+1, sa+1, 0|-1; s_setpc_b64 s[a:a+1] is a far
     branch (s_branch only reaches +-32K dwords): the target is the address after s_getpc plus K. Fold the four
@@ -9204,6 +9231,7 @@ def translate(path):
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
     if not branchy and not g.emulate:
         g.park_masks(([insns], [[]]))
+        halves_analysis(g, [insns], [[]])
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
         for ins in insns:
@@ -9271,6 +9299,7 @@ def translate(path):
             raw_edges = split_edges
     succ = [list(dict.fromkeys(e)) for e in raw_edges]
     g.park_masks((blocks, succ))
+    halves_analysis(g, blocks, succ)
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
@@ -9691,6 +9720,14 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
          # 64-wide subgroups can only be requested for compute/mesh on RADV and NVIDIA; VS/PS/GS wave64
          # shaders must be treated as emulated (per-32-lane halves) until cross-half ops go through LDS.
          "wave64_emulated": bool(g.wave64 and (g.stage in ("vs", "ps", "gs") or g.emulate))}
+    if g.w64g:
+        # SHADER-10: partition invariance on 32-wide subgroups. A and B are exact there (B: aggregated atomics up to
+        # the order of the slots), C is not; the reasons name the construct (docs/design.md, Wave64 graphics).
+        m["wave64_graphics"] = g.w64g["tier"]
+        if g.w64g["reasons"]:
+            m["wave64_graphics_reasons"] = g.w64g["reasons"]
+        if g.w64g["idioms"]:
+            m["wave64_graphics_idioms"] = g.w64g["idioms"]
     if g.emulate:
         # Exact on any subgroup size: no subgroup operation, cross-lane data in %x_buf (workgroup memory).
         m["wave64_exchange"] = "workgroup"
@@ -9854,6 +9891,10 @@ def main():
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
+    ap.add_argument("--wave64-graphics", choices=("warn", "error", "off"), default="warn",
+                    help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
+                         "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
+                         "error = refuse them (Unsupported), off = skip the analysis")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
@@ -9875,10 +9916,11 @@ def main():
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
     a = ap.parse_args()
-    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
+    WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
@@ -9954,6 +9996,9 @@ def main():
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, old)
     print(f"{len(files)} shaders: {ok} translated, {valid} pass spirv-val")
+    if W64G_COUNTS:
+        print("wave64 VS/PS/GS on 32-wide subgroups: " + ", ".join(f"tier {t}: {n}" for t, n in sorted(W64G_COUNTS.items()))
+              + (" (tier C is not exact there; see wave64_graphics_reasons in the index)" if W64G_COUNTS["C"] else ""))
     for k, v in why.most_common(25):
         print(f"  {v:6}  {k}")
 
