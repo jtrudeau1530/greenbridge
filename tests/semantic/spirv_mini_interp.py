@@ -927,12 +927,16 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
                 values[res] = abs(_s32(args[0])) & MASK
             elif name in ("FMax", "FClamp"):
-                if any(math.isnan(v) for v in args) or (name == "FClamp" and args[1] > args[2]):
-                    raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
-                # Equal zeros: -0 is ordered below +0, as in NMin/NMax above (the order RDNA2 hardware uses, so a
-                # med3 built from these ops is the hardware's median for signed zeros too).
-                v = _nmin_nmax("NMax", args[0], args[1])
-                values[res] = f32(v if name == "FMax" else _nmin_nmax("NMin", v, args[2]))
+                def fmax_clamp(*xs):
+                    if any(math.isnan(v) for v in xs) or (name == "FClamp" and xs[1] > xs[2]):
+                        raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
+                    # Equal zeros: -0 is ordered below +0, as in NMin/NMax above (the order RDNA2 hardware uses,
+                    # so a med3 built from these ops is the hardware's median for signed zeros too).
+                    v = _nmin_nmax("NMax", xs[0], xs[1])
+                    return f32(v if name == "FMax" else _nmin_nmax("NMin", v, xs[2]))
+                # Vector operands (v_pk_* clamp) are component-wise.
+                values[res] = (tuple(fmax_clamp(*c) for c in zip(*args)) if isinstance(args[0], tuple)
+                               else fmax_clamp(*args))
             elif name in ("RoundEven", "Floor", "Ceil", "Trunc"):
                 # round() breaks ties to even. An integral result keeps the operand's sign (IEEE 754
                 # roundToIntegral), so RoundEven(-0.4), Ceil(-0.5) and Trunc(-0.5) are -0.0, not +0.0.
