@@ -3091,7 +3091,12 @@ public:
             fs->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
             const Format fmt = texture_storage_format(fs->Format, false);
             const Format depth_fmt = vulkan_format(fs->Format, true);
-            const VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
+            VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
+            // Report what creation makes: a D24 texture on a GPU without Vulkan D24 (AMD) is a D32_SFLOAT_S8_UINT
+            // image (texture_format), so its features are D32S8's. Asking D24 itself gave Support1 = 0 there,
+            // although CreateCommittedResource(ALLOW_DEPTH_STENCIL) succeeds.
+            if (vk_fmt == VK_FORMAT_D24_UNORM_S8_UINT && !state_.depth_usable(vk_fmt))
+                vk_fmt = VK_FORMAT_D32_SFLOAT_S8_UINT;
             if (vk_fmt == VK_FORMAT_UNDEFINED || !state_.format_properties) {
                 return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             }
@@ -3224,7 +3229,11 @@ public:
             if (levels->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && levels->SampleCount != 1)
                 return d3d12_trace::result(method, S_OK);  // single-sample 2D only; no quality levels
             Format format = texture_storage_format(levels->Format, false);
-            if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            // A typeless format that is only a texture as depth (R24G8_TYPELESS, R32G8X24_TYPELESS) has no colour
+            // format; creation makes it a depth image, so ask the same.
+            const bool depth_only_typeless = format.format == VK_FORMAT_UNDEFINED &&
+                                             (texture_storage_format(levels->Format, true).aspects & VK_IMAGE_ASPECT_DEPTH_BIT);
+            if ((format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) || depth_only_typeless) {
                 D3D12_RESOURCE_DESC depth_desc{};
                 depth_desc.Format = levels->Format;
                 depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
