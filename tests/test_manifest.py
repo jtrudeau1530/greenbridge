@@ -667,6 +667,30 @@ class ManifestDigestCaseTest(unittest.TestCase):
                         self.assertEqual(f.read(), before)
 
 
+class ManifestPosixBackslashTest(unittest.TestCase):
+    @unittest.skipIf(os.sep == "\\", "backslashes are path separators on Windows")
+    def test_posix_literal_backslash_does_not_collide_with_subdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = os.path.join(tmp, "pkg")
+            os.makedirs(os.path.join(pkg, "sub"))
+            with open(os.path.join(pkg, "sub", "a.dat"), "wb") as f:
+                f.write(b"nested")
+            with open(os.path.join(pkg, "sub\\a.dat"), "wb") as f:
+                f.write(b"literal-backslash")
+            out = os.path.join(tmp, "manifest.json")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(manifest.create(pkg, out, jobs=1), 0)
+            entries = manifest.load_manifest(out)
+            self.assertEqual(sorted(entries), ["sub/a.dat", "sub\\a.dat"])
+            self.assertEqual(entries["sub/a.dat"]["size"], len(b"nested"))
+            self.assertEqual(entries["sub\\a.dat"]["size"], len(b"literal-backslash"))
+            verify_out = io.StringIO()
+            with contextlib.redirect_stdout(verify_out):
+                self.assertEqual(manifest.verify(pkg, out, jobs=1), 0)
+            self.assertEqual(verify_out.getvalue(), "OK\n")
+
+
 class ManifestBelowNormalTest(unittest.TestCase):
     def test_below_normal_callable(self):
         manifest.below_normal()

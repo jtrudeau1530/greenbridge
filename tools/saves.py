@@ -24,7 +24,11 @@ import json
 import os
 import struct
 import sys
+import tempfile
 from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 # ---------------------------------------------------------------------------------------------- ASAV
 ASAV_HDR = 0x170          # header size seen on every plain ASAV file
@@ -100,7 +104,22 @@ def parse_jsav(d):
         body_off = d.index(b'{', table_end)
     except ValueError:
         raise ValueError('JSAV body marker not found after the entry table') from None
-    body_end = len(d.rstrip(b'\0'))
+    try:
+        body_text = d[body_off:].rstrip(b'\0').decode('utf-8')
+        _, json_end = json.JSONDecoder().raw_decode(body_text)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f'JSAV body is not valid UTF-8 JSON: {exc}') from None
+    # raw_decode returns a character offset, while the entry table uses byte offsets.
+    # The last nonzero byte is not the JSON boundary: corrupt data can follow the document's padding.
+    body_end = body_off + len(body_text[:json_end].encode('utf-8'))
+    for entry in entries:
+        start, end = entry['offset'], entry['offset'] + entry['size']
+        if start < body_off or end > body_end:
+            # Python slices silently truncate invalid ranges; never export or compare those as real blocks.
+            raise ValueError(f"JSAV entry {entry['index']} range {start:#x}..{end:#x} is outside "
+                             f"the JSON body {body_off:#x}..{body_end:#x}")
+    if body_text[json_end:].strip(' \t\r\n'):
+        raise ValueError('JSAV has non-padding data after the JSON body')
     return {'magic': 'JSAV', 'version': ver, 'code_blocks': n_code, 'script_blocks': n_script,
             'table_end': table_end, 'body_offset': body_off, 'body_end': body_end,
             'file_size': len(d)}, entries
@@ -226,7 +245,7 @@ def info(paths):
                 print(f'{p}: save folder, dir {meta.get("save_directory")}')
             for name in sorted(os.listdir(p)):
                 fp = os.path.join(p, name)
-                if os.path.isfile(fp) and kind_of(read(fp)[:8]):
+                if os.path.isfile(fp) and kind_of(read(fp, 8)):
                     info_file(fp, '  ')
         else:
             info_file(p)
@@ -282,8 +301,24 @@ def pack_from_dir(src):
 
 def pack(src, out):
     data = pack_from_dir(src)
-    with open(out, 'wb') as f:
-        f.write(data)
+    parent = os.path.dirname(os.path.abspath(out))
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile('wb', dir=parent, prefix='.saves-pack-', suffix='.tmp',
+                                         delete=False) as f:
+            tmp = f.name
+            f.write(data)
+        os.chmod(tmp, published_mode(out))
+        os.replace(tmp, out)
+    except BaseException:
+        if tmp is not None:
+            try:
+                # A failed replacement may leave a read-only staging file on Windows.
+                os.chmod(tmp, 0o600)
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
     print(f'wrote {out} ({len(data)} bytes)')
 
 
