@@ -10395,7 +10395,7 @@ class Gen:
         org = [f(r) for r in rest[1:4]]
         dirv = [f(r) for r in rest[4:7]]
         inv = [f(r) for r in rest[7:10]]
-        INF, ONE, NEGMAX, POSMAX = (self.tof(self.cu(x)) for x in (0x7F800000, 0x3F800000, 0xFF7FFFFF, 0x7F7FFFFF))
+        INF, ONE, NEGINF = (self.tof(self.cu(x)) for x in (0x7F800000, 0x3F800000, 0xFF800000))
         out = lambda k, v: self.dst({"k": "vgpr", "r": vd["r"] + k, "n": 1}, v)
 
         def fop(o, x, y):
@@ -10564,7 +10564,6 @@ class Gen:
         e(f"OpSelectionMerge {L['end2']} None")
         e(f"OpBranchConditional {is_box} {L['box']} {L['oth']}")
         e(f"{L['box']} = OpLabel")
-        invc = [fext("FClamp", d, NEGMAX, POSMAX) for d in inv]
         dist, idx = [], []
         for i in range(4):
             child = ldw(i)
@@ -10580,28 +10579,31 @@ class Gen:
                     e(f"{x} = OpCompositeExtract %float {v2} {c}")
                     m16.append(x)
             mm = [sel(is_b16, m16[c], m32[c]) for c in range(6)]
-            b0 = [fop("OpFMul", fop("OpFSub", mm[c], org[c]), invc[c]) for c in range(3)]
-            b1 = [fop("OpFMul", fop("OpFSub", mm[3 + c], org[c]), invc[c]) for c in range(3)]
-            tmin = fext("FMax", fext("FMax", fext("FMin", b0[0], b1[0]), fext("FMin", b0[1], b1[1])),
-                        fext("FMin", b0[2], b1[2]))
-            tmx = fext("FMin", fext("FMin", fext("FMax", b0[0], b1[0]), fext("FMax", b0[1], b1[1])),
-                       fext("FMax", b0[2], b1[2]))
-            notnan = T()
-            e(f"{notnan} = OpFOrdEqual %bool {mm[0]} {mm[0]}")
-            # An empty box (min > max on any axis) is inactive, not a box that spans everything: xdxr_bvh._box_test
-            # culls it before the slabs. Ordered > keeps a NaN bound out of this decision, as before (SHADER-650).
-            empty = bop("OpLogicalOr",
-                        bop("OpLogicalOr", bop("OpFOrdGreaterThan", mm[0], mm[3]),
-                            bop("OpFOrdGreaterThan", mm[1], mm[4])),
-                        bop("OpFOrdGreaterThan", mm[2], mm[5]))
-            nonempty = T()
-            e(f"{nonempty} = OpLogicalNot %bool {empty}")
-            h1 = bop("OpFOrdGreaterThanEqual", tmx, fext("FMax", "%f0", tmin))
+            b0 = [fop("OpFMul", fop("OpFSub", mm[c], org[c]), inv[c]) for c in range(3)]
+            b1 = [fop("OpFMul", fop("OpFSub", mm[3 + c], org[c]), inv[c]) for c in range(3)]
+            near, far, nnan, fnan = [], [], [], []
+            for c in range(3):
+                pos = bop("OpFOrdGreaterThanEqual", inv[c], "%f0")
+                n_, f_ = sel(pos, b0[c], b1[c]), sel(pos, b1[c], b0[c])
+                nn, fn = T(), T()
+                e(f"{nn} = OpIsNan %bool {n_}")
+                e(f"{fn} = OpIsNan %bool {f_}")
+                near.append(sel(nn, NEGINF, n_))
+                far.append(sel(fn, INF, f_))
+                nnan.append(nn)
+                fnan.append(fn)
+            tmin = fext("FMax", fext("FMax", near[0], near[1]), near[2])
+            tmx = fext("FMin", fext("FMin", far[0], far[1]), far[2])
+            nonan = T()
+            e(f"{nonan} = OpLogicalNot %bool "
+              f"{orr(andd(andd(nnan[0], nnan[1]), nnan[2]), andd(andd(fnan[0], fnan[1]), fnan[2]))}")
+            tnear = fext("FMax", "%f0", tmin)
+            h1 = bop("OpFOrdGreaterThanEqual", tmx, tnear)
             h2 = bop("OpFOrdLessThan", tmin, tmax)
-            hb = andd(notnan, andd(nonempty, andd(h1, h2)))
-            dist.append(sel(hb, tmin, INF))
+            hb = andd(nonan, andd(h1, h2))
+            dist.append(sel(hb, tnear, INF))
             idx.append(sel(hb, child, self.cu(0xFFFFFFFF), "%uint"))
-        for p_, q_ in ((0, 1), (2, 3), (0, 2), (1, 3), (1, 2)):
+        for p_, q_ in ((0, 2), (1, 3), (0, 1), (2, 3), (1, 2)):
             sw = andd(sort, bop("OpFOrdLessThan", dist[q_], dist[p_]))
             dist[p_], dist[q_] = sel(sw, dist[q_], dist[p_]), sel(sw, dist[p_], dist[q_])
             idx[p_], idx[q_] = sel(sw, idx[q_], idx[p_], "%uint"), sel(sw, idx[p_], idx[q_], "%uint")

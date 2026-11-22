@@ -221,7 +221,7 @@ int main(int argc, char** argv) {
     if (!std::strcmp(argv[3], "bvh")) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
         // triangle at z=10 (node 0x40, addr 0x200), a triangle at z=5 (node 0x48, addr 0x240), a box the ray
-        // misses, and an inactive (NaN) box. Node id = address >> 3 | type.
+        // misses, and a box with a NaN min.x that RDNA2 still enters at t = 0 (SHADER-650). Node id = address >> 3 | type.
         auto f32 = [&](uint32_t at, float v) { std::memcpy(static_cast<char*>(map) + at, &v, 4); };
         auto u32 = [&](uint32_t at, uint32_t v) { std::memcpy(static_cast<char*>(map) + at, &v, 4); };
         u32(0x100, 0x40); u32(0x104, 0x48); u32(0x108, 0x60); u32(0x10C, 0x68);
@@ -411,7 +411,7 @@ int main(int argc, char** argv) {
             }
     }
     if (!std::strcmp(argv[3], "bvh")) {
-        const uint32_t want[8] = {0x48, 0x40, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xC1200000u, 0xBF800000u, 0xBE800000u, 0xBE800000u};
+        const uint32_t want[8] = {0x68, 0x48, 0x40, 0xFFFFFFFFu, 0xC1200000u, 0xBF800000u, 0xBE800000u, 0xBE800000u};
         for (int i = 0; i < 8; i++) if (out[i] != want[i]) { if (!bad) first_bad = i; bad++; }
         std::printf("bvh out = %08x %08x %08x %08x | %08x %08x %08x %08x\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
     }
