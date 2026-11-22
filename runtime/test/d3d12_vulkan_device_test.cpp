@@ -365,6 +365,54 @@ bool host_has_graphics_command_list7(ID3D12Device* host) {
     return SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list7.p)));
 }
 
+int compare_format_info(ID3D12Device* ours, const vktest::Device& vk) {
+    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    vk.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(vk.physical, &properties);
+    LUID luid{};
+    static_assert(sizeof(luid) == sizeof(id.deviceLUID));
+    std::memcpy(&luid, id.deviceLUID, sizeof(luid));
+    copycmp::Ptr<ID3D12Device> host;
+    std::string adapter_name;
+    if (!id.deviceLUIDValid || !copycmp::try_create_host(host, adapter_name, &luid)) {
+        std::printf("FORMAT_INFO: no native D3D12 device on the Vulkan adapter, skipped comparison\n");
+        return 0;
+    }
+
+    unsigned compared = 0, host_unknown = 0;
+    int mismatches = 0;
+    const auto compare = [&](DXGI_FORMAT format, UINT size) {
+        D3D12_FEATURE_DATA_FORMAT_INFO expected{format, 0xff}, actual = expected;
+        HRESULT expected_hr = host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &expected, size);
+        // Some Windows runtimes predate these single-plane formats. Still require the layer to recognize them.
+        if (expected_hr == E_INVALIDARG && size == sizeof(expected) &&
+            (format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE ||
+             format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE || format == DXGI_FORMAT_A4B4G4R4_UNORM)) {
+            expected_hr = S_OK;
+            expected.PlaneCount = 1;
+            ++host_unknown;
+            std::printf("FORMAT_INFO format %u: host returned E_INVALIDARG, checking for one plane\n", UINT(format));
+        }
+        const HRESULT our_hr = ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &actual, size);
+        ++compared;
+        if (our_hr != expected_hr || actual.PlaneCount != expected.PlaneCount || actual.Format != format) {
+            std::fprintf(stderr, "FORMAT_INFO format %u size %u: HRESULT/planes %08lx/%u, expected %08lx/%u\n",
+                         UINT(format), size, static_cast<unsigned long>(our_hr), UINT(actual.PlaneCount),
+                         static_cast<unsigned long>(expected_hr), UINT(expected.PlaneCount));
+            ++mismatches;
+        }
+    };
+    constexpr UINT size = sizeof(D3D12_FEATURE_DATA_FORMAT_INFO);
+    // Include UNKNOWN, holes between format families, and the value after the last named format.
+    for (UINT format = 0; format <= UINT(DXGI_FORMAT_A4B4G4R4_UNORM) + 1; ++format)
+        compare(static_cast<DXGI_FORMAT>(format), size);
+    compare(DXGI_FORMAT_FORCE_UINT, size);
+    compare(DXGI_FORMAT_D24_UNORM_S8_UINT, size - 1);
+    std::printf("FORMAT_INFO on %s: %u queries, %u newer formats unknown to host, %d mismatches\n",
+                adapter_name.c_str(), compared, host_unknown, mismatches);
+    return mismatches;
+}
+
 // GetCopyableFootprints must match the PC runtime's exactly, since applications size and fill upload buffers from
 // it. Unaligned block-compressed cases are skipped when the host runtime cannot answer them, so the rest still
 // run. Returns the number of mismatches, or -1 when the host has no D3D12 device to compare with.
@@ -1219,6 +1267,15 @@ int main() {
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va_support, sizeof(va_support))));
         EXPECT(va_support.MaxGPUVirtualAddressBitsPerResource == 40);
         EXPECT(va_support.MaxGPUVirtualAddressBitsPerProcess == 48);
+
+        EXPECT(compare_format_info(device.p, d) == 0);
+        // Use a real oversized buffer and check that rejecting it leaves the output untouched.
+        D3D12_FEATURE_DATA_FORMAT_INFO format_info[2]{{DXGI_FORMAT_D24_UNORM_S8_UINT, 0xff}};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, nullptr, sizeof(format_info[0])) == E_INVALIDARG);
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, format_info, sizeof(format_info)) == E_INVALIDARG);
+        EXPECT(format_info[0].PlaneCount == 0xff);
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, format_info, sizeof(format_info[0])) == S_OK);
+        EXPECT(format_info[0].PlaneCount == 2);
 
         D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support{DXGI_FORMAT_R8G8B8A8_UNORM};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support))));

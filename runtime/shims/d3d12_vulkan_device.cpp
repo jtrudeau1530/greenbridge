@@ -1926,6 +1926,38 @@ public:
             va->MaxGPUVirtualAddressBitsPerProcess = 48;
             return d3d12_trace::result(method, S_OK);
         }
+        case D3D12_FEATURE_FORMAT_INFO: {
+            if (size != sizeof(D3D12_FEATURE_DATA_FORMAT_INFO)) return E_INVALIDARG;
+            auto* info = static_cast<D3D12_FEATURE_DATA_FORMAT_INFO*>(data);
+            // Plane count describes the DXGI layout even when the backend cannot create the texture.
+            switch (info->Format) {
+            case DXGI_FORMAT_R32G8X24_TYPELESS:
+            case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+            case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+            case DXGI_FORMAT_R24G8_TYPELESS:
+            case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+            case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+            case DXGI_FORMAT_NV12:
+            case DXGI_FORMAT_P010:
+            case DXGI_FORMAT_P016:
+            case DXGI_FORMAT_NV11:
+                info->PlaneCount = 2;
+                break;
+            case DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE:
+            case DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE:
+            case DXGI_FORMAT_A4B4G4R4_UNORM:
+                info->PlaneCount = 1;
+                break;
+            default:
+                // Native D3D12 accepts UNKNOWN but rejects R1_UNORM and the gaps in the enum.
+                if (UINT(info->Format) > DXGI_FORMAT_B4G4R4A4_UNORM || info->Format == DXGI_FORMAT_R1_UNORM)
+                    return E_INVALIDARG;
+                info->PlaneCount = 1;
+            }
+            return S_OK;
+        }
         case D3D12_FEATURE_FORMAT_SUPPORT: {
             if (size != sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* fs = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(data);
