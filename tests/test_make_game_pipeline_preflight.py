@@ -19,7 +19,7 @@ if ROOT not in sys.path:
 import make_game  # noqa: E402
 
 
-class PipelinePreflightTest(unittest.TestCase):
+class PreflightEnv:
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -43,8 +43,10 @@ class PipelinePreflightTest(unittest.TestCase):
         self.assertIn(match, err.getvalue())
         return err.getvalue()
 
+
+class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
     def test_pipelines_without_checker_fails_in_preflight(self):
-        with mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
+        with mock.patch("os.name", "nt"), mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
             err = self.assert_preflight_fails(["shaders", "pipelines"], "vk_pipeline_check")
         self.assertIn("Install these first, then run the build again:", err)
 
@@ -55,6 +57,7 @@ class PipelinePreflightTest(unittest.TestCase):
         argv = ["make_game.py", "--game", game, "--work", self.work, "--out", out,
                 "--stages", "shaders,pipelines"]
         with mock.patch.object(sys, "argv", argv), \
+                mock.patch("os.name", "nt"), \
                 mock.patch.object(make_game, "below_normal"), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch.object(make_game, "pipeline_check_exe", return_value=None), \
@@ -96,11 +99,64 @@ class PipelinePreflightTest(unittest.TestCase):
                 self.assertIn("vk_pipeline_check", err)
 
     def test_missing_checker_is_listed_with_other_missing_prerequisites(self):
-        with mock.patch("make_game.tool_available", return_value=False), \
+        with mock.patch("os.name", "nt"), mock.patch("make_game.tool_available", return_value=False), \
                 mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
             err = self.assert_preflight_fails(["shaders", "pipelines"], "vk_pipeline_check")
         self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
         self.assertEqual(err.count("vk_pipeline_check"), 1)
+
+
+
+class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
+    """Off Windows preflight builds the checker itself once every other prerequisite is there."""
+
+    def setUp(self):
+        super().setUp()
+        for patcher in (mock.patch("os.name", "posix"),
+                        mock.patch.object(make_game, "pipeline_check_exe", return_value=None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_builds_the_checker_after_the_checks(self):
+        with mock.patch.object(make_game, "pipeline_check_exe", side_effect=[None, None, "/bin/vk_pipeline_check"]), \
+                mock.patch.object(make_game, "build_pipeline_check") as build:
+            make_game.preflight(["pipelines"], self.work, jobs=3)
+        build.assert_called_once_with(3)
+
+    def test_a_checker_built_where_it_isnt_looked_for_fails_in_preflight(self):
+        with mock.patch.object(make_game, "build_pipeline_check") as build:
+            self.assert_preflight_fails(["shaders", "pipelines"], "delete runtime/build/linux")
+        build.assert_called_once()
+
+    def test_without_cmake_nothing_is_built(self):
+        with mock.patch("shutil.which", side_effect=lambda t: None if t == "cmake" else "/bin/tool"), \
+                mock.patch.object(make_game, "build_pipeline_check") as build:
+            err = self.assert_preflight_fails(["pipelines"], "CMake 3.24 or newer")
+        self.assertIn("vk_pipeline_check", err)
+        build.assert_not_called()
+
+    def test_another_missing_prerequisite_stops_before_the_build(self):
+        with mock.patch("make_game.tool_available", return_value=False), \
+                mock.patch.object(make_game, "build_pipeline_check") as build:
+            self.assert_preflight_fails(["shaders", "pipelines"], "llvm-mc")
+        build.assert_not_called()
+
+    def test_a_built_checker_is_not_rebuilt(self):
+        with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
+                mock.patch.object(make_game, "build_pipeline_check") as build:
+            make_game.preflight(["pipelines"], self.work)
+        build.assert_not_called()
+
+    def test_the_build_uses_the_readme_folder(self):
+        with mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch.object(make_game, "log"), \
+                mock.patch.object(make_game, "run") as run:
+            make_game.build_pipeline_check(2)
+        configure, build = (c.args[0] for c in run.call_args_list)
+        folder = os.path.join(self.root, "runtime", "build", "linux")
+        self.assertEqual(configure[:5], ["cmake", "-S", os.path.join(self.root, "runtime"), "-B", folder])
+        self.assertEqual(build, ["cmake", "--build", folder, "--parallel", "2", "--target", "vk_pipeline_check"])
+        self.assertIn("Vulkan headers", run.call_args_list[1].kwargs["hint"])
 
 
 if __name__ == "__main__":

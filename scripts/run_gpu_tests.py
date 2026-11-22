@@ -94,7 +94,7 @@ def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     if name in CLIP_CASES:
         cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[name]}")
     cmd.append("-show-encoding")
-    p = subprocess.run(
+    p = mc_command.run(   # a missing llvm-mc: one line naming LLVM_MC/--llvm-mc, not a traceback
         cmd,
         input=raw,
         capture_output=True,

@@ -13,6 +13,7 @@
 </h4>
 
 <p align="center">
+  <a href="docs/i18n/README.md">Other languages</a> |
   <a href="#project-status">Status</a> |
   <a href="#how-to-build">How to build</a> |
   <a href="#how-it-works">How it works</a> |
@@ -137,22 +138,26 @@ cmake --build runtime/build/linux --parallel
 Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
 
 `make_game.py` runs on Linux too. The `pipelines` stage uses the `vk_pipeline_check` built above
-(`runtime/build/linux`, or `runtime/build`). The `runtime` stage builds on Windows only, so on Linux it needs a
-Windows build of `runtime/`; without one it is left out of the default stages, and asking for it fails before any
-work starts.
+(`runtime/build/linux`, or `runtime/build`), and builds it there itself before any other work if it is missing.
 
 ### Running the loader on Linux
 
 The loader is a Windows program and runs under Wine or Proton; CI runs its tests under Wine on every change to
-`runtime/` (the `wine` job of the Runtime workflow). Give the `runtime` stage a folder with `gta6rt.exe` and
-`gta6rt_tls_host.dll`, such as the `runtime-windows` artifact of that workflow's `windows` job, unzipped:
+`runtime/` (the `wine` job of the Runtime workflow). On Linux the `runtime` stage cross-builds it into
+`runtime/build/windows` with clang-cl and lld-link (LLVM 19+) against the MSVC CRT and Windows SDK that
+[xwin](https://github.com/Jake-Shadle/xwin) lays out, in `XWIN_DIR` or `~/.local/share/xwin-sdk`
+([docs/testing.md](docs/testing.md#the-windows-runtime-on-linux-under-wine-or-proton) has the one-time `xwin`
+command). Without them the stage is left out of the default stages, and asking for it lists what is missing before
+any work starts. A Windows build made elsewhere works too, such as the `runtime-windows` artifact of that workflow's
+`windows` job, unzipped:
 
 ```sh
 python3 -I make_game.py --runtime-build ~/Downloads/runtime-windows
 ```
 
-It copies both files into `--out` and writes `gta6rt.sh` next to them, which starts `gta6rt.exe` with `wine`, or
-with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option skips the build on Windows.
+Either way it copies `gta6rt.exe` and `gta6rt_tls_host.dll` into `--out` and writes `gta6rt.sh` next to them, which
+starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option
+skips the build on Windows.
 
 ## How it works
 

@@ -279,3 +279,7 @@ every sample of a pixel one value, so the modes over differing samples are not c
 $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_depth_resolve_test.exe
 ```
+
+### Predicate capture lifetime
+
+`vk_predicate_capture_test` checks full-width predicate snapshots, offset rebinding and reset with 32 gated submissions, then reuses completed command-buffer slots. Run explicitly on a Vulkan GPU with conditional rendering; it uses only synthetic data.

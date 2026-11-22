@@ -31,6 +31,7 @@
 #include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
+#include "vulkan_predicate.h"
 
 #include <algorithm>
 #include <array>
@@ -674,6 +675,9 @@ struct ReplayFunctions {
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
+    // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
+    std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
+    std::function<void(VkCommandBuffer, const PredicateCapture&)> capture_predicate;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
@@ -720,6 +724,7 @@ struct PreparedQuery {
 };
 
 struct Prepared {
+    PredicateCapture predicate;
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
@@ -1678,11 +1683,16 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             predicated = predication->buffer != 0;
             if (!predicated) continue;
             if (!conditional) return ReplayResult::unsupported;
+            // The internal dispatch must not appear in the application's pipeline-statistics result. Virtualising
+            // that query is separate work; reject the combination before emitting any commands instead of lying.
+            if (statistics_active) return ReplayResult::unsupported;
             if (!bind(predication->buffer)) return ReplayResult::unresolved_resource;
-            // Vulkan reads one 32-bit word at a 4-byte aligned offset; D3D12's value is 64 bits at an 8-byte
-            // aligned one, so its low word is read (docs/d3d12_vulkan.md section 4.7).
-            if (!p.binding.buffer || !detail::within(predication->offset, 4, p.binding.size))
+            if (!p.binding.buffer || !detail::within(predication->offset, 8, p.binding.size) ||
+                predication->offset > UINT64_MAX - p.binding.buffer_offset)
                 return ReplayResult::invalid_predication;
+            if (!vk.prepare_predicate || !vk.capture_predicate ||
+                !vk.prepare_predicate(p.binding.buffer, p.binding.buffer_offset + predication->offset, p.predicate))
+                return ReplayResult::unsupported;
         } else if (const QueryRange range = query_range(command); range.count) {
             // BeginQuery, EndQuery and ResolveQueryData are not among D3D12's predicated calls, and Vulkan's
             // conditional rendering leaves query commands and transfers alone, so a predicate changes nothing here.
@@ -1938,9 +1948,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         if (const auto* predication = std::get_if<Predication>(&command)) {
             // Conditional rendering cannot nest, so a new predicate ends the previous one first.
             if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
-            predicate.buffer = p.binding.buffer;
+            predicate.buffer = predication->buffer ? p.predicate.scratch : VK_NULL_HANDLE;
             if (predicate.buffer) {
-                predicate.offset = predication->offset;
+                vk.capture_predicate(command_buffer, p.predicate);
+                predicate.offset = p.predicate.offset + 8;
                 // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
                 predicate.flags = predication->op == d3d12_predication::not_equal_zero
                                       ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT
