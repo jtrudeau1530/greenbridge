@@ -93,10 +93,8 @@ def convert_single(
                         if png_bytes:
                             tex_cache[found_path] = png_bytes
                     if png_bytes:
-                        mat_key = mat_name if mat_name else clean_stem
-                        prim["material"] = mat_key
-                        materials[mat_key] = {
-                            "name": mat_key,
+                        materials[mat_name] = {
+                            "name": mat_name or clean_stem,
                             "png_bytes": png_bytes,
                         }
 
