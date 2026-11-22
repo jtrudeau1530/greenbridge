@@ -21,6 +21,7 @@ import stat
 import struct
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterable
 
@@ -863,13 +864,19 @@ def _replace(source: str, destination: str) -> None:
     os.replace(source, destination)
 
 
+# os.umask can only be read by setting it, and the umask is process-wide: two writers reading it at once could
+# leave it at 0 for the whole process. One lock makes the set-and-restore atomic for every writer in this module.
+_UMASK_LOCK = threading.Lock()
+
+
 def _output_mode(path: str) -> int:
     """Permission bits for a published GLB: those of the file it replaces, or 0666 minus the umask."""
     try:
         return stat.S_IMODE(os.stat(path).st_mode)
     except FileNotFoundError:
-        mask = os.umask(0)
-        os.umask(mask)
+        with _UMASK_LOCK:
+            mask = os.umask(0)
+            os.umask(mask)
         return 0o666 & ~mask
 
 
