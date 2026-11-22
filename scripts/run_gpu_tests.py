@@ -214,14 +214,14 @@ def make_fs_passthru(loc: int) -> str:
 def read_raw_rgba32f(path: str) -> list[tuple[float, float, float, float]]:
     with open(path, "rb") as source:
         data = source.read()
-    n = len(data) // 16
+    n = len(data) // 16 if len(data) % 16 == 0 else 0   # a partial pixel means a malformed readback: no frame
     return [struct.unpack_from("<4f", data, 16 * i) for i in range(n)]
 
 
 def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     with open(path, "rb") as source:
         data = source.read()
-    n = len(data) // 16
+    n = len(data) // 16 if len(data) % 16 == 0 else 0   # a partial pixel means a malformed readback: no frame
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
 
@@ -331,6 +331,8 @@ def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
     px = read_raw_u32(raw_path)
     if skip := bitmask_perm_narrow_skip(msg, px):
         return None, str(skip)
+    if problem := frame_problem(px):
+        return False, problem
     bad = 0
     first = ""
     judged = 0
@@ -362,7 +364,11 @@ def check_flat(raw_path: str) -> tuple[bool, str]:
     """ps_flat with vs_ids: the integer IDs come from the first (provoking) vertex, the UVs still interpolate."""
     with open(raw_path, "rb") as source:
         data = source.read()
+    if len(data) != 64 * 64 * 16:
+        return False, f"expected a 64x64 frame, got {len(data)} bytes"
     px = list(struct.iter_unpack("<2I2f", data))
+    if problem := frame_problem(px):
+        return False, problem
     w = int(len(px) ** 0.5)
     wrong = sum((a, b) != (0x101, 0x102) for a, b, _, _ in px)
     err = max(max(abs(u - (i % w + 0.5) / w), abs(v - (i // w + 0.5) / w)) for i, (_, _, u, v) in enumerate(px))
@@ -389,6 +395,9 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     """ps_uniform_branch / ps_scc_mask32: s5 = 8 wherever the lane's own bit is set; a lane with bit 0 gets 8 when
     another lane of its wave has the bit (the wave-wide vote), else 7. All three kinds must occur, as in check.py:
     without a (8, bit 0) pixel the vote is not shown, and a translator that decides per lane would pass."""
+    # Only z (the barycentric i) is judged as a float; a NaN i passes both range tests below.
+    if problem := frame_problem([p[2:3] for p in px]):
+        return False, problem
     bad = 0
     n8 = 0
     n7 = 0
@@ -460,8 +469,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
     """Check 64x64 output with ClipDistance[0] = NDC x: left half (x < 32) clipped to clear (-1),
     right half (x >= 32) covered (2048/4096 pixels) with the gradient."""
     px = read_raw_rgba32f(raw_path)
-    if len(px) != 64 * 64:
-        return False, f"expected 4096 pixels, got {len(px)}"
+    if problem := frame_problem(px):
+        return False, problem
     covered = 0
     bad = 0
     first = ""
