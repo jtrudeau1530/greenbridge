@@ -1,6 +1,8 @@
 """Synthetic tests for tools/opus_tags.py (no game data: invented banks, names and subtitles)."""
+import codecs
 import csv
 import os
+from pathlib import Path
 import struct
 import subprocess
 import sys
@@ -86,6 +88,7 @@ class TestRetag(unittest.TestCase):
         self.assertEqual(old[old_pages[2][0]:], new[new_pages[2][0]:])
         self.assertTrue(crc_ok(new))
         self.assertEqual(read_tags(new), (T.VENDOR, ["TITLE=" + "x" * 3000]))
+        self.assertEqual(T.retag(new, T.tags_packet([("TITLE", "x" * 3000)])), new)
 
     def test_rejects_what_it_cannot_rewrite(self):
         with tempfile.TemporaryDirectory() as d:
@@ -127,6 +130,23 @@ class TestFolder(unittest.TestCase):
         with open(os.path.join(self.opus, *parts), "rb") as f:
             return read_tags(f.read())[1]
 
+    def test_preserves_file_with_an_extra_packet_on_the_tags_page(self) -> None:
+        path = os.path.join(self.opus, "story", "bank_01", "0ABCDEF1.ogg")
+        with open(path, "rb") as f:
+            data = f.read()
+        tags_at, tags_end = list(T.pages(data))[1]
+        serial, = struct.unpack_from("<I", data, tags_at + 14)
+        mixed_page = awc_opus.ogg_page(serial, 1, 960, [T.tags_packet([]), PACKET], 0)
+        original = data[:tags_at] + mixed_page + data[tags_end:]
+        with open(path, "wb") as f:
+            f.write(original)
+
+        stats = T.tag_folder(self.opus, T.load_names(self.names, "story"))
+
+        with open(path, "rb") as f:
+            self.assertTrue(f.read() == original, "tagging changed a file whose tags page includes audio")
+        self.assertEqual(stats["skipped: the OpusTags page contains another packet"], 1)
+
     def test_names_and_dialogue(self):
         names = T.load_names(self.names, "story")
         dialogue, langs = T.load_dialogue(self.dialogue)
@@ -138,6 +158,27 @@ class TestFolder(unittest.TestCase):
                           "SUBTITLE_EN=Move. Now.", "SUBTITLE_DE=Los."])
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
         self.assertEqual(self.tags("story", "bank_01", "00000123.ogg"), [])
+
+    def test_cli_accepts_a_missing_trailing_subtitle(self):
+        # A CSV row can omit its final optional field rather than end with a comma.
+        with open(self.dialogue, "w", encoding="utf-8", newline="\n") as f:
+            csv.writer(f, lineterminator="\n").writerows([
+                ["wave", "key", "label", "speaker", "text_de", "text_en"],
+                ["heistau_abcd_01", "HEISTAU_ABCD", "HEIST_ZED_1", "ZED", "~z~Los."],
+            ])
+        parts = ("story", "bank_01", "0ABCDEF1.ogg")
+        path = os.path.join(self.opus, *parts)
+        with open(path, "rb") as f:
+            before = f.read()
+        result = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names,
+                                 "--source", "story", "--dialogue", self.dialogue], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tags(*parts), ["TITLE=heistau_abcd_01", "LABEL=HEIST_ZED_1", "SPEAKER=ZED",
+                                             "SUBTITLE=Los.", "SUBTITLE_DE=Los."])
+        with open(path, "rb") as f:
+            after = f.read()
+        self.assertEqual(before[list(T.pages(before))[2][0]:], after[list(T.pages(after))[2][0]:])
+        self.assertTrue(crc_ok(after))
 
     def test_duplicate_id_stream_gets_the_same_tags(self):
         # awc_opus.py names a bank's second stream with an id already used <id>~2 (export_stems); it has the same
@@ -181,6 +222,22 @@ class TestFolder(unittest.TestCase):
         self.assertEqual((stats["ogg files"], stats.get("tagged", 0), stats.get("without a name", 0)), (3, 1, 2))
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
 
+    def test_bank_label_as_is_wins_over_its_awc_spelling(self):
+        # "story/bank_02" and "story/bank_02.awc" for one id (a directory scan can give both, from bank_02.awc and
+        # bank_02.awc.awc): each folder keeps its own name, whatever the row order.
+        make_ogg(os.path.join(self.opus, "story", "bank_02.awc", "1FFFFFFF.ogg"), stream_id=0x1FFFFFFF)
+
+        def row(bank, name):
+            return {"source": "s", "bank": bank, "stream_id": "1fffffff", "name": name, "rule": "family"}
+
+        rows = [row("story/bank_02", "plain_label"), row("story/bank_02.awc", "awc_label")]
+        names = os.path.join(self.tmp.name, "both.csv")
+        for order in (rows, rows[::-1]):
+            write_csv(names, NAMES, order)
+            T.tag_folder(self.opus, T.load_names(names))
+            self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=plain_label"])
+            self.assertEqual(self.tags("story", "bank_02.awc", "1FFFFFFF.ogg"), ["TITLE=awc_label"])
+
     def test_cli(self):
         r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names, "--source", "story",
                             "--dialogue", self.dialogue], capture_output=True, text=True)
@@ -190,6 +247,15 @@ class TestFolder(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+
+    def test_cli_reads_utf8_bom_in_names_and_dialogue(self):
+        for path in map(Path, (self.names, self.dialogue)):
+            path.write_bytes(codecs.BOM_UTF8 + path.read_bytes())
+        result = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names,
+                                 "--source", "story", "--dialogue", self.dialogue], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
+        self.assertIn("SUBTITLE=Move. Now.", self.tags("story", "bank_01", "0ABCDEF1.ogg"))
 
 
 if __name__ == "__main__":
