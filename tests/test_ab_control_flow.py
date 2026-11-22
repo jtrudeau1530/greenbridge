@@ -66,6 +66,21 @@ class CandidateSelectionTest(unittest.TestCase):
         picked = AB.select_candidates(index, self.disasm, self.spirv, count=10)
         self.assertEqual(picked, ["a_valid", "z_valid"])
 
+    def test_metadata_filters_reject_shaders_that_pass_every_file_check(self):
+        # Each rejected entry has a valid disassembly and SPIR-V, so only its metadata can drop it.
+        index = {
+            "valid": self.shader(bindings=[0, 1, 2], features=sorted(AB.HOSTED_FEATURES)),
+            "vertex_stage": self.shader(stage="vs"),
+            "compute_stage": self.shader(stage="cs"),
+            "no_stage": {"bindings": [], "features": []},
+            "one_unsupported_binding": self.shader(bindings=[0, 3]),
+            "one_unhosted_feature": self.shader(features=["shaderInt64", "shaderFloat16"]),
+        }
+        for name in index:
+            self.add_shader(name, "\ts_cbranch_scc0 12\n\ts_branch 24\n")
+        self.assertEqual(AB.supported_pixel_shaders(index), ["valid"])
+        self.assertEqual(AB.select_candidates(index, self.disasm, self.spirv, count=10), ["valid"])
+
     def test_backward_branch_detection_and_loops_filter(self):
         self.assertFalse(AB.is_backward_branch("\ts_cbranch_scc0 12\n\ts_branch 40\n"))
         self.assertTrue(AB.is_backward_branch("\ts_cbranch_scc0 32768\n\ts_branch 40\n"))
@@ -141,6 +156,13 @@ class ResultClassificationTest(unittest.TestCase):
 
     def test_inconsistent_repeated_runs_are_unstable(self):
         self.assertEqual(AB.classify_result(True, [b"first", b"second"], [b"image"]),
+                         "unstable from run to run")
+
+    def test_inconsistent_structured_runs_are_unstable(self):
+        self.assertEqual(AB.classify_result(True, [b"image", b"image"], [b"first", b"second"]),
+                         "unstable from run to run")
+        # A form that times out on one run and not the next is unstable, not "ONLY ONE FORM TERMINATES".
+        self.assertEqual(AB.classify_result(True, [b"image", b"image"], [b"image", "timeout"]),
                          "unstable from run to run")
 
     def test_identical_images(self):
