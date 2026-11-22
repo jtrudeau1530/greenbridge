@@ -153,6 +153,12 @@ class ValidationGateTests(unittest.TestCase):
             self.assertEqual((code, err), (0, ""))
             self.assertTrue(os.path.isfile(out))
 
+    def test_out_cannot_be_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, err = self.main_with(argv=["turing_atlas.py", "--out", tmp])
+            self.assertEqual(code, 2)
+            self.assertIn("--out is a folder", err)
+
     def test_missing_tools_skip_without_treating_it_as_a_control_failure(self):
         with patch.object(turing_atlas.shutil, "which", return_value=None):
             self.assertEqual(turing_atlas.validate_cases(),
