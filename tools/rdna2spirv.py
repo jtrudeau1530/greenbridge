@@ -1277,11 +1277,18 @@ class Gen:
                65: (8, "unorm", (16, 16, 16, 16)), 66: (8, "snorm", (16, 16, 16, 16)),
                44: (4, "unorm", (2, 10, 10, 10)), 50: (4, "unorm", (10, 10, 10, 2)),
                69: (8, "uint", (16, 16, 16, 16)), 27: (4, "uint", (16, 16)),
-               2: (1, "snorm", (8,)), 8: (2, "snorm", (16,)), 15: (2, "snorm", (8, 8))}
+               2: (1, "snorm", (8,)), 8: (2, "snorm", (16,)), 15: (2, "snorm", (8, 8)),
+               # Narrow integer formats, measured natively on gfx1036 (wave32 and wave64): UINT loads zero-extend
+               # and stores saturate to the channel; SINT loads sign-extend and stores clamp the 32-bit signed value
+               # to [-2^(w-1), 2^(w-1) - 1].
+               5: (1, "uint", (8,)), 11: (2, "uint", (16,)), 18: (2, "uint", (8, 8)),
+               6: (1, "sint", (8,)), 12: (2, "sint", (16,)), 19: (2, "sint", (8, 8)), 28: (4, "sint", (16, 16)),
+               61: (4, "sint", (8, 8, 8, 8)), 70: (8, "sint", (16, 16, 16, 16))}
 
     def encode_format(self, fcomps, icomps, code):
         """Encode one element of format `code` -> list of uint ids (whole dwords; elements under 4 bytes return one
-        value in the low bits). fcomps are f32 bit patterns (float/normalized kinds), icomps integer bit patterns (u32/i32/uint)."""
+        value in the low bits). fcomps are f32 bit patterns (float/normalized kinds), icomps integer bit patterns
+        (u32/i32/uint/sint)."""
         try:
             size, kind, widths = self.FORMATS[code]
         except KeyError:
@@ -1310,6 +1317,11 @@ class Gen:
                 self.emit(f"{i} = OpConvertFToS %int {rd}")
                 self.emit(f"{u} = OpBitcast %uint {i}")
                 field = u
+            elif kind == "sint":   # Narrow SINT stores clamp the signed value to the field's range.
+                clamped, field = self.tmp(), self.tmp()
+                lo, hi = self.as_int(self.cu((-(1 << (w - 1))) & 0xFFFFFFFF)), self.as_int(self.cu((1 << (w - 1)) - 1))
+                self.emit(f"{clamped} = OpExtInst %int %glsl SClamp {self.as_int(icomps[c])} {lo} {hi}")
+                self.emit(f"{field} = OpBitcast %uint {clamped}")
             else:   # Narrow UINT stores saturate to the field width before insertion.
                 field = self.tmp()
                 self.emit(f"{field} = OpExtInst %uint %glsl UMin {icomps[c]} {self.cu((1 << w) - 1)}")
@@ -1418,6 +1430,11 @@ class Gen:
                 self.emit(f"{lo} = OpULessThan %bool {au} {self.cu(1 << (w - 1))}")
                 self.emit(f"{res} = OpSelect %uint {lo} {sel} {self.cu(0xBF800000)}")
                 out.append(res)
+            elif kind == "sint":
+                si, su = self.tmp(), self.tmp()
+                self.emit(f"{si} = OpBitFieldSExtract %int {self.as_int(src)} {self.cu(bit % 32)} {self.cu(w)}")
+                self.emit(f"{su} = OpBitcast %uint {si}")
+                out.append(su)
             else:   # uint: raw integer
                 out.append(f)
             bit += w
@@ -1769,12 +1786,12 @@ class Gen:
         # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm) or integer 1 (UINT/SINT; SHADER-86), 4..7 -> X..W.
         is_int_fmt, is_signed = "%false", "%false"
         for code_v, (_, kind, _) in self.FORMATS.items():
-            if kind in ("u32", "i32", "uint"):
+            if kind in ("u32", "i32", "uint", "sint"):
                 e, o = self.tmp(), self.tmp()
                 self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
                 self.emit(f"{o} = OpLogicalOr %bool {is_int_fmt} {e}")
                 is_int_fmt = o
-                if d16 and kind == "i32":
+                if d16 and kind in ("i32", "sint"):
                     signed = self.tmp()
                     self.emit(f"{signed} = OpLogicalOr %bool {is_signed} {e}")
                     is_signed = signed
@@ -2456,7 +2473,7 @@ class Gen:
                 fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
                 if code in (50, 56):
                     fcs = unorm_view
-                integer_source = signed_ic if kind == "i32" else ic
+                integer_source = signed_ic if kind in ("i32", "sint") else ic
                 ics = integer_source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
                 words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
                 if size >= 4:
