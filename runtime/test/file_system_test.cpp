@@ -642,6 +642,62 @@ int main() {
               "the copy staging folder is hidden from a GAME: listing");
     }
 
+    // RT-218: "G:\" is the package and "T:\" a writable scratch folder in the overlay, as in the other console layers.
+    // A host path under the configured folders stays a host path, and a path that climbs out of the drive is refused.
+    {
+        write_path(package / "drives" / "sub" / "probe.txt", "probe");
+        HANDLE h = create_w(L"G:\\drives\\sub\\probe.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "probe", "CreateFileW opens G:\\drives\\sub\\probe.txt from the package");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        h = create_w(L"g:/drives/sub/probe.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "the drive letter is case-insensitive and accepts forward slashes");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"G:\\data\\sub") != INVALID_FILE_ATTRIBUTES, "GetFileAttributesW stats a G: folder");
+
+        SetLastError(0);
+        check(create_w(L"G:\\..\\x.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr) ==
+                      INVALID_HANDLE_VALUE &&
+                  GetLastError() == ERROR_INVALID_NAME,
+              "G:\\.. is refused with ERROR_INVALID_NAME");
+
+        h = create_w(L"T:\\cache\\scratch.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "CreateFileW creates a file on T: (parent folders and all)");
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            ::WriteFile(h, "scratch", 7, &written, nullptr);
+            ::CloseHandle(h);
+        }
+        check(read_path(overlay / ".gta6rt-temp" / "cache" / "scratch.bin") == "scratch",
+              "a T: file lands in the overlay's scratch folder");
+        check(!std::filesystem::exists(package / "cache" / "scratch.bin") && !std::filesystem::exists(package / ".gta6rt-temp"),
+              "and the package is untouched");
+        h = create_w(L"t:/cache/scratch.bin", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "scratch", "the T: file reads back");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\cache\\scratch.bin") == INVALID_FILE_ATTRIBUTES,
+              "T: is its own drive: GAME: does not see the scratch file");
+        check(!contains(list(first_w, next_w, find_close, L"GAME:\\*"), L".gta6rt-temp"),
+              "a listing of GAME:\\ does not show the scratch folder");
+        SetLastError(0);
+        check(create_w(L"T:\\..\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr) ==
+                      INVALID_HANDLE_VALUE &&
+                  GetLastError() == ERROR_INVALID_NAME,
+              "T:\\.. cannot climb out of the scratch folder into the package");
+
+        // A package that itself sits on drive G: is reached by host paths, which must stay host paths.
+        rt::fs::configure(L"G:\\leonida_missing_package", L"G:\\leonida_missing_overlay");
+        SetLastError(0);
+        check(attributes_w(L"G:\\leonida_missing_package\\data.txt") == INVALID_FILE_ATTRIBUTES &&
+                  GetLastError() != ERROR_INVALID_NAME,
+              "a path under a configured G: game folder is a host path");
+        // No roots configured: nothing to map G: and T: onto, so they are host paths.
+        rt::fs::configure({}, {});
+        SetLastError(0);
+        check(attributes_w(L"T:\\x") == INVALID_FILE_ATTRIBUTES && GetLastError() != ERROR_INVALID_NAME,
+              "without configured folders G: and T: stay host drives");
+        rt::fs::configure(package, overlay);
+    }
+
     std::filesystem::remove_all(root);
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

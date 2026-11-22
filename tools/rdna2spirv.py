@@ -13276,6 +13276,20 @@ def input_signature(path, name):
     return []
 
 
+def vertex_input_locations(sig):
+    """One (register, component type) per declared input register, in first-seen order.
+
+    A packed ISG1 signature declares two elements in one register (xy and zw of a float4). Both fetch from the
+    same VGPR group and share one Vulkan vertex input, so the register appears once here; the SPIR-V variable
+    %vin{reg} would otherwise be declared twice. A register whose elements disagree on the component type has no
+    single Vulkan input type, so it is rejected rather than guessed."""
+    seen = {}
+    for reg, _, _, ctype in sig:
+        if seen.setdefault(reg, ctype) != ctype:
+            raise Unsupported("vertex input register with mixed component types")
+    return list(seen.items())
+
+
 # RDNA2 VOP3_SDST_ENC forms have both VDST and SDST in the printed operands.
 VOP3_TWO_DESTS = frozenset({
     "v_add_co_u32", "v_sub_co_u32", "v_subrev_co_u32",
@@ -13768,7 +13782,7 @@ def translate(path):
         reads = {r for r in read_before_write_vgprs(insns) if r >= 4}
         if not reads <= predicted:
             raise Unsupported("fetch mapping")
-        g.vertex_inputs = [(reg, ctype) for reg, _, _, ctype in sig]
+        g.vertex_inputs = vertex_input_locations(sig)
         g.vertex_signature = [{"register": reg, "mask": mask, "system_value": sv, "component_type": ctype}
                               for reg, mask, sv, ctype in sig]
         for reg, _ in g.vertex_inputs:          # register the VGPR index constants before assembly

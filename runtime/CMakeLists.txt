@@ -226,6 +226,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(xgameruntime_test
     test/xgameruntime_test.cpp
     shims/xgameruntime.cpp
+    shims/file_system.cpp
     shims/library_loader.cpp
     shims/registry.cpp
   )

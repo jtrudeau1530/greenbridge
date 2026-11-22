@@ -204,6 +204,34 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
           "nonzero XMem allocation attributes are rejected before host allocation");
 }
 
+using HostVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);
+
+// RT-217: a title's kernel32!VirtualAlloc carries the console's MEM_GRAPHICS / MEM_TITLE type bits, which the host
+// rejects. The registered shim has to drop them and still allocate.
+void test_title_virtual_alloc() {
+    constexpr DWORD kMemGraphics = 0x10000000;
+    constexpr DWORD kMemTitle = 0x40000000;
+    const char* const dlls[] = {"kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-l1-1-0.dll"};
+    for (const char* dll : dlls) {
+        const auto alloc = reinterpret_cast<HostVirtualAllocFn>(rt::shims::find(dll, "VirtualAlloc"));
+        char what[160];
+        std::snprintf(what, sizeof what, "registry exposes %s!VirtualAlloc", dll);
+        check(alloc != nullptr, what);
+        if (!alloc) continue;
+
+        for (const DWORD bits : {kMemGraphics, kMemTitle, kMemGraphics | kMemTitle, DWORD{0}}) {
+            void* const p = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT | bits, PAGE_READWRITE);
+            std::snprintf(what, sizeof what, "%s!VirtualAlloc with type bits %#lx returns memory", dll,
+                          static_cast<unsigned long>(bits));
+            check(p != nullptr, what);
+            if (!p) continue;
+            static_cast<volatile uint8_t*>(p)[0] = 0x5a;
+            check(static_cast<volatile uint8_t*>(p)[0] == 0x5a, "the allocation is committed and writable");
+            check(VirtualFree(p, 0, MEM_RELEASE), "release the allocation");
+        }
+    }
+}
+
 void print_result() {
     if (g_failures == 0) {
         std::printf("xmem_test: OK (%d checks)\n", g_checks);
@@ -249,6 +277,8 @@ int main() {
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
     }
+
+    test_title_virtual_alloc();
 
     print_result();
     return g_failures ? 1 : 0;

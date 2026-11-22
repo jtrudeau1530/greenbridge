@@ -330,9 +330,9 @@ def run(tree, choose, limit):
             stack[-1] = ("items", items, idx + 1)
             it = items[idx]
             if it[0] == "block":
-                trace.append(it[1])
                 if len(trace) >= limit:
                     break
+                trace.append(it[1])
                 pc[0] = choose(it[1])
             elif it[0] == "guard":
                 if pc[0] == it[1]:
