@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <memory>
 #include <string>
 #include <utility>
 #include <variant>
@@ -403,6 +404,15 @@ struct IndexBufferView {
     std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
 };
 
+// The views a draw captured, at the D3D12 maxima. Kept by value because the CPU descriptor slots and the bound
+// views can change after the draw is recorded, and out of line because the command variant is sized by its largest
+// member: inline they made every recorded command, barriers included, 976 bytes.
+struct DrawViews {
+    std::array<TargetView, 8> render_targets{};
+    std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
+    std::uint32_t render_target_count = 8;
+};
+
 // DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
 // render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
 // the draw. resource 0 marks an unbound render-target slot or no depth buffer.
@@ -411,9 +421,8 @@ struct IndexBufferView {
 struct Draw {
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
-    std::array<TargetView, 8> render_targets{};
+    std::shared_ptr<const DrawViews> views;  // null: no render targets or vertex buffers captured
     TargetView depth{};
-    std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
     IndexBufferView index{};
     std::uint32_t topology = 0;  // D3D_PRIMITIVE_TOPOLOGY
     Viewport viewport{};       // the first; more viewports are not modelled yet
@@ -427,7 +436,6 @@ struct Draw {
     std::uint32_t first = 0;  // first vertex or first index
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
-    std::uint32_t render_target_count = 8;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
