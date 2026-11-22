@@ -5,11 +5,9 @@ Covers the 11 named scalar instructions and their syntax variants in tools/shade
     s_clause, s_delay_alu (RDNA3 hint kept in NOOPS), s_inst_prefetch, s_setprio, s_sleep,
     s_waitcnt_depctr, s_waitcnt_expcnt, s_waitcnt_lgkmcnt, s_waitcnt_vmcnt,
     plus the sibling wait/no-op forms s_waitcnt, s_waitcnt_vscnt, s_nop, and v_nop.
-  * Refused mode mnemonics in rdna2spirv._insn:
-    s_denorm_mode and s_round_mode raise Unsupported ("MODE is modelled through s_setreg only");
-    valid MODE.FP_ROUND[3:2] writes go through s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0|3,
-    which updates %mode_r16 only and leaves VGPRs, SGPRs, VCC, SCC, and EXEC intact, while
-    non-MODE s_setreg* writes emit nothing and other MODE writes stay Unsupported.
+  * s_round_mode and s_setreg_imm32_b32 can select nearest-even or toward-zero FP16/64 rounding while
+    retaining nearest-even FP32. These writes leave VGPRs, SGPRs, VCC, SCC, and EXEC intact. Tests also cover
+    rejection of unmodelled modes and the no-op behavior of non-MODE s_setreg* writes.
 
 Standard library only (runs with python -I); hand-written RDNA2 listings, no GPU or game data.
 """
@@ -109,10 +107,15 @@ REFUSED_MODE_VARIANTS = [
     "s_denorm_mode 0x3",
     "s_denorm_mode 0",
     "s_round_mode 0x3",
-    "s_round_mode 0",
+    "s_round_mode 1",
+    "s_round_mode 2",
+    "s_round_mode 4",
+    "s_round_mode 8",
 ]
 
 MODELLED_MODE_VARIANTS = [
+    ("s_round_mode 0", "%c0"),
+    ("s_round_mode 12", "%c3"),
     ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0", "%c0"),
     ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3", "%c3"),
 ]
@@ -526,22 +529,34 @@ class ComputeShaderNoopWaitcntTests(unittest.TestCase):
 class ModeInstructionsTests(unittest.TestCase):
     """Tests for s_denorm_mode, s_round_mode, and s_setreg* hardware MODE writes."""
 
-    def test_s_denorm_mode_and_s_round_mode_stay_unsupported(self):
+    def test_round_mode_switches_half_precision_color_rounding(self) -> None:
+        # Each magnitude is three quarters of the way from half 1.0 to its next neighbour.
+        spv = translate_ps("ps_immediate_round_mode", [
+            "v_mov_b32 v0, 0x3f801800", "v_mov_b32 v1, 0xbf801800",
+            "s_round_mode 0xfffc",  # only SIMM16[3:0] contributes to FP_ROUND
+            "v_cvt_f16_f32 v2, v0", "v_cvt_f16_f32 v3, v1",
+            "s_round_mode 0",
+            "v_cvt_f16_f32 v4, v0", "v_cvt_f16_f32 v5, v1",
+            "exp mrt0 v2, v3, v4, v5 done vm", "s_endpgm",
+        ])
+        self.assertEqual(tuple(si.run_fragment(spv)["%out_mrt0"]), (0x3c00, 0xbc00, 0x3c01, 0xbc01))
+
+    def test_unmodelled_immediate_modes_raise_unsupported(self):
         for insn in REFUSED_MODE_VARIANTS:
             op = insn.split()[0]
             with self.subTest(stage="ps", insn=insn):
                 with self.assertRaises(rdna2spirv.Unsupported) as ctx:
                     translate_ps("ps_refused_mode", ps_program([insn]))
                 self.assertIn(op, str(ctx.exception))
-                self.assertIn("s_setreg", str(ctx.exception))
+                self.assertIn("mode" if op == "s_denorm_mode" else "rounding", str(ctx.exception))
 
             with self.subTest(stage="cs", insn=insn):
                 with self.assertRaises(rdna2spirv.Unsupported) as ctx:
                     translate_cs("cs_refused_mode", cs_program([insn], wave64=False), threads=32)
                 self.assertIn(op, str(ctx.exception))
-                self.assertIn("s_setreg", str(ctx.exception))
+                self.assertIn("mode" if op == "s_denorm_mode" else "rounding", str(ctx.exception))
 
-    def test_s_setreg_mode_fp_round_emits_only_mode_r16_and_preserves_state(self):
+    def test_fp_round_emits_only_mode_r16_and_preserves_state(self):
         ps_base = translate_ps("ps_mode_base", ps_program([]))
         want_ps = expected_ps_mrt0()
         cs_base = translate_cs("cs_mode_base", cs_program([], wave64=False), threads=32)

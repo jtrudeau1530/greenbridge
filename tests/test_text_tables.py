@@ -309,5 +309,92 @@ class TestCli(unittest.TestCase):
             self.assertIn("cannot read input", err.getvalue())
 
 
+UNDECIDED = {"ZZ_CODE_1": "qqq zzz", "ZZ_CODE_2": "xkcd 42"}        # no script, letter or word decides: xx
+
+
+def rpf9_header(data_off=0x800):
+    return b"9FPR" + struct.pack("<I", data_off)
+
+
+class TestNestedArchiveLanguage(unittest.TestCase):
+    """A table inside a nested RPF9 archive takes the language most of that archive's tables share."""
+
+    def test_nested_archives_are_aligned_headers_with_a_sane_data_offset(self):
+        data = bytearray(0x5000)
+        data[0:8] = rpf9_header(0x100)                    # the archive itself: not nested
+        data[0x1000:0x1008] = rpf9_header()               # nested
+        data[0x2010:0x2018] = rpf9_header()               # not 4 KiB-aligned
+        data[0x3000:0x3008] = rpf9_header(0x7FFFFFFF)     # data offset past the end of the file
+        data[0x4000:0x4008] = rpf9_header(4)              # data offset inside its own header
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "a.rpf"), bytes(data))
+            self.assertEqual(T.nested_archives(path), [0x1000])
+        self.assertEqual(T.archive_of([0x1000, 0x3000], 0x0FFF), None)
+        self.assertEqual(T.archive_of([0x1000, 0x3000], 0x2000), 0x1000)
+        self.assertEqual(T.archive_of([0x1000, 0x3000], 0x3000), 0x3000)
+
+    def test_the_archive_majority_replaces_strays_and_xx(self):
+        scan = T.Scan()
+        en, de = make_resource(EN), make_resource(DE)
+        for off, data in ((0x100, en), (0x200, en), (0x300, make_resource(UNDECIDED))):
+            scan.add("s", off, data, ("s", 0x1000))       # archive A: en, en, xx
+        for off, data in ((0x2100, de), (0x2200, de), (0x2300, en)):
+            scan.add("s", off, data, ("s", 0x2000))       # archive B: de, de and one en stray
+        scan.add("s", 0x9000, make_resource(UNDECIDED))   # outside any nested archive
+        self.assertEqual(scan.archive_lang, {("s", 0x1000): "en", ("s", 0x2000): "de"})
+        self.assertEqual([lang for _s, _o, lang, _t in scan.tables], ["en", "en", "en", "de", "de", "de", "xx"])
+        self.assertEqual([f[2] for f in scan.found], ["en", "en", "xx", "de", "de", "en", "xx"])  # own guesses kept
+        self.assertEqual(set(scan.texts), {"en", "de", "xx"})
+
+    def test_no_majority_keeps_each_guess(self):
+        scan = T.Scan()
+        scan.add("s", 0x100, make_resource(EN), ("s", 0x1000))
+        scan.add("s", 0x200, make_resource(DE), ("s", 0x1000))
+        scan.add("s", 0x300, make_resource(UNDECIDED), ("s", 0x1000))  # xx does not vote
+        self.assertEqual(scan.archive_lang, {})
+        self.assertEqual([lang for _s, _o, lang, _t in scan.tables], ["en", "de", "xx"])
+
+    def test_carve_directory_finds_the_archive_from_its_index(self):
+        """End to end: an rpf9_carve.py directory whose index.json names the archive on disk."""
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = bytearray(0x4000)
+            arc[0:8] = rpf9_header(0x40)
+            arc[0x1000:0x1008] = rpf9_header()
+            arc[0x2000:0x2008] = rpf9_header()
+            arc_path = write(os.path.join(tmp, "pack.rpf"), bytes(arc))
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            rows = []
+            for off, strings in ((0x1100, EN), (0x1200, UNDECIDED), (0x1300, EN),
+                                 (0x2100, DE), (0x2200, DE), (0x2300, UNDECIDED)):
+                data = make_resource(strings)
+                write(os.path.join(carve, f"{off:012x}.bin"), data)
+                rows.append({"off": off, "stored": len(data), "size": len(data), "pre": "", "head": data[:16].hex()})
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8") as fh:
+                json.dump({"summary": {"archive": arc_path}, "files": rows}, fh)
+            out = os.path.join(tmp, "tables.csv")
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                self.assertEqual(T.main([carve, "--tables", out]), 0)
+            self.assertIn("language from the nested archive: 6 tables in 2 archives; 2 differ", log.getvalue())
+            with open(out, encoding="utf-8", newline="") as fh:
+                got = [(r["offset"], r["lang"], r["guess"], r["archive"]) for r in csv.DictReader(fh)]
+            self.assertEqual(got, [("4352", "en", "en", "0x1000"), ("4608", "en", "xx", "0x1000"),
+                                   ("4864", "en", "en", "0x1000"), ("8448", "de", "de", "0x2000"),
+                                   ("8704", "de", "de", "0x2000"), ("8960", "de", "xx", "0x2000")])
+
+    def test_without_the_archive_each_table_keeps_its_guess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "a.bin"), make_resource(UNDECIDED))
+            out = os.path.join(tmp, "tables.csv")
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                self.assertEqual(T.main([src, "--tables", out]), 0)
+            self.assertNotIn("nested archive", log.getvalue())
+            with open(out, encoding="utf-8", newline="") as fh:
+                self.assertEqual([(r["lang"], r["guess"], r["archive"]) for r in csv.DictReader(fh)],
+                                 [("xx", "xx", "")])
+
+
 if __name__ == "__main__":
     unittest.main()

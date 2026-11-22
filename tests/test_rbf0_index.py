@@ -366,5 +366,42 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(doc["files"][0]["sample_strings"], ["alpha", "body"])
 
 
+class ScanDirCollisionAndTrailingTest(unittest.TestCase):
+    def _make_rbf0(self, root_name):
+        raw = root_name.encode("utf-8")
+        return b"RBF0\x00\x00" + struct.pack("<H", len(raw)) + raw + struct.pack("<HHH", 0, 0, 0) + b"\xff\xff"
+
+    def test_scan_dir_keeps_each_file_on_offset_collisions(self):
+        with tempfile.TemporaryDirectory() as d:
+            # Non-hex name used to get offset=len(entries)=1, colliding with 00000001.bin, and
+            # duplicate hex prefixes (00001000.bin + 00001000_alt.bin) used to overwrite in by_offset.
+            with open(os.path.join(d, "00000001.bin"), "wb") as f:
+                f.write(self._make_rbf0("Alpha"))
+            with open(os.path.join(d, "extra.bin"), "wb") as f:
+                f.write(b"NOT_RBF0_PAYLOAD" * 8)
+            with open(os.path.join(d, "00001000.bin"), "wb") as f:
+                f.write(self._make_rbf0("First"))
+            with open(os.path.join(d, "00001000_alt.bin"), "wb") as f:
+                f.write(self._make_rbf0("Second"))
+            _, records, _ = rbf0_index.scan_dir(d)
+        self.assertEqual([r["root"] for r in records], ["Alpha", "First", "Second"])
+
+    def test_join_resource_stops_on_trailing_status(self):
+        hdr = b"RBF0\x00\x00" + struct.pack("<H", 4) + b"Root" + struct.pack("<HHH", 0, 0, 0)
+        full = hdr + b"\xfd\xff" + struct.pack("<I", 70000) + (b"A" * 70000) + b"\xff\xff"
+        c1, c2 = full[:65536], full[65536:].ljust(65536, b"\x00")
+        c3 = b"UNRELATED_NON_RBF0_CHUNK" + b"\x00" * 100
+        rows = [
+            {"offset": 0, "stored": len(c1), "size": len(c1), "head": c1[:8]},
+            {"offset": len(c1), "stored": len(c2), "size": len(c2), "head": c2[:8]},
+            {"offset": len(c1) + len(c2), "stored": len(c3), "size": len(c3), "head": c3[:8]},
+        ]
+        blobs = {0: c1, len(c1): c2, len(c1) + len(c2): c3}
+        blob, chunks, parsed = rbf0_index.join_resource(rows, 0, lambda r: blobs[r["offset"]], check_gap=False)
+        self.assertEqual(chunks, 2)
+        self.assertEqual(len(blob), 131072)
+        self.assertEqual(parsed["status"], "trailing")
+
+
 if __name__ == "__main__":
     unittest.main()
