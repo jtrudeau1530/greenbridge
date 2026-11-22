@@ -64,8 +64,10 @@ SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out
 // 0x75b1): ECX is the constant 0x20000001 (its meaning is not known) and RDX points at a stack buffer (0x80 bytes
 // where the frame shows it). The caller reads a 64-bit size at +8 and treats a zero return as "no data". Taking the
 // pointer from the first argument wrote to address 0x20000001.
-// Other Series layers (xcl, xbox-emulator) and title engine telemetry write the title's memory limit at +0 and
-// working set at +8 (RT-220).
+// The measured FSR sites establish argument shape, kind and the 64-bit working-set read at +8; +0's title-total memory
+// limit interpretation is inferred from other Series implementations (xcl, xbox-emulator) and title engine telemetry
+// sizing memory pools (RT-220). Note that if GlobalMemoryStatusEx reports 0 physical memory, XMem falls back to the
+// 12 GiB title limit, whereas XSystemGetAppMemoryUsageLimit remains 0.
 BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     if (!stats) {
         static std::atomic<bool> warned{false};

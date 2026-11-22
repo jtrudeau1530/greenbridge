@@ -83,6 +83,15 @@ void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
     std::memcpy(&total_memory, stats + 0, sizeof(total_memory));
     check(ok != FALSE && total_memory != 0, "XMemGetWorkingSetStatistics writes a non-zero total memory at +0");
 
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0) {
+        check(ok != FALSE && total_memory == ms.ullTotalPhys,
+              "XMemGetWorkingSetStatistics total memory (+0) matches GlobalMemoryStatusEx ullTotalPhys");
+    } else {
+        check(ok != FALSE && total_memory == 12ULL * 1024 * 1024 * 1024,
+              "XMemGetWorkingSetStatistics total memory (+0) falls back to 12 GiB title limit");
+    }
+
     uint64_t working_set = 0;
     std::memcpy(&working_set, stats + 8, sizeof(working_set));
     check(ok != FALSE && working_set != 0, "XMemGetWorkingSetStatistics writes a non-zero size at +8");

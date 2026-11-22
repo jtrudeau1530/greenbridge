@@ -526,6 +526,8 @@ void test_xmem_working_set_statistics_abi_layout() {
           "GetProcessMemoryInfo succeeds and returns non-zero WorkingSetSize");
 
     // Verify FidelityFX / XMem layout contract (RT-220):
+    // The measured FSR sites establish argument shape, kind and the +8 working-set read; +0's title-total memory
+    // limit is inferred from other Series implementations (xcl, xbox-emulator).
     // stats[0..7] = TotalMemoryLimit (uint64_t), stats[8..15] = WorkingSetSize (uint64_t)
     alignas(64) uint8_t stats[64];
     std::memset(stats, 0xA5, sizeof(stats));
