@@ -1539,12 +1539,24 @@ public:
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
         if (get_properties) {
             VkPhysicalDeviceVulkan12Properties indexed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
-            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &indexed};
+            VkPhysicalDeviceVulkan11Properties v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &indexed};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &v11};
             get_properties(state_.info.physical, &properties);
             features.ms_samples = {VK_SAMPLE_COUNT_4_BIT, state_.ms_fallback_samples(VK_FORMAT_R32_UINT),
                                    state_.ms_fallback_samples(VK_FORMAT_R32_SINT)};
-            leonida::bindless::limit_ms_bindings(features, properties.properties.limits, indexed);
+            if (!leonida::bindless::size_bindings(features, properties.properties.limits, v11, indexed))
+                std::fprintf(stderr, "[rt] d3d12: the device's descriptor limits are below the bindless set's default "
+                                     "sizes; it holds less\n");
         }
+        namespace b = leonida::bindless;
+        std::fprintf(stderr, "[rt] d3d12: bindless set: %u 2D images, %u samplers, %u 2D-array, %u 3D, %u 1D, "
+                             "%u storage indices in 2D\n",
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_2d)],
+                     features.counts[b::sampler_binding],
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_2d_array)],
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_3d)],
+                     features.counts[b::sampled_binding(leonida::ImageDimension::dim_1d)],
+                     features.counts[b::storage_binding(leonida::ImageDimension::dim_2d, 0)]);
         state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
         if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
             state_.bindless.reset();
