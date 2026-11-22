@@ -15,9 +15,12 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+sys.path.insert(0, TOOLS_DIR)
 sys.path.insert(0, HERE)
 
-import rdna2spirv  # noqa: E402  (support puts tools/ on the path)
+import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 from support import mrt0_words, translate_lines  # noqa: E402
 

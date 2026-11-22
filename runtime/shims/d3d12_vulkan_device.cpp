@@ -3917,9 +3917,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         }
     }
 #endif
-    if (!info.shader_fma)
-        std::fprintf(stderr, "[rt] d3d12: no VK_KHR_shader_fma (shaderFmaFloat32); shaders translated with --fma khr "
-                             "(OpFmaKHR) will be refused, use --fma glsl\n");
 
     // GetClockCalibration reads both clocks at once with calibrated timestamps (KHR, or the older EXT).
     const char* calibrated = nullptr;
