@@ -208,7 +208,8 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   bindings, and four dispatches that sample two SRVs, bytes no view was made for and a clamping sampler through
   the bindless set the layer binds.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
-  Vulkan, resizes it and presents 10 more, and checks the colour on screen. A driver double then injects an
+  Vulkan, resizes it and presents 10 more, and checks the colour in the presented images (the presenter's
+  capture) and on screen where GDI can read it. A driver double then injects an
   out-of-date and a suboptimal present, a failed semaphore during a swapchain recreation and a failed blit
   submission, which the presenter must survive. Set
   `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.
