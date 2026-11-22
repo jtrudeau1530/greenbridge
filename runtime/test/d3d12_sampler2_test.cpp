@@ -236,13 +236,27 @@ int main() {
             ++plain;
         }
 
-        // UINT border colours take the S#'s border types as the float ones do; anything else is the
-        // application's colour, including the bits of 1.0f, which as integers are not white.
+        // UINT border colours take the S#'s border types as the float ones do, marked as integers in
+        // BORDER_COLOR_PTR (kIntegerBorderPtr), so that they are their own key and VK_BORDER_COLOR_INT_* in Vulkan.
+        // Anything else is the application's colour, including the bits of 1.0f, which as integers are not white.
         const D3D12_SAMPLER_DESC border = sampler(D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_BORDER);
         const D3D12_SAMPLER_DESC2 border2 = desc2(border);
-        EXPECT(via2(with_uint_border(border2, 0, 0, 0, 0)) == via1(with_border(border, 0, 0, 0, 0)));
-        EXPECT(via2(with_uint_border(border2, 0, 0, 0, 1)) == via1(with_border(border, 0, 0, 0, 1)));
-        EXPECT(via2(with_uint_border(border2, 1, 1, 1, 1)) == via1(with_border(border, 1, 1, 1, 1)));
+        const auto marked = [](std::vector<unsigned char> bytes) {
+            leonida::gfx10::SamplerWords w = words_of(bytes);
+            w[3] |= leonida::gfx10::kIntegerBorderPtr;
+            std::memcpy(bytes.data(), w.data(), sizeof(w));
+            return bytes;
+        };
+        for (const std::array<UINT, 4> c : {std::array<UINT, 4>{0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1}}) {
+            const std::vector<unsigned char> got = via2(with_uint_border(border2, c[0], c[1], c[2], c[3]));
+            EXPECT(got == marked(via1(with_border(border, FLOAT(c[0]), FLOAT(c[1]), FLOAT(c[2]), FLOAT(c[3])))));
+            const leonida::gfx10::Sampler s = leonida::gfx10::decode(words_of(got));
+            EXPECT(s.integer_border && s.border_color_index == 0);
+            EXPECT(leonida::gfx10::vulkan_sampler(s).borderColor ==
+                   (c[3] == 0   ? VK_BORDER_COLOR_INT_TRANSPARENT_BLACK
+                    : c[0] == 0 ? VK_BORDER_COLOR_INT_OPAQUE_BLACK
+                                : VK_BORDER_COLOR_INT_OPAQUE_WHITE));
+        }
         EXPECT(via2(with_uint_border(border2, 7, 9, 0, 1)) == via1(with_border(border, 0.25f, 0, 0, 1)));
         const UINT one = 0x3f800000;
         EXPECT(via2(with_uint_border(border2, one, one, one, one)) == via1(with_border(border, 0.25f, 0, 0, 1)));

@@ -231,10 +231,16 @@ What is implemented (all of it testable without the game):
     `CreatePlacedResource1/2` and `CreateHeap1` wait for #286's base methods.
   - `CreateSampler2` as a wrapper over `CreateSampler` (D3D-28, part 2). Without flags it writes the same S#.
     `D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR` reads the union as integers. `(0,0,0,0)`, `(0,0,0,1)` and `(1,1,1,1)`
-    take the S#'s transparent-black, opaque-black and opaque-white types. The S# has no separate integer types:
-    the hardware reads them by the image's format, which is why radv gives `VK_BORDER_COLOR_INT_*` and `_FLOAT_*`
-    the same `SQ_TEX_BORDER_COLOR`. Any other colour is a table colour, still transparent black like
-    `CreateSampler`'s custom colours. That includes the bits of `1.0f`, which as integers are not white.
+    take the S#'s transparent-black, opaque-black and opaque-white types. The S# has no separate integer types,
+    since the hardware reads them by the image's format. Vulkan does not: an integer image sampled with a
+    `VK_BORDER_COLOR_FLOAT_*` border reads 0. Vonsek found this on an RTX 5080 (#538), and `d3d12_descriptor_test`
+    reproduces it on an RTX 4090 when the layer uses the float enums. So the layer marks an integer border in the S#
+    with `BORDER_COLOR_PTR = 0x800` (`gfx10::kIntegerBorderPtr`). The hardware reads that pointer only for a table
+    colour, and Mesa writes it only for `SQ_TEX_BORDER_COLOR_REGISTER`. The mark gives the integer border its own
+    key in the descriptor hash table, so it does not share the float border's `VkSampler`, and `vulkan_sampler`
+    makes it `VK_BORDER_COLOR_INT_*`. Any other colour is a table colour, still transparent black like
+    `CreateSampler`'s custom colours, with no integer mark yet. That includes the bits of `1.0f`, which as integers
+    are not white.
     `D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES` sets `FORCE_UNNORMALIZED` (word 0, bit 15) and changes nothing
     else; `vulkan_sampler` makes it `unnormalizedCoordinates`. The layer answers `D3D12_OPTIONS17` with
     `NonNormalizedCoordinateSamplersSupported` (core Vulkan, with the same restrictions) and no
@@ -383,7 +389,8 @@ and any validation error fails them.
   is uploaded, copied back and compared on a queue from `CreateCommandQueue1`.
 - `d3d12_sampler2_test`: `CreateSampler2` against `CreateSampler`, on the slots' bytes. It checks:
   - 10 descriptions without flags, which must be byte for byte the same;
-  - 6 UINT and float-bit border colours against their float equivalents;
+  - 6 UINT and float-bit border colours against their float equivalents (the three built-in UINT colours with
+    the integer mark, which must decode to `VK_BORDER_COLOR_INT_*`);
   - 3 non-normalized samplers, which must be `CreateSampler`'s S# with `FORCE_UNNORMALIZED` set;
   - the `D3D12_OPTIONS17` answer;
   - the 22 written-or-refused cases behind the table in section 3.2, compared with the host's PC runtime when
@@ -395,6 +402,10 @@ and any validation error fails them.
     BGRA cube with a component mapping, an unordered-access view (the same bytes as the shader-resource view of
     that mip), and the null descriptors of a missing resource, a texture without `ALLOW_UNORDERED_ACCESS`, a view
     past the mips and a volume.
+  - UINT border colours (Vonsek's case on #538): an `R8G8B8A8_UINT` texture sampled one tile to the right
+    through `CreateSampler2` samplers with a UINT `(0,0,0,0)` and `(1,1,1,1)` border reads 0 and 1 in every
+    channel. A float white border on the UNORM texture reads 255; its S# differs from the UINT white one only in
+    the integer mark.
   - That set 0 holds them: a compute shader (`test/glsl/cs_sample.comp`, GLSL, compiled with `glslangValidator`;
     skipped without it) is handed a slot's T# and the sampler's S#, looks them up in the hash table as a
     translated shader does, and samples. The sampler wraps in U and the shader samples one tile to the right,

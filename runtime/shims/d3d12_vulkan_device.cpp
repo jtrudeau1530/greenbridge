@@ -1395,8 +1395,8 @@ public:
         if (!uint_border) std::memcpy(base.BorderColor, desc->FloatBorderColor, sizeof(base.BorderColor));
         leonida::gfx10::Sampler sampler = sampler_descriptor(base);
         if (uint_border) {
-            // The S# has one set of border types; the hardware reads them as integers for an integer format
-            // (radv gives VK_BORDER_COLOR_INT_* and _FLOAT_* the same SQ_TEX_BORDER_COLOR value).
+            // The S#'s border types are the float ones', plus the layer's integer mark (kIntegerBorderPtr), which
+            // gives the integer border its own key and VK_BORDER_COLOR_INT_* in Vulkan.
             namespace g = leonida::gfx10;
             const UINT* c = desc->UintBorderColor;
             const bool black = c[0] == 0 && c[1] == 0 && c[2] == 0;
@@ -1404,6 +1404,7 @@ public:
                                    : black && c[3] == 1                               ? g::BorderColor::opaque_black
                                    : c[0] == 1 && c[1] == 1 && c[2] == 1 && c[3] == 1 ? g::BorderColor::opaque_white
                                                                                       : g::BorderColor::table;
+            sampler.integer_border = true;
         }
         sampler.unnormalized = desc->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
         const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler);
