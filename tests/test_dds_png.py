@@ -835,8 +835,8 @@ class DownscaleTests(unittest.TestCase):
                 self.assertEqual((w, h), (max(1, width // 2), max(1, height // 2)))
                 self.assertEqual(pixels(out), [(20, 20, 20, 255), (180, 180, 180, 255)])
 
-        rgba = bytes(4 * 8) + bytes((90, 180, 0, 255))
-        self.assertEqual(dds.downscale_rgba(3, 3, rgba, 1), (1, 1, bytes((10, 20, 0, 28))))
+        rgba = bytes((0, 0, 0, 255)) * 8 + bytes((90, 180, 0, 255))
+        self.assertEqual(dds.downscale_rgba(3, 3, rgba, 1), (1, 1, bytes((10, 20, 0, 255))))
 
     def test_repeated_halving(self):
         w, h, out = dds.downscale_rgba(8, 8, self.rgba_grid(8, 8), 2)
@@ -904,6 +904,21 @@ class PngTests(unittest.TestCase):
             16, 16, payload, flags=DDPF_FOURCC, fourcc=b"DXT1",
         ), max_size=4)
         self.assertEqual(struct.unpack(">II", png_chunks(png)[0][1][:8]), (4, 4))
+
+    def test_downscaled_png_weights_color_by_alpha(self) -> None:
+        red = bytes((255, 0, 0, 255))
+        translucent_green = bytes((0, 255, 0, 128))
+        transparent_blue = bytes((0, 0, 255, 0))
+        cases = (
+            (2, red + transparent_blue, (255, 0, 0, 128)),
+            (3, red + translucent_green + transparent_blue, (170, 85, 0, 128)),
+        )
+        for width, rgba, expected in cases:
+            with self.subTest(width=width):
+                data = dds_buffer(width, 1, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=28)
+                chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+                self.assertEqual(struct.unpack(">II", chunks[0][1][:8]), (1, 1))
+                self.assertEqual(zlib.decompress(chunks[1][1]), bytes((0, *expected)))
 
     def test_dds_to_png_rejects_negative_max_size(self):
         payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
