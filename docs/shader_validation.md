@@ -158,7 +158,12 @@ python -I tools/hw_oracle/runner.py        # checks the setup: prints the device
 Setup on Windows, about 800 MB and no admin rights:
 
 - **Driver.** The AMD Windows driver ships the HIP runtime as `amdhip64_7.dll` in System32; nothing else is
-  loaded from the SDK. `LEONIDA_HIP_DLL` overrides the path.
+  loaded from the SDK. `LEONIDA_HIP_DLL` overrides the path. Drivers from 2024 ship `amdhip64_6.dll` instead and
+  refuse code object v6 (LLVM 23's default) with error 209; the oracle then assembles as v5 (seen with driver
+  32.0.11020.1002 on gfx1103).
+- **true16.** LLVM 23 wants `v8.l`, not `v8`, for 16-bit operands on GFX11. The oracle asks the assembler once and
+  uses the spelling it takes, for the ops its tools run: the two f16/f32 conversions and `f16_trans_sweep.py`'s
+  seven. Another f16 op needs adding to `asm.true16_spelling`.
 - **Compiler.** AMD clang with the amdgcn backend and `ld.lld`. The stock LLVM from winget has no amdgcn
   target. The ROCm wheel has one:
   `py -m venv .venv` then `.venv\Scripts\python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm-sdk-core==10.0.0"`;
