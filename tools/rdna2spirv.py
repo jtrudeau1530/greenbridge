@@ -6418,38 +6418,70 @@ class Gen:
                 self.emit(f"OpStore %scc {z}")
         elif op in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
             # 64-bit compare of masks/pointers: equal iff both halves are equal.
-            m0, m1 = self.holds_lane_mask(a[0]), self.holds_lane_mask(a[1])
+            # Only canonical full-wave masks (exec, mask vcc, or a wave64 (MASK_LO, MASK_HI) pair) can take the
+            # per-lane vote path; pairs with EITHER (0/-1), plain data, swapped/duplicated halves, or wave32 masks
+            # materialize each 32-bit word independently so inactive/unlaunched lanes and data halves stay exact.
+            def _is_full_wave_mask(s):
+                if s["k"] == "special":
+                    t = s.get("t", "")
+                    return t == "exec" or (t == "vcc" and "vcc" in self.cur_masks)
+                if self.wave64 and s["k"] == "sgpr" and s.get("n") == 2:
+                    r = s["r"]
+                    return (self.cur_masks.get(r) == lane_masks.MASK_LO
+                            and self.cur_masks.get(r + 1) == lane_masks.MASK_HI)
+                return False
 
-            def _is_u64_zero_or_all_ones(src):
-                if src["k"] != "imm":
-                    return False
-                v = src["v"] & 0xFFFFFFFFFFFFFFFF
-                return v == 0
+            def _is_u64_zero(src):
+                return src["k"] == "imm" and (src["v"] & 0xFFFFFFFFFFFFFFFF) == 0
 
-            use_vote = (m0 and m1) or (m0 and _is_u64_zero_or_all_ones(a[1])) or (m1 and _is_u64_zero_or_all_ones(a[0]))
-
-            def halves(s, is_mask):
-                if is_mask and not use_vote:
-                    return self.wave_mask(s)
-                if s["k"] == "sgpr" and s.get("n") == 2:
-                    return self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
-                if s["k"] == "imm":
-                    v = s["v"] & 0xFFFFFFFFFFFFFFFF
-                    return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-                m = self.mask_src(s)
-                return m, m
-
-            (x0, x1), (y0, y1) = halves(a[0], m0), halves(a[1], m1)
-            e0, e1, eq, r = (self.tmp() for _ in range(4))
-            self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
-            self.emit(f"{e1} = OpIEqual %bool {x1} {y1}")
-            self.emit(f"{eq} = OpLogicalAnd %bool {e0} {e1}")
+            f0, f1 = _is_full_wave_mask(a[0]), _is_full_wave_mask(a[1])
+            use_vote = (f0 and f1) or (f0 and _is_u64_zero(a[1])) or (f1 and _is_u64_zero(a[0]))
             if use_vote:
+                x = self.mask_src(a[0]) if f0 else self.cu(0)
+                y = self.mask_src(a[1]) if f1 else self.cu(0)
+                eq = self.tmp()
+                self.emit(f"{eq} = OpIEqual %bool {x} {y}")
                 eq = self.wave_equal(eq, True)
+            else:
+                def halves(s, is_full):
+                    if is_full:
+                        return self.wave_mask(s)
+                    if s["k"] == "sgpr" and s.get("n") == 2:
+                        words = []
+                        for i in range(2):
+                            r = s["r"] + i
+                            rk = self.cur_masks.get(r)
+                            if rk is not None:
+                                lo, hi = self.wave_mask({"k": "sgpr", "r": r, "n": 1})
+                                words.append(hi if (self.wave64 and rk == lane_masks.MASK_HI) else lo)
+                            else:
+                                words.append(self.load_reg("sgpr", r))
+                        return words[0], words[1]
+                    if s["k"] == "imm":
+                        v = s["v"] & 0xFFFFFFFFFFFFFFFF
+                        return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+                    if s["k"] == "special" and s.get("t") == "null":
+                        return self.cu(0), self.cu(0)
+                    if self.holds_lane_mask(s):
+                        return self.wave_mask(s)
+                    if s["k"] == "special" and s.get("t") == "vcc":
+                        lo, hi = self.tmp(), self.tmp()
+                        self.emit(f"{lo} = OpLoad %uint %vcc")
+                        self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+                        return lo, hi
+                    m = self.mask_src(s)
+                    return m, m
+
+                (x0, x1), (y0, y1) = halves(a[0], f0), halves(a[1], f1)
+                e0, e1, eq = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
+                self.emit(f"{e1} = OpIEqual %bool {x1} {y1}")
+                self.emit(f"{eq} = OpLogicalAnd %bool {e0} {e1}")
             if op == "s_cmp_lg_u64":
                 ne = self.tmp()
                 self.emit(f"{ne} = OpLogicalNot %bool {eq}")
                 eq = ne
+            r = self.tmp()
             self.emit(f"{r} = OpSelect %uint {eq} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {r}")
         elif op.startswith("buffer_atomic_"):
