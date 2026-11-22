@@ -277,6 +277,8 @@ class MainTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("types.json", proc.stderr)
         self.assertIn("is a directory", proc.stderr)
+        self.assertIn("remove or rename", proc.stderr)
+        self.assertIn("before rerun", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
         self.assertEqual(proc.stdout, "")
         self.assertEqual(os.listdir(report), [])

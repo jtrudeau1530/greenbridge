@@ -80,7 +80,7 @@ def main():
         return 2
     report = os.path.join(root, "types.json")
     if os.path.isdir(report):
-        print(f"{report}: is a directory; give a report file path", file=sys.stderr)
+        print(f"{report}: is a directory; remove or rename that directory before rerun", file=sys.stderr)
         return 2
     per = {}
     total = defaultdict(lambda: [0, 0, []])
