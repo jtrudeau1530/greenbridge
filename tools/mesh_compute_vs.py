@@ -20,6 +20,7 @@ Standard library only; build_for_index assembles and validates with spirv-as / s
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -177,27 +178,48 @@ def write_for_index(spirv_dir):
     return written
 
 
+def tool_path(name):
+    """The SPIR-V tool's full path, or RuntimeError naming it: subprocess's own FileNotFoundError says only
+    "the system cannot find the file specified", which does not say which tool is missing."""
+    path = shutil.which(name)
+    if path is None:
+        raise RuntimeError(f"{name} not found on PATH (it ships with SPIRV-Tools, e.g. VulkanSDK/Bin)")
+    return path
+
+
 def build_for_index(spirv_dir):
     """write_for_index, then assemble to <name>.mesh_vs.spv and validate (Vulkan 1.2, as for the translator).
     Returns the .spv paths; raises RuntimeError with the tool output on failure."""
+    steps = [("spirv-as", tool_path("spirv-as")), ("spirv-val", tool_path("spirv-val"))]
     built = []
     for asm in write_for_index(spirv_dir):
         spv = asm[: -len(".spvasm")] + ".spv"
-        for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
-                    ["spirv-val", "--target-env", "vulkan1.2", spv]):
+        for name, tool in steps:
+            args = [asm, "-o", spv] if name == "spirv-as" else [spv]
+            cmd = [tool, "--target-env", "vulkan1.2"] + args
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode:
-                raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
+                raise RuntimeError(f"{name} failed for {asm}:\n{r.stdout}{r.stderr}")
         built.append(spv)
     return built
 
 
 def main(argv):
     if len(argv) != 2:
-        sys.exit(__doc__)
-    for path in build_for_index(argv[1]):
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        built = build_for_index(argv[1])
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"ERROR: {e.filename or argv[1]}: {e.strerror or e}", file=sys.stderr)
+        return 1
+    for path in built:
         print(path)
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    sys.exit(main(sys.argv))

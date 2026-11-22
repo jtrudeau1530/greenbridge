@@ -401,7 +401,8 @@ reported with fewer entities or as `meta` rather than guessed.
 ## Building a placed world
 
 `tools/world_build.py --placements` builds the viewer's chunks from map placements instead of each model's own
-coordinates. It covers points 3 and 4 of *What a runtime needs*; point 5 (HD/LOD switching) is not done.
+coordinates. It covers points 3 and 4 of *What a runtime needs*, and approximates point 5 with `--lod-sets`
+(below).
 
 1. `world_index.py <levels.rpf> --entities-out <work>\world\entities.jsonl` writes one row per complete entity.
 2. rpf9dump exports the models (`models/manifest.json` + OBJ).
@@ -410,45 +411,130 @@ coordinates. It covers points 3 and 4 of *What a runtime needs*; point 5 (HD/LOD
    entity row carries the +0x20 key, the model's Murmur3-64 must equal it, as in `world_names.py`; a 32-bit-only
    match is a `key_mismatch` and is not placed. The model is scaled by (`scaleXY`, `scaleXY`, `scaleZ`), rotated
    by the **conjugate** of the stored quaternion, translated to `position`, and converted from RAGE Z-up to
-   glTF Y-up `(x, z, -y)`. Normals use the inverse-transpose; a negative scale product flips the winding.
+   glTF Y-up `(x, z, -y)`.
 
 `--lod-levels` picks the `lodLevel` values to place (default `0,5`: HD and ORPHAN_HD) and `--region
 MINX,MINY,MAXX,MAXY` bounds the RAGE world X/Y. `world.json` then has `"layout": "placements"` and a
 `stats.placements` block: `rows`, `malformed`, `other_lod_level`, `outside_region`, `selected`, `placed`,
 `placed_unverified` (no key in the row), `key_mismatch`, `unresolved_archetype` (no exported model has that name),
-`model_not_loadable` and `distinct_models`.
+`model_not_loadable`, `degenerate_scale`, `mirrored` and `distinct_models`.
 
-Measured on the 1.0.2.1 package:
+### Shared geometry (`--instancing`)
+
+A city has 1.55 M HD placements of about 120 k models, and most models are placed many times. By default
+(`--instancing gpu`) each model's OBJ is parsed once into a packed cache file, each chunk stores every model it uses
+once, and the placements in the chunk are instance transforms (`EXT_mesh_gpu_instancing`: one node per model with
+`TRANSLATION`/`ROTATION`/`SCALE` accessors; listed in `extensionsRequired`). three.js's `GLTFLoader`, which the
+viewer uses, turns each such node into `InstancedMesh`es. `--instancing nodes` writes one plain glTF node per
+placement instead, for loaders without the extension (a draw call per placement). `--instancing bake` keeps the
+first version's output, where every placement is a transformed copy of the geometry.
+
+Each chunk is written as soon as it is built, so memory holds about 100 bytes per placement plus the models of
+the chunks being written, not the whole map. `--jobs N` packs models and writes chunks in N processes.
+
+Every instance transform has a positive determinant, so the winding is right in any loader:
+- the TRS is the baked transform split into node form (checked against it on random rotations and scales);
+- a negative `scaleXY` is a 180° turn about the model's Z axis and is folded into the rotation;
+- a negative `scaleZ` mirrors. Those placements draw a mirrored copy of the mesh (glTF Y negated, winding
+  reversed) with a positive scale, counted as `mirrored`;
+- a zero scale cannot be inverted for normals; those rows are counted as `degenerate_scale` and not placed.
+
+Chunk records add `distinct_models` (meshes stored) and `stored_triangles`; `triangles` stays the drawn count
+(each mesh's triangles times its placements). `world.json` adds `instancing`, `stats.stored_triangles`,
+`stats.chunk_bytes` and `stats.max_chunk_bytes`.
+
+### LOD sets (`--lod-sets`)
+
+`--lod-sets` places every `lodLevel` (unless `--lod-levels` narrows it) and builds one chunk set per tier, ids
+`c_<tier>_<x>_<z>` with tiers `hd`, `lod`, `slod1`, `slod2`, `slod3`, `slod4` and `orphan_hd`. Each chunk record
+names its `lod` tier and its grid `cell` (`[minx, minz, maxx, maxz]`, glTF metres). `world.json` gets
+`lod_bands`: for each tier, the camera distance band in which it is drawn, from the selected entities:
+
+- a tier starts at its own median `childLodDist` (the distance inside which a parent hands over to its children);
+  HD starts at 0;
+- it ends where the next coarser tier present starts; the coarsest tier ends at its median `lodDist`;
+- ORPHAN_HD has no parent and runs from 0 to its median `lodDist`.
+
+`stats.lod_tiers` records the medians and each tier's chunk and placement counts. The viewer loads a tiered chunk
+while the horizontal distance from the camera to its cell is inside the band, and keeps it up to 32 m past the
+band, so each cell shows one tier. Worlds without `lod_bands` stream as before.
+
+Tier medians over all 1,670,435 entities (`lodDist` ≤ 0 means "use the archetype's default" and is left out):
+
+| Tier | Entities | Median `childLodDist` | Median `lodDist` | Band |
+|---|---:|---:|---:|---|
+| HD | 1,153,122 | — | 124 (97,625 set) | 0–130 |
+| LOD | 100,953 | 130 | 450 | 130–450 |
+| SLOD1 | 16,828 | 450 | 1,000 | 450–1,000 |
+| SLOD2 | 1,708 | 1,000 | 2,000 | 1,000–1,976 |
+| SLOD3 | 601 | 1,976 | 4,000 | 1,976–6,043.5 |
+| SLOD4 | 352 | 6,043.5 | 20,000 | 6,043.5–20,000 |
+| ORPHAN_HD | 396,871 | — | 1,000 | 0–1,000 |
+
+From HD to SLOD2, each tier's median `lodDist` is within 5% of the next tier's median `childLodDist` (124/130,
+450/450, 1,000/1,000, 2,000/1,976), so the two fields agree on the bands. For SLOD3 they differ (4,000 and
+6,043.5), and the band follows `childLodDist`.
+
+This is an approximation of point 5, per cell and per tier. Per-entity `lodDist` overrides and the
+`parentIndex`/`numChildren` links are not used: an entity row doesn't say which map file it came from, and
+`parentIndex` is an index into that file's entity table.
+
+### Measured
+
+On the 1.0.2.1 package, `levels.rpf`, Linux, 88 cores, `--no-textures`, 256 m chunks. Models were exported with
+rpf9-explorer at Leonida's pin (917e9b9) and with breadbbbb/rpf9-explorer#8 and #10 applied. Each placement was
+counted against the first export and built from the second.
 
 | Step | Result |
 |---|---|
-| `--entities-out` over the whole data area (24 parallel `--start/--limit` windows) | 1,670,435 rows, about 1 min |
+| `--entities-out` over the whole data area (24 parallel `--start/--limit` windows) | 1,670,435 rows, 66 s |
 | `lodLevel` split | 0: 1,153,122 · 5: 396,871 · 1: 100,953 · 2: 16,828 · 3: 1,708 · 4: 601 · 6: 352 |
-| one 700 m × 700 m downtown box, HD + ORPHAN_HD | 29,258 entities, 3,995 distinct archetypes |
-| placed with models recovered by the pinned rpf9-explorer (917e9b9) | 10,729 (36.7%); 18,529 `unresolved_archetype`, 0 `key_mismatch` |
-| same box, models recovered with breadbbbb/rpf9-explorer#8 and #10 applied | 29,229 of 29,258 entities have a model (3,992 of 3,995 archetypes) |
-| build of the 10,729 placed instances (`--no-textures --jobs 8`, 256 m chunks) | 16 chunks, 29.3M triangles, 1.17 GB of GLB, median chunk 104 MB, max 164 MB; 5 min, 22 GB peak RSS |
+| HD + ORPHAN_HD placements with a recovered model (joaat + Murmur3-64) | 640,080 of 1,549,993 (41.3%) at the pin; 1,549,347 (99.96%) with #8/#10, from 121,411 resources |
+| 700 m × 700 m downtown box, 10,729 placements, `--jobs 16` | `bake` (#1183): 5 min, 22 GB peak RSS. `gpu`: 35 s; 0.43 GB in the largest process, 1.93 GB for all 17 processes; same 16 chunks and 29,331,138 triangles |
+| **whole city**, HD + ORPHAN_HD, `gpu`, `--jobs 40` | 1,549,343 placed (646 `unresolved_archetype`, 4 `model_not_loadable`, 0 `key_mismatch`, 0 `mirrored`), 121,407 distinct models → 2,940 chunks; 7.31 G triangles drawn, 3.34 G stored; 125 GB of GLB, median chunk 17 MB, largest 926 MB; 21 min; 3.4 GB in the largest process, 38 GB for all 41 processes |
+| **whole city, all tiers, `--lod-sets`, `gpu`, `--jobs 24`** | 1,669,771 placed (660 `unresolved_archetype`, 4 `model_not_loadable`), 228,566 distinct models → 12,340 chunks: HD 2,911 (median 16.9 MB), LOD 2,836 (0.6 MB), SLOD1 2,811, SLOD2 1,222, SLOD3 501, SLOD4 284 (all ≤ 0.1 MB median), ORPHAN_HD 1,775 (3.0 MB); bands as in the table above; 33 min; 2.6 GB in the largest process, 30 GB for all 25 |
+| what the viewer loads at the densest HD cell (camera at street level in its centre) | with `lod_bands`: 577 chunks, 180 M triangles, 3.1 GB of GLB (5 HD, 69 ORPHAN_HD, the rest LOD/SLOD); the same city without LOD sets at the viewer's 1,400 m radius: 119 chunks, 1,060 M triangles, 16.3 GB |
 
-The unresolved share in that box is a model-recovery gap, not a naming gap. All 1,800 archetypes that #8/#10 add
-in that box are `.#ft` fragments (18,500 of the entities). The pinned `LooksLikeFragment` rejects their headers
-(breadbbbb/rpf9-explorer#8).
-
-Checks on the same box:
-- The conjugate of every stored rotation equals SixNG's independently derived world rotation:
+Checks:
+- Every chunk of the whole-city build passes a structural check: accessors inside their bufferViews, indices
+  below the vertex count, POSITION `min`/`max` equal to the data, the instancing attributes' counts equal, unit
+  rotations, and positive finite scales. Recomputed from the GLBs, the chunk bounds, placement counts (1,549,343)
+  and drawn triangles (7,311,221,858) equal `world.json`.
+- three r160's `GLTFLoader` (the viewer's loader), run under Node, parses 65 of the city chunks: 60 random and the
+  5 largest, including the 926 MB one. It builds `InstancedMesh`es whose drawn triangles equal `world.json`, with
+  bounds inside the chunk's bounds. It also parses all 16 chunks of the box and 35 chunks of the LOD-set build
+  (4 random and the largest per tier).
+- The LOD-set build's 12,340 chunks pass the same structural check; 1,669,771 placements and 7,527,211,045 drawn
+  triangles equal `world.json`.
+- On the downtown box, the conjugate of every stored rotation equals SixNG's independently derived world rotation:
   |dot| ≥ 0.9999 on 29,124 of 29,125 entities matched by position and archetype, and the minimum is 0.99894.
-  Scales are equal on all 29,125.
-- Every placed instance's position lies inside its chunk's bounds (10,620 of 10,620 distinct
-  position/archetype pairs).
+  Scales are equal on all 29,125. The instance TRS equals that transform (see the tests).
 
-**Not verified:** the result has not been looked at in a browser. Instances are baked into the chunk geometry,
-not shared, so a dense box makes 100 MB+ chunks; a smaller `--chunk-size` keeps them small. Building a whole
-city needs glTF instancing and LOD switching, which are next steps.
+The pin's 41.3% is a model-recovery gap, not a naming gap: almost every archetype name resolves (99.85%, see
+*What is readable* above), but only recovered models can be placed. The archetypes that #8/#10 add are `.#ft`
+fragments, whose headers the pinned `LooksLikeFragment` rejects (breadbbbb/rpf9-explorer#8).
+
+**Not verified or limited:**
+- Nothing here was looked at in a browser. The checks above are structural and numeric.
+- Memory grows with `--jobs` (each worker holds the models of one chunk), not with the map: 38 GB at 40 jobs, 30
+  GB at 24 jobs for a bigger build, 1.9 GB at 16 jobs for the box.
+- With LOD sets, most of what is still loaded near the centre is ORPHAN_HD: it has no parent tier, so its band is
+  0 to 1,000 m.
+- Chunk sizes follow model detail. A few dense downtown cells exceed 100 MB, and the largest stores 24 M
+  triangles of 2,204 distinct models, so a smaller `--chunk-size` there helps a browser.
+- No placement in this package has a negative `scaleZ`, so the mirrored path is checked by the synthetic tests
+  only.
+- Textures were not part of these runs (`--no-textures`).
 
 ```powershell
 python -I tools\world_index.py <levels.rpf> --out work\world\index.json --entities-out work\world\entities.jsonl
-python -I tools\world_build.py work\assets --out work\world\placed --no-textures `
-    --placements work\world\entities.jsonl --region=-900,500,-200,1200
+python -I tools\world_build.py work\assets --out work\world\placed --no-textures --jobs 16 `
+    --placements work\world\entities.jsonl
+python -I tools\world_build.py work\assets --out work\world\lod --no-textures --jobs 16 `
+    --placements work\world\entities.jsonl --lod-sets
 python -I tests\test_world_place.py
+python -I tests\test_world_instancing.py
+node --test tests\test_viewer_streaming.cjs
 ```
 
 The entity rows and the placed chunks come from your own copy of the game; keep them in the local work folder.

@@ -167,6 +167,30 @@ class NavmeshIndexTest(unittest.TestCase):
         with open(report, "rb") as f:
             self.assertEqual(f.read(), b"previous report")
 
+    def test_report_path_cannot_be_scanned_input(self):
+        # Before: --out/--csv naming a file the scan reads replaced that file with the report, exit 0.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page(pages=4))
+        rpf = os.path.join(self.root, "nav.rpf")
+        make_rpf(rpf)
+        originals = {}
+        for path in (carved, rpf):
+            with open(path, "rb") as f:
+                originals[path] = f.read()
+        cases = [((folder, "--out", carved), carved), ((folder, "--csv", carved), carved),
+                 ((rpf, "--out", rpf), rpf), ((rpf, "--csv", rpf), rpf)]
+        for args, path in cases:
+            r = subprocess.run([sys.executable, "-I", TOOL, *args], cwd=ROOT, capture_output=True, text=True,
+                               check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), originals[path], f"{args} touched the input")
+
     def test_not_an_rpf(self):
         path = os.path.join(self.root, "not.rpf")
         with open(path, "wb") as f:

@@ -895,6 +895,24 @@ class CliInputTest(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn("0 textures", p.stdout)
 
+    def test_malformed_index_is_one_error_line(self):
+        # An index.json of the wrong shape ended in a KeyError/TypeError traceback after the carve had finished;
+        # gamedata_index.py already reports this as one ERROR line with exit 2.
+        cases = {"no files key": {}, "files not a list": {"files": "oops"}, "files null": {"files": None},
+                 "row not an object": {"files": [1, 2]}, "row without head": {"files": [{"off": 0}, {"off": 16}]}}
+        for label, index in cases.items():
+            with self.subTest(index=label), tempfile.TemporaryDirectory() as tmp:
+                os.makedirs(os.path.join(tmp, "carve", "a"))
+                with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                    json.dump(index, f)
+                out = os.path.join(tmp, "t.json")
+                p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertIn("ERROR: cannot read", p.stderr)
+                self.assertIn("index.json", p.stderr)
+                self.assertFalse(os.path.exists(out))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
