@@ -1609,6 +1609,43 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
     return ReplayResult::success;
 }
 
+// A depth or stencil resolve of a rectangle runs in a rendering scope whose render area is the rectangle, and Vulkan
+// resolves only inside it. MoltenVK resolves the whole destination subresource instead: the resolve is Metal's
+// store action, which has no render area (measured on MoltenVK 1.4.2 and 1.4.3, docs/d3d12_vulkan.md). No Vulkan
+// property tells, so on every GPU the texels around the rectangle go into `staged` before the resolve and come back
+// after it, in up to four bands (`staged_reads`, one region per band, used in both directions).
+inline ReplayResult keep_around_resolve(const ReplayFunctions& vk, Prepared& p) {
+    const VkExtent2D to = mip_extent(p.binding, p.range.baseMipLevel);
+    const auto x0 = std::uint32_t(p.resolve.dstOffset.x), y0 = std::uint32_t(p.resolve.dstOffset.y);
+    const std::uint32_t x1 = x0 + p.resolve.extent.width, y1 = y0 + p.resolve.extent.height;
+    const VkRect2D bands[4] = {
+        {{0, 0}, {to.width, y0}},                                         // above
+        {{0, std::int32_t(y1)}, {to.width, to.height - y1}},              // below
+        {{0, std::int32_t(y0)}, {x0, y1 - y0}},                           // left
+        {{std::int32_t(x1), std::int32_t(y0)}, {to.width - x1, y1 - y0}}, // right
+    };
+    // Depth aspects want 4-byte buffer offsets; 16 covers every texel size here.
+    const std::uint32_t texel = block_format(p.binding.format, p.range.aspectMask).bytes;
+    VkDeviceSize total = 0;
+    for (const VkRect2D& band : bands) {
+        if (!band.extent.width || !band.extent.height) continue;
+        VkBufferImageCopy region{};
+        region.bufferOffset = total;
+        region.imageSubresource = p.resolve.dstSubresource;
+        region.imageOffset = {band.offset.x, band.offset.y, 0};
+        region.imageExtent = {band.extent.width, band.extent.height, 1};
+        p.staged_reads.push_back(region);
+        total += (VkDeviceSize(band.extent.width) * band.extent.height * texel + 15) / 16 * 16;
+    }
+    if (p.staged_reads.empty()) return ReplayResult::success;  // the rectangle is the whole subresource
+    VkDeviceSize base = 0;
+    if (!texel || !vk.copy_image_to_buffer || !vk.copy_buffer_to_image || !vk.copy_scratch ||
+        !vk.copy_scratch(total, p.staged, base))
+        return ReplayResult::unsupported;
+    for (VkBufferImageCopy& region : p.staged_reads) region.bufferOffset += base;
+    return ReplayResult::success;
+}
+
 // The layout a copy uses for a range: D3D12 requires copy_dest/copy_source, or common (GENERAL), where an implicit
 // promotion lets the copy run in place. Anything else is moved to `wanted` and tracked.
 inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
@@ -2262,6 +2299,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.view = vk.image_view(p.source, p.source_range);
                 p.resolve_view = vk.image_view(p.binding, p.range);
                 if (!p.view || !p.resolve_view) return ReplayResult::unsupported;
+                if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
+                    return result;
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
@@ -3005,6 +3044,22 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 auto dest_pieces = detail::current(
                     tracker, dst_id, detail::planes_for_layout(p.binding, p.range, separate), dest_layout);
                 detail::initialize(vk, command_buffer, p.binding, dst_id, dest_pieces, dest_layout, tracker);
+                // The texels around the rectangle, kept in `staged` across the resolve (keep_around_resolve).
+                const auto keep = [&](VkImageLayout wanted, VkAccessFlags access, auto&& copy) {
+                    const VkImageLayout layout = image_layout(p.binding, wanted);
+                    detail::round_trip(vk, command_buffer, p.binding, dest_pieces, layout, dest_state, access,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, [&] { copy(layout); });
+                };
+                const auto bands = std::uint32_t(p.staged_reads.size());
+                if (p.staged) {
+                    keep(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, [&](VkImageLayout layout) {
+                        vk.copy_image_to_buffer(command_buffer, p.binding.image, layout, p.staged, bands,
+                                                p.staged_reads.data());
+                    });
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT);
+                }
                 const VkImageLayout source_attachment =
                     image_layout(p.source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
                 const VkImageLayout dest_attachment =
@@ -3032,6 +3087,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         vk.end_rendering(command_buffer);
                     });
                 });
+                if (p.staged) {
+                    keep(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, [&](VkImageLayout layout) {
+                        vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, layout, bands,
+                                                p.staged_reads.data());
+                    });
+                }
                 continue;
             }
             const VkImageLayout src_layout = detail::copy_layout(
