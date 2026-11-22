@@ -110,7 +110,7 @@ class Wave64Checks(unittest.TestCase):
                 words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_store":
-                return 0, "out[0..7] = 1073774847 3758097407 1006649344 4008636142 1073757184 3154130944 0 0\n"
+                return 0, "out[0..7] = " + " ".join(map(str, (check.CS_STORE + [0] * 8)[:8])) + "\n"
             if name == "cs_smem_soffset_imm":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CS_SMEM)) + "\n"
             if name in WAVE32_WORDS:           # wave32 dumps run on any subgroup size
