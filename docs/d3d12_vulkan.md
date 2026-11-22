@@ -595,6 +595,16 @@ private copy before calling the host serializer/deserializer; never modify the g
 bits is unknown. The v1.0 `D3D12SerializeRootSignature` path keeps flags at offset +32, and a descriptor with
 `0x3000001` also fails on the PC runtime.
 
+**Version 1.2 on older runtimes.** The in-box `d3d12.dll` of Windows 10 (measured on 22H2, 10.0.19045, without the
+Agility SDK) and of Windows 11 23H2 (#361) serializes root signatures only up to 1.1. On Windows 10 it rejects even an
+empty 1.2 description with `E_INVALIDARG`, and `D3D12_FEATURE_ROOT_SIGNATURE` reports `HighestVersion` 1.1 (#528).
+Version 1.2 differs from 1.1 only in
+`D3D12_STATIC_SAMPLER_DESC1::Flags`. So on such a host, the `d3d12_xs` serializer rewrites a 1.2 description whose
+static samplers all have `Flags == 0` as the same root signature in 1.1. It refuses one that uses sampler flags (a
+UINT border colour or non-normalized coordinates) with a log line, since 1.1 can't express them. The host is probed
+once with an empty 1.2 description. `root_sig_test` checks the rewrite field by field and through the host
+deserializer.
+
 Things that can invalidate this simple model, all **Open**:
 
 - **Shader visibility.** The layer starts with one global block in root-parameter order and treats visibility as
