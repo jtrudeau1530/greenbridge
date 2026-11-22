@@ -902,5 +902,201 @@ class TestBufferAtomicSmaxRegisterAliasing(unittest.TestCase):
             self.assertEqual(s32(simd.vgprs[lane][0]), -10)
 
 
+class BufferAtomicStatusFlags:
+    """Status flags and architectural condition codes for a buffer atomic operation."""
+
+    def __init__(self, old_val: int, new_val: int, in_bounds: bool, addr: int) -> None:
+        self.old_val = old_val & MASK32
+        self.new_val = new_val & MASK32
+        self.in_bounds = in_bounds
+        self.is_oob = not in_bounds
+        self.unaligned = (addr % 4 != 0)
+        self.is_zero = (self.new_val == 0)
+        self.is_negative = bool(self.new_val & SIGN_BIT32)
+        self.was_updated = (self.old_val != self.new_val) and in_bounds
+
+    def __repr__(self) -> str:
+        flags = [k for k, v in self.__dict__.items() if v is True]
+        return f"BufferAtomicStatusFlags({', '.join(flags)})"
+
+
+def evaluate_buffer_atomic_smax_with_flags(
+    mem: BufferMemory,
+    desc: BufferResourceDescriptor,
+    soffset: int,
+    vaddr: int,
+    cmp_val: int,
+    inst_offset: int = 0,
+    glc: bool = False,
+    offen: bool = True,
+) -> tuple[int, BufferAtomicStatusFlags]:
+    """Execute buffer_atomic_smax and return result along with status flags."""
+    effective_offset = (soffset & MASK32) + (inst_offset & 0xFFF)
+    if offen:
+        effective_offset += (vaddr & MASK32)
+
+    phys_addr = (desc.base_address + effective_offset) & 0xFFFFFFFFFFFFFFFF
+    old_mem = mem.read_u32(phys_addr)
+
+    ret, ok = ref_buffer_atomic_smax(
+        mem, desc, soffset, vaddr, cmp_val, inst_offset, glc, offen
+    )
+    new_mem = mem.read_u32(phys_addr)
+
+    flags = BufferAtomicStatusFlags(
+        old_val=old_mem,
+        new_val=new_mem,
+        in_bounds=ok,
+        addr=phys_addr,
+    )
+    return ret, flags
+
+
+def generate_buffer_vcc_mask(
+    simd: SIMDBufferWavefrontInterpreter,
+    inst: Instruction,
+    predicate: str,
+) -> int:
+    """Generate 64-bit VCC mask evaluating condition across all active lanes."""
+    d0 = simd.sgprs[inst.srsrc.index]
+    d1 = simd.sgprs[inst.srsrc.index + 1]
+    d2 = simd.sgprs[inst.srsrc.index + 2]
+    d3 = simd.sgprs[inst.srsrc.index + 3]
+    desc = BufferResourceDescriptor.from_dwords(d0, d1, d2, d3)
+
+    soffset = (
+        simd.sgprs[inst.soffset.index]
+        if isinstance(inst.soffset, Register)
+        else inst.soffset
+    )
+
+    vcc = 0
+    for lane in range(simd.wave_size):
+        if (simd.exec_mask >> lane) & 1:
+            vaddr = simd.vgprs[lane][inst.vaddr.index]
+            cmp_val = simd.vgprs[lane][inst.vdata.index]
+
+            effective_offset = (soffset & MASK32) + (inst.mods.offset & 0xFFF)
+            if inst.mods.offen:
+                effective_offset += (vaddr & MASK32)
+
+            in_bounds = (effective_offset + 4 <= desc.num_records)
+            phys_addr = (desc.base_address + effective_offset) & 0xFFFFFFFFFFFFFFFF
+            cur_mem = simd.mem.read_u32(phys_addr)
+
+            cond = False
+            if predicate == "in_bounds":
+                cond = in_bounds
+            elif predicate == "was_updated":
+                cond = in_bounds and (s32(cmp_val) > s32(cur_mem))
+            elif predicate == "result_ge_zero":
+                res = max(s32(cur_mem), s32(cmp_val)) if in_bounds else s32(cur_mem)
+                cond = in_bounds and (res >= 0)
+            elif predicate == "result_lt_zero":
+                res = max(s32(cur_mem), s32(cmp_val)) if in_bounds else s32(cur_mem)
+                cond = in_bounds and (res < 0)
+            else:
+                raise ValueError(f"Unknown predicate: {predicate}")
+
+            if cond:
+                vcc |= (1 << lane)
+
+    return vcc
+
+
+class TestBufferAtomicSmaxStatusFlagsAndConditionCodes(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and VCC predicate generation."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(1024)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=512)
+
+    def test_status_flags_updated_vs_not_updated(self) -> None:
+        # Initial memory has 10
+        self.mem.write_u32(0, 10)
+
+        # 1. Compare with 20 -> updated = True
+        _, flags1 = evaluate_buffer_atomic_smax_with_flags(
+            self.mem, self.desc, soffset=0, vaddr=0, cmp_val=20
+        )
+        self.assertTrue(flags1.in_bounds)
+        self.assertTrue(flags1.was_updated)
+        self.assertFalse(flags1.is_negative)
+        self.assertFalse(flags1.is_zero)
+
+        # 2. Compare with 15 (memory is already 20) -> updated = False
+        _, flags2 = evaluate_buffer_atomic_smax_with_flags(
+            self.mem, self.desc, soffset=0, vaddr=0, cmp_val=15
+        )
+        self.assertTrue(flags2.in_bounds)
+        self.assertFalse(flags2.was_updated)
+
+    def test_status_flags_zero_and_negative(self) -> None:
+        self.mem.write_u32(4, u32(-50))
+
+        # Memory is -50, cmp with 0 -> new value is 0 (is_zero=True, is_negative=False)
+        _, flags = evaluate_buffer_atomic_smax_with_flags(
+            self.mem, self.desc, soffset=0, vaddr=4, cmp_val=0
+        )
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertTrue(flags.was_updated)
+
+        # Memory at 8 is -100, cmp with -60 -> new value is -60 (is_negative=True)
+        self.mem.write_u32(8, u32(-100))
+        _, flags_neg = evaluate_buffer_atomic_smax_with_flags(
+            self.mem, self.desc, soffset=0, vaddr=8, cmp_val=u32(-60)
+        )
+        self.assertTrue(flags_neg.is_negative)
+        self.assertFalse(flags_neg.is_zero)
+
+    def test_status_flags_oob_and_alignment(self) -> None:
+        # OOB access at offset 512
+        _, flags_oob = evaluate_buffer_atomic_smax_with_flags(
+            self.mem, self.desc, soffset=0, vaddr=512, cmp_val=10
+        )
+        self.assertTrue(flags_oob.is_oob)
+        self.assertFalse(flags_oob.was_updated)
+
+        # Unaligned address
+        _, flags_unaligned = evaluate_buffer_atomic_smax_with_flags(
+            self.mem, self.desc, soffset=0, vaddr=3, cmp_val=10
+        )
+        self.assertTrue(flags_unaligned.unaligned)
+
+    def test_vcc_mask_generation_across_wave(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=64, mem_size=1024)
+        simd.set_buffer_descriptor(0, self.desc)
+        # Upper 32 lanes inactive
+        simd.set_exec_lo(0xFFFFFFFF)
+        simd.set_exec_hi(0x00000000)
+
+        # Even lanes in 0..31 have positive numbers, odd lanes have negative numbers
+        for lane in range(64):
+            simd.mem.write_u32(lane * 4, u32(-50))
+            simd.vgprs[lane][0] = 10 if (lane % 2 == 0) else u32(-80)
+            simd.vgprs[lane][1] = lane * 4
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+        )
+
+        # Even lanes in 0..31 will have positive result (0x55555555)
+        vcc_ge = generate_buffer_vcc_mask(simd, inst, "result_ge_zero")
+        self.assertEqual(vcc_ge, 0x55555555)
+
+        # Odd lanes in 0..31 will have negative result (0xAAAAAAAA)
+        vcc_lt = generate_buffer_vcc_mask(simd, inst, "result_lt_zero")
+        self.assertEqual(vcc_lt, 0xAAAAAAAA)
+
+        # Inactive lanes (32..63) are 0 in VCC
+        self.assertEqual(vcc_ge >> 32, 0)
+        self.assertEqual(vcc_lt >> 32, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
