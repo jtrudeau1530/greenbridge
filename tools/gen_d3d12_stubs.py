@@ -114,7 +114,7 @@ def main():
         "#pragma warning(push)",
         "#pragma warning(disable : 4100)  // unreferenced parameters",
     ]
-    parts += [emit_class(interfaces, leaf) for leaf in args.interfaces]
+    parts += [emit_class(interfaces, leaf) for leaf in dict.fromkeys(args.interfaces)]
     parts.append("#pragma warning(pop)")
     text = "\n".join(parts) + "\n"
 
