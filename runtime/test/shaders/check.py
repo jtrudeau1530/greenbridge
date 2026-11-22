@@ -209,7 +209,7 @@ GATHER_WRAP = (5090733.0, 14942181.0, 258623.0, 9702309.0)
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
+PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
@@ -581,11 +581,18 @@ def texoff_words(px, py):
     return (bx | by << 4, 0x0761, x0 | bx << 4 | bx << 8 | x0 << 12, by | by << 4 | y0 << 8 | y0 << 12)
 
 
-def texoff_problem(data, output):
+# LEONIDA_TEXOFF_FALLBACK=1 (set for build.py too): image_sample*_o was translated with --texel-offset-fallback, so
+# ps_texoff runs without VK_KHR_maintenance8 and every offset is defined, whatever the device's texel offset limits.
+TEXOFF_FALLBACK = os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1"
+
+
+def texoff_problem(data, output, all_offsets=None):
     """Judge ps_texoff's 64x64 RGBA32 dump: (failure text or "", what was covered). The +16 / -32 sample (bits 8-15
     of .y) is only defined, and so only judged, where vk_texture_test printed texel offset limits that cover it."""
     m = re.search(r"texel offset limits: (-?\d+)\.\.(-?\d+)", output)
     wide = bool(m) and int(m.group(1)) <= -32 and int(m.group(2)) >= 16
+    if TEXOFF_FALLBACK if all_offsets is None else all_offsets:
+        wide = True                    # the offset is a coordinate shift: no device limit applies
     if len(data) != 64 * 64 * 16:
         return "vk_texture_test returned an unexpected pixel count", ""
     keep = (0xFFFFFFFF, 0xFFFFFFFF if wide else 0xFFFF00FF, 0xFFFFFFFF, 0xFFFFFFFF)
@@ -593,12 +600,21 @@ def texoff_problem(data, output):
     bad = [(i, got) for i, got in enumerate(px)
            if any((g ^ w) & k for g, w, k in zip(got, texoff_words(i % 64, i // 64), keep))]
     limits = f"{m.group(1)}..{m.group(2)}" if m else "unknown"
-    covered = "offsets +16/-32 judged" if wide else f"offsets +16/-32 not judged (device texel offset limits {limits})"
+    covered = ("offsets +16/-32 judged" + (" (texel offset fallback)" if wide and not (
+        bool(m) and int(m.group(1)) <= -32 and int(m.group(2)) >= 16) else "")) if wide else f"offsets +16/-32 not judged (device texel offset limits {limits})"
     if not bad:
         return "", covered
     i, got = bad[0]
     return (f"{len(bad)} of {len(px)} pixels differ; first at ({i % 64},{i // 64}): got {[hex(x) for x in got]}, "
             f"want {[hex(x) for x in texoff_words(i % 64, i // 64)]} ({covered})"), covered
+
+
+def texoff_env(base=None):
+    """vk_texture_test environment for ps_texoff: it needs VK_KHR_maintenance8 unless translated with the fallback."""
+    env = dict(base if base is not None else os.environ)
+    if not TEXOFF_FALLBACK:
+        env["VKT_NEED_MAINTENANCE8"] = "1"
+    return env
 
 
 def texoff_test(tools, spirv, name):
@@ -607,7 +623,7 @@ def texoff_test(tools, spirv, name):
         raw = Path(tmp) / "pixels.raw"
         code, out = run(os.path.join(tools, "vk_texture_test" + EXE), os.path.join(spirv, "vs_ids.spv"),
                         os.path.join(spirv, name + ".spv"), raw, *TEXOFF_ARGS,
-                        env=dict(os.environ, VKT_NEED_MAINTENANCE8="1"))
+                        env=texoff_env())
         if code == UNSUPPORTED:   # vk_texture_test: no VK_KHR_maintenance8 (a non-constant Offset outside gather)
             m = re.search(r"unsupported: .*", out)
             return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
@@ -666,7 +682,7 @@ def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
-    if name == "ps_texoff":
+    if name in ("ps_texoff", "ps_texoff_implicit"):
         return texoff_test(tools, spirv, name)
     px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I")
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
