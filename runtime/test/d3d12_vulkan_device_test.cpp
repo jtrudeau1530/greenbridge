@@ -3,8 +3,8 @@
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue, a fence and query heaps. Results are read back through D3D12 itself
 // (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo,
-// GetResourceTiling, copies (d3d12_copy_compare.h) and the HRESULTs of invalid arguments to resource,
-// heap, queue and fence creation and Map are compared with the host PC runtime's
+// GetResourceTiling, copies (d3d12_copy_compare.h), CheckFeatureSupport's error paths and the HRESULTs of invalid
+// arguments to resource, heap, queue and fence creation and Map are compared with the host PC runtime's
 // (LEONIDA_D3D49_VERBOSE=1 prints every argument case). WriteToSubresource/ReadFromSubresource run on
 // devices of their own, once per copy path. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run
 // under VK_LAYER_KHRONOS_validation; any validation error fails the test.
@@ -3168,6 +3168,58 @@ int compare_heap_neighbours(ID3D12Device* ours) {
     return mismatches;
 }
 
+// CheckFeatureSupport's error paths must match the host runtime's exactly: games and middleware branch on these
+// HRESULTs at startup, and a wrong success or a wrong error sends them down the wrong path. A null data pointer, a
+// structure smaller than the feature requires, or a feature value no runtime defines must all return the same HRESULT
+// on both sides. Valid queries are not compared here: their answers are the GPU's choice. Returns the number of
+// mismatches, or -1 when the host has no D3D12 device to compare with.
+int compare_check_feature_support(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+    // Features the shim answers; their error paths must match the host's.
+    const D3D12_FEATURE answered[] = {
+        D3D12_FEATURE_FEATURE_LEVELS, D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_ARCHITECTURE1,
+        D3D12_FEATURE_D3D12_OPTIONS, D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+    };
+    // Feature values no runtime defines (well beyond D3D12_FEATURE's range); both sides must reject them the same way.
+    const D3D12_FEATURE undefined[] = {D3D12_FEATURE(0x4000), D3D12_FEATURE(0x7fffffff)};
+    int mismatches = 0;
+    const auto check = [&](const char* what, D3D12_FEATURE feature, void* data, UINT size) {
+        const HRESULT a = ours->CheckFeatureSupport(feature, data, size);
+        const HRESULT b = host->CheckFeatureSupport(feature, data, size);
+        if (a == b) return;
+        if (mismatches++ < 24)
+            std::fprintf(stderr, "CheckFeatureSupport %s feature %d size %u: ours 0x%08x host 0x%08x\n", what,
+                         int(feature), size, static_cast<unsigned>(a), static_cast<unsigned>(b));
+    };
+    for (const D3D12_FEATURE f : answered) {
+        std::uint8_t buf[256] = {};
+        check("null data", f, nullptr, sizeof(buf));
+        check("zero size", f, buf, 0);
+        check("one byte", f, buf, 1);
+    }
+    // A structure one byte short, for every answered feature's data type.
+    {
+        D3D12_FEATURE_DATA_FEATURE_LEVELS fl{};
+        check("feature levels short", D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl) - 1);
+        D3D12_FEATURE_DATA_ARCHITECTURE ar{};
+        check("architecture short", D3D12_FEATURE_ARCHITECTURE, &ar, sizeof(ar) - 1);
+        D3D12_FEATURE_DATA_ARCHITECTURE1 a1{};
+        check("architecture1 short", D3D12_FEATURE_ARCHITECTURE1, &a1, sizeof(a1) - 1);
+        D3D12_FEATURE_DATA_D3D12_OPTIONS op{};
+        check("options short", D3D12_FEATURE_D3D12_OPTIONS, &op, sizeof(op) - 1);
+        D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va{};
+        check("gpu va short", D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va, sizeof(va) - 1);
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
+        check("format short", D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs) - 1);
+    }
+    for (const D3D12_FEATURE f : undefined) {
+        std::uint8_t buf[256] = {};
+        check("undefined feature", f, buf, sizeof(buf));
+    }
+    return mismatches;
+}
+
 }  // namespace
 
 int main() {
@@ -3592,6 +3644,10 @@ int main() {
         if (argument_mismatches < 0)
             std::printf("invalid arguments: no host D3D12 device to compare with, skipped\n");
         EXPECT(argument_mismatches <= 0);
+        const int feature_error_mismatches = compare_check_feature_support(device.p);
+        if (feature_error_mismatches < 0)
+            std::printf("CheckFeatureSupport error paths: no host D3D12 device to compare with, skipped\n");
+        EXPECT(feature_error_mismatches <= 0);
 
         // D3D-236: CreateCommandQueue with D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME requires
         // SeIncreaseBasePriorityPrivilege enabled in the token, matching the Windows D3D12 runtime.
@@ -5866,7 +5922,7 @@ int main() {
         return 1;
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
-                "BC copies, a resolve, reserved resources, queries, and GetCopyableFootprints and GetResourceTiling all "
-                "matched\n");
+                "BC copies, a resolve, reserved resources, queries, GetCopyableFootprints, GetResourceTiling and "
+                "CheckFeatureSupport error paths all matched\n");
     return 0;
 }
