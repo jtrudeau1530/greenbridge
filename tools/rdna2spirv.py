@@ -6485,6 +6485,48 @@ class Gen:
                     self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
                     self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
                     self.dst(a[0], v)
+        elif op in ("v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16"):
+            # Normalized f16 -> snorm16/unorm16 (RDNA2 ISA VOP1/VOP3): round_even(clamp(S0, lo, 1.0) * scale),
+            # NaN -> 0, preserving the unwritten 16-bit half of the destination (op_sel:[src,dst] supported).
+            # For |cl| >= 0.25, cl * (scale + 1) is an exact even integer in f32 so round_even(cl * scale) ==
+            # cl * (scale + 1) - RoundEven(cl), avoiding the f32 double-rounding ties near +-0.5.
+            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+                raise Unsupported(op + " output modifier")
+            sel, dhi = self.opsel_bits(mods, 1)
+            snorm = op == "v_cvt_norm_i16_f16"
+            x = self.f16_in(a[1], sel[0])
+            nan, xs, cl, ax, big, hp, rc, rbig, ps, rsm, rn, conv, lo = (self.tmp() for _ in range(13))
+            self.emit(f"{nan} = OpIsNan %bool {x}")
+            self.emit(f"{xs} = OpSelect %float {nan} %f0 {x}")
+            lo_b = -1.0 if snorm else 0.0
+            sc, sc1 = (32767.0, 32768.0) if snorm else (65535.0, 65536.0)
+            self.emit(f"{cl} = OpExtInst %float %glsl FClamp {xs} {self.fconst(lo_b)} {self.fconst(1.0)}")
+            self.emit(f"{ax} = OpExtInst %float %glsl FAbs {cl}")
+            self.emit(f"{big} = OpFOrdGreaterThanEqual %bool {ax} {self.fconst(0.25)}")
+            self.emit(f"{hp} = OpFMul %float {cl} {self.fconst(sc1)}")
+            self.emit(f"{rc} = OpExtInst %float %glsl RoundEven {cl}")
+            self.emit(f"{rbig} = OpFSub %float {hp} {rc}")
+            self.emit(f"{ps} = OpFMul %float {cl} {self.fconst(sc)}")
+            self.emit(f"{rsm} = OpExtInst %float %glsl RoundEven {ps}")
+            self.emit(f"{rn} = OpSelect %float {big} {rbig} {rsm}")
+            if snorm:
+                ci = self.tmp()
+                self.emit(f"{ci} = OpConvertFToS %int {rn}")
+                self.emit(f"{conv} = OpBitcast %uint {ci}")
+            else:
+                self.emit(f"{conv} = OpConvertFToU %uint {rn}")
+            self.emit(f"{lo} = OpBitwiseAnd %uint {conv} {self.cu(0xFFFF)}")
+            if not dhi:
+                self.write_lo16(a[0], lo)
+            else:
+                if a[0]["k"] != "vgpr":
+                    raise Unsupported("op_sel destination")
+                old, keep, sh16, v = (self.tmp() for _ in range(4))
+                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+                self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
+                self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+                self.dst(a[0], v)
         elif op in ("v_frexp_mant_f16", "v_frexp_exp_i16_f16", "v_ldexp_f16"):
             # The binary16 version of v_frexp_mant_f32 / v_frexp_exp_i32_f32 / v_ldexp_f32, bit-exact on the f16 word
             # of the low half (op_sel picks the high half of a source; the last bit sends the result to the high half;
