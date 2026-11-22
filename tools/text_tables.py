@@ -221,7 +221,11 @@ def blobs(source: str):
     else:
         paths = [source]
         if os.path.isdir(source):
-            paths = [os.path.join(r, f) for r, _d, fs in os.walk(source) for f in sorted(fs)]
+            def scan_failed(error: OSError) -> None:
+                raise error
+
+            paths = [os.path.join(r, f) for r, _d, fs in os.walk(source, onerror=scan_failed)
+                     for f in sorted(fs)]
         for path in paths:
             if os.path.getsize(path) <= MAX_RESOURCE_BYTES:
                 with open(path, "rb") as fh:
