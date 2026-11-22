@@ -40,6 +40,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anim_index  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 
 SYSTEM = 0x50000000
 CHANNEL_NAMES = ("static_quat", "static_vec3", "static_float", "raw_float", "quantize_float",
@@ -767,7 +768,7 @@ def scan(path, start=None, limit=None, jobs=1, progress=None, budget=None):
     stats, out = new_stats(), []
     if jobs > 1 and len(work) > 1:
         import multiprocessing
-        with multiprocessing.Pool(jobs) as pool:
+        with multiprocessing.Pool(process_workers(jobs)) as pool:
             for n, (row, st) in enumerate(pool.imap_unordered(_decode_star, work, chunksize=4), 1):
                 out.append(row)
                 merge(stats, st)
