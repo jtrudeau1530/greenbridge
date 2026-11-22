@@ -143,6 +143,45 @@ class FixtureTests(unittest.TestCase):
         finally:
             os.unlink(src)
 
+    def test_accepted_names_keeps_tuple_comparators_when_refusal_uses_tuple(self):
+        # Python shares the ast.Load() singleton across every tuple/list comparator in the AST, so putting
+        # non-expr nodes into accepted_names()'s skip set used to drop every other `op in (...)` tuple in the file.
+        accepted = ic.accepted_names(self.src)
+        self.assertIn("image_load", accepted)
+        self.assertIn("v_add_u32_e64", accepted)
+        self.assertNotIn("s_denorm_mode", accepted)
+        src = _fixture(
+            'def f(op):\n'
+            '    if op in ("v_fancy_f32",):\n'
+            '        raise Unsupported(op)\n'
+            '    elif op in ("v_fancy_f32", "s_mov_b32"):\n'
+            '        return 1\n',
+            ".py",
+        )
+        try:
+            rep = ic.build_report(self.isa, ic.scan_translator(src), ic.accepted_names(src))
+            self.assertEqual(rep["class"]["v_fancy_f32"], "handled-exact")
+            self.assertNotIn("v_fancy_f32", rep["refused"])
+        finally:
+            os.unlink(src)
+
+    def test_negated_and_guarded_comparisons_are_not_refusals(self):
+        src = _fixture(
+            'def f(op, bad):\n'
+            '    if not (op == "s_setreg_imm32_b32"):\n'
+            '        raise Unsupported(op)\n'
+            '    if op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8") and bad:\n'
+            '        raise Unsupported(op)\n',
+            ".py",
+        )
+        try:
+            scan = ic.scan_translator(src)
+            self.assertEqual(scan["refused"], [])
+            self.assertEqual(scan["partial"], ["v_mqsad_pk_u16_u8", "v_qsad_pk_u16_u8"])
+            self.assertTrue({"v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"} <= ic.accepted_names(src))
+        finally:
+            os.unlink(src)
+
     def test_groups_count_each_encoding(self):
         g = self.rep["groups"]
         self.assertEqual(g["VOP2"]["handled-exact"], 1)
@@ -182,6 +221,10 @@ class TranslatorScanTests(unittest.TestCase):
     def test_dispatch_size_sanity(self):
         # A scan that silently stops seeing the if/elif chain would report almost everything unknown.
         self.assertGreater(len(self.scan["exact"]), 300)
+
+    def test_accepted_names_matches_non_refused_exact(self):
+        accepted = ic.accepted_names(TRANSLATOR)
+        self.assertEqual(set(self.scan["exact"]) - accepted, set(self.scan["refused"]))
 
 
 @unittest.skipUnless(REAL_XML and os.path.isfile(REAL_XML), f"set {ic.ENV_XML} to amdgpu_isa_rdna2.xml")
