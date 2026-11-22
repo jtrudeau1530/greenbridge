@@ -713,9 +713,16 @@ vehicle models to far-away light recipes. Counts only; no model names.
   this build the document is an index from model and variant to recipe with the light positions absent,
   so distant vehicle lights cannot be reconstructed from it.
 
-Not measured here (hypothesis): what the secondary tokens name (per-model parts or liveries would fit the
-model-name substrings), and where the light positions are generated at runtime (for example from the model's
-own light bones).
+The sampled `CPaletteIndexedRecipeTintsArray` document reuses 746 of the 780 distinct distant-light
+secondary tokens in its own `secondaryRecipes` field. Of the 1,668 distant-light rows with at least one
+token, 1,339 match a palette recipe on both vehicle name and the complete token list, ignoring case and
+token order. Replacing each vehicle name with the next of the 319 lowercased names in sorted order
+(wrapping at the end) and keeping its tokens fixed gives 56 matches among the same 1,668 rows.
+
+In the 34-row `CVehicleBoneOffsetsArray` document, 0 of the 780 distinct tokens match a whole text or
+attribute value case-insensitively. In the 2,447-row document of the same type, 178 of the 780 match
+`boneOffsets/Item/name`. These comparisons establish recipe reuse across the light and palette documents.
+Which physical parts or liveries a token selects, and where the runtime obtains light positions, remain open.
 
 ## Skinned GLB export
 
