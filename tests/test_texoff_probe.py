@@ -60,5 +60,98 @@ class RowsTest(unittest.TestCase):
         self.assertEqual(p.sampler_words()[0] & 0x1FF, 2 | 2 << 3 | 2 << 6)
 
 
+class OracleLifecycleTest(unittest.TestCase):
+    def _run_hw(self, fake_oracle):
+        import contextlib
+        import io
+        from unittest import mock
+        import runner
+
+        buf = io.StringIO()
+        with (
+            mock.patch.object(runner, "open_oracle", return_value=fake_oracle) as open_mock,
+            mock.patch.object(runner, "Oracle", side_effect=AssertionError("Oracle() called directly")),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = p.main(["--oracle", "hw"])
+        open_mock.assert_called_once_with()
+        return rc, buf.getvalue()
+
+    def test_hw_uses_open_oracle_and_closes_on_match(self):
+        import struct
+
+        class FakeOracle:
+            device = "fake-gpu"
+            arch = "gfx1036"
+            closed = False
+
+            def run(self, kernels):
+                text = "\n".join(kernels[0].lines)
+                dim = "2d" if "SQ_RSRC_IMG_2D" in text else "3d"
+                rows = [r for r in p.ROWS if r[1] == dim]
+                return [[struct.unpack("<I", struct.pack("<f", p.expected(dim, s, o)))[0] for _n, _d, s, o in rows]]
+
+            def close(self):
+                self.closed = True
+
+        fake = FakeOracle()
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 0)
+        self.assertTrue(fake.closed)
+        self.assertIn("device: fake-gpu", out)
+
+    def test_hw_closes_on_mismatch(self):
+        class FakeOracle:
+            device = "fake-gpu"
+            arch = "gfx1036"
+            closed = False
+
+            def run(self, kernels):
+                return [[0] * kernels[0].words]
+
+            def close(self):
+                self.closed = True
+
+        fake = FakeOracle()
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 1)
+        self.assertTrue(fake.closed)
+        self.assertIn("DIFFERS", out)
+
+    def test_hw_closes_on_kernel_rejection(self):
+        class FakeOracle:
+            device = "fake-gpu"
+            arch = "gfx1036"
+            closed = False
+
+            def run(self, kernels):
+                return ["assembler rejected"]
+
+            def close(self):
+                self.closed = True
+
+        fake = FakeOracle()
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 2)
+        self.assertTrue(fake.closed)
+        self.assertIn("kernel rejected", out)
+
+    def test_hw_unavailable_returns_77(self):
+        import contextlib
+        import io
+        from unittest import mock
+        import runner
+
+        buf = io.StringIO()
+        with (
+            mock.patch.object(runner, "open_oracle", side_effect=runner.Unavailable("no device")),
+            mock.patch.object(runner, "Oracle", side_effect=AssertionError("Oracle() called directly")),
+            contextlib.redirect_stdout(buf),
+        ):
+            rc = p.main(["--oracle", "hw"])
+        self.assertEqual(rc, 77)
+        self.assertIn("no device", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
