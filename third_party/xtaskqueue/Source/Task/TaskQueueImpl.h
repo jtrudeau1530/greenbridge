@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "ApiRefState.h"
 #include "AtomicVector.h"
 #include "LocklessQueue.h"
 #include "StaticArray.h"
@@ -49,29 +50,38 @@ public:
     uint32_t __stdcall AddRef()
     {
         ApiRefs::GlobalAddRef();
-        return m_refs++;
+        return m_refState.AddRef();
+    }
+
+    bool TryAddRef() noexcept
+    {
+        // Account globally before publishing the local reference.
+        ApiRefs::GlobalAddRef();
+
+        if (m_refState.TryAddRef())
+        {
+            return true;
+        }
+
+        ApiRefs::GlobalRelease();
+        return false;
     }
 
     uint32_t __stdcall Release()
     {
-        uint32_t refs = --m_refs;
+        const auto result = m_refState.Release();
 
-        // Note: rundown may addref/release as it
-        // progresses, so we guard against redundant
-        // deletes with m_deleting.
-
-        if (refs == 0 && m_deleting.test_and_set() == false)
+        if (result.startRundown)
         {
-            // Hold an extra global ref during destruction to prevent
-            // cascading child releases from bringing g_globalApiRefs
-            // to zero while DLL code is still on the stack.
+            // Keep the global reference count nonzero during teardown.
             ApiRefs::GlobalAddRef();
             RundownObject();
             delete this;
             ApiRefs::GlobalRelease();
         }
+
         ApiRefs::GlobalRelease();
-        return refs;
+        return result.remaining;
     }
 
     HRESULT __stdcall QueryApi(ApiId id, void** ptr)
@@ -109,10 +119,7 @@ protected:
     }
 
 private:
-    std::atomic<uint32_t> m_refs{ 0 };
-    // Explicitly clear: before C++20 a default-constructed atomic_flag has an
-    // unspecified value, and a set flag would make Release() skip deletion.
-    std::atomic_flag m_deleting = ATOMIC_FLAG_INIT;
+    ApiRefState m_refState;
 };
 
 static uint32_t const SUBMIT_CALLBACK_MAX = 32;

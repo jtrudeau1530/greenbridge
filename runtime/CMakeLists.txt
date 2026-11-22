@@ -229,6 +229,14 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(api_ref_state_test PRIVATE
     /W4 /permissive- /utf-8)
+  # Verify global reference accounting during task queue teardown.
+  add_executable(api_global_refs_test test/api_global_refs_test.cpp)
+  target_compile_definitions(api_global_refs_test PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(api_global_refs_test PRIVATE
+    /W4 /permissive- /utf-8)
+  target_link_libraries(api_global_refs_test PRIVATE
+    gta6rt_xtaskqueue)
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
   add_executable(xgameruntime_test
@@ -751,6 +759,10 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
     set_tests_properties(api_ref_state PROPERTIES TIMEOUT 10)
+  endif()
+  if(WIN32 AND TARGET api_global_refs_test)
+    add_test(NAME api_global_refs COMMAND api_global_refs_test)
+    set_tests_properties(api_global_refs PROPERTIES TIMEOUT 10)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
