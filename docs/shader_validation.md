@@ -1484,6 +1484,40 @@ the Windows check's `attr0.x` code (with `v40`, past the template's 8 VGPRs) giv
 P0 = 0 and P10 = 4.0 for the single parameter, and a second patch with another constant changes the result (nothing
 is cached).
 
+#### Helper lanes at a triangle edge (`tools/ps_helper_probe.py`, SHADER-681)
+
+What a pixel wave does with the helper lanes of a partly covered 2x2 quad, which the translator's EXEC model and
+`s_wqm` lowering depend on (`docs/design.md` row "Whole-quad mode"). The probe draws one triangle, (-1, -1), (1.3, -1),
+(-1, 0.9), into a 16 x 16 target, so its edge cuts quads; the varying is the vertex position, so each lane's
+interpolated value is its own pixel centre. The template pixel shader takes a derivative, so the driver builds it as
+a shader that needs quads. Seven wave64 programs replace the pixel shader. A helper is never written to the target,
+so a covered lane of the same quad reads the helper's registers through DPP `quad_perm` and exports them.
+
+```sh
+LEONIDA_VK_DEVICE=raphael python -I tools/ps_helper_probe.py --build <runtime build> [--json out.json]
+```
+
+On the Ryzen 7 9800X3D iGPU (`RADV RAPHAEL_MENDOCINO`, gfx1036, Mesa 26.3.1): 137 covered pixels in three waves,
+25 (covered lane, helper neighbour) pairs, and all 10 checks hold in three runs, with identical words except an
+unwritten helper register:
+
+| check | gfx1036 |
+|---|---|
+| entry EXEC | exactly the covered pixels: helpers start off |
+| `s_wqm_b64 exec, exec` | turns on exactly the quads with a covered pixel |
+| wave layout | quads packed from lane 0; a quad with no covered pixel is not in the wave |
+| lane order in a quad | lane % 4 = (x & 1) + 2 (y & 1): top-left, top-right, bottom-left, bottom-right |
+| a helper's `v_interp_p1/p2_f32` after `s_wqm` | its own pixel centre, extrapolated (error 1.64e-4, as covered) |
+| a helper's v0/v1 without `s_wqm` | already its own pixel's I/J (to 7e-5; I + J > 1, outside the triangle) |
+| a helper's VGPR without `s_wqm` | not written (an unwritten register, different in every run) |
+| EXEC without `s_wqm` | stays the entry mask |
+| DPP without `fi` from an inactive lane | leaves the destination unchanged |
+| `exp mrt0 ... done vm` with helpers on in EXEC | writes no pixel outside the triangle |
+
+The last row is what the driver's own code relies on: RADV compiles the template as `s_wqm_b64 exec, exec` at entry,
+then the interpolation and an `exp mrt0 ... done vm` with the helpers still on. The programs are wave64; a wave32
+pixel stage (`RADV_PERFTEST=pswave32`) and GFX11+ exit 77. Not measured: wave32, RDNA1/gfx1013 and the Windows driver.
+
 
 ## Coverage plan and cost
 
