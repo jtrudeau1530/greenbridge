@@ -791,6 +791,8 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_queue_wait_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_queue_wait COMMAND d3d12_queue_wait_test)
     set_tests_properties(d3d12_queue_wait PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    add_test(NAME d3d12_queue_wait_timeout COMMAND d3d12_queue_wait_test --timeout-control)
+    set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 WILL_FAIL TRUE TIMEOUT 10)
 
     # GCL8's QueryInterface and its one method need an allocator and a list, not a Vulkan device.
     add_executable(d3d12_gcl8_test test/d3d12_gcl8_test.cpp)
