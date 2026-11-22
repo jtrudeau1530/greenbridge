@@ -62,9 +62,10 @@ class TbufferStoreTranslation(unittest.TestCase):
             f"tbuffer_store_format_x v20, v5, s[0:3], 0{fmt_mod} offen", "s_endpgm"], fssm=CS_FSSM)
 
     def test_format_outside_formats_is_unsupported(self):
-        # BUF_FMT_8_UINT is a GFX10 format the FORMATS table has no encoder for: reported, never guessed.
+        # BUF_FMT_8_USCALED is a GFX10 format the FORMATS table has no encoder for: reported, never guessed.
+        # (BUF_FMT_8_UINT was the example until #1871 added the measured 8/16-bit UINT/SINT formats.)
         with self.assertRaises(rdna2spirv.Unsupported):
-            self.store(" format:[BUF_FMT_8_UINT]")
+            self.store(" format:[BUF_FMT_8_USCALED]")
 
     def test_default_format_is_one_unorm_byte(self):
         # No modifier is GFX10's default, BUF_FMT_8_UNORM: 1.0 is 0xff in the low byte, the other three kept.

@@ -551,7 +551,10 @@ int main(int argc, char** argv) {
         else if (a == "--cache-feedback") cache_feedback = true;
         else if (a == "--isolate") isolate = true;
         else if (a == "--isolate-child") iso_child = true;   // internal: the parent's child runs
-        else if (a == "--isolate-batch") isolate_batch = std::max<size_t>(1, std::stoull(val()));
+        else if (a == "--isolate-batch") {   // parsed like the other numbers (#1735); at least one per batch
+            valid = number(isolate_batch);
+            isolate_batch = std::max<size_t>(1, isolate_batch);
+        }
         else cache_path = a;
         if (!valid) {
             std::fprintf(stderr, "%s requires a valid value\n", a.c_str());
