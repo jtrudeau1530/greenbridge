@@ -260,7 +260,7 @@ paragraph). Every call below except the two barriers is the fallback branch of a
 
 | RVA | Vtable offset | Console slot → PC method | Observed arguments | Confidence |
 |---:|---:|---|---|---|
-| `0x2171e` | `+0xd0` | 26 → 26 `ResourceBarrier` | `NumBarriers=1`, `&{Type=2 (UAV), Flags=0, pResource=null}` | **Measured**: the shape is a global UAV barrier; slot 26 is the SDK `ResourceBarrier` |
+| `0x2171e` | `+0xd0` | 26 → 26 `ResourceBarrier` | `NumBarriers=1`, `&{Type=2 (UAV), Flags=0, pResource=null}` | **Measured**: the shape is a global UAV barrier; slot 26 is the SDK `ResourceBarrier`; the site is gated (section 3.3b), so the call never fires in the shipping DLL |
 | `0x1d9cb` | `+0x70` | 14 → 14 `Dispatch` | `(1, 1, 1)` | **Measured**: exact `Dispatch` shape |
 | `0x1d85e` | `+0xc8` | 25 → 25 `SetPipelineState` | `RCX=list`, `RDX=[rdi+8]`: loaded at `0x1d7fa` and not changed before the call; the inline branch (`0x1d822`–`0x1d850`) copies 28 bytes from that object's `+0x10` | **Measured**: RDX is the pipeline the inline branch reads |
 | `0x1d7f4` | `+0x108` | 33 → 29 `SetComputeRootSignature` | one argument, `RDX=[rcx]`: the pointer stored next to the pipeline (`[rdi]`; the pipeline is `[rdi+8]`) | **Measured** shape; agrees with slot 33 in section 3.5a |
@@ -322,6 +322,71 @@ That byte is one of seven bools at `0xd7738`–`0xd773e` in zero-initialised `.b
 `.text` are about 50 RIP-relative reads (`cmp`, `movzx`); there is no write and no export that points there. So in
 the shipping DLL the label path is unreachable unless something writes that byte through a computed pointer, and
 the barrier path is the one that runs.
+
+### 3.3b The batched build validates the geometry descriptors on the CPU first
+
+A logging-proxy harness (section 7, item 1) never reached the first list-vtable call: both runs of the
+batched export faulted at RVA `0x142d3`, before the object received in the command-list parameter was
+touched once. The reason is a CPU-side validation of the build items that the section 7 descriptor
+guidance did not cover. The batched entry (`0x216a0`) reaches it through `0xe6a0` (call at `0x216dc`),
+the packet processor `0xcc00` (call at `0xe781`) and a per-record validator at `0x14270` (call at
+`0xce18`; a second call site exists at `0x11c25`). The processor walks the batched descriptor's 80-byte
+build items (item `i` at descriptor `+ i*0x50`) and routes each by the dword at its `+0x08` — the
+pointer's `+0x00` at the validator: kind 1 reaches the validator, kind 0 goes through `0xc820`/`0xc780`
+instead, other values take an error path (`0xd52f`). The validator reads, from the pointer it receives
+(all **measured** in the static disassembly):
+
+| Offset | Field | Check |
+|---:|---|---|
+| `+0x08` | descriptor count | loop bound |
+| `+0x0c` | elements layout (`D3D12_ELEMENTS_LAYOUT`) | 0 = inline array of 0x38-byte records, 1 = array of pointers to records; other values print `D3D12 XDXR Error: Unexpected value for D3D12_ELEMENTS_LAYOUT` and throw `E_INVALIDARG` |
+| `+0x10` | descriptor base | mode 0: record `i` at `base + i*0x38`; mode 1: record `i` at `[base + i*8]` |
+| record `+0x00` | geometry type (`D3D12_RAYTRACING_GEOMETRY_TYPE`) | 0 = triangles, 1 = AABBs; others print `D3D12 XDXR Error: Unrecognized D3D12_RAYTRACING_GEOMETRY_TYPE` and throw `E_INVALIDARG` |
+| record `+0x08` | AABB count (type 1) | accumulated |
+| record `+0x10` | index format (type 0) | at most `0x39` and in the bitset `0x0220040000000000` — `DXGI_FORMAT_R32_UINT` (42), `DXGI_FORMAT_R16_TYPELESS` (53), `DXGI_FORMAT_R16_UINT` (57); others print `D3D12 XDXR Error: Unsupported index buffer format provided` and throw `E_NOTIMPL` |
+| record `+0x18` | index count (type 0, format ≠ 0) | exact multiple of 3; otherwise prints `D3D12 XDXR Error: Triangle index count must be a multiple of 3 when an index buffer is provided` and throws `E_INVALIDARG` |
+| record `+0x1c` | vertex count (type 0, format = 0) | checked instead of the index count, also an exact multiple of 3; otherwise prints `D3D12 XDXR Error: Triangle vertex count must be a multiple of 3 when no index buffer is provided` and throws `E_INVALIDARG` |
+
+The fault that stopped the dynamic runs is the base dereference itself: at `0x142d3` (`mov ecx,[rdx]`,
+`rdx = base + i*0x38` in the inline mode) the record's type word is read with a CPU load, so a descriptor
+whose base is a GPU address that is not CPU-readable faults there. For a replacement runtime this is a
+measured host-side contract: the geometry descriptors must be backed by CPU-readable memory, not only by
+the GPU arena. The validator returns the summed primitive count (the triangle counts ÷ 3 plus the AABB
+counts), which the packet processor stores (`0xce1d`). It reads nothing past record `+0x1f`; what the
+`+0x20..+0x37` tail of a record is used for is open — the dynamic runs stopped at the first record read.
+
+The same static pass settles what the first list calls would have been, and finds that three of the sites
+section 3.3 and 3.3a list or miss are gated by the zero-initialised bytes of section 3.3a, so in the
+shipping DLL they never run:
+
+- The `+0xd0` `ResourceBarrier` at `0x2171e` (section 3.3) needs a non-zero item count (`0x216e1`) and the
+  byte at `0xd773c` (`0x216e9`). Its shape stays as measured; in the shipping DLL the call never fires.
+- Slot 90 (`+0x2d0`, call at `0xe836`) is new — it is not in the section 3.3a tail list. Its shape is
+  `(list, p, 0, last)`: `RDX = [item+0x28] + [item+0x54]*4`, where `item` is one 160-byte element of the
+  processor's output array, selected through the dword array beside it, `R9 = 1` on the last iteration,
+  and the element's dword at `+0x9c` is cleared first. The loop is behind the same `0xd773c` byte
+  (`0xe7d0`) and the count check, so it does not run in the shipping DLL either.
+- The direct slot-146 barrier at `0xea99` is behind the adjacent byte `0xd773b` (`0xea41`, after the
+  per-item callback reports true); the wrapper calls at `0xebbb`, `0xec79`, `0xed37` and `0xee17` are not
+  gated by these bytes, and each ends in the measured slot-146 global UAV barrier (section 3.3a).
+
+The path also reads one byte past the seven bools of section 3.3a: `0xd773f` at `0xce3f` and `0x11c35`.
+A linear sweep of `.text` finds no writes to `0xd7738`–`0xd773f` (only `cmp`/`movzx` reads; the two `lea`
+sites take the address of `0xd7740`, one past the last byte), so the read-only range is eight bytes.
+
+With the gated sites removed, the shipping-DLL order for one item is (measured with a postbuild-info
+type of 2, which routes to the `0x1d7c0` worker): the validation above → slot 146 four times through
+the `0xd580` wrapper → the upload function `0x20ea0` (called at `0xee85`; a second site at `0xf0f9`):
+slot 148 for `count * 40` bytes at alignment 16 (`0x20ed6`; the size is
+`lea edx,[rsi+rsi*4]; shl edx,3`), root signature (33), pipeline (25, or its inline write), the
+slot-148 pointer as root SRV (43, or inline), the count as a 32-bit root constant (37), and
+`Dispatch((count+31)/32, 1, 1)` (`0x21054`, or its inline four-word packet) — then the per-entry
+worker `0x1d7c0` (called at `0x217d0`) whose sequence section 3.3 lists, ending in the slot-146
+barrier at `0x1da02`. Postbuild-info types 0 and 3 route to the mirrored worker `0x1d540` (called at
+`0x217e2`). Slot 148 is therefore asked before the per-entry dispatch, and the first dispatch on the
+path is the upload function's own — the two refinements to section 7's prediction. The `+0x490` barrier
+arguments (one global UAV group `{0x80, 0x80, 0x10, 0x10}`) and slot 148's `count * 40`/16 are confirmed
+by both passes (D3D-293's static disassembly and this section's independent iced-x86 re-check).
 
 ### 3.4 The object is wider than the public vtable
 
@@ -691,16 +756,22 @@ return has been measured.
 The executable is absent, so the next step should use the one shipped client that exists rather
 than invent slots.
 
-1. **Confirm sections 3.3 and 3.3a with a logging proxy.** Create a test-only command
+1. **Confirm sections 3.3, 3.3a and 3.3b with a logging proxy.** Create a test-only command
    list whose public GCL6/GCL8 vtable logs `(slot, raw arguments)` and whose tail is a page of
    logged unknown slots. Pass it to
    `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X` with a minimal non-empty
-   descriptor. The `+0xd0` barrier and `+0x70` dispatch should be observed first; the `+0x490`
-   call should arrive with one global UAV barrier group (section 3.3), and slot 148 should be
-   asked for `count * 40` bytes. Keep the cursor at its limit so every call reaches the vtable. If the
-   builder validates its inputs before reaching the dispatch, use a descriptor shaped like the
-   one its own `GetRaytracingAccelerationStructurePrebuildInfo` accepts (prior art measured a
-   3,000-vertex triangle geometry; the prebuild answer is 204,800 bytes / 128,704 scratch).
+   descriptor. The proxy ran twice; both runs stopped one step short, at the CPU-side geometry
+   validation of section 3.3b (fault at `0x142d3`), before the first list call. The static pass
+   settled what the first calls will be: not the `+0xd0` barrier — it is gated and never fires
+   in the shipping DLL — but the wrapper's slot-146 barriers, then the upload function's slot
+   148 for `count * 40` bytes and its own `Dispatch((count+31)/32, 1, 1)`, and only then the
+   per-entry `Dispatch(1,1,1)` of section 3.3; the other new slot, 90, is gated too
+   (section 3.3b). Keep the cursor at its limit so every call reaches the vtable, and back the
+   geometry descriptors with CPU-readable memory holding valid 0x38-byte records per section 3.3b
+   (type 0, index format 0, vertex count a multiple of 3 — prior art measured a 3,000-vertex
+   triangle geometry; the prebuild answer is 204,800 bytes / 128,704 scratch). A descriptor shaped
+   like the one `GetRaytracingAccelerationStructurePrebuildInfo` accepts is not enough by itself,
+   because the validation reads the records with CPU loads.
 2. **GCL8 is now implemented** in PR #164 (public slot 81, recorded/reset, CTest 9/9); the
    builder's `+0x490` is `Barrier` (section 3.3), and its slot 148 needs an upload allocator (section 3.3a).
 3. **When the executable appears, trace the four creation calls first.** Per-slot counters on
@@ -748,6 +819,13 @@ the SDK; the console GUIDs are attributed to SCARAB in
   `call [reg+disp]` sites in the rest of `.text` whose object register holds the list pointer,
   each read with the argument registers set before it and the inline write it falls back from;
   the barrier constant is the 16 bytes at RVA `0xcdf60` (file offset from the section table).
+- Section 3.3b and the gated sites: a second, independent disassembly pass (iced-x86, run for the
+  D3D-293 measurement) of the batched entry, the validation chain (`0xe6a0`, `0xcc00`, `0x14270`),
+  the upload function `0x20ea0` and the wrapper call sites; the dynamic side is D3D-293's
+  logging-proxy harness, whose two runs faulted at `0x142d3` before the first list call. The
+  quoted validation messages are the DLL's own wide strings at the `.rdata` addresses the throw
+  paths load. The gate-byte sentence is a linear sweep of `.text` collecting memory operands
+  targeting `0xd7738`–`0xd773f`.
 - Public slots: parse the `MIDL_INTERFACE`/`virtual` declarations in `d3d12.h`; the counts in
   section 2 include the seven `IUnknown`+`ID3D12Object` slots. Cross-check selected values with
   `python tools/d3d12_xs_surface.py --check --sdk` (116 slots, 83 standard GUIDs) and
