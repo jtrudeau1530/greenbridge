@@ -242,6 +242,76 @@ class VSqrtF16Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr16(self, index: int, half: HalfSelect) -> int:
+        dword = self.vgprs[index]
+        lo, hi = dword_to_f16_halves(dword)
+        return hi if half == HalfSelect.HI else lo
+
+    def set_vgpr16(self, index: int, half: HalfSelect, bits: int) -> None:
+        dword = self.vgprs[index]
+        lo, hi = dword_to_f16_halves(dword)
+        if half == HalfSelect.HI:
+            self.vgprs[index] = f16_halves_to_dword(lo, bits & 0xFFFF)
+        else:
+            self.vgprs[index] = f16_halves_to_dword(bits & 0xFFFF, hi)
+
+    def get_sgpr16(self, index: int, half: HalfSelect) -> int:
+        dword = self.sgprs[index]
+        lo, hi = dword_to_f16_halves(dword)
+        return hi if half == HalfSelect.HI else lo
+
+    def set_sgpr16(self, index: int, half: HalfSelect, bits: int) -> None:
+        dword = self.sgprs[index]
+        lo, hi = dword_to_f16_halves(dword)
+        if half == HalfSelect.HI:
+            self.sgprs[index] = f16_halves_to_dword(lo, bits & 0xFFFF)
+        else:
+            self.sgprs[index] = f16_halves_to_dword(bits & 0xFFFF, hi)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_sqrt_f16."""
+
+    def resolve_operand(self, op: VOP3Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, RegHalf):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr16(op.source.index, op.source.half)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr16(op.source.index, op.source.half)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal16):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VSqrtF16Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s0_raw = self.resolve_operand(instr.src0, state)
+
+        # Computation phase
+        result_bits = oracle_v_sqrt_f16(
+            src0_bits=s0_raw,
+            abs0=instr.src0.abs_mod,
+            neg0=instr.src0.neg_mod,
+            clamp=instr.clamp,
+        )
+
+        # Write-back phase
+        state.set_vgpr16(instr.dst.index, instr.dst.half, result_bits)
+        return result_bits
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -415,6 +485,81 @@ class TestSymbolicAST(unittest.TestCase):
             VOP3Operand(RegHalf(2, RegType.VGPR, HalfSelect.HI)),
         )
         self.assertEqual(i1, i2)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_to_vgpr_lo(self) -> None:
+        self.state.set_vgpr16(2, HalfSelect.LO, FOUR_F16)
+        instr = VSqrtF16Instruction(
+            dst=RegHalf(0, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(RegHalf(2, RegType.VGPR, HalfSelect.LO)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, TWO_F16)
+        self.assertEqual(self.state.get_vgpr16(0, HalfSelect.LO), TWO_F16)
+
+    def test_scalar_vgpr_hi_preserves_lo(self) -> None:
+        # Prepopulate v0 with 0xAAAA in lo, 0x5555 in hi
+        self.state.vgprs[0] = 0x5555AAAA
+        self.state.set_vgpr16(4, HalfSelect.LO, NINE_F16)
+        instr = VSqrtF16Instruction(
+            dst=RegHalf(0, RegType.VGPR, HalfSelect.HI),
+            src0=VOP3Operand(RegHalf(4, RegType.VGPR, HalfSelect.LO)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, THREE_F16)
+        # Hi half updated to THREE_F16, Lo half preserved (0xAAAA)
+        self.assertEqual(self.state.get_vgpr16(0, HalfSelect.HI), THREE_F16)
+        self.assertEqual(self.state.get_vgpr16(0, HalfSelect.LO), 0xAAAA)
+
+    def test_scalar_sgpr_source(self) -> None:
+        self.state.set_sgpr16(8, HalfSelect.LO, ONE_F16)
+        instr = VSqrtF16Instruction(
+            dst=RegHalf(1, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(RegHalf(8, RegType.SGPR, HalfSelect.LO)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, ONE_F16)
+        self.assertEqual(self.state.get_vgpr16(1, HalfSelect.LO), ONE_F16)
+
+    def test_scalar_literal_source(self) -> None:
+        instr = VSqrtF16Instruction(
+            dst=RegHalf(3, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(Literal16.from_float(0.25)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, HALF_F16)
+        self.assertEqual(self.state.get_vgpr16(3, HalfSelect.LO), HALF_F16)
+
+    def test_scalar_with_modifiers_and_clamp(self) -> None:
+        self.state.set_vgpr16(5, HalfSelect.LO, FOUR_F16 | SIGN_MASK)  # -4.0
+        # abs clears sign bit, then sqrt(4.0) = 2.0, clamp limits to 1.0
+        instr = VSqrtF16Instruction(
+            dst=RegHalf(6, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(RegHalf(5, RegType.VGPR, HalfSelect.LO), abs_mod=True),
+            clamp=True,
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, ONE_F16)
+        self.assertEqual(self.state.get_vgpr16(6, HalfSelect.LO), ONE_F16)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.set_vgpr16(0, HalfSelect.LO, 0x4880)  # 9.0
+            instr = VSqrtF16Instruction(
+                dst=RegHalf(1, RegType.VGPR, HalfSelect.LO),
+                src0=VOP3Operand(RegHalf(0, RegType.VGPR, HalfSelect.LO)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
 
 
 if __name__ == "__main__":
