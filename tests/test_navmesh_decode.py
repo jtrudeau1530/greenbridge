@@ -551,6 +551,25 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(doc["resources"]["psin"]["incomplete"], 1)
         self.assertEqual(doc["psin"]["complete"], 0)
 
+    def test_header_only_psin_does_not_swallow_the_next_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            with open(os.path.join(carve, "000000000000.bin"), "wb") as f:
+                f.write(struct.pack(">4sI", b"PSIN", 64) + bytes(56))
+            with open(os.path.join(carve, "000000000040.bin"), "wb") as f:
+                f.write(struct.pack(">4sI", b"PSIN", 64) + bytes(56) + struct.pack(">4sI", b"SECT", 64) + bytes(56))
+            out = os.path.join(tmp, "out.json")
+            proc = subprocess.run([sys.executable, "-I", TOOL, carve, "--quiet", "--out", out],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+
+        self.assertEqual(doc["resources"]["psin"]["resources"], 2)
+        self.assertEqual(doc["resources"]["psin"]["incomplete"], 1)
+        self.assertEqual(doc["psin"]["complete"], 1)
+
     def test_carved_directory_mode_and_window_limit(self):
         sector = (260 << 9) | 250
         p0, p1 = build_0drp(total_size=0x1000, split_at=0x1000, node_count=2, override_n4e=0)

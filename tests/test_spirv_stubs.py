@@ -135,16 +135,28 @@ class ShaderMetaTests(unittest.TestCase):
 
 
 class MalformedIndexTest(unittest.TestCase):
-    def test_bad_index_json_is_one_error_not_a_traceback(self):
+    def run_tool(self, contents):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
-                f.write("not json")
+                f.write(contents)
             tool = os.path.join(ROOT, "tools", "spirv_stubs.py")
-            p = subprocess.run([sys.executable, "-I", tool, tmp], capture_output=True, text=True)
+            return subprocess.run([sys.executable, "-I", tool, tmp], capture_output=True, text=True)
+
+    def test_bad_index_json_is_one_error_not_a_traceback(self):
+        p = self.run_tool("not json")
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("cannot read", p.stderr)
         self.assertIn("index.json", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
+
+    def test_valid_json_of_the_wrong_shape_is_one_error(self):
+        for contents in ("5", "[]"):
+            with self.subTest(contents=contents):
+                p = self.run_tool(contents)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("cannot read", p.stderr)
+                self.assertIn("expected a JSON object", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
 
 
 if __name__ == "__main__":

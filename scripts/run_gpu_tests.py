@@ -440,6 +440,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
+              "ps_gather_wrap": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm"}
 
 
@@ -631,10 +632,24 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_bounds", "cs_cmpx_class_f32"):
-            # These per-lane results do not require a particular subgroup width.
+        elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail",
+                      "cs_cmpx_class_f32"):
+            # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
+            # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
+            # cs_cmpx_class_f32 is per-lane and needs no particular subgroup width either.
+            # The other four pin the SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm).
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
-            want = CMPX_CLASS_WORDS if name == "cs_cmpx_class_f32" else [0x12345678, 0x12345678, 0, 0xEEEEEEEE]
+            want = {
+                "cs_bounds": [0x12345678, 0x12345678, 0, 0xEEEEEEEE],
+                "cs_smem_bounds": [0, 0x5EED0010, 0x5EED000C, 0, 0x5EED000C, 0x5EED0010, 0, 0],
+                "cs_smem_stride_align": [0x5EED0010, 0, 0, 0x5EED0000, 0x5EED0000, 0x5EED0000, 0x5EED0000,
+                                         0x5EED0004],
+                # never run with a translator that zero-extends the s_load immediate (reads 4 GiB past the heap)
+                "cs_smem_sload_neg": [0x5EED0004, 0x5EED0000, 0x5EED0004, 0x5EED0004, 0x5EED0008, 0x5EED000C,
+                                      0xEEEEEEEE, 0xEEEEEEEE],
+                "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
+                "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
+            }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
             results.append((name, rc == 0 and vals == want,
@@ -673,7 +688,7 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_exec_const", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
 
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
@@ -694,6 +709,8 @@ def run_suite(a, work: str) -> int:
                 "cs_w32_permute": [218, 29, 8, 211, 0, 15, 99, 15],
                 # SHADER-85: ds_read_u8/i8_d16[_hi] (cs_w32_lds_u8_d16.asm header)
                 "cs_w32_lds_u8_d16": [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234],
+                # constant EXEC masks (cs_exec_const.asm): each lane takes its own bit of the constant
+                "cs_exec_const": [16, 8, 2, 16, 0, 16],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
                 "cs_wm_half_ops": [32, 16, 16, 0, 16],
                 "cs_wm_half_cmp": [1, 0, 1, 1],
@@ -738,7 +755,7 @@ def run_suite(a, work: str) -> int:
             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
             wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32",
-                                  "cs_w32_partial_scmp") and not emulated and not partial
+                                  "cs_w32_partial_scmp", "cs_exec_const") and not emulated and not partial
 
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
@@ -945,6 +962,17 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
+
+    if a.filter and not results:   # the filter matched only inputs/partners: say so rather than "0/0 passed"
+        names = [os.path.splitext(f)[0] for f in asm_files]
+        partners = {os.path.splitext(f)[0] for f in DRAWN_WITH.values()} | set(TEXTURE_MIP_DEPENDENCIES)
+        shown = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
+        role = "partners built for other tests" if partners.issuperset(names) else "inputs without a GPU test row"
+        hint = ("; cs_bench_* shaders are benchmark inputs, run them with the benchmark tool"
+                if all(n.startswith("cs_bench_") for n in names) else "")
+        print(f"error: --filter {a.filter!r} selected {shown} but no runnable GPU test cases ({role}){hint}",
+              file=sys.stderr)
+        return 2
 
     print("\n=== GPU TEST RESULTS ===")
     passed = skipped = 0

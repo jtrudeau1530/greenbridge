@@ -4,7 +4,7 @@
 // from its descriptor tables; this one is handed them as push constants: the eight dwords of a heap slot and the
 // four of a sampler slot. It looks both up in the hash table at set 0 binding 2 (FNV-1a over the eight key dwords,
 // eight probes, a miss is index 0; an S# key is its four dwords and four of 0xFFFFFFFF), samples the 2D image
-// array at binding 0 (or a volume at binding 6) with the sampler array at binding 1. For 2D it writes
+// array at binding 0 (a 2D array at binding 3, or a volume at binding 6) with the sampler array at binding 1. For 2D it writes
 //   result[first + i] = the texel at ((i % 8) + 0.5, (i / 8) + 0.5) / 8 + (1, 0), as RGBA8 with red in the low byte.
 // With mode 1 the image is an integer one (an R8G8B8A8_UINT view, read through the same binding as a
 // utexture2D), and each channel is stored as its value clamped to 255: a UINT border colour shows as 0 or 1.
@@ -40,6 +40,7 @@ layout(set = 0, binding = 21) uniform texture2DMSArray ms_arrays[];
 layout(set = 0, binding = 0) uniform texture2D images[];
 layout(set = 0, binding = 0) uniform utexture2D uimages[];
 layout(set = 0, binding = 1) uniform sampler samplers[];
+layout(set = 0, binding = 3) uniform texture2DArray layers[];
 layout(set = 0, binding = 6) uniform texture3D volumes[];
 #endif
 layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
@@ -90,6 +91,9 @@ void main() {
         // A 4x4x4 grid, offset from nearest-sampling boundaries at both 8x8x4 and 4x4x2.
         const vec3 uvw = (vec3(i % 4, (i / 4) % 4, i / 16) + 0.625) / 4.0;
         result[pc.first + i] = packUnorm4x8(textureLod(sampler3D(volumes[image], samplers[smp]), uvw, 0.0));
+    } else if ((pc.tsharp[3] >> 28) == 13u) {
+        const vec3 coord = vec3(uv, float(i / 32u));  // read both layers of the array SRV
+        result[pc.first + i] = packUnorm4x8(textureLod(sampler2DArray(layers[image], samplers[smp]), coord, 0.0));
     } else if (pc.mode == 1) {
         const uvec4 t = min(textureLod(usampler2D(uimages[image], samplers[smp]), uv, 0.0), uvec4(255));
         result[pc.first + i] = t.r | (t.g << 8) | (t.b << 16) | (t.a << 24);

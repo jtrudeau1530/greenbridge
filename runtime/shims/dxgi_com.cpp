@@ -21,23 +21,25 @@ void stub(const char* method) {
 
 VkFormat dxgi_to_vk_format(DXGI_FORMAT fmt) {
     switch (fmt) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
     case DXGI_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
-    case DXGI_FORMAT_B8G8R8A8_UNORM:
-    default: return VK_FORMAT_B8G8R8A8_UNORM;
+    default: return VK_FORMAT_UNDEFINED;
     }
 }
 
 DXGI_FORMAT vk_to_dxgi_format(VkFormat fmt) {
     switch (fmt) {
+    case VK_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
     case VK_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
     case VK_FORMAT_R8G8B8A8_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-    case VK_FORMAT_B8G8R8A8_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return DXGI_FORMAT_R10G10B10A2_UNORM;
     case VK_FORMAT_R16G16B16A16_SFLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case VK_FORMAT_B8G8R8A8_UNORM:
-    default: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
     }
 }
 
@@ -110,7 +112,12 @@ public:
         const std::uint32_t w = desc.Width ? desc.Width : 256u;
         const std::uint32_t h = desc.Height ? desc.Height : 256u;
         const std::uint32_t count = desc.BufferCount ? desc.BufferCount : 2u;
-        if (!swapchain_.create(hwnd, w, h, dxgi_to_vk_format(desc.Format), count)) return false;
+        VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
+        if (desc.Format != DXGI_FORMAT_UNKNOWN) {
+            vk_fmt = dxgi_to_vk_format(desc.Format);
+            if (vk_fmt == VK_FORMAT_UNDEFINED) return false;
+        }
+        if (!swapchain_.create(hwnd, w, h, vk_fmt, count)) return false;
         register_buffers();
         std::uint32_t idx = 0;
         return swapchain_.acquire_next_image(idx);
@@ -183,10 +190,14 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT) override {
+        VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
+        if (fmt != DXGI_FORMAT_UNKNOWN) {
+            vk_fmt = dxgi_to_vk_format(fmt);
+            if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_UNSUPPORTED;
+        }
         unregister_buffers();
         const std::uint32_t w = width ? width : swapchain_.extent().width;
         const std::uint32_t h = height ? height : swapchain_.extent().height;
-        const VkFormat vk_fmt = (fmt != DXGI_FORMAT_UNKNOWN) ? dxgi_to_vk_format(fmt) : VK_FORMAT_UNDEFINED;
         if (!swapchain_.resize(w, h, vk_fmt, count)) return E_FAIL;
         register_buffers();
         std::uint32_t next = 0;

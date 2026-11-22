@@ -118,6 +118,24 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertIsNone(row["stored"])
         self.assertEqual(row["size"], 0x80)
 
+    def test_out_and_csv_in_missing_folders_are_created(self):
+        # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
+        # FileNotFoundError traceback and lost the index.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=5))
+        out = os.path.join(self.root, "no", "such", "index.json")
+        csv_path = os.path.join(self.root, "also", "missing", "index.csv")
+        self.run_tool(folder, "--out", out, "--csv", csv_path, "--pattern", "*.bin")
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["page_counts"], {"5": 1})
+        with open(csv_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("0DRP@16", lines[1])
+
     def test_not_an_rpf(self):
         path = os.path.join(self.root, "not.rpf")
         with open(path, "wb") as f:

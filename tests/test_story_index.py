@@ -227,11 +227,25 @@ class ArchiveTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout, "")
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc["summary"]["signatures"]["psin"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["page-directory"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["rsc8"]["files"], 1)
+
+    def test_unwritable_or_bad_output_path_fails_before_the_scan(self):
+        for out in (os.path.join(self.root, "no_such_folder", "x.json"),
+                    os.path.join(self.root, "out.txt"),
+                    self.root):
+            with self.subTest(out=out):
+                p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "out.txt")))
 
     def test_directory(self):
         folder = os.path.join(self.root, "carved")

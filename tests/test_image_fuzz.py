@@ -70,6 +70,43 @@ def test_pixel_shader_is_tabbed_and_carries_the_size():
     assert "\tv_mul_f32_e32 v2, 16.0, v2" in asm and "\tv_mul_f32_e32 v3, 8.0, v3" in asm
 
 
+@pytest.mark.parametrize("mask,want", [
+    (0x1, [10.0, 2.0, 3.0, 4.0]),
+    (0x2, [20.0, 2.0, 3.0, 4.0]),
+    (0x5, [10.0, 30.0, 3.0, 4.0]),
+    (0xa, [20.0, 40.0, 3.0, 4.0]),
+    (0xf, [10.0, 20.0, 30.0, 40.0]),
+])
+def test_dmask_packs_selected_components_and_preserves_unwritten_registers(mask, want):
+    assert imf.masked_components([10.0, 20.0, 30.0, 40.0], mask) == want
+
+
+@pytest.mark.parametrize("mask", range(1, 16))
+def test_pixel_shader_uses_the_requested_dmask(mask):
+    asm = imf.pixel_shader(16, 8, mask)
+    assert f"dmask:0x{mask:x}" in asm
+    for reg, value in enumerate((1.0, 2.0, 3.0, 4.0), 4):
+        assert f"v_mov_b32_e32 v{reg}, {value}" in asm
+
+
+def test_dmask_schedule_covers_each_format_and_keeps_full_mask_first():
+    formats = tuple(imf.FORMATS)
+    pairs = {(formats[i % len(formats)], imf.DMASKS[i % len(imf.DMASKS)]) for i in range(60)}
+    assert imf.DMASKS[0] == 0xf
+    assert pairs == {(fmt, mask) for fmt in formats for mask in range(1, 16)}
+
+
+def test_compare_detects_wrong_dmask_order_and_unwritten_register():
+    width = height = 8
+    texels = struct.pack("<4f", 10.0, 20.0, 30.0, 40.0) * (width * height)
+    got = [10.0, 30.0, 3.0, 4.0] * (imf.DRAW * imf.DRAW)
+    assert imf.compare("R32G32B32A32_SFLOAT", texels, width, height, got, 0x5) == []
+    got[1] = 20.0  # wrong component instead of B
+    got[6] = 30.0  # second pixel: unwritten register changed
+    problems = imf.compare("R32G32B32A32_SFLOAT", texels, width, height, got, 0x5)
+    assert [(p[0], p[1]) for p in problems] == [(0, 0), (1, 0)]
+
+
 def test_tsharp_word1_carries_the_format_and_the_size():
     rng = random.Random(3)
     for name, (_, code, bpp, _) in imf.FORMATS.items():

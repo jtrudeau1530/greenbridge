@@ -263,6 +263,18 @@ class ParseFileTests(unittest.TestCase):
         self.assertEqual([i["pc"] for i in info["insns"]], [0x100, 0x102, 0x104])
         self.assertEqual(info["invalid"], 1)
 
+    def test_tab_between_mnemonic_and_operands(self):
+        path = self.write(
+            "; sample code 0x0..0x4 (header)\n"
+            "\ts_mov_b32\ts3, 1 ; encoding: [0x81,0x00,0x83,0xbe]\n"
+        )
+        ins = shader_ir.parse_file(path)["insns"][0]
+        self.assertEqual(ins["op"], "s_mov_b32")
+        self.assertEqual(ins["args"], [
+            {"k": "sgpr", "r": 3, "n": 1, "neg": False, "abs": False},
+            {"k": "imm", "v": 1},
+        ])
+
     def test_file_without_a_header_starts_at_zero(self):
         path = self.write("\tv_mov_b32 v0, v1 ; encoding: [0xaa,0xbb]\n")
         info = shader_ir.parse_file(path)

@@ -420,7 +420,7 @@ private:
         if (swapchain_) fn_.destroy_swapchain(device_, swapchain_, nullptr);
         destroy_offscreen();
         swapchain_ = next;
-        format_ = chosen.format;
+        format_ = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : chosen.format;
         surface_extent_ = ext;
         extent_ = (width > 0 && height > 0) ? VkExtent2D{width, height} : ext;
 
@@ -428,7 +428,8 @@ private:
         fn_.get_images(device_, swapchain_, &img_count, nullptr);
         images_.resize(img_count);
         fn_.get_images(device_, swapchain_, &img_count, images_.data());
-        if (extent_.width != surface_extent_.width || extent_.height != surface_extent_.height) {
+        if (extent_.width != surface_extent_.width || extent_.height != surface_extent_.height ||
+            format_ != chosen.format) {
             if (!create_offscreen_backbuffers(img_count)) return false;
         }
         current_index_ = 0;

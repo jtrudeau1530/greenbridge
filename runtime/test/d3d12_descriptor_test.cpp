@@ -505,6 +505,31 @@ int main() {
             for (UINT x = 0; x < mip_size; ++x) row[x] = std::uint8_t(208 + y * mip_size + x);
         }
 
+        // Three layers with three distinct mip colours each. The test views start at layer 1 and mip 1.
+        auto array_desc = sampled_desc;
+        array_desc.Width = array_desc.Height = 4;
+        array_desc.DepthOrArraySize = 3;
+        Ref<ID3D12Resource> array_texture;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &array_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&array_texture.p))));
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT array_levels[9]{};
+        device->GetCopyableFootprints(&array_desc, 0, UINT(std::size(array_levels)), 49152, array_levels,
+                                      nullptr, nullptr, nullptr);
+        const auto array_color = [](UINT layer, UINT mip) {
+            return std::array<std::uint8_t, 4>{std::uint8_t(40 + 60 * layer), std::uint8_t(20 + 80 * mip), 64, 255};
+        };
+        for (UINT sub = 0; sub < std::size(array_levels); ++sub) {
+            const auto& placed_array = array_levels[sub];
+            const auto& fp = placed_array.Footprint;
+            EXPECT(placed_array.Offset + UINT64(fp.RowPitch) * fp.Height <= upload_desc.Width);
+            const auto color = array_color(sub / array_desc.MipLevels, sub % array_desc.MipLevels);
+            for (UINT y = 0; y < fp.Height; ++y) {
+                auto* row = static_cast<std::uint8_t*>(mapped) + placed_array.Offset + y * fp.RowPitch;
+                for (UINT x = 0; x < fp.Width; ++x) std::memcpy(row + 4 * x, color.data(), 4);
+            }
+        }
+
         // Shader-visible heaps, start handles in the Xbox shape.
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         const UINT sampler_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
@@ -514,9 +539,11 @@ int main() {
             {0, 3, 0.25f}, {0, 3, 0.75f}, {1, 2, 1.75f}, {0, 2, 1.75f}, {1, 2, 0.75f}, {0, 2, 1.75f, true}
         };
         constexpr UINT first_lod_slot = 10;
-        // Keep the multisample views after all minimum-LOD views and the preceding volume views.
+        constexpr float array_clamps[] = {1.0f, 1.75f, 2.25f};
+        // Keep multisample views after the preceding volume and minimum-LOD views.
         enum : UINT {
-            ms_slot = first_lod_slot + std::size(lod_views), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
+            array_lod_slot = first_lod_slot + std::size(lod_views),
+            ms_slot = array_lod_slot + std::size(array_clamps), ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
@@ -529,6 +556,15 @@ int main() {
         EXPECT(view_cpu && sampler_cpu);
         const auto view_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(view_cpu + i * step)}; };
         const auto view_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(view_cpu + i * step); };
+
+        for (UINT i = 0; i < std::size(array_clamps); ++i) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = array_desc.Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2DArray = {1, 2, 1, 2, 0, array_clamps[i]};
+            device->CreateShaderResourceView(array_texture.p, &srv, view_slot(array_lod_slot + i));
+        }
 
         for (UINT i = 0; i < std::size(lod_views); ++i) {
             const auto& v = lod_views[i];
@@ -1099,6 +1135,15 @@ int main() {
             transition(uint_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(volume.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
         list->ResourceBarrier(UINT(std::size(sampled)), sampled);
+        to_texture.pResource = array_texture.p;
+        for (UINT sub = 0; sub < std::size(array_levels); ++sub) {
+            to_texture.SubresourceIndex = sub;
+            from_upload.PlacedFootprint = array_levels[sub];
+            list->CopyTextureRegion(&to_texture, 0, 0, 0, &from_upload, nullptr);
+        }
+        const auto array_ready = transition(array_texture.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(1, &array_ready);
         if (ms_texture.p) {
             const D3D12_RESOURCE_BARRIER ms_sampled[] = {
                 transition(ms_texture.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -1227,6 +1272,31 @@ int main() {
                 }
             }
         }
+
+        SampleKeys array_keys[std::size(array_clamps)]{};
+        for (UINT i = 0; i < std::size(array_keys); ++i) {
+            array_keys[i] = keys[0];
+            std::memcpy(array_keys[i].tsharp, view_bytes(array_lod_slot + i), sizeof(array_keys[i].tsharp));
+            array_keys[i].first = i * texels;
+        }
+        std::array<std::uint8_t, std::size(array_keys) * bytes> array_pixels{};
+        EXPECT(sample_through_set(d, set0, set0_layout, array_keys, array_pixels.data()));
+        for (UINT i = 0; i < texels; ++i) {
+            const UINT layer = 1 + i / 32;
+            const std::array<std::uint8_t, 4> zero{};
+            const std::array expected{array_color(layer, 1), d.image_view_min_lod ? array_color(layer, 2) : zero, zero};
+            for (UINT view = 0; view < expected.size(); ++view) {
+                const auto* got = array_pixels.data() + view * bytes + i * 4;
+                if (std::memcmp(got, expected[view].data(), 4)) {
+                    std::fprintf(stderr, "array LOD %.2f, layer %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
+                                 array_clamps[view], layer, got[0], got[1], got[2], got[3],
+                                 expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
+                    return 1;
+                }
+            }
+        }
+        std::printf("array minimum LOD: %u samples matched across two layers and three views\n",
+                    UINT(array_pixels.size() / 4));
 
         const D3D12_CPU_DESCRIPTOR_HANDLE volume_slots[] = {view_slot(volume_all), view_slot(volume_mip),
                                                             linear_slot, srgb_slot};
@@ -1466,6 +1536,7 @@ int main() {
         }
 
         upload.reset();
+        array_texture.reset();
         volume.reset();
         typeless_volume.reset();
         typeless_heap.reset();
