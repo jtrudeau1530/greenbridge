@@ -116,6 +116,13 @@ class SimpleNameTest(unittest.TestCase):
             (".?AV?$Sink@P6AXPEAX0@_E@io@@", "io::Sink<void (*)(void *, void *) noexcept>"),
             (".?AV?$Span@AEAY03$$CBH@io@@", "io::Span<int const (&)[4]>"),
             (".?AV?$Ref@AEBQEAUNode@scene@@@scene@@", "scene::Ref<scene::Node * const &>"),
+            # A pointer to a function pointer or to an array goes inside the brackets, not after them.
+            (".?AV?$Cb@PEAP6AXH@Z@lab@@", "lab::Cb<void (**)(int)>"),
+            (".?AV?$Cb@QEAP6AXH@Z@lab@@", "lab::Cb<void (** const)(int)>"),
+            (".?AV?$Cb@P6AP6AXH@ZXZ@lab@@", "lab::Cb<void (*(*)(void))(int)>"),
+            (".?AV?$Cb@AEAY03P6AXH@Z@lab@@", "lab::Cb<void (*(&)[4])(int)>"),
+            (".?AV?$Cb@PEAY03$$CBH@lab@@", "lab::Cb<int const (*)[4]>"),
+            (".?AV?$Arr@$$BY01H@lab@@", "lab::Arr<int [2]>"),
         ):
             with self.subTest(mangled=mangled):
                 self.assertEqual(rtti_scan.simple_name(mangled), name)
@@ -126,6 +133,9 @@ class SimpleNameTest(unittest.TestCase):
             (".?AV<lambda_1>@?1??Run@Task@jobs@@QEAAXH@Z@", "`jobs::Task::Run'::`2'::<lambda_1>"),
             (".?AV<lambda_1>@?0???0Task@jobs@@QEAA@XZ@", "`jobs::Task::Task'::`1'::<lambda_1>"),
             (".?AV<lambda_1>@?0???RTask@jobs@@QEBAHH@Z@", "`jobs::Task::operator()'::`1'::<lambda_1>"),
+            # A conversion operator is named after the type it returns: two of them in one class stay apart.
+            (".?AVX@?0???BObj@@QEBAHXZ@", "`Obj::operator int'::`1'::X"),
+            (".?AVX@?0???BObj@@QEBAP6AXH@ZXZ@", "`Obj::operator void (*)(int)'::`1'::X"),
             (".?AV<lambda_2>@?5???$Each@H@List@core@@SA_NPEBVNode@2@0@Z@", "`core::List::Each<int>'::`6'::<lambda_2>"),
             (".?AV?$Holder@V<lambda_1>@?1??Run@Task@jobs@@QEAAXH@Z@H@jobs@@",
              "jobs::Holder<`jobs::Task::Run'::`2'::<lambda_1>, int>"),
@@ -138,8 +148,10 @@ class SimpleNameTest(unittest.TestCase):
         self.assertEqual(rtti_scan.simple_name(".?ATBits@gfx@@"), "gfx::Bits")
 
     def test_a_form_that_is_not_read_stays_mangled(self):
-        # No made-up scope chain: a pointer to a member function, a template cut short, a name that never ends.
+        # No made-up scope chain: a pointer to a member function, a template cut short, a name that never ends,
+        # an array with a negative number of dimensions or a negative size.
         for mangled in (".?AV?$Bind@P8Task@jobs@@EAAXXZ@jobs@@", ".?AV?$Pool@@", ".?AV?$Pool@H@", ".?AV9@@",
+                        ".?AV?$Arr@$$BY?0H@lab@@", ".?AV?$Arr@$$BY0?1H@lab@@", ".?AV?$Arr@AEAY?0H@lab@@",
                         ".?AV" + "?$A@V" * 5000 + "@"):
             with self.subTest(mangled=mangled[:40]):
                 self.assertEqual(rtti_scan.simple_name(mangled), mangled)
@@ -259,6 +271,7 @@ class RttiScanCoreTest(unittest.TestCase):
         rdata = bytearray(0x1000)
         rdata[0x010:0x010 + len(base)] = base                 # TD at RVA 0x2000
         rdata[0x050:0x050 + len(local)] = local               # TD at RVA 0x2040
+        rdata[0x210:0x21A] = b".?AVNoise@"                    # one '@' after a plain name: not a descriptor name
         rdata[0x080:0x09C] = struct.pack("<IIiiiII", 0x2000, 0, 0, 0, 0, 0, 0)     # BCD of the base
         rdata[0x0A0:0x0BC] = struct.pack("<IIiiiII", 0x2040, 1, 0, 0, 0, 0, 0)     # BCD of the local class
         rdata[0x0C0:0x0C8] = struct.pack("<II", 0x20A0, 0x2080)

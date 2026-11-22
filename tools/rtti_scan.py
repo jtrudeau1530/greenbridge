@@ -116,7 +116,10 @@ _OPERATOR = {"2": " new", "3": " delete", "4": "=", "5": ">>", "6": "<<", "7": "
              "_3": "<<=", "_4": "&=", "_5": "|=", "_6": "^=", "_U": " new[]", "_V": " delete[]"}
 _POINTER = {"P": " *", "Q": " * const", "R": " * volatile", "S": " * const volatile", "A": " &", "B": " & volatile"}
 _QUALIFIERS = re.compile(r"(?: const| volatile)*$")
+_SLOT = "\0"    # in a function or array type: where a further `*`, `&` or qualifier goes, `void (*|)(int)`
 _LOCAL_SCOPE = re.compile(r"\?(?:\d|[B-P][A-P]*@)\?")
+# How a type descriptor's name ends: '@@'; a local scope's function ('@?...Z@', '_E@' when noexcept); a back-reference.
+_NAME_END = re.compile(rb"(?:@@|@\?[\x21-\x7e]*(?:Z|_E)@|@\d+@)\x00$")
 
 
 class _TypeName:
@@ -202,6 +205,8 @@ class _TypeName:
         outer = self.names, self.params
         self.names, self.params = [], []
         name = self.operator() if self.peek() == "?" else self.simple()
+        if name == "operator":
+            raise ValueError("a conversion operator template is not read")
         arguments = []
         while not self.eat("@"):
             if self.eat("$$$V") or self.eat("$$V") or self.eat("$$Z") or self.eat("$S"):
@@ -216,7 +221,7 @@ class _TypeName:
             elif self.eat("$$Y"):
                 arguments.append(self.qualified())
             else:
-                arguments.append(self.type())
+                arguments.append(self.type().replace(_SLOT, ""))
         self.names, self.params = outer
         return f"{name}<{', '.join(arguments)}>"
 
@@ -260,7 +265,9 @@ class _TypeName:
             self.cv()
         elif kind not in "CDKLSTYZ":
             raise ValueError("not a plain function")
-        self.signature()
+        result = self.signature()[0]
+        if name == "operator":                             # a conversion: named after the type it returns
+            name += " " + result.replace(_SLOT, "")
         return "::".join(scope[::-1] + [name])
 
     def cv(self):
@@ -268,14 +275,28 @@ class _TypeName:
 
     def sizes(self):
         """An array's dimensions: how many, then each."""
-        return "".join(f"[{self.number()}]" for _ in range(self.number()))
+        count = self.number()
+        sizes = [self.number() for _ in range(count)]
+        if count < 1 or min(sizes) < 0:
+            raise ValueError("bad array dimensions")
+        return "".join(f"[{n}]" for n in sizes)
+
+    @staticmethod
+    def declare(text, declarator, keep=False):
+        """The type `text` with `declarator` (` *`, ` (*)(int)`, ` [4]`, ...) applied. It goes after a plain type,
+        and inside the brackets of a function or array type: a pointer to `void (*)(int)` is `void (**)(int)`.
+        `keep` leaves the slot after a `*` or `&`; a function or array declarator brings its own."""
+        if _SLOT in text:
+            return text.replace(_SLOT, declarator.lstrip() + (_SLOT if keep else ""))
+        return text + declarator
 
     @staticmethod
     def qualify(text, qualifiers):
         """`text` with `const`/`volatile` after it. A const pointer is marked twice, by its own code and by the
         qualifiers of whatever refers to it, so one that is already there is not repeated."""
-        present = _QUALIFIERS.search(text).group(0).split()
-        return text + "".join(f" {q}" for q in qualifiers if q not in present)
+        head, slot, tail = text.partition(_SLOT)
+        present = _QUALIFIERS.search(head).group(0).split()
+        return head + "".join(f" {q}" for q in qualifiers if q not in present) + slot + tail
 
     def signature(self):
         """Calling convention, return type, parameters, exception specification: (return type, parameters,
@@ -295,7 +316,7 @@ class _TypeName:
                     parameters.append(self.params[int(self.next())])
                     continue
                 start = self.i
-                parameters.append(self.type())
+                parameters.append(self.type().replace(_SLOT, ""))
                 if self.i - start > 1 and len(self.params) < 10:
                     self.params.append(parameters[-1])
         if self.eat("_E"):
@@ -306,7 +327,7 @@ class _TypeName:
 
     def function(self, declarator):
         result, parameters, noexcept = self.signature()
-        return f"{result} {declarator}({', '.join(parameters)}){noexcept}"
+        return self.declare(result, f" {declarator}({', '.join(parameters)}){noexcept}")
 
     def indirect(self, suffix):
         """What a pointer or reference refers to, with `suffix` (` *`, ` &`, ...) after it."""
@@ -315,14 +336,14 @@ class _TypeName:
             if self.next() == "F":
                 unaligned = ("__unaligned",)
         if self.eat("6"):
-            return self.function(f"({suffix.strip()})")
+            return self.function(f"({suffix.strip()}{_SLOT})")
         if self.eat("$A"):                                 # a C++/CX handle
             suffix = suffix.replace("*", "^")
         qualifiers = self.cv()
         if self.eat("Y"):
             sizes = self.sizes()
-            return f"{self.qualify(self.type(), qualifiers + unaligned)} ({suffix.strip()}){sizes}"
-        return self.qualify(self.type(), qualifiers + unaligned) + suffix
+            return self.declare(self.qualify(self.type(), qualifiers + unaligned), f" ({suffix.strip()}{_SLOT}){sizes}")
+        return self.declare(self.qualify(self.type(), qualifiers + unaligned), suffix, keep=True)
 
     def type(self):
         if self.eat("$$Q"):
@@ -336,7 +357,7 @@ class _TypeName:
             return self.qualify(self.type(), qualifiers)
         if self.eat("$$BY"):                               # an array passed as a template argument
             sizes = self.sizes()
-            return f"{self.type()} {sizes}"
+            return self.declare(self.type(), " " + sizes)
         c = self.next()
         if c == "_":
             c += self.next()
@@ -365,7 +386,7 @@ def simple_name(mangled: str) -> str:
         name = reader.qualified()
     except (ValueError, IndexError, KeyError, RecursionError):
         return mangled
-    return name if reader.i == len(reader.s) else mangled
+    return name.replace(_SLOT, "") if reader.i == len(reader.s) else mangled
 
 
 def scan_pe64_rtti(data: bytes) -> dict:
@@ -384,10 +405,13 @@ def scan_pe64_rtti(data: bytes) -> dict:
         return struct.unpack_from("<I", img, rva)[0]
 
     # 1. Type descriptors: '.?AV' / '.?AU' / '.?AW' / '.?AT' strings, 16 bytes after the descriptor start. A name
-    # ends with '@': '@@' for most, but a class local to a function ends with that function's 'Z@'.
+    # ends with '@@', except where its outermost scope is a function (a local class: '...@?1??f@@YAXXZ@') or a
+    # back-reference ('...@1@'); any other text that ends with one '@' is not counted.
     tds = {}
     for m in re.finditer(rb"\.\?A[TUVW][\x21-\x7e]{1,2000}?@\x00", img):
         rva = m.start() - 16
+        if not _NAME_END.search(m.group(0)):
+            continue
         if rva >= 0:
             tds[rva] = m.group(0)[:-1].decode("latin-1")
 
