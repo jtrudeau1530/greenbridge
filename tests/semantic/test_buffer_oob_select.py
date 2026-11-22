@@ -407,6 +407,107 @@ class BufferOobOracle:
             written.append(addr)
         return written
 
+
+class WaveBufferOobInterpreter:
+    """Multi-lane SIMD wave reference interpreter modeling RDNA2 Wave32/Wave64 buffer operations."""
+
+    def __init__(self, wave_size: int = 32, memory: dict[int, int] | None = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Unsupported wave size: {wave_size}")
+        self.wave_size = wave_size
+        self.memory = {} if memory is None else dict(memory)
+        self.sgprs = [0] * 106
+        self.vgprs = [[0] * 256 for _ in range(wave_size)]
+        self.exec_mask = (1 << wave_size) - 1
+
+    def set_exec_mask(self, mask: int) -> None:
+        self.exec_mask = mask & ((1 << self.wave_size) - 1)
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def set_sgpr_range(self, start: int, values: list[int] | tuple[int, ...]) -> None:
+        for i, val in enumerate(values):
+            self.sgprs[start + i] = val & MASK32
+
+    def set_lane_vgpr(self, lane: int, reg: int, val: int) -> None:
+        self.vgprs[lane][reg] = val & MASK32
+
+    def get_lane_vgpr(self, lane: int, reg: int) -> int:
+        return self.vgprs[lane][reg] & MASK32
+
+    def get_descriptor(self, start_sgpr: int) -> BufferResourceDescriptor:
+        return BufferResourceDescriptor(
+            self.sgprs[start_sgpr],
+            self.sgprs[start_sgpr + 1],
+            self.sgprs[start_sgpr + 2],
+            self.sgprs[start_sgpr + 3],
+        )
+
+    def buffer_load_dword(
+        self,
+        vdst: int,
+        srsrc: int,
+        soffset: int = 0,
+        inst_offset: int = 0,
+        vaddr_off_reg: int | None = None,
+        vaddr_idx_reg: int | None = None,
+        num_dwords: int = 1,
+    ) -> list[list[int]]:
+        desc = self.get_descriptor(srsrc)
+        wave_results = []
+        for lane in range(self.wave_size):
+            active = self.is_lane_active(lane)
+            off = self.get_lane_vgpr(lane, vaddr_off_reg) if vaddr_off_reg is not None else None
+            idx = self.get_lane_vgpr(lane, vaddr_idx_reg) if vaddr_idx_reg is not None else None
+            loaded = BufferOobOracle.load_dwords(
+                desc=desc,
+                num_dwords=num_dwords,
+                idx=idx,
+                off=off,
+                soffset=soffset,
+                inst_offset=inst_offset,
+                memory=self.memory,
+                lane=lane,
+                active=active,
+            )
+            for k in range(num_dwords):
+                self.set_lane_vgpr(lane, vdst + k, loaded[k])
+            wave_results.append(loaded)
+        return wave_results
+
+    def buffer_store_dword(
+        self,
+        vdata: int,
+        srsrc: int,
+        soffset: int = 0,
+        inst_offset: int = 0,
+        vaddr_off_reg: int | None = None,
+        vaddr_idx_reg: int | None = None,
+        num_dwords: int = 1,
+    ) -> list[list[int]]:
+        desc = self.get_descriptor(srsrc)
+        wave_written = []
+        for lane in range(self.wave_size):
+            active = self.is_lane_active(lane)
+            off = self.get_lane_vgpr(lane, vaddr_off_reg) if vaddr_off_reg is not None else None
+            idx = self.get_lane_vgpr(lane, vaddr_idx_reg) if vaddr_idx_reg is not None else None
+            vals = [self.get_lane_vgpr(lane, vdata + k) for k in range(num_dwords)]
+            written = BufferOobOracle.store_dwords(
+                desc=desc,
+                values=vals,
+                idx=idx,
+                off=off,
+                soffset=soffset,
+                inst_offset=inst_offset,
+                memory=self.memory,
+                lane=lane,
+                active=active,
+            )
+            wave_written.append(written)
+        return wave_written
+
+
 BASE = tv.VEC_REGION
 OUT_V = 0x31016FAC                          # the output V# in s[0:3]: RAW, base 0
 W3 = 0x01016FAC                             # word3 without OOB_SELECT: RESOURCE_LEVEL, FORMAT 32_FLOAT, DST_SEL xyzw
@@ -861,6 +962,295 @@ class TestBufferOobOracle(unittest.TestCase):
         written = BufferOobOracle.store_dwords(desc, [0x123], off=0, memory=store_mem, active=False)
         self.assertEqual(written, [])
         self.assertEqual(store_mem, {})
+
+
+class TestBufferOobSimdMultiLane(unittest.TestCase):
+    """Multi-lane SIMD wave tests modeling partial component OOB zero fill and clamping."""
+
+    def translate_helper(self, lines):
+        return support.translate_lines(
+            "cs_oob_simd_t",
+            ["v_cmpx_eq_u32_e32 0, v0", *lines, "s_endpgm"],
+            fssm=tv.CS_BOUNDS_FSSM,
+        )
+
+    def run_spv_helper(self, spv, num_records=24):
+        memory = tv.ReadLog({BASE + k: tv._pattern_word(k) for k in range(-4, 0x80)})
+        support.run_fragment(
+            spv,
+            inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x100, OUT_V] + [0] * 28,
+            memory=memory,
+        )
+        return memory
+
+    def test_wave32_divergent_offsets_raw_load_x4_partial_fill(self):
+        wave = WaveBufferOobInterpreter(wave_size=32)
+        base = 0x1000
+        nr = 48
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=base,
+            stride=0,
+            num_records=nr,
+            oob_select=3,
+        )
+        wave.set_sgpr_range(4, desc.as_words())
+
+        # Populate memory with distinctive pattern
+        for byte_off in range(0, 80, 4):
+            wave.memory[base + byte_off] = 0x50000000 | byte_off
+
+        # Set divergent offsets for lanes: v1 = lane * 4
+        for lane in range(32):
+            wave.set_lane_vgpr(lane, 1, lane * 4)
+
+        # Execute buffer_load_dwordx4 v[4:7], v1, s[4:7], 0 offen
+        results = wave.buffer_load_dword(
+            vdst=4,
+            srsrc=4,
+            soffset=0,
+            inst_offset=0,
+            vaddr_off_reg=1,
+            num_dwords=4,
+        )
+
+        for lane in range(32):
+            off = lane * 4
+            expected = []
+            for k in range(4):
+                if off + 4 * k + 4 <= nr:
+                    expected.append(0x50000000 | (off + 4 * k))
+                else:
+                    expected.append(0)
+            self.assertEqual(results[lane], expected, f"Mismatch on lane {lane} with offset {off}")
+            # Check register state
+            for k in range(4):
+                self.assertEqual(wave.get_lane_vgpr(lane, 4 + k), expected[k])
+
+        # Verify specifically the boundary transition lanes:
+        # Lane 8 (off 32): 32+16 = 48 <= 48 -> all 4 loaded
+        self.assertEqual(results[8], [0x50000020, 0x50000024, 0x50000028, 0x5000002C])
+        # Lane 9 (off 36): dword 3 is OOB (36+16=52 > 48) -> zero fill
+        self.assertEqual(results[9], [0x50000024, 0x50000028, 0x5000002C, 0])
+        # Lane 10 (off 40): dwords 2, 3 OOB -> zero fill
+        self.assertEqual(results[10], [0x50000028, 0x5000002C, 0, 0])
+        # Lane 11 (off 44): dwords 1, 2, 3 OOB -> zero fill
+        self.assertEqual(results[11], [0x5000002C, 0, 0, 0])
+        # Lane 12 (off 48): all dwords OOB -> all zero
+        self.assertEqual(results[12], [0, 0, 0, 0])
+
+    def test_wave32_divergent_indices_mode0_partial_fill(self):
+        wave = WaveBufferOobInterpreter(wave_size=32)
+        base = 0x2000
+        stride = 16
+        nr = 8
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=base,
+            stride=stride,
+            num_records=nr,
+            oob_select=0,
+        )
+        wave.set_sgpr_range(4, desc.as_words())
+
+        # Seed memory
+        for idx in range(nr):
+            for off in range(0, stride, 4):
+                wave.memory[base + idx * stride + off] = (idx << 16) | off
+
+        # Lanes have varying idxen (v1) and offen (v2)
+        for lane in range(32):
+            wave.set_lane_vgpr(lane, 1, lane)
+            wave.set_lane_vgpr(lane, 2, (lane % 5) * 4)
+
+        results = wave.buffer_load_dword(
+            vdst=4,
+            srsrc=4,
+            soffset=0,
+            inst_offset=0,
+            vaddr_off_reg=2,
+            vaddr_idx_reg=1,
+            num_dwords=4,
+        )
+
+        # Mode 0 rule: in-bounds if idx < nr AND off + 4*k + 4 <= stride
+        # Lane 0: idx 0 < 8, off 0 -> all 4 dwords fit (0, 4, 8, 12, ends <= 16)
+        self.assertEqual(results[0], [0x00000000, 0x00000004, 0x00000008, 0x0000000C])
+        # Lane 1: idx 1 < 8, off 4 -> 3 dwords fit, 4th OOB
+        self.assertEqual(results[1], [0x00010004, 0x00010008, 0x0001000C, 0])
+        # Lane 2: idx 2 < 8, off 8 -> 2 dwords fit, 3rd and 4th OOB
+        self.assertEqual(results[2], [0x00020008, 0x0002000C, 0, 0])
+        # Lane 3: idx 3 < 8, off 12 -> 1 dword fits, others OOB
+        self.assertEqual(results[3], [0x0003000C, 0, 0, 0])
+        # Lane 4: idx 4 < 8, off 16 -> 16+4 > 16 -> all OOB
+        self.assertEqual(results[4], [0, 0, 0, 0])
+        # Lane 8..31: idx >= 8 -> all OOB
+        for lane in range(8, 32):
+            self.assertEqual(results[lane], [0, 0, 0, 0])
+
+    def test_wave64_partial_exec_mask_and_inactive_lanes(self):
+        wave = WaveBufferOobInterpreter(wave_size=64)
+        base = 0x4000
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=base,
+            stride=4,
+            num_records=64,
+            oob_select=1,
+        )
+        wave.set_sgpr_range(4, desc.as_words())
+
+        # Alternate active lanes: 0, 2, 4, ...
+        exec_mask = 0x5555555555555555
+        wave.set_exec_mask(exec_mask)
+
+        for lane in range(64):
+            wave.set_lane_vgpr(lane, 1, lane)
+            wave.set_lane_vgpr(lane, 2, 0xDEAD0000 | lane)
+
+        # Active lanes store their data; inactive lanes are masked
+        written = wave.buffer_store_dword(
+            vdata=2,
+            srsrc=4,
+            soffset=0,
+            inst_offset=0,
+            vaddr_idx_reg=1,
+            num_dwords=1,
+        )
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(len(written[lane]), 1)
+                self.assertEqual(wave.memory[base + lane * 4], 0xDEAD0000 | lane)
+            else:
+                self.assertEqual(written[lane], [])
+                self.assertNotIn(base + lane * 4, wave.memory)
+
+        # Clear vgprs and load back
+        for lane in range(64):
+            wave.set_lane_vgpr(lane, 3, 0xFFFFFFFF)
+
+        loaded = wave.buffer_load_dword(
+            vdst=3,
+            srsrc=4,
+            soffset=0,
+            inst_offset=0,
+            vaddr_idx_reg=1,
+            num_dwords=1,
+        )
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(loaded[lane], [0xDEAD0000 | lane])
+                self.assertEqual(wave.get_lane_vgpr(lane, 3), 0xDEAD0000 | lane)
+            else:
+                self.assertEqual(loaded[lane], [0])
+                self.assertEqual(wave.get_lane_vgpr(lane, 3), 0)
+
+    def test_wave32_divergent_partial_store_x4_boundary_integrity(self):
+        wave = WaveBufferOobInterpreter(wave_size=32)
+        base = 0x5000
+        nr = 32
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=base,
+            stride=0,
+            num_records=nr,
+            oob_select=3,
+        )
+        wave.set_sgpr_range(4, desc.as_words())
+
+        # Test partial component store suppression near boundary
+        # Lane 0: off 16 -> 4 dwords fit (16..32)
+        # Lane 1: off 20 -> 3 dwords fit (20..32)
+        # Lane 2: off 24 -> 2 dwords fit (24..32)
+        # Lane 3: off 28 -> 1 dword fits (28..32)
+        # Lane 4: off 32 -> 0 dwords fit
+        for lane in range(5):
+            wave.set_lane_vgpr(lane, 1, 16 + lane * 4)
+            for k in range(4):
+                wave.set_lane_vgpr(lane, 2 + k, 0x11110000 * (k + 1) | lane)
+
+        # Execute store for each lane independently to observe written addresses
+        for lane in range(5):
+            sub_wave = WaveBufferOobInterpreter(wave_size=32)
+            sub_wave.set_sgpr_range(4, desc.as_words())
+            sub_wave.set_lane_vgpr(lane, 1, 16 + lane * 4)
+            for k in range(4):
+                sub_wave.set_lane_vgpr(lane, 2 + k, 0x11110000 * (k + 1) | lane)
+
+            written = sub_wave.buffer_store_dword(
+                vdata=2,
+                srsrc=4,
+                soffset=0,
+                inst_offset=0,
+                vaddr_off_reg=1,
+                num_dwords=4,
+            )
+            expected_count = max(0, 4 - lane)
+            self.assertEqual(len(written[lane]), expected_count, f"Lane {lane} write count mismatch")
+            # Confirm that no bytes >= base + 32 were ever written
+            for addr in sub_wave.memory:
+                self.assertLess(addr, base + nr, f"Out of bounds store leaked past limit: {addr:#x}")
+
+    def test_wave_load_dwordx2_and_dwordx3_partial_fill(self):
+        wave = WaveBufferOobInterpreter(wave_size=32)
+        base = 0x6000
+        nr = 24
+        desc = BufferResourceDescriptor.from_fields(
+            base_address=base,
+            stride=0,
+            num_records=nr,
+            oob_select=3,
+        )
+        wave.set_sgpr_range(4, desc.as_words())
+        for byte_off in range(0, 40, 4):
+            wave.memory[base + byte_off] = 0x70000000 | byte_off
+
+        # Test x2 loads
+        wave.set_lane_vgpr(0, 1, 16)  # off 16: both dwords fit (16, 20)
+        wave.set_lane_vgpr(1, 1, 20)  # off 20: dword 0 fits, dword 1 OOB
+        wave.set_lane_vgpr(2, 1, 24)  # off 24: both OOB
+        res_x2 = wave.buffer_load_dword(vdst=2, srsrc=4, vaddr_off_reg=1, num_dwords=2)
+        self.assertEqual(res_x2[0], [0x70000010, 0x70000014])
+        self.assertEqual(res_x2[1], [0x70000014, 0])
+        self.assertEqual(res_x2[2], [0, 0])
+
+        # Test x3 loads
+        wave.set_lane_vgpr(0, 1, 12)  # off 12: all 3 fit (12, 16, 20)
+        wave.set_lane_vgpr(1, 1, 16)  # off 16: 2 fit (16, 20), 1 OOB
+        wave.set_lane_vgpr(2, 1, 20)  # off 20: 1 fits (20), 2 OOB
+        wave.set_lane_vgpr(3, 1, 24)  # off 24: all 3 OOB
+        res_x3 = wave.buffer_load_dword(vdst=4, srsrc=4, vaddr_off_reg=1, num_dwords=3)
+        self.assertEqual(res_x3[0], [0x7000000C, 0x70000010, 0x70000014])
+        self.assertEqual(res_x3[1], [0x70000010, 0x70000014, 0])
+        self.assertEqual(res_x3[2], [0x70000014, 0, 0])
+        self.assertEqual(res_x3[3], [0, 0, 0])
+
+    def test_spirv_translated_wave_partial_oob_zero_fill(self):
+        # End-to-end test translating buffer_load_dwordx4 with partial component zero fill
+        # num_records = 24.
+        # off 12: dwords at 12, 16, 20 fit, dword 24 is OOB -> [P(12), P(16), P(20), 0]
+        # off 16: dwords at 16, 20 fit, dwords 24, 28 OOB -> [P(16), P(20), 0, 0]
+        # off 20: dword at 20 fits, others OOB -> [P(20), 0, 0, 0]
+        # off 24: all OOB -> [0, 0, 0, 0]
+        cases = [
+            (12, [tv._pattern_word(12), tv._pattern_word(16), tv._pattern_word(20), 0]),
+            (16, [tv._pattern_word(16), tv._pattern_word(20), 0, 0]),
+            (20, [tv._pattern_word(20), 0, 0, 0]),
+            (24, [0, 0, 0, 0]),
+        ]
+        for off, want in cases:
+            with self.subTest(offset=off):
+                lines = [
+                    f"s_mov_b32 s4, {BASE:#x}",
+                    "s_mov_b32 s5, 0",
+                    "s_mov_b32 s6, 24",
+                    "s_mov_b32 s7, 0x31016FAC",  # Mode 3 RAW
+                    f"v_mov_b32 v1, {off}",
+                    "buffer_load_dwordx4 v[4:7], v1, s[4:7], 0 offen",
+                    "s_waitcnt vmcnt(0)",
+                    "buffer_store_dwordx4 v[4:7], off, s[0:3], 0",
+                ]
+                spv = self.translate_helper(lines)
+                memory = self.run_spv_helper(spv)
+                got = [dict.get(memory, 4 * k, 0) for k in range(4)]
+                self.assertEqual(got, want, f"Offset {off} yielded {got} instead of {want}")
 
 
 if __name__ == "__main__":
