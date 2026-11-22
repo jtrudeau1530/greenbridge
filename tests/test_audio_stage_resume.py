@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -34,6 +35,45 @@ class WriteFileTest(unittest.TestCase):
                 with self.assertRaises(OSError):
                     awc_opus.write_file(p, b"data")
             self.assertEqual(os.listdir(d), [])
+
+    def test_interleaved_writes_use_private_staging_files(self):
+        # Two writers to the same destination interleave: the first has staged its data and is paused at
+        # os.replace while the second stages and publishes. With a shared ".part" sibling the second writer
+        # truncates the first's staged data, so the first replace publishes the second writer's bytes (or
+        # fails once the sibling is gone). A private staging file lets both writers publish their own bytes,
+        # the last replace winning.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.ogg")
+            real_replace = awc_opus.os.replace
+            first_entered = threading.Event()
+            allow_first = threading.Event()
+            errors = []
+
+            def delayed_replace(src, dst):
+                if not first_entered.is_set():
+                    first_entered.set()
+                    if not allow_first.wait(5):
+                        raise AssertionError("first writer was never released")
+                real_replace(src, dst)
+
+            def first():
+                try:
+                    awc_opus.write_file(p, b"A" * 100)
+                except BaseException as e:  # pragma: no cover - recorded for the assertion below
+                    errors.append(e)
+
+            with mock.patch.object(awc_opus.os, "replace", side_effect=delayed_replace):
+                t = threading.Thread(target=first)
+                t.start()
+                self.assertTrue(first_entered.wait(5), "first writer never reached os.replace")
+                awc_opus.write_file(p, b"B" * 100)
+                allow_first.set()
+                t.join(5)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(errors, [])
+            with open(p, "rb") as f:
+                self.assertEqual(f.read(), b"A" * 100)
+            self.assertEqual(os.listdir(d), ["a.ogg"])
 
 
 class AwcMainExitTest(unittest.TestCase):
