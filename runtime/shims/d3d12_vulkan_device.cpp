@@ -3971,15 +3971,8 @@ public:
     HRESULT STDMETHODCALLTYPE CreateCommandList(UINT, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
                                                 ID3D12PipelineState* state, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandList";
-        HRESULT hr = create_command_list(type, allocator, riid, out, identity());
-        // The initial pipeline state is set as SetPipelineState would set it.
-        if (SUCCEEDED(hr) && state) {
-            ID3D12GraphicsCommandList* list = nullptr;
-            if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list)))) {
-                list->SetPipelineState(state);
-                list->Release();
-            }
-        }
+        // The initial pipeline state is set as SetPipelineState would set it (a bundle's is its first deferred call).
+        HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state);
         return d3d12_trace::result(method, hr);
     }
 

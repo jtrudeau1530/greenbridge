@@ -772,11 +772,15 @@ public:
         return append(ClearUnorderedAccess{view, is_float, values, {rects.begin(), rects.end()}});
     }
 
-    // ExecuteBundle copies the closed bundle's commands at the call site. The COM layer validates D3D12 list
-    // types and bundle-only restrictions before calling this method.
-    bool execute_bundle(const CommandList& bundle) {
+    // ExecuteBundle copies the closed bundle's commands [first, last) at the call site. The COM layer validates D3D12
+    // list types and bundle-only restrictions before calling this method, and calls it once per stretch between the
+    // bundle's deferred state calls and draws (d3d12_com.cpp, GraphicsCommandList::ExecuteBundle).
+    bool execute_bundle(const CommandList& bundle, std::size_t first = 0, std::size_t last = std::size_t(-1)) {
         if (this == &bundle || closed_ || !bundle.closed_) return false;
-        commands_.insert(commands_.end(), bundle.commands_.begin(), bundle.commands_.end());
+        last = std::min(last, bundle.commands_.size());
+        if (first < last)
+            commands_.insert(commands_.end(), bundle.commands_.begin() + std::ptrdiff_t(first),
+                             bundle.commands_.begin() + std::ptrdiff_t(last));
         return true;
     }
 
