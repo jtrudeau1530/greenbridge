@@ -224,8 +224,9 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
   under a masked wave32 `ds_bpermute`, and with #253's translator all 480 programs (seeds 1 to 3,
   native and emulated) match.
 - **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
-- **Not covered.** The translator rejects `ds_permute_b32` and the 8-bit d16 reads
-  (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out.
+- **Not covered.** The translator rejects the 8-bit d16 reads (`ds_read_u8_d16[_hi]`,
+  `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out. It supports `ds_permute_b32` since SHADER-90,
+  but the fuzzer does not generate it yet (FUZZ-10).
 ### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
 
 `cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`
@@ -249,19 +250,16 @@ fields the translator does not model yet, so they need a GPU-confirmed rule befo
 this. Not covered yet: images.
 
 The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
-random DST_SEL of 0/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
+random DST_SEL of 0/1/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
 (`16_16_SNORM`, `8_8_8_8_UNORM`, `8_8_8_8_UINT`, `2_10_10_10_UNORM`, `16_16_16_16_UINT`, about 53,000
 instructions) with an identity swizzle. Its reference decodes each element from the GFX10 format *name*
 (`tools/gfx10_formats.json`; channel widths listed from the top bit), not from the translator's own
-table: UNORM/SNORM correctly rounded, missing channels 0, 0, 0, 1. Elements are naturally aligned. Left
-out: DST_SEL 1 on integer formats, and whether `tbuffer` applies the V#'s DST_SEL (neither is measured).
+table: UNORM/SNORM correctly rounded (`x/(2ⁿ−1)`), missing channels *c* mod *n*, DST_SEL 1 = integer 1
+for UINT/SINT and 1.0f otherwise (SHADER-86, RX 6700). Elements are naturally aligned. Left out: whether
+`tbuffer` applies the V#'s DST_SEL (unmeasured).
 
-Two results are counted apart, not as mismatches, until a gfx10 hardware measurement settles them
-(posted in #374): `norm-ulp1`, a UNORM/SNORM result 1 ULP from the correctly rounded value (the
-translator multiplies by a rounded reciprocal), and `missing-w32`, the missing W of a 32-bit format,
-where the translator returns 0 and every other format 1 / 1.0. Over 5,000 programs, everything else
-matches; breaking the `16_16_SNORM` kind, the `8_8_8_8_UINT` widths or the DST_SEL order in the
-translator makes 33, 37 and 191 of 300 programs fail.
+Over 5,000 programs the reference and translator match bit for bit; breaking the `16_16_SNORM` kind, the
+`8_8_8_8_UINT` widths or the DST_SEL order in the translator makes 33, 37 and 191 of 300 programs fail.
 
 A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
 76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
@@ -313,9 +311,11 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   EXEC constants only enable lanes that exist. Every mask register is zero-initialised, as compiled code does,
   so a branch that skips the `v_cmp` writing a mask leaves a defined mask after the join.
 - **Hypotheses are reported apart.** `v_permlane16/x16` with op_sel FI = 0 reading a lane that is off in
-  EXEC is modelled as the DPP "invalid source" case (vD kept). That isn't measured on AMD hardware, and the
-  translator always reads the lane. A program that hits it counts as `hyp_only`, not as a mismatch.
-  `--permlane-fetch-inactive` models FI = 1 instead.
+  EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured on RDNA2 and RDNA3.5 (@aslan2142,
+  #374): FI = 1 returns the source lane's value, FI = 0 leaves the destination unwritten and FI = 0 with BOUND_CTRL
+  gives 0; #580 (SHADER-74) makes the translator do that. Where the translator still always reads the lane, a
+  program that hits the case counts as `hyp_only`, not as a mismatch. `--permlane-fetch-inactive` models FI = 1
+  instead.
 - **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
   which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.
 - **Reports.** The thread, wave, lane and register of the first differences. `--minimize` drops ops while the
@@ -330,7 +330,7 @@ First results on an RTX 4090 (subgroup 32, driver 621.14):
   should be left unwritten (invalid source without `bound_ctrl`, or a lane off in `row_mask`/`bank_mask`), and
   DPP16 ignored `fi:1`. Each was confirmed with a hand-written program.
 - **Everything else matches.** On `main`, 1,000 programs (`--seed 8 --ops 28 --no-maskdata --no-w32-hi-lanes`, 500 wave32 native and 500 wave64 emulated) give 0 mismatches. 297 of them are `hyp_only` (permlane with FI = 0 and an inactive source), and with `--permlane-fetch-inactive` all 1,000 match. Native wave64 on the 32-wide card mismatches as documented: `s_bcnt1` of EXEC counts one half, and a `v_readlane` from the other half wraps.
-- **Open question (#374):** what hardware does for permlane with FI = 0 (see above). It needs a run on an AMD GPU.
+- **Closed question (#374):** what hardware does for permlane with FI = 0 was measured on RDNA2 and RDNA3.5 (see above).
 
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 
