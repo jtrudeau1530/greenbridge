@@ -1,11 +1,16 @@
 #include "pe_loader.h"
 
 #include <windows.h>
+#include <intrin.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <vector>
 
 #include "../shims/shims.h"
 
@@ -42,6 +47,94 @@ std::string read_string(const std::string& name, uint8_t* base, uint32_t image_s
     return {s, end};
 }
 
+// PE/COFF: NumberOfRvaAndSizes counts the data directories; entries past it are not directories, whatever they hold.
+IMAGE_DATA_DIRECTORY directory(const IMAGE_NT_HEADERS64* nt, unsigned index) {
+    return index < nt->OptionalHeader.NumberOfRvaAndSizes ? nt->OptionalHeader.DataDirectory[index] : IMAGE_DATA_DIRECTORY{};
+}
+
+// The TLS directory holds virtual addresses, which relocations have already moved to this mapping.
+uint64_t rva_in(const Module& m, uint64_t va, const char* what) {
+    const uint64_t base = reinterpret_cast<uint64_t>(m.base);
+    if (va < base || va - base >= m.size) throw std::runtime_error(m.name + ": " + what + " is outside the image");
+    return va - base;
+}
+
+IMAGE_TLS_DIRECTORY64* tls_directory(Module& m) {
+    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dir.Size || !dir.VirtualAddress) return nullptr;
+    require_range(m.name, dir.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64), m.size, "the TLS directory");
+    return at<IMAGE_TLS_DIRECTORY64>(m.base, dir.VirtualAddress);
+}
+
+// __declspec(thread) reads TEB->ThreadLocalStoragePointer[_tls_index] at gs:[58h]. That array is indexed by the
+// loader-assigned per-module TLS index and is a different index space from TlsAlloc/TlsGetValue (TlsSlots). Only the OS
+// loader can allocate a module index, so the runtime ships a minimal DLL whose only content is a TLS anchor
+// (src/tls_host.cpp). Loading it makes the OS reserve an index and give every thread a block for it; the native loader
+// reuses that index for the mapped image. One helper means one mapped TLS module at a time.
+constexpr DWORD kMaxModuleTlsSlots = 64;
+void** module_tls_slots() { return reinterpret_cast<void**>(__readgsqword(0x58)); }
+
+struct TlsHostModule {
+    HMODULE module = nullptr;
+    DWORD index = TLS_OUT_OF_INDEXES;
+};
+
+TlsHostModule load_tls_host() {
+    TlsHostModule host;
+    // Dynamic buffer loop for paths that exceed MAX_PATH
+    std::wstring exe_path;
+    DWORD size = MAX_PATH;
+    while (true) {
+        exe_path.resize(size);
+        DWORD len = GetModuleFileNameW(nullptr, exe_path.data(), size);
+        if (len == 0) return host;
+        if (len < size - 1) {
+            exe_path.resize(len);
+            break;
+        }
+        size *= 2;
+    }
+    const std::filesystem::path path = std::filesystem::path(exe_path).parent_path() / L"gta6rt_tls_host.dll";
+    // The helper is linked with the static CRT (/MT), so it needs only system DLLs. Restricting the dependency search
+    // to System32 keeps a game-supplied vcruntime next to the executable from being picked up.
+    host.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!host.module) return host;
+
+    auto* base = reinterpret_cast<uint8_t*>(host.module);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    auto* nt = at<IMAGE_NT_HEADERS64>(base, dos->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dir.Size || !dir.VirtualAddress) {
+        FreeLibrary(host.module);
+        host.module = nullptr;
+        return host;
+    }
+    auto* tls = at<IMAGE_TLS_DIRECTORY64>(base, dir.VirtualAddress);
+    if (!tls->AddressOfIndex) {
+        FreeLibrary(host.module);
+        host.module = nullptr;
+        return host;
+    }
+    host.index = *reinterpret_cast<DWORD*>(tls->AddressOfIndex);
+    return host;
+}
+
+TlsHostModule& tls_host() {
+    // The helper stays loaded for the process lifetime: unloading it would release the reserved TLS index. Its own
+    // per-thread blocks are restored by uninstall_tls_for_thread, so the OS loader can free them normally.
+    static TlsHostModule host = load_tls_host();
+    return host;
+}
+
+std::atomic<Module*> g_tls_slot_owner{nullptr};
+
+// Per-thread installation state. Only one mapped TLS module can own the reserved slot, so one entry per thread is
+// enough; the saved pointer is the helper DLL's own block that the OS loader will free at thread exit.
+thread_local Module* g_thread_tls_module = nullptr;
+thread_local void* g_thread_tls_saved = nullptr;
+thread_local void* g_thread_tls_block = nullptr;
+
 // The Xbox builds of the MSVC runtime import the same CRT the desktop does, so the host's own copies are used.
 bool prefer_host_copy(const std::string& dll) {
     static const char* names[] = {"vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll",
@@ -54,10 +147,58 @@ bool prefer_host_copy(const std::string& dll) {
 
 }  // namespace
 
+namespace {
+bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t& rva) {
+    for (const Module* m : static_cast<Loader*>(ctx)->modules()) {
+        const auto base = reinterpret_cast<uint64_t>(m->base);
+        if (m->base && address >= base && address - base < m->size) {
+            module = m->name;
+            rva = static_cast<uint32_t>(address - base);
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
+    shims::add_module_lookup(this, &lookup_in_loader);
+}
+
 Loader::~Loader() {
+    // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
+    // block alive throughout the notifications: a detach handler can still call an imported function or free an
+    // FLS slot whose destructor lives in another mapped image.
+    for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
+        Module& m = **it;
+        if (!m.initialised) continue;  // a map-only load never opts in to running image code
+        m.initialised = false;
+        try {
+            run_tls_callbacks(m, DLL_PROCESS_DETACH);
+        } catch (const std::exception& e) {
+            // A module may have changed its callback table since attach. A destructor cannot propagate the validation
+            // error; report it and still let DllMain release resources before the image is freed.
+            std::fprintf(stderr, "[rt] TLS process detach failed for %s: %s\n", m.name.c_str(), e.what());
+        }
+        auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+        if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+            auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
+            entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
+        }
+    }
+    shims::remove_module_lookup(this);
     for (auto* m : order_) {
+        // TLS state must go away before the image and its TLS block are unmapped.
+        if (m->tls_index != kNoTlsIndex) {
+            // Only the loading thread has this module installed; other threads must uninstall for themselves before
+            // the Loader is destroyed.
+            uninstall_tls_for_thread(*m);
+            Module* owner = m;
+            g_tls_slot_owner.compare_exchange_strong(owner, nullptr);
+        }
+        // Before the image is freed: a stale table would let a later stack walk read unmapped memory.
+        if (m->function_table) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(m->function_table));
         if (m->tls_block) VirtualFree(m->tls_block, 0, MEM_RELEASE);
-        if (m->has_tls_slot) TlsFree(m->tls_slot);
         if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
         delete m;
     }
@@ -69,8 +210,46 @@ Module& Loader::load(const std::filesystem::path& image) {
     Module& m = map_image(image);
     bind_imports(m);  // loads every bundled module m imports first, so they land in init_order_ before m
     protect_sections(m);
+    register_unwind(m);
     init_order_.push_back(&m);
     return m;
+}
+
+// x64 has no frame-pointer chain to fall back on: without its .pdata registered, an exception raised in (or passing
+// through) a mapped image can't be dispatched past that frame, and the process dies. Images the system loader maps
+// are found through its own module list; ours are VirtualAlloc'd, so they are registered as dynamic function tables.
+//
+// The table is checked before it is handed over, because RtlLookupFunctionEntry trusts it: it binary-searches the
+// entries by BeginAddress and follows UnwindData without bounds checks. Measured over 3,780 x64 images in
+// System32 (5,023,071 entries) and the package's FidelityFX DLLs: every table is sorted and non-overlapping and in
+// bounds, and one shipped image (symcryptk.dll) has a zero-length entry (BeginAddress == EndAddress), so that is
+// allowed. No entry in that set uses the indirect form (UnwindData bit 0).
+void Loader::register_unwind(Module& m) {
+    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
+    // Like the system loader, a trailing partial entry is ignored.
+    const uint32_t count = dir.Size / sizeof(RUNTIME_FUNCTION);
+    if (!count) return;
+    require_range(m.name, dir.VirtualAddress, static_cast<uint64_t>(count) * sizeof(RUNTIME_FUNCTION), m.size,
+                  "the exception directory");
+    auto* table = at<RUNTIME_FUNCTION>(m.base, dir.VirtualAddress);
+    auto reject = [&](uint32_t i, const char* why) {
+        throw std::runtime_error(m.name + ": unwind entry " + std::to_string(i) + " " + why);
+    };
+    uint32_t previous_end = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const RUNTIME_FUNCTION& f = table[i];
+        if (f.EndAddress < f.BeginAddress || f.EndAddress > m.size) reject(i, "covers code outside the image");
+        if (f.BeginAddress < previous_end) reject(i, "is out of order or overlaps the one before it");
+        // UNWIND_INFO starts with a 4-byte header; its codes and handler data are the unwinder's to read.
+        const uint32_t info = f.UnwindData & ~1u;
+        if (info > m.size || m.size - info < 4) reject(i, "has unwind data outside the image");
+        previous_end = f.EndAddress;
+    }
+    if (!RtlAddFunctionTable(table, count, reinterpret_cast<DWORD64>(m.base)))
+        throw std::runtime_error(m.name + ": RtlAddFunctionTable failed");
+    m.function_table = table;
+    m.function_count = count;
 }
 
 void Loader::initialise() {
@@ -81,70 +260,12 @@ void Loader::initialise() {
 
 void Loader::initialise(Module& m) {
     if (m.initialised) return;
-    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    const uint64_t base = reinterpret_cast<uint64_t>(m.base);
 
-    // The TLS directory holds virtual addresses, which relocations have already moved to this mapping.
-    auto rva_of = [&](uint64_t va, const char* what) {
-        if (va < base || va - base >= m.size)
-            throw std::runtime_error(m.name + ": " + what + " is outside the image");
-        return va - base;
-    };
-
-    auto& tls_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-    if (tls_dir.Size) {
-        require_range(m.name, tls_dir.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64), m.size, "the TLS directory");
-        auto* tls = at<IMAGE_TLS_DIRECTORY64>(m.base, tls_dir.VirtualAddress);
-
-        uint64_t start = 0, template_size = 0;
-        if (tls->StartAddressOfRawData || tls->EndAddressOfRawData) {
-            start = rva_of(tls->StartAddressOfRawData, "the TLS template");
-            uint64_t end = rva_of(tls->EndAddressOfRawData, "the end of the TLS template");
-            if (end < start) throw std::runtime_error(m.name + ": the TLS template ends before it starts");
-            template_size = end - start;
-            require_range(m.name, start, template_size, m.size, "the TLS template");
-        }
-        m.tls_block_size = template_size + tls->SizeOfZeroFill;
-        if (m.tls_block_size > (1u << 20)) throw std::runtime_error(m.name + ": the TLS block is larger than 1 MiB");
-        if (m.tls_block_size) {
-            m.tls_block = VirtualAlloc(nullptr, static_cast<SIZE_T>(m.tls_block_size), MEM_RESERVE | MEM_COMMIT,
-                                       PAGE_READWRITE);
-            if (!m.tls_block) throw std::runtime_error(m.name + ": cannot allocate the TLS block");
-            if (template_size) std::memcpy(m.tls_block, m.base + start, static_cast<size_t>(template_size));
-        }
-
-        if (tls->AddressOfIndex) {
-            uint64_t index_rva = rva_of(tls->AddressOfIndex, "the TLS index");
-            require_range(m.name, index_rva, sizeof(uint32_t), m.size, "the TLS index");
-            DWORD slot = TlsAlloc();
-            if (slot == TLS_OUT_OF_INDEXES) throw std::runtime_error(m.name + ": no TLS slot is free");
-            m.tls_slot = slot;
-            m.has_tls_slot = true;
-            if (m.tls_block) TlsSetValue(slot, m.tls_block);
-            // The index lives in a writable section, but protect_sections already ran, so lift it for the write.
-            auto* index = m.base + index_rva;
-            auto* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(index) & ~uintptr_t(0xFFF));
-            DWORD old = 0, ignored = 0;
-            if (!VirtualProtect(page, 0x1000, PAGE_READWRITE, &old))
-                throw std::runtime_error(m.name + ": the TLS index can't be written");
-            *reinterpret_cast<uint32_t*>(index) = slot;
-            VirtualProtect(page, 0x1000, old, &ignored);
-        }
-
-        if (tls->AddressOfCallBacks) {
-            uint64_t table_rva = rva_of(tls->AddressOfCallBacks, "the TLS callback table");
-            for (uint64_t i = 0;; ++i) {
-                uint64_t entry_rva = table_rva + i * sizeof(uint64_t);
-                require_range(m.name, entry_rva, sizeof(uint64_t), m.size, "a TLS callback table entry");
-                uint64_t fn = *at<uint64_t>(m.base, static_cast<uint32_t>(entry_rva));
-                if (!fn) break;
-                auto callback = reinterpret_cast<void(NTAPI*)(void*, DWORD, void*)>(m.base + rva_of(fn, "a TLS callback"));
-                callback(m.base, DLL_PROCESS_ATTACH, nullptr);
-            }
-        }
-    }
+    // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.
+    run_tls_callbacks(m, DLL_PROCESS_ATTACH);
 
     // Only a DLL gets DllMain. An EXE's entry point has a different signature and is the caller's to run.
+    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
         if (m.entry_rva >= m.size) throw std::runtime_error(m.name + ": the entry point is outside the image");
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
@@ -190,7 +311,7 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     m->base = static_cast<uint8_t*>(
         VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!m->base) {
-        auto& relocs = oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
         if (!relocs.Size)
             throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
         m->base = static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -211,7 +332,7 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     int64_t delta = reinterpret_cast<int64_t>(m->base) - static_cast<int64_t>(oh.ImageBase);
     if (delta) {
         m->relocated = true;
-        auto& dir = oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
         if (!dir.Size) throw std::runtime_error(m->name + ": the image has no relocations and isn't at its base");
         require_range(m->name, dir.VirtualAddress, dir.Size, m->size, "the relocation table");
         auto* block = at<IMAGE_BASE_RELOCATION>(m->base, dir.VirtualAddress);
@@ -228,6 +349,17 @@ Module& Loader::map_image(const std::filesystem::path& path) {
                     require_range(m->name, static_cast<uint64_t>(block->VirtualAddress) + off, sizeof(uint64_t), m->size,
                                   "a relocation");
                     *at<uint64_t>(m->base, block->VirtualAddress + off) += delta;
+                } else if (type == IMAGE_REL_BASED_HIGHLOW) {
+                    // A 32-bit absolute address (code built /LARGEADDRESSAWARE:NO), which the x64 Windows loader
+                    // also applies. Where the new address no longer fits in 32 bits, Windows would truncate it; the
+                    // image would then jump or read through a wrong pointer, so the load is refused instead.
+                    require_range(m->name, static_cast<uint64_t>(block->VirtualAddress) + off, sizeof(uint32_t),
+                                  m->size, "a relocation");
+                    auto* slot = at<uint32_t>(m->base, block->VirtualAddress + off);
+                    const int64_t moved = static_cast<int64_t>(*slot) + delta;
+                    if (moved < 0 || moved > 0xFFFFFFFFll)
+                        throw std::runtime_error(m->name + ": a 32-bit (HIGHLOW) relocation does not fit at this base");
+                    *slot = static_cast<uint32_t>(moved);
                 } else if (type != IMAGE_REL_BASED_ABSOLUTE) {
                     throw std::runtime_error(m->name + ": unsupported relocation type " + std::to_string(type));
                 }
@@ -235,13 +367,130 @@ Module& Loader::map_image(const std::filesystem::path& path) {
             block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uint8_t*>(block) + block->SizeOfBlock);
         }
     }
+    // The TLS directory and the exception directory hold virtual addresses, so both are read after relocation. TLS is
+    // installed here, before bind_imports can return control to the caller and before any image code can run.
+    initialize_tls(*m);
     parse_exports(*m);
     return *m;
 }
 
+// Static TLS for the thread that calls load(). The PE TLS directory only carries the template (Start..End) and the
+// zero-fill size; it has no field naming the TLS block. The Windows loader allocates a block per module per thread and
+// puts it in TEB->ThreadLocalStoragePointer[module index], which is what __declspec(thread) code reads via _tls_index.
+// Only the OS loader can allocate that module index, so the loader reuses the index the OS assigned to
+// gta6rt_tls_host.dll. That makes one manually mapped TLS module work; a second one is rejected rather than silently
+// sharing (and corrupting) the same slot.
+void Loader::initialize_tls(Module& m) {
+    auto* tls = tls_directory(m);
+    if (!tls) return;
+    // A present but all-zero directory is treated like an absent one.
+    if (!tls->StartAddressOfRawData && !tls->EndAddressOfRawData && !tls->AddressOfIndex && !tls->AddressOfCallBacks &&
+        !tls->SizeOfZeroFill)
+        return;
+    if (tls->EndAddressOfRawData < tls->StartAddressOfRawData)
+        throw std::runtime_error(m.name + ": TLS template end precedes its start");
+    uint64_t raw = tls->EndAddressOfRawData - tls->StartAddressOfRawData;
+    uint64_t total = raw + tls->SizeOfZeroFill;
+    if (total > 0xFFFFFFFFull) throw std::runtime_error(m.name + ": TLS block is too large");
+    const uint32_t raw_rva =
+        raw ? static_cast<uint32_t>(rva_in(m, tls->StartAddressOfRawData, "the TLS template")) : 0;
+    if (raw) require_range(m.name, raw_rva, raw, m.size, "the TLS template");
+    uint64_t index_rva = 0;
+    if (tls->AddressOfIndex) {
+        index_rva = rva_in(m, tls->AddressOfIndex, "the TLS index");
+        require_range(m.name, index_rva, sizeof(uint32_t), m.size, "the TLS index");
+    }
+
+    DWORD index = tls_host().index;
+    if (index == TLS_OUT_OF_INDEXES)
+        throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+    if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
+    if (!module_tls_slots()) throw std::runtime_error(m.name + ": this thread has no TLS array");
+
+    Module* expected = nullptr;
+    if (!g_tls_slot_owner.compare_exchange_strong(expected, &m))
+        throw std::runtime_error(m.name + ": only one manually mapped module may use static TLS at a time");
+
+    m.tls_index = index;
+    m.tls_template = raw ? m.base + raw_rva : nullptr;
+    m.tls_raw_size = static_cast<uint32_t>(raw);
+    m.tls_zero_fill = tls->SizeOfZeroFill;
+    m.tls_block_size = static_cast<uint32_t>(total);
+    // The index lives in a writable section and protect_sections() has not run yet, so the write needs no
+    // VirtualProtect dance.
+    if (index_rva) *reinterpret_cast<uint32_t*>(m.base + index_rva) = index;
+    try {
+        install_tls_for_thread(m);
+    } catch (...) {
+        m.tls_index = kNoTlsIndex;
+        g_tls_slot_owner = nullptr;
+        throw;
+    }
+}
+
+void Loader::install_tls_for_thread(Module& m) {
+    if (m.tls_index == kNoTlsIndex) return;
+    if (g_thread_tls_module == &m) return;
+    if (g_thread_tls_module)
+        throw std::runtime_error("another manually mapped module's TLS is already installed in this thread");
+
+    const uint64_t total = static_cast<uint64_t>(m.tls_raw_size) + m.tls_zero_fill;
+    if (!total) return;
+    void** slots = module_tls_slots();
+    if (!slots || m.tls_index >= kMaxModuleTlsSlots)
+        throw std::runtime_error(m.name + ": cannot install TLS in this thread");
+
+    void* block = VirtualAlloc(nullptr, static_cast<SIZE_T>(total), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!block) throw std::runtime_error(m.name + ": TLS block allocation failed");
+    if (m.tls_raw_size) std::memcpy(block, m.tls_template, m.tls_raw_size);
+    if (m.tls_zero_fill)
+        std::memset(static_cast<uint8_t*>(block) + m.tls_raw_size, 0, m.tls_zero_fill);
+
+    void* saved = slots[m.tls_index];
+    slots[m.tls_index] = block;
+    g_thread_tls_module = &m;
+    g_thread_tls_saved = saved;
+    g_thread_tls_block = block;
+    if (!m.tls_block) {
+        m.tls_block = block;
+        m.tls_saved_block = saved;
+    }
+}
+
+void Loader::uninstall_tls_for_thread(Module& m) {
+    if (g_thread_tls_module != &m) return;
+    void** slots = module_tls_slots();
+    if (slots && m.tls_index < kMaxModuleTlsSlots && slots[m.tls_index] == g_thread_tls_block)
+        slots[m.tls_index] = g_thread_tls_saved;
+    if (m.tls_block == g_thread_tls_block) {
+        m.tls_block = nullptr;
+        m.tls_saved_block = nullptr;
+    }
+    VirtualFree(g_thread_tls_block, 0, MEM_RELEASE);
+    g_thread_tls_module = nullptr;
+    g_thread_tls_saved = nullptr;
+    g_thread_tls_block = nullptr;
+}
+
+void Loader::run_tls_callbacks(Module& m, uint32_t reason) {
+    auto* tls = tls_directory(m);
+    if (!tls || !tls->AddressOfCallBacks) return;
+    const uint64_t table_rva = rva_in(m, tls->AddressOfCallBacks, "the TLS callback table");
+    // The callback table has no length field: it ends at a zero entry, so every step is checked against the image.
+    for (uint64_t i = 0;; ++i) {
+        const uint64_t entry_rva = table_rva + i * sizeof(uint64_t);
+        require_range(m.name, entry_rva, sizeof(uint64_t), m.size, "a TLS callback table entry");
+        const uint64_t fn = *at<uint64_t>(m.base, static_cast<uint32_t>(entry_rva));
+        if (!fn) break;
+        auto callback =
+            reinterpret_cast<PIMAGE_TLS_CALLBACK>(m.base + rva_in(m, fn, "a TLS callback"));
+        callback(m.base, static_cast<DWORD>(reason), nullptr);
+    }
+}
+
 void Loader::parse_exports(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
     if (!dir.Size) return;
     require_range(m.name, dir.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY), m.size, "the export directory");
     auto* ed = at<IMAGE_EXPORT_DIRECTORY>(m.base, dir.VirtualAddress);
@@ -281,12 +530,23 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     auto dot = spec.rfind('.');
     if (dot == std::string::npos || dot == 0 || dot + 1 >= spec.size()) return nullptr;
     const std::string module = spec.substr(0, dot), symbol = spec.substr(dot + 1);
+
+    // A forwarder can name a module the loader shims. Shims take precedence over a bundled or host copy, exactly as
+    // they do for a direct import in resolve(); without this, a forwarded xmem or d3d12_xs call becomes a failure thunk.
+    std::string shim_key = lower(module);
+    if (shim_key.size() < 4 || shim_key.compare(shim_key.size() - 4, 4, ".dll") != 0) shim_key += ".dll";
+    if (void* p = shims::find(shim_key, symbol)) {
+        binding = Binding::Shim;
+        return p;
+    }
+
     const bool by_ordinal = symbol.size() > 1 && symbol[0] == '#';
     uint32_t ordinal = 0;
     if (by_ordinal) {
         for (size_t i = 1; i < symbol.size(); ++i) {
-            if (symbol[i] < '0' || symbol[i] > '9' || ordinal > 0xFFFF) return nullptr;
+            if (symbol[i] < '0' || symbol[i] > '9') return nullptr;
             ordinal = ordinal * 10 + static_cast<uint32_t>(symbol[i] - '0');
+            if (ordinal > 0xFFFF) return nullptr;  // checked after the digit, so "#65537" can't truncate to 1
         }
     }
 
@@ -371,7 +631,7 @@ void Loader::bind_imports(Module& m) {
         }
     };
 
-    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_IMPORT);
     if (dir.Size) {
         for (uint64_t i = 0;; ++i) {
             uint64_t rva = dir.VirtualAddress + i * sizeof(IMAGE_IMPORT_DESCRIPTOR);
@@ -384,7 +644,7 @@ void Loader::bind_imports(Module& m) {
         }
     }
     // Delay imports are bound eagerly: simpler, and the full import surface shows up in --dry-run.
-    auto& ddir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    const auto ddir = directory(nt, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT);
     if (ddir.Size) {
         for (uint64_t i = 0;; ++i) {
             uint64_t rva = ddir.VirtualAddress + i * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
@@ -398,9 +658,12 @@ void Loader::bind_imports(Module& m) {
             if (!d->ImportAddressTableRVA)
                 throw std::runtime_error(m.name + ": a delay-import descriptor has no address table");
             std::string dll = read_string(m.name, m.base, m.size, d->DllNameRVA, "a delay-imported DLL name");
-            // The name table is optional: without it, entries are read back through the address table itself.
-            bind_thunks(dll, d->ImportNameTableRVA ? d->ImportNameTableRVA : d->ImportAddressTableRVA,
-                        d->ImportAddressTableRVA);
+            // Without a name table the IAT still holds delay thunks, not import names, so there is no symbol to bind
+            // eagerly. Every MSVC delay descriptor and every System32 DLL has one; reject the form instead of reading
+            // thunk addresses as name RVAs.
+            if (!d->ImportNameTableRVA)
+                throw std::runtime_error(m.name + ": a delay-import descriptor has no name table");
+            bind_thunks(dll, d->ImportNameTableRVA, d->ImportAddressTableRVA);
         }
     }
 }

@@ -1,11 +1,20 @@
 """Profile the disassembled shader corpus: which RDNA instructions the translator must support.
 
 Usage:
-    python -I shader_profile.py <disasm dir> [--out profile.json]
+    python -I shader_profile.py <disasm dir> [--out profile.json] [--per-shader]
 
 Counts each mnemonic (number of shaders using it and total occurrences), groups them by encoding family,
-classifies instructions (ALU vs memory vs branch), computes operation ratios, tracks register footprints,
-and lists the dwords LLVM couldn't decode (likely Xbox-specific instructions) with how many shaders contain them.
+classifies instructions (ALU vs memory vs branch), computes operation ratios, and summarises register pressure
+per stage (VGPR/SGPR counts from `profile_shader`; `--per-shader` also lists every shader).
+In the JSON report, ratios.alu_to_memory is null when the corpus has ALU instructions and no memory instructions.
+
+`undecoded` counts the llvm-mc 'invalid instruction encoding' warnings shader_disasm.py copies into each .s file.
+by_word lists the four bytes at each warning position, their total occurrences and how many shaders contain them.
+unresolved counts warnings whose position or echoed input gives no complete word. Results depend on LLVM's
+version, target and input range, which can include embedded data.
+
+The terminal prints warning totals. The JSON report includes the bytes, so keep reports from real shaders local
+(see CONTRIBUTING.md).
 """
 import argparse
 import json
@@ -125,6 +134,16 @@ def parse_registers(line: str) -> dict:
     return {"vgprs": vgprs, "sgprs": sgprs, "special": specials}
 
 
+def instruction_lines(lines):
+    for line in lines:
+        if line.startswith("; ---"):
+            break
+        if line.startswith("\t"):
+            code = line.partition(";")[0].strip()
+            if code and not code.startswith("."):
+                yield code
+
+
 def register_footprint(lines_or_text) -> dict:
     """Calculate the register footprint (max index, allocation count, and unique sets)
     across disassembly lines or text."""
@@ -137,9 +156,7 @@ def register_footprint(lines_or_text) -> dict:
     all_sgprs = set()
     all_specials = set()
 
-    for line in lines:
-        if not line.startswith("\t"):
-            continue
+    for line in instruction_lines(lines):
         regs = parse_registers(line)
         all_vgprs.update(regs["vgprs"])
         all_sgprs.update(regs["sgprs"])
@@ -164,15 +181,7 @@ def register_footprint(lines_or_text) -> dict:
 def profile_shader(text: str) -> dict:
     """Profile a single shader's disassembly: mnemonics, categories, ratios, and register footprint."""
     lines = text.splitlines()
-    mnemonics = Counter()
-    for line in lines:
-        if not line.startswith("\t"):
-            continue
-        code = line.strip().partition(";")[0].strip()
-        if not code:
-            continue
-        m = code.split()[0]
-        mnemonics[m] += 1
+    mnemonics = Counter(line.split(maxsplit=1)[0] for line in instruction_lines(lines))
 
     cats = count_categories(mnemonics)
     ratios = compute_ratios(cats)
@@ -187,48 +196,146 @@ def profile_shader(text: str) -> dict:
     }
 
 
+LLVM_MESSAGES = "; --- llvm-mc messages ---"    # the header shader_disasm.py writes above llvm-mc's stderr
+WARNING_LOCATION = re.compile(r"; <stdin>:[1-9][0-9]*:([1-9][0-9]*)")
+BYTE_ECHO = re.compile(r"; [ \t]*0x[0-9a-fA-F]{2}(?=[ \t]|$)")
+WORD = re.compile(r"[ \t]+".join([r"0x([0-9a-fA-F]{2})"] * 4) + r"(?!\S)")    # four complete 0xNN tokens
+
+
+def warning_words(text: str):
+    """Words LLVM warned about in one .s file's llvm-mc messages section, as (words, unresolved).
+
+    Each 'invalid instruction encoding' warning gives one word: the four complete 0xNN tokens starting exactly
+    at its one-based column of the source line LLVM echoes right after it, as e.g. 'ff ff ff d7'. A warning whose
+    position, echo or tokens don't give such a word counts as unresolved instead."""
+    if LLVM_MESSAGES not in text:    # clean shaders have no messages section
+        return [], 0
+    lines = text.splitlines()
+    try:
+        start = lines.index(LLVM_MESSAGES) + 1
+    except ValueError:
+        return [], 0
+    words, unresolved = [], 0
+    for index in range(start, len(lines)):
+        head = lines[index]
+        if not head.startswith("; <stdin>:"):
+            continue
+        location, _, message = head.partition(": ")
+        if message != "warning: invalid instruction encoding":
+            continue
+        echo = lines[index + 1] if index + 1 < len(lines) else ""
+        position = WARNING_LOCATION.fullmatch(location)
+        word = None
+        # A column longer than the echo length in decimal cannot be in range. Check before int() to
+        # keep even arbitrarily long malformed locations from aborting the scan.
+        if position and len(position[1]) <= len(str(len(echo))) and BYTE_ECHO.match(echo):
+            col = int(position[1])
+            # The producer added "; ". At a token start, echo[col] is the preceding whitespace and
+            # echo[col + 1] is the first byte's '0' (including the column-one case).
+            if col < len(echo) - 1 and echo[col] in " \t":
+                word = WORD.match(echo, col + 1)
+        if word:
+            words.append(" ".join(word.groups()).lower())
+        else:
+            unresolved += 1
+    return words, unresolved
+
+
+def register_summary(reg_stage) -> dict:
+    """Per-stage VGPR/SGPR pressure from (vgpr_count, sgpr_count) pairs: max, mean and a VGPR histogram.
+
+    The histogram buckets are upper bounds on the VGPR count (wave32 RDNA2 allocates in blocks of 8 and caps a
+    wave at 256), so the counts show how many shaders fit each occupancy step."""
+    out = {}
+    for stage in sorted(reg_stage):
+        pairs = reg_stage[stage]
+        if not pairs:
+            continue
+        v = [p[0] for p in pairs]
+        s = [p[1] for p in pairs]
+        hist = Counter()
+        for c in v:
+            hist[next(b for b in (32, 64, 128, 256) if c <= b) if c <= 256 else ">256"] += 1
+        out[stage] = {"shaders": len(pairs),
+                      "vgpr_max": max(v), "vgpr_mean": round(sum(v) / len(v), 2),
+                      "sgpr_max": max(s), "sgpr_mean": round(sum(s) / len(s), 2),
+                      "vgpr_hist": {str(k): hist[k] for k in (32, 64, 128, 256, ">256") if hist[k]}}
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("--out")
+    ap.add_argument("--per-shader", action="store_true",
+                    help="also list each shader's instruction count and VGPR/SGPR footprint")
     a = ap.parse_args()
+    if not os.path.isdir(a.src):
+        what = "is not a folder" if os.path.exists(a.src) else "does not exist"
+        print(f"ERROR: {a.src} {what}. Give the folder of .s files shader_disasm.py writes.", file=sys.stderr)
+        return 2
+    path = a.out or os.path.join(a.src, "..", "profile.json")
+    out_dir = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(out_dir):        # checked before the scan, which takes minutes on the whole corpus
+        print(f"ERROR: the folder for {path} does not exist", file=sys.stderr)
+        return 2
+    try:
+        with os.scandir(a.src) as entries:
+            shader_files = [entry for entry in entries if entry.name.endswith(".s") and entry.is_file()]
+    except OSError as e:
+        print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
     occ, users = Counter(), Counter()
-    invalid_users = Counter()
+    word_occ, word_users = Counter(), Counter()    # warned-at word -> warnings, shaders
+    unresolved = 0
     per_stage = defaultdict(Counter)
+    reg_stage = defaultdict(list)    # stage -> [(vgpr_count, sgpr_count)]
+    shaders = []
     n = 0
-    for name in os.listdir(a.src):
-        if not name.endswith(".s"):
-            continue
+    for entry in shader_files:
+        name = entry.name
         n += 1
         stage = name[:2].lower() if name[2:3] == "_" else "?"
-        seen = set()
-        with open(os.path.join(a.src, name), encoding="utf-8", errors="replace") as f:
+        with open(entry.path, encoding="utf-8", errors="replace") as f:
             text = f.read()
-        for line in text.splitlines():
-            if not line.startswith("\t"):
-                continue
-            m = line.split()[0]
-            occ[m] += 1
-            seen.add(m)
-        for m in seen:
-            users[m] += 1
-            per_stage[stage][m] += 1
-        for w in set(re.findall(r"<stdin>:\d+:\d+: warning: invalid instruction encoding\n; (0x[0-9a-f]{2}(?: 0x[0-9a-f]{2}){3})", text)):
-            invalid_users[w] += 1
+        prof = profile_shader(text)
+        regs = prof["registers"]
+        reg_stage[stage].append((regs["vgpr_count"], regs["sgpr_count"]))
+        if a.per_shader:
+            shaders.append({"name": name[:-2], "stage": stage, "instructions": prof["total_instructions"],
+                            "vgpr_count": regs["vgpr_count"], "sgpr_count": regs["sgpr_count"]})
+        occ.update(prof["mnemonics"])
+        users.update(prof["mnemonics"].keys())
+        per_stage[stage].update(prof["mnemonics"].keys())
+        words, bad = warning_words(text)
+        word_occ.update(words)
+        word_users.update(set(words))
+        unresolved += bad
     fam = defaultdict(lambda: [0, 0])
     for m, c in occ.items():
         fam[family(m)][0] += 1
         fam[family(m)][1] += c
     cats = count_categories(occ)
     ratios = compute_ratios(cats)
+    if ratios["alu_to_memory"] == float("inf"):
+        ratios["alu_to_memory"] = None
     out = {"shaders": n, "mnemonics": len(occ),
            "families": {k: {"mnemonics": v[0], "occurrences": v[1]} for k, v in sorted(fam.items())},
            "categories": cats,
            "ratios": ratios,
-           "by_mnemonic": [{"m": m, "shaders": users[m], "count": occ[m]} for m, _ in users.most_common()]}
-    path = a.out or os.path.join(a.src, "..", "profile.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=1)
+           "by_mnemonic": [{"m": m, "shaders": users[m], "count": occ[m]} for m, _ in users.most_common()],
+           "registers": register_summary(reg_stage),
+           "undecoded": {"warnings": sum(word_occ.values()) + unresolved, "unresolved": unresolved,
+                         "by_word": [{"word": w, "shaders": word_users[w], "count": word_occ[w]}
+                                     for w in sorted(word_occ, key=lambda w: (-word_occ[w], -word_users[w], w))]}}
+    if a.per_shader:
+        out["per_shader"] = sorted(shaders, key=lambda e: e["name"])
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=1, allow_nan=False)
+    except OSError as e:
+        print(f"ERROR: cannot write {path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     print(f"{n} shaders, {len(occ)} distinct mnemonics -> {os.path.abspath(path)}")
     for k, v in sorted(fam.items(), key=lambda kv: -kv[1][1]):
         print(f"  {k:8} {v[0]:4} mnemonics {v[1]:>12,} uses")
@@ -239,7 +346,12 @@ def main():
         if total > 0 and cum / total >= 0.99:
             print(f"  {i} mnemonics cover 99% of all instructions")
             break
+    for st, r in out["registers"].items():
+        print(f"  {st:2} registers: VGPR max {r['vgpr_max']} mean {r['vgpr_mean']}, "
+              f"SGPR max {r['sgpr_max']} mean {r['sgpr_mean']} ({r['shaders']} shaders)")
     print("  most widespread:", ", ".join(f"{m} ({users[m]})" for m, _ in users.most_common(12)))
+    print(f"  undecoded: {out['undecoded']['warnings']} LLVM warnings, {len(word_occ)} distinct words, "
+          f"{unresolved} unresolved (words only in the JSON report)")
 
 
 if __name__ == "__main__":

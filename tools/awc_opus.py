@@ -16,7 +16,7 @@ previous chunk's tail and are dropped (whole packets). The descriptor's `channel
 groups, not necessarily the packet channel count: an Opus packet's TOC stereo bit gives the real channel count,
 and the descriptor's `samples` counts interleaved samples across those packet channels.
 
-Output: <out>/<bank>/<stream id>.ogg (or .wav), plus a summary line per bank.
+Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each bank's relative path.
 
 For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
 """
@@ -140,6 +140,8 @@ def parse_awc(d: bytes):
             t = struct.unpack_from("<Q", d, p)[0]
             p += 8
             typ, size, at = t >> 56, (t >> 28) & 0x0FFFFFFF, t & 0x0FFFFFFF
+            if typ in (0x55, 0x76, 0x48) and at + size > len(d):
+                raise ValueError(f"AWC tag 0x{typ:02x} extends outside the bank")
             if typ == 0x55:
                 data = (at, size)
             elif typ == 0x76:
@@ -188,7 +190,7 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
             if info[c][3] != 0x0B or count == 0:
                 continue
             packets = opus_packets(d, start, count * 2048)
-            if packets and info[c][5] == 0:
+            if packets and info[c][5] < 2:
                 info[c][5] = 2 if any(p[0] & 0x04 for p in packets) else 1
             if not collect_packets:
                 continue
@@ -221,11 +223,11 @@ def opus_packets(d: bytes, at: int, size: int):
 def export_bank(path: str, out_dir: str):
     with open(path, "rb") as f:
         d = f.read()
+    streams, music = parse_awc(d)
     name = os.path.splitext(os.path.basename(path))[0]
     od = os.path.join(out_dir, name)
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
-    streams, music = parse_awc(d)
     for mus, data in music:
         for cid, samples, rate, codec, pk, packet_channels in music_channels(d, mus, data):
             if pk:
@@ -254,22 +256,33 @@ def export_bank(path: str, out_dir: str):
     return counts
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("out")
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--limit", type=int, help="maximum number of banks to export (default: all)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="banks to export at once (default: half the CPU count)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    if a.limit is not None and a.limit < 0:
+        ap.error("--limit must be non-negative")
+    if a.jobs < 1:
+        ap.error("--jobs must be at least 1")
+    if not os.path.exists(a.src):
+        ap.error(f"{a.src} does not exist")
+    if os.path.isfile(a.out):
+        ap.error(f"{a.out} is a file, not a folder")
     if os.path.isdir(a.src):
         banks = []
         for root, _, files in os.walk(a.src):
-            banks += [os.path.join(root, f) for f in files if f.lower().endswith(".awc")]
+            output_parent = os.path.join(a.out, os.path.relpath(root, a.src))
+            banks.extend((os.path.join(root, name), output_parent)
+                         for name in files if name.lower().endswith(".awc"))
         banks.sort()
     else:
-        banks = [a.src]
-    banks = banks[: a.limit] if a.limit else banks
+        banks = [(a.src, a.out)]
+    if a.limit is not None:
+        banks = banks[:a.limit]
     tot = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     jobs = max(1, a.jobs)
 
@@ -289,9 +302,9 @@ def main() -> int:
             print(f"  skip {os.path.basename(b)}: {e}")
 
     if jobs == 1:
-        for i, b in enumerate(banks):
+        for i, (b, output_parent) in enumerate(banks):
             try:
-                add(export_bank(b, a.out))
+                add(export_bank(b, output_parent))
             except (ValueError, struct.error, IndexError, OSError) as e:
                 skipped(b, e)
                 continue
@@ -299,7 +312,7 @@ def main() -> int:
                 print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
     else:
         with ProcessPoolExecutor(max_workers=jobs) as ex:
-            futures = {ex.submit(export_bank, b, a.out): b for b in banks}
+            futures = {ex.submit(export_bank, b, output_parent): b for b, output_parent in banks}
             for i, fut in enumerate(as_completed(futures), 1):
                 b = futures[fut]
                 try:

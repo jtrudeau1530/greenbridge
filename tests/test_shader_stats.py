@@ -1,0 +1,134 @@
+"""Unit tests for scripts/shader_stats.py (standard library only, no GPU).
+
+    python -I tests/test_shader_stats.py
+"""
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = os.path.join(ROOT, "scripts", "shader_stats.py")
+
+# ps_flat's listing as llvm-mc prints it: 8 instructions, highest VGPR v5.
+PS_FLAT = """; ps_flat  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words
+\tv_interp_mov_f32_e32 v2, p0, attr1.x    ; encoding: [0x02,0x04,0x0a,0xc8]
+\tv_add_nc_u32_e32 v3, 1, v2              ; encoding: [0x81,0x04,0x06,0x4a]
+\tv_interp_p1_f32_e32 v4, v0, attr0.x     ; encoding: [0x00,0x00,0x10,0xc8]
+\tv_interp_p2_f32_e32 v4, v1, attr0.x     ; encoding: [0x01,0x00,0x11,0xc8]
+\tv_interp_p1_f32_e32 v5, v0, attr0.y     ; encoding: [0x00,0x01,0x14,0xc8]
+\tv_interp_p2_f32_e32 v5, v1, attr0.y     ; encoding: [0x01,0x01,0x15,0xc8]
+\texp mrt0 v2, v3, v4, v5 done vm         ; encoding: [0x0f,0x18,0x00,0xf8,0x02,0x03,0x04,0x05]
+\ts_endpgm                                ; encoding: [0x00,0x00,0x81,0xbf]
+"""
+
+# Every RADV statistic reported: this full output must stay byte for byte as it was.
+COMPLETE = ["ps_flat,ps,Instructions,16", "ps_flat,ps,VGPRs,8", "ps_flat,ps,SGPRs,20", "ps_flat,ps,Scratch size,1024",
+            "ps_flat,ps,Spilled VGPRs,2", "ps_flat,ps,Spilled SGPRs,1", "ps_flat,ps,Subgroups per SIMD,16",
+            "ps_flat,ps,Driver pipeline hash,abc"]
+COMPLETE_SUMMARY = ("ps: 1 shaders, code growth median 2.00x (p90 2.00x, max 2.00x); VGPRs median 8 vs original 6; "
+                    "scratch in 1, spills in 1; waves/SIMD median 16\n")
+COMPLETE_DETAILS = """shader                     stage  orig   aco growth v_orig VGPRs SGPRs scratch spills waves
+ps_flat                    ps        8    16   2.00      6     8    20    1024      3    16
+
+"""
+NOTHING = "ps: 1 shaders, code growth n/a; VGPRs n/a; scratch n/a, spills n/a; waves/SIMD n/a\n"
+
+
+class ShaderStats(unittest.TestCase):
+    def run_stats(self, rows, details=True, listings=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.makedirs(disasm)
+            for name, text in (listings or {"ps_flat": PS_FLAT}).items():
+                with open(os.path.join(disasm, name + ".s"), "w", encoding="utf-8") as f:
+                    f.write(text)
+            csv_path = os.path.join(tmp, "stats.csv")
+            with open(csv_path, "w", encoding="utf-8") as f:
+                f.write("name,stage,statistic,value\n" + "".join(f"{r}\n" for r in rows))
+            cmd = [sys.executable, "-I", SCRIPT, csv_path, disasm] + (["--details"] if details else [])
+            return subprocess.run(cmd, capture_output=True, text=True)
+
+    def detail(self, r, name="ps_flat"):
+        return next(ln for ln in r.stdout.splitlines() if ln.startswith(name + " ")).split()
+
+    def test_growth_registers_and_scratch(self):
+        r = self.run_stats(["ps_flat,ps,Instructions,16", "ps_flat,ps,VGPRs,8", "ps_flat,ps,SGPRs,20",
+                            "ps_flat,ps,Scratch size,1024", "ps_flat,ps,Spilled VGPRs,2",
+                            "ps_flat,ps,Subgroups per SIMD,16", "ps_flat,ps,Driver pipeline hash,abc"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = next(ln for ln in r.stdout.splitlines() if ln.startswith("ps_flat"))
+        self.assertEqual(line.split(), ["ps_flat", "ps", "8", "16", "2.00", "6", "8", "20", "1024", ">=2", "16"])
+        self.assertIn("ps: 1 shaders, code growth median 2.00x", r.stdout)
+        self.assertIn("scratch in 1, spills in 1", r.stdout)
+
+    def test_shaders_without_a_listing_are_left_out(self):
+        r = self.run_stats(["ps_other,ps,Instructions,10"], details=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no shader is in both", r.stderr)
+
+    def test_complete_radv_output_is_unchanged(self):
+        r = self.run_stats(COMPLETE)
+        self.assertEqual((r.returncode, r.stderr, r.stdout), (0, "", COMPLETE_DETAILS + COMPLETE_SUMMARY))
+        r = self.run_stats(COMPLETE, details=False)
+        self.assertEqual((r.returncode, r.stderr, r.stdout), (0, "", COMPLETE_SUMMARY))
+
+    def test_other_driver_statistics_are_shown_raw_not_interpreted(self):
+        rows = ["ps_flat,ps,Foo count (bytes),123", 'ps_flat,ps,"Bar, total",18446744073709551615',
+                "ps_flat,ps,Register Count,24", "ps_flat,ps,stage,99"]
+        r = self.run_stats(rows)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.detail(r), ["ps_flat", "ps", "8", "-", "-", "6", "-", "-", "-", "-", "-"])
+        lines = r.stdout.splitlines()
+        i = lines.index("    Bar, total = 18446744073709551615")
+        self.assertEqual(lines[i + 1:i + 3], ["    Foo count (bytes) = 123", "    Register Count = 24"])
+        self.assertIn("    stage = 99", lines)
+        self.assertTrue(r.stdout.endswith("\n" + NOTHING), r.stdout)
+        r = self.run_stats(rows, details=False)
+        self.assertEqual((r.returncode, r.stdout), (0, NOTHING))
+        self.assertEqual(len(r.stderr.splitlines()), 1, r.stderr)
+        self.assertEqual(r.stderr, "additional driver statistics (see --details): Bar, total; Foo count (bytes); Register Count; stage\n")
+
+    def test_partial_statistics_state_their_subset(self):
+        rows = ["ps_flat,ps,Instructions,16", "ps_flat,ps,VGPRs,8", "ps_flat,ps,SGPRs,20", "ps_flat,ps,Scratch size,1024",
+                "ps_flat,ps,Spilled VGPRs,2", "ps_flat,ps,Spilled SGPRs,0", "ps_flat,ps,Subgroups per SIMD,16",
+                "ps_part,ps,Instructions,12"]
+        listings = {"ps_flat": PS_FLAT, "ps_part": PS_FLAT}
+        r = self.run_stats(rows, listings=listings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.detail(r, "ps_part"), ["ps_part", "ps", "8", "12", "1.50", "6", "-", "-", "-", "-", "-"])
+        r = self.run_stats(rows, details=False, listings=listings)
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        self.assertEqual(r.stdout, "ps: 2 shaders, code growth median 1.75x (p90 1.50x, max 2.00x); "
+                                   "VGPRs median 8 vs original 6 (1 of 2); scratch in 1 (1 of 2), spills in 1 (1 of 2); "
+                                   "waves/SIMD median 16 (1 of 2)\n")
+
+    def test_measured_zero_differs_from_missing_and_one_spill_counter_is_a_lower_bound(self):
+        cases = [(["Scratch size,0", "Spilled VGPRs,0", "Spilled SGPRs,0"], "0", "0", "scratch in 0, spills in 0;"),
+                 (["Spilled SGPRs,3"], "-", ">=3", "scratch n/a, spills in 1;"),
+                 (["Spilled VGPRs,0"], "-", "-", "scratch n/a, spills n/a;")]
+        for stats, scratch, spilled, summary in cases:
+            with self.subTest(stats=stats):
+                r = self.run_stats(["ps_flat,ps,Instructions,16"] + ["ps_flat,ps," + s for s in stats])
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(self.detail(r)[8:10], [scratch, spilled])
+                self.assertIn(summary, r.stdout)
+
+    def test_values_are_exact_or_unavailable(self):
+        r = self.run_stats(["ps_flat,ps,Instructions,18446744073709551615"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.detail(r)[3], "18446744073709551615")
+        r = self.run_stats(["ps_flat,ps,Instructions,12.0"])
+        self.assertEqual(self.detail(r)[3], "12")
+        for stat, column in [("Instructions,nan", 3), ("Instructions,", 3), ("Instructions,inf", 3),
+                             ("Instructions," + "9" * 400, 3), ("VGPRs,abc", 6)]:
+            with self.subTest(stat=stat[:20]):
+                r = self.run_stats(["ps_flat,ps," + stat])
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(self.detail(r)[column], "-")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -5,8 +5,9 @@
 The AWC layout is read by tools/awc_opus.py (parse_awc + music_channels), so this manifest and the
 exporter agree on stream ids, codecs, sample rates and streamed-music descriptors. A directory is
 scanned recursively for *.awc. CSV is the default on stdout; --out writes a file and a .json
-extension selects JSON unless --format says otherwise. Unreadable banks are reported on stderr and
-skipped.
+extension selects JSON unless --format says otherwise. Unreadable banks are reported on stderr, skipped,
+and excluded from bank_count. The bank column gives the path relative to the scanned directory or the basename
+for a single file.
 
 CSV columns: bank, stream, codec, codec_name, channels, sample_rate, declared_samples, duration_s,
 streamed_music, data_offset, data_size, bank_size, notes. JSON is an object with bank_count,
@@ -23,10 +24,12 @@ import json
 import os
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the parser.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 FIELDS = ("bank", "stream", "codec", "codec_name", "channels", "sample_rate", "declared_samples",
           "duration_s", "streamed_music", "data_offset", "data_size", "bank_size", "notes")
@@ -86,7 +89,7 @@ def _row(bank: str, sid: int, codec: int, channels: int, rate: int, samples: int
     }
 
 
-def _bank_rows(path: str) -> list:
+def _bank_rows(path: str, bank: str) -> list:
     with open(path, "rb") as f:
         d = f.read()
     parsed = awc_opus.parse_awc(d)
@@ -95,7 +98,7 @@ def _bank_rows(path: str) -> list:
     else:                                                    # older parser: streams + attribute
         streams = parsed
         music = getattr(awc_opus.parse_awc, "music", [])
-    bank, bank_size, rows = os.path.basename(path), len(d), {}
+    bank_size, rows = len(d), {}
     for s in streams:
         rows[s["id"]] = _row(bank, s["id"], s["codec"], s["channels"], s["rate"], s["samples"],
                              s["data"], bank_size, False)
@@ -115,8 +118,13 @@ def _bank_rows(path: str) -> list:
 
 
 def collect(src: str):
-    """(bank count, rows, streamed-music row count); one warning per skipped bank."""
-    if os.path.isdir(src):
+    """(parsed bank count, rows, streamed-music row count); one warning per skipped bank.
+
+    Invalid banks are reported on stderr and excluded from the bank count, so the summary cannot claim
+    that a directory was inventoried when none of its files could be read.
+    """
+    recursive = os.path.isdir(src)
+    if recursive:
         banks = []
         for root, dirs, files in os.walk(src):
             dirs.sort()
@@ -125,21 +133,29 @@ def collect(src: str):
     else:
         banks = [src]
     rows = []
+    parsed = 0
     for path in banks:
         try:
-            rows += _bank_rows(path)
+            bank = os.path.relpath(path, src).replace(os.sep, "/") if recursive else os.path.basename(path)
+            rows += _bank_rows(path, bank)
+            parsed += 1
         except (ValueError, struct.error, IndexError, OSError) as e:
             print(f"awc_manifest: warning: skipping {path}: {e}", file=sys.stderr)
     rows.sort(key=lambda r: (r["bank"].lower(), int(r["stream"], 16)))
-    return len(banks), rows, sum(1 for r in rows if r["streamed_music"])
+    return parsed, rows, sum(1 for r in rows if r["streamed_music"])
 
 
 def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) -> None:
+    """Write to stdout, or to a temporary file renamed over `out` once it is complete, so a failed
+    write keeps the previous manifest instead of truncating it."""
     doc = {"bank_count": banks, "stream_count": len(rows),
            "streamed_music_channel_count": streamed, "streams": rows}
+    tmp = None
     if out:
-        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-        f = open(out, "w", encoding="utf-8", newline="")
+        folder = os.path.dirname(os.path.abspath(out))
+        os.makedirs(folder, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".awc_manifest-", suffix=".tmp")
+        f = os.fdopen(fd, "w", encoding="utf-8", newline="")
     else:
         f = sys.stdout
     try:
@@ -154,9 +170,19 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
                 row["duration_s"] = "" if r["duration_s"] is None else f"{r['duration_s']:.6f}"
                 row["streamed_music"] = "yes" if r["streamed_music"] else "no"
                 w.writerow(row)
+        if tmp:
+            f.close()
+            os.chmod(tmp, published_mode(out))   # mkstemp creates 0600
+            os.replace(tmp, out)
+            tmp = None
     finally:
         if f is not sys.stdout:
             f.close()
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def main(argv=None) -> int:

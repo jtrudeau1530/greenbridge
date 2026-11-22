@@ -93,6 +93,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         ".glb": "model/gltf-binary",
     }
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The viewer can cancel a chunk download while its response is being sent.
+            pass
+
     def send_head(self):
         if not host_allowed(self.headers.get("Host")):
             self.send_error(403, "Forbidden: open the viewer at http://127.0.0.1 or http://localhost")
@@ -116,14 +123,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
 
+def port_number(text: str) -> int:
+    """--port: 0-65535. Anything else used to reach socketserver and end in OverflowError."""
+    try:
+        value = int(text, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if not 0 <= value <= 65535:
+        raise argparse.ArgumentTypeError("must be 0-65535")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--world", default=r"<work>\world")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=port_number, default=8765,
+                    help="0 asks the OS for a free port; the bound port is printed")
     a = ap.parse_args()
     Handler.world = a.world if os.path.isdir(a.world) else None
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
-    print(f"viewer: http://127.0.0.1:{a.port}/  world: {Handler.world or '(none: test terrain)'}", flush=True)
+    print(f"viewer: http://127.0.0.1:{srv.server_address[1]}/  world: {Handler.world or '(none: test terrain)'}",
+          flush=True)
     srv.serve_forever()
 
 

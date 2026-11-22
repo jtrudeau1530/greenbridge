@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -165,6 +166,56 @@ class CliTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_missing_path_is_one_line(self):
+        missing = os.path.join(self.dir, "missing")
+        p = subprocess.run([sys.executable, "-I", TOOL, missing], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn(missing, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.stdout, "")
+
+    def test_limit_counts_from_the_start(self):
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json", "--limit", "1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm"])
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json", "--limit", "0x1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm"])
+        # A negative limit sliced from the end (paths[:-1] dropped b.fssm) instead of being refused.
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "-1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("must be 0 or more", p.stderr)
+        self.assertEqual(p.stdout, "")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "nope"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("invalid int value: 'nope'", p.stderr)
+        self.assertNotIn("non_negative", p.stderr)
+
+    def test_ignores_fssm_subdirectories_and_reports_read_errors_cleanly(self):
+        os.makedirs(os.path.join(self.fssm_dir, "nested.fssm"))
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm", "b.fssm"])
+
+        err = PermissionError(13, "Permission denied", os.path.join(self.fssm_dir, "a.fssm"))
+        with mock.patch("fssm_header.summarize", side_effect=err):
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
+                orig_stderr = sys.stderr
+                try:
+                    sys.stderr = stderr_file
+                    rc = fssm_header.main([self.fssm_dir])
+                finally:
+                    sys.stderr = orig_stderr
+                stderr_file.seek(0)
+                err_out = stderr_file.read()
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: cannot read", err_out)
+
     def test_text_tally(self):
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -178,6 +229,38 @@ class CliTest(unittest.TestCase):
         doc = json.loads(p.stdout)
         self.assertEqual(doc["tally"]["ps_with_table"], 1)
         self.assertEqual(doc["tally"]["entries"], 2)
+
+    def test_table_only_entry_counts_exclude_blobs_without_a_table(self):
+        os.remove(os.path.join(self.dir, "index.json"))
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        tally = json.loads(p.stdout)["tally"]
+        self.assertEqual(tally["stage_source"], "table-only")
+        self.assertEqual(tally["ps_with_table"], 1)
+        self.assertEqual(tally["entries"], 2)
+        self.assertEqual(tally["entry_counts"], {"2": 1})
+        self.assertEqual(sum(tally["entry_counts"].values()), tally["ps_with_table"])
+
+    def test_table_only_tally_with_only_non_ps_blobs_has_an_empty_histogram(self):
+        rows = [{"stage": None, "directory_ok": True, "entries": 0, "fp16_mask": 0, "inputs": []}]
+        tally = fssm_header.tally(rows, False)
+        self.assertEqual(tally["entry_counts"], {})
+        self.assertEqual(tally["entries"], 0)
+
+    def test_local_stage_index_works_with_an_unrelated_parent_index(self):
+        with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"unrelated": []}, f)
+        with open(os.path.join(self.fssm_dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump([{"file": "a.dxbc", "stage": "ps"}], f)
+        self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps"})
+
+    def test_parent_stage_index_is_used_when_local_index_is_empty_or_unrelated(self):
+        for data in ({"unrelated": []}, [], {}):
+            with self.subTest(data=data):
+                with open(os.path.join(self.fssm_dir, "index.json"), "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps", "b": "ps"})
 
 
 class BindingCliTest(unittest.TestCase):

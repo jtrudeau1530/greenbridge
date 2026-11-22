@@ -106,6 +106,20 @@ int test_load_factor_and_growth() {
     return 0;
 }
 
+int test_insert_reports_mapping_changes() {
+    DescriptorTable table;
+    const DescriptorKey key{1, 2, 3, 4, 5, 6, 7, 8};
+    using Result = DescriptorTable::InsertResult;
+
+    EXPECT(table.insert_or_update(key.data(), 0) == Result::added);
+    EXPECT(table.insert_or_update(key.data(), 0) == Result::unchanged);
+    EXPECT(table.insert_or_update(key.data(), 17) == Result::replaced);
+    EXPECT(table.insert_or_update(key.data(), 17) == Result::unchanged);
+    EXPECT(table.lookup(key) == 17);
+    EXPECT(table.size() == 1);
+    return 0;
+}
+
 int test_probe_collision_resolution() {
     DescriptorTable table(64);
 
@@ -269,13 +283,87 @@ int test_erase_and_cluster_compact() {
     return 0;
 }
 
+int test_change_tracking() {
+    DescriptorTable table(16);
+    const std::uint32_t k1[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const std::uint32_t k2[8] = {9, 10, 11, 12, 13, 14, 15, 16};
+
+    // A fresh table has nothing to upload.
+    DescriptorTable::Changes changes = table.take_changes();
+    EXPECT(!changes.all && changes.slots.empty());
+
+    // An insert marks exactly the slot it landed in, and read_slot agrees with build_gpu_buffer.
+    EXPECT(table.insert(k1, 42));
+    changes = table.take_changes();
+    EXPECT(!changes.all && changes.slots.size() == 1);
+    const std::uint32_t slot = changes.slots.front();
+    const auto words = table.build_gpu_buffer();
+    std::uint32_t read[10] = {};
+    EXPECT(table.read_slot(slot, read));
+    EXPECT(std::memcmp(read, &words[1 + slot * 10], sizeof(read)) == 0);
+    EXPECT(read[8] == 42 && read[9] == kSlotOccupiedMarker);
+    EXPECT(table.take_changes().slots.empty());  // taking consumes the list
+
+    // Replacing an index marks the same slot; read_slot sees the new index.
+    EXPECT(table.insert_or_update(k1, 43) == DescriptorTable::InsertResult::replaced);
+    changes = table.take_changes();
+    EXPECT(!changes.all && changes.slots.size() == 1 && changes.slots.front() == slot);
+    EXPECT(table.read_slot(slot, read) && read[8] == 43);
+
+    // Erasing marks the slot it was in and the ones the cluster compaction moved.
+    EXPECT(table.insert(k2, 7));
+    table.take_changes();
+    EXPECT(table.erase(k1));
+    changes = table.take_changes();
+    EXPECT(!changes.all && !changes.slots.empty() && changes.slots.front() == slot);
+
+    // Growth changes the mask, so everything re-uploads.
+    const std::size_t before = table.capacity();
+    for (std::uint32_t i = 0; i < 200 && table.capacity() == before; ++i) {
+        const std::uint32_t key[8] = {i, i * 2, i * 3, i * 4, i * 5, i * 6, i * 7, i * 8};
+        table.insert(key, 1000 + i);
+    }
+    EXPECT(table.capacity() > before);
+    EXPECT(table.take_changes().all);
+
+    // Out-of-range slots are refused rather than read past the table.
+    EXPECT(!table.read_slot(std::uint32_t(table.capacity()), read));
+    return 0;
+}
+
+int test_relocation_marks_both_slots() {
+    DescriptorTable table(64);
+    const std::uint32_t slots = std::uint32_t(table.capacity());
+    // Eight keys in eight adjacent home slots across the end of the table; the ninth shares the first home and can
+    // only fit by moving a resident (make_probe_slot), which changes two slots.
+    std::array<DescriptorKey, kDescriptorProbes + 1> keys{};
+    for (std::uint32_t i = 0; i < keys.size(); ++i) {
+        auto& key = keys[i];
+        key[0] = i + 1;
+        const std::uint32_t target = (slots - 4 + i % kDescriptorProbes) & (slots - 1);
+        while ((hash_descriptor_key(key) & (slots - 1)) != target) ++key[7];
+    }
+    for (std::uint32_t i = 0; i < kDescriptorProbes; ++i) EXPECT(table.insert(keys[i].data(), 100 + i));
+    table.take_changes();
+    EXPECT(table.insert_or_update(keys.back().data(), 999) == DescriptorTable::InsertResult::added_with_relocation);
+    const DescriptorTable::Changes changes = table.take_changes();
+    EXPECT(!changes.all);
+    EXPECT(changes.slots.size() >= 2);  // the hole a resident moved into and the slot the new key took
+    for (std::uint32_t i = 0; i < kDescriptorProbes; ++i) EXPECT(table.lookup(keys[i]) == 100 + i);
+    EXPECT(table.lookup(keys.back()) == 999);
+    return 0;
+}
+
 int main() {
     EXPECT(test_fnv1a_hash_matches_contract() == 0);
     EXPECT(test_ssharp_key_padding() == 0);
     EXPECT(test_basic_insertion_and_lookup() == 0);
+    EXPECT(test_insert_reports_mapping_changes() == 0);
     EXPECT(test_load_factor_and_growth() == 0);
     EXPECT(test_probe_collision_resolution() == 0);
     EXPECT(test_gpu_buffer_serialization() == 0);
+    EXPECT(test_change_tracking() == 0);
+    EXPECT(test_relocation_marks_both_slots() == 0);
     EXPECT(test_multithreaded_insert_and_lookup() == 0);
     EXPECT(test_clear_resets_table() == 0);
     EXPECT(test_erase_and_cluster_compact() == 0);

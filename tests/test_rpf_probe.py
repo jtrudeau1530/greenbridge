@@ -3,11 +3,14 @@
     python -I tests/test_rpf_probe.py
 """
 import contextlib
+import errno
 import importlib.util
 import io
 import json
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -138,6 +141,14 @@ class MainTests(unittest.TestCase):
         self.assertIn("2 archives", out)
         self.assertIn("'RPF4': 2", out)
 
+    def test_equal_sized_archives_are_sorted_by_path(self):
+        self.write("z.rpf", archive_bytes())
+        self.write("a.rpf", archive_bytes())
+        with mock.patch.object(probe.os, "walk", return_value=[(self.game, [], ["z.rpf", "a.rpf"])]):
+            self.run_main()
+
+        self.assertEqual([os.path.basename(row["file"]) for row in self.rows()], ["a.rpf", "z.rpf"])
+
     def test_creates_the_output_directory(self):
         self.write("a.rpf", archive_bytes())
         self.run_main()
@@ -147,6 +158,73 @@ class MainTests(unittest.TestCase):
         out = self.run_main()
         self.assertEqual(self.rows(), [])
         self.assertIn("0 archives", out)
+
+    @unittest.skipUnless(os.name == "posix", "requires a POSIX file size limit")
+    def test_failed_write_preserves_the_existing_report(self):
+        self.write("demo.rpf", b"9FPR" + struct.pack("<I", 16) + bytes(32))
+        previous = b'{"previous": true}'
+        out_dir = os.path.dirname(self.out)
+        os.makedirs(out_dir)
+        with open(self.out, "wb") as f:
+            f.write(previous)
+
+        limited_probe = """\
+import resource
+import runpy
+import signal
+import sys
+
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+resource.setrlimit(resource.RLIMIT_FSIZE, (32, 32))
+runpy.run_path(sys.argv.pop(1), run_name="__main__")
+"""
+        script = os.path.join(ROOT, "tools", "rpf_probe.py")
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", limited_probe, script, self.game, "--out", self.out],
+            capture_output=True, text=True,
+        )
+
+        with open(self.out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(os.listdir(out_dir), [os.path.basename(self.out)])
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn(self.out, result.stderr)
+
+    def test_failed_scan_preserves_the_existing_report(self):
+        archive = self.write("a.rpf", archive_bytes())
+        self.run_main()
+        before = self.rows()
+        missing = os.path.join(self.tmp, "missing")
+        for source in (missing, archive):
+            with self.subTest(source=source):
+                err = io.StringIO()
+                argv = ["rpf_probe.py", source, "--out", self.out]
+                with mock.patch("sys.argv", argv), contextlib.redirect_stderr(err):
+                    self.assertEqual(probe.main(), 2)
+                self.assertIn(source, err.getvalue())
+                self.assertEqual(self.rows(), before)
+
+    def test_unreadable_subdirectory_preserves_the_existing_report(self):
+        self.write("a.rpf", archive_bytes())
+        blocked = os.path.dirname(self.write("blocked/b.rpf", archive_bytes()))
+        self.run_main()
+        before = self.rows()
+        scandir = os.scandir
+
+        def deny_subdirectory(path):
+            if path == blocked:
+                raise PermissionError(errno.EACCES, "Permission denied", path)
+            return scandir(path)
+
+        err = io.StringIO()
+        argv = ["rpf_probe.py", self.game, "--out", self.out]
+        with (mock.patch("sys.argv", argv), mock.patch.object(os, "scandir", side_effect=deny_subdirectory),
+              contextlib.redirect_stderr(err)):
+            self.assertEqual(probe.main(), 2)
+        self.assertIn(blocked, err.getvalue())
+        self.assertEqual(self.rows(), before)
 
 
 if __name__ == "__main__":

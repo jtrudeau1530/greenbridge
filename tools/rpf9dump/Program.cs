@@ -20,15 +20,33 @@ if (mode == "ttpf")
     foreach (var t in info.Textures)
     {
         string name = $"{t.Index:D6}_{Util.Safe(Path.GetFileNameWithoutExtension(t.Name))}.dds";
-        rows.Add(new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, t.Limitation, File = t.CanExtract ? name : null });
-        if (!t.CanExtract) { skip++; continue; }
         string path = Path.Combine(outDir, name);
-        if (File.Exists(path)) { ok++; continue; }
-        try { Util.WriteAllBytes(path, TtpfReader.CreateDds(src, t.Index)); ok++; }
-        catch (Exception e) { fail++; if (fail <= 5) Console.WriteLine($"  fail {t.Index}: {e.GetType().Name} {e.Message}"); }
-        if ((ok + fail) % 5000 == 0) Console.WriteLine($"  {ok + fail}/{info.Textures.Count}");
+        string? file = t.CanExtract ? name : null, limitation = t.Limitation;
+        if (!t.CanExtract) skip++;
+        else if (File.Exists(path)) ok++;
+        else
+        {
+            try
+            {
+                // Content the decoder cannot handle is a skip like !CanExtract. Pool read errors, DDS write errors,
+                // cancellation and anything unexpected stay failures.
+                byte[]? dds = null;
+                try { dds = TtpfReader.CreateDds(src, t.Index); }
+                catch (Exception e) when (e.GetType() == typeof(NotSupportedException) || e.GetType() == typeof(InvalidDataException))
+                { skip++; file = null; limitation = e.Message; }
+                if (dds != null) { Util.WriteAllBytes(path, dds); ok++; }
+            }
+            catch (Exception e) { fail++; if (fail <= 5) Console.WriteLine($"  fail {t.Index}: {e.GetType().Name} {e.Message}"); }
+            if ((ok + fail) % 5000 == 0) Console.WriteLine($"  {ok + fail}/{info.Textures.Count}");
+        }
+        rows.Add(new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, Limitation = limitation, File = file });
     }
-    Util.WriteAllText(Path.Combine(outDir, "manifest.json"), JsonSerializer.Serialize(new { src, info.Version, Count = info.Textures.Count, info.Metadata, Textures = rows }, json));
+    // The manifest is the build's completion marker. Keep successful DDS for retry, but withdraw a stale marker.
+    string manifest = Path.Combine(outDir, "manifest.json");
+    if (fail == 0)
+        Util.WriteAllText(manifest, JsonSerializer.Serialize(new { src, info.Version, Count = info.Textures.Count, info.Metadata, Textures = rows }, json));
+    else
+        File.Delete(manifest);
 }
 else if (mode == "audio")
 {
@@ -72,11 +90,15 @@ else if (mode == "xma")
             catch (Exception ex) { fail++; if (fail <= 5) Console.WriteLine($"  fail {e.Name}#{st.Index}: {ex.GetType().Name} {ex.Message}"); }
         }
     }
+    // make_game marks audio/xma done on exit 0, so a failed stream must fail the run to be retried.
+    Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
+    return fail != 0 ? 1 : 0;
 }
 else if (mode is "models" or "textures")
 {
     byte[] header; using (var f = File.OpenRead(src)) { header = new byte[64]; f.ReadExactly(header); }
     var cached = RecoveryIndexCache.Load(mode, src, length, header);
+    int? candidates = ScanCounts.Candidates(cached?.Coverage);
     if (cached == null)
     {
         long last = -1;
@@ -92,12 +114,17 @@ else if (mode is "models" or "textures")
             if ((i / 32) % 200 == 0) Console.WriteLine($"  validated {i + chunk.Length:N0}/{cands.Count:N0} -> {entries.Count:N0} ({sw.Elapsed.TotalSeconds:0}s)");
         }
         entries = entries.OrderBy(e => e.Offset).Select((e, k) => e with { Index = k }).ToList();
-        RecoveryIndexCache.Save(mode, src, entries, $"rpf9dump full scan, {cands.Count:N0} candidates, {entries.Count:N0} recovered");
+        RecoveryIndexCache.Save(mode, src, entries, ScanCounts.Coverage(cands.Count, entries.Select(e => e.Offset).Distinct().Count()));
+        candidates = cands.Count;
     }
     var doc = ArchiveReader.Open(src);
     string want = mode == "models" ? "Recovered model" : "Recovered texture dictionary";
     var list = doc.Entries.Where(e => e.Compression == want).ToList();
     Console.WriteLine($"  {list.Count:N0} {mode} entries ({sw.Elapsed.TotalSeconds:0}s)");
+    // A drawable dictionary yields one entry per child, all with the candidate's offset: count resources by offset.
+    int recovered = list.Select(e => e.Offset).Distinct().Count();
+    if (candidates is int c && c > recovered)
+        Console.WriteLine($"  {c - recovered:N0} of {c:N0} scan candidates were not recovered (rejected before decoding)");
     string sub = Path.Combine(outDir, mode); Directory.CreateDirectory(sub);
     // The manifest is streamed row by row: holding 150k rows (each capturing its decoded model through lazy
     // projections) ran out of memory on levels.rpf. Written to a .partial file and renamed when complete.
@@ -107,6 +134,16 @@ else if (mode is "models" or "textures")
     writer.WriteStartObject();
     writer.WriteString("src", src);
     writer.WriteNumber("Count", list.Count);
+    // Scan-level counts. Candidates the recovery step rejects never reach the per-item loop or
+    // ModelDecodeFailures, so NotRecovered is the only place they show up. Recovered counts resources (candidate
+    // offsets); Entries counts manifest items (one per dictionary child). Null when a cached index does not record
+    // the candidate count.
+    writer.WriteStartObject("Scan");
+    if (candidates is int scanned) writer.WriteNumber("Candidates", scanned); else writer.WriteNull("Candidates");
+    writer.WriteNumber("Recovered", recovered);
+    if (candidates is int total) writer.WriteNumber("NotRecovered", total - recovered); else writer.WriteNull("NotRecovered");
+    writer.WriteNumber("Entries", list.Count);
+    writer.WriteEndObject();
     writer.WriteStartArray("Items");
     void Row(object row) => JsonSerializer.Serialize(writer, row, json);
     int embedded = 0;
@@ -121,7 +158,7 @@ else if (mode is "models" or "textures")
             var sys = data.AsSpan(0, split); var gfx = data.AsSpan(split);
             if (mode == "models")
             {
-                var m = RageModelDecoder.Decode(sys, gfx);
+                var m = RageModelDecoder.Decode(sys, gfx, e.ResourceDrawableOffset);
                 if (m == null)
                 {
                     var reason = ModelDecodeFailure.Explain(sys, gfx.Length);
@@ -144,7 +181,7 @@ else if (mode is "models" or "textures")
                         try { Util.WriteAllBytes(p, Util.BgraDds(RageTextureDecoder.DecodeEmbeddedTexturePixels(sys, gfx, dOff, t.Index))); embedded++; } catch { }
                     }
                 }
-                Row(new { e.Offset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
+                Row(new { e.Offset, Drawable = e.ResourceDrawableOffset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
                     Min = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z }, Max = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
                     MeshShaders = m.Meshes.Select(x => x.ShaderIndex).ToArray(),
                     Embedded = m.EmbeddedTextures?.Select(t => new { t.Index, t.Name, t.Width, t.Height, t.Format, Hash = t.NameHash.ToString("X8"), Key = t.AssetKey?.ToString("X16") }).ToArray(),
@@ -183,4 +220,4 @@ else if (mode is "models" or "textures")
     File.Move(partial, manifestPath, true);
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
-return 0;
+return mode == "ttpf" && fail != 0 ? 1 : 0;

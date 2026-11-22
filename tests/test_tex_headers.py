@@ -8,6 +8,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -55,8 +56,8 @@ class TestGFX10FormatMapping(unittest.TestCase):
             (14, 49, "R8G8_UNORM"),
             (22, 41, "R32_FLOAT"),
             (29, 34, "R16G16_FLOAT"),
-            (43, 26, "R11G11B10_FLOAT"),
-            (44, 24, "R10G10B10A2_UNORM"),
+            (36, 26, "R11G11B10_FLOAT"),
+            (50, 24, "R10G10B10A2_UNORM"),
             (56, 28, "R8G8B8A8_UNORM"),
             (130, 29, "R8G8B8A8_UNORM_SRGB"),
             (64, 16, "R32G32_FLOAT"),
@@ -68,6 +69,20 @@ class TestGFX10FormatMapping(unittest.TestCase):
                 dxgi_id, name = tex_headers.map_gfx10_format(gfx10_code)
                 self.assertEqual(dxgi_id, expected_dxgi)
                 self.assertEqual(name, expected_name)
+
+    def test_packed_formats_follow_top_bit_first_names(self):
+        # GFX10 names list widths from the top bit: 2_10_10_10 is R10G10B10A2, 10_11_11 is R11G11B10.
+        with open(os.path.join(TOOLS_DIR, "gfx10_formats.json"), encoding="utf-8") as f:
+            names = json.load(f)
+        for gfx10, dxgi, name in ((36, 26, "10_11_11_FLOAT"), (50, 24, "2_10_10_10_UNORM"),
+                                  (54, 25, "2_10_10_10_UINT")):
+            with self.subTest(gfx10=gfx10):
+                self.assertEqual(names[str(gfx10)], "GFX10_FORMAT_" + name)
+                self.assertEqual(tex_headers.map_gfx10_format(gfx10)[0], dxgi)
+                self.assertEqual(tex_headers.dxgi_to_gfx10(dxgi), gfx10)
+        for gfx10 in (43, 44, 48):   # 11_11_10_FLOAT, 10_10_10_2_*: no DXGI format has these layouts
+            with self.subTest(gfx10=gfx10), self.assertRaises(ValueError):
+                tex_headers.map_gfx10_format(gfx10)
 
     def test_unsupported_gfx10_raises(self):
         for invalid in [0, 9999, -1, 400]:
@@ -356,19 +371,176 @@ class TestCompactMipLayout(unittest.TestCase):
 
     def test_parse_etpf_maximum_fields(self):
         # All packed fields at their maximum: 16 Ki mips worth of split bits,
-        # maximum depth/dimension/mode/meta/base. The parser reports the bit
-        # fields; layout validation is what rejects an impossible mip count.
+        # 7-bit format (0..127), 11-bit depth (1..2048), dimension/mode/meta/base.
+        # The parser reports the bit fields; layout validation is what rejects
+        # an impossible mip count.
         record = struct.pack("<IIII", 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
         desc = tex_headers.parse_etpf_texture_record(record)
         self.assertEqual((desc["width"], desc["height"]), (16384, 16384))
         self.assertEqual((desc["packed_mips"], desc["non_tail"], desc["mips"]), (15, 7, 22))
-        self.assertEqual((desc["format"], desc["depth"], desc["dimension"]), (255, 1024, 3))
+        self.assertEqual((desc["format"], desc["depth"], desc["dimension"]), (127, 2048, 3))
         self.assertEqual(desc["mode"], 511)
         self.assertEqual(desc["meta"], 0x7FF)
         self.assertEqual(desc["base"], 0x1FFFFF * 4096)
         with self.assertRaises(ValueError):
             tex_headers.compact_surface_layout(desc["width"], desc["height"],
                                                desc["mips"], 16, 4)
+
+    def test_parse_etpf_bit10_format_depth_boundary(self):
+        # Bit 10 of word b is depth bit 0 (depth - 1), not format bit 7.
+        cases = [
+            (28, 2, 1),   # old 8-bit format view would have read 28 | 128 = 156, depth=1
+            (71, 6, 2),   # cubemap: depth - 1 = 5 (odd -> bit 10 set)
+            (54, 8, 3),   # 3D volume: depth - 1 = 7 (odd -> bit 10 set)
+        ]
+        for fmt, depth, dim in cases:
+            with self.subTest(fmt=fmt, depth=depth, dim=dim):
+                a = (64 - 1) | ((64 - 1) << 14) | (1 << 28)
+                b = 0 | (fmt << 3) | ((depth - 1) << 10) | (dim << 21) | (1 << 23)
+                desc = tex_headers.parse_etpf_texture_record(struct.pack("<IIII", a, b, 1, 0))
+                self.assertEqual(desc["format"], fmt)
+                self.assertEqual(desc["depth"], depth)
+                self.assertEqual(desc["dimension"], dim)
+
+    def test_decode_etpf_chunk_pages_and_padding(self):
+        # Empty metadata decodes to empty tuple.
+        self.assertEqual(tex_headers.decode_etpf_chunk_pages(0, 0), ())
+
+        # Single-chunk code in low 5 bits of meta (code 11 -> 16 pages).
+        self.assertEqual(tex_headers.decode_etpf_chunk_pages(11, 0), (16,))
+
+        # Multi-chunk codes spanning the 11-bit meta / extra boundary:
+        # codes (6, 21, 15, 16) -> pages (6, 18, 64, 128).
+        val20 = 6 | (21 << 5) | (15 << 10) | (16 << 15)
+        meta = val20 & 0x7FF
+        extra_low = val20 >> 11
+        # Upper 13 bits of extra carry (align_group=2, pad_pages=9); reserved bits 9..18 = 0.
+        extra = extra_low | (2 << 19) | (9 << 21)
+        self.assertEqual(tex_headers.decode_etpf_chunk_pages(meta, extra), (6, 18, 64, 128))
+        self.assertEqual(tex_headers.etpf_streaming_padding(extra), (2, 9))
+        self.assertEqual(tex_headers.etpf_streaming_padding(0), (0, 0))
+
+        # Negative controls: unknown 5-bit code (9, 17, 31 not in table).
+        for bad_code in (9, 17, 25, 31):
+            with self.subTest(bad_code=bad_code):
+                self.assertIsNone(tex_headers.decode_etpf_chunk_pages(bad_code, 0))
+
+        # Negative controls: non-zero code after zero terminator.
+        self.assertIsNone(tex_headers.decode_etpf_chunk_pages(1 << 5, 0))
+        self.assertIsNone(tex_headers.decode_etpf_chunk_pages(1 | (2 << 10), 0))
+
+        # Negative control: non-zero reserved bits (extra >> 9) & 0x3FF.
+        for bit in (9, 13, 18):
+            with self.subTest(reserved_bit=bit):
+                self.assertIsNone(tex_headers.decode_etpf_chunk_pages(1, 1 << bit))
+
+        # Negative controls: out-of-range or non-integer inputs.
+        for bad_meta, bad_extra in [(-1, 0), (0x800, 0), (0, -1), (0, 1 << 32), ("1", 0), (0, None)]:
+            with self.subTest(meta=bad_meta, extra=bad_extra):
+                self.assertIsNone(tex_headers.decode_etpf_chunk_pages(bad_meta, bad_extra))
+
+    def test_array_surface_layout(self):
+        lay = tex_headers.array_layout_for_dxgi(256, 256, 3, 83, 6, tile=tex_headers.COMPACT_TILE_64K)
+        self.assertTrue(lay["mip_major"])
+        self.assertEqual(lay["depth"], 3)
+        self.assertEqual(lay["tile"], 65536)
+        self.assertEqual(lay["first_tail"], 1)
+        self.assertEqual(lay["slice_size"], 131072)
+        self.assertEqual(lay["size"], 3 * lay["slice_size"])
+        # Packed tail sits at offset 0 with slice_stride == tile; standalone mip 0 follows depth * tile.
+        self.assertEqual(lay["mips"][1]["offset"], 0)
+        self.assertEqual(lay["mips"][1]["slice_stride"], 65536)
+        self.assertEqual(lay["mips"][0]["offset"], 3 * 65536)
+        self.assertEqual(lay["mips"][0]["slice_stride"], lay["mips"][0]["region"])
+
+        # Negative controls: depth <= 0 or unknown format.
+        for bad_depth in (0, -1, "3"):
+            with self.subTest(depth=bad_depth):
+                with self.assertRaises(ValueError):
+                    tex_headers.array_surface_layout(256, 256, bad_depth, 6, 16, 4)
+        with self.assertRaises(ValueError):
+            tex_headers.array_layout_for_dxgi(256, 256, 2, 9999, 6)
+
+    def test_cubemap_surface_layout(self):
+        # non_tail=0 (mode 18): single 6-face snapshot at offset 0.
+        lay0 = tex_headers.cubemap_layout_for_dxgi(128, 128, 71, 6, non_tail=0)
+        self.assertEqual(lay0["data_offset"], 0)
+        self.assertEqual(lay0["face_size"], 12288)
+        self.assertEqual(lay0["full_bytes"], 73728)
+        self.assertEqual(lay0["padded_full_bytes"], 73728)
+        self.assertEqual(lay0["size"], 73728)
+        self.assertEqual(lay0["snapshots"], 1)
+        self.assertEqual(lay0["depth"], 6)
+        # Explicit matching 1-chunk list is accepted for non_tail=0.
+        lay0_pages = tex_headers.cubemap_layout_for_dxgi(128, 128, 71, 6, non_tail=0, chunk_pages=(18,))
+        self.assertEqual(lay0_pages["size"], 73728)
+
+        # Streaming non_tail=1 below 36-page 64 KiB padding threshold: 18 pages stays 18 pages.
+        lay1_small = tex_headers.cubemap_layout_for_dxgi(128, 128, 71, 6, non_tail=1, chunk_pages=(6, 18))
+        self.assertEqual(lay1_small["full_bytes"], 18 * 4096)
+        self.assertEqual(lay1_small["padded_full_bytes"], 18 * 4096)
+        self.assertEqual(lay1_small["data_offset"], 6 * 4096)
+        self.assertEqual(lay1_small["size"], 24 * 4096)
+        self.assertEqual(lay1_small["snapshots"], 2)
+
+        # Streaming non_tail=2 at exact 36-page threshold (128x128 BC7 -> 6 * 24576 = 36 * 4096)
+        # rounds final chunk up to 64 KiB boundary (48 pages = 196608 bytes).
+        lay2_thresh = tex_headers.cubemap_layout_for_dxgi(128, 128, 98, 6, non_tail=2, chunk_pages=(6, 12, 48))
+        self.assertEqual(lay2_thresh["full_bytes"], 36 * 4096)
+        self.assertEqual(lay2_thresh["padded_full_bytes"], 48 * 4096)
+        self.assertEqual(lay2_thresh["data_offset"], 18 * 4096)
+        self.assertEqual(lay2_thresh["size"], 66 * 4096)
+        self.assertEqual(lay2_thresh["snapshots"], 3)
+
+        # Streaming non_tail=3 above threshold (256x256 BC1 -> 6 * 45056 = 66 * 4096 -> 80 * 4096).
+        lay3 = tex_headers.cubemap_layout_for_dxgi(256, 256, 71, 7, non_tail=3, chunk_pages=(6, 12, 24, 80))
+        self.assertEqual(lay3["full_bytes"], 66 * 4096)
+        self.assertEqual(lay3["padded_full_bytes"], 80 * 4096)
+        self.assertEqual(lay3["data_offset"], 42 * 4096)
+        self.assertEqual(lay3["size"], 122 * 4096)
+
+        # Negative controls: bad non_tail, wrong len(chunk_pages), final chunk size mismatch, bad format.
+        for bad_nt in (-1, 4, "1"):
+            with self.subTest(non_tail=bad_nt):
+                with self.assertRaises(ValueError):
+                    tex_headers.cubemap_layout_for_dxgi(128, 128, 71, 6, non_tail=bad_nt)
+        with self.assertRaises(ValueError):
+            tex_headers.cubemap_layout_for_dxgi(128, 128, 71, 6, non_tail=1, chunk_pages=(18,))
+        with self.assertRaises(ValueError):
+            tex_headers.cubemap_layout_for_dxgi(128, 128, 71, 6, non_tail=0, chunk_pages=(6, 18))
+        with self.assertRaises(ValueError):
+            tex_headers.cubemap_layout_for_dxgi(128, 128, 71, 6, non_tail=1, chunk_pages=(6, 16))
+        with self.assertRaises(ValueError):
+            tex_headers.cubemap_layout_for_dxgi(128, 128, 98, 6, non_tail=2, chunk_pages=(6, 12, 36))
+        with self.assertRaises(ValueError):
+            tex_headers.cubemap_layout_for_dxgi(128, 128, 9999, 6, non_tail=0)
+
+    def test_volume_surface_layout(self):
+        v1 = tex_headers.volume_layout_for_dxgi(256, 32, 8, 54)
+        self.assertEqual(v1["size"], 262144)
+        self.assertEqual((v1["block_d"], v1["padded_d"]), (16, 16))
+
+        v2 = tex_headers.volume_layout_for_dxgi(32, 32, 32, 10)
+        self.assertEqual(v2["size"], 262144)
+        self.assertEqual((v2["block_d"], v2["padded_d"]), (8, 32))
+
+        v3 = tex_headers.volume_layout_for_dxgi(32, 64, 32, 10)
+        self.assertEqual(v3["size"], 524288)
+        self.assertEqual((v3["block_d"], v3["padded_d"]), (8, 32))
+
+        # Negative controls: mips != 1, BC format, invalid dims, invalid element size, unknown format.
+        for bad_mips in (0, 2):
+            with self.subTest(mips=bad_mips):
+                with self.assertRaises(ValueError):
+                    tex_headers.volume_layout_for_dxgi(32, 32, 32, 10, mips=bad_mips)
+        with self.assertRaises(ValueError):
+            tex_headers.volume_layout_for_dxgi(32, 32, 8, 71)
+        with self.assertRaises(ValueError):
+            tex_headers.volume_layout_for_dxgi(32, 32, 8, 9999)
+        for bad_args in [(0, 32, 8, 1, 2), (32, -1, 8, 1, 2), (32, 32, 0, 1, 2), (32, 32, 8, 1, 3)]:
+            with self.subTest(bad_args=bad_args):
+                with self.assertRaises(ValueError):
+                    tex_headers.volume_surface_layout(*bad_args)
 
 
 class TestDDSHeaderSynthesis(unittest.TestCase):
@@ -413,7 +585,34 @@ class TestDDSHeaderSynthesis(unittest.TestCase):
         info = tex_headers.parse_dds_header(hdr)
         self.assertTrue(info["caps2"] & tex_headers.DDSCAPS2_CUBEMAP_ALLFACES)
         self.assertEqual(info["misc_flags"], tex_headers.D3D10_RESOURCE_MISC_TEXTURECUBE)
-        self.assertEqual(info["array_size"], 6)
+        self.assertEqual(info["array_size"], 1)
+
+    def test_dds_cubemap_array_size_matches_payload(self):
+        # DDS_HEADER_DXT10.arraySize counts cubes, each containing six faces:
+        # https://learn.microsoft.com/en-us/windows/win32/direct3ddds/dds-header-dxt10
+        # Check the serialized field directly, independently of our header parser.
+        for cubes in (1, 2, 6):
+            with self.subTest(cubes=cubes):
+                # One RGBA texel per face, with distinct values for every face.
+                payload = b"".join(bytes((face, 0, 0, 255)) for face in range(cubes * 6))
+                dds = tex_headers.dds_bytes(1, 1, fmt=28, payload=payload,
+                                            is_cube=True, array_size=cubes)
+                fmt, dimension, misc, array_size, _ = struct.unpack_from("<IIIII", dds, 128)
+                self.assertEqual((fmt, dimension, misc), (28, 3, 4))
+                self.assertEqual(array_size, cubes)
+                self.assertEqual(len(dds) - 148, array_size * 6 * 4)
+                self.assertEqual(dds[148:], payload)
+
+    def test_dds_header_2d_array(self):
+        hdr = tex_headers.dds_header(256, 256, depth=1, mips=1, fmt=83, is_cube=False, array_size=5)
+        info = tex_headers.parse_dds_header(hdr)
+        self.assertEqual(info["resource_dimension"], tex_headers.D3D10_RESOURCE_DIMENSION_TEXTURE2D)
+        self.assertEqual(info["misc_flags"], 0)
+        self.assertEqual(info["array_size"], 5)
+        self.assertTrue(info["caps"] & tex_headers.DDSCAPS_COMPLEX)
+        self.assertEqual(info["caps2"], 0)
+        blob = tex_headers.dds_bytes(16, 16, fmt=71, payload=b"\x00" * 128, array_size=4)
+        self.assertEqual(tex_headers.parse_dds_header(blob)["array_size"], 4)
 
     def test_dds_bytes_payload(self):
         payload = b"\xAA\xBB\xCC\xDD" * 64
@@ -653,6 +852,48 @@ class TestTextureDescriptorParsing(unittest.TestCase):
         q_active, hits_active = tex_headers._find_gpu_ptr_qwords(blob)
         self.assertEqual([int(v) for v in q_active], [int(v) for v in q_std])
         self.assertEqual([int(k) for k in hits_active], hits_std)
+
+
+class CliInputTest(unittest.TestCase):
+    """A missing carve folder or an unknown --archives name ended in a FileNotFoundError traceback."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "tex_headers.py"), *args],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_out_in_a_missing_folder_is_created(self):
+        # Before: main() opened --out directly after the scan, so this ended in a FileNotFoundError traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            out = os.path.join(tmp, "no", "such", "textures.json")
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), [])
+
+    def test_bad_carve_folders_are_usage_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            os.makedirs(os.path.join(tmp, "empty"))
+            out = os.path.join(tmp, "t.json")
+            cases = (((os.path.join(tmp, "missing"),), "is not a folder"),
+                     ((os.path.join(tmp, "empty"),), "no carved archive"),
+                     ((os.path.join(tmp, "carve"), "--archives", "a,nope"), "no index.json for nope"))
+            for args, message in cases:
+                with self.subTest(args=args):
+                    p = self.run_tool(*args, "--out", out)
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertIn(message, p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("0 textures", p.stdout)
 
 
 if __name__ == "__main__":

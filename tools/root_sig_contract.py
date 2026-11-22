@@ -108,6 +108,15 @@ def cluster(shaders):
     return [(shape, len(names), names) for shape, names in ranked]
 
 
+def _load_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        reason = getattr(e, "strerror", None) or e
+        raise ValueError(f"cannot read {path}: {reason}") from None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Root-signature vs shader-reads reconciler.")
     ap.add_argument("index", nargs="?", help="spirv/index.json")
@@ -125,10 +134,42 @@ def main():
         return 0
     if not a.index or not a.rootsig:
         ap.error("index.json and --rootsig are required (or --example)")
-    with open(a.index, encoding="utf-8") as f:
-        index = json.load(f)
-    with open(a.rootsig, encoding="utf-8") as f:
-        sig = json.load(f)
+    try:
+        index = _load_json(a.index)
+        sig = _load_json(a.rootsig)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(index, dict):
+        print(f"ERROR: {a.index}: expected a JSON object of shader -> metadata entries", file=sys.stderr)
+        return 2
+    if any(not isinstance(entry, dict) for entry in index.values()):
+        print(f"ERROR: {a.index}: each shader entry must be a JSON object", file=sys.stderr)
+        return 2
+    if not isinstance(sig, dict):
+        print(f"ERROR: {a.rootsig}: expected a JSON object root signature", file=sys.stderr)
+        return 2
+    params = sig.get("params", [])
+    if not isinstance(params, list):
+        print(f"ERROR: {a.rootsig}: 'params' must be a JSON array", file=sys.stderr)
+        return 2
+    if any(not isinstance(p, dict) for p in params):
+        print(f"ERROR: {a.rootsig}: each param must be a JSON object", file=sys.stderr)
+        return 2
+    for name in sorted(index):
+        reads = index[name].get("user_sgpr_reads", [])
+        if not isinstance(reads, list):
+            print(f"ERROR: {a.index}: {name}: 'user_sgpr_reads' must be a JSON array", file=sys.stderr)
+            return 2
+        for read in reads:
+            if not isinstance(read, dict) or "sgpr" not in read or "kind" not in read:
+                print(f"ERROR: {a.index}: {name}: each read needs 'sgpr' and 'kind' fields",
+                      file=sys.stderr)
+                return 2
+            if not isinstance(read["kind"], str):
+                print(f"ERROR: {a.index}: {name}: each read kind must be a string",
+                      file=sys.stderr)
+                return 2
     dwords, error = pack_layout(sig)
     if error:
         print(f"root signature refused: {error}")

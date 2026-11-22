@@ -4,6 +4,7 @@ Usage:
     python -I rpf_probe.py <game_dir> [--out FILE]
 
 Reads the first 64 KiB of each archive only. It doesn't decrypt or extract anything.
+A directory scan or archive read error stops the survey before it writes the report.
 """
 import argparse
 import json
@@ -11,6 +12,7 @@ import math
 import os
 import struct
 import sys
+import tempfile
 from collections import Counter
 
 
@@ -45,14 +47,33 @@ def main() -> int:
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "rpf_probe.json"))
     a = ap.parse_args()
     rows = []
-    for root, _, files in os.walk(a.game_dir):
-        for name in files:
-            if name.lower().endswith(".rpf"):
-                rows.append(probe(os.path.join(root, name)))
-    rows.sort(key=lambda r: -r["size"])
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=1)
+
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    try:
+        for root, _, files in os.walk(a.game_dir, onerror=scan_failed):
+            for name in files:
+                if name.lower().endswith(".rpf"):
+                    rows.append(probe(os.path.join(root, name)))
+    except OSError as error:
+        path = error.filename or a.game_dir
+        reason = error.strerror or str(error)
+        print(f"ERROR: {path}: {reason}", file=sys.stderr)
+        return 2
+    rows.sort(key=lambda r: (-r["size"], r["file"]))
+    try:
+        out_dir = os.path.dirname(os.path.abspath(a.out))
+        os.makedirs(out_dir, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=out_dir) as staging:
+            staged = os.path.join(staging, "rpf_probe.json")
+            with open(staged, "w", encoding="utf-8") as f:
+                json.dump(rows, f, indent=1)
+            os.replace(staged, a.out)
+    except OSError as error:
+        reason = error.strerror or str(error)
+        print(f"ERROR: {a.out}: {reason}", file=sys.stderr)
+        return 2
     versions = Counter(r["version"] for r in rows)
     print(f"{len(rows)} archives, {sum(r['size'] for r in rows) / 2**30:.1f} GiB, versions {dict(versions)}")
     for r in rows:

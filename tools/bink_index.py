@@ -46,10 +46,10 @@ BASE_FIELDS = [
 PROBE_FIELDS = ["decodes", "codec", "probe_duration_s"]
 
 
-def _audio_layout(data, base, count):
+def _audio_layout(data, base, count, end):
     """Decode one candidate audio layout, or return None if it is not plausible."""
     need = base + 12 * count
-    if need > len(data):
+    if need > end:
         return None
     rates, flags = [], []
     for i in range(count):
@@ -79,11 +79,9 @@ def parse_header(data, offset):
         return None
     if not (16 <= width <= MAX_WIDTH and 16 <= height <= MAX_HEIGHT):
         return None
-    if not (1 <= fps_num <= 1000 and 1 <= fps_den <= 1000):
+    if fps_den == 0 or not fps_den <= fps_num <= 240 * fps_den:
         return None
     fps = fps_num / fps_den
-    if not 1.0 <= fps <= 240.0:
-        return None
     if audio > MAX_AUDIO_TRACKS:
         return None
 
@@ -95,7 +93,7 @@ def parse_header(data, offset):
         # layout first, then the other, and accept only plausible descriptors.
         bases = [offset + 0x30, offset + 0x2C] if revision in "ijkn" else [offset + 0x2C]
         for base in bases:
-            got = _audio_layout(data, base, audio)
+            got = _audio_layout(data, base, audio, offset + stored)
             if got:
                 rates, flags = got
                 break
@@ -137,7 +135,7 @@ def scan_file(path, source):
     """Index every Bink 2 stream in one file. Returns (rows, stats)."""
     rows = []
     size = os.path.getsize(path)
-    if size < HDR:
+    if size == 0:
         return rows, {"files_scanned": 1, "streams": 0, "bytes": 0, "zero_padding": 0,
                       "unread_bytes": 0, "span": 0}
     with open(path, "rb") as fh:
@@ -231,13 +229,22 @@ def probe_row(row, ffprobe):
              "stream=codec_name,codec_type:format=duration", "-of", "json", name],
             capture_output=True, text=True, timeout=60,
         )
-        info = json.loads(proc.stdout) if proc.stdout.strip() else {}
-        video = next((s for s in info.get("streams", [])
-                      if s.get("codec_type") == "video"), None)
+        proc.check_returncode()
+        info = json.loads(proc.stdout)
+        if not isinstance(info, dict):
+            raise ValueError("expected an ffprobe JSON object")
+        streams, container = info.get("streams", []), info.get("format", {})
+        if (not isinstance(streams, list) or any(not isinstance(s, dict) for s in streams)
+                or not isinstance(container, dict)):
+            raise ValueError("invalid ffprobe stream or format metadata")
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
         codec = (video or {}).get("codec_name") or ""
+        duration = container.get("duration", "")
+        if not isinstance(codec, str) or not isinstance(duration, str):
+            raise ValueError("invalid ffprobe codec name or duration")
         row["decodes"] = "yes" if codec else "no"
         row["codec"] = codec
-        row["probe_duration_s"] = info.get("format", {}).get("duration", "")
+        row["probe_duration_s"] = duration
     except (OSError, subprocess.SubprocessError, ValueError):
         row["decodes"] = "no"
         row["codec"] = ""
@@ -282,6 +289,9 @@ def main(argv=None):
     ap.add_argument("--format", choices=["csv", "json"], help="inferred from --out if omitted")
     ap.add_argument("--probe", action="store_true", help="run ffprobe on each stream")
     a = ap.parse_args(argv)
+    if not os.path.exists(a.target):
+        print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
+        return 2
 
     rows, summary = scan_target(a.target)
     probe = False
@@ -296,10 +306,14 @@ def main(argv=None):
 
     fmt = a.format or ("json" if a.out and a.out.lower().endswith(".json") else "csv")
     if a.out:
-        if fmt == "json":
-            write_json(a.out, a.target, rows, summary, probe)
-        else:
-            write_csv(a.out, rows, probe)
+        try:
+            if fmt == "json":
+                write_json(a.out, a.target, rows, summary, probe)
+            else:
+                write_csv(a.out, rows, probe)
+        except OSError as error:
+            print(f"bink_index: error: cannot write {a.out}: {error}", file=sys.stderr)
+            return 2
         print(f"{len(rows)} Bink 2 streams, {summary['bytes']} bytes, "
               f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding")
     else:
@@ -309,7 +323,9 @@ def main(argv=None):
                               "streams": [_flat(r, fields) for r in rows]}, indent=1))
         else:
             fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
-            writer = csv.DictWriter(sys.stdout, fieldnames=fields)
+            # stdout is a text stream that already turns "\n" into the platform's line end;
+            # csv's default "\r\n" would come out as "\r\r\n" on Windows
+            writer = csv.DictWriter(sys.stdout, fieldnames=fields, lineterminator="\n")
             writer.writeheader()
             for row in rows:
                 writer.writerow(_flat(row, fields))

@@ -79,6 +79,37 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertIn("produced no disassembly", p.stderr)
         self.assertEqual(sorted(os.listdir(out)), [])
 
+    def test_llvm_error_discards_partial_disassembly(self):
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "if '-show-encoding' in sys.argv:\n"
+                       "    print('s_nop 0')\n"
+                       "    sys.stderr.write('error: disassembly stopped\\n')\n"
+                       "    sys.exit(1)\n"
+                       "print('s_endpgm')\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("'failed': 1", p.stdout)
+        self.assertIn(self.fssm, p.stderr)
+        self.assertIn("error: disassembly stopped", p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
+    def test_no_code_is_an_error_when_no_listings_are_written(self):
+        with open(self.fssm, "wb") as f:
+            f.write(b"FSSM\x01\x01" + bytes(320))
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "print('s_endpgm')\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("'no s_endpgm': 1", p.stdout)
+        self.assertIn(self.fssm, p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
     def test_a_real_disassembly_is_written(self):
         mc = self.fake("import sys\n"
                        "probe = sys.stdin.read().strip() == %r\n"
@@ -142,6 +173,16 @@ class DisasmInputTest(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(out)), ["a_good.s", "c_good.s"])
         self.assertIn("'clean': 2", p.stdout)
         self.assertIn("'scan failed': 1", p.stdout)
+
+    def test_directory_with_fssm_suffix_does_not_count_toward_limit(self):
+        os.mkdir(os.path.join(self.src, "a_cache.fssm"))
+        self.write("b_shader.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+
+        result = self.run_tool(self.src, "--out", out, "--limit", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(out), ["b_shader.s"])
 
     def test_jobs_and_limit_must_be_at_least_one(self):
         self.write("one.fssm", fssm())

@@ -71,10 +71,58 @@ The six unique Xbox-specific imports (eight consumer/import pairs) are exactly t
 The video path (`Bink2Scarlett.dll`), the BVH builder and the FidelityFX upscaler therefore all go through the
 two shim DLLs that already exist. `libHttpClient.GDK.dll` and `XCurl.dll` import only desktop APIs.
 
+## When an unimplemented import is called
+
+The table above has no unimplemented imports, but the game executable will. A call to one used to return 0
+silently, which for an `HRESULT` function is `S_OK` with its out parameters never written; the caller then carries on
+with stale pointers and fails somewhere unrelated. `LEONIDA_UNIMPLEMENTED` chooses what the thunk does instead
+(details in `runtime/README.md`):
+
+- `log` (default): print the name once, return 0. Unchanged.
+- `fail`: return `E_NOTIMPL` for imports known to return `HRESULT`, 0 otherwise.
+- `stop`: print the import, the caller as `module+RVA` and rcx/rdx/r8/r9, then break (debugger) or exit with code 3.
+
+The `--dry-run` report ends with `unimplemented by return policy: hresult=N other=N`, so the first run against the
+executable shows how many of its missing imports `fail` would turn into errors.
+
+The `HRESULT` list is by DLL and name: `D3D12Create*` and `D3D12Serialize*` (`d3d12.dll`, `d3d12_xs.dll`),
+`D3D12GetDebugInterface`, `D3D12EnableExperimentalFeatures`, `CreateDXGIFactory*`, `DXGIGetDebugInterface1`,
+`DXGIDeclareAdapterRemovalSupport` (`dxgi.dll`), and in `xgameruntime.dll` `XGameRuntimeInitialize`, `XGameEventWrite`
+and the families `XAsync*`, `XTaskQueue*`, `XUser*`, `XStore*`, `XGameSave*`, `XPackage*`, `XGameUi*` except the 33
+functions their public reference pages show returning `void`, `bool` or `int` (for example `XTaskQueueDispatch`,
+`XUserCloseHandle`, `XStoreIsLicenseValid`). The mixed `XSystem*`, `XGameStreaming*`, `XThread*` and `XDisplay*`
+families are not listed. The sources are the Microsoft Learn pages for the D3D12/DXGI functions and the GDK reference
+(`gaming/gdk/docs/reference/system/<family>/functions/<name>`); `D3D12XboxCreateDevice` is matched by name from the
+measurement in `d3d12_vulkan.md`, because its page could not be found.
+
 ## What this proves and what it does not
 
 - It proves the loader parses real Xbox Series PE files, maps their sections, applies no unnecessary relocation,
   walks their import tables, and classifies every thunk.
+- The loader also registers each image's unwind table. `pe_loader_test` checks, for every DLL present in
+  `LEONIDA_GAME_DIR`, that the whole exception directory is registered, that `RtlLookupFunctionEntry` returns
+  each entry for its first byte, and that the entry point is covered (directly, or through the `jmp rel32` thunks
+  an incrementally linked entry point goes through: a thunk touches no stack, so it has no entry of its own).
+  Measured on all 16 DLLs: every table passes the loader's checks and every entry resolves to itself.
+
+  | Image | Unwind entries | Entry point |
+  |---|---:|---|
+  | `Bink2Scarlett.dll` | 527 | covered |
+  | `XboxBvhBuilder.dll` | 449 | covered |
+  | `amd_fidelityfx_upscaler_xbox.dll` | 477 | covered |
+  | `amd_fidelityfx_loader_xbox.dll` | 46 | covered |
+  | `libHttpClient.GDK.dll` | 2,452 | `jmp rel32` thunk to a covered function |
+  | `XCurl.dll` | 446 | covered |
+  | `concrt140.dll` | 1,121 | covered |
+  | `msvcp140.dll` | 1,228 | covered |
+  | `msvcp140_1.dll` | 45 | covered |
+  | `msvcp140_2.dll` | 469 | covered |
+  | `msvcp140_atomic_wait.dll` | 86 | covered |
+  | `msvcp140_codecvt_ids.dll` | 32 | covered |
+  | `vccorlib140.dll` | 697 | covered |
+  | `vcomp140.dll` | 195 | covered |
+  | `vcruntime140.dll` | 236 | covered |
+  | `vcruntime140_1.dll` | 79 | covered |
 - It does **not** prove any imported function behaves correctly when called. That needs the executable, or a
   harness that calls a known entry point.
 - The executable's own imports are unknown. `MicrosoftGame.Config` names `game_scarlett_master.exe`; the package

@@ -4,6 +4,7 @@
 
 Zero game data: all tests use deterministic, synthetic byte sequences constructed in-memory.
 """
+import io
 import json
 import os
 import struct
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -342,6 +344,45 @@ class TestCrcAndChecksumBounds(unittest.TestCase):
             fssm_unpack.unpack(dxbc)
 
 
+class TestMainBadSource(unittest.TestCase):
+    """A source that is missing, a file, or unlistable is one line on stderr, exit 2, and nothing is created."""
+
+    def run_tool(self, src):
+        return subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True)
+
+    def test_missing_source_is_not_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "carve", "shaders")      # mistyped: neither folder exists
+            res = self.run_tool(src)
+            self.assertEqual(res.returncode, 2)
+            self.assertIn(src, res.stderr)
+            self.assertIn("does not exist", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertEqual(res.stdout, "")
+            self.assertEqual(os.listdir(tmp), [])            # on main: carve/shaders/fssm was made
+
+    def test_file_as_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "shader_a.dxbc")
+            with open(src, "wb") as f:
+                f.write(b"DXBC")
+            res = self.run_tool(src)
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("is not a folder", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertEqual(os.listdir(tmp), ["shader_a.dxbc"])
+
+    def test_unlistable_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = io.StringIO()
+            with mock.patch.object(fssm_unpack.os, "scandir", side_effect=PermissionError(13, "Permission denied")), \
+                    mock.patch.object(sys, "stderr", out):
+                self.assertEqual(fssm_unpack.main([tmp]), 2)
+            self.assertIn("cannot list", out.getvalue())
+            self.assertIn("Permission denied", out.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(tmp, "fssm")))
+
+
 class TestMainDirectoryProcessing(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -349,6 +390,33 @@ class TestMainDirectoryProcessing(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_main_rejects_invalid_fssm_magic(self):
+        bad_payload = b"JUNK\x01\x01" + bytes(58)
+        bad_dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(bad_payload)}))])
+        bad_path = os.path.join(self.src, "bad.dxbc")
+        with open(bad_path, "wb") as f:
+            f.write(bad_dxbc)
+
+        cmd = [sys.executable, "-I", TOOL, self.src]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("'ValueError': 1", res.stdout)
+        self.assertIn("no shader in", res.stderr)
+        fssm_dir = os.path.join(self.src, "fssm")
+        self.assertEqual(os.listdir(fssm_dir) if os.path.isdir(fssm_dir) else [], [])
+        self.assertFalse(os.path.exists(os.path.join(self.src, "fssm_index.json")))
+
+        good_dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        with open(os.path.join(self.src, "good.dxbc"), "wb") as f:
+            f.write(good_dxbc)
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("'ValueError': 1", res.stdout)
+        self.assertEqual(os.listdir(fssm_dir), ["good.fssm"])
+        with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["good"])
 
     def test_main_cli_processing_and_index_generation(self):
         fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
@@ -359,6 +427,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         dxbc_no_xbch = make_dxbc([(b"DXIL", make_xdat({0x07: b"dxil-hdr"}))])
         dxbc_mismatch = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1, unpacked_override=9999)}))])
         dxbc_bad_zlib = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1, corrupt_zlib=True)}))])
+        dxbc_short_fssm = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(b"FSSM")}))])
 
         with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
             f.write(dxbc_1)
@@ -370,8 +439,11 @@ class TestMainDirectoryProcessing(unittest.TestCase):
             f.write(dxbc_mismatch)
         with open(os.path.join(self.src, "bad_zlib.dxbc"), "wb") as f:
             f.write(dxbc_bad_zlib)
+        with open(os.path.join(self.src, "short_fssm.dxbc"), "wb") as f:
+            f.write(dxbc_short_fssm)
         with open(os.path.join(self.src, "ignored.txt"), "w") as f:
             f.write("not a dxbc container")
+        os.mkdir(os.path.join(self.src, "cache.dxbc"))
 
         res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)

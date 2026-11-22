@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -246,6 +247,17 @@ class ArchiveTest(unittest.TestCase):
         self.assertGreater(summary["readable_fraction"], 0.5)
         self.assertEqual(summary["skipped_candidates"], 0)
 
+    def test_psin_longer_than_256_bytes_reads_the_whole_chain(self):
+        # Before: scan_rpf classified only the first 256 inflated bytes, so CHKS (at 0x140) was cut off.
+        data = (b"PSIN" + (16).to_bytes(4, "big") + struct.pack("<II", 22, 0)
+                + b"LSCH" + (8 + 300).to_bytes(4, "big") + bytes(300) + b"CHKS" + (16).to_bytes(4, "big") + bytes(8))
+        rpf = os.path.join(self.root, "long_psin.rpf")
+        with open(rpf, "wb") as f:
+            f.write(b"9FPR" + struct.pack("<I", 16) + bytes(8) + zlib.compress(data) + bytes(64))
+        (row,), _ = restofworld_index.scan_rpf(rpf)
+        self.assertEqual((row["signature"], row["count"], row["detail"]),
+                         ("psin", 2, "tags=LSCH,CHKS;field8=22;complete=1"))
+
     def test_scan_limit(self):
         limit = self.offsets[2] - 0x100 - 1
         rows, summary = restofworld_index.scan_rpf(self.rpf, limit=limit)
@@ -269,6 +281,51 @@ class ArchiveTest(unittest.TestCase):
             doc = json.load(f)
         self.assertEqual(doc["summary"]["files"], len(PAYLOADS))
         self.assertEqual(len(doc["files"]), len(PAYLOADS))
+
+    def test_bad_scan_arguments_fail_before_an_index_is_written(self):
+        for flag, value, message in (("--start", "-1", "must be 0 or more"),
+                                     ("--limit", "0", "must be at least 1"),
+                                     ("--limit", "-100", "must be at least 1"),
+                                     ("--max-inflate", "0", "must be at least 1")):
+            out = os.path.join(self.root, "bad.json")
+            proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet", flag, value],
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn(message, proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_missing_source_is_an_error_not_a_traceback(self):
+        out = os.path.join(self.root, "missing.json")
+        proc = subprocess.run([sys.executable, "-I", TOOL, os.path.join(self.root, "nope.rpf"), out, "--quiet"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("nope.rpf", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_unwritable_output_path_fails_before_the_scan(self):
+        for out in (os.path.join(self.root, "no_such_folder", "x.json"), self.root):
+            proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
+
+    def test_cli_rejects_output_aliasing_source_archive(self):
+        with open(self.rpf, "rb") as f:
+            original = f.read()
+        output = os.path.join(os.path.dirname(self.rpf), ".", os.path.basename(self.rpf))
+
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.rpf, output],
+            capture_output=True, text=True,
+        )
+
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), original, "the source archive was overwritten")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("output must not overwrite the source archive", result.stderr)
 
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
@@ -295,6 +352,86 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(rows[2]["count"], 7)
         self.assertEqual(summary["mode"], "directory")
         self.assertEqual(summary["files"], 4)
+
+    def test_directory_rejects_start_and_limit(self):
+        folder = os.path.join(self.root, "carved_opts")
+        os.makedirs(folder)
+        with open(os.path.join(folder, f"{0x1000:012x}.bin"), "wb") as f:
+            f.write(page())
+        for extra in (["--start", "0"], ["--limit", "64"], ["--start", "0", "--limit", "64"]):
+            out = os.path.join(self.root, "dir_bad.json")
+            proc = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet", *extra],
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("--start and --limit apply to a single archive, not a directory", proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_directory_respects_max_inflate(self):
+        folder = os.path.join(self.root, "carved_limit")
+        os.makedirs(folder)
+        small_bin = page()  # 96 bytes
+        large_bin = psin()  # 244 bytes
+        large_bk2 = bytearray(200)
+        large_bk2[:len(bink())] = bink()
+        struct.pack_into("<I", large_bk2, 4, len(large_bk2) - 8)
+        with open(os.path.join(folder, f"{0x1000:012x}.bin"), "wb") as f:
+            f.write(small_bin)
+        with open(os.path.join(folder, f"{0x2000:012x}.bin"), "wb") as f:
+            f.write(large_bin)
+        with open(os.path.join(folder, f"{0x3000:012x}.bk2"), "wb") as f:
+            f.write(large_bk2)
+
+        rows, summary = restofworld_index.scan_dir(folder, max_inflate=100)
+        self.assertEqual([r["signature"] for r in rows], ["0drp", "bink2"])
+        self.assertEqual(summary["files"], 2)
+        self.assertEqual(summary["skipped_candidates"], 1)
+
+        out = os.path.join(self.root, "dir_limit.json")
+        proc = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet", "--max-inflate", "100"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["files"], 2)
+        self.assertEqual(doc["summary"]["skipped_candidates"], 1)
+        self.assertEqual([r["signature"] for r in doc["files"]], ["0drp", "bink2"])
+
+    def test_scan_rpf_closes_mmap_on_success_and_out_of_range_start(self):
+        created = []
+        real_mmap = restofworld_index.mmap.mmap
+
+        def track_mmap(*args, **kwargs):
+            m = real_mmap(*args, **kwargs)
+            created.append(m)
+            return m
+
+        with open(self.rpf, "rb") as src:
+            raw_bytes = src.read()
+        rpf_ok = os.path.join(self.root, "ok.rpf")
+        rpf_err = os.path.join(self.root, "err.rpf")
+        for path in (rpf_ok, rpf_err):
+            with open(path, "wb") as dst:
+                dst.write(raw_bytes)
+
+        try:
+            with unittest.mock.patch.object(restofworld_index.mmap, "mmap", side_effect=track_mmap):
+                restofworld_index.scan_rpf(rpf_ok)
+                self.assertEqual(len(created), 1)
+                self.assertTrue(created[-1].closed)
+                os.remove(rpf_ok)
+                self.assertFalse(os.path.exists(rpf_ok))
+
+                with self.assertRaisesRegex(ValueError, "start offset is outside the archive"):
+                    restofworld_index.scan_rpf(rpf_err, start=len(raw_bytes) + 1)
+                self.assertEqual(len(created), 2)
+                self.assertTrue(created[-1].closed)
+                os.remove(rpf_err)
+                self.assertFalse(os.path.exists(rpf_err))
+        finally:
+            for m in created:
+                if not m.closed:
+                    m.close()
 
 
 if __name__ == "__main__":

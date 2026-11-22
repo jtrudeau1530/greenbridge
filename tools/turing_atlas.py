@@ -127,45 +127,55 @@ def vulkan_matrix():
         return m
     with tempfile.TemporaryDirectory() as d:
         r = run(["vulkaninfo", "-j"], cwd=d)
-        if r is None:
+        if r is None or r.returncode != 0:
             return m
         files = glob.glob(os.path.join(d, "VP_VULKANINFO_*.json"))
         if not files:
             return m
         try:
-            doc = json.load(open(files[0], encoding="utf-8"))
+            with open(files[0], encoding="utf-8") as f:
+                doc = json.load(f)
         except (OSError, ValueError):
             return m
-    try:
-        dev = doc["capabilities"]["device"]
-        props = dev.get("properties", {})
-        feats = dev.get("features", {})
-        exts = dev.get("extensions", {})
-        v11 = props.get("VkPhysicalDeviceVulkan11Properties", {})
-        v13p = props.get("VkPhysicalDeviceVulkan13Properties", {})
-        v13f = feats.get("VkPhysicalDeviceVulkan13Features", {})
-        v11f = feats.get("VkPhysicalDeviceVulkan11Features", {})
-        pdev = props.get("VkPhysicalDeviceProperties", {})
-        m["device"] = {"name": pdev.get("deviceName"),
-                       "driver": pdev.get("driverVersion"),
-                       "api": pdev.get("apiVersion")}
-        m["subgroup"] = {"size": v11.get("subgroupSize"),
-                         "stages": v11.get("subgroupSupportedStages"),
-                         "min": v13p.get("minSubgroupSize"),
-                         "max": v13p.get("maxSubgroupSize")}
-        m["subgroup_size_control"] = {
+    caps = doc.get("capabilities") if isinstance(doc, dict) else None
+    dev = caps.get("device") if isinstance(caps, dict) else None
+    if not isinstance(dev, dict):
+        return m
+    props = dev.get("properties")
+    feats = dev.get("features")
+    exts = dev.get("extensions")
+    if not all(isinstance(x, dict) for x in (props, feats, exts)):
+        return m
+    pdev = props.get("VkPhysicalDeviceProperties")
+    v11 = props.get("VkPhysicalDeviceVulkan11Properties", {})
+    v13p = props.get("VkPhysicalDeviceVulkan13Properties", {})
+    v13f = feats.get("VkPhysicalDeviceVulkan13Features", {})
+    v11f = feats.get("VkPhysicalDeviceVulkan11Features", {})
+    if not all(isinstance(x, dict) for x in (pdev, v11, v13p, v13f, v11f)):
+        return m
+    name = pdev.get("deviceName")
+    if not isinstance(name, str) or not name:
+        return m
+    m.update({
+        "vulkaninfo": "ok",
+        "device": {"name": name,
+                   "driver": pdev.get("driverVersion"),
+                   "api": pdev.get("apiVersion")},
+        "subgroup": {"size": v11.get("subgroupSize"),
+                     "stages": v11.get("subgroupSupportedStages"),
+                     "min": v13p.get("minSubgroupSize"),
+                     "max": v13p.get("maxSubgroupSize")},
+        "subgroup_size_control": {
             "subgroupSizeControl": v13f.get("subgroupSizeControl"),
             "computeFullSubgroups": v13f.get("computeFullSubgroups"),
             "requiredSubgroupSizeStages": v13p.get("requiredSubgroupSizeStages"),
-        }
-        m["mesh"] = "VK_EXT_mesh_shader" in exts
-        m["barycentric"] = "VK_KHR_fragment_shader_barycentric" in exts
-        m["maintenance8"] = "VK_KHR_maintenance8" in exts
-        m["descriptor_heap"] = "VK_EXT_descriptor_heap" in exts
-        m["storageInputOutput16"] = v11f.get("storageInputOutput16")
-    except (KeyError, IndexError, TypeError, AttributeError):
-        pass
-    m["vulkaninfo"] = "ok"
+        },
+        "mesh": "VK_EXT_mesh_shader" in exts,
+        "barycentric": "VK_KHR_fragment_shader_barycentric" in exts,
+        "maintenance8": "VK_KHR_maintenance8" in exts,
+        "descriptor_heap": "VK_EXT_descriptor_heap" in exts,
+        "storageInputOutput16": v11f.get("storageInputOutput16"),
+    })
     return m
 
 
@@ -188,6 +198,15 @@ def validate_cases():
             out[name] = {"assemble": True,
                          "valid": bool(rv and rv.returncode == 0),
                          "stderr": ((rv.stderr if rv else "") or "")[:300]}
+    # The control must be rejected: if spirv-as or spirv-val accepts a malformed module, none of the
+    # other results say anything about the toolchain gate and the atlas must not be read as a pass.
+    control = out.get("broken_negative")
+    if isinstance(control, dict):
+        rejected = control.get("assemble") is False or control.get("valid") is False
+        control["control_ok"] = rejected
+        if not rejected:
+            control["error"] = ("broken_negative was accepted: the spirv-as/spirv-val gate is not rejecting "
+                                "malformed modules, so the other case results are not trustworthy")
     return out
 
 
@@ -195,8 +214,9 @@ def main():
     ap = argparse.ArgumentParser(description="Turing bring-up atlas (no game data).")
     ap.add_argument("--out", default=None, help="write JSON atlas to FILE (default: stdout)")
     a = ap.parse_args()
+    cases = validate_cases()
     atlas = {"tool": "turing_atlas", "gpu": None, "features": vulkan_matrix(),
-             "cases": validate_cases()}
+             "cases": cases}
     # Surface the discrete GPU name at top level when present.
     try:
         atlas["gpu"] = atlas["features"].get("device", {}).get("name")
@@ -204,11 +224,18 @@ def main():
         pass
     text = json.dumps(atlas, indent=2, sort_keys=True)
     if a.out:
+        folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         with open(a.out, "w", encoding="utf-8") as f:
             f.write(text + "\n")
         print(f"atlas -> {a.out}")
     else:
         print(text)
+    control = cases.get("broken_negative") if isinstance(cases, dict) else None
+    if isinstance(control, dict) and control.get("error"):
+        print(f"turing_atlas: error: {control['error']}", file=sys.stderr)
+        return 2
     return 0
 
 

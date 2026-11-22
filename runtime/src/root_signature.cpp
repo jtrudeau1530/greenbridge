@@ -11,7 +11,7 @@ PackResult pack(const RootSignature& sig) {
         out.error = "root signature has more than 64 root parameters";
         return out;
     }
-    uint32_t cost = 0;
+    uint64_t cost = 0;  // 64-bit: a parameter of 0xFFFFFFFF constants must not wrap past the limits
     for (const RootParameter& p : sig.params) {
         if (p.type == ParamType::Constants && p.num_values == 0) {
             out.error = "root constant parameter needs at least 1 dword";
@@ -25,7 +25,7 @@ PackResult pack(const RootSignature& sig) {
             out.error = "root signature exceeds the 64-dword D3D12 cost limit";
             return out;
         }
-        if (out.dword_count + dwords > kMaxUserSgprs) {
+        if (uint64_t(out.dword_count) + dwords > kMaxUserSgprs) {
             // Spill layout is unknown (see __XB_GetRootSignatureSpillPointer):
             // refuse loudly instead of silently truncating every draw.
             out.error = "root signature needs more than 32 user SGPRs (spill unsupported)";
@@ -39,7 +39,7 @@ PackResult pack(const RootSignature& sig) {
             ++out.dword_count;
         }
     }
-    out.d3d12_cost = cost;
+    out.d3d12_cost = static_cast<uint32_t>(cost);  // <= kMaxD3d12Cost here
     out.ok = true;
     return out;
 }
@@ -90,7 +90,16 @@ private:
 };
 
 constexpr uint32_t kCanonicalMagic = 0x3153524Cu;  // "LRS1" little-endian
-constexpr uint32_t kCanonicalVersion = 1;
+// 2: ranges store all six D3D12_DESCRIPTOR_RANGE1 fields (1 stored only type and count). Nothing persists these
+// blobs across builds, so version 1 is simply refused.
+constexpr uint32_t kCanonicalVersion = 2;
+
+// D3D_ROOT_SIGNATURE_VERSION 1 (1.0), 2 (1.1), 3 (1.2): the numbering RTS0 and the canonical codec both store.
+bool known_version(uint32_t v, Version& out) {
+    if (v < 1 || v > 3) return false;
+    out = static_cast<Version>(v);
+    return true;
+}
 
 }  // namespace
 
@@ -114,6 +123,10 @@ std::vector<uint8_t> encode_canonical(const RootSignature& sig) {
         for (const DescriptorRange& r : p.ranges) {
             put_u32(out, r.range_type);
             put_u32(out, r.num_descriptors);
+            put_u32(out, r.base_shader_register);
+            put_u32(out, r.register_space);
+            put_u32(out, r.flags);
+            put_u32(out, r.offset_in_table);
         }
     }
     for (const StaticSampler& s : sig.static_samplers) {
@@ -130,6 +143,7 @@ std::vector<uint8_t> encode_canonical(const RootSignature& sig) {
         put_u32(out, s.shader_register);
         put_u32(out, s.register_space);
         put_u32(out, static_cast<uint32_t>(s.visibility));
+        if (sig.version == Version::V1_2) put_u32(out, s.flags);
     }
     return out;
 }
@@ -155,7 +169,7 @@ DecodeResult decode_canonical(const uint8_t* data, size_t size) {
         out.error = "truncated canonical header";
         return out;
     }
-    if (ver != 1 && ver != 2) {
+    if (!known_version(ver, out.sig.version)) {
         out.error = "unknown root-signature version";
         return out;
     }
@@ -167,7 +181,6 @@ DecodeResult decode_canonical(const uint8_t* data, size_t size) {
         out.error = "absurd sampler count";
         return out;
     }
-    out.sig.version = ver == 1 ? Version::V1_0 : Version::V1_1;
     out.sig.params.reserve(nparams);
     for (uint32_t i = 0; i < nparams; ++i) {
         RootParameter p;
@@ -191,7 +204,8 @@ DecodeResult decode_canonical(const uint8_t* data, size_t size) {
         p.ranges.reserve(nranges);
         for (uint32_t j = 0; j < nranges; ++j) {
             DescriptorRange range;
-            if (!r.u32(range.range_type) || !r.u32(range.num_descriptors)) {
+            if (!r.u32(range.range_type) || !r.u32(range.num_descriptors) || !r.u32(range.base_shader_register) ||
+                !r.u32(range.register_space) || !r.u32(range.flags) || !r.u32(range.offset_in_table)) {
                 out.error = "truncated canonical range";
                 return out;
             }
@@ -206,7 +220,8 @@ DecodeResult decode_canonical(const uint8_t* data, size_t size) {
         if (!r.u32(s.filter) || !r.u32(s.address_u) || !r.u32(s.address_v) || !r.u32(s.address_w) ||
             !r.f32(s.mip_lod_bias) || !r.u32(s.max_anisotropy) || !r.u32(s.comparison_func) ||
             !r.u32(s.border_color) || !r.f32(s.min_lod) || !r.f32(s.max_lod) ||
-            !r.u32(s.shader_register) || !r.u32(s.register_space) || !r.u32(vis)) {
+            !r.u32(s.shader_register) || !r.u32(s.register_space) || !r.u32(vis) ||
+            (out.sig.version == Version::V1_2 && !r.u32(s.flags))) {
             out.error = "truncated canonical sampler";
             return out;
         }
@@ -221,10 +236,12 @@ DecodeResult decode_canonical(const uint8_t* data, size_t size) {
     return out;
 }
 
-// RTS0 payload hypothesis: u32 version (1 = 1.0, 2 = 1.1), u32 num_params,
+// RTS0 payload: u32 version (1 = 1.0, 2 = 1.1, 3 = 1.2), u32 num_params,
 // u32 num_static_samplers, u32 flags, then per-parameter fields in d3d12.h
-// order. Static samplers follow the same field order as D3D12_STATIC_SAMPLER_DESC.
-// Anything else (v1.2 blobs, extra dwords, truncation) is a hard error.
+// order. Static samplers follow the field order of D3D12_STATIC_SAMPLER_DESC, and
+// of D3D12_STATIC_SAMPLER_DESC1 (one more dword, Flags) in 1.2. Root descriptors
+// and ranges have a flags dword from 1.1 on. Anything else (unknown versions,
+// truncation) is a hard error.
 // Payload decoder: the RTS0 chunk contents (see header for the hypothesis).
 static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
     DecodeResult out;
@@ -264,8 +281,8 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
         out.error = "truncated RTS0 header";
         return out;
     }
-    if (ver != 1 && ver != 2) {
-        out.error = "unknown RTS0 version (not 1.0/1.1)";
+    if (!known_version(ver, out.sig.version)) {
+        out.error = "unknown RTS0 version (not 1.0/1.1/1.2)";
         return out;
     }
     if (nparams > 64) {
@@ -276,7 +293,7 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
         out.error = "RTS0 with absurd sampler count";
         return out;
     }
-    out.sig.version = ver == 1 ? Version::V1_0 : Version::V1_1;
+    const bool flags_v11 = ver >= 2;  // descriptor and range flags (1.1 and 1.2)
     out.sig.flags = flags;
     // Parameter table at params_off: num_params x {u32 d3d_type, u32
     // visibility, u32 offset}. d3d_type follows D3D12_ROOT_PARAMETER_TYPE
@@ -307,7 +324,7 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
         } else if (dtype == 2 || dtype == 3 || dtype == 4) {
             p.type = ParamType::Descriptor;
             uint32_t dflags = 0;
-            const size_t need = ver == 2 ? 12 : 8;
+            const size_t need = flags_v11 ? 12 : 8;
             if (poff > size || need > size - static_cast<size_t>(poff)) {
                 out.error = "truncated RTS0 descriptor payload";
                 return out;
@@ -316,15 +333,17 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
                 out.error = "truncated RTS0 descriptor payload";
                 return out;
             }
-            if (ver == 2 && !u32_at(poff + 8, dflags)) {
+            if (flags_v11 && !u32_at(poff + 8, dflags)) {
                 out.error = "truncated RTS0 descriptor flags";
                 return out;
             }
             (void)dflags;  // descriptor flags do not affect the user-SGPR map
         } else if (dtype == 0) {
             p.type = ParamType::Table;
-            uint32_t nranges = 0;
-            if (!u32_at(poff, nranges)) {
+            // Table payload: {u32 num_ranges, u32 ranges_offset}; the ranges sit at ranges_offset (from the payload
+            // start), like every other table in RTS0. Measured against the PC serializer (root_signature_oracle_test).
+            uint32_t nranges = 0, ranges_off = 0;
+            if (!u32_at(poff, nranges) || !u32_at(static_cast<size_t>(poff) + 4, ranges_off)) {
                 out.error = "truncated RTS0 table payload";
                 return out;
             }
@@ -332,29 +351,25 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
                 out.error = "absurd RTS0 range count";
                 return out;
             }
-            // Range record: {type, num, base_reg, space, offset} (+ flags on 1.1).
-            const size_t stride = ver == 2 ? 24 : 20;
-            if (nranges > 0 &&
-                (poff + 4 > size || nranges > (size - (poff + 4)) / stride)) {
+            // Range record, in D3D12_DESCRIPTOR_RANGE(1) order: {type, num, base_reg, space, offset} in 1.0, and
+            // {type, num, base_reg, space, flags, offset} in 1.1 and 1.2: the flags come BEFORE the table offset
+            // (measured against the PC serializer in root_signature_oracle_test).
+            const size_t stride = flags_v11 ? 24 : 20;
+            if (nranges > 0 && (ranges_off > size || nranges > (size - ranges_off) / stride)) {
                 out.error = "RTS0 ranges overrun their payload";
                 return out;
             }
             p.ranges.reserve(nranges);
             for (uint32_t j = 0; j < nranges; ++j) {
-                const size_t roff = static_cast<size_t>(poff) + 4 + j * stride;
+                const size_t roff = static_cast<size_t>(ranges_off) + j * stride;
                 DescriptorRange range;
-                uint32_t base_reg = 0, space = 0, disp_off = 0, rflags = 0;
+                const size_t offset_at = roff + (flags_v11 ? 20 : 16);
                 if (!u32_at(roff, range.range_type) || !u32_at(roff + 4, range.num_descriptors) ||
-                    !u32_at(roff + 8, base_reg) || !u32_at(roff + 12, space) ||
-                    !u32_at(roff + 16, disp_off) ||
-                    (ver == 2 && !u32_at(roff + 20, rflags))) {
+                    !u32_at(roff + 8, range.base_shader_register) || !u32_at(roff + 12, range.register_space) ||
+                    (flags_v11 && !u32_at(roff + 16, range.flags)) || !u32_at(offset_at, range.offset_in_table)) {
                     out.error = "truncated RTS0 range";
                     return out;
                 }
-                (void)base_reg;
-                (void)space;
-                (void)disp_off;
-                (void)rflags;
                 p.ranges.push_back(range);
             }
         } else {
@@ -363,8 +378,9 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
         }
         out.sig.params.push_back(std::move(p));
     }
-    // Sampler records mirror D3D12_STATIC_SAMPLER_DESC field order.
-    constexpr size_t kSamplerBytes = 13 * 4;
+    // Sampler records mirror D3D12_STATIC_SAMPLER_DESC field order; 1.2 appends Flags (D3D12_STATIC_SAMPLER_DESC1).
+    const bool sampler_flags = ver == 3;
+    const size_t kSamplerBytes = (sampler_flags ? 14 : 13) * 4;
     if (nsamplers > 0 &&
         (samplers_off > size || nsamplers > (size - samplers_off) / kSamplerBytes)) {
         out.error = "RTS0 samplers overrun their payload";
@@ -381,7 +397,7 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
             !u32_at(soff + 24, s.comparison_func) || !u32_at(soff + 28, s.border_color) ||
             !f32_at(soff + 32, s.min_lod) || !f32_at(soff + 36, s.max_lod) ||
             !u32_at(soff + 40, s.shader_register) || !u32_at(soff + 44, s.register_space) ||
-            !u32_at(soff + 48, vis)) {
+            !u32_at(soff + 48, vis) || (sampler_flags && !u32_at(soff + 52, s.flags))) {
             out.error = "truncated RTS0 sampler";
             return out;
         }

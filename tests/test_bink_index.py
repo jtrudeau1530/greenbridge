@@ -2,13 +2,17 @@
 
     python -I tests/test_bink_index.py
 """
+import contextlib
 import csv
 import importlib.util
+import io
 import json
 import os
 import struct
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -61,6 +65,17 @@ class TestHeader(unittest.TestCase):
         self.assertEqual(row["audio_codecs"], ["binkaudio_dct", "binkaudio_dct"])
         self.assertEqual(row["audio_channels"], [2, 2])
 
+    def test_audio_descriptors_stay_within_declared_size(self):
+        stream = struct.pack("<4s10I", b"KB2a", 40, 1, 0, 1, 16, 16, 30, 1, 0, 1) + bytes(4)
+        prefix = b"archive prefix"
+        data = prefix + stream
+        row = bink.parse_header(data, len(prefix))
+        self.assertEqual(row["size"], 48)
+        self.assertEqual(row["audio_rates"], [])
+        self.assertEqual(row["audio_channels"], [])
+        self.assertEqual(bink.parse_header(data + struct.pack("<HHI", 44100, 0x2000, 17),
+                                           len(prefix)), row)
+
     def test_truncated_file_is_skipped(self):
         data = make_stream()[:-100]
         self.assertIsNone(bink.parse_header(data, 0))
@@ -75,6 +90,14 @@ class TestHeader(unittest.TestCase):
         bad_audio = bytearray(make_stream())
         struct.pack_into("<I", bad_audio, 0x28, 999)
         self.assertIsNone(bink.parse_header(bad_audio, 0))
+
+    def test_frame_rate_limits(self):
+        for num, den in [(240, 1), (0xFFFFFFFF, 0xFFFFFFFF)]:
+            with self.subTest(num=num, den=den):
+                self.assertIsNotNone(bink.parse_header(make_stream(fps_num=num, fps_den=den), 0))
+        for num, den in [(0, 1), (1, 0), (0, 0), (1, 2), (240001, 1000)]:
+            with self.subTest(num=num, den=den):
+                self.assertIsNone(bink.parse_header(make_stream(fps_num=num, fps_den=den), 0))
 
 
 class TestScanAndWrite(unittest.TestCase):
@@ -98,6 +121,46 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(rows[0]["frames"], 7)
         self.assertEqual(summary["streams"], 1)
 
+    def test_short_file_bytes_are_accounted_for(self):
+        path = os.path.join(self.dir, "tiny.bk2")
+        with open(path, "wb") as fh:
+            fh.write(b"KB2a" + bytes(16))
+        rows, summary = bink.scan_target(path)
+        self.assertEqual(rows, [])
+        self.assertEqual(summary["span"], 20)
+        self.assertEqual(summary["unread_bytes"], 20)
+        self.assertEqual(summary["zero_padding"], 0)
+
+    def test_fractional_rates_are_indexed(self):
+        path = os.path.join(self.dir, "fractional.bk2")
+        with open(path, "wb") as fh:
+            for num in (24000, 30000, 60000):
+                fh.write(make_stream(frames=120, fps_num=num, fps_den=1001))
+        rows, summary = bink.scan_target(path)
+        self.assertEqual(summary["streams"], 3)
+        self.assertEqual(
+            [(r["fps_num"], r["fps_den"], r["fps"], r["duration_s"]) for r in rows],
+            [(24000, 1001, 23.976, 5.005), (30000, 1001, 29.97, 4.004),
+             (60000, 1001, 59.94, 2.002)],
+        )
+
+    def test_probe_handles_failed_or_malformed_results(self):
+        rows, _ = bink.scan_target(self.dir)
+        valid_info = {"streams": [{"codec_type": "video", "codec_name": "bink2"}],
+                      "format": {"duration": "0.233"}}
+        for status, info, expected in (
+            (0, valid_info, ("yes", "bink2", "0.233")),
+            (1, valid_info, ("no", "", "")),
+            (0, [], ("no", "", "")),
+            (0, {"streams": [None]}, ("no", "", "")),
+            (0, {"streams": valid_info["streams"], "format": None}, ("no", "", "")),
+        ):
+            with self.subTest(status=status, info=info):
+                proc = subprocess.CompletedProcess(["ffprobe"], status, json.dumps(info))
+                with mock.patch.object(bink.subprocess, "run", return_value=proc):
+                    row = bink.probe_row(dict(rows[0]), "ffprobe")
+                self.assertEqual((row["decodes"], row["codec"], row["probe_duration_s"]), expected)
+
     def test_csv_and_json(self):
         rows, summary = bink.scan_target(self.dir)
         csv_path = os.path.join(self.dir, "index.csv")
@@ -114,6 +177,47 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(doc["summary"]["streams"], 1)
         self.assertEqual(doc["streams"][0]["width"], 320)
         self.assertNotIn("decodes", doc["streams"][0])
+
+
+class TestCommandLine(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "one.bk2")
+        with open(self.path, "wb") as fh:
+            fh.write(make_stream(frames=7))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_csv_on_stdout_has_one_line_end_per_row(self):
+        # A text stream that writes "\n" as "\r\n", as Windows' stdout does, on any platform.
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="utf-8", newline="\r\n")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(bink.main([self.path]), 0)
+        out.flush()
+        data = raw.getvalue()
+        self.assertNotIn(b"\r\r\n", data)
+        rows = list(csv.reader(io.StringIO(data.decode("utf-8"), newline="")))
+        self.assertEqual(len(rows), 2)   # header and the one stream, no blank rows
+        self.assertEqual(rows[0][:len(bink.BASE_FIELDS)], bink.BASE_FIELDS)
+
+    def test_missing_target_is_an_error_not_a_traceback(self):
+        missing = os.path.join(self.tmp.name, "nonexistent.bk2")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([missing]), 2)
+        self.assertIn("no such file or directory", err.getvalue())
+
+    def test_output_write_failure_is_an_error(self):
+        for extension in ("csv", "json"):
+            with self.subTest(extension=extension):
+                path = os.path.join(self.tmp.name, "missing", f"index.{extension}")
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(bink.main([self.path, "--out", path]), 2)
+                self.assertEqual(out.getvalue(), "")
+                self.assertIn(f"cannot write {path}", err.getvalue())
 
 
 if __name__ == "__main__":

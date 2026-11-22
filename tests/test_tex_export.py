@@ -173,7 +173,9 @@ def build_case(eq, tmp_path, fmt, top_first):
     return carve, top.tobytes()
 
 
-@pytest.mark.parametrize("fmt,name", [(10, "R16G16B16A16_FLOAT"), (28, "R8G8B8A8_UNORM")])
+@pytest.mark.parametrize("fmt,name", [(10, "R16G16B16A16_FLOAT"), (28, "R8G8B8A8_UNORM"),
+                                      # Pillow 13.0.0 cannot decode these three: scored on raw elements instead
+                                      (81, "BC4_SNORM"), (87, "B8G8R8A8_UNORM"), (91, "B8G8R8A8_UNORM_SRGB")])
 @pytest.mark.parametrize("top_first", [True, False])
 def test_export_picks_the_top_mip_placement_and_writes_dds(eq, tmp_path, fmt, name, top_first):
     if fmt in T.PILLOW_OK:
@@ -185,11 +187,43 @@ def test_export_picks_the_top_mip_placement_and_writes_dds(eq, tmp_path, fmt, na
     place = "first" if top_first else "last"
     assert r == "ok:" + place
     assert t["export"]["place"] == place
+    assert t["export"]["heuristic"] is True
     assert t["export"]["file"] == f"{0xABC:012x}_3_64x64_{name}.dds"
     with open(os.path.join(out, "x.rpf", t["export"]["file"]), "rb") as f:
         dds = f.read()
     assert struct.unpack_from("<I", dds, 128)[0] == fmt
     assert dds[148:] == expected
+
+
+def test_fmt_reuses_the_indexer_table_without_12_byte_rgb32():
+    from tex_headers import FMT_INFO
+    assert T.FMT == {f: v for f, v in FMT_INFO.items() if f not in (6, 7, 8)}
+    assert len(T.FMT) == 56
+
+
+@pytest.mark.parametrize("fmt", sorted(T.FMT))
+def test_every_tileable_format_exports_exact_top_mip_and_header(eq, tmp_path, fmt):
+    bpe, blk = T.FMT[fmt]
+    eq(bpe)
+    w, h = 43, 37  # not a whole number of tiles or BC blocks
+    we, he = (w + blk - 1) // blk, (h + blk - 1) // blk
+    offs, bw, bh = T.detile_offsets(bpe, we, he)
+    top = np.frombuffer(noise(we * he * bpe, seed=fmt), np.uint8).reshape(-1, bpe)
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, tile(top, offs, T.level_bytes(we, he, bpe, bw, bh)))
+    t = texture(fmt, "F", w, h, mips=1)
+    out = str(tmp_path / "out")
+    assert T.export_one(t, carve, out, {}) == "ok:first"
+    assert t["export"]["heuristic"] is False  # one mip: both placements are the same offset
+    with open(os.path.join(out, "x.rpf", t["export"]["file"]), "rb") as f:
+        dds = f.read()
+    flags, pitch = struct.unpack_from("<I", dds, 8)[0], struct.unpack_from("<I", dds, 20)[0]
+    if blk == 1:
+        assert (flags, pitch) == (0x1007 | 0x8, w * bpe)
+    else:
+        assert (flags, pitch) == (0x1007 | 0x80000, we * he * bpe)
+    assert struct.unpack_from("<I", dds, 128)[0] == fmt
+    assert dds[148:] == top.tobytes()
 
 
 def test_gpu_chain_parts_are_read_in_order(eq, tmp_path):
@@ -218,8 +252,48 @@ def test_blob_cache_is_reused_for_the_same_blob(eq, tmp_path):
     assert T.export_one(t2, carve, str(tmp_path / "out"), cache) == "ok:first"
 
 
-def test_unsupported_format_is_reported():
-    assert T.export_one(texture(9999, "X", 4, 4, 1), "unused", "unused", {}) == "unsupported format"
+@pytest.mark.parametrize("fmt", [9999, 6, 7, 8])  # 6-8: 12-byte R32G32B32 has no SW_4K_S equation
+def test_unsupported_format_is_reported(fmt):
+    assert T.export_one(texture(fmt, "X", 4, 4, 1), "unused", "unused", {}) == "unsupported format"
+
+
+@pytest.mark.parametrize("fmt,bpe", [(61, 1), (56, 2), (10, 8), (28, 4)])
+@pytest.mark.parametrize("w,h", [(5, 3), (5, 1), (1, 5)])
+def test_score_prefers_a_smooth_gradient(fmt, bpe, w, h):
+    if fmt in T.PILLOW_OK:
+        pytest.importorskip("PIL")
+    pixels = max(w, h)
+    values = [i * 240 // (pixels - 1) for i in range(pixels)]
+    zigzag = values[::2] + values[1::2][::-1]
+    copies = min(w, h)
+    ramp = b"".join(bytes([value]) * bpe for value in values * copies)
+    rough = b"".join(bytes([value]) * bpe for value in zigzag * copies)
+    assert T.score_image(w, h, fmt, ramp, bpe) < T.score_image(w, h, fmt, rough, bpe)
+
+
+def test_bc2_srgb_is_scored_as_bc2():
+    pytest.importorskip("PIL")
+    payload = noise(4 * 4 * 16)
+    assert T.score_image(16, 16, 75, payload, 16) == T.score_image(16, 16, 74, payload, 16)
+
+
+@pytest.mark.parametrize("fmt", [81, 87, 91])
+def test_score_falls_back_to_raw_elements_when_pillow_cannot_decode(monkeypatch, fmt):
+    PIL_Image = pytest.importorskip("PIL.Image")
+    bpe, blk = T.FMT[fmt]
+
+    def unimplemented(*args, **kwargs):
+        raise NotImplementedError(f"Unimplemented DXGI format {fmt}")
+    monkeypatch.setattr(PIL_Image, "open", unimplemented)
+    payload = noise(4 * 4 * bpe, seed=fmt)
+    score = T.score_image(4 * blk, 4 * blk, fmt, payload, bpe)
+    assert 0 < score < 1e6
+    monkeypatch.setattr(T, "PILLOW_OK", set())  # the branch formats outside PILLOW_OK take
+    assert score == T.score_image(4 * blk, 4 * blk, fmt, payload, bpe)
+
+
+def test_single_element_has_no_edge_transitions():
+    assert T.score_image(1, 1, 61, b"\x80", 1) == 0
 
 
 def test_data_outside_the_blob_is_reported(eq, tmp_path):
@@ -250,3 +324,17 @@ def test_main_writes_the_log_and_honours_limit(eq, tmp_path, monkeypatch, capsys
     monkeypatch.setattr(sys, "argv", ["tex_export.py", str(index), carve, str(out), "--limit", "1"])
     T.main()
     assert len(json.loads((out / "export_log.json").read_text(encoding="utf-8"))) == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "x"])
+def test_main_rejects_a_limit_below_one(tmp_path, monkeypatch, capsys, value):
+    # --limit 0 exported every texture (0 read as "no limit") and -1 silently dropped the last one.
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["tex_export.py", str(index), str(tmp_path), str(out), "--limit", value])
+    with pytest.raises(SystemExit) as e:
+        T.main()
+    assert e.value.code == 2
+    assert "--limit" in capsys.readouterr().err
+    assert not out.exists()

@@ -191,88 +191,95 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     rows = []
     zero = unread = skipped = 0
     t0 = time.time()
+    if os.path.getsize(path) == 0:
+        raise ValueError("empty file")
     with open(path, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        size = len(m)
-        first = struct.unpack_from("<I", m, 4)[0] if size >= 8 else 0
-        pos = start if start is not None else first
-        if not 0 <= pos <= size:
-            raise ValueError("start offset is outside the archive")
-        end = min(size, pos + limit) if limit else size
-        span_start = pos
-        last = pos
-        while pos < end:
-            found = ZHDR.search(m, pos, end)
-            if not found:
-                break
-            s = found.start()
-            if m[s:s + 3] == b"KB2":
-                blen = (_u32(m, s + 4) or 0) + 8
-                w, h = _u32(m, s + 0x14), _u32(m, s + 0x18)
-                if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            size = len(m)
+            first = struct.unpack_from("<I", m, 4)[0] if size >= 8 else 0
+            pos = start if start is not None else first
+            if not 0 <= pos <= size:
+                raise ValueError("start offset is outside the archive")
+            end = min(size, pos + limit) if limit else size
+            span_start = pos
+            last = pos
+            while pos < end:
+                found = ZHDR.search(m, pos, end)
+                if not found:
+                    break
+                s = found.start()
+                if m[s:s + 3] == b"KB2":
+                    blen = (_u32(m, s + 4) or 0) + 8
+                    w, h = _u32(m, s + 0x14), _u32(m, s + 0x18)
+                    if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                        pos = s + 1
+                        continue
+                    z, u = _gap(m[last:s])
+                    zero += z
+                    unread += u
+                    rows.append(classify(m[s:s + 256], s, blen))
+                    last = pos = s + blen
+                    continue
+                d = zlib.decompressobj()
+                p, total, head, psin = s, 0, b"", bytearray()
+                too_big = False
+                try:
+                    while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
+                        block = m[p:min(p + (1 << 20), end)]
+                        if not block:
+                            break
+                        p += len(block)
+                        while block and not d.eof:
+                            chunk = d.decompress(block, 1 << 20)
+                            block = d.unconsumed_tail
+                            if chunk:
+                                total += len(chunk)
+                                if total > max_inflate:
+                                    too_big = True
+                                    break
+                                if len(head) < 256:
+                                    head += chunk[:256 - len(head)]
+                                if len(head) < 4 or head[:4] == b"PSIN":   # classify walks the whole PSIN chain
+                                    psin += chunk
+                            if not block:
+                                break
+                        if too_big:
+                            break
+                except zlib.error:
                     pos = s + 1
                     continue
+                if too_big or not d.eof or total < 64:
+                    skipped += 1
+                    pos = s + 1
+                    continue
+                used = p - s - len(d.unused_data)
                 z, u = _gap(m[last:s])
                 zero += z
                 unread += u
-                rows.append(classify(m[s:s + 256], s, blen))
-                last = pos = s + blen
-                continue
-            d = zlib.decompressobj()
-            p, total, head = s, 0, b""
-            too_big = False
-            try:
-                while not d.eof and p < size:
-                    block = m[p:p + (1 << 20)]
-                    if not block:
-                        break
-                    p += len(block)
-                    while block and not d.eof:
-                        chunk = d.decompress(block, 1 << 20)
-                        block = d.unconsumed_tail
-                        if chunk:
-                            total += len(chunk)
-                            if total > max_inflate:
-                                too_big = True
-                                break
-                            if len(head) < 256:
-                                head += chunk[:256 - len(head)]
-                        if not block:
-                            break
-                    if too_big:
-                        break
-            except zlib.error:
-                pos = s + 1
-                continue
-            if too_big or not d.eof or total < 64:
-                skipped += 1
-                pos = s + 1
-                continue
-            used = p - s - len(d.unused_data)
-            z, u = _gap(m[last:s])
+                row = classify(bytes(psin) if head[:4] == b"PSIN" else head, s, used)
+                row["size"] = total
+                rows.append(row)
+                last = pos = s + used
+            z, u = _gap(m[last:end])
             zero += z
             unread += u
-            row = classify(head, s, used)
-            row["size"] = total
-            rows.append(row)
-            last = pos = s + used
-        z, u = _gap(m[last:end])
-        zero += z
-        unread += u
-        m.close()
     summary = summarise(rows, end - span_start, zero, unread)
     summary.update(mode="rpf9", archive=path, elapsed_seconds=round(time.time() - t0, 3),
                    skipped_candidates=skipped)
     return rows, summary
 
 
-def scan_dir(path):
+def scan_dir(path, max_inflate=MAX_INFLATE):
     """Index already-carved files. A leading hexadecimal file name supplies the offset."""
     rows = []
+    skipped = 0
     t0 = time.time()
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         if not os.path.isfile(full) or not (name.endswith(".bin") or name.endswith(".bk2")):
+            continue
+        if name.endswith(".bin") and os.path.getsize(full) > max_inflate:
+            skipped += 1
             continue
         found = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(found.group(1), 16) if found else len(rows)
@@ -286,7 +293,7 @@ def scan_dir(path):
         rows.append(row)
     summary = summarise(rows, sum(r["stored"] for r in rows), 0, 0)
     summary.update(mode="directory", directory=path, elapsed_seconds=round(time.time() - t0, 3),
-                   skipped_candidates=0)
+                   skipped_candidates=skipped)
     return rows, summary
 
 
@@ -326,20 +333,62 @@ def write_output(path, rows, summary):
                              for i, c in enumerate(COLUMNS)])
 
 
+def offset(text):
+    """--start: 0 or more, decimal or 0x hex."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be 0 or more") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
+def byte_count(text):
+    """--limit/--max-inflate: at least 1; 0 used to mean no limit."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be at least 1") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin/.bk2 files")
     ap.add_argument("out", help="output path ending in .csv or .json")
-    ap.add_argument("--start", type=lambda s: int(s, 0), help="first byte to scan (default: RPF data start)")
-    ap.add_argument("--limit", type=lambda s: int(s, 0), help="number of bytes to scan")
-    ap.add_argument("--max-inflate", type=lambda s: int(s, 0), default=MAX_INFLATE,
+    ap.add_argument("--start", type=offset, help="first byte to scan (default: RPF data start)")
+    ap.add_argument("--limit", type=byte_count, help="number of bytes to scan")
+    ap.add_argument("--max-inflate", type=byte_count, default=MAX_INFLATE,
                     help="skip a stream that inflates above this many bytes (default: 512 MiB)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
-    if os.path.isdir(args.source):
-        rows, summary = scan_dir(args.source)
-    else:
-        rows, summary = scan_rpf(args.source, args.start, args.limit, args.max_inflate)
+    if os.path.isdir(args.source) and (args.start is not None or args.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
+    if os.path.isdir(args.out):
+        ap.error(f"{args.out} is a folder, not a .csv or .json file")
+    folder = os.path.dirname(os.path.abspath(args.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {args.out} cannot be written")
+    try:
+        overwrites_source = os.path.samefile(args.source, args.out)
+    except FileNotFoundError:
+        overwrites_source = False
+    except OSError as e:
+        ap.error(f"cannot compare source and output paths: {e}")
+    if overwrites_source:
+        ap.error("output must not overwrite the source archive")
+    try:
+        if os.path.isdir(args.source):
+            rows, summary = scan_dir(args.source, args.max_inflate)
+        else:
+            rows, summary = scan_rpf(args.source, args.start, args.limit, args.max_inflate)
+    except ValueError as e:
+        sys.exit(f"{args.source}: {e}")
+    except OSError as e:
+        sys.exit(f"{args.source}: {e.strerror or e}")
     write_output(args.out, rows, summary)
     if not args.quiet:
         print(json.dumps({k: summary[k] for k in
@@ -354,4 +403,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

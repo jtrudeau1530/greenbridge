@@ -346,5 +346,120 @@ class ShaderMetaIntegrationTests(unittest.TestCase):
         })
 
 
+    def test_imm_u32_applies_vop3_abs_before_neg(self):
+        import shader_ir
+        self.assertEqual(M._imm_u32(shader_ir.operand("-|1.0|")), 0xBF800000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("-|-2.0|")), 0xC0000000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("neg(0x3f800000)")), 0xBF800000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("|0xbf800000|")), 0x3F800000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("-|0|")), 0x80000000)
+        self.assertEqual(M._imm_u32(shader_ir.operand("neg(1)")), 0x80000001)
+
+
+class OperandClassificationTests(unittest.TestCase):
+    @staticmethod
+    def _parse(lines):
+        import shader_ir
+        return [shader_ir.parse_line(ln) for ln in lines]
+
+    def test_split_operands_scalar_rmw(self):
+        import shader_ir
+        cases = [
+            ("s_cmov_b32 s2, s4", [2, 4], [2]),
+            ("s_cmov_b64 s[2:3], s[4:5]", [2, 3, 4, 5], [2, 3]),
+            ("s_bitset0_b32 s3, 7", [3], [3]),
+            ("s_bitset1_b32 s3, s5", [3, 5], [3]),
+            ("s_bitset0_b64 s[4:5], 33", [4, 5], [4, 5]),
+            ("s_bitset1_b64 s[4:5], s6", [4, 5, 6], [4, 5]),
+        ]
+        for asm, want_reads, want_writes in cases:
+            with self.subTest(asm=asm):
+                reads, writes = M._split_operands(shader_ir.parse_line(asm))
+                self.assertEqual(reads, want_reads)
+                self.assertEqual(writes, want_writes)
+
+    def test_split_operands_v_div_scale_dual_dst(self):
+        import shader_ir
+        cases = [
+            ("v_div_scale_f32 v0, s4, v1, v2, s6", [6], [4]),
+            ("v_div_scale_f32_e64 v0, s4, v1, v2, v1", [], [4]),
+            ("v_div_scale_f32 v0, s[4:5], s7, v1, v2", [7], [4, 5]),
+            ("v_div_scale_f64 v[0:1], s[4:5], v[2:3], v[4:5], s[6:7]", [6, 7], [4, 5]),
+            ("v_div_scale_f64 v[0:1], vcc, v[2:3], v[4:5], v[2:3]", [], []),
+        ]
+        for asm, want_reads, want_writes in cases:
+            with self.subTest(asm=asm):
+                reads, writes = M._split_operands(shader_ir.parse_line(asm))
+                self.assertEqual(reads, want_reads)
+                self.assertEqual(writes, want_writes)
+
+    def test_analyse_scalar_rmw_keeps_live_user_sgprs_and_invalidates_tags(self):
+        # Each RMW op on an unwritten user SGPR (or pair) must record a user_sgpr_read.
+        # s10 is written first, so s_bitset1_b32 on s10 must NOT mark s10 as a user SGPR.
+        # s12 is initialized to a constant then conditionally overwritten by s_cmov_b32,
+        # invalidating the constant tag so s[12:15] is NOT emitted as a literal sampler.
+        insns = self._parse([
+            "s_mov_b32 s10, 0",
+            "s_bitset1_b32 s10, 1",
+            "s_cmov_b32 s0, 1",
+            "s_cmov_b64 s[2:3], s[20:21]",
+            "s_bitset0_b32 s4, 2",
+            "s_bitset1_b32 s5, 3",
+            "s_bitset0_b64 s[6:7], 4",
+            "s_bitset1_b64 s[8:9], 35",
+            "s_mov_b32 s12, 0x92",
+            "s_mov_b32 s13, 0",
+            "s_mov_b32 s14, 0",
+            "s_mov_b32 s15, 0",
+            "s_cmov_b32 s12, s11",
+            "image_sample v[4:7], v[0:1], s[24:31], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        sgprs = {r["sgpr"]: r["kind"] for r in got["user_sgpr_reads"]}
+        for r in (0, 2, 3, 4, 5, 6, 7, 8, 9, 11, 20, 21):
+            self.assertIn(r, sgprs, f"expected s{r} in user_sgpr_reads")
+        self.assertNotIn(10, sgprs)
+        self.assertNotIn(12, sgprs)
+        self.assertEqual(got["literal_samplers"], [])
+
+    def test_analyse_v_div_scale_sdst_not_user_sgpr_even_when_read_after(self):
+        # s4 (f32 wave32 sdst) and s[6:7] (f64 wave64 sdst) are scratch outputs written by
+        # v_div_scale_* and then read later; neither may fabricate a user SGPR.
+        # s2 and s[8:9] are source operands and MUST be reported as user SGPRs.
+        insns = self._parse([
+            "v_div_scale_f32 v0, s4, s2, v1, s2",
+            "v_mov_b32_e32 v2, s4",
+            "v_div_scale_f64 v[4:5], s[6:7], v[2:3], v[6:7], s[8:9]",
+            "s_or_b64 s[10:11], s[6:7], s[6:7]",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        sgprs = [r["sgpr"] for r in got["user_sgpr_reads"]]
+        self.assertEqual(sgprs, [2, 8, 9])
+
+    def test_translate_synthetic_scalar_rmw_user_sgprs(self):
+        lines = [
+            "s_cmp_eq_u32 s0, 0",
+            "s_cmov_b32 s1, 42",
+            "s_bitset0_b32 s2, 1",
+            "s_bitset1_b32 s3, 2",
+            "s_bitset0_b64 s[4:5], 5",
+            "s_bitset1_b64 s[6:7], 36",
+            "v_mov_b32_e32 v0, s1",
+            "v_add_nc_u32_e32 v0, s2, v0",
+            "v_add_nc_u32_e32 v0, s3, v0",
+            "v_add_nc_u32_e32 v0, s4, v0",
+            "v_add_nc_u32_e32 v0, s5, v0",
+            "v_add_nc_u32_e32 v0, s6, v0",
+            "v_add_nc_u32_e32 v0, s7, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_rmw_user", lines)
+        sgprs = [r["sgpr"] for r in meta["user_sgpr_reads"]]
+        self.assertEqual(sgprs, [0, 1, 2, 3, 4, 5, 6, 7])
+
+
 if __name__ == "__main__":
     unittest.main()

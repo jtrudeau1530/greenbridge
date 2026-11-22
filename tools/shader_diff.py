@@ -1,7 +1,7 @@
 r"""Differential oracle for the RDNA2 translator (standard library only).
 
 Runs seeded straight-line ALU programs through two independent oracles and
-compares them bit-exact:
+compares their output words:
   * tools/cpu_ref.py      - the ISA model, executed per lane (lanes=1, lane=0)
   * rdna2spirv + tests/semantic/spirv_mini_interp.py - the translated SPIR-V
 
@@ -61,6 +61,16 @@ def _is_nan_bits(word):
     return exp == 0xFF and (word & 0x7FFFFF) != 0
 
 
+def _emit_perm(rng, dst, srcs):
+    """Half the cases pin the selector so bytes 8-13 (sign bits, 0x00, 0xff) are not left to chance."""
+    if rng.random() < 0.5:
+        sel = 0
+        for i in range(4):
+            sel |= rng.randrange(0, 16) << (8 * i)
+        return f"v_perm_b32 v{dst}, v{srcs[0]}, v{srcs[1]}, 0x{sel:08x}"
+    return f"v_perm_b32 v{dst}, v{srcs[0]}, v{srcs[1]}, v{srcs[2]}"
+
+
 def _op_templates():
     """(name, emitter) table owned by this runner. Emitters take
     (rng, dst, srcs) and return one assembly line (without leading tab)."""
@@ -76,6 +86,28 @@ def _op_templates():
         ("v_lshlrev_b32", lambda r, d, s: f"v_lshlrev_b32 v{d}, {r.randrange(0, 8)}, v{s[0]}"),
         ("v_lshrrev_b32", lambda r, d, s: f"v_lshrrev_b32 v{d}, {r.randrange(0, 8)}, v{s[0]}"),
         ("v_ashrrev_i32", lambda r, d, s: f"v_ashrrev_i32 v{d}, {r.randrange(0, 8)}, v{s[0]}"),
+        ("v_add_nc_u32", lambda r, d, s: f"v_add_nc_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_sub_nc_u32", lambda r, d, s: f"v_sub_nc_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_subrev_nc_u32", lambda r, d, s: f"v_subrev_nc_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_u32_u24", lambda r, d, s: f"v_mul_u32_u24 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_i32_i24", lambda r, d, s: f"v_mul_i32_i24 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_lo_u32", lambda r, d, s: f"v_mul_lo_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_hi_u32", lambda r, d, s: f"v_mul_hi_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mul_hi_i32", lambda r, d, s: f"v_mul_hi_i32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_mad_u32_u24", lambda r, d, s: f"v_mad_u32_u24 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_mad_i32_i24", lambda r, d, s: f"v_mad_i32_i24 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_min_u32", lambda r, d, s: f"v_min_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_max_u32", lambda r, d, s: f"v_max_u32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_min_i32", lambda r, d, s: f"v_min_i32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_max_i32", lambda r, d, s: f"v_max_i32 v{d}, v{s[0]}, v{s[1]}"),
+        ("v_bfe_u32", lambda r, d, s: f"v_bfe_u32 v{d}, v{s[0]}, {r.randrange(0, 40)}, {r.randrange(0, 40)}"),
+        ("v_bfe_i32", lambda r, d, s: f"v_bfe_i32 v{d}, v{s[0]}, {r.randrange(0, 40)}, {r.randrange(0, 40)}"),
+        ("v_bfi_b32", lambda r, d, s: f"v_bfi_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_alignbit_b32", lambda r, d, s: f"v_alignbit_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_alignbyte_b32", lambda r, d, s: f"v_alignbyte_b32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_perm_b32", _emit_perm),
+        ("v_med3_i32", lambda r, d, s: f"v_med3_i32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
+        ("v_med3_u32", lambda r, d, s: f"v_med3_u32 v{d}, v{s[0]}, v{s[1]}, v{s[2]}"),
         ("s_add_u32", lambda r, d, s: f"s_add_u32 s{d}, s{s[0]}, s{s[1]}"),
     ]
 
@@ -88,7 +120,14 @@ def _op_templates():
 # mini-interp (not this runner) re-enables scalar ALU coverage.
 _VEC_OPS = ("v_mov_b32", "v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32",
             "v_and_b32", "v_or_b32", "v_xor_b32", "v_lshlrev_b32",
-            "v_lshrrev_b32", "v_ashrrev_i32")
+            "v_lshrrev_b32", "v_ashrrev_i32",
+            "v_add_nc_u32", "v_sub_nc_u32", "v_subrev_nc_u32", "v_mul_u32_u24",
+            "v_mul_i32_i24", "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_hi_i32",
+            "v_mad_u32_u24", "v_mad_i32_i24", "v_min_u32", "v_max_u32",
+            "v_min_i32", "v_max_i32",
+            "v_bfe_u32", "v_bfe_i32", "v_bfi_b32", "v_alignbit_b32",
+            "v_alignbyte_b32", "v_perm_b32", "v_med3_i32", "v_med3_u32")
+_FLOAT_OPS = ("v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32")
 
 
 def _seed_value(rng):
@@ -113,12 +152,24 @@ def generate_program(rng, n_ops):
     for s in s_regs:
         lines.append(f"s_mov_b32 s{s}, {_seed_value(rng) % 256}")
     vec_ops = [t for t in _op_templates() if t[0] in _VEC_OPS and t[0] != "v_mov_b32"]
+    # A float op may return any NaN payload (Vulkan does not promise one) and the
+    # comparison accepts both-NaN. If that value then fed an integer op, the two
+    # payloads would produce different integer results, so integer ops never read
+    # the destination of a float op. Every untainted register is bit-identical on
+    # both oracles; a later integer write clears the taint.
+    tainted = set()
     for _ in range(n_ops):
         name, emit = rng.choice(vec_ops)
         dst = rng.choice(SCRATCH)
-        srcs = [rng.choice(SCRATCH) for _ in range(4)]
+        clean = [v for v in SCRATCH if v not in tainted]
+        pool = SCRATCH if name in _FLOAT_OPS or not clean else clean
+        srcs = [rng.choice(pool) for _ in range(4)]
         lines.append(emit(rng, dst, srcs))
         writers[dst] = (name, len(lines))
+        if name in _FLOAT_OPS:
+            tainted.add(dst)
+        else:
+            tainted.discard(dst)
     # Observe one scalar through a VGPR so scalar ops are covered too.
     lines.append(f"v_mov_b32 v15, s{rng.choice(s_regs)}")
     writers[15] = ("v_mov_b32/sgpr-copy", len(lines))
@@ -135,27 +186,31 @@ def _write_listing(path, lines, with_export):
         f.write("\ts_endpgm\n")
 
 
-def compare_pair(cpu_words, spv_words):
-    """Bit-exact compare of two 4-word exports. Returns a mismatch string or None.
+def compare_pair(cpu_words, spv_words, *, writers=None):
+    """Compare two 4-word exports and return the first mismatch or None.
 
-    NaN words match only if both sides are NaN (payloads recorded); finite
-    words must be exactly equal.
+    Results of floating-point instructions can have different NaN payloads.
+    All other words must match bit for bit.
     """
     if len(cpu_words) != 4 or len(spv_words) != 4:
         return f"shape mismatch: cpu has {len(cpu_words)} words, spv has {len(spv_words)}"
+    writers = writers or {}
     for i in range(4):
         c = cpu_words[i] & 0xFFFFFFFF
         s = spv_words[i] & 0xFFFFFFFF
         if c == s:
             continue
-        c_nan, s_nan = _is_nan_bits(c), _is_nan_bits(s)
-        if c_nan and s_nan:
-            continue  # both NaN: payloads legitimately differ, not a mismatch
-        if c_nan or s_nan:
-            return (f"lane word {i}: only one side is NaN "
-                    f"(cpu=0x{c:08x} spv=0x{s:08x})")
-        return (f"lane word {i}: expected 0x{c:08x} ({c}), "
-                f"actual 0x{s:08x} ({s})")
+        writer = writers.get(EXPORT_REGS[i])
+        mismatch = f"lane word {i}: expected 0x{c:08x} ({c}), actual 0x{s:08x} ({s})"
+        if writer and cpu_ref.base_op(writer[0]) in _FLOAT_OPS:
+            c_nan, s_nan = _is_nan_bits(c), _is_nan_bits(s)
+            if c_nan and s_nan:
+                continue
+            if c_nan or s_nan:
+                mismatch = f"lane word {i}: only one side is NaN (cpu=0x{c:08x} spv=0x{s:08x})"
+        if writer:
+            mismatch += f" (last writer {writer[0]} at body line {writer[1]})"
+        return mismatch
     return None
 
 
@@ -195,16 +250,10 @@ def run_one(name, lines, writers):
         regs = cpu_res["registers"]["vgpr"]
         cpu_words = [regs.get(r, [0])[0] if isinstance(regs.get(r), list) else regs.get(r, 0)
                      for r in EXPORT_REGS]
-        mismatch = compare_pair(cpu_words, list(out["%out_mrt0"]))
+        mismatch = compare_pair(cpu_words, list(out["%out_mrt0"]), writers=writers)
         if mismatch is None:
             return ("match", "")
-        first_bad = next(i for i in range(4)
-                         if (cpu_words[i] & 0xFFFFFFFF) != (list(out["%out_mrt0"])[i] & 0xFFFFFFFF)
-                         or (_is_nan_bits(cpu_words[i] & 0xFFFFFFFF) !=
-                             _is_nan_bits(list(out["%out_mrt0"])[i] & 0xFFFFFFFF)))
-        writer = writers.get(EXPORT_REGS[first_bad], ("?", 0))
-        return ("mismatch",
-                f"{mismatch} (last writer {writer[0]} at body line {writer[1]})")
+        return ("mismatch", mismatch)
 
 
 def run_suite(programs, seed, max_ops, limit=None):
@@ -277,17 +326,17 @@ def main(argv=None):
         return 0 if self_test() else 1
     counts, first_failure = run_suite(a.programs, a.seed, a.max_ops, a.limit)
     total_skips = sum(counts["skip"].values())
-    print(f"{a.programs} programs (seed {a.seed}): "
+    total_run = counts["pass"] + counts["mismatch"] + total_skips + counts["harness-error"]
+    print(f"{total_run} programs (seed {a.seed}): "
           f"{counts['pass']} pass, {counts['mismatch']} mismatch, "
           f"{total_skips} skipped, {counts['harness-error']} harness errors")
     for reason, n in sorted(counts["skip"].items()):
         print(f"  skip x{n}: {reason}")
     if first_failure is not None:
-        print("FIRST MISMATCH:\n" + first_failure)
-        return 1
+        print("FIRST FAILURE:\n" + first_failure)
     if counts["harness-error"]:
         return 2
-    return 0
+    return 1 if counts["mismatch"] else 0
 
 
 if __name__ == "__main__":

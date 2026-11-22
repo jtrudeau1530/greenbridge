@@ -2,7 +2,7 @@
 
 Candidates: every addrlib 4K/64K pattern for the element size, crossed with two placements of the top mip
 (at the texture's data offset, or at the end of its mip chain, since GFX10 stores mips smallest first).
-Scored with exact BC1/BC3 block averages (smoothness relative to the image's own spread).
+Scored with average RGB colours for BC1, BC2 and BC3 blocks (smoothness relative to the image's own spread).
 
 Usage:
     python -I tex_mode_probe.py <textures_index.json> <carve dir> [--fmt BC1] [--n 12]
@@ -19,14 +19,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from amd_swizzle import _parity, equation, load  # noqa: E402
 from bc_feature import block_average, smoothness  # noqa: E402
 
-BPE = {"BC1": 8, "BC4": 8, "BC2": 16, "BC3": 16, "BC5": 16, "BC6H": 16, "BC7": 16}
+BPE = {"BC1": 8, "BC2": 16, "BC3": 16}
 
 
 def bc_bpe(fmt_name):
-    for k, v in BPE.items():
-        if fmt_name.startswith(k):
-            return v
-    return None
+    return BPE.get(fmt_name.split("_", 1)[0])
 
 
 def mip_bytes(w, h, bpe, align):
@@ -49,15 +46,29 @@ def offsets_for(eq, bb, bpe, wb, hb):
     return (o + ((y // bh) * nbx + x // bw) * (1 << bb)) // bpe
 
 
+def positive_int(text):
+    """--n: 0 probed nothing and printed an empty ranking as a result; a negative N dropped the last N textures."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("index")
     ap.add_argument("carve")
-    ap.add_argument("--fmt", default="BC1")
-    ap.add_argument("--n", type=int, default=12)
+    ap.add_argument("--fmt", default="BC1", help="BC1, BC2, or BC3, optionally with a DXGI suffix")
+    ap.add_argument("--n", type=positive_int, default=12, help="probe the first N matching textures (N >= 1)")
     a = ap.parse_args()
+    if bc_bpe(a.fmt) is None:
+        ap.error(f"no color scorer for {a.fmt!r}; expected BC1, BC2, or BC3")
     nib, tab = load()
-    texs = [t for t in json.load(open(a.index)) if t["fmt_name"].startswith(a.fmt) and t["w"] >= 256 and t["h"] >= 256]
+    texs = [t for t in json.load(open(a.index)) if t["fmt_name"].startswith(a.fmt)
+            and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
     texs = texs[: a.n]
     cands = {}
     for tname, ents in tab.items():
@@ -91,8 +102,9 @@ def main():
         if res:
             lin_raw = np.frombuffer(G[t["data_off"]:t["data_off"] + wb * hb * bpe], np.uint8)
             lin = smoothness(block_average(lin_raw.reshape(-1, bpe), bpe).reshape(hb, wb, 3)) if len(lin_raw) == wb * hb * bpe else -1
+            second = f"{res[1][0]:.4f} {res[1][1]} [{res[1][2]}]" if len(res) > 1 else "n/a"
             print(f"{t['w']}x{t['h']} {t['fmt_name']} mips={mips} gpu={t['gpu_size']}  best {res[0][0]:.4f} {res[0][1]} [{res[0][2]}]"
-                  f"  2nd {res[1][0]:.4f} {res[1][1]} [{res[1][2]}]  linear {lin:.4f}")
+                  f"  2nd {second}  linear {lin:.4f}")
             wins[(res[0][1].split(' ')[0], res[0][2])] += 1
     print("winners:", wins.most_common())
 

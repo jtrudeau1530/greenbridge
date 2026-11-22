@@ -14,7 +14,15 @@ import os
 import re
 import sys
 
-STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,200}")
+# A whole printable run, however long (one linear scan: a single character class, no nested quantifiers).
+STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,}")
+# A name (a whole run or one piece of it) longer than this is not added: it is a blob of text, not a name.
+# The old pattern cut every run at 201 characters, so no entry was ever longer than this.
+MAX_NAME_LEN = 201
+# The pieces of a path or dotted name, found one at a time (a run can be megabytes: no list of all its parts).
+PART = re.compile(r"[^./:\\]+")
+# Where re.split would yield an empty piece; only matters for --min 0 or less, which keeps "" as a name.
+EMPTY_PART = re.compile(r"[./:\\]{2}|[./:\\]$")
 
 
 def joaat(s: str) -> int:
@@ -32,11 +40,14 @@ def harvest(data: bytes, out: set, minlen: int):
     for m in STR.finditer(data):
         s = m.group(0).decode("latin-1")
         if len(s) >= minlen:
-            out.add(s)
+            if len(s) <= MAX_NAME_LEN:
+                out.add(s)
             # also the pieces of paths and dotted names, which are hashed on their own
-            for part in re.split(r"[./:\\]", s):
-                if len(part) >= minlen:
-                    out.add(part)
+            for pm in PART.finditer(s):
+                if minlen <= pm.end() - pm.start() <= MAX_NAME_LEN:
+                    out.add(pm.group(0))
+            if minlen <= 0 and EMPTY_PART.search(s):
+                out.add("")
 
 
 def main():
@@ -46,27 +57,69 @@ def main():
     ap.add_argument("--archives", default="common,data,script,pack_story000_story000_script,textures")
     ap.add_argument("--extra", nargs="*", default=[])
     ap.add_argument("--min", type=int, default=3)
-    ap.add_argument("--lookup", nargs="+")
+    ap.add_argument("--lookup", nargs="+", metavar="VALUE", help="dictionary path followed by one or more hashes")
     a = ap.parse_args()
     if a.lookup:
-        d = json.load(open(a.lookup[0], encoding="utf-8"))
+        if len(a.lookup) < 2:
+            ap.error("--lookup requires a dictionary and at least one hash")
+        values = []
         for h in a.lookup[1:]:
-            print(h, d.get(f"{int(h, 16):08x}", "?"))
+            try:
+                values.append((h, int(h, 16)))
+            except ValueError:
+                ap.error(f"--lookup: {h!r} is not a hexadecimal hash")
+        try:
+            with open(a.lookup[0], encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot read the dictionary {a.lookup[0]}: {getattr(e, 'strerror', None) or e}",
+                  file=sys.stderr)
+            return 2
+        if not isinstance(d, dict):
+            print(f"ERROR: the dictionary {a.lookup[0]} is not a JSON object of hash -> name", file=sys.stderr)
+            return 2
+        for h, v in values:
+            print(h, d.get(f"{v:08x}", "?"))
         return 0
+    if a.carve is None:
+        ap.error("a carve directory is required to build a dictionary")
+    if not os.path.isdir(a.carve):
+        what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
+        print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
+        return 2
     strings = set()
     full = set(a.archives.split(","))
+    missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
     for arch in sorted(os.listdir(a.carve)):
         p = os.path.join(a.carve, arch, "index.json")
         if not os.path.isfile(p):
             continue
-        for r in json.load(open(p, encoding="utf-8"))["files"]:
+        try:
+            with open(p, encoding="utf-8") as f:
+                rows = json.load(f)["files"]
+            if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                raise ValueError('"files" is not a list of entries')
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            reason = getattr(e, "strerror", None) or (f"no {e} key" if isinstance(e, KeyError) else e)
+            print(f"ERROR: cannot read {p}: {reason}", file=sys.stderr)
+            return 2
+        for r in rows:
             if r.get("type") == "bink2":
                 continue
             meta = r["head"].startswith("5053494e") or r["head"].startswith("52424630")
             if arch in full or meta:
-                with open(os.path.join(a.carve, arch, f"{r['off']:012x}.bin"), "rb") as f:
-                    harvest(f.read(), strings, a.min)
+                blob = os.path.join(a.carve, arch, f"{r['off']:012x}.bin")
+                try:
+                    with open(blob, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    missing.append(blob)
+                    continue
+                harvest(data, strings, a.min)
         print(f"{arch}: {len(strings)} strings so far", flush=True)
+    if missing:
+        print(f"WARNING: {len(missing)} carved blobs listed in an index.json could not be read and were skipped "
+              f"(first: {missing[0]}). Re-run the carve to get their strings.", file=sys.stderr)
     for x in a.extra:
         if os.path.isdir(x):
             for root, _, files in os.walk(x):
@@ -77,8 +130,14 @@ def main():
     d = {}
     for s in sorted(strings):
         d.setdefault(f"{joaat(s):08x}", s)
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(d, f)
+    # Other tools create the output parent too: a long harvest must not be lost to a missing folder.
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError as e:
+        print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)
+        return 2
     print(f"{len(strings)} strings -> {len(d)} hashes -> {a.out}")
     return 0
 

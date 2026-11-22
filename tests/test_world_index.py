@@ -2,8 +2,10 @@
 
     python -I tests/test_world_index.py
 """
+import contextlib
 import csv
 import importlib.util
+import io
 import json
 import os
 import struct
@@ -60,6 +62,7 @@ def make_resource(map_file=True):
         member(WI.FIELD["guid"], 0x20, 0x4F),
         member(WI.FIELD["lodLevel"], 0x7E, 0x60),
         member(WI.FIELD["lodDist"], 0x60, 0x21),
+        member(WI.ARCHETYPE_KEY, 0x20, 0x4F),
     ]
     entity_members = 0x300
     for i, m in enumerate(members):
@@ -80,6 +83,7 @@ def make_resource(map_file=True):
     if map_file:
         mm = [
             member(WI.FIELD["name"], 0x08, 0x4A),
+            member(WI.FIELD["name64"], 0x10, 0x4F),
             member(WI.FIELD["parent"], 0x68, 0x4A),
             member(WI.FIELD["streamingExtentsMin"], 0x70, 0x32),
             member(WI.FIELD["streamingExtentsMax"], 0x7C, 0x32),
@@ -93,6 +97,7 @@ def make_resource(map_file=True):
         struct.pack_into("<IIQ", b, 0x210, WI.MAPDATA, 0x120, ptr(0x500))
         root = 0x500
         struct.pack_into("<I", b, root + 0x08, 0x11223344)
+        struct.pack_into("<Q", b, root + 0x10, 0x1122334455667788)
         struct.pack_into("<I", b, root + 0x68, 0xAABBCCDD)
         struct.pack_into("<3f", b, root + 0x70, -10.0, -20.0, -30.0)
         struct.pack_into("<3f", b, root + 0x7C, 10.0, 20.0, 30.0)
@@ -130,6 +135,7 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(row["entity_size"], 0x90)
         self.assertEqual(row["archetypes"], 1)
         self.assertEqual(row["map_name"], 0x11223344)
+        self.assertEqual(row["map_name64"], 0x1122334455667788)
         self.assertEqual(row["parent"], 0xAABBCCDD)
         self.assertEqual(row["extent_min"], [-10.0, -20.0, -30.0])
         self.assertEqual(row["extent_max"], [10.0, 20.0, 30.0])
@@ -168,6 +174,79 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "map")
         self.assertEqual(rows[0]["entities"], 1)
 
+    def test_scan_window_options(self):
+        blob = make_resource()
+        path = os.path.join(self.dir, "sample.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf_streams([blob]))
+        size = os.path.getsize(path)
+        out = os.path.join(self.dir, "out.json")
+        # A one-byte window at the data start: the scan ends one byte later.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([path, "--out", out, "--start", "64", "--limit", "1"]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["summary"]["scan_end"], 0x41)
+        os.remove(out)
+        # --limit 0 used to read as "no limit" (the whole archive); negative values were used as given.
+        for args in (["--limit", "0"], ["--limit", "-16"], ["--start", "-1"],
+                     ["--max-inflate", "0"], ["--max-inflate", "-1"]):
+            with self.subTest(args=args), self.assertRaises(SystemExit) as ctx, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                WI.main([path, "--out", out, *args])
+            self.assertEqual(ctx.exception.code, 2)
+        # A start inside the RPF9 header or past the end is refused, and no report is written.
+        for start in ("16", str(size)):
+            with self.subTest(start=start):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(WI.main([path, "--out", out, "--start", start]), 2)
+                self.assertIn("outside the data area", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
+    def test_scan_limit_excludes_crossing_stream_and_accepts_hex(self):
+        blob = make_resource()
+        stored = len(zlib.compress(blob))
+        path = os.path.join(self.dir, "sample.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf_streams([blob]))
+        out = os.path.join(self.dir, "out.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([path, "--out", out, "--start", "0x40", "--limit", hex(stored)]), 0)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["resources"], 1)
+        self.assertEqual(doc["summary"]["scanned_bytes"], stored)
+
+        rows, stats = WI.scan_rpf(path, start=0x40, limit=stored - 1)
+        self.assertEqual(rows, [])
+        self.assertEqual(stats["streams"], 0)
+        self.assertEqual(stats["scanned_bytes"], 0)
+        self.assertEqual(stats["scan_end"], 0x40 + stored - 1)
+
+    def test_missing_path_is_an_error_not_a_traceback(self):
+        out = os.path.join(self.dir, "missing.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([os.path.join(self.dir, "nope.rpf"), "--out", out]), 2)
+        self.assertIn("ERROR:", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
+    def test_rpf_scan_survives_a_damaged_candidate_continuation(self):
+        blob = make_resource()
+        partial = blob[:0x150]
+        unrelated = bytes(72)
+        archive = bytearray(make_rpf_streams([partial, unrelated, blob]))
+        continuation = (0x40 + len(zlib.compress(partial)) + 15) & ~15
+        end = continuation + len(zlib.compress(unrelated))
+        archive[end - 1] ^= 1  # Corrupt only the second stream's checksum.
+        path = os.path.join(self.dir, "damaged_continuation.rpf")
+        with open(path, "wb") as f:
+            f.write(archive)
+        rows, stats = WI.scan_rpf(path)
+        self.assertEqual(stats["streams"], 2)
+        self.assertEqual(rows[-1]["offset"], (end + 15) & ~15)
+        self.assertEqual(rows[-1]["size"], len(blob))
+
     def test_directory_scan_and_outputs(self):
         with open(os.path.join(self.dir, "map.bin"), "wb") as f:
             f.write(make_resource())
@@ -192,6 +271,84 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["signature"], "0DRPz")
         self.assertEqual(rows[0]["version"], "122")
+
+    def test_directory_inflate_cap_does_not_exclude_large_archives(self):
+        resource = make_resource()
+        cap = len(resource)
+        with open(os.path.join(self.dir, "large.rpf"), "wb") as f:
+            f.write(make_rpf_streams([resource]) + bytes(cap))
+        with open(os.path.join(self.dir, "oversized.bin"), "wb") as f:
+            f.write(resource + b"\0")
+        rows, stats = WI.scan_path(self.dir, max_inflate=cap)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "map")
+        self.assertEqual(stats["files"], 1)
+
+    def test_archetypes_out_counts_each_entity_once(self):
+        blob = make_resource()
+        path = os.path.join(self.dir, "sample.rpf")
+        with open(path, "wb") as f:
+            # One resource split over two streams (joined, parsed again) and one whole copy.
+            f.write(make_rpf_streams([blob[:0x150], blob[0x150:], blob, make_resource(map_file=False)]))
+        out = os.path.join(self.dir, "out.json")
+        arch = os.path.join(self.dir, "archetypes.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([path, "--out", out, "--archetypes-out", arch]), 0)
+        with open(arch, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["archetypes"], {"deadbeef": 2})
+        self.assertEqual(doc["keys"], {"deadbeef": "1122334455667788"})
+        self.assertEqual(doc["summary"], {"entities": 2, "archetypes": 1, "with_key": 1, "key_conflicts": 0,
+                                          "incomplete_entities": 0})
+
+    def test_conflicting_keys_leave_the_hash_unverified(self):
+        agg = WI.ArchetypeCounts()
+        agg.append({"complete": True, "archetype": 1, "archetype_key": 5})
+        agg.append({"complete": True, "archetype": 1, "archetype_key": 6})
+        agg.append({"complete": True, "archetype": 2, "archetype_key": 7})
+        agg.append({"complete": True, "archetype": None, "archetype_key": 8})
+        doc = agg.to_json()
+        self.assertEqual(doc["archetypes"], {"00000001": 2, "00000002": 1})
+        self.assertEqual(doc["keys"], {"00000002": "0000000000000007"})
+        self.assertEqual(doc["conflicting_keys"], {"00000001": ["0000000000000005", "0000000000000006"]})
+        self.assertEqual(doc["summary"]["key_conflicts"], 1)
+
+    def test_entity_past_the_inflated_bytes_is_not_aggregated(self):
+        # The entity block starts at 0x400 (0x90 bytes); the bytes end at 0x448, just after archetypeName.
+        agg = WI.ArchetypeCounts()
+        row = WI.parse_resource(make_resource()[:0x448], agg)
+        self.assertIsNotNone(row)
+        self.assertEqual((agg.counts, agg.incomplete), ({}, 1))
+
+    def test_entity_block_starting_past_the_inflated_bytes_is_incomplete(self):
+        # The entity block is moved to 0x700, after the bytes kept; its entities must still be reported.
+        b = bytearray(make_resource()) + bytearray(0x90)
+        struct.pack_into("<IIQ", b, 0x200, WI.ENTITY, 0x90, ptr(0x700))
+        b[0x700:0x790] = b[0x400:0x490]
+        full = WI.ArchetypeCounts()
+        WI.parse_resource(bytes(b), full)
+        self.assertEqual((full.counts, full.incomplete), ({0xDEADBEEF: 1}, 0))
+        for cut in (0x710, 0x700):
+            with self.subTest(cut=cut):
+                agg = WI.ArchetypeCounts()
+                self.assertIsNotNone(WI.parse_resource(bytes(b[:cut]), agg))
+                self.assertEqual((agg.counts, agg.incomplete), ({}, 1))
+
+    def test_archetypes_out_is_a_world_names_input(self):
+        spec = importlib.util.spec_from_file_location("world_names_for_index", os.path.join(ROOT, "tools", "world_names.py"))
+        WN = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(WN)
+        agg = WI.ArchetypeCounts()
+        WI.parse_resource(make_resource(), agg)
+        stats = WN.resolve_archetypes(agg.to_json(), WN.NameDictionary())
+        self.assertEqual((stats["entities"], stats["unique_hashes"], stats["unresolved_hashes"]), (1, 1, 1))
+
+
+def setUpModule():
+    # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
+    quiet = contextlib.redirect_stdout(io.StringIO())
+    quiet.__enter__()
+    unittest.addModuleCleanup(quiet.__exit__, None, None, None)
 
 
 if __name__ == "__main__":

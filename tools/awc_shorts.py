@@ -6,7 +6,7 @@ Uses `tools/awc_opus.py` for the AWC parse and packet collection. A streamed-mus
 when its decoded duration is inside the requested range. The descriptor's sample count is interleaved
 across the Opus packet channels, so the packet channel count is read from the TOC stereo bit and the
 per-channel frame count is `samples / packet_channels`. The output is
-`<out>/<bank>/<stream id>.ogg` plus `<out>/shorts.csv`.
+`<out>/<bank>/<stream id>.ogg` plus `<out>/shorts.csv`. Directory scans preserve the input subdirectories.
 
 This tool never re-encodes: the selected Opus packets are repacked into Ogg Opus exactly as stored.
 It does not transcribe or classify the clips; that is a separate analysis step.
@@ -14,6 +14,7 @@ It does not transcribe or classify the clips; that is a separate analysis step.
 import argparse
 import csv
 import os
+import struct
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -44,11 +45,12 @@ def short_channels(d: bytes, mus, data, min_seconds: float, max_seconds: float):
     return selected
 
 
-def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float):
+def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float, *, bank=None):
     """Export the selected channels of one bank; returns CSV rows."""
     with open(path, "rb") as f:
         d = f.read()
-    bank = os.path.splitext(os.path.basename(path))[0]
+    if bank is None:
+        bank = os.path.splitext(os.path.basename(path))[0]
     od = os.path.join(out_dir, bank)
     os.makedirs(od, exist_ok=True)
     _streams, music = awc.parse_awc(d)
@@ -74,8 +76,9 @@ def _banks(src: str):
         found = []
         for root, _dirs, files in os.walk(src):
             found += [os.path.join(root, name) for name in files if name.lower().endswith(".awc")]
-        return sorted(found)
-    return [src]
+        return [(path, os.path.splitext(os.path.relpath(path, src))[0].replace(os.sep, "/"))
+                for path in sorted(found)]
+    return [(src, os.path.splitext(os.path.basename(src))[0])]
 
 
 def main(argv=None) -> int:
@@ -86,28 +89,35 @@ def main(argv=None) -> int:
     ap.add_argument("--max-seconds", type=float, default=60.0)
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args(argv)
-    if a.min_seconds < 0 or a.max_seconds < a.min_seconds:
-        print("awc_shorts: error: require 0 <= min-seconds <= max-seconds", file=sys.stderr)
+    if a.jobs < 1:
+        print("awc_shorts: error: --jobs must be at least 1", file=sys.stderr)
+        return 2
+    if not 0 <= a.min_seconds <= a.max_seconds:
+        print("awc_shorts: error: require 0 <= --min-seconds <= --max-seconds", file=sys.stderr)
+        return 2
+    if not os.path.exists(a.src):
+        print(f"awc_shorts: error: source does not exist: {a.src!r}", file=sys.stderr)
         return 2
     banks = _banks(a.src)
     os.makedirs(a.out, exist_ok=True)
     rows = []
     if a.jobs == 1:
-        for i, bank in enumerate(banks, 1):
+        for i, (path, bank) in enumerate(banks, 1):
             try:
-                rows += export_bank(bank, a.out, a.min_seconds, a.max_seconds)
-            except (ValueError, OSError, IndexError) as e:
-                print(f"  skip {os.path.basename(bank)}: {e}", file=sys.stderr)
+                rows += export_bank(path, a.out, a.min_seconds, a.max_seconds, bank=bank)
+            except (ValueError, struct.error, OSError, IndexError) as e:
+                print(f"  skip {bank}: {e}", file=sys.stderr)
             if i % 200 == 0:
                 print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
     else:
-        with ProcessPoolExecutor(max_workers=max(1, a.jobs)) as ex:
-            futures = {ex.submit(export_bank, b, a.out, a.min_seconds, a.max_seconds): b for b in banks}
+        with ProcessPoolExecutor(max_workers=a.jobs) as ex:
+            futures = {ex.submit(export_bank, path, a.out, a.min_seconds, a.max_seconds, bank=bank): bank
+                       for path, bank in banks}
             for i, fut in enumerate(as_completed(futures), 1):
                 try:
                     rows += fut.result()
-                except (ValueError, OSError, IndexError) as e:
-                    print(f"  skip {os.path.basename(futures[fut])}: {e}", file=sys.stderr)
+                except (ValueError, struct.error, OSError, IndexError) as e:
+                    print(f"  skip {futures[fut]}: {e}", file=sys.stderr)
                 if i % 200 == 0:
                     print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
     rows.sort(key=lambda r: (r["bank"].lower(), r["stream"]))

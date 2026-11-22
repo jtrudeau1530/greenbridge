@@ -1,18 +1,26 @@
 // Headless Vulkan harness: draws one triangle (3 vertices, no vertex buffers) with a given VS + FS into a
 // W x H RGBA32F image and writes the raw floats to a file. Used to check translated shaders on the real GPU.
 //
-//   vk_harness <vs.spv> <fs.spv> <out.raw> [width height]
+//   vk_harness <vs.spv> <fs.spv> <out.raw> [width height [clip-test-s0 clip-test-s1]]
 //   vk_harness <ms.spv> <fs.spv> <out.raw> --mesh-group-readback X Y Z
 // The latter captures one full-screen triangle per mesh workgroup, in Vulkan rasterization order.
 //
+// Push constants follow the contract in docs/design.md: s0..s31, then the heap base lo/hi. They are zero unless
+//   VKH_SGPRS=w0,w1,...          sets s0, s1, ... (decimal or 0x hex)
+//   VKH_HEAP=addr=word,...       allocates a zeroed 64 KiB heap (Xbox VA 0 = its device address), writes each word at
+//                                its address and passes the heap base, so a V# in VKH_SGPRS can point into it.
+//
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 
+#include <cctype>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <utility>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -34,13 +42,48 @@ static std::vector<uint32_t> read_spv(const char* path) {
     return w;
 }
 
+static bool parse_u32(const char*& s, uint32_t& v) {
+    const bool hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+    const char* digits = hex ? s + 2 : s;
+    if (!(hex ? std::isxdigit(uint8_t(*digits)) : std::isdigit(uint8_t(*digits)))) return false;   // no sign or space
+    char* end;
+    unsigned long long x = std::strtoull(digits, &end, hex ? 16 : 10);
+    if (x > 0xFFFFFFFFull) return false;
+    v = uint32_t(x); s = end;
+    return true;
+}
+
+// A list separator must be followed by another item: "1,2," is rejected.
+static bool next_item(const char*& s) {
+    if (!*s) return true;
+    return *s++ == ',' && *s;
+}
+
+static bool parse_sgprs(const char* s, uint32_t* sgprs) {
+    for (uint32_t i = 0; *s; i++) {
+        if (i == 32 || !parse_u32(s, sgprs[i]) || !next_item(s)) return false;
+    }
+    return true;
+}
+
+static bool parse_heap(const char* s, std::vector<std::pair<uint32_t, uint32_t>>& words, uint32_t heap_bytes) {
+    while (*s) {
+        uint32_t addr, word;
+        if (!parse_u32(s, addr) || *s++ != '=' || !parse_u32(s, word) || !next_item(s)) return false;
+        if (addr % 4 || addr > heap_bytes - 4) return false;
+        words.emplace_back(addr, word);
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h]\n"
+        std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h [clip-test-s0 clip-test-s1]]\n"
                              "       vk_harness ms.spv fs.spv out.raw --mesh-group-readback X Y Z\n");
         return 2;
     }
     const bool group_readback = argc > 4 && !std::strcmp(argv[4], "--mesh-group-readback");
+    const bool clip_shifts = !group_readback && argc == 8;
     uint32_t groups[3] = {1, 1, 1};
     uint32_t W = 64, H = 64;
     if (group_readback) {
@@ -62,6 +105,21 @@ int main(int argc, char** argv) {
     } else if (argc > 5) {
         W = atoi(argv[4]); H = atoi(argv[5]);
     }
+    uint32_t pc[36] = {};
+    const char* sgprs_env = std::getenv("VKH_SGPRS");
+    if (sgprs_env && !parse_sgprs(sgprs_env, pc)) {
+        std::fprintf(stderr, "VKH_SGPRS: expected up to 32 comma-separated words, got \"%s\"\n", sgprs_env);
+        return 2;
+    }
+    const uint32_t heap_bytes = 64 * 1024;
+    const char* heap_env = std::getenv("VKH_HEAP");
+    if (heap_env && !*heap_env) heap_env = nullptr;
+    std::vector<std::pair<uint32_t, uint32_t>> heap_words;
+    if (heap_env && !parse_heap(heap_env, heap_words, heap_bytes)) {
+        std::fprintf(stderr, "VKH_HEAP: expected addr=word pairs, 4-byte aligned below 0x%x, got \"%s\"\n",
+                     heap_bytes, heap_env);
+        return 2;
+    }
     gipa = load_vulkan();
     if (!gipa) return 1;
     VkInstance inst = VK_NULL_HANDLE;
@@ -79,10 +137,13 @@ int main(int argc, char** argv) {
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    for (auto d : pds) {   // prefer the discrete GPU
-        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(d, &p);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
+    std::vector<VkPhysicalDeviceProperties> candidates(pds.size());
+    for (std::size_t i = 0; i < pds.size(); ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
+    if (!pd) {
+        leonida::vk_test::report_no_device();
+        return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
@@ -115,14 +176,14 @@ int main(int argc, char** argv) {
     // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
     // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
     const std::vector<uint32_t> fs_code = read_spv(argv[2]);
-    bool needs_barycentric = false;
+    bool needs_barycentric = false, needs_float64 = false;
     for (std::size_t i = 5; i + 1 < fs_code.size();) {   // instructions follow the 5-word SPIR-V header
         const uint32_t words = fs_code[i] >> 16, op = fs_code[i] & 0xffffu;
         if (!words) break;
-        if (op == 17 && fs_code[i + 1] == 5284) {        // OpCapability FragmentBarycentricKHR
+        if (op == 17 && fs_code[i + 1] == 5284)          // OpCapability FragmentBarycentricKHR
             needs_barycentric = true;
-            break;
-        }
+        if (op == 17 && fs_code[i + 1] == 10)            // OpCapability Float64 (v_add_f64 and friends)
+            needs_float64 = true;
         i += words;
     }
     if (needs_barycentric && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
@@ -166,7 +227,9 @@ int main(int argc, char** argv) {
         m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
     }
 #endif
+    VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    f13q.pNext = &f12q;
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f13q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
@@ -176,21 +239,45 @@ int main(int argc, char** argv) {
         f13.pNext = chain;
         chain = &f13;
     }
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    if (heap_env) {
+        // 77 is the "this device cannot run the test" code that check.py and run_gpu_tests.py report as SKIP.
+        if (!f12q.bufferDeviceAddress) { std::fprintf(stderr, "unsupported: VKH_HEAP needs bufferDeviceAddress\n"); return 77; }
+        f12.bufferDeviceAddress = VK_TRUE;
+        f12.pNext = chain;
+        chain = &f12;
+    }
     for (auto e : enable) std::fprintf(stderr, "enabled %s\n", e);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     dci.pNext = chain;
-    // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders.
+    // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders. VKH_SUBGROUP_SIZE then
+    // applies to it, unless VKH_GS_HELPER=1 says the GS only feeds the pixel shader under test.
     const char* gs_path = std::getenv("VKH_GS");
     if (gs_path && !f2q.features.geometryShader) {   // MoltenVK: Metal has no geometry stage
         std::fprintf(stderr, "unsupported: no geometryShader\n");
         return 77;
     }
     VkPhysicalDeviceFeatures feats{};
+    if (clip_shifts && !f2q.features.shaderClipDistance) {
+        std::fprintf(stderr, "unsupported: shaderClipDistance\n");
+        return 77;
+    }
     feats.geometryShader = gs_path ? VK_TRUE : VK_FALSE;
     feats.shaderClipDistance = f2q.features.shaderClipDistance;
     feats.shaderCullDistance = f2q.features.shaderCullDistance;
+    if (needs_float64) {
+        if (!f2q.features.shaderFloat64) {
+            std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[2]);
+            return 77;
+        }
+        feats.shaderFloat64 = VK_TRUE;
+    }
+    if (heap_env) {
+        if (!f2q.features.shaderInt64) { std::fprintf(stderr, "unsupported: VKH_HEAP needs shaderInt64\n"); return 77; }
+        feats.shaderInt64 = VK_TRUE;   // heap addresses are 64-bit
+    }
     dci.pEnabledFeatures = &feats;
     VkDevice dev;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
@@ -300,11 +387,14 @@ int main(int argc, char** argv) {
     reqSg.requiredSubgroupSize = req_sg;
     if (req_sg > 0 && f13q.subgroupSizeControl &&
         req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize) {
+        // VKH_GS_HELPER=1: the geometry shader only feeds the pixel shader under test (the --bary-fallback
+        // pass-through), so the size still goes to the fragment stage.
+        const bool gs_tested = gs_path && !std::getenv("VKH_GS_HELPER");
         if (mesh && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT))
             stages[0].pNext = &reqSg;
-        else if (gs_path && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_GEOMETRY_BIT))
+        else if (gs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_GEOMETRY_BIT))
             stages[2].pNext = &reqSg;
-        else if (!mesh && !gs_path && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
+        else if (!mesh && !gs_tested && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
             stages[1].pNext = &reqSg;
     }
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -320,7 +410,7 @@ int main(int argc, char** argv) {
     VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
-    // Translated shaders declare a 136-byte push-constant block (user SGPRs + heap base); zeros here.
+    // Translated shaders declare a 136-byte push-constant block (user SGPRs + heap base); see VKH_SGPRS / VKH_HEAP.
     const VkShaderStageFlags pcs = (mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
                                    VK_SHADER_STAGE_FRAGMENT_BIT | (gs_path ? VK_SHADER_STAGE_GEOMETRY_BIT : 0);
     VkPushConstantRange pcr{pcs, 0, 144};
@@ -353,6 +443,28 @@ int main(int argc, char** argv) {
     bai.memoryTypeIndex = memtype(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkDeviceMemory bmem; CHECK(vkAllocateMemory(dev, &bai, nullptr, &bmem));
     CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
+    if (heap_env) {
+        LOADD(vkGetBufferDeviceAddress);
+        VkBufferCreateInfo hbi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        hbi.size = heap_bytes;
+        hbi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        VkBuffer heap; CHECK(vkCreateBuffer(dev, &hbi, nullptr, &heap));
+        VkMemoryRequirements hr; vkGetBufferMemoryRequirements(dev, heap, &hr);
+        VkMemoryAllocateFlagsInfo haf{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        haf.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo hai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        hai.pNext = &haf; hai.allocationSize = hr.size;
+        hai.memoryTypeIndex = memtype(hr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkDeviceMemory hmem; CHECK(vkAllocateMemory(dev, &hai, nullptr, &hmem));
+        CHECK(vkBindBufferMemory(dev, heap, hmem, 0));
+        void* hp; CHECK(vkMapMemory(dev, hmem, 0, heap_bytes, 0, &hp));
+        std::memset(hp, 0, heap_bytes);
+        for (auto [addr, word] : heap_words) std::memcpy(static_cast<char*>(hp) + addr, &word, 4);
+        VkBufferDeviceAddressInfo hda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        hda.buffer = heap;
+        const uint64_t base = vkGetBufferDeviceAddress(dev, &hda);
+        pc[32] = uint32_t(base); pc[33] = uint32_t(base >> 32);
+    }
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpi.queueFamilyIndex = qi;
     VkCommandPool pool; CHECK(vkCreateCommandPool(dev, &cpi, nullptr, &pool));
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -376,9 +488,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "mesh workgroups: %u x %u x %u\n", groups[0], groups[1], groups[2]);
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    uint32_t zeros[36] = {};
+    if (clip_shifts) {
+        const float shifts[] = {float(std::atof(argv[6])), float(std::atof(argv[7]))};
+        std::memcpy(pc, shifts, sizeof(shifts));
+    }
     reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"))(
-        cmd, pl, pcs, 0, sizeof(zeros), zeros);
+        cmd, pl, pcs, 0, sizeof(pc), pc);
     if (mesh)
         reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT"))(cmd, groups[0], groups[1], groups[2]);
     else

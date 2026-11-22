@@ -3,9 +3,13 @@
     python -I tests/test_awc_manifest.py
 """
 import csv, io, json, os, struct, subprocess, sys, tempfile, unittest
+from unittest import mock
 
 TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "tools", "awc_manifest.py")
+sys.path.insert(0, os.path.dirname(TOOL))
+import awc_manifest  # noqa: E402
+
 HEADER = ["bank", "stream", "codec", "codec_name", "channels", "sample_rate", "declared_samples",
           "duration_s", "streamed_music", "data_offset", "data_size", "bank_size", "notes"]
 
@@ -93,7 +97,7 @@ class ManifestTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
         self.assertIn("warning", p.stderr.lower())
         self.assertIn("bad.awc", p.stderr)
-        self.assertIn("2 banks, 5 streams, 2 streamed-music channels", p.stderr)
+        self.assertIn("1 banks, 5 streams, 2 streamed-music channels", p.stderr)
         reader = csv.DictReader(io.StringIO(p.stdout))
         self.assertEqual(reader.fieldnames, HEADER)
         rows = {r["stream"]: r for r in reader}
@@ -131,6 +135,45 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual([r["stream"] for r in doc["streams"]], ["00000010", "00000020", "00000030"])
         self.assertIs(doc["streams"][0]["streamed_music"], False)
         self.assertAlmostEqual(doc["streams"][0]["duration_s"], 0.1, places=6)
+
+    def test_invalid_banks_are_not_counted(self):
+        for name in ("bad1.awc", "bad2.awc"):
+            with open(os.path.join(self.tmp.name, name), "wb") as f:
+                f.write(b"not an AWC")
+        p = self.run_tool(self.tmp.name, "--format", "json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("warning", p.stderr.lower())
+        self.assertIn("bad1.awc", p.stderr)
+        self.assertIn("bad2.awc", p.stderr)
+        self.assertIn("0 banks, 0 streams, 0 streamed-music channels", p.stderr)
+        doc = json.loads(p.stdout)
+        self.assertEqual((doc["bank_count"], doc["stream_count"]), (0, 0))
+        self.assertEqual(doc["streams"], [])
+
+    def test_failed_write_keeps_the_previous_manifest(self):
+        out = os.path.join(self.tmp.name, "manifest.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('{"previous": true}\n')
+
+        def full_disk(_doc, f, **_kwargs):
+            f.write('{"bank_count": ')
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(awc_manifest.json, "dump", side_effect=full_disk):
+            with self.assertRaises(OSError):
+                awc_manifest.write_manifest([], 0, 0, "json", out)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"previous": true}\n')
+        self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
+
+    def test_recursive_report_distinguishes_banks_with_the_same_basename(self):
+        for folder in ("left", "right"):
+            os.mkdir(os.path.join(self.tmp.name, folder))
+            self.write_bank(os.path.join(folder, "shared.awc"), with_music=False)
+        p = self.run_tool(self.tmp.name, "--format", "json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rows = json.loads(p.stdout)["streams"]
+        self.assertEqual([row["bank"] for row in rows], ["left/shared.awc"] * 3 + ["right/shared.awc"] * 3)
 
     def test_stereo_streamed_music_uses_packet_channels_and_per_channel_samples(self):
         desc, data = music_blob([0x40], 1920, 48000, toc=0xFC)   # 2 x 960 interleaved samples

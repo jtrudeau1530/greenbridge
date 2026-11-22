@@ -297,6 +297,17 @@ class ManifestCliTest(unittest.TestCase):
         self.assertEqual(p_verify.returncode, 0, p_verify.stderr)
         self.assertIn("OK", p_verify.stdout)
 
+    def test_in_tree_manifest_is_ignored_on_create_and_verify(self):
+        manifest_path = os.path.join(self.pkg, "reports", "manifest.json")
+        for _ in range(2):
+            result = self.run_cli("create", self.pkg, "--out", manifest_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with open(manifest_path, encoding="utf-8") as f:
+            self.assertEqual(set(json.load(f)["files"]), {"sample.dat"})
+        result = self.run_cli("verify", self.pkg, "--manifest", manifest_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "OK")
+
     def test_cli_verify_failure_exit_code(self):
         self.assertEqual(self.run_cli("create", self.pkg, "--out", self.out_manifest, "--jobs", "1").returncode, 0)
 
@@ -364,6 +375,31 @@ class ManifestAtomicCreateTest(unittest.TestCase):
     def create(self):
         with contextlib.redirect_stdout(io.StringIO()):
             return manifest.create(self.pkg, self.out, jobs=1)
+
+    def test_create_preserves_an_existing_partial_sibling(self):
+        sibling = self.out + ".partial"
+        with open(sibling, "wb") as f:
+            f.write(b"existing report")
+
+        self.assertEqual(self.create(), 0)
+        with open(sibling, "rb") as f:
+            self.assertEqual(f.read(), b"existing report")
+
+    def test_overlapping_creates_each_publish_their_own_manifest(self):
+        empty_pkg = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty_pkg)
+        replace = os.replace
+
+        def publish_inner_first(staged, destination):
+            with patch.object(manifest.os, "replace", replace):
+                self.assertEqual(manifest.create(empty_pkg, self.out), 0)
+            self.assertEqual(manifest.load_manifest(self.out), {})
+            replace(staged, destination)
+
+        with patch.object(manifest.os, "replace", side_effect=publish_inner_first):
+            self.assertEqual(self.create(), 0)
+        self.assertEqual(set(manifest.load_manifest(self.out)), {"sample.dat"})
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["empty", "manifest.json", "pkg"])
 
     def test_an_interrupted_create_keeps_the_previous_manifest(self):
         self.assertEqual(self.create(), 0)

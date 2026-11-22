@@ -3,12 +3,17 @@
 Usage:
     python -I pe_inspect.py <image> [--game-dir DIR] [--out DIR]
 
-Writes <out>/<name>.json and <out>/<name>.md. Reads the file only; never runs it.
+Writes <out>/<file>.json and <out>/<file>.md, where <file> is the image's full file name (game.exe.json,
+game.dll.md), so an exe and a dll with the same stem get separate reports. Images with the same file name from
+different directories get a numbered suffix (x.exe-2.json), and the name used is printed to stderr. The same file
+given twice with the same import search folder is inspected once. Reads the file only; never runs it.
 
 Standard library only: the headers, the section table, the import, delay-import, export, TLS and relocation
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
 by the same standard-library-only CI job as the other tools.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -68,6 +73,8 @@ class PeImage:
         magic = struct.unpack_from("<H", data, opt)[0]
         if magic not in (0x10B, 0x20B):
             raise PeFormatError(f"unknown optional header magic 0x{magic:x}")
+        if opt + 72 > len(data):  # the fixed fields read below end with DllCharacteristics at +70
+            raise PeFormatError("truncated optional header")
         self.is64 = magic == 0x20B
         self.entry_rva = struct.unpack_from("<I", data, opt + 16)[0]
         self.image_base = struct.unpack_from("<Q" if self.is64 else "<I", data, opt + (24 if self.is64 else 28))[0]
@@ -199,7 +206,7 @@ def _exports(img: PeImage) -> list[str]:
      addr_names, addr_ordinals) = struct.unpack_from("<IIHHIIIIIII", img.data, at)
 
     named, names = set(), []
-    for i in range(name_count):
+    for i in range(min(name_count, MAX_ENTRIES)):
         name_at = img.offset(addr_names + i * 4)
         ord_at = img.offset(addr_ordinals + i * 2)
         if name_at is None or ord_at is None:
@@ -207,8 +214,15 @@ def _exports(img: PeImage) -> list[str]:
         symbol = img.string_at(struct.unpack_from("<I", img.data, name_at)[0])
         names.append(symbol if symbol is not None else "?")
         named.add(struct.unpack_from("<H", img.data, ord_at)[0])
-    for i in range(functions):
-        if i not in named:
+    for i in range(min(functions, MAX_ENTRIES)):
+        if i in named:
+            continue
+        # A zero RVA in AddressOfFunctions marks an unused ordinal slot, not an export. A forwarder (an RVA inside the
+        # export directory) is a real export. A slot the file does not hold is skipped like any other unreadable entry.
+        slot = img.offset(addr_functions + i * 4)
+        if slot is None or slot + 4 > len(img.data):
+            continue
+        if struct.unpack_from("<I", img.data, slot)[0]:
             names.append(f"#{base + i}")
     return names
 
@@ -282,6 +296,15 @@ def classify_dll(name: str, game_dir: str | None) -> str:
 
 
 def inspect(path: str, game_dir: str | None) -> dict:
+    """The report for one image. A file cut off inside a table raises PeFormatError like any other bad image;
+    the struct.error it used to raise escaped main() and stopped a multi-file run at that file."""
+    try:
+        return _inspect(path, game_dir)
+    except struct.error as e:
+        raise PeFormatError(f"truncated or corrupt table: {e}") from None
+
+
+def _inspect(path: str, game_dir: str | None) -> dict:
     with open(path, "rb") as f:
         img = PeImage(f.read())
     sections = []
@@ -362,16 +385,39 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
     a = ap.parse_args(argv)
-    os.makedirs(a.out, exist_ok=True)
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:
+        print(f"cannot create output directory {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 1
     rc = 0
+    seen_paths: set[tuple[str, str]] = set()
+    used_names: set[str] = set()
     for img in a.image:
+        search_dir = a.game_dir or os.path.dirname(os.path.abspath(img))
+        key = (os.path.normcase(os.path.realpath(img)), os.path.normcase(os.path.abspath(search_dir)))
+        if key in seen_paths:
+            print(f"{img}: given more than once; inspected once", file=sys.stderr)
+            continue
+        seen_paths.add(key)
         try:
-            r = inspect(img, a.game_dir or os.path.dirname(os.path.abspath(img)))
+            r = inspect(img, search_dir)
         except (PeFormatError, OSError) as e:
             print(f"{img}: not a PE image ({e})", file=sys.stderr)
             rc = 1
             continue
-        stem = os.path.join(a.out, os.path.splitext(r["file"])[0])
+        # One report per image: the full file name keeps game.exe and game.dll apart, and a numbered suffix keeps
+        # a/x.exe and b/x.exe apart. Compared case-insensitively, as Windows file names are.
+        name = r["file"]
+        n = 1
+        while name.lower() in used_names:
+            n += 1
+            name = f"{r['file']}-{n}"
+        used_names.add(name.lower())
+        if n > 1:
+            print(f"{img}: another input is also named {r['file']}; report written as {name}.json/.md",
+                  file=sys.stderr)
+        stem = os.path.join(a.out, name)
         with open(stem + ".json", "w", encoding="utf-8") as f:
             json.dump(r, f, indent=1)
         with open(stem + ".md", "w", encoding="utf-8") as f:

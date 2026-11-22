@@ -3,14 +3,24 @@
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
 //            "workgroup_yz": pass 2x3x4 for groups; check the Y/Z histogram (cs_workgroup_yz.asm)
 //            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
+//   VKC_BENCH=N (env): dispatch N more times after the checked one and print the median / min / max wall time of one
+//   dispatch (submit to queue idle) as "bench ms: median=.. min=.. max=.. n=..". The buffer is not cleared in between.
+//   VKC_OUT_WORDS=N (env): make the output buffer at least N words (default groups * 64), so a single group can
+//   write more than one word per thread. VKC_DUMP=<file> (env): write the whole buffer to <file> after the dispatch.
 //   --require-wave64: require full 64-wide subgroups (local size X must be a multiple of 64), or exit 77.
+//   VKC_SGPRS=w4,w5,... (env): set s4, s5, ... (decimal or 0x hex, up to s31), the user SGPRs after the output V#,
+//   so a test can take input words (cs_user_sgprs.asm). They are zero otherwise. Same syntax as vk_harness's VKH_SGPRS.
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -26,10 +36,41 @@ static PFN_vkGetInstanceProcAddr gipa;
         }                                                                                \
     } while (0)
 
+// The same word list parser as vk_harness: decimal or 0x hex, no sign or space, and "1,2," is rejected.
+static bool parse_u32(const char*& s, uint32_t& v) {
+    const bool hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+    const char* digits = hex ? s + 2 : s;
+    if (!(hex ? std::isxdigit(uint8_t(*digits)) : std::isdigit(uint8_t(*digits)))) return false;
+    char* end;
+    unsigned long long x = std::strtoull(digits, &end, hex ? 16 : 10);
+    if (x > 0xFFFFFFFFull) return false;
+    v = uint32_t(x); s = end;
+    return true;
+}
+
+static bool next_item(const char*& s) {
+    if (!*s) return true;
+    return *s++ == ',' && *s;
+}
+
+// VKC_SGPRS: s4, s5, ... in order, at most s31 (s[0:3] stay the output V#).
+static bool parse_user_sgprs(const char* s, uint32_t* pc) {
+    for (uint32_t i = 4; *s; i++) {
+        if (i == 32 || !parse_u32(s, pc[i]) || !next_item(s)) return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     const bool require_wave64 = argc == 5 && !std::strcmp(argv[4], "--require-wave64");
     if (argc != 4 && !require_wave64) {
         std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect [--require-wave64]\n");
+        return 2;
+    }
+    uint32_t pc[36] = {};
+    const char* sgprs_env = std::getenv("VKC_SGPRS");
+    if (sgprs_env && !parse_user_sgprs(sgprs_env, pc)) {
+        std::fprintf(stderr, "VKC_SGPRS: expected up to 28 comma-separated words for s4..s31, got \"%s\"\n", sgprs_env);
         return 2;
     }
     const bool workgroup_yz = !std::strcmp(argv[3], "workgroup_yz");
@@ -41,6 +82,18 @@ int main(int argc, char** argv) {
     const uint32_t groups_y = workgroup_yz ? 3u : 1u, groups_z = workgroup_yz ? 4u : 1u;
     const uint32_t yz_bins = (groups_y + 1) * (groups_z + 1);
     const uint32_t origins = workgroup_yz ? groups * groups_y * groups_z : 0;
+    const char* out_words_env = std::getenv("VKC_OUT_WORDS");
+    const char* dump_path = std::getenv("VKC_DUMP");
+    uint32_t out_words = 0;
+    if (out_words_env) {
+        char* end;
+        const unsigned long n = std::strtoul(out_words_env, &end, 10);
+        if (*out_words_env < '0' || *out_words_env > '9' || *end || n == 0 || n > (1ul << 24)) {
+            std::fprintf(stderr, "VKC_OUT_WORDS: expected 1..16777216, got \"%s\"\n", out_words_env);
+            return 2;
+        }
+        out_words = uint32_t(n);
+    }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -59,13 +112,12 @@ int main(int argc, char** argv) {
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    for (auto d : pds) {
-        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(d, &p);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
-    }
+    std::vector<VkPhysicalDeviceProperties> candidates(pds.size());
+    for (std::size_t i = 0; i < pds.size(); ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
     if (!pd) {
-        std::fprintf(stderr, "no Vulkan physical device found\n");
+        leonida::vk_test::report_no_device();
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
@@ -123,7 +175,8 @@ int main(int argc, char** argv) {
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
 
     // Output buffer = heap. Host-visible so the result can be read back directly.
-    const VkDeviceSize words = workgroup_yz ? yz_bins * (1 + origins) : VkDeviceSize(groups) * 64;
+    VkDeviceSize words = workgroup_yz ? yz_bins * (1 + origins) : VkDeviceSize(groups) * 64;
+    if (out_words > words) words = out_words;
     const VkDeviceSize bytes = words * sizeof(uint32_t);
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
@@ -183,9 +236,15 @@ int main(int argc, char** argv) {
     cpi.layout = pl;
     VkPipeline pipe; CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
     if (require_wave64) std::printf("compute subgroup size: 64\n");
+    else if (req_sg) {
+        // VKC_SUBGROUP_SIZE: say whether the pipeline really runs at that size, so a runner can skip a test the device
+        // can't pin instead of judging words from whatever size the driver picked (#774).
+        const bool fixed = sgProps.minSubgroupSize == sgProps.maxSubgroupSize && subgroup.subgroupSize == req_sg;
+        if (can_request_size || fixed) std::printf("compute subgroup size: %u\n", req_sg);
+        else std::printf("compute subgroup size: %u not available\n", req_sg);
+    }
 
-    uint32_t pc[36] = {};
-    pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0;     // V#: base 0, stride 0, num_records max
+    pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0x31016FACu;     // V#: base 0, stride 0, num_records max, OOB_SELECT 3 (raw)
     pc[32] = uint32_t(heap); pc[33] = uint32_t(heap >> 32);    // heap base
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = qi;
@@ -216,6 +275,32 @@ int main(int argc, char** argv) {
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
+    if (const char* b = std::getenv("VKC_BENCH")) {
+        std::vector<double> ms;
+        for (int i = 0, n = std::atoi(b); i < n; i++) {
+            auto t0 = std::chrono::steady_clock::now();
+            CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
+            CHECK(vkQueueWaitIdle(q));
+            ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        if (!ms.empty()) {
+            std::sort(ms.begin(), ms.end());
+            std::printf("bench ms: median=%.3f min=%.3f max=%.3f n=%zu\n", ms[ms.size() / 2], ms.front(), ms.back(), ms.size());
+        }
+        uint32_t h = 2166136261u;   // FNV-1a of the whole output buffer, to compare configurations
+        for (VkDeviceSize i = 0; i < bytes; i++) h = (h ^ static_cast<const unsigned char*>(map)[i]) * 16777619u;
+        std::printf("bench out fnv1a: %08x\n", h);
+    }
+
+    if (dump_path) {
+        std::ofstream dump(dump_path, std::ios::binary);
+        dump.write(static_cast<const char*>(map), std::streamsize(bytes));
+        dump.close();
+        if (dump.fail()) {
+            std::fprintf(stderr, "VKC_DUMP: could not write %s\n", dump_path);
+            return 1;
+        }
+    }
 
     const uint32_t* out = static_cast<const uint32_t*>(map);
     uint32_t bad = 0, first_bad = ~0u;

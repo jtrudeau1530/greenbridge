@@ -201,6 +201,68 @@ void test_version_1_1(SerializeFn serialize, DeserializeFn deserialize, ID3D12De
     std::puts("PASS root signature 1.1 serialization, versioned reflection, and legacy comparison");
 }
 
+void test_version_1_2(SerializeFn serialize, DeserializeFn deserialize, ID3D12Device& device) {
+    // Older in-box D3D12 runtimes (e.g. Windows 11 23H2) refuse root signature
+    // 1.2 entirely, so the whole 1.2 path is skipped there.
+    D3D12_FEATURE_DATA_ROOT_SIGNATURE feature{D3D_ROOT_SIGNATURE_VERSION_1_2};
+    require_success(device.CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &feature, sizeof(feature)),
+                    "query WARP root signature support");
+    if (feature.HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1_2) {
+        std::puts("SKIP root signature 1.2 (runtime HighestVersion < 1.2)");
+        return;
+    }
+
+    const D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 5, 6,
+                                        D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
+                                        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+    D3D12_ROOT_PARAMETER1 table{};
+    table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    table.DescriptorTable = {1, &range};
+    table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
+    desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+    desc.Desc_1_2 = {1, &table, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+
+    const auto blob = compare_serialization(serialize, desc);
+    const void* data = blob->GetBufferPointer();
+    const SIZE_T size = blob->GetBufferSize();
+    ComPtr<ID3D12VersionedRootSignatureDeserializer> versioned;
+    require_success(D3D12CreateVersionedRootSignatureDeserializer(data, size, IID_PPV_ARGS(&versioned)),
+                    "deserialize 1.2 with Windows versioned API");
+    require(versioned != nullptr, "Windows returned a versioned deserializer");
+    const auto& layout = *versioned->GetUnconvertedRootSignatureDesc();
+    require(layout.Version == D3D_ROOT_SIGNATURE_VERSION_1_2 &&
+            layout.Desc_1_2.NumParameters == 1, "1.2 version and parameter count");
+    const auto& decoded_table = layout.Desc_1_2.pParameters[0];
+    require(decoded_table.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+            decoded_table.DescriptorTable.NumDescriptorRanges == 1 &&
+            decoded_table.DescriptorTable.pDescriptorRanges[0].Flags == range.Flags &&
+            decoded_table.ShaderVisibility == table.ShaderVisibility,
+            "1.2 descriptor table and shader visibility survive");
+    require(layout.Desc_1_2.Flags == D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+            "1.2 root signature flags preserved");
+
+    ComPtr<ID3D12RootSignatureDeserializer> direct_legacy, shim_legacy;
+    const HRESULT direct_hr = D3D12CreateRootSignatureDeserializer(data, size, IID_PPV_ARGS(&direct_legacy));
+    const HRESULT shim_hr = deserialize(data, size, IID_PPV_ARGS(&shim_legacy));
+    require(direct_hr == shim_hr && (direct_legacy.Get() != nullptr) == (shim_legacy.Get() != nullptr),
+            "legacy deserialization of 1.2 matches Windows");
+    if (SUCCEEDED(direct_hr)) {
+        require(direct_legacy && shim_legacy, "legacy deserializers return interfaces on success");
+        const auto& direct_desc = *direct_legacy->GetRootSignatureDesc();
+        const auto& shim_desc = *shim_legacy->GetRootSignatureDesc();
+        require(direct_desc.NumParameters == 1 && shim_desc.NumParameters == 1 &&
+                direct_desc.Flags == shim_desc.Flags, "legacy projection header matches");
+    }
+
+    ComPtr<ID3D12RootSignature> signature;
+    require_success(device.CreateRootSignature(0, data, size, IID_PPV_ARGS(&signature)),
+                    "create WARP 1.2 root signature");
+    require(signature != nullptr, "WARP returned a 1.2 root signature");
+    std::puts("PASS WARP 1.2 root signature creation");
+    std::puts("PASS root signature 1.2 serialization, versioned reflection, and legacy comparison");
+}
+
 }  // namespace
 
 int main() {
@@ -215,11 +277,16 @@ int main() {
         ComPtr<IDXGIAdapter> adapter;
         ComPtr<ID3D12Device> device;
         require_success(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "create DXGI factory");
-        require_success(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "enumerate WARP adapter");
+        if (const HRESULT warp = factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)); FAILED(warp)) {
+            // Windows always has WARP; Wine doesn't. CTest reads exit code 77 as a skip (SKIP_RETURN_CODE).
+            std::printf("SKIP no WARP adapter (0x%08lX)\n", static_cast<unsigned long>(warp));
+            return 77;
+        }
         require_success(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
                         "create WARP device");
         test_version_1_0(serialize, deserialize, *device.Get());
         test_version_1_1(serialize, deserialize, *device.Get());
+        test_version_1_2(serialize, deserialize, *device.Get());
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL %s\n", error.what());
         return 1;

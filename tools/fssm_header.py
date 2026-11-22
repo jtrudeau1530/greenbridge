@@ -27,8 +27,9 @@ table (55,791 records, 11,199 of them 16-bit).  The table count equals the numbe
 `v_interp attr` numbers in 11,316/12,101 shaders (93.5%); 300 more declare exactly one unread input,
 475 declare two or more, and the 10 shaders whose table starts with a non-6 record are the only ones
 that undercount.  A 200-PS spot check agreed on 187/200.  Flag bit 4 matched the 16-bit interpolant
-opcodes in 12,067/12,101 (99.7%).  This is available for a translator integration; nothing in
-`rdna2spirv.py` uses it yet.
+opcodes in 12,067/12,101 (99.7%).  `rdna2spirv.py` consumes it in the PS input path (pixel_interpolants:
+every table position declared as a fragment input, 16-bit-flagged positions
+rounded f32->f16->f32 on 32-bit reads).
 
 The post-`code_end` tail carries a binding table.  After 16 bytes of `0xBF9F0000` filler and an
 8-byte header, 20-byte records run until a `0xFFFFFFFF` sentinel; then `u32 0`, `u16 0`, `u16`
@@ -173,23 +174,30 @@ def stage_index(path):
 
     The index is the one `make_game.py` writes next to the carved `.dxbc` files.  Both the `fssm`
     directory (parent holds index.json) and a directory that contains index.json are accepted.
+    Prefer the local index when it has rows.
     """
     base = path if os.path.isdir(path) else os.path.dirname(path)
-    for candidate in (os.path.join(base, "..", "index.json"), os.path.join(base, "index.json")):
+    for candidate in (os.path.join(base, "index.json"), os.path.join(base, "..", "index.json")):
         if os.path.isfile(candidate):
             try:
                 with open(candidate, encoding="utf-8") as f:
                     rows = json.load(f)
-                return {os.path.splitext(row["file"])[0]: row.get("stage") for row in rows}
+                stages = {os.path.splitext(row["file"])[0]: row.get("stage") for row in rows}
             except (OSError, ValueError, KeyError, TypeError):
-                return {}
+                continue
+            if stages:
+                return stages
     return {}
 
 
 def files_of(path):
     if os.path.isfile(path):
         return [path]
-    return [os.path.join(path, name) for name in sorted(os.listdir(path)) if name.endswith(".fssm")]
+    return [
+        full
+        for name in sorted(os.listdir(path))
+        if name.endswith(".fssm") and os.path.isfile(full := os.path.join(path, name))
+    ]
 
 
 def summarize(path, stages, bindings=False):
@@ -225,7 +233,9 @@ def tally(rows, stages_known):
     else:
         # Without a stage index, a non-empty table is the only PS signal the blob carries.
         ps = [row for row in rows if row["entries"]]
-        counts = Counter(row["entries"] for row in rows)
+        # Keep the histogram in the same scope as ps_with_table/entries: non-PS blobs have no table
+        # and must not show up as a 0:N bucket in the reported corpus counts.
+        counts = Counter(row["entries"] for row in ps)
         scope = "all"
     return {
         "files": len(rows),
@@ -238,19 +248,41 @@ def tally(rows, stages_known):
     }
 
 
+def non_negative(text):
+    """--limit: a count of blobs. A negative one would slice from the end (paths[:-1] drops the last blob)."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Read the FSSM pixel-shader input table.")
     ap.add_argument("path", help="an .fssm file or a directory of them")
     ap.add_argument("--json", action="store_true", help="print one JSON document instead of lines")
-    ap.add_argument("--limit", type=int, help="stop after this many blobs")
+    ap.add_argument("--limit", type=non_negative, help="stop after this many blobs")
     ap.add_argument("--bindings", action="store_true", help="also parse the post-code binding table")
     args = ap.parse_args(argv)
 
-    paths = files_of(args.path)
+    if not os.path.exists(args.path):
+        print(f"ERROR: {args.path} does not exist", file=sys.stderr)
+        return 2
+    try:
+        paths = files_of(args.path)
+    except OSError as e:
+        print(f"ERROR: cannot list {args.path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if args.limit is not None:
         paths = paths[:args.limit]
     stages = stage_index(args.path)
-    rows = [summarize(path, stages, args.bindings) for path in paths]
+    try:
+        rows = [summarize(path, stages, args.bindings) for path in paths]
+    except OSError as e:
+        print(f"ERROR: cannot read {e.filename or args.path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     summary = tally(rows, bool(stages))
 
     if args.json:

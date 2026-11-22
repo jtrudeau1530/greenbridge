@@ -49,7 +49,7 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
         self.assertIsNone(a.game)
         self.assertIsNone(a.out)
         self.assertIsNone(a.work)
-        self.assertEqual(a.stages, "check,shaders,assets,runtime,pipelines")
+        self.assertIsNone(a.stages)
         self.assertFalse(a.check)
         self.assertFalse(a.full_check)
         self.assertFalse(a.wav)
@@ -176,7 +176,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                         with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
                             with self.assertRaises(SystemExit) as ctx:
                                 make_game.main()
-                            self.assertEqual(ctx.exception.code, 1)
+                            self.assertEqual(ctx.exception.code, 2)
                             self.assertIn("unknown stage 'invalid_stage'", mock_err.getvalue())
 
     def test_mixed_valid_and_unknown_stage_rejected(self):
@@ -189,8 +189,30 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                         with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
                             with self.assertRaises(SystemExit) as ctx:
                                 make_game.main()
-                            self.assertEqual(ctx.exception.code, 1)
+                            self.assertEqual(ctx.exception.code, 2)
                             self.assertIn("unknown stage 'badstage'", mock_err.getvalue())
+
+    def test_invalid_stages_rejected_before_game_access(self):
+        for stages in ("", " ", ",,", " , , ", "badstage", "shaders,badstage"):
+            with (
+                self.subTest(stages=stages),
+                patch.object(sys, "argv", ["make_game.py", "--stages", stages]),
+                patch("make_game.below_normal"),
+                patch("make_game.choose_game", return_value=self.game_dir) as choose,
+                patch("make_game.check", return_value={}) as check,
+                patch("make_game.preflight") as preflight,
+                patch("make_game.shaders") as shaders,
+                patch("make_game.log"),
+                patch("sys.stderr", new_callable=io.StringIO) as error,
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    make_game.main()
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("--stages", error.getvalue())
+                choose.assert_not_called()
+                check.assert_not_called()
+                preflight.assert_not_called()
+                shaders.assert_not_called()
 
     def test_whitespace_and_empty_items_in_stages(self):
         ret, mocks = self.run_main("--stages", " shaders , , assets ")
@@ -219,10 +241,10 @@ class StageValidationAndSequencingTest(unittest.TestCase):
 
         expected_calls = [
             call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
-                         emulate=unittest.mock.ANY),
+                         emulate=unittest.mock.ANY, keep_emulated=True),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
-            call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
-            call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir)),
+            call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None),
+            call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
         ]
         self.assertEqual(manager.mock_calls, expected_calls)
 
@@ -290,14 +312,18 @@ class JobsHandlingTest(unittest.TestCase):
                                             "--stages", "shaders", "--jobs", "6"]):
                 with patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
-                        with patch("make_game.preflight"):
+                        with patch("make_game.preflight") as mock_preflight:
                             with patch("make_game.log"):
                                 with patch("make_game.shaders") as mock_shaders, \
-                                        patch("make_game.wave64_emulate", return_value=True):
+                                        patch("make_game.wave64_emulate", return_value=True) as probe:
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
+                                    probe.assert_called_once_with("auto")
+                                    mock_preflight.assert_called_once_with(
+                                        ["shaders"], os.path.abspath(work), False, None,
+                                        emulate=True, keep_emulated=True)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
-                                                                         emulate=True)
+                                                                         emulate=True, keep_emulated=True)
 
     def test_custom_jobs_forwarded_to_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -347,7 +373,7 @@ class WavValidationTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     @patch("make_game.ensure_submodule")
     def test_preflight_wav_requires_ffmpeg_when_assets_included(self, _mock_submodule):
         with patch("shutil.which", return_value=None):
@@ -357,7 +383,7 @@ class WavValidationTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 1)
                 self.assertIn("ffmpeg (needed for --wav)", mock_err.getvalue())
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     @patch("make_game.ensure_submodule")
     def test_preflight_wav_passes_when_ffmpeg_present(self, _mock_submodule):
         def fake_which(cmd):
@@ -371,7 +397,7 @@ class WavValidationTest(unittest.TestCase):
                 with patch("os.makedirs"):
                     make_game.preflight(stages=["assets"], work="C:/dummy_work", wav=True)
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     def test_preflight_wav_without_assets_does_not_require_ffmpeg(self):
         def fake_which(cmd):
             if cmd in ("spirv-as", "spirv-val"):
@@ -386,7 +412,7 @@ class WavValidationTest(unittest.TestCase):
                         # Assets stage not included; ffmpeg is not required even though wav=True
                         make_game.preflight(stages=["shaders"], work="C:/dummy_work", wav=True)
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     @patch("make_game.ensure_submodule")
     def test_preflight_assets_without_wav_does_not_require_ffmpeg(self, _mock_submodule):
         def fake_which(cmd):
@@ -547,7 +573,7 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
                             self.assertEqual(ctx.exception.code, 1)
                             self.assertIn("--out and --work must be outside the game folder", mock_err.getvalue())
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     def test_preflight_space_calculation_and_failure(self):
         # Shaders needs 30GB, Assets needs 300GB -> 330GB total
         def fake_which(cmd):

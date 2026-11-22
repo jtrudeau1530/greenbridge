@@ -21,6 +21,8 @@ tables are reported by offset only; their internal layout is not decoded here.
 Usage:
     python -I page_index.py <archive.rpf> <out.json|out.csv> [--start N] [--limit BYTES] [--quiet]
     python -I page_index.py <carved-dir> <out.json|out.csv> [--quiet]
+
+--start and --limit apply to a single archive only; with a directory they are an error (exit 2).
 """
 import argparse
 import csv
@@ -74,13 +76,14 @@ def is_page(data):
 def scan_rpf(path, start=None, limit=None):
     """Yield (archive_offset, stored_bytes, inflated_bytes) for each zlib stream."""
     with open(path, "rb") as fh:
+        if os.fstat(fh.fileno()).st_size < 8:   # no header word; mmap also refuses an empty file
+            return
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         size = len(m)
-        if size < 8:
-            return
         first = struct.unpack_from("<I", m, 4)[0]
         pos = start if start is not None else first
         if not 0 <= pos <= size:
+            m.close()
             raise ValueError("start offset is outside the archive")
         end = min(size, pos + limit) if limit else size
         try:
@@ -92,8 +95,8 @@ def scan_rpf(path, start=None, limit=None):
                 d = zlib.decompressobj()
                 chunks, p = [], s
                 try:
-                    while not d.eof and p < size:
-                        block = m[p:p + (1 << 20)]
+                    while not d.eof and p < end:
+                        block = m[p:min(p + (1 << 20), end)]
                         if not block:
                             break
                         chunks.append(d.decompress(block))
@@ -267,9 +270,11 @@ def index_streams(streams, progress=None):
             if is_page(data):
                 # The previous resource ended before its declared table/entries did. Report it, then
                 # treat this stream as the new directory page instead of swallowing it as a continuation.
-                waiting[0]["complete"] = False
-                waiting[0]["error"] = waiting[0]["error"] or "resource ended before q38 was complete"
-                pages.append(waiting[0])
+                # Report the page re-parsed with this stream: waiting[0] is the parse before the last
+                # continuation was appended and would lose it from the reported continuations/records.
+                page["complete"] = False
+                page["error"] = page["error"] or "resource ended before q38 was complete"
+                pages.append(page)
                 waiting = start(offset, stored, data)
                 continue
             if len(cont) >= MAX_CONTINUATIONS:
@@ -341,14 +346,46 @@ def write_csv(path, pages):
                                 target="0x%x" % r["target"], target_stream=r["target_stream"]))
 
 
+def byte_count(text):
+    """--limit: 0 or less used to scan nothing (negative) or everything (0 is falsy) without a word."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def offset(text):
+    """--start: a negative offset would slice the archive from its end."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(description="Index RPF9 0DRP page directories (read-only, no TOC decryption)")
     ap.add_argument("source", help="archive.rpf or a directory of carved <offset>.bin files")
     ap.add_argument("out", help="output .json or .csv")
-    ap.add_argument("--start", type=lambda v: int(v, 0), help="first archive offset (default: header u32@4)")
-    ap.add_argument("--limit", type=lambda v: int(v, 0), help="stop after this many bytes")
+    ap.add_argument("--start", type=offset, help="first archive offset (default: header u32@4)")
+    ap.add_argument("--limit", type=byte_count, help="stop after this many bytes")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
+    if os.path.isdir(a.out):
+        ap.error(f"{a.out} is a folder, not a .json or .csv file")
+    ext = os.path.splitext(a.out)[1].lower()
+    if ext not in (".json", ".csv"):   # checked before the scan, which can take minutes on a large archive
+        ap.error("output must end in .json or .csv")
+    folder = os.path.dirname(os.path.abspath(a.out))
+    if not os.path.isdir(folder):
+        ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
 
     def progress(n, pages):
         print("streams=%d pages=%d" % (n, pages), file=sys.stderr, flush=True)
@@ -362,16 +399,20 @@ def main():
     else:
         print("not a file or directory: %s" % a.source, file=sys.stderr)
         return 2
-    pages, streams_seen = index_streams(streams, None if a.quiet else progress)
+    try:
+        pages, streams_seen = index_streams(streams, None if a.quiet else progress)
+    except (OSError, ValueError) as e:
+        print("%s: %s" % (a.source, e), file=sys.stderr)
+        return 2
     summary = summarise(pages, mode, a.source)
     summary["streams"] = streams_seen
-    ext = os.path.splitext(a.out)[1].lower()
-    if ext == ".json":
-        write_json(a.out, pages, summary)
-    elif ext == ".csv":
-        write_csv(a.out, pages)
-    else:
-        print("output must end in .json or .csv", file=sys.stderr)
+    try:
+        if ext == ".json":
+            write_json(a.out, pages, summary)
+        else:
+            write_csv(a.out, pages)
+    except OSError as e:
+        print(f"{a.out}: {e.strerror or e}", file=sys.stderr)
         return 2
     if not a.quiet:
         print(json.dumps(summary, indent=1))

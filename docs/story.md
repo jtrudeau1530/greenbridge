@@ -91,7 +91,7 @@ were the 21,980 page directories.
 | zero-prefix page | 1,782 | 104,870,151 | 188,050,712 | first 8 bytes zero |
 | `0DRP` page directory at +16 | 787 | 6,251,535 | 19,538,880 | version 122; page counts 1 = 578, 2 = 192, 4 = 4, 6 = 3 |
 | `PSIN` | 73 | 164,290 | 556,280 | 70 full six-section chains; 3 without a chain |
-| `63 30 00 00` record page | 45 | 4,470,231 | 14,894,128 | float records, not decoded |
+| `63 30 00 00` mesh page | 45 | 4,470,231 | 14,894,128 | vertex blocks and meshlet groups; see [the section below](#63-30-00-00-mesh-pages) |
 | XML text | 16 | 11,500 | 57,317 | UTF-8 BOM + `<?xml` |
 | other text | 10 | 131,472 | 6,985,204 | printable NUL-terminated strings |
 | raw `RSC8` header | 1,957 | - | - | version 8001; u32@8 sum 32,904,308 |
@@ -101,6 +101,85 @@ headers and the 1,957 `RSC8` headers; the archive has 49 nested headers in total
 fixed header is 0x30 bytes; a NUL-terminated name follows it before a pointer into the
 `0x50xxxxxx` range. The name field was present in the sampled headers. No `RSC7`, `AWC`, `FSSM`,
 `SCRP` or `YSC` container was validated.
+
+### `63 30 00 00` mesh pages
+
+The 45 `shared_minigame000.rpf` streams that start with `63 30 00 00` are mesh geometry, not loose float records: each is a run of
+16-byte-aligned chunks of two kinds, a **vertex block** and a **meshlet group**. `tools/meshlet_page.py` walks
+them; over all 45 pages it parses every chunk and leaves 0 bytes unaccounted for. The same walk over the whole
+archive finds 290 more streams that start with a meshlet group instead (continuation pages, below). Counts are
+from package 1.0.2.1; no value from the pages is stored here.
+
+Confidence: **high** = holds in every chunk of all 45 pages and is checked by the tool; **medium** = consistent
+over all pages, but the meaning is inferred; **open** = not decoded.
+
+**Vertex block** (137 in the 45 pages, 301,916 vertices; 10 to 27,280 vertices per block):
+
+| Offset | Field | Measured | Confidence |
+|---:|---|---|---|
+| +0x00 to +0x58 | 23 slot words: low byte = tag, high 24 bits = byte offset / 2 from the block start; 0 = slot unused | slots 0-4 used, 5-22 zero in all 137 | high |
+| +0x00 | slot 0 = `63 30 00 00`: tag 0x63, offset 0x60 | all 137; this is the page magic | high |
+| +0x5C | u32 | 0x200 in all 137 | high (value), open (meaning) |
+| +0x60 | vertex streams, stored in slot order 0, 2, 1, 3, 4 | sizes below in all 137 | high |
+
+| Slot | Tag | Bytes/vertex | Content | Blocks | Confidence |
+|---:|---:|---:|---|---:|---|
+| 0 | 0x63 | 12 | float3 position | 137 | high (layout); medium (position): all 301,916 finite and within ±300 of the origin |
+| 1 | 0x26 | 4 | 4 bytes, alpha-like 4th byte | 120 | medium: 4th byte is 255 for all 300,074 vertices; RGBA8 colour is the likely reading |
+| 2 | 0x63 | 12 | float3 normal | 137 | high: length 1 ± 0.02 for all 301,916 |
+| 3 | 0x42 | 8 | float2 | 137 | medium: all finite; texture coordinates are the likely reading |
+| 4 | 0x42 | 8 | float2 | 120 | medium: all finite; a second texture coordinate set is the likely reading |
+
+The vertex count is (slot 2 offset − 0x60) / 12; every other slot's size is its stride times that count, and the
+block ends 8 × count bytes after its last slot. Blocks come in two layouts: 120 with all five slots and 17 with
+slots 0, 2 and 3 only. 811,377 of the 905,748 position floats have a zero low byte, so most positions look
+quantised to 16 mantissa bits. The positions are local (model space): every coordinate lies within ±300 of the
+block's origin, so they are not compared with the map bounds in `docs/world.md`.
+
+**Meshlet group** (107 in the 45 pages):
+
+| Offset | Field | Measured | Confidence |
+|---:|---|---|---|
+| +0 | u32: bit 31 set, bits 0-30 = meshlet count K | 2,119 meshlets | high |
+| +4 | u32 triangle count T | 254,180 triangles | high |
+| +8 | u32 vertex reference count V | 263,895 references | high |
+| +12 | K × 16-byte meshlet records | see below | |
+| +12 + 16K | T × u32 triangles: three 7-bit meshlet-local indices (bits 0-6, 7-13, 14-20), meshlet index (bits 21-31) | every index below its meshlet's vertex count; every meshlet index matches its record | high |
+| +12 + 16K + 4T | V × u16 vertex references into a vertex block | | high |
+
+Meshlet record:
+
+| Offset | Field | Measured | Confidence |
+|---:|---|---|---|
+| +0 | u32: bits 0-6 = vertices − 1, bits 7-13 = triangles − 1 | sums equal V and T in all 107 groups; 1,971 of 2,119 meshlets have 128 vertices | high |
+| +0 | bits 14-31 | not decoded; vary between meshlets | open |
+| +4 | u16 first vertex reference, u16 first triangle | running sums in all 2,119 | high |
+| +8 | u32 | 0x007FF7FF in 2,092 of 2,119 | open (likely culling bounds) |
+| +12 | u32 | 0x7FF in 2,087 of 2,119 | open |
+
+So the meshlets hold at most 128 vertices and 128 triangles, which fits mesh-shader geometry. In every group the
+references cover 0 to max exactly once or more (no gaps), so a group indexes one vertex block of that many
+vertices. 78 of the 107 groups match a block of the same vertex count in the same page and 104 in the same or an
+adjacent page (in archive order); the other 3 are small and match no block in those pages. A page can therefore hold a group
+whose block is in the page before it.
+
+**Pages.** 18 pages are one block and one group; the others interleave several blocks and groups (one page has
+3 blocks and no group). 39 of the 45 pages are distinct by SHA-256 (one page occurs twice and one six times).
+
+**Continuation pages.** A full-archive walk also accepts streams that start with a meshlet group which passes
+every check above: 290 such streams (8,237,552 bytes inflated), with 748 groups, 7,015 meshlets, 742,141 triangles
+and 5 vertex blocks. 109 parse to the end, 16 end inside a group that continues in the next stream, and 165 run
+into a `42 40 00 00` chunk. That chunk uses the same slot-word header (slot 0 is tag 0x42 at offset 0x80) with other
+tags (0x21, 0x28), so the `42 40 00 00` resource pages are probably the same vertex-block family with other vertex
+formats. Their strides are not measured here, and the tool stops at them instead of guessing.
+
+| Scope | Streams | Blocks | Vertices | Groups | Meshlets | Triangles |
+|---|---:|---:|---:|---:|---:|---:|
+| `63 30 00 00` pages | 45 | 137 | 301,916 | 107 | 2,119 | 254,180 |
+| group-led pages | 290 | 5 | 608 | 748 | 7,015 | 742,141 |
+| total | 335 | 142 | 302,524 | 855 | 9,134 | 996,321 |
+
+Still open: the +0x5C word, meshlet record bits 14-31 and words +8/+12, and the `42 40 00 00` vertex formats.
 
 ### `story000_script.rpf`, full
 
@@ -248,7 +327,17 @@ sizes, signatures and header fields; it does not write resource payloads or carv
 python -I tools/story_index.py <archive.rpf> <out.csv|out.json> [--start N] [--limit BYTES]
 python -I tools/rpf9_carve.py <archive.rpf> <out_dir> --index-only [--start N] [--limit BYTES]
 python -I tests/test_story_index.py
+python -I tools/meshlet_page.py <archive.rpf | carved-dir | page.bin> [...] [--json out.json] [--quiet]
+python -I tests/test_meshlet_page.py
 ```
+
+`meshlet_page.py` writes counts and layout checks only (chunk kinds, vertex, meshlet and triangle counts, and
+how many values pass each check), never vertex or index values. It exits 1 if a page fails to parse and 2 if an
+input does not exist.
+
+`--start` must be 0 or more and `--limit` at least 1 (decimal or `0x` hex). A value outside that, or a `--start`
+past the end of the archive, stops `story_index.py` with a one-line error and exit code 2 and writes nothing.
+An empty archive gives an index with no files.
 
 `story_index.py` is stdlib-only. It classifies the same zlib/Bink walk as `rpf9_carve.py`, parses
 the `PSIN` section chain, and reports `0DRP`/`RSC8`/`9FPR` headers when they start a stream or a

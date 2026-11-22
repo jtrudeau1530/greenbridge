@@ -71,9 +71,9 @@ GFX10_TO_DXGI = {
     27: 36,
     28: 38,
     29: 34,
-    43: 26,
-    44: 24,
-    48: 25,
+    36: 26,
+    50: 24,
+    54: 25,
     56: 28,
     57: 31,
     60: 30,
@@ -167,7 +167,7 @@ def calc_mip_level_bytes(w, h, depth=1, fmt=28, align=1):
     return total
 
 
-# AMD Gfx10 compact mip chain (the TTPF "compact" profile).
+# AMD Gfx10 compact mip chain (the TTPF "compact" profile) and multi-slice layouts.
 #
 # The 9-bit descriptor mode is a low flag bit plus a 4-bit Gfx10 tile mode at
 # bit 1. Tile mode 0 is SW_64KB_D; the observed 1-3 and 9-12 values are
@@ -178,6 +178,21 @@ COMPACT_TILE_64K = 65536
 COMPACT_MAX_TAIL_MIPS = {COMPACT_TILE_4K: 8, COMPACT_TILE_64K: 12}
 _COMPACT_ELEMENT_LOG = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}
 _COMPACT_TILE_ORIGIN = {0: (16, 16), 1: (16, 8), 2: (8, 8), 3: (8, 4), 4: (4, 4)}
+# AMD Gfx10 3D SW_4KB_S micro-tile extents (blocks_w, blocks_h, blocks_d) by log2(element_bytes).
+_VOLUME_4K_TILE = {
+    0: (16, 16, 16),
+    1: (16, 8, 16),
+    2: (8, 8, 16),
+    3: (8, 8, 8),
+    4: (8, 4, 8),
+}
+# 5-bit chunk page-count codes packed in the low 20 bits of ((extra << 11) | meta),
+# mapping each non-zero code to its RDS5 chunk virtual size in 4 KiB pages.
+ETPF_CHUNK_CODE_PAGES = {
+    1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8,
+    10: 12, 11: 16, 12: 24, 13: 32, 14: 48, 15: 64, 16: 128,
+    21: 18, 22: 80, 23: 96, 24: 144, 26: 272, 27: 384, 28: 528,
+}
 
 
 def gfx10_tile_mode(mode):
@@ -195,8 +210,9 @@ def gfx10_tile_bytes(mode):
 def parse_etpf_texture_record(record):
     """Parse one 16-byte ETPF texture record (the RDS5 embedded descriptor).
 
-    The fields are the tuple the compact-profile gate checks:
-    ``(mode, width, height, mips, non_tail, element_bytes)``.
+    Word ``b`` packs 3-bit ``non_tail`` (bits 0..2), 7-bit DXGI ``format``
+    (bits 3..9), 11-bit ``depth - 1`` (bits 10..20), 2-bit ``dimension``
+    (bits 21..22), and 9-bit ``mode`` (bits 23..31).
     """
     if len(record) < 16:
         raise ValueError(f"ETPF texture record truncated: expected 16 bytes, got {len(record)}")
@@ -207,14 +223,50 @@ def parse_etpf_texture_record(record):
         "packed_mips": a >> 28,
         "non_tail": b & 7,
         "mips": (a >> 28) + (b & 7),
-        "format": (b >> 3) & 255,
-        "depth": ((b >> 11) & 1023) + 1,
+        "format": (b >> 3) & 0x7F,
+        "depth": ((b >> 10) & 0x7FF) + 1,
         "dimension": (b >> 21) & 3,
         "mode": b >> 23,
         "meta": c >> 21,
         "extra": d,
         "base": (c & 0x1FFFFF) * 4096,
     }
+
+
+def decode_etpf_chunk_pages(meta, extra):
+    """Decode the 43-bit ``(extra << 11) | meta`` streaming chunk-page list.
+
+    The low 20 bits hold up to four zero-terminated 5-bit codes giving each
+    RDS5 chunk's virtual size in 4 KiB pages. Bits 9..18 of ``extra`` must be
+    zero. Returns a tuple of page counts, or ``None`` if any code or reserved
+    bit is invalid.
+    """
+    if not isinstance(meta, int) or not isinstance(extra, int):
+        return None
+    if meta < 0 or meta > 0x7FF or extra < 0 or extra > 0xFFFFFFFF:
+        return None
+    if ((extra >> 9) & 0x3FF) != 0:
+        return None
+    val43 = (extra << 11) | meta
+    pages = []
+    ended = False
+    for slot in range(4):
+        code = (val43 >> (5 * slot)) & 0x1F
+        if code == 0:
+            ended = True
+            continue
+        if ended:
+            return None
+        count = ETPF_CHUNK_CODE_PAGES.get(code)
+        if count is None:
+            return None
+        pages.append(count)
+    return tuple(pages)
+
+
+def etpf_streaming_padding(extra):
+    """Return ``(align_group, pad_pages)`` from the upper 13 bits of ``extra``."""
+    return (extra >> 19) & 3, extra >> 21
 
 
 def compact_profile_key(descriptor, element_bytes):
@@ -307,6 +359,173 @@ def compact_layout_for_dxgi(width, height, fmt, mips, tile=COMPACT_TILE_4K):
     return compact_surface_layout(width, height, mips, bpe, blk, tile)
 
 
+def array_surface_layout(width, height, depth, mips, element_bytes, block=1,
+                         tile=COMPACT_TILE_64K):
+    """Compute the mip-major Gfx10 layout for a 2D texture array.
+
+    Every slice shares the same per-mip dimensions; the packed tail (if any)
+    occupies ``depth * tile`` bytes at offset 0 (slice ``s`` at ``s * tile``),
+    followed by standalone mips from ``first_tail - 1`` down to ``0``, each
+    occupying ``depth * region`` bytes (slice ``s`` at ``offset + s * region``).
+    """
+    if not isinstance(depth, int) or depth < 1:
+        raise ValueError(f"invalid array depth: {depth!r}")
+    base = compact_surface_layout(width, height, mips, element_bytes, block, tile)
+    first_tail = base["first_tail"]
+    mips_out = [dict(m) for m in base["mips"]]
+    off = depth * tile if first_tail < mips else 0
+    for i in range(first_tail - 1, -1, -1):
+        mips_out[i]["offset"] = off
+        mips_out[i]["slice_stride"] = mips_out[i]["region"]
+        off += depth * mips_out[i]["region"]
+    for i in range(first_tail, mips):
+        mips_out[i]["offset"] = 0
+        mips_out[i]["slice_stride"] = tile
+    return {
+        "size": off,
+        "slice_size": base["size"],
+        "tile": tile,
+        "first_tail": first_tail,
+        "block_w": base["block_w"],
+        "block_h": base["block_h"],
+        "element_bytes": element_bytes,
+        "levels": base["levels"],
+        "depth": depth,
+        "mip_major": True,
+        "mips": mips_out,
+    }
+
+
+def array_layout_for_dxgi(width, height, depth, fmt, mips, tile=COMPACT_TILE_64K):
+    """Mip-major 2D array layout using tex_headers' DXGI element-size table."""
+    if fmt not in FMT_INFO:
+        raise ValueError(f"unsupported format for array layout: {fmt}")
+    bpe, blk = FMT_INFO[fmt]
+    return array_surface_layout(width, height, depth, mips, bpe, blk, tile)
+
+
+def cubemap_surface_layout(width, height, mips, element_bytes, block=1,
+                           non_tail=0, chunk_pages=None):
+    """Compute the slice-major SW_4KB_S layout for a 6-face streaming cubemap.
+
+    ``non_tail == 0`` (mode 18) stores one 6-face cubemap at offset 0.
+    ``non_tail in 1..3`` (modes 20/22/24) stores ``non_tail + 1`` self-contained
+    cubemap snapshots back-to-back in the RDS5 chunk stream; the final chunk
+    holds the full-resolution 6-face slice-major cubemap, zero-padded to a
+    64 KiB boundary when ``6 * face_size >= 36 * 4096``.
+    """
+    if not isinstance(non_tail, int) or not 0 <= non_tail <= 3:
+        raise ValueError(f"unsupported cubemap non_tail: {non_tail!r}")
+    face = compact_surface_layout(width, height, mips, element_bytes, block, COMPACT_TILE_4K)
+    face_size = face["size"]
+    full_bytes = 6 * face_size
+    if non_tail == 0:
+        padded_full = full_bytes
+        if chunk_pages is not None and len(chunk_pages) != 0:
+            if len(chunk_pages) != 1 or chunk_pages[0] * COMPACT_TILE_4K != padded_full:
+                raise ValueError(
+                    f"non-streaming cubemap chunk_pages {chunk_pages!r} != expected ({padded_full // COMPACT_TILE_4K},)")
+        data_offset = 0
+        total_size = full_bytes
+    else:
+        padded_full = ((full_bytes + 65535) // 65536 * 65536
+                       if full_bytes >= 36 * COMPACT_TILE_4K else full_bytes)
+        if chunk_pages is not None:
+            if len(chunk_pages) != non_tail + 1:
+                raise ValueError(
+                    f"cubemap chunk count mismatch: expected {non_tail + 1}, got {len(chunk_pages)}")
+            if chunk_pages[-1] * COMPACT_TILE_4K != padded_full:
+                raise ValueError(
+                    f"cubemap final chunk size {chunk_pages[-1] * COMPACT_TILE_4K} != expected {padded_full}")
+            data_offset = sum(chunk_pages[:-1]) * COMPACT_TILE_4K
+            total_size = sum(chunk_pages) * COMPACT_TILE_4K
+        else:
+            data_offset = 0
+            total_size = padded_full
+    return {
+        "size": total_size,
+        "data_offset": data_offset,
+        "face_size": face_size,
+        "full_bytes": full_bytes,
+        "padded_full_bytes": padded_full,
+        "snapshots": non_tail + 1,
+        "tile": COMPACT_TILE_4K,
+        "first_tail": face["first_tail"],
+        "block_w": face["block_w"],
+        "block_h": face["block_h"],
+        "element_bytes": element_bytes,
+        "levels": face["levels"],
+        "depth": 6,
+        "mips": face["mips"],
+    }
+
+
+def cubemap_layout_for_dxgi(width, height, fmt, mips, non_tail=0, chunk_pages=None):
+    """Cubemap layout using tex_headers' DXGI element-size table."""
+    if fmt not in FMT_INFO:
+        raise ValueError(f"unsupported format for cubemap layout: {fmt}")
+    bpe, blk = FMT_INFO[fmt]
+    return cubemap_surface_layout(width, height, mips, bpe, blk, non_tail, chunk_pages)
+
+
+def volume_surface_layout(width, height, depth, mips, element_bytes):
+    """Compute the AMD Gfx10 3D SW_4KB_S layout for a single-mip volume texture."""
+    if width <= 0 or height <= 0 or depth <= 0:
+        raise ValueError(f"invalid volume dimensions {width}x{height}x{depth}")
+    if mips != 1:
+        raise ValueError(f"only single-mip 3D volumes are validated, got mips={mips}")
+    if element_bytes not in _COMPACT_ELEMENT_LOG:
+        raise ValueError(f"unsupported volume element size: {element_bytes}")
+    bw, bh, bd = _VOLUME_4K_TILE[_COMPACT_ELEMENT_LOG[element_bytes]]
+    pw = (width + bw - 1) // bw * bw
+    ph = (height + bh - 1) // bh * bh
+    pd = (depth + bd - 1) // bd * bd
+    z_tile_stride = (pw // bw) * (ph // bh) * COMPACT_TILE_4K
+    size = (pd // bd) * z_tile_stride
+    return {
+        "size": size,
+        "tile": COMPACT_TILE_4K,
+        "first_tail": 1,
+        "block_w": bw,
+        "block_h": bh,
+        "block_d": bd,
+        "padded_w": pw,
+        "padded_h": ph,
+        "padded_d": pd,
+        "z_tile_stride": z_tile_stride,
+        "element_bytes": element_bytes,
+        "depth": depth,
+        "levels": calc_mipmap_count(width, height, depth),
+        "mips": [{
+            "index": 0,
+            "blocks_w": width,
+            "blocks_h": height,
+            "blocks_d": depth,
+            "padded_w": pw,
+            "padded_h": ph,
+            "padded_d": pd,
+            "pixels_w": width,
+            "pixels_h": height,
+            "pixels_d": depth,
+            "offset": 0,
+            "region": size,
+            "tile_x": 0,
+            "tile_y": 0,
+            "in_tail": False,
+        }],
+    }
+
+
+def volume_layout_for_dxgi(width, height, depth, fmt, mips=1):
+    """Single-mip 3D SW_4KB_S volume layout using tex_headers' DXGI table."""
+    if fmt not in FMT_INFO:
+        raise ValueError(f"unsupported format for volume layout: {fmt}")
+    bpe, blk = FMT_INFO[fmt]
+    if blk != 1:
+        raise ValueError(f"block-compressed 3D volumes are not supported: format {fmt}")
+    return volume_surface_layout(width, height, depth, mips, bpe)
+
+
 def compact_span_matches(layout, span):
     """True only when an allocation span is byte-exact for the computed chain."""
     return isinstance(span, int) and span == layout["size"]
@@ -334,7 +553,8 @@ D3D10_RESOURCE_DIMENSION_TEXTURE3D = 4
 D3D10_RESOURCE_MISC_TEXTURECUBE = 0x4
 
 
-def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0):
+def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0, array_size=1):
+    """Build a DX10 DDS header; array_size counts cubes, not faces, for cubemaps."""
     hdr = bytearray(128)
     hdr[0:4] = b"DDS "
     flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT
@@ -350,7 +570,7 @@ def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0):
     caps = DDSCAPS_TEXTURE
     if mips > 1:
         caps |= DDSCAPS_COMPLEX | DDSCAPS_MIPMAP
-    if depth > 1 or is_cube:
+    if depth > 1 or is_cube or array_size > 1:
         caps |= DDSCAPS_COMPLEX
 
     caps2 = 0
@@ -365,13 +585,13 @@ def dds_header(w, h, depth=1, mips=1, fmt=28, is_cube=False, linear_size=0):
 
     dim = D3D10_RESOURCE_DIMENSION_TEXTURE3D if depth > 1 else D3D10_RESOURCE_DIMENSION_TEXTURE2D
     misc = D3D10_RESOURCE_MISC_TEXTURECUBE if is_cube else 0
-    array_size = 6 if is_cube else 1
     dxt10 = struct.pack("<IIIII", fmt, dim, misc, array_size, 0)
     return bytes(hdr) + dxt10
 
 
-def dds_bytes(w, h, fmt, payload=b"", mips=1, depth=1, is_cube=False):
-    return dds_header(w, h, depth=depth, mips=mips, fmt=fmt, is_cube=is_cube, linear_size=len(payload)) + payload
+def dds_bytes(w, h, fmt, payload=b"", mips=1, depth=1, is_cube=False, array_size=1):
+    return dds_header(w, h, depth=depth, mips=mips, fmt=fmt, is_cube=is_cube,
+                      linear_size=len(payload), array_size=array_size) + payload
 
 
 def parse_dds_header(data):
@@ -491,14 +711,24 @@ def main():
     ap.add_argument("--archives")
     ap.add_argument("--out")
     a = ap.parse_args()
+    if not os.path.isdir(a.carve):
+        ap.error(f"{a.carve} is not a folder")
     archs = a.archives.split(",") if a.archives else sorted(
         d for d in os.listdir(a.carve) if os.path.isfile(os.path.join(a.carve, d, "index.json")))
+    missing = [arch for arch in archs if not os.path.isfile(os.path.join(a.carve, arch, "index.json"))]
+    if missing:
+        ap.error(f"no index.json for {', '.join(missing)} in {a.carve}")
+    if not archs:
+        ap.error(f"no carved archive (a folder with index.json) in {a.carve}")
     allt = []
     for arch in archs:
         t = scan_archive(a.carve, arch)
         print(f"{arch}: {len(t)} texture headers", flush=True)
         allt += t
     path = a.out or os.path.join(a.carve, "textures_index.json")
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:      # the scan is already done; a missing folder used to lose it in a FileNotFoundError
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(allt, f)
     print(f"{len(allt)} textures -> {path}")

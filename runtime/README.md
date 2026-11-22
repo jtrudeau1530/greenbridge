@@ -14,7 +14,8 @@ powershell -File scripts/build_runtime.ps1
 ```
 
 It uses CMake + Ninja from Visual Studio when available, otherwise `cl.exe`, and writes
-`runtime\build\gta6rt.exe`. The direct CMake path works too:
+`runtime\build\gta6rt.exe` plus `gta6rt_tls_host.dll` (the loader's TLS-index helper; it must stay next to
+the executable). The direct CMake path works too:
 
 ```powershell
 cmake -S runtime -B runtime/build
@@ -32,9 +33,21 @@ gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>]
 ```
 
 The dry run maps the image and the bundled modules it imports, applies base relocations, binds every
-import through the shim registry, a host DLL, or another bundled module, parses exports, applies
-section protections, and prints a per-module report. It does **not** call `DllMain`, TLS callbacks,
-or the entry point, so no image code runs.
+import through the shim registry, a host DLL, or another bundled module, parses exports, installs static
+TLS for the calling thread, applies section protections, and
+prints a per-module report. It does **not** call `DllMain`, TLS callbacks, or the entry point, so no
+code from the mapped images runs. TLS reserves its module index through the runtime's own
+`gta6rt_tls_host.dll`, and host imports load system DLLs, as they did before.
+
+`gta6rt --init <image>` runs the same mapping and then `Loader::initialise()`: each module's TLS
+callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. An EXE's entry point is not
+run. When the loader is destroyed, initialised modules receive TLS callbacks and DLL entry-point calls with
+`DLL_PROCESS_DETACH`, in reverse initialisation order. All mapped images, unwind tables and static TLS stay
+available until these notifications finish, so DLLs can release resources such as FLS callbacks safely. The reserved
+argument is null (explicit unload). A map-only load receives no detach notifications.
+
+`--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
+print the usage and exit 2 before anything is mapped.
 
 The report line is:
 
@@ -46,17 +59,68 @@ Shim and unimplemented imports are listed by name. A non-zero `unimplemented` co
 signal: it names the next shim that is missing. The measured result for the 16 DLLs shipped in the
 package is recorded in the runtime-imports documentation.
 
+After the totals the report counts the unimplemented imports by return class, and marks the HRESULT ones in the list:
+
+```
+    UNIMPLEMENTED xgameruntime.dll!XUserAddAsync  [returns HRESULT]
+1 module(s) mapped, 1 unimplemented import(s)
+unimplemented by return policy: hresult=1 other=0
+```
+
+### Unimplemented imports at run time: `LEONIDA_UNIMPLEMENTED`
+
+An import with no shim, host function or bundled module is bound to a thunk. What a call to it does is set by the
+environment variable `LEONIDA_UNIMPLEMENTED`, read once per process:
+
+| value | a call to the thunk |
+|---|---|
+| `log` (default) | prints `[rt] unimplemented: dll!name` once and returns 0 in rax and xmm0. This is what the runtime always did. |
+| `fail` | the same, but returns `E_NOTIMPL` (`0x80004001`) for imports known to return an `HRESULT`, and 0 for all others. |
+| `stop` | on the first call prints the import, the caller's return address as `module+RVA`, and rcx, rdx, r8 and r9 as the game passed them; then breaks if a debugger is attached (continuing returns the `fail` value), else ends the process with exit code 3. |
+
+No mode writes to an out parameter: a function that fills one in on success leaves it as the caller had it. Under
+`log` an `HRESULT` function therefore returns `S_OK` with its outputs unset, which is why `fail` exists; with `fail`
+the caller sees an error and can take its own failure path. Any other value is reported and treated as `log`.
+
+Whether an import returns an `HRESULT` is decided by DLL and name alone (`classify_import` in
+`shims/registry.cpp`, where each entry names its source). The list is short on purpose and every entry was checked
+against the public Microsoft documentation: `D3D12Create*`/`D3D12Serialize*` and the D3D12 debug/experimental
+entries, `CreateDXGIFactory*` and two DXGI functions, `XGameRuntimeInitialize`, and the GDK families `XAsync*`,
+`XTaskQueue*`, `XUser*`, `XStore*`, `XGameSave*`, `XPackage*`, `XGameUi*` minus the functions the same pages document
+as `void`/`bool`/`int`. A function that is not on the list gets 0 under `fail`, exactly as under `log`.
+
+The thunk keeps the Win64 argument registers and the return address intact (it is entered by the game's `call`), and
+reaches a shared stub that saves them, so a floating-point caller still reads 0.0 from xmm0 and a debugger can unwind
+through it.
+
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
 that base is taken, copies headers and sections, applies `IMAGE_REL_BASED_DIR64` relocations, binds
-imports by name or ordinal, parses the export table, and sets section protections. Modules are deduped
-by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
+imports by name or ordinal, parses the export table, sets section protections, and registers the
+image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
+through a mapped image are dispatched and stack walks can step over its frames. The table is validated
+first (entries in bounds, sorted and non-overlapping) and removed when the loader is destroyed. Modules
+are deduped by lower-case file name, so an import graph that reaches the same DLL twice maps it once.
+
+`load()` also installs static TLS for the calling thread. `__declspec(thread)` reads `TEB->ThreadLocalStoragePointer[_tls_index]`, which is a
+different index space from the `TlsAlloc` slots, and only the OS loader can allocate a module index.
+The runtime therefore ships a minimal `gta6rt_tls_host.dll`; the loader reuses the index the OS assigns
+it, writes that index into the image's `AddressOfIndex`, and copies the image's TLS template into the
+slot. This reserves one index, so **one manually mapped TLS module can be live at a time**; a second
+one is rejected with an error instead of sharing the slot. Images without a TLS directory (or with an
+all-zero one) load normally.
 
 Current limits, by design:
 
-- `DllMain`, TLS callbacks and the entry point are left to the caller; `--dry-run` never runs them.
-- The loader does not yet register x64 unwind tables; that is a separate runtime step.
+- `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own
+  `gta6rt_tls_host.dll`; host imports still load system DLLs as before.
+- `--dry-run` never runs image code. `initialise()` runs TLS callbacks and a DLL's `DllMain`;
+  `run_tls_callbacks()` is the opt-in seam for `DLL_THREAD_ATTACH`/`DETACH` and for callers that do not
+  use `initialise()`. An EXE's entry point is the caller's to run.
+- The loader does not deliver thread attach/detach events. Call `install_tls_for_thread()` before mapped
+  code runs on a thread the runtime created and `uninstall_tls_for_thread()` before it exits; destroy the
+  `Loader` on the thread that called `load()`.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -64,7 +128,8 @@ Current limits, by design:
 
 `shims/registry.cpp` holds the static tables. The current shims are:
 
-- `xmem.dll` — `XMemAlloc`, `XMemFree`, `XMemGetWorkingSetStatistics`, and the measured three-argument
+- `xmem.dll` — `XMemAlloc`, `XMemFree`, the measured two-argument `XMemGetWorkingSetStatistics(kind, out)`, and the
+  measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address.
@@ -77,19 +142,29 @@ Current limits, by design:
   depth views, committed resources and copies (uploads, readbacks, BC textures); see `docs/d3d12_vulkan.md`
   section 3.2 for what is missing.
 
+- `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
+  (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, and on a
+  DualSense adaptive-trigger effects and the lightbar. Optional and CMake-only: built when an installed SDL3 is found,
+  or with `-DLEONIDA_SDL3_FETCH=ON` to download the pinned release; nothing is downloaded otherwise, and the
+  `scripts/build_runtime.ps1` cl.exe fallback never builds it. See [docs/gameinput.md](../docs/gameinput.md) for the mapping, the `LEONIDA_DS_*` settings and what is
+  unverified.
+
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
 imports are unknown until it is available.
 
 ## Tests
 
+For a Visual Studio build, pass CTest the same configuration you built above.
+
 ```powershell
-ctest --test-dir runtime/build --output-on-failure
+ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure
 ```
 
 On Windows the build configures the CPU tests that do not need a GPU or game files, including the
-root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools are built
-when the Vulkan SDK is found:
+root-signature forwarding test (`root_sig_test`) and the clear-command test. The Vulkan tools and
+D3D12-over-Vulkan COM targets are built when Vulkan headers are found (via `VULKAN_SDK`, an installed
+SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulkan-Headers release):
 
 - `vk_harness` — hand-written RDNA2 shader programs on a real Vulkan device.
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
@@ -103,12 +178,26 @@ when the Vulkan SDK is found:
   driver's compile time on multi-megabyte ray-tracing shaders. The measured partial pass is in
   [docs/pipeline_check.md](../docs/pipeline_check.md).
 
+`gameinput_test` (only with SDL3; otherwise CTest lists `gameinput` as not run) drives the GameInput shim on SDL virtual joysticks (no controller needed): enumeration, readings
+and the button/axis mapping, rumble and trigger rumble, DualSense effect bytes, a dispatcher, and hot-plug.
+`gameinput_probe [--seconds N] [--rumble]` is the manual check on a real pad: it prints live readings and plays each
+motor and trigger.
+
+`unimplemented_policy_test` builds a small image whose two imports bind to nothing and checks `log`, `fail` and
+`stop` on it: return values, untouched out parameter, xmm0 = 0, environment parsing, and (in a child process) the
+`stop` message with the caller's module+RVA and the argument registers. It also checks that the stub keeps the stack
+16-byte aligned at the call into the runtime, that rbx/rbp/rdi/rsi/r12-r15 and xmm6-xmm15 survive a call
+(`test/fixtures/abi_probe.asm`, MASM; skipped without `ml64`), and that `RtlVirtualUnwind` from inside the call walks
+back to the caller.
+
 The PE-loader and Bink-decode tests that need the retail package are optional: when
 `LEONIDA_GAME_DIR` (and, for Bink, `LEONIDA_MOVIE`) is unset they print `SKIP` and exit 0. They read
 the files in place and never copy or commit game data.
 
 ## Current limits
 
+`gta6rt --run <exe> [-- args]` runs an executable's entry point inside the runtime (`shims/process.cpp` gives it its
+own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
@@ -118,3 +207,75 @@ in [docs/design.md](../docs/design.md), and the differential-validation design i
 work.
 
 No game data, keys, or extracted assets belong in this directory or in the repository.
+
+### First-boot D3D12 trace
+
+On a Vulkan-enabled build, select the Vulkan backend to trace device, command-list and queue calls handled
+by Leonida. Put `--trace-d3d12` before the separator for game arguments.
+
+```powershell
+$env:LEONIDA_D3D12 = 'vulkan'
+.\runtime\build\gta6rt.exe --run $gameExe --trace-d3d12 2>&1 |
+    Select-String '^\[d3d12-trace\]'
+```
+
+Each trace line contains a sequence number, a fixed API name and an outcome. `called` marks a void API call
+whose validation may be deferred. `ok`, `failed` and `unsupported` report known results. `ignored` marks a no-op.
+Share only the lines prefixed with `[d3d12-trace]`. Other runtime diagnostics are separate.
+
+### Typed clear regression
+
+`clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
+`d3d12_clear_test` compares full/rectangle readbacks with Windows WARP across UNORM, SNORM, FLOAT, UINT and SINT
+render-target formats, plus depth and stencil clears. Fixtures are synthetic; no shaders or game data are needed.
+The GPU test runs explicitly, while the CPU test is registered in CTest.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^clear_color$' --output-on-failure
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_clear_test.exe
+```
+
+### RGBA8 typeless RTV clear regression (phase 1)
+
+`typeless_rtv_test` checks typed-view recording and replay without a GPU. It is registered in CTest.
+`d3d12_typeless_rtv_test` compares synthetic full and rectangular clears with Windows WARP through explicit
+UNORM/SRGB/UINT RTVs on a one-mip, one-layer, single-sample 2D RGBA8 typeless resource. It checks descriptor
+snapshots, alternating view formats, SRGB with UAV resource usage, and invalid view rejection.
+Other typeless families, typed-resource casts, SINT/SNORM, mip/array expansion, MSAA and 3D views are not added.
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^typeless_rtv$' --output-on-failure
+$env:LEONIDA_VK_VALIDATION = '1'
+$env:VK_VALIDATION_VALIDATE_SYNC = '1'
+.\runtime\build\RelWithDebInfo\d3d12_typeless_rtv_test.exe
+```
+
+RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT views of 2D mip slices and contiguous array-layer ranges, with sample count 1. Other format families, typed-resource casts, MSAA and 3D views are not expanded.
+
+### Resource descriptions
+
+`d3d12_resource_desc_test` creates the same committed and reserved resources on the Vulkan-backed device and on
+Windows D3D12 (the default adapter and WARP, whichever exist) and compares every field of `ID3D12Resource::GetDesc`:
+the `Alignment` and `MipLevels` a description left at 0 must read back as the host fills them in. A description the
+host refuses is skipped, and one only the layer refuses (1D textures today) is listed and not compared. It needs a
+Vulkan GPU and runs explicitly.
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_resource_desc_test.exe
+```
+
+### Depth and stencil resolves
+
+`d3d12_depth_resolve_test` resolves one plane of a 4x D32 or D24S8 target into a 1x one with
+`ResolveSubresourceRegion` (MIN and MAX of depth or stencil, AVERAGE of depth by its own format; whole and by
+rectangle) on the Vulkan-backed device and on Windows D3D12 (the default adapter and WARP), and compares the
+destinations read back. Calls the layer refuses must fail `Close` and leave the destination as cleared. Clears give
+every sample of a pixel one value, so the modes over differing samples are not checked. It needs a Vulkan GPU.
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_depth_resolve_test.exe
+```

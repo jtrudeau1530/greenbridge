@@ -391,6 +391,7 @@ def find_sdk_include():
                 candidates += glob.glob(os.path.join(root, "Windows Kits", "10", "Include", "*"))
     best = None
     for path in candidates:
+        path = os.path.normpath(path)                 # "...\um\" has an empty basename
         um = path if os.path.basename(path).lower() == "um" else os.path.join(path, "um")
         shared = os.path.join(os.path.dirname(um), "shared")
         if os.path.isdir(um):

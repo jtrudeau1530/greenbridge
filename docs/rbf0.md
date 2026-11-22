@@ -470,6 +470,9 @@ python -I tests/test_rbf0_index.py
 python -I tests/test_rbf0_tree.py
 ```
 
+`--start` must be 0 or more and `--limit` at least 1 (decimal or `0x` hex); an out-of-range value stops with a
+one-line error and exit code 2 before an index is written.
+
 The JSON summary carries the corpus totals used above (`streams`, `compressed_bytes`, `inflated_bytes`,
 `rbf0.resources`, `rbf0.multi_chunk`, `rbf0.by_root`, `rbf0.size_buckets`, record counts, string categories and
 keyword occurrences), so the numbers can be re-measured without committing an index. `--all-strings` writes the

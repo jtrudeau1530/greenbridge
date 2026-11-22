@@ -34,7 +34,7 @@ between streams that did not inflate, not empty space.
 
 | Archive | Byte-dominant payload | Models | Maps | Scripts |
 |---|---|---|---:|---:|---:|
-| `core_restofworld` | Bink 2 video, 95.8% of the data span; 958 graphics pages and 924 model-name system pages | 37 decoded in the existing manifest; 433 unique name strings measured here | 0 | 0 |
+| `core_restofworld` | Bink 2 video, 95.8% of the data span; 958 streams start with a graphics block, 13 more contain one later, and 924 system pages carry model names | 37 decoded in the existing manifest; 433 unique name strings measured here | 0 | 0 |
 | `story000_restofworld` | Bink 2 video 60.6% of the data span, then system pages and 101 `0DRP` metadata resources | 1 page with 3 `.#dr` strings; no decoded model | 0 | 0 |
 | `story000_script` | `PSIN` metadata, 79.2% of inflated bytes | 0 | 0 | 0 validated container |
 | `core_restofworld001` | 23 zero-prefix system pages plus 4 XML content manifests | 0 | 0 | 0 |
@@ -52,7 +52,7 @@ pages are a larger upper bound on the page population, not 924 decoded models.
 | Class | Streams | Stored | Inflated | Share of inflated |
 |---|---:|---:|---:|---:|
 | Bink 2 (`KB2n`) | 11 | 1,241,514,796 | 1,241,514,796 | 91.6% |
-| `42 40 00 00` resource pages | 958 | 37,556,463 | 77,862,128 | 5.7% |
+| Streams starting with a `42 40 00 00` block | 958 | 37,556,463 | 77,862,128 | 5.7% |
 | zero-prefix system pages | 1,230 | 12,920,541 | 34,278,992 | 2.5% |
 | other raw/page starts | 162 | 1,045,600 | 1,960,826 | 0.1% |
 | `PSIN` | 6 | 50,402 | 142,056 | <0.1% |
@@ -66,8 +66,8 @@ pages are a larger upper bound on the page population, not 924 decoded models.
   SHA-256 over the 11 + 7 stored bodies).
 - **Models and pages.** 924 zero-prefix system pages carry 936 model-name strings (883 `.#dr`, 53
   `.#ft`; 433 unique strings), which is the same name-bearing system-page pattern used by the model
-  exporter. There are no `.#dd`, `.#td` or `.#txd` strings. The separate `42 40 00 00` graphics-page
-  family has 958 streams, 256 bytes to 9.4 MiB each, 37.6 MB stored / 77.9 MB inflated. The existing
+  exporter. There are no `.#dd`, `.#td` or `.#txd` strings. The 958 streams starting with a
+  `42 40 00 00` block range from 256 bytes to 9.4 MiB each and total 37.6 MB stored / 77.9 MB inflated. The existing
   model manifest reports 37 decoded `core_restofworld` models; the 924 name pages are not all complete
   resources, so this page does not raise that count.
 - **Metadata.** One standalone `0DRP` resource at offset 53,899,280 has version 122 and 16 at +0x20.
@@ -190,7 +190,7 @@ text is recorded as a substring, not as a container.
 | `RBF0` | +0 | printable schema string after the 8-byte header | 3 core |
 | `RSC8` | +0 | version 8001 at +4, flags 1 at +12, declared size below EOF | 0 at stream starts; 9 raw headers in the story-rest unread gap |
 | `RSC7` | +0 | - | 0 everywhere |
-| `42 40 00 00` | +0 | 0x4042 page marker | 958 core, 1 story-rest |
+| `42 40 00 00` | +0 | 0x4042 vertex-block header | 958 core stream starts, 1 story-rest stream start |
 | zero-prefix page | +0 | first 8 bytes zero | 1,230 core, 400 story-rest, 65 script, 23 core001 |
 | XML | +0 | optional UTF-8 BOM + `<?xml` | 10 core, 13 story-rest, 4 core001, 3 licenses |
 | text | +0 | printable sample, at least 64 bytes | 3 story-rest |
@@ -271,11 +271,148 @@ block boundaries.
 
 Readable: the RPF9 header and data offset, zlib streams, Bink 2 headers, XML content definitions,
 `PSIN` tag/length chains, `0DRP` version and count fields, `RBF0` schema strings, and model-name
-strings in system pages. `42 40 00 00` page relocation tables are visible but not decoded.
+strings in system pages.
+
+**Vertex blocks on graphics pages (ASSET-57).** In core rest-of-world, 958 inflated streams
+start with the target header and another 13 reach it after earlier chunks. In all 971, the
+first 23 little-endian words contain tagged stream locations: for a populated slot,
+the low byte is the tag and twice the upper 24 bits gives the byte offset from the block
+start. Slot 0 starts at +0x80. Sorting the populated slots by offset gives positive spans.
+
+The independent check is the meshlet group following the streams. To locate a candidate
+group, take the greatest common divisor of the adjacent stream spans, try one through four
+times that unit for the final span, then round up to 16 bytes across zero padding.
+In 553 blocks the following group fits and validates: meshlet base offsets match the running
+vertex-reference and triangle counts, and every packed triangle identifies its meshlet and
+uses local indices within range. In 535 of these blocks the referenced indices cover
+every integer from zero through the maximum, and each adjacent span divides exactly by
+the size of that range. For all 535 the measured span per referenced vertex is **8 bytes
+for tag 0x42** and **4 bytes for tags 0x21, 0x25, 0x26, 0x27 and 0x28** wherever
+present with a measured successor. This supports separate vertex streams. It leaves the
+component types, final stream width and blocks without an independent count unresolved.
+
+Across all 22 accessible RPF9 archives, a full data-area scan using the four zlib
+headers from #752 accepted 2,241,411 streams at checksum-validated EOF. There were
+309,007 target page starts and 41,342 streams in which a chunk walk reached the
+target later. Each stream contributes at most its first target block. Of these
+350,349 blocks, 350,348 passed the slot bounds and positive-span checks, 108,342
+had a validated following meshlet group, and 62,207 also had dense references and
+integral span quotients. The recurring widths below account for 61,896 of those
+blocks. Each row counts blocks with a measured successor for that tag.
+
+| Slot tag | Bytes per referenced vertex | Supporting blocks |
+|---|---:|---:|
+| 0x42 | 8 | 61,896 |
+| 0x21 | 4 | 59,308 |
+| 0x25 | 4 | 21,837 |
+| 0x26 | 4 | 60,480 |
+| 0x27 | 4 | 18,030 |
+| 0x28 | 4 | 31,164 |
+| 0x8c | 16 | 3,391 |
+
+Of the 61,896, core rest-of-world contributes 535, minigame 263, full story 110,
+story rest-of-world 1 and the other archives 60,987. Full story alone has 5,589
+target starts and 1,523 continuations. The 311 other integral cases give different
+quotients. A dense range measures the vertices used by the following group and can
+miss vertices used elsewhere. The outlier analysis below checks those counts. The survey counts
+stream occurrences, including duplicates, and excludes opaque data and encrypted
+directory contents.
+
+**Integral outliers.** Comparing each measured adjacent span with the following
+group's dense reference count times the recurring width for its tag gives a
+single ratio per block: all measured tags in that block scale together. The
+61,896 controls have ratio 1. Among the 311 outliers (62 distinct sets of
+tag/quotient pairs), 193 have ratio 1/4, 59 have 1/2, eight have 3/4 and
+51 have a ratio above 1. These counts include every integral case once.
+
+For the 260 ratios below 1, the first stream alone cannot hold all vertices
+referenced by the following group at eight bytes each. Missing references or
+positive padding cannot explain that shortfall. For the 51 above 1, a group
+using only part of a block is possible. In both directions, a common scale
+across tags also fits a different vertex count. It does not establish a new
+encoding for any tag. The final stream has no measured successor and is
+excluded from this comparison.
+
+Dividing each adjacent span by its tag's recurring width gives the same
+positive integer count within each of the 311 blocks. A scan of every other
+16-byte-aligned group header in the same inflated page, using the meshlet
+checks above, found a second group whose references cover exactly that count
+in **230 blocks** (222 of the 260 short cases and eight of the 51 long cases).
+This independently corroborates the proposed count on those pages. It leaves
+**81 blocks** without a second count match: 48 have another validated group
+but no match, and 33 have no other validated group on the page. Even an exact
+match does not identify which block a group draws from.
+
+For each of those 81, scan the immediately preceding and following
+checksum-validated zlib streams in the same archive, in stored order, without
+skipping intervening stream types. Use the same aligned group validation and
+require dense references from zero through the proposed count minus one.
+All 81 have an exact match on one side only: 66 in the preceding stream and
+15 in the following stream. As a distance check, repeating the test two streams
+away on either side yields matches for four of the same 81.
+
+Together, 230 same-stream and 81 adjacent-stream matches corroborate the
+recurring-width count for **all 311 outliers**. The 61,896 original controls
+remain a separate count because their immediately following group supplies
+the matching range. No outlier had a control with the same header and bytes
+through the last measured span. Applying the recurring widths to the final
+slot as a separate check lets a chunk walk consume the whole stream in 219
+outlier cases. Only six of those walks have a one-to-one count match between
+all blocks and dense groups, with a unique match for the target block.
+Count agreement therefore supports the widths across the outlier set while
+leaving the draw-to-block mapping unresolved.
+
+Rounding each measured stream's size up to 16 bytes using the following
+group's count and the recurring widths fits zero of the 311 blocks. Padding
+after the final stream cannot change the earlier spans. In three blocks, the
+four candidate final lengths lead to more than one distinct validated group
+offset. The original first-match rule is retained for the counts above.
+The page-only survey supplies no reason to introduce an alternate per-tag format.
+
+**Draw ownership from system metadata.** A geometry record supplies two independent
+resource-relative addresses. Following the pinned `RageModelDecoder.ReadMesh` layout,
+geometry +8 points to the vertex buffer and geometry +64 points to the meshlet
+descriptor, whose first pointer selects the index buffer. Each buffer's +24 pointer
+addresses the complete inflated graphics segment, including when its target is in
+another compressed stream. The vertex layout supplies the count separately. The
+descriptor supplies meshlet, triangle and reference counts that must agree with the
+pointed-to group's header. This check also validates the packed triangles, vertex
+reference bounds and padded index-buffer length.
+
+All 311 target blocks have one distinct validated group address under this check.
+Geometry records reached through resource-root model lists account for 303. For
+the other eight, a search of aligned system records found the same pointer layout
+and a primary-LOD geometry list containing the record. The path from the resource
+root to that list is still unknown. The pointer search reproduced the addresses
+without selecting on the proposed vertex count. The layout count and the group's
+dense range subsequently agreed in all 311. This includes the six uniquely paired
+page walks and seven walks with a repeated target block count.
+
+| Pointed-to group start relative to the target stream | Blocks |
+|---|---:|
+| Preceding stream | 68 |
+| Same stream | 228 |
+| Following stream | 15 |
+
+Two of the 230 same-stream count matches have their descriptor-selected group
+in the preceding stream. A count-only association would therefore choose a
+different group even with an exact match in hand.
+
+For an already separated system/graphics resource pair, the following command
+walks the primary LOD from the drawable offset reported by the model manifest.
+Use `--geometry-offset` for a known individual geometry record. Both offsets
+are relative to the start of the system segment. Unsupported or inconsistent
+bindings are reported as unresolved.
+
+```powershell
+python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
+```
 
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` payloads, the bodies of the
-`RSC8` headers, the 958 graphics pages beyond their header, the nested RPF9 payloads, and the whole
-`appdata0` data area. "Unread" in the tables above is not a claim that those bytes are empty: in
+`RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
+core graphics blocks, component types and final-slot widths remain unresolved. The stride check
+also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
+"Unread" in the tables above is not a claim that those bytes are empty: in
 `story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and
 in `story000_script` the 53 MB unread region contains four nested RPF9 headers.
 
@@ -315,8 +452,10 @@ The only UI-adjacent evidence is content-manifest XML and text; there is no UI c
 6. A model-page joiner. `rpf9dump` already exports 37 core models; the 924 name-bearing system pages
    are the larger page population, but grouping them into complete resources needs the missing TOC or
    a page-graph rule.
-7. A page/texture decoder for `42 40 00 00` and zero-prefix pages. No DDS, `TXTR`, DXT or BC magic was
-   found at a stream start, so the texture format is not claimed from these bytes.
+7. A vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths;
+   decoding vertex values still requires component types, final-stream widths and a way to
+   locate the owning geometry when only a graphics page is available. Texture identification also remains open:
+   the stream-start scan found no DDS, `TXTR`, DXT or BC signature.
 8. An XML content-definition reader. The roots are content change sets, content definitions and
    `SSetupData`; this is configuration, not UI layout.
 9. A false-positive-aware magic scanner. `ADAT` inside `METADATA`, `AWC` inside names and `ATI2` inside
@@ -337,6 +476,9 @@ python -I tools/restofworld_index.py <archive.rpf> <work>\index.csv
 python -I tools/restofworld_index.py <archive.rpf> <work>\index.json
 python -I tests/test_restofworld_index.py
 ```
+
+`--start` must be 0 or more, and `--limit` and `--max-inflate` at least 1 (decimal or `0x` hex). An out-of-range
+value stops with a one-line error and exit code 2 before an index is written.
 
 For the map/meta split, run the `world_index.py` from `docs/world.md` over the same archive; it reports
 `maps`, `meta`, `entities` and the `0x7a` version without decoding geometry. The index tool walks readable

@@ -17,6 +17,8 @@ game data. Non-XML payloads follow the 64 KiB block rule; a file whose inflated 
 64 KiB can merge with the next stream. XML documents close on their root element, so their grouping is exact.
 The tool is standard library only and never writes outside the requested output files.
 """
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -35,6 +37,8 @@ BOM = b"\xef\xbb\xbf"
 XML_DECL = re.compile(rb"<\?xml[^>]*\?>")
 XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
 XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
+# Tag-like text inside these cannot open or close an element.
+XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
 MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1Z": "SPS1Z", b"RBF0": "RBF0", b"PSIN": "PSIN"}
 
 
@@ -47,9 +51,10 @@ def printable(data: bytes) -> float:
 
 
 def has_xml_decl(data: bytes) -> bool:
-    if data.startswith(BOM) and XML_DECL.match(data[3:]):
-        return True
-    return bool(XML_DECL.match(data) or XML_DECL.match(data.lstrip(b" \t\r\n")))
+    # xml_root() drops the BOM before looking for the declaration; do the same here, or a BOM followed by
+    # whitespace makes the two disagree and the stream is grouped by the 64 KiB binary rule instead.
+    text = data[3:] if data.startswith(BOM) else data
+    return bool(XML_DECL.match(text) or XML_DECL.match(text.lstrip(b" \t\r\n")))
 
 
 def xml_root(data: bytes) -> str:
@@ -80,13 +85,23 @@ def tail_root(data: bytes) -> str:
 
 
 def xml_complete(root: str, data: bytes) -> bool:
+    """True when every <root> in data is closed, not merely when a </root> occurs somewhere in the tail.
+
+    A nested element with the same name as the root used to satisfy the old substring test, so a truncated
+    document was reported complete and its continuation streams were not absorbed into the payload.
+    """
     if not root:
         return False
-    close = b"</" + root.encode("ascii", "replace") + b">"
-    if close in data[-65536:]:
-        return True
-    return bool(re.search(rb"<" + re.escape(root.encode("ascii", "replace")) + rb"\b[^>]*/>\s*$",
-                          data[-4096:]))
+    text = XML_NON_TAG.sub(b"", data)
+    name = re.escape(root.encode("ascii", "replace"))
+    # A quoted attribute value may contain '>'; consume quoted strings as one unit or a self-closing
+    # tag with such a value is mistaken for an unclosed element.
+    opens = re.findall(rb"<" + name + rb"(?=[\s/>])(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", text)
+    closes = re.findall(rb"</" + name + rb"\s*>", text)
+    self_closed = sum(1 for tag in opens if tag.rstrip().endswith(b"/>"))
+    if len(opens) - self_closed > len(closes):
+        return False
+    return bool(closes or self_closed)
 
 
 def standalone_xml(data: bytes) -> bool:
@@ -323,6 +338,15 @@ def write_csv(path: str, rows: list) -> None:
         w.writerows(rows)
 
 
+def same_report_path(first: str, second: str) -> bool:
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="carve directory or .rpf archive")
@@ -330,7 +354,12 @@ def main() -> int:
     ap.add_argument("--csv", help="write one row per payload to this CSV")
     ap.add_argument("--json", help="write the summary and rows to this JSON")
     a = ap.parse_args()
+    if a.csv and a.json and same_report_path(a.csv, a.json):
+        ap.error("--csv and --json must use different paths")
 
+    if not os.path.exists(a.target):
+        print(f"ERROR: {a.target} does not exist", file=sys.stderr)
+        return 2
     source = None
     try:
         if os.path.isdir(a.target):
@@ -339,6 +368,17 @@ def main() -> int:
             source = ArchiveSource(a.target, a.carve_dir)
         rows = build_rows(source.rows, source)
         summary = summarize(rows, source.summary, a.target)
+    except RuntimeError as e:          # rpf9_carve.py refused the archive; its own message says why
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as e:
+        print(f"ERROR: {e.filename} is missing. Give a carve folder from rpf9_carve.py or an .rpf archive.",
+              file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        where = getattr(e, "filename", None) or a.target
+        print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
+        return 2
     finally:
         if isinstance(source, ArchiveSource):
             source.close()

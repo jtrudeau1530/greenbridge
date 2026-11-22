@@ -2,7 +2,11 @@
 
 Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
 (BGRA8, RGBA8, BGRX8, RGBX8, and arbitrary 32-bit RGB/RGBA bitmasks) and
-block-compressed formats (BC1, BC2, BC3, BC4, BC5).
+block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
+
+BC7 covers all eight modes. DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB) emit
+the stored RGBA8 values with no sRGB transfer, and the reserved mode (no mode
+bit in the first byte) decodes as transparent black. BC6H is not supported.
 
 Usage:
     python -I tools/dds_png.py <in.dds> <out.png> [--max-size N]
@@ -16,9 +20,17 @@ import struct
 import sys
 import zlib
 
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+import bcpack_tables_bptc as _bptc  # noqa: E402
+
 DDS_MAGIC = b"DDS "
 DDS_HEADER_SIZE = 128
 DDS_DX10_HEADER_SIZE = 148
+DDSD_PITCH = 0x8
+DDS_ALPHA_MODE_MASK = 0x7
+DDS_ALPHA_MODE_OPAQUE = 3
 
 DDPF_ALPHAPIXELS = 0x1
 DDPF_FOURCC = 0x4
@@ -60,6 +72,9 @@ _DXGI_MAP: dict[int, str] = {
     82: "BC5",
     83: "BC5",
     84: "BC5_SNORM",
+    97: "BC7",
+    98: "BC7",
+    99: "BC7",
 }
 
 _CANONICAL_MASKS: dict[tuple[int, int, int, int], str] = {
@@ -78,6 +93,56 @@ _UNPACK_BC4 = struct.Struct("<Q").unpack_from
 _UNPACK_BC5 = struct.Struct("<QQ").unpack_from
 
 _BC5_Z_LUT: bytes | None = None
+
+# BC7 mode layouts (Microsoft BC7 format mode reference, Khronos BPTC):
+# (subsets, partition bits, rotation bits, index-selector bits, colour bits,
+#  alpha bits, p-bit per endpoint, p-bit per subset, index bits, second index bits).
+_BC7_MODES = (
+    (3, 4, 0, 0, 4, 0, 1, 0, 3, 0),
+    (2, 6, 0, 0, 6, 0, 0, 1, 3, 0),
+    (3, 6, 0, 0, 5, 0, 0, 0, 2, 0),
+    (2, 6, 0, 0, 7, 0, 1, 0, 2, 0),
+    (1, 0, 2, 1, 5, 6, 0, 0, 2, 3),
+    (1, 0, 2, 0, 7, 8, 0, 0, 2, 2),
+    (1, 0, 0, 0, 7, 7, 1, 0, 4, 0),
+    (2, 6, 0, 0, 5, 5, 1, 0, 2, 0),
+)
+_BC7_WEIGHTS = {
+    2: (0, 21, 43, 64),
+    3: (0, 9, 18, 27, 37, 46, 55, 64),
+    4: (0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64),
+}
+# Endpoint precision (bits plus p-bit, 5..8) -> 8-bit value by MSB replication.
+_BC7_UNQUANTIZE = {
+    prec: bytes((v << (8 - prec)) | (v >> (2 * prec - 8)) for v in range(1 << prec))
+    for prec in range(5, 9)
+}
+# Output byte for interpolated R, G, B, A under rotation 0-3 (A swaps with R, G or B).
+_BC7_ROTATIONS = ((0, 1, 2, 3), (3, 1, 2, 0), (0, 3, 2, 1), (0, 1, 3, 2))
+_BC7_RESERVED_BLOCK = bytes(64)
+_BC7_BLOCK_CACHE_LIMIT = 4096
+
+
+def _bc7_partition_layouts() -> tuple:
+    """Per subset count, each partition's (subset of pixel, pixel is anchor) tuples."""
+
+    def layout(subset_of, anchors):
+        return tuple(subset_of), tuple(int(p in anchors) for p in range(16))
+
+    two = tuple(
+        layout(((mask >> p) & 1 for p in range(16)), (0, anchor))
+        for mask, anchor in zip(_bptc.BC7_PART2_PACKED, _bptc.BC7_ANCHOR2)
+    )
+    three = tuple(
+        layout(((mask >> (2 * p)) & 3 for p in range(16)), (0, anchor_a, anchor_b))
+        for mask, anchor_a, anchor_b in zip(
+            _bptc.BC7_PART3_PACKED, _bptc.BC7_ANCHOR3A, _bptc.BC7_ANCHOR3B
+        )
+    )
+    return (None, (layout((0,) * 16, (0,)),), two, three)
+
+
+_BC7_LAYOUTS = _bc7_partition_layouts()
 
 
 class DdsError(ValueError):
@@ -169,18 +234,26 @@ def parse_dds_header(data: bytes) -> dict:
 
 
 def _decode_uncompressed_32(
-    payload: bytes | bytearray | memoryview,
+    payload: memoryview,
     width: int,
     height: int,
     fmt: str,
     masks: tuple[int, int, int, int] | None,
+    pitch: int,
 ) -> bytes:
     pixel_count = width * height
-    expected = pixel_count * 4
+    row_bytes = width * 4
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
     if len(payload) < expected:
         raise DdsError(f"Truncated {fmt} payload: {len(payload)} bytes (need {expected})")
 
-    src = bytes(payload[:expected])
+    if pitch == row_bytes:
+        src = bytes(payload[:expected])
+    else:
+        src = b"".join(payload[start : start + row_bytes] for start in range(0, height * pitch, pitch))
 
     if masks is None or masks in _CANONICAL_MASKS:
         if fmt == "RGBA8":
@@ -205,6 +278,7 @@ def _decode_uncompressed_32(
     b_shift, b_max = _validate_mask(masks[2])
     a_shift, a_max = _validate_mask(masks[3])
 
+    out = bytearray(len(src))
     # Fast path when all non-zero masks are byte-aligned 8-bit lanes.
     if (
         (r_max in (0, 255) and (r_shift & 7) == 0)
@@ -212,7 +286,6 @@ def _decode_uncompressed_32(
         and (b_max in (0, 255) and (b_shift & 7) == 0)
         and (a_max in (0, 255) and (a_shift & 7) == 0)
     ):
-        out = bytearray(expected)
         if r_max:
             out[0::4] = src[r_shift >> 3 :: 4]
         if g_max:
@@ -226,7 +299,6 @@ def _decode_uncompressed_32(
         return bytes(out)
 
     # General bitmask fallback (e.g. R10G10B10A2).
-    out = bytearray(expected)
     r_half = r_max >> 1
     g_half = g_max >> 1
     b_half = b_max >> 1
@@ -680,6 +752,135 @@ def _decode_bc5(
     return bytes(out)
 
 
+def _bc7_read_indices(bits: int, index_bits: int, is_anchor: tuple[int, ...]) -> tuple[list[int], int]:
+    """Read 16 LSB-first pixel indices; anchor pixels omit their implicit zero MSB."""
+    indices = []
+    for anchor in is_anchor:
+        width = index_bits - anchor
+        indices.append(bits & ((1 << width) - 1))
+        bits >>= width
+    return indices, bits
+
+
+def _decode_bc7_block(block: int) -> bytes:
+    """Decode one little-endian 128-bit BC7 block to 64 bytes of row-major RGBA8."""
+    if not block & 0xFF:
+        return _BC7_RESERVED_BLOCK
+    mode = (block & -block).bit_length() - 1
+    (subsets, partition_bits, rotation_bits, selector_bits, color_bits, alpha_bits,
+     endpoint_pbits, shared_pbits, index_bits, index2_bits) = _BC7_MODES[mode]
+
+    # Fields are LSB-first: mode, partition, rotation, index selector, endpoints,
+    # p-bits, then the index set(s).
+    bits = block >> (mode + 1)
+    partition = bits & ((1 << partition_bits) - 1)
+    bits >>= partition_bits
+    rotation = bits & ((1 << rotation_bits) - 1)
+    bits >>= rotation_bits
+    selector = bits & ((1 << selector_bits) - 1)
+    bits >>= selector_bits
+
+    # All R endpoints, then all G, B and A, each ordered subset 0 end 0, subset 0 end 1, ...
+    endpoint_count = 2 * subsets
+    channel_bits = (color_bits,) * 3 + ((alpha_bits,) if alpha_bits else ())
+    raw_channels = []
+    for width in channel_bits:
+        mask = (1 << width) - 1
+        values = []
+        for _ in range(endpoint_count):
+            values.append(bits & mask)
+            bits >>= width
+        raw_channels.append(values)
+
+    if endpoint_pbits:
+        pbits = [(bits >> e) & 1 for e in range(endpoint_count)]
+        bits >>= endpoint_count
+    elif shared_pbits:
+        pbits = [(bits >> (e >> 1)) & 1 for e in range(endpoint_count)]
+        bits >>= subsets
+    else:
+        pbits = None
+
+    endpoints = []
+    for width, values in zip(channel_bits, raw_channels):
+        if pbits is not None:
+            values = [(v << 1) | p for v, p in zip(values, pbits)]
+            width += 1
+        unquantize = _BC7_UNQUANTIZE[width]
+        endpoints.append([unquantize[v] for v in values])
+
+    subset_of, is_anchor = _BC7_LAYOUTS[subsets][partition]
+    color_indices, bits = _bc7_read_indices(bits, index_bits, is_anchor)
+    color_weights = alpha_weights = _BC7_WEIGHTS[index_bits]
+    if index2_bits:
+        # Modes 4 and 5: the selector swaps which index set drives colour and alpha.
+        alpha_indices, _ = _bc7_read_indices(bits, index2_bits, is_anchor)
+        alpha_weights = _BC7_WEIGHTS[index2_bits]
+        if selector:
+            color_indices, alpha_indices = alpha_indices, color_indices
+            color_weights, alpha_weights = alpha_weights, color_weights
+    else:
+        if subsets > 1:
+            # Address the per-subset palettes concatenated below.
+            stride = len(color_weights)
+            color_indices = [s * stride + i for s, i in zip(subset_of, color_indices)]
+        alpha_indices = color_indices
+
+    # Alpha stays 255 in modes 0-3; rotation is applied after interpolation.
+    out = bytearray(b"\xff" * 64)
+    order = _BC7_ROTATIONS[rotation]
+    for channel, ends in enumerate(endpoints):
+        if channel == 3:
+            weights, indices = alpha_weights, alpha_indices
+        else:
+            weights, indices = color_weights, color_indices
+        palette = []
+        for e0, e1 in zip(ends[0::2], ends[1::2]):
+            palette += [(e0 * (64 - w) + e1 * w + 32) >> 6 for w in weights]
+        out[order[channel]::4] = bytes(map(palette.__getitem__, indices))
+    return bytes(out)
+
+
+def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, height: int) -> bytes:
+    blocks_x = (width + 3) // 4
+    blocks_y = (height + 3) // 4
+    expected = blocks_x * blocks_y * 16
+    if len(data) - offset < expected:
+        raise DdsError(f"Truncated BC7 payload: {len(data) - offset} bytes (need {expected})")
+
+    out = bytearray(width * height * 4)
+    row_stride = width * 4
+    cache: dict[bytes, bytes] = {}
+    from_bytes = int.from_bytes
+    pos = offset
+
+    for by in range(blocks_y):
+        py0 = by * 4
+        max_y = height - py0
+        if max_y > 4:
+            max_y = 4
+        row_base = py0 * row_stride
+
+        for bx in range(blocks_x):
+            key = bytes(data[pos : pos + 16])
+            pos += 16
+            block_rgba = cache.get(key)
+            if block_rgba is None:
+                block_rgba = _decode_bc7_block(from_bytes(key, "little"))
+                if len(cache) < _BC7_BLOCK_CACHE_LIMIT:
+                    cache[key] = block_rgba
+
+            px0 = bx * 4
+            span = min(width - px0, 4) * 4
+            dst = row_base + px0 * 4
+            for ty in range(max_y):
+                src = ty * 16
+                out[dst : dst + span] = block_rgba[src : src + span]
+                dst += row_stride
+
+    return bytes(out)
+
+
 def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     """Decode mip 0 of a DDS buffer into top-down row-major RGBA8 bytes."""
     info, masks = _parse_header_internal(data)
@@ -689,7 +890,9 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     offset = int(info["data_offset"])  # type: ignore[arg-type]
 
     if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8"):
-        rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks)
+        flags = struct.unpack_from("<I", data, 8)[0]
+        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
+        rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks, pitch)
     elif fmt == "BC1":
         rgba = _decode_bc1(data, offset, width, height)
     elif fmt == "BC2":
@@ -704,8 +907,17 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
         rgba = _decode_bc5(data, offset, width, height, signed=False)
     elif fmt == "BC5_SNORM":
         rgba = _decode_bc5(data, offset, width, height, signed=True)
+    elif fmt == "BC7":
+        rgba = _decode_bc7(data, offset, width, height)
     else:
         raise DdsError(f"Unsupported DDS format: {fmt}")
+
+    if offset == DDS_DX10_HEADER_SIZE:
+        misc_flags2 = struct.unpack_from("<I", data, 144)[0]
+        if misc_flags2 & DDS_ALPHA_MODE_MASK == DDS_ALPHA_MODE_OPAQUE:
+            opaque = bytearray(rgba)
+            opaque[3::4] = b"\xff" * (width * height)
+            rgba = bytes(opaque)
 
     return width, height, rgba
 
@@ -757,7 +969,9 @@ def downscale_rgba(width: int, height: int, rgba: bytes, max_size: int) -> tuple
     if len(rgba) != expected:
         raise DdsError(f"Invalid RGBA buffer length: {len(rgba)} (expected {expected})")
 
-    if max_size <= 0 or max(width, height) <= max_size:
+    if max_size < 0:
+        raise DdsError(f"Invalid max_size: {max_size}")
+    if max_size == 0 or max(width, height) <= max_size:
         return width, height, bytes(rgba) if not isinstance(rgba, bytes) else rgba
 
     w, h = width, height
@@ -800,6 +1014,8 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
 
 def dds_to_png_bytes(data: bytes, max_size: int = 0) -> bytes:
     """Decode a DDS buffer (optionally downscaling) and encode as PNG bytes."""
+    if max_size < 0:
+        raise DdsError(f"Invalid max_size: {max_size}")
     w, h, rgba = decode_dds(data)
     if max_size > 0:
         w, h, rgba = downscale_rgba(w, h, rgba, max_size)
@@ -824,8 +1040,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Downscale via repeated 2x box filter until max(width, height) <= N (0 = disabled)",
     )
     args = ap.parse_args(argv)
+    if args.max_size < 0:
+        ap.error("--max-size must be 0 or more")
 
     try:
+        try:
+            overwrites_input = os.path.samefile(args.input, args.output)
+        except FileNotFoundError:
+            overwrites_input = False
+        if overwrites_input:
+            raise DdsError("output must not overwrite the input DDS")
         png = dds_file_to_png_bytes(args.input, max_size=args.max_size)
         parent = os.path.dirname(os.path.abspath(args.output))
         if parent:
