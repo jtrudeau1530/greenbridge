@@ -8,10 +8,13 @@
 // and ...Float, which the D3D12 methods keep):
 // - Uint copies the low n bits of value i into channel i, where n is the channel's width, with no conversion,
 //   whatever the format's type: 0x3f800000 into an R32_FLOAT channel is 1.0, 0xff into an R8_UNORM one is 1.0.
-//   A raw or structured buffer view takes value 0 for every 32-bit word.
+//   A raw or structured buffer view takes value 0 for every 32-bit word. R9G9B9E5_SHAREDEXP has no independent
+//   per-channel integer bit layout and WARP clears it to 0 for any uint input.
 // - Float converts to the format: UNORM and SNORM clamp to [0, 1] / [-1, 1] and round to nearest (NaN is 0);
 //   16-bit and the packed 11/10-bit floats round toward zero, a finite value too large becoming the largest finite
 //   (D3D11.3 3.2.2; WARP and NVIDIA agree), and the small floats have no sign: negative is 0.
+//   R9G9B9E5_SHAREDEXP clamps negative/NaN to 0 and +Inf/overflow to 65408.0, shares the largest channel's
+//   exponent and rounds mantissas half-up (bumping the exponent on 512), matching WARP.
 //   D3D11 calls Float on an integer view invalid and D3D12 does not say; here the value is converted to the
 //   integer (rounded toward zero, clamped, NaN is 0) so the result is defined. A raw or structured buffer view
 //   takes value 0's bits.
@@ -35,7 +38,7 @@
 
 namespace leonida::uav_clear {
 
-enum class Kind : std::uint8_t { unorm, snorm, uint, sint, sfloat, ufloat };
+enum class Kind : std::uint8_t { unorm, snorm, uint, sint, sfloat, ufloat, shared_exp };
 
 // One channel: where its bits are in the element (little-endian, from bit 0 of byte 0) and how many.
 struct Channel {
@@ -66,6 +69,7 @@ inline constexpr Layout layouts[] = {
     {VK_FORMAT_A2B10G10R10_UNORM_PACK32, Kind::unorm, 4, {{{0, 10}, {10, 10}, {20, 10}, {30, 2}}}},
     {VK_FORMAT_A2B10G10R10_UINT_PACK32, Kind::uint, 4, {{{0, 10}, {10, 10}, {20, 10}, {30, 2}}}},
     {VK_FORMAT_B10G11R11_UFLOAT_PACK32, Kind::ufloat, 4, {{{0, 11}, {11, 11}, {22, 10}, {}}}},
+    {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, Kind::shared_exp, 4, {{{0, 9}, {9, 9}, {18, 9}, {27, 5}}}},
     {VK_FORMAT_R8G8B8A8_UNORM, Kind::unorm, 4, {{{0, 8}, {8, 8}, {16, 8}, {24, 8}}}},
     {VK_FORMAT_R8G8B8A8_SNORM, Kind::snorm, 4, {{{0, 8}, {8, 8}, {16, 8}, {24, 8}}}},
     {VK_FORMAT_R8G8B8A8_UINT, Kind::uint, 4, {{{0, 8}, {8, 8}, {16, 8}, {24, 8}}}},
@@ -184,6 +188,33 @@ inline std::uint32_t to_integer(float value, bool is_signed, unsigned bits) {
     return std::uint32_t(std::clamp(std::trunc(double(value)), 0.0, std::ldexp(1.0, int(bits)) - 1));
 }
 
+// Shared-exponent 9:9:9:5 unsigned float (EXT_texture_shared_exponent / D3D11.3).
+// Clamps negative and NaN to 0 and overflow/+Inf to 65408.0 ((511/512) * 2^16), shares the largest channel's
+// exponent, rounds mantissas half-up (floor(c / denom + 0.5)), and bumps the exponent if the largest mantissa
+// rounds to 512. Matches ClearUnorderedAccessViewFloat on WARP.
+inline std::uint32_t to_rgb9e5(float r, float g, float b) {
+    constexpr float max_value = 65408.0f;
+    const auto clamp_channel = [](float v) { return !(v > 0.0f) ? 0.0f : (v > max_value ? max_value : v); };
+    r = clamp_channel(r);
+    g = clamp_channel(g);
+    b = clamp_channel(b);
+    const float max_c = std::max(r, std::max(g, b));
+    if (max_c == 0.0f) return 0u;
+    int exp_raw = 0;
+    std::frexp(max_c, &exp_raw);  // floor(log2(max_c)) == exp_raw - 1
+    int exp_shared = std::max(0, exp_raw + 15);
+    double denom = std::ldexp(1.0, exp_shared - 24);  // 2^(exp_shared - 15 - 9)
+    const int max_m = static_cast<int>(std::floor(double(max_c) / denom + 0.5));
+    if (max_m == 512) {
+        ++exp_shared;
+        denom *= 2.0;
+    }
+    const auto rm = static_cast<std::uint32_t>(std::floor(double(r) / denom + 0.5));
+    const auto gm = static_cast<std::uint32_t>(std::floor(double(g) / denom + 0.5));
+    const auto bm = static_cast<std::uint32_t>(std::floor(double(b) / denom + 0.5));
+    return rm | (gm << 9) | (bm << 18) | (static_cast<std::uint32_t>(exp_shared) << 27);
+}
+
 }  // namespace detail
 
 // The element a clear writes into a view of `format`. `values` are the call's four UINTs, or the bits of its four
@@ -193,6 +224,14 @@ inline bool encode(VkFormat format, bool is_float, const std::array<std::uint32_
     if (!l) return false;
     out = {};
     out.size = l->bytes;
+    if (l->kind == Kind::shared_exp) {
+        const std::uint32_t word = is_float ? detail::to_rgb9e5(std::bit_cast<float>(values[0]),
+                                                                std::bit_cast<float>(values[1]),
+                                                                std::bit_cast<float>(values[2]))
+                                            : 0u;
+        std::memcpy(out.bytes.data(), &word, 4);
+        return true;
+    }
     for (unsigned i = 0; i < 4; ++i) {
         const Channel c = l->rgba[i];
         if (!c.bits) continue;
@@ -215,6 +254,7 @@ inline bool encode(VkFormat format, bool is_float, const std::array<std::uint32_
         case Kind::sint: detail::put(out, c, detail::to_integer(v, true, c.bits)); break;
         case Kind::sfloat:
         case Kind::ufloat: detail::put(out, c, detail::to_float_bits(v, *l, c.bits)); break;
+        case Kind::shared_exp: break;
         }
     }
     return true;
@@ -226,6 +266,16 @@ inline bool decode(VkFormat format, const Element& element, VkClearColorValue& o
     const Layout* l = layout(format);
     if (!l || l->bytes != element.size) return false;
     out = {};
+    if (l->kind == Kind::shared_exp) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, element.bytes.data(), 4);
+        const float scale = std::ldexp(1.0f, static_cast<int>(word >> 27) - 24);
+        out.float32[0] = float(word & 0x1ffu) * scale;
+        out.float32[1] = float((word >> 9) & 0x1ffu) * scale;
+        out.float32[2] = float((word >> 18) & 0x1ffu) * scale;
+        out.float32[3] = 1.0f;
+        return true;
+    }
     for (unsigned i = 0; i < 4; ++i) {
         const Channel c = l->rgba[i];
         if (!c.bits) continue;
@@ -246,6 +296,7 @@ inline bool decode(VkFormat format, const Element& element, VkClearColorValue& o
         }
         case Kind::sfloat:
         case Kind::ufloat: out.float32[i] = detail::from_float_bits(raw, *l, c.bits); break;
+        case Kind::shared_exp: break;
         }
     }
     return true;

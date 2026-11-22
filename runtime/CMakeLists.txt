@@ -751,6 +751,29 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_uav_clear COMMAND d3d12_uav_clear_test)
     set_tests_properties(d3d12_uav_clear PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Emulation of R9G9B9E5_SHAREDEXP UAV textures as mutable R32_UINT on GPUs without E5B9G9R9 storage:
+    # format support, 1D/2D/3D/reserved creation, SRV/UAV T#s, WARP differential UAV clears, cross-backing copies,
+    # and set-0 storage write -> E5B9G9R9 sampled HDR round-trip.
+    add_executable(d3d12_r9g9b9e5_uav_test test/d3d12_r9g9b9e5_uav_test.cpp)
+    target_link_libraries(d3d12_r9g9b9e5_uav_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_r9g9b9e5_uav_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_r9g9b9e5_uav COMMAND d3d12_r9g9b9e5_uav_test)
+    set_tests_properties(d3d12_r9g9b9e5_uav PROPERTIES SKIP_RETURN_CODE 77)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_TEST_CS_R9G9B9E5_UAV ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_r9g9b9e5_uav.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_R9G9B9E5_UAV}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_R9G9B9E5_UAV}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_r9g9b9e5_uav.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_r9g9b9e5_uav.comp
+        COMMENT "Compiling cs_r9g9b9e5_uav.comp"
+        VERBATIM)
+      target_sources(d3d12_r9g9b9e5_uav_test PRIVATE ${LEONIDA_TEST_CS_R9G9B9E5_UAV})
+      target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE
+        LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV="${LEONIDA_TEST_CS_R9G9B9E5_UAV}")
+    endif()
+
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
     add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
     target_link_libraries(d3d12_debug_markers_test PRIVATE gta6rt_d3d12_com)
@@ -936,6 +959,11 @@ if(TARGET Vulkan::Headers)
     if(TARGET bvh_builder_test)
       target_link_libraries(bvh_builder_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(bvh_builder_test PRIVATE LEONIDA_VULKAN_DEVICE)
+    endif()
+    # fsr_dispatch_test can put the package's FidelityFX DLL on this device too (LEONIDA_FSR_DEVICE=vulkan).
+    if(TARGET fsr_dispatch_test)
+      target_link_libraries(fsr_dispatch_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(fsr_dispatch_test PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
   else()
     message(STATUS "Python 3, Windows or d3d12.h missing: the D3D12 COM objects and d3d12_com_test are not built")
