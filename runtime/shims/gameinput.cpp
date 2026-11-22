@@ -1190,10 +1190,12 @@ HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* de
     if (device) {
         Device* dev = as_device(device);
         if (dev->info.deviceFamily == GameInputFamilyAggregate) {
-            const uint32_t effective_kind = (kind != GameInputKindUnknown) ? kind : dev->info.supportedInput;
+            if (kind != GameInputKindUnknown && !(kind & dev->info.supportedInput))
+                return GAMEINPUT_E_READING_NOT_FOUND;
+            const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & dev->info.supportedInput) : dev->info.supportedInput;
             scope.clear();
             for (Device* cd : s.connected) {
-                if (effective_kind == GameInputKindUnknown || (effective_kind & cd->info.supportedInput)) {
+                if (effective_kind & cd->info.supportedInput) {
                     scope.push_back(cd);
                 }
             }
@@ -1246,9 +1248,11 @@ public:
         if (device) {
             Device* d = as_device(device);
             if (d->info.deviceFamily == GameInputFamilyAggregate) {
-                const uint32_t effective_kind = (kind != GameInputKindUnknown) ? kind : d->info.supportedInput;
+                if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
+                    return GAMEINPUT_E_READING_NOT_FOUND;
+                const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & d->info.supportedInput) : d->info.supportedInput;
                 for (Device* cd : g().connected) {
-                    if (effective_kind != GameInputKindUnknown && !(effective_kind & cd->info.supportedInput)) continue;
+                    if (!(effective_kind & cd->info.supportedInput)) continue;
                     if (Reading* r = cd->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
                 }
             } else {
@@ -1283,6 +1287,9 @@ public:
 
     HRESULT STDMETHODCALLTYPE RegisterReadingCallback(IGameInputDevice* device, uint32_t kind, float, void* context,
                                                       GameInputReadingCallback fn, GameInputCallbackToken* token) override {
+        if (token) *token = kInvalidCallbackToken;
+        if (!fn) return E_INVALIDARG;
+        if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         return add({0, CbType::Reading, as_device(device), kind, 0, context, reinterpret_cast<void*>(fn), true}, token);
     }
 
@@ -1291,6 +1298,7 @@ public:
                                                      GameInputDeviceCallback fn, GameInputCallbackToken* token) override {
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
+        if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         State& s = g();
         GameInputCallbackToken t;
         std::vector<Event> now;
