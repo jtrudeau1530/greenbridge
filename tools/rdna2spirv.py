@@ -1932,6 +1932,14 @@ class Gen:
             # Every format in FORMATS (the same table the loads decode); unknown formats store nothing.
             fc = comps + [self.cu(0)] * (4 - len(comps))
             ic = icomps + [self.cu(0)] * (4 - len(icomps))
+            # Normalized stores map either sign of NaN to zero before clamping.
+            # Compute this once per source component; float and integer formats use the original bits.
+            normalized = []
+            for component, float_value in zip(comps, fl):
+                nan, value = self.tmp(), self.tmp()
+                self.emit(f"{nan} = OpIsNan %bool {float_value}")
+                self.emit(f"{value} = OpSelect %uint {nan} {self.cu(0)} {component}")
+                normalized.append(value)
             for code, (size, kind, widths) in self.FORMATS.items():
                 e = self.tmp()
                 self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
@@ -1940,7 +1948,8 @@ class Gen:
                 self.emit(f"OpBranchConditional {e} {ld} {le}")
                 self.emit(f"{ld} = OpLabel")
                 ncomp = min(len(widths), n)
-                fcs = fc[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
+                source = normalized if kind in ("unorm", "snorm") else fc
+                fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
                 ics = ic[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
                 words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
                 if size >= 4:
