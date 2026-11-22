@@ -253,12 +253,12 @@ What is implemented (all of it testable without the game):
     single-mip, single-sample 2D texture: extra mips, multisampling and 3D are refused in creation, allocation
     and footprints. Format support reports `TEXTURE2D` and `CAST_WITHIN_BIT_LAYOUT`, not the host's display,
     back-buffer-cast or video-processor bits;
-  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS`, `OPTIONS1`,
-    `OPTIONS2`–`5`, `7`–`9`, `11`–`21`), GPU virtual-address support, format support, format plane counts,
+  - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS`, `OPTIONS2`–`5`,
+    `7`–`9`, `11`–`21`), GPU virtual-address support, format support, format plane counts,
     multisample quality levels, shader model and root signature version. `D3D12_OPTIONS8` reports unaligned block
     textures when the Vulkan logical device enables BC texture compression, and `D3D12_OPTIONS12` reports
-    `RelaxedFormatCastingSupported = TRUE`, so a committed texture accepts a castable-format list. Other queries
-    (including `OPTIONS6`/`10`) are logged and refused until the trace shows what the game asks (question 11);
+    `RelaxedFormatCastingSupported = TRUE`, so a committed or placed texture accepts a castable-format list. Other queries
+    (including `OPTIONS1`/`6`/`10`) are logged and refused until the trace shows what the game asks (question 11);
   - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
     image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
@@ -281,10 +281,11 @@ What is implemented (all of it testable without the game):
     | `SamplerFeedbackMipRegion` on a buffer | ignored |
     | a buffer's initial layout other than `UNDEFINED` | `E_INVALIDARG` |
     | a castable-format count with a null list | no list (`S_OK`) |
-    | a castable-format list | accepted on a texture when the formats map to Vulkan formats: the image is mutable and carries a `VkImageFormatListCreateInfo`; a buffer or an unmapped format is `E_INVALIDARG`. The list is kept on the resource, so an SRV whose format is neither the resource format nor in the list leaves a null descriptor. The resource's own format is always accepted and is added to the Vulkan format list when the D3D12 list omits it. A listed same-size cross-family cast, such as `R8G8B8A8_UINT` to `R32_UINT`, is accepted. `D3D12_OPTIONS12` reports `RelaxedFormatCastingSupported = TRUE` (this layer requires Vulkan 1.3, where the format list is core) |
+    | a castable-format list | accepted on a texture when the formats map to Vulkan formats: the image is mutable and carries a `VkImageFormatListCreateInfo`; a buffer or an unmapped format is `E_INVALIDARG`. A cast whose texel size differs from the resource's is also `E_INVALIDARG` — the host refuses other sizes, and a size-mismatched format list is a Vulkan validation error (`VUID-VkImageCreateInfo-pNext-06722`). The list is kept on the resource, so an SRV whose format is neither the resource format nor in the list leaves a null descriptor. The resource's own format is always accepted and is added to the Vulkan format list when the D3D12 list omits it. A listed same-size cross-family cast, such as `R8G8B8A8_UINT` to `R32_UINT`, is accepted. An RTV in a listed RGBA8 family format on a typed `R8G8B8A8_UNORM` texture clears through the cast, the same reinterpretation a typeless RTV uses; without a list a typed resource still refuses a different-format RTV. `D3D12_OPTIONS12` reports `RelaxedFormatCastingSupported = TRUE` (this layer requires Vulkan 1.3, where the format list is core). `CreatePlacedResource2`'s list reaches its placed image through the same rules (D3D-90) |
     | `CreateCommandQueue1`'s creator ID | ignored |
 
-    `CreatePlacedResource1/2` and `CreateHeap1` wait for #286's base methods.
+    `CreatePlacedResource1/2` wrap the placed path above; `2` carries the castable-format list. `CreateHeap1`
+    remains a stub.
   - `CreateSampler2` as a wrapper over `CreateSampler` (D3D-28, part 2). Without flags it writes the same S#.
     `D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR` reads the union as integers. `(0,0,0,0)`, `(0,0,0,1)` and `(1,1,1,1)`
     take the S#'s transparent-black, opaque-black and opaque-white types. The S# has no separate integer types,
@@ -518,7 +519,8 @@ The compute path, end to end:
     `SetPredication` on a default-heap buffer reads at the buffer's offset in the arena plus the call's offset.
   - `CreateHeap` reserves the requested size in the arena at 64 KiB, and a buffer placed in it gets the heap's
     place plus the placed offset as its console VA. A placed texture keeps its own `VkDeviceMemory` and a null VA,
-    and a tiled (`64KB_UNDEFINED_SWIZZLE`) placement is refused with `E_NOTIMPL`.
+    and a tiled (`64KB_UNDEFINED_SWIZZLE`) placement is refused with `E_NOTIMPL`. `CreatePlacedResource2`'s
+    castable-format list reaches the placed texture's image as the committed path's does (D3D-90).
 
 Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and
 therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
@@ -595,7 +597,9 @@ and any validation error fails them.
   round trip and a buffer region. A 4x multisampled render target is cleared through a `TEXTURE2DMS` view and
   resolved into a texture that is read back; the multisampled shapes D3D12 refuses are refused, and so is a
   resolve from a single-sampled texture. `GetCopyableFootprints` is compared with the PC runtime's, and a short
-  run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
+  run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes. That standalone run also covers
+  heaps and placed resources: a castable list on a placed texture is cleared through an RTV in a cast format and
+  read back against the host's answer, and refused lists match the host's `E_INVALIDARG` (D3D-90).
   The comparison tests run against a PC D3D12 device: the default adapter, or the one named by
   `LEONIDA_HOST_ADAPTER` (`warp`, or part of an adapter's name; the adapter used is printed). Some answers are the
   driver's choice, so pick the host side when two adapters disagree: `GetResourceTiling` splits standard and packed
@@ -1214,8 +1218,8 @@ The trace will enumerate them.
   concrete image format plus `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and a `VK_KHR_image_format_list` when views cast
   within the family; unsupported casts are logged and fall back to the resource format. `CreateCommittedResource3`'s
   castable-format lists are mapped to a `VkImageFormatListCreateInfo`; buffers and unmapped formats are refused.
-  `CreatePlacedResource2` is still absent here, waiting on #286 (D3D-16). Depth/stencil, BCn and packed formats map
-  directly; any format the device rejects is a hard error with the DXGI value.
+  `CreatePlacedResource2`'s list is mapped the same way on the placed path (D3D-90). Depth/stencil, BCn and packed
+  formats map directly; any format the device rejects is a hard error with the DXGI value.
 - `Map`/`Unmap`: upload/readback buffers map their host-visible memory; default-heap resources return
   `E_INVALIDARG` as D3D12 does. A texture in a CPU-visible custom heap maps only with a null pointer (its layout is
   the driver's), as on D3D12.

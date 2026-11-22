@@ -610,6 +610,31 @@ Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc
     return format;
 }
 
+// The castable-format list a committed or placed texture was created with, mapped to Vulkan (D3D-85's committed
+// path, D3D-90's placed one). Each format must map and be the same texel size as the resource's: the host PC
+// runtime refuses other sizes, and a size-mismatched VkImageFormatListCreateInfo is a Vulkan validation error
+// (VUID-VkImageCreateInfo-pNext-06722). A nonzero count with a null list is no list. E_INVALIDARG on a bad format.
+HRESULT castable_view_formats(const Format& format, UINT32 count, const DXGI_FORMAT* castable,
+                              std::vector<VkFormat>& out) {
+    if (!count || !castable) return S_OK;
+    const bool depth = (format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+    const leonida::BlockFormat own = leonida::block_format(format.format, format.aspects);
+    for (UINT32 i = 0; i < count; ++i) {
+        const Format cast = vulkan_format(castable[i], depth);
+        if (cast.format == VK_FORMAT_UNDEFINED) {
+            log_once("castable format not supported yet:", castable[i]);
+            return E_INVALIDARG;
+        }
+        const leonida::BlockFormat block = leonida::block_format(cast.format, cast.aspects);
+        if (own.bytes && block.bytes && (block.bytes != own.bytes || block.block != own.block)) {
+            log_once("castable format is a different texel size than the resource:", castable[i]);
+            return E_INVALIDARG;
+        }
+        if (std::find(out.begin(), out.end(), cast.format) == out.end()) out.push_back(cast.format);
+    }
+    return S_OK;
+}
+
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12DescriptorHeap> {
@@ -836,6 +861,7 @@ public:
         leonida::ResourceBinding binding{};
         binding.image = image_;
         binding.rgba8_typeless = desc_.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        binding.castable_view_formats = !view_formats_.empty();  // a castable list made the image mutable
         binding.format = format.format;
         binding.aspects = format.aspects;
         binding.width = std::uint32_t(desc_.Width);
@@ -2550,7 +2576,15 @@ public:
                 view = {};
             } else if (typeless_rgba8 || typed_rgba8) {
                 const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
-                if (typeless_rgba8) {
+                // A typed UNORM RGBA8 resource with a castable list may be viewed in a listed family format
+                // (D3D-85's committed path, D3D-90's placed one): its image is mutable and lists the view
+                // format, so the reinterpretation is the typeless path's. Only a UNORM image is advertised,
+                // as that is what the clear path reinterprets. The switch knows the RGBA8 family only.
+                const bool listed = requested == rd.Format ||
+                                    (r->has_view_format_list() &&
+                                     r->allows_view_format(vulkan_format(requested, false).format));
+                if (typeless_rgba8 || (requested != rd.Format && listed &&
+                                       rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
                     const bool plain = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
                     const bool array = desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
                     const UINT plane = plain ? desc->Texture2D.PlaneSlice :
@@ -2993,9 +3027,50 @@ public:
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
                                                    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
                                                    const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+        return create_placed(heap_interface, heap_offset, desc, 0, nullptr, riid, out);
+    }
+
+    // Device8: the DESC1 placed variant without a castable list. A texture with a mip region gets the failure
+    // answer, as on the PC runtime; a buffer's mip region is ignored.
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource1(ID3D12Heap* heap_interface, UINT64 heap_offset,
+                                                    const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES,
+                                                    const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        if (texture_mip_region(*desc)) return E_INVALIDARG;
+        const D3D12_RESOURCE_DESC base = resource_desc(*desc);
+        return create_placed(heap_interface, heap_offset, &base, 0, nullptr, riid, out);
+    }
+
+    // Device10: an initial layout instead of a state, and the castable-format list, which the placed texture's
+    // Vulkan image takes exactly as the committed path's does. A count with a null array is no list (as on the
+    // PC runtime); the layer reports RelaxedFormatCastingSupported, so a real list is passed through.
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource2(ID3D12Heap* heap_interface, UINT64 heap_offset,
+                                                    const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
+                                                    const D3D12_CLEAR_VALUE*, UINT32 castable_count,
+                                                    const DXGI_FORMAT* castable, REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        if (texture_mip_region(*desc)) return E_INVALIDARG;
+        // Enhanced barriers: a buffer has no layout, so its initial layout must be UNDEFINED.
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && layout != D3D12_BARRIER_LAYOUT_UNDEFINED)
+            return E_INVALIDARG;
+        const D3D12_RESOURCE_DESC base = resource_desc(*desc);
+        return create_placed(heap_interface, heap_offset, &base, castable_count, castable, riid, out);
+    }
+
+    // The placed path every CreatePlacedResource variant shares. A castable-format list reaches the placed
+    // texture's Vulkan image as the committed path's does (create_committed): a buffer with a list is
+    // E_INVALIDARG, and so is a format with no Vulkan mapping.
+    HRESULT create_placed(ID3D12Heap* heap_interface, UINT64 heap_offset, const D3D12_RESOURCE_DESC* desc,
+                          UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return E_INVALIDARG;
+        if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            log_once("castable formats on a placed buffer are invalid; count", int(castable_count));
+            return E_INVALIDARG;
+        }
         if (heap_offset % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
             log_once("placed resource offset not 64 KiB aligned:", int(heap_offset));
             return E_INVALIDARG;
@@ -3021,8 +3096,15 @@ public:
         } else if (desc->SampleDesc.Count > 1) {
             log_once("multisampled placed resource not supported; samples", int(desc->SampleDesc.Count));
         } else {
+            hr = S_OK;
             const Format format = state_.texture_format(*desc);
-            hr = format.format == VK_FORMAT_UNDEFINED ? E_INVALIDARG : resource->create_texture(format);
+            if (format.format == VK_FORMAT_UNDEFINED) {
+                hr = E_INVALIDARG;
+            } else {
+                std::vector<VkFormat> cast_formats;
+                hr = castable_view_formats(format, castable_count, castable, cast_formats);
+                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+            }
         }
         if (FAILED(hr)) {
             resource->Release();
@@ -3295,20 +3377,6 @@ public:
             *opts = {};
             opts->DynamicDepthBiasSupported = FALSE;
             opts->GPUUploadHeapSupported = FALSE;
-            return S_OK;
-        }
-        case D3D12_FEATURE_D3D12_OPTIONS1: {
-            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1)) return E_INVALIDARG;
-            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1*>(data);
-            const DeviceState::SubgroupFacts& facts = state_.subgroup_facts();
-            *opts = {};
-            opts->WaveOps = facts.wave_ops;
-            opts->WaveLaneCountMin = facts.lane_min;
-            opts->WaveLaneCountMax = facts.lane_max;
-            // D3D12 counts every lane of the device here, and Vulkan has no such number. This is one full wave
-            // (section 4.1): a game that sizes work from it plans for less parallelism than the GPU has, not more.
-            opts->TotalLaneCount = facts.lane_max;
-            opts->ExpandedComputeResourceStates = TRUE;  // Vulkan has no resource states to expand
             return S_OK;
         }
         case D3D12_FEATURE_D3D12_OPTIONS12: {
@@ -3714,19 +3782,7 @@ private:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                if (castable_count && castable) {
-                    const bool depth = (format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
-                    for (UINT32 i = 0; i < castable_count; ++i) {
-                        const Format cast = vulkan_format(castable[i], depth);
-                        if (cast.format == VK_FORMAT_UNDEFINED) {
-                            log_once("castable format not supported yet:", castable[i]);
-                            hr = E_INVALIDARG;
-                            break;
-                        }
-                        if (std::find(cast_formats.begin(), cast_formats.end(), cast.format) == cast_formats.end())
-                            cast_formats.push_back(cast.format);
-                    }
-                }
+                hr = castable_view_formats(format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
             }
         }

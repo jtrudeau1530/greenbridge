@@ -67,6 +67,8 @@ struct ResourceBinding {
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
     bool rgba8_typeless = false;       // Original resource was R8G8B8A8_TYPELESS; views may reinterpret it.
+    bool castable_view_formats = false;  // A creation-time castable list made the image mutable (D3D-85/D3D-90),
+                                         // so views may reinterpret it as typeless resources do.
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
 };
 
@@ -777,7 +779,9 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     return value;
 }
 
-// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format.
+// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format. A typeless
+// resource or one created with a castable-format list (its image is mutable and lists the view formats) may be
+// reinterpreted; the reinterpretation itself is the UNORM image's.
 inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
     if (target.format == ColorViewFormat::resource)
         return resource.rgba8_typeless ? VK_FORMAT_UNDEFINED : resource.format;
@@ -788,7 +792,8 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     case ColorViewFormat::rgba8_uint: format = VK_FORMAT_R8G8B8A8_UINT; break;
     default: return VK_FORMAT_UNDEFINED;
     }
-    if (!resource.rgba8_typeless) return format == resource.format ? format : VK_FORMAT_UNDEFINED;
+    if (!resource.rgba8_typeless && !resource.castable_view_formats)
+        return format == resource.format ? format : VK_FORMAT_UNDEFINED;
     if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1 || resource.samples != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
