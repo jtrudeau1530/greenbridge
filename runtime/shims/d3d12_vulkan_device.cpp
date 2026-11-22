@@ -77,6 +77,9 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color, true};
     case DXGI_FORMAT_R10G10B10A2_UNORM: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color};
     case DXGI_FORMAT_R10G10B10A2_UINT: return {VK_FORMAT_A2B10G10R10_UINT_PACK32, color};
+    // XR_BIAS is the same packed 10:10:10:2 bit layout as R10G10B10A2_UNORM. Vulkan has no XR_BIAS format:
+    // the application biases and scales the channels in its shader, so the resource itself is an ordinary UNORM.
+    case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM: return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, color};
     case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: return {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, color};
     case DXGI_FORMAT_R11G11B10_FLOAT: return {VK_FORMAT_B10G11R11_UFLOAT_PACK32, color};
     case DXGI_FORMAT_R8G8B8A8_TYPELESS: return {VK_FORMAT_R8G8B8A8_UNORM, color, true};
@@ -156,6 +159,15 @@ UINT16 full_mips(UINT64 width, UINT height, UINT depth) {
     UINT16 mips = 0;
     for (UINT64 size = std::max<UINT64>({width, height, depth}); size; size >>= 1) ++mips;
     return mips;
+}
+
+// XR_BIAS is a display format: the PC runtime accepts it only as a single-mip, single-sample 2D texture, and
+// refuses 3D, extra mips and multisampling in creation, allocation and footprints alike.
+bool xr_bias_compatible(const D3D12_RESOURCE_DESC& desc) {
+    if (desc.Format != DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM) return true;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return false;
+    const UINT mips = desc.MipLevels ? desc.MipLevels : full_mips(desc.Width, desc.Height, 1);
+    return mips == 1;
 }
 
 // A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
@@ -294,6 +306,7 @@ struct DeviceState {
 
     // The format a texture description is created with, D24S8's fallback included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
+        if (!xr_bias_compatible(desc)) return {};
         if (desc.Format == DXGI_FORMAT_A8_UNORM &&
             (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
              (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
@@ -2038,7 +2051,7 @@ public:
             }
             if (total) *total = ~0ull;
         };
-        if (!desc) return fail();
+        if (!desc || !xr_bias_compatible(*desc)) return fail();
         const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (first != 0 || count != 1) return fail();
@@ -2401,6 +2414,13 @@ public:
             if (vk_fmt == VK_FORMAT_UNDEFINED || !state_.format_properties) {
                 return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             }
+            if (fs->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM) {
+                // The host reports this display format as 2D, display, cast-within-bit-layout, back-buffer-cast and
+                // video-processor output, and no shader reads. The layer has the 2D resource and the bit-compatible
+                // view cast; it has no display scan-out or video processor, so it reports only what it provides.
+                fs->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT;
+                return S_OK;
+            }
             VkFormatProperties props{};
             state_.format_properties(state_.info.physical, vk_fmt, &props);
             const VkFormatFeatureFlags optimal = props.optimalTilingFeatures;
@@ -2488,6 +2508,8 @@ public:
                 return d3d12_trace::result(method, E_INVALIDARG);
             const bool alpha_only = levels->Format == DXGI_FORMAT_A8_UNORM;
             if (alpha_only && levels->SampleCount != 1) return d3d12_trace::result(method, S_OK);
+            if (levels->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && levels->SampleCount != 1)
+                return d3d12_trace::result(method, S_OK);  // single-sample 2D only; no quality levels
             Format format = texture_storage_format(levels->Format, false);
             if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
                 D3D12_RESOURCE_DESC depth_desc{};
