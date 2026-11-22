@@ -171,5 +171,34 @@ class FallbackVertexShader(unittest.TestCase):
         self.assertNotIn("f16_halves", meta)
 
 
+class FallbackStagePair(unittest.TestCase):
+    def test_producer_output_budget_at_the_pixel_inputs(self):
+        # Each vertex writes the same values, so smooth interpolation preserves them.
+        vs = ["v_mov_b32_e32 v1, 0x42004000",  # packed f16: low 2.0, high 3.0
+              "v_mov_b32_e32 v2, 0x40a00000",  # ordinary f32: 5.0
+              "v_mov_b32_e32 v3, 0x40e00000",  # ordinary f32: 7.0
+              "exp pos0 v1, v1, v1, v1 done", "exp param0 v1, v1, v1, v1"]
+        ps = ["v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
+              "v_interp_p1ll_f16 v3, v0, attr0.x high", "v_interp_p2_f16 v3, v1, attr0.x, v3 high",
+              "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"]
+        pixel, pixel_meta = translate("ps_budget", ps)
+        self.assertEqual(pixel_meta["f16_halves"], {"0": [28, 29]})
+        for fits, exports, expected in (
+                (True, ["exp param27 v2, v2, v2, v2"], (2.0, 3.0)),
+                (False, ["exp param28 v2, v2, v2, v2", "exp param29 v3, v3, v3, v3"], (5.0, 7.0))):
+            with self.subTest(halves_fit=fits):
+                vertex, vertex_meta = translate("vs_budget", vs + exports + ["s_endpgm"])
+                self.assertEqual(vertex_meta.get("f16_halves", {}), pixel_meta["f16_halves"] if fits else {})
+                outputs = run_fragment(vertex)
+                # Link the two translated modules by their emitted SPIR-V Location decorations.
+                locations = {loc: tuple(f32(w) for w in outputs[var]) for var, loc in
+                             re.findall(r"OpDecorate (%out_\w+) Location (\d+)", vertex)}
+                inputs = {var: locations[loc] for var, loc in
+                          re.findall(r"OpDecorate (%in_\w+) Location (\d+)", pixel)}
+                words = support.mrt0_words(pixel, inputs=inputs)
+                actual = tuple(struct.unpack("<e", struct.pack("<H", w & 0xffff))[0] for w in words[:2])
+                self.assertEqual(actual, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
