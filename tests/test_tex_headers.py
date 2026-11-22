@@ -847,6 +847,19 @@ class CliInputTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "tex_headers.py"), *args],
                               capture_output=True, text=True, timeout=60)
 
+    def test_out_in_a_missing_folder_is_created(self):
+        # Before: main() opened --out directly after the scan, so this ended in a FileNotFoundError traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "carve", "a"))
+            with open(os.path.join(tmp, "carve", "a", "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"files": []}, f)
+            out = os.path.join(tmp, "no", "such", "textures.json")
+            p = self.run_tool(os.path.join(tmp, "carve"), "--out", out)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), [])
+
     def test_bad_carve_folders_are_usage_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "carve", "a"))
