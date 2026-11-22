@@ -21,9 +21,9 @@
 #include "../src/shader_library.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
+#include "../src/vulkan13_features.h"
 
 #include <vulkan/vulkan_win32.h>
-
 
 #include <algorithm>
 #include <atomic>
@@ -5244,7 +5244,8 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
                                     i.queue_family, riid, out);
 }
 
-// Creates its own Vulkan 1.3 instance and device. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
+// Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and
+// VK_KHR_synchronization2 (vulkan13_features.h). LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -5342,18 +5343,18 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     bool chosen_bc = false;
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
+    leonida::Vulkan13Features v13, candidate13;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
-        if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
-        VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
+        if (!leonida::vulkan_device_wanted(props.deviceName)) continue;
+        candidate13.query(candidate, props.apiVersion, vkGetPhysicalDeviceFeatures2, vkEnumerateDeviceExtensionProperties);
+        if (!candidate13.usable()) continue;
+        VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
         vkGetPhysicalDeviceFeatures2(candidate, &features);
         const bool bc = features.features.textureCompressionBC;
-        if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore ||
-            !f12.separateDepthStencilLayouts || !f12.bufferDeviceAddress)
-            continue;
+        if (!f12.timelineSemaphore || !f12.separateDepthStencilLayouts || !f12.bufferDeviceAddress) continue;
         std::uint32_t family_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
@@ -5367,16 +5368,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 chosen_bc = bc;
                 chosen_features = features.features;
                 chosen12 = f12;
+                v13.choose(candidate13);
             }
             break;
         }
     }
     if (!info.physical)
         return fail(leonida::vulkan_device_filter().empty()
-                        ? "no Vulkan 1.3 GPU with dynamicRendering, synchronization2, timelineSemaphore and "
-                          "separateDepthStencilLayouts"
-                        : "no GPU named by LEONIDA_VK_DEVICE has Vulkan 1.3 with dynamicRendering, synchronization2, "
-                          "timelineSemaphore and separateDepthStencilLayouts");
+                        ? "no Vulkan 1.3 GPU (or 1.2 with VK_KHR_dynamic_rendering and VK_KHR_synchronization2) with "
+                          "dynamicRendering, synchronization2, timelineSemaphore and separateDepthStencilLayouts"
+                        : "no GPU named by LEONIDA_VK_DEVICE has Vulkan 1.3 (or 1.2 with VK_KHR_dynamic_rendering and "
+                          "VK_KHR_synchronization2) with dynamicRendering, synchronization2, timelineSemaphore and "
+                          "separateDepthStencilLayouts");
+    if (!v13.core)
+        std::fprintf(stderr, "[rt] d3d12: Vulkan 1.2 device: dynamicRendering and synchronization2 through their KHR "
+                             "extensions\n");
 
     // VK_EXT_conditional_rendering for SetPredication, VK_KHR_swapchain for DXGI presentation, and optional
     // VK_KHR_acceleration_structure + VK_KHR_ray_query for hardware BVH builds (BLAS + TLAS).
@@ -5436,10 +5442,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         ext_chain = &enable_conditional;
     }
 
-    VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, ext_chain};
-    enable13.dynamicRendering = VK_TRUE;
-    enable13.synchronization2 = VK_TRUE;
-    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
+    VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                              v13.enable(ext_chain)};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
     info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
@@ -5505,8 +5509,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
         info.image_view_min_lod = min_lod.minLod == VK_TRUE;
         if (info.image_view_min_lod) {
-            min_lod.pNext = enable13.pNext;
-            enable13.pNext = &min_lod;
+            min_lod.pNext = *v13.next();
+            *v13.next() = &min_lod;
         }
     }
     VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
@@ -5517,8 +5521,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
     info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
     if (info.host_image_copy) {
-        host_copy.pNext = enable13.pNext;  // after the conditional rendering features, if any
-        enable13.pNext = &host_copy;
+        host_copy.pNext = *v13.next();  // after the conditional rendering features, if any
+        *v13.next() = &host_copy;
     } else {
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
@@ -5535,8 +5539,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
         info.shader_fma = shader_fma.shaderFmaFloat32 == VK_TRUE;
         if (info.shader_fma) {
-            shader_fma.pNext = enable13.pNext;
-            enable13.pNext = &shader_fma;
+            shader_fma.pNext = *v13.next();
+            *v13.next() = &shader_fma;
         }
     }
 #endif
@@ -5572,6 +5576,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
     std::vector<const char*> device_extensions;
+    v13.add_extensions(device_extensions);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);

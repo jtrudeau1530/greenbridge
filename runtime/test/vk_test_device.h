@@ -1,10 +1,12 @@
-// Shared setup for the GPU tests of the D3D12 layer: a Vulkan 1.3 device with dynamicRendering, synchronization2,
-// timelineSemaphore and separateDepthStencilLayouts, images, buffers and one-shot submissions.
+// Shared setup for the GPU tests of the D3D12 layer: a Vulkan 1.3 device (or 1.2 with VK_KHR_dynamic_rendering and
+// VK_KHR_synchronization2) with dynamicRendering, synchronization2, timelineSemaphore and
+// separateDepthStencilLayouts, images, buffers and one-shot submissions.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; Device::validation_errors() counts errors.
 #pragma once
 
 #include "vulkan_loader.h"
 #include "../src/vulkan_device_filter.h"
+#include "../src/vulkan13_features.h"
 #include "vk_device_pick.h"
 
 #include <algorithm>
@@ -125,9 +127,10 @@ public:
             reinterpret_cast<PFN_vkDestroyInstance>(instance_proc(instance, "vkDestroyInstance"))(instance, nullptr);
     }
 
+    // A Vulkan 1.3 function falls back to its KHR name on a 1.2 device.
     template<typename F>
     F fn(const char* name) const {
-        return reinterpret_cast<F>(device_proc(device, name));
+        return reinterpret_cast<F>(leonida::device_proc_or_khr(device_proc, device, name));
     }
 
     template<typename F>
@@ -234,10 +237,16 @@ public:
         if (result != VK_SUCCESS) return failure("vkEnumeratePhysicalDevices", result);
         VkPhysicalDeviceProperties chosen{};
         int best_rank = -1;
+        const auto features2_of = instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2");
+        const auto device_extensions_of =
+            instance_fn<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
+        leonida::Vulkan13Features candidate13;
         for (auto candidate : devices) {
             VkPhysicalDeviceProperties props{};
             properties_of(candidate, &props);
-            if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
+            if (!leonida::vulkan_device_wanted(props.deviceName)) continue;
+            candidate13.query(candidate, props.apiVersion, features2_of, device_extensions_of);
+            if (!candidate13.usable()) continue;
             std::uint32_t family_count = 0;
             families_of(candidate, &family_count, nullptr);
             std::vector<VkQueueFamilyProperties> families(family_count);
@@ -250,6 +259,7 @@ public:
                     family = i;
                     chosen = props;
                     best_rank = rank;
+                    v13_.choose(candidate13);
                 }
                 break;
             }
@@ -257,21 +267,24 @@ public:
         if (!physical) {
             if (const std::string filter = leonida::vulkan_device_filter(); !filter.empty()) {
                 // A filter that matches nothing fails the test instead of skipping it.
-                std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 device with a graphics queue matches\n",
+                std::fprintf(stderr,
+                             "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 device (or 1.2 with VK_KHR_dynamic_rendering and "
+                             "VK_KHR_synchronization2) with a graphics queue matches\n",
                              filter.c_str());
                 return DeviceStatus::failed;
             }
-            std::fprintf(stderr, "no Vulkan 1.3 device with a graphics queue\n");
+            std::fprintf(stderr, "no Vulkan 1.3 device (or 1.2 with VK_KHR_dynamic_rendering and "
+                                 "VK_KHR_synchronization2) with a graphics queue\n");
             return DeviceStatus::unavailable;
         }
-        std::printf("device: %s%s\n", chosen.deviceName, validation ? " (validation on)" : "");
+        std::printf("device: %s%s%s\n", chosen.deviceName, v13_.core ? "" : " (Vulkan 1.2 + KHR extensions)",
+                    validation ? " (validation on)" : "");
 
-        VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features13};
+        VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
-        instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
-        if (!features13.dynamicRendering || !features13.synchronization2 || !features12.timelineSemaphore ||
-            !features12.separateDepthStencilLayouts || !features12.bufferDeviceAddress) {
+        features2_of(physical, &features);
+        if (!features12.timelineSemaphore || !features12.separateDepthStencilLayouts ||
+            !features12.bufferDeviceAddress) {
             std::fprintf(stderr, "the device lacks dynamicRendering, synchronization2, timelineSemaphore or "
                                  "separateDepthStencilLayouts\n");
             return DeviceStatus::unavailable;
@@ -297,11 +310,8 @@ public:
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
         enable_conditional.conditionalRendering = VK_TRUE;
 
-        VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                                  conditional_rendering ? &enable_conditional : nullptr};
-        enable13.dynamicRendering = VK_TRUE;
-        enable13.synchronization2 = VK_TRUE;
-        VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
+        VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                                  v13_.enable(conditional_rendering ? &enable_conditional : nullptr)};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
         storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;
@@ -350,8 +360,8 @@ public:
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             image_view_min_lod = min_lod.minLod == VK_TRUE;
             if (image_view_min_lod) {
-                min_lod.pNext = enable13.pNext;
-                enable13.pNext = &min_lod;
+                min_lod.pNext = *v13_.next();
+                *v13_.next() = &min_lod;
             }
         }
         VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{
@@ -364,8 +374,8 @@ public:
         }
         const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
         if (host_image_copy) {
-            host_copy.pNext = enable13.pNext;  // after the conditional rendering features, if any
-            enable13.pNext = &host_copy;
+            host_copy.pNext = *v13_.next();  // after the conditional rendering features, if any
+            *v13_.next() = &host_copy;
         }
 
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
@@ -378,8 +388,8 @@ public:
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             shader_fma = fma_features.shaderFmaFloat32 == VK_TRUE;
             if (shader_fma) {
-                fma_features.pNext = enable13.pNext;
-                enable13.pNext = &fma_features;
+                fma_features.pNext = *v13_.next();
+                *v13_.next() = &fma_features;
             }
         }
 #endif
@@ -393,6 +403,7 @@ public:
         device_info.pEnabledFeatures = &enable;
         enabled = enable;
         std::vector<const char*> device_extensions;
+        v13_.add_extensions(device_extensions);
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
@@ -543,6 +554,7 @@ private:
     VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory_{};
+    leonida::Vulkan13Features v13_;  // the chosen device's dynamicRendering/synchronization2 path
     std::vector<std::pair<VkImage, VkDeviceMemory>> images_;
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> buffers_;
 };
