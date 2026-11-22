@@ -176,6 +176,21 @@ def structure(succ):
 
 
 
+def depth(tree):
+    """Nesting depth of a tree from structure(): a block is depth 0 and each guard or loop adds one."""
+    best = 0
+    stack = [(tree, 0)]
+    while stack:
+        items, d = stack.pop()
+        for it in items:
+            if it[0] == "block":
+                best = max(best, d)
+            else:
+                best = max(best, d + 1)
+                stack.append((it[2], d + 1))
+    return best
+
+
 def _sccs(nodes, adj):
     """Iterative Tarjan's algorithm over `nodes` with adjacency `adj`; returns SCCs with >= 2 nodes."""
     index, low, on_stack, stack, out = {}, {}, set(), [], []

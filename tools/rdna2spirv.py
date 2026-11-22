@@ -38,6 +38,12 @@ import shader_meta as _shader_meta  # noqa: E402
 import wave64_halves  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
+# Deeper structured trees are emitted in the flat dispatch-loop form instead. `spirv-val`'s selection/loop
+# checking cost grows with the nesting depth: over the 1.0.2.1 corpus (26,503 modules) the deepest block of a
+# module is nested 118 constructs deep and 85% of the validation time is in modules nested 20 or deeper, while
+# the dispatch-loop form validates a depth-20 module 1.4x faster, a depth-50 one 2.3x and a depth-77 one 4.5x
+# (SHADER-299, docs/design.md "Control flow"). Both forms are equivalent; only the routing differs.
+MAX_STRUCTURED_DEPTH = 16
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 # --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
 # default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
@@ -10165,6 +10171,11 @@ def assemble(gen):
     out = hdr + dec + types + gvars + helpers + fn
     tree = (cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate and not gen.bar_rounds
             else None)
+    if tree is not None:
+        nesting = cfg_structure.depth(tree)
+        if nesting > MAX_STRUCTURED_DEPTH:
+            tree = None                              # too deep to validate cheaply: use the flat form
+        gen.nesting = nesting
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
     if gen.emulate:
         gen.control_flow = "emulated wave64 rounds"
