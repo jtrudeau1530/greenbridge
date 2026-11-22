@@ -1476,5 +1476,100 @@ class TestValuSubrevF16ConditionCodesAndFlags(unittest.TestCase):
         self.assertEqual(borrow0, 0)
 
 
+class TestValuSubrevF16IEEE754Boundaries(unittest.TestCase):
+    """Exhaustive IEEE 754-2008 boundary extremes, subnormals, and NaN handling tests for v_subrev_f16."""
+
+    def test_signed_zero_combinations(self) -> None:
+        # All 4 permutations of signed zero operands
+        # S1 - S0:
+        # (+0.0) - (+0.0) -> +0.0
+        self.assertEqual(ref_subrev_f16(POS_ZERO_F16, POS_ZERO_F16), POS_ZERO_F16)
+        # (+0.0) - (-0.0) -> +0.0
+        self.assertEqual(ref_subrev_f16(NEG_ZERO_F16, POS_ZERO_F16), POS_ZERO_F16)
+        # (-0.0) - (+0.0) -> -0.0
+        self.assertEqual(ref_subrev_f16(POS_ZERO_F16, NEG_ZERO_F16), NEG_ZERO_F16)
+        # (-0.0) - (-0.0) -> +0.0
+        self.assertEqual(ref_subrev_f16(NEG_ZERO_F16, NEG_ZERO_F16), POS_ZERO_F16)
+
+    def test_subnormal_boundary_transitions(self) -> None:
+        # MIN_NORMAL = 0x0400 (2^-14). Subtract MIN_SUBNORMAL = 0x0001 (2^-24).
+        # Expected result is MAX_SUBNORMAL = 0x03FF.
+        res = ref_subrev_f16(MIN_SUBNORMAL_F16, MIN_NORMAL_F16)
+        self.assertEqual(res, MAX_SUBNORMAL_F16)
+        self.assertTrue(is_subnormal_f16(res))
+
+        # Reversing: MIN_SUBNORMAL - MIN_NORMAL = -MAX_SUBNORMAL
+        res_rev = ref_subrev_f16(MIN_NORMAL_F16, MIN_SUBNORMAL_F16)
+        self.assertEqual(res_rev, MAX_SUBNORMAL_F16 | SIGN_MASK_F16)
+        self.assertTrue(is_subnormal_f16(res_rev))
+
+    def test_subnormal_precision_and_gradual_underflow(self) -> None:
+        # Subtraction of two close normalized numbers that results in a subnormal
+        # 1.0009765625 (0x3C01) - 1.0 (0x3C00) = 2^-10 in normal range,
+        # but near MIN_NORMAL: 0x0401 - 0x0400 = 0x0001 (MIN_SUBNORMAL)
+        val_a = 0x0401
+        val_b = 0x0400
+        res = ref_subrev_f16(val_b, val_a)
+        self.assertEqual(res, MIN_SUBNORMAL_F16)
+        self.assertTrue(is_subnormal_f16(res))
+
+    def test_infinity_edge_cases(self) -> None:
+        # (+inf) - (+inf) -> Canonical Quiet NaN
+        self.assertEqual(ref_subrev_f16(POS_INF_F16, POS_INF_F16), CANONICAL_QNAN_F16)
+        # (-inf) - (-inf) -> Canonical Quiet NaN
+        self.assertEqual(ref_subrev_f16(NEG_INF_F16, NEG_INF_F16), CANONICAL_QNAN_F16)
+        # (+inf) - (-inf) -> +inf
+        self.assertEqual(ref_subrev_f16(NEG_INF_F16, POS_INF_F16), POS_INF_F16)
+        # (-inf) - (+inf) -> -inf
+        self.assertEqual(ref_subrev_f16(POS_INF_F16, NEG_INF_F16), NEG_INF_F16)
+
+        # Infinities with modifiers: S1 - (-|S0|): (+inf) - (-|+inf|) = (+inf) - (-inf) = +inf
+        res_mod = ref_subrev_f16(POS_INF_F16, POS_INF_F16, abs0=True, neg0=True)
+        self.assertEqual(res_mod, POS_INF_F16)
+
+    def test_nan_quieting_and_payload_preservation(self) -> None:
+        # Signaling NaNs must have quiet bit (bit 9) set
+        snan_payload = 0x7C55
+        self.assertTrue(is_snan_f16(snan_payload))
+        res_s0 = ref_subrev_f16(snan_payload, ONE_F16)
+        self.assertTrue(is_qnan_f16(res_s0))
+        self.assertEqual(res_s0 & QNAN_BIT_F16, QNAN_BIT_F16)
+
+        res_s1 = ref_subrev_f16(ONE_F16, snan_payload)
+        self.assertTrue(is_qnan_f16(res_s1))
+        self.assertEqual(res_s1 & QNAN_BIT_F16, QNAN_BIT_F16)
+
+        # Quiet NaN payload preserved
+        qnan_payload = 0x7EAA
+        res_q = ref_subrev_f16(qnan_payload, ONE_F16)
+        self.assertTrue(is_qnan_f16(res_q))
+
+    def test_nan_clamping_to_zero(self) -> None:
+        # In RDNA2, clamping any NaN result produces +0.0
+        qnan = CANONICAL_QNAN_F16
+        snan = SNAN_DEFAULT_F16
+        self.assertEqual(ref_subrev_f16(qnan, ONE_F16, clamp=True), POS_ZERO_F16)
+        self.assertEqual(ref_subrev_f16(ONE_F16, qnan, clamp=True), POS_ZERO_F16)
+        self.assertEqual(ref_subrev_f16(snan, ONE_F16, clamp=True), POS_ZERO_F16)
+        self.assertEqual(ref_subrev_f16(POS_INF_F16, POS_INF_F16, clamp=True), POS_ZERO_F16)
+
+    def test_max_finite_overflow_boundaries(self) -> None:
+        # 65504.0 - (-1.0) = 65505.0 -> rounds to 65504.0 (even tie)
+        res_near = ref_subrev_f16(NEG_ONE_F16, MAX_FINITE_F16)
+        self.assertEqual(res_near, MAX_FINITE_F16)
+
+        # 65504.0 - (-16.0) -> overflows to +inf
+        f_neg16 = f16_to_bits(-16.0)
+        res_over = ref_subrev_f16(f_neg16, MAX_FINITE_F16)
+        self.assertEqual(res_over, POS_INF_F16)
+
+    def test_subnormal_with_modifiers(self) -> None:
+        # S0 = -MIN_SUBNORMAL, S1 = MIN_SUBNORMAL. With abs0: S1 - |-S0| = 0
+        s0 = MIN_SUBNORMAL_F16 | SIGN_MASK_F16
+        s1 = MIN_SUBNORMAL_F16
+        res = ref_subrev_f16(s0, s1, abs0=True)
+        self.assertEqual(res, POS_ZERO_F16)
+
+
 if __name__ == "__main__":
     unittest.main()
