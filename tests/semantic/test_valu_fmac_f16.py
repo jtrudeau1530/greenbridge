@@ -376,5 +376,372 @@ class TestFmacF16MathematicalOracle(unittest.TestCase):
         self.assertEqual(u_res, f16_to_u16(2.0))
 
 
+class Opcode(Enum):
+    V_FMAC_F16 = "v_fmac_f16"
+
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    INLINE_CONST = auto()
+    LITERAL_CONST = auto()
+
+
+class HalfSel(Enum):
+    LO = 0  # bits 15:0 (.l)
+    HI = 1  # bits 31:16 (.h)
+
+    def to_asm(self) -> str:
+        return "l" if self == HalfSel.LO else "h"
+
+
+class TypeKind(Enum):
+    FLOAT16 = "f16"
+    UINT16 = "u16"
+    UINT32 = "u32"
+
+
+class OMod(Enum):
+    NONE = 0
+    MUL2 = 1
+    MUL4 = 2
+    DIV2 = 3
+
+    def to_asm(self) -> str:
+        if self == OMod.MUL2:
+            return "mul:2"
+        elif self == OMod.MUL4:
+            return "mul:4"
+        elif self == OMod.DIV2:
+            return "div:2"
+        return ""
+
+
+class ASTOperand:
+    """Symbolic AST operand representing a 16-bit register half, constant, or literal with modifiers."""
+
+    def __init__(
+        self,
+        kind: OperandKind,
+        index: int = 0,
+        half: HalfSel = HalfSel.LO,
+        value: float | int | None = None,
+        *,
+        neg: bool = False,
+        abs_: bool = False,
+        type_kind: TypeKind = TypeKind.FLOAT16,
+    ) -> None:
+        self.kind = kind
+        self.index = index
+        self.half = half
+        self.value = value
+        self.neg = neg
+        self.abs_ = abs_
+        self.type_kind = type_kind
+
+    @classmethod
+    def vgpr(
+        cls,
+        index: int,
+        half: HalfSel = HalfSel.LO,
+        *,
+        neg: bool = False,
+        abs_: bool = False,
+    ) -> ASTOperand:
+        return cls(OperandKind.VGPR, index=index, half=half, neg=neg, abs_=abs_)
+
+    @classmethod
+    def sgpr(
+        cls,
+        index: int,
+        half: HalfSel = HalfSel.LO,
+        *,
+        neg: bool = False,
+        abs_: bool = False,
+    ) -> ASTOperand:
+        return cls(OperandKind.SGPR, index=index, half=half, neg=neg, abs_=abs_)
+
+    @classmethod
+    def inline_const(cls, value: float, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.INLINE_CONST, value=value, neg=neg, abs_=abs_)
+
+    @classmethod
+    def literal_const(cls, value: float, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.LITERAL_CONST, value=value, neg=neg, abs_=abs_)
+
+    def disasm(self) -> str:
+        if self.kind == OperandKind.VGPR:
+            body = f"v{self.index}.{self.half.to_asm()}"
+        elif self.kind == OperandKind.SGPR:
+            body = f"s{self.index}.{self.half.to_asm()}"
+        elif self.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            body = str(self.value)
+        else:
+            raise ValueError(f"Unknown operand kind: {self.kind}")
+
+        if self.abs_:
+            body = f"|{body}|"
+        if self.neg:
+            body = f"-{body}"
+        return body
+
+    def __repr__(self) -> str:
+        return f"ASTOperand({self.disasm()}, type={self.type_kind.value})"
+
+
+class ASTInstruction:
+    """Symbolic AST instruction representation for v_fmac_f16: D = (S0 * S1) + D."""
+
+    def __init__(
+        self,
+        opcode: Opcode,
+        dst: ASTOperand,
+        src0: ASTOperand,
+        src1: ASTOperand,
+        *,
+        clamp: bool = False,
+        omod: OMod = OMod.NONE,
+    ) -> None:
+        self.opcode = opcode
+        self.dst = dst
+        self.src0 = src0
+        self.src1 = src1
+        self.clamp = clamp
+        self.omod = omod
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.V_FMAC_F16:
+            raise ValueError(f"Invalid opcode for v_fmac_f16 AST: {self.opcode}")
+        if self.dst.kind != OperandKind.VGPR:
+            raise TypeError("Destination must be a VGPR accumulator")
+        if self.dst.type_kind != TypeKind.FLOAT16:
+            raise TypeError(f"Destination type must be FLOAT16, got {self.dst.type_kind}")
+        if not (0 <= self.dst.index <= 255):
+            raise ValueError(f"Destination VGPR index out of range: {self.dst.index}")
+        if self.dst.neg or self.dst.abs_:
+            raise ValueError("Destination accumulator operand cannot have neg/abs modifiers")
+
+        for i, src in enumerate((self.src0, self.src1)):
+            if src.type_kind != TypeKind.FLOAT16:
+                raise TypeError(f"Source operand {i} type must be FLOAT16, got {src.type_kind}")
+            if src.kind == OperandKind.VGPR and not (0 <= src.index <= 255):
+                raise ValueError(f"Source {i} VGPR index out of range: {src.index}")
+            if src.kind == OperandKind.SGPR and not (0 <= src.index <= 105):
+                raise ValueError(f"Source {i} SGPR index out of range: {src.index}")
+
+    def disasm(self) -> str:
+        parts = [
+            self.opcode.value,
+            f"{self.dst.disasm()},",
+            f"{self.src0.disasm()},",
+            self.src1.disasm(),
+        ]
+        if self.omod != OMod.NONE:
+            parts.append(self.omod.to_asm())
+        if self.clamp:
+            parts.append("clamp")
+        return " ".join(parts)
+
+    def __repr__(self) -> str:
+        return f"ASTInstruction({self.disasm()})"
+
+
+class TypedExpr:
+    """Base class for typed symbolic expressions."""
+
+    def __init__(self, type_kind: TypeKind = TypeKind.FLOAT16) -> None:
+        self.type_kind = type_kind
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        raise NotImplementedError
+
+    def simplify(self) -> TypedExpr:
+        return self
+
+
+class VariableExpr(TypedExpr):
+    """Named variable in symbolic expression tree (e.g. representing a register value)."""
+
+    def __init__(self, name: str, type_kind: TypeKind = TypeKind.FLOAT16) -> None:
+        super().__init__(type_kind)
+        self.name = name
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        if self.name not in env:
+            raise KeyError(f"Variable {self.name} not found in evaluation environment")
+        return env[self.name]
+
+    def __repr__(self) -> str:
+        return f"Var({self.name})"
+
+
+class ConstantExpr(TypedExpr):
+    """Constant literal in symbolic expression tree."""
+
+    def __init__(self, value: float, type_kind: TypeKind = TypeKind.FLOAT16) -> None:
+        super().__init__(type_kind)
+        self.value = value
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        return self.value
+
+    def __repr__(self) -> str:
+        return f"Const({self.value})"
+
+
+class UnaryOpExpr(TypedExpr):
+    """Unary modifier applied to a typed expression ('neg' or 'abs')."""
+
+    def __init__(self, op: str, expr: TypedExpr, type_kind: TypeKind = TypeKind.FLOAT16) -> None:
+        super().__init__(type_kind)
+        if op not in ("neg", "abs"):
+            raise ValueError(f"Unknown unary operator: {op}")
+        self.op = op
+        self.expr = expr
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        val = self.expr.evaluate(env)
+        if self.op == "abs":
+            return math.fabs(val)
+        elif self.op == "neg":
+            return -val
+        return val
+
+    def simplify(self) -> TypedExpr:
+        sub = self.expr.simplify()
+        if isinstance(sub, ConstantExpr):
+            if self.op == "abs":
+                return ConstantExpr(math.fabs(sub.value), self.type_kind)
+            elif self.op == "neg":
+                return ConstantExpr(-sub.value, self.type_kind)
+        return UnaryOpExpr(self.op, sub, self.type_kind)
+
+    def __repr__(self) -> str:
+        return f"{self.op}({self.expr})"
+
+
+class FMAC16Expr(TypedExpr):
+    """Symbolic FMAC ternary typed expression: (src0 * src1) + acc with modifiers."""
+
+    def __init__(
+        self,
+        src0: TypedExpr,
+        src1: TypedExpr,
+        acc: TypedExpr,
+        *,
+        clamp: bool = False,
+        omod: OMod = OMod.NONE,
+        type_kind: TypeKind = TypeKind.FLOAT16,
+    ) -> None:
+        super().__init__(type_kind)
+        self.src0 = src0
+        self.src1 = src1
+        self.acc = acc
+        self.clamp = clamp
+        self.omod = omod
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        v0 = self.src0.evaluate(env)
+        v1 = self.src1.evaluate(env)
+        va = self.acc.evaluate(env)
+        return ref_fmac_f16(v0, v1, va, clamp=self.clamp, omod=self.omod.value)
+
+    def simplify(self) -> TypedExpr:
+        s0 = self.src0.simplify()
+        s1 = self.src1.simplify()
+        sa = self.acc.simplify()
+        if isinstance(s0, ConstantExpr) and isinstance(s1, ConstantExpr) and isinstance(sa, ConstantExpr):
+            res = ref_fmac_f16(s0.value, s1.value, sa.value, clamp=self.clamp, omod=self.omod.value)
+            return ConstantExpr(res, self.type_kind)
+        return FMAC16Expr(s0, s1, sa, clamp=self.clamp, omod=self.omod, type_kind=self.type_kind)
+
+    def __repr__(self) -> str:
+        return f"FMAC16({self.src0}, {self.src1}, {self.acc}, clamp={self.clamp}, omod={self.omod.name})"
+
+
+class TestFmacF16SymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_validation(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.HI),
+        )
+        inst.validate()
+        self.assertEqual(inst.disasm(), "v_fmac_f16 v0.l, v1.l, v2.h")
+
+    def test_ast_with_modifiers_and_disasm(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.HI, neg=True, abs_=True),
+            src1=ASTOperand.sgpr(2, HalfSel.LO),
+            clamp=True,
+            omod=OMod.MUL2,
+        )
+        inst.validate()
+        self.assertEqual(inst.disasm(), "v_fmac_f16 v0.l, -|v1.h|, s2.l mul:2 clamp")
+
+    def test_ast_validation_errors(self):
+        # Invalid destination kind
+        bad_dst = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(TypeError):
+            bad_dst.validate()
+
+        # Destination has modifiers (illegal in RDNA2)
+        bad_dst_mod = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(0, neg=True),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(ValueError):
+            bad_dst_mod.validate()
+
+        # Destination out of bounds
+        bad_index = ASTInstruction(
+            opcode=Opcode.V_FMAC_F16,
+            dst=ASTOperand.vgpr(256),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(ValueError):
+            bad_index.validate()
+
+    def test_typed_expressions_and_evaluation(self):
+        # Symbolic: (a * b) + acc
+        expr = FMAC16Expr(
+            VariableExpr("a"),
+            VariableExpr("b"),
+            VariableExpr("acc"),
+        )
+        env = {"a": 2.5, "b": 4.0, "acc": -3.0}
+        self.assertEqual(expr.evaluate(env), 7.0)
+
+    def test_typed_expression_constant_folding(self):
+        # FMAC(Const(2.0), Const(3.0), Const(4.0)) -> Const(10.0)
+        c_expr = FMAC16Expr(
+            ConstantExpr(2.0),
+            ConstantExpr(3.0),
+            ConstantExpr(4.0),
+        )
+        folded = c_expr.simplify()
+        self.assertIsInstance(folded, ConstantExpr)
+        self.assertEqual(folded.value, 10.0)
+
+        # Unary folding
+        u_expr = UnaryOpExpr("neg", ConstantExpr(5.5))
+        u_folded = u_expr.simplify()
+        self.assertIsInstance(u_folded, ConstantExpr)
+        self.assertEqual(u_folded.value, -5.5)
+
+
 if __name__ == "__main__":
     unittest.main()
