@@ -294,11 +294,49 @@ def extract(p, out):
 
 
 def pack_from_dir(src):
-    idx = json.loads(read(os.path.join(src, 'index.json')))
-    h, es = idx['header'], idx['entries']
+    index_path = os.path.join(src, 'index.json')
+
+    def invalid(field, expected):
+        raise ValueError(f'{index_path}: {field} must be {expected}')
+
+    try:
+        idx = json.loads(read(index_path))
+    except ValueError as exc:
+        raise ValueError(f'{index_path}: invalid JSON ({exc})') from None
+    if not isinstance(idx, dict):
+        invalid('index', 'an object')
+    h, es = idx.get('header'), idx.get('entries')
+    if not isinstance(h, dict):
+        invalid('header', 'an object')
+    if not isinstance(es, list):
+        invalid('entries', 'an array')
+    for field in ('version', 'code_blocks'):
+        value = h.get(field)
+        if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+            invalid('header.' + field, 'a uint32 integer')
+    if h['code_blocks'] > len(es):
+        invalid('header.code_blocks', f'between 0 and the entry count ({len(es)})')
+    hashes = []
+    for i, entry in enumerate(es):
+        prefix = f'entries[{i}]'
+        if not isinstance(entry, dict):
+            invalid(prefix, 'an object')
+        if not isinstance(entry.get('file'), str) or not entry['file']:
+            invalid(prefix + '.file', 'a nonempty path string')
+        flags = entry.get('flags')
+        if type(flags) is not int or not 0 <= flags <= 0xFFFFFFFF:
+            invalid(prefix + '.flags', 'a uint32 integer')
+        if not isinstance(entry.get('hash'), str):
+            invalid(prefix + '.hash', 'a hexadecimal uint32 string')
+        try:
+            hashed = int(entry['hash'], 16)
+        except ValueError:
+            invalid(prefix + '.hash', 'a hexadecimal uint32 string')
+        if not 0 <= hashed <= 0xFFFFFFFF:
+            invalid(prefix + '.hash', 'a hexadecimal uint32 string')
+        hashes.append(hashed)
     blocks = [read(os.path.join(src, e['file'])) for e in es]
-    return build_jsav(h['version'], h['code_blocks'], [int(e['hash'], 16) for e in es],
-                      [e['flags'] for e in es], blocks)
+    return build_jsav(h['version'], h['code_blocks'], hashes, [e['flags'] for e in es], blocks)
 
 
 def pack(src, out):
