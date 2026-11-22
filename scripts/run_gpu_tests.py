@@ -748,7 +748,7 @@ def run_suite(a, work: str) -> int:
             cmd.append("--mesh-compute")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
             cmd.append("--pc-tail-ubo")
-        if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add: GLSL Fma or OpFmaKHR (docs/design.md)
+        if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
             cmd += ["--fma", os.environ["LEONIDA_FMA"]]
         rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
