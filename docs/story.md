@@ -179,7 +179,49 @@ formats. Their strides are not measured here, and the tool stops at them instead
 | group-led pages | 290 | 5 | 608 | 748 | 7,015 | 742,141 |
 | total | 335 | 142 | 302,524 | 855 | 9,134 | 996,321 |
 
-Still open: the +0x5C word, meshlet record bits 14-31 and words +8/+12, and the `42 40 00 00` vertex formats.
+**`42 40 00 00` vertex blocks (ASSET-146).** These are sized now, and `tools/meshlet_page.py` walks past them
+instead of stopping. The header is 0x80 bytes:
+
+| Offset | Field | Measured | Confidence |
+|---:|---|---|---|
+| +0x00..+0x58 | 23 slot words, encoded as in the `63 30` block; slot 0 is tag 0x42 at +0x80 | all blocks | high |
+| +0x5C | u32 | 0x200, the same word as the `63 30` block's +0x5C | high (value), open (meaning) |
+| +0x60..+0x68 | three words that read as plausible f32 values | | open (likely a position offset) |
+| +0x6C | u32 | 0, 1 or 2 | open |
+| +0x70..+0x78 | three words that read as small positive f32 values | | open (likely per-axis scales) |
+| +0x7C | u32 | 0x40800000 (4.0f) | open |
+
+Per-vertex stride by slot tag: 0x42 is 8 bytes; 0x21, 0x26, 0x27 and 0x28 are 4 bytes (0x26 also in the `63 30`
+block, where it is RGBA8). The slots used are 0-4 and 11-14. The vertex count is the slot-0 span divided by 8, and
+every stream is stride × count bytes. Of every 16-byte-aligned `42 40 00 00` word in `shared_minigame000.rpf`,
+14,671 have a header that fits this rule exactly. Each of them is followed by another `42 40` block (9,234), a
+meshlet group (5,109), a group that continues in the next stream (216), the end of the stream (110) or a `63 30`
+block (2), so nothing is left between chunks. 246 more hits have slot tags with no stride; they are not block
+headers and are left alone. One `63 30` block also has a slot 12 (tag 0x26, 4 bytes) between slots 1 and 3; it
+sizes with the same tag rule.
+
+The 8-byte position stream and the 4-byte attributes are not decoded. As 4 × u16 the positions span the whole u16
+range on most axes, which suggests a quantisation to a box given by the f32 words above. The layout isn't settled,
+so the tool reports sizes and counts only.
+
+With these blocks sized, the archive walk accepts 1,569 streams and leaves 0 unparsed:
+
+| Scope | Streams | `63 30` blocks | `42 40` blocks | Vertices | Groups | Meshlets | Triangles |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| before | 335 | 142 | not sized | 302,524 | 855 | 9,134 | 996,321 |
+| now | 1,569 | 145 | 13,545 | 302,584 + 15,956,983 | 12,697 | 159,387 | 16,868,805 |
+
+1,234 streams start with a `42 40` block. 7,759 groups have the vertex count of a `42 40` block in the same
+stream. 520 streams end inside a group that continues in the next one; 5 stop at a `42 40` word whose header
+doesn't fit. The `63 30` checks are unchanged on the 3 extra blocks: all positions finite and all normals of unit
+length.
+
+Still open: the +0x5C word, meshlet record bits 14-31 and words +8/+12, and the `42 40 00 00` position and
+attribute encodings (the header words +0x60..+0x7C above). The record words +8/+12 keep their default
+(0x007FF7FF / 0x7FF) in 2,453 of the 9,134 meshlets of the earlier scope. The rest stay close to 0x7FF/0x800 per
+12-bit field, which looks like a quantised vector. They don't correlate with the mean normal or the centre of the
+meshlet's vertices in a `63 30` block (|r| < 0.13 on the 2,449 meshlets that have one), so they need the `42 40`
+positions to test.
 
 ### `story000_script.rpf`, full
 

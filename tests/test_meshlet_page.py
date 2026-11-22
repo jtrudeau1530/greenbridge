@@ -56,6 +56,24 @@ def block(n, colour=True, uv1=True, normal=True, flags=0x200):
     return bytes(head + body)
 
 
+def other_block(n, tags=((0, 0x42, 8), (2, 0x21, 4), (11, 0x27, 4), (1, 0x26, 4), (12, 0x26, 4), (3, 0x28, 4),
+                         (4, 0x28, 4), (14, 0x28, 4)), mode=2, bad_size=False):
+    """A `42 40 00 00` vertex block with n vertices: 0x80-byte header, streams stored in the order given (slot, tag,
+    stride), +0x5C = 0x200, +0x6C = mode, +0x7C = 4.0f. bad_size makes the second stream one vertex short."""
+    head = bytearray(0x80)
+    off = 0x80
+    body = bytearray()
+    for k, (slot, tag, stride) in enumerate(tags):
+        struct.pack_into("<I", head, 4 * slot, tag | ((off // 2) << 8))
+        count = n - 1 if bad_size and k == 1 else n
+        body += bytes((v * 7 + k) & 0xFF for v in range(stride * count))
+        off += stride * count
+    struct.pack_into("<I", head, 0x5C, 0x200)
+    struct.pack_into("<I", head, 0x6C, mode)
+    struct.pack_into("<f", head, 0x7C, 4.0)
+    return bytes(head + body)
+
+
 def group(sizes):
     """A meshlet group. sizes is a list of (vertices, triangles) per meshlet (each <= 128)."""
     recs = bytearray()
@@ -196,6 +214,59 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(summary["sequence"], "G.")
         self.assertEqual(summary["stop"], "42 40 00 00 block")
 
+    def test_4240_block_led_page(self):
+        data = page(other_block(40), group([(40, 30)]))
+        self.assertTrue(mp.is_mesh_page(data))
+        chunks = mp.parse_page(data)
+        self.assertEqual([c["kind"] for c in chunks], ["block4240", "group"])
+        b = chunks[0]
+        self.assertEqual((b["vertices"], b["flags"], b["mode"]), (40, 0x200, 2))
+        self.assertEqual([s[0] for s in b["slots"]], [0, 1, 2, 3, 4, 11, 12, 14])
+        summary = mp.summarise_page(data, "x")
+        self.assertEqual((summary["starts_with"], summary["sequence"]), ("block4240", "QG"))
+        self.assertEqual((summary["blocks_4240"], summary["vertices_4240"]), (1, 40))
+        self.assertEqual(summary["groups_matching_4240_block_here"], 1)
+        self.assertEqual((summary["blocks"], summary["checks"].get("vertices", 0)), (0, 0))
+
+    def test_walk_past_4240_block(self):
+        # before ASSET-146 the walk stopped at the 42 40 block and never reached the second group
+        data = page(block(6), group([(6, 4)]), other_block(9, tags=((0, 0x42, 8), (3, 0x28, 4))), group([(9, 3)]))
+        summary = mp.summarise_page(data, "x")
+        self.assertEqual(summary["sequence"], "BGQG")
+        self.assertIsNone(summary["stop"])
+        self.assertEqual((summary["groups"], summary["triangles"]), (2, 7))
+
+    def test_4240_block_that_does_not_fit_stops(self):
+        for bad in (other_block(5, bad_size=True), other_block(5, tags=((0, 0x42, 8), (1, 0x99, 4)))):
+            summary = mp.summarise_page(page(group([(4, 2)]), bad), "x")
+            self.assertEqual((summary["sequence"], summary["stop"]), ("G.", "42 40 00 00 block"))
+            self.assertFalse(mp.is_mesh_page(page(bad)))
+
+    def test_63_30_block_with_a_slot_past_4(self):
+        # streams in the order 0, 2, 1, 12, 3, as in the one measured block with a slot 12 (tag 0x26): slot 12 takes
+        # the tag's 4-byte stride, so the block ends where the group starts
+        n = 28
+        head = bytearray(0x60)
+        body = bytearray()
+        off = 0x60
+        for slot, tag, stride in ((0, 0x63, 12), (2, 0x63, 12), (1, 0x26, 4), (12, 0x26, 4), (3, 0x42, 8)):
+            struct.pack_into("<I", head, 4 * slot, tag | ((off // 2) << 8))
+            body += (struct.pack("<3f", 1.0, 2.0, 3.0) if stride == 12 else bytes(stride)) * n
+            off += stride * n
+        struct.pack_into("<I", head, 0x5C, 0x200)
+        chunks = mp.parse_page(page(bytes(head + body), group([(n, 9)])))
+        self.assertEqual([c["kind"] for c in chunks], ["block", "group"])
+        self.assertEqual(chunks[0]["vertices"], n)
+        self.assertEqual([s[0] for s in chunks[0]["slots"]], [0, 1, 2, 3, 12])
+
+    def test_totals_count_4240_blocks(self):
+        pages = [mp.summarise_page(page(other_block(12, mode=1), group([(12, 5)])), "a"),
+                 mp.summarise_page(page(other_block(8, mode=0)), "b")]
+        t = mp.totals(pages)
+        self.assertEqual((t["block_4240_led_pages"], t["blocks_4240"], t["vertices_4240"]), (2, 2, 20))
+        self.assertEqual((t["blocks_4240_flags"], t["blocks_4240_modes"]), ([0x200], [0, 1]))
+        self.assertEqual(t["groups_matching_4240_block_here"], 1)
+
     def test_stop_in_truncated_group(self):
         data = page(block(4), group([(4, 2)]))
         g = group([(100, 90)])
@@ -270,7 +341,8 @@ class CliTests(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
 
     def test_directory_and_archive(self):
-        pages = [page(block(20), group([(20, 18)])), page(group([(6, 4)]), block(6, colour=False, uv1=False))]
+        pages = [page(block(20), group([(20, 18)])), page(group([(6, 4)]), block(6, colour=False, uv1=False)),
+                 page(other_block(10), group([(10, 8)]))]
         with tempfile.TemporaryDirectory() as tmp:
             folder = os.path.join(tmp, "carve")
             os.mkdir(folder)
@@ -284,9 +356,11 @@ class CliTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out, encoding="utf-8") as fh:
                 totals = json.load(fh)["totals"]
-            self.assertEqual((totals["pages"], totals["block_led_pages"], totals["group_led_pages"]), (2, 1, 1))
-            self.assertEqual((totals["blocks"], totals["groups"], totals["vertices"]), (2, 2, 26))
+            self.assertEqual((totals["pages"], totals["block_led_pages"], totals["group_led_pages"]), (3, 1, 1))
+            self.assertEqual((totals["blocks"], totals["groups"], totals["vertices"]), (2, 3, 26))
             self.assertEqual(totals["groups_matching_block_near"], 2)
+            # a page that starts with a 42 40 block is read from a directory too, not only from an archive
+            self.assertEqual((totals["block_4240_led_pages"], totals["blocks_4240"]), (1, 1))
 
             # A minimal RPF9-like file: data offset at +4, then zlib streams (one is not a mesh page).
             rpf = os.path.join(tmp, "a.rpf")
@@ -297,7 +371,7 @@ class CliTests(unittest.TestCase):
             r = self.run_tool(rpf, "--json", out2, "--quiet")
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out2, encoding="utf-8") as fh:
-                self.assertEqual(json.load(fh)["totals"]["pages"], 2)
+                self.assertEqual(json.load(fh)["totals"]["pages"], 3)
 
     def test_page_report_write_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
