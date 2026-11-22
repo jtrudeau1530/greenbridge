@@ -203,6 +203,117 @@ def _accessor_count(gltf: dict, index: object) -> int | None:
     return count if _is_int(count) and count >= 0 else None
 
 
+def _accessor_max(accessor: dict | None) -> float | None:
+    """An accessor's declared max[0], or None when it is missing or not a number."""
+    if accessor is None:
+        return None
+    upper = accessor.get("max")
+    if (isinstance(upper, list) and upper
+            and isinstance(upper[0], (int, float)) and not isinstance(upper[0], bool)):
+        return float(upper[0])
+    return None
+
+
+def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
+    """Summarize an animation and flag references that cannot be resolved."""
+    raw_samplers = _array(animation.get("samplers"))
+    raw_channels = _array(animation.get("channels"))
+    issues: list[str] = []
+    samplers: list[dict] = []
+    for sampler_index, sampler in enumerate(raw_samplers):
+        if not isinstance(sampler, dict):
+            issues.append(f"sampler[{sampler_index}] is not an object")
+            samplers.append({"index": sampler_index, "input_accessor": None, "input_count": None,
+                             "output_accessor": None, "output_count": None,
+                             "interpolation": None, "duration": None})
+            continue
+        input_index = _index(sampler.get("input"))
+        output_index = _index(sampler.get("output"))
+        input_accessor = _accessor(gltf, input_index)
+        output_accessor = _accessor(gltf, output_index)
+        input_count = _accessor_count(gltf, input_index)
+        output_count = _accessor_count(gltf, output_index)
+        interpolation = _text(sampler.get("interpolation")) or "LINEAR"
+        duration = _accessor_max(input_accessor)
+        if input_accessor is None:
+            issues.append(f"sampler[{sampler_index}] input accessor is missing")
+        elif input_count is None or input_count == 0:
+            issues.append(f"sampler[{sampler_index}] input accessor has no keyframes")
+        if output_accessor is None:
+            issues.append(f"sampler[{sampler_index}] output accessor is missing")
+        if input_count is not None and output_count is not None:
+            expected = input_count * 3 if interpolation == "CUBICSPLINE" else input_count
+            if output_count != expected:
+                issues.append(
+                    f"sampler[{sampler_index}] has {output_count} output values for {input_count} "
+                    f"keys with {interpolation} interpolation"
+                )
+        if interpolation not in ("LINEAR", "STEP", "CUBICSPLINE"):
+            issues.append(f"sampler[{sampler_index}] has unknown interpolation {interpolation!r}")
+        samplers.append({
+            "index": sampler_index,
+            "input_accessor": input_index,
+            "input_count": input_count,
+            "output_accessor": output_index,
+            "output_count": output_count,
+            "interpolation": interpolation,
+            "duration": duration,
+        })
+
+    channels: list[dict] = []
+    paths: dict[str, int] = {}
+    target_nodes: set[int] = set()
+    for channel_index, channel in enumerate(raw_channels):
+        if not isinstance(channel, dict):
+            issues.append(f"channel[{channel_index}] is not an object")
+            channels.append({"index": channel_index, "sampler": None, "node": None,
+                             "node_name": None, "path": None})
+            continue
+        sampler_index = _index(channel.get("sampler"))
+        target = _object(channel.get("target"))
+        node_index = _index(target.get("node"))
+        path = _text(target.get("path"))
+        node = _entry(gltf, "nodes", node_index)
+        if sampler_index is None or sampler_index >= len(raw_samplers):
+            issues.append(f"channel[{channel_index}] has no valid sampler")
+        if node_index is None:
+            issues.append(f"channel[{channel_index}] has no target node")
+        elif node is None:
+            issues.append(f"channel[{channel_index}] targets missing node {node_index}")
+        else:
+            target_nodes.add(node_index)
+        if path is None:
+            issues.append(f"channel[{channel_index}] has no target path")
+        elif path not in ("translation", "rotation", "scale", "weights"):
+            issues.append(f"channel[{channel_index}] has unknown target path {path!r}")
+        else:
+            paths[path] = paths.get(path, 0) + 1
+        channels.append({
+            "index": channel_index,
+            "sampler": sampler_index,
+            "node": node_index,
+            "node_name": _text(node.get("name")) if node is not None else None,
+            "path": path,
+        })
+
+    known_durations = [sampler["duration"] for sampler in samplers if sampler["duration"] is not None]
+    return {
+        "index": index,
+        "name": _text(animation.get("name")),
+        "channel_count": len(raw_channels),
+        "sampler_count": len(raw_samplers),
+        "duration": max(known_durations) if known_durations else None,
+        "target_node_count": len(target_nodes),
+        "paths": dict(sorted(paths.items())),
+        "interpolations": sorted({sampler["interpolation"] for sampler in samplers
+                                  if sampler["interpolation"] is not None}),
+        "channels": channels,
+        "samplers": samplers,
+        "issues": issues,
+    }
+
+
+
 def _bbox(accessor: dict | None) -> dict | None:
     """An accessor's declared POSITION min/max, or None when either is missing."""
     if accessor is None:
@@ -347,15 +458,19 @@ def build_report(glb: dict, file_bytes: int) -> dict:
             "name": _text(skin.get("name")),
             "joint_count": len(joints) if isinstance(joints, list) else None,
         })
+    animations = [_animation_report(gltf, i, animation)
+                  for i, animation in enumerate(_array(gltf.get("animations")))
+                  if isinstance(animation, dict)]
 
     boxes = [primitive["bbox"] for mesh in meshes for primitive in mesh["primitives"]
              if primitive["bbox"] is not None]
     position_primitives = sum(1 for mesh in meshes for primitive in mesh["primitives"]
                               if primitive["position_accessor"] is not None)
-    invalid_counts = {
-        key: sum(1 for entry in _array(gltf.get(key)) if not isinstance(entry, dict))
-        for key in ("meshes", "materials", "skins")
-    }
+    invalid_counts = {}
+    for key in ("meshes", "materials", "skins", "animations"):
+        count = sum(1 for entry in _array(gltf.get(key)) if not isinstance(entry, dict))
+        if count:
+            invalid_counts[key] = count
     report = {
         "bytes": file_bytes,
         "asset": {
@@ -377,6 +492,7 @@ def build_report(glb: dict, file_bytes: int) -> dict:
         "meshes": meshes,
         "materials": materials,
         "skins": skins,
+        "animations": animations,
     }
     if any(invalid_counts.values()):
         report["invalid_counts"] = invalid_counts
@@ -459,6 +575,20 @@ def format_report(report: dict) -> str:
         lines.append("  (none)")
     for skin in report["skins"]:
         lines.append(f"  [{skin['index']}] name={_show(skin['name'])} joints={_show(skin['joint_count'])}")
+
+    lines.append("animations:")
+    if not report["animations"]:
+        lines.append("  (none)")
+    for animation in report["animations"]:
+        paths = ", ".join(f"{name}={count}" for name, count in animation["paths"].items()) or "none"
+        interpolation = ", ".join(animation["interpolations"]) or "none"
+        lines.append(
+            f"  [{animation['index']}] name={_show(animation['name'])} "
+            f"channels={animation['channel_count']} samplers={animation['sampler_count']} "
+            f"duration={_show(animation['duration'])} targets={animation['target_node_count']}")
+        lines.append(f"    paths: {paths}; interpolation: {interpolation}")
+        for issue in animation["issues"]:
+            lines.append(f"    issue: {issue}")
     return "\n".join(lines)
 
 

@@ -150,6 +150,22 @@ def bbox_gltf(with_bounds):
     }
 
 
+def animated_gltf():
+    gltf = triangle_gltf()
+    gltf["nodes"][0]["name"] = "Triangle"
+    gltf["animations"] = [{
+        "name": "Bounce",
+        "samplers": [{"input": 2, "output": 3, "interpolation": "LINEAR"}],
+        "channels": [{"sampler": 0, "target": {"node": 0, "path": "translation"}}],
+    }]
+    gltf["accessors"].extend([
+        {"componentType": 5126, "count": 2, "type": "SCALAR", "min": [0.0], "max": [1.0]},
+        {"componentType": 5126, "count": 2, "type": "VEC3"},
+    ])
+    return gltf
+
+
+
 class GlbInspectTests(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args],
@@ -471,6 +487,56 @@ class GlbInspectTests(unittest.TestCase):
                 "alpha_mode": None,
                 "double_sided": None,
             })
+
+    def test_animation_channels_samplers_and_duration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "animated.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(animated_gltf(), triangle_bin()))
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("animations=1", result.stdout)
+            self.assertIn('name="Bounce" channels=1 samplers=1 duration=1.0 targets=1', result.stdout)
+            self.assertIn("paths: translation=1; interpolation: LINEAR", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            animation = report["animations"][0]
+            self.assertEqual(animation["channel_count"], 1)
+            self.assertEqual(animation["sampler_count"], 1)
+            self.assertEqual(animation["duration"], 1.0)
+            self.assertEqual(animation["target_node_count"], 1)
+            self.assertEqual(animation["paths"], {"translation": 1})
+            self.assertEqual(animation["channels"][0]["node_name"], "Triangle")
+            self.assertEqual(animation["channels"][0]["path"], "translation")
+            self.assertEqual(animation["samplers"][0]["interpolation"], "LINEAR")
+            self.assertEqual(animation["issues"], [])
+
+    def test_animation_reference_issues_are_reported(self):
+        gltf = animated_gltf()
+        gltf["animations"][0]["channels"] = [
+            {"sampler": 9, "target": {"node": 99, "path": "translation"}},
+            {"sampler": 0, "target": {"node": 0, "path": "bogus"}},
+        ]
+        gltf["animations"][0]["samplers"][0]["output"] = 4
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "issues.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("issue:", result.stdout)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            issues = report["animations"][0]["issues"]
+            self.assertTrue(any("no valid sampler" in issue for issue in issues))
+            self.assertTrue(any("missing node 99" in issue for issue in issues))
+            self.assertTrue(any("unknown target path 'bogus'" in issue for issue in issues))
+            self.assertTrue(any("output accessor is missing" in issue for issue in issues))
+            self.assertEqual(report["animations"][0]["target_node_count"], 1)
 
 
 if __name__ == "__main__":
