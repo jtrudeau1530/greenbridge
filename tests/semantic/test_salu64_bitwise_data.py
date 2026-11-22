@@ -12,6 +12,7 @@ Covers s_and_b64, s_or_b64, s_xor_b64, s_andn2_b64, s_orn2_b64, s_nand_b64, s_no
 Run directly:
     python -I tests/semantic/test_salu64_bitwise_data.py -v
 """
+import atexit
 import os
 import re
 import struct
@@ -38,7 +39,15 @@ _CS_PATH = None
 
 def setUpModule():
     global _TMP_DIR, _PS_PATH, _CS_PATH
+    if _TMP_DIR is not None:
+        # translate_ps() and the importers' helpers (test_interp_merge_check, test_mask_src_sgpr_const,
+        # test_saveexec_variants) may have created it already; replacing it would leak the first one
+        return
     _TMP_DIR = tempfile.TemporaryDirectory()
+    # A module that imports a helper from here and runs after this module's teardown recreates the folder through
+    # translate_ps(), and unittest never tears this module down again. Registered after the TemporaryDirectory, so
+    # it runs before tempfile's own exit finalizer (atexit is last in, first out) and that finalizer stays quiet.
+    atexit.register(tearDownModule)
     dis = os.path.join(_TMP_DIR.name, "disasm")
     fssm = os.path.join(_TMP_DIR.name, "fssm")
     os.mkdir(dis)
