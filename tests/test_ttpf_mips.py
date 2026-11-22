@@ -1624,6 +1624,25 @@ class BadPoolTest(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("out of range", err)
 
+    def test_export_force_protects_input_files(self):
+        metadata = os.path.join(self.tmp.name, "metadata.json")
+        with open(metadata, "wb") as f:
+            f.write(b"{}")
+        cases = [
+            (self.good, [], "input pool"),
+            (metadata, ["--calibration", metadata], "--calibration profile"),
+            (metadata, ["--history", metadata], "--history file"),
+        ]
+        for source, options, message in cases:
+            with self.subTest(options=options):
+                with open(source, "rb") as f:
+                    before = f.read()
+                code, err = self.run_main("export", self.good, "0", source, "--force", *options)
+                self.assertEqual(code, 2)
+                self.assertIn(message, err)
+                with open(source, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
 
 class SyntheticArrayPoolTest(unittest.TestCase):
     def setUp(self):
