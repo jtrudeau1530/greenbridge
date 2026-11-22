@@ -1524,9 +1524,7 @@ class Gen:
             self.emit(f"{src} = OpBitwiseOr %uint {keep} {self.cu(args[1])}")
         else:
             raise Unsupported("ds_swizzle " + kind)
-        v, r = self.src_u(a[1]), self.tmp()
-        self.g_shuffle(r, v, src)
-        self.dst(a[0], r)
+        self.ds_lane_read(a[0], self.src_u(a[1]), src, lane)
 
     def buffer_load(self, op, a, mods):
         """buffer_load_dword[xN] vD, vaddr, s[V#], soffset [offen|idxen] offset:N  -> buffer-device-address loads.
@@ -4061,18 +4059,32 @@ class Gen:
         lo = self.x_round(bits=(bit, None))[1][0]
         self.emit(f"{r} = {'OpIEqual' if kind == 'All' else 'OpINotEqual'} %bool {lo} {self.cu(0)}")
 
-    def g_shuffle(self, r, v, src, zero_inactive=False):
-        """r = v of lane `src` of this wave (OpGroupNonUniformShuffle; emulated: any lane 0-63). zero_inactive:
-        a source lane that is off in EXEC gives 0 (ds_bpermute)."""
+    def g_shuffle(self, r, v, src):
+        """r = v of lane src of this wave (OpGroupNonUniformShuffle, or any emulated lane 0-63)."""
         if not self.emulate:
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {src}")
             return
-        if zero_inactive:
-            z = self.tmp()
-            self.emit(f"{z} = OpSelect %uint {self.active_b()} {v} {self.cu(0)}")
-            v = z
         read = self.x_round(data=v)[0]
         self.emit(f"{r} = OpCopyObject %uint {read(src)}")
+
+    def ds_lane_read(self, dst: dict, data: str, src: str, lane: str) -> None:
+        """DS swizzle and backward permute read zero from an inactive or absent source lane."""
+        value, result = self.tmp(), self.tmp()
+        self.emit(f"{value} = OpSelect %uint {self.active_b()} {data} {self.cu(0)}")
+        if self.emulate:
+            self.g_shuffle(result, value, src)
+        else:
+            # Redirect absent source lanes before the shuffle: even a masked undefined result is undefined.
+            ballot, present, safe_src, shuffled, mask = (self.tmp() for _ in range(5))
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+            self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {src}")
+            self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
+            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {value} {safe_src}")
+            self.emit(f"{mask} = OpSelect %uint {present} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            self.emit(f"{result} = OpBitwiseAnd %uint {shuffled} {mask}")
+            self.uses_subgroup = self.uses_ballot = True
+        # Bitwise masks keep MSL from placing the ballot and shuffle in a short-circuiting ternary.
+        self.dst(dst, result, eager=not self.emulate)
 
     def ds_permute(self, a, mods):
         """ds_permute_b32 vD, vAddr, vData offset:N, the forward (scatter) permute: every source lane that is on in
@@ -6091,39 +6103,18 @@ class Gen:
             # vD = vData from lane ((vAddr + offset) / 4) mod 32: a subgroup shuffle (no LDS memory involved).
             d, ad, dat = a[0], self.src_u(a[1]), self.src_u(a[2])
             off = self.mod_int(mods, "offset", 0)
-            s1, ln, ln2, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            s1, ln, src, lane = (self.tmp() for _ in range(4))
             self.emit(f"{s1} = OpIAdd %uint {ad} {self.cu(off)}")
             self.emit(f"{ln} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
-            self.emit(f"{ln2} = OpBitwiseAnd %uint {ln} {self.cu(31)}")
-            if self.emulate:
-                # Wave64 runs it as two wave32s (RDNA ISA 10.4.4): lanes 32-63 read from their own half, and a
-                # source lane that is off in EXEC reads as 0.
-                half, src = self.tmp(), self.tmp()
-                self.emit(f"{half} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(32)}")
-                self.emit(f"{src} = OpBitwiseOr %uint {half} {ln2}")
-                self.g_shuffle(r, dat, src, zero_inactive=True)
-            else:
-                lane = self.tmp()
-                self.emit(f"{lane} = OpLoad %uint %sg_lane")
-                src = ln2
-                if self.wave64:
-                    half, src = self.tmp(), self.tmp()
-                    self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
-                    self.emit(f"{src} = OpBitwiseOr %uint {half} {ln2}")
-                # EXEC-off source lanes supply zero. Redirect missing source lanes to the calling lane before
-                # shuffling so the zero mask never has to consume an undefined result.
-                z, bal, ex, safe_src, sh, mask = (self.tmp() for _ in range(6))
-                self.emit(f"{z} = OpSelect %uint {self.active_b()} {dat} {self.cu(0)}")
-                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
-                self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
-                self.emit(f"{safe_src} = OpSelect %uint {ex} {src} {lane}")
-                self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {z} {safe_src}")
-                self.emit(f"{mask} = OpSelect %uint {ex} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
-                self.emit(f"{r} = OpBitwiseAnd %uint {sh} {mask}")
-                self.uses_subgroup = self.uses_ballot = True
-            # A scalar select can become a short-circuiting ternary in MSL, moving the ballot and shuffle into
-            # divergent control flow. Use bitwise masks for both the result and the destination write.
-            self.dst(d, r, eager=not self.emulate)
+            self.emit(f"{src} = OpBitwiseAnd %uint {ln} {self.cu(31)}")
+            self.sub_lane(lane)
+            if self.wave64:
+                # RDNA2 ISA 10.4.4: each half-wave permutes independently.
+                half, full_src = self.tmp(), self.tmp()
+                self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
+                self.emit(f"{full_src} = OpBitwiseOr %uint {half} {src}")
+                src = full_src
+            self.ds_lane_read(d, dat, src, lane)
         elif op == "ds_permute_b32":
             self.ds_permute(a, mods)
         elif op.startswith("ds_") and self.stage == "gs":
