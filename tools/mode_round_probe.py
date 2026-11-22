@@ -178,7 +178,7 @@ def main():
         print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
               f"7/7 f16 transcendentals 0/65536 RNE/RTZ diffs")
     if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8") as f:
+        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(out, f, indent=2)
     return 1 if mismatches else 0
 
