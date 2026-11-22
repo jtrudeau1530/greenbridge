@@ -156,7 +156,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.below_normal"), \
                 mock.patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")), \
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
-                mock.patch("make_game.wave64_emulate", return_value=False), \
+                mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
