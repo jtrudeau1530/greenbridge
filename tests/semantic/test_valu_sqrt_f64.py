@@ -237,6 +237,66 @@ class VSqrtF64Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr64(self, index: int) -> int:
+        return words_to_f64_bits(self.vgprs[index], self.vgprs[index + 1])
+
+    def set_vgpr64(self, index: int, bits: int) -> None:
+        lo, hi = f64_bits_to_words(bits)
+        self.vgprs[index] = lo
+        self.vgprs[index + 1] = hi
+
+    def get_sgpr64(self, index: int) -> int:
+        return words_to_f64_bits(self.sgprs[index], self.sgprs[index + 1])
+
+    def set_sgpr64(self, index: int, bits: int) -> None:
+        lo, hi = f64_bits_to_words(bits)
+        self.sgprs[index] = lo
+        self.sgprs[index + 1] = hi
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_sqrt_f64."""
+
+    def resolve_operand(self, op: VOP3Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, RegPair):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr64(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr64(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal64):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VSqrtF64Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s_raw = self.resolve_operand(instr.src, state)
+
+        # Computation phase
+        result_bits = oracle_v_sqrt_f64(
+            src_bits=s_raw,
+            abs_mod=instr.src.abs_mod,
+            neg_mod=instr.src.neg_mod,
+            clamp=instr.clamp,
+        )
+
+        # Write-back phase
+        state.set_vgpr64(instr.dst.index, result_bits)
+        return result_bits
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -424,6 +484,67 @@ class TestSymbolicAST(unittest.TestCase):
             VOP3Operand(RegPair(2, RegType.VGPR)),
         )
         self.assertEqual(i1, i2)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vgpr_source(self) -> None:
+        self.state.set_vgpr64(2, f64_to_bits(25.0))
+        instr = VSqrtF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src=VOP3Operand(RegPair(2, RegType.VGPR)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f64(res_bits), 5.0)
+        self.assertEqual(self.state.get_vgpr64(0), res_bits)
+
+    def test_scalar_sgpr_source(self) -> None:
+        self.state.set_sgpr64(4, f64_to_bits(144.0))
+        instr = VSqrtF64Instruction(
+            dst=RegPair(6, RegType.VGPR),
+            src=VOP3Operand(RegPair(4, RegType.SGPR)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f64(res_bits), 12.0)
+        self.assertEqual(self.state.get_vgpr64(6), res_bits)
+
+    def test_scalar_literal_source(self) -> None:
+        instr = VSqrtF64Instruction(
+            dst=RegPair(8, RegType.VGPR),
+            src=VOP3Operand(Literal64.from_float(0.0625)),
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(bits_to_f64(res_bits), 0.25)
+        self.assertEqual(self.state.get_vgpr64(8), res_bits)
+
+    def test_scalar_with_modifiers_and_clamp(self) -> None:
+        self.state.set_vgpr64(0, f64_to_bits(-16.0))
+        # |-16.0| = 16.0 -> sqrt(16.0) = 4.0 -> clamp -> 1.0
+        instr = VSqrtF64Instruction(
+            dst=RegPair(4, RegType.VGPR),
+            src=VOP3Operand(RegPair(0, RegType.VGPR), abs_mod=True),
+            clamp=True,
+        )
+        res_bits = self.interp.step(instr, self.state)
+        self.assertEqual(res_bits, ONE_F64)
+        self.assertEqual(self.state.get_vgpr64(4), ONE_F64)
+
+    def test_scalar_determinism(self) -> None:
+        runs = []
+        for _ in range(50):
+            st = ScalarMachineState()
+            st.set_vgpr64(0, 0x400921FB54442D18)  # pi
+            instr = VSqrtF64Instruction(
+                dst=RegPair(2, RegType.VGPR),
+                src=VOP3Operand(RegPair(0, RegType.VGPR)),
+            )
+            runs.append(self.interp.step(instr, st))
+        self.assertTrue(all(r == runs[0] for r in runs))
 
 
 if __name__ == "__main__":
