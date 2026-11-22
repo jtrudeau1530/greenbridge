@@ -955,8 +955,23 @@ def main(argv=None):
                                              "(counts only, no shader names)")
     ap.add_argument("--census", required=True, metavar="INDEX_JSON", help="<spirv>/index.json from rdna2spirv.py")
     args = ap.parse_args(argv)
-    with open(args.census, encoding="utf-8") as f:
-        c = census(json.load(f))
+    # One line per bad input, as everywhere else in tools/: an unreadable path, a folder, a file that is not JSON and a
+    # JSON document that is not the index object used to end in a traceback (FileNotFoundError, PermissionError,
+    # JSONDecodeError, AttributeError).
+    try:
+        with open(args.census, encoding="utf-8") as f:
+            index = json.load(f)
+    except OSError as exc:
+        print(f"ERROR: cannot read {args.census}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:  # json.JSONDecodeError
+        print(f"ERROR: {args.census} is not JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(index, dict):
+        print(f"ERROR: {args.census} is not an index object (a mapping of shader name to entry), got "
+              f"{type(index).__name__}. Give the <spirv>/index.json rdna2spirv.py writes.", file=sys.stderr)
+        return 2
+    c = census(index)
     total = Counter()
     for stage, counts in c["tiers"].items():
         print(f"{stage}: " + ", ".join(f"{t}={n}" for t, n in counts.items()))
