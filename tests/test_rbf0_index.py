@@ -172,6 +172,12 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(r["status"], "ok")
         self.assertEqual(r["attributes"], 1)
 
+        # Truncated after content starts must still record the already-observed attribute mismatch once.
+        trunc = bytearray(b"RBF0") + _open(0, b"Root", attrs=1) + _text(b"hi")
+        rt = rbf0_index.parse_rbf0(bytes(trunc))
+        self.assertEqual(rt["status"], "truncated")
+        self.assertEqual(rt["attributes"], 1)
+
     def test_attribute_count(self):
         b = bytearray(WIDE)
         b += _open(0, b"Root", attrs=2)
