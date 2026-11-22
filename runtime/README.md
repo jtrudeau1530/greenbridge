@@ -253,6 +253,10 @@ It prints counts only; on the 1.0.2.1 corpus all 26,503 containers resolve.
 
 `gta6rt --run <exe> [-- args]` runs an executable's entry point inside the runtime (`shims/process.cpp` gives it its
 own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
+`run_tiny_frame` does it with a stand-in that imports `d3d12_xs.dll!D3D12XboxCreateDevice` and, with
+`LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
+the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks
+the verdict, the `shim` binding and the call order in the `--trace-d3d12` output, and skips without a Vulkan GPU).
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
