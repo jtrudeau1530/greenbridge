@@ -975,12 +975,50 @@ BOOL WINAPI copy_file_ex_a(LPCSTR from, LPCSTR to, LPPROGRESS_ROUTINE progress, 
     return copy_file_ex_w(wide_from.c_str(), wide_to.c_str(), progress, data, cancel, flags);
 }
 
+namespace {
+
+// The host's CopyFile2, or null where the host has none. Wine 9's kernel32 and kernelbase don't export it: Wine's
+// loader binds a static import of it to a stub that aborts the process when called ("unimplemented function
+// KERNEL32.dll.CopyFile2, aborting"), so a direct ::CopyFile2 call (or MSVC's std::filesystem::copy_file, which uses
+// it) kills a title under Wine 9 or a Proton built on it; pe_loader.cpp and loader_tls_test.cpp avoid it for the same
+// reason. GetProcAddress returns null there instead, and the fallback below runs.
+using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
+CopyFile2Fn host_copy_file2() {
+    static const CopyFile2Fn fn = [] {
+        for (const wchar_t* dll : {L"kernelbase.dll", L"kernel32.dll"}) {
+            if (const HMODULE module = GetModuleHandleW(dll))
+                if (const FARPROC p = GetProcAddress(module, "CopyFile2")) return reinterpret_cast<CopyFile2Fn>(p);
+        }
+        return CopyFile2Fn{};
+    }();
+    return fn;
+}
+
+// CopyFile2 through CopyFileExW, for hosts without it. The flags both calls define are passed on; the rest are
+// CopyFile2-only hints and privilege requests (no offload, compressed traffic, low-free-space mode, ...) that don't
+// change what a plain file copy produces, and CopyFileExW refuses flags it doesn't know. The cancel flag has the same
+// type in both. A COPYFILE2 progress routine has another signature and message set, so it isn't called here.
+HRESULT copy_file2_fallback(const wchar_t* source, const wchar_t* destination,
+                            const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
+    constexpr DWORD kCopyFileExFlags = COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_RESTARTABLE |
+                                       COPY_FILE_OPEN_SOURCE_FOR_WRITE | COPY_FILE_ALLOW_DECRYPTED_DESTINATION |
+                                       COPY_FILE_COPY_SYMLINK | COPY_FILE_NO_BUFFERING;
+    const DWORD flags = parameters ? parameters->dwCopyFlags & kCopyFileExFlags : 0;
+    BOOL* const cancel = parameters ? parameters->pfCancel : nullptr;
+    if (::CopyFileExW(source, destination, nullptr, nullptr, cancel, flags)) return S_OK;
+    const DWORD error = GetLastError();
+    return HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE);
+}
+
+}  // namespace
+
 HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS* parameters) {
     const bool fail_if_exists = parameters && (parameters->dwCopyFlags & COPY_FILE_FAIL_IF_EXISTS) != 0;
     std::filesystem::path source, destination;
     DWORD error = 0;
     if (!copy_paths(from, to, fail_if_exists, source, destination, error)) return HRESULT_FROM_WIN32(error);
-    return ::CopyFile2(source.c_str(), destination.c_str(), parameters);
+    if (const CopyFile2Fn host = host_copy_file2()) return host(source.c_str(), destination.c_str(), parameters);
+    return copy_file2_fallback(source.c_str(), destination.c_str(), parameters);
 }
 
 BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
