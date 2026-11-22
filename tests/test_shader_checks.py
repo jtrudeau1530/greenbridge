@@ -460,6 +460,36 @@ class Wave32LaneDumps(unittest.TestCase):
         self.assertTrue(problem)
         self.assertNotIsInstance(problem, check.Skip)
 
+    def test_lane_dumps_request_32_lanes(self):
+        # #774: like run_gpu_tests.py, so an 8..32 device (Intel ANV) doesn't judge the dump at a narrower size.
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name), patch.object(check, "run", return_value=(0, self.words(name))) as run:
+                check.compute_test("tools", "spirv", name, "1", "dump", expected_words=dict(check.CS_DUMPS)[name],
+                                   needs_32_lanes=True)
+                self.assertEqual(run.call_args.kwargs["env"]["VKC_SUBGROUP_SIZE"], "32")
+
+    def test_other_dumps_keep_the_default_size(self):
+        with patch.object(check, "run", return_value=(0, self.words("cs_store"))) as run:
+            check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
+        self.assertNotIn("env", run.call_args.kwargs)
+
+    def test_skipped_when_32_lanes_cannot_be_pinned(self):
+        for name in check.WAVE32_LANE_DUMPS:
+            for flip in (False, True):
+                with self.subTest(name=name, flip=flip):
+                    out = ("device: gpu (subgroup 8..32)\ncompute subgroup size: 32 not available\n"
+                           + self.words(name, flip))
+                    problem = self.run_dump(name, 0, out)
+                    self.assertIsInstance(problem, check.Skip)
+                    self.assertIn("at 32 lanes on request", problem)
+
+    def test_judged_when_32_lanes_are_pinned(self):
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name):
+                out = "device: gpu (subgroup 8..32)\ncompute subgroup size: 32\n"
+                self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
+                self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
+
 
 if __name__ == "__main__":
     unittest.main()

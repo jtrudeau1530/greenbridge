@@ -31,7 +31,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PRO
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
-from check import WAVE32_LANE_DUMPS, narrow_subgroup_skip   # wave32 lane-mask dumps skip below 32 lanes, as in check.py
+from check import WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, narrow_subgroup_skip, wave32_lane_skip   # as in check.py
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -759,8 +759,10 @@ def run_suite(a, work: str) -> int:
 
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
+            if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
+                cs_env = dict(os.environ, **WAVE32_LANE_ENV)
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
-            skip = narrow_subgroup_skip(msg) if name in WAVE32_LANE_DUMPS else None
+            skip = wave32_lane_skip(msg) if name in WAVE32_LANE_DUMPS else None
             if skip:   # e.g. Mesa llvmpipe's 8-wide subgroups: these 32-lane masks can't come out right
                 ok, detail = None, str(skip)
             else:
