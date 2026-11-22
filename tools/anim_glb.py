@@ -718,6 +718,8 @@ def main(argv=None):
         for i in inputs:
             if os.path.exists(o) and same_path(i, o):
                 ap.error(f"{o} is an input; refusing to overwrite it")
+    if args.report and os.path.isdir(args.report):
+        ap.error(f"--report is a directory: {args.report}")
     if args.out and args.report and same_path(args.out, args.report):
         ap.error("the GLB and the report are the same path")
     if args.coverage:
@@ -736,9 +738,13 @@ def main(argv=None):
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     if args.report:
-        with open(args.report, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1, sort_keys=True)
-            f.write("\n")
+        try:
+            with open(args.report, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1, sort_keys=True)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write report {args.report}: {e.strerror or e}", file=sys.stderr)
+            return 2
     print(json.dumps({k: v for k, v in report.items() if k in ("counts", "skeleton", "seconds")}, sort_keys=True))
     return 0
 
