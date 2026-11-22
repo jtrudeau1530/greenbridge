@@ -458,7 +458,7 @@ def write_output(path, rows, summary):
             json.dump({"summary": summary, "files": rows}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(COLUMNS)
         for r in rows:
             w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])

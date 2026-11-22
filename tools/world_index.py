@@ -748,7 +748,7 @@ def _write_reports(a, rows, stats, agg):
                 "position_max", "lod", "lod_dist_min", "lod_dist_max"]
         os.makedirs(os.path.dirname(os.path.abspath(a.csv)), exist_ok=True)
         with open(a.csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             for r in rows:
                 r = dict(r)

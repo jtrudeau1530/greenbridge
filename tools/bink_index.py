@@ -276,7 +276,7 @@ def _flat(row, fields):
 def write_csv(path, rows, probe):
     fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer = csv.DictWriter(fh, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         for row in rows:
             writer.writerow(_flat(row, fields))
