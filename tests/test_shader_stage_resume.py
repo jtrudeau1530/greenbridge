@@ -93,6 +93,8 @@ class ShaderStageResumeTest(unittest.TestCase):
                 json.dump([{"file": "s0.dxbc"}], f)
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "s0"}], f)
+            elif p.endswith(".s"):
+                f.write("synthetic listing\n")
 
     def fake_py(self, tool, *args):
         self.ran.append(tool)
@@ -246,6 +248,17 @@ class ShaderStageResumeTest(unittest.TestCase):
         with mock.patch.object(self, "fake_py", side_effect=repair):
             self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
         self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
+
+    def test_finished_disassembly_repairs_a_zero_byte_listing(self):
+        self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
+        listing = os.path.join(self.dxbc, "disasm", "s0.s")
+        self.assertGreater(os.path.getsize(listing), 0)
+        open(listing, "wb").close()
+
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertGreater(os.path.getsize(listing), 0)
+        self.assertEqual(self.run_stage(), [])
 
     def test_translation_stopped_after_many_files_runs_again(self):
         self.run_stage()

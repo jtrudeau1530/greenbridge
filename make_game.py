@@ -658,7 +658,7 @@ def disassembly_listings(dxbc: str) -> set[str] | None:
                     continue
                 if entry.is_symlink():
                     return None
-                if entry.is_file():
+                if entry.is_file() and entry.stat().st_size > 0:
                     listings.add(entry.name[:-2])
             return listings
     except OSError:

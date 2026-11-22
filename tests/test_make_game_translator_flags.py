@@ -106,6 +106,8 @@ class RecordedFlagsTest(unittest.TestCase):
                 json.dump([{"file": "shader.dxbc"}], f)
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "shader"}], f)
+            elif p.endswith(".s"):
+                f.write("synthetic listing\n")
 
     def run_stage(self, fallbacks=()):
         ran = []
