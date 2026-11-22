@@ -182,6 +182,19 @@ class DirectoryScanTest(unittest.TestCase):
             keys = sk.collect_keys([tmp])
             self.assertEqual(keys[0x12345678], 4)
 
+    def test_warning_names_the_offending_file_in_a_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "broken.bin")
+            with open(path, "wb") as f:
+                f.write(b"JSAV" + struct.pack("<III", 0, 4, 0))  # claims 4 entries, has no table
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                keys = sk.collect_keys([tmp])
+            self.assertEqual(keys, {})
+            self.assertIn("broken.bin", err.getvalue())
+            self.assertIn("JSAV header declares 4 entries", err.getvalue())
+            self.assertEqual(err.getvalue().count("warning:"), 1)
+
     def test_direct_jsav_file_still_matches_directory_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "save.jsav")
