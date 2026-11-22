@@ -18,9 +18,11 @@ and dynamic register indirection across the 256-entry physical register file.
 This module provides:
   1. A mathematical reference oracle (MovrelOracle) and pure-Python register file model
      implementing dynamic VGPR indexing with modulo-256 arithmetic.
-  2. Synthetic shader translation and execution via rdna2spirv and spirv_mini_interp /
+  2. M0-indexed register file dynamic addressing tests across the full register space,
+     computed M0 values via SALU, chained dynamic moves, and downstream VALU usage.
+  3. Synthetic shader translation and execution via rdna2spirv and spirv_mini_interp /
      spirv_wave_interp to verify translator lowering and execution semantics.
-  3. Golden vector verification ensuring parity between the formal ISA model and
+  4. Golden vector verification ensuring parity between the formal ISA model and
      the translator pipeline.
 """
 
@@ -321,6 +323,149 @@ class TestMovrelsReferenceOracle(unittest.TestCase):
 
         updated_pure = ref_movrels_b32(dst=50, src=20, m0=7, vgpr_file=regs)
         self.assertEqual(oracle.vgpr, updated_pure)
+
+
+class TestM0IndexedDynamicAddressing(unittest.TestCase):
+    """Dynamic addressing tests verifying M0-based VGPR file access in translated shaders."""
+
+    def test_dynamic_addressing_matrix(self) -> None:
+        """Test matrix of base VGPRs and M0 offsets against the reference oracle."""
+        test_matrix = [
+            (0, 1, 0),    # v0 <- VGPR[v1 + 0] = v1
+            (1, 2, 3),    # v1 <- VGPR[v2 + 3] = v5
+            (2, 4, 6),    # v2 <- VGPR[v4 + 6] = v10
+            (3, 0, 7),    # v3 <- VGPR[v0 + 7] = v7
+            (0, 5, 10),   # v0 <- VGPR[v5 + 10] = v15
+            (1, 10, 20),  # v1 <- VGPR[v10 + 20] = v30
+        ]
+        for dst, base_src, m0 in test_matrix:
+            target_reg = base_src + m0
+            val = (0x77000000 | (target_reg * 0x10101)) & MASK32
+            base_val = 0x11111111
+
+            lines = [
+                f"v_mov_b32 v{base_src}, {base_val:#x}",
+                f"v_mov_b32 v{target_reg}, {val:#x}",
+                f"s_mov_b32 m0, {m0}",
+                f"v_movrels_b32 v{dst}, v{base_src}",
+                f"exp mrt0 v{dst}, v{base_src}, v{target_reg}, v{dst} done vm",
+            ]
+            spv = translate_listing(lines)
+            words = mrt0_words(spv)
+
+            oracle = MovrelOracle()
+            oracle.set_vgpr(base_src, base_val)
+            oracle.set_vgpr(target_reg, val)
+            oracle.set_m0(m0)
+            oracle.execute_v_movrels(dst, base_src)
+            expected = (
+                oracle.get_vgpr(dst),
+                oracle.get_vgpr(base_src),
+                oracle.get_vgpr(target_reg),
+                oracle.get_vgpr(dst),
+            )
+            self.assertEqual(
+                tuple(words),
+                expected,
+                f"Failed for dst=v{dst}, src=v{base_src}, m0={m0}: got {words}, expected {expected}",
+            )
+
+    def test_computed_m0_salu_indexing(self) -> None:
+        """Dynamic M0 values computed at runtime via scalar ALU correctly index VGPRs."""
+        # M0 computed via addition: s0 (10) + s1 (5) = 15
+        asm_add = [
+            "v_mov_b32 v20, 0xCAFE0001",
+            "s_mov_b32 s0, 10",
+            "s_mov_b32 s1, 5",
+            "s_add_u32 m0, s0, s1",
+            "v_movrels_b32 v0, v5",  # v5 + 15 = v20
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        words = mrt0_words(translate_listing(asm_add))
+        self.assertEqual(words, [0xCAFE0001] * 4)
+
+        # M0 computed via shift: s0 (3) << 2 = 12
+        asm_shift = [
+            "v_mov_b32 v16, 0xCAFE0002",
+            "s_mov_b32 s0, 3",
+            "s_lshl_b32 m0, s0, 2",
+            "v_movrels_b32 v0, v4",  # v4 + 12 = v16
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        words = mrt0_words(translate_listing(asm_shift))
+        self.assertEqual(words, [0xCAFE0002] * 4)
+
+    def test_dynamic_lookup_table_simulation(self) -> None:
+        """Simulate an 8-entry register lookup table indexed via M0."""
+        table_values = [0x1000 + i * 0x111 for i in range(8)]
+        body = []
+        for i, val in enumerate(table_values):
+            body.append(f"v_mov_b32 v{10 + i}, {val:#x}")
+
+        # Query index 3 and index 6
+        body.extend([
+            "s_mov_b32 m0, 3",
+            "v_movrels_b32 v0, v10",  # v10 + 3 = v13
+            "s_mov_b32 m0, 6",
+            "v_movrels_b32 v1, v10",  # v10 + 6 = v16
+            "exp mrt0 v0, v1, v0, v1 done vm",
+        ])
+        words = mrt0_words(translate_listing(body))
+        expected = (table_values[3], table_values[6], table_values[3], table_values[6])
+        self.assertEqual(tuple(words), expected)
+
+    def test_chained_dynamic_moves(self) -> None:
+        """Multiple sequential v_movrels_b32 instructions with modified M0 values in one shader."""
+        lines = [
+            "v_mov_b32 v10, 0x11111111",
+            "v_mov_b32 v20, 0x22222222",
+            "v_mov_b32 v30, 0x33333333",
+            "s_mov_b32 m0, 10",
+            "v_movrels_b32 v0, v0",  # reads v10
+            "s_mov_b32 m0, 15",
+            "v_movrels_b32 v1, v5",  # reads v20
+            "s_mov_b32 m0, 28",
+            "v_movrels_b32 v2, v2",  # reads v30
+            "exp mrt0 v0, v1, v2, v0 done vm",
+        ]
+        words = mrt0_words(translate_listing(lines))
+        self.assertEqual(tuple(words), (0x11111111, 0x22222222, 0x33333333, 0x11111111))
+
+    def test_dynamic_movrels_feed_valu(self) -> None:
+        """Dynamically indexed VGPR value feeds downstream vector ALU arithmetic."""
+        lines = [
+            "v_mov_b32 v10, 0x000000FF",
+            "v_mov_b32 v1, 0x0000FF00",
+            "s_mov_b32 m0, 6",
+            "v_movrels_b32 v0, v4",     # v4 + 6 = v10 -> v0 = 0x000000FF
+            "v_add_nc_u32 v2, v0, v1",  # v2 = 0x000000FF + 0x0000FF00 = 0x0000FFFF
+            "v_lshlrev_b32 v3, 16, v2", # v3 = 0xFFFF0000
+            "exp mrt0 v0, v1, v2, v3 done vm",
+        ]
+        words = mrt0_words(translate_listing(lines))
+        self.assertEqual(tuple(words), (0x000000FF, 0x0000FF00, 0x0000FFFF, 0xFFFF0000))
+
+    def test_high_register_dynamic_read(self) -> None:
+        """Dynamic addressing into high register space (v150..v250) across the 256-entry array."""
+        lines = [
+            "v_mov_b32 v220, 0xFEEDC0DE",
+            "s_mov_b32 m0, 40",
+            "v_movrels_b32 v0, v180",  # v180 + 40 = v220
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        words = mrt0_words(translate_listing(lines))
+        self.assertEqual(tuple(words), (0xFEEDC0DE, 0xFEEDC0DE, 0xFEEDC0DE, 0xFEEDC0DE))
+
+    def test_overlapping_source_and_destination(self) -> None:
+        """When destination matches the target register, the value is preserved."""
+        lines = [
+            "v_mov_b32 v5, 0x99887766",
+            "s_mov_b32 m0, 3",
+            "v_movrels_b32 v5, v2",  # v2 + 3 = v5, write to v5
+            "exp mrt0 v5, v5, v5, v5 done vm",
+        ]
+        words = mrt0_words(translate_listing(lines))
+        self.assertEqual(tuple(words), (0x99887766, 0x99887766, 0x99887766, 0x99887766))
 
 
 class ModelMatchesHandConstants(unittest.TestCase):
