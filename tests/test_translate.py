@@ -89,10 +89,11 @@ def test_depth_compare_sample_result_width(make_shader, d16):
     dref = re.search(r"^\s*(%\w+) = OpImageSampleDrefExplicitLod %float ", spvasm, re.M)
     assert dref, "the depth compare sample is missing"
     d = re.escape(dref.group(1))
-    as_f16 = re.search(rf"^\s*(%\w+) = OpCompositeConstruct %v2float {d} %f0\n\s*%\w+ = OpExtInst %uint %glsl "
-                       r"PackHalf2x16 \1$", spvasm, re.M)
-    as_f32 = re.search(rf"^\s*%\w+ = OpBitcast %uint {d}$", spvasm, re.M)
-    assert (bool(as_f16), bool(as_f32)) == (d16, not d16)
+    bitcast = re.search(rf"^\s*(%\w+) = OpBitcast %uint {d}$", spvasm, re.M)
+    assert bitcast, "the depth compare bitcast is missing"
+    bc = re.escape(bitcast.group(1))
+    as_f16 = re.search(rf"^\s*%\w+ = OpShiftRightLogical %uint {bc} %c10$", spvasm, re.M)
+    assert bool(as_f16) == d16
 
 
 def test_a16_sample_gradients_use_full_vgprs(make_shader):
