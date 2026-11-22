@@ -247,8 +247,9 @@ What is implemented (all of it testable without the game):
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options, GPU virtual-address
-    support, format support, multisample quality levels, shader model and root signature version. Other queries are
-    logged and refused until the trace shows what the game asks (question 11);
+    support, format support, multisample quality levels, shader model and root signature version.
+    `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device enables BC texture compression.
+    Other queries are logged and refused until the trace shows what the game asks (question 11);
   - reserved resources and `GetResourceTiling` (section 4.2);
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
