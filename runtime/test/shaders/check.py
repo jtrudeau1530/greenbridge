@@ -707,9 +707,10 @@ def subgroup_size(spirv, name):
         return None
 
 
-def bindless_test(tools, spirv):
-    """ps_tex: a texture found through the descriptor hash table and the bindless set (vk_bindless_test)."""
-    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", "ps_tex")]
+def bindless_test(tools, spirv, pixel="ps_tex"):
+    """ps_tex: a texture found through the descriptor hash table and the bindless set (vk_bindless_test).
+    ps_imgatomic: image atomics in a pixel shader through the set's r32ui storage arrays, checked per texel."""
+    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", pixel)]
     for path in shaders:
         if not os.path.isfile(path):
             return f"missing {os.path.basename(path)}"
@@ -717,6 +718,9 @@ def bindless_test(tools, spirv):
     if code == UNSUPPORTED:
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    if pixel == "ps_imgatomic":
+        m = re.search(r"ps_imgatomic: (\d+) of \d+ texels wrong.*; (\d+) of \d+ render-target pixels wrong", out)
+        return "" if code == 0 and m and m.group(1) == "0" and m.group(2) == "0" else failure(code, out, 3)
     m = re.search(r"(\d+) draws read back, (\d+) bad pixels", out)
     return "" if code == 0 and m and m.group(2) == "0" else failure(code, out, 3)
 
@@ -1254,6 +1258,7 @@ def main():
         results.append((name, texture_constant_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append(("ps_ssharp", sampler_test(tools, spirv)))
+    results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))
     for name in MIP_TEST_PASSES:
         results.append((name, texture_mip_test(tools, spirv, name)))
     for name in GRADIENT_TESTS:
