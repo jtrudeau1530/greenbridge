@@ -56,6 +56,8 @@ struct VulkanDeviceInfo {
     bool host_image_copy = false;
     // The caller enabled textureCompressionBC on this logical device.
     bool texture_compression_bc = false;
+    // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
+    bool image_view_min_lod = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive

@@ -367,7 +367,24 @@ struct DeviceState {
         view_info.image = vk_image;
         view_info.viewType = g::vulkan_view_type(image.type);
         view_info.format = view_format;
-        view_info.components = g::vulkan_swizzle(image.swizzle, view_format);
+        auto swizzle = image.swizzle;
+        VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
+        if (!storage && image.type == g::ImageType::image_2d && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+            // Use the clamp in the T# itself: views with identical keys must sample identically.
+            clamp.minLod = g::image_min_lod(words);
+            if (clamp.minLod > float(image.first_mip + image.mip_count - 1)) {
+                // The accessible mip set is empty. Keep the dimensions and constant/missing channels.
+                for (auto& channel : swizzle)
+                    if (channel != g::select_one) channel = g::select_zero;
+            } else if (clamp.minLod > float(image.first_mip)) {
+                if (!info.image_view_min_lod) {
+                    log_once("2D SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
+                    return false;
+                }
+                view_info.pNext = &clamp;
+            }
+        }
+        view_info.components = g::vulkan_swizzle(swizzle, view_format);
         // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
         view_info.subresourceRange = {
             VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
@@ -2714,6 +2731,18 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
+    VkPhysicalDeviceImageViewMinLodFeaturesEXT min_lod{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+    if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &min_lod};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.image_view_min_lod = min_lod.minLod == VK_TRUE;
+        if (info.image_view_min_lod) {
+            min_lod.pNext = enable13.pNext;
+            enable13.pNext = &min_lod;
+        }
+    }
     VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
     if (has_host_image_copy) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
@@ -2733,6 +2762,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
     std::vector<const char*> device_extensions;
+    if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
