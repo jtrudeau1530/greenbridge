@@ -1049,5 +1049,133 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             )
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        # v[0:1]: (hi=2.0, lo=-1.0), v[2:3]: (hi=0.5, lo=1.0)
+        state.set_reg64(RegPair(0, RegKind.VGPR), pack_pk_f32(NEG_ONE, POS_TWO))
+        state.set_reg64(RegPair(2, RegKind.VGPR), pack_pk_f32(POS_ONE, POS_HALF))
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MIN_F32,
+            dst=RegPair(0, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(0, RegKind.VGPR)),
+            src1=VOP3POperand(RegPair(2, RegKind.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = pack_pk_f32(NEG_ONE, POS_HALF)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_reg64(RegPair(0, RegKind.VGPR)), expected)
+        # src1 (v[2:3]) must remain untouched
+        self.assertEqual(state.get_reg64(RegPair(2, RegKind.VGPR)), pack_pk_f32(POS_ONE, POS_HALF))
+
+    def test_dst_alias_src1(self) -> None:
+        state = ScalarMachineState()
+        state.set_reg64(RegPair(0, RegKind.VGPR), pack_pk_f32(NEG_ONE, POS_TWO))
+        state.set_reg64(RegPair(2, RegKind.VGPR), pack_pk_f32(POS_ONE, POS_HALF))
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MIN_F32,
+            dst=RegPair(2, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(0, RegKind.VGPR)),
+            src1=VOP3POperand(RegPair(2, RegKind.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = pack_pk_f32(NEG_ONE, POS_HALF)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_reg64(RegPair(2, RegKind.VGPR)), expected)
+        # src0 (v[0:1]) must remain untouched
+        self.assertEqual(state.get_reg64(RegPair(0, RegKind.VGPR)), pack_pk_f32(NEG_ONE, POS_TWO))
+
+    def test_dst_alias_both_srcs(self) -> None:
+        state = ScalarMachineState()
+        val = pack_pk_f32(POS_HALF, NEG_TWO)
+        state.set_reg64(RegPair(0, RegKind.VGPR), val)
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MAX_F32,
+            dst=RegPair(0, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(0, RegKind.VGPR)),
+            src1=VOP3POperand(RegPair(0, RegKind.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, val)
+        self.assertEqual(state.get_reg64(RegPair(0, RegKind.VGPR)), val)
+
+    def test_inplace_iterative_accumulation(self) -> None:
+        state = ScalarMachineState()
+        state.set_reg64(RegPair(0, RegKind.VGPR), pack_pk_f32(f32_to_bits(100.0), f32_to_bits(100.0)))
+
+        for i in range(50):
+            step_val = float(50 - i)
+            state.set_reg64(RegPair(2, RegKind.VGPR), pack_pk_f32(f32_to_bits(step_val), f32_to_bits(step_val * 2.0)))
+            instr = VPkMinMaxF32Instruction(
+                opcode=Opcode.V_PK_MIN_F32,
+                dst=RegPair(0, RegKind.VGPR),
+                src0=VOP3POperand(RegPair(0, RegKind.VGPR)),
+                src1=VOP3POperand(RegPair(2, RegKind.VGPR)),
+            )
+            self.scalar_interp.step(instr, state)
+
+        final_val = state.get_reg64(RegPair(0, RegKind.VGPR))
+        lo, hi = unpack_pk_f32(final_val)
+        self.assertEqual(lo, f32_to_bits(1.0))
+        self.assertEqual(hi, f32_to_bits(2.0))
+
+    def test_inplace_cross_half_swizzle_alias(self) -> None:
+        state = ScalarMachineState()
+        state.set_reg64(RegPair(0, RegKind.VGPR), pack_pk_f32(f32_to_bits(5.0), f32_to_bits(2.0)))
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MIN_F32,
+            dst=RegPair(0, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(0, RegKind.VGPR), op_sel=(0, 0)),
+            src1=VOP3POperand(RegPair(0, RegKind.VGPR), op_sel=(1, 1)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = pack_pk_f32(f32_to_bits(2.0), f32_to_bits(2.0))
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_reg64(RegPair(0, RegKind.VGPR)), expected)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        sentinel = 0x55AA55AA55AA55AA
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_FFFF)
+        for lane in range(32):
+            state.set_lane_reg64(lane, RegPair(0, RegKind.VGPR), pack_pk_f32(POS_ONE, POS_ONE))
+            state.set_lane_reg64(lane, RegPair(2, RegKind.VGPR), pack_pk_f32(POS_TWO, POS_TWO))
+            state.set_lane_reg64(lane, RegPair(4, RegKind.VGPR), sentinel)
+
+        instr = VPkMinMaxF32Instruction(
+            opcode=Opcode.V_PK_MAX_F32,
+            dst=RegPair(0, RegKind.VGPR),
+            src0=VOP3POperand(RegPair(0, RegKind.VGPR)),
+            src1=VOP3POperand(RegPair(2, RegKind.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(
+                    state.get_lane_reg64(lane, RegPair(0, RegKind.VGPR)),
+                    pack_pk_f32(POS_TWO, POS_TWO),
+                )
+            else:
+                self.assertEqual(
+                    state.get_lane_reg64(lane, RegPair(0, RegKind.VGPR)),
+                    pack_pk_f32(POS_ONE, POS_ONE),
+                )
+            self.assertEqual(state.get_lane_reg64(lane, RegPair(2, RegKind.VGPR)), pack_pk_f32(POS_TWO, POS_TWO))
+            self.assertEqual(state.get_lane_reg64(lane, RegPair(4, RegKind.VGPR)), sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
