@@ -1251,5 +1251,209 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(oracle_v_sub_f16(MAX_FINITE_F16 | SIGN_MASK_F16, MAX_FINITE_F16 | SIGN_MASK_F16), POS_ZERO_F16)
 
 
+
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def parse_vop_sub_f16(asm: str) -> VSubF16Instruction:
+    """Parse a v_sub_f16 instruction assembly string with validation."""
+    tokens = asm.replace(",", " ").split()
+    if not tokens:
+        raise ValueError("Empty assembly string")
+    opcode = tokens[0]
+    if opcode not in ("v_sub_f16", "v_sub_f16_e32", "v_sub_f16_e64"):
+        raise ValueError(f"Unrecognized opcode: {opcode}")
+
+    is_vop3 = opcode == "v_sub_f16_e64"
+    operands = tokens[1:]
+    clamp = "clamp" in operands
+    if clamp:
+        operands.remove("clamp")
+
+    if len(operands) != 3:
+        raise ValueError(f"Expected 3 operands (dst, src0, src1), got {len(operands)}")
+
+    dst_str, src0_str, src1_str = operands
+
+    def parse_reg(r_str: str) -> Reg:
+        r = r_str.strip()
+        hi = False
+        if "." in r:
+            parts = r.split(".")
+            r = parts[0]
+            hi = parts[1] == "h"
+        prefix = r[0]
+        if prefix not in ("v", "s"):
+            raise ValueError(f"Invalid register prefix: {prefix}")
+        reg_type = RegType.VGPR if prefix == "v" else RegType.SGPR
+        idx = int(r[1:])
+        return Reg(idx, reg_type, hi)
+
+    def parse_op(op_str: str) -> VOP3Operand16:
+        op_str = op_str.strip()
+        abs_mod = False
+        neg_mod = False
+        if op_str.startswith("-"):
+            neg_mod = True
+            op_str = op_str[1:]
+        if op_str.startswith("|") and op_str.endswith("|"):
+            abs_mod = True
+            op_str = op_str[1:-1]
+        try:
+            val = float(op_str)
+            return VOP3Operand16(Literal16.from_float(val), abs_mod=abs_mod, neg_mod=neg_mod)
+        except ValueError:
+            return VOP3Operand16(parse_reg(op_str), abs_mod=abs_mod, neg_mod=neg_mod)
+
+    dst_reg = parse_reg(dst_str)
+    src0_op = parse_op(src0_str)
+    src1_op = parse_op(src1_str)
+    return VSubF16Instruction(dst=dst_reg, src0=src0_op, src1=src1_op, clamp=clamp, is_vop3=is_vop3)
+
+
+def mutant_swap_operands(src0: int, src1: int) -> int:
+    """Mutant A: computes reverse subtraction src1 - src0 instead of src0 - src1."""
+    return oracle_v_sub_f16(src1, src0)
+
+
+def mutant_ignore_abs_modifier(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+    """Mutant B: ignores abs modifier."""
+    res = bits & 0xFFFF
+    if neg_mod:
+        res ^= SIGN_MASK_F16
+    return res
+
+
+def mutant_ignore_neg_modifier(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+    """Mutant C: ignores neg modifier."""
+    res = bits & 0xFFFF
+    if abs_mod:
+        res &= ~SIGN_MASK_F16
+    return res
+
+
+def mutant_flush_subnormal(src0: int, src1: int) -> int:
+    """Mutant D: flushes subnormals to zero prematurely."""
+    res = oracle_v_sub_f16(src0, src1)
+    if is_subnormal_f16(res):
+        return POS_ZERO_F16
+    return res
+
+
+def mutant_skip_snan_quietening(src0: int, src1: int) -> int:
+    """Mutant E: fails to quiet signaling NaN."""
+    if is_snan_f16(src0):
+        return src0
+    if is_snan_f16(src1):
+        return src1
+    return oracle_v_sub_f16(src0, src1)
+
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_sub_f16."""
+
+    def test_syntax_rejection_invalid_opcode(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_sub_f16("v_add_f16 v0, v1, v2")
+
+    def test_syntax_rejection_insufficient_operands(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_sub_f16("v_sub_f16 v0, v1")
+
+    def test_syntax_rejection_out_of_range_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_sub_f16("v_sub_f16 v256, v1, v2")
+        with self.assertRaises(ValueError):
+            parse_vop_sub_f16("v_sub_f16 v0, s256, v2")
+
+    def test_syntax_rejection_sgpr_as_destination(self) -> None:
+        with self.assertRaises(TypeError):
+            parse_vop_sub_f16("v_sub_f16 s0, v1, v2")
+
+    def test_single_bit_flip_detection(self) -> None:
+        s0 = f16_to_bits(15.0)
+        s1 = f16_to_bits(5.0)
+        correct = oracle_v_sub_f16(s0, s1)
+        self.assertEqual(bits_to_f16(correct), 10.0)
+
+        # Corrupt single fraction bit
+        corrupted_frac = correct ^ 0x1
+        self.assertNotEqual(correct, corrupted_frac)
+
+        # Corrupt single exponent bit
+        corrupted_exp = correct ^ (1 << 10)
+        self.assertNotEqual(correct, corrupted_exp)
+
+        # Corrupt sign bit
+        corrupted_sign = correct ^ SIGN_MASK_F16
+        self.assertNotEqual(correct, corrupted_sign)
+
+    def test_mutation_swap_operands(self) -> None:
+        s0 = f16_to_bits(20.0)
+        s1 = f16_to_bits(5.0)
+        expected = oracle_v_sub_f16(s0, s1)
+        mutant = mutant_swap_operands(s0, s1)
+        self.assertEqual(bits_to_f16(expected), 15.0)
+        self.assertEqual(bits_to_f16(mutant), -15.0)
+        self.assertNotEqual(expected, mutant)
+
+    def test_mutation_ignore_abs(self) -> None:
+        val = f16_to_bits(-10.0)
+        correct = apply_f16_modifiers(val, abs_mod=True, neg_mod=False)
+        mutant = mutant_ignore_abs_modifier(val, abs_mod=True, neg_mod=False)
+        self.assertEqual(correct, f16_to_bits(10.0))
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_neg(self) -> None:
+        val = f16_to_bits(10.0)
+        correct = apply_f16_modifiers(val, abs_mod=False, neg_mod=True)
+        mutant = mutant_ignore_neg_modifier(val, abs_mod=False, neg_mod=True)
+        self.assertEqual(correct, f16_to_bits(-10.0))
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_flush_subnormal(self) -> None:
+        sub = MIN_SUBNORMAL_F16 * 2
+        correct = oracle_v_sub_f16(sub, MIN_SUBNORMAL_F16)
+        mutant = mutant_flush_subnormal(sub, MIN_SUBNORMAL_F16)
+        self.assertTrue(is_subnormal_f16(correct))
+        self.assertEqual(mutant, POS_ZERO_F16)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_skip_snan_quietening(self) -> None:
+        snan = 0x7C05
+        correct = oracle_v_sub_f16(snan, f16_to_bits(1.0))
+        mutant = mutant_skip_snan_quietening(snan, f16_to_bits(1.0))
+        self.assertTrue(is_qnan_f16(correct))
+        self.assertTrue(is_snan_f16(mutant))
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_exec_mask_leak(self) -> None:
+        sentinel = 0xCAFE
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.set_vgpr16(lane, 4, sentinel, hi=False)
+
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VSubF16Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: ignores exec_mask and corrupts lane
+                    res = oracle_v_sub_f16(f16_to_bits(10.0), f16_to_bits(5.0))
+                    state.set_vgpr16(lane, instr.dst.index, res, instr.dst.hi)
+                    results.append(res)
+                return results
+
+        mutant = MutantSIMDInterpreter()
+        instr = VSubF16Instruction(
+            dst=Reg(4, RegType.VGPR, hi=False),
+            src0=VOP3Operand16(Literal16.from_float(10.0)),
+            src1=VOP3Operand16(Literal16.from_float(5.0)),
+        )
+        mutant.step(instr, state)
+        corrupted = [l for l in range(32) if state.get_vgpr16(l, 4, hi=False) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
