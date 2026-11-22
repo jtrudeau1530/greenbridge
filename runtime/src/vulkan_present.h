@@ -647,7 +647,7 @@ private:
         VkSwapchainPresentModesCreateInfoKHR switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR};
         std::array<VkPresentModeKHR, 2> switchable_modes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAX_ENUM_KHR};
         VkPresentModeKHR tear = VK_PRESENT_MODE_MAX_ENUM_KHR;
-        if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR) tear = find_tear_mode(modes, info.minImageCount);
+        if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR) tear = find_tear_mode(modes, info.minImageCount, info.imageUsage, info.imageExtent);
         if (tear != VK_PRESENT_MODE_MAX_ENUM_KHR) {
             switchable_modes[1] = tear;
             switchable.presentModeCount = 2;
@@ -702,8 +702,10 @@ private:
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
     // The mode a FIFO swapchain can also present in, so that a late frame can be shown at once: IMMEDIATE, else
     // FIFO_RELAXED, each only if the surface lists it and reports it compatible with FIFO (VK_KHR_surface_maintenance1).
-    // `min_images` is raised to what that mode needs too. MAX_ENUM when there is none or the extension is not in use.
-    VkPresentModeKHR find_tear_mode(const std::vector<VkPresentModeKHR>& modes, std::uint32_t& min_images) {
+    // `min_images` is raised to what that mode needs too. The mode must also accept the swapchain's image usage and
+    // extent (its capabilities can differ from FIFO's). MAX_ENUM when there is none or the extension is not in use.
+    VkPresentModeKHR find_tear_mode(const std::vector<VkPresentModeKHR>& modes, std::uint32_t& min_images,
+                                    VkImageUsageFlags usage, VkExtent2D extent) {
         if (!maintenance1_ || !vkGetPhysicalDeviceSurfaceCapabilities2KHR_) return VK_PRESENT_MODE_MAX_ENUM_KHR;
         // The capabilities of the surface for one present mode, and the modes it can switch to from there.
         const auto ask = [&](VkPresentModeKHR asked, VkSurfaceCapabilitiesKHR& caps,
@@ -734,6 +736,10 @@ private:
                 continue;
             VkSurfaceCapabilitiesKHR mode_caps{};
             if (!ask(wanted, mode_caps, nullptr, nullptr)) continue;
+            if ((mode_caps.supportedUsageFlags & usage) != usage) continue;
+            if (extent.width < mode_caps.minImageExtent.width || extent.height < mode_caps.minImageExtent.height ||
+                extent.width > mode_caps.maxImageExtent.width || extent.height > mode_caps.maxImageExtent.height)
+                continue;
             // One image count that every mode of the swapchain accepts.
             std::uint32_t count = std::max({min_images, fifo_caps.minImageCount, mode_caps.minImageCount});
             const std::uint32_t most = std::min(fifo_caps.maxImageCount ? fifo_caps.maxImageCount : UINT32_MAX,

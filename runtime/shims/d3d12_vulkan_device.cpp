@@ -3825,10 +3825,16 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     if (create_surface(info.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) return nullptr;
     // LEONIDA_PRESENT_NO_TEAR=1 keeps the swapchain FIFO-only (ImmediateThresholdPercent then does nothing).
-    char no_tear[8] = {};
-    std::size_t no_tear_length = 0;
-    const bool tear_allowed = !(getenv_s(&no_tear_length, no_tear, "LEONIDA_PRESENT_NO_TEAR") == 0 &&
-                                no_tear_length > 1 && no_tear[0] != '0');
+    // Any non-empty value other than "0" turns it off.
+    bool tear_allowed = true;
+    {
+        char* value = nullptr;
+        std::size_t length = 0;
+        if (_dupenv_s(&value, &length, "LEONIDA_PRESENT_NO_TEAR") == 0 && value) {
+            tear_allowed = value[0] == '\0' || std::strcmp(value, "0") == 0;
+            std::free(value);
+        }
+    }
     auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
                                                                 info.instance, info.physical, info.queue,
                                                                 info.queue_family, surface,  // owns the surface

@@ -57,8 +57,9 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
     const bool wants_tear = threshold > 0.0f;
     if (wants_tear && !presenter_->tear_supported())
         log_once(logged_threshold_,
-                 "ImmediateThresholdPercent is not implemented here (the swapchain cannot switch to IMMEDIATE or "
-                 "FIFO_RELAXED: no VK_KHR/EXT_swapchain_maintenance1 or no such mode): a late frame waits for the next vblank");
+                 "ImmediateThresholdPercent has no effect on this swapchain (tearing disabled by LEONIDA_PRESENT_NO_TEAR, "
+                 "no VK_KHR/EXT_swapchain_maintenance1, or no IMMEDIATE/FIFO_RELAXED mode the surface can switch to): "
+                 "a late frame waits for the next vblank");
 
     // Unpaced (no interval registered): do not hold the queue for vblanks.
     const UINT sync_interval = pacer_.registered() ? 1 : 0;
@@ -127,8 +128,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
     if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
     pacer_.commit_present_token(token, plane_count,
                                 tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
-                                                                        : leonida::PresentSync::vblank,
-                                timing.late_us);
+                                                                        : leonida::PresentSync::vblank);
     ++presents_;
     return S_OK;
 }

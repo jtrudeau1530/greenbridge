@@ -414,8 +414,9 @@ int main() {
         EXPECT(timing.late_us == 8000);
         const PresentSync mode = decide_present_sync(timing.late_us, timing.period_us, 60.0f);
         EXPECT(mode == PresentSync::immediate);
-        pacer.commit_present_token(token1, 1, mode, timing.late_us);
+        pacer.commit_present_token(token1, 1, mode);
         EXPECT(pacer.immediate_presents() == 1);
+        EXPECT(pacer.present_timing(token1).late_us == 0);  // presented already: a repeated token never tears
         EXPECT(pacer.frames_in_flight() == 0);  // shown at once, not queued for the next vblank
         std::uint32_t count = 4;
         FrameStatistic stats[4];
@@ -431,7 +432,7 @@ int main() {
         timing = pacer.present_timing(token2);
         EXPECT(timing.late_us == 8000);
         EXPECT(decide_present_sync(timing.late_us, timing.period_us, 40.0f) == PresentSync::vblank);
-        pacer.commit_present_token(token2, 1, PresentSync::vblank, timing.late_us);
+        pacer.commit_present_token(token2, 1, PresentSync::vblank);
         EXPECT(pacer.immediate_presents() == 1 && pacer.frames_in_flight() == 1);
         EXPECT(pacer.get_frame_statistics(token2, stat_display, &count, stats) == pacer_hr::false_);  // not shown yet
         clock.advance_us(period);  // vblank at 5 * period

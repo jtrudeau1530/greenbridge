@@ -267,7 +267,8 @@ public:
     }
     // How late the frame of `token` is if it is presented now (see the model above). late_us stays 0 when the frame
     // could not be shown at once anyway: unpaced, null or unknown token, or earlier frames still waiting for their
-    // vblank (a flip cannot overtake them).
+    // vblank (a flip cannot overtake them), or the token was already presented or is older than the last presented
+    // (a repeated or stale token never tears).
     struct PresentTiming {
         std::uint64_t late_us = 0;
         std::uint32_t period_us = 0;   // 0: unpaced
@@ -281,17 +282,17 @@ public:
         timing.period_us = period_us_;
         if (!pending_.empty()) return timing;
         for (const Record& r : records_)
-            if (r.token == token) {
+            if (r.token == token && !r.presented && token > last_presented_) {
                 const std::uint64_t due = r.origin_us - std::min<std::uint64_t>(r.origin_us, offset_us_) + period_us_;
                 if (now > due) timing.late_us = now - due;
             }
         return timing;
     }
 
-    // `sync` immediate: the frame is shown at once (display time = present time, percent_scanned from `late_us`)
-    // instead of at the next vblank. The caller got that from decide_present_sync and the presenter confirmed it.
-    void commit_present_token(std::uint64_t token, std::uint32_t plane_count, PresentSync sync = PresentSync::vblank,
-                              std::uint64_t late_us = 0) {
+    // `sync` immediate: the frame is shown at once (display time = present time) instead of at the next vblank, and
+    // percent_scanned is the lateness measured at this commit, so it agrees with the display time. The caller got
+    // `sync` from decide_present_sync and the presenter confirmed it.
+    void commit_present_token(std::uint64_t token, std::uint32_t plane_count, PresentSync sync = PresentSync::vblank) {
         (void)plane_count;
         std::lock_guard guard(mutex_);
         const std::uint64_t now = clock_.now_us();
@@ -309,6 +310,12 @@ public:
         float percent = 0.0f;
         if (sync == PresentSync::immediate && pending_.empty()) {
             flip = now;
+            std::uint64_t late_us = 0;
+            for (const Record& r : records_)
+                if (r.token == token) {
+                    const std::uint64_t due = r.origin_us - std::min<std::uint64_t>(r.origin_us, offset_us_) + period_us_;
+                    if (now > due) late_us = now - due;
+                }
             percent = scan_percent(late_us, period_us_);
             ++immediate_presents_;
         }

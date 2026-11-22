@@ -523,8 +523,6 @@ int main() {
             if (can_tear) EXPECT(xbox.presenter().tear_presents() == xbox.immediate_presents() - tears_before);
         }
 
-        // Real time, 60 Hz: 30 frames cycling through three colours; tokens count up one per wait, each frame shows
-        // the colour that was presented, and the loop takes about 30 vblanks.
         owner.reset();  // one swapchain per window: the first presenter goes
         // Kill switch: LEONIDA_PRESENT_NO_TEAR=1 keeps the swapchain FIFO-only, so a late frame with a threshold waits.
         {
@@ -549,6 +547,8 @@ int main() {
             EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
             std::printf("no tearing mode (LEONIDA_PRESENT_NO_TEAR): late frame waits for the vblank: ok\n");
         }
+        // Real time, 60 Hz: 30 frames cycling through three colours; tokens count up one per wait, each frame shows
+        // the colour that was presented, and the loop takes about 30 vblanks.
         auto presenter2 = rt::d3d12::create_window_presenter(inner, window);
         EXPECT(presenter2 && presenter2->enable_capture());
         rt::d3d12::XboxPresentation real(std::move(presenter2));  // the real clock
