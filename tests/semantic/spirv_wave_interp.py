@@ -160,7 +160,12 @@ class _Module:
                     raise UnsupportedConstruct(f"{op} before the first label")
                 if res and a and op != "OpStore":
                     self.id_type[res] = a[0]
+                if op == "OpVariable" and a[1:2] == ["Function"] and len(self.blocks) > 1:
+                    raise InvalidModule(f"{line!r} is a Function variable outside the function's first block")
                 if op == "OpPhi":
+                    if cur.body:
+                        raise InvalidModule(f"{line!r} follows a non-phi instruction of its block (spirv-val: "
+                                            "OpPhi must come first)")
                     cur.phis.append((res, a))
                 elif op in ("OpSelectionMerge", "OpLoopMerge"):
                     cur.merge = (op, a[0], a[1] if op == "OpLoopMerge" else None)
