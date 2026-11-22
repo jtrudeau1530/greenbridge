@@ -8455,13 +8455,7 @@ class Gen:
             coords = unpacked
             if op == "image_load":
                 # 16-bit integer coordinates: each half is an unsigned 16-bit int, not an f16.
-                ints = []
-                for c in [self.load_reg("vgpr", r) for r in addr]:
-                    lo, hi = self.tmp(), self.tmp()
-                    self.emit(f"{lo} = OpBitwiseAnd %uint {c} {self.cu(0xFFFF)}")
-                    self.emit(f"{hi} = OpShiftRightLogical %uint {c} {self.cu(16)}")
-                    ints += [lo, hi]
-                coords = ints
+                coords = self.unpack_image_a16_uints([self.load_reg("vgpr", r) for r in addr])
         if op == "image_load":
             if len(coords) < ncoord:
                 raise Unsupported("image_load coords")
@@ -8959,6 +8953,16 @@ class Gen:
         self.emit(f"OpBranch {L['e2']}")
         self.emit(f"{L['e2']} = OpLabel")
 
+    def unpack_image_a16_uints(self, words: list[str]) -> list[str]:
+        """Unpack the unsigned address components of a samplerless MIMG instruction, low half first."""
+        halves = []
+        for word in words:
+            lo, hi = self.tmp(), self.tmp()
+            self.emit(f"{lo} = OpBitwiseAnd %uint {word} {self.cu(0xFFFF)}")
+            self.emit(f"{hi} = OpShiftRightLogical %uint {word} {self.cu(16)}")
+            halves.extend((lo, hi))
+        return halves
+
     def image_store(self, a, mods, dim):
         """image_store vData, vAddr, T#: write the dmask components to a storage image. The view is picked at run
         time from T# word1 FORMAT [28:20]: *_UINT -> uint view, *_SINT -> sint view, anything else -> float view
@@ -8974,14 +8978,7 @@ class Gen:
         vdata, addr = a[0], self.addr_regs(a[1])
         raw = [self.load_reg("vgpr", r) for r in addr]
         if "a16" in mods:
-            # 16-bit coordinates: two unsigned 16-bit values per register, low half first.
-            halves = []
-            for c in raw:
-                lo, hi = self.tmp(), self.tmp()
-                self.emit(f"{lo} = OpBitwiseAnd %uint {c} {self.cu(0xFFFF)}")
-                self.emit(f"{hi} = OpShiftRightLogical %uint {c} {self.cu(16)}")
-                halves += [lo, hi]
-            raw = halves
+            raw = self.unpack_image_a16_uints(raw)
         if len(raw) < nc:
             raise Unsupported("image_store coords")
         # The enabled components come from consecutive VGPRs, in component order (dmask 0x9: R = vD, A = vD+1).
@@ -9071,8 +9068,9 @@ class Gen:
                     out += 1
             return
         is_atomic = op in self.IMG_ATOMICS or op == "image_atomic_cmpswap"
+        packed_mip = op == "image_load_mip" and "tfe" not in mods and "lwe" not in mods
         if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query))
-                or ("a16" in mods and not is_atomic)
+                or ("a16" in mods and not (is_atomic or packed_mip))
                 or ("d16" in mods and op != "image_load_mip")):
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         vdata, addr = a[0], self.addr_regs(a[1])
@@ -9207,9 +9205,14 @@ class Gen:
                     out += 1
             return
         # image_load_mip: x, y, mip, with the same typed SRV as image_load.
-        if len(addr) < 3:
+        packed = "a16" in mods
+        if len(addr) < (2 if packed else 3):
             raise Unsupported("image_load_mip coords")
-        xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:3]]
+        if packed:
+            words = [self.load_reg("vgpr", r) for r in addr[:2]]
+            xs = [self.as_int(c) for c in self.unpack_image_a16_uints(words)[:3]]
+        else:
+            xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:3]]
         iv = self.tmp()
         self.emit(f"{iv} = OpCompositeConstruct %v2int {xs[0]} {xs[1]}")
         self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, dmask, vdata, xs[2], d16="d16" in mods)
