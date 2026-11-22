@@ -25,12 +25,14 @@ def pad16(buf):
     return buf
 
 
-def block(n, colour=True, uv1=True, flags=0x200):
+def block(n, colour=True, uv1=True, normal=True, flags=0x200):
     """A vertex block with n vertices: slots 0 (pos), 1 (rgba), 2 (normal), 3 (uv0), 4 (uv1).
 
     The streams are stored in slot order 0, 2, 1, 3, 4, as measured.
     """
     order = [(0, 0x63, 12), (2, 0x63, 12), (1, 0x26, 4), (3, 0x42, 8), (4, 0x42, 8)]
+    if not normal:
+        order = [o for o in order if o[0] != 2]
     if not colour:
         order = [o for o in order if o[0] != 1]
     if not uv1:
@@ -98,6 +100,20 @@ class ParseTests(unittest.TestCase):
         chunks = mp.parse_page(data)
         self.assertEqual([c["kind"] for c in chunks], ["block", "group", "block"])
         self.assertEqual([s[0] for s in chunks[0]["slots"]], [0, 2, 3])
+
+    def test_block_without_normals(self):
+        # slots 0, 3, 4 only: the vertex count comes from slot 0's span up to the next stream (slot 3)
+        data = page(block(7, colour=False, normal=False), group([(7, 5)]))
+        chunks = mp.parse_page(data)
+        self.assertEqual([c["kind"] for c in chunks], ["block", "group"])
+        self.assertEqual(chunks[0]["vertices"], 7)
+        self.assertEqual([s[0] for s in chunks[0]["slots"]], [0, 3, 4])
+        self.assertTrue(chunks[0]["tags_expected"])
+        summary = mp.summarise_page(data, "x")
+        self.assertNotIn("error", summary)
+        c = summary["checks"]
+        self.assertEqual((c["vertices"], c["positions_finite"], c["normals_unit"]), (7, 7, 0))
+        self.assertEqual((c["uv_vertices"], c["uv_finite"]), (14, 14))
 
     def test_group_led_page(self):
         data = page(group([(10, 8)]), block(10))
@@ -167,6 +183,12 @@ class RejectTests(unittest.TestCase):
     def test_slot_size_mismatch(self):
         b = bytearray(block(10))
         struct.pack_into("<I", b, 4, 0x26 | (((0x60 + 120 + 8) // 2) << 8))
+        with self.assertRaises(mp.PageError):
+            mp.parse_block(bytes(b), 0)
+
+    def test_block_with_only_slot_0(self):
+        b = bytearray(0x60 + 12 * 4)
+        struct.pack_into("<I", b, 0, 0x63 | ((0x60 // 2) << 8))
         with self.assertRaises(mp.PageError):
             mp.parse_block(bytes(b), 0)
 
