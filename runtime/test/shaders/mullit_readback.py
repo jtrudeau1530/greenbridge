@@ -67,8 +67,11 @@ def operand_triples():
                  (MIN_NORMAL, 0x3f000000), (SIGN | MIN_NORMAL, 0x3f000000),
                  (INF, SIGN | ONE), (ONE, LIGHT_OFF - 1)):
         yield x, y, ONE
+    # Halfway products round up to 0x3fc00002 and down to 0x3fc00004.
+    yield 0x3fc00000, ONE + 1, ONE
+    yield 0x3fc00000, ONE + 3, ONE
     rng = random.Random(578)
-    for _ in range(30):
+    for _ in range(28):
         x = rng.randrange(MIN_NORMAL, INF) | rng.choice((0, SIGN))
         y = rng.randrange(MIN_NORMAL, INF) | rng.choice((0, SIGN))
         yield x, y, ONE
