@@ -6,7 +6,7 @@ Uses `tools/awc_opus.py` for the AWC parse and packet collection. A streamed-mus
 when its decoded duration is inside the requested range. The descriptor's sample count is interleaved
 across the Opus packet channels, so the packet channel count is read from the TOC stereo bit and the
 per-channel frame count is `samples / packet_channels`. The output is
-`<out>/<bank>/<stream id>.ogg` plus `<out>/shorts.csv`.
+`<out>/<bank>/<stream id>.ogg` plus `<out>/shorts.csv`. Directory scans preserve the input subdirectories.
 
 This tool never re-encodes: the selected Opus packets are repacked into Ogg Opus exactly as stored.
 It does not transcribe or classify the clips; that is a separate analysis step.
@@ -44,11 +44,12 @@ def short_channels(d: bytes, mus, data, min_seconds: float, max_seconds: float):
     return selected
 
 
-def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float):
+def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float, *, bank=None):
     """Export the selected channels of one bank; returns CSV rows."""
     with open(path, "rb") as f:
         d = f.read()
-    bank = os.path.splitext(os.path.basename(path))[0]
+    if bank is None:
+        bank = os.path.splitext(os.path.basename(path))[0]
     od = os.path.join(out_dir, bank)
     os.makedirs(od, exist_ok=True)
     _streams, music = awc.parse_awc(d)
@@ -74,8 +75,9 @@ def _banks(src: str):
         found = []
         for root, _dirs, files in os.walk(src):
             found += [os.path.join(root, name) for name in files if name.lower().endswith(".awc")]
-        return sorted(found)
-    return [src]
+        return [(path, os.path.splitext(os.path.relpath(path, src))[0].replace(os.sep, "/"))
+                for path in sorted(found)]
+    return [(src, os.path.splitext(os.path.basename(src))[0])]
 
 
 def main(argv=None) -> int:
@@ -93,21 +95,22 @@ def main(argv=None) -> int:
     os.makedirs(a.out, exist_ok=True)
     rows = []
     if a.jobs == 1:
-        for i, bank in enumerate(banks, 1):
+        for i, (path, bank) in enumerate(banks, 1):
             try:
-                rows += export_bank(bank, a.out, a.min_seconds, a.max_seconds)
+                rows += export_bank(path, a.out, a.min_seconds, a.max_seconds, bank=bank)
             except (ValueError, OSError, IndexError) as e:
-                print(f"  skip {os.path.basename(bank)}: {e}", file=sys.stderr)
+                print(f"  skip {bank}: {e}", file=sys.stderr)
             if i % 200 == 0:
                 print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
     else:
         with ProcessPoolExecutor(max_workers=max(1, a.jobs)) as ex:
-            futures = {ex.submit(export_bank, b, a.out, a.min_seconds, a.max_seconds): b for b in banks}
+            futures = {ex.submit(export_bank, path, a.out, a.min_seconds, a.max_seconds, bank=bank): bank
+                       for path, bank in banks}
             for i, fut in enumerate(as_completed(futures), 1):
                 try:
                     rows += fut.result()
                 except (ValueError, OSError, IndexError) as e:
-                    print(f"  skip {os.path.basename(futures[fut])}: {e}", file=sys.stderr)
+                    print(f"  skip {futures[fut]}: {e}", file=sys.stderr)
                 if i % 200 == 0:
                     print(f"  {i}/{len(banks)} banks, {len(rows)} clips", flush=True)
     rows.sort(key=lambda r: (r["bank"].lower(), r["stream"]))

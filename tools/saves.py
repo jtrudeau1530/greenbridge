@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""saves.py: inspect, extract, rebuild and import the game's save containers (ASAV / JSAV / SLAYER1).
+
+Standard library only. Run with `python -I tools/saves.py <command> ...`.
+Reads files that are already plain on disk. It does no decryption and contains no keys; the packed SLAYER1 body
+is reported, not decoded. Format notes: docs/saves.md.
+
+Commands
+  info    <file|dir>...          print headers (auto-detects ASAV, JSAV, SLAYER1 and save folders)
+  extract <file> <outdir>        JSAV  -> index.json + blocks/NNN_<group>_<hash>.json + save.pretty.json
+                                 ASAV  -> header.json + payload.bin (+ payload.json if it is text)
+  pack    <extracted dir> <out>  rebuild a JSAV from an `extract` folder (blocks are taken verbatim)
+  verify  <JSAV file>            extract + pack in memory and check the rebuild is byte-identical
+  diff    <JSAV a> <JSAV b>      list blocks that were added, removed or changed between two saves
+  import <save dir>... [--out DIR] [--map OLD=CONTAINER/BLOB]... [--with-packed] [--force] [--dry-run]
+                                 copy the ASAV/JSAV payloads out of plain save folders into the on-disk layout
+                                 of the offline XGameSave shim (runtime/shims/xgameruntime_services.cpp):
+                                 DIR/local-user/<container>/<blob>, names %-encoded the same way.
+                                 DIR defaults to %LOCALAPPDATA%\\Leonida\\saves (the shim's LEONIDA_SAVE_DIR default).
+                                 VERIFY: container/blob names are a guess until the executable shows them; by default
+                                 container = slot name (from the ASAV header), blob = payload file name. Use --map.
+"""
+import json
+import os
+import struct
+import sys
+from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------------------------- ASAV
+ASAV_HDR = 0x170          # header size seen on every plain ASAV file
+ASAV_TITLE = (0x28, 0x128)  # UTF-16LE display title, 128 code units
+ASAV_NAME = (0x128, 0x160)  # ASCII slot name, 56 bytes
+
+
+def ts(v):
+    try:
+        return datetime.fromtimestamp(v, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def parse_asav(d):
+    if d[:4] != b'ASAV':
+        raise ValueError('not ASAV')
+    f = struct.unpack_from('<IIIIIII', d, 4)
+    h = {
+        'magic': 'ASAV',
+        'version': f[0],            # 1
+        'kind': f[1],               # 1 = story (wraps compressed/encrypted JSAV), 2 = settings, 3 = player
+        'unk_0c': f[2],             # 1 on plain files, 3 on the SLAYER1-wrapped one
+        'field_10': f[3],           # 0 on plain files; 0x180 (= header size?) on the wrapped one
+        'payload_offset': f[4],     # 0x170
+        'field_18': f[5],           # 0 on plain files; looks like stored size on the wrapped one
+        'field_1c': f[6],           # total file size on plain files; unpacked size on the wrapped one
+        'timestamp': struct.unpack_from('<Q', d, 0x20)[0],
+        'title': d[ASAV_TITLE[0]:ASAV_TITLE[1]].decode('utf-16le', 'replace').split('\0', 1)[0],
+        'slot_name': d[ASAV_NAME[0]:ASAV_NAME[1]].split(b'\0', 1)[0].decode('ascii', 'replace'),
+        'checksum_160': '%08x' % struct.unpack_from('<I', d, 0x160)[0],   # algorithm unknown
+        'field_164': struct.unpack_from('<I', d, 0x164)[0],
+        'size_168': struct.unpack_from('<Q', d, 0x168)[0],
+        'file_size': len(d),
+    }
+    h['timestamp_utc'] = ts(h['timestamp'])
+    return h
+
+
+def asav_payload(d, h):
+    end = h['field_1c'] if h['unk_0c'] == 1 and h['field_1c'] <= len(d) else len(d)
+    return d[h['payload_offset']:end]
+
+
+# ---------------------------------------------------------------------------------------------- JSAV
+JSAV_HDR = 16
+JSAV_ENTRY = struct.Struct('<IIIII')  # hash, flags (1), reserved (0), absolute offset, size
+JSAV_SEP = b',\r\n'
+
+
+def parse_jsav(d):
+    if d[:4] != b'JSAV':
+        raise ValueError('not JSAV')
+    ver, n_code, n_script = struct.unpack_from('<III', d, 4)
+    n = n_code + n_script
+    entries = []
+    for i in range(n):
+        hsh, flags, rsv, off, size = JSAV_ENTRY.unpack_from(d, JSAV_HDR + i * JSAV_ENTRY.size)
+        entries.append({'index': i, 'group': 'code' if i < n_code else 'script',
+                        'hash': '%08x' % hsh, 'flags': flags, 'reserved': rsv, 'offset': off, 'size': size})
+    table_end = JSAV_HDR + n * JSAV_ENTRY.size
+    body_off = d.index(b'{', table_end)
+    body_end = len(d.rstrip(b'\0'))
+    return {'magic': 'JSAV', 'version': ver, 'code_blocks': n_code, 'script_blocks': n_script,
+            'table_end': table_end, 'body_offset': body_off, 'body_end': body_end,
+            'file_size': len(d)}, entries
+
+
+def jsav_blocks(d, entries):
+    return [d[e['offset']:e['offset'] + e['size']] for e in entries]
+
+
+def align(n, a):
+    return (n + a - 1) // a * a
+
+
+def build_jsav(version, n_code, hashes, flags, blocks):
+    """Rebuild the exact framing seen in retail saves."""
+    n = len(blocks)
+    body_off = align(JSAV_HDR + n * JSAV_ENTRY.size, 16)
+    # Retail framing: '{"CodeSaveBlocks":[\r\n' b0 ',\r\n' b1 ... '],\r\n"ScriptSaveBlocks":[\r\n' ... ']\r\n}'
+    # (the closing ']' follows the last block directly, no newline before it).
+    body = bytearray(b'{"CodeSaveBlocks":[\r\n')
+    offs = []
+    for i, b in enumerate(blocks):
+        if i == n_code:
+            if n_code:
+                body[-len(JSAV_SEP):] = b''
+            body += b'],\r\n"ScriptSaveBlocks":[\r\n'
+        offs.append(body_off + len(body))
+        body += b + JSAV_SEP
+    if blocks:
+        body[-len(JSAV_SEP):] = b''
+    if n_code == n:
+        body += b'],\r\n"ScriptSaveBlocks":[\r\n'
+    body += b']\r\n}'
+    out = bytearray(struct.pack('<4sIII', b'JSAV', version, n_code, n - n_code))
+    for h, f, o, b in zip(hashes, flags, offs, blocks):
+        out += JSAV_ENTRY.pack(h, f, 0, o, len(b))
+    out += b'\0' * (body_off - len(out))
+    out += body
+    out += b'\0' * (align(len(out), 16) - len(out))
+    return bytes(out)
+
+
+# ---------------------------------------------------------------------------------------------- SLAYER1
+def parse_slayer(d):
+    if d[:8] != b'SLAYER1\0':
+        raise ValueError('not SLAYER1')
+    ver, nlen = struct.unpack_from('<II', d, 8)
+    name = d[16:16 + nlen].decode('ascii', 'replace')
+    size = struct.unpack_from('<Q', d, 16 + nlen)[0]
+    inner = 16 + nlen + 8
+    return {'magic': 'SLAYER1', 'version': ver, 'name': name, 'payload_size': size,
+            'payload_offset': inner, 'file_size': len(d)}
+
+
+# ---------------------------------------------------------------------------------------------- helpers
+def kind_of(d):
+    if d[:4] == b'ASAV':
+        return 'ASAV'
+    if d[:4] == b'JSAV':
+        return 'JSAV'
+    if d[:8] == b'SLAYER1\0':
+        return 'SLAYER1'
+    return None
+
+
+def read(p):
+    with open(p, 'rb') as f:
+        return f.read()
+
+
+def info_file(p, indent=''):
+    d = read(p)
+    k = kind_of(d)
+    print(f'{indent}{p}: {k or "unknown"} ({len(d)} bytes)')
+    if k == 'ASAV':
+        h = parse_asav(d)
+        for key, v in h.items():
+            print(f'{indent}  {key:15} {v}')
+        pl = asav_payload(d, h)
+        print(f'{indent}  payload         {len(pl)} bytes, starts {pl[:16]!r}')
+    elif k == 'JSAV':
+        h, es = parse_jsav(d)
+        for key, v in h.items():
+            print(f'{indent}  {key:15} {v}')
+        groups = {}
+        for e, b in zip(es, jsav_blocks(d, es)):
+            g = b[2:15].decode('ascii', 'replace').strip('"')
+            groups.setdefault((e['group'], g), []).append(e['size'])
+        for (g, w), sizes in groups.items():
+            print(f'{indent}  {g:6} wrapper {w}: {len(sizes)} blocks, {sum(sizes)} bytes, largest {max(sizes)}')
+    elif k == 'SLAYER1':
+        h = parse_slayer(d)
+        for key, v in h.items():
+            print(f'{indent}  {key:15} {v}')
+        inner = d[h['payload_offset']:]
+        if inner[:4] == b'ASAV':
+            ih = parse_asav(inner)
+            print(f'{indent}  inner ASAV: kind={ih["kind"]} title={ih["title"]!r} slot={ih["slot_name"]!r} '
+                  f'time={ih["timestamp_utc"]} f10={ih["field_10"]:#x} f18={ih["field_18"]} f1c={ih["field_1c"]}')
+            print(f'{indent}  inner body is high-entropy (compressed and/or encrypted); not decoded')
+
+
+def info(paths):
+    for p in paths:
+        if os.path.isdir(p):
+            cj = os.path.join(p, 'chives.json')
+            if os.path.exists(cj):
+                meta = json.loads(read(cj))
+                print(f'{p}: save folder, dir {meta.get("save_directory")}')
+            for name in sorted(os.listdir(p)):
+                fp = os.path.join(p, name)
+                if os.path.isfile(fp) and kind_of(read(fp)[:8]):
+                    info_file(fp, '  ')
+        else:
+            info_file(p)
+
+
+def extract(p, out):
+    d = read(p)
+    k = kind_of(d)
+    os.makedirs(out, exist_ok=True)
+    if k == 'JSAV':
+        h, es = parse_jsav(d)
+        bd = os.path.join(out, 'blocks')
+        os.makedirs(bd, exist_ok=True)
+        blocks = jsav_blocks(d, es)
+        for e, b in zip(es, blocks):
+            e['file'] = f'blocks/{e["index"]:03d}_{e["group"]}_{e["hash"]}.json'
+            with open(os.path.join(out, e['file']), 'wb') as f:
+                f.write(b)
+        with open(os.path.join(out, 'index.json'), 'w') as f:
+            json.dump({'header': h, 'entries': es}, f, indent=1)
+        body = d[h['body_offset']:h['body_end']].decode('utf-8')
+        with open(os.path.join(out, 'save.pretty.json'), 'w', encoding='utf-8') as f:
+            json.dump(json.loads(body), f, indent=1)
+        print(f'{len(es)} blocks -> {out}')
+    elif k == 'ASAV':
+        h = parse_asav(d)
+        pl = asav_payload(d, h)
+        with open(os.path.join(out, 'header.json'), 'w') as f:
+            json.dump(h, f, indent=1)
+        with open(os.path.join(out, 'header.bin'), 'wb') as f:
+            f.write(d[:h['payload_offset']])
+        with open(os.path.join(out, 'payload.bin'), 'wb') as f:
+            f.write(pl)
+        if pl[:1] == b'{':
+            try:
+                obj = json.loads(pl.rstrip(b'\0').decode('utf-8'))
+                with open(os.path.join(out, 'payload.json'), 'w', encoding='utf-8') as f:
+                    json.dump(obj, f, indent=1)
+            except ValueError as ex:
+                print('payload looks like text but did not parse as JSON:', ex)
+        print(f'ASAV kind {h["kind"]} ({h["slot_name"]}) -> {out}')
+    else:
+        sys.exit(f'{p}: extract supports JSAV and ASAV')
+
+
+def pack_from_dir(src):
+    idx = json.loads(read(os.path.join(src, 'index.json')))
+    h, es = idx['header'], idx['entries']
+    blocks = [read(os.path.join(src, e['file'])) for e in es]
+    return build_jsav(h['version'], h['code_blocks'], [int(e['hash'], 16) for e in es],
+                      [e['flags'] for e in es], blocks)
+
+
+def pack(src, out):
+    data = pack_from_dir(src)
+    with open(out, 'wb') as f:
+        f.write(data)
+    print(f'wrote {out} ({len(data)} bytes)')
+
+
+def verify(p):
+    d = read(p)
+    h, es = parse_jsav(d)
+    blocks = jsav_blocks(d, es)
+    for b in blocks:
+        json.loads(b)                 # every block must be valid JSON on its own
+    rebuilt = build_jsav(h['version'], h['code_blocks'], [int(e['hash'], 16) for e in es],
+                         [e['flags'] for e in es], blocks)
+    if rebuilt == d:
+        print(f'{p}: OK, {len(es)} blocks parse and the rebuild is byte-identical')
+        return True
+    n = next((i for i, (a, b) in enumerate(zip(rebuilt, d)) if a != b), min(len(rebuilt), len(d)))
+    print(f'{p}: MISMATCH at {n:#x} (rebuilt {len(rebuilt)} vs original {len(d)} bytes)')
+    return False
+
+
+def diff(pa, pb):
+    da, db = read(pa), read(pb)
+    (_, ea), (_, eb) = parse_jsav(da), parse_jsav(db)
+    ma = {(e['group'], e['hash']): b for e, b in zip(ea, jsav_blocks(da, ea))}
+    mb = {(e['group'], e['hash']): b for e, b in zip(eb, jsav_blocks(db, eb))}
+    for k in ma.keys() - mb.keys():
+        print('only in A:', *k, len(ma[k]))
+    for k in mb.keys() - ma.keys():
+        print('only in B:', *k, len(mb[k]))
+    same = 0
+    for k in ma.keys() & mb.keys():
+        if ma[k] == mb[k]:
+            same += 1
+            continue
+        a, b = ma[k], mb[k]
+        n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+        print(f'changed: {k[0]} {k[1]} {len(a)} -> {len(b)} bytes, first difference near: '
+              f'A {a[max(0, n - 40):n + 40]!r}  B {b[max(0, n - 40):n + 40]!r}')
+    print(f'{same} blocks identical')
+
+
+# ---------------------------------------------------------------------------------------------- import
+def xgs_encode(name):
+    """Same rule as encode_name() in runtime/shims/xgameruntime_services.cpp: keep
+    [A-Za-z0-9_-] and '.' except as the first character; everything else becomes %XX (uppercase hex) per UTF-8 byte."""
+    out = []
+    for c in name.encode('utf-8'):
+        ch = chr(c)
+        if (ch.isascii() and ch.isalnum()) or ch in '_-' or (ch == '.' and out):
+            out.append(ch)
+        else:
+            out.append('%%%02X' % c)
+    return ''.join(out)
+
+
+def save_slot(folder):
+    """Return (folder label, payload filename, slot name, title) for one save folder."""
+    meta_path = os.path.join(folder, 'chives.json')
+    meta = json.loads(read(meta_path)) if os.path.isfile(meta_path) else {}
+    payload = None
+    for name in sorted(os.listdir(folder)):
+        fp = os.path.join(folder, name)
+        if os.path.isfile(fp) and name not in ('chives.json', 'chives.dat') and kind_of(read(fp)[:8]) in ('ASAV', 'JSAV'):
+            payload = name
+    if payload is None:
+        raise SystemExit(f'{folder}: no ASAV/JSAV payload found')
+    slot, title = payload, None
+    d = read(os.path.join(folder, payload))
+    if kind_of(d) == 'ASAV':
+        h = parse_asav(d)
+        slot, title = h['slot_name'] or payload, h['title']
+    packed = os.path.join(folder, 'chives.dat')
+    if os.path.isfile(packed):
+        p = read(packed)
+        if kind_of(p) == 'SLAYER1':
+            inner = p[parse_slayer(p)['payload_offset']:]
+            if inner[:4] == b'ASAV':
+                ih = parse_asav(inner)
+                slot, title = ih['slot_name'] or slot, ih['title']
+    return meta.get('save_directory') or os.path.basename(os.path.normpath(folder)), payload, slot, title
+
+
+def import_saves(args):
+    import hashlib
+    out, maps, with_packed, force, dry = None, {}, False, False, False
+    folders = []
+    it = iter(args)
+    for a in it:
+        if a == '--out':
+            out = next(it)
+        elif a == '--map':
+            k, v = next(it).split('=', 1)
+            c, _, b = v.partition('/')
+            maps[k] = (c, b or None)
+        elif a == '--with-packed':
+            with_packed = True
+        elif a == '--force':
+            force = True
+        elif a == '--dry-run':
+            dry = True
+        else:
+            folders.append(a)
+    if not folders:
+        raise SystemExit('import: give one or more save folders')
+    if out is None:
+        out = os.path.join(os.environ.get('LOCALAPPDATA', '.'), 'Leonida', 'saves')
+    root = os.path.join(out, 'local-user')
+    manifest = {'note': 'VERIFY: container/blob names are a guess until the executable shows them',
+                'layout': '<LEONIDA_SAVE_DIR>/local-user/<container>/<blob>', 'entries': []}
+    plan = []
+    for folder in folders:
+        sd, payload, slot, title = save_slot(folder)
+        container, blob = slot, payload
+        for key in (sd, payload, slot):
+            if key in maps:
+                container = maps[key][0] or container
+                blob = maps[key][1] or blob
+        files = [(payload, blob)]
+        if with_packed and os.path.isfile(os.path.join(folder, 'chives.dat')):
+            files.append(('chives.dat', 'chives.dat'))
+        for src_name, blob_name in files:
+            src = os.path.join(folder, src_name)
+            dst = os.path.join(root, xgs_encode(container), xgs_encode(blob_name))
+            plan.append((src, dst))
+            data = read(src)
+            manifest['entries'].append({'folder': sd, 'source': src_name, 'title': title, 'container': container,
+                                        'blob': blob_name, 'size': len(data),
+                                        'sha256': hashlib.sha256(data).hexdigest()})
+            print(f'{sd:34} {src_name:24} -> container {container!r:12} blob {blob_name!r:24} {len(data):>9} bytes'
+                  f'  ({title})')
+    dsts = [d.lower() for _, d in plan]
+    if len(set(dsts)) != len(dsts):
+        raise SystemExit('import: two payloads map to the same container/blob (names are case-insensitive on '
+                         'Windows); use --map to separate them')
+    if dry:
+        print('dry run: nothing written')
+        return
+    for src, dst in plan:
+        if os.path.exists(dst) and not force:
+            raise SystemExit(f'{dst} exists; pass --force to overwrite')
+    for src, dst in plan:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = os.path.join(os.path.dirname(dst), '~' + os.path.basename(dst))   # the shim's temp-file convention
+        with open(tmp, 'wb') as f:
+            f.write(read(src))
+        os.replace(tmp, dst)
+    with open(os.path.join(out, 'import-manifest.json'), 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=1)
+    print(f'wrote {len(plan)} blobs under {root}')
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ('-h', '--help'):
+        print(__doc__)
+        return 0
+    cmd, args = argv[1], argv[2:]
+    if cmd == 'info' and args:
+        info(args)
+    elif cmd == 'extract' and len(args) == 2:
+        extract(*args)
+    elif cmd == 'pack' and len(args) == 2:
+        pack(*args)
+    elif cmd == 'verify' and args:
+        return 0 if all([verify(p) for p in args]) else 1
+    elif cmd == 'diff' and len(args) == 2:
+        diff(*args)
+    elif cmd == 'import':
+        import_saves(args)
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

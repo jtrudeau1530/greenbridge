@@ -146,5 +146,39 @@ int main() {
     CHECK(list.close());
     CHECK(list.commands().size() == 1);
     CHECK(std::get<ClearRenderTarget>(list.commands()[0]).target.resource == 36);
+
+    // Synthetic IR values here test copy-by-value mechanics only; the COM test below enforces D3D12 bundle
+    // restrictions on every currently implemented forbidden operation.
+    // Bundles are copied into the parent at ExecuteBundle time and can be reused independently.
+    CommandList parent, bundle;
+    CHECK(parent.copy_resource({1, 2}));
+    CHECK(bundle.copy_resource({3, 4}));
+    CHECK(bundle.copy_buffer({5, 0, 6, 16, 32}));
+    CHECK(bundle.close());
+    CHECK(parent.execute_bundle(bundle));
+    CHECK(parent.copy_resource({7, 8}));
+    CHECK(parent.execute_bundle(bundle));  // the same closed bundle can execute more than once
+    CHECK(parent.close());
+    CHECK(parent.commands().size() == 6);
+    CHECK(std::get<CopyResource>(parent.commands()[0]).src == 2);
+    CHECK(std::get<CopyResource>(parent.commands()[1]).src == 4);
+    CHECK(std::get<CopyBuffer>(parent.commands()[2]).size == 32);
+    CHECK(std::get<CopyResource>(parent.commands()[3]).src == 8);
+    CHECK(std::get<CopyResource>(parent.commands()[4]).src == 4);
+    CHECK(std::get<CopyBuffer>(parent.commands()[5]).size == 32);
+
+    // Resetting/rerecording the source bundle cannot mutate the parent's copied commands.
+    CHECK(bundle.reset());
+    CHECK(bundle.copy_resource({9, 10}));
+    CHECK(bundle.close());
+    CHECK(parent.commands().size() == 6);
+    CHECK(std::get<CopyResource>(parent.commands()[1]).src == 4);
+    CHECK(!parent.execute_bundle(bundle));  // parent is closed
+
+    CommandList open_parent, open_bundle;
+    CHECK(!open_parent.execute_bundle(open_bundle));  // bundle must be closed
+    CHECK(!open_parent.execute_bundle(open_parent));  // a list cannot execute itself
+    CHECK(open_parent.commands().empty());
+
     return 0;
 }

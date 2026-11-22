@@ -79,11 +79,9 @@ def parse_header(data, offset):
         return None
     if not (16 <= width <= MAX_WIDTH and 16 <= height <= MAX_HEIGHT):
         return None
-    if not (1 <= fps_num <= 1000 and 1 <= fps_den <= 1000):
+    if fps_den == 0 or not fps_den <= fps_num <= 240 * fps_den:
         return None
     fps = fps_num / fps_den
-    if not 1.0 <= fps <= 240.0:
-        return None
     if audio > MAX_AUDIO_TRACKS:
         return None
 
@@ -282,6 +280,9 @@ def main(argv=None):
     ap.add_argument("--format", choices=["csv", "json"], help="inferred from --out if omitted")
     ap.add_argument("--probe", action="store_true", help="run ffprobe on each stream")
     a = ap.parse_args(argv)
+    if not os.path.exists(a.target):
+        print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
+        return 2
 
     rows, summary = scan_target(a.target)
     probe = False
@@ -309,7 +310,9 @@ def main(argv=None):
                               "streams": [_flat(r, fields) for r in rows]}, indent=1))
         else:
             fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
-            writer = csv.DictWriter(sys.stdout, fieldnames=fields)
+            # stdout is a text stream that already turns "\n" into the platform's line end;
+            # csv's default "\r\n" would come out as "\r\r\n" on Windows
+            writer = csv.DictWriter(sys.stdout, fieldnames=fields, lineterminator="\n")
             writer.writeheader()
             for row in rows:
                 writer.writerow(_flat(row, fields))

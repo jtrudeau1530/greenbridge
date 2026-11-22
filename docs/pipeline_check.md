@@ -41,6 +41,11 @@ vertex) and 472 compute pipelines. No summary was printed for either shard. This
 compile-time limit, not a module or pipeline rejection: no `MODULE FAIL` or `PIPELINE FAIL` line
 exists in any completed shard.
 
+A later full-corpus build on different hardware (RTX 4060 Ti, driver 595) completed **26,503 of 26,503**
+modules and pipelines with **0 failures** and a 3.81 GB cache; see the "Full-corpus pipeline build" row in
+[`docs/design.md`](design.md). The two stalled shards above therefore record a hardware/driver-specific
+compile-time stall, not a project-wide limit.
+
 The recurring slow family at every shard tail was a set of 6.7-7.2 MB ray-tracing resolve compute
 shaders. One observed single-module stall exceeded 27 minutes. The tool has no per-shader timer, so
 these are lower bounds, not exact compile times.
@@ -72,10 +77,9 @@ and excluded from the module/pipeline totals; the summary prints how many entrie
 30-entry smoke test with `--max-bytes 20000`, 24 modules were skipped and the remaining 6 pixel
 modules passed.
 
-A full corpus report should therefore state the limit and the skip count. A run with a 2 MB limit
-can finish the 26,503-entry set while naming the handful of huge modules that the driver cannot
-complete in a useful time. The option is a visibility tool, not a pass: a skipped module has not
-been validated.
+The report above therefore states the limit and the skip count; a later run on an RTX 4060 Ti / 595
+completed the full 26,503-entry set without them (`docs/design.md`). `--max-bytes` remains a visibility
+tool, not a pass: a skipped module has not been validated.
 
 ## Device
 

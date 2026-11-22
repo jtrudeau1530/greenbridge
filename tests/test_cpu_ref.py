@@ -48,6 +48,120 @@ class CpuRefTest(unittest.TestCase):
     def sgpr(self, result, index):
         return result["registers"]["sgpr"][index]
 
+    def test_integer_add_sub_mul(self):
+        r = self.execute("""
+            v_mov_b32 v0, 0xffffffff
+            v_mov_b32 v1, 2
+            v_add_nc_u32 v2, v0, v1
+            v_sub_nc_u32 v3, v0, v1
+            v_subrev_nc_u32 v4, v0, v1
+            v_mul_u32_u24 v5, v0, v1
+            v_mul_i32_i24 v6, 0x800000, 2
+            v_mul_lo_u32 v7, v0, v1
+            s_endpgm
+        """)
+        self.assertEqual(self.vgpr(r, 2), 1)             # wraps
+        self.assertEqual(self.vgpr(r, 3), 0xFFFFFFFD)    # dst = src0 - src1
+        self.assertEqual(self.vgpr(r, 4), 3)             # dst = src1 - src0
+        self.assertEqual(self.vgpr(r, 5), 0x1FFFFFE)     # low 24 bits of each source
+        self.assertEqual(self.vgpr(r, 6), 0xFF000000)    # -2**23 * 2
+        self.assertEqual(self.vgpr(r, 7), 0xFFFFFFFE)    # low 32 bits
+
+    def test_integer_min_max_med3(self):
+        r = self.execute("""
+            v_mov_b32 v0, 0xfffffffb
+            v_mov_b32 v1, 3
+            v_mov_b32 v2, 0
+            v_min_i32 v3, v0, v1
+            v_max_i32 v4, v0, v1
+            v_min_u32 v5, v0, v1
+            v_max_u32 v6, v0, v1
+            v_med3_i32 v7, v0, v1, v2
+            v_med3_u32 v8, v0, v1, v2
+            s_endpgm
+        """)
+        self.assertEqual(self.vgpr(r, 3), 0xFFFFFFFB)    # -5
+        self.assertEqual(self.vgpr(r, 4), 3)
+        self.assertEqual(self.vgpr(r, 5), 3)
+        self.assertEqual(self.vgpr(r, 6), 0xFFFFFFFB)
+        self.assertEqual(self.vgpr(r, 7), 0)             # median(-5, 3, 0)
+        self.assertEqual(self.vgpr(r, 8), 3)             # median(4294967291, 3, 0)
+
+    def test_bitfield_extract_and_insert(self):
+        r = self.execute("""
+            v_mov_b32 v0, 0xabcdef12
+            v_bfe_u32 v1, v0, 28, 8
+            v_bfe_i32 v2, v0, 28, 8
+            v_bfe_u32 v3, v0, 4, 0
+            v_bfe_i32 v4, v0, 0, 4
+            v_mov_b32 v5, 0xff00ff00
+            v_mov_b32 v6, 0x12345678
+            v_mov_b32 v7, 0xaabbccdd
+            v_bfi_b32 v8, v5, v6, v7
+            s_endpgm
+        """)
+        self.assertEqual(self.vgpr(r, 1), 0xA)           # width cut to 32 - 28
+        self.assertEqual(self.vgpr(r, 2), 0xFFFFFFFA)    # sign-extended 0xA
+        self.assertEqual(self.vgpr(r, 3), 0)             # a zero width extracts nothing
+        self.assertEqual(self.vgpr(r, 4), 2)
+        self.assertEqual(self.vgpr(r, 8), 0x12BB56DD)    # (x & y) | (~x & z)
+
+    def test_align_and_permute(self):
+        r = self.execute("""
+            v_mov_b32 v0, 0x11223344
+            v_mov_b32 v1, 0xaabbccdd
+            v_mov_b32 v2, 8
+            v_alignbit_b32 v3, v0, v1, v2
+            v_mov_b32 v2, 3
+            v_alignbyte_b32 v4, v0, v1, v2
+            v_mov_b32 v2, 0
+            v_alignbit_b32 v5, v0, v1, v2
+            v_mov_b32 v2, 0x0c0b0400
+            v_perm_b32 v6, v0, v1, v2
+            v_mov_b32 v2, 0x0d080000
+            v_perm_b32 v7, v0, v1, v2
+            s_endpgm
+        """)
+        self.assertEqual(self.vgpr(r, 3), 0x44AABBCC)    # {v0, v1} >> 8
+        self.assertEqual(self.vgpr(r, 4), 0x223344AA)    # {v0, v1} >> 24
+        self.assertEqual(self.vgpr(r, 5), 0xAABBCCDD)    # a zero shift keeps src1
+        self.assertEqual(self.vgpr(r, 6), 0x000044DD)    # bytes 0, 4; sign 0; zero
+        self.assertEqual(self.vgpr(r, 7), 0xFFFFDDDD)    # byte 0, sign of src1 half, 0xff
+
+    def test_perm_sign_bit_selectors(self):
+        r = self.execute("""
+            v_mov_b32 v0, 0x80000000
+            v_mov_b32 v1, 0x80000000
+            v_mov_b32 v2, 0x0b0a0908
+            v_perm_b32 v3, v0, v1, v2
+            v_mov_b32 v0, 0x00008000
+            v_mov_b32 v1, 0x00008000
+            v_perm_b32 v4, v0, v1, v2
+            s_endpgm
+        """)
+        # Selectors 8/9 read bit 7 of src1 bytes 1/3 (bits 15/31), 10/11 the same of src0.
+        self.assertEqual(self.vgpr(r, 3), 0xFF00FF00)
+        self.assertEqual(self.vgpr(r, 4), 0x00FF00FF)
+
+    def test_mul_hi_and_mad(self):
+        r = self.execute("""
+            v_mul_hi_u32 v0, 0xffffffff, 0xffffffff
+            v_mul_hi_i32 v1, 0xffffffff, 1
+            v_mul_hi_i32 v2, 0x40000000, 0x40000000
+            v_mul_hi_i32 v3, 0x80000000, 0x40000000
+            v_mad_u32_u24 v4, 0xffffff, 0xffffff, 5
+            v_mad_i32_i24 v5, 0xffffff, 0xffffff, 5
+            v_mad_i32_i24 v6, 0x800000, 0x800000, 1
+            s_endpgm
+        """)
+        self.assertEqual(self.vgpr(r, 0), 0xFFFFFFFE)
+        self.assertEqual(self.vgpr(r, 1), 0xFFFFFFFF)
+        self.assertEqual(self.vgpr(r, 2), 0x10000000)
+        self.assertEqual(self.vgpr(r, 3), 0xE0000000)
+        self.assertEqual(self.vgpr(r, 4), 0xFE000006)    # 0xffffff**2 + 5, low 32 bits
+        self.assertEqual(self.vgpr(r, 5), 6)
+        self.assertEqual(self.vgpr(r, 6), 1)             # 2**46 + 1, low 32 bits
+
     def test_mov_inline_constants_and_literals(self):
         r = self.execute("""
             v_mov_b32 v0, 1.0

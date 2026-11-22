@@ -51,6 +51,18 @@ if(WIN32)
   target_compile_options(gta6rt_xtaskqueue PRIVATE /utf-8)  # third-party code: its own warning level
   target_link_libraries(gta6rt_xtaskqueue PUBLIC ole32)
 
+  # Reserves one loader-assigned module TLS index for mapped images. Loaded from the executable's directory by
+  # Loader::initialize_tls; its trivial DllMain only keeps the TLS anchor in the image. Built in the same directory as
+  # the executables that map images, because the loader looks for it next to the running EXE.
+  add_library(gta6rt_tls_host SHARED src/tls_host.cpp)
+  target_compile_options(gta6rt_tls_host PRIVATE /W4 /permissive- /utf-8 /GS-)
+  target_compile_definitions(gta6rt_tls_host PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  set_target_properties(gta6rt_tls_host PROPERTIES
+    OUTPUT_NAME gta6rt_tls_host
+    PREFIX ""
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+  )
+
   add_executable(gta6rt
     src/main.cpp
     src/pe_loader.cpp
@@ -59,7 +71,9 @@ if(WIN32)
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
+    shims/process.cpp
   )
+  add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
@@ -164,6 +178,7 @@ if(BUILD_TESTING)
     target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(loader_test PRIVATE /OPT:NOREF)
+    add_dependencies(loader_test gta6rt_tls_host)
     add_test(NAME loader COMMAND loader_test)
     # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
     # imports it so Loader::load exercises recursive module loading. They contain no game data.
@@ -209,8 +224,56 @@ if(BUILD_TESTING)
     target_compile_options(pe_loader_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(pe_loader_test PRIVATE /OPT:NOREF)
     target_link_libraries(pe_loader_test PRIVATE gta6rt_d3d12_xs_rootsig psapi)
-    add_dependencies(pe_loader_test tiny_dll tiny_exe)
+    add_dependencies(pe_loader_test tiny_dll tiny_exe gta6rt_tls_host)
+
+    # `gta6rt --run` rehearsal: a stand-in game EXE (CRT startup, statics, heap, files, threads) that imports
+    # xgameruntime.dll from a link-time stub; under --run the shim registry answers those imports instead.
+    add_library(xgameruntime_stub SHARED test/fixtures/xgameruntime_stub.cpp)
+    target_compile_definitions(xgameruntime_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    set_target_properties(xgameruntime_stub PROPERTIES
+      OUTPUT_NAME xgameruntime
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
+    add_executable(tiny_game test/fixtures/tiny_game.cpp)
+    target_link_libraries(tiny_game PRIVATE xgameruntime_stub)
+    target_compile_definitions(tiny_game PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)  # plain fopen, as games use
+    target_compile_options(tiny_game PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    set_target_properties(tiny_game PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
+
+    # Static TLS fixture: a DLL with __declspec(thread) and a TLS callback. It is ordinary test code; no game data
+    # is involved. loader_tls_test needs gta6rt_tls_host.dll next to its own EXE, because that is where
+    # Loader::initialize_tls looks for the reserved module TLS index.
+    add_library(tiny_tls SHARED test/fixtures/tiny_tls.cpp)
+    target_compile_definitions(tiny_tls PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_tls PRIVATE /W4 /permissive- /utf-8 /GS-)
+    set_target_properties(tiny_tls PROPERTIES
+      OUTPUT_NAME tiny_tls
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+
+    # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The fixtures import only host
+    # DLLs, so no shim tables are linked.
+    add_executable(loader_tls_test
+      test/loader_tls_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(loader_tls_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_compile_definitions(loader_tls_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(loader_tls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_dependencies(loader_tls_test tiny_tls gta6rt_tls_host)
+    add_test(NAME loader_tls
+      COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
+    )
   endif()
 
   if(TARGET device_proxy_test)
@@ -236,6 +299,7 @@ if(BUILD_TESTING)
     target_compile_options(bink_decode_test PRIVATE /W4 /permissive- /EHsc /utf-8)
     target_link_options(bink_decode_test PRIVATE /OPT:NOREF)
     target_link_libraries(bink_decode_test PRIVATE psapi)
+    add_dependencies(bink_decode_test gta6rt_tls_host)
     add_test(NAME bink_decode COMMAND bink_decode_test)
 
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE_AUDIO are set.
@@ -250,6 +314,7 @@ if(BUILD_TESTING)
     target_compile_options(bink_audio_test PRIVATE /W4 /permissive- /EHsc /utf-8)
     target_link_options(bink_audio_test PRIVATE /OPT:NOREF)
     target_link_libraries(bink_audio_test PRIVATE psapi)
+    add_dependencies(bink_audio_test gta6rt_tls_host)
     add_test(NAME bink_audio COMMAND bink_audio_test)
   endif()
   if(WIN32 AND TARGET xmem_test)
@@ -257,6 +322,12 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
+  endif()
+  if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+    # The stand-in game passes only with its own arguments; with others it exits 1, which --run passes through.
+    add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
+    add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
+    set_tests_properties(run_tiny_game_exit_code PROPERTIES WILL_FAIL TRUE)
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
@@ -334,11 +405,36 @@ if(Vulkan_FOUND)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
 
-    # Descriptors through the proxy: copies between heaps.
-    add_executable(d3d12_descriptor_test test/d3d12_descriptor_test.cpp shims/d3d12_xs_device.cpp)
+    # Descriptors through the proxy: copies between heaps, what texture views and samplers write into their slots,
+    # and (where glslangValidator is found) a compute shader the test runs on the device's bindless set, which
+    # finds a T# and an S# through the hash table and samples. The shader is GLSL, compiled here.
+    add_executable(d3d12_descriptor_test test/d3d12_descriptor_test.cpp)
     target_link_libraries(d3d12_descriptor_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_descriptor_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_descriptor_test PRIVATE /W4 /permissive- /utf-8)
+    if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    endif()
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_TEST_CS_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_sample.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_SAMPLE}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_SAMPLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sample.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sample.comp
+        COMMENT "Compiling the descriptor test shader"
+        VERBATIM)
+      target_sources(d3d12_descriptor_test PRIVATE ${LEONIDA_TEST_CS_SAMPLE})
+      target_compile_definitions(d3d12_descriptor_test PRIVATE LEONIDA_TEST_CS_SAMPLE_SPV="${LEONIDA_TEST_CS_SAMPLE}")
+    else()
+      message(STATUS "glslangValidator not found: d3d12_descriptor_test skips its shader")
+    endif()
+
+    # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
+    add_executable(d3d12_uint_clear_test test/d3d12_uint_clear_test.cpp)
+    target_link_libraries(d3d12_uint_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_uint_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_uint_clear_test PRIVATE /W4 /permissive- /utf-8)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
@@ -351,6 +447,12 @@ if(Vulkan_FOUND)
 
   # Needs only the Vulkan headers, not a GPU.
   if(BUILD_TESTING)
+    add_executable(clear_color_test test/clear_color_test.cpp)
+    target_link_libraries(clear_color_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(clear_color_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME clear_color COMMAND clear_color_test)
     add_executable(d3d12_state_map_test test/d3d12_state_map_test.cpp)
     target_link_libraries(d3d12_state_map_test PRIVATE Vulkan::Headers)
     if(WIN32)

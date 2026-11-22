@@ -67,7 +67,16 @@ HRESULT WINAPI serialize_root_signature_legacy(const D3D12_ROOT_SIGNATURE_DESC* 
 
 HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {
     static auto fn = reinterpret_cast<DeserializerFn>(host("D3D12CreateRootSignatureDeserializer"));
-    return fn ? fn(data, size, iid, out) : E_NOTIMPL;
+    if (!fn) return E_NOTIMPL;
+
+    // The host deserializer rejects a blob whose RTS0 flags carry the Xbox high
+    // byte, so forward a copy with that byte cleared when present (the same fix
+    // the serializer applies to descriptors).
+    std::vector<uint8_t> cleared;
+    if (rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(data, static_cast<size_t>(size), cleared)) {
+        return fn(cleared.data(), cleared.size(), iid, out);
+    }
+    return fn(data, size, iid, out);
 }
 
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only

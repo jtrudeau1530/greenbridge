@@ -19,14 +19,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from amd_swizzle import _parity, equation, load  # noqa: E402
 from bc_feature import block_average, smoothness  # noqa: E402
 
-BPE = {"BC1": 8, "BC4": 8, "BC2": 16, "BC3": 16, "BC5": 16, "BC6H": 16, "BC7": 16}
+BPE = {"BC1": 8, "BC2": 16, "BC3": 16}
 
 
 def bc_bpe(fmt_name):
-    for k, v in BPE.items():
-        if fmt_name.startswith(k):
-            return v
-    return None
+    return BPE.get(fmt_name.split("_", 1)[0])
 
 
 def mip_bytes(w, h, bpe, align):
@@ -53,11 +50,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("index")
     ap.add_argument("carve")
-    ap.add_argument("--fmt", default="BC1")
+    ap.add_argument("--fmt", default="BC1", help="BC1, BC2, or BC3, optionally with a DXGI suffix")
     ap.add_argument("--n", type=int, default=12)
     a = ap.parse_args()
+    if bc_bpe(a.fmt) is None:
+        ap.error(f"no color scorer for {a.fmt!r}; expected BC1, BC2, or BC3")
     nib, tab = load()
-    texs = [t for t in json.load(open(a.index)) if t["fmt_name"].startswith(a.fmt) and t["w"] >= 256 and t["h"] >= 256]
+    texs = [t for t in json.load(open(a.index)) if t["fmt_name"].startswith(a.fmt)
+            and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
     texs = texs[: a.n]
     cands = {}
     for tname, ents in tab.items():

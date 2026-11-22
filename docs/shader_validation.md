@@ -1,9 +1,11 @@
 # Differential shader validation
 
-This note designs a value-level check for the RDNA2 → SPIR-V translator. It is a plan and a
-prototype, not a claim that the corpus is correct. The prototype in `tools/cpu_ref.py` executes a
-small straight-line instruction subset from a `shader_ir` listing; the GPU side and the corpus
-runner described here are not implemented yet.
+This note describes a value-level check for the RDNA2 → SPIR-V translator; it is not a claim that
+the corpus is correct. The CPU differential oracle in `tools/shader_diff.py` is implemented and
+tested (`tests/test_shader_diff.py`): it compares the ISA model in `tools/cpu_ref.py` against
+translated SPIR-V run in `tests/semantic/spirv_mini_interp.py` over seeded straight-line programs.
+Run it with `python -I tools/shader_diff.py --programs 200 --seed 7` (`--self-test` checks the
+harness itself). The GPU-side runner described below is still future work.
 
 ## Why `spirv-val` is not enough
 
@@ -38,10 +40,11 @@ Two independent computations start from the same architectural state:
 The comparison is bit-for-bit on every value the test declares observable. A mismatch is reported
 with the first differing lane/register, both bit patterns, the random seed, and (in the future
 runner) the RDNA2 instruction that last wrote the value. The translator is the path under test; the
-CPU and GPU are the two independent oracles. The existing translator → `spirv-as`/`spirv-val` →
-Vulkan tools path is what the GPU oracle runs, not a reference to be trusted. A hand-written SPIR-V
-twin of a test program is a useful third control: it checks the harness and driver without involving
-the translator, so a harness failure is not blamed on translation.
+CPU model and the SPIR-V interpreter are the two independent oracles in the shipped CPU runner. The
+translator → `spirv-as`/`spirv-val` → Vulkan tools path is what the future GPU oracle will run, not
+a reference to be trusted. A hand-written SPIR-V twin of a test program is a useful third control: it
+checks the harness and driver without involving the translator, so a harness failure is not blamed on
+translation.
 
 The CPU model is deliberately not a second translator. It interprets the listing's mnemonics and
 operands; it never consumes SPIR-V. That independence is what makes a disagreement meaningful.
@@ -77,7 +80,7 @@ operands; it never consumes SPIR-V. That independence is what makes a disagreeme
 
 The repository already has the pieces: `runtime/test/shaders/build.py` assembles `.asm` with
 `llvm-mc`, `tools/rdna2spirv.py` translates the resulting `.s`, and the `runtime/test/vk_*_test.cpp`
-programs dispatch SPIR-V on Vulkan and read buffers/images back. A differential runner would:
+programs dispatch SPIR-V on Vulkan and read buffers/images back. A GPU-side differential runner would:
 
 1. assemble the `.asm` to a `.s` listing with `llvm-mc -show-encoding`;
 2. run the CPU model on that listing with the test's inputs;
@@ -175,6 +178,42 @@ double-rounded answer.
 The existing `runtime/test` tools already expose the hard parts (device selection, push constants,
 descriptor setup, readback). The differential runner should call them rather than grow a second
 Vulkan stack.
+
+### LDS and `ds_*` on the GPU (`tools/lds_fuzz.py`, FUZZ-6)
+
+LDS ops are workgroup-wide, so `tools/lds_fuzz.py` runs on the GPU rather than one lane in the
+interpreter. Each seeded program is one 64-thread group (wave64, or two wave32s) with 4 KiB of LDS
+that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, each followed by
+`s_waitcnt` and `s_barrier`, then stores all 16 result VGPRs of every thread and the whole LDS.
+`vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP`.
+
+- **Instructions.** Every read width (`b32` to `b128`, `u8`/`i8`/`u16`/`i16`, `u16_d16[_hi]`), the
+  byte and short writes (also `d16_hi`), `read2`/`write2` with and without `st64`, the add, sub,
+  min, max, and, or and xor atomics with and without return, `wrxchg`, `cmpst`, `ds_swizzle_b32`
+  and `ds_bpermute_b32`.
+- **Reference.** A model in the same file, written from the ISA and not from the translator.
+- **Determinism.** Programs stay deterministic. Writes, returning atomics, `wrxchg` and `cmpst` use
+  addresses no other lane touches in the same op. Only order-independent atomics without return
+  share addresses. Every access is in bounds, because the translator wraps out-of-range indices
+  where hardware returns 0.
+- **Swizzle.** Offsets are the two forms the LLVM `swizzle()` macros encode, checked with
+  `llvm-mc 23 -mcpu=gfx1013`: bit 15 = quad permute; otherwise and = bits 4:0, or = 9:5,
+  xor = 14:10, within each 32-lane group.
+- **EXEC.** Random EXEC masks are used on every op except `ds_swizzle`.
+- **Reports.** A mismatch names the thread, the register or LDS word, and the op that last wrote it.
+  `--no-exec KIND` drops one op kind's masks without changing the rest of the program, to separate
+  a known finding from new ones.
+
+First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and with
+`--wave64-emulate` at subgroup 32:
+
+- **One finding, already fixed by #253.** With wave32 `ds_bpermute` under EXEC, a source lane that
+  is off returned its value instead of 0: 12 of 240 programs (seeds 1 to 3) failed, each time
+  under a masked wave32 `ds_bpermute`, and with #253's translator all 480 programs (seeds 1 to 3,
+  native and emulated) match.
+- **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
+- **Not covered.** The translator rejects `ds_permute_b32` and the 8-bit d16 reads
+  (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out.
 
 ## Coverage plan and cost
 

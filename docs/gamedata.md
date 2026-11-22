@@ -259,8 +259,10 @@ four prefix rules and a content-set/mount walk, not a general include processor.
 
 A runtime dispatcher needs the 118-root table (or an RTTI class bridge), the 12 category buckets, the 318-value
 `type` registry, the 33-name attribute whitelist, the `content=` array decoders and a streaming reader for the
-14 MB document. It also needs to mark the 9 tail-only documents and the one rootless block as incomplete
-evidence: `gamedata_xml.py --check` is the reference for that split. The catalog is a local work product. Only
+14 MB document. The mount/reference half of that layer is measured separately in
+[gamedata_graph.md](gamedata_graph.md): 25 manifest documents, 30 content-set ids, 12 resolved include edges
+and 3,343 reachable target references. It also needs to mark the 9 tail-only documents and the one rootless
+block as incomplete evidence: `gamedata_xml.py --check` is the reference for that split. The catalog is a local work product. Only
 aggregate counts and schema/root/element/attribute names belong in git; the CSV/JSON, the element values, the
 `type`/`content` values and per-file paths stay on the local machine. The tests are synthetic.
 

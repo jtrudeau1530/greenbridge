@@ -1,9 +1,10 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
-render-target and depth views, committed buffers, 2D textures and 3D texture transfers) runs behind the Xbox-ABI device proxy
-(section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is set and the host PC device otherwise.
-Shader views, root signatures, PSOs, draws and the swapchain are not implemented.** This is the plan for replacing the console's
+render-target and depth views, texture views and samplers, committed buffers, 2D textures and 3D texture transfers)
+runs behind the Xbox-ABI device proxy (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
+set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the swapchain are not
+implemented.** This is the plan for replacing the console's
 `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
 exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
 [design.md](design.md#translator-status-and-runtime-contract)).
@@ -118,7 +119,8 @@ The design is therefore an **IR per command list**:
   descriptor ranges and the hash table, and emitting barriers. Bundles are inlined at record time.
 - `Reset` on a command list discards its IR; the allocator owns the memory. D3D12 already requires the application
   not to reset an allocator whose lists are in flight; the layer can rely on that and assert in debug builds.
-- `Close` freezes the IR. `ExecuteBundle` copies the bundle's commands into the parent IR at the current state.
+- `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle IR is copied by value at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
+- Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies and resolves); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. The currently implemented sticky front/back stencil reference is carried back to the parent when the bundle sets it. Draw and other graphics-state commands are still stubs, so this establishes validation and the IR insertion point but does not yet render bundle geometry.
 - A queue's `ExecuteCommandLists` submits in order with one timeline semaphore signal. `Wait`/`Signal` become
   timeline-semaphore waits/signals. `Present` queues after the frame's work.
 
@@ -150,7 +152,7 @@ What is implemented (all of it testable without the game):
 - **IR** (`runtime/src/command_list.h`): legacy barriers (transition, UAV, aliasing; split barriers record their end
   half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
   replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles,
-  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, and `ResolveSubresource`.
+  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, and colour resolves.
   Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
@@ -163,9 +165,11 @@ What is implemented (all of it testable without the game):
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
-  subresource into a single-sampled one of the same size and format. Depth-stencil resolves, and resolves between
-  two formats of one typeless family, are refused as unsupported. A multisampled texture copies only to one with
-  the same sample count and has no footprint.
+  subresource into a single-sampled one of the same size and format. `ResolveSubresourceRegion` uses the same
+  Vulkan operation for non-integer colour with average mode, taking a source rectangle (or the entire subresource)
+  and a destination offset. Depth-stencil resolves, other resolve modes, and resolves between two formats of
+  one typeless family remain open. A multisampled texture copies only to one with the same sample count and has
+  no footprint.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -218,15 +222,11 @@ What is implemented (all of it testable without the game):
   the inner device, so `GetDevice` always returns the Xbox-ABI object. All D3D12 queues share one graphics
   `VkQueue` behind a submit lock (question 12).
 
-Two pieces of milestone M2 that the device does not use yet, built and tested on their own:
-- **`runtime/src/gfx10_descriptors.h`**: the T#, S# and V# structures (section 5.3), encoded and decoded, with
-  their mapping to Vulkan formats, view types, component mappings and samplers. Field positions are Mesa's
-  (`src/amd/registers/gfx10-rsrc.json`) and agree with what the translator and the GPU tests already use. Bits
-  that only the console's driver could give a meaning (tiling, compression metadata, performance hints) are
-  written as zero.
+Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
+side inwards:
 - **`runtime/src/vulkan_bindless.h`**: set 0 itself, the twenty bindings the translator declares, with the array
   sizes `vk_pipeline_check` uses, and `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1) behind
-  binding 2. Details:
+  binding 2. One set for the device. Details:
   - An image has one index in its dimension (2D, 2D array, 3D, 1D), the same in every binding of that dimension.
   - The storage arrays are shorter (256), so an image with a storage view gets an index below 256 and a read-only
     one goes above where there is room.
@@ -237,14 +237,51 @@ Two pieces of milestone M2 that the device does not use yet, built and tested on
   - `flush()` also copies the table to its buffer. Adding a key changes the buffer in place, which a running
     lookup cannot see half done. Erasing a key compacts its probe cluster, which moves other keys' entries, and
     a table that has grown gets a new buffer behind binding 2: `flush_needs_idle()` says when a flush would do
-    either, so the owner can wait until no command buffer that uses the set is still running.
+    either.
+- **`runtime/src/gfx10_descriptors.h`**: the T#, S# and V# structures (section 5.3), encoded and decoded, with
+  their mapping to Vulkan formats, view types, component mappings and samplers. Field positions are Mesa's
+  (`src/amd/registers/gfx10-rsrc.json`) and agree with what the translator and the GPU tests already use. Bits
+  that only the console's driver could give a meaning (tiling, compression metadata, performance hints) are
+  written as zero.
+- **Device**: `CreateShaderResourceView` and `CreateUnorderedAccessView` of textures write a T# into the slot,
+  `CreateSampler` an S#; each then makes sure set 0 has the view or sampler and the table has the key. Details:
+  - The key is the descriptor's bytes, so a copied descriptor needs nothing more, and an unordered-access view
+    and a shader-resource view of the same mip are one entry.
+  - A view the layer cannot show (below) leaves a null descriptor, all zeros, which finds the fallback.
+  - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
+    dereferences; its entries leave the set and the table when it is destroyed.
+  - `VulkanDeviceInfo::bindless` says the Vulkan device has the features this needs: `runtimeDescriptorArray`,
+    dynamic indexing of sampled- and storage-image arrays, and update after bind for sampled images, storage
+    images and storage buffers. The standalone device enables them where the GPU has them.
+  - Every `ExecuteCommandLists` flushes the set before its commands are written.
+  - `rt::d3d12::bindless_set` and `bindless_set_layout` hand out the set and its layout: what a pipeline whose
+    shader declares set-0 bindings is created with and binds. Nothing in the layer creates such a pipeline yet.
+- **Layouts.** A descriptor in set 0 has one image layout for as long as it lives, but D3D12 lets a texture be
+  sampled in a shader-resource state and also while promoted from `COMMON`, which is `GENERAL` here (section
+  4.3). So with the bindless set, a texture's shader-resource states use `GENERAL` too
+  (`ResourceBinding::sampled_in_general`), and every descriptor is written with `GENERAL`. This follows from the
+  Vulkan rule that a descriptor's layout matches the image's; no test here can see it broken, because the
+  validation layer does not follow which element of a runtime array a shader reads. A depth texture sampled
+  while it is also bound read-only (`DEPTH_READ` with a shader-resource state) is in
+  `DEPTH_STENCIL_READ_ONLY_OPTIMAL` and is not handled.
 
-Known gaps: shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs, draws, volume attachment
-views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves and
-`ResolveSubresourceRegion`, 1D textures and the swapchain;
+Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
+(the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
+views of 1D, 3D and multisampled textures and of the stencil plane; descriptors the game writes itself, which need
+the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
+of root signatures and the literal S#s of shaders (`literal_samplers` in the index), which are not registered yet;
+custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
+feature, each logged and approximated; the storage arrays hold 255 images a dimension; nothing writes through a
+storage view in a D3D12-level test yet (`vk_bindless_test` goes through the storage bindings at the Vulkan
+level); the set is flushed at every `ExecuteCommandLists` whether or not earlier lists are still running, and a
+flush that erases keys or moves the table to a larger buffer should wait for them, or one of their lookups can
+miss: `BindlessSet::flush_needs_idle()` says when, but the queue cannot yet tell the device that it is idle.
+
+Known gaps: buffer and constant-buffer views, root signatures, PSOs, draws, volume attachment
+views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
+1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
-increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
-sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error; the GCL8
+increase; such a signal is reported and dropped); the GCL8
 front/back stencil references are recorded but not applied, because there is no pipeline or draw path for them to
 affect.
 
@@ -266,6 +303,9 @@ and any validation error fails them.
   and read back; a 4x multisampled target cleared and resolved; and the copies and resolves that must be refused
   (a z range past the volume or its footprint, a footprint past the buffer, a resolve from a single-sampled
   texture or into another size, a multisampled texture copied to a footprint or to another sample count).
+- `vk_command_replay_test`, part D: every D3D12 sync bit against every access bit (360 pairs), each as a global,
+  a buffer and a texture barrier. Under the validation layer none may be rejected; before
+  `vulkan_barrier_scope` there were 462 validation errors on Intel(R) Graphics.
 - `vk_bindless_test` (run by `runtime/test/shaders/check.py` and `scripts/run_gpu_tests.py`): the translator's
   own lookup against the table and the set. `ps_tex.asm`, a hand-written RDNA2 pixel shader built by `build.py`,
   loads a T# and an S# from a descriptor table and samples. The test draws the gradient with the T# at the fourth
@@ -289,8 +329,20 @@ and any validation error fails them.
   run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
   round trip and a buffer region. `GetCopyableFootprints` is compared with the PC runtime's, and a short run
   repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
-- `d3d12_descriptor_test`: descriptor copies through the proxy, checked on the slots' bytes: one run, range lists
-  of different shapes on each side, null size arrays, and a destination longer than its source.
+- `d3d12_descriptor_test`: descriptors through the proxy.
+  - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
+    arrays, and a destination longer than its source.
+  - What views and samplers write, decoded: a view of an uploaded 8x8 texture and a sampler, mips 1 and 2 of a
+    BGRA cube with a component mapping, an unordered-access view (the same bytes as the shader-resource view of
+    that mip), and the null descriptors of a missing resource, a texture without `ALLOW_UNORDERED_ACCESS`, a view
+    past the mips and a volume.
+  - That set 0 holds them: a compute shader (`test/glsl/cs_sample.comp`, GLSL, compiled with `glslangValidator`;
+    skipped without it) is handed a slot's T# and the sampler's S#, looks them up in the hash table as a
+    translated shader does, and samples. The sampler wraps in U and the shader samples one tile to the right,
+    so a missed S# shows too: the fallback sampler clamps. The layer has no pipelines yet, so the test creates
+    this one in Vulkan and binds the device's set. It reads the texture through the view's own slot and through
+    a copy of it, and gets the fallback from a slot of bytes no view was made for and, after the texture is
+    destroyed, from the view's own bytes.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
@@ -456,6 +508,17 @@ Reconciliation: `tools/root_sig_contract.py` checks a candidate root signature a
 the build on the first contradiction. Until the console mapping in §3.5 is confirmed by a PSO, this check — not
 a rendered frame — is the acceptance gate for the mapping above.
 
+Blob format: `rt::rootsig::parse_rts0` reads the `RTS0` chunk of a serialized root signature, versions 1.0, 1.1
+and 1.2. `root_signature_oracle_test` checks it on Windows against blobs the PC `d3d12.dll` serializes. These
+layouts are measured, not assumed:
+- a descriptor table's payload is `{num_ranges, ranges_offset}`, with the ranges at that offset;
+- ranges are 20 bytes, or 24 with the 1.1/1.2 flags dword;
+- root descriptors carry a flags dword from 1.1 on;
+- static samplers are 13 dwords (`D3D12_STATIC_SAMPLER_DESC` order). In 1.2 they are 14: `D3D12_STATIC_SAMPLER_DESC1`
+  appends `Flags`, i.e. UINT border colours and non-normalized coordinates.
+
+Static samplers take no user-data dwords, so 1.2 changes nothing in `pack`.
+
 **Root-signature flag quirk.** Prior art measured Xbox root-signature descriptors carrying flags `0x03000000`; the
 PC serializer rejects them with `E_INVALIDARG` because its flags live in the low 16 bits. Clear the high byte on a
 private copy before calling the host serializer/deserializer; never modify the game's descriptor. The meaning of the
@@ -602,7 +665,15 @@ The trace will enumerate them.
   arena's limits, not the console's.
 - `GetResourceAllocationInfo` and `GetCopyableFootprints`: implement D3D12's rules locally; the game uses them to
   suballocate and to lay out uploads. They are deterministic and public. Validate against a host D3D12 device in
-  tests if one is available; do not require one at runtime.
+  tests if one is available; do not require one at runtime. `GetResourceAllocationInfo` (and `1`/`2`): a buffer
+  takes its width rounded up to 64 KiB, aligned to 64 KiB. A texture's size is the memory its `VkImage` needs
+  (`vkGetDeviceImageMemoryRequirements`), rounded up to its D3D12 alignment. That alignment is 64 KiB, or 4 MiB with
+  MSAA. The small alignments (4 KiB, or 64 KiB with MSAA) apply only when the application asks for them. 4 KiB
+  also needs the texture to fit in 64 KiB and not be a render target or depth buffer; if it doesn't qualify, the
+  description is invalid (`UINT64_MAX`), as the PC runtime answers. The MSAA 64 KiB alignment has no size limit
+  on the PC runtime, so none here either. Texture sizes are the driver's on both runtimes, so only buffer sizes,
+  alignments and invalid descriptions are compared with the host. One known difference: a mip count beyond the
+  full chain is invalid here (Vulkan can't create it), while the PC runtime still answers with a size.
 
 ### 4.2 Resources, heaps, placed and reserved
 
@@ -638,11 +709,19 @@ The trace will enumerate them.
   images copy dimension, format, mip levels, array layers and sample count.
 - Copies: `CopyBufferRegion` → `vkCmdCopyBuffer` with arena offsets; `CopyTextureRegion` →
   `vkCmdCopyBufferToImage`/`vkCmdCopyImageToBuffer`/`vkCmdCopyImage`, using the `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`
-  row pitch and height; `CopyResource` → a whole-subresource copy; `ResolveSubresource` → `vkCmdResolveImage`.
+  row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`.
   Partial resolve regions need a shader or a region copy.
 - Clears: a full-subresource clear maps to `vkCmdClearColorImage`/`vkCmdClearDepthStencilImage` (UAV buffers to
   `vkCmdFillBuffer`); a rect clear uses `vkCmdClearAttachments` inside the rendering scope. UAV image clears use
   `vkCmdClearColorImage` in `GENERAL`; non-32-bit buffer patterns need a compute clear.
+- **Typed UINT RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For the currently exposed
+  `R8G8B8A8_UINT`, `R32_UINT` and `R32G32B32A32_UINT` resources, convert those values numerically into
+  `VkClearColorValue::uint32` for both image and rectangle clears; copying float bits gives incorrect stored
+  integers without a Vulkan validation error. **Measured:** Windows D3D12 on WARP and AMD RX 5700 XT clamps
+  negatives/NaN to zero, positive overflow/infinity to the component maximum, and truncates fractions.
+  `d3d12_uint_clear_test` compares full and rectangular D3D12 readbacks with WARP over seven input sets on all
+  three formats; `clear_color_test` checks both replay paths without a GPU, including unchanged float values.
+  This does not add typed-view reinterpretation of typeless resources or new integer formats.
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
   raw DCC metadata.
@@ -681,6 +760,21 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   `VkPipelineStageFlags2`, `VkAccessFlags2` and `VkImageLayout` (`vulkan_sync`, `vulkan_barrier_access`,
   `vulkan_layout`). Queue-specific layouts map like their generic forms; ray tracing, video and split scopes use
   `ALL_COMMANDS`; `LayoutBefore = UNDEFINED` or the discard flag becomes `oldLayout = UNDEFINED`.
+- Access bits and sync scopes are not one-to-one. D3D12 lets an access be named with a sync scope whose Vulkan
+  stages cannot perform it: `SYNC_ALL_SHADING` with `ACCESS_VERTEX_BUFFER` is valid D3D12, but
+  `VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT` needs `VERTEX_ATTRIBUTE_INPUT`, which shading stages are not. Vulkan
+  rejects such a barrier. `vulkan_barrier_scope` therefore widens each side's stages by the narrowest stage that
+  can perform each access without one. The table is the synchronization2 chapter's "supported access types". The
+  stages it adds:
+  - `DRAW_INDIRECT` for indirect arguments;
+  - `INDEX_INPUT` and `VERTEX_ATTRIBUTE_INPUT` for index and vertex buffers;
+  - all shading for constant buffers, SRVs and UAVs;
+  - `COLOR_ATTACHMENT_OUTPUT` for render targets;
+  - the fragment tests for depth/stencil;
+  - `ALL_TRANSFER` for copies and resolves. `CLEAR` alone cannot read, and `ALL_GRAPHICS` contains no transfer stage.
+
+  The access itself is never dropped, so the dependency still covers everything the application named, over a
+  slightly larger scope.
 - Render passes: `BeginRenderPass`/`EndRenderPass` map to `vkCmdBeginRendering`/`vkCmdEndRendering` (dynamic
   rendering). The `D3D12_RENDER_PASS_BEGINNING_ACCESS`/`ENDING_ACCESS` types give the load/store ops and resolve
   targets. Suspending/resuming passes have no direct Vulkan equivalent; split them into two rendering scopes with
@@ -879,6 +973,10 @@ contract, not a runtime bug:
   adds a descriptor binding and a load per `s_getpc`, but avoids growing push constants. Decide after measuring
   how many real PSOs have two code-base stages.
 
+Measured per stage (all 26,503, `tools/feature_scan.py`): `s_getpc_b64` is kept to read code-embedded data in 54
+VS, 93 PS, 266 MS and 263 CS (0 GS); the 147 VS/PS match the translator's own note. Both stages of a VS+PS or
+MS+PS pipeline can therefore need a code base.
+
 **Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). On Intel Arc (Alchemist, Battlemage), Vulkan exposes the 128-byte specification minimum (`maxPushConstantsSize == 128`), which cannot fit the 16-byte tail (dwords 32–35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback` for the uniform-buffer fallback.
 Measured per stage (all 26,503, `tools/feature_scan.py`): `s_getpc_b64` is kept to read code-embedded data in 54
 VS, 93 PS, 266 MS and 263 CS (0 GS); the 147 VS/PS match the translator's own note. Both stages of a VS+PS or
@@ -887,6 +985,8 @@ MS+PS pipeline can therefore need a code base.
 **Open:** the exact count of such PSOs (the pairing is in the executable), and the minimum `maxPushConstantsSize` across target GPUs. If a GPU only
 supports 128 bytes, the current 144-byte contract already fails; the layer needs a fallback (uniform buffer for the
 tail) regardless.
+
+**Open:** the exact count of such PSOs; the pairing is in the executable, not in `shaders.rpf`.
 
 ### 5.3 Descriptor T#/S# parsing
 
