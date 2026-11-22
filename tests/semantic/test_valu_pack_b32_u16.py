@@ -273,6 +273,7 @@ class ScalarMachineState:
     """Architectural register file for a single wavefront lane."""
     vgprs: List[int] = field(default_factory=lambda: [0] * 256)
     sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    vcc: int = 0
 
     def get_vgpr(self, index: int) -> int:
         return self.vgprs[index] & MASK32
@@ -422,6 +423,7 @@ class SIMDState:
     exec_mask: Optional[int] = None
     vgprs: List[List[int]] = field(default_factory=list)
     sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    vcc: int = 0
 
     def __post_init__(self) -> None:
         if self.num_lanes not in (32, 64):
@@ -754,6 +756,185 @@ class TestValuPackB32U16RegisterAliasing(unittest.TestCase):
             expected = (((0xBB00 | lane) & MASK16) << 16) | (lane & MASK16)
             self.assertEqual(state.get_vgpr(lane, 0), expected)
             self.assertEqual(state.get_vgpr(lane, 1), 0xBB00 | lane)
+
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class PackU16StatusFlags:
+    """Architectural condition codes and status flags for packed 16-bit integer channels."""
+    lo_zero: bool
+    hi_zero: bool
+    both_zero: bool
+    sign31: bool
+    sign15: bool
+    lo_saturated: bool
+    hi_saturated: bool
+    any_saturated: bool
+    parity: bool
+    vcc_modified: bool = False
+
+
+def evaluate_u16_pack_flags(
+    res32: int,
+    s0_val: int = 0,
+    s1_val: int = 0,
+    clamp: bool = False,
+    signed: bool = False,
+) -> PackU16StatusFlags:
+    """Evaluate packed integer status flags and saturation conditions."""
+    h0 = res32 & MASK16
+    h1 = (res32 >> 16) & MASK16
+
+    lo_z = (h0 == 0)
+    hi_z = (h1 == 0)
+
+    # Check saturation
+    lo_sat = False
+    hi_sat = False
+    if clamp:
+        if signed:
+            s0 = s32(s0_val)
+            s1 = s32(s1_val)
+            lo_sat = (s0 < 0) or (s0 > MAX_U16)
+            hi_sat = (s1 < 0) or (s1 > MAX_U16)
+        else:
+            lo_sat = (s0_val & MASK32) > MAX_U16
+            hi_sat = (s1_val & MASK32) > MAX_U16
+
+    # Parity calculation across 32 bits (True if even number of bits set)
+    bits_set = bin(res32 & MASK32).count("1")
+    even_parity = (bits_set % 2) == 0
+
+    return PackU16StatusFlags(
+        lo_zero=lo_z,
+        hi_zero=hi_z,
+        both_zero=lo_z and hi_z,
+        sign31=bool(res32 & 0x8000_0000),
+        sign15=bool(h0 & SIGN16),
+        lo_saturated=lo_sat,
+        hi_saturated=hi_sat,
+        any_saturated=lo_sat or hi_sat,
+        parity=even_parity,
+        vcc_modified=False,
+    )
+
+
+def compute_u16_add_carry(a: int, b: int) -> Tuple[int, int]:
+    """Compute 16-bit unsigned addition sum and carry out."""
+    total = (a & MASK16) + (b & MASK16)
+    return total & MASK16, (total >> 16) & 1
+
+
+def compute_u16_sub_borrow(a: int, b: int) -> Tuple[int, int]:
+    """Compute 16-bit unsigned subtraction difference and borrow out."""
+    diff = (a & MASK16) - (b & MASK16)
+    borrow = 1 if diff < 0 else 0
+    return diff & MASK16, borrow
+
+
+class TestValuPackB32U16ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_zero_flags(self) -> None:
+        # Both zeros
+        f_both = evaluate_u16_pack_flags(0x00000000)
+        self.assertTrue(f_both.lo_zero)
+        self.assertTrue(f_both.hi_zero)
+        self.assertTrue(f_both.both_zero)
+
+        # Low zero only
+        f_lo = evaluate_u16_pack_flags(0x12340000)
+        self.assertTrue(f_lo.lo_zero)
+        self.assertFalse(f_lo.hi_zero)
+        self.assertFalse(f_lo.both_zero)
+
+        # High zero only
+        f_hi = evaluate_u16_pack_flags(0x00005678)
+        self.assertFalse(f_hi.lo_zero)
+        self.assertTrue(f_hi.hi_zero)
+        self.assertFalse(f_hi.both_zero)
+
+    def test_condition_codes_sign_flags(self) -> None:
+        # Bit 31 set, Bit 15 clear
+        f_sign31 = evaluate_u16_pack_flags(0x80000042)
+        self.assertTrue(f_sign31.sign31)
+        self.assertFalse(f_sign31.sign15)
+
+        # Bit 31 clear, Bit 15 set
+        f_sign15 = evaluate_u16_pack_flags(0x00428000)
+        self.assertFalse(f_sign15.sign31)
+        self.assertTrue(f_sign15.sign15)
+
+        # Both sign bits set
+        f_both = evaluate_u16_pack_flags(0x80008000)
+        self.assertTrue(f_both.sign31)
+        self.assertTrue(f_both.sign15)
+
+    def test_condition_codes_parity(self) -> None:
+        # 0 has 0 bits set -> even parity (True)
+        self.assertTrue(evaluate_u16_pack_flags(0).parity)
+        # 1 bit set -> odd parity (False)
+        self.assertFalse(evaluate_u16_pack_flags(1).parity)
+        # 2 bits set -> even parity (True)
+        self.assertTrue(evaluate_u16_pack_flags(3).parity)
+
+    def test_saturation_flags_clamping(self) -> None:
+        # Unsigned saturation
+        res = oracle_v_pack_b32_u16(0x20000, 0x100, clamp=True)
+        flags = evaluate_u16_pack_flags(res, 0x20000, 0x100, clamp=True)
+        self.assertTrue(flags.lo_saturated)
+        self.assertFalse(flags.hi_saturated)
+        self.assertTrue(flags.any_saturated)
+
+        # Signed saturation (negative clamps to 0)
+        res_signed = oracle_v_pack_b32_u16(-100, 0x20000, clamp=True, signed=True)
+        flags_signed = evaluate_u16_pack_flags(res_signed, -100, 0x20000, clamp=True, signed=True)
+        self.assertTrue(flags_signed.lo_saturated)
+        self.assertTrue(flags_signed.hi_saturated)
+        self.assertTrue(flags_signed.any_saturated)
+
+    def test_carry_borrow_simulation(self) -> None:
+        # 16-bit carry
+        s, c = compute_u16_add_carry(0xFFFF, 1)
+        self.assertEqual(s, 0)
+        self.assertEqual(c, 1)
+
+        s2, c2 = compute_u16_add_carry(0x1000, 0x2000)
+        self.assertEqual(s2, 0x3000)
+        self.assertEqual(c2, 0)
+
+        # 16-bit borrow
+        d, b = compute_u16_sub_borrow(0x0000, 1)
+        self.assertEqual(d, 0xFFFF)
+        self.assertEqual(b, 1)
+
+        d2, b2 = compute_u16_sub_borrow(0x5000, 0x2000)
+        self.assertEqual(d2, 0x3000)
+        self.assertEqual(b2, 0)
+
+    def test_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xFEEDFACECAFEBEEF
+        state = ScalarMachineState(vcc=canary_vcc)
+
+        instr = VPackB32U16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Literal32(0xFFFF)),
+            src1=VOP3Operand(Literal32(0xFFFF)),
+        )
+        interp.step(instr, state)
+        # VCC must be entirely unmodified by VALU pack
+        self.assertEqual(state.vcc, canary_vcc)
+
+        # Check SIMD state VCC invariant
+        simd = SIMDInterpreter()
+        simd_state = SIMDState(num_lanes=64, vcc=canary_vcc)
+        simd.step(instr, simd_state)
+        self.assertEqual(simd_state.vcc, canary_vcc)
+
 
 
 
