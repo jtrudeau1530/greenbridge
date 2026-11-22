@@ -895,11 +895,29 @@ def main() -> int:
     work = os.path.abspath(a.work or os.path.join(out, "work"))
     # Resolve existing parents too: a not-yet-created destination can be under a junction or symlink.
     real_game = os.path.normcase(os.path.realpath(game))
+    is_game_drive_root = os.path.splitdrive(real_game)[1] in ("\\", "/")
+    game_entries = []
+    if is_game_drive_root:
+        try:
+            game_entries = [
+                os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
+                for e in os.listdir(real_game)
+            ]
+        except OSError:
+            game_entries = []
     for p in (out, work):
         try:
             # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
             real_destination = os.path.normcase(os.path.realpath(p))
-            inside = os.path.commonpath([real_destination, real_game]) == real_game
+            if is_game_drive_root:
+                # If the game is at drive root (e.g. D:\), reject the drive root itself and anything
+                # inside the dump's existing top-level entries, but allow separate top-level folders.
+                inside = (real_destination == real_game) or any(
+                    os.path.commonpath([real_destination, entry]) == entry
+                    for entry in game_entries
+                )
+            else:
+                inside = os.path.commonpath([real_destination, real_game]) == real_game
         except ValueError:          # different drives
             inside = False
         if inside:
