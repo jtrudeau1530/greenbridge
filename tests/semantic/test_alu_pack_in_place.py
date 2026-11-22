@@ -111,13 +111,10 @@ def ref_pack_in_place(
     dst &= MASK32
     src &= MASK32
     if target == "hi":
-        # dst = v_pack_b32_u16 dst, src (replaces high half of dst)
         return ref_pack_b32_u16(dst, src, op_sel=op_sel, clamp=clamp)
     elif target == "lo":
-        # dst = v_pack_b32_u16 src, dst (replaces low half of dst)
         return ref_pack_b32_u16(src, dst, op_sel=op_sel, clamp=clamp)
     elif target == "both":
-        # dst = v_pack_b32_u16 dst, dst (self-pack / permute)
         return ref_pack_b32_u16(dst, dst, op_sel=op_sel, clamp=clamp)
     raise ValueError(f"Unknown in-place target: {target}")
 
@@ -251,7 +248,6 @@ class SimdWaveState:
         """Execute v_pack_b32_u16 across all active lanes with in-place semantics."""
         for lane in range(self.wave_size):
             if (self.exec_mask >> lane) & 1:
-                # Read src0
                 if isinstance(src0, int):
                     s0_val = src0
                 elif src0.startswith("v"):
@@ -261,7 +257,6 @@ class SimdWaveState:
                 else:
                     s0_val = int(src0, 0)
 
-                # Read src1
                 if isinstance(src1, int):
                     s1_val = src1
                 elif src1.startswith("v"):
@@ -386,7 +381,6 @@ class TestUpperByteTruncation(unittest.TestCase):
     """Validation of upper and lower half-word byte truncation semantics."""
 
     def test_src0_upper_bytes_masked_when_op_sel_zero(self):
-        # Varying upper bytes (bits 31:16) with fixed lower bytes (0x1234)
         upper_variants = [0x00000000, 0x00010000, 0x7FFF0000, 0x80000000, 0xFFFF0000, 0xDEAD0000]
         for upper in upper_variants:
             s0 = upper | 0x1234
@@ -395,7 +389,6 @@ class TestUpperByteTruncation(unittest.TestCase):
             self.assertEqual(res & MASK16, 0x1234)
 
     def test_src1_upper_bytes_masked_when_op_sel_zero(self):
-        # Varying upper bytes of src1 with fixed lower bytes (0x5678)
         upper_variants = [0x00000000, 0x00010000, 0x80000000, 0xFFFF0000, 0xBEEF0000]
         for upper in upper_variants:
             s1 = upper | 0x5678
@@ -404,7 +397,6 @@ class TestUpperByteTruncation(unittest.TestCase):
             self.assertEqual(res >> 16, 0x5678)
 
     def test_src0_lower_bytes_masked_when_op_sel_one(self):
-        # Varying lower bytes with fixed upper bytes (0x9ABC)
         lower_variants = [0x0000, 0x0001, 0x7FFF, 0x8000, 0xFFFF, 0x1234]
         for lower in lower_variants:
             s0 = (0x9ABC << 16) | lower
@@ -413,7 +405,6 @@ class TestUpperByteTruncation(unittest.TestCase):
             self.assertEqual(res & MASK16, 0x9ABC)
 
     def test_src1_lower_bytes_masked_when_op_sel_one(self):
-        # Varying lower bytes of src1 with fixed upper bytes (0xDEF0)
         lower_variants = [0x0000, 0x0001, 0x8000, 0xFFFF, 0x5678]
         for lower in lower_variants:
             s1 = (0xDEF0 << 16) | lower
@@ -422,7 +413,6 @@ class TestUpperByteTruncation(unittest.TestCase):
             self.assertEqual(res >> 16, 0xDEF0)
 
     def test_all_upper_byte_patterns_invariant_under_op_sel_zero(self):
-        # Exhaustively check all 256 high-byte values in byte 3 and byte 2
         for b in range(256):
             s0 = (b << 24) | 0x0042
             self.assertEqual(ref_pack_b32_u16(s0, 0, op_sel=(0, 0)), 0x00000042)
@@ -430,7 +420,6 @@ class TestUpperByteTruncation(unittest.TestCase):
             self.assertEqual(ref_pack_b32_u16(s0_b2, 0, op_sel=(0, 0)), 0x00000042)
 
     def test_all_lower_byte_patterns_invariant_under_op_sel_one(self):
-        # Exhaustively check all 256 low-byte values in byte 0 and byte 1
         for b in range(256):
             s0 = 0x42000000 | b
             self.assertEqual(ref_pack_b32_u16(s0, 0, op_sel=(1, 0)), 0x00004200)
@@ -438,7 +427,6 @@ class TestUpperByteTruncation(unittest.TestCase):
             self.assertEqual(ref_pack_b32_u16(s0_b1, 0, op_sel=(1, 0)), 0x00004200)
 
     def test_in_place_upper_byte_overwrite(self):
-        # Initial dst has non-zero upper bytes; verify in-place pack truncates and overwrites them
         dst = 0xAAAA5555
         src = 0x00003333
         new_dst = ref_pack_in_place(dst, src, target="hi", op_sel=(0, 0))
@@ -446,7 +434,6 @@ class TestUpperByteTruncation(unittest.TestCase):
         self.assertNotEqual(new_dst >> 16, dst >> 16)
 
     def test_in_place_lower_byte_overwrite(self):
-        # Initial dst has non-zero lower bytes; verify in-place pack truncates and overwrites them
         dst = 0x5555AAAA
         src = 0x00003333
         new_dst = ref_pack_in_place(dst, src, target="lo", op_sel=(0, 1))
@@ -454,9 +441,6 @@ class TestUpperByteTruncation(unittest.TestCase):
         self.assertNotEqual(new_dst & MASK16, dst & MASK16)
 
     def test_truncation_vs_clamping_contrast(self):
-        # 0x00020005 has upper bits set.
-        # Without clamp: bits 31:16 are truncated, yielding 0x0005.
-        # With clamp: value exceeds 65535, saturating to 0xFFFF.
         val = 0x00020005
         unclamped = ref_pack_b32_u16(val, 0, clamp=False)
         clamped = ref_pack_b32_u16(val, 0, clamp=True)
@@ -474,7 +458,6 @@ class TestSimdMultiLanePack(unittest.TestCase):
         wave.set_vgpr_lanes(0, v0_initial)
         wave.set_vgpr_lanes(1, v1_initial)
 
-        # In-place packing: v0 = v_pack_b32_u16 v0, v1
         wave.execute_pack_b32_u16(dst_reg=0, src0="v0", src1="v1", op_sel=(0, 0))
 
         v0_result = wave.get_vgpr_lanes(0)
@@ -503,7 +486,6 @@ class TestSimdMultiLanePack(unittest.TestCase):
         wave.set_vgpr_lanes(0, v0_initial)
         wave.set_vgpr_lanes(1, v1_initial)
 
-        # Only even lanes active
         wave.exec_mask = 0x55555555
         wave.execute_pack_b32_u16(dst_reg=0, src0="v0", src1="v1", op_sel=(0, 0))
 
@@ -521,7 +503,6 @@ class TestSimdMultiLanePack(unittest.TestCase):
         wave.set_vgpr_lanes(0, v0_initial)
         wave.set_vgpr_lanes(1, v1_initial)
 
-        # Lower 16 lanes active
         wave.exec_mask = 0x0000FFFF
         wave.execute_pack_b32_u16(dst_reg=0, src0="v0", src1="v1", op_sel=(0, 0))
 
@@ -538,7 +519,6 @@ class TestSimdMultiLanePack(unittest.TestCase):
         v0_initial = [(0x1000 | lane) for lane in range(32)]
         wave.set_vgpr_lanes(0, v0_initial)
 
-        # v0 = v_pack_b32_u16 v0, s0
         wave.execute_pack_b32_u16(dst_reg=0, src0="v0", src1="s0", op_sel=(0, 0))
 
         v0_result = wave.get_vgpr_lanes(0)
@@ -546,14 +526,12 @@ class TestSimdMultiLanePack(unittest.TestCase):
             self.assertEqual(v0_result[lane], (0x7777 << 16) | v0_initial[lane])
 
     def test_simd_interleaved_vertex_packing(self):
-        # Interleaving vertex attribute channels (U and V) across 32 lanes
         wave = SimdWaveState(wave_size=32)
         u_coords = [lane * 100 for lane in range(32)]
         v_coords = [lane * 200 for lane in range(32)]
         wave.set_vgpr_lanes(10, u_coords)
         wave.set_vgpr_lanes(11, v_coords)
 
-        # In-place pack into v10: v10 = v_pack_b32_u16 v10, v11
         wave.execute_pack_b32_u16(dst_reg=10, src0="v10", src1="v11", op_sel=(0, 0))
 
         packed_coords = wave.get_vgpr_lanes(10)
@@ -562,7 +540,6 @@ class TestSimdMultiLanePack(unittest.TestCase):
             self.assertEqual(packed_coords[lane], expected)
 
     def test_spirv_wave_interp_lane_packing(self):
-        # Validate wave packing across 32 lanes using spirv_wave_interp
         head = """OpCapability Shader
 OpCapability GroupNonUniformBallot
 OpMemoryModel Logical GLSL450
@@ -601,6 +578,221 @@ OpFunctionEnd
             s1 = lane + 8192
             expected = ref_pack_b32_u16(s0, s1)
             self.assertEqual(outputs[lane], expected)
+
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Validation of register aliasing when destination matches src0, src1, or both."""
+
+    def test_dst_aliases_src0_in_place_pack_high(self):
+        v0 = 0x11112222
+        v1 = 0x33334444
+        self.assertEqual(ref_pack_b32_u16(v0, v1, op_sel=(0, 0)), 0x44442222)
+        self.assertEqual(ref_pack_b32_u16(v0, v1, op_sel=(1, 0)), 0x44441111)
+        self.assertEqual(ref_pack_b32_u16(v0, v1, op_sel=(0, 1)), 0x33332222)
+        self.assertEqual(ref_pack_b32_u16(v0, v1, op_sel=(1, 1)), 0x33331111)
+
+    def test_dst_aliases_src1_in_place_pack_low(self):
+        v0 = 0x11112222
+        v1 = 0x33334444
+        self.assertEqual(ref_pack_b32_u16(v0, v1, op_sel=(0, 0)), 0x44442222)
+        self.assertEqual(ref_pack_b32_u16(v0, v1, op_sel=(1, 0)), 0x44441111)
+        self.assertEqual(ref_pack_b32_u16(v0, v1, op_sel=(0, 1)), 0x33332222)
+        self.assertEqual(ref_pack_b32_u16(v0, v1, op_sel=(1, 1)), 0x33331111)
+
+    def test_dst_aliases_both_sources_self_pack(self):
+        v0 = 0xAABBCCDD
+        self.assertEqual(ref_pack_b32_u16(v0, v0, op_sel=(0, 0)), 0xCCDDCCDD)
+        self.assertEqual(ref_pack_b32_u16(v0, v0, op_sel=(1, 1)), 0xAABBAABB)
+        self.assertEqual(ref_pack_b32_u16(v0, v0, op_sel=(1, 0)), 0xCCDDAABB)
+        self.assertEqual(ref_pack_b32_u16(v0, v0, op_sel=(0, 1)), 0xAABBCCDD)
+
+    def test_simd_wave_aliased_registers(self):
+        wave = SimdWaveState(wave_size=32)
+        initial_v0 = [(0x10000000 | (lane << 16) | (lane * 2)) for lane in range(32)]
+        initial_v1 = [(0x20000000 | ((31 - lane) << 16) | (lane * 3)) for lane in range(32)]
+
+        wave.set_vgpr_lanes(0, initial_v0)
+        wave.set_vgpr_lanes(1, initial_v1)
+        wave.execute_pack_b32_u16(dst_reg=0, src0="v0", src1="v1", op_sel=(0, 0))
+
+        result_v0 = wave.get_vgpr_lanes(0)
+        for lane in range(32):
+            expected = ref_pack_b32_u16(initial_v0[lane], initial_v1[lane], op_sel=(0, 0))
+            self.assertEqual(result_v0[lane], expected)
+
+        wave.execute_pack_b32_u16(dst_reg=0, src0="v0", src1="v0", op_sel=(1, 0))
+        swapped_v0 = wave.get_vgpr_lanes(0)
+        for lane in range(32):
+            expected = ref_pack_b32_u16(result_v0[lane], result_v0[lane], op_sel=(1, 0))
+            self.assertEqual(swapped_v0[lane], expected)
+
+    def test_chained_in_place_packing_sequence(self):
+        wave = SimdWaveState(wave_size=1)
+        wave.set_vgpr_lane(0, 0, 0x00000000)
+        wave.set_vgpr_lane(1, 0, 0x00001111)
+        wave.set_vgpr_lane(2, 0, 0x00002222)
+        wave.set_vgpr_lane(3, 0, 0x00003333)
+
+        wave.execute_pack_b32_u16(dst_reg=0, src0="v1", src1="v2", op_sel=(0, 0))
+        self.assertEqual(wave.vgprs[0][0], 0x22221111)
+
+        wave.execute_pack_b32_u16(dst_reg=0, src0="v0", src1="v3", op_sel=(0, 0))
+        self.assertEqual(wave.vgprs[0][0], 0x33331111)
+
+        wave.execute_pack_b32_u16(dst_reg=0, src0="v0", src1="v0", op_sel=(1, 0))
+        self.assertEqual(wave.vgprs[0][0], 0x11113333)
+
+
+class TestBoundaryExtremes(unittest.TestCase):
+    """Validation of boundary extreme words, bit patterns, and clamping saturation limits."""
+
+    EXTREME_WORDS = (
+        0x00000000,
+        0xFFFFFFFF,
+        0x7FFFFFFF,
+        0x80000000,
+        0x0000FFFF,
+        0xFFFF0000,
+        0x00010000,
+        0x00000001,
+        0x7FFF0000,
+        0x00007FFF,
+        0x80000000,
+        0x00008000,
+    )
+
+    PATTERNS = (
+        0x55555555,
+        0xAAAAAAAA,
+        0x33333333,
+        0xCCCCCCCC,
+        0x0F0F0F0F,
+        0xF0F0F0F0,
+        0x00FF00FF,
+        0xFF00FF00,
+    )
+
+    def test_full_word_extremes(self):
+        for s0 in self.EXTREME_WORDS:
+            for s1 in (0x00000000, 0xFFFFFFFF, 0x12345678):
+                for op_sel in itertools.product((0, 1), repeat=2):
+                    expected = ref_pack_b32_u16(s0, s1, op_sel=op_sel)
+                    self.assertEqual(run_spirv_pack_logical(s0, s1, op_sel=op_sel), expected)
+
+    def test_alternating_bit_patterns(self):
+        for s0 in self.PATTERNS:
+            for s1 in self.PATTERNS:
+                expected = ref_pack_b32_u16(s0, s1)
+                self.assertEqual(run_spirv_pack_logical(s0, s1), expected)
+
+    def test_single_bit_walking_ones(self):
+        for k in range(32):
+            s0 = 1 << k
+            s1 = 0
+            res = ref_pack_b32_u16(s0, s1, op_sel=(0, 0))
+            expected = s0 & MASK16
+            self.assertEqual(res, expected)
+
+            res_hi = ref_pack_b32_u16(s0, s1, op_sel=(1, 0))
+            expected_hi = (s0 >> 16) & MASK16
+            self.assertEqual(res_hi, expected_hi)
+
+    def test_single_bit_walking_zeros(self):
+        for k in range(32):
+            s0 = MASK32 ^ (1 << k)
+            s1 = 0xFFFFFFFF
+            res = ref_pack_b32_u16(s0, s1, op_sel=(0, 0))
+            expected = (s0 & MASK16) | 0xFFFF0000
+            self.assertEqual(res, expected)
+
+    def test_clamp_saturation_boundaries(self):
+        boundary_cases = (
+            (65534, 65534),
+            (65535, 65535),
+            (65536, 65535),
+            (65537, 65535),
+            (0x7FFFFFFE, 65535),
+            (0x7FFFFFFF, 65535),
+            (0x80000000, 65535),
+            (0xFFFFFFFE, 65535),
+            (0xFFFFFFFF, 65535),
+        )
+        for val, expected_half in boundary_cases:
+            with self.subTest(val=hex(val)):
+                res = ref_pack_b32_u16(val, 0, clamp=True)
+                self.assertEqual(res & MASK16, expected_half)
+                res_hi = ref_pack_b32_u16(0, val, clamp=True)
+                self.assertEqual(res_hi >> 16, expected_half)
+
+    def test_deterministic_fuzzing(self):
+        rng = random.Random(0x1616)
+        for _ in range(40):
+            s0 = rng.getrandbits(32)
+            s1 = rng.getrandbits(32)
+            op_sel = (rng.choice((0, 1)), rng.choice((0, 1)))
+            clamp = rng.choice((True, False))
+
+            expected = ref_pack_b32_u16(s0, s1, op_sel=op_sel, clamp=clamp)
+            got = run_spirv_pack_logical(s0, s1, op_sel=op_sel, clamp=clamp)
+            self.assertEqual(got, expected)
+
+
+class TestNegativeControls(unittest.TestCase):
+    """Negative controls ensuring mutated packing or missing masks fail assertions."""
+
+    def test_missing_high_half_shift_fails(self):
+        s0, s1 = 0x1234, 0x5678
+        correct = ref_pack_b32_u16(s0, s1)
+        sabotaged_no_shift = (s0 & MASK16) | (s1 & MASK16)
+        self.assertNotEqual(correct, sabotaged_no_shift)
+
+    def test_off_by_one_shift_fails(self):
+        s0, s1 = 0x1234, 0x5678
+        correct = ref_pack_b32_u16(s0, s1)
+        sabotaged_shift_15 = (s0 & MASK16) | ((s1 & MASK16) << 15)
+        sabotaged_shift_17 = (s0 & MASK16) | (((s1 & MASK16) << 17) & MASK32)
+        self.assertNotEqual(correct, sabotaged_shift_15)
+        self.assertNotEqual(correct, sabotaged_shift_17)
+
+    def test_inverted_operand_order_fails(self):
+        s0, s1 = 0x11112222, 0x33334444
+        correct = ref_pack_b32_u16(s0, s1, op_sel=(0, 0))
+        reversed_operands = ref_pack_b32_u16(s1, s0, op_sel=(0, 0))
+        self.assertNotEqual(correct, reversed_operands)
+
+    def test_missing_low_half_mask_fails(self):
+        s0, s1 = 0xDEAD1234, 0xBEEF5678
+        correct = ref_pack_b32_u16(s0, s1)
+        sabotaged_no_truncation = (s0 | (s1 << 16)) & MASK32
+        self.assertNotEqual(correct, sabotaged_no_truncation)
+
+    def test_inverted_op_sel_fails(self):
+        s0, s1 = 0x12345678, 0x9ABCDEF0
+        correct = ref_pack_b32_u16(s0, s1, op_sel=(0, 0))
+        inverted = ref_pack_b32_u16(s0, s1, op_sel=(1, 1))
+        self.assertNotEqual(correct, inverted)
+
+    def test_modulo_wrap_instead_of_clamp_fails(self):
+        s0, s1 = 70000, 20
+        clamped = ref_pack_b32_u16(s0, s1, clamp=True)
+        wrapped = ref_pack_b32_u16(s0, s1, clamp=False)
+        self.assertNotEqual(clamped, wrapped)
+
+    def test_signed_vs_unsigned_clamp_discrepancy_fails(self):
+        s0, s1 = -10, 10
+        uclamped = ref_pack_b32_u16(s0, s1, clamp=True, signed=False)
+        sclamped = ref_pack_b32_u16(s0, s1, clamp=True, signed=True)
+        self.assertNotEqual(uclamped, sclamped)
+
+    def test_read_after_write_hazard_simulator_detected(self):
+        s0 = 0x11112222
+        s1 = 0x33334444
+        correct = ref_pack_b32_u16(s0, s1)
+
+        sim_reg = s1
+        sim_reg = s0 & MASK16
+        corrupted = sim_reg | ((sim_reg & MASK16) << 16)
+        self.assertNotEqual(correct, corrupted)
 
 
 if __name__ == "__main__":
