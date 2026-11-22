@@ -886,6 +886,91 @@ class LocalExecFoldTests(unittest.TestCase):
             want = 200 if lane >= 32 else 0
             self.assertEqual(mem[512 + lane * 4], want, f"lane {lane}")
 
+    def test_nested_reused_saveexec_and_xor_if_else_folds_cleanly(self):
+        # Outer `if (lane >= 16)` containing TWO sequential inner `if/else` diamonds that reuse the SAME
+        # s[10:11] saved-EXEC pair and use LLVM's `s_xor_b64` + `s_or_saveexec_b64` if/else lowering.
+        insns = [
+            ("v_mov_b32_e32 v4, v0", 4),
+            ("v_cmp_le_u32_e64 s[6:7], 16, v0", 8),        # outer: lane >= 16
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 17", 4),                     # outer skip (17 dwords)
+            # Inner 1: if (lane >= 32) v4 += 100 else v4 += 10 using s[10:11] + s_xor_b64 + s_or_saveexec_b64
+            ("v_cmp_le_u32_e64 vcc, 32, v0", 8),
+            ("s_and_saveexec_b64 s[10:11], vcc", 4),
+            ("s_xor_b64 s[10:11], exec, s[10:11]", 4),     # else mask in s[10:11]
+            ("s_cbranch_execz 1", 4),
+            ("v_add_nc_u32_e32 v4, 100, v4", 4),
+            ("s_or_saveexec_b64 s[12:13], s[10:11]", 4),   # swap to else, save then-exec
+            ("s_andn2_b64 exec, exec, s[12:13]", 4),       # keep else lanes only
+            ("s_cbranch_execz 1", 4),
+            ("v_add_nc_u32_e32 v4, 10, v4", 4),
+            ("s_or_b64 exec, exec, s[12:13]", 4),          # restore outer exec
+            # Inner 2: REUSE s[10:11] for a second inner guard: if (lane >= 48) v4 += 1000
+            ("v_cmp_le_u32_e64 vcc, 48, v0", 8),
+            ("s_and_saveexec_b64 s[10:11], vcc", 4),
+            ("s_cbranch_execz 1", 4),
+            ("v_add_nc_u32_e32 v4, 1000, v4", 4),
+            ("s_or_b64 exec, exec, s[10:11]", 4),
+            # Outer restore
+            ("s_or_b64 exec, exec, s[8:9]", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v4, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, gen = _translate_encoded("cs_reused_nested_fold", insns, (64, 1, 1), emulate=True)
+        self.assertEqual(_switch_case_count(gen), 1)
+        self.assertEqual(spv.count("OpAtomicOr"), 0)
+        mem, _ = run_emulated_workgroup(spv, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            want = lane
+            if lane >= 16:
+                want += 100 if lane >= 32 else 10
+                if lane >= 48:
+                    want += 1000
+            self.assertEqual(mem[lane * 4], want, f"lane {lane}")
+
+    def test_negative_live_in_pair_and_unmasked_vcc_scc_not_folded(self):
+        # 1) s[10:11] initialized to -1 BEFORE the region and ORed with exec inside -> live-in at run -> MUST NOT fold!
+        insns_live_in = [
+            ("v_mov_b32_e32 v4, v0", 4),
+            ("s_mov_b64 s[10:11], -1", 4),
+            ("v_cmp_le_u32_e64 s[6:7], 32, v0", 8),
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 3", 4),
+            ("s_or_b64 s[10:11], s[10:11], exec", 4),      # preserves entry -1, NOT guaranteed 0!
+            ("s_or_b64 exec, exec, s[10:11]", 4),          # widens EXEC to all-ones!
+            ("v_add_nc_u32_e32 v4, 5, v4", 4),
+            ("s_or_b64 exec, exec, s[8:9]", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v4, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv1, _ = _translate_encoded("cs_neg_livein_zero", insns_live_in, (64, 1, 1), emulate=True)
+        self.assertGreaterEqual(spv1.count("OpAtomicOr"), 1)
+        mem1, _ = run_emulated_workgroup(spv1, (64, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            self.assertEqual(mem1[lane * 4], lane + 5, f"lane {lane}: EXEC widen must run for all lanes")
+
+        # 2) `s_and_b64 s[10:11], vcc, s[12:13]` where vcc is not tracked by lane_masks, with internal live SCC:
+        # Gen.is_mask_op treats vcc as a mask op and emits scc_from_mask -> MUST NOT fold or crash!
+        insns_vcc_scc = [
+            ("s_mov_b32 s12, 1", 4),
+            ("s_mov_b32 s13, 0", 4),
+            ("s_mov_b64 vcc, s[12:13]", 4),                # vcc written as plain data, NOT in lane_masks
+            ("v_cmp_le_u32_e64 s[6:7], 32, v0", 8),
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 3", 4),
+            ("s_and_b64 s[10:11], vcc, s[12:13]", 4),      # Gen.is_mask_op(vcc) -> scc_from_mask!
+            ("s_cselect_b32 s14, 7, 3", 4),                # reads SCC inside region (s14 dead at join)
+            ("v_mov_b32_e32 v4, s14", 4),
+            ("s_or_b64 exec, exec, s[8:9]", 4),
+            ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+            ("buffer_store_dword v4, v9, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv2, _ = _translate_encoded("cs_neg_vcc_scc", insns_vcc_scc, (64, 1, 1), emulate=True)
+        self.assertGreaterEqual(spv2.count("OpAtomicOr"), 2)  # branch vote + scc_from_mask vote
+
 
 if __name__ == "__main__":
     unittest.main()

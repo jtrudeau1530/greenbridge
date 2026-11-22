@@ -62,6 +62,7 @@ _SCC_UNCONDITIONAL_WRITES = _ALL_SAVEEXEC_WREXEC | frozenset({
     "s_nand_b64", "s_nor_b64", "s_xnor_b64", "s_not_b64",
     "s_and_b32", "s_or_b32", "s_xor_b32", "s_andn2_b32", "s_orn2_b32",
     "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_not_b32",
+    "s_and_b32_mask", "s_or_b32_mask",
     "s_add_u32", "s_addc_u32", "s_sub_u32", "s_subb_u32",
     "s_add_i32", "s_sub_i32", "s_addk_i32",
     "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
@@ -81,6 +82,7 @@ _SCC_UNCONDITIONAL_WRITES = _ALL_SAVEEXEC_WREXEC | frozenset({
 _MASK_SCC_VOTE_OPS = _ALL_SAVEEXEC_WREXEC | frozenset({
     "s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64",
     "s_nand_b64", "s_nor_b64", "s_xnor_b64", "s_not_b64",
+    "s_and_b32_mask", "s_or_b32_mask",
     "s_wqm_b32", "s_wqm_b64",
 })
 
@@ -395,6 +397,13 @@ def _holds_lane_mask(ins, x, lm_map):
     return False
 
 
+def _is_mask_op(ins, x, lm_map):
+    """Matches Gen.is_mask_op in tools/rdna2spirv.py (special exec/vcc operands always take the mask path)."""
+    if _holds_lane_mask(ins, x, lm_map):
+        return True
+    return x.get("k") == "special" and x.get("t", "").startswith(("exec", "vcc"))
+
+
 def _is_exec_op_arg(x):
     return x.get("k") == "special" and x.get("t", "") == "exec"
 
@@ -408,19 +417,17 @@ def _sgpr_pair(x):
 def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
     """Inspect non-terminator instructions of a block for lane-local region safety.
 
-    Returns `(clean, mem_reads, may_write_scalars, exec_writes, sgpr_writes_all, saveexec_pairs)` where:
+    Returns `(clean, mem_reads, may_write_scalars, exec_writes, sgpr_write_ops)` where:
       - `clean`: True if no instruction does a cross-lane op, barrier, memory write, or unmasked side effect.
       - `mem_reads`: subset of {"lds", "mem"}.
       - `may_write_scalars`: int bitmask of scalar regs possibly written.
       - `exec_writes`: list of `(op, args)` that write EXEC.
-      - `sgpr_writes_all`: dict mapping sgpr index -> count of writes inside this block.
-      - `saveexec_pairs`: set of base SGPR indices `r` written by `s_and_saveexec_b64 s[r:r+1], ...`.
+      - `sgpr_write_ops`: list of `(sgpr_bitmask, op, args)` for every instruction writing any SGPR.
     """
     mem_reads = set()
     may_w = 0
     exec_writes = []
-    sgpr_writes = collections.Counter()
-    saveexec_pairs = set()
+    sgpr_write_ops = []
 
     for ins in insns:
         raw_op = ins["op"]
@@ -429,13 +436,13 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             break
         if id(ins) in mask_writes:
             # write_all_lanes VGPR store (parked lane mask): runs even when EXEC == 0, so must not be skipped.
-            return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+            return False, frozenset(), 0, (), ()
         a = ins["args"]
         lm = lane_masks.get(id(ins), {})
 
         # 1. Strictly forbidden opcodes inside a lane-local folded region.
         if raw_op.endswith(("_dpp", "_dpp8")):
-            return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+            return False, frozenset(), 0, (), ()
         if op in ("s_barrier", "s_sendmsg", "s_setpc_b64", "s_swappc_b64", "s_trap",
                   "s_sethalt", "s_setkill", "s_sleep", "s_setprio",
                   "s_round_mode", "s_denorm_mode",
@@ -443,16 +450,16 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
                   "v_permlane16_b32", "v_permlanex16_b32",
                   "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
                   "s_wqm_b32", "s_wqm_b64", "s_quadmask_b32", "s_quadmask_b64"):
-            return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+            return False, frozenset(), 0, (), ()
         if op.startswith(("s_movrel", "s_setreg", "s_getreg", "s_store", "s_buffer_store", "s_atomic", "exp")):
-            return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+            return False, frozenset(), 0, (), ()
         if "store" in op or "atomic" in op:
-            return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+            return False, frozenset(), 0, (), ()
         if op.startswith("ds_"):
             if not op.startswith("ds_read"):
-                return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+                return False, frozenset(), 0, (), ()
             mem_reads.add("lds")
-        elif op.startswith(("buffer_load", "tbuffer_load", "global_load", "flat_load", "scratch_load",
+        elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "scratch_",
                             "s_load_", "s_buffer_load_",
                             "image_load", "image_sample", "image_gather", "image_bvh")):
             mem_reads.add("mem")
@@ -461,73 +468,107 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
         if op in ("s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
                   "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64"):
             if len(a) > 1 and _holds_lane_mask(ins, a[1], lm):
-                return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+                return False, frozenset(), 0, (), ()
         elif op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
             if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm):
-                return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+                return False, frozenset(), 0, (), ()
         elif op.startswith(("s_cmp", "s_bitcmp")):
             if any(_holds_lane_mask(ins, x, lm) for x in a):
-                return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+                return False, frozenset(), 0, (), ()
         elif op in _MASK_SCC_VOTE_OPS and id(ins) in scc_live:
-            # Would emit scc_from_mask -> x_round if operating on a lane mask.
+            # Would emit scc_from_mask -> x_round if operating on a lane mask (matches Gen.is_mask_op).
             is_mask_dst = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith(("exec", "vcc"))
-            if "saveexec" in op or "wrexec" in op or is_mask_dst or any(_holds_lane_mask(ins, x, lm) for x in a[1:]):
-                return False, frozenset(), 0, (), sgpr_writes, saveexec_pairs
+            if "saveexec" in op or "wrexec" in op or op.endswith("_mask") or is_mask_dst \
+                    or any(_is_mask_op(ins, x, lm) for x in a[1:]):
+                return False, frozenset(), 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
         _, ins_mw, _ = _scalar_rw(ins)
         may_w |= ins_mw
-        # Track individual SGPR writes for exact saved-EXEC-mask checking.
         s_bits = ins_mw & _ALL_SGPRS
-        while s_bits:
-            lsb = s_bits & -s_bits
-            sgpr_writes[lsb.bit_length() - 1] += 1
-            s_bits ^= lsb
-        if op == "s_and_saveexec_b64" and a:
-            pair = _sgpr_pair(a[0])
-            if pair is not None:
-                saveexec_pairs.add(pair)
+        if s_bits:
+            sgpr_write_ops.append((s_bits, op, a))
         writes_exec = (op.startswith("v_cmpx") or "saveexec" in op or "wrexec" in op
                        or (bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec")))
         if writes_exec:
             exec_writes.append((op, a))
 
-    return True, frozenset(mem_reads), may_w, exec_writes, sgpr_writes, saveexec_pairs
+    return True, frozenset(mem_reads), may_w, exec_writes, sgpr_write_ops
 
 
-def _exec_writes_stay_inactive(region_blocks, blk_info):
-    """Return True iff every EXEC write in `region_blocks` preserves `active == False` for inactive lanes."""
-    total_sgpr_writes = collections.Counter()
-    cand_saved = set()
+def _is_zero_val(x, zero_pairs):
+    if _is_exec_op_arg(x):
+        return True
+    if x.get("k") == "imm" and x.get("v", 1) == 0:
+        return True
+    return _sgpr_pair(x) in zero_pairs
+
+
+def _write_preserves_zero(op, a, zero_pairs, *, for_exec):
+    """True iff the write produces 0 whenever EXEC == 0 and every pair in `zero_pairs` == 0."""
+    if for_exec:
+        if op.startswith("v_cmpx") or op in (
+                "s_and_saveexec_b64", "s_and_saveexec_b32",
+                "s_andn1_saveexec_b64", "s_andn1_saveexec_b32",
+                "s_andn1_wrexec_b64", "s_andn1_wrexec_b32"):
+            return True
+        if op in ("s_andn2_saveexec_b64", "s_or_saveexec_b64", "s_xor_saveexec_b64", "s_andn2_wrexec_b64"):
+            return len(a) >= 2 and _is_zero_val(a[1], zero_pairs)
+        if not a or not _is_exec_op_arg(a[0]):
+            return False  # partial exec_lo/exec_hi or unknown EXEC write
+    else:
+        if op.endswith("_saveexec_b64") or op == "s_andn1_wrexec_b64":
+            return True  # saves old EXEC (or ~S0 & EXEC), both 0 when EXEC == 0
+        if op == "s_andn2_wrexec_b64":
+            return len(a) >= 2 and _is_zero_val(a[1], zero_pairs)
+    if op == "s_and_b64" and len(a) == 3:
+        return _is_zero_val(a[1], zero_pairs) or _is_zero_val(a[2], zero_pairs)
+    if op == "s_andn2_b64" and len(a) == 3:
+        return _is_zero_val(a[1], zero_pairs)
+    if op in ("s_or_b64", "s_xor_b64") and len(a) == 3:
+        return _is_zero_val(a[1], zero_pairs) and _is_zero_val(a[2], zero_pairs)
+    if op == "s_mov_b64" and len(a) == 2:
+        return _is_zero_val(a[1], zero_pairs)
+    return False
+
+
+def _exec_writes_stay_inactive(region_blocks, blk_info, run_live_in):
+    """Return True iff every EXEC write in `region_blocks` preserves `active == False` for inactive lanes.
+
+    Inductive proof over all execution steps in `region_blocks`: any SGPR pair `s[r:r+1]` not live-in at
+    the region entry (`run_live_in`) cannot be read before being written in the region. If every write to
+    `s[r:r+1]` and every write to `EXEC` produces 0 whenever `EXEC == 0` and all such pairs are 0, then
+    an inactive lane stays inactive across arbitrary nested / reused saveexec if-else diamonds.
+    """
+    sgpr_writers = collections.defaultdict(list)
     for u in region_blocks:
-        total_sgpr_writes.update(blk_info[u][4])
-        cand_saved.update(blk_info[u][5])
-    # A pair s[r:r+1] is guaranteed to hold 0 for every lane entering R inactive if its ONLY write in R
-    # is `s_and_saveexec_b64 s[r:r+1], ...` (and neither half is written anywhere else in R).
-    zero_pairs = {r for r in cand_saved if total_sgpr_writes[r] == 1 and total_sgpr_writes[r + 1] == 1}
+        for item in blk_info[u][4]:
+            s_bits = item[0]
+            while s_bits:
+                lsb = s_bits & -s_bits
+                sgpr_writers[lsb.bit_length() - 1].append(item)
+                s_bits ^= lsb
+    zero_pairs = set()
+    for r in range(127):
+        if (3 << r) & run_live_in:
+            continue  # entry value could be read before first write in R
+        w0 = sgpr_writers.get(r)
+        if not w0 or w0 != sgpr_writers.get(r + 1):
+            continue
+        pair_mask = 3 << r
+        if all(s_bits == pair_mask and bool(a) and _sgpr_pair(a[0]) == r for s_bits, _, a in w0):
+            zero_pairs.add(r)
+    changed = True
+    while changed:
+        changed = False
+        for r in list(zero_pairs):
+            if not all(_write_preserves_zero(op, a, zero_pairs, for_exec=False) for _, op, a in sgpr_writers[r]):
+                zero_pairs.remove(r)
+                changed = True
     for u in region_blocks:
         for op, a in blk_info[u][3]:
-            if op.startswith("v_cmpx") or op in ("s_and_saveexec_b64", "s_and_saveexec_b32"):
-                continue
-            if not a or not _is_exec_op_arg(a[0]):
-                return False  # partial exec_lo/exec_hi or unknown EXEC write
-            if op == "s_and_b64" and len(a) == 3 and (_is_exec_op_arg(a[1]) or _is_exec_op_arg(a[2])):
-                continue
-            if op == "s_andn2_b64" and len(a) == 3:
-                if _is_exec_op_arg(a[1]):
-                    continue
-                if _sgpr_pair(a[1]) in zero_pairs:
-                    continue
+            if not _write_preserves_zero(op, a, zero_pairs, for_exec=True):
                 return False
-            if op == "s_or_b64" and len(a) == 3:
-                if _is_exec_op_arg(a[1]) and _sgpr_pair(a[2]) in zero_pairs:
-                    continue
-                if _is_exec_op_arg(a[2]) and _sgpr_pair(a[1]) in zero_pairs:
-                    continue
-                return False
-            if op == "s_mov_b64" and len(a) == 2 and _sgpr_pair(a[1]) in zero_pairs:
-                continue
-            return False
     return True
 
 
@@ -613,7 +654,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
         if region_may_w & scalar_live_in[skip]:
             continue
         # EXEC must stay inactive for any lane that skipped R.
-        if not _exec_writes_stay_inactive(region, blk_info):
+        if not _exec_writes_stay_inactive(region, blk_info, scalar_live_in[run]):
             continue
         candidates.append((len(region), b, run, skip, frozenset(region)))
 
