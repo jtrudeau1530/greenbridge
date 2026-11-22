@@ -507,6 +507,7 @@ if(BUILD_TESTING)
     target_link_libraries(bink_decode_test PRIVATE psapi)
     add_dependencies(bink_decode_test gta6rt_tls_host)
     add_test(NAME bink_decode COMMAND bink_decode_test)
+    set_tests_properties(bink_decode PROPERTIES SKIP_RETURN_CODE 77)
 
     # Optional: skips unless LEONIDA_GAME_DIR is set. Drives the package's FSR DLL on the Xbox-ABI device proxy.
     if(D3D12_LIBRARY AND DXGI_LIBRARY)
@@ -523,6 +524,7 @@ if(BUILD_TESTING)
       target_link_options(fsr_dispatch_test PRIVATE /OPT:NOREF)
       target_link_libraries(fsr_dispatch_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY} psapi)
       add_test(NAME fsr_dispatch COMMAND fsr_dispatch_test)
+      set_tests_properties(fsr_dispatch PROPERTIES SKIP_RETURN_CODE 77)
 
       # Optional: skips unless LEONIDA_GAME_DIR is set. Constructs the package's XboxBvhBuilder on the device proxy.
       add_executable(bvh_builder_test
@@ -538,6 +540,7 @@ if(BUILD_TESTING)
       target_link_options(bvh_builder_test PRIVATE /OPT:NOREF)
       target_link_libraries(bvh_builder_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY} psapi)
       add_test(NAME bvh_builder COMMAND bvh_builder_test)
+      set_tests_properties(bvh_builder PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE_AUDIO are set.
@@ -554,6 +557,7 @@ if(BUILD_TESTING)
     target_link_libraries(bink_audio_test PRIVATE psapi)
     add_dependencies(bink_audio_test gta6rt_tls_host)
     add_test(NAME bink_audio COMMAND bink_audio_test)
+    set_tests_properties(bink_audio PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)

@@ -6,7 +6,7 @@
 //   LEONIDA_FSR_WARP=1                (optional: use the WARP adapter instead of the default hardware adapter)
 //   LEONIDA_FSR_DEVICE=vulkan         (optional: use the Vulkan-backed ID3D12Device instead of a PC device)
 //
-// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 0. Nothing from the DLL is written to disk.
+// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip). Nothing from the DLL is written to disk.
 //
 // Steps, each one only if the previous worked:
 //   1. map: the console imports bind to the shims and nothing is unimplemented
@@ -624,7 +624,7 @@ int main() {
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
-        return 0;
+        return 77;
     }
     const std::filesystem::path game_dir = game_dir_arg;
     const std::filesystem::path dll = game_dir / "amd_fidelityfx_upscaler_xbox.dll";
