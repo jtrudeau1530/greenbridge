@@ -528,6 +528,7 @@ def run_suite(a, work: str) -> int:
         os.makedirs(d, exist_ok=True)
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
+    disasm_files = []
     for fname in build_files:
         name = os.path.splitext(fname)[0]
         if name in CLIP_CASES and name != "vs_clip_undeclared":
@@ -555,15 +556,20 @@ def run_suite(a, work: str) -> int:
             with open(os.path.join(fssm_dir, f"{name}.fssm"), "wb") as f:
                 f.write(compute_header(os.path.join(SHADER_DIR, fname)))
         fname = shader_source(name) + ".asm"
-        assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), os.path.join(disasm_dir, f"{name}.s"), name)
+        disasm_path = os.path.join(disasm_dir, f"{name}.s")
+        assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), disasm_path, name)
+        disasm_files.append(disasm_path)
         # A failed translation must not run an old binary left in a reused --work directory.
         Path(spirv_dir, f"{name}.spv").unlink(missing_ok=True)
 
-    # 2. Translate all .s -> .spv
-    cmd = [sys.executable, "-I", TRANSLATOR, disasm_dir, "--out", spirv_dir]
-    if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
-        cmd.append("--wave64-emulate")
-    rc, out = run_cmd(cmd)
+    # 2. Translate this run's inputs only. The translator looks for metadata one level above the input directory.
+    with tempfile.TemporaryDirectory(prefix="disasm-", dir=work) as selected_disasm:
+        for path in disasm_files:
+            shutil.copyfile(path, os.path.join(selected_disasm, os.path.basename(path)))
+        cmd = [sys.executable, "-I", TRANSLATOR, selected_disasm, "--out", spirv_dir]
+        if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
+            cmd.append("--wave64-emulate")
+        rc, out = run_cmd(cmd)
     print("=== rdna2spirv.py ===")
     print(out)
     if rc != 0:
