@@ -1,4 +1,5 @@
-Claimed in #156 as: <!-- the item ID, for example TEST-17, or a link to your claim -->
+Claimed in the coordination issue as: <!-- the item ID from the open "Coordinating who works on what" issue,
+     for example TEST-17, or a link to your claim -->
 
 ### What and why
 

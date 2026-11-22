@@ -116,6 +116,26 @@ class SameStemTest(unittest.TestCase):
         else:
             self.assertEqual((named, renamed), (items, 0))
 
+    def test_output_names_follow_linked_directories_and_counter_collisions(self):
+        with tempfile.TemporaryDirectory() as out:
+            first = os.path.join(out, "first")
+            os.mkdir(first)
+            try:
+                os.symlink(first, os.path.join(out, "second"), target_is_directory=True)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"directory symlinks unavailable: {e}")
+
+            # The worker will create child/ later. Both logical paths lead to one physical WAV.
+            a = os.path.join("first", "child", "track")
+            b = os.path.join("second", "child", "track")
+            c = os.path.join("independent", "child", "track")
+            items = [(a + ".ogg", a), (b + ".ogg", b), (c + ".opus", c)]
+            expected = [(a + ".ogg", a + ".ogg"), (b + ".ogg", b + ".ogg~2"), (c + ".opus", c)]
+            self.assertEqual(audio_wav.output_names(items, out), (expected, 2))
+            self.assertFalse(os.path.exists(os.path.join(first, "child")))
+            os.mkdir(os.path.join(first, "child"))
+            self.assertEqual(audio_wav.output_names(items, out), (expected, 2))
+
     def test_every_input_gets_its_own_wav(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in")

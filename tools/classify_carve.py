@@ -14,6 +14,7 @@ Writes types.json (per archive and overall counts/bytes per class, plus size sta
 import json
 import os
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 
@@ -49,8 +50,19 @@ def main():
         per[name] = {k: {"files": v[0], "bytes": v[1]} for k, v in sorted(c.items(), key=lambda kv: -kv[1][1])}
     top = sorted(total.items(), key=lambda kv: -kv[1][1])
     out = {"overall": {k: {"files": v[0], "bytes": v[1]} for k, v in top}, "per_archive": per}
-    with open(os.path.join(root, "types.json"), "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=1)
+    fd, temp = tempfile.mkstemp(dir=root, prefix=".types-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, os.path.join(root, "types.json"))
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
     print(f"{'class':24} {'files':>10} {'GiB':>8}")
     for k, v in top[:25]:
         print(f"{k:24} {v[0]:>10} {v[1] / 2**30:8.2f}")

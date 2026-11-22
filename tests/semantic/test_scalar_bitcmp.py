@@ -9,6 +9,8 @@ Covers:
   - s_bcnt0_i32_b64: D = count_zero_bits(S0_64), SCC = (D != 0)
   - s_ff0_i32_b32: D = find_first_zero_bit(S0), -1 if none
   - s_ff0_i32_b64: D = find_first_zero_bit(S0_64), -1 if none
+  - s_ff1_i32_b32/b64: D = find_first_set_bit(S0), -1 if none
+  - Non-mask `_b32` sources for s_ff0/s_ff1 are scalar values, including float immediates and m0
   - Lane mask awareness: testing bits on lane-mask registers (exec / vcc)
   - SPIR-V translation validation via rdna2spirv.Gen
 """
@@ -249,6 +251,102 @@ class TestRdna2SpirvBitcmpEmission(unittest.TestCase):
         emitted = "\n".join(g.body)
         self.assertIn("OpNot %uint", emitted)
         self.assertIn("FindILsb", emitted)
+
+    def test_s_ff0_i32_b32_immediate_is_scalar(self):
+        for value in (5, 61):
+            with self.subTest(value=value):
+                g = rdna2spirv.Gen("ps")
+                ins = {
+                    "op": "s_ff0_i32_b32",
+                    "args": [
+                        {"k": "sgpr", "r": 0},
+                        {"k": "imm", "v": value},
+                    ],
+                    "mods": [],
+                }
+                g.insn(ins)
+                emitted = "\n".join(g.body)
+                self.assertIn(f"OpNot %uint %c{value:x}", emitted)
+                self.assertNotIn("OpNot %uint %cffffffff", emitted)
+
+    def test_s_ff0_i32_b32_float_immediate_is_scalar(self):
+        g = rdna2spirv.Gen("ps")
+        ins = {
+            "op": "s_ff0_i32_b32",
+            "args": [
+                {"k": "sgpr", "r": 0},
+                {"k": "fimm", "v": 1.0},
+            ],
+            "mods": [],
+        }
+        g.insn(ins)
+        emitted = "\n".join(g.body)
+        self.assertIn("OpNot %uint %c3f80000", emitted)
+        self.assertNotIn("OpNot %uint %cffffffff", emitted)
+
+    def test_s_ff0_i32_b32_m0_is_scalar(self):
+        g = rdna2spirv.Gen("ps")
+        ins = {
+            "op": "s_ff0_i32_b32",
+            "args": [
+                {"k": "sgpr", "r": 0},
+                {"k": "special", "t": "m0"},
+            ],
+            "mods": [],
+        }
+        g.insn(ins)
+        emitted = "\n".join(g.body)
+        self.assertIn("OpLoad %uint %m0", emitted)
+        self.assertIn("FindILsb", emitted)
+        self.assertNotIn("OpNot %uint %cffffffff", emitted)
+
+    def test_s_ff1_i32_b32_immediate_is_scalar(self):
+        g = rdna2spirv.Gen("ps")
+        ins = {
+            "op": "s_ff1_i32_b32",
+            "args": [
+                {"k": "sgpr", "r": 0},
+                {"k": "imm", "v": 5},
+            ],
+            "mods": [],
+        }
+        g.insn(ins)
+        emitted = "\n".join(g.body)
+        self.assertIn("FindILsb", emitted)
+        self.assertIn("%c5", emitted)
+        self.assertNotIn("%cffffffff", emitted)
+
+    def test_s_ff0_i32_b64_immediate_is_scalar(self):
+        g = rdna2spirv.Gen("ps")
+        ins = {
+            "op": "s_ff0_i32_b64",
+            "args": [
+                {"k": "sgpr", "r": 0},
+                {"k": "imm", "v": 5},
+            ],
+            "mods": [],
+        }
+        g.insn(ins)
+        emitted = "\n".join(g.body)
+        self.assertIn("OpNot %uint %c5", emitted)
+        self.assertIn("OpNot %uint %c0", emitted)
+        self.assertNotIn("OpNot %uint %cffffffff", emitted)
+
+    def test_s_ff1_i32_b64_immediate_is_scalar(self):
+        g = rdna2spirv.Gen("ps")
+        ins = {
+            "op": "s_ff1_i32_b64",
+            "args": [
+                {"k": "sgpr", "r": 0},
+                {"k": "imm", "v": 5},
+            ],
+            "mods": [],
+        }
+        g.insn(ins)
+        emitted = "\n".join(g.body)
+        self.assertIn("FindILsb", emitted)
+        self.assertIn("OpBitcast %int %c5", emitted)
+        self.assertNotIn("OpBitcast %int %cffffffff", emitted)
 
     def test_s_ff0_i32_b64_emission(self):
         g = rdna2spirv.Gen("ps")
