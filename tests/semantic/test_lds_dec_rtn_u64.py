@@ -199,6 +199,93 @@ def bytearray_oracle_ds_dec_rtn_u64(
     return old_val, new_mem
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Supported Data Share (DS) 64-bit atomic opcodes."""
+    DS_DEC_RTN_U64 = "ds_dec_rtn_u64"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegSingle:
+    """Represents a single 32-bit register."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(
+                f"Register index out of bounds: {self.reg_type.value}{self.index} "
+                f"(expected 0 <= index < {max_limit})"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclass(frozen=True)
+class RegPair:
+    """Represents an aligned 64-bit pair of registers (e.g. v[0:1])."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit - 1):
+            raise ValueError(
+                f"Register pair base index out of bounds: {self.reg_type.value}[{self.index}:{self.index + 1}] "
+                f"(expected 0 <= index < {max_limit - 1})"
+            )
+
+    @property
+    def indices(self) -> Tuple[int, int]:
+        return self.index, self.index + 1
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}[{self.index}:{self.index + 1}]"
+
+
+@dataclass(frozen=True)
+class DSDecRtnU64Instruction:
+    """Symbolic AST node for ds_dec_rtn_u64 atomic instruction."""
+    vdst: RegPair
+    vaddr: RegSingle
+    vdata0: RegPair
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_DEC_RTN_U64
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.vdst, RegPair) or self.vdst.reg_type != RegType.VGPR:
+            raise TypeError("vdst operand must be a VGPR RegPair")
+        if not isinstance(self.vaddr, RegSingle) or self.vaddr.reg_type != RegType.VGPR:
+            raise TypeError("vaddr operand must be a VGPR RegSingle")
+        if not isinstance(self.vdata0, RegPair) or self.vdata0.reg_type != RegType.VGPR:
+            raise TypeError("vdata0 operand must be a VGPR RegPair")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"offset out of 16-bit range [0, 65535]: {self.offset}")
+
+    def disasm(self) -> str:
+        """Format canonical assembly mnemonic and operand string."""
+        text = f"{self.opcode.value} {self.vdst.name}, {self.vaddr.name}, {self.vdata0.name}"
+        if self.offset != 0:
+            text += f" offset:{self.offset}"
+        if self.gds:
+            text += " gds"
+        return text
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -298,7 +385,7 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
             self.assertEqual(self.mem.read_qword(idx * 8), exp_new)
 
     def test_effective_address_and_qword_alignment(self) -> None:
-        # vaddr = 0x1000, offset = 16 -> eff = 0x1010 -> qword index = (0x1010 >> 3) & 1023 = 514 & 1023
+        # vaddr = 0x1000, offset = 16 -> eff = 0x1010 -> qword index = (0x1010 >> 3) & 1023
         self.mem.write_qword(0x1010, 50)
         old_val, new_val = self.mem.atomic_dec_rtn_u64(vaddr=0x1000, wrap_limit=100, offset=16)
         self.assertEqual(old_val, 50)
@@ -321,6 +408,121 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(old_val, val64)
         self.assertEqual(new_val, 0x1000)
         self.assertEqual(struct.unpack_from("<Q", self.lds_bytes, addr)[0], 0x1000)
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_enumeration(self) -> None:
+        self.assertEqual(DSOpcode.DS_DEC_RTN_U64.value, "ds_dec_rtn_u64")
+
+    def test_reg_single_and_pair_creation(self) -> None:
+        v1 = RegSingle(1, RegType.VGPR)
+        s0 = RegSingle(0, RegType.SGPR)
+        self.assertEqual(v1.name, "v1")
+        self.assertEqual(s0.name, "s0")
+
+        v_pair = RegPair(4, RegType.VGPR)
+        self.assertEqual(v_pair.name, "v[4:5]")
+        self.assertEqual(v_pair.indices, (4, 5))
+
+    def test_ast_construction_and_disassembly(self) -> None:
+        instr_basic = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(6),
+            offset=0,
+        )
+        self.assertEqual(instr_basic.disasm(), "ds_dec_rtn_u64 v[4:5], v1, v[6:7]")
+
+        instr_offset = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(6),
+            offset=32,
+        )
+        self.assertEqual(instr_offset.disasm(), "ds_dec_rtn_u64 v[4:5], v1, v[6:7] offset:32")
+
+        instr_gds = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(6),
+            offset=16,
+            gds=True,
+        )
+        self.assertEqual(instr_gds.disasm(), "ds_dec_rtn_u64 v[4:5], v1, v[6:7] offset:16 gds")
+
+    def test_ast_immutability_and_equality(self) -> None:
+        instr1 = DSDecRtnU64Instruction(
+            vdst=RegPair(2),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(4),
+            offset=8,
+        )
+        instr2 = DSDecRtnU64Instruction(
+            vdst=RegPair(2),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(4),
+            offset=8,
+        )
+        self.assertEqual(instr1, instr2)
+        self.assertEqual(hash(instr1), hash(instr2))
+
+    def test_ast_validation_rejects_invalid_types_and_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            RegSingle(-1)
+        with self.assertRaises(ValueError):
+            RegSingle(256)
+        with self.assertRaises(ValueError):
+            RegPair(255)  # Can't have pair starting at 255 (255:256)
+
+        # vdst must be RegPair
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegSingle(4),  # type: ignore
+                vaddr=RegSingle(1),
+                vdata0=RegPair(6),
+            )
+
+        # vdata0 must be RegPair
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(4),
+                vaddr=RegSingle(1),
+                vdata0=RegSingle(6),  # type: ignore
+            )
+
+        # vaddr must be RegSingle
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(4),
+                vaddr=RegPair(0),  # type: ignore
+                vdata0=RegPair(6),
+            )
+
+        # SGPR operands rejected
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(4, RegType.SGPR),
+                vaddr=RegSingle(1),
+                vdata0=RegPair(6),
+            )
+
+        # offset bounds
+        with self.assertRaises(ValueError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(4),
+                vaddr=RegSingle(1),
+                vdata0=RegPair(6),
+                offset=-1,
+            )
+        with self.assertRaises(ValueError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(4),
+                vaddr=RegSingle(1),
+                vdata0=RegPair(6),
+                offset=65536,
+            )
 
 
 if __name__ == "__main__":
