@@ -310,6 +310,49 @@ class CliTest(unittest.TestCase):
             self.assertIn(maps, err.getvalue())
             self.assertFalse(os.path.exists(out))
 
+    def test_resolve_out_refuses_to_overwrite_an_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dictionary = os.path.join(tmp, "names.json")
+            maps = os.path.join(tmp, "maps.json")
+            archetypes = os.path.join(tmp, "archetypes.json")
+            with open(dictionary, "w", encoding="utf-8") as handle:
+                json.dump(WN.NameDictionary().to_json(), handle)
+            with open(maps, "w", encoding="utf-8") as handle:
+                json.dump({"maps": [{"map_name": WN.joaat("synthetic_cli_prop")}]}, handle)
+            with open(archetypes, "w", encoding="utf-8") as handle:
+                json.dump({"archetypes": {f"{WN.joaat('synthetic_cli_prop'):08x}": 1}}, handle)
+            with open(dictionary, "rb") as handle:
+                dict_bytes = handle.read()
+
+            cases = [
+                ("dict", ["--dict", dictionary]),
+                ("map", ["--dict", dictionary, "--maps", maps]),
+                ("archetype", ["--dict", dictionary, "--archetypes", archetypes]),
+            ]
+            for name, prefix in cases:
+                with self.subTest(input=name):
+                    source = {"dict": dictionary, "map": maps, "archetype": archetypes}[name]
+                    with open(source, "rb") as handle:
+                        original = handle.read()
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertNotEqual(WN.main(["resolve", *prefix, "--out", source]), 0)
+                    self.assertIn(repr(source), err.getvalue())
+                    with open(source, "rb") as handle:
+                        self.assertEqual(handle.read(), original)
+
+            # A hard link is another spelling of the same inode.
+            hardlink = os.path.join(tmp, "dict_hardlink.json")
+            try:
+                os.link(dictionary, hardlink)
+            except OSError:
+                self.skipTest("hard links unsupported on this filesystem")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertNotEqual(WN.main(["resolve", "--dict", dictionary, "--out", hardlink]), 0)
+            with open(dictionary, "rb") as handle:
+                self.assertEqual(handle.read(), dict_bytes)
+
     def test_build_and_resolve(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = os.path.join(tmp, "manifest.json")

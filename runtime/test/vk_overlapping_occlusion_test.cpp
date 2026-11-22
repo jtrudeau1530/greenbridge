@@ -3,8 +3,10 @@
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <string>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -133,11 +135,14 @@ struct Draws {
     std::vector<std::uint32_t> extents;
     std::size_t next = 0;
     bool overflow = false;
+    bool every = false;  // --bisect: one 1x1 draw before every end, no schedule
 };
 Draws* draws = nullptr;
 
 VKAPI_ATTR void VKAPI_CALL end_query_with_draw(VkCommandBuffer cb, VkQueryPool pool, std::uint32_t index) {
-    if (draws->next == draws->extents.size()) {
+    if (draws->every) {
+        draws->fixture.draw(cb, 1);
+    } else if (draws->next == draws->extents.size()) {
         draws->overflow = true;
     } else if (const auto extent = draws->extents[draws->next++]) {
         draws->fixture.draw(cb, extent);
@@ -150,7 +155,20 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device_proc(VkDevice device, const 
     return draws->fixture.d.device_proc(device, name);
 }
 
-int run(vktest::Device& d, const char* vertex, const char* fragment) {
+// --bisect (D3D-189, #1540): the test's query patterns one by one, each in its own submission. Ungated, each
+// submission is waited for before the next, so the last "running" line before a hang or a lost device names the
+// pattern. --gated queues them all behind one semaphore the CPU signals afterwards, as the full test does. Named
+// phases run only those, in the order below. Only completion is checked, not values.
+struct Bisect {
+    bool enabled = false;
+    bool gated = false;
+    std::vector<std::string> phases;
+    bool wants(const char* name) const {
+        return phases.empty() || std::find(phases.begin(), phases.end(), name) != phases.end();
+    }
+};
+
+int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisect& bisect) {
     std::uint32_t family_count = 0;
     const auto families = d.instance_fn<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
         "vkGetPhysicalDeviceQueueFamilyProperties");
@@ -167,6 +185,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     // The statistics lists below: a split query (two segments), two unsplit references and a second split query.
     if (d.pipeline_statistics_query) schedule.extents.insert(schedule.extents.end(), {3, 5, 3, 5, 3, 5});
     schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0});
+    schedule.every = bisect.enabled;
     draws = &schedule;
     VulkanContext context(get_device_proc, d.device, true, d.conditional_rendering);
     EXPECT(context.loaded());
@@ -197,6 +216,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     dst.buffer = d.buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapping);
     dst.buffer_offset = binding_offset;
     dst.size = size - binding_offset;
+    dst.host_readable = true;  // ResolveQueryData writes results that the CPU reads below.
     EXPECT(dst.buffer && mapping);
     std::memset(mapping, 0xcd, size);
     context.add_resource(dst_id, dst);
@@ -208,6 +228,78 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
         EXPECT(predicate.buffer && words);
         std::memset(words, 0, 8);
         context.add_resource(predicate_id, predicate);
+    }
+
+    if (bisect.enabled) {
+        std::vector<std::pair<const char*, CommandList>> lists;
+        const auto add = [&](const char* name) -> CommandList* {
+            if (!bisect.wants(name)) return nullptr;
+            return &lists.emplace_back(name, CommandList{}).second;
+        };
+        if (auto* l = add("crossing")) {  // two queries of one heap overlap; resolve while one is active
+            EXPECT(l->begin_query({a, occ, 0}) && l->begin_query({a, occ, 1}) && l->end_query({a, occ, 0}));
+            EXPECT(l->resolve_queries({a, occ, 0, 1, dst_id, 8}) && l->end_query({a, occ, 1}));
+            EXPECT(l->resolve_queries({a, occ, 0, 2, dst_id, 24}));
+        }
+        if (auto* l = add("nested")) {  // the same index in two heaps, one inside the other
+            EXPECT(l->begin_query({a, occ, 2}) && l->begin_query({b, occ, 2}));
+            EXPECT(l->end_query({b, occ, 2}) && l->end_query({a, occ, 2}));
+            EXPECT(l->resolve_queries({a, occ, 2, 1, dst_id, 40}) && l->resolve_queries({b, occ, 2, 1, dst_id, 48}));
+        }
+        if (auto* l = add("unwritten")) {  // a query never begun: zero fill
+            EXPECT(l->resolve_queries({b, occ, 0, 1, dst_id, 56}));
+        }
+        if (auto* l = add("binary")) {  // the binary-occlusion compute resolve
+            EXPECT(l->begin_query({a, binary, 3}) && l->end_query({a, binary, 3}));
+            EXPECT(l->resolve_queries({a, binary, 3, 1, dst_id, 64}));
+        }
+        if (d.conditional_rendering) {
+            if (auto* l = add("predicated")) {  // both compute resolves under a false predicate
+                EXPECT(l->begin_query({a, binary, 3}) && l->end_query({a, binary, 3}));
+                EXPECT(l->set_predication({predicate_id, 0, d3d12_predication::equal_zero}));
+                EXPECT(l->resolve_queries({a, binary, 3, 1, dst_id, 64}));
+                EXPECT(l->resolve_queries({a, occ, 0, 1, dst_id, 72}));
+                EXPECT(l->resolve_queries({a, binary, 3, 1, dst_id, 80}));
+                EXPECT(copy_control.record(*l));
+            }
+        }
+        if (auto* l = add("chunked")) {  // 2 * bursts + 1 segments: the summing resolve takes two chunks
+            EXPECT(l->begin_query({a, occ, 3}));
+            for (std::uint32_t i = 0; i < bursts; ++i) EXPECT(l->begin_query({b, occ, 0}) && l->end_query({b, occ, 0}));
+            EXPECT(l->end_query({a, occ, 3}));
+            EXPECT(l->resolve_queries({a, occ, 3, 1, dst_id, 88}) && l->resolve_queries({b, occ, 0, 1, dst_id, 96}));
+        }
+        if (auto* l = add("replace")) {  // every heap query begun and ended again, then resolved
+            for (const auto& [heap, index] : {std::pair{a, 0u}, std::pair{a, 1u}, std::pair{a, 2u}, std::pair{b, 2u}})
+                EXPECT(l->begin_query({heap, occ, index}) && l->end_query({heap, occ, index}));
+            EXPECT(l->resolve_queries({a, occ, 0, 2, dst_id, 112}));
+        }
+        EXPECT(!lists.empty());
+        if (bisect.gated) queue.wait(gate.semaphore(), 1);
+        for (auto& [name, list] : lists) {
+            EXPECT(list.close());
+            std::printf("running %s\n", name);
+            std::fflush(stdout);
+            const CommandList* submit[] = {&list};
+            const ReplayResult result = queue.execute(submit);
+            if (result != ReplayResult::success) {
+                std::printf("%s: execute returned %d\n", name, int(result));
+                return 1;
+            }
+            if (!bisect.gated && !queue.idle()) {
+                std::printf("%s: vkQueueWaitIdle failed (device lost?)\n", name);
+                return 1;
+            }
+        }
+        if (bisect.gated) {
+            EXPECT(gate.signal(1));
+            if (!queue.idle()) {
+                std::printf("gated: vkQueueWaitIdle failed (device lost?)\n");
+                return 1;
+            }
+        }
+        std::printf("bisect: every phase completed%s\n", bisect.gated ? " (gated)" : "");
+        return 0;
     }
 
     CommandList crossing;
@@ -376,13 +468,21 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
 
 } // namespace
 
+// vk_overlapping_occlusion_test <vert.spv> <frag.spv> [--bisect [--gated] [phase...]]
 int main(int argc, char** argv) {
-    EXPECT(argc == 3);
+    EXPECT(argc >= 3);
+    Bisect bisect;
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--bisect") == 0) bisect.enabled = true;
+        else if (std::strcmp(argv[i], "--gated") == 0) bisect.gated = true;
+        else bisect.phases.emplace_back(argv[i]);
+    }
+    EXPECT(argc == 3 || bisect.enabled);
     vktest::Device device;
     const auto status = device.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
     EXPECT(status == vktest::DeviceStatus::ready);
-    const int result = run(device, argv[1], argv[2]);
+    const int result = run(device, argv[1], argv[2], bisect);
     EXPECT(device.validation_errors() == 0);
     return result;
 }

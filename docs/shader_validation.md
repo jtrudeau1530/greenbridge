@@ -503,6 +503,77 @@ read a float format, so an Intel UHD 770 (Xe-LP), which lacks `shaderStorageImag
 case. Not covered yet: wider UINT/SINT formats, mips, 1D/2D-array/3D/cube,
 `image_sample`/`gather` with filters and borders, and texel offsets with `VK_KHR_maintenance8`.
 
+#### Hardware oracle for the image fetches (`--oracle hw`)
+
+`--oracle hw` runs the same fetches natively on an AMD GPU through `tools/hw_oracle/` (setup: "Hardware oracle" under
+FUZZ-4) and compares every result register of every texel, bit for bit, with the CPU model above;
+`--oracle translator,hw` does both on the same textures and says, for each case the hardware disagrees with, what the
+translator did. It tests the **model**: whether `image_load` on real hardware returns what the oracle says. Without the
+tools it prints `hardware oracle unavailable: ...` and exits 77.
+
+```
+python -I tools/image_fuzz.py --oracle hw --programs 2400 --seed 1
+python -I tools/image_fuzz.py --oracle hw --programs 180 --seed 1 --negative-control
+python -I tools/image_fuzz.py --oracle translator,hw --programs 90 --seed 1
+python -m pytest tests/test_image_fuzz_hw.py
+```
+
+- **What runs.** One raw compute kernel per case, wave32 and native wave64 alternating. The texture is linear
+  (`SW_MODE` 0) device memory the kernel carries behind its own code, 256-byte aligned and found with `s_getpc_b64`, so
+  the launchers need no input buffer; rows are padded to a 256-byte pitch and the padding is a pattern that is wrong to
+  read (`0xCD`). The kernel builds the T# in `s[8:15]` (the base address from the PC, the other words are literals),
+  runs `image_load v[8:..], v[2:3], s[8:15] dmask:.. dim:SQ_RSRC_IMG_2D unorm` for one texel per lane (1,024 lanes
+  and a short loop for 64x64) and stores `v[8:11]` for each texel, so the sentinels of the registers `dmask` does not
+  write are compared too. A texture that was not 256-byte aligned would make every word `0xBAADF00D`; the run reports
+  that as an error instead of reading from a wrong base. The same texels, sizes (8 to 64 per side) and 15 masks as the
+  translator run; a seed names the same textures for both.
+- **The T# per family** (`hw_oracle/tsharp.py`, exact words in `tests/test_image_fuzz_hw.py`). Facts from Mesa's AMD
+  register database and `ac_descriptors.c` and LLVM's `SIDefines.h` (MIT / Apache-2.0; own code, see
+  [related_projects.md](related_projects.md)). GFX10 and GFX11 differ here, and GFX12 is a third layout that is not
+  built (`--oracle hw` on gfx12xx exits 77 with that reason):
+
+  | | GFX10 (gfx10xx, RDNA1/2) | GFX11 (gfx11xx, RDNA3 and RDNA3.5) |
+  | --- | --- | --- |
+  | WORD1 `FORMAT` | `[28:20]`, 9 bits | `[27:20]`, 8 bits |
+  | `R8G8B8A8_UNORM`, `_UINT`, `_SINT` | 56, 60, 61 | 42, 46, 47 |
+  | `R16G16B16A16_SFLOAT`, `R32G32B32A32_SFLOAT`, `R32_SFLOAT` | 71, 77, 22 | 57, 63, 22 |
+  | WORD2 `RESOURCE_LEVEL` (bit 31) | 1 ("must be 1") | not there (0) |
+  | `MAX_MIP` | WORD5 `[7:4]` on GFX10.3 | WORD1 `[19:16]` |
+  | linear pitch | WORD4: `DEPTH` `[12:0]` and `PITCH_MSB` bit 13, GFX10.3 only | same |
+
+  The pitch is always written explicitly (the row size rounded up to 256 bytes); GFX10.1 (gfx1010) has no such field
+  and the builder leaves it zero. DST_SEL is X, Y, Z, W, except `R32_SFLOAT`, which reads (X, 0, 0, 1) as the model
+  says. `WORD5` carries Mesa's `PERF_MOD` 4, the rest is zero.
+- **Negative control.** `--negative-control` runs the cases and then re-judges the same hardware words with seven
+  deliberately wrong models (UNORM8 `/256`, red and blue swapped, SINT8 read unsigned, `R32_SFLOAT` alpha 0, dmask
+  components not packed, unwritten registers read as 0, texel coordinates transposed) and runs the kernels again with
+  the T# `FORMAT` of the next format in the table. It exits 1 unless every one of them mismatches.
+
+Results on a Radeon 880M (gfx1150, RDNA3.5, driver 26.11.2, AMD clang 23.0.0git):
+
+| Run | Cases | Mismatches |
+| --- | --- | --- |
+| `--oracle hw`, seeds 1, 2, 3, 2,400 cases each (wave32 and wave64, all six formats, all 15 masks, 8 to 64 per side) | 7,200 | 0 |
+| `--oracle translator,hw`, seed 1 (Vulkan on the same GPU, subgroup 64) | 12 | 0 (translator and hardware) |
+
+Negative control (`--oracle hw --programs 180 --seed 1 --negative-control`): the unperturbed model mismatches on 0 of
+180 cases; the seven wrong models are caught by 16 to 168 of them (`unorm_256` 30, `swap_rb` 144, `sint_unsigned` 30,
+`alpha_zero` 16, `dmask_in_place` 132, `no_sentinels` 168, `transpose` 166), and a kernel built with the next format's
+`FORMAT` code is caught on every format (24 to 30 of 30 cases each). So a mismatch would have shown.
+
+Finding: none. The CPU model and the hardware agree word for word on all 7,200 cases, including NaN, infinity, signed
+zero and denormal inputs (NaN payloads are compared as "any NaN", as in the translator run), the sentinel registers
+`dmask` leaves alone, and the `R32_SFLOAT` (r, 0, 0, 1) fill. The translator run on 12 of the same cases agrees too; a
+longer `translator,hw` run was not done (the Vulkan side takes about half a minute per case on this machine).
+
+**RDNA3.5 is not RDNA2.** The gfx1150 T# and image unit are GFX11's; a match shows that the model is right for the
+texel fetch of these formats on that hardware, which is not the console's. The GFX10 words are built and assemble for
+gfx1030 (`tests/test_image_fuzz_hw.py`) but have not run on a GFX10 GPU. The Linux libdrm backend of #1265
+(`tools/hw_oracle/drm.py`) was not tried: it copies only `.text` (the texture is in `.text`, so that works in
+principle, but it needs the loaded code to be 256-byte aligned, which the kernel checks and reports) and the LDS
+section above records a 4096-word output cap there, while a 64x64 case stores 16,384 words. Until that is measured
+on a GFX10 card, treat RDNA2 as unverified.
+
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 
 `tools/valu_fuzz.py --family f16|mem` uses the same runner shape as `lds_fuzz.py`. It generates seeded
@@ -555,7 +626,7 @@ every form has to mean the same on gfx1013 and gfx1150. Checked against Mesa ACO
 | `v_fma_f16`, `v_med3_f16`, `v_add_nc_u16`, `v_sub_nc_u16` VOP3 with `op_sel` | `op_sel` source bits, destination bit = high half, other half kept | same | run |
 | `v_mul_lo_u16`, `v_lshlrev/lshrrev/ashrrev_b16`, `v_max/min_u16/i16` VOP3 with `op_sel` | same fields | same fields and meaning, but LLVM's gfx11 assembler has no `op_sel` operand for these, and GFX11 renumbered the three shifts (`0x314..0x316` to `0x338..0x33a`) | run: with `op_sel` nonzero the instruction words are written out (`GFX11_VOP3_OPCODE`, checked against llvm-mc in the tests); all-zero `op_sel` uses the plain mnemonic |
 | `v_pk_add/mul/max/min/fma_f16`, `v_pk_lshlrev/lshrrev_b16`, `v_pk_ashrrev_i16` with `op_sel`/`op_sel_hi` | per-half selection | same | run |
-| `v_pack_b32_f16` | halves moved | same, but gfx1150 **quiets a signaling NaN** half (`0x7c96` becomes `0x7e96`) | run; a NaN half is "uncertain" in the model (RDNA2 not measured) |
+| `v_pack_b32_f16` | halves moved under IEEE mode 0; under IEEE mode 1 a **signaling NaN** half is quieted (`0x7c96` becomes `0x7e96`; measured on gfx1036, see the RDNA2 results below) | same, gfx1150 quiets it too (measured under IEEE mode 1 only) | run; a signaling-NaN half is "uncertain" in the model (the kernels run with IEEE mode 1) |
 | f16 transcendentals (`v_exp/log/rcp/rsq/sqrt/sin/cos_f16`) | write the low half | same | not generated: covered by FUZZ-29 (#1310), which sweeps all 65,536 inputs on the hardware oracle |
 | 16-bit integer VOP2 `_e32` forms (`v_add_u16_e32`, ...) | exist, define the whole register (design.md) | **do not exist** (only VOP3, with `op_sel`) | not generated, nothing to compare |
 | `v_pk_fmac_f16`, `v_mad_f16`/`v_mac_f16`, `v_subrev_f16` | various | removed or not in this fuzzer | not generated |
@@ -571,7 +642,18 @@ left the pipe); both together give 0 mismatches over 20,000 programs, and adding
 changes nothing (a vector load after a store of the same thread needs neither). The default (`--hw-sync scalar`) is
 vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
 
-*Results (Radeon 880M, gfx1150, driver 26.11.2, AMD clang 23.0.0git).* Hardware, 5 seeds (101 to 105) x 2,000 programs x wave32 and native wave64 per family: **`mem` 20,000 of 20,000 match, `f16` 20,000 of 20,000 match, 0 mismatches, 0 assembler rejections** (plus earlier development runs of a further 15,000 `mem` and 12,000 `f16` programs; the one mismatch they produced, the `v_pack_b32_f16` NaN quieting above, is now modelled as uncertain). Negative controls (`--negative-control --programs 500`, 1,000 programs per row, unperturbed model: 0 mismatches): `f16` hi half zeroed 994, `op_sel` destination ignored 863, packed halves swapped 864, `v_min` as `v_max` 424, `v_pack_b32_f16` halves swapped 254, `op_sel` of the encoded 16-bit integer ops ignored 862; `mem` OOB_SELECT ignored 506, mode 0 without the stride check 54, index unchecked 364, soffset left out of the check 69, whole-access instead of per-dword 45, out-of-range loads keeping the old value 590, `s_buffer_load` unbounded 209, its stride ignored 81. Every perturbation is caught. Not run here: `translator,hw` for `mem` (see below), RDNA2 hardware.
+*Results (Radeon 880M, gfx1150, driver 26.11.2, AMD clang 23.0.0git).* Hardware, 5 seeds (101 to 105) x 2,000 programs x wave32 and native wave64 per family: **`mem` 20,000 of 20,000 match, `f16` 20,000 of 20,000 match, 0 mismatches, 0 assembler rejections** (plus earlier development runs of a further 15,000 `mem` and 12,000 `f16` programs; the one mismatch they produced, the `v_pack_b32_f16` NaN quieting above, is now modelled as uncertain). Negative controls (`--negative-control --programs 500`, 1,000 programs per row, unperturbed model: 0 mismatches): `f16` hi half zeroed 994, `op_sel` destination ignored 863, packed halves swapped 864, `v_min` as `v_max` 424, `v_pack_b32_f16` halves swapped 254, `op_sel` of the encoded 16-bit integer ops ignored 862; `mem` OOB_SELECT ignored 506, mode 0 without the stride check 54, index unchecked 364, soffset left out of the check 69, whole-access instead of per-dword 45, out-of-range loads keeping the old value 590, `s_buffer_load` unbounded 209, its stride ignored 81. Every perturbation is caught. Not run here: `translator,hw` for `mem` (see below); RDNA2 is in the next paragraph.
+
+*Results on RDNA2 (gfx1036 integrated GPU, AMD Windows driver 32.0.21044.64, HIP backend, AMD clang 23.0.0git, `main` bb2e1842).*
+- **Hardware, same protocol** (seeds 101 to 105 x 2,000 programs x wave32 and native wave64 per family): **`f16` 20,000 of 20,000 and `mem` 20,000 of 20,000 match, 0 mismatches, 0 assembler rejections.** On a gfx1030, ROCm 6.2's clang 19 rejected 3,768 of 4,000 `f16` programs (#1365); clang 23 rejects none.
+- **Negative controls**, in the order above: `f16` 992, 865, 826, 430, 280 and 879 caught; `mem` 514, 57, 354, 60, 37, 580, 214 and 89 caught. The unperturbed model gives 0 mismatches.
+- **`translator,hw` at seed 3** (100 programs, the same GPU through the AMD Vulkan driver): `mem` 200 of 200 match, `f16` 199 of 200. The one difference, `s3_22_w64`, is a driver mismatch of the #1506 kind. The hardware and `tests/semantic/spirv_mini_interp` both give the model's value for it, and the same emulated SPIR-V matches on NVIDIA.
+- **`v_pack_b32_f16` with signaling NaNs**, measured with hand-written raw kernels in both wave sizes and both IEEE modes. The inputs were five signaling-NaN halves, quiet NaNs, ±0, +inf and a denormal, in either half, with `op_sel` and with `neg`.
+  - IEEE mode 1, the assembler's default: a signaling-NaN half is quieted. Bit 9 is set and the sign and payload are kept, as on gfx1150.
+  - IEEE mode 0: the half is moved unchanged.
+  - `neg` flips the sign before any quieting (`0x7c01` gives `0xfe01` under mode 1 and `0xfc01` under mode 0).
+  - Every other input is moved unchanged.
+  - The translator moves the bits, which is exact under IEEE mode 0. Which mode the game's shaders run in is not recorded here.
 
 *Findings.* The OOB_SELECT per-mode rules, the per-dword straddle rule and the `s_buffer_load` bound of design.md hold
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
@@ -684,7 +766,10 @@ python -I tools/f32_fuzz.py --oracle hw --perturb mul_rtz --programs 500     # o
   `s_getreg_b32`). The primary mode, `flush`, is the state inferred for the game's shaders (IEEE off, f32 denormals
   flushed, DX10_CLAMP on: MODE `0x1c0`). Three more are run for what the model does not judge: `keep` (f32 denormals
   kept, `0x1f0`), `no_dx10` (`0x0c0`), `ieee` (`0x3c0`). The run reads MODE back in a kernel for each and fails if a
-  directive did not take. Rounding is always to nearest even.
+  directive did not take. Rounding is always to nearest even. On gfx1170+ (GFX11.7, GFX12) IEEE and DX10_CLAMP are
+  fixed and AMD clang rejects `.amdhsa_ieee_mode` / `.amdhsa_dx10_clamp` ("directive unsupported on gfx1170+"), so
+  `asm.mode_skip_reason` reports a kernel that sets either as not runnable there and the runner never assembles it;
+  the MODE probe then fails naming that reason instead of a whole chunk failing to assemble (FUZZ-43).
 - **GFX11 against GFX10, handled explicitly** (`tools/hw_oracle/asm.py`, checked by assembling every opcode for gfx1013,
   gfx1010, gfx1030, gfx1100, gfx1150 and gfx1200):
   - *Skipped, never substituted:* `v_mad_f32`, `v_mac_f32`, `v_madak_f32` and `v_mad_legacy_f32` exist on GFX10.1 only

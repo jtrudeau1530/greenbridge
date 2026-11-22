@@ -1116,6 +1116,22 @@ def test_repeated_tbuffer_loads_share_normalization(make_shader):
     assert spv.count("FindUMsb") == 2
 
 
+def test_array_resinfo_queries_width_height_layers_and_mip_count(make_shader):
+    shader = make_shader(
+        "v_mov_b32_e32 v1, 1\n"
+        "image_get_resinfo v[4:7], v1, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY\n"
+        "s_waitcnt vmcnt(0)\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n",
+        name="ps_array_resinfo",
+    )
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpDecorate %images_arr Binding 3" in asm
+    size = re.search(r"(%\w+) = OpImageQuerySizeLod %v3int (%\w+) %\w+", asm)
+    assert size and f"OpImageQueryLevels %int {size[2]}" in asm
+    for axis in range(3):
+        assert f"OpCompositeExtract %int {size[1]} {axis}" in asm
+
+
 def test_image_sample_d16_avoids_packhalf2x16(make_shader):
     """d16 image_sample packs f32->f16 via integer ops (no PackHalf2x16) and pass spirv-val."""
     sample_asm = (
@@ -1298,6 +1314,40 @@ def test_unnormalized_buffer_store_keeps_nan_bits(fmt, make_shader):
     memory = {0x1000: 0}
     _load_mini_interp().run_fragment(shader.translate(), memory=memory)
     assert memory[0x1000] == 0xFFC01000
+
+
+# GFX10 32-bit integer formats by component count: UINT code, SINT code (gfx10_formats.json).
+INT32_FORMATS = [(1, 20, 21), (2, 62, 63), (3, 72, 73), (4, 75, 76)]
+
+
+@pytest.mark.parametrize("n, uint_fmt, sint_fmt", INT32_FORMATS)
+def test_int32_buffer_formats_load_and_store_raw_bits(n, uint_fmt, sint_fmt, make_shader):
+    """SHADER-257: the 32-bit SINT typed-buffer formats (and 32_32_32_UINT) load and store each dword unchanged, as
+    their UINT twins do. Negative values and NaN-like patterns must survive both ways; a load's missing channels
+    repeat the format's own, as for every other format (SHADER-86)."""
+    si = _load_mini_interp()
+    words = [0xFFFFFFFF, 0x80000000, 0x7FC01000, 0x00000005][:n]
+    for fmt in (uint_fmt, sint_fmt):
+        desc = (f"s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, {4 * n}\n"
+                f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n")
+        load = desc + ("buffer_load_format_xyzw v[4:7], off, s[0:3], 0\ns_waitcnt vmcnt(0)\n"
+                       "exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n")
+        shader = make_shader(load, name=f"ps_int32_load_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: w for i, w in enumerate(words)}
+        out = si.run_fragment(spv, memory=memory)["%out_mrt0"]
+        assert list(out) == [words[c % n] for c in range(4)], fmt
+
+        setup = "".join(f"v_mov_b32 v{4 + i}, {w:#x}\n" for i, w in enumerate(words))
+        regs = "v4" if n == 1 else f"v[4:{3 + n}]"
+        store = desc + setup + f"buffer_store_format_{'xyzw'[:n]} {regs}, off, s[0:3], 0\ns_endpgm\n"
+        shader = make_shader(store, name=f"ps_int32_store_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: 0xDEADBEEF for i in range(5)}
+        si.run_fragment(spv, memory=memory)
+        assert [memory[0x1000 + 4 * i] for i in range(5)] == words + [0xDEADBEEF] * (5 - n), fmt
 
 
 @pytest.mark.parametrize("fmt, shifts, channels", [(56, (0, 8, 16, 24), (64, 128, 191, 255)),

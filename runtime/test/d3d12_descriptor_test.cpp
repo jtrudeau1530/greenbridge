@@ -307,6 +307,7 @@ int main() {
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
+        info.sampler_filter_minmax = d.sampler_filter_minmax;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -547,14 +548,19 @@ int main() {
             {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 2},
             {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 2},
         };
+        constexpr LodView volume_lod_views[] = {
+            {0, 2, 1.0f}, {1, 1, 0.5f}, {0, 2, 2.0f}, {0, 2, 2.0f, true},
+        };
         constexpr UINT lod_view_count = std::size(lod_views);
         constexpr UINT array_clamp_count = std::size(array_clamps);
         constexpr UINT cube_lod_count = std::size(cube_lods);
+        constexpr UINT volume_lod_count = std::size(volume_lod_views);
         // Keep multisample views after the preceding volume and minimum-LOD views.
         enum : UINT {
             array_lod_slot = first_lod_slot + lod_view_count,
             cube_lod_slot = array_lod_slot + array_clamp_count,
-            ms_slot = cube_lod_slot + cube_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
+            volume_lod_slot = cube_lod_slot + cube_lod_count,
+            ms_slot = volume_lod_slot + volume_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot,
             line_default, line_mip, line_clamped, view_slot_count
         };
@@ -926,10 +932,19 @@ int main() {
         volume_view.Texture3D.MostDetailedMip = 0;
         device->CreateShaderResourceView(texture.p, &volume_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
-        volume_view.Texture3D.ResourceMinLODClamp = 0.5f;
-        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
-        EXPECT(null_at(null_slot));
-        volume_view.Texture3D.ResourceMinLODClamp = 0;
+        for (UINT i = 0; i < volume_lod_count; ++i) {
+            const auto& v = volume_lod_views[i];
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = volume_desc.Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            srv.Shader4ComponentMapping = v.force_alpha_one
+                ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1)
+                : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture3D = {v.first, v.count, v.clamp};
+            device->CreateShaderResourceView(volume.p, &srv, view_slot(volume_lod_slot + i));
+            EXPECT(image_at(volume_lod_slot + i, vol) && vol.type == g::ImageType::image_3d);
+            EXPECT(vol.first_mip == v.first && vol.mip_count == v.count && vol.min_lod == v.clamp);
+        }
         volume_view.Format = DXGI_FORMAT_R8G8B8A8_UINT;
         device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
@@ -1507,6 +1522,41 @@ int main() {
         std::printf("volume SRVs: %u of %zu sampled RGBA texels differ\n", volume_errors, std::size(volume_slots) * texels);
         EXPECT(volume_errors == 0);
 
+        SampleKeys volume_lod_keys[volume_lod_count]{};
+        std::array<std::uint8_t, volume_lod_count * bytes> volume_lod_pixels{};
+        for (UINT i = 0; i < volume_lod_count; ++i) {
+            std::memcpy(volume_lod_keys[i].tsharp, view_bytes(volume_lod_slot + i), sizeof(volume_lod_keys[i].tsharp));
+            std::memcpy(volume_lod_keys[i].ssharp, sampler_bytes, sizeof(volume_lod_keys[i].ssharp));
+            volume_lod_keys[i].first = i * texels;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, volume_lod_keys, volume_lod_pixels.data()));
+        UINT volume_lod_errors = 0;
+        UINT volume_clamp_diffs = 0;
+        for (UINT i = 0; i < texels; ++i) {
+            using Pixel = std::array<std::uint8_t, 4>;
+            const UINT x = i % 4, y = (i / 4) % 4, z = i / 16;
+            const Pixel mip1{std::uint8_t(x * 19), std::uint8_t(y * 23), std::uint8_t((z / 2) * 53), 101};
+            const Pixel expected[volume_lod_count] = {
+                d.image_view_min_lod ? mip1 : Pixel{}, mip1, {}, {0, 0, 0, 255},
+            };
+            for (UINT view = 0; view < volume_lod_count; ++view) {
+                const auto* sample = &volume_lod_pixels[view * bytes + 4 * i];
+                if (std::memcmp(sample, expected[view].data(), 4) && volume_lod_errors++ == 0) {
+                    std::fprintf(stderr, "volume LOD view %u texel %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
+                                 view, i, sample[0], sample[1], sample[2], sample[3],
+                                 expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
+                }
+            }
+            // Negative control: clamp 1.0 vs unclamped volume_all (clamp 0.0) must differ at every texel.
+            if (std::memcmp(&volume_lod_pixels[4 * i], &volume_pixels[4 * i], 4) != 0) ++volume_clamp_diffs;
+        }
+        lod_mismatches += volume_lod_errors;
+        std::printf("volume minimum LOD: %u/%u samples matched across %u views (clamp 1.0 vs 0.0: %u/%u texels differed)\n",
+                    UINT(volume_lod_pixels.size() / 4) - volume_lod_errors, UINT(volume_lod_pixels.size() / 4),
+                    volume_lod_count, volume_clamp_diffs, texels);
+        EXPECT(volume_lod_errors == 0);
+        if (d.image_view_min_lod) EXPECT(volume_clamp_diffs == texels);
+
         SampleKeys byte_keys[byte_view_count]{};
         for (UINT k = 0; k < byte_view_count; ++k) {
             std::memcpy(byte_keys[k].tsharp, byte_bytes(k), sizeof(byte_keys[k].tsharp));
@@ -1906,6 +1956,114 @@ int main() {
                 }
             }
             std::printf("%s sampled: %u texels matched\n", format.name, texels);
+#endif
+        }
+
+        // Minimum/maximum filter reduction modes on a 2x2 RGBA8 texture: every sample of cs_sample.comp's 8x8 grid
+        // lands strictly between texel centres, so all four texels have positive weight under WRAP addressing.
+        {
+            D3D12_RESOURCE_DESC minmax_desc = texture_desc;
+            minmax_desc.Width = minmax_desc.Height = 2;
+            minmax_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            Ref<ID3D12Resource> minmax_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &minmax_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&minmax_texture.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT minmax_fp{};
+            device->GetCopyableFootprints(&minmax_desc, 0, 1, 49152, &minmax_fp, nullptr, nullptr, nullptr);
+            constexpr std::uint8_t minmax_texels[2][2][4] = {
+                {{16, 240, 80, 255}, {240, 16, 160, 255}},
+                {{96, 128, 240, 255}, {176, 64, 16, 255}},
+            };
+            for (UINT y = 0; y < 2; ++y)
+                for (UINT x = 0; x < 2; ++x)
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + minmax_fp.Offset + y * minmax_fp.Footprint.RowPitch +
+                                    x * 4,
+                                minmax_texels[y][x], 4);
+            device->CreateShaderResourceView(minmax_texture.p, nullptr, view_slot(null_slot));
+
+            D3D12_DESCRIPTOR_HEAP_DESC mm_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 3,
+                                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            Ref<ID3D12DescriptorHeap> mm_samplers;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&mm_heap_desc, IID_PPV_ARGS(&mm_samplers.p))));
+            const auto mm_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(mm_samplers.p, 9))(mm_samplers.p);
+            const auto mm_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(mm_cpu + i * sampler_step)}; };
+            const auto mm_bytes = [&](UINT i) { return reinterpret_cast<const std::uint8_t*>(mm_cpu + i * sampler_step); };
+            constexpr D3D12_FILTER mm_filters[3] = {
+                D3D12_FILTER_MINIMUM_MIN_MAG_MIP_LINEAR,
+                D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_LINEAR,
+                D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            };
+            constexpr g::FilterMode mm_modes[3] = {g::FilterMode::minimum, g::FilterMode::maximum, g::FilterMode::blend};
+            for (UINT i = 0; i < 3; ++i) {
+                D3D12_SAMPLER_DESC sd = sampler_desc;
+                sd.Filter = mm_filters[i];
+                sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+                device->CreateSampler(&sd, mm_slot(i));
+                g::SamplerWords sw{};
+                std::memcpy(sw.data(), mm_bytes(i), sizeof(sw));
+                EXPECT(g::decode(sw).filter_mode == mm_modes[i]);
+            }
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            D3D12_TEXTURE_COPY_LOCATION to_mm{minmax_texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            to_mm.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION from_mm{upload.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            from_mm.PlacedFootprint = minmax_fp;
+            list->CopyTextureRegion(&to_mm, 0, 0, 0, &from_mm, nullptr);
+            const D3D12_RESOURCE_BARRIER mm_readable =
+                transition(minmax_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &mm_readable);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            ++packed_signal;
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
+
+#ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+            SampleKeys mm_keys[3]{};
+            for (UINT i = 0; i < 3; ++i) {
+                std::memcpy(mm_keys[i].tsharp, view_bytes(null_slot), sizeof(mm_keys[i].tsharp));
+                std::memcpy(mm_keys[i].ssharp, mm_bytes(i), sizeof(mm_keys[i].ssharp));
+                mm_keys[i].first = i * texels;
+            }
+            std::array<std::uint8_t, 3 * bytes> mm_pixels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, mm_keys, mm_pixels.data()));
+            const auto get_fmt_props =
+                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+            VkFormatProperties rgba8_props{}, bc1_props{};
+            get_fmt_props(d.physical, VK_FORMAT_R8G8B8A8_UNORM, &rgba8_props);
+            get_fmt_props(d.physical, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &bc1_props);
+            const bool rgba8_minmax =
+                d.sampler_filter_minmax &&
+                (rgba8_props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
+            const bool bc1_minmax =
+                d.sampler_filter_minmax &&
+                (bc1_props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
+            constexpr std::array<std::uint8_t, 4> want_min{16, 16, 16, 255};
+            constexpr std::array<std::uint8_t, 4> want_max{240, 240, 240, 255};
+            UINT min_matches = 0, max_matches = 0, blend_diff_min = 0, blend_diff_max = 0;
+            for (UINT i = 0; i < texels; ++i) {
+                const auto* got_min = &mm_pixels[0 * bytes + i * 4];
+                const auto* got_max = &mm_pixels[1 * bytes + i * 4];
+                const auto* got_blend = &mm_pixels[2 * bytes + i * 4];
+                if (rgba8_minmax) {
+                    min_matches += std::memcmp(got_min, want_min.data(), 4) == 0;
+                    max_matches += std::memcmp(got_max, want_max.data(), 4) == 0;
+                    blend_diff_min += std::memcmp(got_blend, want_min.data(), 4) != 0;
+                    blend_diff_max += std::memcmp(got_blend, want_max.data(), 4) != 0;
+                } else {
+                    min_matches += std::memcmp(got_min, got_blend, 4) == 0;
+                    max_matches += std::memcmp(got_max, got_blend, 4) == 0;
+                }
+            }
+            std::printf("sampler reduction min/max (RGBA8=%s, BC1=%s): min %u/%u, max %u/%u (blend differed: %u/%u vs "
+                        "min, %u/%u vs max)\n",
+                        rgba8_minmax ? "yes" : "no", bc1_minmax ? "yes" : "no", min_matches, texels, max_matches,
+                        texels, blend_diff_min, texels, blend_diff_max, texels);
+            EXPECT(min_matches == texels && max_matches == texels);
+            if (rgba8_minmax) EXPECT(blend_diff_min == texels && blend_diff_max == texels);
 #endif
         }
 

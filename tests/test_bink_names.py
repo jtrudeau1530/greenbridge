@@ -265,5 +265,64 @@ class TestCli(unittest.TestCase):
                 self.assertEqual(fh.read(), before, "the pins CSV must not be modified")
 
 
+class TestReportErrors(unittest.TestCase):
+    """Bad bink_index.csv/.json sources fail with a one-line, path-specific error and no report."""
+
+    def write(self, tmp, name, text):
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def run_cli(self, source, tmp):
+        xml = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
+        out = os.path.join(tmp, "names.csv")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = names_mod.main([source, "--mount", xml, "--out", out])
+        return code, err.getvalue(), out
+
+    def test_bad_sources_are_rejected(self):
+        # (extension, contents, expected error fragment or None to only require the path)
+        cases = [
+            ("index.json", '{"summary": {}, "target": "x.rpf"}', "streams"),
+            ("index.json", '[]', "streams"),
+            ("index.json", '{"streams": [{"source": "a", "offset": 0}]}', "stream 1"),
+            ("index.json", '{"streams": [', None),
+            ("index.csv", "source,offset,size,width,height\n", "frames"),
+            ("index.csv", "source,offset,size,width,height,frames\n"
+                          "a.rpf,0,0x100,1280,720,100\n"
+                          "a.rpf,bogus,0x100,1280,720,100\n", "row 3"),
+            ("index.csv", "", "frames"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text, needle in cases:
+                with self.subTest(name=name, text=text):
+                    source = self.write(tmp, name, text)
+                    code, err, out = self.run_cli(source, tmp)
+                    self.assertEqual(code, 1)
+                    self.assertIn(source, err)
+                    if needle is not None:
+                        self.assertIn(needle, err)
+                    self.assertFalse(os.path.exists(out))
+
+    def test_empty_sources_are_accepted(self):
+        cases = [
+            ("index.csv", "source,offset,size,width,height,frames\n"),
+            ("index.json", '{"streams": []}'),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text in cases:
+                with self.subTest(name=name):
+                    source = self.write(tmp, name, text)
+                    xml = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
+                    out = os.path.join(tmp, "names.csv")
+                    log = io.StringIO()
+                    with contextlib.redirect_stdout(log), contextlib.redirect_stderr(io.StringIO()):
+                        code = names_mod.main([source, "--mount", xml, "--out", out])
+                    self.assertEqual(code, 0)
+                    self.assertIn("1 list entries, 0 streams", log.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -578,6 +578,7 @@ struct RtTriangleGeometry {
     std::uint32_t index_type = 0;     // 0=NONE, 1=UINT16, 2=UINT32
     std::uint64_t transform_va = 0;
     bool opaque = true;
+    std::uint32_t flags = 0;          // D3D12_RAYTRACING_GEOMETRY_FLAGS (bit 0 opaque, bit 1 no duplicate any-hit)
 };
 
 // BLAS or TLAS build command (VK_KHR_acceleration_structure).
@@ -799,7 +800,8 @@ public:
     }
 
     bool execute_indirect(const ExecuteIndirect& indirect) {
-        if (!indirect.argument_buffer || !indirect.stride || !indirect.max_count) return false;
+        if (!indirect.argument_buffer || !indirect.stride) return false;
+        if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }
 
