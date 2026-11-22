@@ -4651,12 +4651,15 @@ public:
             if ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
                 (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) {
                 s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-                // A typed UAV read is not a storage-image read: the translator reads the texture through its
-                // sampled binding with the T#'s numeric type (rdna2spirv.py image_read_typed), and a typed buffer
-                // through its address. So every typed UAV format can also be read.
+                // A typed UAV texture read is not a storage-image read: the translator reads it through the
+                // texture's sampled binding with the T#'s numeric type (rdna2spirv.py image_read_typed), so a
+                // format that can be stored can be read. Typed buffer UAVs share the store side's limits: the layer
+                // creates no buffer UAV views yet, and rdna2spirv.py FORMATS decodes only some buffer formats.
                 s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE | D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
-                // Image atomics go through the r32ui storage view, which only an R32_UINT texture gets
-                // (StorageViews::r32ui). The translator has no image_atomic_swap, so no exchange.
+                // Image atomics go through the r32ui storage view, which an R32_UINT UAV view gets
+                // (StorageViews::r32ui). Today that is 2D UAVs only: the translator's image atomics cover 2D and 3D,
+                // the bindless set has r32ui slots for those two, and the layer creates no 3D UAV views yet. There
+                // is no image_atomic_swap, so no exchange.
                 if (vk_fmt == VK_FORMAT_R32_UINT && (optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT)) {
                     s2 |= D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
                           D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
@@ -4672,7 +4675,7 @@ public:
                 const bool block_compressed = vk_fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && vk_fmt <= VK_FORMAT_BC7_SRGB_BLOCK;
                 // Gathers read the sampled view like a sample does (OpImageGather); the host reports one with the other.
                 if (s1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) s1 |= D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
-                // A mip chain where the image can have one, with the usage it is created with.
+                // A mip chain where the image can have one (asked with its sampled or depth-stencil usage).
                 if (s1 & (D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D |
                           D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
                           D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL)) {
@@ -4686,14 +4689,16 @@ public:
                                                        &limits) == VK_SUCCESS &&
                         limits.maxMipLevels > 1)
                         s1 |= D3D12_FORMAT_SUPPORT1_MIP;
-                    // Depth formats multisample as depth-stencil targets (MULTISAMPLE_QUALITY_LEVELS already
-                    // reports their counts); the colour-attachment check above never sees them.
+                    // Depth formats multisample as depth-stencil targets; the colour-attachment check above never
+                    // sees them. Same usages as MULTISAMPLE_QUALITY_LEVELS and resource creation ask for.
                     if (depth && !chosen.typeless && (s1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) &&
                         state_.image_format_properties &&
                         state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
                                                        VK_IMAGE_TILING_OPTIMAL,
-                                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
-                                                       &limits) == VK_SUCCESS &&
+                                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                       0, &limits) == VK_SUCCESS &&
                         (limits.sampleCounts & d3d12_multisample_sample_counts))
                         s1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET;
                 }
@@ -4701,12 +4706,17 @@ public:
                 if (DeviceState::numeric_class(vk_fmt) != 0) s1 &= ~D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
                 // Block-compressed textures are 2D, 3D or cubes: 1D has no 4x4 blocks.
                 if (block_compressed) s1 &= ~D3D12_FORMAT_SUPPORT1_TEXTURE1D;
-                // Depth formats are 1D, 2D and cube resources whose shaders read them through a colour view
-                // (R32_FLOAT, R24_UNORM_X8_TYPELESS, ...), not 3D and not shader resources themselves.
-                if (depth)
-                    s1 &= ~(D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+                // Depth formats are 2D and cube resources whose shaders read and write them through a colour view
+                // (R32_FLOAT, R24_UNORM_X8_TYPELESS, ...): not 3D, not shader resources or UAVs themselves (NVIDIA
+                // gives D32_SFLOAT and D16_UNORM STORAGE_IMAGE). Native D3D12 also allows 1D, but the layer refuses
+                // 1D depth-stencil resources (CreateCommittedResource).
+                if (depth) {
+                    s1 &= ~(D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
                             D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
-                            D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER);
+                            D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER |
+                            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW);
+                    s2 = D3D12_FORMAT_SUPPORT2_NONE;
+                }
                 // A TYPELESS format is only storage: views give it a type, so it is a texture with mips and
                 // nothing a view would do (no buffer, shader, render-target or UAV use of its own).
                 if (chosen.typeless) {
@@ -4718,12 +4728,8 @@ public:
             }
             if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && state_.r9g9b9e5_uav_emulated) {
                 s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-                s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
-                VkFormatProperties r32{};
-                state_.format_properties(state_.info.physical, VK_FORMAT_R32_UINT, &r32);
-                if (r32.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT) {
-                    s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
-                }
+                // Reads go through the sampled E5B9G9R9 view, like every typed UAV read (see above).
+                s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE | D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
             }
             if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
                 // The native packed format supports single-sample RTVs on some adapters.

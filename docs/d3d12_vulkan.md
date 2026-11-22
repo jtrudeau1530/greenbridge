@@ -1333,16 +1333,23 @@ The trace will enumerate them.
   and resolve bits also require the format's image-usage/sample-count query to succeed. D3D12's per-format
   rules then apply, as native D3D12 reports them (RX 9070 XT, AMD 26.11.2, and WARP):
   - `MIP` wherever the image can have more than one level.
-  - `SHADER_GATHER` with `SHADER_SAMPLE`.
-  - `UAV_TYPED_LOAD` with every typed UAV. Typed UAV reads use the sampled binding (`image_read_typed`), not a
-    storage-image read.
-  - The UAV atomic bits other than exchange for `R32_UINT`, the one format with the `r32ui` storage view. There
-    is no `image_atomic_swap`, and the translator's image atomics cover 2D and 3D textures only.
-  - No integer resolve, no 1D block-compressed, no 3D or shader reads of depth formats.
+  - `SHADER_GATHER` with `SHADER_SAMPLE` (not `A8_UNORM`, whose swizzled view isn't verified for gathers).
+  - `UAV_TYPED_LOAD` with every typed UAV. Typed UAV texture reads use the sampled binding (`image_read_typed`),
+    not a storage-image read. Typed buffer UAVs share the store side's gaps: the layer creates no buffer UAV
+    views yet, and `rdna2spirv.py` `FORMATS` decodes only some buffer formats (no SINT, 8/16-bit UINT, 10_11_11).
+  - The UAV atomic bits other than exchange for `R32_UINT`, whose UAV views get the `r32ui` storage view. Today
+    that works on 2D UAVs only: the translator's image atomics and the `r32ui` slots cover 2D and 3D, and the
+    layer creates no 3D UAV views yet. There is no `image_atomic_swap`, and `R32_SINT` gets no `r32ui` view.
+  - `MULTISAMPLE_RENDERTARGET` for depth formats, from the same usages `MULTISAMPLE_QUALITY_LEVELS` queries.
+  - No integer resolve, no 1D block-compressed. Depth formats are 2D and cube only: no 3D, shader reads, UAVs,
+    buffer or vertex use, and no 1D, which native D3D12 allows but the layer's resource creation refuses.
   - TYPELESS formats report texture dimensions and `MIP` only.
 
-  `d3d12_vulkan_device_test` compares these bits with native D3D12 on the same adapter for every format both
-  support.
+  `d3d12_vulkan_device_test` checks these bits for every format that both the layer and native D3D12 on the same
+  adapter (matched by LUID or PCI ID) support. Some checks compare with the host and some check the layer's own
+  consistency; the comment on `compare_format_support` lists which are which. Formats the layer answers with no
+  uses, such as D24 without Vulkan D24, are listed but not checked. It skips when there is no host on the same
+  adapter (Wine, or no LUID/PCI match).
 - `D3D12_FEATURE_FORMAT_INFO`: report the DXGI plane count independently of Vulkan texture support. Both
   depth/stencil families (including their view formats), NV12, P010, P016 and NV11 have two planes. The
   device test compares counts and HRESULTs with native D3D12 on the same adapter. If an older host rejects the
