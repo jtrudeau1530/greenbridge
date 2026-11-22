@@ -712,5 +712,214 @@ class TestValuCvtF32F64AST(unittest.TestCase):
         self.assertEqual(prog.to_assembly(), expected)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar interpreter for GFX10/RDNA2 VALU conversion instructions."""
+
+    def __init__(self) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= 256) or (kind == RegKind.SGPR and idx >= 106):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        return (self.vgprs[idx] if kind == RegKind.VGPR else self.sgprs[idx]) & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= 256) or (kind == RegKind.SGPR and idx >= 106):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def read_reg_u64(self, kind: RegKind, idx: int) -> int:
+        lo = self.read_reg_u32(kind, idx)
+        hi = self.read_reg_u32(kind, idx + 1)
+        return join_dwords(lo, hi)
+
+    def write_reg_u64(self, kind: RegKind, idx: int, val: int) -> None:
+        lo, hi = split_dwords(val)
+        self.write_reg_u32(kind, idx, lo)
+        self.write_reg_u32(kind, idx + 1, hi)
+
+    def read_operand(self, op: Register | Immediate, mods: OperandModifiers, is_64bit: bool) -> int:
+        if isinstance(op, Immediate):
+            raw = op.bits
+        elif isinstance(op, Register):
+            raw = self.read_reg_u64(op.kind, op.index) if is_64bit else self.read_reg_u32(op.kind, op.index)
+        else:
+            raise TypeError(f"Unsupported operand type: {type(op)}")
+        return mods.apply(raw, is_64bit)
+
+    def step(self, inst: Instruction) -> int:
+        """Executes a single VALU conversion instruction deterministically."""
+        # Read-before-write semantics: latch operand
+        if inst.opcode == Opcode.V_CVT_F32_F64:
+            s0 = self.read_operand(inst.src0, inst.src0_mods, is_64bit=True)
+            res = ref_cvt_f32_f64(s0)
+            final_res = inst.inst_mods.apply_f32(res)
+            self.write_reg_u32(inst.dst.kind, inst.dst.index, final_res)
+            self.trace.append(f"{inst.to_assembly()} => {final_res:#010x}")
+            return final_res
+        elif inst.opcode == Opcode.V_CVT_F64_F32:
+            s0 = self.read_operand(inst.src0, inst.src0_mods, is_64bit=False)
+            res = ref_cvt_f64_f32(s0)
+            final_res = inst.inst_mods.apply_f64(res)
+            self.write_reg_u64(inst.dst.kind, inst.dst.index, final_res)
+            self.trace.append(f"{inst.to_assembly()} => {final_res:#018x}")
+            return final_res
+        else:
+            raise NotImplementedError(f"Unsupported opcode in scalar interpreter: {inst.opcode}")
+
+    def run_program(self, prog: Program) -> list[int]:
+        """Executes all instructions in a program sequentially."""
+        return [self.step(inst) for inst in prog.instructions]
+
+
+class TestValuCvtF32F64ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar VALU instruction interpreter."""
+
+    def test_scalar_register_read_write(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, POS_ONE_F32)
+        interp.write_reg_u64(RegKind.VGPR, 2, POS_TWO_F64)
+        interp.write_reg_u64(RegKind.SGPR, 4, NEG_ONE_F64)
+
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), POS_ONE_F32)
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 2), POS_TWO_F64)
+        self.assertEqual(interp.read_reg_u64(RegKind.SGPR, 4), NEG_ONE_F64)
+
+    def test_scalar_cvt_f32_f64_vgpr(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u64(RegKind.VGPR, 2, POS_TEN_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 2, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, POS_TEN_F32)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), POS_TEN_F32)
+
+    def test_scalar_cvt_f32_f64_sgpr(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u64(RegKind.SGPR, 4, NEG_HALF_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.SGPR, 4, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, NEG_HALF_F32)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), NEG_HALF_F32)
+
+    def test_scalar_cvt_f64_f32_vgpr(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 2, POS_TEN_F32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2, count=1),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, POS_TEN_F64)
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 0), POS_TEN_F64)
+
+    def test_scalar_cvt_f64_f32_sgpr(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.SGPR, 4, NEG_HALF_F32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.SGPR, 4, count=1),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, NEG_HALF_F64)
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 0), NEG_HALF_F64)
+
+    def test_scalar_immediate_operands(self) -> None:
+        interp = ScalarVALUInterpreter()
+
+        # Immediate f64 -> f32
+        inst1 = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(2.0, is_64bit=True),
+        )
+        res1 = interp.step(inst1)
+        self.assertEqual(res1, POS_TWO_F32)
+
+        # Immediate f32 -> f64
+        inst2 = Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 2, count=2),
+            src0=Immediate(2.0, is_64bit=False),
+        )
+        res2 = interp.step(inst2)
+        self.assertEqual(res2, POS_TWO_F64)
+
+    def test_scalar_modifiers_abs_neg_clamp(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u64(RegKind.VGPR, 2, NEG_TWO_F64)
+
+        # v_cvt_f32_f64 with abs and clamp: |-2.0| = 2.0 clamped to [0,1] = 1.0f
+        inst1 = Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            src0_mods=OperandModifiers(abs_val=True),
+            inst_mods=InstructionModifiers(clamp=True),
+        )
+        res1 = interp.step(inst1)
+        self.assertEqual(res1, POS_ONE_F32)
+
+        # v_cvt_f64_f32 with neg and clamp: -2.0f clamped to [0,1] = +0.0
+        interp.write_reg_u32(RegKind.VGPR, 4, POS_TWO_F32)
+        inst2 = Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 6, count=2),
+            src0=Register(RegKind.VGPR, 4, count=1),
+            src0_mods=OperandModifiers(neg=True),
+            inst_mods=InstructionModifiers(clamp=True),
+        )
+        res2 = interp.step(inst2)
+        self.assertEqual(res2, POS_ZERO_F64)
+
+    def test_scalar_program_round_trip(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 2, POS_TEN_F32)
+
+        prog = Program()
+        # v[4:5] = (double)v2
+        prog.append(Instruction(
+            opcode=Opcode.V_CVT_F64_F32,
+            dst=Register(RegKind.VGPR, 4, count=2),
+            src0=Register(RegKind.VGPR, 2, count=1),
+        ))
+        # v6 = (float)v[4:5]
+        prog.append(Instruction(
+            opcode=Opcode.V_CVT_F32_F64,
+            dst=Register(RegKind.VGPR, 6, count=1),
+            src0=Register(RegKind.VGPR, 4, count=2),
+        ))
+
+        results = interp.run_program(prog)
+        self.assertEqual(results, [POS_TEN_F64, POS_TEN_F32])
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 4), POS_TEN_F64)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 6), POS_TEN_F32)
+        self.assertEqual(len(interp.trace), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
