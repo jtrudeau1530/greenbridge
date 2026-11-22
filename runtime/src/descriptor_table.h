@@ -10,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace leonida {
@@ -69,6 +70,8 @@ public:
     enum class InsertResult { added, unchanged, replaced, added_with_relocation };
 
     explicit DescriptorTable(std::uint32_t initial_capacity = 16) {
+        // Slots use nonnegative int indices internally. Larger powers also wrap the capacity counter.
+        if (initial_capacity > max_capacity) throw std::length_error("Descriptor table capacity exceeds slot range");
         std::uint32_t cap = 16;
         while (cap < initial_capacity) cap <<= 1;
         mask_ = cap - 1;
@@ -332,6 +335,7 @@ private:
     }
 
     void grow_locked() {
+        if (entries_.size() >= max_capacity) throw std::length_error("Descriptor table capacity exhausted");
         std::uint32_t new_cap = static_cast<std::uint32_t>(entries_.size() * 2);
         while (true) {
             std::vector<DescriptorEntry> new_entries(new_cap);
@@ -364,10 +368,12 @@ private:
                 changed_slots_.clear();
                 break;
             }
+            if (new_cap >= max_capacity) throw std::length_error("Descriptor probe range exhausted");
             new_cap *= 2;
         }
     }
 
+    static constexpr std::uint32_t max_capacity = std::uint32_t{1} << 31;
     mutable std::mutex mutex_;
     std::uint32_t mask_ = 15;
     std::vector<DescriptorEntry> entries_;

@@ -408,7 +408,22 @@ int test_erase_moves_no_other_entry() {
     return 0;
 }
 
+int test_capacity_overflow() {
+    for (std::uint32_t requested : {0x80000001u, 0xffffffffu}) {
+        bool rejected = false;
+        try { DescriptorTable table(requested); }
+        catch (const std::length_error&) { rejected = true; }
+        EXPECT(rejected);
+    }
+    for (std::uint32_t requested : {0u, 1u, 16u, 17u, 31u, 32u}) {
+        DescriptorTable table(requested);
+        EXPECT(table.capacity() == (requested <= 16 ? 16 : 32));
+    }
+    return 0;
+}
+
 int main() {
+    EXPECT(test_capacity_overflow() == 0);
     EXPECT(test_fnv1a_hash_matches_contract() == 0);
     EXPECT(test_ssharp_key_padding() == 0);
     EXPECT(test_basic_insertion_and_lookup() == 0);
