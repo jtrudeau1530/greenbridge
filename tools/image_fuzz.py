@@ -560,6 +560,8 @@ def main() -> int:
     if a.negative_control and "hw" not in backends:
         ap.error("--negative-control needs --oracle hw")
     formats = [f.strip() for f in a.formats.split(",") if f.strip()]
+    if not formats:
+        ap.error("--formats must select at least one format")
     unknown = [f for f in formats if f not in FORMATS]
     if unknown:
         print(f"unknown format(s): {', '.join(unknown)}; known: {', '.join(FORMATS)}", file=sys.stderr)
