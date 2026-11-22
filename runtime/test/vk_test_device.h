@@ -84,6 +84,12 @@ public:
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t family = 0;
+    // Set before initialize(): how many queues of `family` to create (fewer if the family has fewer). `queues` holds the
+    // handles; queues[0] == queue. A test that wants distinct VkQueues for its D3D12 queues passes them on as
+    // VulkanDeviceInfo::command_queues when there is more than one.
+    std::uint32_t queue_count_wanted = 1;
+    std::uint32_t family_queue_count = 1;  // the family's queueCount, known after the device is chosen
+    std::vector<VkQueue> queues;
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
     VkPhysicalDeviceFeatures enabled{};  // the core features enabled on `device`
@@ -286,6 +292,7 @@ public:
                     rank > best_rank) {
                     physical = candidate;
                     family = i;
+                    family_queue_count = families[i].queueCount;
                     chosen = props;
                     best_rank = rank;
                     v13_.choose(candidate13);
@@ -377,11 +384,11 @@ public:
         enable12.samplerFilterMinmax = sampler_filter_minmax;
         enable12.bufferDeviceAddress = VK_TRUE;
 
-        const float priority = 1.0f;
+        const std::vector<float> priority(std::max(1u, std::min(queue_count_wanted, family_queue_count)), 1.0f);
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         queue_info.queueFamilyIndex = family;
-        queue_info.queueCount = 1;
-        queue_info.pQueuePriorities = &priority;
+        queue_info.queueCount = std::max(1u, std::min(queue_count_wanted, family_queue_count));
+        queue_info.pQueuePriorities = priority.data();
         VkPhysicalDeviceFeatures enable{};
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
@@ -487,7 +494,10 @@ public:
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);
         if (result != VK_SUCCESS) return failure("vkCreateDevice", result);
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
-        fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, family, 0, &queue);
+        queues.resize(queue_info.queueCount);
+        for (std::uint32_t i = 0; i < queue_info.queueCount; ++i)
+            fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, family, i, &queues[i]);
+        queue = queues[0];
         instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(physical,
                                                                                                     &memory_);
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
