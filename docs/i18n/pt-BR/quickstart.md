@@ -76,6 +76,12 @@ O script procura automaticamente sua cópia (Downloads, Desktop, Documentos, Gam
 discos até dois níveis), valida os pré-requisitos e o espaço livre e grava o resultado em `Documents\Leonida`.
 Se o build for interrompido, basta rodar novamente para retomar de onde parou.
 
+**Espaço em disco baixo:** o valor de ~350 GB é para o build completo. Para *rodar* o port, `--stages check,shaders,runtime`
+precisa de cerca de 30 GB; o estágio `assets` (~300 GB) é apenas para as ferramentas de assets, e `--wav` adiciona
+várias vezes o tamanho do Ogg Opus. `--work` e `--out` podem ficar em outro disco; uma unidade de pacote somente leitura
+precisa de `--overlay` em uma gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm` no lugar: apagá-los
+mantendo a pasta faz o estágio parecer concluído com zero shaders, e um `disasm` com symlink é recusado.
+
 ### Pelo terminal (`make_game.py`)
 
 ```powershell
