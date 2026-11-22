@@ -701,5 +701,30 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags.sign)
 
 
+class TestBoundaryExtremesAndBitPatterns(unittest.TestCase):
+    """Unit tests for boundary extremes, unsigned wraparound, and bit patterns."""
+
+    def test_add_modulo_wrap_extremes(self) -> None:
+        self.assertEqual(ref_ds_add_src2_u32(MASK32, 1), 0)
+        self.assertEqual(ref_ds_add_src2_u32(MASK32, MASK32), MASK32 - 1)
+        self.assertEqual(ref_ds_add_src2_u32(0, 0), 0)
+
+    def test_sub_borrow_wrap_extremes(self) -> None:
+        self.assertEqual(ref_ds_sub_src2_u32(0, 1), MASK32)
+        self.assertEqual(ref_ds_sub_src2_u32(0, MASK32), 1)
+        self.assertEqual(ref_ds_sub_src2_u32(MASK32, MASK32), 0)
+
+    def test_alternating_bit_patterns(self) -> None:
+        p1 = 0x55555555
+        p2 = 0xAAAAAAAA
+        self.assertEqual(ref_ds_add_src2_u32(p1, p2), MASK32)
+        self.assertEqual(ref_ds_sub_src2_u32(MASK32, p1), p2)
+        self.assertEqual(ref_ds_sub_src2_u32(MASK32, p2), p1)
+
+    def test_sign_boundary_transitions(self) -> None:
+        self.assertEqual(ref_ds_add_src2_u32(0x7FFFFFFF, 1), 0x80000000)
+        self.assertEqual(ref_ds_sub_src2_u32(0x80000000, 1), 0x7FFFFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
