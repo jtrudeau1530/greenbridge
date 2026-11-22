@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Semantic interpreter tests for RDNA2 v_add_nc_i32 / v_sub_nc_i32 and the integer clamp bit.
 
 v_add_nc_i32 / v_sub_nc_i32: D = S0 + S1 / S0 - S1, wrapping at 32 bits. With the VOP3 clamp bit an integer
@@ -34,6 +36,39 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 def s32(x: int) -> int:
     x &= M32
     return x - (1 << 32) if x >> 31 else x
+
+
+def ref_add_nc_u32(x: int, y: int, clamp: bool = False) -> int:
+    """Pure reference oracle for RDNA2 unsigned 32-bit addition with optional VOP3 clamp.
+
+    Computes (x & M32) + (y & M32). Without clamp, the sum wraps modulo 2^32.
+    With clamp, if the 33-bit sum exceeds 0xFFFFFFFF (generating a carry),
+    the result saturates to 0xFFFFFFFF (GFX9+ uaddsat behavior).
+    """
+    a = x & M32
+    b = y & M32
+    full_sum = a + b
+    if clamp:
+        return min(full_sum, M32)
+    return full_sum & M32
+
+
+def oracle_add_nc_u32_analysis(x: int, y: int) -> dict[str, int | bool]:
+    """Arithmetic analysis for v_add_nc_u32: full sum, carry, wrapped, and clamped results."""
+    a = x & M32
+    b = y & M32
+    total = a + b
+    has_carry = total > M32
+    wrapped = total & M32
+    clamped = M32 if has_carry else total
+    return {
+        "a": a,
+        "b": b,
+        "total": total,
+        "carry": has_carry,
+        "wrapped": wrapped,
+        "clamped": clamped,
+    }
 
 
 def ref(op: str, x: int, y: int, clamp: bool) -> int:
@@ -123,6 +158,111 @@ class AddNcClampTests(unittest.TestCase):
         # The VOP2 encodings have no clamp bit: they wrap.
         self.assertEqual(run_lines(["v_mov_b32 v1, -1", "v_add_nc_u32_e32 v0, 2, v1"]), 1)
         self.assertEqual(run_lines(["v_mov_b32 v1, 1", "v_sub_nc_u32_e32 v0, 0, v1"]), M32)
+
+
+class TestAddNcU32ReferenceOracle(unittest.TestCase):
+    """Reference oracle tests for vector addition with clamp saturation v_add_nc_u32."""
+
+    def test_oracle_identity_zero(self) -> None:
+        """Adding zero must preserve operand under both wrapping and clamping."""
+        test_values = [0, 1, 2, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF]
+        for val in test_values:
+            with self.subTest(val=hex(val)):
+                self.assertEqual(ref_add_nc_u32(val, 0, clamp=False), val)
+                self.assertEqual(ref_add_nc_u32(val, 0, clamp=True), val)
+                self.assertEqual(ref_add_nc_u32(0, val, clamp=False), val)
+                self.assertEqual(ref_add_nc_u32(0, val, clamp=True), val)
+
+    def test_oracle_commutativity(self) -> None:
+        """v_add_nc_u32 must be strictly commutative with and without clamp."""
+        test_pairs = [
+            (0, 0),
+            (1, 0xFFFFFFFF),
+            (0x12345678, 0x87654321),
+            (0x7FFFFFFF, 0x80000000),
+            (0xFFFFFFFE, 2),
+            (0xAAAAAAAA, 0x55555555),
+            (0xC0000000, 0x60000000),
+            (0xFFFFFFFF, 0xFFFFFFFF),
+        ]
+        for a, b in test_pairs:
+            for clamp in (False, True):
+                with self.subTest(a=hex(a), b=hex(b), clamp=clamp):
+                    self.assertEqual(ref_add_nc_u32(a, b, clamp), ref_add_nc_u32(b, a, clamp))
+
+    def test_oracle_sub_saturation_equivalence(self) -> None:
+        """When the sum does not exceed 0xFFFFFFFF, clamp and no-clamp results must be identical."""
+        safe_pairs = [
+            (0, 0),
+            (10, 20),
+            (0x1000, 0x2000),
+            (0x7FFFFFFF, 0),
+            (0x7FFFFFFF, 0x80000000),  # sum == 0xFFFFFFFF exactly
+            (0x55555555, 0x22222222),
+            (0xFFFFFFFE, 1),           # sum == 0xFFFFFFFF exactly
+        ]
+        for a, b in safe_pairs:
+            with self.subTest(a=hex(a), b=hex(b)):
+                wrapped = ref_add_nc_u32(a, b, clamp=False)
+                clamped = ref_add_nc_u32(a, b, clamp=True)
+                self.assertEqual(wrapped, clamped)
+                self.assertEqual(clamped, a + b)
+
+    def test_oracle_saturation_boundary_transitions(self) -> None:
+        """At and across the 2^32 boundary, clamping must saturate to 0xFFFFFFFF while wrapping wraps."""
+        cases = [
+            # (a, b, expected_wrapped, expected_clamped, expected_carry)
+            (0xFFFFFFFF, 0, 0xFFFFFFFF, 0xFFFFFFFF, False),
+            (0xFFFFFFFE, 1, 0xFFFFFFFF, 0xFFFFFFFF, False),
+            (0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0xFFFFFFFF, False),
+            # Transition across boundary:
+            (0xFFFFFFFF, 1, 0, 0xFFFFFFFF, True),
+            (0xFFFFFFFE, 2, 0, 0xFFFFFFFF, True),
+            (0xFFFFFFFF, 2, 1, 0xFFFFFFFF, True),
+            (0x80000000, 0x80000000, 0, 0xFFFFFFFF, True),
+            (0x80000001, 0x80000000, 1, 0xFFFFFFFF, True),
+            (0xC0000000, 0x80000000, 0x40000000, 0xFFFFFFFF, True),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFF, True),
+        ]
+        for a, b, exp_wrap, exp_clamp, exp_carry in cases:
+            with self.subTest(a=hex(a), b=hex(b)):
+                analysis = oracle_add_nc_u32_analysis(a, b)
+                self.assertEqual(analysis["carry"], exp_carry)
+                self.assertEqual(analysis["wrapped"], exp_wrap)
+                self.assertEqual(analysis["clamped"], exp_clamp)
+                self.assertEqual(ref_add_nc_u32(a, b, clamp=False), exp_wrap)
+                self.assertEqual(ref_add_nc_u32(a, b, clamp=True), exp_clamp)
+
+    def test_oracle_monotonicity_under_saturation(self) -> None:
+        """For a fixed base, clamped addition must be monotonically non-decreasing up to saturation."""
+        base = 0xFFFFFFF0
+        prev_clamped = 0
+        for delta in range(32):
+            clamped = ref_add_nc_u32(base, delta, clamp=True)
+            self.assertGreaterEqual(clamped, prev_clamped)
+            if delta < 15:
+                self.assertEqual(clamped, base + delta)
+            else:
+                self.assertEqual(clamped, M32)
+            prev_clamped = clamped
+
+    def test_translation_execution_matches_ref_oracle(self) -> None:
+        """SPIR-V translation and mini-interpreter execution must match ref_add_nc_u32."""
+        sample_pairs = [
+            (0, 0),
+            (100, 200),
+            (0x7FFFFFFF, 1),
+            (0xFFFFFFFF, 1),
+            (0xFFFFFFFE, 2),
+            (0x80000000, 0x80000000),
+            (0xFFFFFFFF, 0xFFFFFFFF),
+        ]
+        for a, b in sample_pairs:
+            for clamp in (False, True):
+                with self.subTest(a=hex(a), b=hex(b), clamp=clamp):
+                    got = run_op("v_add_nc_u32", a, b, clamp)
+                    want = ref_add_nc_u32(a, b, clamp)
+                    self.assertEqual(got, want)
 
 
 if __name__ == "__main__":
