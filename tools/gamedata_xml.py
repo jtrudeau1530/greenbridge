@@ -191,10 +191,22 @@ def scan_xml(data: bytes) -> dict:
     except (ET.ParseError, LookupError, ValueError) as exc:
         # The parser also raises LookupError or ValueError for unsupported encoding declarations.
         report["error"] = str(exc)
+        # The parser stops at the error, so the comments after it would go uncounted (a truncated or tail-only
+        # document): count them in the bytes instead, still skipping comment-like text inside CDATA.
+        report["comments"] = raw_comment_count(data)
     if ended is not None:
         scan_refs(ended.tail, report)
     report["attributes"] = sorted(report["attrs"])
     return report
+
+
+CDATA = re.compile(rb"<!\[CDATA\[.*?(?:\]\]>|\Z)", re.S)
+
+
+def raw_comment_count(data: bytes) -> int:
+    """Comment starts in a document the parser could not finish, outside CDATA sections (an unclosed one runs to
+    the end of the data)."""
+    return CDATA.sub(b"", data).count(b"<!--")
 
 
 def looks_truncated(data: bytes, root: str) -> bool:
