@@ -391,19 +391,18 @@ of root signatures and the literal S#s of shaders (`literal_samplers` in the ind
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
 feature, each logged and approximated; the storage arrays hold 255 images a dimension; nothing writes through a
 storage view in a D3D12-level test yet (`vk_bindless_test` goes through the storage bindings at the Vulkan
-level); the set is flushed at every `ExecuteCommandLists` whether or not earlier lists are still running, and a
-flush that erases keys or moves the table to a larger buffer should wait for them, or one of their lookups can
-miss: `BindlessSet::flush_needs_idle()` says when, but the queue cannot yet tell the device that it is idle.
+level). The set is flushed at every `ExecuteCommandLists`; a flush that erases keys or moves the table to a larger
+buffer (`BindlessSet::flush_needs_idle()`) first waits for the device to be idle and then frees the retired table
+buffers, so no running lookup misses (D3D-76). That wait stalls every queue, which is correct but slow if the game
+destroys textures every frame; a per-queue wait is open.
 
-Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
-creation), root signatures, PSOs, draws, volume attachment
-views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
 A typed 3D color target supports default and explicit RTVs. The default covers mip 0; `FirstWSlice` and
 `WSize` select the depth slices in an explicit view's mip. `d3d12_clear_test --volume` checks full and
 rectangular clears of overlapping slice ranges against both Windows WARP and expected RGBA bytes.
 
-Known gaps: buffer and constant-buffer views, root signatures, PSOs, draws, typeless volume RTVs,
-placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
+Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
+creation), root signatures, PSOs, draws, typeless volume RTVs,
+placed resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
 1D textures and the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); the GCL8
