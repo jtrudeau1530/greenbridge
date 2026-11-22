@@ -930,6 +930,12 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_vulkan_device COMMAND d3d12_vulkan_device_test)
+
+    add_executable(d3d12_shader_views_test test/d3d12_shader_views_test.cpp)
+    target_link_libraries(d3d12_shader_views_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_shader_views_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_shader_views_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_shader_views COMMAND d3d12_shader_views_test)
     set_tests_properties(d3d12_vulkan_device PROPERTIES SKIP_RETURN_CODE 77)
 
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
