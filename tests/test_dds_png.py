@@ -441,6 +441,13 @@ class UncompressedTests(unittest.TestCase):
         )
         self.assertEqual(dds.decode_dds(data), (1, 2, bytes((255, 128, 64, 255, 0, 128, 255, 85))))
 
+    def test_dx10_r10g10b10a2_unorm_with_padded_rows(self):
+        first = 1023 | (512 << 10) | (17 << 20) | (2 << 30)
+        second = 256 | (1023 << 20) | (1 << 30)
+        payload = struct.pack("<I", first) + b"\xcc" * 4 + struct.pack("<I", second)
+        data = dds_buffer(1, 2, payload, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=24, pitch=8)
+        self.assertEqual(dds.decode_dds(data), (1, 2, bytes((255, 128, 4, 170, 64, 0, 255, 85))))
+
     def test_pitch_errors_are_reported(self):
         header = dict(flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=28)
         with self.assertRaisesRegex(dds.DdsError, "pitch"):

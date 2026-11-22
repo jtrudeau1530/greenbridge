@@ -1,7 +1,7 @@
 """Pure standard-library DDS to PNG decoder and 2x box-filter downscaler.
 
 Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
-(BGRA8, RGBA8, BGRX8, RGBX8, and arbitrary 32-bit RGB/RGBA bitmasks) and
+(BGRA8, RGBA8, BGRX8, RGBX8, R10G10B10A2_UNORM, and arbitrary 32-bit RGB/RGBA bitmasks) and
 block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
 BC7 covers all eight modes. DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB) emit
@@ -208,7 +208,11 @@ def _parse_header_internal(
                     f"Truncated DX10 DDS header: {len(data)} bytes (need at least {DDS_DX10_HEADER_SIZE})"
                 )
             dxgi_format = struct.unpack_from("<I", data, 128)[0]
-            fmt = _DXGI_MAP.get(dxgi_format)
+            if dxgi_format == 24:  # DXGI_FORMAT_R10G10B10A2_UNORM, R in the low bits.
+                fmt = "RGBA8"
+                masks = (0x000003FF, 0x000FFC00, 0x3FF00000, 0xC0000000)
+            else:
+                fmt = _DXGI_MAP.get(dxgi_format)
             if fmt is None:
                 raise DdsError(f"Unsupported DXGI format: {dxgi_format}")
             data_offset = DDS_DX10_HEADER_SIZE
