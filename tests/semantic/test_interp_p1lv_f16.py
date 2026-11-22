@@ -659,5 +659,211 @@ class InterpP1lvF16ReferenceOracleTests(unittest.TestCase):
         self.assertEqual(f16_to_bits(tie_odd), 0x3C02)
 
 
+class SimdWaveInterpP1lv:
+    """Simulates an RDNA2 SIMD wave (Wave32 or Wave64) executing perspective interpolation instructions.
+
+    Models:
+      - Wave32 (32 lanes) and Wave64 (64 lanes).
+      - Per-lane VGPR bank (256 registers per lane).
+      - Shared SGPR bank (128 scalar registers).
+      - EXEC mask (32-bit or 64-bit) gating lane evaluation and register writes.
+      - Inactive lane preservation: disabled lanes keep their prior VGPR state.
+      - v_interp_p1lv_f16: evaluates first-axis perspective interpolation intermediate in f32.
+      - v_interp_p2_f16: accumulates second axis, applies optional clamp, narrows to f16 (nearest-even).
+    """
+
+    def __init__(self, wave_size: int = 32, exec_mask: int | None = None):
+        if wave_size not in (32, 64):
+            raise ValueError(f"Unsupported wave_size: {wave_size}")
+        self.wave_size = wave_size
+        self.mask_all = (1 << wave_size) - 1
+        self.exec_mask = self.mask_all if exec_mask is None else (exec_mask & self.mask_all)
+        self.sgprs = [0] * 128
+        self.vgprs = [[0] * 256 for _ in range(wave_size)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def set_lane_barycentrics(self, lane: int, i_coord: float, j_coord: float,
+                              v_i: int = 0, v_j: int = 1):
+        """Set barycentric I and J coordinates in given VGPRs for lane."""
+        self.vgprs[lane][v_i] = f32_to_bits(i_coord)
+        self.vgprs[lane][v_j] = f32_to_bits(j_coord)
+
+    def v_interp_p1lv_f16(self, vdst: int, vsrc_i: int,
+                          attr_packed: tuple[int, int, int],
+                          high: bool = False):
+        """Execute v_interp_p1lv_f16 across all active SIMD lanes."""
+        vals = [unpack_f16_halves(p)[1 if high else 0] for p in attr_packed]
+        p0, p1 = vals[0], vals[1]
+
+        for lane in range(self.wave_size):
+            if not self.is_lane_active(lane):
+                continue
+            i_coord = bits_to_f32(self.vgprs[lane][vsrc_i])
+            accum_f32 = v_interp_p1lv_f16_ref(i_coord, p0, p1)
+            self.vgprs[lane][vdst] = f32_to_bits(accum_f32)
+
+    def v_interp_p2_f16(self, vdst: int, vsrc_j: int,
+                        attr_packed: tuple[int, int, int],
+                        partial_src: int,
+                        high: bool = False, clamp: bool = False):
+        """Execute v_interp_p2_f16 across all active SIMD lanes."""
+        vals = [unpack_f16_halves(p)[1 if high else 0] for p in attr_packed]
+        p0, p2 = vals[0], vals[2]
+
+        for lane in range(self.wave_size):
+            if not self.is_lane_active(lane):
+                continue
+            j_coord = bits_to_f32(self.vgprs[lane][vsrc_j])
+            accum_f32 = bits_to_f32(self.vgprs[lane][partial_src])
+            res_bits = v_interp_p2_f16_ref(j_coord, p0, p2, accum_f32, clamp=clamp)
+            self.vgprs[lane][vdst] = res_bits
+
+
+class InterpP1lvSimdMultiLaneTests(unittest.TestCase):
+    """SIMD multi-lane wave evaluation tests for half-precision perspective interpolation."""
+
+    def test_wave32_uniform_triangle_raster_grid(self):
+        wave = SimdWaveInterpP1lv(wave_size=32)
+        attr0 = (pack_f16(1.0, 2.0), pack_f16(3.0, 6.0), pack_f16(5.0, 10.0))
+
+        bary_coords = []
+        for lane in range(32):
+            i_val = (lane % 8) * 0.1
+            j_val = (lane // 8) * 0.15
+            bary_coords.append((i_val, j_val))
+            wave.set_lane_barycentrics(lane, i_val, j_val)
+
+        wave.v_interp_p1lv_f16(vdst=2, vsrc_i=0, attr_packed=attr0, high=False)
+        wave.v_interp_p2_f16(vdst=2, vsrc_j=1, attr_packed=attr0, partial_src=2, high=False)
+
+        wave.v_interp_p1lv_f16(vdst=3, vsrc_i=0, attr_packed=attr0, high=True)
+        wave.v_interp_p2_f16(vdst=3, vsrc_j=1, attr_packed=attr0, partial_src=3, high=True)
+
+        for lane, (i_val, j_val) in enumerate(bary_coords):
+            _, want_lo = v_interp_p1lv_eval_ref(i_val, j_val, 1.0, 3.0, 5.0)
+            _, want_hi = v_interp_p1lv_eval_ref(i_val, j_val, 2.0, 6.0, 10.0)
+            self.assertEqual(wave.vgprs[lane][2], want_lo)
+            self.assertEqual(wave.vgprs[lane][3], want_hi)
+
+    def test_wave64_divergent_exec_masking(self):
+        wave = SimdWaveInterpP1lv(wave_size=64)
+        attr0 = (pack_f16(2.0, -1.0), pack_f16(4.0, 3.0), pack_f16(8.0, 7.0))
+
+        for lane in range(64):
+            wave.vgprs[lane][2] = 0xDEAD0000 | lane
+
+        active_mask = 0
+        for lane in range(64):
+            if lane % 3 != 0:
+                active_mask |= (1 << lane)
+        wave.exec_mask = active_mask
+
+        for lane in range(64):
+            wave.set_lane_barycentrics(lane, 0.25, 0.5)
+
+        wave.v_interp_p1lv_f16(vdst=2, vsrc_i=0, attr_packed=attr0, high=False)
+        wave.v_interp_p2_f16(vdst=2, vsrc_j=1, attr_packed=attr0, partial_src=2, high=False)
+
+        _, want_bits = v_interp_p1lv_eval_ref(0.25, 0.5, 2.0, 4.0, 8.0)
+        for lane in range(64):
+            if lane % 3 != 0:
+                self.assertEqual(wave.vgprs[lane][2], want_bits)
+            else:
+                self.assertEqual(wave.vgprs[lane][2], 0xDEAD0000 | lane)
+
+    def test_checkerboard_and_half_wave_divergence(self):
+        wave = SimdWaveInterpP1lv(wave_size=32, exec_mask=0x55555555)
+        for lane in range(32):
+            wave.vgprs[lane][4] = 0xCAFE0000 | lane
+            wave.set_lane_barycentrics(lane, 0.2, 0.4)
+
+        attr0 = (pack_f16(10.0, 0.0), pack_f16(20.0, 0.0), pack_f16(30.0, 0.0))
+        wave.v_interp_p1lv_f16(vdst=4, vsrc_i=0, attr_packed=attr0, high=False)
+        wave.v_interp_p2_f16(vdst=4, vsrc_j=1, attr_packed=attr0, partial_src=4, high=False)
+
+        _, want_bits = v_interp_p1lv_eval_ref(0.2, 0.4, 10.0, 20.0, 30.0)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[lane][4], want_bits)
+            else:
+                self.assertEqual(wave.vgprs[lane][4], 0xCAFE0000 | lane)
+
+        wave_odd = SimdWaveInterpP1lv(wave_size=32, exec_mask=0xAAAAAAAA)
+        for lane in range(32):
+            wave_odd.vgprs[lane][4] = 0xBEEF0000 | lane
+            wave_odd.set_lane_barycentrics(lane, 0.1, 0.7)
+
+        wave_odd.v_interp_p1lv_f16(vdst=4, vsrc_i=0, attr_packed=attr0, high=False)
+        wave_odd.v_interp_p2_f16(vdst=4, vsrc_j=1, attr_packed=attr0, partial_src=4, high=False)
+
+        _, want_bits_odd = v_interp_p1lv_eval_ref(0.1, 0.7, 10.0, 20.0, 30.0)
+        for lane in range(32):
+            if lane % 2 == 1:
+                self.assertEqual(wave_odd.vgprs[lane][4], want_bits_odd)
+            else:
+                self.assertEqual(wave_odd.vgprs[lane][4], 0xBEEF0000 | lane)
+
+    def test_multi_lane_high_vs_low_packed_independence(self):
+        wave = SimdWaveInterpP1lv(wave_size=32)
+        attr0 = (pack_f16(-2.0, 100.0), pack_f16(0.0, 200.0), pack_f16(4.0, 300.0))
+        for lane in range(32):
+            wave.set_lane_barycentrics(lane, lane / 64.0, (31 - lane) / 64.0)
+
+        wave.v_interp_p1lv_f16(vdst=2, vsrc_i=0, attr_packed=attr0, high=False)
+        wave.v_interp_p2_f16(vdst=2, vsrc_j=1, attr_packed=attr0, partial_src=2, high=False)
+
+        wave.v_interp_p1lv_f16(vdst=3, vsrc_i=0, attr_packed=attr0, high=True)
+        wave.v_interp_p2_f16(vdst=3, vsrc_j=1, attr_packed=attr0, partial_src=3, high=True)
+
+        for lane in range(32):
+            i_c = lane / 64.0
+            j_c = (31 - lane) / 64.0
+            _, want_lo = v_interp_p1lv_eval_ref(i_c, j_c, -2.0, 0.0, 4.0)
+            _, want_hi = v_interp_p1lv_eval_ref(i_c, j_c, 100.0, 200.0, 300.0)
+            self.assertEqual(wave.vgprs[lane][2], want_lo)
+            self.assertEqual(wave.vgprs[lane][3], want_hi)
+
+    def test_multi_sample_shader_translation_evaluation(self):
+        spv, _ = translate_with_flags("ps_p1lv_multi", P1LV_SHADER, dxbc=PS_ATTR01_DXBC)
+        y_lo = (-1.0, -1.0, 0.5)
+        y_hi = (0.5, 1.5, 2.5)
+        z_lo = (1.0, 3.0, 5.0)
+        w_raw = (0x1234, 0x5678, 0x9ABC)
+        attr0 = [(pack_f16(lo, hi), pack_f16(yl, yh), pack_f16(zl, 0.0), wr)
+                 for lo, hi, yl, yh, zl, wr in zip(LO, HI, y_lo, y_hi, z_lo, w_raw)]
+        attr1 = [(f32_bits(x), 0, 0, 0) for x in (-2.0, 2.0, 4.0)]
+
+        sample_points = [
+            (0.1, 0.1),
+            (0.2, 0.3),
+            (0.5, 0.2),
+            (0.0, 0.8),
+            (0.33, 0.33),
+            (0.7, 0.1),
+            (0.1, 0.6),
+            (0.25, 0.5),
+        ]
+        for i_c, j_c in sample_points:
+            with self.subTest(i=i_c, j=j_c):
+                bary_w = (1.0 - i_c - j_c, i_c, j_c)
+                inputs = support.varyings(spv, {0: attr0, 1: attr1}, bary_w)
+                out = support.run_fragment(spv, inputs=inputs)
+                mrt0, mrt1 = out["%out_mrt0"], out["%out_mrt1"]
+
+                _, want_x_lo = v_interp_p1lv_eval_ref(i_c, j_c, LO[0], LO[1], LO[2], clamp=False)
+                _, want_x_hi = v_interp_p1lv_eval_ref(i_c, j_c, HI[0], HI[1], HI[2], clamp=False)
+                _, want_y_lo = v_interp_p1lv_eval_ref(i_c, j_c, y_lo[0], y_lo[1], y_lo[2], clamp=True)
+                _, want_y_hi = v_interp_p1lv_eval_ref(i_c, j_c, y_hi[0], y_hi[1], y_hi[2], clamp=True)
+                want_z_lo_f32 = v_interp_p1lv_f16_ref(i_c, z_lo[0], z_lo[1]) + (z_lo[2] - z_lo[0]) * j_c
+
+                self.assertEqual(mrt0[0] & 0xFFFF, want_x_lo)
+                self.assertEqual(mrt0[1] & 0xFFFF, want_x_hi)
+                self.assertEqual(mrt0[2] & 0xFFFF, want_y_lo)
+                self.assertEqual(mrt0[3] & 0xFFFF, want_y_hi)
+                self.assertAlmostEqual(bits_to_f32(mrt1[0]), want_z_lo_f32, delta=1e-4)
+
+
 if __name__ == "__main__":
     unittest.main()
