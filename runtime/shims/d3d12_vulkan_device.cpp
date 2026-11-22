@@ -1,8 +1,9 @@
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
-// committed buffers and textures (2D, multisampled 2D, 3D), allocation info, CPU texture copies (WriteToSubresource/
-// ReadFromSubresource), a few feature queries. Everything else is a generated stub that reports itself once. See
-// docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and what is still open.
+// committed buffers and textures (2D, multisampled 2D, 3D) and their 1/2/3 variants, allocation info, CPU
+// texture copies (WriteToSubresource/ReadFromSubresource), a few feature queries. Everything else is a generated
+// stub that reports itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and what
+// is still open.
 #include "d3d12_com.h"
 
 #include "d3d12_stubs.h"  // generated
@@ -1481,6 +1482,70 @@ public:
         *count = n;
     }
 
+    // The 1/2/3 variants (D3D-28) are the same calls with newer arguments, answered as the PC runtime answers them
+    // (probed on an RTX 4090; docs/d3d12_vulkan.md section 3.2 has the table). The initial state or layout is not
+    // used: new textures are tracked as UNDEFINED and moved on first use, and buffers have no layout.
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource1(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
+                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                                       const D3D12_CLEAR_VALUE* clear,
+                                                       ID3D12ProtectedResourceSession* session, REFIID riid,
+                                                       void** out) override {
+        if (out) *out = nullptr;
+        if (session) return refuse_protected_session(1);
+        return CreateCommittedResource(heap, heap_flags, desc, state, clear, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource2(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
+                                                       const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES state,
+                                                       const D3D12_CLEAR_VALUE* clear,
+                                                       ID3D12ProtectedResourceSession* session, REFIID riid,
+                                                       void** out) override {
+        if (out) *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        if (session) return refuse_protected_session(2);
+        if (texture_mip_region(*desc)) return E_INVALIDARG;
+        const D3D12_RESOURCE_DESC base = resource_desc(*desc);
+        return CreateCommittedResource(heap, heap_flags, &base, state, clear, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource3(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
+                                                       const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
+                                                       const D3D12_CLEAR_VALUE* clear,
+                                                       ID3D12ProtectedResourceSession* session, UINT32 castable_count,
+                                                       const DXGI_FORMAT* castable, REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (!desc) return E_INVALIDARG;
+        if (session) return refuse_protected_session(3);
+        if (texture_mip_region(*desc)) return E_INVALIDARG;
+        // Enhanced barriers: a buffer has no layout, so its initial layout must be UNDEFINED.
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && layout != D3D12_BARRIER_LAYOUT_UNDEFINED)
+            return E_INVALIDARG;
+        // A count with a null array is no list (as on the PC runtime). A list needs RelaxedFormatCastingSupported,
+        // which the layer does not report (D3D12_OPTIONS12 is unanswered); a device without it refuses every list.
+        if (castable_count && castable) {
+            log_once("castable formats refused (no relaxed format casting); count", int(castable_count));
+            return E_INVALIDARG;
+        }
+        const D3D12_RESOURCE_DESC base = resource_desc(*desc);
+        return CreateCommittedResource(heap, heap_flags, &base, D3D12_RESOURCE_STATE_COMMON, clear, riid, out);
+    }
+
+    // Device9. The creator ID only groups queues for tools; one creator is as good as another here.
+    HRESULT STDMETHODCALLTYPE CreateCommandQueue1(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID, REFIID riid,
+                                                  void** out) override {
+        return CreateCommandQueue(desc, riid, out);
+    }
+
+    // Device8. A texture with a mip region gets the failure answer (every output all ones), as on the PC runtime;
+    // a buffer's mip region is ignored.
+    void STDMETHODCALLTYPE GetCopyableFootprints1(const D3D12_RESOURCE_DESC1* desc, UINT first, UINT count,
+                                                  UINT64 base, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows,
+                                                  UINT64* row_sizes, UINT64* total) override {
+        const D3D12_RESOURCE_DESC base_desc = desc ? resource_desc(*desc) : D3D12_RESOURCE_DESC{};
+        const bool usable = desc && !texture_mip_region(*desc);
+        GetCopyableFootprints(usable ? &base_desc : nullptr, first, count, base, layouts, rows, row_sizes, total);
+    }
+
     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
     // depth-stencil), subresources placed at D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, block-compressed sizes rounded up to whole blocks, depth-stencil
     // formats as two planes. d3d12_vulkan_device_test compares every output with the PC runtime's.
@@ -1940,6 +2005,26 @@ private:
         state_.copy_memory_to_image = to_image;
         state_.copy_image_to_memory = to_memory;
         state_.transition_image_layout = transition;
+    }
+
+    // The layer reports no protected-session support, so a session is refused, as D3D12 refuses one on a device
+    // without D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT. `variant` is the method's number.
+    static HRESULT refuse_protected_session(int variant) {
+        log_once("protected resource session refused (not supported) by CreateCommittedResource", variant);
+        return E_INVALIDARG;
+    }
+
+    // D3D12_RESOURCE_DESC1 is D3D12_RESOURCE_DESC plus SamplerFeedbackMipRegion.
+    static D3D12_RESOURCE_DESC resource_desc(const D3D12_RESOURCE_DESC1& desc) {
+        return {desc.Dimension, desc.Alignment, desc.Width,      desc.Height, desc.DepthOrArraySize,
+                desc.MipLevels, desc.Format,    desc.SampleDesc, desc.Layout, desc.Flags};
+    }
+
+    // A sampler-feedback mip region on a texture, which needs a DXGI_FORMAT_SAMPLER_FEEDBACK_* resource the layer
+    // does not have. The PC runtime ignores the region on a buffer.
+    static bool texture_mip_region(const D3D12_RESOURCE_DESC1& desc) {
+        const D3D12_MIP_REGION& region = desc.SamplerFeedbackMipRegion;
+        return desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (region.Width || region.Height || region.Depth);
     }
 
     DeviceState state_;

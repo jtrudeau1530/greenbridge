@@ -212,6 +212,25 @@ What is implemented (all of it testable without the game):
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
+  - the `1`/`2`/`3` variants as wrappers over the methods above (D3D-28): `CreateCommittedResource1/2/3`,
+    `CreateCommandQueue1` and `GetCopyableFootprints1`. `D3D12_RESOURCE_DESC1` drops to `D3D12_RESOURCE_DESC`,
+    and the initial state or `D3D12_BARRIER_LAYOUT` is not used, because new textures start `UNDEFINED` and move
+    on first use. The newer arguments are answered as the PC runtime answers them. `d3d12_method_variants_test`
+    compares each answer below with the host runtime live, measured on an RTX 4090 (driver 621.14):
+
+    | Argument | Answer |
+    |---|---|
+    | a protected resource session | `E_INVALIDARG`; the layer reports no `D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT` |
+    | `SamplerFeedbackMipRegion` on a texture | `E_INVALIDARG` from `CreateCommittedResource2/3`; `GetCopyableFootprints1` returns its failure answer (every output all ones) |
+    | `SamplerFeedbackMipRegion` on a buffer | ignored |
+    | a buffer's initial layout other than `UNDEFINED` | `E_INVALIDARG` |
+    | a castable-format count with a null list | no list (`S_OK`) |
+    | a castable-format list | `E_INVALIDARG`: a list needs `RelaxedFormatCastingSupported`, and the layer does not answer `D3D12_OPTIONS12`. A device without relaxed casting refuses every list (ezwinxdlmao's probe on a Radeon 680M, in #156). With it, the RTX 4090 accepts same-size casts and refuses other sizes and any list on a buffer |
+    | `CreateCommandQueue1`'s creator ID | ignored |
+
+    `CreatePlacedResource1/2` and `CreateHeap1` wait for #286's base methods. `CreateSampler2` builds on
+    `CreateSampler` and comes separately, since its border-colour and non-normalized-coordinate flags need their
+    own measured answers.
 
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
 
@@ -331,6 +350,14 @@ and any validation error fails them.
   run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
   round trip and a buffer region. `GetCopyableFootprints` is compared with the PC runtime's, and a short run
   repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
+- `d3d12_method_variants_test`: each variant against the method it wraps, on the device directly (the proxy's
+  slot 76 is the Xbox texture method, not `CreateCommittedResource3`). It runs 12 creation cases (buffers on the
+  three heap types, textures, a volume, a multisampled target, and three shapes the base refuses) through every
+  `CreateCommittedResource` variant, which must give the same result, description, heap properties and `Map`
+  answer. It runs the edge cases in the table above and compares them with the host's PC runtime when there is
+  one; protected sessions and castable lists are checked on the layer alone. `GetCopyableFootprints1` must match
+  `GetCopyableFootprints` field by field, including the failure answer. A texture from `CreateCommittedResource3`
+  is uploaded, copied back and compared on a queue from `CreateCommandQueue1`.
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.
@@ -746,7 +773,8 @@ The trace will enumerate them.
   the layer needs a detile step or a matching tiled image. **Open**; the ABI value is known, the data layout is not.
 - Formats: a `DXGI_FORMAT` → `VkFormat` table, including sRGB and typeless variants. Typeless resources get a
   concrete image format plus `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and a `VK_KHR_image_format_list` when views cast
-  within the family; unsupported casts are logged and fall back to the resource format. Depth/stencil, BCn and
+  within the family; unsupported casts are logged and fall back to the resource format. `CreateCommittedResource3`'s
+  castable-format lists are refused for now (section 3.2's device list). Depth/stencil, BCn and
   packed formats map directly; any format the device rejects is a hard error with the DXGI value.
 - `Map`/`Unmap`: upload/readback buffers map their host-visible memory; default-heap resources return
   `E_INVALIDARG` as D3D12 does. A texture in a CPU-visible custom heap maps only with a null pointer (its layout is

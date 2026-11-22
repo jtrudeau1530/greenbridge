@@ -454,6 +454,12 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
 
+    # The 1/2/3 method variants (D3D-28) against the methods they wrap, on the Vulkan device directly.
+    add_executable(d3d12_method_variants_test test/d3d12_method_variants_test.cpp)
+    target_link_libraries(d3d12_method_variants_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_method_variants_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_method_variants_test PRIVATE /W4 /permissive- /utf-8)
+
     # Descriptors through the proxy: copies between heaps, what texture views and samplers write into their slots,
     # and (where glslangValidator is found) a compute shader the test runs on the device's bindless set, which
     # finds a T# and an S# through the hash table and samples. The shader is GLSL, compiled here.
