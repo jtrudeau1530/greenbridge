@@ -235,9 +235,18 @@ What is implemented (all of it testable without the game):
   lists this conversion as an exception to round-to-nearest-even without fixing ties. WARP and AMD's D3D12 driver
   were measured to round the float product to nearest even (2.5 gives 2, 0.5 gives 0), which the tolerance
   allows; NVIDIA's D3D12 driver (and a native D24 clear in its Vulkan driver) breaks some of those ties the other way;
-  the layer follows WARP and AMD there, a measurement and not a rule of the spec. Not covered: a depth test or
-  a depth write by the rasteriser works on D32 and may differ from D24 by up to the 24-bit step, and a depth
-  texture sampled in a shader sees the float; only copies, clears and readbacks are bit-exact.
+  the layer follows WARP and AMD there, a measurement and not a rule of the spec. **Draws** (D3D-309,
+  `src/depth24_fragment.h`): a single-sampled graphics pipeline with depth enabled and a D24 DSV stored as D32 has
+  its pixel stage write `FragDepth = quantise(z + bias)`, with D3D's bias in D24 units (`DepthBias / (2^24 - 1) +
+  SlopeScaledDepthBias * max(|dz/dx|, |dz/dy|)`, clamped by `DepthBiasClamp`) and the same quantisation as
+  `depth24_convert.comp`, so depth tests and stored depth match D24; the rasteriser's bias is off for these
+  pipelines (so a clamp needs no `depthBiasClamp` there). A pipeline without a pixel shader, with or without a
+  geometry shader, gets a built-in one; a shader that writes its own depth has it quantised, unbiased, as in D3D. The slope comes from the derivatives of the
+  interpolated depth, so a slope-scaled bias can land up to two 24-bit steps from D24 hardware's plane-exact one
+  (`d3d12_depth24_draw_test`). Not covered: multisampled targets (a `FragDepth` write is per pixel; they keep float
+  bias and precision, logged), pixel shaders with `EarlyFragmentTests` (which ignore a `FragDepth` write; logged), a
+  viewport depth range narrower than the biased depth (D3D clamps before quantising), and early depth testing, which
+  a `FragDepth` write turns off for these pipelines. A depth texture sampled in a shader still sees the float.
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
   subresource into a single-sampled one of the same size and format. Integer colour formats in the requested
   format or either resource are refused at recording; `Close` fails. `ResolveSubresourceRegion` uses the same
