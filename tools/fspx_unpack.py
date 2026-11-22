@@ -178,6 +178,7 @@ def main(argv=None) -> int:
         disasm = shader_disasm
         os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
     index, bad = [], 0
+    used_names = set()
     for path in a.files:
         with open(path, "rb") as f:
             data = f.read()
@@ -197,6 +198,12 @@ def main(argv=None) -> int:
                 print(f"{name}: FSPX status {status}", file=sys.stderr)
                 bad += 1
                 continue
+            base_name = name
+            number = 1
+            while name.casefold() in used_names:
+                number += 1
+                name = f"{base_name}_{number}"
+            used_names.add(name.casefold())
             meta, blob = got
             stage = psv_stage(dxbc_parts(container)) if container else None
             meta["source"] = {"file": os.path.basename(path), "offset": off}
@@ -211,19 +218,19 @@ def main(argv=None) -> int:
                     f.write(container)
             with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
                 f.write(blob[6])
-            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(meta, f, indent=1)
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
                 asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
                 entry["invalid_words"] = invalid
-                with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8") as f:
+                with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
                     f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
                     f.write(asm)
                     if err.strip():
                         f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
             index.append(entry)
-    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=1)
     print(f"{len(index)} FSPX program(s) unpacked to {a.out}" + (f", {bad} input(s) failed" if bad else ""))
     return 1 if bad else 0

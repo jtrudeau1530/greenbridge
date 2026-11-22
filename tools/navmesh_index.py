@@ -198,7 +198,7 @@ def _make_parent(path):
 
 def write_outputs(rows, summary, out_path, csv_path):
     _make_parent(out_path)
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump({"summary": summary, "pages": rows}, f, indent=1)
     written = []
     if csv_path:

@@ -240,6 +240,17 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // Translated shaders declare a 144-byte push-constant block (user SGPRs, heap base, code base; see VKH_SGPRS /
+    // VKH_HEAP); --mesh-compute modules and their vertex shaders add the output address (152 bytes). A device with
+    // fewer bytes (128, the Vulkan minimum, as on some Intel Arc drivers and AMD's Windows driver for RDNA2 iGPUs)
+    // cannot take that range: declaring it anyway is invalid, and there a shader reading past the limit crashed or
+    // hung the device. 77, as vk_texture_test and vk_bindless_test: a device limit, not a wrong result (D3D-14).
+    const uint32_t pc_bytes = mesh_compute ? 152u : 144u;
+    if (props.limits.maxPushConstantsSize < pc_bytes) {
+        std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n", pc_bytes,
+                     props.limits.maxPushConstantsSize);
+        return 77;
+    }
     // VKH_MESH=1: the first shader is a mesh shader (VK_EXT_mesh_shader), drawn with vkCmdDrawMeshTasksEXT(1,1,1).
     const bool mesh = !mesh_compute && (group_readback || std::getenv("VKH_MESH") != nullptr);
     VkPhysicalDeviceMeshShaderFeaturesEXT meshf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -454,12 +465,11 @@ int main(int argc, char** argv) {
     VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
-    // Translated shaders declare a 144-byte push-constant block (user SGPRs, heap base, code base; see VKH_SGPRS /
-    // VKH_HEAP); --mesh-compute modules and their vertex shaders add the output address (152 bytes).
+    // The push-constant block (pc_bytes, checked against the device limit above).
     const VkShaderStageFlags pcs = (mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
                                    VK_SHADER_STAGE_FRAGMENT_BIT | (gs_path ? VK_SHADER_STAGE_GEOMETRY_BIT : 0) |
                                    (mesh_compute ? VK_SHADER_STAGE_COMPUTE_BIT : 0);
-    VkPushConstantRange pcr{pcs, 0, mesh_compute ? 152u : 144u};
+    VkPushConstantRange pcr{pcs, 0, pc_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
@@ -564,7 +574,6 @@ int main(int argc, char** argv) {
         std::memcpy(pc, shifts, sizeof(shifts));
     }
     auto push = reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"));
-    const uint32_t pc_bytes = mesh_compute ? 152u : 144u;
     if (mesh_compute) {
         // The mesh shader as compute, then make its stores visible to the vertex shader's reads.
         LOADD(vkCmdDispatch); LOADD(vkCmdPipelineBarrier);
@@ -591,7 +600,11 @@ int main(int argc, char** argv) {
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     push(cmd, pl, pcs, 0, pc_bytes, pc);
-    if (mesh_compute)
+    // VKH_VERTICES=<n>: draw n vertices instead of one triangle, so a vertex shader fills whole waves (TEST-251).
+    const char* vertices_env = std::getenv("VKH_VERTICES");
+    if (const unsigned vertices = vertices_env ? unsigned(std::strtoul(vertices_env, nullptr, 10)) : 0; vertices && !mesh)
+        vkCmdDraw(cmd, vertices, 1, 0, 0);
+    else if (mesh_compute)
         vkCmdDraw(cmd, uint32_t(mesh_groups * mesh_prims * 3), 1, 0, 0);
     else if (mesh)
         reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT"))(cmd, groups[0], groups[1], groups[2]);

@@ -339,7 +339,10 @@ the audio itself is not. See the ground rules in [design.md](design.md#ground-ru
 
 ## What has been checked
 
-- 300 random Opus streams decode with ffmpeg with no errors; their lengths match the declared sample counts.
+- 20 real Opus streams (6 at 48 kHz, 14 at 32 kHz) decode with ffmpeg to exactly their declared
+  per-channel frame counts after the EOS fix; 300 random streams decode with no errors. The earlier
+  "lengths match" check read the granule-derived duration, not decoded frames, so it did not catch
+  the backwards-EOS case.
 - All 1,818 XMA2 streams decode after `rpf9dump xma`.
 - A 4-channel streamed-music bank gives four 42.0 s mono channels with real levels and no decoder errors.
 - A 1-channel streamed-music descriptor can carry stereo Opus packets; it exports as one stereo Ogg with the

@@ -159,7 +159,7 @@ def main():
     # Other tools create the output parent too: a long harvest must not be lost to a missing folder.
     try:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, "w", encoding="utf-8") as f:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(d, f)
     except OSError as e:
         print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)

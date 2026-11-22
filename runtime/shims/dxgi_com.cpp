@@ -29,9 +29,7 @@ bool valid_flip_buffer_count(UINT count) {
 VkFormat dxgi_to_vk_format(DXGI_FORMAT fmt) {
     switch (fmt) {
     case DXGI_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
     case DXGI_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
     case DXGI_FORMAT_R10G10B10A2_UNORM: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
     default: return VK_FORMAT_UNDEFINED;
@@ -126,17 +124,12 @@ public:
         if (parent_) parent_->Release();
     }
 
-    bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc) {
+    bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, VkFormat vk_fmt) {
         hwnd_ = hwnd;
         flags_ = desc.Flags;
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
-        VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
-        if (desc.Format != DXGI_FORMAT_UNKNOWN) {
-            vk_fmt = dxgi_to_vk_format(desc.Format);
-            if (vk_fmt == VK_FORMAT_UNDEFINED) return false;
-        }
         const bool allow_tearing = (flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
         if (!swapchain_.create(hwnd, w, h, vk_fmt, desc.BufferCount, allow_tearing)) return false;
         if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
@@ -241,7 +234,7 @@ public:
         VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
         if (fmt != DXGI_FORMAT_UNKNOWN) {
             vk_fmt = dxgi_to_vk_format(fmt);
-            if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_UNSUPPORTED;
+            if (vk_fmt == VK_FORMAT_UNDEFINED) return E_INVALIDARG;
         }
         constexpr UINT creation_only_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
                                              DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
@@ -789,8 +782,10 @@ public:
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
         if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
+        const VkFormat vk_fmt = dxgi_to_vk_format(desc->Format);
+        if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
         auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
-        if (!sc->init(hwnd, *desc)) {
+        if (!sc->init(hwnd, *desc, vk_fmt)) {
             sc->Release();
             return E_FAIL;
         }

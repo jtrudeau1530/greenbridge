@@ -35,6 +35,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   RDNA2 ISA's swizzled buffer_offset and its OOB_SELECT 3 rule (docs/design.md Swizzled buffer addressing): the
   exact addresses loaded and stored for dword, multi-dword and typed accesses, each with a literal and a run-time
   V#, and the GPU fixture `cs_buf_swizzle` on 64 threads.
+- `test_tbuffer_store.py` runs the GPU test `cs_tbuffer_store` (13 `tbuffer_store_format_*` stores through V#s
+  whose format differs from the instruction's, or is 0) and asserts the 52 words `check.py` expects, measured natively on a
+  Radeon 680M; also the default `BUF_FMT_8_UNORM` byte, a format without an encoder staying `Unsupported`, and the
+  store's data VGPRs counting as reads.
 - `test_scalar_mem_smem.py` runs the code `Gen.scalar_load` emits with its own small evaluator (64-bit
   addresses, forward selection constructs) and asserts the SGPR values and the addresses read, including the
   measured SMEM truncation, `s_buffer_load` `NUM_RECORDS` bound and signed `s_load` immediate.
