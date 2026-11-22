@@ -667,14 +667,16 @@ def decode_rsc8(data, *, stream_id=None, deep=True):
 def parse_adat_header_bytes(hb, bank_offset, file_size):
     """Parse one little-endian AWC (`ADAT`) bank header from bytes `hb`.
 
-    Returns a bank descriptor dict or `None` if malformed or out of bounds.
+    Returns a bank descriptor dict or `None` if malformed or out of bounds. A zero-stream bank
+    (`count == 0`) is valid when the flag-selected tables end exactly at the declared header size;
+    the package's `audio.rpf` carries two such 20-byte banks that the encrypted TOC lists as
+    `.awc` entries.
     """
     if bank_offset < 0 or len(hb) < 16 or hb[:4] != ADAT_MAGIC:
         return None
     flags, count, hdr_sz = struct.unpack_from("<III", hb, 4)
     if (
-        count == 0
-        or count > MAX_BANK_STREAMS
+        count > MAX_BANK_STREAMS
         or hdr_sz < 16
         or hdr_sz > MAX_HEADER_BYTES
         or hdr_sz > len(hb)
@@ -688,7 +690,11 @@ def parse_adat_header_bytes(hb, bank_offset, file_size):
         pos += count * 2
     if flags & 0x00200000:
         pos += (count + 1) * 4
-    if pos + count * 4 > hdr_sz:
+    if count == 0:
+        # No stream ids and no tag rows follow, so the tables must fill the header exactly.
+        if pos != hdr_sz:
+            return None
+    elif pos + count * 4 > hdr_sz:
         return None
 
     streams = []
@@ -731,7 +737,10 @@ def parse_adat_header_bytes(hb, bank_offset, file_size):
 
 
 def parse_adat_at_file(fh, bank_offset, file_size):
-    """Read and parse one `ADAT` bank header at `bank_offset` in open binary file `fh`."""
+    """Read and parse one `ADAT` bank header at `bank_offset` in open binary file `fh`.
+
+    Zero-stream banks are validated by :func:`parse_adat_header_bytes`.
+    """
     if bank_offset < 0 or bank_offset + 16 > file_size:
         return None
     fh.seek(bank_offset)
@@ -740,8 +749,7 @@ def parse_adat_at_file(fh, bank_offset, file_size):
         return None
     _, count, hdr_sz = struct.unpack_from("<III", hdr16, 4)
     if (
-        count == 0
-        or count > MAX_BANK_STREAMS
+        count > MAX_BANK_STREAMS
         or hdr_sz < 16
         or hdr_sz > MAX_HEADER_BYTES
         or bank_offset + hdr_sz > file_size
