@@ -550,12 +550,13 @@ def segment(rows, k):
     return rows[k]["offset"], rows[k]["stored"], False
 
 
-def group(m, rows):
+def group(m, rows, *, first_row_only: bool = False):
     """-> ([(root index, [stream indices or gap pages])], unresolved count by reason, gap pages by kind). A
     dictionary takes the page map's system page count of back-to-back streams. When the last page is not the next
-    listed stream, the bytes right after the stream are tried (`_gap_page`); otherwise the root is reported."""
+    listed stream, the bytes right after the stream are tried (`_gap_page`); otherwise the root is reported.
+    With first_row_only, later rows supply continuation pages but cannot start other dictionaries."""
     out, unresolved, taken, gaps = [], collections.Counter(), set(), collections.Counter()
-    for i, row in enumerate(rows):
+    for i, row in enumerate(rows[:1] if first_row_only else rows):
         if i in taken or row["signature"] != "zero-prefix":
             continue
         data = _inflate(m, row)
@@ -803,7 +804,7 @@ def scan(path, start=None, limit=None, jobs=1, progress=None, budget=None):
 def decode_one(path, offset, frames):
     rows, _walk = anim_index.scan_rpf(path, offset, 64 << 20)
     with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        groups, _unresolved, _gaps = group(m, rows[:4])
+        groups, _unresolved, _gaps = group(m, rows, first_row_only=True)
     if not groups or rows[groups[0][0]]["offset"] != offset:
         raise ValueError(f"no clip dictionary starts at 0x{offset:x}")
     with open(path, "rb") as fh:
