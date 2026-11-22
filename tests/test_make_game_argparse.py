@@ -347,7 +347,7 @@ class WavValidationTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     @patch("make_game.ensure_submodule")
     def test_preflight_wav_requires_ffmpeg_when_assets_included(self, _mock_submodule):
         with patch("shutil.which", return_value=None):
@@ -357,7 +357,7 @@ class WavValidationTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 1)
                 self.assertIn("ffmpeg (needed for --wav)", mock_err.getvalue())
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     @patch("make_game.ensure_submodule")
     def test_preflight_wav_passes_when_ffmpeg_present(self, _mock_submodule):
         def fake_which(cmd):
@@ -371,7 +371,7 @@ class WavValidationTest(unittest.TestCase):
                 with patch("os.makedirs"):
                     make_game.preflight(stages=["assets"], work="C:/dummy_work", wav=True)
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     def test_preflight_wav_without_assets_does_not_require_ffmpeg(self):
         def fake_which(cmd):
             if cmd in ("spirv-as", "spirv-val"):
@@ -386,7 +386,7 @@ class WavValidationTest(unittest.TestCase):
                         # Assets stage not included; ffmpeg is not required even though wav=True
                         make_game.preflight(stages=["shaders"], work="C:/dummy_work", wav=True)
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     @patch("make_game.ensure_submodule")
     def test_preflight_assets_without_wav_does_not_require_ffmpeg(self, _mock_submodule):
         def fake_which(cmd):
@@ -547,7 +547,7 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
                             self.assertEqual(ctx.exception.code, 1)
                             self.assertIn("--out and --work must be outside the game folder", mock_err.getvalue())
 
-    @patch.object(sys, "version_info", (3, 11, 0))
+    @patch.object(sys, "version_info", (3, 12, 0))
     def test_preflight_space_calculation_and_failure(self):
         # Shaders needs 30GB, Assets needs 300GB -> 330GB total
         def fake_which(cmd):
