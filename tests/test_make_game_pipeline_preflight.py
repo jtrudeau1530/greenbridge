@@ -73,11 +73,27 @@ class PipelinePreflightTest(unittest.TestCase):
             make_game.preflight(["pipelines"], self.work)
 
     def test_runtime_stage_builds_the_checker_so_it_is_not_required(self):
-        # On Windows runtime produces vk_pipeline_check.exe, so a combined build must not fail preflight.
+        # On Windows runtime produces vk_pipeline_check.exe when the Vulkan SDK is installed.
         with mock.patch("os.name", "nt"), \
+                mock.patch.dict(os.environ, {"VULKAN_SDK": r"C:\Vulkan"}), \
                 mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
                 mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
             make_game.preflight(["runtime", "pipelines"], self.work)
+
+    def test_runtime_without_vulkan_sdk_does_not_build_the_checker(self):
+        # scripts/build_runtime.ps1 builds vk_pipeline_check.exe only 'if defined VULKAN_SDK': a combined
+        # Windows run without it would still spend hours in the shaders stage and fail in pipelines.
+        for sdk in (None, ""):
+            with self.subTest(sdk=sdk), mock.patch("os.name", "nt"), \
+                    mock.patch.dict(os.environ), \
+                    mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
+                    mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
+                if sdk is None:
+                    os.environ.pop("VULKAN_SDK", None)
+                else:
+                    os.environ["VULKAN_SDK"] = sdk
+                err = self.assert_preflight_fails(["runtime", "pipelines"], "VULKAN_SDK")
+                self.assertIn("vk_pipeline_check", err)
 
     def test_missing_checker_is_listed_with_other_missing_prerequisites(self):
         with mock.patch("make_game.tool_available", return_value=False), \

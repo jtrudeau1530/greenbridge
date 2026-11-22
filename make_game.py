@@ -228,9 +228,13 @@ def default_out() -> str:
 MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
 
-def pipeline_check_prerequisite() -> str:
+def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
     """Why the pipelines stage can't run yet. Kept here so preflight can fail before a long shader build;
-    pipelines() prints its own, more detailed message when the stage is reached."""
+    pipelines() prints its own, more detailed message when the stage is reached. On Windows the runtime stage
+    only builds the checker when VULKAN_SDK is set (scripts/build_runtime.ps1)."""
+    if runtime_selected:
+        return ("VULKAN_SDK (the runtime stage builds vk_pipeline_check only when it is set, and the pipelines "
+                "stage needs that executable)")
     return ("vk_pipeline_check (needed by the pipelines stage; run the runtime stage on Windows, or build it "
             "with CMake as described in README.md)")
 
@@ -265,10 +269,12 @@ def preflight(stages: list, work: str, wav: bool = False) -> None:
         ensure_submodule()
     if "runtime" in stages and not visual_cpp_tools_ok():
         missing.append("Visual Studio 2022 with 'Desktop development with C++'")
-    # The pipelines stage needs a checker the runtime stage builds. Without this check a build with
-    # --stages shaders,pipelines spends hours translating shaders only to fail at the very end.
-    if "pipelines" in stages and "runtime" not in stages and not pipeline_check_exe():
-        missing.append(pipeline_check_prerequisite())
+    # The pipelines stage needs a checker the runtime stage builds (on Windows only with VULKAN_SDK set).
+    # Without this check a build with shaders and pipelines spends hours before failing at the very end.
+    if "pipelines" in stages and not pipeline_check_exe():
+        runtime_building = "runtime" in stages and os.name == "nt"
+        if not runtime_building or not os.environ.get("VULKAN_SDK"):
+            missing.append(pipeline_check_prerequisite(runtime_building))
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
     need_gb = sum(MIN_FREE_GB.get(s, 0) for s in stages)
