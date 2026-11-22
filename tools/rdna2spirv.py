@@ -8774,8 +8774,8 @@ class Gen:
     def attribute(self, n, comp, flat=False, half=None, ij=None):
         """Component `comp` of fragment input attribute n (declared as a vec4 Input at Location n).
 
-        An attribute in per_vertex (read by a *_f16 interp somewhere) is a PerVertexKHR vec4[3] of the producer's
-        raw 32-bit words, which hold two f16 (low, high). `half` 0/1 decodes that f16 of each vertex, None keeps the
+        An attribute in per_vertex is a PerVertexKHR vec4[3] of the producer's raw 32-bit words. For a packed
+        attribute, `half` 0/1 decodes its low/high f16 at each vertex; None keeps the
         word as an f32; the three values are then weighted as AMD does, P0 + i(P1 - P0) + j(P2 - P0) with i, j =
         BaryCoordKHR.y, .z, or vertex 0's taken when `flat`. `ij` overrides the weights with the given SPIR-V
         values (computed-I/J sites, SHADER-177: the pair the program wrote into the operand registers).
@@ -10157,7 +10157,7 @@ def assemble(gen):
                 gvars += ["%out_layer = OpVariable %_ptr_Output_int Output"]
             if gen.uses_viewport:
                 gvars += ["%out_viewport = OpVariable %_ptr_Output_int Output"]
-    if gen.per_vertex:      # the three vertices' raw words of a location a *_f16 interp reads (Gen.attribute)
+    if gen.per_vertex:      # the three vertices' raw words for Gen.attribute
         types += [f"%arr_pv4 = OpTypeArray %v4float {gen.cu(3)}", "%_ptr_Input_pv4 = OpTypePointer Input %arr_pv4"]
     gvars += [f"{n} = OpVariable {'%_ptr_Input_pv4' if k in gen.per_vertex else '%_ptr_Input_v4'} Input"
               for n, k in gen.inputs.items()]
@@ -11401,13 +11401,20 @@ def translate(path):
         if unexplained:
             raise Unsupported("PS system inputs")
         g.frag_inputs = layout
-        f16_read = {x["a"] for i in insns if base_op(i["op"]) in ("v_interp_p1ll_f16", "v_interp_p1lv_f16",
-                                                                  "v_interp_p2_f16")
-                    for x in i["args"] if x["k"] == "attr"}
+        attr_reads: dict[str, set[int]] = defaultdict(set)
+        for ins in insns:
+            op = base_op(ins["op"])
+            if op.startswith("v_interp_"):
+                attr_reads[op].update(arg["a"] for arg in ins["args"] if arg["k"] == "attr")
+        f16_read = attr_reads["v_interp_p1ll_f16"] | attr_reads["v_interp_p1lv_f16"] | attr_reads["v_interp_p2_f16"]
+        mixed_f32 = attr_reads["v_interp_mov_f32"] & (attr_reads["v_interp_p1_f32"] | attr_reads["v_interp_p2_f32"])
+        if mixed_f32 and (BARY_FALLBACK or F16_HALVES):
+            raise Unsupported("flat and interpolated reads of one f32 attribute need per-vertex inputs")
         if F16_HALVES:      # decoded halves from the producer: no per-vertex inputs (and no barycentrics)
             g.f16_halves = f16_read
         elif not BARY_FALLBACK:
-            g.per_vertex = f16_read
+            # A smooth input alone cannot supply P0 for a MOV reading the same location.
+            g.per_vertex = f16_read | mixed_f32
         for r in layout:
             g.cu(r)
         # FSSM pixel-input table (tools/fssm_header.py): the authoritative interpolant list. Position i of the
