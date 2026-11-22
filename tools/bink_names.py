@@ -300,11 +300,12 @@ def main(argv=None):
     ap.add_argument("--max-skip", type=int, default=MAX_SKIP, help="most list entries skipped in a row")
     ap.add_argument("--out", help="names.csv or names.json; default is a summary only")
     a = ap.parse_args(argv)
-    for path in [a.source, *a.mount] + ([a.pins] if a.pins else []):
+    inputs = [a.source, *a.mount] + ([a.pins] if a.pins else [])
+    for path in inputs:
         if not os.path.exists(path):
             print(f"bink_names: error: {path}: no such file or directory", file=sys.stderr)
             return 2
-    if a.out and any(bink_index.same_output_path(p, a.out) for p in [a.source, *a.mount]):
+    if a.out and any(bink_index.same_output_path(p, a.out) for p in inputs):
         ap.error("--out must not overwrite an input")
 
     names = read_mount_lists(a.mount)
