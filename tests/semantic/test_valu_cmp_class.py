@@ -915,5 +915,100 @@ class TestValuCmpClassSIMD(unittest.TestCase):
         self.assertEqual(res_mask, 0x3FF)
 
 
+class TestValuCmpClassRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_dst_equals_src1_aliasing_scalar(self) -> None:
+        # Test dst == src1: s4 is both the mask input and the destination register
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, POS_ZERO_F32)
+        interp.write_reg_u32(RegKind.SGPR, 4, CLASS_POS_ZERO)  # mask = 0x040
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SGPR, 4, count=1),
+            src0=Register(RegKind.VGPR, 0, count=1),
+            src1=Register(RegKind.SGPR, 4, count=1),
+            encoding=Encoding.VOP3,
+        )
+        res = interp.step(inst)
+        self.assertTrue(res)
+        # Destination s4 now holds the result mask 1 (latching src1 occurred before writeback)
+        self.assertEqual(interp.read_reg_u32(RegKind.SGPR, 4), 1)
+
+    def test_dst_pair_overlaps_src1_scalar(self) -> None:
+        # Test 64-bit dst s[4:5] where src1 is s5 (high word of dst)
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u64(RegKind.VGPR, 2, QNAN_F64)
+        interp.write_reg_u32(RegKind.SGPR, 5, CLASS_MASK_NAN)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            src1=Register(RegKind.SGPR, 5, count=1),
+            encoding=Encoding.VOP3,
+        )
+        res = interp.step(inst)
+        self.assertTrue(res)
+        # s[4:5] holds 64-bit result mask 1 (low=1, hi=0)
+        self.assertEqual(interp.read_reg_u64(RegKind.SGPR, 4), 1)
+
+    def test_src0_vgpr_immutability(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # Prepopulate VGPR pair with specific double pattern
+        canary = 0xDEADBEEFCAFEBAAD
+        interp.write_reg_u64(RegKind.VGPR, 10, canary)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Register(RegKind.VGPR, 10, count=2),
+            src1=Immediate(CLASS_MASK_ALL),
+        )
+        interp.step(inst)
+        # Source VGPR must never be modified by comparison
+        self.assertEqual(interp.read_reg_u64(RegKind.VGPR, 10), canary)
+
+    def test_unrelated_registers_preserved(self) -> None:
+        interp = ScalarVALUInterpreter()
+        for i in range(20, 30):
+            interp.write_reg_u32(RegKind.VGPR, i, 0x12340000 + i)
+            interp.write_reg_u32(RegKind.SGPR, i, 0x56780000 + i)
+
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Immediate(0.0),
+            src1=Immediate(CLASS_MASK_ZERO),
+        )
+        interp.step(inst)
+
+        for i in range(20, 30):
+            self.assertEqual(interp.read_reg_u32(RegKind.VGPR, i), 0x12340000 + i)
+            self.assertEqual(interp.read_reg_u32(RegKind.SGPR, i), 0x56780000 + i)
+
+    def test_simd_aliasing_dst_sgpr_pair_equals_src1(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        # s4 holds mask for CLASS_MASK_INF
+        simd.write_lane_reg_u32(0, RegKind.SGPR, 4, CLASS_MASK_INF)
+
+        # All lanes hold +INF
+        for lane in range(64):
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 2, POS_INF_F64)
+
+        # dst is s[4:5], src1 is s4
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F64,
+            dst=Register(RegKind.SGPR, 4, count=2),
+            src0=Register(RegKind.VGPR, 2, count=2),
+            src1=Register(RegKind.SGPR, 4, count=1),
+            encoding=Encoding.VOP3,
+        )
+        res_mask = simd.step(inst)
+        self.assertEqual(res_mask, MASK64)
+        self.assertEqual(simd.read_lane_reg_u64(0, RegKind.SGPR, 4), MASK64)
+
+
 if __name__ == "__main__":
     unittest.main()
