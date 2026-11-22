@@ -1,0 +1,657 @@
+"""Synthetic unit tests for tools/rsc8_audio.py (ASSET-56).
+
+    python -I tests/test_rsc8_audio.py
+
+Every byte is synthesized by the test. No game file, game audio, or game asset name is used.
+"""
+import csv
+import json
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "rsc8_audio.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+
+import rsc8_audio  # noqa: E402
+
+
+def _align16(n):
+    return (n + 15) & ~15
+
+
+def build_synthetic_rsc8(
+    *,
+    version=8001,
+    stream_hash=0x20112233,
+    frames=142,
+    block_frames=None,
+    tracks_before_anim=False,
+    fps=60,
+    track_count=90,
+    inline_dict_name=False,
+    extra_bool_prop=False,
+    anim_payload_len=64,
+):
+    """Build a synthetically valid RSC8 v8001 facial/lip-sync clip matching the measured layout."""
+    if block_frames is None:
+        block_frames = [frames]
+    blk_cnt = len(block_frames)
+    block_payloads = [anim_payload_len + bi * 16 for bi in range(blk_cnt)]
+    block_sizes = [32 + pl for pl in block_payloads]
+    tracks_bytes = track_count * 12
+
+    # Place tracks before anim blocks if requested (matches the 7 reordered real-corpus clips),
+    # otherwise place anim blocks starting at virt+0xB0 followed by the sorted track directory.
+    block_voffs = []
+    cur = 0xB0
+    if tracks_before_anim:
+        tracks_voff = cur
+        cur = _align16(cur + tracks_bytes)
+        for bsz in block_sizes:
+            block_voffs.append(cur)
+            cur = _align16(cur + bsz)
+    else:
+        for bsz in block_sizes:
+            block_voffs.append(cur)
+            cur = _align16(cur + bsz)
+        tracks_voff = cur
+        cur = _align16(cur + tracks_bytes)
+
+    props_voff = cur
+
+    prop_count = 5 if extra_bool_prop else 4
+    props_tail_off = 0x70 + prop_count * 0x48
+    # Typed attributes: string (0x40), guid (0x20), optional bool (0x0C), fps int (0x0C), lead_in float (0x0C)
+    attrs_size = 0x40 + 0x20 + (0x0C if extra_bool_prop else 0) + 0x0C + 0x0C
+    props_size = props_tail_off + attrs_size
+
+    clip_voff = _align16(props_voff + props_size)
+    anim_dict_voff = clip_voff + 0xA0
+    anim_desc_voff = anim_dict_voff + 0x70
+    hash_map_voff = anim_desc_voff + 0x70
+    clip_map_voff = hash_map_voff + 0x60
+    tail_voff = clip_map_voff + 0x60
+
+    # Tail sub-allocations
+    dict_str_voff = tail_voff + 0x00          # 0x20 bytes (heap dict name)
+    anim_dict_str_voff = tail_voff + 0x20     # 0x20 bytes
+    clip_str_voff = tail_voff + 0x40          # 0x30 bytes
+    anim_name_voff = tail_voff + 0x70         # 0x20 bytes
+    block_map_voff = tail_voff + 0x90         # 0x20 bytes
+    arr70_voff = tail_voff + 0xB0             # 0x10 bytes (anim_dict_ptr, hash, 1)
+    blk_arr_voff = arr70_voff + 0x10          # blk_cnt * 8 bytes (atArray<crAnimBlock*>)
+    vlen = _align16(blk_arr_voff + blk_cnt * 8)
+
+    virt = bytearray(vlen)
+
+    def put_vptr(off, target):
+        struct.pack_into("<Q", virt, off, rsc8_audio.RSC8_VPTR_BASE + target)
+
+    # ---- Root crClipDictionary ----
+    put_vptr(0x08, block_map_voff)
+    if inline_dict_name:
+        name_bytes = b"synth_dict_001"  # 14 bytes
+        virt[0x38 : 0x38 + len(name_bytes)] = name_bytes
+        virt[0x38 + len(name_bytes)] = 0
+        virt[0x38 + 15] = 0x80 | len(name_bytes)
+    else:
+        name_bytes = b"synthetic_bank_001"  # 18 bytes
+        virt[dict_str_voff : dict_str_voff + len(name_bytes)] = name_bytes
+        virt[dict_str_voff + len(name_bytes)] = 0
+        put_vptr(0x38, dict_str_voff)
+        struct.pack_into("<HHI", virt, 0x40, len(name_bytes), len(name_bytes) + 1, 1)
+
+    put_vptr(0x48, clip_map_voff)
+    struct.pack_into("<I", virt, 0x50, 11)
+    struct.pack_into("<II", virt, 0x58, 1, 0x01000000)
+    struct.pack_into("<II", virt, 0x68, stream_hash, 2)
+    put_vptr(0x70, arr70_voff)
+    struct.pack_into("<HH", virt, 0x78, 1, 1)
+    put_vptr(0x80, hash_map_voff)
+    struct.pack_into("<I", virt, 0x88, 11)
+    struct.pack_into("<II", virt, 0x90, 1, 0x01000000)
+    put_vptr(0xA0, props_voff)
+    struct.pack_into("<I", virt, 0xA8, props_size)
+
+    # ---- Embedded crAnimation packed blocks ----
+    for bi, (bo, pl, bsz, bfr) in enumerate(zip(block_voffs, block_payloads, block_sizes, block_frames)):
+        struct.pack_into(
+            "<IIIIIHHIHH",
+            virt,
+            bo,
+            0x11223344 + bi,   # signature
+            pl,                # payload_size == anim_size - 32
+            0,                 # reserved
+            pl // 2,           # chunk_data_offset
+            bsz,               # anim_size
+            2,                 # format_version
+            bfr,               # frame_count
+            4,                 # extra_flags
+            14,                # sub_count
+            11,                # track_format_tag
+        )
+        # Deterministic synthetic keyframe bytes (avoiding audio magic sequences)
+        for i in range(pl):
+            virt[bo + 32 + i] = ((i + bi) * 37 + 13) & 0xFF
+
+    # ---- Sorted Track Directory ----
+    for ti in range(track_count):
+        th = 0x01000000 + ti * 0x01010101
+        ttype = 3 if ti < 10 else 4
+        struct.pack_into("<III", virt, tracks_voff + ti * 12, th, rsc8_audio.TRACK_SCHEMA_HASH, ttype)
+
+    # ---- crProperties ----
+    put_vptr(props_voff + 0x10, clip_voff)
+    struct.pack_into("<II", virt, props_voff + 0x18, prop_count, prop_count)
+    # Descriptor owner pointers (minimal synthetic descriptors)
+    for pi in range(prop_count):
+        put_vptr(props_voff + 0x88 + pi * 0x48, props_voff)
+    # Typed attributes at props_voff + props_tail_off
+    ap = props_voff + props_tail_off
+    struct.pack_into("<II", virt, ap, 0x11110001, rsc8_audio.ATTR_STRING)
+    struct.pack_into("<Q", virt, ap + 0x18, 8)
+    ap += 0x40
+    struct.pack_into("<II", virt, ap, 0x11110002, rsc8_audio.ATTR_GUID)
+    ap += 0x20
+    if extra_bool_prop:
+        struct.pack_into("<III", virt, ap, 0x11110003, rsc8_audio.ATTR_BOOL, 1)
+        ap += 0x0C
+    struct.pack_into("<III", virt, ap, rsc8_audio.PROP_KEY_FPS, rsc8_audio.ATTR_INT, fps)
+    ap += 0x0C
+    struct.pack_into("<IIf", virt, ap, rsc8_audio.PROP_KEY_LEAD_IN, rsc8_audio.ATTR_FLOAT, 1.0 / 6.0)
+    ap += 0x0C
+    assert ap == props_voff + props_size
+
+    # ---- crClipAnimation ----
+    struct.pack_into("<I", virt, clip_voff + 0x10, 1)
+    put_vptr(clip_voff + 0x18, 0)
+    clip_name = b"synthetic_clip_name_01"
+    virt[clip_str_voff : clip_str_voff + len(clip_name)] = clip_name
+    virt[clip_str_voff + len(clip_name)] = 0
+    put_vptr(clip_voff + 0x28, clip_str_voff)
+    struct.pack_into("<HHI", virt, clip_voff + 0x30, len(clip_name), len(clip_name) + 1, 1)
+    put_vptr(clip_voff + 0x48, props_voff)
+    struct.pack_into("<II", virt, clip_voff + 0x58, stream_hash, stream_hash)
+    put_vptr(clip_voff + 0x68, anim_desc_voff)
+    struct.pack_into("<I", virt, clip_voff + 0x70, stream_hash)
+    total_frames = sum(block_frames) - (blk_cnt - 1)
+    duration = (total_frames - 1) / float(fps) if total_frames > 0 else 0.0
+    struct.pack_into("<ff", virt, clip_voff + 0x94, duration, 1.0)
+
+    # ---- crAnimationDictionary ----
+    ad_name = b"synthetic_anim_dict"
+    virt[anim_dict_str_voff : anim_dict_str_voff + len(ad_name)] = ad_name
+    virt[anim_dict_str_voff + len(ad_name)] = 0
+    put_vptr(anim_dict_voff + 0x38, anim_dict_str_voff)
+    struct.pack_into("<HHI", virt, anim_dict_voff + 0x40, len(ad_name), len(ad_name) + 1, 1)
+    struct.pack_into("<I", virt, anim_dict_voff + 0x68, 0x12345678)
+
+    # ---- crAnimation descriptor ----
+    struct.pack_into("<I", virt, anim_desc_voff + 0x10, 2)
+    put_vptr(anim_desc_voff + 0x18, anim_dict_voff)
+    aname = b"synthetic_anim"
+    virt[anim_name_voff : anim_name_voff + len(aname)] = aname
+    virt[anim_name_voff + len(aname)] = 0
+    put_vptr(anim_desc_voff + 0x30, anim_name_voff)
+    struct.pack_into("<I", virt, anim_desc_voff + 0x48, max(block_sizes))
+    put_vptr(anim_desc_voff + 0x50, blk_arr_voff)
+    struct.pack_into("<HH", virt, anim_desc_voff + 0x58, blk_cnt, blk_cnt)
+    if track_count > 0:
+        put_vptr(anim_desc_voff + 0x60, tracks_voff)
+    struct.pack_into("<HH", virt, anim_desc_voff + 0x68, track_count, track_count)
+
+    # ---- block_map node, arr70, and block pointer array ----
+    struct.pack_into("<I", virt, block_map_voff + 8, 1)
+    put_vptr(arr70_voff, anim_dict_voff)
+    struct.pack_into("<II", virt, arr70_voff + 8, 0x12345678, 1)
+    for bi, bo in enumerate(block_voffs):
+        put_vptr(blk_arr_voff + bi * 8, bo)
+
+    # ---- Outer 16-byte RSC8 wrapper ----
+    total_size = 16 + vlen
+    body_size = total_size - 12
+    hdr = struct.pack("<4sIII", b"RSC8", version, body_size, 1)
+    return hdr + bytes(virt)
+
+
+def build_synthetic_awc(stream_specs):
+    """Build a synthetic little-endian ADAT (AWC) speech bank.
+
+    Each item in `stream_specs` is a dict:
+      `{"id": int, "rsc8": bytes, "samples": int, "rate": int, "codec": int, "channels": int}`
+    """
+    n = len(stream_specs)
+    # 7 tags per stream: 0x36, 0x55, 0x5c, 0x76, 0xa3, 0xb2, 0xbd
+    hdr_sz = 16 + 4 * n + 8 * (7 * n)
+    data_buf = bytearray()
+    tag_tables = []
+
+    for spec in stream_specs:
+        # 0x55 Opus audio placeholder (2048 bytes)
+        o55 = hdr_sz + len(data_buf)
+        s55 = 2048
+        pkt = bytearray(s55)
+        struct.pack_into("<HB", pkt, 0, 160, 0xF8)
+        data_buf.extend(pkt)
+
+        # 0x5c RSC8 clip
+        o5c = hdr_sz + len(data_buf)
+        blob = spec["rsc8"]
+        data_buf.extend(blob)
+
+        # 0x36 peak (12 bytes)
+        o36 = hdr_sz + len(data_buf)
+        data_buf.extend(struct.pack("<6H", 0x5000, 0x5000, 0x4000, 0x3000, 0x2000, 0x1000))
+
+        # 0xa3 seek table (12 bytes)
+        oa3 = hdr_sz + len(data_buf)
+        data_buf.extend(struct.pack("<3I", 0, 11520, 23040))
+
+        # 0xbd marker (16 bytes)
+        obd = hdr_sz + len(data_buf)
+        data_buf.extend(struct.pack("<IfII", rsc8_audio.MARKER_MAGIC, 2.0, 0, 2))
+
+        # 0x76 format (32 bytes)
+        o76 = hdr_sz + len(data_buf)
+        fmt = bytearray(32)
+        struct.pack_into("<I", fmt, 0, spec.get("samples", 89600))
+        struct.pack_into("<H", fmt, 8, spec.get("rate", 48000))
+        fmt[28] = spec.get("codec", 0x0B)
+        fmt[29] = spec.get("channels", 1)
+        data_buf.extend(fmt)
+
+        # 0xb2 loudness (16 bytes = 2 pairs)
+        ob2 = hdr_sz + len(data_buf)
+        data_buf.extend(struct.pack("<IfIf", 0, -37.5, 4800, -38.0))
+
+        tag_tables.append([
+            (0x36, 12, o36),
+            (0x55, s55, o55),
+            (0x5C, len(blob), o5c),
+            (0x76, 32, o76),
+            (0xA3, 12, oa3),
+            (0xB2, 16, ob2),
+            (0xBD, 16, obd),
+        ])
+
+    hdr = bytearray()
+    hdr.extend(struct.pack("<4sIII", b"ADAT", 0xFF020001, n, hdr_sz))
+    for spec, tags in zip(stream_specs, tag_tables):
+        hdr.extend(struct.pack("<I", (len(tags) << 29) | (spec["id"] & 0x1FFFFFFF)))
+    for tags in tag_tables:
+        for tt, tsz, toff in tags:
+            hdr.extend(struct.pack("<Q", (tt << 56) | (tsz << 28) | toff))
+    assert len(hdr) == hdr_sz
+    return bytes(hdr) + bytes(data_buf)
+
+
+class DecodeRsc8Test(unittest.TestCase):
+    def test_valid_heap_sso_clip(self):
+        blob = build_synthetic_rsc8(stream_hash=0x20112233, frames=142, inline_dict_name=False)
+        res = rsc8_audio.decode_rsc8(blob, stream_id=0x00112233)
+        self.assertTrue(res["valid"], res["checks"])
+        self.assertEqual(res["version"], 8001)
+        self.assertEqual(res["flags"], 1)
+        self.assertEqual(res["body_size"] + 12, len(blob))
+        self.assertEqual(res["dict_name"]["storage"], "heap")
+        self.assertEqual(res["dict_name"]["length"], 18)
+        self.assertEqual(res["anim"]["frame_count"], 142)
+        self.assertAlmostEqual(res["clip"]["duration"], 141 / 60.0, places=5)
+        self.assertEqual(res["properties"]["count"], 4)
+        self.assertEqual(res["properties"]["fps"], 60)
+        self.assertAlmostEqual(res["properties"]["lead_in"], 1.0 / 6.0, places=5)
+        self.assertTrue(res["properties"]["attrs_tiled_to_end"])
+        self.assertEqual(res["tracks"]["count"], 90)
+        self.assertEqual(res["tracks"]["type_counts"], {3: 10, 4: 80})
+        # No raw synthetic string leaked anywhere in the JSON output
+        dumped = json.dumps(res)
+        self.assertNotIn("synthetic_bank_001", dumped)
+        self.assertNotIn("synthetic_clip_name_01", dumped)
+        self.assertNotIn("synthetic_anim", dumped)
+
+    def test_valid_inline_sso_and_5_props(self):
+        blob = build_synthetic_rsc8(
+            stream_hash=0x60445566,
+            frames=50,
+            inline_dict_name=True,
+            extra_bool_prop=True,
+        )
+        res = rsc8_audio.decode_rsc8(blob, stream_id=0x00445566)
+        self.assertTrue(res["valid"], res["checks"])
+        self.assertEqual(res["dict_name"]["storage"], "inline")
+        self.assertEqual(res["dict_name"]["length"], 14)
+        self.assertEqual(res["properties"]["count"], 5)
+        self.assertAlmostEqual(res["clip"]["duration"], 49 / 60.0, places=5)
+        self.assertNotIn("synth_dict_001", json.dumps(res))
+
+    def test_stream_id_mismatch_detected(self):
+        blob = build_synthetic_rsc8(stream_hash=0x20112233)
+        res = rsc8_audio.decode_rsc8(blob, stream_id=0x11111111)
+        # Structurally valid RSC8 whose internal clip hash differs from the enclosing AWC stream id
+        self.assertTrue(res["valid"], res["checks"])
+        self.assertFalse(res["checks"]["stream_id_matches"])
+
+    def test_reject_truncated_and_bad_magic(self):
+        self.assertFalse(rsc8_audio.decode_rsc8(b"")["valid"])
+        self.assertFalse(rsc8_audio.decode_rsc8(b"RSC7" + bytes(0x100))["valid"])
+        blob = build_synthetic_rsc8()
+        self.assertFalse(rsc8_audio.decode_rsc8(blob[:0x100])["valid"])
+
+    def test_reject_bad_body_size_and_version(self):
+        blob = bytearray(build_synthetic_rsc8())
+        struct.pack_into("<I", blob, 8, len(blob) - 16)  # off by 4
+        res = rsc8_audio.decode_rsc8(bytes(blob))
+        self.assertFalse(res["valid"])
+        self.assertFalse(res["checks"]["size_matches_body_plus_12"])
+
+        blob2 = bytearray(build_synthetic_rsc8())
+        struct.pack_into("<I", blob2, 4, 8002)
+        res2 = rsc8_audio.decode_rsc8(bytes(blob2))
+        self.assertFalse(res2["valid"])
+        self.assertFalse(res2["checks"]["version_ok"])
+
+    def test_reject_unsorted_tracks_and_null_track_ptr_with_nonzero_count(self):
+        blob = bytearray(build_synthetic_rsc8(track_count=12))
+        dec = rsc8_audio.decode_rsc8(bytes(blob))
+        tr_voff = dec["anim_desc"]["track_ptr"]
+        # Swap hashes of track 0 and track 1 -> unsorted
+        h0 = struct.unpack_from("<I", blob, 0x10 + tr_voff)[0]
+        h1 = struct.unpack_from("<I", blob, 0x10 + tr_voff + 12)[0]
+        struct.pack_into("<I", blob, 0x10 + tr_voff, h1)
+        struct.pack_into("<I", blob, 0x10 + tr_voff + 12, h0)
+        res = rsc8_audio.decode_rsc8(bytes(blob))
+        self.assertFalse(res["valid"])
+        self.assertFalse(res["checks"]["tracks_sorted"])
+
+        # Null track pointer with non-zero count must fail tracks_in_bounds
+        blob2 = bytearray(build_synthetic_rsc8(track_count=12))
+        desc_voff = dec["anim_desc"]["voff"]
+        struct.pack_into("<Q", blob2, 0x10 + desc_voff + 0x60, 0)
+        res2 = rsc8_audio.decode_rsc8(bytes(blob2))
+        self.assertFalse(res2["valid"])
+        self.assertFalse(res2["checks"]["tracks_in_bounds"])
+
+    def test_untrusted_huge_counts_do_not_oom(self):
+        blob = bytearray(build_synthetic_rsc8(track_count=12))
+        dec = rsc8_audio.decode_rsc8(bytes(blob))
+        desc_voff = dec["anim_desc"]["voff"]
+        props_voff = dec["props_ptr"]
+        # Craft huge track count and huge property count
+        struct.pack_into("<HH", blob, 0x10 + desc_voff + 0x68, 0xFFFF, 0xFFFF)
+        struct.pack_into("<II", blob, 0x10 + props_voff + 0x18, 0xFFFFFFFF, 0xFFFFFFFF)
+        res = rsc8_audio.decode_rsc8(bytes(blob))
+        self.assertFalse(res["valid"])
+        self.assertFalse(res["checks"]["tracks_in_bounds"])
+        self.assertFalse(res["checks"]["props_in_bounds"])
+
+    def test_valid_multi_block_reordered_and_flagged_version(self):
+        # Multi-block clip (2 blocks sharing boundary frame: 64 + 37 - 1 = 100 frames -> 99/60 = 1.65s)
+        multi = build_synthetic_rsc8(block_frames=[64, 37], anim_payload_len=64)
+        res_m = rsc8_audio.decode_rsc8(multi, stream_id=0x00112233)
+        self.assertTrue(res_m["valid"], res_m["checks"])
+        self.assertEqual(res_m["anim"]["block_count"], 2)
+        self.assertEqual(res_m["anim"]["frame_count"], 100)
+        self.assertEqual(res_m["anim"]["max_block_size"], res_m["anim_desc"]["max_block_size"])
+        self.assertAlmostEqual(res_m["clip"]["duration"], 99 / 60.0, places=5)
+
+        # Reordered sub-allocation: track directory placed at virt+0xB0, anim block after it
+        reord = build_synthetic_rsc8(frames=120, tracks_before_anim=True)
+        res_r = rsc8_audio.decode_rsc8(reord, stream_id=0x00112233)
+        self.assertTrue(res_r["valid"], res_r["checks"])
+        self.assertEqual(res_r["anim_desc"]["track_ptr"], 0xB0)
+        self.assertGreater(res_r["anim"]["blocks"][0]["voff"], 0xB0)
+
+        # Flagged version 0x01001F41 (bit 24 set, base version 8001)
+        flagged = build_synthetic_rsc8(version=0x01001F41, frames=79)
+        res_f = rsc8_audio.decode_rsc8(flagged, stream_id=0x00112233)
+        self.assertTrue(res_f["valid"], res_f["checks"])
+        self.assertEqual(res_f["version"], 0x01001F41)
+        self.assertEqual(res_f["version_base"], 8001)
+        self.assertEqual(res_f["version_flags"], 0x0100)
+
+        # Non-deep mode omits skipped track and property-dependent duration checks rather than reporting False/True
+        res_nd = rsc8_audio.decode_rsc8(multi, deep=False)
+        self.assertTrue(res_nd["valid"], res_nd["checks"])
+        self.assertNotIn("clip_duration_matches_frames", res_nd["checks"])
+        self.assertNotIn("tracks_sorted", res_nd["checks"])
+        self.assertNotIn("tracks_schema_ok", res_nd["checks"])
+
+        # Non-60 fps clip (fps=30, 61 frames -> 2.0s) validates in both deep and shallow (--no-deep) modes
+        clip_30fps = build_synthetic_rsc8(frames=61, fps=30)
+        res_30_deep = rsc8_audio.decode_rsc8(clip_30fps, deep=True)
+        res_30_shallow = rsc8_audio.decode_rsc8(clip_30fps, deep=False)
+        self.assertTrue(res_30_deep["valid"], res_30_deep["checks"])
+        self.assertAlmostEqual(res_30_deep["clip"]["duration"], 2.0, places=5)
+        self.assertTrue(res_30_shallow["valid"], res_30_shallow["checks"])
+        self.assertNotIn("clip_duration_matches_frames", res_30_shallow["checks"])
+
+    def test_reject_truncated_props_and_zero_fps(self):
+        blob = bytearray(build_synthetic_rsc8(frames=60))
+        dec = rsc8_audio.decode_rsc8(bytes(blob))
+        # Shrink props_size so descriptors cannot fit
+        struct.pack_into("<I", blob, 0x10 + 0xA8, 0x40)
+        res = rsc8_audio.decode_rsc8(bytes(blob))
+        self.assertFalse(res["valid"])
+        self.assertFalse(res["checks"]["props_in_bounds"])
+
+        # Explicit FPS=0 property must fail duration match rather than silently defaulting to 60
+        blob2 = bytearray(build_synthetic_rsc8(frames=60))
+        fps_marker = struct.pack("<II", rsc8_audio.PROP_KEY_FPS, rsc8_audio.ATTR_INT)
+        pos = blob2.find(fps_marker)
+        self.assertGreater(pos, 0)
+        struct.pack_into("<I", blob2, pos + 8, 0)
+        res2 = rsc8_audio.decode_rsc8(bytes(blob2))
+        self.assertFalse(res2["valid"])
+        self.assertFalse(res2["checks"]["clip_duration_matches_frames"])
+
+    def test_embedded_audio_container_flagged(self):
+        # 0x10 (wrapper) + 0xB0 (block voff) + 0x20 (block header) = 0xE0 (animation payload)
+        blob = bytearray(build_synthetic_rsc8(anim_payload_len=64))
+        blob[0xE0:0xEC] = b"RIFF\x24\x00\x00\x00WAVE"
+        res = rsc8_audio.decode_rsc8(bytes(blob))
+        self.assertFalse(res["valid"])
+        self.assertEqual([k for k, v in res["checks"].items() if not v], ["no_embedded_audio_container"])
+
+        blob_ogg = bytearray(build_synthetic_rsc8(anim_payload_len=64))
+        blob_ogg[0xE0:0xED] = b"OggS\x00OpusHead"
+        res_ogg = rsc8_audio.decode_rsc8(bytes(blob_ogg))
+        self.assertFalse(res_ogg["valid"])
+        self.assertEqual([k for k, v in res_ogg["checks"].items() if not v], ["no_embedded_audio_container"])
+
+        # Quadratic memory-copy DoS regression: many bogus "ADAT" occurrences must complete linearly
+        dos_blob = bytearray(build_synthetic_rsc8(anim_payload_len=40_000))
+        dos_blob[0xE0 : 0xE0 + 40_000] = b"ADAT" * 10_000
+        res_dos = rsc8_audio.decode_rsc8(bytes(dos_blob))
+        self.assertTrue(res_dos["valid"], res_dos["checks"])
+
+    def test_reject_duplicate_block_ptr_and_nan_duration(self):
+        multi = bytearray(build_synthetic_rsc8(block_frames=[64, 37], anim_payload_len=64))
+        dec = rsc8_audio.decode_rsc8(bytes(multi))
+        desc_voff = dec["anim_desc"]["voff"]
+        blk_arr_voff = struct.unpack_from("<Q", multi, 0x10 + desc_voff + 0x50)[0] - rsc8_audio.RSC8_VPTR_BASE
+        b0_ptr = struct.unpack_from("<Q", multi, 0x10 + blk_arr_voff)[0]
+        # Duplicate block 0 pointer into slot 1
+        struct.pack_into("<Q", multi, 0x10 + blk_arr_voff + 8, b0_ptr)
+        res_dup = rsc8_audio.decode_rsc8(bytes(multi))
+        self.assertFalse(res_dup["valid"])
+        self.assertFalse(res_dup["checks"]["anim_blocks_in_bounds"])
+
+        # NaN clip duration must fail cleanly with None in JSON-safe output
+        nan_blob = bytearray(build_synthetic_rsc8(frames=60))
+        dec2 = rsc8_audio.decode_rsc8(bytes(nan_blob))
+        clip_voff = dec2["clip"]["voff"]
+        struct.pack_into("<f", nan_blob, 0x10 + clip_voff + 0x94, float("nan"))
+        res_nan = rsc8_audio.decode_rsc8(bytes(nan_blob))
+        self.assertFalse(res_nan["valid"])
+        self.assertIsNone(res_nan["clip"]["duration"])
+        self.assertFalse(res_nan["checks"]["clip_duration_matches_frames"])
+
+
+class AwcAndArchiveScanTest(unittest.TestCase):
+    def test_decode_awc_bank(self):
+        c0 = build_synthetic_rsc8(stream_hash=0x20112233, frames=142, inline_dict_name=False)
+        c1 = build_synthetic_rsc8(stream_hash=0x60445566, frames=50, inline_dict_name=True)
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": c0, "samples": 89600, "rate": 48000, "codec": 0x0B, "channels": 1},
+            {"id": 0x00445566, "rsc8": c1, "samples": 19392, "rate": 48000, "codec": 0x0B, "channels": 1},
+        ])
+        res = rsc8_audio.decode_awc_bank(bank)
+        self.assertEqual(res["stream_count"], 2)
+        self.assertEqual(len(res["records"]), 2)
+        self.assertEqual(res["non_rsc8_0x5c"], 0)
+        self.assertTrue(all(r["valid"] for r in res["records"]))
+        self.assertEqual(res["records"][0]["audio_codec"], 0x0B)
+        self.assertAlmostEqual(res["records"][0]["audio_duration"], 89600 / 48000.0, places=5)
+
+    def test_scan_rpf_with_and_without_stray_rsc8(self):
+        c0 = build_synthetic_rsc8(stream_hash=0x20112233, frames=142)
+        c1 = build_synthetic_rsc8(stream_hash=0x80778899, frames=74, inline_dict_name=True)
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": c0, "samples": 89600},
+            {"id": 0x00778899, "rsc8": c1, "samples": 28800},
+        ])
+        stray = build_synthetic_rsc8(stream_hash=0x11112222, frames=61)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            hdr = b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0)
+            with open(rpf, "wb") as f:
+                f.write(hdr)
+                f.write(bytes(0x40))
+                f.write(bank)
+                f.write(bytes(0x80))
+                f.write(stray)
+
+            records, summary = rsc8_audio.scan_rpf(rpf)
+            self.assertEqual(summary["adat_banks"], 1)
+            self.assertEqual(summary["adat_streams"], 2)
+            self.assertEqual(summary["rsc8_in_adat"], 2)
+            self.assertEqual(summary["rsc8_valid"], 2)
+            self.assertEqual(summary["rsc8_invalid"], 0)
+            self.assertEqual(summary["rsc8_outside_adat"], 1)
+            self.assertEqual(summary["same_stream_audio_yes"], 2)
+            self.assertEqual(len(records), 2)
+
+            # Directory scan + CLI JSON/CSV output
+            awc_path = os.path.join(tmp, "speech.awc")
+            rsc_path = os.path.join(tmp, "standalone.rsc8")
+            with open(awc_path, "wb") as f:
+                f.write(bank)
+            with open(rsc_path, "wb") as f:
+                f.write(stray)
+
+            json_out = os.path.join(tmp, "report.json")
+            csv_out = os.path.join(tmp, "report.csv")
+            cp = subprocess.run([sys.executable, "-I", TOOL, tmp, json_out, "--quiet"], capture_output=True, text=True)
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            with open(json_out, encoding="utf-8") as f:
+                rep = json.load(f)
+            self.assertEqual(rep["summary"]["adat_banks"], 1)
+            self.assertEqual(rep["summary"]["invalid_files"], 0)
+            self.assertEqual(rep["summary"]["rsc8_in_adat"], 2)
+            self.assertEqual(rep["summary"]["rsc8_standalone"], 1)
+            self.assertEqual(rep["summary"]["rsc8_valid"], 3)
+
+            # A truncated/malformed .awc in the directory is counted and named on stderr without aborting the scan
+            bad_awc = os.path.join(tmp, "truncated.awc")
+            with open(bad_awc, "wb") as f:
+                f.write(bank[:20])
+            cp_bad = subprocess.run([sys.executable, "-I", TOOL, tmp, json_out, "--quiet"], capture_output=True, text=True)
+            self.assertEqual(cp_bad.returncode, 0, cp_bad.stderr)
+            self.assertIn("truncated.awc", cp_bad.stderr)
+            with open(json_out, encoding="utf-8") as f:
+                rep_bad = json.load(f)
+            self.assertEqual(rep_bad["summary"]["adat_banks"], 1)
+            self.assertEqual(rep_bad["summary"]["invalid_files"], 1)
+            self.assertEqual(rep_bad["summary"]["rsc8_valid"], 3)
+
+            cp2 = subprocess.run([sys.executable, "-I", TOOL, rpf, csv_out, "--quiet"], capture_output=True, text=True)
+            self.assertEqual(cp2.returncode, 0, cp2.stderr)
+            with open(csv_out, encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["version"], "8001")
+            self.assertEqual(rows[0]["valid"], "True")
+
+    def test_cli_validation_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.rpf")
+            r = subprocess.run([sys.executable, "-I", TOOL, missing], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("path not found", r.stderr)
+
+            r2 = subprocess.run([sys.executable, "-I", TOOL, tmp, "--limit", "100"], capture_output=True, text=True)
+            self.assertEqual(r2.returncode, 2)
+
+            r3 = subprocess.run([sys.executable, "-I", TOOL, tmp, "--start", "-1"], capture_output=True, text=True)
+            self.assertEqual(r3.returncode, 2)
+
+            r4 = subprocess.run([sys.executable, "-I", TOOL, tmp, "--limit", "0"], capture_output=True, text=True)
+            self.assertEqual(r4.returncode, 2)
+
+            tiny = os.path.join(tmp, "tiny.rpf")
+            with open(tiny, "wb") as f:
+                f.write(b"9FPR" + bytes(28))
+            r5 = subprocess.run([sys.executable, "-I", TOOL, tiny, "--start", "1024"], capture_output=True, text=True)
+            self.assertEqual(r5.returncode, 2)
+
+            r6 = subprocess.run([sys.executable, "-I", TOOL, tiny, "--max-banks", "0"], capture_output=True, text=True)
+            self.assertEqual(r6.returncode, 2)
+
+    def test_chunk_boundary_straddling_and_summary_only(self):
+        c0 = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": c0, "samples": 48000}])
+        stray = build_synthetic_rsc8(stream_hash=0x11112222, frames=45)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Place ADAT header straddling a 256-byte chunk boundary (at offset 254)
+            rpf = os.path.join(tmp, "straddle.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + bytes(250))
+                f.write(bank)
+                pad = (256 - (f.tell() % 256) - 2) % 256
+                f.write(bytes(pad))
+                f.write(stray)
+
+            old_chunk = rsc8_audio.SCAN_CHUNK_BYTES
+            try:
+                rsc8_audio.SCAN_CHUNK_BYTES = 256
+                records, summary = rsc8_audio.scan_rpf(rpf)
+            finally:
+                rsc8_audio.SCAN_CHUNK_BYTES = old_chunk
+
+            self.assertEqual(summary["adat_banks"], 1)
+            self.assertEqual(summary["rsc8_in_adat"], 1)
+            self.assertEqual(summary["rsc8_valid"], 1)
+            self.assertEqual(summary["rsc8_outside_adat"], 1)
+            self.assertEqual(len(records), 1)
+
+            # Verify --summary-only writes empty records for dir, standalone .awc, and standalone .rsc8
+            awc_path = os.path.join(tmp, "only.awc")
+            rsc_path = os.path.join(tmp, "only.rsc8")
+            with open(awc_path, "wb") as f:
+                f.write(bank)
+            with open(rsc_path, "wb") as f:
+                f.write(stray)
+
+            for idx, target in enumerate((tmp, awc_path, rsc_path)):
+                out_json = os.path.join(tmp, f"sum_{idx}.json")
+                cp = subprocess.run(
+                    [sys.executable, "-I", TOOL, target, out_json, "--summary-only", "--quiet"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(cp.returncode, 0, cp.stderr)
+                with open(out_json, encoding="utf-8") as f:
+                    rep = json.load(f)
+                self.assertEqual(rep["records"], [])
+                self.assertGreaterEqual(rep["summary"]["rsc8_valid"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

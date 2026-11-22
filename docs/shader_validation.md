@@ -247,7 +247,7 @@ dword aligned (sub-dword loads at their natural alignment), with no format in wo
 results, `OOB_SELECT`, swizzling and the `s_buffer_load` alignment truncation depend on descriptor
 fields the translator does not model yet, so they need a GPU-confirmed rule before they are fuzzed.
 `spirv_mini_interp` gained `OpSConvert` and the 32-bit atomics on PhysicalStorageBuffer memory for
-this. Not covered yet: images.
+this. Images have their own fuzzer (`tools/image_fuzz.py`, below).
 
 The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
 random DST_SEL of 0/1/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
@@ -263,6 +263,36 @@ Over 5,000 programs the reference and translator match bit for bit; breaking the
 
 A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
 76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
+
+### Images on the GPU (`tools/image_fuzz.py`)
+
+`tools/image_fuzz.py` starts on the image path, where the T# format, the view type and the binding layout
+meet the driver. Each case assembles a pixel shader that reads one texel with `image_load` (a nonzero `dmask`, the
+T# in `s[8:15]`), runs it through `runtime/test/vk_image_fuzz.cpp` against a synthetic texture of a chosen
+format, and compares every RGBA32F pixel with an oracle that models the RDNA2 texel fetch for that format: a
+fetch is a memory read, so there is no filter, border or LOD to model.
+
+```sh
+cmake --build runtime/build --target vk_image_fuzz
+python -I tools/image_fuzz.py --programs 8 --seed 1 [--show]
+python -I tools/image_fuzz.py --self-test
+python -m pytest tests/test_image_fuzz.py
+```
+
+Covered: 2D `image_load`, `R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`, `R32G32B32A32_SFLOAT` and `R32_SFLOAT`,
+at sizes that divide the 64x64 draw (8/16/32/64), every texel read at least once. The nonzero masks cycle from
+`0xf` through `0x1`–`0xe`; 60 programs cover all 15 masks for each of the four default formats. Selected channels
+are packed into consecutive destination registers, while unwritten registers keep initialized sentinel values.
+The packing model follows the image VGPR usage description in AMD's
+[RDNA 1.0 ISA guide](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna-shader-instruction-set-architecture.pdf);
+the Vulkan test compares translated shaders on the host GPU, not native RDNA2 execution.
+
+Devices: the harness needs `fragmentStoresAndAtomics` and both without-format storage-image features, because the
+translated `image_load` declares the uint/sint storage path even when the case reads a float format (the choice is
+made from the T# FORMAT at run time). An Intel UHD 770 (Xe-LP) lacks `shaderStorageImageReadWithoutFormat` and
+skips every case; the harness names the missing feature. Not covered yet: UINT/SINT formats (they read through the
+storage views), mips, 1D/2D-array/3D/cube,
+`image_sample`/`gather` with filters and borders, and texel offsets with `VK_KHR_maintenance8`.
 
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 
@@ -314,10 +344,10 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   EXEC is modelled as the DPP "invalid source" case (vD kept). That is now measured, with the same result on both:
   @aslan2142 on RDNA2 and @AlxcBTW on RDNA3.5 (#374). FI = 1 returns the source lane's value, FI = 0 leaves the
   destination unwritten and FI = 0 with BOUND_CTRL gives 0; #580 (SHADER-74) makes the translator do that. The
-  fuzzer has not caught up: its docstring (`tools/crosslane_fuzz.py`) still calls the case unmeasured and
-  `op_permlane` still tags it `hyp`, so a program that hits it and mismatches is filed as `hyp_only` instead of
-  `mismatch`, whatever the translator does (one that matches still counts as `match`). The model (vD kept)
-  already matches the measurement; dropping the tag is a follow-up.
+  fuzzer's docstring (`tools/crosslane_fuzz.py`, since #750) already says it was measured, but `op_permlane` still
+  tags the case `hyp` because the translator models it only with #580, so a program that hits it and mismatches
+  is filed as `hyp_only` instead of `mismatch` (one that matches still counts as `match`). The model (vD kept)
+  already matches the measurement; dropping the tag once #580 lands is a follow-up.
   `--permlane-fetch-inactive` models FI = 1 instead.
 - **Modes.** Wave32 runs natively. Wave64 runs with `--wave64-emulate`; `--w64-native` adds the plain build,
   which on a 32-wide subgroup is the documented cross-half approximation and is expected to mismatch.

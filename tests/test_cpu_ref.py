@@ -192,7 +192,19 @@ class CpuRefTest(unittest.TestCase):
         self.assertEqual(self.vgpr(r, 2), fbits(3.0))
         self.assertEqual(self.vgpr(r, 3), fbits(-1.0))
         self.assertEqual(self.vgpr(r, 4), fbits(2.0))
-        self.assertEqual(self.vgpr(r, 5), fbits(4.0))   # 2 is an inline float constant
+        self.assertEqual(self.vgpr(r, 5), fbits(2.0))   # integer inline 2 is the bits 0x2, a denormal
+
+    def test_integer_inline_constant_in_float_op_is_raw_bits(self):
+        # llvm-mc prints float inline constants with a point (2.0, -1.0); a bare integer is its bit pattern,
+        # as in LLVM's AMDGPU operand syntax example "v_add_f32 v0, -1, 0 // src0 = 0xFFFFFFFF (NaN)".
+        r = self.execute("""
+            v_mov_b32 v0, 2.0
+            v_mul_f32 v1, -1, v0
+            v_add_f32 v2, 1, 0
+            s_endpgm
+        """)
+        self.assertEqual(self.vgpr(r, 1), 0x7FC00000)   # 0xffffffff is a NaN, canonicalised
+        self.assertEqual(self.vgpr(r, 2), 1)            # the denormal 0x1, unflushed
 
     def test_nan_and_signed_zero(self):
         r = self.execute("""

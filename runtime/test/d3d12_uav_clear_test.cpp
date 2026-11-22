@@ -409,7 +409,9 @@ int main() {
     if (conversion_checks()) return 1;
 
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;

@@ -10,7 +10,10 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
+#include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
 #include "../src/vulkan_memory.h"  // D3D-96: resizable_bar
+
+#include <dxgi1_4.h>
 
 #include <dxgi1_4.h>
 
@@ -77,6 +80,12 @@ D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes) {
 D3D12_RESOURCE_DESC volume_desc(UINT16 mips) {
     auto desc = texture_desc(8, 6, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, mips, 16);
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    return desc;
+}
+
+D3D12_RESOURCE_DESC line_desc(UINT width, UINT16 mips, UINT16 layers, DXGI_FORMAT format) {
+    auto desc = texture_desc(width, 1, format, D3D12_RESOURCE_FLAG_NONE, mips, layers);
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
     return desc;
 }
 
@@ -313,6 +322,7 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
 
 // The host PC runtime's D3D12 device to compare answers with: the default adapter, or the one LEONIDA_HOST_ADAPTER
 // names ("warp", or part of an adapter's name); false if there is none.
+// Under Wine there is none (copycmp::create_host).
 bool create_host_device(Ref<ID3D12Device>& host) {
     copycmp::Ptr<ID3D12Device> device;
     std::string name;
@@ -431,6 +441,8 @@ int compare_footprints(ID3D12Device* ours) {
     };
     const Case cases[] = {
         {volume_desc(5), 5},
+        {line_desc(13, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM), 4},
+        {line_desc(5, 3, 2, DXGI_FORMAT_R8G8B8A8_UNORM), 6},
         {buffer_desc(300), 1},
         {texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
         {texture_desc(13, 7, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_NONE, 4, 2), 8},
@@ -452,6 +464,7 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R10G10B10A2_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
+        {texture_desc(16, 16, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, D3D12_RESOURCE_FLAG_NONE, 1), 1},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16_TYPELESS, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R16G16_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
@@ -530,6 +543,10 @@ int compare_allocation_info(ID3D12Device* ours) {
     D3D12_RESOURCE_DESC big_volume = volume_desc(1);
     big_volume.Width = big_volume.Height = 32;
     big_volume.DepthOrArraySize = 8;
+    D3D12_RESOURCE_DESC bad_line = line_desc(8, 1, 1, rgba8);
+    bad_line.Height = 2;
+    D3D12_RESOURCE_DESC line_rt = line_desc(8, 1, 1, rgba8);
+    line_rt.Flags = rt;
     const Case cases[] = {
         {"buffer 300", buffer_desc(300), 0},
         {"buffer 64 KiB", buffer_desc(65536), 0},
@@ -547,6 +564,10 @@ int compare_allocation_info(ID3D12Device* ours) {
          64 * 64 * 4},
         {"8x8 array of 6", texture_desc(8, 8, rgba8, none, 4, 6), 8 * 8 * 4 * 6},
         {"32x32x8 volume", big_volume, 32 * 32 * 8 * 4},
+        {"1D 13 full chain", line_desc(13, 4, 1, rgba8), 13 * 4},
+        {"1D array 5x3", line_desc(5, 3, 2, rgba8), 5 * 4 * 2},
+        {"1D height 2", bad_line, 0},
+        {"1D render target", line_rt, 8 * 4},
         {"64x64 4x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 4), 64 * 64 * 4 * 4},
         {"64x64 32x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 32), 64 * 64 * 4 * 32},
         {"64x64 64x MSAA (invalid)", with(texture_desc(64, 64, rgba8, rt), 0, 64), 0},
@@ -562,6 +583,8 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"16x16 R16G16B16A16_UINT", texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_UINT, none, 1), 16 * 16 * 8},
         {"16x16 R16G16B16A16_SINT", texture_desc(16, 16, DXGI_FORMAT_R16G16B16A16_SINT, none, 1), 16 * 16 * 8},
         {"16x16 R10G10B10A2_UINT", texture_desc(16, 16, DXGI_FORMAT_R10G10B10A2_UINT, none, 1), 16 * 16 * 4},
+        {"16x16 R10G10B10_XR_BIAS_A2_UNORM",
+         texture_desc(16, 16, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, none, 1), 16 * 16 * 4},
         {"16x16 R16G16_TYPELESS", texture_desc(16, 16, DXGI_FORMAT_R16G16_TYPELESS, none, 1), 16 * 16 * 4},
         {"16x16 R16G16_UINT", texture_desc(16, 16, DXGI_FORMAT_R16G16_UINT, none, 1), 16 * 16 * 4},
         {"16x16 R16G16_SINT", texture_desc(16, 16, DXGI_FORMAT_R16G16_SINT, none, 1), 16 * 16 * 4},
@@ -1106,6 +1129,7 @@ int compare_resolves(ID3D12Device* ours, VkSampleCountFlags color_sample_counts)
 // highest supported value clamped to what the layer can honour (DXIL 1.0, root signature 1.1). Returns the number
 // of mismatches, or -1 when the host has no D3D12 device.
 int compare_feature_support(ID3D12Device* ours) {
+    if (copycmp::host_is_wine()) return -1;
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
                                     reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
@@ -1212,6 +1236,7 @@ int compare_feature_support(ID3D12Device* ours) {
 bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physical,
                                      PFN_vkGetInstanceProcAddr instance_proc, Ref<ID3D12Device>& host,
                                      std::string& adapter_name) {
+    if (copycmp::host_is_wine()) return false;
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
                                     reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
@@ -1604,6 +1629,48 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     return mismatches;
 }
 
+// A software Vulkan device (llvmpipe on CI) and the host's WARP device answer about different machines, so the
+// OPTIONS1 comparison is skipped there; on a GPU both runtimes see the same hardware.
+bool software_vulkan_device(const vktest::Device& vk) {
+    const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        vk.instance_proc(vk.instance, "vkGetPhysicalDeviceProperties"));
+    if (!get_properties) return true;
+    VkPhysicalDeviceProperties properties{};
+    get_properties(vk.physical, &properties);
+    return properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+}
+
+// D3D12_OPTIONS1 (D3D-86): wave ops and the lane range come from the Vulkan device's subgroup properties, so the
+// host PC runtime on the same GPU is the oracle. Returns the number of mismatches, -2 for a software Vulkan device,
+// or -1 when the host has no D3D12 device.
+int compare_options1(ID3D12Device* ours, const vktest::Device& vk) {
+    if (software_vulkan_device(vk)) return -2;
+    // The host device must be the same GPU (matched by LUID, then PCI ids), not the default adapter: on a PC with
+    // an AMD iGPU and an NVIDIA card the default is the NVIDIA, whose 32..32 lanes don't match the AMD's 32..64.
+    Ref<ID3D12Device> host;
+    std::string adapter_name;
+    if (!create_host_device_for_physical(vk.instance, vk.physical, vk.instance_proc, host, adapter_name)) return -1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 theirs{};
+    if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &theirs, sizeof(theirs)))) return -1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 mine{};
+    if (FAILED(ours->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &mine, sizeof(mine)))) return 1;
+    int mismatches = 0;
+    const auto same = [&](const char* field, UINT got, UINT want) {
+        if (got == want) return;
+        if (mismatches++ < 4)
+            std::fprintf(stderr, "D3D12_OPTIONS1 %s: ours %u, host %u\n", field, got, want);
+    };
+    same("WaveOps", mine.WaveOps, theirs.WaveOps);
+    same("WaveLaneCountMin", mine.WaveLaneCountMin, theirs.WaveLaneCountMin);
+    same("WaveLaneCountMax", mine.WaveLaneCountMax, theirs.WaveLaneCountMax);
+    same("ExpandedComputeResourceStates", mine.ExpandedComputeResourceStates,
+         theirs.ExpandedComputeResourceStates);
+    // TotalLaneCount is deliberately not compared: the host counts every lane of the device (6144 on the RTX 5070)
+    // and the layer answers one full wave (docs section 4.1).
+    std::printf("D3D12_OPTIONS1: lanes %u..%u, total %u (host total %u)\n", mine.WaveLaneCountMin,
+                mine.WaveLaneCountMax, mine.TotalLaneCount, theirs.TotalLaneCount);
+    return mismatches;
+}
 
 }  // namespace
 
@@ -1642,9 +1709,11 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.conditional_rendering = d.conditional_rendering;  // SetPredication (the D24 tests check copies under it)
         info.texture_compression_bc = d.bc;
         info.occlusion_query_precise = d.occlusion_query_precise;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
+        info.conditional_rendering = d.conditional_rendering;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -1694,6 +1763,17 @@ int main() {
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &feature_levels,
                                                      sizeof(feature_levels))));
         EXPECT(feature_levels.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL_12_1);
+        // An empty or missing list is E_INVALIDARG on the host (NVIDIA and WARP), not DXGI_ERROR_UNSUPPORTED or a
+        // read through null; a list the device can't meet answers DXGI_ERROR_UNSUPPORTED and writes level 0.
+        D3D12_FEATURE_DATA_FEATURE_LEVELS no_levels{0, levels, D3D_FEATURE_LEVEL_11_0};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &no_levels, sizeof(no_levels)) == E_INVALIDARG);
+        D3D12_FEATURE_DATA_FEATURE_LEVELS null_levels{1, nullptr, D3D_FEATURE_LEVEL_11_0};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &null_levels, sizeof(null_levels)) ==
+               E_INVALIDARG);
+        D3D12_FEATURE_DATA_FEATURE_LEVELS too_high{1, &levels[2], D3D_FEATURE_LEVEL_11_0};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &too_high, sizeof(too_high)) ==
+               DXGI_ERROR_UNSUPPORTED);
+        EXPECT(too_high.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL(0));
         D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))));
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
@@ -1739,6 +1819,60 @@ int main() {
 
         D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
         EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
+
+        // D3D-61: XR_BIAS is a display-only format with the R10G10B10A2 bit layout. The layer can create and
+        // copy it, and its views can cast to the ordinary 10:10:10:2 format, but it does not claim display or
+        // video-processor support.
+        {
+            const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT xr{DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &xr, sizeof(xr))));
+            EXPECT(xr.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
+            EXPECT(xr.Support1 & D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT);
+            EXPECT(!(xr.Support1 & (D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_MIP |
+                                    D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
+                                    D3D12_FORMAT_SUPPORT1_BLENDABLE)));
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS multsample{DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, 4};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &multsample,
+                                                         sizeof(multsample))));
+            EXPECT(multsample.NumQualityLevels == 0);
+            Ref<ID3D12Resource> tex;
+            const D3D12_RESOURCE_DESC desc = texture_desc(
+                16, 16, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, D3D12_RESOURCE_FLAG_NONE, 1);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&tex.p))));
+            EXPECT(tex.p != nullptr);
+
+            // The host refuses extra mips, multisampling and 3D; the layer must refuse the same descriptions.
+            D3D12_RESOURCE_DESC invalid = desc;
+            invalid.MipLevels = 2;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &invalid,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &invalid).SizeInBytes == UINT64_MAX);
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
+            UINT rows = 0;
+            UINT64 total = 0;
+            device->GetCopyableFootprints(&invalid, 0, 1, 0, &layout, &rows, nullptr, &total);
+            EXPECT(total == UINT64_MAX);
+
+            invalid = desc;
+            invalid.SampleDesc.Count = 4;
+            invalid.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &invalid,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &invalid).SizeInBytes == UINT64_MAX);
+
+            invalid = desc;
+            invalid.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            invalid.DepthOrArraySize = 4;
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &invalid,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &invalid).SizeInBytes == UINT64_MAX);
+        }
 
         // D3D-60: CheckFeatureSupport and committed resource creation for integer and typeless formats
         {
@@ -1797,6 +1931,27 @@ int main() {
         EXPECT(!uses_unaligned_blocks(texture_desc(8, 8, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE)));
         EXPECT(!uses_unaligned_blocks(texture_desc(10, 6, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE)));
 
+        // D3D12_OPTIONS1 (D3D-86): the lane range is the Vulkan device's own subgroup range and the device-wide lane
+        // count is deliberately one wave, so those are pinned here rather than only compared. Wave ops can only be
+        // promised by a GPU, and a software Vulkan device has no host GPU to compare with either.
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 wave{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &wave, sizeof(wave))));
+            EXPECT(wave.WaveLaneCountMin >= 1);
+            EXPECT(wave.WaveLaneCountMax >= wave.WaveLaneCountMin);
+            EXPECT(wave.TotalLaneCount == wave.WaveLaneCountMax);
+            EXPECT(wave.ExpandedComputeResourceStates);
+            const int options1 = compare_options1(device.p, d);
+            if (options1 == -2)
+                std::printf("D3D12_OPTIONS1: software Vulkan device, host comparison skipped\n");
+            else if (options1 < 0)
+                std::printf("D3D12_OPTIONS1: no host D3D12 device to compare with, skipped\n");
+            EXPECT(options1 <= 0);
+            if (options1 != -2) EXPECT(wave.WaveOps);
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 shrunk{};
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &shrunk, sizeof(shrunk) - 4)));
+            EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, nullptr, sizeof(shrunk))));
+        }
         const int footprint_mismatches = compare_footprints(device.p);
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");
@@ -1846,9 +2001,12 @@ int main() {
         EXPECT(allocation_mismatches <= 0);
 
         // D3D-46: copies against the host runtime (d3d12_copy_compare.h).
-        const int copy_mismatches = copycmp::compare_copies(device.p, d.bc, d.depth_format_usable(VK_FORMAT_D24_UNORM_S8_UINT));
+        const int copy_mismatches = copycmp::compare_copies(device.p, d.bc);
         if (copy_mismatches < 0) std::printf("Copies: no host D3D12 device to compare with, skipped\n");
         EXPECT(copy_mismatches <= 0);
+        const int depth24_mismatches = copycmp::compare_depth24(device.p, d.depth_format_usable(VK_FORMAT_D24_UNORM_S8_UINT));
+        if (depth24_mismatches < 0) std::printf("D24 clears: no host D3D12 device to compare with, skipped\n");
+        EXPECT(depth24_mismatches <= 0);
         const int tiling_mismatches = compare_tiling(device.p);
         if (tiling_mismatches < 0)
             std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
@@ -1877,6 +2035,14 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                    IID_PPV_ARGS(&list.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+        // Every wait on `fence` goes through this: a hand-picked value that is reused or lower than an earlier one
+        // makes SetEventOnCompletion return at once, and the block then reads results the GPU hasn't written.
+        UINT64 fence_last = 0;
+        const auto submit_and_wait = [&] {
+            const UINT64 v = ++fence_last;
+            return SUCCEEDED(queue->Signal(fence.p, v)) && SUCCEEDED(fence->SetEventOnCompletion(v, nullptr)) &&
+                   fence->GetCompletedValue() >= v;
+        };
         {
             Ref<ID3D12Device> parent;
             EXPECT(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
@@ -1987,7 +2153,8 @@ int main() {
         EXPECT(create(default_heap, invalid_buffer_samples, D3D12_RESOURCE_STATE_COPY_DEST, refused_buffer) ==
                E_INVALIDARG && !refused_buffer.p);
 
-        Ref<ID3D12Resource> rt_resource, packed565, ds, untouched, upload, readback, volume;
+        Ref<ID3D12Resource> rt_resource, packed565, ds, untouched, upload, readback, volume, line, line_array,
+            line_refused;
         D3D12_RESOURCE_DESC xbox_rt =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         xbox_rt.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
@@ -2009,6 +2176,21 @@ int main() {
         EXPECT(SUCCEEDED(create(readback_heap, buffer_desc(65536), D3D12_RESOURCE_STATE_COPY_DEST, readback)));
         EXPECT(SUCCEEDED(create(default_heap, volume_desc(0), D3D12_RESOURCE_STATE_COPY_DEST, volume)));
         EXPECT(volume->GetDesc().MipLevels == 5);
+        const auto line_shape = line_desc(size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+        const auto line_array_shape = line_desc(small_size, 1, 3, DXGI_FORMAT_R8G8B8A8_UNORM);
+        EXPECT(SUCCEEDED(create(default_heap, line_shape, D3D12_RESOURCE_STATE_COPY_DEST, line)));
+        EXPECT(SUCCEEDED(create(default_heap, line_array_shape, D3D12_RESOURCE_STATE_COPY_DEST, line_array)));
+        EXPECT(line->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && line->GetDesc().Height == 1);
+        EXPECT(line_array->GetDesc().DepthOrArraySize == 3);
+        EXPECT(rt::d3d12::vulkan_image(line.p) && rt::d3d12::vulkan_image(line_array.p));
+        auto refused_line = line_shape;
+        refused_line.Height = 2;
+        EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
+               !line_refused.p);
+        refused_line = line_shape;
+        refused_line.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
+               !line_refused.p);
         EXPECT(rt_resource->GetDesc().Width == size && rt_resource->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
         EXPECT(rt::d3d12::vulkan_image(rt_resource.p) && !rt::d3d12::vulkan_image(upload.p));
 
@@ -2110,9 +2292,7 @@ int main() {
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
-        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));  // null event: blocks until done
-        EXPECT(fence->GetCompletedValue() == 1);
+        EXPECT(submit_and_wait());  // null event: blocks until done
 
         for (UINT row = 0; row < size; ++row) {
             for (UINT col = 0; col < size; ++col) {
@@ -2216,8 +2396,7 @@ int main() {
         EXPECT(list->Close() == S_OK);
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)));
-        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+        EXPECT(submit_and_wait());
 
         for (UINT row = 0; row < size; ++row)
             for (UINT col = 0; col < size; ++col)
@@ -2273,7 +2452,7 @@ int main() {
             EXPECT(SUCCEEDED(list->Close()));
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+            EXPECT(submit_and_wait());
             const std::array<std::uint8_t, 4> untouched_bytes{0xcd, 0xcd, 0xcd, 0xcd};
             for (UINT z = 0; z < 8; ++z)
                 for (UINT y = 0; y < 3; ++y)
@@ -2342,7 +2521,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)) && SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
+            EXPECT(submit_and_wait());
             const std::uint8_t resolved_green[4] = {0, 255, 0, 255};
             for (UINT row = 0; row < size; ++row)
                 for (UINT col = 0; col < size; ++col)
@@ -2372,7 +2551,7 @@ int main() {
             list->ResourceBarrier(2, resolve_barriers);
             D3D12_RECT region{1, 2, 5, 5};
             const auto region_copy = subresource(region_target.p, 0), region_out = footprint(readback.p, region_place);
-            const auto resolve_and_readback = [&](UINT x, D3D12_RECT* rect, UINT64 fence_value) {
+            const auto resolve_and_readback = [&](UINT x, D3D12_RECT* rect) {
                 list7->ResolveSubresourceRegion(region_target.p, 0, x, 1, msaa.p, 0, rect, region_format,
                                                 D3D12_RESOLVE_MODE_AVERAGE);
                 const auto to_copy = transition(region_target.p, D3D12_RESOURCE_STATE_RESOLVE_DEST,
@@ -2382,10 +2561,9 @@ int main() {
                 if (list->Close() != S_OK) return false;
                 queue->ExecuteCommandLists(1, lists);
                 return rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success &&
-                       SUCCEEDED(queue->Signal(fence.p, fence_value)) &&
-                       SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr));
+                       submit_and_wait();
             };
-            EXPECT(resolve_and_readback(4, &region, 5));
+            EXPECT(resolve_and_readback(4, &region));
             const std::uint8_t resolved_red[4] = {255, 0, 0, 255}, resolved_blue[4] = {0, 0, 255, 255};
             for (UINT row = 0; row < region_height; ++row)
                 for (UINT col = 0; col < region_width; ++col) {
@@ -2401,7 +2579,7 @@ int main() {
             const auto to_resolve = transition(region_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                                D3D12_RESOURCE_STATE_RESOLVE_DEST);
             list->ResourceBarrier(1, &to_resolve);
-            EXPECT(resolve_and_readback(1, nullptr, 6));
+            EXPECT(resolve_and_readback(1, nullptr));
             for (UINT row = 0; row < region_height; ++row)
                 for (UINT col = 0; col < region_width; ++col) {
                     const bool in_source = row >= 1 && col >= 1 && col < 9;
@@ -2466,7 +2644,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)) && SUCCEEDED(fence->SetEventOnCompletion(7, nullptr)));
+            EXPECT(submit_and_wait());
             report("atomic copy UINT", 0, down + 256, reinterpret_cast<const std::uint8_t*>(&value32), 4);
             report("atomic copy UINT64", 0, down + 264, reinterpret_cast<const std::uint8_t*>(&value64), 8);
             const std::uint8_t cd[4] = {0xcd, 0xcd, 0xcd, 0xcd};
@@ -2618,6 +2796,60 @@ int main() {
             EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 2)) && SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
         }
 
+        // 1D textures and 1D arrays use the same footprint path; one array layer is enough to prove the image
+        // type and the array stride. This runs after the resolve fences so it can use a higher fence value.
+        {
+            cursor = 0;
+            const auto line_up = place(device.p, line.p, 0, cursor);
+            const auto line_array_up = place(device.p, line_array.p, 1, cursor);
+            EXPECT(line_up.Footprint.Width == size && line_up.Footprint.Height == 1 &&
+                   line_up.Footprint.Depth == 1 && line_up.Footprint.RowPitch == 256);
+            EXPECT(line_array_up.Footprint.Height == 1 && line_array_up.Footprint.Depth == 1);
+            for (UINT col = 0; col < size; ++col)
+                std::memcpy(up + line_up.Offset + col * 4, pattern(col, 0).data(), 4);
+            for (UINT col = 0; col < small_size; ++col)
+                std::memcpy(up + line_array_up.Offset + col * 4, pattern(col, 1).data(), 4);
+
+            cursor = 0;
+            const auto line_down = place(device.p, line.p, 0, cursor);
+            const auto line_array_down = place(device.p, line_array.p, 1, cursor);
+            std::memset(down, 0xcd, 65536);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            {
+                const auto dst = subresource(line.p, 0);
+                const auto src = footprint(upload.p, line_up);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            {
+                const auto dst = subresource(line_array.p, 1);
+                const auto src = footprint(upload.p, line_array_up);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            barrier = transition(line.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            barrier = transition(line_array.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &barrier);
+            {
+                const auto dst = footprint(readback.p, line_down);
+                const auto src = subresource(line.p, 0);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            {
+                const auto dst = footprint(readback.p, line_array_down);
+                const auto src = subresource(line_array.p, 1);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(submit_and_wait());
+            for (UINT col = 0; col < size; ++col)
+                report("1D texel", col, down + line_down.Offset + col * 4, pattern(col, 0).data(), 4);
+            for (UINT col = 0; col < small_size; ++col)
+                report("1D array texel", col, down + line_array_down.Offset + col * 4,
+                       pattern(col, 1).data(), 4);
+        }
+
         // Reserved resources (docs/d3d12_vulkan.md section 4.2): fully backed at creation, so they copy like
         // committed ones and their first use reads zero; D3D12's description rules hold; tile-mapping calls are
         // accepted and change nothing.
@@ -2731,7 +2963,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 9)) && SUCCEEDED(fence->SetEventOnCompletion(9, nullptr)));
+            EXPECT(submit_and_wait());
             for (UINT row = 0; row < size; ++row)
                 for (UINT col = 0; col < size; ++col) {
                     report("reserved texel", row * size + col,
@@ -2805,7 +3037,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)) && SUCCEEDED(fence->SetEventOnCompletion(10, nullptr)));
+            EXPECT(submit_and_wait());
 
             const UINT64 t0 = u64(ts_at), t1 = u64(ts_at + 8);
             EXPECT(t0 != 0 && t0 != 0xcdcdcdcdcdcdcdcdull && t1 >= t0);
@@ -2823,7 +3055,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 11)) && SUCCEEDED(fence->SetEventOnCompletion(11, nullptr)));
+            EXPECT(submit_and_wait());
             EXPECT(u64(again_at) >= t1 && u64(again_at + 8) == t1);
 
             // Lists that break the rules. Close reports what it can see; the rest is refused at execution, and
@@ -2860,10 +3092,100 @@ int main() {
             EXPECT(SUCCEEDED(list->Close()));
         }
 
+        // An occlusion query resolved into a predicate, the way a renderer skips occluded work (docs/d3d12_vulkan.md
+        // sections 4.6 and 4.7). There are no draws yet, so the query counts 0 samples: EQUAL_ZERO skips the left
+        // clear and NOT_EQUAL_ZERO runs the right one. The predicate goes COPY_DEST -> PREDICATION -> COPY_DEST and is
+        // resolved into again, so validation sees both sides of the hand-off between the copy and conditional
+        // rendering's read.
+        if (!d.conditional_rendering) {
+            std::printf("predication: no VK_EXT_conditional_rendering, skipped\n");
+        } else {
+            Ref<ID3D12QueryHeap> occlusion;
+            Ref<ID3D12Resource> predicate, target;
+            const D3D12_QUERY_HEAP_DESC query_heap_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_heap_desc, IID_PPV_ARGS(&occlusion.p))));
+            EXPECT(SUCCEEDED(create(default_heap, buffer_desc(256), D3D12_RESOURCE_STATE_COPY_DEST, predicate)));
+            EXPECT(SUCCEEDED(create(default_heap,
+                                    texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                                    D3D12_RESOURCE_STATE_RENDER_TARGET, target)));
+            device->CreateRenderTargetView(target.p, nullptr, rtv1);  // the lists that used this slot have run
+            UINT64 target_cursor = 0;
+            const auto target_place = place(device.p, target.p, 0, target_cursor);
+            const FLOAT green[4] = {0, 1, 0, 1};
+            const D3D12_RECT left{0, 0, LONG(size / 2), LONG(size)}, right{LONG(size / 2), 0, LONG(size), LONG(size)};
+            const auto resolve_predicate = [&] {
+                list->BeginQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0);
+                list->EndQuery(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0);
+                list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0, 1, predicate.p, 0);
+            };
+
+            // The predicate's hand-offs, through legacy barriers and through enhanced buffer barriers.
+            const auto hand_off = [&](bool enhanced, bool to_predicate) {
+                if (!enhanced) {
+                    const auto copy_dest = D3D12_RESOURCE_STATE_COPY_DEST, predication = D3D12_RESOURCE_STATE_PREDICATION;
+                    barrier = transition(predicate.p, to_predicate ? copy_dest : predication,
+                                         to_predicate ? predication : copy_dest);
+                    list->ResourceBarrier(1, &barrier);
+                    return;
+                }
+                D3D12_BUFFER_BARRIER buffer{};
+                buffer.SyncBefore = to_predicate ? D3D12_BARRIER_SYNC_COPY : D3D12_BARRIER_SYNC_PREDICATION;
+                buffer.SyncAfter = to_predicate ? D3D12_BARRIER_SYNC_PREDICATION : D3D12_BARRIER_SYNC_COPY;
+                buffer.AccessBefore = to_predicate ? D3D12_BARRIER_ACCESS_COPY_DEST : D3D12_BARRIER_ACCESS_PREDICATION;
+                buffer.AccessAfter = to_predicate ? D3D12_BARRIER_ACCESS_PREDICATION : D3D12_BARRIER_ACCESS_COPY_DEST;
+                buffer.pResource = predicate.p;
+                buffer.Offset = 0;
+                buffer.Size = UINT64_MAX;
+                D3D12_BARRIER_GROUP buffer_group{};
+                buffer_group.Type = D3D12_BARRIER_TYPE_BUFFER;
+                buffer_group.NumBarriers = 1;
+                buffer_group.pBufferBarriers = &buffer;
+                list7->Barrier(1, &buffer_group);
+            };
+            for (const bool enhanced : {false, true}) {
+                std::memset(down, 0xcd, 65536);
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+                if (enhanced) {
+                    barrier = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    list->ResourceBarrier(1, &barrier);
+                }
+                list->ClearRenderTargetView(rtv1, red, 0, nullptr);
+                resolve_predicate();
+                hand_off(enhanced, true);
+                list->SetPredication(predicate.p, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);  // the value is 0: skipped
+                list->ClearRenderTargetView(rtv1, green, 1, &left);
+                list->SetPredication(predicate.p, 0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);  // runs
+                list->ClearRenderTargetView(rtv1, blue, 1, &right);
+                list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+                hand_off(enhanced, false);
+                resolve_predicate();  // written again after conditional rendering has read it
+                barrier = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &barrier);
+                {
+                    const auto dst = footprint(readback.p, target_place);
+                    const auto src = subresource(target.p, 0);
+                    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                }
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                EXPECT(submit_and_wait());
+                const std::uint8_t red_texel[4] = {255, 0, 0, 255}, blue_texel[4] = {0, 0, 255, 255};
+                for (UINT row = 0; row < size; ++row)
+                    for (UINT col = 0; col < size; ++col)
+                        report(enhanced ? "predicated clear texel (enhanced barriers)" : "predicated clear texel",
+                               row * size + col,
+                               down + target_place.Offset + row * target_place.Footprint.RowPitch + col * 4,
+                               col < size / 2 ? red_texel : blue_texel, 4);
+            }
+        }
+
         // Every child holds the proxy; once they are gone the proxy holds the only reference.
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
-        for (auto* r : {&rt_resource, &packed565, &ds, &untouched, &upload, &readback, &source, &whole, &part, &bc}) r->reset();
+        for (auto* r : {&rt_resource, &packed565, &ds, &untouched, &upload, &readback, &source, &whole, &part, &bc,
+                        &line, &line_array}) r->reset();
         list7.reset();
         list.reset();
         allocator.reset();

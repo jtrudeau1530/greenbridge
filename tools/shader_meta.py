@@ -63,10 +63,16 @@ def base_op(op):
 def _imm_u32(a):
     """32-bit unsigned constant value of an imm/fimm operand, or None."""
     if a["k"] == "imm":
-        return a["v"] & 0xFFFFFFFF
-    if a["k"] == "fimm":
-        return struct.unpack("<I", struct.pack("<f", a["v"]))[0]
-    return None
+        v = a["v"] & 0xFFFFFFFF
+    elif a["k"] == "fimm":
+        v = struct.unpack("<I", struct.pack("<f", a["v"]))[0]
+    else:
+        return None
+    if a.get("abs"):
+        v &= 0x7FFFFFFF
+    if a.get("neg"):
+        v ^= 0x80000000
+    return v
 
 
 def _sgpr_regs(a):

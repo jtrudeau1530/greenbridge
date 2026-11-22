@@ -183,6 +183,41 @@ class AsavTest(unittest.TestCase):
             saves.parse_asav(b"JSAV" + bytes(0x200))
 
 
+class MalformedAsavTest(unittest.TestCase):
+    """A truncated or lying ASAV is a ValueError with a readable message, not a struct.error (#980)."""
+
+    def test_file_shorter_than_the_fixed_header_is_rejected(self):
+        for blob in (b"ASAV", b"ASAV" + bytes(0x20)):
+            with self.subTest(size=len(blob)), self.assertRaises(ValueError) as ctx:
+                saves.parse_asav(blob)
+            self.assertIn(f"header is only {len(blob)} bytes", str(ctx.exception))
+
+    def test_a_short_non_asav_blob_keeps_the_not_asav_message(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_asav(b"NOPE")
+        self.assertEqual(str(ctx.exception), "not ASAV")
+
+    def test_payload_offset_past_the_end_is_rejected(self):
+        d = bytearray(make_asav(kind=2))
+        struct.pack_into("<I", d, 0x14, 0xFFFF)  # payload_offset
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_asav(bytes(d))
+        self.assertIn("payload offset 0xffff is past the end", str(ctx.exception))
+
+    def test_cli_reports_an_error_without_a_traceback(self):
+        # End to end: #923's dispatch guard plus this parser message give one line and exit 2.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "truncated.asav")
+            with open(path, "wb") as f:
+                f.write(b"ASAV")
+            p = subprocess.run([sys.executable, "-I", TOOL, "info", path],
+                               capture_output=True, text=True, check=False)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR:", p.stderr)
+        self.assertIn("header is only 4 bytes, an ASAV header is 368", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
 class SlayerTest(unittest.TestCase):
     def test_wrapper_and_unaligned_name(self):
         inner = make_asav(kind=1, title="Packed", slot="SLOT7") + os.urandom(64)
@@ -269,6 +304,46 @@ class ImportTest(unittest.TestCase):
             write(os.path.join(empty, "readme.txt"), b"nothing here")
             with self.assertRaises(SystemExit):
                 quiet(saves.import_saves, [empty, "--out", os.path.join(tmp, "o")])
+
+
+class MalformedJsavTest(unittest.TestCase):
+    """A truncated or lying JSAV is one error line, not a struct.error traceback."""
+
+    def test_header_shorter_than_16_bytes_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(b"JSAV")
+        self.assertIn("header is only 4 bytes", str(ctx.exception))
+
+    def test_a_short_non_jsav_blob_keeps_the_not_jsav_message(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(b"NOPE")
+        self.assertEqual(str(ctx.exception), "not JSAV")
+
+    def test_entry_table_past_end_is_rejected(self):
+        data = b"JSAV" + struct.pack("<III", 1, 4, 0)
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(data)
+        self.assertIn("declares 4 entries but the file has 16 bytes", str(ctx.exception))
+
+    def test_missing_body_marker_is_rejected(self):
+        # A complete entry table with no JSON body marker after it.
+        data = bytearray(b"JSAV" + struct.pack("<III", 3, 1, 0))
+        data += struct.pack("<IIIII", 0x11111111, 1, 0, 36, 0)
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_jsav(bytes(data))
+        self.assertIn("body marker not found", str(ctx.exception))
+
+    def test_cli_reports_an_error_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "truncated.jsav")
+            with open(path, "wb") as f:
+                f.write(b"JSAV" + struct.pack("<III", 1, 4, 0))
+            p = subprocess.run([sys.executable, "-I", TOOL, "info", path],
+                               capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR:", p.stderr)
+        self.assertIn("declares 4 entries", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
 
 
 if __name__ == "__main__":

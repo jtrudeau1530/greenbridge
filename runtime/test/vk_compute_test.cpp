@@ -13,6 +13,7 @@
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 
 #include <cctype>
 #include <cmath>
@@ -111,13 +112,12 @@ int main(int argc, char** argv) {
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    for (auto d : pds) {
-        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(d, &p);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
-    }
+    std::vector<VkPhysicalDeviceProperties> candidates(pds.size());
+    for (std::size_t i = 0; i < pds.size(); ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
     if (!pd) {
-        std::fprintf(stderr, "no Vulkan physical device found\n");
+        leonida::vk_test::report_no_device();
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);

@@ -17,11 +17,14 @@ import itertools
 import json
 import math
 import os
-import stat
 import struct
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -75,7 +78,7 @@ def _normalize3(nx: float, ny: float, nz: float) -> tuple[float, float, float]:
 
 def _compute_smooth_normals(
     positions: list[tuple[float, float, float]],
-    indices: list[int],
+    indices: Iterable[int],
 ) -> list[tuple[float, float, float]]:
     """Compute area-weighted smooth vertex normals with (0, 1, 0) fallback."""
     n = len(positions)
@@ -83,10 +86,8 @@ def _compute_smooth_normals(
     ay = [0.0] * n
     az = [0.0] * n
 
-    for t in range(0, len(indices) - 2, 3):
-        i0 = indices[t]
-        i1 = indices[t + 1]
-        i2 = indices[t + 2]
+    index_iter = iter(indices)
+    for i0, i1, i2 in zip(index_iter, index_iter, index_iter):
         p0 = positions[i0]
         p1 = positions[i1]
         p2 = positions[i2]
@@ -390,11 +391,17 @@ def parse_obj(
             continue
 
         if builder["has_missing_normal"]:
-            computed = _compute_smooth_normals(positions, indices)
-            raw_normals = builder["normals"]
+            # UVs and explicit normals split render vertices, but generated normals
+            # share the first render vertex's accumulator for each OBJ position.
+            first_vertex: dict[int, int] = {}
+            normal_vertices = [
+                first_vertex.setdefault(corner[0], vertex)
+                for corner, vertex in builder["vert_map"].items()
+            ]
+            computed = _compute_smooth_normals(positions, (normal_vertices[i] for i in indices))
             normals = [
-                raw_normals[i] if raw_normals[i] is not None else computed[i]
-                for i in range(len(positions))
+                normal if normal is not None else computed[normal_vertex]
+                for normal, normal_vertex in zip(builder["normals"], normal_vertices)
             ]
         else:
             normals = builder["normals"]
@@ -858,16 +865,6 @@ def _replace(source: str, destination: str) -> None:
     os.replace(source, destination)
 
 
-def _output_mode(path: str) -> int:
-    """Permission bits for a published GLB: those of the file it replaces, or 0666 minus the umask."""
-    try:
-        return stat.S_IMODE(os.stat(path).st_mode)
-    except FileNotFoundError:
-        mask = os.umask(0)
-        os.umask(mask)
-        return 0o666 & ~mask
-
-
 def write_glb(
     path: str,
     primitives: list[dict],
@@ -893,7 +890,7 @@ def write_glb(
             tmp_path = f.name
             f.write(glb_bytes)
         # NamedTemporaryFile creates 0600; give the GLB the mode of the file it replaces, or a new file's.
-        os.chmod(tmp_path, _output_mode(out_path))
+        os.chmod(tmp_path, published_mode(out_path))
         # Close before replacement: Windows cannot rename an open staging file.
         _replace(tmp_path, out_path)
     except BaseException:
@@ -970,10 +967,14 @@ def read_glb_summary(data: bytes) -> dict:
     buffers = gltf.get("buffers")
     if isinstance(buffers, list) and buffers:
         buf0 = buffers[0]
-        if isinstance(buf0, dict) and "uri" not in buf0:
-            declared = buf0.get("byteLength", 0)
-            if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0 or declared > bin_bytes:
+        if isinstance(buf0, dict):
+            embedded = "uri" not in buf0
+            declared = buf0.get("byteLength", 0 if embedded else None)
+            invalid_length = isinstance(declared, bool) or not isinstance(declared, int) or declared < 0
+            if embedded and (invalid_length or declared > bin_bytes):
                 raise GlbError(f"buffers[0].byteLength ({declared}) exceeds BIN chunk ({bin_bytes})")
+            if invalid_length:
+                raise GlbError("invalid buffers[0].byteLength")
             buf0_limit = declared
 
     buffer_views = gltf.get("bufferViews")

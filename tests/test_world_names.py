@@ -95,6 +95,22 @@ class DictionaryTest(unittest.TestCase):
                      "synthetic_cell_b.rpf", "SyntheticCellC"):
             self.assertIn(name, WN._unique_names(dictionary.names))
 
+    def test_rpf9_names_index(self):
+        index = self.write("rpf9_names.json", json.dumps({
+            "summary": {"types": ["dr", "ft"]},
+            "files": [
+                {"offset": 16, "names": ["synthetic_tile_01_lod.#dr", "synthetic_tile_02_lod.#dr"]},
+                {"offset": 64, "names": ["synthetic_frag.#ft"]},
+                {"offset": 96, "names": "not a list"},
+            ],
+        }))
+        dictionary = WN.build_dictionary(rpf9_names=[index])
+        self.assertEqual(WN._unique_names(dictionary.names),
+                         {"synthetic_tile_01_lod", "synthetic_tile_02_lod", "synthetic_frag"})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WN.main(["build", "--rpf9-names", index,
+                                      "--out", os.path.join(self.dir, "names.json")]), 0)
+
     def test_directory_manifest_discovery(self):
         models = os.path.join(self.dir, "assets", "archive", "models")
         os.makedirs(models)
@@ -215,6 +231,39 @@ class ResolveTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_xml_unterminated_comment_keeps_later_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = os.path.join(tmp, "concat.xml")
+            with open(xml, "w", encoding="utf-8") as handle:
+                handle.write("<root><name>First</name><!-- cut off here\n"
+                             '<?xml version="1.0"?><root><name>RealName</name>'
+                             "<filename>x/Real.rpf</filename></root>")
+            d = WN.NameDictionary()
+            d.add_xml(xml)
+            self.assertEqual(sorted(n for names in d.to_json()["names"].values() for n in names),
+                             ["First", "Real", "Real.rpf", "RealName"])
+
+    def test_xml_unescape_is_strict(self):
+        self.assertEqual(WN._xml_unescape("A&amp;B&#x26;C&#38;D&lt;"), "A&B&C&D<")
+        for text in ("Tom&notes", "R&reg_x", "A&nbsp;B", "A&B"):
+            self.assertEqual(WN._xml_unescape(text), text)
+
+    def test_build_xml_decodes_names_and_ignores_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = os.path.join(tmp, "names.xml")
+            out = os.path.join(tmp, "out.json")
+            with open(xml, "w", encoding="utf-8") as handle:
+                handle.write("<root><!-- <name>ghost</name><filename>ghost.rpf</filename> -->"
+                             "<name>A&amp;B</name></root>\n"
+                             '<?xml version="1.0"?><root>'
+                             "<filename>levels/Cell&#x26;Prop.rpf</filename></root>")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["build", "--xml", xml, "--out", out]), 0)
+            with open(out, encoding="utf-8") as handle:
+                names = json.load(handle)["names"]
+            self.assertEqual(names, {WN.joaat_hex(name): [name]
+                                     for name in ("A&B", "Cell&Prop", "Cell&Prop.rpf")})
+
     def test_resolve_rejects_unrecognized_map_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             dictionary = os.path.join(tmp, "names.json")

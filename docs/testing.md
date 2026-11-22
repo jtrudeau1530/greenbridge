@@ -72,6 +72,37 @@ python -I runtime/test/shaders/build.py <out dir>
 python -I runtime/test/shaders/check.py <out dir> <folder with the test programs>
 ```
 
+## The Windows runtime on Linux, under Wine or Proton
+
+The Linux build above makes only the Vulkan programs. The loader (`gta6rt`), its shims and their tests are Windows
+programs; `runtime/cmake/clang-cl-xwin.cmake` cross-compiles them on Linux with clang-cl and lld-link (LLVM 19+: the
+MSVC STL that xwin lays out rejects older Clang; versioned names go in with `-DCMAKE_CXX_COMPILER=clang-cl-19` etc.)
+against an MSVC CRT and Windows SDK that [xwin](https://github.com/Jake-Shadle/xwin) downloads from Microsoft
+(running it means accepting Microsoft's licence), and `ctest` runs them through Wine:
+
+```sh
+xwin --accept-license --sdk-version 10.0.26100 splat --use-winsysroot-style --preserve-ms-arch-notation \
+     --output ~/.local/share/xwin-sdk
+cmake -S runtime -B runtime/build/windows --toolchain "$PWD/runtime/cmake/clang-cl-xwin.cmake" \
+      -DXWIN_DIR="$HOME/.local/share/xwin-sdk"
+cmake --build runtime/build/windows --parallel
+WINEPREFIX="$HOME/.local/share/leonida-wine" ctest --test-dir runtime/build/windows
+```
+
+The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
+`make_game.py --runtime-build runtime/build/windows` takes this folder like a Windows build. CMake packages are
+looked up only inside the SDK folder, so a Windows SDL3 for the GameInput shim is passed as `-DSDL3_DIR=<its
+cmake folder>` (`CMAKE_PREFIX_PATH` is not searched here).
+
+For Proton, start any program once with `proton run` (with `STEAM_COMPAT_DATA_PATH` and
+`STEAM_COMPAT_CLIENT_INSTALL_PATH` set), so that it puts vkd3d-proton and DXVK into the prefix, then configure with
+`-DCMAKE_CROSSCOMPILING_EMULATOR="<Proton>/files/bin/wine"` and run `ctest` with
+`WINEPREFIX=$STEAM_COMPAT_DATA_PATH/pfx WINEDLLOVERRIDES="d3d12=n;d3d12core=n;dxgi=n"`. `proton run` itself doesn't
+pass the program's output on, so the tests can't run through it.
+
+The tests that compare with the host's D3D12 (`root_sig_test`, `root_sig`, `device_proxy`, `d3d12_vulkan_device`)
+check against Wine's vkd3d or vkd3d-proton here, not Microsoft's runtime, so some of them fail for that reason.
+
 ## GPUs with 32-wide subgroups (NVIDIA, Intel, Apple)
 
 The game's shaders are mostly wave64. A GPU that can't run 64-wide compute subgroups skips the wave64 tests
@@ -111,6 +142,14 @@ With more than one GPU, pick one through the Vulkan loader, for example
 `VK_LOADER_DRIVERS_SELECT=*amd*` or `VK_LOADER_DRIVERS_SELECT=nv-vk*` (or `VK_DRIVER_FILES=<path to the ICD json>`).
 `vulkaninfo --summary` shows which devices the loader then sees.
 
+Two GPUs of one vendor share one driver, so the loader cannot tell them apart (an RTX 5070 Ti next to an RTX 3060,
+say; without a choice the D3D12 tests take the last discrete GPU). `LEONIDA_VK_DEVICE` names the GPU by part of its
+name, without case: `LEONIDA_VK_DEVICE=5070` or `LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`)
+and the layer's standalone device read it, and a value that matches no device fails the run instead of testing
+another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12 adapter the same way.
+The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
+`vk_device_pick.h`, and fail with a message naming the filter when it matches no device.
+
 ## Known problems
 
 | What you see | Cause | What to do |
@@ -124,6 +163,7 @@ With more than one GPU, pick one through the Vulkan loader, for example
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |
+| `vulkaninfo` lists `Microsoft Direct3D12 (<gpu>)` next to the real GPU and the tests run on it | The Windows "OpenCL™, OpenGL® and Vulkan® Compatibility Pack" installs Mesa's Dozen, a Vulkan-on-D3D12 layer that reports `DISCRETE_GPU` like the native card | Current `main` prefers a native ICD over Microsoft's vendor (`0x1414`) in every harness; set `LEONIDA_VK_DEVICE=<part of the real GPU name>` to select explicitly. See #915. |
 | A GPU test that uses `image_load` (or lighting built from real shaders) reads zeros from its image; @Silliana saw every texel except pixel (0,0) come back zero in their own layer (#603, not reproduced here) | In this runtime the shader turns the T# words into an index through the descriptor hash table (`runtime/src/descriptor_table.h`: a miss gives index 0), and index 0 is a 1×1 image of zeros (`runtime/src/vulkan_bindless.h`), so a hand-built or zeroed T# that was never registered reads zeros even at (0,0). The translator does not compare coordinates with the T# size, and `cs_imgload.asm` only uses its T# words as a hash key | Register the descriptor through the runtime (for D3D12, create it with `CreateShaderResourceView`) so its T# hits the table, with the image's real width and height (stored as size − 1, see `runtime/src/gfx10_descriptors.h`) |
 
 ## Posting your result

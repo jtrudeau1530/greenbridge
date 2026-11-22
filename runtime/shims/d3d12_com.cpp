@@ -2,6 +2,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_fence_waiter.h"
 #include "d3d12_trace.h"
 #include "../src/gfx10_descriptors.h"
 
@@ -10,6 +11,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <memory>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -53,6 +55,57 @@ const char* name(leonida::ReplayResult result) {
     }
     return "?";
 }
+
+// The label of a SetMarker/BeginEvent call, as UTF-8. Metadata says what the data is (WinPixEventRuntime's
+// pix3_win.h: PIX_EVENT_UNICODE_VERSION 0, a UTF-16 string; PIX_EVENT_ANSI_VERSION 1, an ANSI string;
+// PIX_EVENT_PIX3BLOB_VERSION 2, PIX's own encoded event). Strings end at their terminator or at `size` bytes. The
+// PIX3 blob is not decoded (its console form is unmeasured, docs/d3d12_vulkan.md section 4.10); it gets a fixed
+// label, so the event still nests.
+std::string event_label(UINT metadata, const void* data, UINT size) {
+    if (!data || !size) return {};
+    std::wstring wide;
+    if (metadata == 0) {
+        const auto* text = static_cast<const wchar_t*>(data);
+        const std::size_t limit = size / sizeof(wchar_t);
+        std::size_t n = 0;
+        while (n < limit && text[n]) ++n;
+        wide.assign(text, n);
+    } else if (metadata == 1) {
+        const auto* text = static_cast<const char*>(data);
+        std::size_t n = 0;
+        while (n < size && text[n]) ++n;
+        if (!n) return {};
+        const int count = MultiByteToWideChar(CP_ACP, 0, text, int(n), nullptr, 0);
+        wide.resize(std::size_t(std::max(count, 0)));
+        if (count > 0) MultiByteToWideChar(CP_ACP, 0, text, int(n), wide.data(), count);
+    } else {
+        if (metadata != 2) stub("SetMarker/BeginEvent with unknown metadata");
+        return "PIX event";
+    }
+    if (wide.empty()) return {};
+    const int count = WideCharToMultiByte(CP_UTF8, 0, wide.data(), int(wide.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(std::size_t(std::max(count, 0)), '\0');
+    if (count > 0) WideCharToMultiByte(CP_UTF8, 0, wide.data(), int(wide.size()), out.data(), count, nullptr, nullptr);
+    return out;
+}
+
+class CommandSignature final
+    : public Child<CommandSignature, ID3D12CommandSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12CommandSignature> {
+public:
+    // {9a4e1c2b-55d8-4f7a-b012-3c8e7a1f6d90}
+    static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
+
+    CommandSignature(leonida::IndirectKind kind, UINT byte_stride) : kind_(kind), stride_(byte_stride) {}
+
+    leonida::IndirectKind kind() const { return kind_; }
+    UINT stride() const { return stride_; }
+    static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
+
+private:
+    leonida::IndirectKind kind_;
+    UINT stride_;
+};
 
 class CommandAllocator final
     : public Child<CommandAllocator, ID3D12CommandAllocatorStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
@@ -246,6 +299,7 @@ public:
 
     void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
         front_stencil_ref_ = back_stencil_ref_ = reference;
+        stencil_ref_set_ = true;  // the bundle carry-back in ExecuteBundle needs to see this
     }
 
     void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
@@ -459,6 +513,90 @@ public:
         front_stencil_ref_ = front;
         back_stencil_ref_ = back;
         stencil_ref_set_ = true;
+    }
+
+    // Debug markers, recorded in order with the other commands and replayed as VK_EXT_debug_utils labels. The trace
+    // names the call only, never the label.
+    void STDMETHODCALLTYPE SetMarker(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetMarker");
+        check(list_.marker(leonida::DebugMarker::Kind::set, event_label(metadata, data, size)));
+    }
+    void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::BeginEvent");
+        check(list_.marker(leonida::DebugMarker::Kind::begin, event_label(metadata, data, size)));
+    }
+    void STDMETHODCALLTYPE EndEvent() override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::EndEvent");
+        check(list_.marker(leonida::DebugMarker::Kind::end));
+    }
+
+    void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_command_count,
+                                           ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
+                                           ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        leonida::IndirectKind kind = leonida::IndirectKind::draw;
+        UINT stride = 0;
+        if (!command_signature_info(signature, kind, stride) || !argument_buffer || !max_command_count)
+            return check(false);
+        leonida::ExecuteIndirect cmd{};
+        cmd.kind = kind;
+        cmd.stride = stride;
+        cmd.max_count = max_command_count;
+        cmd.argument_buffer = resource_id(argument_buffer);
+        cmd.argument_offset = argument_buffer_offset;
+        cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
+        cmd.count_offset = count_buffer ? count_buffer_offset : 0;
+        check(list_.execute_indirect(cmd));
+    }
+
+    void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT,
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return check(false);
+        const auto& in = desc->Inputs;
+        leonida::BuildAccelerationStructure cmd{};
+        cmd.is_tlas = (in.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+        cmd.update = (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) != 0;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        cmd.dst_va = desc->DestAccelerationStructureData;
+        cmd.src_va = desc->SourceAccelerationStructureData;
+        cmd.scratch_va = desc->ScratchAccelerationStructureData;
+        if (cmd.is_tlas) {
+            cmd.instances_va = in.InstanceDescs;
+            cmd.instance_count = in.NumDescs;
+        } else {
+            for (UINT i = 0; i < in.NumDescs; ++i) {
+                const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
+                    (in.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+                        ? (in.ppGeometryDescs ? in.ppGeometryDescs[i] : nullptr)
+                        : (in.pGeometryDescs ? &in.pGeometryDescs[i] : nullptr);
+                if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) return check(false);
+                leonida::RtTriangleGeometry t{};
+                t.vertex_va = gd->Triangles.VertexBuffer.StartAddress;
+                t.vertex_count = gd->Triangles.VertexCount;
+                t.vertex_stride = static_cast<std::uint32_t>(gd->Triangles.VertexBuffer.StrideInBytes);
+                t.vertex_format = (gd->Triangles.VertexFormat == DXGI_FORMAT_R32G32_FLOAT)
+                                      ? VK_FORMAT_R32G32_SFLOAT
+                                      : VK_FORMAT_R32G32B32_SFLOAT;
+                t.index_va = gd->Triangles.IndexBuffer;
+                t.index_count = gd->Triangles.IndexCount;
+                if (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
+                    t.index_type = 1;
+                else if (gd->Triangles.IndexFormat == DXGI_FORMAT_R32_UINT)
+                    t.index_type = 2;
+                t.transform_va = gd->Triangles.Transform3x4;
+                t.opaque = (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) != 0;
+                cmd.triangles.push_back(t);
+            }
+        }
+        check(list_.build_acceleration_structure(cmd));
     }
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
@@ -726,18 +864,23 @@ public:
 
     // A null event blocks until the value is reached, as D3D12 does.
     HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
+        if (!event) return fence_.completed() >= value || fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
+        notify(value, std::make_shared<FenceWaiter>(event, 1));
+        return S_OK;
+    }
+
+    // Counts `waiter` down once this fence reaches `value`: now if it has, else from the waiter thread.
+    void notify(UINT64 value, std::shared_ptr<FenceWaiter> waiter) {
         if (fence_.completed() >= value) {
-            if (event) SetEvent(event);
-            return S_OK;
+            waiter->hit();
+            return;
         }
-        if (!event) return fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
         {
             std::lock_guard lock(mutex_);
-            pending_.emplace_back(value, event);
+            pending_.emplace_back(value, std::move(waiter));
             if (!waiter_.joinable()) waiter_ = std::thread([this] { wait_loop(); });
         }
         changed_.notify_all();
-        return S_OK;
     }
 
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
@@ -754,9 +897,11 @@ private:
             fence_.wait(lowest, 10'000'000);  // 10 ms, so destruction is never held up for long
             const UINT64 done = fence_.completed();
             lock.lock();
+            // An ANY wait that another fence already satisfied is dropped without waiting for this one.
             std::erase_if(pending_, [done](const auto& entry) {
+                if (entry.second->done()) return true;
                 if (entry.first > done) return false;
-                SetEvent(entry.second);
+                entry.second->hit();
                 return true;
             });
         }
@@ -767,7 +912,7 @@ private:
     std::atomic<UINT64> highest_;
     std::mutex mutex_;
     std::condition_variable changed_;
-    std::vector<std::pair<UINT64, HANDLE>> pending_;
+    std::vector<std::pair<UINT64, std::shared_ptr<FenceWaiter>>> pending_;
     std::thread waiter_;
     bool stop_ = false;
 };
@@ -780,15 +925,25 @@ public:
     static constexpr GUID kTag{0xe1a85d76, 0x0b3f, 0x4c29, {0xa7, 0xd4, 0x58, 0xf2, 0xc6, 0xe0, 0xb9, 0x13}};
 
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
-                 const D3D12_COMMAND_QUEUE_DESC& desc)
-        : desc_(desc), context_(context), queue_(context, queue, family) {}
+                 const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock)
+        : desc_(desc), context_(context), queue_(context, queue, family), vk_queue_(queue), family_(family),
+          clock_(clock) {}
+
+    ~CommandQueue() override {
+        if (!stamp_.pool) return;
+        const VkDevice device = context_.device();
+        stamp_.destroy_query_pool(device, stamp_.queries, nullptr);
+        context_.vk.vkDestroyCommandPool(device, stamp_.pool, nullptr);
+    }
 
     bool ok() const { return queue_.ok(); }
     leonida::ReplayResult last_result() const { return last_result_; }
 
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override {
         d3d12_trace::record("ID3D12CommandQueue::GetDesc");
-        return desc_;
+        D3D12_COMMAND_QUEUE_DESC desc = desc_;
+        if (!desc.NodeMask) desc.NodeMask = 1;  // node mask 0 reads back as the one node, as on the host
+        return desc;
     }
 
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
@@ -859,23 +1014,151 @@ public:
         return S_OK;
     }
 
+    // Queue labels, in order with the submissions around them.
+    void STDMETHODCALLTYPE SetMarker(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12CommandQueue::SetMarker");
+        marker(leonida::DebugMarker::Kind::set, metadata, data, size);
+    }
+    void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void* data, UINT size) override {
+        d3d12_trace::record("ID3D12CommandQueue::BeginEvent");
+        marker(leonida::DebugMarker::Kind::begin, metadata, data, size);
+    }
+    void STDMETHODCALLTYPE EndEvent() override {
+        d3d12_trace::record("ID3D12CommandQueue::EndEvent");
+        marker(leonida::DebugMarker::Kind::end, 0, nullptr, 0);
+    }
+
+    // The GPU timestamp is in device ticks (what GetTimestampFrequency counts: 1e9 / timestampPeriod per second)
+    // and the CPU one is QueryPerformanceCounter's, both read at about the same moment.
+    HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* gpu, UINT64* cpu) override {
+        if (!gpu || !cpu) return E_INVALIDARG;
+        if (clock_.calibrated) {
+            VkCalibratedTimestampInfoKHR domains[2]{{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR},
+                                                    {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR}};
+            domains[0].timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+            domains[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+            std::uint64_t stamps[2]{}, deviation = 0;
+            if (clock_.calibrated(context_.device(), 2, domains, stamps, &deviation) == VK_SUCCESS) {
+                *gpu = stamps[0];
+                *cpu = stamps[1];
+                return S_OK;
+            }
+        }
+        return submitted_calibration(*gpu, *cpu);
+    }
+
+    bool uses_calibrated_timestamps() const { return clock_.calibrated != nullptr; }
+
     static CommandQueue* from(IUnknown* object) { return Child::from<CommandQueue>(object); }
 
 private:
+    // The fallback without calibrated timestamps: wait for the queue to go idle, then submit a timestamp write and
+    // wait for it, with QueryPerformanceCounter read just before the submission and just after it completes. The
+    // GPU timestamp falls between the two; the midpoint is the answer, off by at most half the round trip (tens of
+    // microseconds). It stalls the queue, which is acceptable for a call profilers make once per capture.
+    HRESULT submitted_calibration(UINT64& gpu, UINT64& cpu) {
+        std::lock_guard lock(mutex_);
+        if (!clock_.timestamp_valid_bits || !clock_.get_device_proc || !create_stamp()) return E_FAIL;
+        auto& vk = context_.vk;
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vk.vkBeginCommandBuffer(stamp_.commands, &begin) != VK_SUCCESS) return E_FAIL;
+        stamp_.reset_query_pool(stamp_.commands, stamp_.queries, 0, 1);
+        stamp_.write_timestamp(stamp_.commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stamp_.queries, 0);
+        if (vk.vkEndCommandBuffer(stamp_.commands) != VK_SUCCESS) return E_FAIL;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &stamp_.commands;
+        LARGE_INTEGER before{}, after{};
+        {
+            std::lock_guard submit_lock(context_.submit_mutex());
+            if (vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS) return E_FAIL;
+            QueryPerformanceCounter(&before);
+            if (vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS ||
+                vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS)
+                return E_FAIL;
+            QueryPerformanceCounter(&after);
+        }
+        std::uint64_t stamp = 0;
+        if (stamp_.get_query_pool_results(context_.device(), stamp_.queries, 0, 1, sizeof(stamp), &stamp,
+                                          sizeof(stamp), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+            return E_FAIL;
+        if (clock_.timestamp_valid_bits < 64) stamp &= (std::uint64_t(1) << clock_.timestamp_valid_bits) - 1;
+        gpu = stamp;
+        cpu = UINT64(before.QuadPart) + UINT64(after.QuadPart - before.QuadPart) / 2;
+        return S_OK;
+    }
+
+    // The fallback's command buffer and one-query timestamp pool, made on first use. Called with mutex_ held.
+    bool create_stamp() {
+        if (stamp_.pool) return true;
+        const VkDevice device = context_.device();
+        const auto get = clock_.get_device_proc;
+        stamp_.create_query_pool = reinterpret_cast<PFN_vkCreateQueryPool>(get(device, "vkCreateQueryPool"));
+        stamp_.destroy_query_pool = reinterpret_cast<PFN_vkDestroyQueryPool>(get(device, "vkDestroyQueryPool"));
+        stamp_.reset_query_pool = reinterpret_cast<PFN_vkCmdResetQueryPool>(get(device, "vkCmdResetQueryPool"));
+        stamp_.write_timestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(get(device, "vkCmdWriteTimestamp"));
+        stamp_.get_query_pool_results =
+            reinterpret_cast<PFN_vkGetQueryPoolResults>(get(device, "vkGetQueryPoolResults"));
+        if (!stamp_.create_query_pool || !stamp_.destroy_query_pool || !stamp_.reset_query_pool ||
+            !stamp_.write_timestamp || !stamp_.get_query_pool_results)
+            return false;
+        auto& vk = context_.vk;
+        VkQueryPoolCreateInfo queries{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        queries.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queries.queryCount = 1;
+        if (stamp_.create_query_pool(device, &queries, nullptr, &stamp_.queries) != VK_SUCCESS) return false;
+        VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pool.queueFamilyIndex = family_;
+        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate.commandBufferCount = 1;
+        if (vk.vkCreateCommandPool(device, &pool, nullptr, &stamp_.pool) == VK_SUCCESS) {
+            allocate.commandPool = stamp_.pool;
+            if (vk.vkAllocateCommandBuffers(device, &allocate, &stamp_.commands) == VK_SUCCESS) return true;
+            vk.vkDestroyCommandPool(device, stamp_.pool, nullptr);
+            stamp_.pool = VK_NULL_HANDLE;
+        }
+        stamp_.destroy_query_pool(device, stamp_.queries, nullptr);
+        stamp_.queries = VK_NULL_HANDLE;
+        return false;
+    }
+
+    void marker(leonida::DebugMarker::Kind kind, UINT metadata, const void* data, UINT size) {
+        const std::string label = event_label(metadata, data, size);
+        std::lock_guard lock(mutex_);
+        queue_.marker(kind, label.c_str());
+    }
+
     D3D12_COMMAND_QUEUE_DESC desc_;
     leonida::VulkanContext& context_;
     std::mutex mutex_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
+    VkQueue vk_queue_;
+    std::uint32_t family_;
+    QueueClock clock_;
+    struct {
+        PFN_vkCreateQueryPool create_query_pool = nullptr;
+        PFN_vkDestroyQueryPool destroy_query_pool = nullptr;
+        PFN_vkCmdResetQueryPool reset_query_pool = nullptr;
+        PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
+        PFN_vkGetQueryPoolResults get_query_pool_results = nullptr;
+        VkQueryPool queries = VK_NULL_HANDLE;
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+    } stamp_;
 };
 
 }  // namespace
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
-                             const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device) {
+                             const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device,
+                             const QueueClock& clock) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* object = new CommandQueue(context, queue, queue_family, desc);
+    auto* object = new CommandQueue(context, queue, queue_family, desc, clock);
     if (!object->ok()) {
         object->Release();
         return E_FAIL;
@@ -916,6 +1199,59 @@ HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D1
     }
     object->attach_device(device);
     return hand_out(object, riid, out);
+}
+
+HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, ID3D12Fence* const* fences,
+                                               const UINT64* values, UINT count,
+                                               D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) {
+    if (flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL && flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY)
+        return E_INVALIDARG;
+    if (count && (!fences || !values)) return E_INVALIDARG;
+    std::vector<Fence*> objects(count);
+    for (UINT i = 0; i < count; ++i)
+        if (!(objects[i] = Fence::from(fences[i]))) return E_INVALIDARG;
+    const bool any = flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
+    if (!count) {  // nothing to wait for
+        if (event) SetEvent(event);
+        return S_OK;
+    }
+    if (!event) {
+        // One vkWaitSemaphores call: VK_SEMAPHORE_WAIT_ANY_BIT is the ANY flag, no flag is ALL.
+        std::vector<VkSemaphore> semaphores(count);
+        for (UINT i = 0; i < count; ++i) semaphores[i] = objects[i]->semaphore();
+        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wait.flags = any ? VK_SEMAPHORE_WAIT_ANY_BIT : 0;
+        wait.semaphoreCount = count;
+        wait.pSemaphores = semaphores.data();
+        wait.pValues = values;
+        return context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX) == VK_SUCCESS ? S_OK : E_FAIL;
+    }
+    // Each fence's own waiter thread counts the shared waiter down; no thread of its own.
+    const auto waiter = std::make_shared<FenceWaiter>(event, any ? 1u : count);
+    for (UINT i = 0; i < count && !waiter->done(); ++i) objects[i]->notify(values[i], waiter);
+    return S_OK;
+}
+
+bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
+    const CommandQueue* q = CommandQueue::from(queue);
+    return q && q->uses_calibrated_timestamps();
+}
+
+HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+                                 IUnknown* device) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    auto* sig = new CommandSignature(kind, byte_stride);
+    sig->attach_device(device);
+    return hand_out(sig, riid, out);
+}
+
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride) {
+    const CommandSignature* s = CommandSignature::from(signature);
+    if (!s) return false;
+    kind = s->kind();
+    byte_stride = s->stride();
+    return true;
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {

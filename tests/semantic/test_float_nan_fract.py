@@ -1,0 +1,230 @@
+"""Float min/max/min3/max3/med3 with a quiet NaN and v_fract next to 1.0, translated and executed.
+
+The expected words were measured on RDNA2 hardware: AMD Radeon RX 6800 (gfx1030), with the hw-oracle tool from
+the AnyPS5 project, in all four IEEE/DX10_CLAMP mode combinations and in wave32 and wave64 (docs/design.md,
+"Float min/max/med3 with NaN, v_fract"). The rules:
+  * v_min/v_max (f32, f16, each half of v_pk_min/max_f16): one NaN operand gives the other operand, bits
+    unchanged; -0 < +0. Both NaN: here only "a NaN", since NMin/NMax leave the payload open.
+  * v_min3/v_max3 = f(f(s0, s1), s2) with that min/max.
+  * v_med3: with any NaN operand the result is min3(s0, s1, s2); otherwise the median.
+  * v_fract_f32: a result that rounds to 1.0 is 0x3f7fffff instead (f16: 0x3bff); fract(-0) = +0,
+    fract(+-inf) = NaN.
+Inputs come from memory through s_buffer_load (V# in s[0:3] -> 0x1000), as in the GPU fixtures
+runtime/test/shaders/ps_fnan_med3.asm and ps_fnan_fract.asm, which are run here too.
+"""
+import gc
+import math
+import os
+import struct
+import sys
+import tempfile
+import unittest
+import warnings
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import support  # noqa: E402  (puts LEONIDA_TOOLS_DIR or tools/ on the path)
+import spirv_mini_interp as si  # noqa: E402
+
+rdna2spirv = support.rdna2spirv
+NAN_A, NAN_B = 0x7FC10001, 0xFFC20002          # two quiet NaNs with different signs and payloads
+M25, P35, P50, P70, ONE = 0xC0200000, 0x40600000, 0x40A00000, 0x40E00000, 0x3F800000   # -2.5 3.5 5 7 1
+PZ, NZ = 0x00000000, 0x80000000
+PUSH = [0x1000, 0, 32, 0] + [0] * 28            # V#: base 0x1000, num_records 32
+
+
+def is_nan32(w):
+    return (w & 0x7F800000) == 0x7F800000 and w & 0x7FFFFF
+
+
+def is_nan16(h):
+    return (h & 0x7C00) == 0x7C00 and h & 0x3FF
+
+
+def translate_text(body):
+    """SPIR-V text for a pixel shader whose instructions are ``body`` (one per line)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.mkdir(os.path.join(tmp, "disasm"))
+        src = os.path.join(tmp, "disasm", "ps_fnan.s")
+        with open(src, "w", encoding="utf-8", newline="\n") as f:
+            f.write("; ps_fnan\n" + "".join("\t" + ln.strip() + "\n" for ln in body.strip().splitlines()))
+        with open(os.path.join(tmp, "ps_fnan.dxbc"), "wb") as f:
+            f.write(support.STUB_DXBC)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            spv = rdna2spirv.translate(src)
+            gc.collect()
+        return spv
+
+
+LOAD = """s_buffer_load_dwordx4 s[4:7], s[0:3], 0
+s_waitcnt lgkmcnt(0)
+v_mov_b32_e32 v1, s4
+v_mov_b32_e32 v2, s5
+v_mov_b32_e32 v3, s6
+v_mov_b32_e32 v4, s7
+v_mov_b32_e32 v0, 0
+"""
+
+
+def run_op(line, inputs):
+    """Run ``line`` (writing v0, reading v1..v4 = inputs) and return the v0 word."""
+    spv = translate_text(LOAD + line + "\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+    mem = {0x1000 + 4 * i: w for i, w in enumerate((list(inputs) + [0] * 4)[:4])}
+    return support.mrt0_words(spv, push_constants=PUSH, memory=mem)[0]
+
+
+class MinMaxNaN(unittest.TestCase):
+    ROWS = [  # (x, y, min, max); None = a NaN
+        (NAN_A, M25, M25, M25),
+        (M25, NAN_B, M25, M25),
+        (NAN_A, NAN_B, None, None),
+        (PZ, NZ, NZ, PZ),
+        (NZ, PZ, NZ, PZ),
+    ]
+
+    def check(self, got, want, what):
+        if want is None:
+            self.assertTrue(is_nan32(got), f"{what}: {got:#010x} is not a NaN")
+        else:
+            self.assertEqual(got, want, f"{what}: got {got:#010x}, want {want:#010x}")
+
+    def test_v_min_v_max_f32(self):
+        for x, y, mn, mx in self.ROWS:
+            for form in ("e32", "e64"):
+                with self.subTest(x=hex(x), y=hex(y), form=form):
+                    self.check(run_op(f"v_min_f32_{form} v0, v1, v2", (x, y)), mn, f"min({x:#x}, {y:#x})")
+                    self.check(run_op(f"v_max_f32_{form} v0, v1, v2", (x, y)), mx, f"max({x:#x}, {y:#x})")
+
+    def test_v_min3_v_max3_f32(self):
+        self.assertEqual(run_op("v_min3_f32 v0, v1, v2, v3", (NAN_A, M25, P35)), M25)
+        self.assertEqual(run_op("v_max3_f32 v0, v1, v2, v3", (NAN_A, M25, P35)), P35)
+
+    def test_v_min_v_max_f16(self):
+        # The other half of the destination (v0 = 0) is kept.
+        for x, y in ((0x7E11, 0xC100), (0xC100, 0xFE22)):
+            with self.subTest(x=hex(x), y=hex(y)):
+                self.assertEqual(run_op("v_min_f16_e32 v0, v1, v2", (x, y)), 0xC100)
+                self.assertEqual(run_op("v_max_f16_e32 v0, v1, v2", (x, y)), 0xC100)
+
+    def test_v_pk_min_v_pk_max_f16(self):
+        # Low halves (0x7e11, 0xc100), high halves (0xc100, 0xfe22): both give 0xc100.
+        x, y = 0xC1007E11, 0xFE22C100
+        self.assertEqual(run_op("v_pk_min_f16 v0, v1, v2", (x, y)), 0xC100C100)
+        self.assertEqual(run_op("v_pk_max_f16 v0, v1, v2", (x, y)), 0xC100C100)
+
+
+class Med3NaN(unittest.TestCase):
+    def test_v_med3_f32_rows(self):
+        rows = [
+            ((NAN_A, P70, P50), P50),
+            ((NAN_A, P35, M25), M25),
+            ((M25, NAN_B, P35), M25),
+            ((NZ, PZ, NZ), NZ),
+            ((ONE, P35, M25), ONE),            # no NaN: the median, unchanged
+        ]
+        for ins, want in rows:
+            with self.subTest(ins=[hex(w) for w in ins]):
+                self.assertEqual(run_op("v_med3_f32 v0, v1, v2, v3", ins), want)
+
+    def test_v_med3_f32_with_inline_constants(self):
+        # med3(0, NaN, 1.0) = 0 on hardware. Only the register operand can be a NaN, so only it is tested.
+        self.assertEqual(run_op("v_med3_f32 v0, 0, v1, 1.0", (NAN_A,)), PZ)
+        spv = translate_text(LOAD + "v_med3_f32 v0, 0, v1, 1.0\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+        self.assertEqual(spv.count("OpIsNan"), 1)
+
+    def test_v_med3_f32_all_constants_needs_no_select(self):
+        spv = translate_text("v_med3_f32 v0, 0, 1.0, 2.0\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+        self.assertNotIn("OpIsNan", spv)
+        self.assertNotIn("OpSelect %float", spv)
+        self.assertEqual(support.mrt0_words(spv)[0], ONE)
+
+    def test_v_med3_f32_nan_literal_is_checked(self):
+        # A literal can be a NaN, so it keeps its OpIsNan (and med3 gives min3 = the smallest of the others).
+        spv = translate_text(LOAD + "v_med3_f32 v0, 0x7fc00000, v1, v2\nexp mrt0 v0, v0, v0, v0 done vm\ns_endpgm")
+        self.assertEqual(spv.count("OpIsNan"), 3)
+        self.assertEqual(support.mrt0_words(spv, push_constants=PUSH, memory={0x1000: P70, 0x1004: P50})[0], P50)
+
+    def test_v_med3_f16_follows_the_same_rule(self):
+        # The f16 form of the first f32 row (rule stated for v_med3_f32/_f16): med3(NaN, 7.0, 5.0) = 5.0.
+        self.assertEqual(run_op("v_med3_f16 v0, v1, v2, v3", (0x7E11, 0x4700, 0x4500)), 0x4500)
+
+
+class FractNearOne(unittest.TestCase):
+    def test_v_fract_f32_rows(self):
+        for x, want in ((0xAEDBE6FF, 0x3F7FFFFF), (0xB2800000, 0x3F7FFFFF), (NZ, PZ),
+                        (0x3FC00000, 0x3F000000), (0xBF99999A, 0x3F4CCCCC)):
+            with self.subTest(x=hex(x)):
+                self.assertEqual(run_op("v_fract_f32_e32 v0, v1", (x,)), want)
+
+    def test_v_fract_f32_of_infinity_is_nan(self):
+        for x in (0x7F800000, 0xFF800000):
+            with self.subTest(x=hex(x)):
+                self.assertTrue(is_nan32(run_op("v_fract_f32_e32 v0, v1", (x,))))
+
+    def test_v_fract_f16_rows(self):
+        for x in (0x8800, 0x8001, 0x9000):
+            with self.subTest(x=hex(x)):
+                self.assertEqual(run_op("v_fract_f16_e32 v0, v1", (x,)), 0x3BFF)
+        got = run_op("v_fract_f16_e32 v0, v1", (0x7C00,))
+        self.assertTrue(is_nan16(got & 0xFFFF) and got >> 16 == 0, hex(got))
+
+    def test_v_fract_f16_mul2_keeps_a_true_one(self):
+        # fract(0.5) * 2 = 1.0 exactly: the 0x3c00 -> 0x3bff fix-up is only for Fract's own rounding.
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", (0x3800,)), 0x3C00)
+
+    def test_fract_alone_rounds_to_one(self):
+        # Without the select, fract(-1e-10) is exactly 1.0: the select is what gives 0x3f7fffff.
+        self.assertEqual(si.f32_bits(si._fract(si.bits_f32(0xAEDBE6FF))), ONE)
+
+
+class GpuFixtures(unittest.TestCase):
+    """The two GPU fixtures with the heap words check.py seeds (the same words the .asm headers give)."""
+
+    def test_ps_fnan_med3(self):
+        heap = (NAN_A, P70, P50, NAN_A, P35, M25)
+        spv = support.translate_fixture("ps_fnan_med3")
+        words = support.mrt0_words(spv, push_constants=PUSH,
+                                   memory={0x1000 + 4 * i: w for i, w in enumerate(heap)})
+        self.assertEqual(words, [P50, M25, M25, P35])
+
+    def test_ps_fnan_fract(self):
+        heap = (0xAEDBE6FF, 0x00008800, NAN_A, M25)
+        spv = support.translate_fixture("ps_fnan_fract")
+        words = support.mrt0_words(spv, push_constants=[0x1000, 0, 16, 0] + [0] * 28,
+                                   memory={0x1000 + 4 * i: w for i, w in enumerate(heap)})
+        self.assertEqual(words, [0x3F7FFFFF, 0x00003BFF, M25, M25])
+
+
+class InterpreterOps(unittest.TestCase):
+    """NMin/NMax, OpIsNan and Fract in spirv_mini_interp, against GLSL.std.450."""
+
+    def test_nmin_nmax(self):
+        nan = float("nan")
+        self.assertEqual(si._nmin_nmax("NMin", nan, -2.5), -2.5)
+        self.assertEqual(si._nmin_nmax("NMax", -2.5, nan), -2.5)
+        self.assertTrue(math.isnan(si._nmin_nmax("NMin", nan, nan)))
+        self.assertEqual(math.copysign(1, si._nmin_nmax("NMin", 0.0, -0.0)), -1)
+        self.assertEqual(math.copysign(1, si._nmin_nmax("NMax", -0.0, 0.0)), 1)
+
+    def test_fract_exact(self):
+        self.assertEqual(si._fract(-0.75), 0.25)
+        self.assertEqual(math.copysign(1, si._fract(-0.0)), 1)
+        self.assertTrue(math.isnan(si._fract(float("inf"))))
+        self.assertEqual(si._fract(si.bits_f32(0x80000001)), 1.0)      # 1 - 2**-149 rounds to 1.0
+
+    def test_fmin_of_nan_still_raises(self):
+        body = ("OpCapability Shader\n%glsl = OpExtInstImport \"GLSL.std.450\"\nOpMemoryModel Logical GLSL450\n"
+                "OpEntryPoint Fragment %main \"main\" %out\n%void = OpTypeVoid\n%fn = OpTypeFunction %void\n"
+                "%uint = OpTypeInt 32 0\n%float = OpTypeFloat 32\n%_ptr_Output_uint = OpTypePointer Output %uint\n"
+                "%out = OpVariable %_ptr_Output_uint Output\n%n = OpConstant %uint 2143289344\n"
+                "%main = OpFunction %void None %fn\n%entry = OpLabel\n%x = OpBitcast %float %n\n"
+                "%r = OpExtInst %float %glsl FMin %x %x\n%u = OpBitcast %uint %r\nOpStore %out %u\nOpReturn\n"
+                "OpFunctionEnd\n")
+        with self.assertRaises(si.UnsupportedConstruct):
+            si.run_fragment(body)
+
+
+if __name__ == "__main__":
+    unittest.main()

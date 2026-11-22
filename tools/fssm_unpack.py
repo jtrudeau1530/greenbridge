@@ -81,6 +81,8 @@ def unpack(dxbc: bytes, payload: str = "last"):
         raise ValueError(f"size mismatch {len(data)} != {unpacked}")
     if len(data) < 6:
         raise ValueError("truncated FSSM magic or version")
+    if data[:4] != b"FSSM":
+        raise ValueError(f"invalid FSSM magic {data[:4]!r}")
     return data, ents
 
 

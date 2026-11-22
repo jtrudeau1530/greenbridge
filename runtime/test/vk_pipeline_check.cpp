@@ -10,6 +10,7 @@
 //   [cache.bin]   loaded first if it exists (a stopped run resumes: cached pipelines are instant), saved every
 //                 10 minutes and at the end
 //   --jobs N      compile on N threads (default: half the hardware threads)
+//   --large-module-bytes N  compile modules larger than N bytes alone (default: 4194304; 0 disables isolation)
 //   --start I --count N   check only index entries [I, I+N) (sorted by name)
 //   --slow SEC    print pipelines slower than SEC (default 30); compiles past 60 s are named while running
 //   --max-bytes N skip modules whose .spv is larger than N bytes (0 = no limit; names every skip)
@@ -19,12 +20,14 @@
 //                 the executable that runs the translated shader is written, not the partner stub's. Use without
 //                 cache.bin: a pipeline loaded from the cache may come without statistics.
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -35,7 +38,9 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -359,13 +364,14 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
-            "[--max-bytes N] [--stage all|cs|graphics | --compute-only | --graphics-only]\n");
+            "[--max-bytes N] [--large-module-bytes N] [--stage all|cs|graphics | --compute-only | --graphics-only]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
     std::string dir = argv[1], cache_path, stats_path;
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
+    size_t large_module_bytes = 4 * 1024 * 1024;
     double slow = 30.0;
     std::string stage_filter = "all";
     for (int i = 2; i < argc; i++) {
@@ -379,6 +385,15 @@ int main(int argc, char** argv) {
         else if (a == "--compute-only") stage_filter = "cs";
         else if (a == "--graphics-only") stage_filter = "graphics";
         else if (a == "--max-bytes") max_bytes = std::stoull(val());
+        else if (a == "--large-module-bytes") {
+            const std::string_view value = i + 1 < argc ? argv[++i] : "";
+            const auto end = value.data() + value.size();
+            const auto [ptr, ec] = std::from_chars(value.data(), end, large_module_bytes);
+            if (ec != std::errc{} || ptr != end) {
+                std::fprintf(stderr, "--large-module-bytes requires a non-negative byte count\n");
+                return 2;
+            }
+        }
         else if (a == "--stats") stats_path = val();
         else cache_path = a;
     }
@@ -436,10 +451,13 @@ int main(int argc, char** argv) {
     if (n == 0) { std::fprintf(stderr, "no Vulkan physical devices found\n"); return 1; }
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    for (auto d : pds) {
-        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(d, &p);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
+    std::vector<VkPhysicalDeviceProperties> candidates(pds.size());
+    for (std::size_t i = 0; i < pds.size(); ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
+    if (!pd) {
+        leonida::vk_test::report_no_device();
+        return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
@@ -624,6 +642,8 @@ int main(int argc, char** argv) {
                  work.size(), lo, hi, stage_filter.c_str(), jobs);
 
     std::mutex mu;  // guards counters, stdout, stub cache and in-flight table
+    std::shared_mutex compile_gate;  // large modules exclude other shader and pipeline work
+    size_t isolated_modules = 0;
     std::map<std::string, uint32_t> modules_ok, modules_bad, big_skipped;
     std::map<std::string, StageStats> stats;
     std::map<std::string, VkShaderModule> stub_cache;
@@ -725,7 +745,7 @@ int main(int argc, char** argv) {
             const std::string& stage = meta.stage;
             std::ifstream f(dir + "/" + name + ".spv", std::ios::binary | std::ios::ate);
             const std::streamoff file_size = f.tellg();
-            if (max_bytes && file_size > std::streamoff(max_bytes)) {   // multi-MB ray-tracing shaders (#108)
+            if (max_bytes && std::cmp_greater(file_size, max_bytes)) {   // multi-MB ray-tracing shaders (#108)
                 {
                     std::lock_guard<std::mutex> g(mu);
                     big_skipped[stage]++;
@@ -735,6 +755,14 @@ int main(int argc, char** argv) {
                 ++done;
                 continue;
             }
+            // Enter before reading the module: creation can also enter the driver. Hold until its pipeline and
+            // module have been destroyed, including on failure. The watchdog and cache writer don't take this lock.
+            const bool isolated = large_module_bytes && std::cmp_greater(file_size, large_module_bytes);
+            std::unique_lock exclusive(compile_gate, std::defer_lock);
+            std::shared_lock parallel(compile_gate, std::defer_lock);
+            if (isolated) exclusive.lock();
+            else if (large_module_bytes) parallel.lock();
+
             f.seekg(0);
             std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
             VkShaderModule sm = VK_NULL_HANDLE;
@@ -746,6 +774,7 @@ int main(int argc, char** argv) {
             }
             {
                 std::lock_guard<std::mutex> g(mu);
+                if (isolated) ++isolated_modules;
                 if (mod_ok) modules_ok[stage]++;
                 else { modules_bad[stage]++; std::printf("MODULE FAIL %s\n", name.c_str()); }
             }
@@ -1021,6 +1050,9 @@ int main(int argc, char** argv) {
         for (auto& [st, c] : big_skipped) std::printf(" %s=%u", st.c_str(), c);
         std::printf("; checked %zu of %zu\n", work.size() - big_total, work.size());
     }
+    if (isolated_modules)
+        std::printf("large modules checked exclusively: %zu (over %zu bytes)\n", isolated_modules,
+                    large_module_bytes);
     std::printf("wall time: %.1fs on %u threads\n", elapsed(), jobs);
     const bool cache_saved = save_cache(true);  // keep successful pipelines even if another entry failed
     if (stats_out) std::fclose(stats_out);

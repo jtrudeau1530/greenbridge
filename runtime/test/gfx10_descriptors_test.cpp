@@ -236,6 +236,8 @@ int main() {
     CHECK((one_field({.max_anisotropy = 0}) == SamplerWords{0, 0, 0, 0}));
     CHECK((one_field({.compare = CompareFunction::less_equal}) == SamplerWords{3u << 12, 0, 0, 0}));
     CHECK((one_field({.compare = CompareFunction::always}) == SamplerWords{7u << 12, 0, 0, 0}));
+    CHECK((one_field({.compare_never = true}) == SamplerWords{0, 0, 0, 1u << 12}));
+    CHECK(!decode(SamplerWords{0, 0, 1u << 31, 1u << 12}).compare_never);  // alternate WORD3 layout
     CHECK((one_field({.unnormalized = true}) == SamplerWords{1u << 15, 0, 0, 0}));  // FORCE_UNNORMALIZED
     CHECK((one_field({.filter_mode = FilterMode::maximum}) == SamplerWords{2u << 29, 0, 0, 0}));
     CHECK((one_field({.min_lod = 1.5f}) == SamplerWords{0, 0x180, 0, 0}));          // MIN_LOD, 4.8 fixed

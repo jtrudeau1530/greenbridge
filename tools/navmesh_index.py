@@ -187,11 +187,21 @@ def add_distribution(summary, rows):
     return summary
 
 
+def _make_parent(path):
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_outputs(rows, summary, out_path, csv_path):
+    _make_parent(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "pages": rows}, f, indent=1)
     written = []
     if csv_path:
+        _make_parent(csv_path)
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
             w.writeheader()

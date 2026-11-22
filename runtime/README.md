@@ -43,6 +43,9 @@ code from the mapped images runs. TLS reserves its module index through the runt
 callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. An EXE's entry point is not
 run.
 
+`--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
+print the usage and exit 2 before anything is mapped.
+
 The report line is:
 
 ```
@@ -122,7 +125,8 @@ Current limits, by design:
 
 `shims/registry.cpp` holds the static tables. The current shims are:
 
-- `xmem.dll` — `XMemAlloc`, `XMemFree`, `XMemGetWorkingSetStatistics`, and the measured three-argument
+- `xmem.dll` — `XMemAlloc`, `XMemFree`, the measured two-argument `XMemGetWorkingSetStatistics(kind, out)`, and the
+  measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address.

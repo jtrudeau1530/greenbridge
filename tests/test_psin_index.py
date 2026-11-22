@@ -212,6 +212,49 @@ class TestSchema(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_schema_on_truncated_psin(self):
+        # Found by @kapitche on #776: --schema read r["schema"] on a record parse() had returned early.
+        good = make_psin([("LSCH", make_lsch(SCHEMA)), ("LENM", make_lenm(ENUMS))])
+        cases = {
+            "00000001.bin": good[:4] + struct.pack(">I", 9999) + good[8:],   # first section past EOF
+            "00000002.bin": make_psin([], first=32, table_bytes=16),          # no first section header
+            "00000003.bin": good[:-4],                                        # LENM cut short
+            "00000004.bin": good,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, blob in cases.items():
+                with open(os.path.join(tmp, name), "wb") as f:
+                    f.write(blob)
+            p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", "--schema"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            files = {r["file"]: r for r in json.loads(p.stdout)["files"]}
+            self.assertEqual(len(files), 4)
+            for r in files.values():   # one shape for every record
+                self.assertEqual(set(r["schema"]), {"structs", "enums", "lsch", "lenm", "reason"})
+            first = files["00000001.bin"]["schema"]
+            self.assertEqual((first["structs"], first["enums"], first["lsch"], first["lenm"]), ([], [], False, False))
+            self.assertIn("outside the file", first["reason"])
+            self.assertIn("first section header", files["00000002.bin"]["schema"]["reason"])
+            cut = files["00000003.bin"]["schema"]
+            self.assertTrue(cut["lsch"])
+            self.assertFalse(cut["lenm"])
+            self.assertEqual(len(cut["structs"]), 2)
+            self.assertIn("no whole LENM section", cut["reason"])
+            self.assertEqual(files["00000004.bin"]["schema"]["reason"], "")
+            t = subprocess.run([sys.executable, "-I", TOOL, tmp, "--schema"], capture_output=True, text=True)
+            self.assertEqual(t.returncode, 0, t.stderr)
+            self.assertNotIn("Traceback", t.stderr)
+            self.assertIn("schema: no whole LSCH section", t.stdout)
+
+    def test_schema_reason_for_missing_and_bad_sections(self):
+        got = P.parse(make_psin([("LGID", b"")]), schema=True)["schema"]
+        self.assertEqual(got["reason"], "no LSCH section; no LENM section")
+        got = P.parse(make_psin([("LSCH", b"\x01\x02\x03"), ("LENM", b"")]), schema=True)["schema"]
+        self.assertFalse(got["lsch"])
+        self.assertTrue(got["lenm"])
+        self.assertIn("LSCH: no struct count", got["reason"])
+
     def test_json_schema(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "00000001.bin"), "wb") as f:

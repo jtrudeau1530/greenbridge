@@ -383,7 +383,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             if mm[s:s + 3] == b"KB2":
                 blen = (_u32(mm, s + 4) or 0) + 8
                 w, h = _u32(mm, s + 0x14), _u32(mm, s + 0x18)
-                if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
                 gap = mm[last:s]
@@ -396,8 +396,8 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
             d = zlib.decompressobj()
             chunks, p = [], s
             try:
-                while not d.eof and p < size:
-                    block = mm[p:p + (1 << 20)]
+                while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
+                    block = mm[p:min(p + (1 << 20), end)]
                     chunks.append(d.decompress(block))
                     p += len(block)
                     if d.unused_data or d.eof:
@@ -435,7 +435,8 @@ def scan_dir(path, string_limit=16):
     entries = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -511,6 +512,8 @@ def main():
     ap.add_argument("--all-strings", action="store_true", help="write every readable string to JSON (game data)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
+    if a.strings < 0:
+        ap.exit(2, f"{ap.prog}: error: argument --strings: must be 0 or more\n")
     if os.path.isdir(a.out):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     folder = os.path.dirname(os.path.abspath(a.out))

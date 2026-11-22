@@ -133,7 +133,7 @@ def test_random_graphs():
             assert got == want, f"graph {succ} seed {seed}: tree ran {got}, graph runs {want}"
     assert structured > 5000 and refused > 1000 and loops > 2000, (structured, refused, loops)
     assert split_ok > 1000 and split_ok + split_cap == refused, (split_ok, split_cap, refused)
-    return structured, refused, loops, split_ok, split_cap
+    # No return: pytest requires a test to end on None, and the counts above are already asserted.
 
 
 def test_shapes():

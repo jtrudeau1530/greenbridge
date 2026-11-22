@@ -42,6 +42,10 @@ def ts(v):
 def parse_asav(d):
     if d[:4] != b'ASAV':
         raise ValueError('not ASAV')
+    # The fixed fields below are read at absolute offsets, so a short file must be rejected here instead of
+    # letting struct.unpack_from raise a struct.error that says nothing about the save (the JSAV parser in #923).
+    if len(d) < ASAV_HDR:
+        raise ValueError(f'header is only {len(d)} bytes, an ASAV header is {ASAV_HDR}')
     f = struct.unpack_from('<IIIIIII', d, 4)
     h = {
         'magic': 'ASAV',
@@ -61,6 +65,8 @@ def parse_asav(d):
         'file_size': len(d),
     }
     h['timestamp_utc'] = ts(h['timestamp'])
+    if h['payload_offset'] > len(d):
+        raise ValueError(f"payload offset {h['payload_offset']:#x} is past the end of a {len(d)}-byte file")
     return h
 
 
@@ -78,15 +84,22 @@ JSAV_SEP = b',\r\n'
 def parse_jsav(d):
     if d[:4] != b'JSAV':
         raise ValueError('not JSAV')
+    if len(d) < JSAV_HDR:
+        raise ValueError('JSAV header is only %d bytes' % len(d))
     ver, n_code, n_script = struct.unpack_from('<III', d, 4)
     n = n_code + n_script
+    table_end = JSAV_HDR + n * JSAV_ENTRY.size
+    if table_end > len(d):
+        raise ValueError('JSAV header declares %d entries but the file has %d bytes' % (n, len(d)))
     entries = []
     for i in range(n):
         hsh, flags, rsv, off, size = JSAV_ENTRY.unpack_from(d, JSAV_HDR + i * JSAV_ENTRY.size)
         entries.append({'index': i, 'group': 'code' if i < n_code else 'script',
                         'hash': '%08x' % hsh, 'flags': flags, 'reserved': rsv, 'offset': off, 'size': size})
-    table_end = JSAV_HDR + n * JSAV_ENTRY.size
-    body_off = d.index(b'{', table_end)
+    try:
+        body_off = d.index(b'{', table_end)
+    except ValueError:
+        raise ValueError('JSAV body marker not found after the entry table') from None
     body_end = len(d.rstrip(b'\0'))
     return {'magic': 'JSAV', 'version': ver, 'code_blocks': n_code, 'script_blocks': n_script,
             'table_end': table_end, 'body_offset': body_off, 'body_end': body_end,
@@ -417,20 +430,25 @@ def main(argv):
         print(__doc__)
         return 0
     cmd, args = argv[1], argv[2:]
-    if cmd == 'info' and args:
-        info(args)
-    elif cmd == 'extract' and len(args) == 2:
-        extract(*args)
-    elif cmd == 'pack' and len(args) == 2:
-        pack(*args)
-    elif cmd == 'verify' and args:
-        return 0 if all([verify(p) for p in args]) else 1
-    elif cmd == 'diff' and len(args) == 2:
-        diff(*args)
-    elif cmd == 'import':
-        import_saves(args)
-    else:
-        print(__doc__)
+    try:
+        if cmd == 'info' and args:
+            info(args)
+        elif cmd == 'extract' and len(args) == 2:
+            extract(*args)
+        elif cmd == 'pack' and len(args) == 2:
+            pack(*args)
+        elif cmd == 'verify' and args:
+            return 0 if all([verify(p) for p in args]) else 1
+        elif cmd == 'diff' and len(args) == 2:
+            diff(*args)
+        elif cmd == 'import':
+            import_saves(args)
+        else:
+            print(__doc__)
+            return 2
+    except (ValueError, struct.error, OSError) as e:
+        # A malformed save must report one clear line, not a traceback.
+        print('ERROR: %s' % e, file=sys.stderr)
         return 2
     return 0
 

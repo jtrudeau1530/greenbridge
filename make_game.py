@@ -216,7 +216,10 @@ def choose_game() -> str:
         if not interactive:
             fail("More than one copy found: choose one with --game.")
         while True:
-            pick = input("Which one? ").strip()
+            try:
+                pick = input("Which one? ").strip()
+            except EOFError:   # Ctrl+Z / Ctrl+D, or a console that gives no input
+                fail("No copy chosen: choose one with --game.")
             if pick.isdigit() and 1 <= int(pick) <= len(found):
                 return found[int(pick) - 1][0]
     if not interactive:
@@ -224,7 +227,10 @@ def choose_game() -> str:
     print("Your game files weren't found automatically. Paste the folder that holds MicrosoftGame.Config "
           "and the .rpf archives.")
     while True:
-        d = input("Game folder: ").strip().strip('"')
+        try:
+            d = input("Game folder: ").strip().strip('"')
+        except EOFError:
+            fail("No folder given. Give the folder with --game.")
         if d and match_version(d):
             return d
         print("  That folder isn't a supported version of the game. Try again.")
@@ -236,6 +242,23 @@ def default_out() -> str:
 
 # ---------------------------------------------------------------- preflight
 MIN_FREE_GB = {"shaders": 30, "assets": 300}
+
+
+def assets_exported(work: str) -> bool:
+    """Whether an earlier run finished the assets stage's exports, so its space is already in use. xma.done is the
+    last marker assets() writes, after every model, texture and audio export before it succeeded; ogg.done is read
+    too. A marker counts only when it holds what mark() writes, not because a file of that name exists.
+    xma.done is written with or without ffmpeg, and every run decodes the XMA2 streams that have no .wav yet once
+    ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again."""
+    audio = os.path.join(work, "assets", "audio")
+    for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
+        try:
+            with open(os.path.join(audio, name), encoding="utf-8") as f:
+                if f.read().strip() != f"{what} finished":
+                    return False
+        except (OSError, UnicodeError):
+            return False
+    return not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma")))
 
 
 def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
@@ -292,7 +315,13 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
             missing.append(pipeline_check_prerequisite(runtime_building))
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
-    need_gb = sum(MIN_FREE_GB.get(s, 0) for s in stages)
+    need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
+    # A rerun that only refreshes the shaders shouldn't need room for a second copy of exports already on disk.
+    # --wav still counts it: the WAV decode writes several times the Ogg Opus size and has no marker.
+    if need.get("assets") and not wav and assets_exported(work):
+        log(f"preflight: the assets are already exported in {work}; not counting their {need['assets']} GB")
+        need["assets"] = 0
+    need_gb = sum(need.values())
     os.makedirs(work, exist_ok=True)
     free_gb = shutil.disk_usage(work).free / 2**30
     if free_gb < need_gb:
@@ -377,13 +406,14 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     unpacked = os.path.join(dxbc, "fssm_index.json")      # fssm_unpack.py, the same
     disassembled = os.path.join(dxbc, "disasm.done")      # written here once shader_disasm.py exits with 0
     translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
+    shard_plan = os.path.join(spirv, SHARD_PLAN)          # lets translate() keep finished shards; see there
     if not os.path.isfile(carved):
         log("shaders: carving shaders.rpf")
-        drop(unpacked, disassembled, translated)
+        drop(unpacked, disassembled, translated, shard_plan)
         py("shader_carve.py", src, dxbc)
     if not os.path.isfile(unpacked):
         log("shaders: unpacking native code")
-        drop(disassembled, translated)
+        drop(disassembled, translated, shard_plan)
         py("fssm_unpack.py", dxbc)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
@@ -402,7 +432,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         need(os.environ.get("LLVM_MC", "llvm-mc"),
              "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's path or whole command.")
         log("shaders: disassembling (gfx1013)")
-        drop(translated)
+        drop(translated, shard_plan)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
         mark_done(disassembled)
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
@@ -548,20 +578,57 @@ def drop(*paths: str) -> None:
             os.remove(p)
 
 
+SHARD_PLAN = "shards.json"   # beside the index parts: the --jobs, mode and translator source that made them
+
+
+def translator_digest() -> str:
+    """SHA-256 over every file directly in tools/: rdna2spirv.py, the modules it imports and the data it reads
+    (gfx10_formats.json). Any change there counts, so parts made by other code are never merged with new ones."""
+    import hashlib
+    h = hashlib.sha256()
+    for name in sorted(os.listdir(TOOLS)):
+        path = os.path.join(TOOLS, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                h.update(name.encode("utf-8") + b"\0" + f.read() + b"\0")
+    return h.hexdigest()
+
+
 def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False) -> None:
-    """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts."""
+    """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts.
+
+    A shard renames its index.part<i>.json into place last, so a part on disk is a finished shard. A run stopped
+    part-way, or during the merge, keeps those parts when it resumes with the same --jobs, wave64 mode and translator
+    source, and starts only the shards that have none. shaders() drops the plan whenever an earlier step reruns."""
     os.makedirs(spirv, exist_ok=True)
-    for f in os.listdir(spirv):  # parts from an earlier run with another --jobs would be merged in too
-        if f.startswith("index.part") and f.endswith(".json"):
-            os.remove(os.path.join(spirv, f))
+    plan_path = os.path.join(spirv, SHARD_PLAN)
+    plan = {"jobs": jobs, "wave64_emulate": bool(emulate), "translator": translator_digest()}
+    try:
+        with open(plan_path, encoding="utf-8") as f:
+            same = json.load(f) == plan
+    except (OSError, ValueError):
+        same = False
+    if not same:
+        # Parts from another --jobs would be merged in too, and parts from another mode or translator are wrong.
+        # They go before the new plan is written: a stop in between must not leave old parts under a new plan.
+        for f in os.listdir(spirv):
+            if f.startswith("index.part") and f.endswith(".json"):
+                os.remove(os.path.join(spirv, f))
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(plan, f)
+    todo = [i for i in range(jobs) if not os.path.isfile(os.path.join(spirv, f"index.part{i}.json"))]
+    if len(todo) < jobs:
+        log(f"  keeping {jobs - len(todo)} of {jobs} shards finished by the run before")
     tool = os.path.join(TOOLS, "rdna2spirv.py")
     extra = ["--wave64-emulate"] if emulate else []
-    log(f"  rdna2spirv.py {disasm} --out {spirv} --shard 0..{jobs - 1}/{jobs}" + "".join(" " + e for e in extra))
+    if todo:
+        which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
+        log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))
     # --no-asm: keep only the .spv modules; the .spvasm text would add ~35 GB for the corpus
     procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}", "--no-asm",
                                *extra])
-             for i in range(jobs)]
-    bad = [f"shard {i} exited with {r}" for i, r in enumerate(p.wait() for p in procs) if r != 0]
+             for i in todo]
+    bad = [f"shard {i} exited with {r}" for i, r in zip(todo, [p.wait() for p in procs]) if r != 0]
     if bad:
         fail("rdna2spirv.py: " + ", ".join(bad))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
@@ -578,6 +645,35 @@ def rpf9dump(work: str) -> str:
     run(["dotnet", "build", os.path.join(TOOLS, "rpf9dump", "rpf9dump.csproj"), "-c", "Release",
          "-o", os.path.dirname(exe), "--nologo", "-v", "q"])
     return exe
+
+
+def ttpf_complete(pool_dir: str) -> bool:
+    """An older exporter could publish the manifest after a failed DDS write. Check its promised files on resume."""
+    try:
+        with open(os.path.join(pool_dir, "manifest.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        with os.scandir(pool_dir) as it:
+            have = {e.name for e in it if e.is_file()}
+    except (OSError, ValueError, RecursionError):
+        return False
+    if not isinstance(doc, dict):
+        return False
+    rows, count = doc.get("Textures"), doc.get("Count")
+    if not isinstance(rows, list) or type(count) is not int or count != len(rows):
+        return False
+    for row in rows:
+        if not isinstance(row, dict) or "File" not in row:
+            return False
+        name = row["File"]
+        if name is None:  # The catalog marked this texture unsupported.
+            continue
+        if not isinstance(name, str):
+            return False
+        if name not in have:
+            # An existing file may use another spelling on a case-insensitive volume.
+            if name != os.path.basename(name) or not os.path.isfile(os.path.join(pool_dir, name)):
+                return False
+    return True
 
 
 def assets(game: str, work: str, wav: bool, jobs: int) -> None:
@@ -600,7 +696,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
         name = os.path.splitext(os.path.basename(p))[0]
         parts = os.path.relpath(p, game).replace("\\", "/").split("/")
         dest = os.path.join(out, "ttpf_pack", parts[1]) if parts[0] == "pack" else os.path.join(out, "ttpf")
-        if os.path.isfile(os.path.join(dest, name, "manifest.json")):
+        if ttpf_complete(os.path.join(dest, name)):
             continue
         log(f"assets: texture pool {os.path.relpath(p, game)}")
         run([get_exporter(work), "ttpf", p, dest])
@@ -643,14 +739,20 @@ def mark(path: str, what: str) -> None:
         f.write(f"{what} finished\n")
 
 
-def decode_xma(ff: str, xma_dir: str) -> None:
-    """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
-    temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
+def pending_xma(xma_dir: str) -> list:
+    """The XMA2 streams (.xma.wav) under xma_dir that have no decoded .wav next to them yet."""
     todo = []
     for root, _, files in os.walk(xma_dir):
         for f in files:
             if f.endswith(".xma.wav") and not os.path.isfile(os.path.join(root, f[:-8] + ".wav")):
                 todo.append(os.path.join(root, f))
+    return todo
+
+
+def decode_xma(ff: str, xma_dir: str) -> None:
+    """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
+    temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
+    todo = pending_xma(xma_dir)
     if not todo:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")
@@ -822,5 +924,14 @@ def main() -> int:
     return 0
 
 
+def cli() -> int:
+    """main(), with Ctrl+C reported in one line instead of a traceback: every stage resumes on the next run."""
+    try:
+        return main()
+    except KeyboardInterrupt:
+        print("\nStopped. Run it again to continue where it left off.", file=sys.stderr)
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())

@@ -44,7 +44,7 @@ class PackedFormatFixture(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
 
-            def translate(_cmd):
+            def translate(_cmd, env=None, gpu=True):
                 (Path(tmp) / "spirv" / f"{name}.spv").touch()
                 return 0, ""
 
@@ -59,6 +59,89 @@ class PackedFormatFixture(unittest.TestCase):
             check_fmt.assert_called_once()
             self.assertIn(problem, output.getvalue())
             self.assertIn("0/1 passed", output.getvalue())
+
+
+class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
+    """vk_texture_test exits 77 on a device with 128 push constant bytes: a SKIP, not a FAIL."""
+    UNSUPPORTED_MSG = "unsupported: need 144 push constant bytes, device has 128\n"
+
+    def run_one(self, name):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            texture = SimpleNamespace(returncode=77, stdout="", stderr=self.UNSUPPORTED_MSG)
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt.subprocess, "run", return_value=texture),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+            return rc, output.getvalue()
+
+    def test_bindless_texture_and_gather_tests_skip(self):
+        for name in ("ps_cube_sample", "ps_texture_sample_d16", "ps_gather_wrap"):
+            with self.subTest(name=name):
+                rc, out = self.run_one(name)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("SKIP (unsupported: need 144 push constant bytes, device has 128)", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+                self.assertNotIn("no runnable", out)
+
+
+class FilterWithoutRunnableCases(unittest.TestCase):
+    """A filter selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
+
+    def run_filter(self, name, translate_rc=0, spv=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                if spv:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return translate_rc, ""
+
+            out, err = io.StringIO(), io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()) as asm,
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate) as run,
+                  patch.object(rgt, "fmt_1010102_test", return_value=None),
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(err)):
+                rc = rgt.run_suite(args, tmp)
+            return rc, out.getvalue(), err.getvalue(), asm, run
+
+    def test_benchmark_input_reports_no_runnable_cases(self):
+        rc, out, err, _, _ = self.run_filter("cs_bench_mix")
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("--filter 'cs_bench_mix' selected cs_bench_mix but no runnable GPU test cases", err)
+        self.assertIn("inputs without a GPU test row", err)
+        self.assertIn("benchmark tool", err)
+        self.assertIn("=== rdna2spirv.py ===", out)
+        self.assertNotIn("0/0 passed", out)
+
+    def test_translation_failure_stays_a_failure(self):
+        rc, out, err, _, _ = self.run_filter("cs_bench_mix", translate_rc=1)
+        self.assertEqual((rc, err), (1, ""))
+        rc, out, err, _, _ = self.run_filter("cs_bench_mix", spv=False)
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("missing .spv (translation failed)", out)
+        self.assertIn("0/1 passed", out)
+
+    def test_supported_case_still_passes(self):
+        rc, out, err, _, _ = self.run_filter("cs_fmt_1010102")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("1/1 passed", out)
+
+    def test_unmatched_filter_fails_before_the_tools_run(self):
+        rc, out, err, asm, run = self.run_filter("unmatched_nicofilter")
+        self.assertEqual(rc, 2)
+        self.assertEqual(err, "error: --filter 'unmatched_nicofilter' matched no GPU test cases\n")
+        asm.assert_not_called()
+        run.assert_not_called()
 
 
 class WholeWaveDump(unittest.TestCase):
