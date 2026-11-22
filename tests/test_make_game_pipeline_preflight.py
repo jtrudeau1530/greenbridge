@@ -149,6 +149,14 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
             self.assert_preflight_fails(["shaders", "pipelines"], "delete runtime/build/linux")
         build.assert_called_once()
 
+    def test_missing_built_checker_does_not_initialize_asset_submodule(self):
+        with mock.patch.object(make_game, "dotnet_sdk_ok", return_value=True), \
+                mock.patch.object(make_game, "build_pipeline_check") as build, \
+                mock.patch.object(make_game, "ensure_submodule") as initialize:
+            self.assert_preflight_fails(["shaders", "assets", "pipelines"], "delete runtime/build/linux")
+        build.assert_called_once()
+        initialize.assert_not_called()
+
     def test_without_cmake_nothing_is_built(self):
         with mock.patch("shutil.which", side_effect=lambda t: None if t == "cmake" else "/bin/tool"), \
                 mock.patch.object(make_game, "build_pipeline_check") as build:

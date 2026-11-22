@@ -643,8 +643,6 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
             hint = " To prepare the loader without exporting assets, use --stages check,shaders,runtime."
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work." + hint)
-    if "assets" in stages:
-        ensure_submodule()
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
     if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
@@ -653,6 +651,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
             fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
                  "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
                  "runtime/build/linux and run the build again.")
+    if "assets" in stages:
+        ensure_submodule()
 
 
 def visual_cpp_tools_ok() -> bool:
