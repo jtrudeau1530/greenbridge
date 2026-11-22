@@ -543,7 +543,7 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
                  "ps_m2": "d3d12_m2_textured_test", "vs_m2": "d3d12_m2_textured_test", "ps_m2_uoff": "d3d12_m2_textured_test",
                  "ps_m2_array": "d3d12_m2_formats_test",
                  "ps_m3": "d3d12_m3_frame_test", "vs_m3": "d3d12_m3_frame_test",
-                 "ps_m3_post": "d3d12_m3_frame_test",
+                 "ps_m3_post": "d3d12_m3_frame_test", "ps_m3_query": "d3d12_m3_frame_test",
                  "cs_m4_fill": "d3d12_m4_compute_test", "cs_m4_indirect": "d3d12_m4_compute_test",
                  "cs_buf_typed": "d3d12_buffer_uav_test", "cs_buf_counter": "d3d12_buffer_uav_test"}
 
