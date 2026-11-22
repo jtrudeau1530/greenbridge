@@ -1185,5 +1185,89 @@ class TestValuDot4IntIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res_sat, UINT32_MAX)
 
 
+# ---------------------------------------------------------------------------
+# Negative Controls, Syntax Rejection, and Mutation Detection Tests
+# ---------------------------------------------------------------------------
+
+class TestValuDot4IntNegativeControls(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection unit tests."""
+
+    def test_rejection_of_sgpr_as_valu_destination(self) -> None:
+        interp = Dot4IntScalarInterpreter()
+        # VALU cannot write to an SGPR destination
+        with self.assertRaises(ValueError):
+            interp.execute_asm(["v_dot4_u32_u8 s0, v1, v2, v3"])
+
+    def test_rejection_of_out_of_bounds_registers(self) -> None:
+        interp = Dot4IntScalarInterpreter()
+        # VGPR >= 256
+        with self.assertRaises(IndexError):
+            interp.rf.read_operand(ASTOperand(kind=OperandKind.VGPR, reg_num=256))
+        # SGPR >= 106
+        with self.assertRaises(IndexError):
+            interp.rf.read_operand(ASTOperand(kind=OperandKind.SGPR, reg_num=106))
+
+    def test_rejection_of_unrecognized_opcode(self) -> None:
+        with self.assertRaises(NotImplementedError):
+            parse_instruction("v_dot4_unknown_op v0, v1, v2, v3")
+
+    def test_rejection_of_malformed_instruction_syntax(self) -> None:
+        # Too few operands
+        with self.assertRaises(ValueError):
+            parse_instruction("v_dot4_u32_u8 v0, v1")
+        # Empty instruction
+        with self.assertRaises(ValueError):
+            parse_instruction("")
+
+    def test_rejection_of_invalid_wave_size(self) -> None:
+        # Only wave32 and wave64 are valid in RDNA2
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_mutation_bit_flip_sensitivity(self) -> None:
+        # Every bit flip in S0 or S1 should produce a distinct result for non-zero multiplier
+        s0 = pack_u8(10, 20, 30, 40)
+        s1 = pack_u8(1, 2, 3, 4)
+        acc = 100
+        baseline = ref_dot4_u32_u8(s0, s1, acc)
+
+        # Perturb each of the 32 bits of s0 individually
+        for bit_pos in range(32):
+            s0_mutated = s0 ^ (1 << bit_pos)
+            mutated_res = ref_dot4_u32_u8(s0_mutated, s1, acc)
+            self.assertNotEqual(
+                mutated_res,
+                baseline,
+                f"Bit flip at bit {bit_pos} failed to perturb output",
+            )
+
+    def test_mutation_byte_endianness_divergence(self) -> None:
+        # Swapping byte 0 and byte 1 in s0 must produce divergent dot product when s1 has different multipliers
+        s0 = pack_u8(10, 20, 30, 40)
+        s1 = pack_u8(1, 5, 1, 1)  # byte 0 weight = 1, byte 1 weight = 5
+        base_dot = ref_dot4_u32_u8(s0, s1, 0)
+
+        # Mutate endianness: swap byte 0 and byte 1
+        s0_swapped = pack_u8(20, 10, 30, 40)
+        mutated_dot = ref_dot4_u32_u8(s0_swapped, s1, 0)
+        self.assertNotEqual(base_dot, mutated_dot)
+
+    def test_mutation_signedness_divergence_detection(self) -> None:
+        # Treating negative i8 values as u8 must strongly diverge
+        s0 = pack_i8(-1, -2, -3, -4)
+        s1 = pack_i8(1, 1, 1, 1)
+
+        signed_res = ref_dot4_i32_i8(s0, s1, 0)
+        unsigned_res = ref_dot4_u32_u8(s0, s1, 0)
+
+        # Signed: (-1) + (-2) + (-3) + (-4) = -10 (0xFFFFFFF6)
+        # Unsigned: 255 + 254 + 253 + 252 = 1014
+        self.assertEqual(signed_res, (-10) & MASK32)
+        self.assertEqual(unsigned_res, 1014)
+        self.assertNotEqual(signed_res, unsigned_res)
+
+
 if __name__ == "__main__":
     unittest.main()
