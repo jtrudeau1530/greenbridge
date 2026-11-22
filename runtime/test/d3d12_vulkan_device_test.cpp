@@ -734,6 +734,49 @@ int compare_allocation_info(ID3D12Device* ours) {
              d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
              return d;
          }(), 0},
+        {"tiled 2D 4x MSAA RGBA8", [&] {
+             D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, rgba8, rt, 1), 0, 4);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 256 * 256 * 4 * 4},
+        {"tiled 2D 4x MSAA RGBA32F", [&] {
+             D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, DXGI_FORMAT_R32G32B32A32_FLOAT, rt, 1), 0, 4);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 256 * 256 * 16 * 4},
+        {"tiled 2D 4x MSAA D32F", [&] {
+             D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, DXGI_FORMAT_D32_FLOAT,
+                                                       D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1), 0, 4);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 256 * 256 * 4 * 4},
+        {"tiled 2D 2x MSAA (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, rgba8, rt, 1), 0, 2);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
+        {"tiled 2D 8x MSAA (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, rgba8, rt, 1), 0, 8);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
+        {"tiled 2D 4x MSAA NONE (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, rgba8, none, 1), 0, 4);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
+        {"tiled 2D 4x MSAA RT+DS (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, rgba8,
+                                                       rt | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1), 0, 4);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
+        {"tiled 2D 4x MSAA 4M alignment (invalid)", [&] {
+             D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, rgba8, rt, 1),
+                                          D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT, 4);
+             d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+             return d;
+         }(), 0},
     };
     int mismatches = 0;
     const auto mismatch = [&](const char* name, const D3D12_RESOURCE_ALLOCATION_INFO& a,
@@ -3693,9 +3736,14 @@ int main() {
         standalone->GetResourceTiling(xbox_tiled.p, &xbox_tiles, nullptr, nullptr, nullptr, 0, nullptr);
         EXPECT(xbox_tiles == 4);
 
-        // Refusals matching host D3D12: 1D, 4 KiB alignment, 96-bit, two-plane DS, upload heap, past-end placement.
+        // Refusals matching host D3D12: 1D, 4 KiB alignment, 96-bit, two-plane DS, invalid MSAA, upload heap, past-end.
         D3D12_RESOURCE_DESC bad_1d = line_desc(256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
         bad_1d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+        auto tiled_2d_msaa = [&](UINT samples, D3D12_RESOURCE_FLAGS flags, UINT64 align = 0) {
+            D3D12_RESOURCE_DESC d = tiled_2d(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, 1, flags, align);
+            d.SampleDesc.Count = samples;
+            return d;
+        };
         const D3D12_RESOURCE_DESC bad_cases[] = {
             bad_1d,
             tiled_2d(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 1, D3D12_RESOURCE_FLAG_NONE,
@@ -3703,11 +3751,21 @@ int main() {
             tiled_2d(64, 64, DXGI_FORMAT_R32G32B32_FLOAT, 1, D3D12_RESOURCE_FLAG_NONE),
             tiled_2d(64, 64, DXGI_FORMAT_D24_UNORM_S8_UINT, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
             tiled_2d(64, 64, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+            tiled_2d_msaa(2, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+            tiled_2d_msaa(4, D3D12_RESOURCE_FLAG_NONE),
+            tiled_2d_msaa(4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT),
         };
         for (const D3D12_RESOURCE_DESC& bad : bad_cases) {
             Ref<ID3D12Resource> fail;
             EXPECT(standalone->CreatePlacedResource(tiled_heap.p, 0, &bad, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                     IID_PPV_ARGS(&fail.p)) == E_INVALIDARG);
+            EXPECT(!fail.p);
+        }
+        {
+            const D3D12_RESOURCE_DESC valid_4x = tiled_2d_msaa(4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            Ref<ID3D12Resource> fail;
+            EXPECT(standalone->CreatePlacedResource(tiled_heap.p, 0, &valid_4x, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                    IID_PPV_ARGS(&fail.p)) == E_NOTIMPL);
             EXPECT(!fail.p);
         }
         {

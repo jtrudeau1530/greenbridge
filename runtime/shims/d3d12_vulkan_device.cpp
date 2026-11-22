@@ -4697,6 +4697,9 @@ private:
         if (tiled) {
             if (one_d) return kInvalidAllocation;
             if (desc.Alignment && desc.Alignment != align_64k) return kInvalidAllocation;
+            // Tiled MSAA is 4x single-mip 2D attachment only (measured on RTX 5070 Ti and WARP).
+            if (samples > 1 && (samples != 4 || !(desc.Flags & attachment) || (desc.Flags & attachment) == attachment))
+                return kInvalidAllocation;
         } else if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
         }
@@ -4946,6 +4949,7 @@ private:
         const leonida::BlockFormat block = leonida::block_format(format.format, format.aspects);
         tiling.element_bytes = block.bytes;
         tiling.block = block.block;
+        tiling.samples = desc.SampleDesc.Count;
         return leonida::resource_tiling(tiling, out);
     }
 
