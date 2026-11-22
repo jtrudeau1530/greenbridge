@@ -649,18 +649,21 @@ def unpacked_shader_stems(dxbc: str) -> set[str] | None:
     return unpacked if unpacked and unpacked <= carved else None
 
 
-def disassembly_matches(dxbc: str, signature: str) -> bool:
-    if read_shader_setting(os.path.join(dxbc, "disasm.done")) != signature:
-        return False
+def disassembly_files_match(dxbc: str) -> bool:
     names = unpacked_shader_stems(dxbc)
     if names is None:
         return False
     try:
         with os.scandir(os.path.join(dxbc, "disasm")) as entries:
-            return all(entry.name[:-2] in names for entry in entries
-                       if entry.name.endswith(".s") and entry.is_file())
+            return all(entry.name[:-2] in names and not entry.is_symlink() for entry in entries
+                       if entry.name.endswith(".s") and (entry.is_file() or entry.is_symlink()))
     except OSError:
         return False
+
+
+def disassembly_matches(dxbc: str, signature: str) -> bool:
+    return (read_shader_setting(os.path.join(dxbc, "disasm.done")) == signature
+            and disassembly_files_match(dxbc))
 
 
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
@@ -681,12 +684,12 @@ def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
             and disassembly_matches(dxbc, llvm_mc_signature()))
 
 
-def clear_shader_disassembly(work: str, disasm: str) -> None:
-    """Remove generated assembly so a failed decode cannot leave a file from an older run."""
+def prepare_shader_disassembly(work: str, disasm: str, resume: bool) -> None:
+    """Check the output path and remove old listings before starting a new run."""
     expected = os.path.join(os.path.realpath(work), "shaders", "dxbc", "disasm")
     if os.path.normcase(os.path.realpath(disasm)) != os.path.normcase(expected):
         fail(f"The shader disassembly folder must be inside the work folder: {disasm}")
-    if os.path.isdir(disasm):
+    if not resume and os.path.isdir(disasm):
         with os.scandir(disasm) as entries:
             for entry in entries:
                 if entry.name.endswith(".s") and (entry.is_file(follow_symlinks=False) or entry.is_symlink()):
@@ -703,17 +706,18 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     # or holds many files: a run stopped part-way leaves both. Re-running a stage drops the later stages' proof.
     carved = os.path.join(dxbc, "index.json")             # shader_carve.py, renamed into place at the end
     unpacked = os.path.join(dxbc, "fssm_index.json")      # fssm_unpack.py, the same
+    disassembly_started = os.path.join(dxbc, "disasm.started")
     disassembled = os.path.join(dxbc, "disasm.done")      # records the LLVM command and version after a successful run
     translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
     shard_plan = os.path.join(spirv, SHARD_PLAN)          # lets translate() keep finished shards; see there
     signature = llvm_mc_signature()
     if not os.path.isfile(carved):
         log("shaders: carving shaders.rpf")
-        drop(translated, shard_plan, disassembled, unpacked)
+        drop(translated, shard_plan, disassembled, disassembly_started, unpacked)
         py("shader_carve.py", src, dxbc)
     if unpacked_shader_stems(dxbc) is None:
         log("shaders: unpacking native code")
-        drop(translated, shard_plan, disassembled)
+        drop(translated, shard_plan, disassembled, disassembly_started)
         py("fssm_unpack.py", dxbc, "--carve-index", carved)
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
@@ -721,13 +725,19 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     if not disassembly_matches(dxbc, signature):
         if os.path.isfile(disassembled) or os.path.isfile(translated):
             log("shaders: llvm-mc changed or the saved disassembly could not be verified")
-        log("shaders: disassembling (gfx1013)")
+        resume = (not os.path.isfile(disassembled)
+                  and read_shader_setting(disassembly_started) == signature and disassembly_files_match(dxbc))
+        log("shaders: resuming disassembly (gfx1013)" if resume else "shaders: disassembling (gfx1013)")
         drop(translated, shard_plan, disassembled)
-        clear_shader_disassembly(work, disasm)
+        if not resume:
+            drop(disassembly_started)
+        prepare_shader_disassembly(work, disasm, resume)
+        if not resume:
+            with open(disassembly_started, "w", encoding="utf-8", newline="\n") as f:
+                f.write(signature + "\n")
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--unpack-index", unpacked,
-           "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
-        with open(disassembled, "w", encoding="utf-8", newline="\n") as f:
-            f.write(signature + "\n")
+           "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs, *(("--skip-existing",) if resume else ()))
+        os.replace(disassembly_started, disassembled)
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
     # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
     # disassembly stay current.

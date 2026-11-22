@@ -179,6 +179,34 @@ class ShaderStageResumeTest(unittest.TestCase):
             self.touch(self.dxbc, "disasm", f"s{i}.s")
         self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
 
+    def test_disassembly_resume_keeps_completed_listings_for_the_same_llvm(self):
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        listing = os.path.join(self.dxbc, "disasm", "s0.s")
+
+        def stop(tool, *args):
+            self.assertEqual(tool, "shader_disasm.py")
+            self.assertNotIn("--skip-existing", args)
+            self.touch(listing)
+            raise KeyboardInterrupt
+
+        for change_llvm in (False, True):
+            with self.subTest(change_llvm=change_llvm):
+                if change_llvm:
+                    os.remove(os.path.join(self.dxbc, "disasm.done"))
+                with mock.patch.object(self, "fake_py", side_effect=stop):
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.run_stage()
+                if change_llvm:
+                    self.llvm_mc_signature.return_value = "different llvm-mc"
+                with mock.patch.object(self, "fake_py", wraps=self.fake_py) as invoke:
+                    self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+                args = invoke.call_args.args
+                self.assertEqual("--skip-existing" in args, not change_llvm)
+                self.assertEqual(os.path.isfile(listing), not change_llvm)
+                self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
+                self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm.started")))
+
     def test_translation_stopped_after_many_files_runs_again(self):
         self.run_stage()
         os.remove(os.path.join(self.spirv, "index.json"))   # stopped before --merge
