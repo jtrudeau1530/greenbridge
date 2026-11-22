@@ -296,14 +296,16 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
+        if (!waitable_) return DXGI_ERROR_INVALID_CALL;
         if (max_latency == 0 || max_latency > 16) return E_INVALIDARG;
         const UINT prev = max_frame_latency_.exchange(max_latency, std::memory_order_relaxed);
-        if (waitable_ && max_latency > prev)
+        if (max_latency > prev)
             ReleaseSemaphore(waitable_, static_cast<LONG>(max_latency - prev), nullptr);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* n) override {
         if (!n) return E_INVALIDARG;
+        if (!waitable_) return DXGI_ERROR_INVALID_CALL;
         *n = max_frame_latency_.load(std::memory_order_relaxed);
         return S_OK;
     }

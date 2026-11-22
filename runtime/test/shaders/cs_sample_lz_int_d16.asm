@@ -1,5 +1,6 @@
 ; Point-sample the R32_UINT and R32_SINT images at each texel centre and add the D16 results.
-; vk_store_test load checks the sum (100 - 8y - x) and the untouched UINT image.
+; vk_store_test load-d16 checks the signed/unsigned saturation boundaries in the last row,
+; the sum (100 - 8y - x) elsewhere, and the untouched UINT image.
 ; The unregistered S# selects the harness's nearest, clamp-to-edge sampler.
 v_and_b32_e32 v1, 7, v0
 v_lshrrev_b32_e32 v2, 3, v0

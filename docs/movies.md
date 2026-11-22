@@ -1,8 +1,8 @@
 # Movies (`movies.rpf`)
 
 **Status: indexed. All 515 Bink 2 streams have been enumerated and their fixed headers read; representative
-frames decode with the package's own Bink 2 library. No stream has a name, because the RPF9 table of contents is
-encrypted. Nothing here is a playback path yet.**
+frames decode with the package's own Bink 2 library. The RPF9 table of contents is encrypted, but the streams can be
+named from the game's mount lists ([section 8](#8-names-from-the-mount-lists)). Nothing here is a playback path yet.**
 
 Every number below was measured on the Xbox Series 1.0.2.1 package on 2026-11-21. The archive is read-only. No
 game video, audio, frames, carved streams or reports that quote them are in this repository; the tools write only
@@ -199,9 +199,9 @@ The raw buffer and PNG stay in temp. FFmpeg is only the raw-to-PNG step here; it
 
 ## 5. What is still unknown
 
-- **Names and roles.** The RPF9 table of contents is encrypted, so no stream has a filename. Which stream is a
-  cutscene, a loading screen, a TV broadcast, an animated texture or a splash is not known. The square videos are
-  only guessed to be UI/texture content.
+- **Roles.** The RPF9 table of contents is encrypted, but `tools/bink_names.py` recovers each stream's path from
+  the mount lists ([section 8](#8-names-from-the-mount-lists)), and the folder names group the streams by use. What
+  the game does with each folder at run time is not established.
 - **Audio association.** The header gives a track count, sample rate, flags and track IDs, but not which audio
   belongs to which video frame beyond the interleaving described by the Bink format. No Bink Audio packet was
   decoded, and no track was matched to a movie. `BinkOpenTrack`/`BinkGetTrackData` were not called successfully.
@@ -284,4 +284,59 @@ All 74 are named; the ordinal equals the index. This is the complete export tabl
 34 BinkOpenXAudio2                   71 BinkWaitStopAsyncThread
 35 BinkPause                         72 BinkWaitStopAsyncThreadsMulti
 36 BinkRegisterFrameBuffers          73 RADTimerRead
+```
+
+## 8. Names from the mount lists
+
+The table of contents is encrypted, but every pack registers its videos in a `CDataFileMgr__ContentChangeSetDef`
+mount list as `<filename>$(common)/movies/<folder>/<name>.bk2</filename>`. For `movies.rpf` these are the
+`core_binks` and `core_stinger_binks` lists in `common.rpf`; each other pack carries its own `<pack>_binks` list.
+The archive stores a pack's streams in the order of its list sorted by lowercase path: folder first, then file name
+without the extension, compared as bytes (so `x_final_y` sorts before `x_finale`). A list can name more files than
+the archive holds, because some entries are stored in other packs, so `tools/bink_names.py` aligns the two rather
+than zipping them. The longest list (`core_binks`, 74,268 bytes) spans two zlib streams with an entry cut at the
+boundary, so `--mount` rebuilds whole XML payloads with `gamedata_index.py` when it is given an archive or an
+`rpf9_carve.py` directory.
+
+The alignment is a monotone dynamic programme over (list entry, stream in offset order) that may skip list entries,
+never streams. Scores come from header facts only: `_720`/`_1080`/`_1440`/`_4k` in a name against the height,
+`snapmatic/` against a portrait frame, `tv/sprt/` against 1280x720, and neighbours of one family (the name without
+trailing digits or side/size words) sharing width, height and frame count. An optional pins CSV (`offset,path`,
+alternatives separated by `|`) adds paths confirmed by watching the stream. Each row gets a confidence:
+
+| Confidence | Meaning |
+|---|---|
+| `verified` | a pin names exactly this path |
+| `anchored` | a family neighbour agrees on the header, a name hint matched, or a pin allows this path |
+| `bracketed` | between the nearest anchored rows (or the ends) the names and streams have equal counts, so no skipped entry can hide there |
+| `positional` | only the order supports it |
+
+Measured on the 1.0.2.1 package (2026-11-22), without pins:
+
+| Archive | List entries | Streams | Anchored | Bracketed | Positional | Entries in other packs |
+|---|---:|---:|---:|---:|---:|---:|
+| `movies.rpf` | 537 | 515 | 361 | 129 | 25 | 22 |
+| `story000.rpf` | 271 | 264 | 78 | 37 | 149 | 7 |
+| `story000_restofworld.rpf` | 7 | 7 | 5 | 2 | 0 | 0 |
+| `core_restofworld.rpf` | 11 | 11 | 0 | 11 | 0 | 0 |
+
+All 797 streams in the four archives get a path. A local pins file of 53 streams (42 exact, 11 narrowed to two or
+three names), made by watching them, moved 32 rows in `movies.rpf` and 32 in `story000.rpf`. In `story000.rpf` all
+32 had been `positional`. In `movies.rpf` 21 were `positional`, 1 `bracketed` and 10 `anchored`: runs of same-shape
+siblings (`..._01`, `_02`, `_03`) anchor each other even when the whole run is shifted by one entry, so `anchored`
+does not rule out an off-by-one inside such a run. With the pins, `movies.rpf` has 2 positional rows left and
+`story000.rpf` 7.
+
+The collation was checked by eye on `story000.rpf`, where one list's own order disagrees with the archive. Comparing
+names with the extension instead gives the same paths in all four archives of this package.
+
+The output names game files. Like the index, it is a local work product: do not commit it or attach it to an issue.
+
+```sh
+# Lists read straight from common.rpf (a list split over several zlib streams is rebuilt whole)
+python -I tools/bink_names.py <package>/movies.rpf --mount <package>/common.rpf --out <temp>/movies-names.csv
+
+# Reuse an index or an rpf9_carve.py directory, add pins, or name another pack's streams with its own list
+python -I tools/bink_names.py <temp>/movies.csv --mount <temp>/common --pins <temp>/pins.csv --out <temp>/names.json
+python -I tools/bink_names.py <package>/pack/story000/story000.rpf --mount <package>/pack/story000/story000.rpf --out <temp>/story000-names.csv
 ```

@@ -334,6 +334,70 @@ class ArchiveTest(unittest.TestCase):
             self.assertEqual(p.stdout, "")
             self.assertFalse(os.path.exists(out))
 
+    def test_output_cannot_overwrite_source_archive(self):
+        with open(self.rpf, "rb") as f:
+            rpf_data = f.read()
+        arc = os.path.join(self.root, "archive.json")
+        with open(arc, "wb") as f:
+            f.write(rpf_data)
+
+        # Same path
+        p = subprocess.run([sys.executable, "-I", TOOL, arc, arc, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output must not overwrite the source", p.stderr)
+        with open(arc, "rb") as f:
+            self.assertEqual(f.read(), rpf_data)
+
+        # Hard-link alias
+        if hasattr(os, "link"):
+            alias = os.path.join(self.root, "alias.json")
+            try:
+                os.link(arc, alias)
+            except OSError:
+                alias = None
+            if alias:
+                p2 = subprocess.run([sys.executable, "-I", TOOL, arc, alias, "--quiet"],
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p2.returncode, 2)
+                self.assertIn("output must not overwrite the source", p2.stderr)
+                with open(arc, "rb") as f:
+                    self.assertEqual(f.read(), rpf_data)
+
+    def test_output_cannot_overwrite_carve_manifest(self):
+        folder = os.path.join(self.root, "carved_manifest")
+        os.makedirs(folder)
+        manifest = os.path.join(folder, "index.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            f.write('{"carve_manifest": true}')
+        with open(os.path.join(folder, "00000001.bin"), "wb") as f:
+            f.write(psin())
+
+        p = subprocess.run([sys.executable, "-I", TOOL, folder, manifest, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output would overwrite the carve manifest", p.stderr)
+        with open(manifest, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_output_cannot_overwrite_carved_input(self):
+        if not hasattr(os, "link"):
+            return
+        folder = os.path.join(self.root, "carved_linked")
+        os.makedirs(folder)
+        bin_path = os.path.join(folder, "00000001.bin")
+        with open(bin_path, "wb") as f:
+            f.write(psin())
+        linked_json = os.path.join(folder, "linked.json")
+        try:
+            os.link(bin_path, linked_json)
+        except OSError:
+            return
+        p = subprocess.run([sys.executable, "-I", TOOL, folder, linked_json, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output would overwrite an input file", p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

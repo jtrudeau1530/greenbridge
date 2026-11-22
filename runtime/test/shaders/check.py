@@ -73,17 +73,18 @@ def not_found_message(build, missing):
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
-CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
+CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
-                "cs_w32_partial_scmp", "cs_exec_const")
+                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
-WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const")
+WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
+                     "cs_w32_mask_imm")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -105,6 +106,10 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
             # constant EXEC: each lane takes its own bit (Intel got 16-bit constants wrong for lanes 16-31)
             ("cs_exec_const", [16, 8, 2, 16, 0, 16]),
+            # a constant lane mask (saveexec, wrexec, s_and/s_not/s_mov_b64 into EXEC or VCC) gives lane L its bit L,
+            # not bit 0 for every lane; word = set lanes | lowest lane << 8 (derivations in each .asm header)
+            ("cs_w32_mask_imm", [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
+            ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
@@ -159,6 +164,11 @@ GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+# cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
+# them; the words are the exact fused results (derivations in the .asm header). The same with --fma glsl and --fma khr
+# (LEONIDA_FMA=khr for build.py): GLSL Fma may be split into two roundings by a driver, OpFmaKHR may not.
+FMA_FUSED_ENV = {"VKC_SGPRS": "0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002"}
+FMA_FUSED = [0x33800000, 0xa8800000, 0x3a000400, 0x33800000, 0x33800000, 0x33800000, 0x28800000, 0x00007351]
 # cs_cvt_f32_sat.asm (#300): s4 is a binary32 input, out[0] = v_cvt_u32_f32, out[1] = v_cvt_i32_f32 (truncate,
 # saturate, NaN -> 0). One dispatch per input through VKC_SGPRS; the inputs of tests/semantic/test_float_to_int.py.
 CVT_F32_SAT_CASES = (
@@ -195,7 +205,8 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
-PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
+PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
+              "ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops": (0x48804300, 5, 7, 0xfffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xfffffffa, 7),
               "ps_ops3": (0xfffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
               "ps_ops5": (0x12340010, 0xbeef0800, 0xaaaaffff, 0xdeadbc00),
@@ -205,6 +216,8 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_f32_mods": (0xc0256a01, 0x3f800000, 0x41e00000, 0x3fc00000),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
               "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
+              # v_cmpx_{eq,gt,le,lt,ngt,nle}_f32, f_i32, t_u32, {eq,gt,le}_i64, {ge,lt,ne}_u64 (.asm header)
+              "ps_vcmpx_forms": (0xf05b2a48, 0xf05e8a12, 0xb174be18, 0x15550000),
               "ps_med3_mods": (0x3f800000, 0x40400000, 0x40c00000, 0x3f400000),
               "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
@@ -232,6 +245,13 @@ PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
+             # the 14 v_cmpx forms: f32 and 64-bit operands from memory (derivations in the .asm header)
+             "ps_vcmpx_forms": {"VKH_SGPRS": "0x1000,0,96,0",
+                                "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x3f800000,0x1008=0x40000000,0x100c=0x80000000,"
+                                            "0x1010=0,0x1014=0xff800000,0x1018=0,0x101c=0,0x1020=0x80000000,0x1024=0,"
+                                            "0x1028=0x1,0x102c=0,0x1030=0x7,0x1034=0x80000000,0x1038=0x7,0x103c=0,"
+                                            "0x1040=0x1,0x1044=0x5,0x1048=0x80000000,0x104c=0x5,0x1050=0x7,0x1054=0x5,"
+                                            "0x1058=0x7,0x105c=0x5"},
              # float NaN / fract rows measured on RDNA2 hardware (see the .asm headers)
              "ps_fnan_med3": {"VKH_SGPRS": "0x1000,0,32,0",
                               "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x40e00000,0x1008=0x40a00000,"
@@ -861,7 +881,7 @@ def clip_test(tools, spirv, name):
         raw = Path(tmp) / "pixels.raw"
         for clip_x, clip_y in ((False, False), (True, False), (False, True), (True, True)):
             code, output = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, name + ".spv"),
-                               os.path.join(spirv, "ps_ops.spv"), raw, "64", "64",
+                               os.path.join(spirv, "ps_clip_color.spv"), raw, "64", "64",
                                "0" if clip_x else "4", "0" if clip_y else "4")
             if code == UNSUPPORTED:
                 return Skip("SKIP (shaderClipDistance unavailable)")
@@ -878,7 +898,7 @@ def clip_test(tools, spirv, name):
             for i, pixel in enumerate(struct.iter_unpack("<4I", data)):
                 inside = (not clip_x or i % 64 < 32) and (not clip_y or i // 64 < 16)
                 drawn = inside or name == "vs_clip_undeclared"
-                wrong += pixel != (PIXEL_BITS["ps_ops"] if drawn else clear)
+                wrong += pixel != (PIXEL_BITS["ps_clip_color"] if drawn else clear)
             if wrong:
                 return f"x={clip_x} y={clip_y}: {wrong} of 4096 pixels differ"
     return ""
@@ -910,6 +930,8 @@ def main():
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
+    results.append(("cs_fma_fused", compute_test(tools, spirv, "cs_fma_fused", "1", "dump", expected_words=FMA_FUSED,
+                                                 env=FMA_FUSED_ENV)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
@@ -919,8 +941,8 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_d16", ["load"]),
-                       ("cs_sample_lz_int_d16", ["load"])):
+    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_d16", ["load-d16"]),
+                       ("cs_sample_lz_int_d16", ["load-d16"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
             m = re.search(r"unsupported: .*", out)

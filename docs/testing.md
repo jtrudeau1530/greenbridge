@@ -64,18 +64,19 @@ belongs to the commit that built it; check that commit out as well.
 ### Without a compiler: a CI-built runtime
 
 If you cannot build the test programs locally, the Runtime workflow publishes them as the `runtime-windows`
-artifact of its own commit. Open the run for that commit under Actions -> Runtime, download and unzip
-`runtime-windows`, and pass the unzipped folder to `--build`:
+artifact of its own commit. It holds Windows executables, so use them on Windows or under Wine as in the
+section below; GitHub expires the artifact after 7 days. Open the run for that commit under Actions ->
+Runtime, download and unzip `runtime-windows`, and pass the unzipped folder to `--build`:
 
 ```sh
-python -I scripts/run_gpu_tests.py --build ~/Downloads/runtime-windows
+python -I scripts/run_gpu_tests.py --build <unzipped runtime-windows>
 ```
 
 `build.py` and `check.py` take the same folder as their second argument:
 
 ```sh
 python -I runtime/test/shaders/build.py <out dir>
-python -I runtime/test/shaders/check.py <out dir> ~/Downloads/runtime-windows
+python -I runtime/test/shaders/check.py <out dir> <unzipped runtime-windows>
 ```
 
 The artifact belongs to the commit that built it, so run the scripts from that commit as well (see the note above).
@@ -188,6 +189,16 @@ without it they're skipped, which is expected, not a failure. To test the fallba
 **for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
 (`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
 
+## Fused multiply-add: GLSL Fma or OpFmaKHR
+
+`cs_fma_fused` checks that `v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32` (and one `v_fma_f16`) round once, on
+operands taken from user SGPRs so the driver cannot fold them. It passes with the default translation (`--fma glsl`,
+GLSL.std.450 `Fma`) and with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`.
+That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable it when the device has it and exit
+77 (a SKIP) for a module that needs it on a device without it. The Vulkan specification allows a driver to split GLSL
+`Fma` into two roundings, which is why `khr` exists. Neither the AMD (26.11.2) nor the NVIDIA (617.42) driver we tried
+does, so `cs_fma_fused` passing with `glsl` is not evidence that every driver is safe.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example
@@ -213,6 +224,7 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | `vk_harness` doesn't compile: `VK_KHR_maintenance8` names unknown | Vulkan headers older than the SDK the code was written against | Update to current `main` (the code now builds without it), or use current Khronos Vulkan-Headers; conda-forge's package is too old |
 | `ps_bary` and `ps_uniform_branch` fail by about 0.9 | The GPU runs pixel shaders wave64 without fragment barycentrics (GCN3 and RDNA1 on RADV), or an old AMD Windows driver (22.40) | Current `main` skips them on such devices; on Windows, update the driver |
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
+| On a Mac, a multiply with a zero result reads `+0` where the model wants `-0` (`v_mul_f16` and `v_pk_mul_f16` in `valu_fuzz.py --family f16`, `v_mul_f32`) | MoltenVK computes a `NoContraction` multiply as `fma(l, r, +0)`, which drops the sign. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-182, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions. To run the rest of the fuzzer clean, add `--skip-op v_mul_f16 --skip-op v_pk_mul_f16`. To see the multiplies match, use KosmicKrisp: `LEONIDA_VULKAN_LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib VK_DRIVER_FILES=<path>/kosmickrisp_mesa_icd.aarch64.json`. Or build MoltenVK with SPIRV-Cross `300681bb` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision`, and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
 | `ctest` lists `fsr_dispatch` and `bvh_builder` as failed (`Not Run`) after clang-cl hits an internal compiler error in `fsr_dispatch_test.cpp` and `bvh_builder_test.cpp` | clang-cl 22.1.8 on Fedora (Linux cross-build) and Windows, plus 22.1.7 on Windows | Use clang-cl 23.1.6 (both files compile on Windows) |
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |

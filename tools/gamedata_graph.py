@@ -596,6 +596,15 @@ def main() -> int:
     except FileNotFoundError as exc:
         print(f"not found: {exc}", file=sys.stderr)
         return 2
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # Same one-line contract as gamedata_xml.py and gamedata_index.py: a bad carve index is an error,
+        # not a traceback.
+        where = getattr(exc, "filename", None) or args.targets[0]
+        print(f"ERROR: cannot read {where}: {getattr(exc, 'strerror', None) or exc!r}", file=sys.stderr)
+        return 2
     graph = build_graph(documents)
     graph["summary"]["mode"] = gx.document_mode(args.targets)
     print_summary(graph)

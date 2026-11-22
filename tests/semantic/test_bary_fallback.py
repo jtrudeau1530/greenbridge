@@ -19,6 +19,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 import warnings
@@ -190,6 +191,16 @@ class BaryFallbackGeometryShader(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "mixed"):
                 bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
             self.assertEqual(list(Path(tmp).glob("*.spvasm")), [Path(path)])
+
+    def test_a_missing_directory_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing")
+            p = subprocess.run([sys.executable, "-I", bary_fallback_gs.__file__, missing],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 1)
+            self.assertEqual(p.stdout, "")
+            self.assertIn("not a directory", p.stderr)
+            self.assertEqual(os.listdir(tmp), [])                          # nothing written
 
     def test_collision_is_refused(self):
         with self.assertRaises(ValueError):

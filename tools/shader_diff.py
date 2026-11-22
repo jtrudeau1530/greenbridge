@@ -309,12 +309,29 @@ def self_test():
     return True
 
 
+def _at_least_one(value):
+    """An integer option that must be at least 1.
+
+    0 and negative values used to run nothing (--programs, --limit) or raise
+    `empty range in randrange(1, 1)` (--max-ops) instead of being refused.
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1 (got {n})")
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Differential oracle: cpu_ref vs translated SPIR-V.")
-    ap.add_argument("--programs", type=int, default=200)
+    ap.add_argument("--programs", type=_at_least_one, default=200, help="number of programs to run (default: 200)")
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--max-ops", type=int, default=8)
-    ap.add_argument("--limit", type=int, default=None, help="run only the first N programs")
+    ap.add_argument("--max-ops", type=_at_least_one, default=8,
+                    help="maximum ops per generated program (default: 8)")
+    ap.add_argument("--limit", type=_at_least_one, default=None,
+                    help="run only the first N programs (N >= 1)")
     ap.add_argument("--list-ops", action="store_true", help="print the op table and exit")
     ap.add_argument("--self-test", action="store_true", help="run harness canaries and exit")
     a = ap.parse_args(argv)

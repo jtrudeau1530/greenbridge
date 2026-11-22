@@ -396,7 +396,7 @@ int main() {
         EXPECT((fs.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURECUBE) != 0);
         EXPECT((fs.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD) != 0);
         EXPECT((fs.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0);
-        EXPECT((fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) == 0);
+        EXPECT(bool(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) == native_attach);
         EXPECT((fs.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) == 0);
         EXPECT((fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0);
         std::printf("R9G9B9E5 UAV mode: %s (Support1=0x%08x Support2=0x%08x)\n",
@@ -460,12 +460,20 @@ int main() {
         EXPECT(total_tiles > 0 && tile_shape.WidthInTexels == 128 && tile_shape.HeightInTexels == 128 &&
                tile_shape.DepthInTexels == 1);
 
-        // Refusals: render target, render target + UAV, depth-stencil, DENY_SHADER_RESOURCE + UAV, MSAA.
+        for (const auto flags : {D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
+            const auto desc = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 1, 1,
+                                       DXGI_FORMAT_R9G9B9E5_SHAREDEXP, flags);
+            const bool supported = native_attach && (!(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || native_storage);
+            Ref<ID3D12Resource> target;
+            const HRESULT hr = device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                               D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p));
+            EXPECT(hr == (supported ? S_OK : E_INVALIDARG));
+            EXPECT(bool(target.p) == supported);
+            EXPECT((device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != UINT64_MAX) == supported);
+        }
+
         const D3D12_RESOURCE_DESC bad_descs[] = {
-            tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 1, 1, DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
-                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
-            tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 1, 1, DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
-                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
             tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 1, 1, DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
                      D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
             tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 1, 1, DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
@@ -579,6 +587,17 @@ int main() {
             if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
                 SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) {
                 D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&warp.p));
+            }
+        }
+        // The reference needs typed R9G9B9E5 UAVs. Windows 10's WARP has none (Support1 0x008013f0: its
+        // CreateCommittedResource with ALLOW_UNORDERED_ACCESS returns E_INVALIDARG), so it can't be compared with.
+        if (warp.p) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT warp_fs{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
+            if (FAILED(warp->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &warp_fs, sizeof(warp_fs))) ||
+                !(warp_fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) {
+                std::printf("WARP has no typed R9G9B9E5 UAVs (Support1=0x%08x): UAV clears not compared with it\n",
+                            unsigned(warp_fs.Support1));
+                warp.reset();
             }
         }
         std::vector<std::vector<ClearStep>> clear_cases = {
