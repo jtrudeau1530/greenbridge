@@ -966,6 +966,100 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(mask_u, 0b1000)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling for v_rcp_f64
+# ==============================================================================
+
+DBL_MIN = 0x0010000000000000          # 2^-1022
+DBL_MAX = 0x7FEFFFFFFFFFFFFF          # ~1.7976931348623157e+308
+NEG_DBL_MIN = 0x8010000000000000
+NEG_DBL_MAX = 0xFFEFFFFFFFFFFFFF
+
+SUBNORM_MIN = 0x0000000000000001      # 2^-1074
+SUBNORM_MAX = 0x000FFFFFFFFFFFFF
+NEG_SUBNORM_MIN = 0x8000000000000001
+NEG_SUBNORM_MAX = 0x800FFFFFFFFFFFFF
+
+QNAN_PAYLOAD_A = 0x7FF8000000000001
+QNAN_PAYLOAD_B = 0x7FF8AAAAAAAAAAAA
+SNAN_F64 = 0x7FF0000000000001
+NEG_SNAN_F64 = 0xFFF0000000000001
+
+
+class TestIEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zero_boundary(self) -> None:
+        self.assertEqual(ref_rcp_f64(F64_POS_ZERO), F64_POS_INF)
+        self.assertEqual(ref_rcp_f64(F64_NEG_ZERO), F64_NEG_INF)
+
+        # Input modifiers on zeros
+        self.assertEqual(ref_rcp_f64(F64_NEG_ZERO, src0_abs=True), F64_POS_INF)
+        self.assertEqual(ref_rcp_f64(F64_POS_ZERO, src0_neg=True), F64_NEG_INF)
+        self.assertEqual(ref_rcp_f64(F64_NEG_ZERO, src0_neg=True), F64_POS_INF)
+
+    def test_infinities_boundary(self) -> None:
+        self.assertEqual(ref_rcp_f64(F64_POS_INF), F64_POS_ZERO)
+        self.assertEqual(ref_rcp_f64(F64_NEG_INF), F64_NEG_ZERO)
+
+        # Input modifiers on infinities
+        self.assertEqual(ref_rcp_f64(F64_NEG_INF, src0_abs=True), F64_POS_ZERO)
+        self.assertEqual(ref_rcp_f64(F64_POS_INF, src0_neg=True), F64_NEG_ZERO)
+        self.assertEqual(ref_rcp_f64(F64_NEG_INF, src0_neg=True), F64_POS_ZERO)
+
+    def test_subnormals_overflow(self) -> None:
+        # Minimum subnormal (2^-1074) reciprocal overflows binary64 to signed infinity
+        self.assertEqual(ref_rcp_f64(SUBNORM_MIN), F64_POS_INF)
+        self.assertEqual(ref_rcp_f64(NEG_SUBNORM_MIN), F64_NEG_INF)
+
+        # Maximum subnormal (2^-1022 * (1 - 2^-52)) reciprocal is a finite normal float (~4.49e307)
+        res_sub_max = ref_rcp_f64(SUBNORM_MAX)
+        self.assertTrue(is_f64_normal(res_sub_max))
+        self.assertAlmostEqual(u64_to_f64(res_sub_max), 1.0 / u64_to_f64(SUBNORM_MAX))
+
+    def test_normal_extrema(self) -> None:
+        # 1.0 / DBL_MIN = 2^1022
+        exp_val = 2.0 ** 1022
+        self.assertEqual(ref_rcp_f64(DBL_MIN), f64_to_u64(exp_val))
+        self.assertEqual(ref_rcp_f64(NEG_DBL_MIN), f64_to_u64(-exp_val))
+
+        # 1.0 / DBL_MAX produces a tiny positive subnormal (~5.56e-309 < 2^-1022)
+        res_max = ref_rcp_f64(DBL_MAX)
+        self.assertEqual(f64_sign(res_max), 0)
+        self.assertTrue(is_f64_subnormal(res_max))
+        self.assertAlmostEqual(u64_to_f64(res_max), 1.0 / u64_to_f64(DBL_MAX))
+
+        # 1.0 / NEG_DBL_MAX produces a tiny negative subnormal
+        res_neg_max = ref_rcp_f64(NEG_DBL_MAX)
+        self.assertEqual(f64_sign(res_neg_max), 1)
+        self.assertTrue(is_f64_subnormal(res_neg_max))
+        self.assertAlmostEqual(u64_to_f64(res_neg_max), 1.0 / u64_to_f64(NEG_DBL_MAX))
+
+    def test_nan_handling_and_quieting(self) -> None:
+        nans = [F64_CANONICAL_QNAN, QNAN_PAYLOAD_A, QNAN_PAYLOAD_B, SNAN_F64, NEG_SNAN_F64]
+        for n in nans:
+            with self.subTest(nan=f"{n:#018x}"):
+                res = ref_rcp_f64(n)
+                self.assertTrue(is_f64_nan(res))
+                self.assertTrue(is_f64_qnan(res))
+
+    def test_boundary_extremes_with_clamp(self) -> None:
+        # +0.0 -> +Inf clamped to 1.0
+        self.assertEqual(ref_rcp_f64(F64_POS_ZERO, clamp=True), F64_ONE)
+        # -0.0 -> -Inf clamped to +0.0
+        self.assertEqual(ref_rcp_f64(F64_NEG_ZERO, clamp=True), F64_POS_ZERO)
+        # +Inf -> +0.0 clamped to +0.0
+        self.assertEqual(ref_rcp_f64(F64_POS_INF, clamp=True), F64_POS_ZERO)
+        # -Inf -> -0.0 clamped to +0.0
+        self.assertEqual(ref_rcp_f64(F64_NEG_INF, clamp=True), F64_POS_ZERO)
+        # Subnormals clamped
+        self.assertEqual(ref_rcp_f64(SUBNORM_MIN, clamp=True), F64_ONE)
+        self.assertEqual(ref_rcp_f64(NEG_SUBNORM_MIN, clamp=True), F64_POS_ZERO)
+        # NaNs clamped to +0.0
+        self.assertEqual(ref_rcp_f64(F64_CANONICAL_QNAN, clamp=True), F64_POS_ZERO)
+        self.assertEqual(ref_rcp_f64(SNAN_F64, clamp=True), F64_POS_ZERO)
+
+
 class TestScalarInterpreter(unittest.TestCase):
     """Test suite for deterministic scalar instruction interpreter."""
 
