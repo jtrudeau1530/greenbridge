@@ -32,7 +32,12 @@ import os
 import re
 import struct
 import sys
-import unicodedata
+
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -1061,20 +1066,6 @@ def format_report(report):
     return "\n".join(lines)
 
 
-def _path_key(path):
-    return unicodedata.normalize("NFC", os.path.normcase(os.path.realpath(path)))
-
-
-def same_input_path(input_path, report_path):
-    """True when ``report_path`` names the same file as ``input_path``."""
-    if _path_key(input_path) == _path_key(report_path):
-        return True
-    try:
-        return os.path.samefile(input_path, report_path)
-    except OSError:
-        return False
-
-
 def write_json(path, report):
     """Write LF-only JSON without ever guessing values that JSON cannot hold."""
     payload = json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
@@ -1090,7 +1081,7 @@ def main(argv=None):
     parser.add_argument("--json", metavar="FILE", help="write the report as LF-only JSON")
     args = parser.parse_args(argv)
 
-    if args.json and same_input_path(args.glb, args.json):
+    if args.json and same_report_path(args.glb, args.json):
         print("ERROR: --json must not overwrite the input GLB", file=sys.stderr)
         return 2
     try:
