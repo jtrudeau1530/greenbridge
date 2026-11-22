@@ -34,7 +34,8 @@ Usage:
     --out     JSON summary (default: <input name>.navmesh-decode.json in the current directory)
     --csv     optional CSV, one row of numeric header fields per resource
     --start   first byte to scan in an archive (default: the archive's data start, u32 at offset 4)
-    --limit   bytes to scan from --start; a resource that starts inside the window is read to its end
+    --limit   bytes to scan from --start; a resource that starts inside the window is read to its end, but a
+              stream past the window's end is reported under past_window, not in the carver counts
     --deep    also walk every navmesh polygon, quadtree node and grid hash-table slot (slower)
     --quiet   do not print the summary
 """
@@ -793,7 +794,15 @@ def _scan_rpf(path, start, limit, deep, rows):
 
 
 def _account(m, carver, last, s, used, inflated, end):
-    """Carver-compatible accounting of one stream of 64 bytes or more, plus the gap before it."""
+    """Carver-compatible accounting of one stream of 64 bytes or more, plus the gap before it.
+
+    A stream that runs past the --limit window is still decoded (a resource is read to its end) but, as in
+    navmesh_index.py (#766), it is not counted as carved: its bytes inside the window fall into the tail, so
+    streams + zero_padding + unread add up to the span. It is reported under past_window instead."""
+    if s + used > end:
+        carver["past_window"] += 1
+        carver["past_window_stored"] += used
+        return last
     if s > last and last < end:
         gap = m[last:min(s, end)]
         carver["zero_padding" if gap.count(0) == len(gap) else "unread"] += len(gap)
@@ -853,7 +862,8 @@ def _summary(path, mode, start, end, carver, classes, checks, stats, elapsed):
         "end": end,
         "span": (end - start) if (start is not None and end is not None) else None,
         "carver_streams": {k: carver.get(k, 0) for k in ("streams", "stored", "inflated", "zero_padding",
-                                                         "unread", "tiny_continuations", "tiny_orphans")},
+                                                         "unread", "tiny_continuations", "tiny_orphans",
+                                                         "past_window", "past_window_stored")},
         "resources": {cls: dict(v, streams={str(k): c for k, c in sorted(v["streams"].items())})
                       for cls, v in sorted(classes.items())},
         "checks": {cls: {name: {"pass": p, "fail": f} for name, (p, f) in sorted(t.items())}
