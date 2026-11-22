@@ -126,6 +126,55 @@ def test_unsupported_instruction_is_reported_not_guessed(make_shader):
         shader.translate()
 
 
+@pytest.mark.parametrize("a16", [False, True], ids=["a32", "a16"])
+@pytest.mark.parametrize("d16", [False, True], ids=["f32", "d16"])
+def test_explicit_mip_depth_compare(make_shader, a16, d16):
+    # Under A16 the reference is still f32; XY share v1 and LOD is the low half of v2.
+    if a16:
+        moves = "v_mov_b32 v1, 0x3a003400\nv_mov_b32 v2, 0x40003c00\n"
+        address, modifier = "v[0:2]", " a16"
+    else:
+        moves = "v_mov_b32 v1, 0.25\nv_mov_b32 v2, 0.75\nv_mov_b32 v3, 1.0\n"
+        address, modifier = "v[0:3]", ""
+    shader = make_shader("v_mov_b32 v0, 0.5\n" + moves +
+                         f"image_sample_c_l v4, {address}, s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D" +
+                         modifier + (" d16" if d16 else "") + "\ns_waitcnt vmcnt(0)\nexp mrt0 v4, v4, v4, v4 done vm\ns_endpgm\n")
+    spv = shader.translate()
+    shader.validate(spv)
+    sample = re.search(r"(%\w+) = OpImageSampleDrefExplicitLod %float %\w+ %\w+ (%\w+) Lod (%\w+)", spv)
+    assert sample
+    defs = dict(re.findall(r"(%\w+) = (.+)", spv))
+
+    def float_source_register(value: str) -> list[str]:
+        load = defs[value].split()[-1]  # f32 bitcast
+        ptr = defs[load].split()[-1]    # raw VGPR word
+        return defs[ptr].split()[-2:]
+
+    result, ref, lod = sample.groups()
+    assert float_source_register(ref) == ["%vgpr", "%c0"]
+    if a16:
+        packed_word = defs[lod].split()[-1]
+        unpacked_half = defs[packed_word].split()[-1]
+        op, _, pair, half = defs[unpacked_half].split()
+        assert (op, half) == ("OpCompositeExtract", "0")
+        raw = defs[pair].split()[-1]
+        assert defs[defs[raw].split()[-1]].endswith("%vgpr %c2")
+    else:
+        assert float_source_register(lod) == ["%vgpr", "%c3"]
+    bits = next(name for name, code in defs.items() if code == f"OpBitcast %uint {result}")
+    assert any(code == f"OpShiftRightLogical %uint {bits} %c10" for code in defs.values()) == d16
+
+
+@pytest.mark.parametrize("sample", [
+    "v[4:5], v[0:3], s[0:7], s[8:11] dmask:0x3 dim:SQ_RSRC_IMG_2D",
+    "v4, v[0:4], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_3D",
+])
+def test_explicit_mip_depth_compare_unmodelled_forms(make_shader, sample):
+    shader = make_shader(f"image_sample_c_l {sample}\ns_endpgm\n")
+    with pytest.raises(rdna2spirv.Unsupported, match="scalar 2D depth comparison"):
+        shader.translate()
+
+
 @pytest.mark.parametrize("d16", [False, True], ids=["f32", "d16"])
 def test_depth_compare_sample_result_width(make_shader, d16):
     """image_sample_c_lz returns one value: f32 bits, or with d16 an f16 in the low half like every other d16 sample
