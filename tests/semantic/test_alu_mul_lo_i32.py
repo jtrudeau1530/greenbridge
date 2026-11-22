@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import gc
 import os
+import random
 import struct
 import sys
 import tempfile
@@ -36,6 +37,7 @@ MASK32 = 0xFFFFFFFF
 SIGN32 = 0x80000000
 MASK64 = 0xFFFFFFFFFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
+VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
 
 SAMPLE_VALUES = (
     0,
@@ -124,27 +126,92 @@ def ref_mul_64(a: int, b: int, signed: bool = False) -> tuple[int, int]:
     return prod_u & MASK32, (prod_u >> 32) & MASK32
 
 
+class VectorALUMulInterpreter:
+    """Deterministic multi-lane SIMD interpreter modeling AMD RDNA2 VALU execution."""
+
+    def __init__(self, num_vgprs: int = 64, num_sgprs: int = 106, wave_size: int = 64):
+        self.num_vgprs = num_vgprs
+        self.num_sgprs = num_sgprs
+        self.wave_size = wave_size
+        self.vgprs = [[0] * wave_size for _ in range(num_vgprs)]
+        self.sgprs = [0] * num_sgprs
+        self.exec_mask = (1 << wave_size) - 1
+
+    def reset(self) -> None:
+        self.vgprs = [[0] * self.wave_size for _ in range(self.num_vgprs)]
+        self.sgprs = [0] * self.num_sgprs
+        self.exec_mask = (1 << self.wave_size) - 1
+
+    def set_vgpr(self, reg_idx: int, lane: int, val: int) -> None:
+        self.vgprs[reg_idx][lane] = val & MASK32
+
+    def get_vgpr(self, reg_idx: int, lane: int) -> int:
+        return self.vgprs[reg_idx][lane] & MASK32
+
+    def set_sgpr(self, reg_idx: int, val: int) -> None:
+        self.sgprs[reg_idx] = val & MASK32
+
+    def get_sgpr(self, reg_idx: int) -> int:
+        return self.sgprs[reg_idx] & MASK32
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & ((1 << self.wave_size) - 1)
+
+    def resolve_src(self, op: str | int, lane: int) -> int:
+        if isinstance(op, int):
+            return op & MASK32
+        op_str = op.strip().lower()
+        if op_str.startswith("v"):
+            return self.vgprs[int(op_str[1:])][lane] & MASK32
+        if op_str.startswith("s"):
+            return self.sgprs[int(op_str[1:])] & MASK32
+        return int(op_str, 0) & MASK32
+
+    def execute_v_mul_lo_u32(self, dst_idx: int, src0: str | int, src1: str | int) -> None:
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.resolve_src(src0, lane)
+                s1 = self.resolve_src(src1, lane)
+                self.vgprs[dst_idx][lane] = ref_mul_lo_u32(s0, s1)
+
+
 _TMP_DIR: tempfile.TemporaryDirectory | None = None
 _SRC_PATH: str | None = None
+_CS_PATH: str | None = None
+_CS_FSSM: str | None = None
+
+
+def _make_fssm(rsrc2: int, group: tuple[int, int, int]) -> bytes:
+    header = bytearray(0x148)
+    struct.pack_into("<4I", header, 0x138, rsrc2, *group)
+    return bytes(header)
 
 
 def setUpModule() -> None:
-    global _TMP_DIR, _SRC_PATH
+    global _TMP_DIR, _SRC_PATH, _CS_PATH, _CS_FSSM
     _TMP_DIR = tempfile.TemporaryDirectory()
     disasm_dir = os.path.join(_TMP_DIR.name, "disasm")
+    fssm_dir = os.path.join(_TMP_DIR.name, "fssm")
     os.mkdir(disasm_dir)
+    os.mkdir(fssm_dir)
     _SRC_PATH = os.path.join(disasm_dir, "ps_mul_lo.s")
+    _CS_PATH = os.path.join(disasm_dir, "cs_mul_lo.s")
+    _CS_FSSM = os.path.join(fssm_dir, "cs_mul_lo.fssm")
     with open(os.path.join(_TMP_DIR.name, "ps_mul_lo.dxbc"), "wb") as f:
+        f.write(STUB_DXBC)
+    with open(os.path.join(_TMP_DIR.name, "cs_mul_lo.dxbc"), "wb") as f:
         f.write(STUB_DXBC)
 
 
 def tearDownModule() -> None:
-    global _TMP_DIR, _SRC_PATH
+    global _TMP_DIR, _SRC_PATH, _CS_PATH, _CS_FSSM
     if _TMP_DIR is not None:
         gc.collect()
         _TMP_DIR.cleanup()
         _TMP_DIR = None
         _SRC_PATH = None
+        _CS_PATH = None
+        _CS_FSSM = None
 
 
 def run_mul_lo_shader(
@@ -187,6 +254,42 @@ def run_mul_lo_shader(
         spv = rdna2spirv.translate(_SRC_PATH)
         gc.collect()
     return si.run_fragment(spv)["%out_mrt0"][0]
+
+
+def run_mul_lo_cs(
+    multiplier: int,
+    wave_size: int = 64,
+) -> dict[int, int]:
+    """Run a multi-lane compute shader where each lane multiplies its lane index by `multiplier`."""
+    if _TMP_DIR is None:
+        setUpModule()
+    with open(_CS_FSSM, "wb") as f:
+        f.write(_make_fssm(0x8088, (wave_size, 1, 1)))
+
+    lines = [
+        f"\ts_mov_b32 s4, {u32(multiplier):#x}",
+        "\tv_mul_lo_u32 v1, v0, s4",
+        "\tv_lshlrev_b32_e32 v2, 2, v0",
+        "\tbuffer_store_dword v1, v2, s[0:3], 0 offen",
+        "\ts_endpgm",
+    ]
+    asm = "; test_mul_lo_cs\n" + "\n".join(lines) + "\n"
+    with open(_CS_PATH, "w", encoding="utf-8") as f:
+        f.write(asm)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        spv = rdna2spirv.translate(_CS_PATH)
+        gc.collect()
+
+    pc = VSHARP + [0] * 28
+    return si.run_workgroup(
+        spv,
+        wave_size,
+        wave_size,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+        push_constants=pc,
+        memory={},
+    )
 
 
 def run_spirv_imul(a: int, b: int) -> int:
@@ -297,25 +400,15 @@ class TestMulLoReferenceOracle(unittest.TestCase):
         cases = [
             (0, 0, 0),
             (1, 1, 1),
-            # 0xFFFFFFFF * 0xFFFFFFFF = (-1) * (-1) = 1 in two's complement
             (0xFFFFFFFF, 0xFFFFFFFF, 1),
-            # 0x7FFFFFFF * 2 = 0xFFFFFFFE (INT32_MAX * 2)
             (0x7FFFFFFF, 2, 0xFFFFFFFE),
-            # 0x80000000 * 2 = 0x1_00000000 -> lo = 0
             (0x80000000, 2, 0),
-            # 0x80000000 * 0x80000000 = (-2^31)^2 = 2^62 = 0x40000000_00000000 -> lo = 0
             (0x80000000, 0x80000000, 0),
-            # 0x80000000 * 0xFFFFFFFF = (-2^31) * (-1) = 2^31 = 0x80000000
             (0x80000000, 0xFFFFFFFF, 0x80000000),
-            # 0x10000 * 0x10000 = 2^16 * 2^16 = 2^32 = 0x1_00000000 -> lo = 0
             (0x10000, 0x10000, 0),
-            # 0x10001 * 0x10001 = (2^16 + 1)^2 = 2^32 + 2*2^16 + 1 -> lo = 0x00020001
             (0x10001, 0x10001, 0x00020001),
-            # 100 * -1 = -100 = 0xFFFFFF9C
             (100, -1, 0xFFFFFF9C),
-            # 100 * 0xFFFFFFFF = 0xFFFFFF9C
             (100, 0xFFFFFFFF, 0xFFFFFF9C),
-            # 0x12345678 * 2 = 0x2468ACF0
             (0x12345678, 2, 0x2468ACF0),
         ]
         for a, b, expected in cases:
@@ -409,6 +502,253 @@ class TestMulLoTranslator(unittest.TestCase):
         for a, b in SAMPLE_PAIRS:
             with self.subTest(a=hex(a), b=hex(b)):
                 self.assertEqual(run_spirv_imul(a, b), ref_mul_lo_u32(a, b))
+
+
+class TestMulLoSIMDDivergence(unittest.TestCase):
+    """Multi-lane SIMD execution and divergence tests for v_mul_lo_u32."""
+
+    def test_simd_independent_lanes(self) -> None:
+        """All 64 lanes evaluate distinct, divergent multiplications concurrently."""
+        interp = VectorALUMulInterpreter(wave_size=64)
+        for lane in range(64):
+            interp.set_vgpr(1, lane, lane * 17 + 3)
+            interp.set_vgpr(2, lane, 0x10001 + lane * 5)
+
+        interp.execute_v_mul_lo_u32(0, "v1", "v2")
+
+        for lane in range(64):
+            s0 = lane * 17 + 3
+            s1 = 0x10001 + lane * 5
+            expected = ref_mul_lo_u32(s0, s1)
+            self.assertEqual(interp.get_vgpr(0, lane), expected)
+
+    def test_simd_exec_mask_even_odd_gating(self) -> None:
+        """Inactive EXEC lanes preserve their prior VGPR contents unchanged."""
+        interp = VectorALUMulInterpreter(wave_size=64)
+        sentinel = 0xDEADBEEF
+
+        for lane in range(64):
+            interp.set_vgpr(0, lane, sentinel)
+            interp.set_vgpr(1, lane, lane)
+            interp.set_vgpr(2, lane, 10)
+
+        # Alternating even lanes active: 0x5555555555555555
+        interp.set_exec(0x5555555555555555)
+        interp.execute_v_mul_lo_u32(0, "v1", "v2")
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(interp.get_vgpr(0, lane), lane * 10)
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), sentinel)
+
+    def test_simd_exec_mask_half_wave_divergence(self) -> None:
+        """First 32 lanes active, last 32 lanes inactive (wave32 sub-execution)."""
+        interp = VectorALUMulInterpreter(wave_size=64)
+        sentinel = 0xCAFEBABE
+
+        for lane in range(64):
+            interp.set_vgpr(0, lane, sentinel)
+            interp.set_vgpr(1, lane, 0x1234)
+            interp.set_vgpr(2, lane, lane + 1)
+
+        interp.set_exec(0x00000000FFFFFFFF)
+        interp.execute_v_mul_lo_u32(0, "v1", "v2")
+
+        for lane in range(64):
+            if lane < 32:
+                expected = ref_mul_lo_u32(0x1234, lane + 1)
+                self.assertEqual(interp.get_vgpr(0, lane), expected)
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), sentinel)
+
+    def test_simd_exec_mask_single_lane(self) -> None:
+        """Exactly one divergent lane active in wave."""
+        interp = VectorALUMulInterpreter(wave_size=64)
+        target_lane = 42
+
+        for lane in range(64):
+            interp.set_vgpr(0, lane, 0)
+            interp.set_vgpr(1, lane, 1000)
+            interp.set_vgpr(2, lane, 3)
+
+        interp.set_exec(1 << target_lane)
+        interp.execute_v_mul_lo_u32(0, "v1", "v2")
+
+        for lane in range(64):
+            if lane == target_lane:
+                self.assertEqual(interp.get_vgpr(0, lane), 3000)
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), 0)
+
+    def test_simd_exec_mask_contiguous_slice(self) -> None:
+        """Contiguous sub-range of active lanes [16, 48)."""
+        interp = VectorALUMulInterpreter(wave_size=64)
+        for lane in range(64):
+            interp.set_vgpr(0, lane, 0x77777777)
+            interp.set_vgpr(1, lane, lane)
+            interp.set_vgpr(2, lane, 0x80000001)
+
+        mask = ((1 << 32) - 1) << 16
+        interp.set_exec(mask)
+        interp.execute_v_mul_lo_u32(0, "v1", "v2")
+
+        for lane in range(64):
+            if 16 <= lane < 48:
+                expected = ref_mul_lo_u32(lane, 0x80000001)
+                self.assertEqual(interp.get_vgpr(0, lane), expected)
+            else:
+                self.assertEqual(interp.get_vgpr(0, lane), 0x77777777)
+
+    def test_simd_sgpr_scalar_broadcast(self) -> None:
+        """Scalar SGPR multiplier broadcast across all active lanes."""
+        interp = VectorALUMulInterpreter(wave_size=64)
+        scalar_val = 0x10001
+        interp.set_sgpr(5, scalar_val)
+
+        for lane in range(64):
+            interp.set_vgpr(1, lane, lane * 256)
+
+        interp.execute_v_mul_lo_u32(0, "s5", "v1")
+
+        for lane in range(64):
+            expected = ref_mul_lo_u32(scalar_val, lane * 256)
+            self.assertEqual(interp.get_vgpr(0, lane), expected)
+
+    def test_simd_inline_constant_broadcast(self) -> None:
+        """Inline constant broadcast across divergent lanes."""
+        interp = VectorALUMulInterpreter(wave_size=64)
+        for lane in range(64):
+            interp.set_vgpr(1, lane, 0x80000000 + lane)
+
+        interp.execute_v_mul_lo_u32(0, 3, "v1")
+
+        for lane in range(64):
+            expected = ref_mul_lo_u32(3, 0x80000000 + lane)
+            self.assertEqual(interp.get_vgpr(0, lane), expected)
+
+    def test_simd_spirv_workgroup_wave32(self) -> None:
+        """Multi-lane execution of v_mul_lo_u32 in a 32-lane wave via run_workgroup."""
+        multiplier = 0x10003
+        mem = run_mul_lo_cs(multiplier, wave_size=32)
+        for lane in range(32):
+            expected = ref_mul_lo_u32(lane, multiplier)
+            self.assertEqual(mem[lane * 4], expected, f"Wave32 lane {lane}")
+
+    def test_simd_spirv_workgroup_wave64(self) -> None:
+        """Multi-lane execution of v_mul_lo_u32 in a 64-lane wave via run_workgroup."""
+        multiplier = 0x7FFFFFFF
+        mem = run_mul_lo_cs(multiplier, wave_size=64)
+        for lane in range(64):
+            expected = ref_mul_lo_u32(lane, multiplier)
+            self.assertEqual(mem[lane * 4], expected, f"Wave64 lane {lane}")
+
+
+class TestMulLoOverflowWrapping(unittest.TestCase):
+    """Exhaustive 32-bit overflow wrapping and modulo 2^32 truncation tests."""
+
+    def test_overflow_wrap_boundary_products(self) -> None:
+        """Boundary products wrapping cleanly modulo 2^32."""
+        cases = [
+            # 0xFFFFFFFF * 2 = 2^33 - 2 -> 0xFFFFFFFE
+            (0xFFFFFFFF, 2, 0xFFFFFFFE),
+            # 0xFFFFFFFF * 3 = 3 * 2^32 - 3 -> 0xFFFFFFFD
+            (0xFFFFFFFF, 3, 0xFFFFFFFD),
+            # 0xFFFFFFFF * 0xFFFFFFFF = 2^64 - 2*2^32 + 1 -> 1
+            (0xFFFFFFFF, 0xFFFFFFFF, 1),
+            # 0x80000000 * 2 = 2^32 -> 0
+            (0x80000000, 2, 0),
+            # 0x80000000 * 3 = 2^32 + 2^31 -> 0x80000000
+            (0x80000000, 3, 0x80000000),
+            # 0x80000000 * 4 = 2^33 -> 0
+            (0x80000000, 4, 0),
+            # 0x80000000 * 0x80000000 = 2^62 -> 0
+            (0x80000000, 0x80000000, 0),
+            # 0x7FFFFFFF * 0x7FFFFFFF = (2^31 - 1)^2 = 2^62 - 2^32 + 1 -> 1
+            (0x7FFFFFFF, 0x7FFFFFFF, 1),
+            # 0x7FFFFFFF * 2 = 2^32 - 2 -> 0xFFFFFFFE
+            (0x7FFFFFFF, 2, 0xFFFFFFFE),
+            # 0x7FFFFFFF * 3 = 3 * 2^31 - 3 = 2^32 + 2^31 - 3 -> 0x7FFFFFFD
+            (0x7FFFFFFF, 3, 0x7FFFFFFD),
+            # 0x55555555 * 3 = 0xFFFFFFFF
+            (0x55555555, 3, 0xFFFFFFFF),
+            # 0xAAAAAAAA * 3 = 2 * 0xFFFFFFFF = 2^33 - 2 -> 0xFFFFFFFE
+            (0xAAAAAAAA, 3, 0xFFFFFFFE),
+            # 0x10000001 * 0x10000001 = (2^28 + 1)^2 = 2^56 + 2^29 + 1 -> 0x20000001
+            (0x10000001, 0x10000001, 0x20000001),
+            # 0x10000000 * 0x10 = 2^28 * 2^4 = 2^32 -> 0
+            (0x10000000, 0x10, 0),
+        ]
+        for a, b, expected in cases:
+            with self.subTest(a=hex(a), b=hex(b), expected=hex(expected)):
+                self.assertEqual(ref_mul_lo_u32(a, b), expected)
+                self.assertEqual(run_spirv_imul(a, b), expected)
+
+    def test_overflow_wrap_powers_of_two(self) -> None:
+        """Powers of two wrapping: 2^p * 2^q mod 2^32."""
+        for p in range(32):
+            for q in range(32):
+                a = 1 << p
+                b = 1 << q
+                expected = (1 << (p + q)) & MASK32 if (p + q < 32) else 0
+                with self.subTest(p=p, q=q):
+                    self.assertEqual(ref_mul_lo_u32(a, b), expected)
+
+    def test_overflow_wrap_large_primes(self) -> None:
+        """Multiplying large primes that exceed 32 bits."""
+        prime_pairs = [
+            (65537, 65539),
+            (1000003, 1000033),
+            (2147483647, 3),
+            (2147483647, 5),
+            (2147483647, 2147483647),
+        ]
+        for p1, p2 in prime_pairs:
+            with self.subTest(p1=p1, p2=p2):
+                expected = (p1 * p2) & MASK32
+                self.assertEqual(ref_mul_lo_u32(p1, p2), expected)
+                self.assertEqual(run_spirv_imul(p1, p2), expected)
+
+    def test_overflow_wrap_chain_accumulation(self) -> None:
+        """Chained multiplication wrapping across repeated iterations."""
+        val = 3
+        mult = 5
+        py_val = 3
+        for i in range(100):
+            val = ref_mul_lo_u32(val, mult)
+            py_val = (py_val * mult) & MASK32
+            self.assertEqual(val, py_val, f"Iteration {i}")
+
+    def test_overflow_multiplicative_inverses(self) -> None:
+        """Every odd 32-bit integer has a multiplicative inverse mod 2^32."""
+        odd_numbers = [
+            1,
+            3,
+            5,
+            7,
+            11,
+            17,
+            257,
+            65537,
+            0x12345679,
+            0x7FFFFFFF,
+            0xFFFFFFFF,
+        ]
+        for x in odd_numbers:
+            inv = pow(x, -1, 1 << 32)
+            with self.subTest(x=hex(x), inv=hex(inv)):
+                self.assertEqual(ref_mul_lo_u32(x, inv), 1)
+                self.assertEqual(run_spirv_imul(x, inv), 1)
+
+    def test_fuzz_overflow_differential(self) -> None:
+        """Differential fuzz testing with pseudo-random 32-bit numbers."""
+        rng = random.Random(0x4D554C)
+        for _ in range(150):
+            a = rng.randint(0, MASK32)
+            b = rng.randint(0, MASK32)
+            expected = (a * b) & MASK32
+            self.assertEqual(ref_mul_lo_u32(a, b), expected)
+            self.assertEqual(run_spirv_imul(a, b), expected)
 
 
 if __name__ == "__main__":
