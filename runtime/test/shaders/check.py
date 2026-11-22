@@ -431,11 +431,18 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         args.append("--require-wave64")
     if needs_32_lanes:
         env = {**WAVE32_LANE_ENV, **(env or {})}
+    # Run at the wave size the translator recorded, as run_gpu_tests.py does: a wave32 test left to the device's
+    # default runs 64-wide on AMD (subgroups 32..64), and cs_barrier_loop's four waves of 32 became two.
+    sg = None if "VKC_SUBGROUP_SIZE" in (env or {}) else subgroup_size(spirv, name)
+    if sg:
+        env = {**(env or {}), "VKC_SUBGROUP_SIZE": str(sg)}
     extra = {"env": dict(os.environ, **env)} if env else {}
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args, **extra)
     if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
         return None
     if needs_32_lanes and (skip := wave32_lane_skip(out)):
+        return skip
+    if sg and (skip := unpinned_subgroup_skip(out)):
         return skip
     if code != 0:
         return failure(code, out, 2)
