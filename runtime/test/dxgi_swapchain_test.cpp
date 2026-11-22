@@ -828,11 +828,31 @@ int main() {
             return fail("CheckFeatureSupport should reject null data or wrong size with E_INVALIDARG");
         factory5->Release();
 
+        constexpr UINT tearing_flag = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        constexpr UINT waitable_flag = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        constexpr UINT both_flags = tearing_flag | waitable_flag;
+        const UINT node_masks[2] = {1, 1};
+        IUnknown* const present_queues[2] = {queue, queue};
+        const auto rejects_flag_change = [&](IDXGISwapChain3* chain, UINT flags) {
+            DXGI_SWAP_CHAIN_DESC1 before{}, after{};
+            if (FAILED(chain->GetDesc1(&before))) return false;
+            const UINT width = before.Width + 1;
+            return chain->ResizeBuffers(0, width, before.Height, DXGI_FORMAT_UNKNOWN, flags) == E_INVALIDARG &&
+                   chain->ResizeBuffers1(2, width, before.Height, DXGI_FORMAT_UNKNOWN, flags,
+                                         node_masks, present_queues) == E_INVALIDARG &&
+                   SUCCEEDED(chain->GetDesc1(&after)) && after.Flags == before.Flags &&
+                   after.BufferCount == before.BufferCount && after.Width == before.Width &&
+                   after.Height == before.Height;
+        };
+
         // Non-waitable, non-tearing swapchain: GetFrameLatencyWaitableObject is null and ALLOW_TEARING is rejected.
+        for (UINT flags : {waitable_flag, tearing_flag, both_flags})
+            if (!rejects_flag_change(sc, flags)) return fail("Resize accepted adding a creation-only flag");
         if (sc->GetFrameLatencyWaitableObject() != nullptr)
             return fail("Non-waitable swapchain should return nullptr from GetFrameLatencyWaitableObject");
         if (sc->Present(0, DXGI_PRESENT_ALLOW_TEARING) != DXGI_ERROR_INVALID_CALL)
             return fail("Present(ALLOW_TEARING) on non-tearing swapchain should return DXGI_ERROR_INVALID_CALL");
+        if (FAILED(sc->Present(0, 0))) return fail("Present after rejected resize on a plain swapchain");
 
         HWND hwnd3 = create_test_window(128, 96);
         if (!hwnd3) return fail("CreateWindowExW (third)");
@@ -840,7 +860,7 @@ int main() {
         wdesc.Width = 128;
         wdesc.Height = 96;
         wdesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;  // also tests presenting an untouched offscreen backbuffer
-        wdesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        wdesc.Flags = both_flags;
         IDXGISwapChain1* wsc1 = nullptr;
         if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd3, &wdesc, nullptr, nullptr, &wsc1)) || !wsc1)
             return fail("CreateSwapChainForHwnd (tearing + waitable)");
@@ -848,6 +868,8 @@ int main() {
         if (FAILED(wsc1->QueryInterface(IID_PPV_ARGS(&wsc))) || !wsc) return fail("QI IDXGISwapChain3 (waitable)");
         wsc1->Release();
 
+        for (UINT flags : {0u, waitable_flag, tearing_flag})
+            if (!rejects_flag_change(wsc, flags)) return fail("Resize accepted removing a creation-only flag");
         DXGI_SWAP_CHAIN_DESC1 got_desc{};
         if (FAILED(wsc->GetDesc1(&got_desc)) || got_desc.Flags != wdesc.Flags)
             return fail("Waitable swapchain GetDesc1 did not preserve Flags");
@@ -870,6 +892,12 @@ int main() {
         if (!check_statistics_disjoint(wsc)) return fail("first statistics query after Present should be disjoint");
         if (WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
             return fail("Post-Present WaitForSingleObject on waitable swapchain failed");
+        if (FAILED(wsc->ResizeBuffers(0, wdesc.Width + 1, wdesc.Height, DXGI_FORMAT_UNKNOWN, both_flags)) ||
+            FAILED(wsc->GetDesc1(&got_desc)) || got_desc.Width != wdesc.Width + 1 || got_desc.Flags != both_flags)
+            return fail("ResizeBuffers with matching creation flags failed");
+        if (FAILED(wsc->Present(0, DXGI_PRESENT_ALLOW_TEARING)) ||
+            WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
+            return fail("Present or wait after resizing the waitable swapchain failed");
         CloseHandle(waitable);
         wsc->Release();
         DestroyWindow(hwnd3);

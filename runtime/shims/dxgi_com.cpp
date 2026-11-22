@@ -243,6 +243,9 @@ public:
             vk_fmt = dxgi_to_vk_format(fmt);
             if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_UNSUPPORTED;
         }
+        constexpr UINT creation_only_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+                                             DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        if ((flags & creation_only_flags) != (flags_ & creation_only_flags)) return E_INVALIDARG;
         // DXGI refuses to resize while the app still holds a back buffer reference.
         for (auto* bb : buffers_)
             if (bb->held_by_app()) return DXGI_ERROR_INVALID_CALL;
@@ -250,8 +253,7 @@ public:
         const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
-        const UINT waitable_bit = flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-        const UINT next_flags = (flags ? flags : flags_) | waitable_bit;
+        const UINT next_flags = flags ? flags : flags_;
         const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
         if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
         statistics_disjoint_.store(true, std::memory_order_relaxed);
