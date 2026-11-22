@@ -1453,8 +1453,10 @@ class Gen:
         (RDNA2 ISA, FLAT/GLOBAL). With glc the pre-op value lands in vdst (the first operand); without it there is no
         vdst. cmpswap takes vdata as a pair {DATA, CMP}: M = (M == CMP) ? DATA : M. Inactive lanes don't touch memory
         and keep vdst. and/or/xor/swap_x2 work on a 64-bit element (two dwords, low first) as one 32-bit atomic per
-        dword: a bitwise op or an exchange leaves the same memory that way, with no Int64 atomics. The returned pair is
-        two reads, so another lane's 64-bit op on the same element between them could be seen half done. The other
+        dword, with no Int64 atomics. That leaves the same memory for a bitwise op, whose bits are independent, but not
+        always for an exchange: two lanes swapping into one element at once can leave one's low dword with the other's
+        high dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two reads, so another lane's 64-bit op on the same
+        element between them could be seen half done. The other
         _x2 forms (add/sub/min/max carry or compare across the dwords, cmpswap_x2 compares all 64 bits), inc/dec and
         the float atomics stay Unsupported."""
         kind = op[len("global_atomic_"):]
@@ -1570,10 +1572,11 @@ class Gen:
 
     def buffer_atomic_x2(self, op, kind, a, mods):
         """buffer_atomic_{and,or,xor,swap}_x2 vdata[0:1], vaddr, s[V#], soffset: M = op(M, DATA) on the 64-bit element
-        (two dwords, low first); with glc the old 64 bits are returned in vdata. A bitwise op or an exchange leaves the
-        same memory done one dword at a time, so each dword is its own 32-bit atomic and no Int64 atomics are needed;
-        the returned pair is two reads, so another lane's 64-bit op on the same element between them could be seen half
-        done. The bounds check covers the whole 8-byte element, all or nothing, as for a typed element (a 32_32
+        (two dwords, low first); with glc the old 64 bits are returned in vdata. Each dword is its own 32-bit atomic, so
+        no Int64 atomics are needed. That leaves the same memory for a bitwise op, whose bits are independent, but an
+        exchange can tear: two lanes swapping into one element at once can leave one's low dword with the other's high
+        dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two reads, so another lane's 64-bit op on the same element
+        between them could be seen half done. The bounds check covers the whole 8-byte element, all or nothing, as for a typed element (a 32_32
         format): how hardware treats a 64-bit atomic that is only partly in range is not measured."""
         vd = a[0]
         if vd["k"] != "vgpr" or vd.get("n", 1) != 2:
@@ -2705,10 +2708,11 @@ class Gen:
         elif op in ("ds_wrxchg_rtn_b64", "ds_wrxchg2_rtn_b64", "ds_wrxchg2st64_rtn_b64"):
             # 64-bit exchanges: M[A] = DATA (two dwords, low first) and vdst gets the old 64 bits. wrxchg_rtn_b64 has
             # one element at ADDR + offset; the 2 forms have two, at ADDR + offset0/offset1 * 8 (x64 for st64), as
-            # ds_write2_b64 addresses them, and vdst is four VGPRs. Each dword is its own 32-bit exchange: the memory
-            # ends as a 64-bit exchange leaves it (both dwords take DATA), with no Int64 atomics on Workgroup memory.
-            # The returned pair is two reads, so another lane's 64-bit op on the same element between them could be
-            # seen half done (as for ds_and/or/xor_b64).
+            # ds_write2_b64 addresses them, and vdst is four VGPRs. Each dword is its own 32-bit exchange, with no Int64
+            # atomics on Workgroup memory. That can tear: two lanes exchanging into one element at once can leave one's
+            # low dword with the other's high dword (A.lo, B.lo, B.hi, A.hi), which a 64-bit exchange never does. The
+            # returned pair is two reads, so another lane's 64-bit op on the same element between them could be seen
+            # half done (as for ds_and/or/xor_b64).
             two = op != "ds_wrxchg_rtn_b64"
             d = a[0]
             if d["k"] != "vgpr" or d.get("n") != (4 if two else 2):
