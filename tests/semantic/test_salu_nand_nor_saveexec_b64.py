@@ -283,6 +283,107 @@ class ScalarInterpreter:
 
 
 # ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDWaveState:
+    """Architectural state for a SIMD wavefront (Wave32 or Wave64)."""
+    num_lanes: int = 64
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    vcc: int = 0
+    scc: int = 0
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+        else:
+            lane_mask = (1 << self.num_lanes) - 1
+            self.exec_mask &= lane_mask
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx]
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.vgprs[lane][reg_idx] = val & MASK32
+
+    def get_sgpr64(self, idx: int) -> int:
+        return words_to_u64(self.sgprs[idx], self.sgprs[idx + 1])
+
+    def set_sgpr64(self, idx: int, val: int) -> None:
+        lo, hi = u64_to_words(val)
+        self.sgprs[idx] = lo
+        self.sgprs[idx + 1] = hi
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool(self.exec_mask & (1 << lane))
+
+
+class SIMDExecutionEngine:
+    """Simulates wave execution across divergent SIMD lanes governed by EXEC masking."""
+
+    def resolve_operand(self, op: Operand64, state: SIMDWaveState) -> int:
+        if isinstance(op, Reg64):
+            if op.reg_type == RegType.SGPR:
+                return state.get_sgpr64(op.index)
+            elif op.reg_type == RegType.EXEC:
+                return state.exec_mask
+            elif op.reg_type == RegType.VCC:
+                return state.vcc
+            elif op.reg_type == RegType.SCC:
+                return state.scc
+        elif isinstance(op, Literal64):
+            return op.value
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def execute_saveexec(self, instr: SaveExecInstruction, state: SIMDWaveState) -> Tuple[int, int, int]:
+        s0 = self.resolve_operand(instr.ssrc0, state)
+        old_exec = state.exec_mask
+        lane_mask = (1 << state.num_lanes) - 1
+
+        if instr.opcode == Opcode.S_NAND_SAVEEXEC_B64:
+            saved = old_exec
+            new_exec = (~(s0 & old_exec)) & lane_mask
+            scc = 1 if new_exec != 0 else 0
+        elif instr.opcode == Opcode.S_NOR_SAVEEXEC_B64:
+            saved = old_exec
+            new_exec = (~(s0 | old_exec)) & lane_mask
+            scc = 1 if new_exec != 0 else 0
+        else:
+            raise ValueError(f"Unsupported opcode: {instr.opcode}")
+
+        if instr.sdst.reg_type == RegType.SGPR:
+            state.set_sgpr64(instr.sdst.index, saved)
+        elif instr.sdst.reg_type == RegType.EXEC:
+            pass  # Overwritten by new_exec below
+
+        state.exec_mask = new_exec
+        state.scc = scc
+        return saved, new_exec, scc
+
+    def execute_valu_mov(
+        self,
+        dst_vgpr: int,
+        src_val: Union[int, List[int]],
+        state: SIMDWaveState,
+    ) -> List[bool]:
+        """Simulate masked VALU write: only lanes active in state.exec_mask are updated."""
+        written = [False] * state.num_lanes
+        for lane in range(state.num_lanes):
+            if state.is_lane_active(lane):
+                val = src_val[lane] if isinstance(src_val, list) else src_val
+                state.set_vgpr(lane, dst_vgpr, val)
+                written[lane] = True
+        return written
+
+
+# ==============================================================================
 # Phase 1 Unit Tests: Oracle and Architectural Model
 # ==============================================================================
 
@@ -541,6 +642,109 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(saved2, 0)
         self.assertEqual(exec2, ALL64)
         self.assertEqual(scc2, 1)
+
+
+# ==============================================================================
+# Phase 4 Unit Tests: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class TestSIMDDivergenceAndMasking(unittest.TestCase):
+    """Verify SIMD lane masking, multi-lane divergence, and inactive lane preservation."""
+
+    def setUp(self) -> None:
+        self.engine = SIMDExecutionEngine()
+
+    def test_wave64_nand_divergence(self) -> None:
+        state = SIMDWaveState(num_lanes=64)
+        # Initialize VGPR 5 to a baseline pattern across all lanes
+        for lane in range(64):
+            state.set_vgpr(lane, 5, 0xDEAD0000 + lane)
+
+        # Set initial EXEC to alternating pattern
+        state.exec_mask = 0x5555_5555_5555_5555  # Even lanes active
+        # SSRC0 mask = 0x3333_3333_3333_3333 (pairs of lanes)
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 8),
+            ssrc0=Literal64(0x3333_3333_3333_3333),
+        )
+
+        saved, new_exec, scc = self.engine.execute_saveexec(instr, state)
+        self.assertEqual(saved, 0x5555_5555_5555_5555)
+
+        # Expected new EXEC: ~(0x3333_3333_3333_3333 & 0x5555_5555_5555_5555)
+        # 0x3333... & 0x5555... = 0x1111_1111_1111_1111
+        # ~(0x1111...) = 0xEEEE_EEEE_EEEE_EEEE
+        expected_new_exec = 0xEEEE_EEEE_EEEE_EEEE
+        self.assertEqual(new_exec, expected_new_exec)
+        self.assertEqual(state.exec_mask, expected_new_exec)
+        self.assertEqual(scc, 1)
+
+        # Execute VALU write to VGPR 5 with new value 0xBEEF0000 + lane
+        written = self.engine.execute_valu_mov(5, [0xBEEF0000 + l for l in range(64)], state)
+
+        # Verify that only lanes enabled in new_exec received the new value!
+        for lane in range(64):
+            if expected_new_exec & (1 << lane):
+                self.assertTrue(written[lane])
+                self.assertEqual(state.get_vgpr(lane, 5), 0xBEEF0000 + lane)
+            else:
+                self.assertFalse(written[lane])
+                self.assertEqual(state.get_vgpr(lane, 5), 0xDEAD0000 + lane)
+
+    def test_wave64_nor_half_wave_divergence(self) -> None:
+        state = SIMDWaveState(num_lanes=64)
+        for lane in range(64):
+            state.set_vgpr(lane, 12, 0xCAFE0000 + lane)
+
+        # Old EXEC is lower 32 lanes only
+        state.exec_mask = 0x0000_0000_FFFF_FFFF
+        # SSRC0 covers upper 32 lanes
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NOR_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 16),
+            ssrc0=Literal64(0xFFFF_FFFF_0000_0000),
+        )
+
+        saved, new_exec, scc = self.engine.execute_saveexec(instr, state)
+        self.assertEqual(saved, 0x0000_0000_FFFF_FFFF)
+        # ~(0xFFFF_FFFF_0000_0000 | 0x0000_0000_FFFF_FFFF) = ~(ALL64) = 0
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+
+        # Since all lanes turned off, VALU write should touch 0 lanes
+        written = self.engine.execute_valu_mov(12, 0x12345678, state)
+        self.assertFalse(any(written))
+        for lane in range(64):
+            self.assertEqual(state.get_vgpr(lane, 12), 0xCAFE0000 + lane)
+
+    def test_wave32_divergence_and_masking(self) -> None:
+        state = SIMDWaveState(num_lanes=32)
+        for lane in range(32):
+            state.set_vgpr(lane, 7, 0xAA00 + lane)
+
+        state.exec_mask = 0x0000_FFFF  # lanes 0..15
+        instr = SaveExecInstruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B64,
+            sdst=Reg64(RegType.SGPR, 2),
+            ssrc0=Literal64(0x00FF_00FF),
+        )
+
+        saved, new_exec, scc = self.engine.execute_saveexec(instr, state)
+        self.assertEqual(saved, 0x0000_FFFF)
+        # s0 & old_exec in 32-bit: 0x00FF & 0xFFFF = 0x00FF
+        # ~(0x00FF) & 0xFFFFFFFF = 0xFFFF_FF00
+        self.assertEqual(new_exec, 0xFFFF_FF00)
+        self.assertEqual(scc, 1)
+
+        written = self.engine.execute_valu_mov(7, 0xBBBB, state)
+        for lane in range(32):
+            if lane < 8:
+                self.assertFalse(written[lane])
+                self.assertEqual(state.get_vgpr(lane, 7), 0xAA00 + lane)
+            else:
+                self.assertTrue(written[lane])
+                self.assertEqual(state.get_vgpr(lane, 7), 0xBBBB)
 
 
 if __name__ == "__main__":
