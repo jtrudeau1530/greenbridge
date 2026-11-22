@@ -147,6 +147,7 @@ class Gen:
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.uses_psb = False
         self.uses_active = False
+        self.vm_latch = False      # PS: EXEC can change after a `vm` export, so that export's EXEC is kept
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
         self.uses_tex = False
         self.uses_subgroup = False
@@ -7535,6 +7536,9 @@ class Gen:
     def export(self, ins):
         a = ins["args"]
         tgt = a[0]["t"] if a and a[0]["k"] in ("target", "special") else None
+        if self.vm_latch and "vm" in ins["mods"]:       # any target, null included
+            self.emit(f"OpStore %vm_mask {self.active_b()}")
+            self.emit("OpStore %vm_set %true")
         if tgt is None or tgt == "null":
             return
         if self.stage == "ms":
@@ -8324,6 +8328,9 @@ def assemble(gen):
           "%scc = OpVariable %_ptr_Function_uint Function %c0",
           *(["%mode_r16 = OpVariable %_ptr_Function_uint Function %c0"] if gen.round_mode else []),
           "%active = OpVariable %_ptr_Function_bool Function %true"]
+    if gen.vm_latch:
+        fn += ["%vm_mask = OpVariable %_ptr_Function_bool Function %true",
+               "%vm_set = OpVariable %_ptr_Function_bool Function %false"]
     if gen.emulate:
         fn += ["%x_it = OpVariable %_ptr_Function_uint Function %c0",
                "%x_bar = OpVariable %_ptr_Function_bool Function %false",
@@ -8585,10 +8592,17 @@ def assemble(gen):
               "OpBranch %ms_pend", "%ms_pend = OpLabel"]
         end_lock = "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L) + end_lock
     if gen.uses_active and gen.stage == "ps":
-        # A pixel lane switched off by v_cmpx at the final export writes nothing: equivalent to discard.
-        tail = end_lock + ("         %act_end = OpLoad %bool %active\n"
+        # A pixel lane off in EXEC at the last `vm` export is discarded. Without a latch EXEC can't have changed since
+        # that export, or there is none: then it is EXEC at the end.
+        keep, latched = "%act_end", ""
+        if gen.vm_latch:
+            keep = "%vm_keep"
+            latched = ("         %vm_was_set = OpLoad %bool %vm_set\n"
+                       "         %vm_exec = OpLoad %bool %vm_mask\n"
+                       "         %vm_keep = OpSelect %bool %vm_was_set %vm_exec %act_end\n")
+        tail = end_lock + ("         %act_end = OpLoad %bool %active\n" + latched +
                 "         OpSelectionMerge %live None\n"
-                "         OpBranchConditional %act_end %live %dead\n"
+                f"         OpBranchConditional {keep} %live %dead\n"
                 "%dead = OpLabel\n         OpKill\n"
                 "%live = OpLabel\n         OpReturn\n         OpFunctionEnd\n")
     else:
@@ -8755,6 +8769,48 @@ def reachable_code(insns):
             if k is None and op not in ("s_endpgm",):
                 break
     return [insns[k] for k in sorted(seen)]
+
+
+def writes_exec(ins):
+    """Whether an instruction can change EXEC: v_cmpx, saveexec / wrexec, or EXEC as the destination (first operand
+    of everything but the compares, which only read it there)."""
+    op, a = ins["op"], ins["args"]
+    if op.startswith("v_cmpx") or "saveexec" in op or "wrexec" in op:
+        return True
+    if op.startswith(("s_cmp_", "s_cmpk_", "s_bitcmp")):
+        return False
+    return bool(a) and a[0]["k"] == "special" and a[0]["t"].startswith("exec")
+
+
+def exec_changes_after_vm(blocks, succ):
+    """Whether some path writes EXEC after an `exp ... vm`. Only then does a PS need that export's EXEC kept."""
+    after = []
+    for n, blk in enumerate(blocks):
+        seen_vm = False
+        for ins in blk:
+            op = base_op(ins["op"])
+            if op == "s_endpgm" or op in BRANCHES:
+                break
+            if seen_vm and writes_exec(ins):
+                return True
+            if op == "exp" and "vm" in ins["mods"]:
+                seen_vm = True
+        if seen_vm:
+            after += succ[n]
+    reached = set()
+    while after:
+        n = after.pop()
+        if n in reached or not 0 <= n < len(blocks):
+            continue
+        reached.add(n)
+        for ins in blocks[n]:
+            op = base_op(ins["op"])
+            if op == "s_endpgm" or op in BRANCHES:
+                break
+            if writes_exec(ins):
+                return True
+        after += succ[n]
+    return False
 
 
 def read_before_write_vgprs(insns):
@@ -9203,6 +9259,7 @@ def translate(path):
         g.v_interp_copy = interp_copy_sources(insns)   # before v_interp runs: I/J guards (SHADER-177)
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
     if not branchy and not g.emulate:
+        g.vm_latch = stage == "ps" and exec_changes_after_vm([insns], [[]])
         g.park_masks(([insns], [[]]))
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
@@ -9270,6 +9327,7 @@ def translate(path):
                 g.cu(n)
             raw_edges = split_edges
     succ = [list(dict.fromkeys(e)) for e in raw_edges]
+    g.vm_latch = stage == "ps" and exec_changes_after_vm(blocks, succ)
     g.park_masks((blocks, succ))
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
