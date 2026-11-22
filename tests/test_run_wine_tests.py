@@ -28,7 +28,7 @@ import run_wine_tests as rwt  # noqa: E402
 WINDOWS_ROOT = "D:/win/root"
 
 
-def test_entry(name, command, properties=None):
+def ctest_entry(name, command, properties=None):
     entry = {"name": name}
     if command is not None:
         entry["command"] = command
@@ -54,7 +54,7 @@ class PathMappingTest(unittest.TestCase):
         self.assertEqual(rwt.wine_path("/tmp/x y"), "Z:" + os.path.abspath("/tmp/x y").replace("/", "\\"))
 
     def test_properties_are_flattened(self):
-        self.assertEqual(rwt.properties(test_entry("t", ["x"], {"SKIP_RETURN_CODE": "77", "WILL_FAIL": "1"})),
+        self.assertEqual(rwt.properties(ctest_entry("t", ["x"], {"SKIP_RETURN_CODE": "77", "WILL_FAIL": "1"})),
                          {"SKIP_RETURN_CODE": "77", "WILL_FAIL": "1"})
         self.assertEqual(rwt.properties({"name": "t"}), {})
 
@@ -96,55 +96,55 @@ class RunTestTest(unittest.TestCase):
         return rwt.run_test(entry, self.args, self.wine)
 
     def test_a_passing_test(self):
-        status, detail = self.run_entry(test_entry("ok", self.command_for(self.exiting(0))))
+        status, detail = self.run_entry(ctest_entry("ok", self.command_for(self.exiting(0))))
         self.assertEqual(status, "pass")
         self.assertIn("exit 0", detail)
 
     def test_a_failing_test_reports_the_exit_code(self):
-        status, detail = self.run_entry(test_entry("bad", self.command_for(self.exiting(3))))
+        status, detail = self.run_entry(ctest_entry("bad", self.command_for(self.exiting(3))))
         self.assertEqual(status, "fail")
         self.assertIn("exit 3", detail)
 
     def test_a_test_without_a_command_fails(self):
-        status, detail = self.run_entry(test_entry("unbuilt", None))
+        status, detail = self.run_entry(ctest_entry("unbuilt", None))
         self.assertEqual(status, "fail")
         self.assertIn("no command", detail)
 
     def test_a_test_that_runs_a_runner_program_is_skipped(self):
-        status, detail = self.run_entry(test_entry("python-test", ["/usr/bin/cmake", "-P", "x.cmake"]))
+        status, detail = self.run_entry(ctest_entry("python-test", ["/usr/bin/cmake", "-P", "x.cmake"]))
         self.assertEqual(status, "skip")
         self.assertIn("not a program from the build", detail)
 
     def test_a_missing_executable_fails(self):
-        status, detail = self.run_entry(test_entry("gone", [WINDOWS_ROOT + "/artifact/gone.py"]))
+        status, detail = self.run_entry(ctest_entry("gone", [WINDOWS_ROOT + "/artifact/gone.py"]))
         self.assertEqual(status, "fail")
         self.assertIn("not in the artifact", detail)
 
     def test_will_fail_inverts_the_exit_code(self):
         exe = self.exiting(2)
-        status, _ = self.run_entry(test_entry("expected", self.command_for(exe), {"WILL_FAIL": "1"}))
+        status, _ = self.run_entry(ctest_entry("expected", self.command_for(exe), {"WILL_FAIL": "1"}))
         self.assertEqual(status, "pass")
 
     def test_will_fail_zero_does_not_invert_the_exit_code(self):
         # A JSON property value is a string; "0" must stay false.
-        status, detail = self.run_entry(test_entry("normal", self.command_for(self.exiting(0)), {"WILL_FAIL": "0"}))
+        status, detail = self.run_entry(ctest_entry("normal", self.command_for(self.exiting(0)), {"WILL_FAIL": "0"}))
         self.assertEqual(status, "pass", detail)
 
     def test_the_skip_return_code_is_a_skip(self):
         status, detail = self.run_entry(
-            test_entry("skipped", self.command_for(self.exiting(77)), {"SKIP_RETURN_CODE": "77"}))
+            ctest_entry("skipped", self.command_for(self.exiting(77)), {"SKIP_RETURN_CODE": "77"}))
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
 
     def test_a_timeout_is_reported_without_hanging(self):
         slow = self.program("slow.py", "import time\ntime.sleep(5)\n")
         self.args.timeout = 0.2
-        status, detail = self.run_entry(test_entry("slow", self.command_for(slow)))
+        status, detail = self.run_entry(ctest_entry("slow", self.command_for(slow)))
         self.assertEqual(status, "fail")
         self.assertIn("timed out after 0.2 s", detail)
 
     def test_an_unstartable_wine_fails_the_test_instead_of_aborting_the_run(self):
-        status, detail = rwt.run_test(test_entry("ok", self.command_for(self.exiting(0))), self.args,
+        status, detail = rwt.run_test(ctest_entry("ok", self.command_for(self.exiting(0))), self.args,
                                       ["definitely-not-a-real-wine-xyz"])
         self.assertEqual(status, "fail")
         self.assertIn("could not start", detail)
@@ -155,7 +155,7 @@ class RunTestTest(unittest.TestCase):
             "import json, os, sys\n"
             "json.dump({'argv': sys.argv[1:], 'cwd': os.getcwd()}, open(os.environ['REPORT_PATH'], 'w'))\n"))
         (self.artifact / "sub").mkdir()
-        entry = test_entry("mapped", self.command_for(script, WINDOWS_ROOT + "/artifact/data.bin", "--flag"),
+        entry = ctest_entry("mapped", self.command_for(script, WINDOWS_ROOT + "/artifact/data.bin", "--flag"),
                            {"WORKING_DIRECTORY": WINDOWS_ROOT + "/artifact/sub"})
         with mock.patch.dict(os.environ, {"REPORT_PATH": str(report)}):
             status, detail = self.run_entry(entry)
@@ -199,28 +199,28 @@ class MainTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_a_required_test_that_passes_exits_zero(self):
-        code, out, _ = self.run_main([test_entry("ok", self.command("ok.py"))], "--require", "ok")
+        code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "ok")
         self.assertEqual(code, 0)
         self.assertIn("1 passed, 0 failed, 0 skipped under Wine (1 tests)", out)
 
     def test_a_required_test_that_fails_exits_one(self):
-        code, out, _ = self.run_main([test_entry("bad", self.command("bad.py"))], "--require", "bad")
+        code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))], "--require", "bad")
         self.assertEqual(code, 1)
         self.assertIn("required tests that did not pass: bad", out)
 
     def test_a_required_test_that_is_not_listed_exits_one(self):
-        code, out, _ = self.run_main([test_entry("ok", self.command("ok.py"))], "--require", "absent")
+        code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "absent")
         self.assertEqual(code, 1)
         self.assertIn("required test not listed", out)
 
     def test_unrequired_failures_are_reported_but_do_not_fail_the_job(self):
-        code, out, _ = self.run_main([test_entry("bad", self.command("bad.py"))])
+        code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))])
         self.assertEqual(code, 0)
         self.assertIn("[FAIL] bad", out)
 
     def test_the_summary_table_is_appended(self):
         summary = self.root / "summary.md"
-        code, _, _ = self.run_main([test_entry("ok", self.command("ok.py")), test_entry("bad", self.command("bad.py"))],
+        code, _, _ = self.run_main([ctest_entry("ok", self.command("ok.py")), ctest_entry("bad", self.command("bad.py"))],
                                    "--summary", str(summary), "--label", "Wine 11", "--require", "ok")
         self.assertEqual(code, 0)
         text = summary.read_text(encoding="utf-8")
