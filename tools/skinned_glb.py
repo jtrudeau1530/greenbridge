@@ -696,6 +696,8 @@ def _component_primitives(gltf: dict, wanted: int) -> list[dict]:
 def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                       generator: str = "Leonida skinned_glb") -> tuple[bytes, dict]:
     """Build one skinned GLB from a ped skeleton and one or more component models."""
+    if not component_paths:
+        raise SkinError("at least one --component is required")
     _skeleton_dir, skeleton_json = model_json_path(skeleton_path)
     ped_model = _load_json(skeleton_json)
     ped_skeleton = (ped_model.get("drawable") or {}).get("skeleton")
