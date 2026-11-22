@@ -934,8 +934,9 @@ int main() {
         UINT lat = 0;
         if (FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 1)
             return fail("Waitable swapchain default GetMaximumFrameLatency should be 1");
-        if (wsc->SetMaximumFrameLatency(0) != E_INVALIDARG || wsc->SetMaximumFrameLatency(17) != E_INVALIDARG)
-            return fail("Waitable SetMaximumFrameLatency should reject 0 and > 16 with E_INVALIDARG");
+        if (wsc->SetMaximumFrameLatency(0) != DXGI_ERROR_INVALID_CALL ||
+            FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 1)
+            return fail("Waitable SetMaximumFrameLatency(0) should return INVALID_CALL and preserve latency");
         if (FAILED(wsc->SetMaximumFrameLatency(2)) || FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 2)
             return fail("Waitable SetMaximumFrameLatency(2) round-trip failed");
         HANDLE waitable = wsc->GetFrameLatencyWaitableObject();
@@ -956,6 +957,13 @@ int main() {
         if (FAILED(wsc->Present(0, DXGI_PRESENT_ALLOW_TEARING)) ||
             WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
             return fail("Present or wait after resizing the waitable swapchain failed");
+        if (FAILED(wsc->SetMaximumFrameLatency(40)) || FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 40)
+            return fail("Waitable SetMaximumFrameLatency(40) round-trip failed");
+        if (WaitForSingleObject(waitable, 0) != WAIT_OBJECT_0)
+            return fail("Waitable handle was not signaled after increasing latency from 2 to 40");
+        if (wsc->SetMaximumFrameLatency(41) != DXGI_ERROR_INVALID_CALL ||
+            FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 40)
+            return fail("Waitable SetMaximumFrameLatency(41) should return INVALID_CALL and preserve latency");
         CloseHandle(waitable);
         wsc->Release();
         DestroyWindow(hwnd3);

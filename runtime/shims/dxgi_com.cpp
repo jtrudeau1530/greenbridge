@@ -15,6 +15,9 @@
 namespace rt::dxgi {
 namespace {
 
+// Native DXGI accepts up to 40 queued frames on a waitable swapchain.
+constexpr UINT max_waitable_frame_latency = 40;
+
 void stub(const char* method) {
     static std::mutex mutex;
     static std::set<std::string> seen;
@@ -135,7 +138,7 @@ public:
         if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
             // DXGI: waitable swapchains default to maximum frame latency 1.
             max_frame_latency_.store(1, std::memory_order_relaxed);
-            waitable_ = CreateSemaphoreW(nullptr, 1, 16, nullptr);
+            waitable_ = CreateSemaphoreW(nullptr, 1, max_waitable_frame_latency, nullptr);
             if (!waitable_) return false;
         }
         register_buffers();
@@ -334,8 +337,8 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
-        if (!waitable_) return DXGI_ERROR_INVALID_CALL;
-        if (max_latency == 0 || max_latency > 16) return E_INVALIDARG;
+        if (!waitable_ || max_latency == 0 || max_latency > max_waitable_frame_latency)
+            return DXGI_ERROR_INVALID_CALL;
         const UINT prev = max_frame_latency_.exchange(max_latency, std::memory_order_relaxed);
         if (max_latency > prev)
             ReleaseSemaphore(waitable_, static_cast<LONG>(max_latency - prev), nullptr);
