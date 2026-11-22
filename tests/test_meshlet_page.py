@@ -312,6 +312,30 @@ class CliTests(unittest.TestCase):
         self.assertIn(f"cannot write {out}", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_neighbor_counts_keep_malformed_page_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            block_path = os.path.join(tmp, "block.bin")
+            bad_path = os.path.join(tmp, "malformed.bin")
+            group_path = os.path.join(tmp, "group.bin")
+            out = os.path.join(tmp, "report.json")
+            for path, data in ((block_path, page(block(4))),
+                               (bad_path, b"bad"),
+                               (group_path, page(group([(4, 2)])))):
+                with open(path, "wb") as fh:
+                    fh.write(data)
+
+            for paths, exit_code, matches in (
+                ((block_path, group_path), 0, 1),
+                ((group_path, block_path), 0, 1),
+                ((block_path, bad_path, group_path), 1, 0),
+            ):
+                with self.subTest(paths=paths):
+                    result = self.run_tool(*paths, "--json", out, "--quiet")
+                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    with open(out, encoding="utf-8") as fh:
+                        totals = json.load(fh)["totals"]
+                    self.assertEqual(totals["groups_matching_block_near"], matches)
+
     def test_missing_input(self):
         r = self.run_tool(os.path.join(tempfile.gettempdir(), "no-such-meshlet-page.bin"))
         self.assertEqual(r.returncode, 2)
