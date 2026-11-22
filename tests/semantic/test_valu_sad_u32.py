@@ -1122,5 +1122,115 @@ class TestValuSadU32IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(dist_overflow_clamped, MASK32)
 
 
+class TestValuSadU32NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_negative_control_sgpr_as_destination(self) -> None:
+        with self.assertRaises(TypeError):
+            VSadU32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        with self.assertRaises(TypeError):
+            VSadHiU32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        with self.assertRaises(TypeError):
+            VMqsadU32Instruction(
+                dst=Operand.sgpr(0, count=4),
+                src0=Operand.vgpr(4, count=2),
+                src1=Operand.vgpr(6, count=1),
+                src2=Operand.vgpr(8, count=4),
+            )
+
+    def test_negative_control_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(253, count=4)  # 253 + 4 - 1 = 256 > 255
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(104, count=4)  # 104 + 4 - 1 = 107 > 105
+
+    def test_negative_control_literal_destination(self) -> None:
+        with self.assertRaises(TypeError):
+            VSadU32Instruction(
+                dst=Operand.literal(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_negative_control_wave_state_boundaries(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        wave = SIMDWaveState(wave_size=32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(-1)
+
+    def test_mutation_detection_signed_vs_unsigned_diff(self) -> None:
+        def mutant_signed_diff(s0: int, s1: int) -> int:
+            return abs(s32(s0) - s32(s1)) & MASK32
+
+        # In unsigned arithmetic |0 - 0xFFFFFFFF| == 0xFFFFFFFF.
+        # In signed arithmetic |0 - (-1)| == 1.
+        correct = ref_abs_diff_u32(0, MASK32)
+        mutant = mutant_signed_diff(0, MASK32)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, MASK32)
+        self.assertEqual(mutant, 1)
+
+    def test_mutation_detection_sad_hi_carry(self) -> None:
+        def mutant_sad_hi(s0: int, s1: int, s2: int) -> int:
+            # Faulty implementation: forgets difference and just does (s0 + s2) >> 32
+            return ((s0 & MASK32) + (s2 & MASK32)) >> 32
+
+        # For s0 = 0, s1 = 0xFFFFFFFF, s2 = 1:
+        # Correct: diff = 0xFFFFFFFF, diff + 1 = 0x100000000 -> hi = 1
+        # Mutant: 0 + 1 = 1 -> hi = 0
+        correct = ref_sad_hi_u32(0, MASK32, 1)
+        mutant = mutant_sad_hi(0, MASK32, 1)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, 1)
+        self.assertEqual(mutant, 0)
+
+    def test_mutation_detection_mqsad_mask_skipping(self) -> None:
+        def mutant_quad_byte_sad(win: int, s1: int) -> int:
+            # Faulty implementation: ignores mask check and always adds byte differences
+            total = 0
+            for i in range(4):
+                total += abs(extract_byte(win, i) - extract_byte(s1, i))
+            return total
+
+        win = 0x0101_0101
+        s1 = 0x0001_0001  # bytes 0 and 2 are 0
+        correct = ref_quad_byte_sad(win, s1, masked=True)
+        mutant = mutant_quad_byte_sad(win, s1)
+        # In correct masked behavior: bytes 0 and 2 are skipped; bytes 1 and 3 match (diff=0) -> total = 0
+        # In mutant unmasked behavior: bytes 0 and 2 have diff 1 each -> total = 2
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, 0)
+        self.assertEqual(mutant, 2)
+
+    def test_mutation_detection_clamp_overflow(self) -> None:
+        def mutant_clamped_sad(s0: int, s1: int, s2: int) -> int:
+            # Faulty clamp: wraps modulo 2^32 instead of saturating
+            return (ref_abs_diff_u32(s0, s1) + (s2 & MASK32)) & MASK32
+
+        correct = ref_sad_u32(0, MASK32, 1, clamp=True)
+        mutant = mutant_clamped_sad(0, MASK32, 1)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, MASK32)
+        self.assertEqual(mutant, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
