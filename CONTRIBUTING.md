@@ -33,7 +33,7 @@ who builds what, and which D3D12 methods are still open.
   `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. The CPU tests that need no game data are configured
   on Windows. Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink
   decode test) in place and print `SKIP` when the variable is unset; never copy or commit those files.
-- Viewer streaming tests: `node --test tests/test_viewer_streaming.cjs` (Node.js 22+, no packages,
+- Viewer streaming tests: `node --test tests/test_viewer_streaming.cjs` (Node.js 22+, CI tests 24 LTS; no packages,
   browser, network or game data). These execute the viewer streaming code with a synthetic loader and clock.
 - `loader_test` writes small PE images to a `leonida_loader_test` folder in `%TEMP%`. Antivirus that blocks newly
   written executables makes it stop with that reason; exclude the folder or set `LEONIDA_TEST_DIR` to one it skips.
