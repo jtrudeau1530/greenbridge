@@ -111,7 +111,7 @@ def string_tables(buf: bytes):
                 continue
             start = blob + (struct.unpack_from("<Q", buf, at)[0] >> 20)
             end = buf.find(b"\0", start, blob + blob_bytes)
-            if blob <= start and end > start:
+            if blob <= start <= end:
                 out[h] = buf[start:end].decode("utf-8", "replace")
         if out:
             yield out

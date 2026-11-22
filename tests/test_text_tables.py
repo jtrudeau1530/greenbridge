@@ -176,6 +176,20 @@ class TestDialogue(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_csv_exports_explicitly_empty_strings(self) -> None:
+        strings = {"ZZ_SYNTHETIC_BLANK": "", "ZZ_SYNTHETIC_LINE": "This is the text you know"}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = write(os.path.join(tmp, "strings.bin"), make_resource(strings))
+            tables_csv = os.path.join(tmp, "tables.csv")
+            strings_csv = os.path.join(tmp, "strings.csv")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(T.main([source, "--tables", tables_csv, "--strings", strings_csv]), 0)
+            with open(tables_csv, encoding="utf-8", newline="") as f:
+                self.assertEqual([row["strings"] for row in csv.DictReader(f)], ["2"])
+            with open(strings_csv, encoding="utf-8", newline="") as f:
+                self.assertEqual({row["hash"]: row["text"] for row in csv.DictReader(f)},
+                                 {f"{T.joaat(label):08x}": text for label, text in strings.items()})
+
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "src")
