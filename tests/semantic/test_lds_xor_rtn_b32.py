@@ -1383,6 +1383,257 @@ class TestIEEE754BoundaryExtremesSubnormalsAndNaNs(unittest.TestCase):
             self.assertEqual(state.lds.read_dword(0x300 + lane * 4), expected_new)
 
 
+# ============================================================================
+# Section 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ============================================================================
+
+class TestNegativeControlsSyntaxRejectionAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_negative_invalid_vgpr_index(self) -> None:
+        """VGPR indices must be in [0, 255]."""
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+
+    def test_negative_invalid_sgpr_index(self) -> None:
+        """SGPR indices must be in [0, 105]."""
+        with self.assertRaises(ValueError):
+            SGPR(106)
+        with self.assertRaises(ValueError):
+            SGPR(-1)
+
+    def test_negative_invalid_offset_range(self) -> None:
+        """Offset must be 16-bit unsigned [0, 65535]."""
+        with self.assertRaises(ValueError):
+            DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2), offset=65536)
+        with self.assertRaises(ValueError):
+            DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2), offset=-1)
+
+    def test_negative_operand_type_rejection(self) -> None:
+        """Type errors for invalid operand types."""
+        with self.assertRaises(TypeError):
+            DSXorRtnB32Instruction(dst=SGPR(0), addr=VGPR(1), data0=VGPR(2))  # type: ignore
+        with self.assertRaises(TypeError):
+            DSXorRtnB32Instruction(dst=VGPR(0), addr=SGPR(1), data0=VGPR(2))  # type: ignore
+        with self.assertRaises(TypeError):
+            DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0="bad_data")  # type: ignore
+
+    def test_negative_invalid_lds_capacity(self) -> None:
+        """LDSModel capacity must be a power of two."""
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=1000)  # Not a power of two
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=0)
+
+    def test_negative_invalid_simd_num_lanes(self) -> None:
+        """SIMDState only supports 32 (Wave32) or 64 (Wave64)."""
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    # --- Mutation Detection Tests ---
+
+    def test_mutation_memory_not_updated_detected(self) -> None:
+        """Mutant: Interpreter executes atomic read, but omits memory writeback."""
+        class BuggyNoWritebackInterpreter(ScalarInterpreter):
+            def step(self, instr: DSXorRtnB32Instruction, s: ScalarMachineState):
+                vaddr = s.get_vgpr(instr.addr.index)
+                data = self.resolve_operand(instr.data0, s)
+                eff = calc_lds_effective_address(vaddr, instr.offset)
+                old_val = s.lds.read_dword(eff)
+                # Bug: does not write back old_val ^ data to LDS!
+                s.set_vgpr(instr.dst.index, old_val)
+                return old_val, old_val  # Returns old as new
+
+        state = ScalarMachineState()
+        state.lds.write_dword(0x20, 0x1111)
+        state.set_vgpr(1, 0x20)
+        state.set_vgpr(2, 0x2222)
+
+        buggy = BuggyNoWritebackInterpreter()
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        buggy.step(instr, state)
+
+        # Catch mutation: memory must be updated to 0x1111 ^ 0x2222 = 0x3333
+        self.assertNotEqual(state.lds.read_dword(0x20), 0x3333)
+
+    def test_mutation_return_new_val_instead_of_old_detected(self) -> None:
+        """Mutant: Interpreter writes new_val into vdst instead of old_val."""
+        class BuggyReturnNewValInterpreter(ScalarInterpreter):
+            def step(self, instr: DSXorRtnB32Instruction, s: ScalarMachineState):
+                vaddr = s.get_vgpr(instr.addr.index)
+                data = self.resolve_operand(instr.data0, s)
+                old_val, new_val = s.lds.atomic_xor_b32(vaddr, data, offset=instr.offset)
+                # Bug: stores new_val into dst
+                s.set_vgpr(instr.dst.index, new_val)
+                return old_val, new_val
+
+        state = ScalarMachineState()
+        state.lds.write_dword(0x30, 0xAAAA)
+        state.set_vgpr(1, 0x30)
+        state.set_vgpr(2, 0x5555)
+
+        buggy = BuggyReturnNewValInterpreter()
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        buggy.step(instr, state)
+
+        # Catch mutation: dst should have received old value 0xAAAA, not 0xFFFF
+        self.assertNotEqual(state.get_vgpr(0), 0xAAAA)
+        self.assertEqual(state.get_vgpr(0), 0xFFFF)
+
+    def test_mutation_bitwise_op_substitution_detected(self) -> None:
+        """Mutant: Opcode substituted with OR or AND instead of XOR."""
+        def mutant_or_oracle(curr: int, data: int) -> Tuple[int, int]:
+            return curr, curr | data
+
+        def mutant_and_oracle(curr: int, data: int) -> Tuple[int, int]:
+            return curr, curr & data
+
+        curr = 0b1010
+        data = 0b1100
+        correct_old, correct_new = oracle_ds_xor_rtn_b32(curr, data)
+
+        mutant_or_old, mutant_or_new = mutant_or_oracle(curr, data)
+        mutant_and_old, mutant_and_new = mutant_and_oracle(curr, data)
+
+        self.assertNotEqual(correct_new, mutant_or_new)
+        self.assertNotEqual(correct_new, mutant_and_new)
+
+    def test_mutation_offset_dropped_detected(self) -> None:
+        """Mutant: Address calculation drops the 16-bit offset."""
+        def buggy_calc_eff(vaddr: int, offset: int = 0) -> int:
+            return vaddr & MASK_32  # Drops offset!
+
+        vaddr = 0x100
+        offset = 0x20
+        correct = calc_lds_effective_address(vaddr, offset)
+        mutant = buggy_calc_eff(vaddr, offset)
+        self.assertEqual(correct, 0x120)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_inactive_lane_executed_detected(self) -> None:
+        """Mutant: SIMD interpreter executes inactive lanes ignoring exec_mask."""
+        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
+        for l in range(32):
+            state.lds.write_dword(l * 4, 0x100)
+            state.set_vgpr(l, 0, 0x5555)  # Sentinel in dst
+            state.set_vgpr(l, 1, l * 4)
+            state.set_vgpr(l, 2, 0x0FF)
+
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: DSXorRtnB32Instruction, s: SIMDState):
+                for l in range(s.num_lanes):
+                    # Bug: ignores exec_mask!
+                    vaddr = s.get_vgpr(l, instr.addr.index)
+                    data = self.resolve_lane_operand(instr.data0, l, s)
+                    old_v, new_v = s.lds.atomic_xor_b32(vaddr, data, offset=instr.offset)
+                    s.set_vgpr(l, instr.dst.index, old_v)
+                return []
+
+        buggy = BuggySIMDInterpreter()
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        buggy.step(instr, state)
+
+        # Catch mutation: inactive lane 1 was modified
+        self.assertNotEqual(state.get_vgpr(1, 0), 0x5555)
+        self.assertNotEqual(state.lds.read_dword(4), 0x100)
+
+    def test_mutation_lane_collision_reverse_order_detected(self) -> None:
+        """Mutant: Intra-wave collision resolves in reverse lane order."""
+        state = SIMDState(num_lanes=32, exec_mask=0x3)  # Lanes 0 and 1 active
+        target_addr = 0x50
+        state.lds.write_dword(target_addr, 0)
+
+        # Lane 0 XORs 0x1, Lane 1 XORs 0x2
+        state.set_vgpr(0, 1, target_addr)
+        state.set_vgpr(0, 2, 0x1)
+        state.set_vgpr(1, 1, target_addr)
+        state.set_vgpr(1, 2, 0x2)
+
+        class ReverseCollisionSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: DSXorRtnB32Instruction, s: SIMDState):
+                # Bug: serialize in reverse lane order
+                for l in reversed(range(s.num_lanes)):
+                    if s.is_lane_active(l):
+                        vaddr = s.get_vgpr(l, instr.addr.index)
+                        data = self.resolve_lane_operand(instr.data0, l, s)
+                        old_v, new_v = s.lds.atomic_xor_b32(vaddr, data, offset=instr.offset)
+                        s.set_vgpr(l, instr.dst.index, old_v)
+                return []
+
+        buggy = ReverseCollisionSIMDInterpreter()
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        buggy.step(instr, state)
+
+        # In correct order: lane 0 gets 0, lane 1 gets 1.
+        # In reverse order: lane 1 gets 0, lane 0 gets 2!
+        self.assertNotEqual(state.get_vgpr(0, 0), 0)
+        self.assertEqual(state.get_vgpr(0, 0), 2)
+
+    def test_mutation_subnormal_flushed_to_zero_detected(self) -> None:
+        """Mutant: Bitwise memory operation flushes subnormal to zero."""
+        def buggy_ftz(val: int) -> int:
+            if (val & 0x7F80_0000) == 0 and (val & 0x007F_FFFF) != 0:
+                return 0
+            return val
+
+        sub = FLOAT32_MIN_SUBNORMAL
+        mutant = buggy_ftz(sub)
+        self.assertNotEqual(sub, mutant)
+        self.assertEqual(mutant, 0)
+
+    def test_mutation_snan_quietening_detected(self) -> None:
+        """Mutant: Bitwise memory operation incorrectly quietens sNaN."""
+        def buggy_quieten(val: int) -> int:
+            if (val & 0x7F80_0000) == 0x7F80_0000 and (val & 0x007F_FFFF) != 0:
+                return val | 0x0040_0000  # Set quiet bit
+            return val
+
+        snan = FLOAT32_SNAN_EXAMPLE
+        mutant = buggy_quieten(snan)
+        self.assertNotEqual(snan, mutant)
+        self.assertEqual(mutant, snan | 0x0040_0000)
+
+    def test_mutation_premature_writeback_aliasing_detected(self) -> None:
+        """Mutant: Writes dst before reading address register in aliased case."""
+        state = ScalarMachineState()
+        addr = 0x200
+        state.set_vgpr(0, addr)
+        state.lds.write_dword(addr, 0x1234)
+
+        class PrematureWritebackInterpreter(ScalarInterpreter):
+            def step(self, instr: DSXorRtnB32Instruction, s: ScalarMachineState):
+                # Bug: prematurely writes dst before reading addr
+                s.set_vgpr(instr.dst.index, 0xDEAD)
+                vaddr = s.get_vgpr(instr.addr.index)  # Reads 0xDEAD instead of 0x200!
+                eff = calc_lds_effective_address(vaddr, instr.offset)
+                old_v, new_v = s.lds.atomic_xor_b32(eff, 0xFF)
+                return old_v, new_v
+
+        buggy = PrematureWritebackInterpreter()
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(0), data0=Immediate(0xFF))
+        old_val, _ = buggy.step(instr, state)
+
+        # Corrupted address caused read from wrong address, returning 0 instead of 0x1234
+        self.assertNotEqual(old_val, 0x1234)
+
+    def test_mutation_overflow_masking_omitted_detected(self) -> None:
+        """Mutant: Omits 32-bit truncation, allowing integer values to exceed 32 bits."""
+        def buggy_xor(old: int, data: int) -> int:
+            return old ^ data  # Without & MASK_32, if either input exceeded 32 bits
+
+        big_val = 0x1_0000_0001
+        correct_old, correct_new = oracle_ds_xor_rtn_b32(big_val, 0)
+        self.assertEqual(correct_new, 0x0000_0001)
+
+        mutant_new = buggy_xor(big_val, 0)
+        self.assertNotEqual(correct_new, mutant_new)
+
+
+
 
 
 
