@@ -414,20 +414,39 @@ def _sgpr_pair(x):
     return None
 
 
+def _x_memory_order_access(op):
+    """Exact mirror of Gen.x_memory_order(op) in tools/rdna2spirv.py -> (kind, reads, writes) or None."""
+    if op in ("ds_swizzle_b32", "ds_bpermute_b32", "ds_permute_b32", "ds_nop"):
+        return None
+    if op.startswith("ds_"):
+        kind = "lds"
+    elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "image_load", "image_store", "image_atomic",
+                        "s_load_", "s_buffer_load_")):
+        kind = "mem"
+    else:
+        return None
+    store = "store" in op or op.startswith("ds_write")
+    reads = not store
+    writes = store or "atomic" in op or (kind == "lds" and not op.startswith("ds_read"))
+    return kind, reads, writes
+
+
 def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
     """Inspect non-terminator instructions of a block for lane-local region safety.
 
-    Returns `(clean, mem_reads, may_write_scalars, exec_writes, sgpr_write_ops)` where:
-      - `clean`: True if no instruction does a cross-lane op, barrier, memory write, or unmasked side effect.
-      - `mem_reads`: subset of {"lds", "mem"}.
+    Returns `(clean, mem_stats, may_write_scalars, exec_writes, sgpr_write_ops)` where:
+      - `clean`: True if no instruction does a cross-lane op, barrier, or unmasked side effect.
+      - `mem_stats`: `(mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w)` counting EXEC-masked memory/LDS ops.
       - `may_write_scalars`: int bitmask of scalar regs possibly written.
       - `exec_writes`: list of `(op, args)` that write EXEC.
       - `sgpr_write_ops`: list of `(sgpr_bitmask, op, args)` for every instruction writing any SGPR.
     """
-    mem_reads = set()
+    mem_ops = lds_ops = 0
+    mem_r = mem_w = lds_r = lds_w = False
     may_w = 0
     exec_writes = []
     sgpr_write_ops = []
+    empty_stats = (0, False, False, 0, False, False)
 
     for ins in insns:
         raw_op = ins["op"]
@@ -436,51 +455,67 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             break
         if id(ins) in mask_writes:
             # write_all_lanes VGPR store (parked lane mask): runs even when EXEC == 0, so must not be skipped.
-            return False, frozenset(), 0, (), ()
+            return False, empty_stats, 0, (), ()
         a = ins["args"]
         lm = lane_masks.get(id(ins), {})
 
-        # 1. Strictly forbidden opcodes inside a lane-local folded region.
+        # 1. Strictly forbidden opcodes inside a lane-local folded region (cross-lane, barrier, unmasked writes).
         if raw_op.endswith(("_dpp", "_dpp8")):
-            return False, frozenset(), 0, (), ()
+            return False, empty_stats, 0, (), ()
         if op in ("s_barrier", "s_sendmsg", "s_setpc_b64", "s_swappc_b64", "s_trap",
                   "s_sethalt", "s_setkill", "s_sleep", "s_setprio",
                   "s_round_mode", "s_denorm_mode",
                   "v_readlane_b32", "v_readfirstlane_b32", "v_writelane_b32",
                   "v_permlane16_b32", "v_permlanex16_b32",
                   "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
+                  "ds_gws_init", "ds_gws_sema_v", "ds_gws_sema_br", "ds_gws_sema_p", "ds_gws_barrier",
+                  "ds_consume", "ds_append", "ds_ordered_count",
                   "s_wqm_b32", "s_wqm_b64", "s_quadmask_b32", "s_quadmask_b64"):
-            return False, frozenset(), 0, (), ()
-        if op.startswith(("s_movrel", "s_setreg", "s_getreg", "s_store", "s_buffer_store", "s_atomic", "exp")):
-            return False, frozenset(), 0, (), ()
-        if "store" in op or "atomic" in op:
-            return False, frozenset(), 0, (), ()
-        if op.startswith("ds_"):
-            if not op.startswith("ds_read"):
-                return False, frozenset(), 0, (), ()
-            mem_reads.add("lds")
-        elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "scratch_",
-                            "s_load_", "s_buffer_load_",
-                            "image_load", "image_sample", "image_gather", "image_bvh")):
-            mem_reads.add("mem")
+            return False, empty_stats, 0, (), ()
+        if op.startswith(("s_movrel", "s_setreg", "s_getreg", "s_store", "s_buffer_store", "s_atomic",
+                          "ds_gws", "exp")):
+            return False, empty_stats, 0, (), ()
+
+        acc = _x_memory_order_access(op)
+        if acc is not None:
+            kind, r, w = acc
+            if kind == "lds":
+                lds_ops += 1
+                lds_r = lds_r or r
+                lds_w = lds_w or w
+            else:
+                mem_ops += 1
+                mem_r = mem_r or r
+                mem_w = mem_w or w
+        elif op.startswith(("scratch_", "image_sample", "image_gather", "image_bvh")):
+            if "store" in op or "atomic" in op:
+                mem_ops += 1
+                mem_w = True
+                if "atomic" in op:
+                    mem_r = True
+            else:
+                mem_ops += 1
+                mem_r = True
+        elif "store" in op or "atomic" in op:
+            return False, empty_stats, 0, (), ()
 
         # 2. Cross-lane mask readers (`wave_mask`, `wave_equal`, live-SCC `scc_from_mask`).
         if op in ("s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
                   "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64"):
             if len(a) > 1 and _holds_lane_mask(ins, a[1], lm):
-                return False, frozenset(), 0, (), ()
+                return False, empty_stats, 0, (), ()
         elif op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
             if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm):
-                return False, frozenset(), 0, (), ()
+                return False, empty_stats, 0, (), ()
         elif op.startswith(("s_cmp", "s_bitcmp")):
             if any(_holds_lane_mask(ins, x, lm) for x in a):
-                return False, frozenset(), 0, (), ()
+                return False, empty_stats, 0, (), ()
         elif op in _MASK_SCC_VOTE_OPS and id(ins) in scc_live:
             # Would emit scc_from_mask -> x_round if operating on a lane mask (matches Gen.is_mask_op).
             is_mask_dst = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith(("exec", "vcc"))
             if "saveexec" in op or "wrexec" in op or op.endswith("_mask") or is_mask_dst \
                     or any(_is_mask_op(ins, x, lm) for x in a[1:]):
-                return False, frozenset(), 0, (), ()
+                return False, empty_stats, 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
         _, ins_mw, _ = _scalar_rw(ins)
@@ -493,7 +528,7 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
         if writes_exec:
             exec_writes.append((op, a))
 
-    return True, frozenset(mem_reads), may_w, exec_writes, sgpr_write_ops
+    return True, (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w), may_w, exec_writes, sgpr_write_ops
 
 
 def _is_zero_val(x, zero_pairs):
@@ -572,12 +607,86 @@ def _exec_writes_stay_inactive(region_blocks, blk_info, run_live_in):
     return True
 
 
+def _tree_has_loop(tree):
+    """Iterative check whether a cfg_structure tree contains any loop node."""
+    if not tree:
+        return False
+    stack = [tree]
+    while stack:
+        for it in stack.pop():
+            if it[0] == "loop":
+                return True
+            if it[0] == "guard":
+                stack.append(it[2])
+    return False
+
+
+def _blocks_in_tree(tree):
+    """Iterative set of all block ids appearing in a cfg_structure tree (or single item)."""
+    out = set()
+    stack = [tree if isinstance(tree, list) else [tree]]
+    while stack:
+        for it in stack.pop():
+            if it[0] == "block":
+                out.add(it[1])
+            else:
+                stack.append(it[2])
+    return out
+
+
+def _map_tree_ids(tree, mapping):
+    """Iterative copy of a cfg_structure tree replacing every compact id with `mapping[id]`."""
+    out = []
+    stack = [(tree, out)]
+    while stack:
+        src, dst = stack.pop()
+        for it in src:
+            if it[0] == "block":
+                dst.append(("block", mapping[it[1]]))
+            else:
+                child = []
+                dst.append((it[0], mapping[it[1]], child))
+                stack.append((it[2], child))
+    return out
+
+
+def _region_has_cycle(region, succ):
+    """Iterative 3-color cycle check over the subgraph induced by `region`."""
+    color = {}
+    for start in region:
+        if start in color:
+            continue
+        color[start] = 1
+        stack = [(start, iter(succ[start]))]
+        while stack:
+            u, it = stack[-1]
+            for v in it:
+                if v not in region:
+                    continue
+                c = color.get(v, 0)
+                if c == 1:
+                    return True
+                if c == 0:
+                    color[v] = 1
+                    stack.append((v, iter(succ[v])))
+                    break
+            else:
+                color[u] = 2
+                stack.pop()
+    return False
+
+
 def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_writes=frozenset()):
     """Find safe lane-local `s_cbranch_execz`/`nz` regions to fold inline under --wave64-emulate.
 
+    Allows read-only regions (including regions with internal scalar-counted loops) AND acyclic
+    single-write-per-domain regions (at most one store/atomic touching `"mem"` or `"lds"` with no
+    other access to that domain inside the region).
+
     Returns `(folds, fold_chain, absorbed)`:
       - `folds`: dict `head_block -> {"run": int, "skip": int, "region": frozenset[int],
-                 "order": list[int], "sub_tree": list | None, "mem_reads": frozenset[str]}`
+                 "order": list[int], "sub_tree": list | None, "mem_reads": frozenset[str],
+                 "mem_writes": frozenset[str], "mem_stats": tuple}`
                  containing only the maximal (outermost) folded regions.
       - `fold_chain`: dict `head_block -> skip_block` when `skip_block` has no predecessors outside
                  `{head_block} | region` and can be emitted directly after the fold in the same block.
@@ -647,6 +756,21 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                 break
         if not ok:
             continue
+        # Memory-write safety: if R writes "mem" (or "lds"), R must be acyclic and touch that domain at most once.
+        mem_ops = lds_ops = 0
+        mem_r = mem_w = lds_r = lds_w = False
+        for u in region:
+            mo, mr, mw, lo, lr, lw = blk_info[u][1]
+            mem_ops += mo
+            mem_r = mem_r or mr
+            mem_w = mem_w or mw
+            lds_ops += lo
+            lds_r = lds_r or lr
+            lds_w = lds_w or lw
+        if (mem_w and mem_ops > 1) or (lds_w and lds_ops > 1):
+            continue
+        if (mem_w or lds_w) and _region_has_cycle(region, succ):
+            continue
         # No scalar written in R may be live-in at `skip`.
         region_may_w = 0
         for u in region:
@@ -656,12 +780,13 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
         # EXEC must stay inactive for any lane that skipped R.
         if not _exec_writes_stay_inactive(region, blk_info, scalar_live_in[run]):
             continue
-        candidates.append((len(region), b, run, skip, frozenset(region)))
+        candidates.append((len(region), b, run, skip, frozenset(region),
+                           (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w)))
 
     # Validate innermost regions first so nested s_cbranch_execz/nz inside an outer region are already verified.
     candidates.sort(key=lambda item: (item[0], item[1]))
     valid = {}
-    for _, b, run, skip, region in candidates:
+    for _, b, run, skip, region, mem_stats in candidates:
         ok = True
         for u in region:
             tkind, top = terms[u]
@@ -689,7 +814,9 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
             sub_tree = cfg_structure.structure(sub_succ)
             if sub_tree is None:
                 continue
-        mem_reads = frozenset().union(*(blk_info[u][1] for u in region))
+        _, mem_r, mem_w, _, lds_r, lds_w = mem_stats
+        mem_reads = frozenset(k for k, flag in (("mem", mem_r), ("lds", lds_r)) if flag)
+        mem_writes = frozenset(k for k, flag in (("mem", mem_w), ("lds", lds_w)) if flag)
         valid[b] = {
             "run": run,
             "skip": skip,
@@ -697,6 +824,8 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
             "order": order,
             "sub_tree": sub_tree,
             "mem_reads": mem_reads,
+            "mem_writes": mem_writes,
+            "mem_stats": mem_stats,
         }
 
     # Select maximal (non-overlapping outermost) folded regions.
@@ -736,3 +865,385 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
 
     absorbed = in_region | chained
     return selected, fold_chain, absorbed
+
+
+_SOP2_B32_LOGIC = frozenset({
+    "s_and_b32", "s_or_b32", "s_xor_b32", "s_andn2_b32", "s_orn2_b32",
+    "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_not_b32",
+})
+
+
+def _is_uniform_scc_safe(active_blocks, lane_masks, scc_live):
+    """True iff no instruction triggers wave64's per-lane 32-bit half-mask SCC write (rdna2spirv.py scc_logic)
+    with live SCC. When True, %scc is guaranteed identical across all 64 lanes of each wave."""
+    for insns in active_blocks:
+        for ins in insns:
+            op = base_op(ins["op"])
+            if op not in _SOP2_B32_LOGIC or id(ins) not in scc_live:
+                continue
+            a = ins["args"]
+            lm = lane_masks.get(id(ins), {})
+            writes_exec = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec")
+            if writes_exec or any(_holds_lane_mask(ins, x, lm) for x in a[1:]):
+                return False
+    return True
+
+
+def _insn_may_barrier(ins, lane_masks, scc_live):
+    """Conservative (over-approximate) check: True if `ins` may emit x_round or OpControlBarrier in --wave64-emulate."""
+    raw_op = ins["op"]
+    op = base_op(raw_op)
+    if op == "s_endpgm" or op in BRANCHES:
+        return False
+    if raw_op.endswith(("_dpp", "_dpp8")):
+        return True
+    if op in ("s_barrier", "v_readlane_b32", "v_readfirstlane_b32",
+              "v_permlane16_b32", "v_permlanex16_b32",
+              "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
+              "s_wqm_b32", "s_wqm_b64"):
+        return True
+    if op.startswith("s_movrel"):
+        return True
+    a = ins["args"]
+    lm = lane_masks.get(id(ins), {})
+    if op in ("s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
+              "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64"):
+        return len(a) > 1 and _holds_lane_mask(ins, a[1], lm)
+    if op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
+        return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm)
+    if op.startswith(("s_cmp", "s_bitcmp")):
+        return any(_holds_lane_mask(ins, x, lm) for x in a)
+    if op in _MASK_SCC_VOTE_OPS and id(ins) in scc_live:
+        is_mask_dst = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith(("exec", "vcc"))
+        return ("saveexec" in op or "wrexec" in op or op.endswith("_mask") or is_mask_dst
+                or any(_is_mask_op(ins, x, lm) for x in a[1:]))
+    return False
+
+
+def _dirty_conflicts(dirty, reads, writes):
+    return (any((k, "w") in dirty for k in reads)
+            or any((k, "r") in dirty or (k, "w") in dirty for k in writes))
+
+
+def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorbed, lane_masks, scc_live, x_lanes):
+    """Plan structured --wave64-emulate emission eliminating the giant global round-loop OpSwitch.
+
+    - Single-wave workgroups (`x_lanes == 64`): every reducible CFG emits 100% inline structured SPIR-V
+      with direct workgroup barriers (`0` OpSwitch cases, `0` x_spill variables, `0` scheduler atomics).
+    - Multi-wave workgroups (`x_lanes > 64`): decomposes top-level post-dominating spine blocks and
+      barrier-free guards/loops (including live-out scalars, single-write stores, EXEC-widening, and
+      read-only loops) into inline structured SPIR-V, isolating any remaining wave-divergent barrier
+      regions into tiny local mini-schedulers instead of one global K_{1,N} switch clique.
+
+    Returns `None` when the shader already collapsed to 1 superblock, is irreducible, uses non-uniform
+    32-bit half-mask SCC, or (multi-wave) has a divergent `s_barrier` or no decomposition gain.
+    """
+    n = len(blocks)
+    eff_blocks = [b for b in range(n) if b not in absorbed]
+    if len(eff_blocks) < 2:
+        return None  # straight-line or fully folded to 1 superblock: existing x_scheduler already has <=1 case
+
+    active_blocks = [_active_insns(blk) for blk in blocks]
+    if not _is_uniform_scc_safe(active_blocks, lane_masks, scc_live):
+        return None
+
+    # Build superblock chains and effective post-fold CFG over `eff_blocks`.
+    eff_idx = {b: i for i, b in enumerate(eff_blocks)}
+    chain_of = {}
+    eff_succ = {}
+    eff_succ_compact = []
+    for b in eff_blocks:
+        chain = []
+        cur = b
+        while True:
+            chain.append(cur)
+            if cur in folds and cur in fold_chain:
+                cur = fold_chain[cur]
+                continue
+            break
+        chain_of[b] = chain
+        tail = chain[-1]
+        if tail in folds:
+            nxt = [folds[tail]["skip"]]
+        else:
+            nxt = succ[tail]
+        if any(s not in eff_idx for s in nxt):
+            return None  # defensive: every effective successor must be a non-absorbed block
+        eff_succ[b] = nxt
+        eff_succ_compact.append([eff_idx[s] for s in nxt])
+
+    compact_tree = cfg_structure.structure(eff_succ_compact)
+    if compact_tree is None:
+        return None
+    tree = _map_tree_ids(compact_tree, eff_blocks)
+
+    # Precompute per-superblock instruction summaries (for dirty transfer, sync-free check, s_barrier, s_endpgm).
+    sb_has_sbarrier = {}
+    sb_has_endpgm = {}
+    sb_may_barrier = {}
+    sb_mem_stats = {}
+
+    for b in eff_blocks:
+        has_sb = False
+        has_end = False
+        may_bar = False
+        mem_ops = lds_ops = 0
+        mem_r = mem_w = lds_r = lds_w = False
+        chain = chain_of[b]
+        for idx_c, cur in enumerate(chain):
+            insns = active_blocks[cur]
+            for ins in insns:
+                op = base_op(ins["op"])
+                if op == "s_endpgm":
+                    has_end = True
+                    break
+                if op in BRANCHES:
+                    if idx_c == len(chain) - 1 and cur not in folds:
+                        if op in ("s_cbranch_execz", "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz"):
+                            may_bar = True
+                    break
+                if op == "s_barrier":
+                    has_sb = True
+                    may_bar = True
+                elif _insn_may_barrier(ins, lane_masks, scc_live):
+                    may_bar = True
+                acc = _x_memory_order_access(op)
+                if acc is not None:
+                    kind, r, w = acc
+                    if kind == "lds":
+                        lds_ops += 1
+                        lds_r = lds_r or r
+                        lds_w = lds_w or w
+                    else:
+                        mem_ops += 1
+                        mem_r = mem_r or r
+                        mem_w = mem_w or w
+                elif op.startswith("scratch_"):
+                    mem_ops += 1
+                    if "store" in op or "atomic" in op:
+                        mem_w = True
+                        if "atomic" in op:
+                            mem_r = True
+                    else:
+                        mem_r = True
+            if cur in folds:
+                mo, mr, mw, lo, lr, lw = folds[cur]["mem_stats"]
+                mem_ops += mo
+                mem_r = mem_r or mr
+                mem_w = mem_w or mw
+                lds_ops += lo
+                lds_r = lds_r or lr
+                lds_w = lds_w or lw
+        sb_has_sbarrier[b] = has_sb
+        sb_has_endpgm[b] = has_end
+        sb_may_barrier[b] = may_bar
+        sb_mem_stats[b] = (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w)
+
+    def transfer_superblock(b, d_in):
+        """Conservative under-approximate barrier clearing + exact x_memory_order dirty transfer."""
+        d = set(d_in)
+        chain = chain_of[b]
+        for idx_c, cur in enumerate(chain):
+            insns = active_blocks[cur]
+            for ins in insns:
+                op = base_op(ins["op"])
+                if op == "s_endpgm":
+                    break
+                if op in BRANCHES:
+                    if idx_c == len(chain) - 1 and cur not in folds:
+                        if op in ("s_cbranch_execz", "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz"):
+                            d.clear()  # branch_condition unconditionally runs g_vote -> x_round -> barrier
+                    break
+                if op == "s_barrier":
+                    d.clear()
+                    continue
+                acc = _x_memory_order_access(op)
+                if acc is not None:
+                    kind, r, w = acc
+                    if (kind, "w") in d or (w and (kind, "r") in d):
+                        d.clear()
+                    if r:
+                        d.add((kind, "r"))
+                    if w:
+                        d.add((kind, "w"))
+            if cur in folds:
+                fd = folds[cur]
+                if _dirty_conflicts(d, fd["mem_reads"], fd["mem_writes"]):
+                    d.clear()
+                for k in fd["mem_reads"]:
+                    d.add((k, "r"))
+                for k in fd["mem_writes"]:
+                    d.add((k, "w"))
+        return frozenset(d)
+
+    # ---- Mode 1: Single-wave (`x_lanes == 64`) -> 100% inline structured SPIR-V, 0 OpSwitch ----
+    if x_lanes == 64:
+        dirty_in = {b: set() for b in eff_blocks}
+        work = collections.deque(eff_blocks)
+        in_work = set(eff_blocks)
+        while work:
+            u = work.popleft()
+            in_work.discard(u)
+            d_out = transfer_superblock(u, dirty_in[u])
+            for v in eff_succ[u]:
+                if not d_out <= dirty_in[v]:
+                    dirty_in[v].update(d_out)
+                    if v not in in_work:
+                        in_work.add(v)
+                        work.append(v)
+        return {
+            "mode": "inline_all",
+            "tree": tree,
+            "dirty_in": {b: frozenset(d) for b, d in dirty_in.items()},
+            "inline_blocks": set(eff_blocks),
+            "sync_free_blocks": set(),
+            "mini_of_block": {},
+            "mini_blocks": {},
+            "tail_blocks": set(),
+        }
+
+    # ---- Mode 2: Multi-wave (`x_lanes > 64`) -> top-level uniform inline + sync-free + local mini-schedulers ----
+    ipdom_c = _postdominators(eff_succ_compact)
+    m_eff = len(eff_blocks)
+    # Require every effective block to reach exit (no infinite-loop sink SCCs bypassing post-dominators).
+    entry_pdoms = set()
+    if len(ipdom_c) == m_eff + 1 and 0 in ipdom_c:
+        cur_c = 0
+        while cur_c != m_eff:
+            entry_pdoms.add(eff_blocks[cur_c])
+            nxt_c = ipdom_c.get(cur_c)
+            if nxt_c is None or nxt_c == cur_c:
+                break
+            cur_c = nxt_c
+
+    eff_preds = {b: set() for b in eff_blocks}
+    for u in eff_blocks:
+        for v in eff_succ[u]:
+            eff_preds[v].add(u)
+
+    # Unwrap top-level guards whose entry strictly post-dominates entry 0 and whose non-back-edge
+    # predecessors have all been emitted, exposing the full post-dominating spine at top level.
+    flat_top = []
+    q = collections.deque(tree)
+    seen_before = set()
+    saw_endpgm = False
+    while q:
+        it = q.popleft()
+        if not saw_endpgm and it[0] == "guard":
+            entry_b = it[1]
+            sub = it[2]
+            if entry_b in entry_pdoms and sub:
+                first_kind = sub[0][0]
+                if first_kind == "block" and sub[0][1] == entry_b:
+                    need_preds = eff_preds[entry_b]
+                elif first_kind == "loop" and sub[0][1] == entry_b:
+                    loop_nodes = _blocks_in_tree(sub[0])
+                    need_preds = eff_preds[entry_b] - loop_nodes
+                else:
+                    need_preds = None
+                if need_preds is not None and need_preds <= seen_before:
+                    for child in reversed(sub):
+                        q.appendleft(child)
+                    continue
+        flat_top.append(it)
+        it_blocks = _blocks_in_tree(it)
+        seen_before.update(it_blocks)
+        if any(sb_has_endpgm[u] for u in it_blocks):
+            saw_endpgm = True
+
+    # Multi-wave soundness guard: any `s_barrier` inside a non-top-level guard/loop must stay in global x_scheduler
+    # so waves on different paths can meet at different s_barrier sites (cs_barrier_divergent).
+    for it in flat_top:
+        if it[0] != "block":
+            if any(sb_has_sbarrier[u] for u in _blocks_in_tree(it)):
+                return None
+
+    def check_sync_free(it):
+        sub_blocks = _blocks_in_tree(it)
+        has_loop = _tree_has_loop([it])
+        mem_ops = lds_ops = 0
+        mem_r = mem_w = lds_r = lds_w = False
+        for u in sub_blocks:
+            if sb_may_barrier[u] or sb_has_endpgm[u] or sb_has_sbarrier[u]:
+                return False, frozenset(), frozenset()
+            mo, mr, mw, lo, lr, lw = sb_mem_stats[u]
+            mem_ops += mo
+            mem_r = mem_r or mr
+            mem_w = mem_w or mw
+            lds_ops += lo
+            lds_r = lds_r or lr
+            lds_w = lds_w or lw
+        if has_loop:
+            if mem_w or lds_w:
+                return False, frozenset(), frozenset()
+        else:
+            if (mem_w and mem_ops > 1) or (lds_w and lds_ops > 1):
+                return False, frozenset(), frozenset()
+        reads = frozenset(k for k, f in (("mem", mem_r), ("lds", lds_r)) if f)
+        writes = frozenset(k for k, f in (("mem", mem_w), ("lds", lds_w)) if f)
+        return True, reads, writes
+
+    steps = []
+    dirty_in = {}
+    inline_blocks = set()
+    sync_free_blocks = set()
+    mini_of_block = {}
+    mini_blocks = {}
+    tail_blocks = set()
+    cur_dirty = frozenset()
+    mini_idx = 0
+
+    for idx_it, it in enumerate(flat_top):
+        it_blocks = _blocks_in_tree(it)
+        has_end = any(sb_has_endpgm[u] for u in it_blocks)
+        if it[0] == "block" and (not has_end or idx_it == len(flat_top) - 1):
+            b = it[1]
+            dirty_in[b] = cur_dirty
+            inline_blocks.add(b)
+            cur_dirty = transfer_superblock(b, cur_dirty)
+            steps.append(("inline_block", b))
+            continue
+        if has_end:
+            # Early s_endpgm inside a wave-divergent guard/loop (or non-final block): hand remaining tail to x_scheduler.
+            rem = set()
+            for rem_it in flat_top[idx_it:]:
+                rem.update(_blocks_in_tree(rem_it))
+            tail_blocks = rem
+            steps.append(("tail_scheduler", rem, bool(cur_dirty)))
+            cur_dirty = frozenset()
+            break
+        ok_sf, sf_reads, sf_writes = check_sync_free(it)
+        if ok_sf:
+            pre_bar = _dirty_conflicts(cur_dirty, sf_reads, sf_writes)
+            if pre_bar:
+                cur_dirty = frozenset()
+            for u in it_blocks:
+                dirty_in[u] = frozenset()  # pre_bar cleared conflicts before entering sync-free region
+                inline_blocks.add(u)
+                sync_free_blocks.add(u)
+            cur_dirty = frozenset(set(cur_dirty)
+                                  | {(k, "r") for k in sf_reads}
+                                  | {(k, "w") for k in sf_writes})
+            steps.append(("inline_sync_free", it, pre_bar))
+        else:
+            pre_bar = bool(cur_dirty)
+            cur_dirty = frozenset()  # mini-scheduler ends with OpControlBarrier %c2 %c2 %c948
+            mini_blocks[mini_idx] = it_blocks
+            for u in it_blocks:
+                mini_of_block[u] = mini_idx
+            steps.append(("mini_scheduler", mini_idx, it_blocks, pre_bar))
+            mini_idx += 1
+
+    # Only engage structured_hybrid when it actually eliminates global-switch blocks or splits into smaller regions.
+    if len(steps) == 1 and steps[0][0] in ("tail_scheduler", "mini_scheduler"):
+        return None
+    return {
+        "mode": "structured_hybrid",
+        "steps": steps,
+        "dirty_in": dirty_in,
+        "inline_blocks": inline_blocks,
+        "sync_free_blocks": sync_free_blocks,
+        "mini_of_block": mini_of_block,
+        "mini_blocks": mini_blocks,
+        "tail_blocks": tail_blocks,
+    }

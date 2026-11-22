@@ -718,10 +718,19 @@ class LocalExecFoldTests(unittest.TestCase):
 
     def test_negative_store_and_crosslane_and_exec_widen_not_folded(self):
         cases = [
-            ("store", [
+            ("multi_store", [
                 ("s_and_saveexec_b64 s[8:9], vcc", 4),
-                ("s_cbranch_execz 2", 4),
+                ("s_cbranch_execz 4", 4),
                 ("buffer_store_dword v0, v0, s[0:3], 0 offen", 8),
+                ("buffer_store_dword v0, v0, s[0:3], 0 offen offset:4", 8),
+                ("s_or_b64 exec, exec, s[8:9]", 4),
+                ("s_endpgm", 4),
+            ]),
+            ("load_and_store", [
+                ("s_and_saveexec_b64 s[8:9], vcc", 4),
+                ("s_cbranch_execz 4", 4),
+                ("buffer_load_dword v4, v0, s[0:3], 0 offen", 8),
+                ("buffer_store_dword v4, v0, s[0:3], 0 offen", 8),
                 ("s_or_b64 exec, exec, s[8:9]", 4),
                 ("s_endpgm", 4),
             ]),
@@ -970,6 +979,182 @@ class LocalExecFoldTests(unittest.TestCase):
         ]
         spv2, _ = _translate_encoded("cs_neg_vcc_scc", insns_vcc_scc, (64, 1, 1), emulate=True)
         self.assertGreaterEqual(spv2.count("OpAtomicOr"), 2)  # branch vote + scc_from_mask vote
+
+    def test_single_store_acyclic_fold_orders_war_and_raw(self):
+        # Acyclic single-store s_cbranch_execz regions fold inline (0 OpAtomicOr), while uniform pre/post
+        # memory ordering protects both WAR (load before folded store) and RAW (folded store before load).
+        insns = [
+            ("v_lshlrev_b32_e32 v7, 2, v0", 4),
+            ("v_add_nc_u32_e32 v6, 50, v0", 4),
+            ("buffer_store_dword v6, v7, s[0:3], 0 offen", 8),
+            ("v_xor_b32_e32 v8, 32, v0", 4),
+            ("v_lshlrev_b32_e32 v8, 2, v8", 4),
+            ("buffer_load_dword v9, v8, s[0:3], 0 offen", 8),  # reads partner half before overwrite
+            ("v_cmp_le_u32_e64 s[6:7], 32, v0", 8),
+            ("s_and_saveexec_b64 s[10:11], s[6:7]", 4),
+            ("s_cbranch_execz 3", 4),
+            ("v_add_nc_u32_e32 v11, 500, v9", 4),
+            ("buffer_store_dword v11, v7, s[0:3], 0 offen", 8),  # single store -> folded with WAR split before!
+            ("s_or_b64 exec, exec, s[10:11]", 4),
+            ("buffer_load_dword v12, v8, s[0:3], 0 offen", 8),   # reads partner half after folded store -> RAW split!
+            ("v_add_nc_u32_e32 v13, 512, v7", 4),
+            ("buffer_store_dword v12, v13, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        for size in ((64, 1, 1), (128, 1, 1)):
+            with self.subTest(size=size):
+                spv, _ = _translate_encoded("cs_single_store_fold", insns, size, emulate=True)
+                self.assertEqual(spv.count("OpAtomicOr"), 0)
+                mem, _ = run_emulated_workgroup(spv, size, push_constants=VSHARP + [0] * 28)
+                for tid in range(size[0]):
+                    partner = tid ^ 32
+                    # lanes < 32 kept 50 + tid; lanes >= 32 overwrote their slot with 500 + (50 + (tid ^ 32))
+                    if partner >= 32:
+                        want = 500 + 50 + (partner ^ 32)
+                    else:
+                        want = 50 + partner
+                    self.assertEqual(mem[512 + tid * 4], want, f"tid {tid}")
+
+
+class StructuredEmulationTests(unittest.TestCase):
+    """Structured --wave64-emulate (`inline_all` for <=64 threads, `structured_hybrid` for >64 threads)."""
+
+    def test_single_wave_inline_all_zero_switch_and_loop_carried_war(self):
+        # 64-thread and partial 40-thread shaders with live-out scalars, loop-carried store->load->store WAR/RAW,
+        # and v_readfirstlane emit 0 OpSwitch cases and 0 x_spills while staying bit-exact.
+        insns = [
+            ("s_mov_b64 exec, -1", 4),
+            ("s_mov_b32 s16, 10", 4),
+            ("v_mov_b32_e32 v4, v0", 4),
+            ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+            ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+            # Un-foldable live-out scalar s_cbranch_execz
+            ("v_cmp_le_u32_e64 s[6:7], 20, v0", 8),
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 2", 4),
+            ("s_add_u32 s16, s16, 5", 4),
+            ("v_add_nc_u32_e32 v4, s16, v4", 4),
+            ("s_or_b64 exec, exec, s[8:9]", 4),
+            ("v_add_nc_u32_e32 v4, s16, v4", 4),
+            # Loop with store -> cross-half load -> next iteration store (tests back-edge dirty_in!)
+            ("s_mov_b32 s20, 3", 4),
+            ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+            ("v_xor_b32_e32 v12, 32, v0", 4),
+            ("v_lshlrev_b32_e32 v12, 2, v12", 4),
+            ("buffer_load_dword v13, v12, s[0:3], 0 offen", 8),
+            ("v_add_nc_u32_e32 v4, v4, v13", 4),
+            ("s_sub_u32 s20, s20, 1", 4),
+            ("s_cmp_gt_u32 s20, 0", 4),
+            ("s_cbranch_scc1 -10", 4),
+            ("buffer_store_dword v4, v10, s[0:3], 0 offen offset:512", 8),
+            ("s_endpgm", 4),
+        ]
+        for threads in (64, 40):
+            with self.subTest(threads=threads):
+                spv, gen = _translate_encoded(f"cs_inline_{threads}", insns, (threads, 1, 1), emulate=True)
+                self.assertEqual(gen.control_flow, "emulated wave64 structured")
+                self.assertEqual(gen.emulate_plan["mode"], "inline_all")
+                self.assertNotIn("OpSwitch", spv)
+                self.assertEqual(len(gen.x_spills), 0)
+                self.assertNotIn("OpGroupNonUniform", spv)
+                mem, _ = run_emulated_workgroup(spv, (threads, 1, 1), push_constants=VSHARP + [0] * 28)
+                # Reference simulation
+                arr = [0] * 64
+                for l in range(threads):
+                    arr[l] = l
+                v4 = [l + (15 if l >= 20 else 0) + 15 for l in range(threads)]
+                for _ in range(3):
+                    for l in range(threads):
+                        arr[l] = v4[l]
+                    nxt = [v4[l] + arr[l ^ 32] for l in range(threads)]
+                    v4 = nxt
+                for l in range(threads):
+                    self.assertEqual(mem[512 + l * 4], v4[l] & 0xFFFFFFFF, f"lane {l}")
+
+    def test_multiwave_structured_hybrid_zero_switch_and_local_mini_scheduler(self):
+        # 128 threads (2 waves): top-level spine + sync-free guard (live-out scalar) + wave-divergent
+        # mini-scheduler (Wave 0 runs v_readlane + store + cross-half load while Wave 1 skips it) + top s_barrier.
+        insns = [
+            ("s_mov_b64 exec, -1", 4),
+            ("s_mov_b32 s16, 7", 4),
+            ("v_mov_b32_e32 v4, v0", 4),
+            ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+            ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+            # 1) Sync-free guard with live-out scalar (0 OpSwitch!)
+            ("v_cmp_le_u32_e64 s[6:7], 96, v0", 8),        # Wave 0 skips, Wave 1 takes
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 2", 4),
+            ("s_add_u32 s16, s16, 30", 4),
+            ("v_add_nc_u32_e32 v4, s16, v4", 4),
+            ("s_or_b64 exec, exec, s[8:9]", 4),
+            ("v_add_nc_u32_e32 v4, s16, v4", 4),
+            # 2) Wave-divergent guard with v_readlane + store + load -> isolated local mini_scheduler!
+            ("v_readfirstlane_b32 s19, v0", 4),
+            ("s_cmp_lt_u32 s19, 64", 4),
+            ("s_cbranch_scc0 9", 4),                       # Wave 0 enters, Wave 1 skips!
+            ("v_readlane_b32 s18, v4, 37", 4),
+            ("v_add_nc_u32_e32 v4, s18, v4", 4),
+            ("buffer_store_dword v4, v10, s[0:3], 0 offen", 8),
+            ("v_xor_b32_e32 v12, 32, v0", 4),
+            ("v_lshlrev_b32_e32 v12, 2, v12", 4),
+            ("buffer_load_dword v13, v12, s[0:3], 0 offen", 8),
+            ("v_add_nc_u32_e32 v4, v4, v13", 4),
+            # 3) Top-level inline s_barrier + cross-wave LDS exchange!
+            ("ds_write_b32 v10, v4", 8),
+            ("s_barrier", 4),
+            ("v_xor_b32_e32 v12, 64, v0", 4),
+            ("v_lshlrev_b32_e32 v12, 2, v12", 4),
+            ("ds_read_b32 v13, v12", 8),
+            ("v_add_nc_u32_e32 v4, v4, v13", 4),
+            ("buffer_store_dword v4, v10, s[0:3], 0 offen offset:1024", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, gen = _translate_encoded("cs_hybrid_128", insns, (128, 1, 1), emulate=True, rsrc2=0x20088)
+        self.assertEqual(gen.control_flow, "emulated wave64 structured")
+        self.assertEqual(gen.emulate_plan["mode"], "structured_hybrid")
+        kinds = [st[0] for st in gen.emulate_plan["steps"]]
+        self.assertIn("inline_sync_free", kinds)
+        self.assertIn("mini_scheduler", kinds)
+        # Only the 1 isolated mini_scheduler has an OpSwitch (with <= 3 segments, NOT the whole shader!).
+        switches = re.findall(r"OpSwitch\s+%\w+\s+%\w+([^\n]*)", spv)
+        self.assertEqual(len(switches), 1)
+        self.assertLessEqual(len(switches[0].split()) // 2, 3)
+
+        # Bit-exact verification against unoptimized baseline x_scheduler.
+        orig_plan = wave64_emulate_opt.plan_structured_emulation
+        wave64_emulate_opt.plan_structured_emulation = lambda *a, **kw: None
+        try:
+            spv_base, _ = _translate_encoded("cs_hybrid_128_base", insns, (128, 1, 1), emulate=True, rsrc2=0x20088)
+        finally:
+            wave64_emulate_opt.plan_structured_emulation = orig_plan
+        mem_new, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28)
+        mem_base, _ = run_emulated_workgroup(spv_base, (128, 1, 1), push_constants=VSHARP + [0] * 28)
+        self.assertEqual(mem_new, mem_base)
+
+    def test_multiwave_divergent_sbarrier_falls_back_to_rounds(self):
+        # Wave 0 hits s_barrier in one arm while Wave 1 hits s_barrier in another -> MUST keep global rounds.
+        insns = [
+            ("s_mov_b64 exec, -1", 4),
+            ("v_lshlrev_b32_e32 v2, 2, v0", 4),
+            ("ds_write_b32 v2, v0", 8),
+            ("v_readfirstlane_b32 s5, v0", 4),
+            ("s_cmp_lt_u32 s5, 64", 4),
+            ("s_cbranch_scc0 8", 4),
+            ("s_barrier", 4),
+            ("v_xor_b32_e32 v3, 64, v0", 4),
+            ("v_lshlrev_b32_e32 v3, 2, v3", 4),
+            ("ds_read_b32 v4, v3", 8),
+            ("buffer_store_dword v4, v2, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+            ("s_barrier", 4),
+            ("s_endpgm", 4),
+        ]
+        spv, gen = _translate_encoded("cs_div_sbar_w64", insns, (128, 1, 1), emulate=True, rsrc2=0x20088)
+        self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+        self.assertIsNone(gen.emulate_plan)
+        mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28)
+        for lane in range(64):
+            self.assertEqual(mem[lane * 4], lane + 64, f"lane {lane}")
 
 
 if __name__ == "__main__":
