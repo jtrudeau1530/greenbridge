@@ -628,8 +628,15 @@ fields are in the object table above. Measured on all 17,247 `.motion` clips:
   `.clip` in anim.rpf, the first float is bit-for-bit that `.clip`'s duration (`+0x78`): 111,948 of 111,948.
 - **Parameter node.** When `+0x58` is 1 the node is at `+0x138`; when it is 2, `+0x120` points at a block whose
   `+0x18` is the node. Every `.motion` has one, and it starts `{u64 0, u32 type, u32 0}`. By type: 3 on 10,171, 1 on
-  3,557, 4 on 2,644, 5 on 482, 6 on 295, 8 on 98. Only type 3 is decoded here.
-- **Type 3: one sampled axis.** It has one u32 name hash, then 1–16 `{u32 sample index, f32 value}` items and the
+  3,557, 4 on 2,644, 5 on 482, 6 on 295, 8 on 98.
+- **Axes by type.** Types 3, 4, 5, 6 and 8 have 1, 2, 3, 4 and 5 axes: `+0x10` is a `{ptr, count}` array of 8-byte
+  `{u32 name hash, u16, u16}` entries, with that count on every node of each type (the two u16 are not decoded).
+  Type 1 has no axis array and a sample count at `+0x20`: 1 on 3,552, 2 on 5. Types 4, 5, 6 and 8 keep their
+  sample count at `+0x90`, `+0x90`, `+0x50` and `+0xA0`: on all 2,281 of them that are a `.motion`'s only node, it
+  equals the number of `+0x90` sample lists below. The word list resolves 1,135 of their 8,404 axis names, the same
+  names as type 3 (`verticalheight`, `yawangle`, `surfaceincline` the most); `anim_clips.py` counts them as
+  `motion_node_axis_name:<type>:<name or unresolved>`.
+- **Type 3: one sampled axis.** It has one axis entry, then 1–16 `{u32 sample index, f32 value}` items and the
   axis min and max. On all 10,171 (29,123 samples), the items are sorted by value, min and max are the first and
   last values, and the sample indices are 0..n−1 in some order. They are not child indices: the sample count
   equals the child count on 4,589 of them. The name hashes are `joaat32` of a lower-case name. 88 distinct hashes
@@ -637,8 +644,21 @@ fields are in the object table above. Measured on all 17,247 `.motion` clips:
   `facingdirection` 638, `speed` 284, `surfaceincline` 271, `roll` 66, `verticalheight` 58, `pitch` 25,
   `pitchangle` 25, `height` 22. The ranges fit the names: `speed` is within [0, 1], `surfaceincline` within
   ±0.698 rad (40°), and `roll` within ±3.14. `anim_clips.py` reports every name as `motion_axis_name:<name or hash>`.
-- Not decoded: parameter node types other than 3, how a type-3 sample index maps to the children, and the rest of
-  the object from `+0x80`, including the `{ptr, count}` lists at `+0x90`.
+- **Samples to children (`+0x90`).** A `{ptr, count}` array of one `{ptr, count}` list per sample of the parameter
+  node; a list item is 12 bytes, `{u32 child index, f32, f32}`. On all 8,932 `.motion`s whose only node is at
+  `+0x138` (`+0x58` 1), the number of lists equals the node's sample count, every child index is below the child
+  count, and every child is played by at least one sample. So sample index k plays the child in list k: the type-3
+  sample index is not a child index, it goes through this list. 8,903 have one item in every list; the other 29
+  (types 5, 6 and 8) have lists of several children. On the 6,970 where the sample count equals the child count,
+  list k names child k; on the other 1,962 there are more samples than children and some children are played by
+  several samples. The first float is 1.0 on every item of types 1, 3 and 4 (36,830) and on all but 576 of the
+  57,043 items of types 5, 6 and 8; the second is 1.0 on 76,604 of the 93,873 items. Neither is decoded. By type
+  (one-node motions, samples equal to children / more): 1: 1,176 / 0, 3: 4,545 / 930, 4: 1,009 / 479, 5: 154 /
+  271, 6: 44 / 226, 8: 42 / 56. `anim_clips.py` counts these as `motion_samples:<type>:*`.
+- Not decoded: where types 4, 5, 6 and 8 place their samples in parameter space (no array of theirs has one entry
+  per sample; most have a pointer at `+0x30`), the two u16 of an axis entry and the two floats of a sample item, how a
+  `.motion` with `+0x58` 2 (a block array at `+0x120` with several nodes) shares the `+0x90` lists among its
+  nodes, and the rest of the object from `+0x80`.
 
 The 180 `.motionmatcher` clips sit in 142 dictionaries that hold only `.motionmatcher` clips and no local pack.
 The three motion matcher streams in [Bone tables and motion matchers](#bone-tables-and-motion-matchers)
