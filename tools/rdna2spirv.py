@@ -1192,10 +1192,10 @@ class Gen:
             raise Unsupported(op + " form")
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
         vd = a[0]
-        addr, _, in_b, raw_parts = self.buffer_address(a, mods, parts=True)
+        addr, _, in_b, raw_parts, step = self.buffer_address(a, mods, parts=True)
         act = self.active_b()
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+        ptr, host = self.tmp(), self.host_addr(addr)
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
 
         def guarded(cond, dwords):
             """One selection construct that loads these dwords when cond holds; the phis give 0 otherwise."""
@@ -1206,8 +1206,7 @@ class Gen:
             self.emit(f"{lbl_do} = OpLabel")
             loaded = []
             for i in dwords:
-                p, v_do = self.tmp(), self.tmp()
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                p, v_do = self.buf_dword_ptr(ptr, host, step, i), self.tmp()
                 self.emit(f"{v_do} = OpLoad %uint {p} Aligned 4")
                 loaded.append(v_do)
             self.emit(f"OpBranch {lbl_end}")
@@ -1405,7 +1404,7 @@ class Gen:
         if kind not in self.BUF_ATOMICS or "x2" in kind:
             raise Unsupported(op)
         spv, neutral = self.BUF_ATOMICS[kind]
-        addr, _, in_b = self.buffer_address(a, mods)
+        addr, _, in_b, _ = self.buffer_address(a, mods)
         vd = a[0]
         val = self.load_reg("vgpr", vd["r"])
         cond = self.tmp()
@@ -1530,7 +1529,7 @@ class Gen:
         d16 = "_d16_" in op
         ncomp = len(op.rsplit("_", 1)[1])
         vd = a[0]
-        addr, d3, in_b = self.buffer_address(a, mods, elem="fmt", fixed_fmt=fixed_fmt)
+        addr, d3, in_b, step = self.buffer_address(a, mods, elem="fmt", fixed_fmt=fixed_fmt)
         if fixed_fmt is not None:
             # An INVALID V# format denotes an unbound resource, even for an explicit MTBUF format.
             descriptor_format, bound, accessible = (self.tmp() for _ in range(3))
@@ -1569,14 +1568,14 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(aligned)}")
+        ptr, host = self.tmp(), self.host_addr(aligned)
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
         loaded = []
         for i in range(5):
-            ok, idx, p, v = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            ok, idx, v = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{ok} = OpULessThan %bool {self.cu(i)} {need}")
             self.emit(f"{idx} = OpSelect %uint {ok} {self.cu(i)} {self.cu(0)}")
-            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {idx}")
+            p = self.buf_dword_ptr(ptr, host, step, idx)
             self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
             loaded.append(v)
         self.emit(f"OpBranch {lbl_end}")
@@ -1771,6 +1770,22 @@ class Gen:
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
 
+    def buf_dword_ptr(self, arr, host, step, i):
+        """Pointer to dword i (a Python int or a uint id) of a buffer access whose first dword is at host address
+        `host`, `arr` the same address as a PSB array: arr[i] for the linear layout (step None), else host + i * step,
+        since dword k of a swizzled access is 4 * index_stride bytes after dword k - 1 (buffer_address)."""
+        ix = self.cu(i) if isinstance(i, int) else i
+        p = self.tmp()
+        if step is None or i == 0:
+            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {arr} {ix}")
+            return p
+        o, o64, h = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{o} = OpIMul %uint {ix} {step}")
+        self.emit(f"{o64} = OpUConvert %ulong {o}")
+        self.emit(f"{h} = OpIAdd %ulong {host} {o64}")
+        self.emit(f"{p} = OpConvertUToPtr %_ptr_PSB_uint {h}")
+        return p
+
     def buffer_address(self, a, mods, parts=False, elem=None, fixed_fmt=None):
         """(64-bit element address id, V# word3 id, in_bounds bool id) for a MUBUF/MTBUF instruction: vdata, vaddr,
         srsrc, soffset. The address is V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex *
@@ -1786,24 +1801,30 @@ class Gen:
         selects with OpSelect. elem="fmt" is for typed loads and stores: the whole element (its format's size, from the
         instruction's fixed_fmt, a literal word3 or the V# at run time) must end inside. parts=True adds a 4th element for buffer_load: a function k -> in-range bool id for
         dword k (modes 0 and 3, and a run-time V#), or None when the literal mode is 1 or 2 (every dword shares
-        in_bounds). Multi-dword loads are per dword for mode 3 (measured, RX 6800); mode 0 is by analogy."""
+        in_bounds). Multi-dword loads are per dword for mode 3 (measured, RX 6800); mode 0 is by analogy.
+        A swizzled V# (SWIZZLE_ENABLE) gets the RDNA2 ISA's swizzled buffer_offset, ADD_TID_ENABLE adds the wave lane
+        to idx, and mode 3 checks like mode 0 when swizzled with a stride (ISA table 35). Every tuple ends with `step`:
+        None when consecutive dwords of the access are 4 bytes apart, else the id of that distance (4 * index_stride
+        when swizzled, selected at run time for a run-time word1), for buf_dword_ptr."""
         vaddr, rsrc = a[1], a[2]
         soff = a[3] if len(a) > 3 else {"k": "imm", "v": 0}
         if rsrc["k"] != "sgpr" or rsrc.get("n") != 4:
             raise Unsupported("buffer V#")
         lit3, lit1 = self.sgpr_imm.get(rsrc["r"] + 3), self.sgpr_imm.get(rsrc["r"] + 1)
-        # swizzled buffers (WORD1 SWIZZLE_ENABLE bit 31, WORD3 ADD_TID_ENABLE bit 23; Mesa gfx10-rsrc.json lines 326,
-        # 337) change the address and the bounds check, in every mode: a literal V# that asks for them is rejected, a
-        # run-time one is translated unswizzled (docs/design.md, Buffer bounds checking)
-        if (lit1 is not None and lit1 >> 31) or (lit3 is not None and lit3 >> 23 & 1):
-            raise Unsupported("buffer V# with SWIZZLE_ENABLE / ADD_TID_ENABLE (swizzled buffers not modelled)")
         d0, d1, d2, d3 = (self.load_reg("sgpr", rsrc["r"] + i) for i in (0, 1, 2, 3))
         hi, stride = self.tmp(), self.tmp()
         self.emit(f"{hi} = OpBitwiseAnd %uint {d1} {self.cu(0xFFFF)}")
         self.emit(f"{stride} = OpBitFieldUExtract %uint {d1} {self.cu(16)} {self.cu(14)}")
+        # Swizzled buffers (docs/design.md, Swizzled buffer addressing; RDNA2 ISA 8.1.5 "Swizzled Buffer Addressing"
+        # and table 35; fields from Mesa gfx10-rsrc.json SQ_BUF_RSRC_WORD1/WORD3): SWIZZLE_ENABLE is word1 bit 31,
+        # INDEX_STRIDE word3 [22:21] (IS = 8 << n indices), ADD_TID_ENABLE word3 bit 23, element_size fixed at 4.
+        # A literal word folds its bit (a Python bool); a run-time one is a SPIR-V id (0 or 1).
+        swz = bool(lit1 >> 31) if lit1 is not None else None
+        tid = bool(lit3 >> 23 & 1) if lit3 is not None else None
         inst = next((int(m.split(":")[1], 0) for m in mods if m.startswith("offset:")), 0)
+        soff_v = self.src_u(soff)
         total = self.tmp()
-        self.emit(f"{total} = OpIAdd %uint {self.src_u(soff)} {self.cu(inst)}")
+        self.emit(f"{total} = OpIAdd %uint {soff_v} {self.cu(inst)}")
         vregs = [] if vaddr["k"] == "special" else [vaddr["r"] + i for i in range(vaddr.get("n", 1))]
         idx = None
         if "idxen" in mods:
@@ -1811,16 +1832,92 @@ class Gen:
         voff = None
         if "offen" in mods:
             voff = self.load_reg("vgpr", vregs[1] if "idxen" in mods else vregs[0])
-        # offs = soffset + inst_offset + vaddr offset (idx * stride excluded); the address adds idx * stride too
+        # ADD_TID_ENABLE adds the lane within the wave (thread_id[5:0]) to the index, swizzled or linear (ISA table
+        # 33 and the Ring/stream-out column of table 36, which is linear with add_tid); the bounds check sees it too
+        if tid is not False:
+            lane = self.wave_lane()
+            if tid is None:                   # lane * the run-time bit
+                b, t = self.tmp(), self.tmp()
+                self.emit(f"{b} = OpBitFieldUExtract %uint {d3} {self.cu(23)} {self.cu(1)}")
+                self.emit(f"{t} = OpIMul %uint {lane} {b}")
+                lane = t
+            if idx is None:
+                idx = lane
+            else:
+                s = self.tmp()
+                self.emit(f"{s} = OpIAdd %uint {idx} {lane}")
+                idx = s
+        # offs = soffset + inst_offset + vaddr offset (idx * stride excluded): the raw bounds check's offset
         offs = total
         if voff is not None:
             offs = self.tmp()
             self.emit(f"{offs} = OpIAdd %uint {total} {voff}")
         total = offs
-        if idx is not None:
-            m, total = self.tmp(), self.tmp()
-            self.emit(f"{m} = OpIMul %uint {idx} {stride}")
-            self.emit(f"{total} = OpIAdd %uint {offs} {m}")
+        # step: bytes between consecutive dwords of one access, None for the linear 4 (callers index an array then)
+        step = None
+        if swz is False:
+            if idx is not None:
+                m, total = self.tmp(), self.tmp()
+                self.emit(f"{m} = OpIMul %uint {idx} {stride}")
+                self.emit(f"{total} = OpIAdd %uint {offs} {m}")
+            sw3 = False
+        else:
+            # buffer_offset = (index / IS * stride + offset / 4 * 4) * IS + index % IS * 4 + offset % 4, Offset =
+            # inst_offset + vaddr offset (no soffset), added to base + soffset; IS = 2^L. Dword k of the access is
+            # element offset / 4 + k, 4 * IS bytes further. L = 0 (a run-time V# without SWIZZLE_ENABLE) is the
+            # linear address: index * stride + offset. 32-bit arithmetic, like the linear address.
+            if lit3 is not None:
+                Li = 3 + (lit3 >> 21 & 3)
+                L = self.cu(Li)
+            else:
+                f, L, Li = self.tmp(), self.tmp(), None
+                self.emit(f"{f} = OpBitFieldUExtract %uint {d3} {self.cu(21)} {self.cu(2)}")
+                self.emit(f"{L} = OpIAdd %uint {f} {self.cu(3)}")
+            if swz is None:                   # L * the run-time bit: 0 when not swizzled
+                b, t = self.tmp(), self.tmp()
+                self.emit(f"{b} = OpBitFieldUExtract %uint {d1} {self.cu(31)} {self.cu(1)}")
+                self.emit(f"{t} = OpIMul %uint {L} {b}")
+                L, Li = t, None
+            off_s = self.cu(inst)
+            if voff is not None:
+                off_s = self.tmp()
+                self.emit(f"{off_s} = OpIAdd %uint {voff} {self.cu(inst)}")
+            om4, ol, sh = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{om4} = OpBitwiseAnd %uint {off_s} {self.cu(0xFFFFFFFC)}")
+            self.emit(f"{ol} = OpBitwiseAnd %uint {off_s} {self.cu(3)}")
+            if idx is not None:
+                msb, ms, inner, lsb, l4, im = (self.tmp() for _ in range(6))
+                self.emit(f"{msb} = OpShiftRightLogical %uint {idx} {L}")
+                self.emit(f"{ms} = OpIMul %uint {msb} {stride}")
+                self.emit(f"{inner} = OpIAdd %uint {ms} {om4}")
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {inner} {L}")
+                if Li is not None:
+                    self.emit(f"{lsb} = OpBitwiseAnd %uint {idx} {self.cu((1 << Li) - 1)}")
+                else:                         # index - (index >> L << L)
+                    hi_part = self.tmp()
+                    self.emit(f"{hi_part} = OpShiftLeftLogical %uint {msb} {L}")
+                    self.emit(f"{lsb} = OpISub %uint {idx} {hi_part}")
+                self.emit(f"{l4} = OpShiftLeftLogical %uint {lsb} {self.cu(2)}")
+                self.emit(f"{im} = OpIAdd %uint {sh} {l4}")
+                sh = im
+            else:
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {om4} {L}")
+            b_off, total = self.tmp(), self.tmp()
+            self.emit(f"{b_off} = OpIAdd %uint {sh} {ol}")
+            self.emit(f"{total} = OpIAdd %uint {soff_v} {b_off}")
+            if Li is not None:
+                step = self.cu(4 << Li)
+            else:
+                step = self.tmp()
+                self.emit(f"{step} = OpShiftLeftLogical %uint {self.cu(4)} {L}")
+            # OOB_SELECT 3 with SWIZZLE_ENABLE and a stride != 0 checks like mode 0 (ISA table 35): index >=
+            # num_records or offset + payload > stride, offset without soffset
+            if lit1 is not None:
+                sw3 = (lit1 >> 16 & 0x3FFF) != 0
+            else:                             # L * stride != 0: swizzled (L >= 3) and a stride (no overflow)
+                ls, sw3 = self.tmp(), self.tmp()
+                self.emit(f"{ls} = OpIMul %uint {L} {stride}")
+                self.emit(f"{sw3} = OpINotEqual %bool {ls} {self.cu(0)}")
         self.uses_psb = True
         l64, h64, sh, base, o64, addr = (self.tmp() for _ in range(6))
         self.emit(f"{l64} = OpUConvert %ulong {d0}")
@@ -1830,9 +1927,10 @@ class Gen:
         self.emit(f"{o64} = OpUConvert %ulong {total}")
         self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
         mode = None if lit3 is None else lit3 >> 28 & 3
+        mode0_rule = mode in (None, 0) or (mode == 3 and sw3 is not False)
         # idx (0 without idxen) < num_records and num_records != 0 do not depend on the dword; the two end checks do
         p1 = p2 = None
-        if mode in (None, 0, 1):
+        if mode in (None, 0, 1) or mode0_rule:
             p1 = self.tmp()
             if idx is None:
                 self.emit(f"{p1} = OpINotEqual %bool {d2} {self.cu(0)}")
@@ -1842,7 +1940,7 @@ class Gen:
             p2 = self.tmp()
             self.emit(f"{p2} = OpINotEqual %bool {d2} {self.cu(0)}")
         lim = {}
-        if mode in (None, 0):
+        if mode0_rule:
             # off = inst_offset + vaddr offset, without soffset (docs/buffer_bounds.md)
             off = self.cu(inst)
             if voff is not None:
@@ -1873,22 +1971,35 @@ class Gen:
             self.emit(f"{ok} = OpULessThanEqual %bool {end} {limit}")
             return ok
 
+        def raw_or_swizzled(e0, end_bytes):
+            """mode 3: the raw end check, or mode 0's e0 for a swizzled V# with a stride (sw3)."""
+            if sw3 is True:
+                return e0
+            raw = end_ok(3, end_bytes)
+            if sw3 is False:
+                return raw
+            r = self.tmp()
+            self.emit(f"{r} = OpSelect %bool {sw3} {e0} {raw}")
+            return r
+
         def check_end(end_bytes):
             """in-range bool of an access that ends end_bytes after its first byte."""
             if mode == 1:
                 return p1
             if mode == 2:
                 return p2
-            if mode == 3:
+            if mode == 3 and sw3 is False:
                 return end_ok(3, end_bytes)
             e0 = self.tmp()
             self.emit(f"{e0} = OpLogicalAnd %bool {p1} {end_ok(0, end_bytes)}")
             if mode == 0:
                 return e0
+            if mode == 3:
+                return raw_or_swizzled(e0, end_bytes)
             s12, s3, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{s12} = OpSelect %bool {sel[0]} {p1} {e0}")
             self.emit(f"{s3} = OpSelect %bool {sel[1]} {p2} {s12}")
-            self.emit(f"{r} = OpSelect %bool {sel[2]} {end_ok(3, end_bytes)} {s3}")
+            self.emit(f"{r} = OpSelect %bool {sel[2]} {raw_or_swizzled(e0, end_bytes)} {s3}")
             return r
 
         def check(k):
@@ -1913,12 +2024,12 @@ class Gen:
                 size = self.tmp()
                 self.emit(f"{size} = OpUConvert %ulong {sz}")
             in_b = check_end(size)
-            return addr, d3, in_b
+            return addr, d3, in_b, step
         in_b = check(0)
         if parts:
             # modes 0 and 3 end-check every dword on its own; 1 and 2 (a literal V#) share the first-byte check
-            return addr, d3, in_b, (check if mode in (None, 0, 3) else None)
-        return addr, d3, in_b
+            return addr, d3, in_b, (check if mode in (None, 0, 3) else None), step
+        return addr, d3, in_b, step
 
     def buffer_store(self, op, a, mods):
         """buffer_store_dword[xN] (raw) and buffer_store_format_* (f32 formats stored raw, f16x2/x4, unorm8x4).
@@ -1929,9 +2040,9 @@ class Gen:
         vd = a[0]
         dword_store = op.startswith("buffer_store_dword")
         if dword_store:
-            addr, d3, in_b, per = self.buffer_address(a, mods, parts=True)
+            addr, d3, in_b, per, step = self.buffer_address(a, mods, parts=True)
         else:
-            addr, d3, in_b = self.buffer_address(a, mods, elem="fmt")
+            addr, d3, in_b, step = self.buffer_address(a, mods, elem="fmt")
             per = None
         if dword_store:
             n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
@@ -1967,16 +2078,15 @@ class Gen:
         if words is not None and per is not None and len(words) > 1:
             # modes 0 and 3: every dword is stored only if it ends inside (measured: a store that straddles the edge
             # writes the dwords before it); a store past the end of the buffer is a host-memory hazard otherwise
-            ptr = self.tmp()
-            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+            ptr, host = self.tmp(), self.host_addr(addr)
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
             for i, w in enumerate(words):
                 cond, lbl_do, lbl_end = self.tmp(), self.tmp() + "_do", self.tmp() + "_end"
                 self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {per(i)}")
                 self.emit(f"OpSelectionMerge {lbl_end} None")
                 self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
                 self.emit(f"{lbl_do} = OpLabel")
-                p = self.tmp()
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                p = self.buf_dword_ptr(ptr, host, step, i)
                 self.emit(f"OpStore {p} {w} Aligned 4")
                 self.emit(f"OpBranch {lbl_end}")
                 self.emit(f"{lbl_end} = OpLabel")
@@ -1987,12 +2097,11 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+        ptr, host = self.tmp(), self.host_addr(addr)
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
         if words is not None:
             for i, w in enumerate(words):
-                p = self.tmp()
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                p = self.buf_dword_ptr(ptr, host, step, i)
                 self.emit(f"OpStore {p} {w} Aligned 4")
         else:
             fmt, comps, f32, fl, icomps = plans
@@ -2032,8 +2141,7 @@ class Gen:
                 words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
                 if size >= 4:
                     for k, w in enumerate(words[:size // 4]):
-                        pp = self.tmp()
-                        self.emit(f"{pp} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(k)}")
+                        pp = self.buf_dword_ptr(ptr, host, step, k)
                         self.emit(f"OpStore {pp} {w} Aligned 4")
                 else:
                     # 1- or 2-byte element: merge into its dword with atomics so neighbours are kept.
