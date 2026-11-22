@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
@@ -102,6 +103,43 @@ class Conventions(unittest.TestCase):
         self.assertEqual(reader.read(b'<R><Item value="1"/><Item value="2"/></R>')[2], [1, 2])
         self.assertEqual(reader.read(b'<R>leaf</R>')[2], "leaf")
 
+    def test_vector_with_extra_attributes_and_non_vector_xyzw(self):
+        reader = R.Reader(root_handlers={}, type_handlers={})
+        self.assertEqual(
+            reader.read(b'<R><offset x="1.0" y="2.5" z="-3" name="head" userFlags="3"/></R>')[2],
+            {"offset": {"$value": (1.0, 2.5, -3.0), "@name": "head", "@userFlags": 3}},
+        )
+        self.assertEqual(reader.stats["vector"], 1)
+        self.assertEqual(reader.stats["extra attributes"], 1)
+
+        self.assertEqual(
+            reader.read(b'<R><node x="label" y="1.0"/></R>')[2],
+            {"node": {"@x": "label", "@y": 1.0}},
+        )
+        self.assertEqual(
+            reader.read(b'<R><node y="2.0" z="3.0"/></R>')[2],
+            {"node": {"@y": 2.0, "@z": 3.0}},
+        )
+        self.assertEqual(
+            reader.read(b'<R><s value="10" x="2"/></R>')[2],
+            {"s": {"$value": 10, "@x": 2}},
+        )
+
+    def test_streaming_drops_top_level_children_from_root(self):
+        orig_iterparse = ET.iterparse
+        roots_seen = []
+
+        def spy_iterparse(*args, **kwargs):
+            for event, el in orig_iterparse(*args, **kwargs):
+                if event == "start" and not roots_seen:
+                    roots_seen.append(el)
+                yield event, el
+
+        with mock.patch.object(ET, "iterparse", side_effect=spy_iterparse):
+            R.Reader(root_handlers={}, type_handlers={}).read(DOC)
+        self.assertEqual(len(roots_seen), 1)
+        self.assertEqual(len(roots_seen[0]), 0)
+
 
 class Dispatch(unittest.TestCase):
     def test_type_handler(self):
@@ -117,6 +155,45 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(value["items"], [("thing", 2), None, {"size": 3}])
         self.assertEqual(calls, ["Item"])
         self.assertEqual(reader.stats["type handler"], 1)
+
+    def test_type_handler_does_not_double_count_types_or_extra_attributes(self):
+        def thing(el, reader):
+            generic = reader.convert(el, use_type_handler=False)
+            return ("thing", generic["size"])
+
+        reader = R.Reader(root_handlers={}, type_handlers={"CThing": thing})
+        _, _, value = reader.read(b'<Root><Item type="CThing" name="first"><size value="2"/></Item></Root>')
+        self.assertEqual(value, [{"$value": ("thing", 2), "@name": "first"}])
+        self.assertEqual(reader.types, {"CThing": 1})
+        self.assertEqual(reader.stats["type handler"], 1)
+        self.assertEqual(reader.stats["extra attributes"], 1)
+        self.assertEqual(reader.stats["object"], 1)
+
+    def test_streaming_parity_on_typed_null_and_attribute_roots(self):
+        def thing(el, reader):
+            generic = reader.convert(el, use_type_handler=False)
+            return ("thing", generic["size"])
+
+        cases = (
+            (b'<R type="CRootType" version="1"><a value="1"/></R>', {}),
+            (b'<R type="CListRoot"><Item value="1"/><Item value="2"/></R>', {}),
+            (b'<R type="NULL" name="empty"><a value="1"/></R>', {}),
+            (b'<R type="CThing" id="7"><size value="2"/></R>', {"CThing": thing}),
+            (b'<R value="10" name="root"><a value="1"/></R>', {}),
+            (b'<R content="short_array" name="arr">1 2<a value="1"/></R>', {}),
+            (b'<R x="1.0" y="2.0" name="vec"><a value="1"/></R>', {}),
+            (b'<R ref="target" name="ref"><a value="1"/></R>', {}),
+            (b'<Item type="CThing" x="1.0" y="2.0"/>', {"CThing": lambda el, r: ("vec", r.convert(el, use_type_handler=False))}),
+        )
+        for raw, handlers in cases:
+            with self.subTest(raw=raw):
+                whole_reader = R.Reader(root_handlers={}, type_handlers=handlers)
+                stream_reader = R.Reader(root_handlers={}, type_handlers=handlers)
+                whole_val = whole_reader.convert(ET.fromstring(raw))
+                _, _, stream_val = stream_reader.read(raw)
+                self.assertEqual(stream_val, whole_val)
+                self.assertEqual(stream_reader.stats, whole_reader.stats)
+                self.assertEqual(stream_reader.types, whole_reader.types)
 
     def test_root_handler_gets_the_whole_root(self):
         def root(el, reader):
