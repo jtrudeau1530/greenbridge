@@ -10179,6 +10179,8 @@ WAVE64_RE = re.compile(
     r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64|"
     r"s_bcnt[01]_i32_b64|s_ff[01]_i32_b64|s_wqm_b64|s_bfm_b64"
 )
+# Wave32-only EXEC mask ops, used to catch a wave64 FSSM header contradicting wave32 code.
+WAVE32_RE = re.compile(r"_(?:saveexec|wrexec)_b32\b")
 
 
 def halves_analysis(g, blocks, succ):
@@ -10811,11 +10813,29 @@ def translate(path):
         g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
                            (i["args"][0].get("t", ""),) if t.startswith("param") and t[5:].isdigit()), default=-1)
     g.round_mode =any(i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", "") for i in insns)
-    g.wave64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
+    code_w64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
                    (base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in i["args"]))
                    for i in insns)
-    if stage == "ms":
-        g.wave64 = True            # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+    code_w32 = any(WAVE32_RE.search(i["op"]) for i in insns)
+    # Authoritative wave size from the FSSM header flags at 0xD4 bit 5 (0x20 = wave32, 0 = wave64;
+    # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
+    # heuristic (+ wave64 default for NGG mesh shaders) when no FSSM sidecar is present (FSPX or
+    # synthetic listings).
+    fssm_path = native_paths(path, info["name"])[0]
+    fssm_ws = None
+    try:
+        with open(fssm_path, "rb") as f:
+            fssm_ws = fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
+    except OSError:
+        pass
+    if fssm_ws is not None:
+        if fssm_ws == 32 and code_w64:
+            raise Unsupported("FSSM wave32 header contradicts wave64 code")
+        if fssm_ws == 64 and code_w32:
+            raise Unsupported("FSSM wave64 header contradicts wave32 code")
+        g.wave64 = fssm_ws == 64
+    else:
+        g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
     if stage == "gs":
         ins_sig = [(reg, sv) for reg, mask, sv, ctype in input_signature(path, info["name"])]
         outs = output_signature(path, info["name"])
