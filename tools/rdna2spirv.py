@@ -160,6 +160,7 @@ class Gen:
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
+        self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
@@ -984,7 +985,24 @@ class Gen:
         self.emit(f"{res} = OpSelect %uint {z} {self.cu(0)} {b4}")
         return res
 
-    def decode_format(self, words, code):
+    def tbuffer_norm_bits(self, magnitude: str, width: int) -> str:
+        """Share the fixed-format quotient across instructions and channels with the same magnitude width."""
+        function = f"%tbuffer_norm_{width}"
+        if width not in self.tbuffer_norm_fns:
+            parameter = f"{function}_m"
+            outer_body, self.body = self.body, []
+            result = self.norm_bits(parameter, width)
+            lines, self.body = self.body, outer_body
+            self.tbuffer_norm_fns[width] = [
+                f"{function} = OpFunction %uint Pure %fn_tbuffer_norm",
+                f"{parameter} = OpFunctionParameter %uint", f"{function}_entry = OpLabel",
+                *lines, f"OpReturnValue {result}", "OpFunctionEnd",
+            ]
+        result = self.tmp()
+        self.emit(f"{result} = OpFunctionCall %uint {function} {magnitude}")
+        return result
+
+    def decode_format(self, words, code, *, fixed: bool = False):
         """Decode one element of format `code` from raw dwords -> 4 uint ids holding f32 bits (or uint for *_UINT/uint).
 
         Missing channels repeat the format's own (component c = c mod n): measured on RX 6700 for SHADER-86.
@@ -1000,6 +1018,7 @@ class Gen:
             while len(vals) < 4:
                 vals.append(vals[len(vals) % n])
             return vals
+        normalize = self.tbuffer_norm_bits if fixed else self.norm_bits
         out, bit = [], 0
         for w in widths:
             src = words[bit // 32]
@@ -1011,7 +1030,7 @@ class Gen:
                 self.emit(f"{x} = OpCompositeExtract %float {v2} 0")
                 out.append(self.tou(x))
             elif kind == "unorm":
-                out.append(self.norm_bits(f, w))
+                out.append(normalize(f, w))
             elif kind == "snorm":
                 # magnitude over 2^(w-1)-1 with the same integer rounding; the most negative code is -1.0
                 si, neg, ab, au, sg, sel, lo, res = (self.tmp() for _ in range(8))
@@ -1019,7 +1038,7 @@ class Gen:
                 self.emit(f"{neg} = OpSLessThan %bool {si} {self.as_int(self.cu(0))}")
                 self.emit(f"{ab} = OpExtInst %int %glsl SAbs {si}")
                 self.emit(f"{au} = OpBitcast %uint {ab}")
-                mag = self.norm_bits(au, w - 1)
+                mag = normalize(au, w - 1)
                 self.emit(f"{sg} = OpBitwiseOr %uint {mag} {self.cu(0x80000000)}")
                 self.emit(f"{sel} = OpSelect %uint {neg} {sg} {mag}")
                 self.emit(f"{lo} = OpULessThan %bool {au} {self.cu(1 << (w - 1))}")
@@ -1236,7 +1255,7 @@ class Gen:
         words = packed
         if fixed_fmt is not None:
             # tbuffer: the format is in the instruction, so only that one is decoded.
-            comps = self.decode_format(words, fixed_fmt) if fixed_fmt in self.FORMATS else [self.cu(0)] * 4
+            comps = self.decode_format(words, fixed_fmt, fixed=True) if fixed_fmt in self.FORMATS else [self.cu(0)] * 4
         else:
             comps = self.format_decode_call(fmt, words)
         # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm) or integer 1 (UINT/SINT; SHADER-86), 4..7 -> X..W.
@@ -6573,6 +6592,8 @@ def assemble(gen):
         types.append(f"{name} = OpConstant %uint {v}")
     if gen.desc_fn:
         types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
+    if gen.tbuffer_norm_fns:
+        types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")
     if gen.fmt_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
         types.append("%fn_fmt_decode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 5))
@@ -6854,7 +6875,10 @@ def assemble(gen):
                    f"OpStore %vinp{reg}_{c} %vinb{reg}_{c}"]
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
-    out = hdr + dec + types + gvars + (gen.desc_fn or []) + (gen.fmt_fn or []) + fn
+    helpers = (gen.desc_fn or []) + (gen.fmt_fn or [])
+    for function in gen.tbuffer_norm_fns.values():
+        helpers.extend(function)
+    out = hdr + dec + types + gvars + helpers + fn
     tree = cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate else None
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
     if gen.emulate:
@@ -6929,7 +6953,7 @@ def assemble(gen):
         fn = fn[:last_var + 1] + fn_vars + fn[last_var + 1:]
         if pops:
             fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
-        out = hdr + dec + types + gvars + (gen.desc_fn or []) + (gen.fmt_fn or []) + fn
+        out = hdr + dec + types + gvars + helpers + fn
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if ms:
