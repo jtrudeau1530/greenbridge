@@ -105,6 +105,9 @@ struct Scene {
     // One graphics pipeline: an RGBA8 target, D32 depth and two vertex input slots, as VulkanContext keeps them.
     GraphicsPipeline pipeline;
     static constexpr std::uintptr_t pipeline_id = 0x7000;
+    // A second one with no depth and one vertex slot, for the self-test's draw-storage check.
+    GraphicsPipeline bare;
+    static constexpr std::uintptr_t bare_id = 0x7001;
     static constexpr std::uint64_t geometry_va = 0x100000000ull;  // a 16 MiB vertex and index arena
     static constexpr std::uint64_t geometry_size = 16ull << 20;
     LayoutTracker tracker;
@@ -196,8 +199,15 @@ struct Scene {
         pipeline.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
         pipeline.vertex_slots = 0b11;
         pipeline.variant = [](std::uint32_t) { return fake_handle<VkPipeline>(0x6002); };
+        bare.pipeline = fake_handle<VkPipeline>(0x6010);
+        bare.layout = pipeline.layout;
+        bare.push_stages = pipeline.push_stages;
+        bare.color_formats = {rgba8};
+        bare.vertex_slots = 0b1;
         vk.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
-            return id == pipeline_id ? &pipeline : nullptr;
+            if (id == pipeline_id) return &pipeline;
+            if (id == bare_id) return &bare;
+            return nullptr;
         };
         vk.buffer_at = [](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             if (va < geometry_va || va >= geometry_va + geometry_size) return false;
@@ -561,6 +571,32 @@ int main(int argc, char** argv) {
     const Result f = run(scene, lists, frame, reps, warmup);
     check("frame", f);
     if (self_test) {
+        // A PreparedList keeps its draws' storage from one execution to the next. A draw prepared in an entry an
+        // indexed draw with depth used before must not keep that draw's depth attachment or index buffer.
+        CommandList earlier, later;
+        Draw plain{};
+        plain.pipeline = Scene::bare_id;
+        plain.render_targets = {color_view};
+        plain.topology = 4;
+        plain.viewport = {0, 0, 1920, 1080, 0, 1};
+        plain.scissor = {0, 0, 1920, 1080};
+        plain.count = 3;
+        plain.instances = 1;
+        PreparedList prepared;
+        const auto resolve = [&scene](ResourceId id) { return scene.resolve(id); };
+        const bool recorded = draw(earlier, 0, true) && draw(earlier, 1, true) && earlier.close() &&
+                              later.draw(plain) && later.close();
+        const bool replayed = recorded && prepare(earlier, resolve, scene.vk, prepared) == ReplayResult::success &&
+                              prepare(later, resolve, scene.vk, prepared) == ReplayResult::success;
+        const detail::PreparedDraw* d =
+            replayed && prepared.draw_count == 1 ? &prepared.draws[prepared.commands[0].draw] : nullptr;
+        if (!d || d->graphics != &scene.bare || d->pipeline != scene.bare.pipeline || d->depth.id ||
+            d->index_buffer || d->vertex_buffers.size() != 1 || d->vertex_buffers[0] != scene.vk.zero_buffer ||
+            d->colors.size() != 1 || d->colors[0].id != Scene::color) {
+            std::fprintf(stderr, "FAIL draw storage: a draw kept state from the draw prepared there before\n");
+            ++failures;
+        }
+
         // The counts don't depend on timing: a second run must make exactly the same allocations and calls.
         const Result again = run(scene, lists, frame, reps, warmup);
         if (again.emit.vk_calls != f.emit.vk_calls || again.prepare.allocations != f.prepare.allocations) {
