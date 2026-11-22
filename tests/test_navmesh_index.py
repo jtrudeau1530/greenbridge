@@ -136,6 +136,37 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["page_counts"], {"6": 1})
         self.assertEqual(doc["pages"][0]["source"], "page.bin")
 
+    def test_folder_name_with_glob_characters_is_a_path(self):
+        # glob read "[v1]" as a character class, so a folder named like this indexed nothing and exited 0.
+        folder = os.path.join(self.root, "carve [v1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=2))
+        out = os.path.join(self.root, "glob.json")
+        self.run_tool(folder, "--out", out)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["streams"], 1)
+        self.assertEqual(doc["summary"]["matched"], 1)
+
+    def test_hard_link_to_a_scanned_file_in_a_glob_named_input_is_refused(self):
+        folder = os.path.join(self.root, "carve [v1]")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page())
+        alias = os.path.join(folder, "alias.dat")   # not matched by *.bin: only the scan's own glob finds the file
+        try:
+            os.link(carved, alias)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("hard links are not available here")
+        r = subprocess.run([sys.executable, "-I", TOOL, folder, "--out", alias], cwd=ROOT,
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("would overwrite the input", r.stderr)
+        with open(carved, "rb") as f:
+            self.assertEqual(f.read(), page())
+
     def test_out_and_csv_in_missing_folders_are_created(self):
         # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
         # FileNotFoundError traceback and lost the index.
