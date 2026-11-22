@@ -368,6 +368,7 @@ class ManifestCliTest(unittest.TestCase):
                         self.assertEqual(f.read(), original)
 
     def test_cli_verify_reports_a_damaged_manifest_without_a_traceback(self):
+        good_hash = hashlib.sha256(b"cli test payload bytes").hexdigest()
         damaged = {
             "truncated": b'{"created": "x", "files": {"sample.dat": {"si',
             "not_utf8": b'\xff\xfe{"files": {}}',
@@ -377,6 +378,17 @@ class ManifestCliTest(unittest.TestCase):
             "entry_is_a_number": b'{"files": {"sample.dat": 5}}',
             "no_sha256": b'{"files": {"sample.dat": {"size": 22}}}',
             "size_is_a_string": b'{"files": {"sample.dat": {"size": "22", "sha256": "00"}}}',
+            "dup_sha256": (
+                f'{{"files": {{"sample.dat": {{"size": 22, "sha256": "{"0" * 64}", "sha256": "{good_hash}"}}}}}}'
+            ).encode(),
+            "dup_file_entry": (
+                f'{{"files": {{"sample.dat": {{"size": 22, "sha256": "{"0" * 64}"}}, '
+                f'"sample.dat": {{"size": 22, "sha256": "{good_hash}"}}}}}}'
+            ).encode(),
+            "dup_top_files": (
+                f'{{"files": {{"sample.dat": {{"size": 22, "sha256": "{"0" * 64}"}}}}, '
+                f'"files": {{"sample.dat": {{"size": 22, "sha256": "{good_hash}"}}}}}}'
+            ).encode(),
         }
         for name, data in damaged.items():
             with self.subTest(name=name):
