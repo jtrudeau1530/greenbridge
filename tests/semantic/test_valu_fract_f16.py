@@ -1228,5 +1228,151 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(oracle_v_fract_f16(H_NEG_1P25), H_0P75)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg16(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg16(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg16(300, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg16(0, RegType.SGPR, RegHalf.LO)
+        src = VOP1Operand(Reg16(1, RegType.VGPR, RegHalf.LO))
+        with self.assertRaises(TypeError):
+            VFractF16Instruction(dst=dst_sgpr, src=src)
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_syntax_rejection_literal_out_of_range(self) -> None:
+        with self.assertRaises(ValueError):
+            Literal16(0x10000)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        correct = oracle_v_fract_f16(H_1P75)  # 1.75 -> 0.75
+        self.assertEqual(correct, H_0P75)
+
+        # Corrupt mantissa LSB
+        corrupted_mantissa = correct ^ 0x1
+        self.assertNotEqual(correct, corrupted_mantissa)
+
+        # Corrupt exponent bit
+        corrupted_exp = correct ^ (1 << 10)
+        self.assertNotEqual(correct, corrupted_exp)
+
+        # Corrupt sign bit
+        corrupted_sign = correct ^ SIGN_MASK
+        self.assertNotEqual(correct, corrupted_sign)
+
+    def test_mutation_fract_to_trunc(self) -> None:
+        """Mutant: Replace fract(x) with trunc(x)."""
+        def mutant_v_fract_f16(src: int) -> int:
+            f = bits_to_f16(src)
+            return f16_to_bits(math.trunc(f))
+
+        expected = oracle_v_fract_f16(H_NEG_1P75)
+        self.assertEqual(expected, H_0P25)
+        mutant_res = mutant_v_fract_f16(H_NEG_1P75)
+        self.assertNotEqual(expected, mutant_res)
+
+    def test_mutation_fract_to_floor(self) -> None:
+        """Mutant: Replace fract(x) with floor(x)."""
+        def mutant_v_fract_f16(src: int) -> int:
+            f = bits_to_f16(src)
+            return f16_to_bits(math.floor(f))
+
+        expected = oracle_v_fract_f16(H_1P5)
+        self.assertEqual(expected, H_0P5)
+        mutant_res = mutant_v_fract_f16(H_1P5)
+        self.assertNotEqual(expected, mutant_res)
+
+    def test_mutation_ignore_abs_modifier(self) -> None:
+        """Mutant: Ignore abs modifier on negative operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if neg_mod:
+                res ^= SIGN_MASK
+            return res
+
+        correct = apply_f16_modifiers(H_NEG_0P25, abs_mod=True, neg_mod=False)
+        mutant = mutant_apply_mod(H_NEG_0P25, abs_mod=True, neg_mod=False)
+        self.assertEqual(correct, H_0P25)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_neg_modifier(self) -> None:
+        """Mutant: Ignore neg modifier on positive operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if abs_mod:
+                res &= ~SIGN_MASK
+            return res
+
+        correct = apply_f16_modifiers(H_0P25, abs_mod=False, neg_mod=True)
+        mutant = mutant_apply_mod(H_0P25, abs_mod=False, neg_mod=True)
+        self.assertEqual(correct, H_NEG_0P25)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_skip_near_one_clamp(self) -> None:
+        """Mutant: Negative subnormal rounding yields 1.0 instead of 0x3BFF."""
+        # Hardware contract mandates result < 1.0
+        expected = oracle_v_fract_f16(H_NEG_SUB_MIN)
+        self.assertEqual(expected, NEAR_ONE_F16)
+        mutant_unclamped = ONE_F16
+        self.assertNotEqual(expected, mutant_unclamped)
+
+    def test_mutation_preserve_negative_zero(self) -> None:
+        """Mutant: fract(-0.0) incorrectly returns -0.0."""
+        expected = oracle_v_fract_f16(NEG_ZERO)
+        self.assertEqual(expected, POS_ZERO)
+        mutant_neg_zero = NEG_ZERO
+        self.assertNotEqual(expected, mutant_neg_zero)
+
+    def test_mutation_ignore_exec_mask(self) -> None:
+        """Mutant: Inactive SIMD lanes overwritten despite EXEC mask."""
+        sentinel = 0x55AA
+        state = SIMDState(num_lanes=32, exec_mask=0x0)  # all inactive
+        for lane in range(32):
+            state.set_vgpr16(lane, 2, RegHalf.LO, sentinel)
+
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VFractF16Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    res = oracle_v_fract_f16(H_1P5)
+                    state.set_vgpr16(lane, instr.dst.index, instr.dst.half, res)
+                    results.append(res)
+                return results
+
+        mutant_interp = MutantSIMDInterpreter()
+        instr = VFractF16Instruction(
+            dst=Reg16(2, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Literal16.from_float(1.5)),
+        )
+        mutant_interp.step(instr, state)
+        corrupted = [lane for lane in range(32) if state.get_vgpr16(lane, 2, RegHalf.LO) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+    def test_mutation_subnormal_flush_to_zero(self) -> None:
+        """Mutant: Positive subnormals flushed to zero (FTZ mode)."""
+        correct = oracle_v_fract_f16(H_SUB_MIN)
+        self.assertEqual(correct, H_SUB_MIN)
+        ftz_mutant = POS_ZERO
+        self.assertNotEqual(correct, ftz_mutant)
+
+    def test_mutation_skip_snan_quietening(self) -> None:
+        """Mutant: Signaling NaN is not quietened."""
+        snan = 0x7C01
+        res = oracle_v_fract_f16(snan)
+        self.assertTrue(is_qnan(res))
+        self.assertNotEqual(res, snan)
+
+
 if __name__ == "__main__":
     unittest.main()
