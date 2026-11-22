@@ -638,6 +638,57 @@ class MalformedMusicGeometryTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(od, "00000021.wav")))
 
 
+class ShortLastMusicBlockTest(unittest.TestCase):
+    """Game banks declare a large `chunk` stride and end the data tag inside the last block: blocks * chunk is
+    larger than the tag (1 block of a 524,288-byte chunk in a 264,192-byte tag on a 1.0.2.1 copy). Such a
+    descriptor is valid and its channels must still export; only blocks that start past the tag are refused."""
+
+    @staticmethod
+    def bank(blocks, stride, tail_cut=0):
+        """A mono music bank: each block is a 2048-byte record header plus one 2048-byte packet subblock,
+        laid out `stride` bytes apart; the data tag ends right after the last block's subblock."""
+        desc = bytearray(12 + 16)
+        struct.pack_into("<III", desc, 0, blocks, stride, 1)
+        struct.pack_into("<II", desc, 12, 0x100, 960 * blocks)
+        struct.pack_into("<H", desc, 22, 48000)
+        desc[24] = 0x0B
+        data = bytearray((blocks - 1) * stride + 4096 - tail_cut)
+        for b in range(blocks):
+            at = b * stride
+            struct.pack_into("<I", data, at + 4, 1)
+            if at + 2048 + 3 <= len(data):
+                struct.pack_into("<HB", data, at + 2048, 1, 0x78)
+        header = 16 + 4 + 2 * 8
+        out = bytearray(b"ADAT" + struct.pack("<III", 0, 1, header))
+        out += struct.pack("<I", 0x20 | (2 << 29))
+        out += struct.pack("<Q", tag(0x48, header, len(desc)))
+        out += struct.pack("<Q", tag(0x55, header + len(desc), len(data)))
+        return bytes(out + desc + data)
+
+    def channels(self, d):
+        _, music = awc.parse_awc(d)
+        return awc.music_channels(d, *music[0])
+
+    def test_single_short_block_exports(self):
+        ch = self.channels(self.bank(1, 524288))
+        self.assertEqual([(c[0], len(c[4])) for c in ch], [(0x100, 1)])
+
+    def test_last_block_shorter_than_the_stride_exports_every_block(self):
+        ch = self.channels(self.bank(3, 16384))
+        self.assertEqual([(c[0], len(c[4])) for c in ch], [(0x100, 3)])
+
+    def test_a_last_block_cut_inside_its_subblock_is_still_refused(self):
+        # The data tag ends 1,024 bytes into the last block's packet subblock: the subblock check refuses it.
+        self.assertEqual(self.channels(self.bank(2, 16384, tail_cut=1024)), [])
+
+    def test_a_block_starting_at_or_past_the_tag_end_is_refused(self):
+        d = bytearray(self.bank(2, 16384))
+        _, music = awc.parse_awc(bytes(d))
+        (m_at, _), _ = music[0]
+        struct.pack_into("<I", d, m_at, 3)           # declare a third block starting past the tag
+        self.assertEqual(self.channels(bytes(d)), [])
+
+
 class MalformedBankTest(unittest.TestCase):
     def test_truncated_pcm_bank_creates_no_outputs(self):
         pcm = b"\x01\x00" * 4
