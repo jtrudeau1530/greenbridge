@@ -583,7 +583,7 @@ class MadAndFmacF32Tests(unittest.TestCase):
             (0x3FC00001, 0x3FBFFFFF, 0xC0100000, POS_ZERO, 0xA8800000),         # (1.5+2^-23)*(1.5-2^-23) - 2.25 = -2^-46
             (0x71800000, 0x4D800000, 0xFF000000, POS_INF, 0x7F000000),          # 2^100*2^28 - 2^127: ovf vs finite
             (0xF1800000, 0x4D800000, 0x7F000000, NEG_INF, 0xFF000000),          # -2^100*2^28 + 2^127: -ovf vs finite
-            (0x17800000, 0x1C800000, SUBNORM_MIN, SUBNORM_MIN, 0x00000002),     # 2^-80*2^-70 + 2^-149: subnormal RTN
+            # Subnormal operands or products: see DenormalDivergenceTests (RDNA2 mad flushes them).
         ]
         for a, b, c, want_mad, want_fmac in cases:
             with self.subTest(a=hex(a), b=hex(b), c=hex(c)):
@@ -694,6 +694,33 @@ class MadAndFmacF32Tests(unittest.TestCase):
         self.assertNotIn("Fma", spv)
 
 
+class DenormalDivergenceTests(unittest.TestCase):
+    """v_mad_f32, v_mac_f32 and v_mad_legacy_f32 do not support f32 denormals on RDNA2: a subnormal operand or
+    result is flushed to zero, whatever the MODE register says. Source: LLVM AMDGPU SIISelLowering.cpp,
+    SITargetLowering::isFMADLegal (llvm-project 1922c0c9244e41ed056f71e897512c72e24c7022), which only forms these
+    instructions when f32 denormals are flushed. The translator emits OpFMul + OpFAdd and keeps Vulkan's default
+    denormal handling, so these results differ from the hardware (docs/design.md, "Known approximations").
+
+    Each case pins what the translator does today and records the RDNA2 result next to it. A translator change that
+    models the flush should swap the expectation to the RDNA2 column.
+    """
+
+    CASES = [
+        # (op, a, b, c, translator, rdna2)
+        ("v_mad_f32", 0x17800000, 0x1C800000, SUBNORM_MIN, SUBNORM_MIN, POS_ZERO),    # 2^-80*2^-70 + 2^-149
+        ("v_mad_legacy_f32", SUBNORM_MIN, POS_INF, NEG_ONE, POS_INF, NEG_ONE),       # 2^-149 -> 0, 0*inf -> +0
+        ("v_mad_legacy_f32", NEG_SUBNORM_MIN, POS_INF, ONE, NEG_INF, ONE),           # -2^-149 -> 0, 0*inf -> +0
+    ]
+
+    def test_translator_keeps_denormals_where_rdna2_flushes(self):
+        refs = {"v_mad_f32": ref_mad_f32, "v_mad_legacy_f32": ref_mad_legacy_f32}
+        for op, a, b, c, translator, rdna2 in self.CASES:
+            with self.subTest(op=op, a=hex(a), b=hex(b), c=hex(c)):
+                self.assertEqual(refs[op](a, b, c), translator)
+                self.assertEqual(run_three_input(op, a, b, c), translator)
+                self.assertNotEqual(translator, rdna2)
+
+
 class MadLegacyF32Tests(unittest.TestCase):
     """Semantic tests for v_mad_legacy_f32 (0 * inf/NaN/-0 -> +0.0, then unfused f32 add)."""
 
@@ -715,8 +742,7 @@ class MadLegacyF32Tests(unittest.TestCase):
             (TWO, NEG_ZERO, NEG_ZERO, POS_ZERO),             # legacy 2*(-0.0) -> +0.0; +0.0 + (-0.0) = +0.0
             # Non-zero tiny values must NOT trigger zero-override.
             (FLT_MIN, POS_INF, ONE, POS_INF),
-            (SUBNORM_MIN, POS_INF, NEG_ONE, POS_INF),
-            (NEG_SUBNORM_MIN, POS_INF, ONE, NEG_INF),
+            # Subnormal multipliers: see DenormalDivergenceTests (RDNA2 flushes them to 0 first).
             # Unfused rounding matches v_mad_f32 when neither multiplier is 0.
             (0x3F800008, 0x3F7FFFF0, NEG_ONE, POS_ZERO),
             (0x71800000, 0x4D800000, 0xFF000000, POS_INF),

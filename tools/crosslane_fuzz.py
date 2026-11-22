@@ -28,7 +28,8 @@ Reference semantics (AMD "RDNA 2" ISA reference guide; Mesa ACO and LLVM where t
   * v_permlane16_b32 vD, vS, s1, s2: lane l reads lane (l & ~15) | sel[l & 15], sel = nibbles of {s2, s1};
     v_permlanex16_b32 reads lane (l & ~31) | ((l & 16) ^ 16) | sel[l & 15]. Only written in active lanes.
     A source lane that is off in EXEC (op_sel FI = 0) is the DPP "invalid source" case: with BOUND_CTRL = 0 the
-    lane keeps its old vD. That case is a hypothesis here (not measured on AMD hardware) and is reported apart.
+    lane keeps its old vD. That was measured on RDNA2 and RDNA3.5 (docs/shader_validation.md, #374), but the
+    translator models it only with #580, so programs that reach it are still reported apart.
   * VALU results are written only in active lanes; SALU is wave-uniform.
 """
 import argparse
@@ -435,7 +436,7 @@ class Gen:
                 if w.active(sl) or PERMLANE_FETCH_INACTIVE:
                     vals[lane] = src[sl]
                 if not w.active(sl):
-                    hyp = not PERMLANE_FETCH_INACTIVE   # FI = 0, BOUND_CTRL = 0: keeps vD (hypothesis)
+                    hyp = not PERMLANE_FETCH_INACTIVE   # FI = 0, BOUND_CTRL = 0: keeps vD (measured; translator: #580)
             w.vwrite(d, vals)
             return hyp
         return Op(text, fn, "permlane")
