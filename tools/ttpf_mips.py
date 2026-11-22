@@ -1804,11 +1804,12 @@ def texture_dds(pool, a, mips=None, *, allow_provisional=False, history=None):
         raise ValueError(f"format {d['format']} is uncompressed and not validated for 2D export")
     if shape == "volume" and d["format"] not in VOLUME_FLOAT_FORMATS:
         raise ValueError(f"volume format {d['format']} is not validated for export")
-    if not a["full_chain"]:
-        raise ValueError("not every source mip uses a supported codec (zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)")
     count = d["mips"] if mips is None else mips
     if count < 1 or count > d["mips"]:
         raise ValueError(f"--mips must be 1..{d['mips']}")
+    available = a["available"]
+    if len(available) < count or not all(available[:count]):
+        raise ValueError("not every requested mip uses a supported codec (zlib/raw/BCPack BC1/BC3/BC4/BC5/BC6H/BC7)")
     layout = a["layout"]
     block = 4 if d["format"] in BC_FORMATS else 1
     cache = {}
