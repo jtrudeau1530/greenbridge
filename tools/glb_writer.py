@@ -1356,6 +1356,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        # write_glb replaces its target, so naming the OBJ as the output would silently destroy the model.
+        if os.path.exists(args.out_glb) and os.path.exists(args.in_obj) and os.path.samefile(
+                args.in_obj, args.out_glb):
+            raise GlbError(f"output must not overwrite the input OBJ: {args.in_obj}")
         primitives = parse_obj(args.in_obj, is_path=True, up_axis=args.up)
         stats = write_glb(args.out_glb, primitives)
     except (GlbError, OSError) as exc:
