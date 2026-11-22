@@ -6848,6 +6848,24 @@ class Gen:
             self.emit(f"{m} = OpIMul %uint {hs[0]} {hs[1]}")
             self.emit(f"{r} = OpIAdd %uint {m} {self.src_u(a[3])}")
             self.dst(a[0], r)
+        elif op in ("v_dot4_i32_i8", "v_dot4c_i32_i8"):
+            # The four products of the signed bytes of two dwords, summed, plus an addend: the third source for
+            # v_dot4_i32_i8 (VOP3P), the destination's old value for v_dot4c_i32_i8 (VOP2). The sum wraps at 32 bits.
+            # Measured on RDNA2 hardware (docs/design.md, "Signed-byte dot products"), where clamp saturates
+            # v_dot4_i32_i8 to a signed 32-bit value and op_sel picks the 16-bit half of a source each half of the
+            # product reads. llvm-mc prints neither for the programs measured, so both forms are refused, not guessed.
+            if "clamp" in mods or any(m.startswith("op_sel") for m in mods):
+                raise Unsupported(op + (" clamp" if "clamp" in mods else " op_sel"))
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            acc = self.src_u(a[3]) if op == "v_dot4_i32_i8" else self.src_u(a[0])
+            for i in range(4):
+                xb, yb, prod, total = (self.tmp() for _ in range(4))
+                self.emit(f"{xb} = OpBitFieldSExtract %uint {x} {self.cu(8 * i)} {self.cu(8)}")
+                self.emit(f"{yb} = OpBitFieldSExtract %uint {y} {self.cu(8 * i)} {self.cu(8)}")
+                self.emit(f"{prod} = OpIMul %uint {xb} {yb}")
+                self.emit(f"{total} = OpIAdd %uint {acc} {prod}")
+                acc = total
+            self.dst(a[0], acc)
         elif op == "v_mad_u32_u24":
             x, y, z = (self.src_u(t) for t in a[1:4])
             xm, ym, p, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
@@ -9974,7 +9992,7 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16") or
+        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8") or
                 (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
@@ -10202,7 +10220,7 @@ def reg_reads_writes(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_fmac_f16") and a[0]["k"] == "vgpr":
+        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_fmac_f16", "v_dot4c_i32_i8") and a[0]["k"] == "vgpr":
             regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
