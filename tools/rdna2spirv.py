@@ -177,6 +177,8 @@ class Gen:
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
         self.uses_int_sampler = False    # 2D typed sampled-image types for sampling and gathering
         self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
+        self.reads_store_views = False  # a coherent image_load reads a storage view (StorageImageReadWithoutFormat)
+        self.coherent_images = False    # a glc image_load/image_store: the storage views are decorated Coherent
         self.writes_depth = False
         self.uses_smul = False
         self.uses_minlod = False
@@ -7687,13 +7689,20 @@ class Gen:
             self.uses_tex_1d = True
         if is3d and op.endswith("_d"):
             raise Unsupported(op + " 3D gradients")
+        # glc makes the access coherent (see image_load_coherent). Only image_load can be: a sampled read has no
+        # coherent form in SPIR-V, so it is refused rather than read stale.
+        coherent = "glc" in mods
+        if coherent and (op != "image_load" or dim not in self.STORE_DIMS):
+            raise Unsupported(op + " glc " + dim.split("SQ_RSRC_IMG_")[-1])
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
         vdata, addr = a[0], self.addr_regs(a[1])
         img_idx = self.desc_lookup_sgpr(a[2], 8)
-        ip, img = self.tmp(), self.tmp()
-        self.emit(f"{ip} = OpAccessChain %{iptr} {iarr} {img_idx}")
-        self.emit(f"{img} = OpLoad %{itype} {ip}")
+        img = None              # a coherent image_load reads the storage view, not this sampled one
+        if not coherent:
+            ip, img = self.tmp(), self.tmp()
+            self.emit(f"{ip} = OpAccessChain %{iptr} {iarr} {img_idx}")
+            self.emit(f"{img} = OpLoad %{itype} {ip}")
         coords = [self.load_reg("vgpr", r) for r in addr]
         if a16:
             # GFX10 A16 packs only the coordinates, and the LOD or clamp after them, as f16 pairs (low half first).
@@ -7738,6 +7747,9 @@ class Gen:
             else:
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
+            if coherent:
+                self.image_load_coherent(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img_idx, dmask, vdata, d16)
+                return
             if dim in self.STORE_DIMS:
                 self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, img_idx,
                                       dmask, vdata, self.cu(0), d16)
@@ -8098,14 +8110,49 @@ class Gen:
             return res
         self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch)
 
-    def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read):
-        """Read a sampled image using the component type selected by FORMAT in T# word 1.
+    def image_load_coherent(self, dim, t1, iv, idx, dmask, vdata, d16):
+        """image_load with glc: a coherent read. On GFX10 a device-scope load is glc + dlc and a device-scope store
+        glc (Mesa ac_get_hw_cache_flags maps ACCESS_COHERENT to exactly these bits); the POPS pixel shaders read and
+        write their ordered images that way. Through the sampled array (image_load_typed) the read could not see
+        another invocation's store: sampled reads have no coherent form, and the interlock between POPS critical
+        sections only makes Coherent memory visible (Vulkan memory model, fragment shader interlock). So the read
+        goes through the storage view the stores write (OpImageRead, StorageImageReadWithoutFormat), and the
+        storage views are decorated Coherent (assemble)."""
+        di = self.STORE_DIMS[dim][0]
+        self.uses_store_views.add(di)
+        self.reads_store_views = True
+        self.coherent_images = True
+
+        def view(cls):
+            ip, im = self.tmp(), self.tmp()
+            self.emit(f"{ip} = OpAccessChain %_ptr_UC_stv{cls}_{di} %stv{cls}_{di} {idx}")
+            self.emit(f"{im} = OpLoad %stimg{cls}_{di} {ip}")
+            return im
+
+        def read(image, _cls, ty):
+            res = self.tmp()
+            self.emit(f"{res} = OpImageRead {ty} {image} {iv}")
+            return res
+        self.image_read_typed(dim, t1, None, idx, dmask, vdata, d16, read, view)
+
+    def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read, view=None):
+        """Read an image using the component type selected by FORMAT in T# word 1.
         read(image, cls, ty) emits the fetch or gather and returns its four components. The float view also
-        handles a lookup miss: index zero holds the RGBA8_UNORM fallback. UINT and SINT views share the
-        dimension's sampled binding through typed aliases (SHADER-151), so no storage image feature is needed.
+        handles a lookup miss: index zero holds the RGBA8_UNORM fallback. view(cls) loads the image of class cls
+        (0 float, 1 uint, 2 sint); by default the sampled image img for float and, for UINT and SINT, typed aliases
+        of the dimension's sampled binding (SHADER-151), so no storage image feature is needed.
         dmask selects the output components; d16 packs two per VGPR."""
         di = self.STORE_DIMS[dim][0]
-        self.uses_int_fetch.add(di)
+        if view is None:
+            self.uses_int_fetch.add(di)
+
+            def view(cls):
+                if cls == 0:
+                    return img
+                ip, im = self.tmp(), self.tmp()
+                self.emit(f"{ip} = OpAccessChain %_ptr_UC_itx{cls}_{di} %itx{cls}_{di} {idx}")
+                self.emit(f"{im} = OpLoad %itximg{cls}_{di} {ip}")
+                return im
         is_u, is_s = self.fmt_int_flags(t1)
         hit = self.tmp()
         self.emit(f"{hit} = OpINotEqual %bool {idx} {self.cu(0)}")
@@ -8143,9 +8190,8 @@ class Gen:
                 self.dst(dest, w)
 
         def read_integer(cls, ty):
-            ip, im, b = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{ip} = OpAccessChain %_ptr_UC_itx{cls}_{di} %itx{cls}_{di} {idx}")
-            self.emit(f"{im} = OpLoad %itximg{cls}_{di} {ip}")
+            im = view(cls)
+            b = self.tmp()
             r = read(im, cls, ty)
             self.emit(f"{b} = OpBitcast %v4uint_st {r}")
             write(b, cls)
@@ -8162,7 +8208,7 @@ class Gen:
         read_integer(1, "%v4uint_st")
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['f']} = OpLabel")
-        res = read(img, 0, "%v4float")
+        res = read(view(0), 0, "%v4float")
         b = self.tmp()
         self.emit(f"{b} = OpBitcast %v4uint_st {res}")
         write(b, 0)
@@ -8179,6 +8225,8 @@ class Gen:
             raise Unsupported("image_store " + dim.split("SQ_RSRC_IMG_")[-1] + (" a16" if "a16" in mods else "")
                               + (" d16" if "d16" in mods else ""))
         di, _, _, nc = self.STORE_DIMS[dim]
+        if "glc" in mods:
+            self.coherent_images = True     # a coherent store (glc, device scope): see image_load_coherent
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0xf")
         dmask = int(dm.split(":")[1], 0)
         vdata, addr = a[0], self.addr_regs(a[1])
@@ -8255,6 +8303,9 @@ class Gen:
         if op == "image_store":
             self.image_store(a, mods, dim)
             return
+        if op == "image_load_mip" and "glc" in mods:
+            # A coherent read of one mip: image_load_coherent reads a storage view, which has one level.
+            raise Unsupported("image_load_mip glc")
         if op == "image_load_mip" and dim == "dim:SQ_RSRC_IMG_3D" and "d16" not in mods and "a16" not in mods:
             # x, y, z, mip from a 3D sampled image (binding 6)
             vdata, addr = a[0], self.addr_regs(a[1])
@@ -9447,6 +9498,8 @@ def assemble(gen):
         caps.append("FMAKHR")
     if gen.uses_store_views:
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
+        if gen.reads_store_views:
+            caps.append("StorageImageReadWithoutFormat")  # shaderStorageImageReadWithoutFormat: coherent image_load
         if 3 in gen.uses_store_views:
             caps.append("Image1D")
     if gsx:
@@ -9707,6 +9760,8 @@ def assemble(gen):
                           f"%_ptr_UC_rt_stv{cls}_{di} = OpTypePointer UniformConstant %rt_stv{cls}_{di}",
                           f"%_ptr_UC_stv{cls}_{di} = OpTypePointer UniformConstant %stimg{cls}_{di}"]
                 dec += [f"OpDecorate %stv{cls}_{di} DescriptorSet 0", f"OpDecorate %stv{cls}_{di} Binding {8 + 3 * di + cls}"]
+                if gen.coherent_images:
+                    dec.append(f"OpDecorate %stv{cls}_{di} Coherent")
                 gvars += [f"%stv{cls}_{di} = OpVariable %_ptr_UC_rt_stv{cls}_{di} UniformConstant"]
     if gsx:
         nst = gen.gs["maxv"] * gen.gs["nreg"]
