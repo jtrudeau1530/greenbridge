@@ -799,5 +799,89 @@ class TestValuFrexpExpI32F64SIMD(unittest.TestCase):
             self.assertEqual(s32(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0)), 2)
 
 
+class TestValuFrexpExpI32F64RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_aliasing_dst_equals_src0_low_dword(self) -> None:
+        # dst = v0, src0 = v[0:1]
+        interp = ScalarVALUInterpreter()
+        # Set v[0:1] = 4.0 -> exp = 3
+        interp.write_reg_u64(RegKind.VGPR, 0, POS_FOUR_F64)
+        lo_orig, hi_orig = split_dwords(POS_FOUR_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 0, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(s32(res), 3)
+        # v0 overwritten with result 3
+        self.assertEqual(s32(interp.read_reg_u32(RegKind.VGPR, 0)), 3)
+        # v1 (high dword) remains undisturbed
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), hi_orig)
+
+    def test_aliasing_dst_equals_src0_high_dword(self) -> None:
+        # dst = v1, src0 = v[0:1]
+        interp = ScalarVALUInterpreter()
+        # Set v[0:1] = 0.25 -> exp = -1
+        interp.write_reg_u64(RegKind.VGPR, 0, QUARTER_F64)
+        lo_orig, hi_orig = split_dwords(QUARTER_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 1, count=1),
+            src0=Register(RegKind.VGPR, 0, count=2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(s32(res), -1)
+        # v0 (low dword) remains undisturbed
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), lo_orig)
+        # v1 overwritten with result -1 (0xFFFFFFFF)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), 0xFFFFFFFF)
+
+    def test_unrelated_registers_preserved(self) -> None:
+        interp = ScalarVALUInterpreter()
+        for idx in range(10, 20):
+            interp.write_reg_u32(RegKind.VGPR, idx, 0x55000000 + idx)
+
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Immediate(2.0),
+        )
+        interp.step(inst)
+
+        for idx in range(10, 20):
+            self.assertEqual(interp.read_reg_u32(RegKind.VGPR, idx), 0x55000000 + idx)
+
+    def test_simd_aliasing_with_divergent_exec_mask(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        exec_mask = 0x0000000F  # Lanes 0..3 active
+        simd.set_exec_mask(exec_mask)
+
+        for lane in range(32):
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 0, POS_TWO_F64)  # exp = 2
+
+        lo_orig, hi_orig = split_dwords(POS_TWO_F64)
+
+        inst = Instruction(
+            opcode=Opcode.V_FREXP_EXP_I32_F64,
+            dst=Register(RegKind.VGPR, 0, count=1),
+            src0=Register(RegKind.VGPR, 0, count=2),
+        )
+        simd.step(inst)
+
+        for lane in range(32):
+            if lane < 4:
+                # Active: v0 updated to 2, v1 unchanged
+                self.assertEqual(s32(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0)), 2)
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), hi_orig)
+            else:
+                # Inactive: v0 and v1 both preserved
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), lo_orig)
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), hi_orig)
+
+
 if __name__ == "__main__":
     unittest.main()
