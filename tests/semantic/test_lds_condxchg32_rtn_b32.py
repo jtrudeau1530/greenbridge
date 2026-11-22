@@ -826,5 +826,169 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(common_addr), 300)
 
 
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_alias_dst_equals_addr(self) -> None:
+        """Destination VGPR aliases Address VGPR: v[0] = ds_condxchg32 v[0], v[1], v[2].
+        
+        Address must be read in the operand stage before v[0] is overwritten with old_val.
+        """
+        state = ScalarMachineState()
+        addr = 0x500
+        state.set_vgpr(0, addr)        # v[0] is address AND destination
+        state.set_vgpr(1, 0x11112222)  # v[1] is cmp_val
+        state.set_vgpr(2, 0x33334444)  # v[2] is new_val
+        state.lds.write_dword(addr, 0x11112222)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(0),
+            addr=VGPR(0),
+            cmp_val=VGPR(1),
+            new_val=VGPR(2),
+        )
+        old, mem, swapped = self.scalar_interp.step(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, 0x11112222)
+        self.assertEqual(mem, 0x33334444)
+        # v[0] now contains the returned old_val
+        self.assertEqual(state.get_vgpr(0), 0x11112222)
+        # Memory at original addr was properly updated
+        self.assertEqual(state.lds.read_dword(addr), 0x33334444)
+
+    def test_alias_dst_equals_cmp(self) -> None:
+        """Destination VGPR aliases Compare VGPR: v[1] = ds_condxchg32 v[0], v[1], v[2]."""
+        state = ScalarMachineState()
+        addr = 0x600
+        state.set_vgpr(0, addr)
+        state.set_vgpr(1, 0xAAAA5555)  # v[1] is cmp_val AND destination
+        state.set_vgpr(2, 0x77778888)  # v[2] is new_val
+        state.lds.write_dword(addr, 0xAAAA5555)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(1),
+            addr=VGPR(0),
+            cmp_val=VGPR(1),
+            new_val=VGPR(2),
+        )
+        old, mem, swapped = self.scalar_interp.step(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, 0xAAAA5555)
+        self.assertEqual(mem, 0x77778888)
+        self.assertEqual(state.get_vgpr(1), 0xAAAA5555)
+        self.assertEqual(state.lds.read_dword(addr), 0x77778888)
+
+    def test_alias_dst_equals_new(self) -> None:
+        """Destination VGPR aliases New Value VGPR: v[2] = ds_condxchg32 v[0], v[1], v[2]."""
+        state = ScalarMachineState()
+        addr = 0x700
+        state.set_vgpr(0, addr)
+        state.set_vgpr(1, 0x12340000)
+        state.set_vgpr(2, 0x99990000)  # v[2] is new_val AND destination
+        state.lds.write_dword(addr, 0x12340000)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(2),
+            addr=VGPR(0),
+            cmp_val=VGPR(1),
+            new_val=VGPR(2),
+        )
+        old, mem, swapped = self.scalar_interp.step(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, 0x12340000)
+        # Memory received new_val before v[2] was overwritten with old_val
+        self.assertEqual(mem, 0x99990000)
+        self.assertEqual(state.lds.read_dword(addr), 0x99990000)
+        self.assertEqual(state.get_vgpr(2), 0x12340000)
+
+    def test_full_operand_aliasing_four_way(self) -> None:
+        """All operands use the same VGPR: v[5] = ds_condxchg32 v[5], v[5], v[5].
+        
+        Address, cmp_val, and new_val all originate from v[5].
+        """
+        state = ScalarMachineState()
+        addr_and_val = 0x200
+        state.set_vgpr(5, addr_and_val)
+        # LDS holds addr_and_val, matching cmp_val
+        state.lds.write_dword(addr_and_val, addr_and_val)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(5),
+            addr=VGPR(5),
+            cmp_val=VGPR(5),
+            new_val=VGPR(5),
+        )
+        old, mem, swapped = self.scalar_interp.step(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old, addr_and_val)
+        self.assertEqual(mem, addr_and_val)
+        self.assertEqual(state.get_vgpr(5), addr_and_val)
+        self.assertEqual(state.lds.read_dword(addr_and_val), addr_and_val)
+
+    def test_unrelated_vgprs_unmodified(self) -> None:
+        """Ensure that registers outside destination are pristine."""
+        state = ScalarMachineState()
+        sentinel_pattern = 0xC001CAFE
+        for r in range(256):
+            state.set_vgpr(r, sentinel_pattern ^ r)
+
+        addr = 0x100
+        state.set_vgpr(10, addr)
+        state.set_vgpr(11, 42)
+        state.set_vgpr(12, 84)
+        state.lds.write_dword(addr, 42)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(9),
+            addr=VGPR(10),
+            cmp_val=VGPR(11),
+            new_val=VGPR(12),
+        )
+        self.scalar_interp.step(instr, state)
+
+        # Only v[9] should be updated
+        self.assertEqual(state.get_vgpr(9), 42)
+        self.assertEqual(state.get_vgpr(10), addr)
+        self.assertEqual(state.get_vgpr(11), 42)
+        self.assertEqual(state.get_vgpr(12), 84)
+
+        for r in range(256):
+            if r not in (9, 10, 11, 12):
+                self.assertEqual(state.get_vgpr(r), sentinel_pattern ^ r)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        """Every lane aliases destination with address."""
+        state = SIMDState(num_lanes=32)
+        for lane in range(32):
+            addr = 0x300 + lane * 4
+            state.set_vgpr(lane, 0, addr)  # v[0] = addr AND dst
+            state.lds.write_dword(addr, 0x1000 + lane)
+
+        instr = DSCondxchg32Instruction(
+            dst=VGPR(0),
+            addr=VGPR(0),
+            cmp_val=Immediate(0x1000),  # only lane 0 matches
+            new_val=Immediate(0x2000),
+        )
+        self.simd_interp.step(instr, state)
+
+        # Lane 0 matched and exchanged
+        self.assertEqual(state.get_vgpr(0, 0), 0x1000)
+        self.assertEqual(state.lds.read_dword(0x300), 0x2000)
+
+        # Other lanes mismatched but received old_val in v[0]
+        for lane in range(1, 32):
+            self.assertEqual(state.get_vgpr(lane, 0), 0x1000 + lane)
+            self.assertEqual(state.lds.read_dword(0x300 + lane * 4), 0x1000 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
