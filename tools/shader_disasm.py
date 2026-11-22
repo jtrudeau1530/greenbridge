@@ -96,6 +96,9 @@ def code_range(b: bytes):
         if last >= 0:
             return start, last + 4, "header"
     end = b.find(ENDPGM)
+    # Fallback instructions are dword-aligned in the blob. A matching byte sequence can straddle metadata words.
+    while end >= 0 and end % 4:
+        end = b.find(ENDPGM, end + 1)
     return None, end + 4 if end >= 0 else None, "scan"
 
 

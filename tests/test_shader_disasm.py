@@ -210,6 +210,20 @@ class DisasmInputTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(os.listdir(out), ["b_shader.s"])
 
+    def test_fallback_scan_ignores_unaligned_endpgm(self) -> None:
+        blob = bytearray(0x110)
+        blob[:4] = b"FSSM"
+        blob[0x101:0x105] = CODE[-4:]  # the same bytes in metadata, straddling two words
+        blob[0x108:0x110] = CODE
+        self.write("fallback.fssm", bytes(blob))
+        out = os.path.join(self.dir, "out")
+
+        result = self.run_tool(self.src, "--out", out, "--jobs", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(os.path.join(out, "fallback.s"), encoding="utf-8") as listing:
+            self.assertIn("..0x110 (scan)", listing.readline())
+
     def test_unpack_index_selects_current_blobs(self):
         self.write("current.fssm", fssm())
         self.write("obsolete.fssm", fssm())
