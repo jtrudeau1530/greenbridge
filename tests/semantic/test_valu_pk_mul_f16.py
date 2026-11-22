@@ -22,10 +22,12 @@ Standard library only: Python 3.9+ compatible, zero game data, zero external dep
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+import enum
 import math
 import struct
+from typing import Optional, Tuple, Union
 import unittest
-from typing import Tuple
 
 MASK16 = 0xFFFF
 MASK32 = 0xFFFFFFFF
@@ -239,6 +241,116 @@ def ref_v_pk_mul_f16(
     return pack_f16x2(res_lo, res_hi)
 
 
+# -----------------------------------------------------------------------------
+# Symbolic AST Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+
+class RegType(enum.Enum):
+    """Architecture register classification."""
+    VGPR = "v"
+    SGPR = "s"
+    LITERAL = "lit"
+    INLINE_CONST = "k"
+
+
+@dataclass(frozen=True)
+class Reg:
+    """Architectural register designator."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index out of valid architectural range [0, 255]: {self.index}")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index out of valid architectural range [0, 105]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclass(frozen=True)
+class VOP3POperand:
+    """Typed operand for VOP3P packed vector instructions."""
+    reg: Optional[Reg] = None
+    literal_val: Optional[int] = None
+    inline_val: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        sources = [self.reg is not None, self.literal_val is not None, self.inline_val is not None]
+        if sum(sources) != 1:
+            raise ValueError("VOP3POperand must have exactly one source (reg, literal_val, or inline_val)")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.reg is not None and self.reg.reg_type == RegType.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.reg is not None and self.reg.reg_type == RegType.SGPR
+
+    @property
+    def is_literal(self) -> bool:
+        return self.literal_val is not None
+
+    @property
+    def is_inline_const(self) -> bool:
+        return self.inline_val is not None
+
+    def __str__(self) -> str:
+        if self.reg is not None:
+            return str(self.reg)
+        if self.literal_val is not None:
+            return f"0x{self.literal_val:08x}"
+        return f"{self.inline_val}"
+
+
+@dataclass(frozen=True)
+class VPkMulF16Instruction:
+    """Symbolic AST node representing AMD RDNA2 v_pk_mul_f16 instruction."""
+    dst: Reg
+    src0: VOP3POperand
+    src1: VOP3POperand
+    op_sel: Tuple[int, int] = (0, 0)
+    op_sel_hi: Tuple[int, int] = (1, 1)
+    neg_lo: Tuple[int, int] = (0, 0)
+    neg_hi: Tuple[int, int] = (0, 0)
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise ValueError(f"Destination must be a VGPR, got {self.dst}")
+        for name, pair in [
+            ("op_sel", self.op_sel),
+            ("op_sel_hi", self.op_sel_hi),
+            ("neg_lo", self.neg_lo),
+            ("neg_hi", self.neg_hi),
+        ]:
+            if len(pair) != 2 or not all(x in (0, 1) for x in pair):
+                raise ValueError(f"{name} modifier must be a tuple of two binary digits (0 or 1), got {pair}")
+
+    def disasm(self) -> str:
+        """Format symbolic instruction into standard RDNA2 disassembly text."""
+        parts = [f"v_pk_mul_f16 {self.dst}, {self.src0}, {self.src1}"]
+        if self.op_sel != (0, 0):
+            parts.append(f"op_sel:[{self.op_sel[0]},{self.op_sel[1]}]")
+        if self.op_sel_hi != (1, 1):
+            parts.append(f"op_sel_hi:[{self.op_sel_hi[0]},{self.op_sel_hi[1]}]")
+        if self.neg_lo != (0, 0):
+            parts.append(f"neg_lo:[{self.neg_lo[0]},{self.neg_lo[1]}]")
+        if self.neg_hi != (0, 0):
+            parts.append(f"neg_hi:[{self.neg_hi[0]},{self.neg_hi[1]}]")
+        if self.clamp:
+            parts.append("clamp")
+        return " ".join(parts)
+
+
+# -----------------------------------------------------------------------------
+# Unit Tests: Phase 1 & Phase 2
+# -----------------------------------------------------------------------------
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Test suite for reference mathematical oracle and architectural model."""
 
@@ -309,6 +421,79 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         res_lo, res_hi = unpack_f16x2(res)
         self.assertEqual(res_lo, F16_POS_ZERO)
         self.assertEqual(res_hi, F16_ONE)
+
+
+class TestSymbolicASTDefinitions(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg_bounds_and_formatting(self) -> None:
+        v0 = Reg(0, RegType.VGPR)
+        v255 = Reg(255, RegType.VGPR)
+        s105 = Reg(105, RegType.SGPR)
+        self.assertEqual(str(v0), "v0")
+        self.assertEqual(str(v255), "v255")
+        self.assertEqual(str(s105), "s105")
+
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(106, RegType.SGPR)
+
+    def test_operand_creation_and_predicates(self) -> None:
+        op_vgpr = VOP3POperand(reg=Reg(5, RegType.VGPR))
+        op_sgpr = VOP3POperand(reg=Reg(10, RegType.SGPR))
+        op_lit = VOP3POperand(literal_val=0x3C003C00)
+        op_k = VOP3POperand(inline_val=1.0)
+
+        self.assertTrue(op_vgpr.is_vgpr)
+        self.assertFalse(op_vgpr.is_sgpr)
+        self.assertTrue(op_sgpr.is_sgpr)
+        self.assertTrue(op_lit.is_literal)
+        self.assertTrue(op_k.is_inline_const)
+
+        with self.assertRaises(ValueError):
+            VOP3POperand()  # no source provided
+        with self.assertRaises(ValueError):
+            VOP3POperand(reg=Reg(0), literal_val=123)  # ambiguous sources
+
+    def test_instruction_disassembly(self) -> None:
+        instr_default = VPkMulF16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+        )
+        self.assertEqual(instr_default.disasm(), "v_pk_mul_f16 v0, v1, v2")
+
+        instr_modifiers = VPkMulF16Instruction(
+            dst=Reg(5, RegType.VGPR),
+            src0=VOP3POperand(reg=Reg(6, RegType.VGPR)),
+            src1=VOP3POperand(reg=Reg(12, RegType.SGPR)),
+            op_sel=(1, 0),
+            op_sel_hi=(0, 1),
+            neg_lo=(1, 0),
+            neg_hi=(0, 1),
+            clamp=True,
+        )
+        expected = "v_pk_mul_f16 v5, v6, s12 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0] neg_hi:[0,1] clamp"
+        self.assertEqual(instr_modifiers.disasm(), expected)
+
+    def test_instruction_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            # SGPR as destination is forbidden for VALU instruction
+            VPkMulF16Instruction(
+                dst=Reg(0, RegType.SGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+            )
+
+        with self.assertRaises(ValueError):
+            # Invalid modifier entry
+            VPkMulF16Instruction(
+                dst=Reg(0, RegType.VGPR),
+                src0=VOP3POperand(reg=Reg(1, RegType.VGPR)),
+                src1=VOP3POperand(reg=Reg(2, RegType.VGPR)),
+                op_sel=(2, 0),
+            )
 
 
 if __name__ == "__main__":
