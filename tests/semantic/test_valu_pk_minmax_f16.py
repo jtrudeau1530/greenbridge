@@ -1443,5 +1443,98 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(simd_state.vcc, 0x87654321)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, infinities, and NaNs."""
+
+    def test_subnormal_boundaries_and_ordering(self) -> None:
+        # Subnormal vs normal transition
+        self.assertEqual(oracle_min_f16(POS_MAX_SUBNORM, POS_MIN_NORMAL), POS_MAX_SUBNORM)
+        self.assertEqual(oracle_max_f16(POS_MAX_SUBNORM, POS_MIN_NORMAL), POS_MIN_NORMAL)
+
+        # Negative subnormal vs negative normal
+        self.assertEqual(oracle_min_f16(NEG_MAX_SUBNORM, NEG_MIN_SUBNORM), NEG_MAX_SUBNORM)
+        self.assertEqual(oracle_max_f16(NEG_MAX_SUBNORM, NEG_MIN_SUBNORM), NEG_MIN_SUBNORM)
+
+        # Subnormal vs zero
+        self.assertEqual(oracle_min_f16(POS_ZERO, POS_MIN_SUBNORM), POS_ZERO)
+        self.assertEqual(oracle_max_f16(POS_ZERO, POS_MIN_SUBNORM), POS_MIN_SUBNORM)
+        self.assertEqual(oracle_min_f16(NEG_ZERO, NEG_MIN_SUBNORM), NEG_MIN_SUBNORM)
+        self.assertEqual(oracle_max_f16(NEG_ZERO, NEG_MIN_SUBNORM), NEG_ZERO)
+
+    def test_max_finite_and_infinity_boundaries(self) -> None:
+        # Max positive normal vs +inf
+        self.assertEqual(oracle_min_f16(POS_MAX_NORMAL, POS_INF), POS_MAX_NORMAL)
+        self.assertEqual(oracle_max_f16(POS_MAX_NORMAL, POS_INF), POS_INF)
+
+        # Max negative normal vs -inf
+        self.assertEqual(oracle_min_f16(NEG_MAX_NORMAL, NEG_INF), NEG_INF)
+        self.assertEqual(oracle_max_f16(NEG_MAX_NORMAL, NEG_INF), NEG_MAX_NORMAL)
+
+        # +inf vs -inf
+        self.assertEqual(oracle_min_f16(POS_INF, NEG_INF), NEG_INF)
+        self.assertEqual(oracle_max_f16(POS_INF, NEG_INF), POS_INF)
+
+    def test_nan_suppression_against_infinities_and_subnormals(self) -> None:
+        qnan_custom = 0x7E55
+        snan_custom = 0x7D33
+
+        # NaN vs +inf: +inf is selected!
+        self.assertEqual(oracle_min_f16(qnan_custom, POS_INF), POS_INF)
+        self.assertEqual(oracle_max_f16(qnan_custom, POS_INF), POS_INF)
+
+        # NaN vs -inf: -inf is selected!
+        self.assertEqual(oracle_min_f16(snan_custom, NEG_INF), NEG_INF)
+        self.assertEqual(oracle_max_f16(snan_custom, NEG_INF), NEG_INF)
+
+        # NaN vs subnormal: subnormal is selected!
+        self.assertEqual(oracle_min_f16(qnan_custom, POS_MIN_SUBNORM), POS_MIN_SUBNORM)
+        self.assertEqual(oracle_max_f16(qnan_custom, POS_MIN_SUBNORM), POS_MIN_SUBNORM)
+
+    def test_both_operands_nan_variants(self) -> None:
+        qnan1 = 0x7E12
+        qnan2 = 0x7E34
+        res_min = oracle_min_f16(qnan1, qnan2)
+        self.assertTrue(is_qnan16(res_min))
+
+        snan = 0x7D44
+        res_max = oracle_max_f16(snan, qnan1)
+        self.assertTrue(is_qnan16(res_max))
+
+    def test_packed_asymmetric_extremes(self) -> None:
+        # lo: NaN vs subnormal -> subnormal selected
+        # hi: +inf vs -inf -> min selects -inf, max selects +inf
+        s0 = pack_pk_f16(QNAN_CANONICAL, POS_INF)
+        s1 = pack_pk_f16(POS_MAX_SUBNORM, NEG_INF)
+
+        res_min = oracle_pk_min_f16(s0, s1)
+        self.assertEqual(res_min, pack_pk_f16(POS_MAX_SUBNORM, NEG_INF))
+
+        res_max = oracle_pk_max_f16(s0, s1)
+        self.assertEqual(res_max, pack_pk_f16(POS_MAX_SUBNORM, POS_INF))
+
+    def test_clamp_extremes_interaction(self) -> None:
+        # Positive subnormal (within [0.0, 1.0]) is preserved under clamp
+        self.assertEqual(clamp_f16(POS_MIN_SUBNORM), POS_MIN_SUBNORM)
+        self.assertEqual(clamp_f16(POS_MAX_SUBNORM), POS_MAX_SUBNORM)
+
+        # Negative subnormal clamps to +0.0
+        self.assertEqual(clamp_f16(NEG_MIN_SUBNORM), POS_ZERO)
+        self.assertEqual(clamp_f16(NEG_MAX_SUBNORM), POS_ZERO)
+
+        # +inf clamps to 1.0
+        self.assertEqual(clamp_f16(POS_INF), POS_ONE)
+
+        # -inf clamps to +0.0
+        self.assertEqual(clamp_f16(NEG_INF), POS_ZERO)
+
+        # NaN clamps to +0.0
+        self.assertEqual(clamp_f16(QNAN_CANONICAL), POS_ZERO)
+        self.assertEqual(clamp_f16(SNAN_DEFAULT), POS_ZERO)
+
+
 if __name__ == "__main__":
     unittest.main()
