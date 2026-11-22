@@ -215,6 +215,20 @@ int main() {
         check(!contains(list(first_w, next_w, find_close, L"GAME:\\data\\*"), L"dup.txt"),
               "and is absent from the listing");
 
+        // A write-open of the hidden name fails, and must leave the name deleted: no copy-up from the package, no
+        // overlay file, and still hidden afterwards.
+        SetLastError(0);
+        const HANDLE write_open =
+            create_w(L"GAME:\\data\\dup.txt", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(write_open == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "a write-open of the deleted name fails with ERROR_FILE_NOT_FOUND");
+        if (write_open != INVALID_HANDLE_VALUE) ::CloseHandle(write_open);
+        check(!std::filesystem::exists(overlay / "data" / "dup.txt"), "the failed write-open left no overlay copy");
+        SetLastError(0);
+        check(attributes_w(L"GAME:\\data\\dup.txt") == INVALID_FILE_ATTRIBUTES &&
+                  GetLastError() == ERROR_FILE_NOT_FOUND,
+              "and the name is still deleted");
+
         // Re-creating it makes it readable again, and it is listed.
         const HANDLE again = create_w(L"GAME:\\data\\dup.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         DWORD written = 0;

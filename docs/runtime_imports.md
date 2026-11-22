@@ -94,7 +94,7 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   cannot reach outside the package and the overlay.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`. Not mapped
-	yet: `CreateDirectory*`/`RemoveDirectory*`, `MoveFile*`, `CopyFile*` and `SetFileAttributes*`; a title that makes a
+yet: `CreateDirectory*`/`RemoveDirectory*`, `MoveFile*`, `CopyFile*` and `SetFileAttributes*`; a title that makes a
 folder through them gets the host's error for a name like `GAME:\...`.
 
 ## When an unimplemented import is called

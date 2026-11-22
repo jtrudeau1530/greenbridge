@@ -8,7 +8,9 @@
 //   - an open that can write, and DeleteFile, go to the overlay (--overlay, default <game-dir>\\overlay), so the
 //     package stays exactly as installed. A write-open of a package file copies it into the overlay first, so
 //     OPEN_EXISTING keeps its bytes; a delete of a package file leaves an empty marker under
-//     <overlay>\\.gta6rt-deleted, and reads and listings treat the name as gone;
+//     <overlay>\\.gta6rt-deleted, and reads and listings treat the name as gone. The marker is never removed and a
+//     deleted name is never copied up: a re-created file is its overlay copy, which reads and listings already
+//     prefer, while an open of a deleted name that fails leaves the name deleted;
 //   - reads prefer the overlay copy and then the package;
 //   - FindFirstFile merges the two folders, the overlay winning on a name, and hides deleted names and the marker
 //     folder;
@@ -23,6 +25,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -121,14 +124,11 @@ std::filesystem::path join(const std::filesystem::path& root, const std::vector<
 
 struct Target {
     std::filesystem::path path;
-    bool mapped = false;
-    bool overlay = false;
     DWORD error = 0;  // non-zero: the caller fails with this error and does not touch the host
 };
 
-Target fail(bool mapped, DWORD error) {
+Target fail(DWORD error) {
     Target t;
-    t.mapped = mapped;
     t.error = error;
     return t;
 }
@@ -145,12 +145,6 @@ bool deleted(const std::filesystem::path& overlay, const std::vector<std::wstrin
     return std::filesystem::exists(marker(overlay, parts), ec);
 }
 
-void clear_deleted(const std::filesystem::path& overlay, const std::vector<std::wstring>& parts) {
-    if (overlay.empty() || parts.empty()) return;
-    std::error_code ec;
-    std::filesystem::remove(marker(overlay, parts), ec);
-}
-
 Target read_target(const std::wstring& path) {
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(path, parts);
@@ -159,10 +153,10 @@ Target read_target(const std::wstring& path) {
         t.path = std::filesystem::path(path);
         return t;
     }
-    if (parsed == Parsed::Refused) return fail(true, ERROR_INVALID_NAME);
+    if (parsed == Parsed::Refused) return fail(ERROR_INVALID_NAME);
 
     const Roots r = roots();
-    if (r.game.empty()) return fail(true, ERROR_PATH_NOT_FOUND);
+    if (r.game.empty()) return fail(ERROR_PATH_NOT_FOUND);
 
     std::error_code ec;
     if (!r.overlay.empty()) {
@@ -170,17 +164,14 @@ Target read_target(const std::wstring& path) {
         if (std::filesystem::exists(overlay_path, ec)) {
             Target t;
             t.path = overlay_path;
-            t.mapped = true;
-            t.overlay = true;
             return t;
         }
     }
     // A package file the title deleted is gone even though the package still holds it.
-    if (deleted(r.overlay, parts)) return fail(true, ERROR_FILE_NOT_FOUND);
+    if (deleted(r.overlay, parts)) return fail(ERROR_FILE_NOT_FOUND);
 
     Target t;
     t.path = join(r.game, parts);
-    t.mapped = true;
     return t;
 }
 
@@ -192,15 +183,13 @@ Target write_target(const std::wstring& path, bool copy_up) {
         t.path = std::filesystem::path(path);
         return t;
     }
-    if (parsed == Parsed::Refused) return fail(true, ERROR_INVALID_NAME);
+    if (parsed == Parsed::Refused) return fail(ERROR_INVALID_NAME);
 
     const Roots r = roots();
-    if (r.overlay.empty()) return fail(true, ERROR_PATH_NOT_FOUND);
-    if (parts.empty()) return fail(true, ERROR_INVALID_NAME);  // "GAME:" is a folder, not a file
+    if (r.overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
+    if (parts.empty()) return fail(ERROR_INVALID_NAME);  // "GAME:" is a folder, not a file
 
     Target t;
-    t.mapped = true;
-    t.overlay = true;
     t.path = join(r.overlay, parts);
 
     std::error_code ec;
@@ -210,15 +199,18 @@ Target write_target(const std::wstring& path, bool copy_up) {
         return t;
     }
 
+    // A deleted package file is not there to copy: copying it up would bring the name back, and an open that keeps
+    // the contents (OPEN_EXISTING, TRUNCATE_EXISTING) has to fail on it instead. CREATE_ALWAYS and CREATE_NEW still
+    // make a new overlay file, which reads prefer over the package and so over the marker.
     const std::filesystem::path package_path = join(r.game, parts);
-    if (copy_up && !std::filesystem::exists(t.path, ec) && std::filesystem::is_regular_file(package_path, ec)) {
+    if (copy_up && !deleted(r.overlay, parts) && !std::filesystem::exists(t.path, ec) &&
+        std::filesystem::is_regular_file(package_path, ec)) {
         std::filesystem::copy_file(package_path, t.path, std::filesystem::copy_options::none, ec);
         if (ec) {
             t.error = static_cast<DWORD>(ec.value());
             return t;
         }
     }
-    clear_deleted(r.overlay, parts);
     return t;
 }
 
@@ -250,42 +242,22 @@ struct Enumeration {
 };
 
 std::mutex g_enum_mutex;
-std::map<HANDLE, Enumeration*> g_enumerations;  // keyed by the pseudo-handle handed to the title
+std::map<HANDLE, std::unique_ptr<Enumeration>> g_enumerations;  // keyed by the pseudo-handle handed to the title
 
-HANDLE register_enumeration(Enumeration* e) {
+HANDLE register_enumeration(std::unique_ptr<Enumeration> e) {
     std::lock_guard lock(g_enum_mutex);
-    const HANDLE h = reinterpret_cast<HANDLE>(e);
-    g_enumerations[h] = e;
+    const HANDLE h = reinterpret_cast<HANDLE>(e.get());
+    g_enumerations.emplace(h, std::move(e));
     return h;
-}
-
-Enumeration* find_enumeration(HANDLE h) {
-    std::lock_guard lock(g_enum_mutex);
-    const auto it = g_enumerations.find(h);
-    return it == g_enumerations.end() ? nullptr : it->second;
 }
 
 bool unregister_enumeration(HANDLE h) {
     std::lock_guard lock(g_enum_mutex);
-    const auto it = g_enumerations.find(h);
-    if (it == g_enumerations.end()) return false;
-    delete it->second;
-    g_enumerations.erase(it);
-    return true;
+    return g_enumerations.erase(h) != 0;
 }
 
-bool collect(const std::wstring& pattern, std::vector<WIN32_FIND_DATAW>& out, DWORD& error) {
-    std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(pattern, parts);
-    if (parsed == Parsed::Refused) {
-        error = ERROR_INVALID_NAME;
-        return false;
-    }
-    if (parsed != Parsed::Console) {
-        error = ERROR_INVALID_NAME;  // only called for a console pattern
-        return false;
-    }
-
+bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts, std::vector<WIN32_FIND_DATAW>& out,
+             DWORD& error) {
     // "GAME:" and "GAME:\\dir\\" name the folder itself: list everything in it.
     std::vector<std::wstring> dirs;
     std::wstring leaf;
@@ -454,13 +426,15 @@ HANDLE WINAPI find_first_file_w(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
 
     std::vector<WIN32_FIND_DATAW> entries;
     DWORD error = 0;
-    if (!collect(pattern, entries, error)) {
+    if (!collect(pattern, parts, entries, error)) {
         SetLastError(error);
         return INVALID_HANDLE_VALUE;
     }
-    auto* e = new Enumeration{std::move(entries), 1};
+    auto e = std::make_unique<Enumeration>();
+    e->entries = std::move(entries);
+    e->next = 1;
     *data = e->entries[0];
-    return register_enumeration(e);
+    return register_enumeration(std::move(e));
 }
 
 HANDLE WINAPI find_first_file_a(LPCSTR pattern, LPWIN32_FIND_DATAA data) {
@@ -480,15 +454,21 @@ BOOL WINAPI find_next_file_w(HANDLE find, LPWIN32_FIND_DATAW data) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    Enumeration* e = find_enumeration(find);
-    if (!e) return ::FindNextFileW(find, data);  // a host listing
-    if (e->next >= e->entries.size()) {
-        SetLastError(ERROR_NO_MORE_FILES);
-        return FALSE;
+    {
+        std::lock_guard lock(g_enum_mutex);
+        const auto it = g_enumerations.find(find);
+        if (it != g_enumerations.end()) {
+            Enumeration& e = *it->second;
+            if (e.next >= e.entries.size()) {
+                SetLastError(ERROR_NO_MORE_FILES);
+                return FALSE;
+            }
+            *data = e.entries[e.next++];
+            SetLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
     }
-    *data = e->entries[e->next++];
-    SetLastError(ERROR_SUCCESS);
-    return TRUE;
+    return ::FindNextFileW(find, data);  // a host listing
 }
 
 BOOL WINAPI find_next_file_a(HANDLE find, LPWIN32_FIND_DATAA data) {
