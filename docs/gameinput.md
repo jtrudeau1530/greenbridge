@@ -62,6 +62,37 @@ controller-button array (`GetControllerButtonState`, indexed in SDL's `SDL_Gamep
 - Player LEDs (and SDL's default lightbar colour) follow connection order: the first pad is player 1, and a pad
   plugged in later takes the lowest free slot.
 
+## Keyboard pad
+
+The title reads gamepads only, so keyboard input has to arrive as a gamepad. With `LEONIDA_KEYBOARD_PAD` set, the
+shim attaches one SDL virtual gamepad named `Keyboard pad (Leonida)` and presses its buttons from the keyboard on
+every poll. It then goes through the same path as a real pad: a device object, the next free player slot, readings,
+reading and device callbacks, and UI navigation derived from its buttons. It reports no rumble motors. It is off by
+default.
+
+| key | button |
+|---|---|
+| arrow keys | d-pad |
+| Enter | `A` |
+| Backspace | `B` |
+| X | `X` |
+| Y | `Y` |
+| Q / E | left / right shoulder |
+| Esc | `Menu` |
+| Tab | `View` |
+
+This is enough to drive menus and press prompts. The sticks and triggers stay at rest: moving with WASD and aiming
+with the mouse are for a later change. Letters are Windows virtual-key codes, so `Y` is the key labelled Y on the
+active layout (it sits where Z does on a QWERTY keyboard with a German layout).
+
+Keys are read with `GetAsyncKeyState`, which needs no window or message loop (SDL's keyboard is part of its video
+subsystem, which this build leaves out) and works under Wine. With `LEONIDA_KEYBOARD_PAD=1` keys count only while a
+window of this process is in the foreground, so typing in another application presses nothing, and every button is
+released when focus moves away. `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focus; a console tool such as
+`gameinput_probe` needs it, because its console window belongs to the terminal, not to the tool.
+
+To try it by hand: `set LEONIDA_KEYBOARD_PAD=always`, then `gameinput_probe --seconds 20` and press keys.
+
 ## Rumble and triggers
 
 `IGameInputDevice::SetRumbleState` takes four motor levels, 0..1. The two body motors go to `SDL_RumbleGamepad` on
@@ -101,6 +132,7 @@ An effect is sent only when its bytes change, so a steady level costs one report
 | `LEONIDA_DS_LIGHTBAR` | unset | `RRGGBB` (hex) sets the DualSense/DualShock 4 lightbar when the pad connects; `off` turns it dark; unset keeps SDL's player colour |
 | `LEONIDA_RUMBLE` | `1` | `0` turns all rumble and trigger output off |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
+| `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to
 leave a DualSense to the generic driver, or `SDL_GAMECONTROLLERCONFIG` to add a mapping for an unknown pad.
@@ -143,7 +175,9 @@ shim fills (`GameInputDeviceInfo` 320 bytes with `deviceFamily` at 96 and the in
   `054c:0ce6`) and a pad without trigger motors. It checks enumeration and device callbacks, the button, stick,
   trigger and UI-navigation mapping, reading callbacks and sequence numbers, the guide button, motor and trigger
   rumble as SDL receives them, the DualSense effect bytes in each `LEONIDA_DS_TRIGGERS` mode, the lightbar, a
-  dispatcher, async and blocking enumeration, unregistering, and unplugging and replugging.
+  dispatcher, async and blocking enumeration, unregistering, and unplugging and replugging. The keyboard pad is
+  driven through `rt::gameinput::set_keyboard_source` with fake keys and focus: every binding, two keys at once, no
+  input out of focus, release on focus loss, the `always` mode, and turning it off and on again.
 - `gameinput_probe [--seconds N] [--rumble]` (by hand, with a pad connected): lists the pads, plays each motor and
   trigger for a second with `--rumble`, then prints the live reading.
 
@@ -164,5 +198,8 @@ These need the game executable or a test on hardware:
 - **`UnregisterCallback` timeout** is not honoured; it waits for a callback that is running.
 - **Device family**: every pad is reported as `GameInputFamilyXboxOne`; a title that filters on family sees only
   that.
+- **Keyboard pad as a second pad**: it is one more connected gamepad, so with a controller plugged in the title sees
+  two. A title that follows only the first pad it saw, or asks the player to press a button to pick the active pad,
+  may ignore one of them; whether the game does either is unknown.
 - **DualSense effect parameters**: the `06` (vibration) and `01` (resistance) byte meanings follow SDL's
   `testcontroller.c`; how strong 255 feels and what frequency suits the Xbox signal needs a session on a real pad.
