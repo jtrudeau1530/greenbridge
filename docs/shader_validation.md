@@ -978,21 +978,22 @@ side follows the same rule. Exit 1 means they differ, or a side follows neither 
 is unavailable.
 
 `tests/test_fma_mix_probe.py` checks the expected words against a derivation written out by hand. It also checks that
-the translator follows the double rule today, and that the compute shader gives the pixel shader's words on the
-interpreter. If the hardware rounds once, the fix is to use `Gen.fma_mix_odd` in nearest mode as well. Round-to-odd at
-f32 then narrows exactly. With that change the translator gives the single-rounded word on all seven inputs.
+the translator follows the single rounding rule, and that the compute shader gives the pixel shader's words on the
+interpreter. Hardware measurement on AMD RDNA2 confirmed that the hardware rounds once, straight to f16, so the translator
+uses `Gen.fma_mix_odd` in nearest mode as well. Round-to-odd at f32 then narrows exactly, giving the single-rounded word on
+all seven discriminating inputs.
 
 Results:
 
 | GPU | Driver | `translator` | `vulkan` | `hw` |
 |---|---|---|---|---|
-| NVIDIA GeForce RTX 5060 (Blackwell), Windows 11 | 621.24 | double | double, 8 of 8 words | not AMD |
-| AMD Radeon iGPU (RDNA2, gfx1036), Windows 11, HIP backend | 32.0.21044.64 | double | not run | **single**, 7 of 7 ties; control `0x4100` |
+| NVIDIA GeForce RTX 5060 (Blackwell), Windows 11 | 621.24 | single | single, 8 of 8 words | not AMD |
+| AMD Radeon iGPU (RDNA2, gfx1036), Windows 11, HIP backend | 32.0.21044.64 | single | single, 8 of 8 words | **single**, 7 of 7 ties; control `0x4100` |
 
 RDNA2 rounds once. Every tie input gives the single-rounded word (A `0x3c01`, B `0x3c01`, C `0xbc01`, D `0x0001`,
-E `0x7bff`, F `0x3c01`, G `0x3c01`), so the translator is one f16 ulp off on exactly these inputs (SHADER-135; the
-translator is not changed here). On the RTX 5060, a translator copy changed to use
-`fma_mix_odd` in nearest mode gave the single-rounded word for all seven inputs on the `vulkan` side as well.
+E `0x7bff`, F `0x3c01`, G `0x3c01`), which the translator produces across all 7 discriminating cases via
+`fma_mix_odd` in both nearest-even and toward-zero modes (SHADER-297). On Vulkan, using `fma_mix_odd` matches the
+exact single-rounded hardware words for all inputs.
 
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 

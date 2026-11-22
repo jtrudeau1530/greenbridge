@@ -6417,16 +6417,7 @@ class Gen:
             self.scc_nonzero(r)
         elif op in ("v_fma_mixlo_f16", "v_fma_mixhi_f16"):
             vals = self.fma_mix_srcs(a, mods)
-            r = self.tmp()
-            self.emit_fma(r, vals[0], vals[1], vals[2])
-            if self.round_mode:
-                # Toward zero the hardware rounds the exact fma once, to f16; round-to-odd at f32 narrows exactly.
-                # Nearest even keeps the f32 Fma then narrow (unchanged).
-                ro, m, isz, rs = self.fma_mix_odd(*vals), self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{m} = OpLoad %uint %mode_r16")
-                self.emit(f"{isz} = OpIEqual %bool {m} {self.cu(3)}")
-                self.emit(f"{rs} = OpSelect %float {isz} {ro} {r}")
-                r = rs
+            r = self.fma_mix_odd(*vals)
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, hi=(op == "v_fma_mixhi_f16"))
         elif op == "v_cvt_pk_u8_f32":
