@@ -178,11 +178,14 @@ class F16AndMixConstModifierTests(unittest.TestCase):
         ])
         self.assertEqual(got[:3], [0x4000BC00, 0x00007C01, 0x7C01FC01])
 
-    def test_v_pack_b32_f16_abs_is_still_rejected(self):
-        # Only `neg` is measured on this instruction; `abs` would be a guessed sign clear, so it stays refused.
-        with self.assertRaises(rdna2spirv.Unsupported):
-            translate(["v_pack_b32_f16 v0, abs(0x3c00), 1.0"])
-
+    def test_v_pack_b32_f16_abs_clears_the_sign_of_the_packed_half(self):
+        # `abs` is the ISA's sign clear (|S|), applied before `neg`; it has no hardware run of this instruction yet.
+        got = run([
+            "v_mov_b32 v1, 0xbc00",
+            "v_pack_b32_f16 v0, abs(0xbc00), 0x4000",     # +1.0h in the low half, 2.0h in the high one
+            "v_pack_b32_f16 v2, -abs(v1), v1",            # clear then flip the low half; src1 stays -1.0h
+        ])
+        self.assertEqual(got[:3], [0x40003C00, 0x0000BC00, 0xBC00BC00])
 
 class F64ConstModifierStructureTests(unittest.TestCase):
     def test_f64_emits_fabs_then_fnegate_for_neg_abs_const(self):
