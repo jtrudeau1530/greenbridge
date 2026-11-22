@@ -246,6 +246,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_f16_const": (0xaaaa3d00, 0x38005555, 0xaaaa3800, 0x3f000000),
               "ps_f16_const2": (0x42003d00, 0x3d004200, 0xaaaabc00, 3),
               "ps_f16_pack": (0x34003c00, 0x38003400, 0x34000000, 0x44004200),
+              # v_pack_b32_f16 neg/abs on the selected half: a sign flip / clear before packing (SHADER-260)
+              "ps_f16_pack_mods": (0x4400b400, 0xc4003400, 0x4400c200, 0xb400b400),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),

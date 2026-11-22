@@ -1108,6 +1108,7 @@ def run_suite(a, work: str) -> int:
                 "ps_f16_const": (0xAAAA3D00, 0x38005555, 0xAAAA3800, 0x3F000000),
                 "ps_f16_const2": (0x42003D00, 0x3D004200, 0xAAAABC00, 3),
                 "ps_f16_pack": (0x34003C00, 0x38003400, 0x34000000, 0x44004200),
+                "ps_f16_pack_mods": (0x4400B400, 0xC4003400, 0x4400C200, 0xB400B400),
                 "ps_sff_imm": (2, 1, 20, 16),                  # SHADER-46: s_ff0/s_ff1 of an immediate
                 "ps_fnan_med3": (0x40A00000, 0xC0200000, 0xC0200000, 0x40600000),   # measured on RDNA2 hardware
                 "ps_fnan_fract": (0x3F7FFFFF, 0x00003BFF, 0xC0200000, 0xC0200000),
