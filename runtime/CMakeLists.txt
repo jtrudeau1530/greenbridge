@@ -560,6 +560,12 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  # CPU-only: the ranking that makes these harnesses prefer a native ICD over Mesa's Dozen (#915). No GPU needed.
+  add_executable(vk_device_pick_test test/vk_device_pick_test.cpp)
+  target_link_libraries(vk_device_pick_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
+  endif()
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
   # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
   find_package(Python3 COMPONENTS Interpreter QUIET)

@@ -20,6 +20,7 @@
 // LEONIDA_VK_VALIDATION=1 runs under VK_LAYER_KHRONOS_validation; a validation error fails the test.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 #include "../src/vulkan_bindless.h"
 
 #include <array>
@@ -150,11 +151,15 @@ int main(int argc, char** argv) {
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
     VkPhysicalDevice pd = VK_NULL_HANDLE;
+    int best_rank = -1;
     for (auto d : pds) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d, &p);
         if (p.apiVersion < VK_API_VERSION_1_2) continue;
-        if (!pd || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) pd = d;
+        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
+            pd = d;
+            best_rank = rank;
+        }
     }
     if (!pd) {
         std::printf("unsupported: no Vulkan 1.2 device\n");

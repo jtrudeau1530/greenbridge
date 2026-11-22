@@ -19,6 +19,7 @@
 //                 the executable that runs the translated shader is written, not the partner stub's. Use without
 //                 cache.bin: a pipeline loaded from the cache may come without statistics.
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
 
@@ -436,11 +437,10 @@ int main(int argc, char** argv) {
     if (n == 0) { std::fprintf(stderr, "no Vulkan physical devices found\n"); return 1; }
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    for (auto d : pds) {
-        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(d, &p);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
-    }
+    std::vector<VkPhysicalDeviceProperties> candidates(pds.size());
+    for (std::size_t i = 0; i < pds.size(); ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    VkPhysicalDevice pd = chosen < pds.size() ? pds[chosen] : VK_NULL_HANDLE;
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
