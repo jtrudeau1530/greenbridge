@@ -673,5 +673,249 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(state.read_vgpr_pair(2), HALF_F64)
 
 
+# ============================================================================
+# Section 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ============================================================================
+
+@dataclass
+class SIMDState:
+    """Architectural state for a wavefront (Wave32 or Wave64) with EXEC masking."""
+    num_lanes: int = 64
+    exec_mask: int = MASK64
+    lanes: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.lanes:
+            self.lanes = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.num_lanes == 32:
+            self.exec_mask &= MASK32
+
+    def is_lane_active(self, lane_idx: int) -> bool:
+        """True if the lane's bit is enabled in the wavefront EXEC mask."""
+        return bool(self.exec_mask & (1 << lane_idx))
+
+    def read_lane_vgpr(self, lane_idx: int, reg_idx: int) -> int:
+        return self.lanes[lane_idx][reg_idx] & MASK32
+
+    def write_lane_vgpr(self, lane_idx: int, reg_idx: int, val: int) -> None:
+        self.lanes[lane_idx][reg_idx] = val & MASK32
+
+    def read_lane_vgpr_pair(self, lane_idx: int, reg_idx: int) -> int:
+        lo = self.read_lane_vgpr(lane_idx, reg_idx)
+        hi = self.read_lane_vgpr(lane_idx, reg_idx + 1)
+        return words_to_f64_bits(lo, hi)
+
+    def write_lane_vgpr_pair(self, lane_idx: int, reg_idx: int, val64: int) -> None:
+        lo, hi = f64_bits_to_words(val64)
+        self.write_lane_vgpr(lane_idx, reg_idx, lo)
+        self.write_lane_vgpr(lane_idx, reg_idx + 1, hi)
+
+    def read_sgpr_pair(self, reg_idx: int) -> int:
+        lo = self.sgprs[reg_idx] & MASK32
+        hi = self.sgprs[reg_idx + 1] & MASK32
+        return words_to_f64_bits(lo, hi)
+
+    def write_sgpr_pair(self, reg_idx: int, val64: int) -> None:
+        lo, hi = f64_bits_to_words(val64)
+        self.sgprs[reg_idx] = lo
+        self.sgprs[reg_idx + 1] = hi
+
+    def read_lane_operand_bits(self, lane_idx: int, op: VOP3Operand) -> int:
+        if op.literal is not None:
+            return op.literal.bits
+        assert op.reg_pair is not None
+        if op.reg_pair.reg_type == RegType.VGPR:
+            return self.read_lane_vgpr_pair(lane_idx, op.reg_pair.index)
+        elif op.reg_pair.reg_type == RegType.SGPR:
+            return self.read_sgpr_pair(op.reg_pair.index)
+        raise ValueError(f"Unknown register type {op.reg_pair.reg_type}")
+
+
+class SIMDInterpreter:
+    """SIMD wavefront execution engine modeling divergent multi-lane execution."""
+
+    def __init__(self, state: Optional[SIMDState] = None) -> None:
+        self.state = state if state is not None else SIMDState()
+
+    def execute(self, instr: VRSQF64Instruction) -> List[Optional[int]]:
+        """Execute VRSQF64Instruction across all active lanes conditioned on EXEC mask."""
+        results: List[Optional[int]] = []
+        for lane in range(self.state.num_lanes):
+            if not self.state.is_lane_active(lane):
+                results.append(None)
+                continue
+            raw_bits = self.state.read_lane_operand_bits(lane, instr.src0)
+            res = oracle_v_rsq_f64(
+                raw_bits,
+                abs_src=instr.src0.abs_mod,
+                neg_src=instr.src0.neg_mod,
+                clamp=instr.clamp,
+                flush_subnormals=instr.flush_denorms,
+            )
+            self.state.write_lane_vgpr_pair(lane, instr.dst.index, res)
+            results.append(res)
+        return results
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_full_execution(self) -> None:
+        """Wave32 wavefront executes across all 32 lanes with divergent per-lane inputs."""
+        simd = SIMDState(num_lanes=32, exec_mask=MASK32)
+        # Populate each lane with a distinct power of 4 or known square
+        test_inputs = [
+            ONE_F64, FOUR_F64, SIXTEEN_F64, SIXTY_FOUR_F64,
+            QUARTER_F64, SIXTEENTH_F64, POS_ZERO, POS_INF,
+        ] * 4  # 32 inputs
+        for lane, inp in enumerate(test_inputs):
+            simd.write_lane_vgpr_pair(lane, 2, inp)
+
+        instr = VRSQF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand.from_vgpr(2),
+        )
+        interp = SIMDInterpreter(simd)
+        res = interp.execute(instr)
+
+        self.assertEqual(len(res), 32)
+        for lane, inp in enumerate(test_inputs):
+            expected = oracle_v_rsq_f64(inp)
+            self.assertEqual(res[lane], expected)
+            self.assertEqual(simd.read_lane_vgpr_pair(lane, 0), expected)
+
+    def test_wave64_full_execution(self) -> None:
+        """Wave64 wavefront executes across all 64 lanes."""
+        simd = SIMDState(num_lanes=64, exec_mask=MASK64)
+        for lane in range(64):
+            simd.write_lane_vgpr_pair(lane, 4, FOUR_F64)
+
+        instr = VRSQF64Instruction(
+            dst=RegPair(6, RegType.VGPR),
+            src0=VOP3Operand.from_vgpr(4),
+        )
+        interp = SIMDInterpreter(simd)
+        res = interp.execute(instr)
+
+        self.assertEqual(len(res), 64)
+        for lane in range(64):
+            self.assertEqual(res[lane], HALF_F64)
+            self.assertEqual(simd.read_lane_vgpr_pair(lane, 6), HALF_F64)
+
+    def test_checkerboard_divergence_even_lanes(self) -> None:
+        """EXEC mask enables even lanes only; odd lanes must remain completely unmodified."""
+        exec_even = 0x5555_5555_5555_5555
+        simd = SIMDState(num_lanes=64, exec_mask=exec_even)
+        SENTINEL = 0xDEAD_BEEF_CAFE_BABE
+
+        for lane in range(64):
+            simd.write_lane_vgpr_pair(lane, 0, SENTINEL)
+            simd.write_lane_vgpr_pair(lane, 2, FOUR_F64)
+
+        instr = VRSQF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand.from_vgpr(2),
+        )
+        interp = SIMDInterpreter(simd)
+        res = interp.execute(instr)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(res[lane], HALF_F64)
+                self.assertEqual(simd.read_lane_vgpr_pair(lane, 0), HALF_F64)
+            else:
+                self.assertIsNone(res[lane])
+                self.assertEqual(simd.read_lane_vgpr_pair(lane, 0), SENTINEL)
+
+    def test_wave_half_divergence(self) -> None:
+        """EXEC mask enables lower 32 lanes (half-wave) only."""
+        exec_lo32 = 0x0000_0000_FFFF_FFFF
+        simd = SIMDState(num_lanes=64, exec_mask=exec_lo32)
+        SENTINEL = 0x1234_5678_9ABC_DEF0
+
+        for lane in range(64):
+            simd.write_lane_vgpr_pair(lane, 0, SENTINEL)
+            simd.write_lane_vgpr_pair(lane, 2, SIXTEEN_F64)
+
+        instr = VRSQF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand.from_vgpr(2),
+        )
+        interp = SIMDInterpreter(simd)
+        res = interp.execute(instr)
+
+        for lane in range(32):
+            self.assertEqual(res[lane], QUARTER_F64)
+            self.assertEqual(simd.read_lane_vgpr_pair(lane, 0), QUARTER_F64)
+
+        for lane in range(32, 64):
+            self.assertIsNone(res[lane])
+            self.assertEqual(simd.read_lane_vgpr_pair(lane, 0), SENTINEL)
+
+    def test_single_lane_active(self) -> None:
+        """EXEC mask enables exactly one lane (lane 17)."""
+        target_lane = 17
+        simd = SIMDState(num_lanes=64, exec_mask=(1 << target_lane))
+        SENTINEL = 0xAAAA_BBBB_CCCC_DDDD
+
+        for lane in range(64):
+            simd.write_lane_vgpr_pair(lane, 0, SENTINEL)
+            simd.write_lane_vgpr_pair(lane, 2, QUARTER_F64)
+
+        instr = VRSQF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand.from_vgpr(2),
+        )
+        interp = SIMDInterpreter(simd)
+        res = interp.execute(instr)
+
+        for lane in range(64):
+            if lane == target_lane:
+                self.assertEqual(res[lane], TWO_F64)
+                self.assertEqual(simd.read_lane_vgpr_pair(lane, 0), TWO_F64)
+            else:
+                self.assertIsNone(res[lane])
+                self.assertEqual(simd.read_lane_vgpr_pair(lane, 0), SENTINEL)
+
+    def test_zero_exec_mask_noop(self) -> None:
+        """An EXEC mask of 0 is a complete no-op across all registers and lanes."""
+        simd = SIMDState(num_lanes=64, exec_mask=0)
+        SENTINEL = 0x5555_AAAA_5555_AAAA
+
+        for lane in range(64):
+            simd.write_lane_vgpr_pair(lane, 0, SENTINEL)
+            simd.write_lane_vgpr_pair(lane, 2, FOUR_F64)
+
+        instr = VRSQF64Instruction(
+            dst=RegPair(0, RegType.VGPR),
+            src0=VOP3Operand.from_vgpr(2),
+        )
+        interp = SIMDInterpreter(simd)
+        res = interp.execute(instr)
+
+        self.assertTrue(all(r is None for r in res))
+        for lane in range(64):
+            self.assertEqual(simd.read_lane_vgpr_pair(lane, 0), SENTINEL)
+
+    def test_scalar_broadcast_to_active_simd_lanes(self) -> None:
+        """Source operand from SGPR pair is broadcast identically across all active lanes."""
+        simd = SIMDState(num_lanes=64, exec_mask=MASK64)
+        simd.write_sgpr_pair(10, SIXTEEN_F64)
+
+        instr = VRSQF64Instruction(
+            dst=RegPair(4, RegType.VGPR),
+            src0=VOP3Operand.from_sgpr(10),
+        )
+        interp = SIMDInterpreter(simd)
+        res = interp.execute(instr)
+
+        for lane in range(64):
+            self.assertEqual(res[lane], QUARTER_F64)
+            self.assertEqual(simd.read_lane_vgpr_pair(lane, 4), QUARTER_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
