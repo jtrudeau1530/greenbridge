@@ -203,6 +203,32 @@ class TestClassify(unittest.TestCase):
         self.assertNotIn(21, mesh.slots)
 
 
+class TestResourceKindDictionary(unittest.TestCase):
+    """Dictionary headers follow the pinned rpf9-explorer's DrawableDictionaryCheckBytes.
+
+    Every byte here is built by the test; no package bytes are used.
+    """
+
+    @staticmethod
+    def dictionary(pages=0x50000000 + 0x100):
+        b = bytearray(192)
+        struct.pack_into("<Q", b, 8, pages)
+        struct.pack_into("<Q", b, 32, 0x50000000 + 0x200)
+        struct.pack_into("<Q", b, 48, 0x50000000 + 0x300)
+        for at in (40, 42, 56, 58):
+            struct.pack_into("<H", b, at, 2)
+        return bytes(b)
+
+    def test_null_page_pointer_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(pages=0)))
+
+    def test_non_system_page_pointer_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(pages=0x12345678)))
+
+    def test_system_page_pointer_is_a_dictionary(self):
+        self.assertEqual(ss.resource_kind(self.dictionary()), "dictionary")
+
+
 class TestValidate(unittest.TestCase):
     def test_weighted_8bit_clean(self):
         _s, gfx, mesh = weighted_mesh("weighted-8inf-8bit", vertices=16, bones=6)
