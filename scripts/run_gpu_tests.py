@@ -38,7 +38,7 @@ from check import gpu_test_timeout, timed_out   # per-program time limit (LEONID
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
-from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem   # pixel producers and checks
+from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 
@@ -1168,6 +1168,11 @@ def run_suite(a, work: str) -> int:
                 with open(raw, "rb") as source:
                     problem = ij_computed_problem(list(struct.iter_unpack("<4I", source.read())))
                 ok, detail = not problem, problem or "computed I/J pair words and v/2 within 1e-6"
+            elif name == "ps_mandelbrot":
+                with open(raw, "rb") as source:
+                    px = list(struct.iter_unpack("<4I", source.read()))
+                problem = mandelbrot_problem(px)
+                ok, detail = not problem, problem or f"{len(px)}/{len(px)} iteration counts match the float32 model"
             else:
                 ok, detail = False, "no checker defined"
             results.append((name, ok, detail))
