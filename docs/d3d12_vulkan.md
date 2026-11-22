@@ -339,6 +339,8 @@ What is implemented (all of it testable without the game):
     signals the frame's fence, and the swapchain is recreated next time to get the image back. The next present
     therefore does not wait forever on a fence nothing signals. If even that batch fails, or a fence wait or reset
     fails, the presenter stops (`ok()` is false) and its owner makes a new one.
+  - for `PresentX` (section 4.5): a source rectangle, a blank present, an sRGB swapchain format for an sRGB source,
+    and an optional capture of each presented frame to host memory (what `xbox_present_test` reads back).
 
   The device needs `VK_KHR_swapchain` (and the instance the surface extensions). The standalone device enables
   them when present.
@@ -542,6 +544,7 @@ and any validation error fails them.
   - the `D3D12_OPTIONS17` answer;
   - the 22 written-or-refused cases behind the table in section 3.2, compared with the host's PC runtime when
     there is one.
+- `xbox_present_test`: `PresentX` and the frame events (section 4.5, "what is implemented"), checked on swapchain pixels.
 - `d3d12_descriptor_test`: descriptors through the proxy.
   - Copies, checked on the slots' bytes: one run, range lists of different shapes on each side, null size
     arrays, and a destination longer than its source.
@@ -1307,6 +1310,47 @@ Layer plan:
   timer and hand the token through to the present; `GetFrameStatisticsX` minimal; `SuspendX`/`ResumeX`; 0
   planes = blank screen. Test the methods directly with a fake clock, before slots are known.
 - The DXGI `CreateSwapChain*` path stays as the fallback and for PC-style tests, not as the first-boot target.
+
+**What is implemented (the presentation core).** Everything in the plan above that does not need a slot exists as
+methods of `rt::d3d12::XboxPresentation` (`runtime/shims/xbox_present.h`), on top of the presenter of section 3.2 and
+`leonida::FramePacer` (`runtime/src/frame_pacer.h`, no Vulkan, no Windows headers). The struct layouts, constant
+values, HRESULTs and the 64-bit token are **our own provisional definitions**: the samples give call shapes and field
+names only, so the real slots, layouts and enum values are still unmeasured and the class is the surface the proxy
+will forward to. The queue-side calls ignore which queue they came on (one `VkQueue` behind all of them).
+
+- *Frame pacing* (`FramePacer`, time from an injectable clock; real time is a steady timer, a host vblank source
+  can replace it). `SetFrameIntervalX` takes the interval as a period in microseconds and the latency, and starts
+  the vblank grid. `ScheduleFrameEventX` arms the origin event, delayed by an offset inside the frame.
+  `WaitFrameEventX` returns at the next origin with the next token (1, 2, 3, ...; 0 is the null token) and does not
+  return while `latency` presented frames are still waiting for their vblank. A wait that comes late returns at once
+  with the newest passed origin; the missed ones are skipped. A finite timeout gives
+  `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
+  `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render, not
+  `PercentScanned`); `S_FALSE` with count 0 for what it does not have.
+- *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
+  single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
+  (bilinear, so the rectangle's outer texels blend with their neighbours). The blit converts between formats; an sRGB
+  source gets an sRGB swapchain format and every other source a UNORM one, so the encoded bytes go through unchanged.
+  Integer, block-compressed and multisampled sources give `DXGI_ERROR_UNSUPPORTED`. 2 planes: plane 0 is shown, plane 1 is
+  dropped, and the missing HDR/GameDVR composition is logged once; they must share one token. More than 2 planes,
+  null planes, or an empty/outside rectangle give `E_INVALIDARG`. A missing `ALLOW_DISPLAY` heap flag is logged once
+  and presented anyway. `ImmediateThresholdPercent` is ignored (logged once when non-zero): a late frame waits for
+  its vblank.
+- *Tokens*: the token of a plane must have been issued by a wait and be newer than the last presented one. Null,
+  never issued, stale and repeated tokens give `E_INVALIDARG` and present nothing (our decision; the samples only pass
+  the token they just received). Skipping a token is fine.
+- *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
+  with `ERROR_INVALID_STATE` and refuses presents; resume allows presents again, but waits fail until
+  `SetFrameIntervalX` and `ScheduleFrameEventX` are called again, as the samples do. Tokens keep counting.
+- *Not done*: HDR/GameDVR plane composition, `ImmediateThresholdPercent`, a host-vblank clock (the timer drifts from the
+  display; with FIFO presents the swapchain holds the queue to the real refresh anyway), render statistics,
+  `PercentScanned`, and the vtable wiring. Slots to measure (all unknown): the device's `SetFrameIntervalX`,
+  `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` and the queue's `PresentX`, `SuspendX`, `ResumeX`
+  (the list is in the header).
+- *Tests*: `frame_pacer_test` (fake clock: interval, offset, late waits, timeouts, latency blocking, tokens,
+  statistics, suspend/resume, a real 10 ms timer; no GPU) and `xbox_present_test` (the Vulkan device, reading the
+  swapchain image back: blank, solid, two colours, source rectangles, RGBA/BGRA/sRGB sources, 2 planes, token errors,
+  statistics, suspend/resume, 30 frames at 60 Hz in real time; skipped, exit 77, without a Vulkan device).
 
 ### 4.6 Queries
 
