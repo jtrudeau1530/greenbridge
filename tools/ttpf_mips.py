@@ -1932,6 +1932,20 @@ def main(argv=None):
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         return 0
+    if a.cmd == "export":
+        # Refuse an output that aliases an input asset or metadata before the pool is
+        # opened (so its mmap can never be truncated on disk). --force may replace an
+        # ordinary DDS but never a pool, a calibration profile, or a supplied history file.
+        for asset, label in ((a.pool, "input pool"),
+                             (a.calibration, "--calibration profile"),
+                             (a.history, "--history file")):
+            if asset is None:
+                continue
+            if label == "--history file" and not os.path.isfile(asset):
+                continue
+            if same_output_path(a.out, asset):
+                print(f"ERROR: {a.out} would overwrite the {label} {asset}", file=sys.stderr)
+                return 2
     try:
         pool = Pool(a.pool)
     except (OSError, ValueError) as exc:
