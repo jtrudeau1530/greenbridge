@@ -539,6 +539,41 @@ child order; it establishes parsing fidelity, not the game's interpretation of f
 Synthetic tests cover the three schemas, unknown fields, symbolic references, duplicate/ambiguous fields,
 chunk boundaries, UTF-16, malformed/DTD input, limits, split carve payloads, missing blocks and the CLI.
 
+## Textures (`ASSET-148`)
+
+The stream-start scan above found zero `DDS`, `TXTR`, `DXT` or `BC` signatures because rest-of-world textures are
+not raw stream-start images. Measured on the 1.0.2.1 package, they live in two places:
+
+1. **Embedded RAGE9 `0x980` texture descriptors inside `zero-prefix` CPU-segment streams** (the same `grcTexture`
+   layout `tools/tex_headers.py` reads in the main archives: `q[k-1] == 0x980`, 256-byte-aligned GPU pointer
+   `0x60000000 + offset` at `q[k]`, `(width, height, depth, byte6, dxgi_format)` at `q[k+4]`, `flags | (mips << 16)`
+   at `q[k+5]`), paired with the following GPU-segment stream chain. `tools/restofworld_index.py` now detects these
+   descriptors inside `zero-prefix` streams (`tex980=`, `dict=`, and summary fields `texture_streams`,
+   `texture_dictionaries`, `texture_headers`):
+
+   | Archive | Texture streams | Standalone `pgDictionary` | Total `0x980` headers | GPU chain fit | Formats and tiling |
+   |---|---:|---:|---:|---:|---|
+   | `core_restofworld.rpf` | 145 | 144 (72×1, 72×2) | 278 | 278 / 278 | 216 tiled (`flags & 0xffff = 0x5`, 1–10 mips: `BC1_UNORM` 146, `BC1_UNORM_SRGB` 31, `BC7_UNORM` 26, `BC5_UNORM` 9, `BC7_UNORM_SRGB` 4) in the 144 dictionaries; 62 linear (`0x0`, 1 mip, `R16G16B16A16_FLOAT`, e.g. `16x4`–`16x10`) in one 576 KiB resource page |
+   | `story000_restofworld.rpf` | 1 | 0 | 51 | 51 / 51 | 51 linear (`0x0`, 1 mip, `R16G16B16A16_FLOAT`, `16x4`–`16x10`) in one 320 KiB resource page |
+   | `core_restofworld001.rpf` | 0 | 0 | 0 | — | textures are in the companion TTPF pool below |
+   | `story000_script.rpf` | 0 | 0 | 0 | — | none |
+
+   All 329 embedded descriptors across these archives have `dtype = 0x980`, `depth = 1`, `byte6 = 1`, and 100% fit
+   within their following GPU-segment stream chain (`data_off + mip0_bytes <= gpu_chain_bytes`).
+
+2. **Companion RDS5/TTPF texture pools** alongside the archives under `pack/core_restofworld*/data/ttdb/` (6 pools,
+   88,795,904 bytes total, **635** 2D textures, already walked and exported by `make_game.py`'s `assets` stage
+   under `ttpf_pack/core_restofworld/` and `ttpf_pack/core_restofworld001/`):
+
+   | Pool | Bytes | Textures | Formats |
+   |---|---:|---:|---|
+   | `pack/core_restofworld/data/ttdb/props/ttdb_props.ttpf` | 35,286,784 | 211 | `BC1_UNORM` 110, `BC1_UNORM_SRGB` 72, `BC7_UNORM_SRGB` 11, `BC7_UNORM` 9, `BC3_UNORM_SRGB` 8, `BC6H_UF16` 1 |
+   | `pack/core_restofworld/data/ttdb/textures_loose.ttpf` | 21,081,856 | 194 | `BC1_UNORM` 89, `BC4_UNORM` 67, `BC7_UNORM` 17, `BC7_UNORM_SRGB` 13, `BC5_UNORM` 5, `BC6H_UF16` 2, `BC3_UNORM_SRGB` 1 |
+   | `pack/core_restofworld/data/ttdb/peds/ttdb_peds.ttpf` | 24,529,408 | 165 | `BC1_UNORM` 67, `BC1_UNORM_SRGB` 46, `BC7_UNORM` 35, `BC5_UNORM` 9, `BC7_UNORM_SRGB` 5, `BC3_UNORM_SRGB` 1, other 2 |
+   | `pack/core_restofworld/data/ttdb/ui/ttdb_ui.ttpf` | 4,729,600 | 43 | `BC1_UNORM` 37, `BC7_UNORM` 6 |
+   | `pack/core_restofworld/data/ttdb/vfx/ttdb_vfx.ttpf` | 3,129,600 | 17 | `BC7_UNORM_SRGB` 5, `BC1_UNORM` 5, `BC5_UNORM` 5, `BC4_UNORM` 1, `BC3_UNORM_SRGB` 1 |
+   | `pack/core_restofworld001/data/ttdb/ui/ttdb_ui.ttpf` | 38,656 | 5 | `BC7_UNORM` 3, `BC3_UNORM` 2 |
+
 ## What a future decoder needs
 
 1. The RPF9 table-of-contents key/schema for names, paths and exact entry boundaries. This project
@@ -557,8 +592,9 @@ chunk boundaries, UTF-16, malformed/DTD input, limits, split carve payloads, mis
    a page-graph rule.
 7. A vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths;
    decoding vertex values still requires component types, final-stream widths and a way to
-   locate the owning geometry when only a graphics page is available. Texture identification also remains open:
-   the stream-start scan found no DDS, `TXTR`, DXT or BC signature.
+   locate the owning geometry when only a graphics page is available. (Texture identification is
+   resolved above under **Textures (`ASSET-148`)**: embedded `0x980` descriptors in `zero-prefix`
+   CPU-segment streams plus the companion `ttdb/*.ttpf` pools.)
 8. Runtime consumers for the XML content-definition records read by `tools/content_definitions.py`
    (see above). Their roots describe configuration, not UI layout; reference resolution and mapping
    to resources remain unimplemented.
