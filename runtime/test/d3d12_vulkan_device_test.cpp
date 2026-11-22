@@ -5133,6 +5133,7 @@ int main() {
                 {msaa_heap.p, msaa_heap_desc.SizeInBytes - 65536, msaa_unk_small_desc},
                 {upload_placed_heap.p, 0, msaa_unk_small_desc},
                 {deny_rt_heap.p, 0, msaa_unk_small_desc},
+                {deny_rt_heap.p, 0, tiled_rt_desc},
                 {msaa_heap.p, 0,
                  msaa_desc(256, 256, 4, 0, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE)},
                 {msaa_heap.p, 0,
@@ -5146,6 +5147,18 @@ int main() {
             for (const BadMsaaCase& bad : bad_msaa) {
                 Ref<ID3D12Resource> fail;
                 EXPECT(standalone->CreatePlacedResource(bad.heap, bad.offset, &bad.desc, D3D12_RESOURCE_STATE_COMMON,
+                                                        nullptr, IID_PPV_ARGS(&fail.p)) == E_INVALIDARG);
+                EXPECT(!fail.p);
+            }
+            D3D12_HEAP_DESC only_rt_desc = tiled_heap_desc;
+            only_rt_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+            Ref<ID3D12Heap> only_rt_heap;
+            EXPECT(SUCCEEDED(standalone->CreateHeap(&only_rt_desc, IID_PPV_ARGS(&only_rt_heap.p))));
+            for (const D3D12_RESOURCE_DESC& bad_only_rt :
+                 {texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1),
+                  buffer_desc(4096)}) {
+                Ref<ID3D12Resource> fail;
+                EXPECT(standalone->CreatePlacedResource(only_rt_heap.p, 0, &bad_only_rt, D3D12_RESOURCE_STATE_COMMON,
                                                         nullptr, IID_PPV_ARGS(&fail.p)) == E_INVALIDARG);
                 EXPECT(!fail.p);
             }
