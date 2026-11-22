@@ -4,6 +4,7 @@
 """
 import contextlib
 import csv
+import errno
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -176,6 +178,35 @@ class TestDialogue(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_unreadable_subdirectory_preserves_previous_tables_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            blocked = os.path.join(source, "blocked")
+            os.makedirs(blocked)
+            write(os.path.join(source, "visible.bin"), make_resource(EN))
+            write(os.path.join(blocked, "hidden.bin"), make_resource(DE))
+            report = os.path.join(tmp, "tables.csv")
+            previous = b"previous complete report\n"
+            write(report, previous)
+            scandir = os.scandir
+
+            def scan(path):
+                if path == blocked:
+                    raise PermissionError(errno.EACCES, "Permission denied", path)
+                return scandir(path)
+
+            with (patch.object(os, "scandir", side_effect=scan),
+                  contextlib.redirect_stderr(io.StringIO()) as error,
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(T.main([source, "--tables", report]), 2)
+
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(len(error.getvalue().splitlines()), 1)
+            self.assertIn("cannot read input", error.getvalue())
+            self.assertIn(repr(blocked), error.getvalue())
+            with open(report, "rb") as fh:
+                self.assertEqual(fh.read(), previous)
+
     def test_csv_exports_explicitly_empty_strings(self) -> None:
         strings = {"ZZ_SYNTHETIC_BLANK": "", "ZZ_SYNTHETIC_LINE": "This is the text you know"}
         with tempfile.TemporaryDirectory() as tmp:
