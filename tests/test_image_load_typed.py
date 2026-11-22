@@ -12,6 +12,7 @@ the capabilities, which binding and component type each fetch reads, and, with a
 picks the branch, the branch taken for all 512 FORMAT values with a hit and with a miss.
 runtime/test/shaders/cs_imgload.asm checks the result on a GPU (vk_store_test load).
 """
+import itertools
 import os
 import re
 import shutil
@@ -31,7 +32,8 @@ EPILOGUE = ["v_mov_b32 v8, v3", "exp mrt0 v8, v8, v8, v8 done vm", "s_endpgm"]
 
 # dim -> (address registers, sampled binding, SPIR-V Dim, arrayed)
 DIMS = {"2D": ("v[4:5]", 0, "2D", "0"), "2D_ARRAY": ("v[4:6]", 3, "2D", "1"),
-        "3D": ("v[4:6]", 6, "3D", "0"), "1D": ("v4", 5, "1D", "0")}
+        "3D": ("v[4:6]", 6, "3D", "0"), "1D": ("v4", 5, "1D", "0"),
+        "CUBE": ("v[4:6]", 3, "2D", "1")}
 STORAGE_IMAGE_CAPS = {"StorageImageReadWithoutFormat", "StorageImageWriteWithoutFormat", "Image1D"}
 
 
@@ -222,15 +224,16 @@ class LoadOnlyShaders(unittest.TestCase):
     def test_d16_odd_dmask_preserves_trailing_vgpr_high_half(self):
         # Odd component counts (1 or 3) must keep the trailing destination VGPR's high 16 bits via write_lo16
         # in all three typed branches (sint, uint, float), while even counts overwrite the whole register.
-        for dmask, dest_reg, expect_preserve in ((0x1, 0, True), (0x7, 1, True), (0x3, 0, False), (0xF, 1, False)):
-            with self.subTest(dmask=hex(dmask)):
+        cases = ((0x1, 0, True), (0x7, 1, True), (0x3, 0, False), (0xF, 1, False))
+        for dim, (dmask, dest_reg, expect_preserve) in itertools.product(("2D", "CUBE"), cases):
+            with self.subTest(dim=dim, dmask=hex(dmask)):
                 reg = "v0" if dest_reg == 0 else "v[0:1]"
                 m = Module(translate([
                     "v_mov_b32 v0, 0x5a5a0000",
                     "v_mov_b32 v1, 0x5a5a0000",
                     "v_mov_b32 v4, 1",
                     "v_mov_b32 v5, 2",
-                    f"image_load {reg}, v[4:5], s[0:7] dmask:0x{dmask:x} dim:SQ_RSRC_IMG_2D unorm d16",
+                    f"image_load {reg}, {DIMS[dim][0]}, s[0:7] dmask:0x{dmask:x} dim:SQ_RSRC_IMG_{dim} unorm d16",
                     "s_waitcnt vmcnt(0)",
                 ]))
                 # write_lo16 emits: OpBitwiseAnd %uint <copy_of_old_vgpr> %uint_0xFFFF0000.
