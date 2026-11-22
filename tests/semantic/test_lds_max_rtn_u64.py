@@ -1116,5 +1116,120 @@ class TestDSMaxRtnU64ConditionCodesAndFlags(unittest.TestCase):
         self.assertEqual(self.state.scc, canary_scc)
 
 
+class TestDSMaxRtnU64IEEE754EdgeCases(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 float64 boundaries, subnormals, and unsigned extremes."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory64(size_bytes=65536)
+        self.state = ScalarThreadState64(lds=self.lds)
+        self.interp = ScalarDSInterpreter64()
+
+    def test_signed_zero_bit_patterns_as_unsigned(self) -> None:
+        # In double-precision IEEE 754:
+        # +0.0 is 0x0000000000000000 (0)
+        # -0.0 is 0x8000000000000000 (9223372036854775808)
+        # In unsigned u64: -0.0 bit pattern is strictly greater than +0.0!
+        addr = 0x100
+        self.lds.write_qword(addr, 0x0000000000000000)
+        self.state.set_vgpr_u32(2, addr)
+        self.state.set_vgpr_u64(4, 0x8000000000000000)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x0000000000000000)
+        self.assertEqual(self.lds.read_qword(addr), 0x8000000000000000)
+
+    def test_signed_infinities_as_unsigned(self) -> None:
+        # Double precision IEEE 754:
+        # +Inf: 0x7FF0000000000000 (9218868437227405312)
+        # -Inf: 0xFFF0000000000000 (18442240474082181120)
+        # In unsigned u64: -Inf bit pattern is larger than +Inf!
+        addr = 0x180
+        self.lds.write_qword(addr, 0x7FF0000000000000)
+        self.state.set_vgpr_u32(2, addr)
+        self.state.set_vgpr_u64(4, 0xFFF0000000000000)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x7FF0000000000000)
+        self.assertEqual(self.lds.read_qword(addr), 0xFFF0000000000000)
+
+    def test_nan_bit_patterns_preserved(self) -> None:
+        # Float64 NaNs:
+        # qNaN: 0x7FF8000000000000
+        # sNaN: 0x7FF0000000000001
+        # neg_NaN: 0xFFF8000000000000
+        qnan = 0x7FF8000000000000
+        snan = 0x7FF0000000000001
+        neg_nan = 0xFFF8000000000000
+
+        addr = 0x200
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+
+        # qNaN vs sNaN -> qNaN is larger in unsigned u64
+        self.lds.write_qword(addr, snan)
+        self.state.set_vgpr_u32(2, addr)
+        self.state.set_vgpr_u64(4, qnan)
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, snan)
+        self.assertEqual(self.lds.read_qword(addr), qnan)
+
+        # neg_NaN vs qNaN -> neg_NaN has sign bit set, so larger in unsigned u64
+        self.state.set_vgpr_u64(4, neg_nan)
+        ret2 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret2, qnan)
+        self.assertEqual(self.lds.read_qword(addr), neg_nan)
+
+    def test_subnormal_doubles_as_unsigned(self) -> None:
+        # Smallest positive double subnormal: 0x0000000000000001
+        # Largest positive double subnormal: 0x000FFFFFFFFFFFFF
+        addr = 0x280
+        self.lds.write_qword(addr, 0x0000000000000001)
+        self.state.set_vgpr_u32(2, addr)
+        self.state.set_vgpr_u64(4, 0x000FFFFFFFFFFFFF)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x0000000000000001)
+        self.assertEqual(self.lds.read_qword(addr), 0x000FFFFFFFFFFFFF)
+
+    def test_uint64_extremes_and_last_qword(self) -> None:
+        # Last valid 8-byte qword boundary in 64 KiB LDS starts at byte 65528 (0xFFF8)
+        last_qword_addr = 65528
+        self.lds.write_qword(last_qword_addr, 0x1234567890ABCDEF)
+        self.state.set_vgpr_u32(2, 0)
+        self.state.set_vgpr_u64(4, UINT64_MAX)
+
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+            offset=last_qword_addr,
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x1234567890ABCDEF)
+        self.assertEqual(self.lds.read_qword(last_qword_addr), UINT64_MAX)
+
+
 if __name__ == "__main__":
     unittest.main()
