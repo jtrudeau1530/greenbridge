@@ -6916,6 +6916,85 @@ class Gen:
             r = self.tmp()
             self.emit_fma(r, vals[0], vals[1], vals[2])
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op in ("v_div_fmas_f32", "v_div_fmas_f64"):
+            # Scaled FMA for IEEE-754 division (RDNA2 ISA VOP3): D = VCC ? (2^32 * fma(S0, S1, S2)) : fma(S0, S1, S2)
+            # for f32, and 2^64 for f64. To preserve tiny intermediates that would underflow before a post-FMA
+            # multiply (e.g. 2^-75 * 2^-75 -> 2^-118 in f32, 2^-540 * 2^-540 -> 2^-1016 in f64), pre-scale the
+            # operands (S0*2^16, S1*2^16, S2*2^32 for f32; S0*2^32, S1*2^32, S2*2^64 for f64) whenever none of the
+            # pre-scaled operands can overflow, falling back to post-FMA scaling otherwise.
+            vcc_b = self.tmp_bool_nz(self.mask_src({"k": "special", "t": "vcc"}))
+            if op == "v_div_fmas_f32":
+                x, y, z = (self.src_f(t) for t in a[1:4])
+                ax, ay, az, lx, ly, lz, lxy, pre_ok = (self.tmp() for _ in range(8))
+                self.emit(f"{ax} = OpExtInst %float %glsl FAbs {x}")
+                self.emit(f"{ay} = OpExtInst %float %glsl FAbs {y}")
+                self.emit(f"{az} = OpExtInst %float %glsl FAbs {z}")
+                self.emit(f"{lx} = OpFOrdLessThan %bool {ax} {self.fconst(2.0 ** 110)}")
+                self.emit(f"{ly} = OpFOrdLessThan %bool {ay} {self.fconst(2.0 ** 110)}")
+                self.emit(f"{lz} = OpFOrdLessThan %bool {az} {self.fconst(2.0 ** 95)}")
+                self.emit(f"{lxy} = OpLogicalAnd %bool {lx} {ly}")
+                self.emit(f"{pre_ok} = OpLogicalAnd %bool {lxy} {lz}")
+                xs, ys, zs, f_pre, f_plain, f_post, sc, r = (self.tmp() for _ in range(8))
+                self.emit(f"{xs} = OpFMul %float {x} {self.fconst(2.0 ** 16)}")
+                self.emit(f"{ys} = OpFMul %float {y} {self.fconst(2.0 ** 16)}")
+                self.emit(f"{zs} = OpFMul %float {z} {self.fconst(2.0 ** 32)}")
+                self.emit_fma(f_pre, xs, ys, zs)
+                self.emit_fma(f_plain, x, y, z)
+                self.emit(f"{f_post} = OpFMul %float {f_plain} {self.fconst(2.0 ** 32)}")
+                self.emit(f"{sc} = OpSelect %float {pre_ok} {f_pre} {f_post}")
+                self.emit(f"{r} = OpSelect %float {vcc_b} {sc} {f_plain}")
+                self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+            else:
+                def f64(sv):
+                    if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                        lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+                    elif sv["k"] in ("imm", "fimm"):
+                        bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
+                                if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+                        lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+                    else:
+                        raise Unsupported(op + " operand")
+                    v2, d = self.tmp(), self.tmp()
+                    self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
+                    self.emit(f"{d} = OpBitcast %double {v2}")
+                    if sv.get("abs"):
+                        t = self.tmp()
+                        self.emit(f"{t} = OpExtInst %double %glsl FAbs {d}")
+                        d = t
+                    if sv.get("neg"):
+                        t = self.tmp()
+                        self.emit(f"{t} = OpFNegate %double {d}")
+                        d = t
+                    return d
+                d = a[0]
+                if d["k"] != "vgpr" or d.get("n") != 2:
+                    raise Unsupported(op + " destination")
+                self.uses_f64 = True
+                x, y, z = (f64(t) for t in a[1:4])
+                ax, ay, az, lx, ly, lz, lxy, pre_ok = (self.tmp() for _ in range(8))
+                self.emit(f"{ax} = OpExtInst %double %glsl FAbs {x}")
+                self.emit(f"{ay} = OpExtInst %double %glsl FAbs {y}")
+                self.emit(f"{az} = OpExtInst %double %glsl FAbs {z}")
+                self.emit(f"{lx} = OpFOrdLessThan %bool {ax} {self.dconst(2.0 ** 990)}")
+                self.emit(f"{ly} = OpFOrdLessThan %bool {ay} {self.dconst(2.0 ** 990)}")
+                self.emit(f"{lz} = OpFOrdLessThan %bool {az} {self.dconst(2.0 ** 958)}")
+                self.emit(f"{lxy} = OpLogicalAnd %bool {lx} {ly}")
+                self.emit(f"{pre_ok} = OpLogicalAnd %bool {lxy} {lz}")
+                xs, ys, zs, f_pre, f_plain, f_post, sc, r, v2, lo, hi = (self.tmp() for _ in range(11))
+                self.emit(f"{xs} = OpFMul %double {x} {self.dconst(2.0 ** 32)}")
+                self.emit(f"{ys} = OpFMul %double {y} {self.dconst(2.0 ** 32)}")
+                self.emit(f"{zs} = OpFMul %double {z} {self.dconst(2.0 ** 64)}")
+                self.emit(f"{f_pre} = OpExtInst %double %glsl Fma {xs} {ys} {zs}")
+                self.emit(f"{f_plain} = OpExtInst %double %glsl Fma {x} {y} {z}")
+                self.emit(f"{f_post} = OpFMul %double {f_plain} {self.dconst(2.0 ** 64)}")
+                self.emit(f"{sc} = OpSelect %double {pre_ok} {f_pre} {f_post}")
+                self.emit(f"{r} = OpSelect %double {vcc_b} {sc} {f_plain}")
+                r = self.clamp_mods_f64(r, mods)
+                self.emit(f"{v2} = OpBitcast %v2uint_d {r}")
+                self.emit(f"{lo} = OpCompositeExtract %uint {v2} 0")
+                self.emit(f"{hi} = OpCompositeExtract %uint {v2} 1")
+                self.dst({"k": "vgpr", "r": d["r"], "n": 1}, lo)
+                self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, hi)
         elif op in ("v_mad_f32", "v_mac_f32"):
             # Unfused: the product is rounded before the add. v_mac_f32 is the VOP2 form with D as the addend
             # (LLVM SIInstrInfo.cpp getNewFMAInst: V_MAC_F32 -> V_MAD_F32_e64, V_FMAC_F32 -> V_FMA_F32_e64).
