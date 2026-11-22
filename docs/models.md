@@ -3,7 +3,8 @@
 Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the
 upstream `rpf9-explorer` fix that closes it. The fix is merged upstream and the submodule is
 pinned at `e293917` (the 350,248-model counts below were measured at `917e9b9`, before
-upstream `v1.2` PRs #8–#12 landed).
+upstream `v1.2` PRs #8-#12 landed; the non-`levels.rpf` archives were then re-counted at
+`e293917`).
 
 Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
 dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
@@ -19,9 +20,9 @@ per entry), the TTPF compact/array/cubemap/volume layouts, and the external draw
 reader. Commits `917e9b9..e293917` add upstream `v1.2` model-discovery changes (PRs #8–#12:
 optional fragment pointers, skipping texture dictionaries in drawable-dictionary scans, 16-bit
 bone-palette indices, probe-count parity, and zero-radius drawables) plus BCPack BC1/BC3/BC4/BC5
-decoding (PR #7). The 350,248-model counts below were measured at `917e9b9` and have not yet been
-re-counted at `e293917`. This page keeps the pre-pin measurements as the control and records the
-`917e9b9` counts below; it is not a competing patch.
+decoding (PR #7). The 350,248-model counts below were measured at `917e9b9` and are kept as the
+control; the `e293917` re-count for the non-`levels.rpf` archives is in the table below. This page
+records both, and is not a competing patch.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
 Leonida, including 169 previously rejected candidates (also verified after archive readback). A
@@ -175,9 +176,10 @@ reproduced the ten-archive total. The `48557ea` column is the pre-fix control:
 | **Total** | **190,792** | **155,598** | **190,792** |
 
 The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archive recovers
-24,034 models, and the other archives' new-pin counts are in the table above. The rows here are
-the `c3708fb` measurements (190,792 models); the new-pin re-count is 350,248. Triangle totals
-have not been re-run at the new pin.
+24,034 models (26,585 at `e293917`), and the other archives' new-pin counts are in the table above.
+The rows here are the `c3708fb` measurements (190,792 models); the `917e9b9` re-count is 350,248,
+and the `e293917` re-count outside `levels.rpf` is 39,454. Triangle totals have not been re-run at
+either new pin.
 
 At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
 failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
