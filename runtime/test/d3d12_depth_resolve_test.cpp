@@ -321,13 +321,21 @@ int main() {
             if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
             const char* name = warp ? "WARP" : "the default adapter";
-            unsigned same = 0, compared = 0, refused_alike = 0;
+            unsigned same = 0, compared = 0, refused_alike = 0, quirks = 0;
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 const Case& c = cases[i];
                 if (results[i].depth.empty() || (warp && c.format == d32)) continue;  // see the top of the file
                 Planes expected;
                 if (!resolve_and_read(host.p, c, expected, false)) return 1;
                 ++compared;
+                // The layer's result was checked against the clears above. A host that differs from the clears is a
+                // host quirk (NVIDIA's D3D12 driver on D24S8 rectangle resolves), not a layer bug: report, don't fail.
+                if (SUCCEEDED(expected.close) && !same_planes(expected, expected_planes(c), warp, c.plane)) {
+                    std::printf("%s %s rect %d against %s: host quirk: the host differs from the clears; the layer "
+                                "matches them\n", c.name, mode_name(c.mode), int(c.rect), name);
+                    ++quirks;
+                    continue;
+                }
                 if (FAILED(expected.close) || !same_planes(expected, results[i], warp, c.plane)) {
                     std::fprintf(stderr, "%s %s rect %d against %s: host Close 0x%08lx, host %s the clears, "
                                  "layer and host %s\n", c.name, mode_name(c.mode), int(c.rect), name, expected.close,
@@ -350,8 +358,8 @@ int main() {
                 }
                 ++refused_alike;
             }
-            std::printf("depth/stencil resolves against %s: %u of %u match, %u refusals alike\n", name, same, compared,
-                        refused_alike);
+            std::printf("depth/stencil resolves against %s: %u of %u match, %u host quirks, %u refusals alike\n", name,
+                        same, compared, quirks, refused_alike);
             matched += same;
             ++references;
         }
