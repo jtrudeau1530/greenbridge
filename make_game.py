@@ -611,9 +611,14 @@ def runtime(game: str, out: str, v: dict) -> None:
     log("runtime: building")
     run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
          os.path.join(ROOT, "scripts", "build_runtime.ps1")])
-    built = os.path.join(ROOT, "runtime", "build", "gta6rt.exe")
+    artifacts = [os.path.join(ROOT, "runtime", "build", name)
+                 for name in ("gta6rt.exe", "gta6rt_tls_host.dll")]
+    for built in artifacts:
+        if not os.path.isfile(built):
+            fail(f"runtime: build did not produce {built}")
     os.makedirs(out, exist_ok=True)
-    shutil.copy2(built, os.path.join(out, "gta6rt.exe"))
+    for built in artifacts:
+        shutil.copy2(built, out)
     with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8") as f:
         f.write(os.path.abspath(game))
     if not os.path.isfile(os.path.join(game, v["expected_exe"])):
