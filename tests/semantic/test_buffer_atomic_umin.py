@@ -73,6 +73,10 @@ class BufferResourceDescriptor:
     num_records: int
     format_flags: int = 0
 
+    def __post_init__(self) -> None:
+        if self.num_records < 0:
+            raise ValueError(f"num_records must be non-negative: {self.num_records}")
+
     @classmethod
     def from_dwords(cls, d0: int, d1: int, d2: int, d3: int) -> BufferResourceDescriptor:
         base_lo = d0 & MASK32
@@ -94,6 +98,8 @@ class BufferMemory:
     """Byte-addressable memory buffer simulating GPU global / buffer device memory."""
 
     def __init__(self, size: int = 65536) -> None:
+        if size < 0:
+            raise ValueError(f"BufferMemory size cannot be negative: {size}")
         self.data: bytearray = bytearray(size)
 
     def read_u32(self, addr: int) -> int:
@@ -922,5 +928,262 @@ class TestBufferAtomicUminBoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.mem.read_u32(16), 0x00000001)
 
 
+
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def mutant_buffer_atomic_signed_min(
+    mem: BufferMemory,
+    desc: BufferResourceDescriptor,
+    soffset: int,
+    vaddr: int,
+    cmp_val: int,
+    inst_offset: int = 0,
+    glc: bool = False,
+    offen: bool = True,
+) -> tuple[int, bool]:
+    """Mutant 1: Signed integer minimum instead of unsigned minimum."""
+    addr = (soffset & MASK32) + (inst_offset & 0xFFF)
+    if offen:
+        addr = (addr + (vaddr & MASK32)) & MASK32
+    if addr + 4 > desc.num_records:
+        return 0, False
+    old_val = mem.read_u32(addr)
+
+    def to_s32(val: int) -> int:
+        v = val & MASK32
+        return v - 0x1_0000_0000 if v & 0x8000_0000 else v
+
+    min_s = min(to_s32(old_val), to_s32(cmp_val))
+    mem.write_u32(addr, min_s & MASK32)
+    return (old_val if glc else 0), True
+
+
+def mutant_buffer_atomic_umax(
+    mem: BufferMemory,
+    desc: BufferResourceDescriptor,
+    soffset: int,
+    vaddr: int,
+    cmp_val: int,
+    inst_offset: int = 0,
+    glc: bool = False,
+    offen: bool = True,
+) -> tuple[int, bool]:
+    """Mutant 2: Unsigned maximum instead of minimum."""
+    addr = (soffset & MASK32) + (inst_offset & 0xFFF)
+    if offen:
+        addr = (addr + (vaddr & MASK32)) & MASK32
+    if addr + 4 > desc.num_records:
+        return 0, False
+    old_val = mem.read_u32(addr)
+    mem.write_u32(addr, max(u32(old_val), u32(cmp_val)))
+    return (old_val if glc else 0), True
+
+
+def mutant_buffer_atomic_oob_write(
+    mem: BufferMemory,
+    desc: BufferResourceDescriptor,
+    soffset: int,
+    vaddr: int,
+    cmp_val: int,
+    inst_offset: int = 0,
+    glc: bool = False,
+    offen: bool = True,
+) -> tuple[int, bool]:
+    """Mutant 3: Writes memory even when out of bounds."""
+    addr = (soffset & MASK32) + (inst_offset & 0xFFF)
+    if offen:
+        addr = (addr + (vaddr & MASK32)) & MASK32
+    is_in_bounds = (addr + 4 <= desc.num_records)
+    old_val = mem.read_u32(addr) if addr + 4 <= len(mem.data) else 0
+    # Faulty mutant ignores bounds check and writes to memory if within physical storage
+    if addr + 4 <= len(mem.data):
+        mem.write_u32(addr, min(u32(old_val), u32(cmp_val)))
+    return (old_val if glc else 0), is_in_bounds
+
+
+def mutant_buffer_atomic_glc_returns_new(
+    mem: BufferMemory,
+    desc: BufferResourceDescriptor,
+    soffset: int,
+    vaddr: int,
+    cmp_val: int,
+    inst_offset: int = 0,
+    glc: bool = False,
+    offen: bool = True,
+) -> tuple[int, bool]:
+    """Mutant 4: GLC returns new value instead of old value."""
+    addr = (soffset & MASK32) + (inst_offset & 0xFFF)
+    if offen:
+        addr = (addr + (vaddr & MASK32)) & MASK32
+    if addr + 4 > desc.num_records:
+        return 0, False
+    old_val = mem.read_u32(addr)
+    new_val = min(u32(old_val), u32(cmp_val))
+    mem.write_u32(addr, new_val)
+    return (new_val if glc else 0), True
+
+
+def mutant_buffer_atomic_add(
+    mem: BufferMemory,
+    desc: BufferResourceDescriptor,
+    soffset: int,
+    vaddr: int,
+    cmp_val: int,
+    inst_offset: int = 0,
+    glc: bool = False,
+    offen: bool = True,
+) -> tuple[int, bool]:
+    """Mutant 5: Addition instead of unsigned minimum."""
+    addr = (soffset & MASK32) + (inst_offset & 0xFFF)
+    if offen:
+        addr = (addr + (vaddr & MASK32)) & MASK32
+    if addr + 4 > desc.num_records:
+        return 0, False
+    old_val = mem.read_u32(addr)
+    mem.write_u32(addr, (old_val + cmp_val) & MASK32)
+    return (old_val if glc else 0), True
+
+
+class TestBufferAtomicUminNegativeControls(unittest.TestCase):
+    """Negative controls and instruction syntax rejection tests."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+
+    def test_rejection_negative_memory_size(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferMemory(-1)
+
+    def test_rejection_invalid_descriptor_records(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferResourceDescriptor(base_address=0, stride=0, num_records=-1)
+
+    def test_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+
+    def test_rejection_invalid_instruction_fields(self) -> None:
+        # Invalid vdata (SGPR instead of VGPR)
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN,
+                vdata=Register(RegKind.SGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 0, count=4),
+                soffset=0,
+            )
+        # Invalid srsrc count (must be 4)
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN,
+                vdata=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 0, count=2),
+                soffset=0,
+            )
+        # Invalid offset out of [0, 4095]
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=5000)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+        # Invalid register index out of range [0, 255]
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 300)
+        # Invalid soffset kind (cannot be VGPR)
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN,
+                vdata=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 0, count=4),
+                soffset=Register(RegKind.VGPR, 2),
+            )
+
+
+class TestBufferAtomicUminMutationDetection(unittest.TestCase):
+    """Mutation detection tests ensuring 100% kill rate of faulty mutants."""
+
+    def setUp(self) -> None:
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+
+    def test_kills_signed_min_mutant(self) -> None:
+        # In unsigned: min(10, 0xFFFFFFFF) == 10
+        # In signed:   min(10, -1) == -1 (0xFFFFFFFF)
+        mem_ref = BufferMemory(1024)
+        mem_ref.write_u32(0, 0xFFFFFFFF)
+        ret_ref, _ = ref_buffer_atomic_umin(mem_ref, self.desc, soffset=0, vaddr=0, cmp_val=10, glc=True)
+
+        mem_mut = BufferMemory(1024)
+        mem_mut.write_u32(0, 0xFFFFFFFF)
+        ret_mut, _ = mutant_buffer_atomic_signed_min(mem_mut, self.desc, soffset=0, vaddr=0, cmp_val=10, glc=True)
+
+        # Mutated memory differs: reference stores 10, signed min stores 0xFFFFFFFF
+        self.assertEqual(mem_ref.read_u32(0), 10)
+        self.assertEqual(mem_mut.read_u32(0), 0xFFFFFFFF)
+        self.assertNotEqual(mem_ref.read_u32(0), mem_mut.read_u32(0))
+
+    def test_kills_umax_mutant(self) -> None:
+        mem_ref = BufferMemory(1024)
+        mem_ref.write_u32(0, 100)
+        ref_buffer_atomic_umin(mem_ref, self.desc, soffset=0, vaddr=0, cmp_val=50)
+
+        mem_mut = BufferMemory(1024)
+        mem_mut.write_u32(0, 100)
+        mutant_buffer_atomic_umax(mem_mut, self.desc, soffset=0, vaddr=0, cmp_val=50)
+
+        # Reference stores 50, umax stores 100
+        self.assertEqual(mem_ref.read_u32(0), 50)
+        self.assertEqual(mem_mut.read_u32(0), 100)
+        self.assertNotEqual(mem_ref.read_u32(0), mem_mut.read_u32(0))
+
+    def test_kills_oob_write_mutant(self) -> None:
+        # Buffer has 100 records (valid dwords up to 96)
+        small_desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        mem_ref = BufferMemory(1024)
+        mem_ref.write_u32(100, 777)
+        ret_ref, bounds_ref = ref_buffer_atomic_umin(mem_ref, small_desc, soffset=0, vaddr=100, cmp_val=50)
+
+        mem_mut = BufferMemory(1024)
+        mem_mut.write_u32(100, 777)
+        ret_mut, bounds_mut = mutant_buffer_atomic_oob_write(mem_mut, small_desc, soffset=0, vaddr=100, cmp_val=50)
+
+        # Reference rejects write (preserves 777), mutant writes 50
+        self.assertEqual(mem_ref.read_u32(100), 777)
+        self.assertEqual(mem_mut.read_u32(100), 50)
+        self.assertNotEqual(mem_ref.read_u32(100), mem_mut.read_u32(100))
+
+    def test_kills_glc_returns_new_mutant(self) -> None:
+        mem_ref = BufferMemory(1024)
+        mem_ref.write_u32(0, 200)
+        ret_ref, _ = ref_buffer_atomic_umin(mem_ref, self.desc, soffset=0, vaddr=0, cmp_val=80, glc=True)
+
+        mem_mut = BufferMemory(1024)
+        mem_mut.write_u32(0, 200)
+        ret_mut, _ = mutant_buffer_atomic_glc_returns_new(mem_mut, self.desc, soffset=0, vaddr=0, cmp_val=80, glc=True)
+
+        # Reference returns old value (200), mutant returns new value (80)
+        self.assertEqual(ret_ref, 200)
+        self.assertEqual(ret_mut, 80)
+        self.assertNotEqual(ret_ref, ret_mut)
+
+    def test_kills_add_mutant(self) -> None:
+        mem_ref = BufferMemory(1024)
+        mem_ref.write_u32(0, 10)
+        ref_buffer_atomic_umin(mem_ref, self.desc, soffset=0, vaddr=0, cmp_val=20)
+
+        mem_mut = BufferMemory(1024)
+        mem_mut.write_u32(0, 10)
+        mutant_buffer_atomic_add(mem_mut, self.desc, soffset=0, vaddr=0, cmp_val=20)
+
+        # Reference stores min(10, 20) = 10, add stores 10 + 20 = 30
+        self.assertEqual(mem_ref.read_u32(0), 10)
+        self.assertEqual(mem_mut.read_u32(0), 30)
+        self.assertNotEqual(mem_ref.read_u32(0), mem_mut.read_u32(0))
+
+
 if __name__ == "__main__":
     unittest.main()
+
