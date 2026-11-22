@@ -200,6 +200,7 @@ public:
         if (!list_.execute_bundle(bundle->list_)) return check(false);
 
         // Only the sticky state currently recorded by this COM layer is carried back from the bundle.
+        if (bundle->blend_factor_set_) blend_factor_ = bundle->blend_factor_;
         if (bundle->stencil_ref_set_) {
             front_stencil_ref_ = bundle->front_stencil_ref_;
             back_stencil_ref_ = bundle->back_stencil_ref_;
@@ -315,6 +316,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
+        blend_factor_set_ = true;
         blend_factor_ = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
                                : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
     }
@@ -816,6 +818,7 @@ private:
     std::vector<leonida::TargetView> render_targets_;
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
+    bool blend_factor_set_ = false;
 
     // The root signatures and pipeline states this recording uses. D3D12 lets an application release them right
     // after Set*RootSignature / SetPipelineState; the list keeps them until Reset or its own release, so the root
@@ -854,6 +857,7 @@ private:
         render_targets_.clear();
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
+        blend_factor_set_ = false;
         set_pipeline(state);
     }
 
