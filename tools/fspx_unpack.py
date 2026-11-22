@@ -23,6 +23,7 @@ corpus uses, so tools/rdna2spirv.py can read it:
     DIR/index.json           [{"file": "<name>.dxbc", "stage": "cs", ...}]
     DIR/fspx/<name>.json     the decoded kind-0 entry, the directory and the code range
     DIR/fspx/<name>.code     the kind-6 program
+    DIR/fspx/<name>.state    the kind-0 entry as it is (its SHA-256 is the index's fspx_state_sha256)
     DIR/disasm/<name>.s      with --disasm: tools/shader_disasm.py output for the code after the prologue
 """
 import argparse
@@ -211,6 +212,8 @@ def main(argv=None) -> int:
                     f.write(container)
             with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
                 f.write(blob[6])
+            with open(os.path.join(a.out, "fspx", name + ".state"), "wb") as f:
+                f.write(blob[0])
             with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=1)
             if disasm and meta["code"]["end"]:

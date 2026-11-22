@@ -514,11 +514,16 @@ inline std::vector<std::uint8_t> fssm_program(std::span<const std::uint8_t> byte
 // ---------------------------------------------------------------------------------------------------------------
 // FSPX payloads: the FidelityFX DLL's compute programs (docs/fspx.md)
 
-// The kind-6 program of an FSPX payload, or an empty span when the payload is not one the DLL's reader accepts.
-// Same rules as that reader and tools/fspx_unpack.py's parse_fspx: the total is clamped to the buffer, the directory
-// must fit it, an entry whose range starts inside the directory or ends past the total is skipped, the last entry of
-// a kind wins, and kind 0 and kind 6 must both be there and non-empty.
-inline std::span<const std::uint8_t> fspx_program(std::span<const std::uint8_t> payload) {
+// The two entries of an FSPX payload the runtime reads: kind 0 (dispatch state) and kind 6 (the program).
+struct FspxParts {
+    std::span<const std::uint8_t> state, code;
+};
+
+// Kinds 0 and 6 of an FSPX payload, both empty when the payload is not one the DLL's reader accepts. Same rules as
+// that reader and tools/fspx_unpack.py's parse_fspx: the total is clamped to the buffer, the directory must fit it,
+// an entry whose range starts inside the directory or ends past the total is skipped, the last entry of a kind wins,
+// and kind 0 and kind 6 must both be there and non-empty.
+inline FspxParts fspx_parts(std::span<const std::uint8_t> payload) {
     const auto u32 = [&](std::size_t at) {
         std::uint32_t v;
         std::memcpy(&v, payload.data() + at, 4);
@@ -528,16 +533,22 @@ inline std::span<const std::uint8_t> fspx_program(std::span<const std::uint8_t> 
     const std::uint64_t total = std::min<std::uint64_t>(u32(12), payload.size());
     const std::uint64_t end_dir = 16 + 16 * std::uint64_t(u32(8));
     if (total < end_dir) return {};
-    std::uint64_t code_offset = 0, code_size = 0, state_size = 0;
+    std::uint64_t code_offset = 0, code_size = 0, state_offset = 0, state_size = 0;
     for (std::uint64_t at = 16; at < end_dir; at += 16) {
         const std::uint32_t kind = u32(std::size_t(at)), offset = u32(std::size_t(at) + 4),
                             size = u32(std::size_t(at) + 8);
         if (offset < end_dir || std::uint64_t(offset) + size > total) continue;  // the DLL skips it too
         if (kind == 6) code_offset = offset, code_size = size;
-        if (kind == 0) state_size = size;
+        if (kind == 0) state_offset = offset, state_size = size;
     }
     if (!state_size || !code_size) return {};
-    return payload.subspan(std::size_t(code_offset), std::size_t(code_size));
+    return {payload.subspan(std::size_t(state_offset), std::size_t(state_size)),
+            payload.subspan(std::size_t(code_offset), std::size_t(code_size))};
+}
+
+// The kind-6 program of an FSPX payload, or an empty span (fspx_parts).
+inline std::span<const std::uint8_t> fspx_program(std::span<const std::uint8_t> payload) {
+    return fspx_parts(payload).code;
 }
 
 // Whether `code` looks like a bare kind-6 program: the 36-byte prologue of three VOP3 words with opcode 0x180
@@ -558,6 +569,9 @@ struct ComputeProgram {
     // The bytes whose SHA-256 is the index key (fssm_sha256 or fspx_code_sha256), and which the pipeline copies to
     // the GPU address arena as its code base: the program's code offsets are into them.
     std::vector<std::uint8_t> bytes;
+    // An FSPX program from a container or a bare payload: its kind-0 entry, whose SHA-256 (fspx_state_sha256) picks
+    // among translations of the same kind-6 bytes. Empty for a bare kind-6 program, which comes without it.
+    std::vector<std::uint8_t> state;
 };
 
 // The program in a compute shader's bytecode:
@@ -573,16 +587,17 @@ inline ComputeProgram compute_program(std::span<const std::uint8_t> bytecode) {
         out.kind = ComputeProgram::Kind::fssm;
         return out;
     }
-    std::span<const std::uint8_t> code;
+    FspxParts parts;
     if (bytecode.size() >= 4 && std::memcmp(bytecode.data(), "DXBC", 4) == 0)
-        code = fspx_program(dxbc_part(bytecode, "ACCC"));
+        parts = fspx_parts(dxbc_part(bytecode, "ACCC"));
     else if (bytecode.size() >= 4 && std::memcmp(bytecode.data(), "FSPX", 4) == 0)
-        code = fspx_program(bytecode);
+        parts = fspx_parts(bytecode);
     else if (fspx_bare_program(bytecode))
-        code = bytecode;
-    if (code.empty()) return out;
+        parts.code = bytecode;
+    if (parts.code.empty()) return out;
     out.kind = ComputeProgram::Kind::fspx;
-    out.bytes.assign(code.begin(), code.end());
+    out.bytes.assign(parts.code.begin(), parts.code.end());
+    out.state.assign(parts.state.begin(), parts.state.end());
     return out;
 }
 
@@ -604,6 +619,7 @@ struct ShaderEntry {
     std::string stage;  // "vs", "ps", "cs", "ms", "gs"
     std::string fssm_sha256;
     std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
+    std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
     std::size_t binding_count = 0;  // set-0 bindings the module declares
     std::uint32_t push_constant_bytes = 0;
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
@@ -664,11 +680,36 @@ public:
         return lookup(fspx_entries_, stage, fspx_code_sha256);
     }
 
-    // The entries for a program compute_program() found, by the key of its kind.
-    std::vector<const ShaderEntry*> program_candidates(std::string_view stage, const ComputeProgram& program) const {
+    // The entries for a program compute_program() found, by the key of its kind (docs/fspx.md, "Build and run-time
+    // lookup"):
+    //   - FSSM: by fssm_sha256, as before;
+    //   - FSPX with its kind-0 entry (a container or a bare payload): by fspx_code_sha256, then only the entries
+    //     whose fspx_state_sha256 is the SHA-256 of that kind-0 entry;
+    //   - a bare kind-6 program, which comes without kind 0: by fspx_code_sha256 when all those entries have the
+    //     same module; when their modules differ the program is ambiguous, the result is empty and `ambiguous` is
+    //     set, instead of picking one of them.
+    std::vector<const ShaderEntry*> program_candidates(std::string_view stage, const ComputeProgram& program,
+                                                       bool* ambiguous = nullptr) const {
+        if (ambiguous) *ambiguous = false;
         if (program.kind == ComputeProgram::Kind::none) return {};
         const std::string hash = sha256_hex(program.bytes);
-        return program.kind == ComputeProgram::Kind::fssm ? candidates(stage, hash) : fspx_candidates(stage, hash);
+        if (program.kind == ComputeProgram::Kind::fssm) return candidates(stage, hash);
+        auto all = fspx_candidates(stage, hash);
+        if (!program.state.empty()) {
+            const std::string state = sha256_hex(program.state);
+            std::erase_if(all, [&](const ShaderEntry* e) { return e->fspx_state_sha256 != state; });
+            return all;
+        }
+        if (all.size() > 1) {
+            const auto first = spirv(*all.front());
+            for (std::size_t i = 1; i < all.size(); ++i) {
+                if (first.empty() || spirv(*all[i]) != first) {
+                    if (ambiguous) *ambiguous = true;
+                    return {};
+                }
+            }
+        }
+        return all;
     }
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
@@ -727,6 +768,8 @@ private:
             e.stage = stage->string;
             if (by_fssm) e.fssm_sha256 = hash->string;
             if (by_fspx) e.fspx_code_sha256 = code_hash->string;
+            if (const Json* s = meta.find("fspx_state_sha256"); s && s->kind == Json::Kind::string)
+                e.fspx_state_sha256 = s->string;
             if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)

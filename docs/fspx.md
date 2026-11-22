@@ -117,10 +117,20 @@ compute shader.
 **Build.** `make_game.py`'s `shaders` stage, after the game's own shaders, runs `tools/fspx_unpack.py --disasm` on
 the package's `amd_fidelityfx_upscaler_xbox.dll` into `<work>/shaders/fspx/` and `tools/rdna2spirv.py` on that
 disassembly into `<work>/shaders/spirv/fspx/`, with the same `--wave64-emulate` and fallback flags. Each index entry
-of a program without an FSSM blob gets `fspx_code_sha256`, the SHA-256 of `fspx/<name>.code`: the whole kind-6
-entry, prologue and padding included (`tools/shader_meta.py`). The step is redone as a whole when the DLL, the
-unpacking or translating tools, `llvm-mc`, the wave64 mode or the flags change (`fspx_build.json`, written last); it
-never makes the game's shaders translate again. A package without the DLL skips it.
+of a program without an FSSM blob gets two keys (`tools/shader_meta.py`):
+
+- `fspx_code_sha256`, the SHA-256 of `fspx/<name>.code`: the whole kind-6 entry, prologue and padding included;
+- `fspx_state_sha256`, the SHA-256 of `fspx/<name>.state`: the kind-0 entry (dispatch state) as it is.
+
+The same kind-6 bytes can come with different kind-0 entries, for example two thread-group sizes, and then translate
+to different modules. Such a pair is allowed: the run time tells them apart by the state key. Two entries with the
+same code key and the same state key must have identical modules; when they do not, the step fails and names both
+programs, and leaves no `index.json` for the runtime to load. In the 1.0.2.1 DLL the 29 kind-6 programs are 29
+different byte strings, so every code key has one entry (measured).
+
+The step is redone as a whole when the DLL, the unpacking or translating tools, `llvm-mc`, the wave64 mode or the
+flags change (`fspx_build.json`, written last); it never makes the game's shaders translate again. A package without
+the DLL skips it.
 
 **Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when it
 is there, `<dir>/fspx/index.json`, whose entries are named `fspx/<name>`. A missing or unreadable `fspx/index.json`
@@ -130,10 +140,15 @@ leaves the main index loaded. Entries are found by `fssm_sha256` or by `fspx_cod
 | Bytecode | Key | Who passes it |
 |---|---|---|
 | `FSSM` blob, bare or in a `DXIL` part | `fssm_sha256` of the blob | the game (unchanged) |
-| `DXBC` container whose `ACCC` part is an FSPX payload | `fspx_code_sha256` of its kind-6 bytes | the DLL, slot 62 |
-| bare FSPX payload | `fspx_code_sha256` of its kind-6 bytes | the DLL's pipeline function accepts one (none measured at a slot) |
-| bare kind-6 program: 4-byte multiple, at least 36 bytes, the prologue's words 0, 3 and 6 with bits 31..16 = `0xD580` | `fspx_code_sha256` of the bytes as they are | the slot-67 description at `+0x28`, size at `+0x30` |
+| `DXBC` container whose `ACCC` part is an FSPX payload | `fspx_code_sha256` of its kind-6 bytes, then only the entries whose `fspx_state_sha256` is that of its kind-0 entry | the DLL, slot 62 |
+| bare FSPX payload | the same two keys | the DLL's pipeline function accepts one (none measured at a slot) |
+| bare kind-6 program: 4-byte multiple, at least 36 bytes, the prologue's words 0, 3 and 6 with bits 31..16 = `0xD580` | `fspx_code_sha256` of the bytes as they are; kind 0 is not passed | the slot-67 description at `+0x28`, size at `+0x30` |
 | anything else | none: `E_INVALIDARG`, as before | |
+
+With kind 0 (the first two rows), an input whose state key matches no entry for its code key has no program and gets
+`E_INVALIDARG`, like any untranslated shader. Without it (a bare kind-6 program), the entries for the code key are
+used when they all have the same module; when their modules differ, the program is ambiguous without its kind-0
+state, so the call is refused with `E_INVALIDARG` and a log line saying so, instead of taking one of them.
 
 The payload is parsed with the DLL reader's rules above (sizes and offsets checked in 64-bit arithmetic against the
 clamped total), so a malformed directory, or one without kind 0 or kind 6, gives no program and `E_INVALIDARG`. The

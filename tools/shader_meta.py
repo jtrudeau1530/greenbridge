@@ -628,6 +628,18 @@ def fspx_code_sha256_file(disasm_path, name):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def fspx_state_sha256_file(disasm_path, name):
+    """SHA-256 hex digest of <disasm_dir>/../fspx/<name>.state, the program's kind-0 entry (dispatch state), or None.
+    Two FSPX programs can share their kind-6 bytes and differ in kind 0; the run time tells them apart by this key
+    when the bytecode carries kind 0 (docs/fspx.md, "Build and run-time lookup")."""
+    parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    state = os.path.join(parent, "fspx", name + ".state")
+    if not os.path.isfile(state):
+        return None
+    with open(state, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     """Collect all build-time runtime metadata for one translated shader."""
     meta = {}
@@ -638,6 +650,9 @@ def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=()
         code_digest = fspx_code_sha256_file(disasm_path, name)
         if code_digest is not None:
             meta["fspx_code_sha256"] = code_digest
+            state_digest = fspx_state_sha256_file(disasm_path, name)
+            if state_digest is not None:
+                meta["fspx_state_sha256"] = state_digest
 
     dxbc_info = {}
     parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))

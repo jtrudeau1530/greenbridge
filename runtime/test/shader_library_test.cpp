@@ -397,7 +397,9 @@ int main() {
             index << "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash << "\"},\n"
                      " \"cs_fspx_main\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << other_hash << "\"}}";
             std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary);
+            // fspx_payload's kind 0 is 28 bytes of 0x11.
             sub << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << code_hash
+                << "\", \"fspx_state_sha256\": \"" << sha256_hex(std::vector<std::uint8_t>(28, 0x11))
                 << "\", \"bindings\": [], \"local_size\": [8, 8, 1], \"wave64\": true}}";
             std::ofstream spv(dir / "fspx" / "upscaler_00.spv", std::ios::binary);
             const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
@@ -427,6 +429,63 @@ int main() {
         CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.fspx_candidates("cs", code_hash).empty());
         std::filesystem::remove(dir / "fspx" / "index.json");
         CHECK(fspx.load(dir.string(), &error) && fspx.size() == 2 && fspx.find("cs", hash));
+        std::filesystem::remove_all(dir);
+    }
+
+    // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
+    // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
+    // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.
+    {
+        const auto code = fspx_code(0x4000);
+        std::vector<std::uint8_t> state32(28, 0), state64(28, 0), state16(28, 0);
+        state32[12] = 32;  // word 3: NumThreadsX
+        state64[12] = 64;
+        state16[12] = 16;
+        const auto n = std::uint32_t(code.size());
+        const auto wrapped = [&](const std::vector<std::uint8_t>& state) {
+            std::vector<std::uint8_t> body = state;
+            body.insert(body.end(), code.begin(), code.end());
+            return accc_container(fspx_payload({{0, 48, 28}, {6, 48 + 28, n}}, body));
+        };
+        const auto module = [](std::uint32_t generator) {
+            return std::vector<std::uint32_t>{0x07230203, 0x00010500, generator, 1, 0};
+        };
+        const auto write = [&](const std::string& name, const std::vector<std::uint32_t>& words) {
+            std::ofstream spv(dir / "fspx" / (name + ".spv"), std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * 4));
+        };
+        const auto index = [&](const std::vector<std::pair<std::string, const std::vector<std::uint8_t>*>>& entries) {
+            std::ofstream main(dir / "index.json", std::ios::binary | std::ios::trunc);
+            main << "{}";
+            std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
+            sub << "{";
+            for (std::size_t i = 0; i < entries.size(); ++i)
+                sub << (i ? ",\n" : "") << "\"" << entries[i].first << "\": {\"stage\": \"cs\", \"fspx_code_sha256\": \""
+                    << sha256_hex(code) << "\", \"fspx_state_sha256\": \"" << sha256_hex(*entries[i].second) << "\"}";
+            sub << "}";
+        };
+        std::filesystem::create_directories(dir / "fspx");
+        write("pair_32", module(1));
+        write("pair_64", module(2));
+        index({{"pair_32", &state32}, {"pair_64", &state64}});
+        ShaderLibrary pair;
+        CHECK(pair.load(dir.string(), &error) && pair.size() == 2);
+        CHECK(pair.fspx_candidates("cs", sha256_hex(code)).size() == 2);
+        bool ambiguous = true;
+        const auto by32 = pair.program_candidates("cs", compute_program(wrapped(state32)), &ambiguous);
+        CHECK(by32.size() == 1 && by32[0]->name == "fspx/pair_32" && !ambiguous);
+        const auto by64 = pair.program_candidates("cs", compute_program(wrapped(state64)), &ambiguous);
+        CHECK(by64.size() == 1 && by64[0]->name == "fspx/pair_64" && !ambiguous);
+        CHECK(pair.program_candidates("cs", compute_program(wrapped(state16)), &ambiguous).empty() && !ambiguous);
+        CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).empty() && ambiguous);
+        // The same two keys with one module (a duplicate container) is not ambiguous for the bare program.
+        write("pair_64", module(1));
+        CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).size() == 2 && !ambiguous);
+        // One translation for the code key: the bare program takes it.
+        index({{"pair_32", &state32}});
+        CHECK(pair.load(dir.string(), &error) && pair.size() == 1);
+        const auto bare = pair.program_candidates("cs", compute_program(code), &ambiguous);
+        CHECK(bare.size() == 1 && bare[0]->name == "fspx/pair_32" && !ambiguous);
         std::filesystem::remove_all(dir);
     }
 

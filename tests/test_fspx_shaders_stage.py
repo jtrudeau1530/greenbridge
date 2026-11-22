@@ -6,6 +6,8 @@ Zero game data: the "DLL" is synthetic bytes around hand-built containers (tests
 the stage tests mock the tools the way tests/test_shader_stage_resume.py does.
 """
 import hashlib
+import io
+import json
 import os
 import struct
 import subprocess
@@ -26,8 +28,9 @@ from test_fspx_unpack import kind0, make_dxbc, make_fspx, program, psv0  # noqa:
 UNPACK = os.path.join(ROOT, "tools", "fspx_unpack.py")
 
 
-def container(code, **fspx):
-    payload = make_fspx([(0, kind0()), (1, b"\1" * 20), (6, code), (7, b"\7" * 24)], **fspx)
+def container(code, state=None, **fspx):
+    payload = make_fspx([(0, kind0() if state is None else state), (1, b"\1" * 20), (6, code), (7, b"\7" * 24)],
+                        **fspx)
     return make_dxbc([(b"PSV0", psv0()), (b"HASH", b"\x5a" * 20), (b"ACCC", payload)])
 
 
@@ -72,6 +75,22 @@ class IndexKey(unittest.TestCase):
                 meta = shader_meta.collect(disasm, name, [[]], [[]])
                 self.assertEqual(meta.get("fspx_code_sha256"), key)
                 self.assertNotIn("fssm_sha256", meta)
+
+    def test_same_program_with_two_dispatch_states_gets_one_code_key_and_two_state_keys(self):
+        """The review case on #1911: two containers with the same kind 6 and kind-0 entries for 32x1x1 and 64x1x1."""
+        code = program()
+        states = [kind0(threads=(32, 1, 1)), kind0(threads=(64, 1, 1))]
+        with tempfile.TemporaryDirectory() as t:
+            dll = os.path.join(t, "pair.dll")
+            with open(dll, "wb") as f:
+                f.write(dll_like(*(container(code, state) for state in states)))
+            out = os.path.join(t, "out")
+            r = subprocess.run([sys.executable, "-I", UNPACK, dll, "--out", out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            metas = [shader_meta.collect(os.path.join(out, "disasm", f"pair_{n:02d}.s"), f"pair_{n:02d}", [[]], [[]])
+                     for n in range(2)]
+            self.assertEqual({m["fspx_code_sha256"] for m in metas}, {hashlib.sha256(code).hexdigest()})
+            self.assertEqual([m["fspx_state_sha256"] for m in metas], [hashlib.sha256(s).hexdigest() for s in states])
 
     def test_an_fssm_blob_keeps_its_key_and_gets_no_fspx_key(self):
         with tempfile.TemporaryDirectory() as t:
@@ -139,8 +158,13 @@ class FspxStage(unittest.TestCase):
         elif tool == "rdna2spirv.py":
             os.makedirs(self.spirv, exist_ok=True)
             open(os.path.join(self.spirv, "upscaler.spv"), "w").close()
+            index = {}
+            for name, (code, state, module) in getattr(self, "translations", {}).items():
+                index[name] = {"stage": "cs", "fspx_code_sha256": code, "fspx_state_sha256": state}
+                with open(os.path.join(self.spirv, name + ".spv"), "wb") as f:
+                    f.write(module)
             with open(os.path.join(self.spirv, "index.json"), "w") as f:
-                f.write("{}")
+                json.dump(index, f)
 
     def run_step(self, signature="llvm-mc 23", emulate=False, fallbacks=()):
         self.calls = []
@@ -177,6 +201,24 @@ class FspxStage(unittest.TestCase):
         with mock.patch.object(make_game, "translation_sources_digest", return_value="another translator"):
             self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags),
                              ["fspx_unpack.py", "rdna2spirv.py"])
+
+    def test_same_keys_with_different_modules_fail_the_step(self):
+        """Same kind 6 and same kind 0 must translate to one module; otherwise the runtime could not choose."""
+        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"module A"),
+                             "upscaler_01": ("c" * 64, "s" * 64, b"module B")}
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.run_step()
+        self.assertIn("upscaler_00", err.getvalue())
+        self.assertIn("upscaler_01", err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))   # nothing for the runtime to load
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "fspx_build.json")))
+
+    def test_same_code_key_is_allowed_with_other_state_or_the_same_module(self):
+        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"module A"),
+                             "upscaler_01": ("c" * 64, "t" * 64, b"module B"),     # Vonsek's case: other kind 0
+                             "upscaler_02": ("c" * 64, "s" * 64, b"module A")}     # a duplicate of 00
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
 
     def test_a_stopped_translation_leaves_no_marker_and_no_old_modules(self):
         self.run_step()
@@ -225,6 +267,8 @@ class ShadersStageWithTheDll(unittest.TestCase):
                     os.makedirs(os.path.join(dxbc, "disasm"), exist_ok=True)
                 elif tool == "rdna2spirv.py":
                     touch(args[args.index("--out") + 1], "index.json")
+                    with open(os.path.join(args[args.index("--out") + 1], "index.json"), "w") as f:
+                        f.write("{}")
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")

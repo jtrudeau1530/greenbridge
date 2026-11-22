@@ -19,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <vector>
 
 #ifndef LEONIDA_TEST_CS_SPV
@@ -70,7 +71,7 @@ std::vector<std::uint8_t> kind6(std::uint32_t marker) {
 // An FSPX payload with kinds 0, 1, 6 and 7 after a four-entry directory; `code_offset` and `code_size` override the
 // kind-6 entry to make a malformed directory.
 std::vector<std::uint8_t> payload(const std::vector<std::uint8_t>& code, std::uint32_t code_offset = 128,
-                                  std::int64_t code_size = -1) {
+                                  std::int64_t code_size = -1, std::uint8_t state_fill = 0x11) {
     std::vector<std::uint8_t> out = {'F', 'S', 'P', 'X'};
     const auto n = std::uint32_t(code.size());
     put32(out, 1);
@@ -85,7 +86,7 @@ std::vector<std::uint8_t> payload(const std::vector<std::uint8_t>& code, std::ui
         put32(out, entry[2]);
         put32(out, 0);
     }
-    out.insert(out.end(), 28, 0x11);
+    out.insert(out.end(), 28, state_fill);  // kind 0
     out.insert(out.end(), 20, 0x22);
     out.insert(out.end(), code.begin(), code.end());
     out.insert(out.end(), 8, 0x77);
@@ -166,16 +167,30 @@ int main() {
     std::filesystem::create_directories(library / "fspx");
     std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "fspx" / "cs_user_data.spv");
     std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "fspx" / "cs_user_data_b.spv");
+    // The review case on #1911: program C in two containers whose kind-0 entries differ, translated to two
+    // different modules (the second has another generator word in its header, still a valid module).
+    const auto code_c = kind6(9100);
+    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "fspx" / "cs_c_state1.spv");
+    {
+        std::ifstream in(LEONIDA_TEST_CS_SPV, std::ios::binary);
+        std::vector<char> words((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT(words.size() > 12);
+        words[8] ^= 0x5a;  // word 2: the generator
+        std::ofstream out(library / "fspx" / "cs_c_state2.spv", std::ios::binary);
+        out.write(words.data(), std::streamsize(words.size()));
+    }
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << std::string(64, '0') << "\"}}";
         std::ofstream sub(library / "fspx" / "index.json", std::ios::binary);
-        const auto entry = [](const std::vector<std::uint8_t>& code) {
+        const auto entry = [](const std::vector<std::uint8_t>& code, std::uint8_t state_fill) {
             return "{\"stage\": \"cs\", \"fspx_code_sha256\": \"" + leonida::sha256_hex(code) +
+                   "\", \"fspx_state_sha256\": \"" + leonida::sha256_hex(std::vector<std::uint8_t>(28, state_fill)) +
                    "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
                    "\"uses_code_base\": true, \"wave64\": false}";
         };
-        sub << "{\"cs_user_data\": " << entry(code_a) << ",\n \"cs_user_data_b\": " << entry(code_b) << "}";
+        sub << "{\"cs_user_data\": " << entry(code_a, 0x11) << ",\n \"cs_user_data_b\": " << entry(code_b, 0x11)
+            << ",\n \"cs_c_state1\": " << entry(code_c, 0x31) << ",\n \"cs_c_state2\": " << entry(code_c, 0x32) << "}";
     }
 
     constexpr UINT elements = 64, bytes = elements * 4;
@@ -233,6 +248,26 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&bare_a.p))));
             pso_desc.CS = {container_b.data(), container_b.size()};
             EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&wrapped_b.p))));
+        }
+
+        // Program C: each container finds its own translation by its kind-0 state; one with a kind 0 nothing was
+        // translated for is refused; the bare program is refused as ambiguous, since its two translations differ.
+        {
+            const auto c1 = container(payload(code_c, 128, -1, 0x31)), c2 = container(payload(code_c, 128, -1, 0x32));
+            const auto c_other = container(payload(code_c, 128, -1, 0x11));
+            Ref<ID3D12PipelineState> pso_c1, pso_c2, none_other, none_bare;
+            pso_desc.CS = {c1.data(), c1.size()};
+            EXPECT(SUCCEEDED(reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
+                device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&pso_c1.p))));
+            pso_desc.CS = {c2.data(), c2.size()};
+            EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso_c2.p))));
+            EXPECT(pso_c1.p != pso_c2.p);
+            pso_desc.CS = {c_other.data(), c_other.size()};
+            EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&none_other.p)) == E_INVALIDARG &&
+                   !none_other.p);
+            pso_desc.CS = {code_c.data(), code_c.size()};
+            EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&none_bare.p)) == E_INVALIDARG &&
+                   !none_bare.p);
         }
 
         // Refused with E_INVALIDARG, and no object: an untranslated program, bare and in a container; directories
