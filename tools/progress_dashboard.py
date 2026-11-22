@@ -13,9 +13,10 @@ Sources, each optional and reported as missing rather than counted as zero when 
     unit tests      --run-tests runs tests/test_*.py the way CI selects them (standard-library files with a
                     __main__ block), one process each; the outcome and the commit it ran on are kept
     ctest           runtime/build/Testing/Temporary/LastTest.log, and any --junit file (CTest or pytest flavour)
+    gpu tests       --gpu-log: saved output of runtime/test/shaders/check.py, one panel group per GPU
     contract        the translator contract table in docs/design.md, by how each row says it was confirmed
     imports         the measured import tables in docs/runtime_imports.md
-    corpus          --work: counts per stage from <work>/dxbc/index.json and <work>/spirv/index.json
+    corpus          --work: counts per stage from <work>/shaders/dxbc/index.json and <work>/shaders/spirv/index.json
     github          --github, read-only through `gh`: latest CI runs on main, the D3D- table of #313, the
                     coordination issue's section sizes and, with --login, that account's claims and pull requests
 
@@ -408,6 +409,69 @@ def collect_ctest(col, args):
                    "tests that passed after the last commit touching runtime/ / tests recorded")
 
 
+# ----------------------------------------------------------------------------------------------- GPU tests
+GPU_LINE = re.compile(r"^(\S+)\s+(ok|SKIP \(.*\)|.+)$")
+GPU_SUMMARY = re.compile(r"^(\d+) of (\d+) pass, (\d+) skipped")
+
+
+def parse_gpu_log(text):
+    """[(shader test, result, detail)] from the output of runtime/test/shaders/check.py (one line per test,
+    "<name> ok", "<name> SKIP (why)" or "<name> <what came back>", then "N of M pass, K skipped")."""
+    rows, summary = [], None
+    for line in text.splitlines():
+        m = GPU_SUMMARY.match(line.strip())
+        if m:
+            summary = tuple(int(x) for x in m.groups())
+            continue
+        m = GPU_LINE.match(line.rstrip())
+        # check.py prints f"{name:20} {result}": the result starts right after the name padded to 20 columns,
+        # which tells result lines from the other lines it prints (the build folder it picked, warnings)
+        if not m or not re.fullmatch(r"[A-Za-z0-9_.]+", m.group(1)) or m.start(2) != max(len(m.group(1)), 20) + 1:
+            continue
+        name, rest = m.group(1), m.group(2).strip()
+        if rest == "ok":
+            rows.append((name, "pass", ""))
+        elif rest.startswith("SKIP"):
+            rows.append((name, "skip", rest))
+        else:
+            rows.append((name, "fail", scrub(rest)))
+    return rows, summary
+
+
+def collect_gpu(col, logs):
+    col.panel("gpu", "GPU tests (hand-written RDNA2 programs)", "test programs")
+    if not logs:
+        col.source("gpu_logs", None, "missing", note="pass --gpu-log <saved check.py output>[=<GPU, driver, OS>]")
+        return
+    changed = max(t for t in (last_commit_time("runtime/test/shaders"), last_commit_time("tools/rdna2spirv.py"), 0) if t is not None)
+    for spec in logs:
+        path, _, label = spec.partition("=")
+        if not os.path.isfile(path):
+            col.source("gpu_log", path, "missing")
+            continue
+        rows, summary = parse_gpu_log(read_text(path))
+        label = label or os.path.splitext(os.path.basename(path))[0]
+        note = None
+        if summary and summary[1] != len(rows):
+            note = f"summary says {summary[1]} tests, {len(rows)} lines parsed"
+        col.source("gpu_log", path, "ok" if rows else "invalid", len(rows), note=note)
+        ran = os.path.getmtime(path)
+        for name, res, detail in rows:
+            if res == "fail":
+                status, fresh = "failed", "failed"
+            elif res == "skip":
+                status, fresh = "unknown", "unknown"
+            elif changed and ran < changed:
+                status, fresh = "partial", "revalidation_required"
+            else:
+                status, fresh = "verified", "current"
+            col.add(f"gpu.{label}.{name}", "gpu", label, name, status, detail=detail or None, freshness=fresh, ran_at=iso(ran))
+    tested = [c for c in col.components if c["panel"] == "gpu" and c["status"] != "unknown"]
+    if tested:
+        col.metric("gpu.current", "gpu", "GPU test programs passing on the current translator", sum(c["status"] == "verified" for c in tested),
+                   len(tested), "programs ok after the last commit touching runtime/test/shaders or tools/rdna2spirv.py / programs run (skips excluded)")
+
+
 # ----------------------------------------------------------------------------------------------- docs
 def md_tables(text):
     """[(heading, header_cells, rows, first_line)] for every pipe table in a Markdown text."""
@@ -548,9 +612,11 @@ def collect_corpus(col, work):
     if not work:
         col.source("corpus", None, "missing", note="pass --work <work> to count your own translation run")
         return
-    carved_p, spirv_p = os.path.join(work, "dxbc", "index.json"), os.path.join(work, "spirv", "index.json")
+    # make_game.py writes <work>/shaders/dxbc and <work>/shaders/spirv; the shaders folder itself is accepted too
+    shaders = os.path.join(work, "shaders") if os.path.isdir(os.path.join(work, "shaders", "dxbc")) else work
+    carved_p, spirv_p = os.path.join(shaders, "dxbc", "index.json"), os.path.join(shaders, "spirv", "index.json")
     if not os.path.isfile(carved_p):
-        col.source("corpus", carved_p, "missing", note="no <work>/dxbc/index.json")
+        col.source("corpus", None, "missing", note="no <work>/shaders/dxbc/index.json (run make_game.py's shaders stage)")
         return
     carved = json.loads(read_text(carved_p))
     entries = carved if isinstance(carved, list) else list(carved.values())
@@ -566,10 +632,10 @@ def collect_corpus(col, work):
                 st = meta.get("stage") or "unknown"
                 per_stage.setdefault(st, [0, 0])[1] += 1
                 validated_total += 1
-        col.source("corpus_spirv", "<work>/spirv/index.json", "ok", len(spirv))
+        col.source("corpus_spirv", "<work>/shaders/spirv/index.json", "ok", len(spirv))
     else:
-        col.source("corpus_spirv", "<work>/spirv/index.json", "missing", note="translation not finished")
-    col.source("corpus_carved", "<work>/dxbc/index.json", "ok", len(entries))
+        col.source("corpus_spirv", "<work>/shaders/spirv/index.json", "missing", note="translation not finished")
+    col.source("corpus_carved", "<work>/shaders/dxbc/index.json", "ok", len(entries))
     for st, (n_carved, n_valid) in sorted(per_stage.items()):
         stage = str(st)
         if n_valid:
@@ -580,7 +646,7 @@ def collect_corpus(col, work):
             col.add(f"corpus.{stage}.not_validated", "corpus", stage, f"{stage}: not translated or rejected by spirv-val",
                     "failed", detail=f"{rest:,} of {n_carved:,} carved", weight=rest, count=rest)
     col.metric("corpus.validated", "corpus", "Carved shaders that translate and pass spirv-val", validated_total, len(entries),
-               "entries in <work>/spirv/index.json without an error / entries in <work>/dxbc/index.json",
+               "entries in <work>/shaders/spirv/index.json without an error / entries in <work>/shaders/dxbc/index.json",
                note="validation is not execution: nothing here says a shader's output is right")
     col.notes.append("corpus: counts come from your own work folder; no shader name or path is stored")
 
@@ -702,6 +768,7 @@ def build(args, out_dir):
     g = git_info()
     collect_unit(col, out_dir, args)
     collect_ctest(col, args)
+    collect_gpu(col, args.gpu_log)
     collect_contract(col)
     collect_imports(col)
     collect_corpus(col, args.work)
@@ -710,7 +777,7 @@ def build(args, out_dir):
         col.source("github", None, "skipped", note="pass --github to read CI, #313 and the coordination issue")
     snap = {
         "schema": SCHEMA, "generated_at": iso(now_utc()), "git": g,
-        "panels": [col.panels[k] for k in ("tests", "runtime", "contract", "imports", "corpus", "d3d12", "ci") if k in col.panels],
+        "panels": [col.panels[k] for k in ("tests", "runtime", "gpu", "contract", "imports", "corpus", "d3d12", "ci") if k in col.panels],
         "counts": counts_by_panel(col.components), "components": col.components, "metrics": col.metrics,
         "sources": col.sources, "notes": col.notes, "github": gh,
     }
@@ -754,6 +821,8 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="test processes at a time")
     ap.add_argument("--test-timeout", type=int, default=300, help="seconds per test file")
     ap.add_argument("--junit", nargs="*", metavar="FILE", help="CTest --output-junit or pytest --junitxml files")
+    ap.add_argument("--gpu-log", nargs="*", metavar="FILE[=LABEL]",
+                    help="saved output of runtime/test/shaders/check.py; LABEL names the GPU, driver and OS")
     ap.add_argument("--github", action="store_true", help="read CI runs, #313 and the coordination issue through gh")
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
     ap.add_argument("--login", help="with --github, show this account's claims and pull requests")

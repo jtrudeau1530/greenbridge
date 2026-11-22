@@ -20,9 +20,10 @@ Each source is optional. A missing one is listed under "Sources" on the page; it
 |---|---|---|
 | Unit tests | `--run-tests` runs `tests/test_*.py` with the selection `ci.yml` uses (standard-library files with a `__main__` block), one process each; the outcome and the commit it ran on are kept in `<out>/unit_results.json` | test file |
 | Runtime tests | `runtime/build/Testing/Temporary/LastTest.log` and any `--junit` file (CTest `--output-junit` or pytest `--junitxml`) | test |
+| GPU tests | `--gpu-log <file>[=<GPU, driver, OS>]`: the saved output of `runtime/test/shaders/check.py`, one group per GPU; a log older than the last commit touching `runtime/test/shaders` or `tools/rdna2spirv.py` counts as needing a re-run | test program |
 | Translator contract | the contract table in [design.md](design.md#translator-status-and-runtime-contract), each row classified by how it says it was confirmed | contract row |
 | Runtime imports | the measured tables in [runtime_imports.md](runtime_imports.md) | import |
-| Shader corpus | `--work <work>`: counts per stage from `<work>/dxbc/index.json` and `<work>/spirv/index.json` | shaders, aggregated per stage |
+| Shader corpus | `--work <work>`: counts per stage from `<work>/shaders/dxbc/index.json` and `<work>/shaders/spirv/index.json` | shaders, aggregated per stage |
 | D3D12 layer | `--github`: the `D3D-` table of [#313](https://github.com/ItsNotRexed/Leonida/issues/313), read through `gh` | item |
 | CI on main | `--github`: the latest completed run of each workflow on `main` | workflow |
 

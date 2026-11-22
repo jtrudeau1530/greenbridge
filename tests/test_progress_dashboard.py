@@ -113,6 +113,34 @@ class Freshness(unittest.TestCase):
         self.assertEqual(got["test_progress_dashboard.py"], ("verified", "unknown"))
 
 
+class GpuLog(unittest.TestCase):
+    LOG = "\n".join([
+        "using runtime/build/RelWithDebInfo",
+        "cs_bounds            ok",
+        "ps_texoff            SKIP (VK_KHR_maintenance8 missing)",
+        "cs_bpermute32        lane 3: got 0x00000000, want 0x00000007",
+        "2 of 3 pass, 1 skipped",
+    ])
+
+    def test_lines_and_summary(self):
+        rows, summary = pd.parse_gpu_log(self.LOG)
+        self.assertEqual([(n, r) for n, r, _ in rows], [("cs_bounds", "pass"), ("ps_texoff", "skip"), ("cs_bpermute32", "fail")])
+        self.assertIn("want 0x00000007", rows[2][2])
+        self.assertEqual(summary, (2, 3, 1))
+
+    def test_panel_groups_by_gpu_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "check.txt")
+            with open(log, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.LOG + "\n")
+            col = pd.Collector()
+            pd.collect_gpu(col, [log + "=RTX 4060, 576.02, Windows 11"])
+            self.assertEqual({c["group"] for c in col.components}, {"RTX 4060, 576.02, Windows 11"})
+            self.assertEqual(sorted(c["status"] for c in col.components)[0], "failed")
+            m = next(m for m in col.metrics if m["id"] == "gpu.current")
+            self.assertEqual(m["denominator"], 2)                     # the skip is not counted
+
+
 class Github(unittest.TestCase):
     def test_d3d_states(self):
         self.assertEqual(pd.d3d_state("@a", "#291 merged, #819, #831 on main", "")[0], "partial")
@@ -125,12 +153,13 @@ class Corpus(unittest.TestCase):
     def test_counts_only_never_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "work")
-            os.makedirs(os.path.join(work, "dxbc"))
-            os.makedirs(os.path.join(work, "spirv"))
+            sh = os.path.join(work, "shaders")      # make_game.py's layout
+            os.makedirs(os.path.join(sh, "dxbc"))
+            os.makedirs(os.path.join(sh, "spirv"))
             carved = [{"name": f"{SENTINEL}_{i}", "stage": "pixel" if i < 3 else "compute"} for i in range(5)]
-            with open(os.path.join(work, "dxbc", "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            with open(os.path.join(sh, "dxbc", "index.json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(carved, f)
-            with open(os.path.join(work, "spirv", "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            with open(os.path.join(sh, "spirv", "index.json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump({f"{SENTINEL}_0": {"stage": "pixel"}, f"{SENTINEL}_3": {"stage": "compute"},
                            f"{SENTINEL}_4": {"error": "x"}}, f)
             col = pd.Collector()
