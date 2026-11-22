@@ -67,8 +67,65 @@ jobs:
           -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
       - name: Build
         run: cmake --build runtime/build
+      # For the wine job: the test list, the checkout it was made in, and the built executables and DLLs. Only what
+      # this repository builds goes in; there is no game data on the runner.
+      - name: List tests for Wine
+        shell: bash
+        run: |
+          ctest --test-dir runtime/build --show-only=json-v1 > runtime/build/ctest.json
+          cygpath -m "$GITHUB_WORKSPACE" > runtime/build/windows-root.txt
+      - name: Upload the Windows build for Wine
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-windows
+          path: |
+            runtime/build/**/*.exe
+            runtime/build/**/*.dll
+            runtime/build/ctest.json
+            runtime/build/windows-root.txt
+          retention-days: 7
+          if-no-files-found: error
       - name: CPU runtime tests
         run: ctest --test-dir runtime/build --output-on-failure
+
+  # Runs the Windows build's tests under Wine, so a change that breaks the loader on Linux (through Wine or Proton)
+  # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary
+  # shows the rest.
+  wine:
+    needs: windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: runtime-windows
+          path: runtime/build
+      - name: Install Wine, Xvfb and llvmpipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wine wine64 xvfb xauth mesa-vulkan-drivers libvulkan1
+          wine --version
+      - name: Create the Wine prefix
+        env:
+          WINEPREFIX: ${{ runner.temp }}/wineprefix
+          WINEDLLOVERRIDES: "mscoree,mshtml="
+          WINEDEBUG: "-all"
+        run: |
+          xvfb-run -a wineboot --init
+          wineserver -w
+      - name: Windows tests under Wine
+        env:
+          WINEPREFIX: ${{ runner.temp }}/wineprefix
+          WINEDLLOVERRIDES: "mscoree,mshtml="
+          WINEDEBUG: "-all"
+        run: >-
+          xvfb-run -a python3 -I scripts/run_wine_tests.py
+          --tests runtime/build/ctest.json
+          --windows-root "$(cat runtime/build/windows-root.txt)"
+          --summary "$GITHUB_STEP_SUMMARY"
+          --require loader --require pe_loader --require loader_tls --require unimplemented_policy
+          --require run_tiny_game --require run_tiny_game_exit_code
 
   # Also runs the hand-written GPU tests (runtime/test/shaders) on Mesa's llvmpipe, a software Vulkan driver, so a
   # translator or harness change that breaks a test result shows up on every pull request, without a GPU.
