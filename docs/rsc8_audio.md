@@ -1,6 +1,6 @@
 # `RSC8` audio-bank resources (AWC tag `0x5c`)
 
-**Status: decoded at container, object-graph, property, animation-block and track-directory level; stdlib decoder in [`tools/rsc8_audio.py`](../tools/rsc8_audio.py).**
+**Status: decoded at container, object-graph, property, animation-block, track-directory and keyframe level; stdlib decoder in [`tools/rsc8_audio.py`](../tools/rsc8_audio.py).**
 
 [story.md](story.md) measured 225,281 raw `RSC8` (version `8001` / `0x1F41`) headers in `story000.rpf`
 (plus 1,957 in `shared_minigame000.rpf` and 9 in `story000_restofworld.rpf`), and the mission-music
@@ -217,15 +217,17 @@ block after it, or splits long dialogue animations across `2` or `3` blocks):
 +0x00  u32  signature
 +0x04  u32  payload_size       always anim_size - 32
 +0x08  u32  reserved           0
-+0x0C  u32  chunk_data_offset  <= payload_size
++0x0C  u32  chunk_data_offset  <= payload_size; where the channel definitions end and the frame data starts
 +0x10  u32  anim_size          total packed block size in bytes (>= 32)
 +0x14  u16  format_version     always 2
 +0x16  u16  frame_count        frames in this block
-+0x18  u32  extra_flags
-+0x1C  u16  sub_count
-+0x1E  u16  track_format_tag   always 11
-+0x20  ...  compressed facial animation bitstream (`payload_size` bytes)
++0x18  u32  extra_flags        low u16: bytes per frame; high u16 not decoded
++0x1C  u16  sub_count          sum of the type-4 channel bit widths
++0x1E  u16  track_format_tag   always 11: a u8 11 (the number of channel types) and a zero byte
++0x20  ...  one keyframe sequence (`payload_size` bytes), see section 7
 ```
+
+The field names are the ones `tools/rsc8_audio.py` reports; the notes on the right are what section 7 measured.
 
 Multi-block animations share their boundary frame between consecutive blocks, so across `N` blocks:
 
@@ -241,9 +243,38 @@ and `restofworld` clips; `90`, `88`, or `87` on `audio.rpf`) × 12-byte records 
 
 ```
 +0x00  u32  track_id_hash   sorted ascending (non-decreasing) across the directory
-+0x04  u32  schema_hash     constant 0x364D3BDB
-+0x08  u32  track_type      3 (vector/quaternion-style) or 4 (scalar facial weight)
++0x04  u32  schema_hash     constant 0x364D3BDB = joaat("facialtranslation"), a track type
++0x08  u32  track_type      the value format: 4 = one value per frame, 3 = two values per frame
 ```
+
+This is the 12-byte track entry of the clip dictionaries in `anim.rpf` (`{id, track-type hash, value format}`,
+[animation.md](animation.md#objects)); `facialtranslation` is one of the track types `tools/anim_clips.py` names.
+
+### 7. Keyframes
+
+A packed block is one **sequence** as [animation.md](animation.md#sequences) describes it for `anim.rpf`: the
+0x20-byte header, the channel definitions grouped by type, `frames x bytes per frame` of frame data, `u16
+count[11]` and the per-type `(track << 2 | component)` lists. Nothing new had to be decoded: `rsc8_audio.py
+--curves` hands every block to `anim_clips`' sequence decoder and counts the outcome. It writes counts only.
+
+| Archive | Clips | Decoded | Type-10 chunk boundaries closed |
+|---|---:|---:|---:|
+| `story000_restofworld.rpf` | 9 | 9 | 593 / 593 |
+| `shared_minigame000.rpf` | 1,957 | 1,957 | 439,313 / 439,313 |
+| `story000.rpf` | 225,281 | 225,281 | 29,144,718 / 29,144,718 |
+| `audio.rpf` | 414,181 | 414,181 | 58,428,044 / 58,428,044 |
+| **Total** | **641,428** | **641,428** | **88,012,668 / 88,012,668** |
+
+Over those 641,428 clips:
+
+- The decoded frame count equals the clip's on 641,428, and the header's bit sum equals the
+  type-4 widths on 641,428.
+- Channels by type: type 2 (constant) 21,683,337, type 4 (quantised) 9,171,169, type 5 (table) 162,508 and
+  type 10 (second-order delta) 33,239,783. No other type occurs, so a facial clip has no quaternion channel.
+- All 57,706,322 directory entries get values, and the component count follows the entry's format on every one:
+  format 4 decodes to one value per frame (51,159,853 tracks) and format 3 to two (6,546,469 tracks).
+
+`decode_facial_curves` returns the per-frame values to a caller; the tool itself never prints or stores them.
 
 ## Full-corpus validation results
 
@@ -267,9 +298,10 @@ internal `RSC8` clip-name hash whose low 29 bits differ from the enclosing AWC `
 
 ## What remains undecoded
 
-- Individual facial keyframe curves inside the compressed `crAnimation` bitstream (`block+0x20 .. block+anim_size`,
-  `format_version = 2`, `track_format_tag = 11`). Decoding facial rigs/blendshape evaluation belongs to
-  the animation runtime, not audio extraction.
+- What the curves drive. The keyframes decode (section 7), but which facial control each `track_id_hash` names,
+  the unit of a value and how the rig evaluates them are not established here; that belongs to the animation
+  runtime, not audio extraction.
+- The high u16 of a block's `+0x18` word.
 - The semantic difference (if any) of version flag bit 24 (`0x01001F41`) on the 201 `audio.rpf` clips;
   structurally all 201 parse identically to `0x00001F41`.
 
@@ -284,6 +316,10 @@ python -I tools/rsc8_audio.py <package>\pack\story000_restofworld\story000_resto
 python -I tools/rsc8_audio.py <package>\pack\shared_minigame000\shared_minigame000.rpf --summary-only
 python -I tools/rsc8_audio.py <package>\pack\story000\story000.rpf --summary-only
 python -I tools/rsc8_audio.py <package>\audio.rpf --summary-only
+
+# Also decode every clip's keyframes and count the outcome (slower: about 40 clips per second per process;
+# split a large archive with --start/--limit and add the summaries)
+python -I tools/rsc8_audio.py <package>\pack\shared_minigame000\shared_minigame000.rpf --summary-only --curves
 
 # Optional per-clip structural JSON/CSV export to a local work directory
 python -I tools/rsc8_audio.py <package>\pack\shared_minigame000\shared_minigame000.rpf <work>\rsc8.csv
