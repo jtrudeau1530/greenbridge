@@ -50,6 +50,10 @@ Two caveats that matter for any render:
   1,748 / 1,816 decoded). Its `FragName` is byte-identical to `cs_monalisa` and `cs_mandy`, so it
   is the shared player/cutscene body, not a unique high-detail mesh. Do not present it as a
   high-detail hero body.
+- **`body` is not a base body.** The only `lucia`-named full-body record in `packs.rpf` is the
+  `cs_lucia_legacypedcs` clothed legacy ped. The decoded part is 1,748 vertices / 1,816
+  triangles, and the manifest lists 874- and 640-vertex rows of the same drawable. Do not present
+  it as Lucia's hero body.
 - **The head drawable has no material texture references**, but its face comes from a **head-skin
   preset** keyed by the head name's `joaat32` (see Textures).
 
