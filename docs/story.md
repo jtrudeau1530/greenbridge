@@ -373,6 +373,7 @@ chunks on a 256-byte boundary behind zero padding; the walk stops there (`stoppe
 | positions within 300 m | 29,572,450 (99.9%) |
 | shared edges with neighbouring faces within ~25° | 33,342,470 of 36,707,506 (90.8%); 1.4% opposed |
 | normals within 8° / 25° of their faces | 76.5% / 94.6% of 20,801,089; 2.1% opposed |
+| normals within 8° / 25° of their faces | 76.5% / 94.5% of 20,801,089; 2.1% opposed |
 | tangents perpendicular to the normal | 30,473,135 of 30,569,246 (99.7%) |
 | radius covers the farthest vertex from the stored centre | 257,091 of 275,832 meshlets (93.2%); 94.8% within rounding |
 | cones: axis within 25° / every face inside within 0.05 | 89.5% / 94.2% of 228,244 |
@@ -381,6 +382,12 @@ The stored centres match the box centre less often here: 25.7% of axes in the sa
 against 50.1% / 71.8% in the minigame archive. 625 meshlets use the 1/8 m step. Since the radius still covers the
 farthest vertex from the stored centre in 93.2%, the decoding holds; these assets seem to store a centre other
 than the box midpoint (a sphere centre would fit).
+against 50.1% / 71.8% in the minigame archive. Since the radius still covers the farthest vertex from the stored
+centre in 93.2%, the decoding holds. These assets seem to store a centre other than the box midpoint; a sphere
+centre would fit. The centre and radius counts in this table were taken before the step exponent was read in
+full: they read only w2 bit 28. `story000` also has e = 2 to 4 on about 456 meshlets (@zzEmmazz's count), so those
+few rows will move slightly when recounted. Most of the remaining misses come from the group-to-block binding:
+several blocks in a page share a vertex count (@Pipodi's count on #2991).
 
 Still open: the +0x5C word, the type-1 normal's
 bits 20-31, and what the `42 40` colour and UV slots hold beyond rpf9-explorer's reading.
