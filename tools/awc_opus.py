@@ -189,6 +189,18 @@ def parse_awc(d: bytes):
     return streams, music
 
 
+def repeated_prefix_packets(packets: list[bytes], previous: list[bytes], samples: int) -> int | None:
+    """Count whole leading packets that repeat the previous chunk's tail, or reject a bad skip."""
+    for count, packet in enumerate(packets, 1):
+        duration = opus_samples(packet)
+        if not 0 < duration <= samples:
+            return None
+        samples -= duration
+        if samples == 0:
+            return count if packets[:count] == previous[-count:] else None
+    return None
+
+
 def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     """[(channel id, samples, rate, codec, [packets], packet channels)] for one streamed-music descriptor.
 
@@ -197,13 +209,16 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
     Opus TOC stereo bit (bit 2) and defaults to 1 when no packet is present.
 
     collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py).
-    A descriptor whose declared blocks or subblock runs do not fit its data tag is rejected ([]), so a
-    corrupt descriptor cannot read past the tag into a sibling stream or past the end of the bank."""
+    The chunk size is the stride between blocks. The last block may be shorter, but each channel table and
+    subblock run must fit in its own block. A declared repeat must match whole packets from the same channel's
+    previous data. Reject malformed descriptors without hiding other bank streams."""
     (m_at, m_size), (d_at, d_size) = mus, data
+    if m_size < 12:
+        return []
     blocks, chunk, channels = struct.unpack_from("<III", d, m_at)
     if not (1 <= channels <= 32 and 1 <= blocks and chunk >= 2048 and m_size == 12 + 16 * channels):
         return []
-    if blocks * chunk > d_size:
+    if (blocks - 1) * chunk >= d_size:
         return []
     info = []
     for c in range(channels):
@@ -212,30 +227,34 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         samples, = struct.unpack_from("<I", d, base + 4)
         rate, = struct.unpack_from("<H", d, base + 10)
         info.append([cid, samples, rate, d[base + 12], [], 0])
+    previous = [[] for _ in range(channels)]
     for b in range(blocks):
-        at = d_at + b * chunk
-        recs = [struct.unpack_from("<III", d, at + 24 * c + 4)[:2] for c in range(channels)]   # (count, skip)
+        offset = b * chunk
+        at = d_at + offset
+        block_size = min(chunk, d_size - offset)
+        if channels * 24 > block_size:
+            return []
+        recs = [struct.unpack_from("<II", d, at + 24 * c + 4) for c in range(channels)]   # (count, skip)
         total = sum(r[0] for r in recs)
         header = (channels * 24 + total * 4 + 2047) & ~2047
-        if header + total * 2048 > d_size - b * chunk:
+        if header + total * 2048 > block_size:
             return []
         before = 0
         for c, (count, skip) in enumerate(recs):
             start = at + header + before * 2048
             before += count
-            if info[c][3] != 0x0B or count == 0:
+            if info[c][3] != 0x0B:
                 continue
             packets = opus_packets(d, start, count * 2048)
+            repeated = repeated_prefix_packets(packets, previous[c], skip) if skip else 0
+            if repeated is None:
+                return []
+            if packets:
+                previous[c] = packets
             if packets and info[c][5] < 2:
                 info[c][5] = 2 if any(p[0] & 0x04 for p in packets) else 1
-            if not collect_packets:
-                continue
-            for pk in packets:
-                n = opus_samples(pk)
-                if skip >= n and skip > 0:
-                    skip -= n
-                    continue
-                info[c][4].append(pk)
+            if collect_packets:
+                info[c][4].extend(packets[repeated:] if repeated else packets)
     for x in info:
         if x[3] == 0x0B and x[5] > 1:
             x[1] //= x[5]

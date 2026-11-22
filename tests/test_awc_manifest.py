@@ -24,14 +24,15 @@ def fmt(samples, rate, codec, channels):
 
 def music_blob(ids, samples, rate, toc=0xF8):
     """(descriptor, data) for one block of Opus channels. toc is the packet TOC byte."""
+    chunk = 2048 * (1 + len(ids))
     desc = bytearray(12 + 16 * len(ids))
-    struct.pack_into("<III", desc, 0, 1, 2048, len(ids))
+    struct.pack_into("<III", desc, 0, 1, chunk, len(ids))
     for i, cid in enumerate(ids):
         base = 12 + 16 * i
         struct.pack_into("<II", desc, base, cid, samples)
         struct.pack_into("<H", desc, base + 10, rate)
         desc[base + 12] = 0x0B
-    data = bytearray(2048 + 2048 * len(ids))          # aligned record table, then channel blocks
+    data = bytearray(chunk)                          # aligned record table, then channel blocks
     for i in range(len(ids)):
         struct.pack_into("<I", data, 24 * i + 4, 1)   # subblock count; skip stays 0
         struct.pack_into("<H", data, 2048 + 2048 * i, 1)
