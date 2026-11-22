@@ -89,10 +89,11 @@ def test_depth_compare_sample_result_width(make_shader, d16):
     dref = re.search(r"^\s*(%\w+) = OpImageSampleDrefExplicitLod %float ", spvasm, re.M)
     assert dref, "the depth compare sample is missing"
     d = re.escape(dref.group(1))
-    as_f16 = re.search(rf"^\s*(%\w+) = OpCompositeConstruct %v2float {d} %f0\n\s*%\w+ = OpExtInst %uint %glsl "
-                       r"PackHalf2x16 \1$", spvasm, re.M)
-    as_f32 = re.search(rf"^\s*%\w+ = OpBitcast %uint {d}$", spvasm, re.M)
-    assert (bool(as_f16), bool(as_f32)) == (d16, not d16)
+    bitcast = re.search(rf"^\s*(%\w+) = OpBitcast %uint {d}$", spvasm, re.M)
+    assert bitcast, "the depth compare bitcast is missing"
+    bc = re.escape(bitcast.group(1))
+    as_f16 = re.search(rf"^\s*%\w+ = OpShiftRightLogical %uint {bc} %c10$", spvasm, re.M)
+    assert bool(as_f16) == d16
 
 
 def test_a16_sample_gradients_use_full_vgprs(make_shader):
@@ -875,3 +876,153 @@ def test_image_sample_and_gather_d16_avoid_packhalf2x16(make_shader):
     sh2.validate(asm2)
     assert "PackHalf2x16" not in asm2
     assert "OpBitwiseOr %uint" in asm2 and "OpSelect %uint" in asm2
+
+
+def _load_mini_interp():
+    import sys
+    semantic_dir = os.path.join(ROOT, "tests", "semantic")
+    if semantic_dir not in sys.path:
+        sys.path.insert(0, semantic_dir)
+    import spirv_mini_interp
+    return spirv_mini_interp
+
+
+def test_fma_mix_decodes_fimm_as_binary16_and_preserves_other_half(make_shader):
+    """v_fma_mix{lo_f16,hi_f16,_f32} with op_sel_hi=1 decode fimm literals (e.g. 1.5, -2.0) as
+    f16 instead of f32 bit patterns, preserve the unwritten dst half, and emit no PackHalf2x16."""
+    si = _load_mini_interp()
+    ps = (
+        "; fma_mix_fimm\n"
+        "v_mov_b32 v1, 0x40000000\n"  # f32 2.0
+        "v_mov_b32 v2, 0x3e800000\n"  # f32 0.25
+        "v_mov_b32 v3, 0xbeef0000\n"  # sentinel high half
+        # 1.5 (f16) * 2.0 (f32) + 0.25 (f32) = 3.25 -> f16 0x4280; high half 0xbeef preserved
+        "v_fma_mixlo_f16 v3, 1.5, v1, v2 op_sel:[0,0,0] op_sel_hi:[1,0,0]\n"
+        "v_mov_b32 v4, 0x0000cafe\n"  # sentinel low half
+        "v_mov_b32 v5, 0x3f800000\n"  # f32 1.0
+        # (-2.0 (f16)) * 1.5 (f16) + 1.0 (f32) = -2.0 -> f16 0xc000; low half 0xcafe preserved
+        "v_fma_mixhi_f16 v4, -2.0, 1.5, v5 op_sel:[0,0,0] op_sel_hi:[1,1,0]\n"
+        # (-2.0 (f16)) * 1.5 (f16) + 0.25 (f32) = -2.75 -> f32 0xc0300000
+        "v_fma_mix_f32 v6, -2.0, 1.5, v2 op_sel:[0,0,0] op_sel_hi:[1,1,0]\n"
+        "exp mrt0 v3, v4, v6, v3 done vm\n"
+        "s_endpgm\n"
+    )
+    shader = make_shader(ps, name="ps_fma_mix_fimm")
+    spv = shader.translate()
+    shader.validate(spv)
+
+    out = si.run_fragment(spv)["%out_mrt0"]
+    assert out[0] == 0xBEEF4280
+    assert out[1] == 0xC000CAFE
+    assert out[2] == 0xC0300000
+    assert "PackHalf2x16" not in spv
+
+
+@pytest.mark.parametrize("op,sentinel,shift,f32_bits,expected_half", [
+    # RTE tie-to-even: 1.0 + 2^-11 -> 0x3c00 (even), 1.0 + 3*2^-11 -> 0x3c02 (even)
+    ("v_fma_mixlo_f16", 0xBEEF0000, 0, 0x3F801000, 0x3C00),
+    ("v_fma_mixlo_f16", 0xBEEF0000, 0, 0x3F803000, 0x3C02),
+    ("v_fma_mixhi_f16", 0x0000CAFE, 16, 0x3F801000, 0x3C00),
+    ("v_fma_mixhi_f16", 0x0000CAFE, 16, 0x3F803000, 0x3C02),
+    # Subnormals & subnormal ties: 2^-15 -> 0x0200, 2^-24 -> 0x0001, 2^-25 -> 0x0000, 3*2^-25 -> 0x0002
+    ("v_fma_mixlo_f16", 0x12340000, 0, 0x38000000, 0x0200),
+    ("v_fma_mixlo_f16", 0x12340000, 0, 0x33800000, 0x0001),
+    ("v_fma_mixlo_f16", 0x12340000, 0, 0x33000000, 0x0000),
+    ("v_fma_mixhi_f16", 0x00005678, 16, 0x33C00000, 0x0002),
+    # Overflow to +-Inf, -0.0, quiet NaN
+    ("v_fma_mixlo_f16", 0xAAAA0000, 0, 0x477FF000, 0x7C00),
+    ("v_fma_mixhi_f16", 0x0000BBBB, 16, 0xC77FF000, 0xFC00),
+    ("v_fma_mixlo_f16", 0xCCCC0000, 0, 0x80000000, 0x8000),
+    ("v_fma_mixhi_f16", 0x0000DDDD, 16, 0x7FC00000, 0x7E00),
+])
+def test_fma_mix_f16_rte_edge_cases_and_half_preservation(
+    op, sentinel, shift, f32_bits, expected_half, make_shader
+):
+    """v_fma_mixlo_f16 / v_fma_mixhi_f16 round f32 results with exact IEEE-754 binary16 RTE
+    (ties-to-even, subnormals, overflow, -0.0, quiet NaN) while preserving the other dst half."""
+    si = _load_mini_interp()
+    # Fma(1.0, x, -0.0) yields x (preserving -0.0 when x == -0.0)
+    ps = (
+        "; fma_mix_f16_rte\n"
+        "v_mov_b32 v1, 0x3f800000\n"
+        f"v_mov_b32 v2, {f32_bits:#010x}\n"
+        "v_mov_b32 v3, 0x80000000\n"
+        f"v_mov_b32 v4, {sentinel:#010x}\n"
+        f"{op} v4, v1, v2, v3 op_sel:[0,0,0] op_sel_hi:[0,0,0]\n"
+        "exp mrt0 v4, v4, v4, v4 done vm\n"
+        "s_endpgm\n"
+    )
+    shader = make_shader(ps, name="ps_fma_mix_f16_rte")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv
+
+    out = si.run_fragment(spv)["%out_mrt0"]
+    expected_word = sentinel | (expected_half << shift)
+    assert out[0] == expected_word
+
+
+@pytest.mark.parametrize("suffix,fmt_code,expected_word", [
+    ("xy", 29, 0x3C023C00),  # format 29 = (4, "f16", (16, 16)): lo=0x3c00, hi=0x3c02
+    ("x", 13, 0x00003C00),   # format 13 = (2, "f16", (16,)): lo=0x3c00
+])
+def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, make_shader):
+    """buffer_store_format_{x,xy} with f16 V# formats uses f16_bits RTE (no PackHalf2x16),
+    validates with spirv-val, and stores exact tie-to-even f16 bits."""
+    si = _load_mini_interp()
+    base = 0x1000
+    vdata = "v2" if suffix == "x" else "v[2:3]"
+    ps = (
+        "; buffer_store_format_f16_rte\n"
+        f"s_mov_b32 s0, {base:#x}\n"
+        "s_mov_b32 s1, 0\n"
+        "s_mov_b32 s2, 0x100\n"
+        f"s_mov_b32 s3, {fmt_code << 12:#x}\n"
+        "v_mov_b32 v1, 0\n"
+        "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (tie to even)
+        "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c02 (tie to even)
+        f"buffer_store_format_{suffix} {vdata}, v1, s[0:3], 0 offen\n"
+        "s_waitcnt vmcnt(0)\n"
+        "exp mrt0 v2, v3, v2, v3 done vm\n"
+        "s_endpgm\n"
+    )
+    shader = make_shader(ps, name=f"ps_encode_format_f16_{suffix}")
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv
+
+    mem = {base: 0}
+    si.run_fragment(spv, memory=mem)
+    assert mem[base] == expected_word
+
+
+def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):
+    """buffer_format d16 and image_sample_c_lz d16 avoid PackHalf2x16 and validate with spirv-val."""
+    tbuf_asm = (
+        "s_mov_b32 s0, 0x1000\n"
+        "s_mov_b32 s1, 0\n"
+        "s_mov_b32 s2, 0x100\n"
+        f"s_mov_b32 s3, {77 << 12:#x}\n"  # format 77 = f32x4
+        "v_mov_b32 v0, 0\n"
+        "buffer_load_format_d16_xy v2, v0, s[0:3], 0 offen\n"
+        "s_waitcnt vmcnt(0)\n"
+        "exp mrt0 v2, v2, v2, v2 done vm\n"
+        "s_endpgm\n"
+    )
+    sh1 = make_shader(tbuf_asm, name="ps_tbuffer_d16_nopack")
+    spv1 = sh1.translate()
+    sh1.validate(spv1)
+    assert "PackHalf2x16" not in spv1
+
+    cmplz_asm = (
+        "s_load_dwordx8 s[8:15], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
+        "s_mov_b32 s16, 0x92\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
+        "image_sample_c_lz v4, v[0:2], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D d16\n"
+        "s_waitcnt vmcnt(0)\n"
+        "exp mrt0 v4, v4, v4, v4 done vm\n"
+        "s_endpgm\n"
+    )
+    sh2 = make_shader(cmplz_asm, name="ps_sample_c_lz_d16_nopack")
+    spv2 = sh2.translate()
+    sh2.validate(spv2)
+    assert "PackHalf2x16" not in spv2

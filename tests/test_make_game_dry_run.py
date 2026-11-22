@@ -394,6 +394,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             f.write("{}")
         with open(os.path.join(spirv_dir, "wave64_emulate.txt"), "w", encoding="utf-8") as f:
             f.write("off\n")
+        with open(os.path.join(spirv_dir, "translation_sources.sha256"), "w", encoding="utf-8") as f:
+            f.write(make_game.translation_sources_digest() + "\n")
 
         with mock.patch("make_game.py") as mock_py, \
                 mock.patch("make_game.translate") as mock_translate, \

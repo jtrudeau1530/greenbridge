@@ -189,5 +189,34 @@ class Modes(unittest.TestCase):
         self.assertIn("unknown mode 'emulat'", r.stderr)
 
 
+class GpuEnv(unittest.TestCase):
+    """FUZZ-13: vk_compute_test is asked for 32-wide subgroups for wave32 and emulated wave64 programs, as lds_fuzz.py
+    and valu_fuzz.py do. On AMD the compute default is 64, and a wave32 group over 32 lanes ran as one subgroup."""
+
+    def program(self, wave, group):
+        return X.Program("p", wave, group, [], {}, [])
+
+    def test_wave32_asks_for_32(self):
+        env = X.gpu_env(self.program(32, 64), False, "d.bin", base={})
+        self.assertEqual(env["VKC_SUBGROUP_SIZE"], "32")
+
+    def test_emulated_wave64_asks_for_32(self):
+        env = X.gpu_env(self.program(64, 64), True, "d.bin", base={})
+        self.assertEqual(env["VKC_SUBGROUP_SIZE"], "32")
+
+    def test_native_wave64_keeps_the_device_default(self):
+        env = X.gpu_env(self.program(64, 64), False, "d.bin", base={"VKC_SUBGROUP_SIZE": "16"})
+        self.assertEqual(env["VKC_SUBGROUP_SIZE"], "16")  # whatever the caller had, untouched
+        self.assertNotIn("VKC_SUBGROUP_SIZE", X.gpu_env(self.program(64, 64), False, "d.bin", base={}))
+
+    def test_buffer_size_and_dump(self):
+        env = X.gpu_env(self.program(32, 96), False, "out/d.bin", base={"KEEP": "1"})
+        self.assertEqual(env["VKC_OUT_WORDS"], str(max(96 * len(X.OUT_REGS), 64)))
+        self.assertEqual(env["VKC_DUMP"], "out/d.bin")
+        self.assertEqual(env["KEEP"], "1")
+        self.assertEqual(X.gpu_env(self.program(32, 1), False, "d", base={})["VKC_OUT_WORDS"],
+                         str(max(len(X.OUT_REGS), 64)))
+
+
 if __name__ == "__main__":
     unittest.main()

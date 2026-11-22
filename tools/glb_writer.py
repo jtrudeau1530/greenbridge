@@ -20,6 +20,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -838,6 +839,24 @@ def build_glb(
     return glb_bytes
 
 
+# On Windows, MoveFileEx fails with a sharing violation (PermissionError) while
+# another writer is replacing the same destination or a reader holds it open
+# without FILE_SHARE_DELETE. Those holds last milliseconds, so the replace is
+# retried with a short backoff (about 1.3 s in total) before the error is raised.
+_REPLACE_RETRY = os.name == "nt"
+_REPLACE_DELAYS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.1, 0.2, 0.3, 0.5)
+
+
+def _replace(source: str, destination: str) -> None:
+    for delay in _REPLACE_DELAYS if _REPLACE_RETRY else ():
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            time.sleep(delay)
+    os.replace(source, destination)
+
+
 def write_glb(
     path: str,
     primitives: list[dict],
@@ -846,7 +865,9 @@ def write_glb(
     """Atomically publish a GLB using a private staging file in its destination directory.
 
     Overlapping writers publish complete files (the last replacement wins), and
-    existing sibling files are never used as staging files.
+    existing sibling files are never used as staging files. On Windows a replace
+    that hits a sharing violation is retried briefly (see ``_replace``); one held
+    longer than that still raises PermissionError and leaves the old file in place.
     """
     glb_bytes, stats = _build_glb_with_stats(primitives, materials)
     out_path = os.fspath(path)
@@ -861,7 +882,7 @@ def write_glb(
             tmp_path = f.name
             f.write(glb_bytes)
         # Close before replacement: Windows cannot rename an open staging file.
-        os.replace(tmp_path, out_path)
+        _replace(tmp_path, out_path)
     except BaseException:
         try:
             if tmp_path is not None:

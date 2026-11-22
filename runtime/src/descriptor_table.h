@@ -143,6 +143,8 @@ public:
         std::lock_guard lock(mutex_);
         std::fill(entries_.begin(), entries_.end(), DescriptorEntry{});
         occupied_count_ = 0;
+        all_changed_ = true;
+        changed_slots_.clear();
     }
 
     std::size_t size() const {
@@ -184,6 +186,38 @@ public:
         return out;
     }
 
+    // What a shader's copy of the table needs re-uploaded since the last take_changes().
+    struct Changes {
+        bool all = false;                  // the mask (table grew or was cleared): every slot and the header
+        std::vector<std::uint32_t> slots;  // slots whose 10 dwords changed, in no particular order
+    };
+
+    Changes take_changes() {
+        std::lock_guard lock(mutex_);
+        Changes changes;
+        changes.all = all_changed_;
+        changes.slots = std::move(changed_slots_);
+        changed_slots_.clear();
+        all_changed_ = false;
+        return changes;
+    }
+
+    // One slot's 10 dwords (key[8], index, pad) to `dest`; false when the slot is out of range.
+    bool read_slot(std::uint32_t slot, std::uint32_t* dest) const { return read_slots(slot, 1, dest); }
+
+    // `count` consecutive slots' 10 dwords each to `dest`, under one lock; false when any is out of range.
+    bool read_slots(std::uint32_t first, std::uint32_t count, std::uint32_t* dest) const {
+        std::lock_guard lock(mutex_);
+        if (first + count > entries_.size()) return false;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const DescriptorEntry& entry = entries_[first + i];
+            std::memcpy(dest + i * 10, entry.key, sizeof(entry.key));
+            dest[i * 10 + 8] = entry.index;
+            dest[i * 10 + 9] = entry.pad;
+        }
+        return true;
+    }
+
     void write_to_buffer(void* dest, bool clear_pad = false) const {
         if (!dest) return;
         const auto buf = build_gpu_buffer(clear_pad);
@@ -191,10 +225,14 @@ public:
     }
 
 private:
+    void mark(std::uint32_t slot) { changed_slots_.push_back(slot); }
+
     // All eight slots for the incoming key are occupied. Try moving one resident
     // to the first empty slot beyond that window, within its own eight probes.
     // A later hole is farther from every resident, so failure here is final for a single move.
-    static int make_probe_slot(std::vector<DescriptorEntry>& entries, std::uint32_t hash) {
+    // `moved_to` receives the hole the resident moved into, so the caller can mark that slot changed too.
+    static int make_probe_slot(std::vector<DescriptorEntry>& entries, std::uint32_t hash,
+                               std::uint32_t* moved_to = nullptr) {
         const auto mask = static_cast<std::uint32_t>(entries.size() - 1);
         for (auto offset = kDescriptorProbes; offset < 2 * kDescriptorProbes - 1; ++offset) {
             const auto hole = (hash + offset) & mask;
@@ -204,6 +242,7 @@ private:
                 const auto home = hash_descriptor_key(entries[slot].key);
                 if (((hole - home) & mask) < kDescriptorProbes) {
                     entries[hole] = entries[slot];
+                    if (moved_to) *moved_to = hole;
                     return static_cast<int>(slot); // caller immediately overwrites the resident
                 }
             }
@@ -224,6 +263,7 @@ private:
                     if (std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
                         if (entry.index == index) return InsertResult::unchanged;
                         entry.index = index;
+                        mark(slot);
                         return InsertResult::replaced;
                     }
                 } else if (empty_slot < 0) {
@@ -237,13 +277,16 @@ private:
             }
 
             const bool relocate = empty_slot < 0;
-            if (relocate) empty_slot = make_probe_slot(entries_, h);
+            std::uint32_t moved_to = 0;
+            if (relocate) empty_slot = make_probe_slot(entries_, h, &moved_to);
             if (empty_slot >= 0) {
                 auto& entry = entries_[empty_slot];
                 std::memcpy(entry.key, key, sizeof(entry.key));
                 entry.index = index;
                 entry.pad = kSlotOccupiedMarker;
                 ++occupied_count_;
+                if (relocate) mark(moved_to);
+                mark(std::uint32_t(empty_slot));
                 return relocate ? InsertResult::added_with_relocation : InsertResult::added;
             }
 
@@ -269,6 +312,7 @@ private:
         // Backward-shift entries in the probe cluster to maintain probe chains
         std::uint32_t i = found_slot;
         std::uint32_t j = i;
+        mark(found_slot);
         while (true) {
             j = (j + 1) & mask_;
             if (entries_[j].pad != kSlotOccupiedMarker) break;
@@ -277,10 +321,12 @@ private:
             const std::uint32_t dist_r_to_j = (j - r) & mask_;
             if (dist_r_to_i < dist_r_to_j && dist_r_to_i < kDescriptorProbes) {
                 entries_[i] = entries_[j];
+                mark(i);
                 i = j;
             }
         }
         entries_[i] = DescriptorEntry{};
+        mark(i);
         --occupied_count_;
         return true;
     }
@@ -314,6 +360,8 @@ private:
             if (rehash_ok) {
                 entries_ = std::move(new_entries);
                 mask_ = new_mask;
+                all_changed_ = true;
+                changed_slots_.clear();
                 break;
             }
             new_cap *= 2;
@@ -324,6 +372,8 @@ private:
     std::uint32_t mask_ = 15;
     std::vector<DescriptorEntry> entries_;
     std::size_t occupied_count_ = 0;
+    bool all_changed_ = false;                  // clear() or a grow: the mask and every slot changed
+    std::vector<std::uint32_t> changed_slots_;  // slots inserted, replaced or moved since take_changes()
 };
 
 } // namespace leonida

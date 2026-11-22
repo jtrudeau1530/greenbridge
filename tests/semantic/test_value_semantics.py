@@ -31,6 +31,8 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   s_min/max_i32/u32     D = S0 < S1 ? S0 : S1 (max: >), SCC = 1 when S0 is chosen, so a tie gives S1 and SCC 0.
   v_fmamk_f32/madmk_f32 D = S0 * K + S1, K the literal (printed vdst, src0, K, vsrc1); fmamk is fused.
   v_fmaak_f32/madak_f32 D = S0 * S1 + K (printed vdst, src0, vsrc1, K).
+  s_ff1_i32_b32 /       index of the lowest set / clear bit of S0, -1 (0xffffffff) when there is none. An inline
+  s_ff0_i32_b32           constant or literal source is a 32-bit value, not a lane mask (SHADER-46).
 
 The appended cases for ps_ops5/ps_ops6 also pin the op_sel source-half selection for packed shifts, which the
 GPU-checked ps_ops4 does not exercise. cs_bounds (compute) pins the buffer num_records bounds checks: an
@@ -61,6 +63,7 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
                         0x10: 0x3F800000, 0x14: 0x00000000, 0x18: 0x3F800000, 0x1C: 0x00000000,
                         0x20: 0x00000000, 0x24: 0x3F800000, 0x28: 0x00000000, 0x2C: 0x3F800000,
                         0x30: 0xC00FFC00, 0x34: 0x003FF003, 0x38: 0xE00003FF, 0x3C: 0xFFE00003}
+EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 
 
 def _f32_bits(x):
@@ -245,6 +248,18 @@ def reference_fmt_1010102():
     return {4 * i: w for i, w in enumerate(words)}
 
 
+def _ff1(x):
+    """Index of the lowest set bit of a 32-bit value, 0xffffffff if none."""
+    x &= 0xFFFFFFFF
+    return (x & -x).bit_length() - 1 if x else 0xFFFFFFFF
+
+
+def reference_sff_imm():
+    # ps_sff_imm: s_ff1 of the inline constant 4 and of the literal 0x00100000; s_ff0 of the inline constant 61
+    # (0b111101) and of the literal 0x0000ffff (the lowest clear bit is the lowest set bit of ~S0).
+    return [_ff1(4), _ff1(~61), _ff1(0x00100000), _ff1(~0x0000FFFF)]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -291,6 +306,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_fma_literal(), EXPECTED_FMA_LITERAL)
         self.assertEqual(reference_bounds(), EXPECTED_BOUNDS)
         self.assertEqual(reference_fmt_1010102(), EXPECTED_FMT_1010102)
+        self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -387,6 +403,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
+
+    def test_s_ff0_s_ff1_read_an_immediate_as_a_value(self):
+        # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
+        # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
+        self.check("ps_sff_imm", EXPECTED_SFF_IMM)
 
 
 if __name__ == "__main__":

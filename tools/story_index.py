@@ -22,6 +22,7 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
 import time
@@ -171,15 +172,15 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 break
             s = match.start()
             if m[s:s + 3] == b"KB2":
-                blen = (_u32(m, s + 4) or 0) + 8
-                w, h = _u32(m, s + 0x14), _u32(m, s + 0x18)
-                if not (64 <= blen <= size - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
+                head = m[s:min(s + 0x20, end)]
+                blen = (_u32(head, 4) or 0) + 8
+                w, h = _u32(head, 0x14), _u32(head, 0x18)
+                if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
                 z, u = _gap(m[last:s])
                 zero += z
                 unread += u
-                head = m[s:s + min(blen, 0x20)]
                 record = classify(head, s, blen)
                 record["size"] = blen
                 rows.append(record)
@@ -188,8 +189,8 @@ def scan_rpf(path, start=None, limit=None, progress=None):
             d = zlib.decompressobj()
             chunks, p = [], s
             try:
-                while not d.eof and p < size:
-                    block = m[p:p + (1 << 20)]
+                while not d.eof and p < end:
+                    block = m[p:min(p + (1 << 20), end)]
                     chunks.append(d.decompress(block))
                     p += len(block)   # advance by the actual slice, not the requested 1 MiB
                     if d.unused_data or d.eof:
@@ -221,13 +222,21 @@ def scan_rpf(path, start=None, limit=None, progress=None):
     return rows, summary
 
 
-def scan_dir(path, progress=None):
-    """Index already-carved files. An offset is taken from a leading hexadecimal file name when possible."""
+def scan_dir(path, progress=None, output=None):
+    """Index carved files, excluding the output report. Use leading hex digits for offsets when possible."""
     entries = []
     t0 = time.time()
+    try:
+        report = os.stat(output) if output is not None else None
+    except FileNotFoundError:
+        report = None
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full):
+        try:
+            info = os.stat(full)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or (report is not None and os.path.samestat(info, report)):
             continue
         with open(full, "rb") as f:
             data = f.read()
@@ -314,7 +323,7 @@ def main():
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(a.source):
-        rows, summary = scan_dir(a.source)
+        rows, summary = scan_dir(a.source, output=a.out)
     else:
         def progress(n, pos, end):
             if not a.quiet:
