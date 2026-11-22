@@ -27,6 +27,7 @@ import statistics
 import sys
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
+from xml.parsers.expat import errors
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -129,6 +130,7 @@ def scan_xml(data: bytes) -> dict:
     report = {
         "root": "",
         "well_formed": False,
+        "mismatched_tag": False,
         "error": "",
         "element_count": 0,
         "max_depth": 0,
@@ -191,6 +193,8 @@ def scan_xml(data: bytes) -> dict:
     except (ET.ParseError, LookupError, ValueError) as exc:
         # The parser also raises LookupError or ValueError for unsupported encoding declarations.
         report["error"] = str(exc)
+        report["mismatched_tag"] = (isinstance(exc, ET.ParseError)
+                                    and exc.code == errors.codes[errors.XML_ERROR_TAG_MISMATCH])
         # The parser stops at the error, so the comments after it would go uncounted (a truncated or tail-only
         # document): count them in the bytes instead, still skipping comment-like text inside CDATA.
         report["comments"] = raw_comment_count(data)
@@ -229,6 +233,11 @@ def file_row(doc: dict, scan: dict) -> dict:
     if doc.get("from_carve"):
         tail_only = not header
         fragment = not root or not doc.get("complete", True)
+    elif scan["mismatched_tag"]:
+        # Expat saw a close that contradicts an opening in the retained bytes.
+        # Prepending missing ancestors could never repair that nesting.
+        root = gi.xml_root(doc["data"]) or scan["root"]
+        tail_only = fragment = False
     else:
         tail_only = not scan["well_formed"] and looks_truncated(doc["data"], root)
         fragment = not root
