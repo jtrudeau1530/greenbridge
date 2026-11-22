@@ -4,6 +4,8 @@
 //   - the GS pipeline draws the quad in the top-left quadrant, red: the GS's copy fills the top-right one too;
 //   - a pipeline without a GS draws the same quad moved to the bottom-left quadrant, green: no copy, so the
 //     bottom-right quadrant stays blue.
+// The PS entry asks for a 32-wide subgroup, so with a GS the third stage's required-size struct is filled too (the
+// recipe keeps one per stage; a two-entry array overflowed here, found by @0xTehuti on #2109).
 // Also refused: a GS pipeline whose topology type is not the GS's input primitive (lines: E_INVALIDARG). Skipped where
 // the GPU lacks geometryShader. Shaders: test/glsl/vs_draw.vert, gs_double.geom, ps_draw.frag. No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
@@ -66,7 +68,7 @@ int main() {
                  " \"gs_double\": {\"stage\": \"gs\", \"fssm_sha256\": \"" << leonida::sha256_hex(gs_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144},\n"
                  " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], \"subgroup_size\": 32}}";
     }
 
     constexpr UINT size = 64;
@@ -81,6 +83,7 @@ int main() {
         info.queue_family = d.family;
         info.buffer_device_address = true;
         info.features = d.enabled;
+        info.subgroup = d.subgroup;
         info.shader_dir = library.string();
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));

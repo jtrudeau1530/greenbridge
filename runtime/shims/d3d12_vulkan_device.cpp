@@ -2291,6 +2291,9 @@ public:
         Stage stages[3] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
                            {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
                            {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
+        // stage_infos.size() indexes the recipe's per-stage required-size structs: one for every table entry.
+        static_assert(std::size(stages) <= std::size(decltype(recipe_.required_sizes){}),
+                      "Recipe::required_sizes needs an entry per graphics stage");
         bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
         // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
@@ -2739,7 +2742,8 @@ private:
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[2]{};  // what `stages` chain
+        // One per entry of create_graphics's stage table (VS, GS, PS), static_assert there; what `stages` chain.
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
