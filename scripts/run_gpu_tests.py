@@ -239,12 +239,13 @@ def unsupported_skip(msg: str) -> str:
     return f"SKIP ({m.group(0) if m else 'unsupported device'})"
 
 
-def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True) -> tuple[int, str]:
+def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
+            cwd: str | None = None) -> tuple[int, str]:
     # A hung GPU test program fails its test instead of stalling the suite (check.py, LEONIDA_GPU_TEST_TIMEOUT).
     # gpu=False (the translator over the whole suite) runs without a limit.
     limit = gpu_test_timeout() if gpu else None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit, cwd=cwd)
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:   # e.g. Smart App Control blocked a fresh build: fail this test, keep running the others
@@ -1033,13 +1034,7 @@ def run_suite(a, work: str) -> int:
                 mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
                         "ps_sample_c_lz_a16": ["dref_a16"]}.get(name, [])
                 cmd = [tool, *mode, raw]
-            try:
-                p = subprocess.run(cmd, capture_output=True, text=True, cwd=spirv_dir)
-                rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
-            except FileNotFoundError:
-                rc, msg = 1, f"missing {tool}"
-            except OSError as e:
-                rc, msg = 1, start_failure(tool, e)
+            rc, msg = run_cmd(cmd, cwd=spirv_dir)
             if rc == UNSUPPORTED:   # e.g. fewer push constant bytes than the texture tests need
                 results.append((name, None, unsupported_skip(msg)))
             elif name == "ps_texture_sample_d16" and rc == 0:
@@ -1051,12 +1046,8 @@ def run_suite(a, work: str) -> int:
             expected = TEXTURE_CONSTANTS[name]
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
-            try:
-                p = subprocess.run([tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "92", "c00000",
-                                    "14500000", "0"], capture_output=True, text=True, cwd=spirv_dir)
-                rc, msg = p.returncode, (p.stdout + "\n" + p.stderr).strip()
-            except FileNotFoundError:
-                rc, msg = 1, f"missing {tool}"
+            rc, msg = run_cmd([tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "92", "c00000",
+                               "14500000", "0"], cwd=spirv_dir)
             bad = 4096
             if rc == 0 and os.path.isfile(raw):
                 data = Path(raw).read_bytes()
