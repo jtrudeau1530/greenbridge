@@ -1647,11 +1647,19 @@ public:
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
     // Active logical queries cover a contiguous range of physical slots. A Begin or End closes the old
     // slot and opens a new one if any query remains active. Each shared interval is recorded only once.
+    // A resolve while a slot is active closes it before the resolve and opens the next after it, so no query is
+    // active during the copy and its dispatch (D3D-189); the logical ranges simply span one more slot.
     std::map<std::pair<QueryHeapId, std::uint32_t>, std::uint32_t> active;
     std::uint32_t current = detail::PreparedQuery::no_segment;
     for (auto& query : out.queries) {
         const Command& command = out.list->commands()[query.command];
-        if (std::holds_alternative<ResolveQueries>(command)) continue;
+        if (std::holds_alternative<ResolveQueries>(command)) {
+            if (current == detail::PreparedQuery::no_segment) continue;
+            query.end_segment = current;
+            current = out.segment_count++;
+            query.begin_segment = current;
+            continue;
+        }
         const auto range = query_range(command);
         if (range.type != d3d12_query::occlusion) continue;
         const auto key = std::pair{range.heap, range.first};
@@ -2051,6 +2059,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     // The internal dispatch would otherwise count towards the application's CSInvocations.
                     if (!vk.resolve_binary_occlusion || statistics_active) return ReplayResult::unsupported;
                 }
+                // No resolve runs while an ordinary occlusion query is active. On a Radeon 8060S with AMD's Windows
+                // driver 26.11.2, vk_overlapping_occlusion times out (TDR) when resolves are recorded inside an
+                // active query, and passes with this pause (D3D-189, #1540). The segment path can pause the active
+                // query around the resolve (plan_occlusion_segments), so such a list takes it when it can sum.
+                if (ordinary_active && vk.sum_occlusion) overlaps = true;
                 if (p.binding.host_readable) {
                     out.wrote_readback = true;
                     out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -2198,16 +2211,21 @@ private:
 inline void emit_query(const PreparedList& list, const detail::PreparedQuery& query, VkCommandBuffer cb,
                        const ReplayFunctions& vk, const VkConditionalRenderingBeginInfoEXT& predicate) {
     constexpr auto none = detail::PreparedQuery::no_segment;
-    if (query.end_segment != none || query.begin_segment != none) {
-        if (query.end_segment != none) vk.end_query(cb, list.segment_pool, list.segment_base + query.end_segment);
-        if (query.begin_segment != none) {
-            const auto index = list.segment_base + query.begin_segment;
-            vk.reset_query_pool(cb, list.segment_pool, index, 1);
-            vk.begin_query(cb, list.segment_pool, index, list.precise_segments ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
-        }
+    const auto& command = list.list->commands()[query.command];
+    // A Begin or End of a segmented query only moves between segments. A resolve inside a segment ends it before
+    // the resolve and begins the next one after it.
+    const bool segmented = query.end_segment != none || query.begin_segment != none;
+    if (query.end_segment != none) vk.end_query(cb, list.segment_pool, list.segment_base + query.end_segment);
+    const auto begin_segment = [&] {
+        if (query.begin_segment == none) return;
+        const auto index = list.segment_base + query.begin_segment;
+        vk.reset_query_pool(cb, list.segment_pool, index, 1);
+        vk.begin_query(cb, list.segment_pool, index, list.precise_segments ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    };
+    if (segmented && !std::holds_alternative<ResolveQueries>(command)) {
+        begin_segment();
         return;
     }
-    const auto& command = list.list->commands()[query.command];
     const QueryPool& heap = *query.heap;
     if (const auto* begin = std::get_if<BeginQuery>(&command)) {
         vk.reset_query_pool(cb, heap.pool, begin->index, 1);
@@ -2243,6 +2261,7 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
             }
         }
         if (suspend) vk.begin_conditional_rendering(cb, &predicate);
+        begin_segment();
     }
 }
 

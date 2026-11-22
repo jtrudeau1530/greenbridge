@@ -183,9 +183,10 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     Fixture fixture{d};
     EXPECT(fixture.create(vertex, fragment));
     constexpr std::uint32_t bursts = 130;
-    Draws schedule{fixture, {8, 4, 2, 8, 4, 2, 3}};
+    // crossing ends four physical queries (the resolve inside it splits the last one), nested three; single ends two.
+    Draws schedule{fixture, {8, 4, 2, 0, 8, 4, 2, 3}};
     schedule.extents.insert(schedule.extents.end(), 2 * bursts + 1, 1);
-    schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0, 1});
+    schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0, 1, 1});
     schedule.every = bisect.enabled;
     schedule.no_draw = bisect.no_draw;
     draws = &schedule;
@@ -401,7 +402,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     const CommandList* fourth[] = {&replace};
     EXPECT(queue.execute(fourth) == ReplayResult::success);
 
-    // A resolve inside one active query, with no overlap.
+    // A resolve inside one active query, with no overlap: the active query is paused around it (D3D-189).
     CommandList single;
     EXPECT(single.begin_query({a, occ, 3}));
     EXPECT(single.resolve_queries({a, occ, 0, 1, dst_id, 128}));
