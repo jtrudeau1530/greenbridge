@@ -1252,5 +1252,267 @@ class TestPkFmaF16RegisterAliasing(unittest.TestCase):
             self.assertEqual(hi, expected)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags for binary16."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+@dataclass(frozen=True)
+class PackedFPStatusFlags:
+    """Status flags for dual-half packed execution (lo and hi lanes)."""
+    lo: FPStatusFlags
+    hi: FPStatusFlags
+
+
+def evaluate_fma_f16_flags(
+    s0_bits: int,
+    s1_bits: int,
+    s2_bits: int,
+    res_bits: int,
+    clamp: bool = False,
+) -> FPStatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for a single f16 lane."""
+    s0_nan = is_nan16(s0_bits)
+    s1_nan = is_nan16(s1_bits)
+    s2_nan = is_nan16(s2_bits)
+    s0_snan = is_snan16(s0_bits)
+    s1_snan = is_snan16(s1_bits)
+    s2_snan = is_snan16(s2_bits)
+
+    s0_inf = is_inf16(s0_bits)
+    s1_inf = is_inf16(s1_bits)
+    s2_inf = is_inf16(s2_bits)
+
+    s0_zero = is_zero16(s0_bits)
+    s1_zero = is_zero16(s1_bits)
+
+    invalid = False
+    if s0_snan or s1_snan or s2_snan:
+        invalid = True
+    elif (s0_inf and s1_zero) or (s0_zero and s1_inf):
+        invalid = True
+    elif (s0_inf or s1_inf) and s2_inf:
+        prod_sign = ((s0_bits ^ s1_bits) & SIGN_MASK16)
+        s2_sign = (s2_bits & SIGN_MASK16)
+        if prod_sign != s2_sign:
+            invalid = True
+
+    nan_flag = is_nan16(res_bits)
+    inf_flag = is_inf16(res_bits)
+    zero_flag = is_zero16(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK16)
+    denorm_flag = is_subnormal16(res_bits)
+
+    overflow = False
+    if not (s0_nan or s1_nan or s2_nan or s0_inf or s1_inf or s2_inf) and inf_flag:
+        overflow = True
+
+    underflow = False
+    if denorm_flag:
+        underflow = True
+
+    inexact = False
+    if overflow:
+        inexact = True
+    elif not (s0_nan or s1_nan or s2_nan or s0_inf or s1_inf or s2_inf or nan_flag or inf_flag):
+        f0 = bits_to_f16(s0_bits)
+        f1 = bits_to_f16(s1_bits)
+        f2 = bits_to_f16(s2_bits)
+        res_f = bits_to_f16(res_bits)
+        exact_frac = Fraction(f0) * Fraction(f1) + Fraction(f2)
+        if not clamp:
+            if Fraction(res_f) != exact_frac:
+                inexact = True
+        else:
+            clamped_math = min(1.0, max(0.0, float(exact_frac)))
+            if Fraction(res_f) != Fraction(clamped_math):
+                inexact = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+    )
+
+
+def evaluate_pk_fma_f16_flags(
+    src0_bits: int,
+    src1_bits: int,
+    src2_bits: int,
+    res_bits: int,
+    op_sel: Tuple[int, int, int] = (0, 0, 0),
+    op_sel_hi: Tuple[int, int, int] = (1, 1, 1),
+    neg_lo: Tuple[int, int, int] = (0, 0, 0),
+    neg_hi: Tuple[int, int, int] = (0, 0, 0),
+    clamp: bool = False,
+) -> PackedFPStatusFlags:
+    """Evaluate architectural flags for both halves of a packed v_pk_fma_f16 operation."""
+    s0_lo, s0_hi = unpack_pk_f16(src0_bits)
+    s1_lo, s1_hi = unpack_pk_f16(src1_bits)
+    s2_lo, s2_hi = unpack_pk_f16(src2_bits)
+    res_lo, res_hi = unpack_pk_f16(res_bits)
+
+    in0_lo = apply_f16_modifiers(s0_hi if op_sel[0] else s0_lo, neg_mod=bool(neg_lo[0]))
+    in1_lo = apply_f16_modifiers(s1_hi if op_sel[1] else s1_lo, neg_mod=bool(neg_lo[1]))
+    in2_lo = apply_f16_modifiers(s2_hi if op_sel[2] else s2_lo, neg_mod=bool(neg_lo[2]))
+
+    in0_hi = apply_f16_modifiers(s0_hi if op_sel_hi[0] else s0_lo, neg_mod=bool(neg_hi[0]))
+    in1_hi = apply_f16_modifiers(s1_hi if op_sel_hi[1] else s1_lo, neg_mod=bool(neg_hi[1]))
+    in2_hi = apply_f16_modifiers(s2_hi if op_sel_hi[2] else s2_lo, neg_mod=bool(neg_hi[2]))
+
+    flags_lo = evaluate_fma_f16_flags(in0_lo, in1_lo, in2_lo, res_lo, clamp=clamp)
+    flags_hi = evaluate_fma_f16_flags(in0_hi, in1_hi, in2_hi, res_hi, clamp=clamp)
+
+    return PackedFPStatusFlags(lo=flags_lo, hi=flags_hi)
+
+
+def compute_f16_fma_mantissa_product_carry(
+    s0_bits: int,
+    s1_bits: int,
+    s2_bits: int,
+) -> Tuple[int, int]:
+    """Demonstrate IEEE 754 binary16 significand product and carry/overflow generation."""
+    _, exp0, frac0 = split_f16_bits(s0_bits)
+    _, exp1, frac1 = split_f16_bits(s1_bits)
+    m0 = (1 << 10) | frac0 if exp0 != 0 else frac0
+    m1 = (1 << 10) | frac1 if exp1 != 0 else frac1
+    product = m0 * m1
+    carry_out = 1 if product >= (1 << 21) else 0
+    return product, carry_out
+
+
+class TestPkFmaF16ConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for status flags, condition codes, and carry generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        v0 = pack_pk_f16(POS_ONE, POS_TWO)
+        v1 = pack_pk_f16(POS_TWO, POS_TWO)
+        v2 = pack_pk_f16(POS_HALF, POS_ONE)
+        res = oracle_v_pk_fma_f16(v0, v1, v2)
+        flags = evaluate_pk_fma_f16_flags(v0, v1, v2, res)
+
+        for lane_flags in (flags.lo, flags.hi):
+            self.assertFalse(lane_flags.invalid)
+            self.assertFalse(lane_flags.overflow)
+            self.assertFalse(lane_flags.underflow)
+            self.assertFalse(lane_flags.inexact)
+            self.assertFalse(lane_flags.zero)
+            self.assertFalse(lane_flags.negative)
+            self.assertFalse(lane_flags.denormal)
+            self.assertFalse(lane_flags.infinite)
+            self.assertFalse(lane_flags.nan)
+
+    def test_inexact_flag_generation(self) -> None:
+        # 1.0 * 1.0 + 2^-24: exact sum is 1 + 2^-24, but rounded binary16 result is 1.0 -> inexact!
+        v0 = pack_pk_f16(POS_ONE, POS_ONE)
+        v1 = pack_pk_f16(POS_ONE, POS_ONE)
+        v2 = pack_pk_f16(POS_MIN_SUBNORM, POS_MIN_SUBNORM)
+        res = oracle_v_pk_fma_f16(v0, v1, v2)
+        flags = evaluate_pk_fma_f16_flags(v0, v1, v2, res)
+        self.assertTrue(flags.lo.inexact)
+        self.assertFalse(flags.lo.overflow)
+
+    def test_overflow_flag_generation(self) -> None:
+        # Max normal 65504.0 * 2.0 + 0.0 -> overflow to +inf
+        v0 = pack_pk_f16(POS_MAX_NORMAL, POS_MAX_NORMAL)
+        v1 = pack_pk_f16(POS_TWO, POS_TWO)
+        v2 = pack_pk_f16(POS_ZERO, POS_ZERO)
+        res = oracle_v_pk_fma_f16(v0, v1, v2)
+        flags = evaluate_pk_fma_f16_flags(v0, v1, v2, res)
+        self.assertTrue(flags.lo.overflow)
+        self.assertTrue(flags.lo.infinite)
+        self.assertTrue(flags.lo.inexact)
+        self.assertFalse(flags.lo.invalid)
+
+    def test_underflow_and_denormal_flags(self) -> None:
+        # Subnormal arithmetic produces denormal flag and underflow flag
+        sub = POS_MIN_SUBNORM
+        v0 = pack_pk_f16(sub, sub)
+        v1 = pack_pk_f16(POS_ONE, POS_ONE)
+        v2 = pack_pk_f16(POS_ZERO, POS_ZERO)
+        res = oracle_v_pk_fma_f16(v0, v1, v2)
+        flags = evaluate_pk_fma_f16_flags(v0, v1, v2, res)
+        self.assertTrue(flags.lo.denormal)
+        self.assertTrue(flags.lo.underflow)
+        self.assertFalse(flags.lo.overflow)
+
+    def test_invalid_operation_flag_generation(self) -> None:
+        # +inf * 0.0 is invalid
+        v0 = pack_pk_f16(POS_INF, POS_ONE)
+        v1 = pack_pk_f16(POS_ZERO, POS_ONE)
+        v2 = pack_pk_f16(POS_ZERO, POS_ZERO)
+        res = oracle_v_pk_fma_f16(v0, v1, v2)
+        flags = evaluate_pk_fma_f16_flags(v0, v1, v2, res)
+        self.assertTrue(flags.lo.invalid)
+        self.assertTrue(flags.lo.nan)
+        self.assertFalse(flags.hi.invalid)
+
+        # Signaling NaN in input produces invalid flag
+        v_snan = pack_pk_f16(SNAN_DEFAULT, POS_ONE)
+        res_snan = oracle_v_pk_fma_f16(v_snan, v1, v2)
+        flags_snan = evaluate_pk_fma_f16_flags(v_snan, v1, v2, res_snan)
+        self.assertTrue(flags_snan.lo.invalid)
+
+    def test_zero_and_negative_flags(self) -> None:
+        # -2.0 * 2.0 + 0.0 = -4.0 (negative)
+        # +0.0 * 1.0 + 0.0 = +0.0 (zero)
+        v0 = pack_pk_f16(NEG_TWO, POS_ZERO)
+        v1 = pack_pk_f16(POS_TWO, POS_ONE)
+        v2 = pack_pk_f16(POS_ZERO, POS_ZERO)
+        res = oracle_v_pk_fma_f16(v0, v1, v2)
+        flags = evaluate_pk_fma_f16_flags(v0, v1, v2, res)
+
+        self.assertTrue(flags.lo.negative)
+        self.assertFalse(flags.lo.zero)
+
+        self.assertTrue(flags.hi.zero)
+        self.assertFalse(flags.hi.negative)
+
+    def test_packed_status_flags_divergence(self) -> None:
+        # lo overflows to +inf, hi underflows to subnormal
+        v0 = pack_pk_f16(POS_MAX_NORMAL, POS_MIN_SUBNORM)
+        v1 = pack_pk_f16(POS_TWO, POS_ONE)
+        v2 = pack_pk_f16(POS_ZERO, POS_ZERO)
+        res = oracle_v_pk_fma_f16(v0, v1, v2)
+        flags = evaluate_pk_fma_f16_flags(v0, v1, v2, res)
+
+        self.assertTrue(flags.lo.overflow)
+        self.assertFalse(flags.lo.underflow)
+
+        self.assertTrue(flags.hi.underflow)
+        self.assertFalse(flags.hi.overflow)
+
+    def test_mantissa_product_carry_generation(self) -> None:
+        # 1.0 has significand (1 << 10) = 1024
+        # 1.0 * 1.0: product = 1024 * 1024 = 1048576 = (1 << 20) -> carry = 0
+        prod0, carry0 = compute_f16_fma_mantissa_product_carry(POS_ONE, POS_ONE, POS_ZERO)
+        self.assertEqual(prod0, 1 << 20)
+        self.assertEqual(carry0, 0)
+
+        # Significand with leading 1.111...: ~2047 * 2047 ~= 4190209 >= (1 << 21) -> carry = 1
+        val_near_two = f16_to_bits(1.999)
+        prod1, carry1 = compute_f16_fma_mantissa_product_carry(val_near_two, val_near_two, POS_ZERO)
+        self.assertEqual(carry1, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
