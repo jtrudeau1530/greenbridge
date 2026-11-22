@@ -294,6 +294,17 @@ private:
                 continue;
             }
 
+            // Nine distinct keys with the same full hash can never fit the shader's eight probes,
+            // regardless of capacity. Refuse before allocating ever larger tables.
+            if (empty_slot < 0) {
+                std::uint32_t same_hash = 0;
+                for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
+                    const auto& entry = entries_[(h + k) & mask_];
+                    if (hash_descriptor_key(entry.key) == h) ++same_hash;
+                }
+                if (same_hash == kDescriptorProbes)
+                    throw std::length_error("Descriptor hash collision exceeds shader probe limit");
+            }
             const bool relocate = empty_slot < 0;
             std::uint32_t moved_to = 0;
             if (relocate) empty_slot = make_probe_slot(entries_, h, &moved_to);
