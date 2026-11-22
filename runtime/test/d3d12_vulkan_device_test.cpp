@@ -3,9 +3,9 @@
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue and a fence. Results are read back through D3D12 itself
 // (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo and
-// GetResourceTiling are compared with the host PC runtime's.
-// No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation
-// error fails the test.
+// GetResourceTiling are compared with the host PC runtime's. WriteToSubresource/ReadFromSubresource run on
+// devices of their own, once per copy path. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run
+// under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -115,6 +115,193 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     barrier.Transition.StateBefore = before;
     barrier.Transition.StateAfter = after;
     return barrier;
+}
+
+std::uint8_t texel_byte(UINT x, UINT y, UINT z, UINT i) { return std::uint8_t(x * 31 + y * 7 + z * 61 + i * 3 + 1); }
+
+// WriteToSubresource/ReadFromSubresource on `device`. Textures in a CPU-visible custom heap copy on the host when the
+// device has VK_EXT_host_image_copy, through a staging submit when it doesn't; main runs this once per path. Covers
+// zero-filled first reads, boxes with pitches unlike the texture's, a mip, a volume, BC1 blocks, a default-heap
+// texture (always staged), the rejected calls, and both directions between the CPU copies and GPU copies.
+int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
+    const D3D12_HEAP_PROPERTIES cpu_heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0};
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto create = [&](const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC& desc,
+                            D3D12_RESOURCE_STATES state, Ref<ID3D12Resource>& out) {
+        return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&out.p));
+    };
+    unsigned bad = 0;
+    const auto expect_bytes = [&](const char* what, UINT x, UINT y, UINT z, const std::uint8_t* got,
+                                  const std::array<std::uint8_t, 4>& want) {
+        if (std::memcmp(got, want.data(), 4) == 0) return;
+        if (bad++ < 8)
+            std::fprintf(stderr, "%s, %s (%u,%u,%u): got %02x %02x %02x %02x, want %02x %02x %02x %02x\n", path, what,
+                         x, y, z, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+    };
+    const auto texel = [](UINT x, UINT y, UINT z) {
+        return std::array<std::uint8_t, 4>{texel_byte(x, y, z, 0), texel_byte(x, y, z, 1), texel_byte(x, y, z, 2),
+                                           texel_byte(x, y, z, 3)};
+    };
+    constexpr std::array<std::uint8_t, 4> zero{};
+
+    Ref<ID3D12Resource> tex, vol, bc1, gpu_only, buffer, upload, readback;
+    EXPECT(SUCCEEDED(create(cpu_heap, texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 2),
+                            D3D12_RESOURCE_STATE_COMMON, tex)));
+    D3D12_RESOURCE_DESC volume = texture_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1, 4);
+    volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    EXPECT(SUCCEEDED(create(cpu_heap, volume, D3D12_RESOURCE_STATE_COMMON, vol)));
+    if (bc)
+        EXPECT(SUCCEEDED(create(cpu_heap, texture_desc(8, 8, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_COMMON, bc1)));
+    EXPECT(SUCCEEDED(create(default_heap, texture_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_SOURCE, gpu_only)));
+    EXPECT(SUCCEEDED(create(cpu_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_COMMON, buffer)));
+    EXPECT(SUCCEEDED(create(upload_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_GENERIC_READ, upload)));
+    EXPECT(SUCCEEDED(create(readback_heap, buffer_desc(4096), D3D12_RESOURCE_STATE_COPY_DEST, readback)));
+
+    // A texture in a CPU-visible heap maps only without a pointer; a default-heap texture not at all.
+    void* pointer = nullptr;
+    EXPECT(tex->Map(0, nullptr, nullptr) == S_OK);
+    EXPECT(tex->Map(1, nullptr, nullptr) == S_OK);
+    EXPECT(tex->Map(0, nullptr, &pointer) == E_INVALIDARG);
+    EXPECT(tex->Map(2, nullptr, nullptr) == E_INVALIDARG);
+    EXPECT(gpu_only->Map(0, nullptr, nullptr) == E_INVALIDARG);
+    tex->Unmap(1, nullptr);
+
+    // A new texture reads back zero-filled.
+    std::vector<std::uint8_t> got(1024, 0xcd);
+    EXPECT(SUCCEEDED(tex->ReadFromSubresource(got.data(), 32, 0, 0, nullptr)));
+    for (UINT y = 0; y < 8; ++y)
+        for (UINT x = 0; x < 8; ++x) expect_bytes("new texture", x, y, 0, &got[y * 32 + x * 4], zero);
+
+    // A 5x4 box from rows 100 bytes apart, read back whole at a 40-byte pitch.
+    std::vector<std::uint8_t> src(1024, 0);
+    const D3D12_BOX box{2, 1, 0, 7, 5, 1};
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 5; ++x) std::memcpy(&src[y * 100 + x * 4], texel(x + 2, y + 1, 0).data(), 4);
+    EXPECT(SUCCEEDED(tex->WriteToSubresource(0, &box, src.data(), 100, 0)));
+    std::fill(got.begin(), got.end(), std::uint8_t(0xcd));
+    EXPECT(SUCCEEDED(tex->ReadFromSubresource(got.data(), 40, 0, 0, nullptr)));
+    for (UINT y = 0; y < 8; ++y)
+        for (UINT x = 0; x < 8; ++x) {
+            const bool inside = x >= 2 && x < 7 && y >= 1 && y < 5;
+            expect_bytes("boxed write", x, y, 0, &got[y * 40 + x * 4], inside ? texel(x, y, 0) : zero);
+        }
+
+    // Mip 1 (4x4) written whole, read back as a box.
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) std::memcpy(&src[y * 16 + x * 4], texel(x, y, 1).data(), 4);
+    EXPECT(SUCCEEDED(tex->WriteToSubresource(1, nullptr, src.data(), 16, 0)));
+    const D3D12_BOX mip_box{1, 1, 0, 3, 4, 1};
+    std::fill(got.begin(), got.end(), std::uint8_t(0xcd));
+    EXPECT(SUCCEEDED(tex->ReadFromSubresource(got.data(), 8, 0, 1, &mip_box)));
+    for (UINT y = 0; y < 3; ++y)
+        for (UINT x = 0; x < 2; ++x) expect_bytes("mip 1", x + 1, y + 1, 1, &got[y * 8 + x * 4], texel(x + 1, y + 1, 1));
+
+    // A volume: three slices of a 3x4 box, rows 12 and slices 64 bytes apart; read back whole at other pitches.
+    std::fill(src.begin(), src.end(), std::uint8_t(0));
+    const D3D12_BOX volume_box{1, 0, 1, 4, 4, 4};
+    for (UINT z = 0; z < 3; ++z)
+        for (UINT y = 0; y < 4; ++y)
+            for (UINT x = 0; x < 3; ++x) std::memcpy(&src[z * 64 + y * 12 + x * 4], texel(x + 1, y, z + 1).data(), 4);
+    EXPECT(SUCCEEDED(vol->WriteToSubresource(0, &volume_box, src.data(), 12, 64)));
+    std::fill(got.begin(), got.end(), std::uint8_t(0xcd));
+    EXPECT(SUCCEEDED(vol->ReadFromSubresource(got.data(), 20, 96, 0, nullptr)));
+    for (UINT z = 0; z < 4; ++z)
+        for (UINT y = 0; y < 4; ++y)
+            for (UINT x = 0; x < 4; ++x)
+                expect_bytes("volume", x, y, z, &got[z * 96 + y * 20 + x * 4], x >= 1 && z >= 1 ? texel(x, y, z) : zero);
+
+    // BC1: 2x2 blocks of 8 bytes written whole, then one block replaced through a box.
+    if (bc1.p) {
+        std::uint8_t blocks[32];
+        for (UINT i = 0; i < 32; ++i) blocks[i] = std::uint8_t(0x40 + i);
+        EXPECT(SUCCEEDED(bc1->WriteToSubresource(0, nullptr, blocks, 16, 0)));
+        const D3D12_BOX corner{4, 4, 0, 8, 8, 1};
+        const std::uint8_t replaced[8] = {0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7};
+        EXPECT(SUCCEEDED(bc1->WriteToSubresource(0, &corner, replaced, 8, 0)));
+        std::memcpy(blocks + 24, replaced, 8);
+        std::uint8_t back[64] = {};
+        EXPECT(SUCCEEDED(bc1->ReadFromSubresource(back, 32, 0, 0, nullptr)));
+        for (UINT row = 0; row < 2; ++row)
+            if (std::memcmp(back + row * 32, blocks + row * 16, 16) != 0 && bad++ < 8)
+                std::fprintf(stderr, "%s, BC1 block row %u differs\n", path, row);
+        const D3D12_BOX cut{2, 0, 0, 8, 4, 1};  // starts inside a block
+        EXPECT(bc1->WriteToSubresource(0, &cut, blocks, 16, 0) == E_INVALIDARG);
+    }
+
+    // Calls D3D12 rejects.
+    const D3D12_BOX outside{0, 0, 0, 9, 1, 1}, empty{2, 2, 0, 2, 3, 1};
+    EXPECT(tex->WriteToSubresource(0, &outside, src.data(), 100, 0) == E_INVALIDARG);
+    EXPECT(tex->WriteToSubresource(0, &empty, src.data(), 100, 0) == E_INVALIDARG);
+    EXPECT(tex->WriteToSubresource(2, nullptr, src.data(), 100, 0) == E_INVALIDARG);  // 2 mips, 1 layer
+    EXPECT(tex->WriteToSubresource(0, nullptr, nullptr, 32, 0) == E_INVALIDARG);
+    EXPECT(tex->ReadFromSubresource(nullptr, 32, 0, 0, nullptr) == E_INVALIDARG);
+    EXPECT(tex->WriteToSubresource(0, nullptr, src.data(), 16, 0) == E_INVALIDARG);  // 32-byte rows 16 apart
+    EXPECT(vol->WriteToSubresource(0, nullptr, src.data(), 16, 32) == E_INVALIDARG);  // 64-byte slices 32 apart
+    EXPECT(buffer->WriteToSubresource(0, nullptr, src.data(), 16, 0) == E_INVALIDARG);
+
+    // A default-heap texture: D3D12 wants a CPU-visible heap, but the copy still works (and is logged).
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) std::memcpy(&src[y * 16 + x * 4], texel(x, y, 7).data(), 4);
+    EXPECT(SUCCEEDED(gpu_only->WriteToSubresource(0, nullptr, src.data(), 16, 0)));
+
+    // GPU copies see the CPU's writes (mip 1, the default-heap texture), and the CPU sees a GPU copy's (a 4x4
+    // upload into the bottom left of mip 0, which is in COMMON and promoted).
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                               IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    std::uint8_t* up = nullptr;
+    std::uint8_t* down = nullptr;
+    EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&down))));
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT square{0, {DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 256}};
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) std::memcpy(up + y * 256 + x * 4, texel(x, y + 4, 0).data(), 4);
+    std::memset(down, 0xcd, 4096);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT second = square;
+    second.Offset = 2048;
+    {
+        const auto dst = subresource(tex.p, 0);
+        const auto in = footprint(upload.p, square);
+        list->CopyTextureRegion(&dst, 0, 4, 0, &in, nullptr);
+        const auto out = footprint(readback.p, square);
+        const auto mip1 = subresource(tex.p, 1);
+        list->CopyTextureRegion(&out, 0, 0, 0, &mip1, nullptr);
+        const auto out2 = footprint(readback.p, second);
+        const auto staged = subresource(gpu_only.p, 0);
+        list->CopyTextureRegion(&out2, 0, 0, 0, &staged, nullptr);
+    }
+    EXPECT(list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) {
+            expect_bytes("GPU copy of mip 1", x, y, 1, down + y * 256 + x * 4, texel(x, y, 1));
+            expect_bytes("GPU copy of the default-heap texture", x, y, 7, down + 2048 + y * 256 + x * 4, texel(x, y, 7));
+        }
+    const D3D12_BOX bottom_left{0, 4, 0, 4, 8, 1};
+    std::fill(got.begin(), got.end(), std::uint8_t(0xcd));
+    EXPECT(SUCCEEDED(tex->ReadFromSubresource(got.data(), 16, 0, 0, &bottom_left)));
+    for (UINT y = 0; y < 4; ++y)
+        for (UINT x = 0; x < 4; ++x) expect_bytes("CPU read of a GPU upload", x, y + 4, 0, &got[y * 16 + x * 4], texel(x, y + 4, 0));
+    upload->Unmap(0, nullptr);
+    readback->Unmap(0, nullptr);
+    EXPECT(!bad);
+    std::printf("WriteToSubresource/ReadFromSubresource (%s): boxes, pitches, a mip, a volume%s, rejected calls and "
+                "GPU copies both ways matched\n", path, bc1.p ? ", BC1" : "");
+    return 0;
 }
 
 // The host PC runtime's D3D12 device on the default adapter, to compare answers with; false if there is none.
@@ -1193,6 +1380,27 @@ int main() {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }  // the device is released here, before the Vulkan device it runs on
     EXPECT(!mismatches);
+
+    // CPU texture copies, once per path. A second D3D12 device on the same Vulkan device, told the extension is
+    // off, takes the staging path even on a GPU that has host image copy.
+    for (const bool host : {true, false}) {
+        if (host && !d.host_image_copy) {
+            std::printf("WriteToSubresource/ReadFromSubresource (host image copy): no VK_EXT_host_image_copy, "
+                        "skipped\n");
+            continue;
+        }
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = d.instance_proc;
+        info.instance = d.instance;
+        info.physical = d.physical;
+        info.device = d.device;
+        info.queue = d.queue;
+        info.queue_family = d.family;
+        info.host_image_copy = host;
+        Ref<ID3D12Device> device;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
+        EXPECT(cpu_copies(device.p, d.bc, host ? "host image copy" : "staging copy") == 0);
+    }
 
     // The path D3D12XboxCreateDevice takes with LEONIDA_D3D12=vulkan: a device on its own Vulkan instance.
     {
