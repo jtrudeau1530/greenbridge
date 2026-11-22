@@ -1037,6 +1037,33 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         const auto padded = [block](std::uint32_t size) { return (size + block - 1) / block * block; };
         if (box.right > padded(from.width) || box.bottom > padded(from.height) || box.back > from_depth)
             return ReplayResult::invalid_copy;
+        if (const std::uint32_t dst_block = block_format(p.binding.format, dst.aspectMask).block; dst_block != block) {
+            // A BC format and its uncompressed equivalent ("Format Conversion using Direct3D 10.1"): one texel of the
+            // uncompressed side is one block of the other. The box is in source texels, the offset in destination
+            // texels, and Vulkan takes the extent in source texels, cut at the source's mip edge.
+            const auto blocks = [](std::uint32_t size, std::uint32_t b) { return (size + b - 1) / b; };
+            const bool same_bytes =
+                block_format(p.binding.format, dst.aspectMask).bytes == block_format(p.source.format, src.aspectMask).bytes;
+            if (!same_bytes || (box.left | box.top) % block || (copy.x | copy.y) % dst_block || box.left >= from.width ||
+                box.top >= from.height || !within(copy.z, box.back - box.front, to_depth) ||
+                copy.x / dst_block + blocks(box.right - box.left, block) > blocks(to.width, dst_block) ||
+                copy.y / dst_block + blocks(box.bottom - box.top, block) > blocks(to.height, dst_block))
+                return ReplayResult::invalid_copy;
+            const std::uint32_t w = std::min(padded(box.right - box.left), from.width - box.left);
+            const std::uint32_t h = std::min(padded(box.bottom - box.top), from.height - box.top);
+            // shortcut: into a BC mip whose edge block is partial, Vulkan's extent cannot reach the padded edge; such
+            // a copy is refused until it is staged through a buffer.
+            if (dst_block > 1 && (copy.x + w * dst_block > to.width || copy.y + h * dst_block > to.height))
+                return ReplayResult::invalid_copy;
+            p.image_copies.push_back({{src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1},
+                                      {std::int32_t(box.left), std::int32_t(box.top), std::int32_t(box.front)},
+                                      {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1},
+                                      {std::int32_t(copy.x), std::int32_t(copy.y), std::int32_t(copy.z)},
+                                      {w, h, box.back - box.front}});
+            p.range = dst;
+            p.source_range = src;
+            return ReplayResult::success;
+        }
         std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
         const std::uint32_t d = box.back - box.front;
         if (block > 1) {
@@ -1138,7 +1165,15 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
         return ReplayResult::success;
     }
     const ResourceBinding &dst = p.binding, &src = p.source;
-    if (!dst.image || !src.image || dst.width != src.width || dst.height != src.height ||
+    // A BC texture and one of its uncompressed equivalent match block for texel ("Format Conversion using
+    // Direct3D 10.1"); the Vulkan extent is in source texels.
+    const std::uint32_t sb = block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).block;
+    const std::uint32_t db = block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).block;
+    const auto blocks = [](std::uint32_t size, std::uint32_t b) { return (size + b - 1) / b; };
+    const bool same_shape = sb == db ? dst.width == src.width && dst.height == src.height
+                                     : blocks(dst.width, db) == blocks(src.width, sb) &&
+                                           blocks(dst.height, db) == blocks(src.height, sb);
+    if (!dst.image || !src.image || !same_shape ||
         dst.depth != src.depth || dst.volume != src.volume || dst.mip_levels != src.mip_levels ||
         dst.array_layers != src.array_layers || dst.aspects != src.aspects || dst.samples != src.samples ||
         block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes)
@@ -1146,7 +1181,13 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     for (const VkImageAspectFlags aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
         if (!(dst.aspects & aspect)) continue;
         for (std::uint32_t mip = 0; mip < dst.mip_levels; ++mip) {
-            const VkExtent2D extent = mip_extent(dst, mip);
+            const VkExtent2D extent = mip_extent(src, mip), to = mip_extent(dst, mip);
+            // Lower mips can differ in blocks (BC 12x8 mip 1 is 2x1 blocks, R32G32 3x2 mip 1 is 1x1): more source
+            // blocks than the destination holds is refused, as by WARP. shortcut: a BC destination mip with a partial
+            // edge block cannot take a whole uncompressed texel per block in one vkCmdCopyImage; refused until such
+            // a copy is staged through a buffer.
+            if (sb != db && (blocks(extent.width, sb) * db > to.width || blocks(extent.height, sb) * db > to.height))
+                return ReplayResult::invalid_copy;
             p.image_copies.push_back({{aspect, mip, 0, dst.array_layers}, {0, 0, 0}, {aspect, mip, 0, dst.array_layers},
                                       {0, 0, 0}, {extent.width, extent.height, std::max(1u, src.depth >> mip)}});
         }
