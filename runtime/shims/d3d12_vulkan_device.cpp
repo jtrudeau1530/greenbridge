@@ -1433,9 +1433,16 @@ public:
                 return DXGI_ERROR_UNSUPPORTED;
 
             // Vulkan exposes one standard sample pattern per supported count, so each supported count maps to
-            // one D3D12 quality level (quality index 0). Query the exact usages used for a D3D12 RT texture.
-            const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            // one D3D12 quality level (quality index 0). Query the matching colour or depth/stencil attachment
+            // usage, plus the transfer and sampled usages used by the resource implementation.
+            VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      VK_IMAGE_USAGE_SAMPLED_BIT;
+            if (format.aspects & VK_IMAGE_ASPECT_COLOR_BIT)
+                usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            else if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+                usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            else
+                return DXGI_ERROR_UNSUPPORTED;
             const VkImageCreateFlags flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
             VkImageFormatProperties image_properties{};
             const VkResult result = state_.image_format_properties(state_.info.physical, format.format,

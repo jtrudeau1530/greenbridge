@@ -578,6 +578,51 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
     return true;
 }
 
+// Compare D3D12 multisample quality queries for depth/stencil formats with the host runtime. The Vulkan
+// backend has one standard sample pattern, so every supported count reports one quality level (index 0).
+int compare_depth_multisample_quality_levels(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+
+    constexpr DXGI_FORMAT formats[] = {
+        DXGI_FORMAT_D32_FLOAT,
+        DXGI_FORMAT_D16_UNORM,
+        DXGI_FORMAT_D24_UNORM_S8_UINT,
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+    };
+    constexpr UINT sample_counts[] = {2, 4, 8, 16, 32};
+    unsigned compared = 0, skipped = 0;
+    int mismatches = 0;
+    for (DXGI_FORMAT format : formats) {
+        for (UINT samples : sample_counts) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS host_levels{};
+            host_levels.Format = format;
+            host_levels.SampleCount = samples;
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS our_levels = host_levels;
+            const HRESULT host_hr = host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                               &host_levels, sizeof(host_levels));
+            if (FAILED(host_hr) || host_levels.NumQualityLevels == 0) {
+                ++skipped;
+                continue;
+            }
+            ++compared;
+            const HRESULT our_hr = ours->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                             &our_levels, sizeof(our_levels));
+            if (FAILED(our_hr) || our_levels.NumQualityLevels != 1) {
+                std::fprintf(stderr,
+                             "depth MSAA quality mismatch: format %d samples %u (host %u quality levels, Vulkan "
+                             "HRESULT 0x%08lx / %u levels)\n",
+                             int(format), samples, host_levels.NumQualityLevels,
+                             static_cast<unsigned long>(our_hr), our_levels.NumQualityLevels);
+                ++mismatches;
+            }
+        }
+    }
+    std::printf("Depth/stencil MSAA quality queries: %u compared, %u host-unsupported skipped, %d mismatches\n",
+                compared, skipped, mismatches);
+    return mismatches;
+}
+
 // Compare the Vulkan-backed resolve output byte-for-byte with the host runtime for every common supported format,
 // sample count and region form. A host-unsupported combination is a deliberate skip; a mismatch in advertised
 // support or in the resulting pixels is a failure.
@@ -781,6 +826,11 @@ int main() {
             std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
                         "skipped\n");
         EXPECT(tiling_mismatches <= 0);
+
+        const int depth_quality_mismatches = compare_depth_multisample_quality_levels(device.p);
+        if (depth_quality_mismatches < 0)
+            std::printf("Depth/stencil MSAA quality queries: no host D3D12 device to compare with, skipped\n");
+        EXPECT(depth_quality_mismatches <= 0);
 
         const int resolve_mismatches = compare_resolves(device.p);
         if (resolve_mismatches < 0)
