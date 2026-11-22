@@ -1235,5 +1235,139 @@ class TestValuCmpClassIEEE754Boundaries(unittest.TestCase):
         self.assertTrue(ref_cmp_class_f64(QNAN_F64, CLASS_QNAN, neg=True))
 
 
+class TestValuCmpClassNegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)  # Pair spills past 255
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, -1, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 105, count=2)  # Pair spills past 105
+
+    def test_invalid_register_counts(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=0)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=3)
+
+    def test_invalid_operand_types_and_sizes(self) -> None:
+        # v_cmp_class_f32 with 64-bit pair src0
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CMP_CLASS_F32,
+                dst=Register(RegKind.SPECIAL, 0, count=2),
+                src0=Register(RegKind.VGPR, 0, count=2),
+                src1=Immediate(CLASS_MASK_ZERO),
+            )
+
+        # v_cmp_class_f64 with 32-bit single register src0
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CMP_CLASS_F64,
+                dst=Register(RegKind.SPECIAL, 0, count=2),
+                src0=Register(RegKind.VGPR, 0, count=1),
+                src1=Immediate(CLASS_MASK_ZERO),
+            )
+
+        # src1 mask cannot be 64-bit pair
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CMP_CLASS_F32,
+                dst=Register(RegKind.SPECIAL, 0, count=2),
+                src0=Register(RegKind.VGPR, 0, count=1),
+                src1=Register(RegKind.SGPR, 2, count=2),
+            )
+
+    def test_interpreter_bounds_and_type_rejection(self) -> None:
+        interp = ScalarVALUInterpreter()
+        with self.assertRaises(IndexError):
+            interp.read_reg_u32(RegKind.VGPR, 256)
+        with self.assertRaises(IndexError):
+            interp.write_reg_u32(RegKind.SGPR, 106, 0)
+        with self.assertRaises(TypeError):
+            interp.read_operand_f32("not_an_operand", OperandModifiers())  # type: ignore
+
+    def test_simd_wave_size_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=128)
+
+
+class TestValuCmpClassMutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of classification are caught."""
+
+    def test_mutation_zero_sign_blindness(self) -> None:
+        # Sabotage: treating -0.0 as +0.0
+        def mutated_classify_f32(bits: int) -> int:
+            u = bits & MASK32
+            if (u & ~SIGN_MASK_F32) == 0:
+                return CLASS_POS_ZERO  # Always return +0.0
+            return classify_f32(bits)
+
+        # Standard check: NEG_ZERO must match CLASS_NEG_ZERO, not CLASS_POS_ZERO
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_classify_f32(NEG_ZERO_F32), CLASS_NEG_ZERO)
+
+    def test_mutation_snan_qnan_conflation(self) -> None:
+        # Sabotage: treating all NaNs as quiet NaNs
+        def mutated_classify_f32(bits: int) -> int:
+            cls = classify_f32(bits)
+            if cls == CLASS_SNAN:
+                return CLASS_QNAN
+            return cls
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_classify_f32(SNAN_F32), CLASS_SNAN)
+
+    def test_mutation_subnormal_flush(self) -> None:
+        # Sabotage: flushing denormals to zero
+        def mutated_classify_f64(bits: int) -> int:
+            cls = classify_f64(bits)
+            if cls in (CLASS_POS_DENORMAL, CLASS_NEG_DENORMAL):
+                return CLASS_POS_ZERO if cls == CLASS_POS_DENORMAL else CLASS_NEG_ZERO
+            return cls
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_classify_f64(DENORM_MIN_F64), CLASS_POS_DENORMAL)
+
+    def test_mutation_infinity_normal_overflow(self) -> None:
+        # Sabotage: treating +INF as +NORMAL
+        def mutated_classify_f32(bits: int) -> int:
+            cls = classify_f32(bits)
+            if cls == CLASS_POS_INF:
+                return CLASS_POS_NORMAL
+            return cls
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_classify_f32(POS_INF_F32), CLASS_POS_INF)
+
+    def test_mutation_exec_mask_leakage(self) -> None:
+        # Sabotage: inactive lanes write 1 to comparison mask
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.set_exec_mask(0)  # All lanes inactive
+        inst = Instruction(
+            opcode=Opcode.V_CMP_CLASS_F32,
+            dst=Register(RegKind.SPECIAL, 0, count=2),
+            src0=Immediate(0.0),
+            src1=Immediate(CLASS_MASK_ZERO),
+        )
+        proper_mask = simd.step(inst)
+        self.assertEqual(proper_mask, 0)
+
+        # Mutated: if inactive lanes leaked, mask would be non-zero
+        mutated_mask = proper_mask | 0x00000001
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_mask, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
