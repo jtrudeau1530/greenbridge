@@ -41,7 +41,8 @@ WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact o
 
 # GFX10 buffer format codes (Mesa src/amd/registers/gfx10-rsrc.json, enum GFX10_FORMAT).
 import json as _json  # noqa: E402
-GFX10_FORMATS = {int(k): v for k, v in _json.load(open(os.path.join(os.path.dirname(__file__), "gfx10_formats.json"))).items()}
+with open(os.path.join(os.path.dirname(__file__), "gfx10_formats.json"), encoding="utf-8") as _f:
+    GFX10_FORMATS = {int(k): v for k, v in _json.load(_f).items()}
 
 # User SGPRs s0..s(USER_SGPRS-1) are initialised from push constants (128 bytes = Vulkan's guaranteed minimum).
 USER_SGPRS = 32
@@ -6945,8 +6946,9 @@ def stage_of(name, path):
         idx = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
         _STAGES = {}
         if os.path.isfile(idx):
-            for e in json.load(open(idx, encoding="utf-8")):
-                _STAGES[e["file"][:-5]] = e["stage"]
+            with open(idx, encoding="utf-8") as f:
+                for e in json.load(f):
+                    _STAGES[e["file"][:-5]] = e["stage"]
     return _STAGES.get(name) or (name[:2].lower() if name[2:3] == "_" else "?")
 
 
@@ -7046,7 +7048,8 @@ def read_before_write_vgprs(insns):
 def input_signature_full(path, name):
     """ISG1 elements as (system value, declared mask, read/write mask)."""
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    d = open(dxbc, "rb").read()
+    with open(dxbc, "rb") as f:
+        d = f.read()
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"ISG1":
@@ -7060,7 +7063,8 @@ def input_signature_full(path, name):
 def input_signature(path, name):
     """ISG1 elements of the shader's DXBC container: (register, mask, system value, component type)."""
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    d = open(dxbc, "rb").read()
+    with open(dxbc, "rb") as f:
+        d = f.read()
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"ISG1":
@@ -7104,7 +7108,8 @@ def same_encoding(raw, printed, op):
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    d = open(dxbc, "rb").read()
+    with open(dxbc, "rb") as f:
+        d = f.read()
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"OSG1":
@@ -7124,7 +7129,8 @@ def output_signature_full(path, name):
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
     if not os.path.isfile(dxbc):
         return []
-    d = open(dxbc, "rb").read()
+    with open(dxbc, "rb") as f:
+        d = f.read()
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"OSG1":
@@ -7185,7 +7191,8 @@ def mesh_psv(path, name):
     PayloadSizeInBytes, u16 MaxOutputVertices, u16 MaxOutputPrimitives), wave lane counts, then PSVRuntimeInfo1
     (stage, UsesViewID, u8 SigPrimVectors, u8 MeshOutputTopology, ...) and PSVRuntimeInfo2 NumThreadsX/Y/Z."""
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    d = open(dxbc, "rb").read()
+    with open(dxbc, "rb") as f:
+        d = f.read()
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"PSV0":
@@ -7213,7 +7220,8 @@ def translate(path):
         # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then
         # translate only code reachable from entry; a branch into data is rejected below.
         fssm = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "fssm", info["name"] + ".fssm")
-        blob = open(fssm, "rb").read()
+        with open(fssm, "rb") as f:
+            blob = f.read()
         pos = info["code_start"]
         for ins in insns:
             enc = bytes.fromhex(ins["enc"])
@@ -7301,7 +7309,8 @@ def translate(path):
         # 0x13C/0x140/0x144 are the thread-group size. Layout (Mesa radv_shader_args.c): s0..user-1 = user data,
         # then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z (separate VGPRs on GFX10).
         fssm = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "fssm", info["name"] + ".fssm")
-        hdr = open(fssm, "rb").read(0x148)
+        with open(fssm, "rb") as f:
+            hdr = f.read(0x148)
         rsrc2, lx, ly, lz = struct.unpack_from("<4I", hdr, 0x138)
         if (rsrc2 >> 10) & 1:
             raise Unsupported("CS thread-group-size SGPR")
@@ -7911,7 +7920,8 @@ def main():
         import glob as _gl, json as _js
         merged = {}
         for part in sorted(_gl.glob(os.path.join(a.out, "index.part*.json"))):
-            merged.update(_js.load(open(part, encoding="utf-8")))
+            with open(part, encoding="utf-8") as f:
+                merged.update(_js.load(f))
         # The stubs go first: index.json is what tells make_game.py the translation finished.
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, merged)
