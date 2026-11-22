@@ -378,9 +378,7 @@ What is implemented (all of it testable without the game):
     | `CreateCommandQueue1`'s creator ID | ignored |
 
     `CreatePlacedResource1/2` wrap the placed path above; `2` carries the castable-format list. `CreateHeap1`
-    wraps `CreateHeap` and refuses a protected session. Both refuse, as the host does (RX 5700 and WARP, D3D-238),
-    an alignment other than 0, 64 KiB and 4 MiB, a heap type outside the enum, a custom heap without a CPU page
-    property and memory pool or a non-custom heap with either, and a heap with all three `DENY_*` flags.
+    remains a stub.
   - `CreateSampler2` as a wrapper over `CreateSampler` (D3D-28, part 2). Without flags it writes the same S#.
     `D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR` reads the union as integers. `(0,0,0,0)`, `(0,0,0,1)` and `(1,1,1,1)`
     take the S#'s transparent-black, opaque-black and opaque-white types. The S# has no separate integer types,
@@ -682,6 +680,12 @@ The compute path, end to end:
     place plus the placed offset as its console VA. A placed texture keeps its own `VkDeviceMemory` and a null VA;
     tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures are backed the same way with
     tile-multiple `GetResourceAllocationInfo`, `GetResourceTiling`, and host-matched `E_INVALIDARG` checks
+    (D3D-191). `CreatePlacedResource2`'s castable-format list reaches the placed texture's image as the committed
+    path's does (D3D-90). `CreateHeap` refuses with `E_INVALIDARG`, as the host does (RX 5700 and WARP, D3D-238),
+    an alignment other than 0, 64 KiB and 4 MiB, a heap type outside the enum, a custom heap without a CPU page
+    property and memory pool or a non-custom heap with either, and a heap with all three `DENY_*` flags. It also
+    refuses `ALLOW_DISPLAY` (committed resources only), as an RTX 4070 SUPER and a UHD 770 host do. It accepts
+    `HARDWARE_PROTECTED`, as those hosts do, though the `D3D12_HEAP_FLAGS` documentation calls it unsupported.
     (D3D-191). Multisampled 2D placed textures (`UNKNOWN` and `4x` tiled) share that backing with host-matched heap
     and offset alignment checks (`4 MiB` vs `64 KiB`, `D3D-222`). `CreatePlacedResource2`'s castable-format list
     reaches the placed texture's image as the committed path's does (D3D-90).
