@@ -60,7 +60,11 @@ struct Module {
 
 class Loader {
 public:
-    explicit Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {}
+    // Also registers the module list with the shim registry, so an unimplemented import called under
+    // LEONIDA_UNIMPLEMENTED=stop can name the module and RVA of its caller.
+    explicit Loader(std::filesystem::path game_dir);
+    Loader(const Loader&) = delete;
+    Loader& operator=(const Loader&) = delete;
     // Restores the TLS slot for the calling thread. Destroy the Loader on the thread
     // that called load() while any mapped TLS module is still live.
     ~Loader();
