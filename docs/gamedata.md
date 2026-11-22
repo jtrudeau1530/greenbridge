@@ -242,15 +242,27 @@ same numeric fields; the rest are names (`type`, `clientSystemName`, tile prefix
 The tile count is the only reading under which the sector override's span matches: 16,384 / 512 = 32 and
 33,792 / 512 = 66, so `width`/`height` are world units, not tile or texel counts.
 
-Which corner `origin` names was tested against the 2,036,542 map placements of the local catalog (x 0.1th to
-99.9th percentile -9,955 to 4,577, y -8,096 to 9,440): with `origin` as the grid centre, 99.83% fall inside
-the grid; as the minimum corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The centre
+Which corner `origin` names was tested against entity positions from a local index of map resources: 2,036,542
+placements from 23,361 resources at every LOD level, 2,011,519 of them in `levels.rpf` and the rest in the
+minigame and story packs (x 0.1th to 99.9th percentile -9,955 to 4,577, y -8,096 to 9,440). This is a
+different count from the 1,670,442 entities of the levels census in [world_census.md](world_census.md); it was
+only used for the share below. With `origin` as the grid centre, 99.83% fall inside the grid; as the minimum
+corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The `levels.rpf` subset alone gives the
+same picture: 99.83%, 1.0% and 83.0%. The centre
 reading also gives a minimum x of exactly -13,312, the `PAMH` heightmap's minimum x above.
 
-Tile names: none of the four `tileTextureNamePrefix` values occurs at the start of a name in the local
-texture catalog, no fallback texture name's joaat hash is a catalog id, and seven obvious `prefix + x + y + suffix` spellings hash
-to 0-2 catalog ids out of 2,112 per atlas, which is chance level. The tile textures are therefore either outside
-the scanned archives or named another way; this is unresolved.
+Tile names: none of the four `tileTextureNamePrefix` values starts an archive entry name or a texture-dictionary
+item name in the local catalog (118,925 named items, 119,090 item hashes). Neither the global nor the sector
+fallback names match an item name or its joaat hash, and ten `prefix + x + y + suffix` spellings over all
+2,112 tiles match nothing in three atlases and one hash in the fourth. The tile textures are therefore either
+outside the scanned archives or named another way; this is unresolved.
+
+A fifth grid uses the same base fields: one `TextureGridInfo` document has `origin`, `width`, `height`,
+`tileSize`, `streamRadius` and `zInflation`, plus a low- and a high-detail fallback name, but no sector
+overrides. It is 32,768 x 32,768 units with the same 512 tile, so **64 x 64 tiles**, the same 512 stream
+radius and the same 1,000 `zInflation`, around a different origin. Tested the same way, 100.00% of the
+placements fall inside with `origin` as the centre, 0.01% as the minimum corner and 11.8% as the top-left
+corner, so the centre convention holds for both document types.
 
 Not measured here (hypothesis): what the four grids hold (their names suggest per-tile map data for separate
 client systems), and how `zInflation` widens a tile's streaming box vertically.
