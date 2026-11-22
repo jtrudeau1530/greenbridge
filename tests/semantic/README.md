@@ -53,6 +53,12 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   constants) through the interpreter, and checks that the words each `.asm` header derives are the ones `check.py`
   and `scripts/run_gpu_tests.py` expect. The two interp fixtures get the constants their vertex shader,
   `vs_interp_consts`, exports.
+- `test_vcmpx_forms.py` runs the 14 `v_cmpx` forms that had no test (`eq`/`gt`/`le`/`lt`/`ngt`/`nle` `_f32`,
+  `f_i32`, `t_u32`, `eq`/`gt`/`le` `_i64`, `ge`/`lt`/`ne` `_u64`) in both encodings: each on a table of
+  operands (NaN, signed zeros, infinities; 64-bit values that only one word or the sign tells apart), where
+  the pixel must survive exactly when Python's comparison of the operands holds, and on a 16-lane wave with
+  one lane switched off beforehand, where the lanes left running and an untouched VCC are checked. It also
+  runs the GPU test `ps_vcmpx_forms` and re-derives its four words.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.
