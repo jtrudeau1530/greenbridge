@@ -59,4 +59,6 @@ panels count different things. The trend chart breaks a line where a metric's fo
 
 The page and the JSON carry counts, pass/fail, error classes and the project's own document text. The corpus panel
 stores per-stage numbers only: no shader name, carved file name or path into the game copy. One-line failure details
-are kept with the home folder and drive paths reduced to their last component.
+are kept with each absolute path replaced: a path inside the repository becomes its relative path, any other path
+(work folder, home folder, temp folder) becomes `<path>`, file name included, since a file name outside the
+repository can be a carved shader's name.

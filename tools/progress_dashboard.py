@@ -100,14 +100,25 @@ HOME = os.path.expanduser("~")
 
 
 def scrub(text, limit=240):
-    """One line of tool output, with the user's home folder and drive paths reduced to their last component."""
+    """One line of tool output with every absolute path replaced: a path inside the repository becomes its relative
+    path, any other path (the work folder, the home folder, a temp folder) becomes <path>, file name included, since
+    a file name outside the repository can be a carved shader's name."""
     if not text:
         return ""
     line = text.strip().splitlines()[-1] if text.strip() else ""
+
+    def shown(m):
+        path = m.group(0)
+        if inside(path, ROOT):
+            rel = os.path.relpath(os.path.realpath(path), os.path.realpath(ROOT)).replace(os.sep, "/")
+            return "." if rel == "." else rel
+        return "<path>"
+
+    line = re.sub(r"(?i)\b[a-z]:[\\/][^\s'\"]*", shown, line)
+    line = re.sub(r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*", shown, line)
     if HOME and len(HOME) > 3:
         line = line.replace(HOME, "~")
-    line = re.sub(r"(?i)\b[a-z]:[\\/](?:[^\s\\/:'\"]+[\\/])+([^\s\\/'\"]+)", r"<path>/\1", line)
-    line = re.sub(r"(?<![\w.])/(?:[^\s/'\"]+/)+([^\s/'\"]+)", r"<path>/\1", line)
+    line = re.sub(r"~[\\/][^\s'\"]*", "<path>", line)
     return line[:limit]
 
 
