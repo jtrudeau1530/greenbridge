@@ -34,6 +34,17 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         needed = set(run_gpu_tests.REQUIRED_TEST_PROGRAMS) | set(check.TEST_PROGRAMS) | {image_fuzz.HARNESS}
         self.assertEqual(needed - self.programs, set(), "missing from build_runtime.ps1's cl.exe fallback")
 
+    def test_the_launcher_compiles_every_source_cmake_gives_gta6rt(self):
+        """BUILD-680: main.cpp calls rt::fs::configure, but the fallback left out shims/file_system.cpp (LNK2019).
+        Every source of CMake's add_executable(gta6rt ...) must be in the fallback's launcher list ($files)."""
+        cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+        block = re.search(r"add_executable\(gta6rt\s+(.*?)\)", cmake, re.S).group(1)
+        wanted = {item.replace("/", "\\") for item in block.split() if item.endswith(".cpp")}
+        files = re.search(r"\$files = (.*?) \| ForEach-Object", self.body).group(1)
+        listed = set(re.findall(r'"([^"]+\.cpp)"', files))
+        self.assertTrue(wanted)
+        self.assertEqual(wanted - listed, set(), "in CMake's gta6rt sources but not in the cl.exe fallback")
+
     def test_every_test_source_it_compiles_exists(self):
         sources = re.findall(r'"\$src\\test\\([A-Za-z0-9_]+\.cpp)"', self.body)
         self.assertTrue(sources)
