@@ -5677,7 +5677,13 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* levels = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS*>(data);
             levels->NumQualityLevels = 0;
-            if (levels->Flags != D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE ||
+            // TILED_RESOURCE asks about tiled (reserved, 64KB_UNDEFINED_SWIZZLE) textures. Measured natively on an
+            // RX 7800 XT, a Radeon iGPU and WARP: 1x and 4x keep the plain answer, every other count has none, and a
+            // format without a tile shape (96-bit) has none at any count. That is GetResourceAllocationInfo's rule
+            // here (tiled MSAA is 4x only). 128-bit formats at 4x: the AMD drivers answer 0, WARP and the RTX 5070 Ti
+            // allocate them; this follows the latter, as the allocation path does.
+            const bool tiled = levels->Flags == D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE;
+            if ((levels->Flags != D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE && !tiled) ||
                 levels->SampleCount == 0 || levels->SampleCount > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
                 (levels->SampleCount & (levels->SampleCount - 1)) != 0)
                 return d3d12_trace::result(method, E_INVALIDARG);
@@ -5698,8 +5704,8 @@ public:
             }
             if (format.format == VK_FORMAT_UNDEFINED || !state_.image_format_properties)
                 return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
-            if (format.rgb96) {  // no 96-bit render targets yet, so no multisampled ones
-                levels->NumQualityLevels = levels->SampleCount == 1 ? 1 : 0;
+            if (format.rgb96) {  // no 96-bit render targets yet, so no multisampled ones; no tile shape either
+                levels->NumQualityLevels = levels->SampleCount == 1 && !tiled ? 1 : 0;
                 return d3d12_trace::result(method, S_OK);
             }
 
@@ -5722,6 +5728,7 @@ public:
             const VkSampleCountFlagBits samples = VkSampleCountFlagBits(levels->SampleCount);
             if (result == VK_SUCCESS && (image_properties.sampleCounts & samples))
                 levels->NumQualityLevels = 1;
+            if (tiled && levels->SampleCount != 1 && levels->SampleCount != 4) levels->NumQualityLevels = 0;
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_SHADER_MODEL: {
