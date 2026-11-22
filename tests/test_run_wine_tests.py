@@ -240,6 +240,24 @@ class MainTest(unittest.TestCase):
         self.assertIn("| `ok` | pass | yes |", text)
         self.assertIn("| `bad` | fail |  |", text)
 
+    def test_a_summary_in_a_missing_folder_creates_it(self):
+        summary = self.root / "missing" / "sub" / "summary.md"
+        code, _, err = self.run_main([ctest_entry("ok", self.command("ok.py"))],
+                                     "--summary", str(summary), "--label", "Wine 12")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("### Windows tests under Wine 12", summary.read_text(encoding="utf-8"))
+
+    def test_an_unwritable_summary_is_one_error_line(self):
+        blocker = self.root / "blocker"
+        blocker.write_text("not a folder", encoding="utf-8")
+        summary = blocker / "summary.md"       # its parent is a file, not a folder
+        code, _, err = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--summary", str(summary))
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("ERROR: cannot write the summary", err)
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+
     def test_a_file_that_is_not_json_is_one_error_line(self):
         listing = self.root / "notes.txt"
         listing.write_text("this is not ctest output\n", encoding="utf-8")
