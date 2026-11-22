@@ -144,12 +144,14 @@ else if (mode is "models" or "textures")
     {
         byte[] header; using (var f = File.OpenRead(src)) { header = new byte[64]; f.ReadExactly(header); }
         var cached = RecoveryIndexCache.Load(mode, src, length, header);
+        // A partial index (rpf9-explorer stopped or still indexing) would export only part of the archive: scan again.
+        if (cached != null && !ScanCounts.IsFullScan(cached)) { Console.WriteLine($"  cached {mode} index is not marked as a full scan ({cached.Entries.Count:N0} entries), rescanning"); cached = null; }
         candidates = ScanCounts.Candidates(cached?.Coverage);
         if (cached == null)
         {
             var cands = Scan(src, 0, null);
             list = Recover(src, length, cands);
-            RecoveryIndexCache.Save(mode, src, list, ScanCounts.Coverage(cands.Count, list.Select(e => e.Offset).Distinct().Count()));
+            RecoveryIndexCache.Save(mode, src, list, ScanCounts.Coverage(cands.Count, list.Select(e => e.Offset).Distinct().Count()), complete: true);
             candidates = cands.Count;
         }
         else
