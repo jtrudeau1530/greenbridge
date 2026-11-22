@@ -21,10 +21,9 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
 PROGRAM_DIRS = ("tools", "scripts", "viewer")
-# Still without the guard because other open pull requests change these files; each gets it there or after them.
+# Still without the guard because open pull requests change this file; it gets the guard there or after them.
 NOT_YET_GUARDED = {
-    "scripts/shader_stats.py",    # guard added separately, see #2135's file
-    "scripts/run_wine_tests.py",  # guard added separately; open Wine runner pull requests change this file
+    "scripts/run_wine_tests.py",  # open Wine runner pull requests change this file
 }
 MARK = ""
 
