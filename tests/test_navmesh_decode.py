@@ -604,6 +604,19 @@ class NavmeshDecodeTest(unittest.TestCase):
             self.assertNotIn("navmesh", win["resources"])
             self.assertEqual(win["carver_streams"]["streams"], 2)
 
+    def test_cli_rejects_shared_report_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "nav.rpf")
+            make_rpf(archive, build_0drp())
+            output = os.path.join(tmp, "nav.navmesh-decode.json")
+            result = subprocess.run(
+                [sys.executable, "-I", TOOL, archive, "--csv", output, "--quiet"],
+                cwd=tmp, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--out and --csv must use different paths", result.stderr)
+            self.assertFalse(os.path.exists(output))
+
     def test_cli_rejects_bad_arguments_and_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = os.path.join(tmp, "empty.rpf")
