@@ -2043,7 +2043,12 @@ class Gen:
         if const is not None:
             r31 = self.tmp()
             self.emit(f"{r31} = OpBitwiseAnd %uint {rel} {self.cu(31)}")
-            self.emit(f"{bit} = OpBitFieldUExtract %uint {self.cu(const & 0xFFFFFFFF)} {r31} {self.cu(1)}")
+            # Shift and mask, not OpBitFieldUExtract: Intel's Windows driver (UHD 770 / Xe-LP, 32.0.101.6129;
+            # also seen on Xe-LPG) extracts from a constant that fits in 16 bits with the offset taken mod 16, so
+            # exec_lo = 0xffff turned on all 32 lanes. GPU-checked with cs_exec_const.asm.
+            shr = self.tmp()
+            self.emit(f"{shr} = OpShiftRightLogical %uint {self.cu(const & 0xFFFFFFFF)} {r31}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
             self.emit(f"{on} = OpINotEqual %bool {bit} {self.cu(0)}")
         else:
             self.emit(f"{on} = OpINotEqual %bool {val} {self.cu(0)}")
