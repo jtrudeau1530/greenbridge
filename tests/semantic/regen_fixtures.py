@@ -32,7 +32,8 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            "ps_f16_pack_mods",          # v_pack_b32_f16 neg/abs (SHADER-260)
            "cs_w64x_andn2_exec",   # s_andn2_saveexec_b64 / s_andn2_wrexec_b64 (test_andn2_exec_b64.py)
            "cs_w64x_saveexec_b64",   # s_and/s_or/s_andn2_saveexec_b64, s_andn2_wrexec_b64 (test_saveexec_b64.py)
-           "ps_valu16_mad", "ps_valu16_subrev")   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
+           "ps_valu16_mad", "ps_valu16_subrev",   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
+           "cs_cvt_pk_u8")   # v_cvt_pk_u8_f32 rounding and NaN (test_cvt_pk_u8.py)
 
 
 def render(name):

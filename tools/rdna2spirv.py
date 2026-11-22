@@ -6552,10 +6552,16 @@ class Gen:
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, hi=(op == "v_fma_mixhi_f16"))
         elif op == "v_cvt_pk_u8_f32":
-            # Convert src0 to u8 (round to nearest even, clamp) and insert it at byte src1 of src2.
+            # Convert src0 to u8 (round to nearest even, clamp, NaN gives 0) and insert it at byte src1 of src2.
+            # Measured natively on RDNA2 (cs_cvt_pk_u8.asm). A NaN, found from its bits, is replaced by +0
+            # before FClamp, which is undefined for a NaN operand.
             x, byte, base = self.src_f(a[1]), self.src_u(a[2]), self.src_u(a[3])
             c, rn, u, sh, mask, nmask, keep, ins_, r = (self.tmp() for _ in range(9))
-            self.emit(f"{c} = OpExtInst %float %glsl FClamp {x} %f0 {self.fconst(255.0)}")
+            mag, not_nan, safe = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{mag} = OpBitwiseAnd %uint {self.tou(x)} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{not_nan} = OpULessThan %bool {mag} {self.cu(0x7F800001)}")
+            self.emit(f"{safe} = OpSelect %float {not_nan} {x} %f0")
+            self.emit(f"{c} = OpExtInst %float %glsl FClamp {safe} %f0 {self.fconst(255.0)}")
             self.emit(f"{rn} = OpExtInst %float %glsl RoundEven {c}")
             self.emit(f"{u} = OpConvertFToU %uint {rn}")
             b3 = self.tmp()
