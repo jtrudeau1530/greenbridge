@@ -108,6 +108,25 @@ class RigDictionaryTest(unittest.TestCase):
             "distinct_rigs": 6, "in_another_dictionary": 1, "key_missing": 1, "keys": 4,
             "keys_named_by_an_entry": 3, "no_dictionary_named_source": 1, "resolved": 3})
 
+    def test_join_uses_all_same_named_rig_dictionaries(self) -> None:
+        source = "src@one"
+        first, second = RIGS[source].items()
+        shared = {"anim/rig/x/shared": [(KIND_A, [10])]}
+        write_rpf(self.rpf, [
+            rig_dictionary(source, dict([first]) | shared),
+            rig_dictionary(source, dict([second]) | shared),
+            rig_dictionary("src@two", RIGS["src@two"]),
+        ])
+        dicts, _ = anim_rigs.scan(self.rpf)
+        self.assertEqual([d["name"] for d in dicts], [source, source, "src@two"])
+
+        for dictionaries in (dicts, dicts[::-1]):
+            joined = anim_rigs.join_rbf0(dictionaries, RIGSETS)
+            self.assertEqual(joined["resolved"], 3)
+            self.assertEqual(joined["keys_named_by_an_entry"], 3)
+            self.assertEqual(joined["key_missing"], 1)
+            self.assertEqual(joined["keys"], 5)
+
     def test_bad_block_is_reported_not_raised(self):
         page = bytearray(rig_dictionary("src@bad", {"anim/rig/b": [(KIND_A, [1])]}))
         at = page.rfind(b"RIG\x02")

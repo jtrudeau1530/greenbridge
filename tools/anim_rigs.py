@@ -113,7 +113,10 @@ def scan(path, start=None, limit=None):
 
 def join_rbf0(dicts, rigs):
     """Resolve the rig-set manager's entries: source = rig dictionary name, joaat32(rig) = a key there."""
-    keys = {d["name"]: {e["key"] for e in d.get("entries", ())} for d in dicts if d.get("name")}
+    keys: collections.defaultdict[str, set[int]] = collections.defaultdict(set)
+    for dictionary in dicts:
+        if name := dictionary.get("name"):
+            keys[name].update(entry["key"] for entry in dictionary.get("entries", ()))
     entries = [e for rs in rigs["rbf0"]["rigsets"] for e in rs["entries"]]
     c = collections.Counter()
     for e in entries:
