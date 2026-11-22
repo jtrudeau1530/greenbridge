@@ -375,6 +375,85 @@ void remove_module_lookup(void* ctx) {
         }
 }
 
+namespace {
+
+struct BundledLoaderEntry {
+    void* ctx;
+    const BundledModuleOps* ops;
+};
+
+// Immortal: late mapped-DLL detach or atexit handlers may call GetProcAddress/FreeLibrary during process teardown.
+std::mutex& bundled_loader_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<BundledLoaderEntry>& bundled_loaders() {
+    static auto* v = new std::vector<BundledLoaderEntry>;
+    return *v;
+}
+
+std::vector<BundledLoaderEntry> snapshot_bundled_loaders() {
+    std::lock_guard lock(bundled_loader_mutex());
+    return bundled_loaders();
+}
+
+}  // namespace
+
+void add_bundled_loader(void* ctx, const BundledModuleOps* ops) {
+    if (!ctx || !ops) return;
+    std::lock_guard lock(bundled_loader_mutex());
+    bundled_loaders().push_back({ctx, ops});
+}
+
+void remove_bundled_loader(void* ctx) {
+    std::lock_guard lock(bundled_loader_mutex());
+    auto& list = bundled_loaders();
+    for (auto it = list.begin(); it != list.end(); ++it)
+        if (it->ctx == ctx) {
+            list.erase(it);
+            break;
+        }
+}
+
+void* find_loaded_bundled_module(const std::string& dll_lower) {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (void* h = entry.ops->find_loaded(entry.ctx, dll_lower)) return h;
+    return nullptr;
+}
+
+void* load_bundled_module(const std::string& dll_lower, bool& handled) {
+    handled = false;
+    for (const auto& entry : snapshot_bundled_loaders()) {
+        bool loader_handled = false;
+        void* h = entry.ops->load_bundled(entry.ctx, dll_lower, loader_handled);
+        if (loader_handled) {
+            handled = true;
+            return h;
+        }
+    }
+    return nullptr;
+}
+
+void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle) {
+    owns_handle = false;
+    for (const auto& entry : snapshot_bundled_loaders()) {
+        bool loader_owns = false;
+        void* fn = entry.ops->get_proc(entry.ctx, module, sym, loader_owns);
+        if (loader_owns) {
+            owns_handle = true;
+            return fn;
+        }
+    }
+    return nullptr;
+}
+
+bool owns_bundled_module_handle(void* module) {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->owns_handle(entry.ctx, module)) return true;
+    return false;
+}
+
 Table::Table(const Entry* entries, size_t count) {
     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }

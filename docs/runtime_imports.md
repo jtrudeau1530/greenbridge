@@ -181,9 +181,12 @@ So `XCurl.dll` needs threading, error reporting and networking from the runtime,
 `libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
 `IXUserImpl6`. The executable's own set is still unmeasured. `QueryApiImpl`'s log gives it on the first boot.
 
-What this does not cover: a title that `LoadLibrary`s one of the package's bundled DLLs (`Bink2Scarlett.dll`,
-`XboxBvhBuilder.dll`, the FidelityFX DLLs) still gets the host loader, which loads the Xbox build without the
-registry's bindings for its own console imports (`xmem.dll`, `d3d12_xs.dll`).
+A title that calls `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` or `FreeLibrary` on one of the package's
+bundled DLLs (`Bink2Scarlett.dll`, `XboxBvhBuilder.dll`, the FidelityFX DLLs) is routed through `rt::Loader` instead of
+the host Windows loader (excluding data-file loads and host-preferred CRTs). The loader maps the DLL from `--game-dir`,
+binds its console imports (`xmem.dll`, `d3d12_xs.dll`) through the shim registry, runs its `DllMain` and TLS callbacks,
+and resolves direct, ordinal and forwarded exports from the mapped image. `run_tiny_bundled_load` exercises this path
+end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMemFree`.
 
 ## What this proves and what it does not
 
