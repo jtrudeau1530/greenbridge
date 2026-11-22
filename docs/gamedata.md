@@ -257,6 +257,15 @@ fallback names match an item name or its joaat hash, and ten `prefix + x + y + s
 2,112 tiles match nothing in three atlases and one hash in the fourth. The tile textures are therefore either
 outside the scanned archives or named another way; this is unresolved.
 
+In the 1.0.2.1 exports, one content change set lists four grid metadata registrations and three candidate
+archive paths as siblings. The list gives no per-grid archive assignment. The two fog grids share a tile
+prefix, while the shore-wave and water-height grids each have a distinct prefix. A case-insensitive search
+of the 30,516 other plain export blobs (30,520 total, excluding the four grid documents) found none of the
+three prefixes or the grids' global or sector fallback names in ASCII or UTF-16LE. None of the three
+archive filenames appeared as a loose file in the local package. The single catalog hash match above
+remains uncorroborated. The tile payloads and the mapping from tile coordinates to archive entries remain
+unverified.
+
 A fifth grid uses the same base fields: one `TextureGridInfo` document has `origin`, `width`, `height`,
 `tileSize`, `streamRadius` and `zInflation`, plus a low- and a high-detail fallback name, but no sector
 overrides. It is 32,768 x 32,768 units with the same 512 tile, so **64 x 64 tiles**, the same 512 stream
