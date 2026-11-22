@@ -1395,5 +1395,81 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(simd_state.vcc, 0x9876543210FEDCBA)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, infinities, and NaNs."""
+
+    def test_subnormal_boundaries_and_ordering(self) -> None:
+        self.assertEqual(oracle_min_f32(POS_MAX_SUBNORM, POS_MIN_NORMAL), POS_MAX_SUBNORM)
+        self.assertEqual(oracle_max_f32(POS_MAX_SUBNORM, POS_MIN_NORMAL), POS_MIN_NORMAL)
+
+        self.assertEqual(oracle_min_f32(NEG_MAX_SUBNORM, NEG_MIN_SUBNORM), NEG_MAX_SUBNORM)
+        self.assertEqual(oracle_max_f32(NEG_MAX_SUBNORM, NEG_MIN_SUBNORM), NEG_MIN_SUBNORM)
+
+        self.assertEqual(oracle_min_f32(POS_ZERO, POS_MIN_SUBNORM), POS_ZERO)
+        self.assertEqual(oracle_max_f32(POS_ZERO, POS_MIN_SUBNORM), POS_MIN_SUBNORM)
+        self.assertEqual(oracle_min_f32(NEG_ZERO, NEG_MIN_SUBNORM), NEG_MIN_SUBNORM)
+        self.assertEqual(oracle_max_f32(NEG_ZERO, NEG_MIN_SUBNORM), NEG_ZERO)
+
+    def test_max_finite_and_infinity_boundaries(self) -> None:
+        self.assertEqual(oracle_min_f32(POS_MAX_NORMAL, POS_INF), POS_MAX_NORMAL)
+        self.assertEqual(oracle_max_f32(POS_MAX_NORMAL, POS_INF), POS_INF)
+
+        self.assertEqual(oracle_min_f32(NEG_MAX_NORMAL, NEG_INF), NEG_INF)
+        self.assertEqual(oracle_max_f32(NEG_MAX_NORMAL, NEG_INF), NEG_MAX_NORMAL)
+
+        self.assertEqual(oracle_min_f32(POS_INF, NEG_INF), NEG_INF)
+        self.assertEqual(oracle_max_f32(POS_INF, NEG_INF), POS_INF)
+
+    def test_nan_suppression_against_infinities_and_subnormals(self) -> None:
+        qnan_custom = 0x7FC01234
+        snan_custom = 0x7F804321
+
+        self.assertEqual(oracle_min_f32(qnan_custom, POS_INF), POS_INF)
+        self.assertEqual(oracle_max_f32(qnan_custom, POS_INF), POS_INF)
+
+        self.assertEqual(oracle_min_f32(snan_custom, NEG_INF), NEG_INF)
+        self.assertEqual(oracle_max_f32(snan_custom, NEG_INF), NEG_INF)
+
+        self.assertEqual(oracle_min_f32(qnan_custom, POS_MIN_SUBNORM), POS_MIN_SUBNORM)
+        self.assertEqual(oracle_max_f32(qnan_custom, POS_MIN_SUBNORM), POS_MIN_SUBNORM)
+
+    def test_both_operands_nan_variants(self) -> None:
+        qnan1 = 0x7FC00010
+        qnan2 = 0x7FC00020
+        res_min = oracle_min_f32(qnan1, qnan2)
+        self.assertTrue(is_qnan32(res_min))
+
+        snan = 0x7F800050
+        res_max = oracle_max_f32(snan, qnan1)
+        self.assertTrue(is_qnan32(res_max))
+
+    def test_packed_asymmetric_extremes(self) -> None:
+        s0 = pack_pk_f32(QNAN_CANONICAL, POS_INF)
+        s1 = pack_pk_f32(POS_MAX_SUBNORM, NEG_INF)
+
+        res_min = oracle_pk_min_f32(s0, s1)
+        self.assertEqual(res_min, pack_pk_f32(POS_MAX_SUBNORM, NEG_INF))
+
+        res_max = oracle_pk_max_f32(s0, s1)
+        self.assertEqual(res_max, pack_pk_f32(POS_MAX_SUBNORM, POS_INF))
+
+    def test_clamp_extremes_interaction(self) -> None:
+        self.assertEqual(clamp_f32(POS_MIN_SUBNORM), POS_MIN_SUBNORM)
+        self.assertEqual(clamp_f32(POS_MAX_SUBNORM), POS_MAX_SUBNORM)
+
+        self.assertEqual(clamp_f32(NEG_MIN_SUBNORM), POS_ZERO)
+        self.assertEqual(clamp_f32(NEG_MAX_SUBNORM), POS_ZERO)
+
+        self.assertEqual(clamp_f32(POS_INF), POS_ONE)
+        self.assertEqual(clamp_f32(NEG_INF), POS_ZERO)
+
+        self.assertEqual(clamp_f32(QNAN_CANONICAL), POS_ZERO)
+        self.assertEqual(clamp_f32(SNAN_DEFAULT), POS_ZERO)
+
+
 if __name__ == "__main__":
     unittest.main()
