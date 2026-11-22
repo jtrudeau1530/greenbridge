@@ -1222,6 +1222,28 @@ class Gen:
                    "gt": "OpSGreaterThan" if s else "OpUGreaterThan",
                    "ge": "OpSGreaterThanEqual" if s else "OpUGreaterThanEqual",
                    "eq": "OpIEqual", "ne": "OpINotEqual", "lg": "OpINotEqual"}
+        elif ty == "f64" and not scalar:
+            b = self.compare_f64_cond(op, cond, srcs, mods)
+            r = self.tmp()
+            bm = b
+            if not exec_only:
+                bm = self.tmp()
+                self.emit(f"{bm} = OpLogicalAnd %bool {b} {self.active_b()}")
+            self.emit(f"{r} = OpSelect %uint {bm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            if dst is None:          # v_cmpx: EXEC &= cond
+                a2 = self.tmp()
+                self.emit(f"{a2} = OpLoad %bool %active")
+                a3 = self.tmp()
+                self.emit(f"{a3} = OpLogicalAnd %bool {a2} {b}")
+                self.emit(f"OpStore %active {a3}")
+                self.uses_active = True
+            elif dst["k"] == "special" and dst["t"] in ("vcc", "vcc_lo"):
+                self.emit(f"OpStore %vcc {r}")
+            elif dst["k"] == "sgpr":
+                self.mask_dst(dst, r)
+            else:
+                raise Unsupported("v_cmp destination")
+            return
         else:
             raise Unsupported(op)
         is_float = ty in ("f32", "f16")
@@ -1278,6 +1300,99 @@ class Gen:
         a destination (vcc/sgpr) which gets the compare result too."""
         srcs = a[-2:]
         self.compare("v_cmp_" + op[len("v_cmpx_"):], [None] + list(srcs), scalar=False, exec_only=True, mods=mods)
+
+    def compare_f64_cond(self, op, cond, srcs, mods):
+        """Evaluate an IEEE-754 binary64 compare predicate using pure 32-bit integer ops (no Float64 capability,
+        denormal-safe). Supports all 16 RDNA2 float compare conditions (f, lt, eq, le, gt, lg, ge, o, u, nge, nlg,
+        ngt, nle, neq, nlt, tru)."""
+        unord_dual = {"nlt": "lt", "nle": "le", "ngt": "gt", "nge": "ge", "neq": "eq", "nlg": "lg"}
+        if cond not in ("f", "tru", "o", "u", "lt", "le", "gt", "ge", "eq", "lg") and cond not in unord_dual:
+            raise Unsupported(op)
+        if mods:
+            raise Unsupported(op + " modifiers")
+
+        def emit_b(line):
+            t = self.tmp()
+            self.emit(f"{t} = {line}")
+            return t
+
+        def read_f64_words(sv):
+            if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+            elif sv["k"] == "fimm":
+                bits = struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
+                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+            elif sv["k"] == "imm":
+                v = sv["v"]
+                if sv.get("literal") or (not (-16 <= v <= 64) and -0x80000000 <= v <= 0xFFFFFFFF):
+                    lo, hi = self.cu(0), self.cu(v & 0xFFFFFFFF)
+                else:
+                    bits = v & 0xFFFFFFFFFFFFFFFF
+                    lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+            else:
+                raise Unsupported(op + " operand")
+            if sv.get("abs"):
+                hi = emit_b(f"OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+            if sv.get("neg"):
+                hi = emit_b(f"OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+            return lo, hi
+
+        alo, ahi = read_f64_words(srcs[0])
+        blo, bhi = read_f64_words(srcs[1])
+        if cond in ("f", "tru"):
+            return emit_b(f"OpCopyObject %bool {'%false' if cond == 'f' else '%true'}")
+
+        def is_nan_words(lo, hi):
+            exp_m = emit_b(f"OpBitwiseAnd %uint {hi} {self.cu(0x7FF00000)}")
+            expmax = emit_b(f"OpIEqual %bool {exp_m} {self.cu(0x7FF00000)}")
+            man_hi = emit_b(f"OpBitwiseAnd %uint {hi} {self.cu(0x000FFFFF)}")
+            man_or = emit_b(f"OpBitwiseOr %uint {man_hi} {lo}")
+            man_nz = emit_b(f"OpINotEqual %bool {man_or} {self.cu(0)}")
+            return emit_b(f"OpLogicalAnd %bool {expmax} {man_nz}")
+
+        nan_a, nan_b = is_nan_words(alo, ahi), is_nan_words(blo, bhi)
+        any_nan = emit_b(f"OpLogicalOr %bool {nan_a} {nan_b}")
+        if cond == "u":
+            return any_nan
+        ordered = emit_b(f"OpLogicalNot %bool {any_nan}")
+        if cond == "o":
+            return ordered
+
+        def order_key(lo, hi):
+            # Canonicalize -0.0 to +0.0, then map IEEE-754 sign-magnitude to a monotonic unsigned 64-bit key.
+            abs_hi = emit_b(f"OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+            mag_or = emit_b(f"OpBitwiseOr %uint {abs_hi} {lo}")
+            is_z = emit_b(f"OpIEqual %bool {mag_or} {self.cu(0)}")
+            c_hi = emit_b(f"OpSelect %uint {is_z} {self.cu(0)} {hi}")
+            sign = emit_b(f"OpShiftRightLogical %uint {c_hi} {self.cu(31)}")
+            is_neg = self.tmp_bool_nz(sign)
+            neg_hi = emit_b(f"OpNot %uint {c_hi}")
+            neg_lo = emit_b(f"OpNot %uint {lo}")
+            pos_hi = emit_b(f"OpBitwiseXor %uint {c_hi} {self.cu(0x80000000)}")
+            khi = emit_b(f"OpSelect %uint {is_neg} {neg_hi} {pos_hi}")
+            klo = emit_b(f"OpSelect %uint {is_neg} {neg_lo} {lo}")
+            return klo, khi
+
+        aklo, akhi = order_key(alo, ahi)
+        bklo, bkhi = order_key(blo, bhi)
+        invert = cond in unord_dual
+        base = unord_dual.get(cond, cond)
+        hi_eq = emit_b(f"OpIEqual %bool {akhi} {bkhi}")
+        if base in ("eq", "lg"):
+            lo_eq = emit_b(f"OpIEqual %bool {aklo} {bklo}")
+            cmp_res = emit_b(f"OpLogicalAnd %bool {hi_eq} {lo_eq}")
+            if base == "lg":
+                cmp_res = emit_b(f"OpLogicalNot %bool {cmp_res}")
+        else:
+            hi_op = "OpULessThan" if base in ("lt", "le") else "OpUGreaterThan"
+            lo_op = {"lt": "OpULessThan", "le": "OpULessThanEqual",
+                     "gt": "OpUGreaterThan", "ge": "OpUGreaterThanEqual"}[base]
+            hi_cmp = emit_b(f"{hi_op} %bool {akhi} {bkhi}")
+            lo_cmp = emit_b(f"{lo_op} %bool {aklo} {bklo}")
+            lo_tie = emit_b(f"OpLogicalAnd %bool {hi_eq} {lo_cmp}")
+            cmp_res = emit_b(f"OpLogicalOr %bool {hi_cmp} {lo_tie}")
+        ord_res = emit_b(f"OpLogicalAnd %bool {ordered} {cmp_res}")
+        return emit_b(f"OpLogicalNot %bool {ord_res}") if invert else ord_res
 
     def bitcmp(self, op, a):
         """s_bitcmp0/1_b32/b64: test if bit (a[1]) of scalar a[0] is 0 or 1, result in SCC."""
