@@ -610,6 +610,250 @@ class ScalarVALUInterpreter:
         return self.execute(ast)
 
 
+class SIMDVALUInterpreter:
+    """SIMD multi-lane execution model supporting Wave32 and Wave64 with EXEC masking."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size}. Must be 32 or 64.")
+        self.wave_size = wave_size
+        self.num_vgprs = 256
+        self.num_sgprs = 106
+        self.vgpr = [[0] * self.wave_size for _ in range(self.num_vgprs)]
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = (1 << self.wave_size) - 1
+
+    def reset(self) -> None:
+        self.vgpr = [[0] * self.wave_size for _ in range(self.num_vgprs)]
+        self.sgpr = [0] * self.num_sgprs
+        self.vcc = 0
+        self.exec = (1 << self.wave_size) - 1
+
+    def get_vgpr_u32(self, reg: int, lane: int) -> int:
+        if not (0 <= reg < self.num_vgprs):
+            raise IndexError(f"VGPR index {reg} out of range [0, {self.num_vgprs})")
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane {lane} out of range [0, {self.wave_size})")
+        return self.vgpr[reg][lane] & MASK32
+
+    def set_vgpr_u32(self, reg: int, lane: int, val: int) -> None:
+        if not (0 <= reg < self.num_vgprs):
+            raise IndexError(f"VGPR index {reg} out of range [0, {self.num_vgprs})")
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane {lane} out of range [0, {self.wave_size})")
+        self.vgpr[reg][lane] = val & MASK32
+
+    def get_vgpr_u64(self, reg_base: int, lane: int) -> int:
+        if not (0 <= reg_base < self.num_vgprs - 1):
+            raise IndexError(f"64-bit VGPR base {reg_base} out of range [0, {self.num_vgprs - 1})")
+        lo = self.get_vgpr_u32(reg_base, lane)
+        hi = self.get_vgpr_u32(reg_base + 1, lane)
+        return join_dwords(lo, hi)
+
+    def set_vgpr_u64(self, reg_base: int, lane: int, val64: int) -> None:
+        if not (0 <= reg_base < self.num_vgprs - 1):
+            raise IndexError(f"64-bit VGPR base {reg_base} out of range [0, {self.num_vgprs - 1})")
+        lo, hi = split_dwords(val64)
+        self.set_vgpr_u32(reg_base, lane, lo)
+        self.set_vgpr_u32(reg_base + 1, lane, hi)
+
+    def get_sgpr_u32(self, reg: int) -> int:
+        if not (0 <= reg < self.num_sgprs):
+            raise IndexError(f"SGPR index {reg} out of range [0, {self.num_sgprs})")
+        return self.sgpr[reg] & MASK32
+
+    def set_sgpr_u32(self, reg: int, val: int) -> None:
+        if not (0 <= reg < self.num_sgprs):
+            raise IndexError(f"SGPR index {reg} out of range [0, {self.num_sgprs})")
+        self.sgpr[reg] = val & MASK32
+
+    def get_sgpr_u64(self, reg_base: int) -> int:
+        if not (0 <= reg_base < self.num_sgprs - 1):
+            raise IndexError(f"64-bit SGPR base {reg_base} out of range [0, {self.num_sgprs - 1})")
+        lo = self.get_sgpr_u32(reg_base)
+        hi = self.get_sgpr_u32(reg_base + 1)
+        return join_dwords(lo, hi)
+
+    def set_sgpr_u64(self, reg_base: int, val64: int) -> None:
+        if not (0 <= reg_base < self.num_sgprs - 1):
+            raise IndexError(f"64-bit SGPR base {reg_base} out of range [0, {self.num_sgprs - 1})")
+        lo, hi = split_dwords(val64)
+        self.set_sgpr_u32(reg_base, lo)
+        self.set_sgpr_u32(reg_base + 1, hi)
+
+    def eval_operand_f64_lane(self, op: Operand, lane: int) -> int:
+        if op.kind == OperandKind.VGPR_PAIR:
+            val = self.get_vgpr_u64(op.reg_index, lane)
+        elif op.kind == OperandKind.SGPR_PAIR:
+            val = self.get_sgpr_u64(op.reg_index)
+        elif op.kind == OperandKind.LITERAL_F64:
+            val = op.literal_val & MASK64
+        else:
+            raise ValueError(f"Unsupported operand kind for f64: {op.kind}")
+
+        if op.abs_mod:
+            val &= ~SIGN_MASK_F64
+        if op.neg_mod:
+            val ^= SIGN_MASK_F64
+        return val
+
+    def eval_operand_i32_lane(self, op: Operand, lane: int) -> int:
+        if op.kind == OperandKind.VGPR_SINGLE:
+            return s32(self.get_vgpr_u32(op.reg_index, lane))
+        elif op.kind == OperandKind.SGPR_SINGLE:
+            return s32(self.get_sgpr_u32(op.reg_index))
+        elif op.kind in (OperandKind.LITERAL_I32, OperandKind.INLINE_CONST):
+            return s32(op.literal_val)
+        else:
+            raise ValueError(f"Unsupported operand kind for i32: {op.kind}")
+
+    def execute(self, ast: InstructionAST) -> list[int]:
+        ast.validate()
+        results: list[int] = []
+        effective_exec = self.exec & ((1 << self.wave_size) - 1)
+
+        # Latch inputs across all lanes before write-back (hardware pipeline semantics)
+        src0_latched = [0] * self.wave_size
+        src1_latched = [0] * self.wave_size
+
+        for lane in range(self.wave_size):
+            if (effective_exec >> lane) & 1:
+                src0_latched[lane] = self.eval_operand_f64_lane(ast.src0, lane)
+                src1_latched[lane] = self.eval_operand_i32_lane(ast.src1, lane)
+
+        # Compute and write back
+        for lane in range(self.wave_size):
+            if not ((effective_exec >> lane) & 1):
+                results.append(self.get_vgpr_u64(ast.dst.reg_index, lane))
+                continue
+
+            res = ref_ldexp_f64(
+                src0_latched[lane],
+                src1_latched[lane],
+                clamp=ast.clamp,
+                omod=ast.omod,
+            )
+            self.set_vgpr_u64(ast.dst.reg_index, lane, res)
+            results.append(res)
+
+        return results
+
+    def execute_asm(self, asm_line: str) -> list[int]:
+        ast = parse_vop3_ldexp_f64(asm_line)
+        return self.execute(ast)
+
+
+class TestValuLdexpF64SIMDMultiLane(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_uniform_execution(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        base = f64_to_bits(1.5)
+        for lane in range(32):
+            sim.set_vgpr_u64(2, lane, base)
+            sim.set_vgpr_u32(4, lane, 3)
+
+        results = sim.execute_asm("v_ldexp_f64 v[0:1], v[2:3], v4")
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertEqual(bits_to_f64(results[lane]), 12.0)
+            self.assertEqual(bits_to_f64(sim.get_vgpr_u64(0, lane)), 12.0)
+
+    def test_wave64_uniform_execution(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        base = f64_to_bits(0.125)
+        for lane in range(64):
+            sim.set_vgpr_u64(6, lane, base)
+            sim.set_vgpr_u32(8, lane, 4)
+
+        results = sim.execute_asm("v_ldexp_f64 v[4:5], v[6:7], v8")
+        self.assertEqual(len(results), 64)
+        for lane in range(64):
+            self.assertEqual(bits_to_f64(results[lane]), 2.0)
+
+    def test_wave32_divergent_lanes(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        expected: list[float] = []
+        for lane in range(32):
+            val = float(lane + 1)
+            exp = (lane % 5) - 2  # exponents in [-2, 2]
+            sim.set_vgpr_u64(0, lane, f64_to_bits(val))
+            sim.set_vgpr_u32(2, lane, exp)
+            expected.append(math.ldexp(val, exp))
+
+        results = sim.execute_asm("v_ldexp_f64 v[4:5], v[0:1], v2")
+        for lane in range(32):
+            self.assertEqual(bits_to_f64(results[lane]), expected[lane])
+
+    def test_wave64_divergent_lanes(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        expected: list[float] = []
+        for lane in range(64):
+            val = 0.5 * (lane + 1)
+            exp = (lane % 7) - 3
+            sim.set_vgpr_u64(2, lane, f64_to_bits(val))
+            sim.set_vgpr_u32(4, lane, exp)
+            expected.append(math.ldexp(val, exp))
+
+        results = sim.execute_asm("v_ldexp_f64 v[0:1], v[2:3], v4")
+        for lane in range(64):
+            self.assertEqual(bits_to_f64(results[lane]), expected[lane])
+
+    def test_exec_mask_partial_inactivity_wave32(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        canary = 0xDEADBEEFCAFEBABE
+        for lane in range(32):
+            sim.set_vgpr_u64(0, lane, canary)
+            sim.set_vgpr_u64(2, lane, f64_to_bits(1.0))
+            sim.set_vgpr_u32(4, lane, 2)
+
+        # Only even lanes active: 0x55555555
+        sim.exec = 0x55555555
+        results = sim.execute_asm("v_ldexp_f64 v[0:1], v[2:3], v4")
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(bits_to_f64(results[lane]), 4.0)
+                self.assertEqual(bits_to_f64(sim.get_vgpr_u64(0, lane)), 4.0)
+            else:
+                self.assertEqual(results[lane], canary)
+                self.assertEqual(sim.get_vgpr_u64(0, lane), canary)
+
+    def test_exec_mask_partial_inactivity_wave64(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        canary = 0x1122334455667788
+        for lane in range(64):
+            sim.set_vgpr_u64(0, lane, canary)
+            sim.set_vgpr_u64(2, lane, f64_to_bits(2.0))
+            sim.set_vgpr_u32(4, lane, 1)
+
+        # Low 32 lanes active, high 32 lanes inactive
+        sim.exec = 0x00000000FFFFFFFF
+        results = sim.execute_asm("v_ldexp_f64 v[0:1], v[2:3], v4")
+
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(bits_to_f64(results[lane]), 4.0)
+            else:
+                self.assertEqual(results[lane], canary)
+                self.assertEqual(sim.get_vgpr_u64(0, lane), canary)
+
+    def test_exec_mask_all_inactive(self):
+        sim = SIMDVALUInterpreter(wave_size=64)
+        canary = 0xCAFEBABE12345678
+        for lane in range(64):
+            sim.set_vgpr_u64(0, lane, canary)
+            sim.set_vgpr_u64(2, lane, f64_to_bits(1.0))
+            sim.set_vgpr_u32(4, lane, 1)
+
+        sim.exec = 0x0
+        results = sim.execute_asm("v_ldexp_f64 v[0:1], v[2:3], v4")
+        for lane in range(64):
+            self.assertEqual(results[lane], canary)
+            self.assertEqual(sim.get_vgpr_u64(0, lane), canary)
+
+
 class TestValuLdexpF64ScalarInterpreter(unittest.TestCase):
     """Unit tests for deterministic scalar instruction interpreter."""
 
