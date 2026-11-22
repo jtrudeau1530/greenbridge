@@ -1856,9 +1856,9 @@ Not implemented yet:
 - **Overlapping queries.** Replay refuses overlapping pipeline-statistics queries or occlusion overlaps involving
   a binary query with `ReplayResult::unsupported`.
 - **Other helper dispatches during a pipeline-statistics query.** Replay still refuses `SetPredication` and
-  predicated copies while pipeline statistics are active, since their dispatches would change the reported
-  compute-invocation count. The single-list `replay()` helper, which has no segment pool, keeps refusing the
-  occlusion resolves above that need a dispatch there.
+  predicated copies and D24/RGB96 footprint conversions while pipeline statistics are active, since their
+  dispatches would change the reported compute-invocation count. The single-list `replay()` helper, which has no
+  segment pool, keeps refusing the occlusion resolves above that need a dispatch there.
 - Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
   queues and frames in flight".)
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.

@@ -2025,6 +2025,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
                     p.has_depth24 = true;
                 }
+                // These footprint conversions emit compute dispatches in emit(). Until pipeline-statistics
+                // segmentation can bracket arbitrary helper dispatches, don't let them inflate CSInvocations.
+                if (p.has_depth24 && statistics_active) return ReplayResult::unsupported;
             } else {
                 result = detail::prepare_resource_copy(p);
             }
