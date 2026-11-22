@@ -1159,5 +1159,100 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(vcc_inf & vcc_nan, 0)
 
 
+# ============================================================================
+# Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_flt_min_normal_boundary(self) -> None:
+        """rsq(2^-126) = 2^63, exact power of 2 representation in binary32."""
+        res_bits = oracle_v_rsq_f32(FLT_MIN)
+        self.assertFalse(is_nan_f32(res_bits))
+        self.assertFalse(is_inf_f32(res_bits))
+        expected_val = 2.0 ** 63
+        self.assertAlmostEqual(bits_to_f32(res_bits), expected_val, delta=expected_val * 1e-6)
+
+    def test_flt_max_normal_boundary(self) -> None:
+        """rsq(FLT_MAX) produces small finite positive normal float."""
+        res_bits = oracle_v_rsq_f32(FLT_MAX)
+        self.assertFalse(is_nan_f32(res_bits))
+        self.assertFalse(is_inf_f32(res_bits))
+        res_val = bits_to_f32(res_bits)
+        self.assertGreater(res_val, 0.0)
+        self.assertLess(res_val, 1e-18)
+
+    def test_subnorm_min_gradual_underflow(self) -> None:
+        """rsq(2^-149) computes finite float under IEEE-754 gradual underflow."""
+        res_bits = oracle_v_rsq_f32(SUBNORM_MIN_F32, flush_subnormals=False)
+        self.assertFalse(is_nan_f32(res_bits))
+        self.assertFalse(is_inf_f32(res_bits))
+        self.assertGreater(bits_to_f32(res_bits), 2.0 ** 63)
+
+    def test_subnorm_max_gradual_underflow(self) -> None:
+        """Largest positive subnormal computes without NaN under IEEE mode."""
+        res_bits = oracle_v_rsq_f32(SUBNORM_MAX_F32, flush_subnormals=False)
+        self.assertFalse(is_nan_f32(res_bits))
+        self.assertFalse(is_inf_f32(res_bits))
+        self.assertGreater(bits_to_f32(res_bits), 2.0 ** 63)
+
+    def test_subnormal_flush_to_zero_mode(self) -> None:
+        """Under FTZ mode, both smallest and largest subnormals flush to 0, producing +Inf."""
+        res_min_ftz = oracle_v_rsq_f32(SUBNORM_MIN_F32, flush_subnormals=True)
+        self.assertEqual(res_min_ftz, POS_INF_F32)
+
+        res_max_ftz = oracle_v_rsq_f32(SUBNORM_MAX_F32, flush_subnormals=True)
+        self.assertEqual(res_max_ftz, POS_INF_F32)
+
+    def test_qnan_payload_preservation(self) -> None:
+        """Quiet NaN payloads are preserved and have the quiet bit asserted."""
+        payload_a = 0x7FC0_1234
+        res_a = oracle_v_rsq_f32(payload_a)
+        self.assertEqual(res_a, payload_a)
+
+        payload_b = 0x7FE0_5678
+        res_b = oracle_v_rsq_f32(payload_b)
+        self.assertEqual(res_b, payload_b)
+
+    def test_snan_quieting(self) -> None:
+        """Signaling NaN is converted to a Quiet NaN with quiet bit set."""
+        snan = 0x7F80_0001
+        res = oracle_v_rsq_f32(snan)
+        self.assertTrue(is_qnan_f32(res))
+        self.assertEqual(res, snan | QNAN_BIT_F32)
+
+    def test_negative_subnormals_yield_qnan(self) -> None:
+        """Negative subnormals represent negative numbers and yield Canonical QNaN."""
+        neg_sub_min = SUBNORM_MIN_F32 | SIGN_MASK_F32
+        neg_sub_max = SUBNORM_MAX_F32 | SIGN_MASK_F32
+        self.assertEqual(oracle_v_rsq_f32(neg_sub_min), CANONICAL_QNAN_F32)
+        self.assertEqual(oracle_v_rsq_f32(neg_sub_max), CANONICAL_QNAN_F32)
+
+    def test_monotonic_decrease_across_normals(self) -> None:
+        """Reciprocal square root is strictly monotonically decreasing for positive inputs."""
+        inputs = [
+            0.0001, 0.01, 0.25, 0.5, 1.0, 2.0, 4.0, 16.0, 100.0, 10000.0, 1e6, 1e12,
+        ]
+        prev_res = math.inf
+        for inp in inputs:
+            curr_res = bits_to_f32(oracle_v_rsq_f32(f32_to_bits(inp)))
+            self.assertLess(curr_res, prev_res)
+            prev_res = curr_res
+
+    def test_clamp_saturation_at_boundaries(self) -> None:
+        """Clamp modifier saturates extreme values to [0.0, 1.0]."""
+        # SUBNORM_MIN_F32 produces >> 1.0 -> clamped to 1.0
+        self.assertEqual(oracle_v_rsq_f32(SUBNORM_MIN_F32, clamp=True), ONE_F32)
+        # FLT_MIN produces 2^63 >> 1.0 -> clamped to 1.0
+        self.assertEqual(oracle_v_rsq_f32(FLT_MIN, clamp=True), ONE_F32)
+        # FLT_MAX produces ~5.4e-20 -> within [0.0, 1.0] -> unchanged
+        self.assertEqual(oracle_v_rsq_f32(FLT_MAX, clamp=True), oracle_v_rsq_f32(FLT_MAX, clamp=False))
+        # +0.0 produces +inf -> clamped to 1.0
+        self.assertEqual(oracle_v_rsq_f32(POS_ZERO_F32, clamp=True), ONE_F32)
+        # -0.0 produces +inf -> clamped to 1.0
+        self.assertEqual(oracle_v_rsq_f32(NEG_ZERO_F32, clamp=True), ONE_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
