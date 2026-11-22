@@ -1917,8 +1917,9 @@ public:
                 log_once("vertex attribute format not supported yet:", element.Format);
                 return E_INVALIDARG;
             }
+            const UINT alignment = std::min(bytes, 4u);
             const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
-                                    ? (slot_end[element.InputSlot] + 3) / 4 * 4
+                                    ? (slot_end[element.InputSlot] + alignment - 1) / alignment * alignment
                                     : element.AlignedByteOffset;
             slot_end[element.InputSlot] = offset + bytes;
             const leonida::SignatureElement* input = nullptr;

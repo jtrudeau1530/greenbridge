@@ -17,6 +17,7 @@
 #include "../src/shader_library.h"
 
 #include <array>
+#include <cstddef>
 #include <cstring>
 
 #if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV)
@@ -35,7 +36,13 @@ namespace {
 struct Vertex {
     float x, y;
     std::uint8_t r, g, b, a;
+    std::uint8_t marker = 0, padding = 0;
+    std::uint8_t narrow_color[2] = {255, 0};
+    std::uint8_t wrong_color[2] = {0, 255};
 };
+static_assert(offsetof(Vertex, marker) == 12);
+static_assert(offsetof(Vertex, narrow_color) == 14);
+static_assert(offsetof(Vertex, wrong_color) == 16);
 
 }  // namespace
 
@@ -132,7 +139,16 @@ int main() {
 
         // Two render-target formats and a depth format, of which draws bind only RTV 0: a variant with the other
         // formats undefined is used at draw time.
+        // The unused R8 element ends at byte 13. An appended R8G8 color starts at 14, while rounding to
+        // four bytes would fetch the sentinel at 16 and turn the top-left draw black.
+        const D3D12_INPUT_ELEMENT_DESC narrow_elements[] = {
+            elements[0],
+            {"MARKER", 0, DXGI_FORMAT_R8_UNORM, 0, offsetof(Vertex, marker),
+             D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R8G8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT,
+             D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
         D3D12_GRAPHICS_PIPELINE_STATE_DESC mrt_desc = pso_desc;
+        mrt_desc.InputLayout = {narrow_elements, 3};
         mrt_desc.NumRenderTargets = 2;
         mrt_desc.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
         mrt_desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
