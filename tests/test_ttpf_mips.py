@@ -659,7 +659,7 @@ class BcDecodeTest(unittest.TestCase):
         self.assertAlmostEqual(sign_err, 255.0, places=5)
 
 
-class Bc3CheckTest(unittest.TestCase):
+class Bc2AndBc3CheckTest(unittest.TestCase):
     def run_check(self, fmt, lower_colour):
         import io
         from contextlib import redirect_stdout
@@ -669,11 +669,12 @@ class Bc3CheckTest(unittest.TestCase):
         payload = bytearray(layout["size"])
         for mip in layout["mips"]:
             colour = top_colour if mip["index"] == 0 else lower_colour
-            block = solid_bc4(255) + colour
+            alpha = b"\xff" * 8 if fmt in (74, 75) else solid_bc4(255)
+            block = alpha + colour
             retile_to(layout, mip, block * (mip["blocks_w"] * mip["blocks_h"]), payload)
         record = pack_etpf_record(256, 256, 6, 1, fmt, 1, 1, 4, 4096, 0x103)
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "bc3.ttpf")
+            path = os.path.join(tmp, "rgb-mips.ttpf")
             write_rds5_pool(path, [record], [payload])
             pool = ttpf.Pool(path)
             buf = io.StringIO()
@@ -684,10 +685,19 @@ class Bc3CheckTest(unittest.TestCase):
                 pool.close()
         return code, json.loads(buf.getvalue())
 
+    def test_bc2_decodes_all_four_rgb_selectors(self) -> None:
+        # Explicit alpha bytes precede the color block. Black comes before
+        # white, but BC2 still uses both interpolated colors.
+        block = struct.pack("<QHHI", 0xFEDCBA9876543210, 0, 0xFFFF, 0xE4E4E4E4)
+        expected = [(value, value, value) for value in (0.0, 255.0, 85.0, 170.0)] * 4
+        for fmt in (74, 75):
+            with self.subTest(fmt=fmt):
+                self.assertEqual(ttpf.decode_pixels(fmt, block, 1, 1), expected)
+
     def test_gray_chain_passes_whatever_the_endpoint_order(self):
         # Reversed endpoints with selector 2 describe the same gray as the top level.
         gray = struct.pack("<HHI", 0xFFFF, 0, 0xAAAAAAAA)
-        for fmt in (77, 78):
+        for fmt in (74, 75, 77, 78):
             with self.subTest(fmt=fmt):
                 code, result = self.run_check(fmt, gray)
                 self.assertEqual(code, 0, result)
@@ -695,7 +705,7 @@ class Bc3CheckTest(unittest.TestCase):
 
     def test_black_child_under_gray_top_fails(self):
         black = struct.pack("<HHI", 0, 0, 0)
-        for fmt in (77, 78):
+        for fmt in (74, 75, 77, 78):
             with self.subTest(fmt=fmt):
                 code, result = self.run_check(fmt, black)
                 self.assertEqual(code, 1, result)

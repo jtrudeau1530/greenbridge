@@ -26,7 +26,7 @@ Read-only: no texture bytes are printed or committed. `scan` emits aggregate
 counters only (both the zlib/raw baseline and the BCPack-enabled projection).
 `layout` prints descriptor fields and offsets. `check` prints the BC
 block-average error against a 2x2 downsample of the parent mip (across all
-slices/faces for arrays and cubemaps; BC1, BC3, BC4_UNORM, BC5_UNORM, BC6H and
+slices/faces for arrays and cubemaps; BC1, BC2, BC3, BC4_UNORM, BC5_UNORM, BC6H and
 BC7) or 3D Z-continuity vs 2D control for float16 volumes. `export` writes a
 DX10 DDS when every source mip uses a supported codec.
 
@@ -614,8 +614,8 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
             at = (by * blocks_w + bx) * 16
             if fmt in (71, 72):
                 blk = decode_bc1_block(data, (by * blocks_w + bx) * 8)
-            elif fmt in (77, 78):
-                # BC3 colour uses four entries regardless of endpoint order.
+            elif fmt in (74, 75, 77, 78):
+                # BC2/BC3 use four RGB entries regardless of endpoint order.
                 blk = decode_bc1_block(data, at + 8, four_color=True)
             elif fmt in (80,):
                 blk = decode_bc4_block(data, (by * blocks_w + bx) * 8)
@@ -1692,7 +1692,7 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
             if all(m is None for m in means):
                 print(json.dumps(dict(index=index, shape=shape, blocked=(
                     f"format {d['format']} is not one of the formats this tool decodes "
-                    "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
+                    "(BC 71/72/74/75/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
                 return 2
             per_slice_max.append(max((e for e in errs if e is not None), default=None))
             all_errs.extend(errs)
@@ -1731,7 +1731,7 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
             if all(m is None for m in means):
                 print(json.dumps(dict(index=index, shape=shape, blocked=(
                     f"format {d['format']} is not one of the formats this tool decodes "
-                    "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
+                    "(BC 71/72/74/75/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
                 return 2
             if face == 0:
                 face0_preds = preds
@@ -1760,7 +1760,7 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
     if all(m is None for m in means):
         print(json.dumps(dict(index=index, blocked=(
             f"format {d['format']} is not one of the formats this tool decodes "
-            "(BC 71/72/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
+            "(BC 71/72/74/75/77/78/80/83/95/96/98/99; uncompressed 10/11/28/29/49/54/56/61/65/87/91)")), indent=1))
         return 2
     control = None
     if 0 < layout["first_tail"] < d["mips"]:
