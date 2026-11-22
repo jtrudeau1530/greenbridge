@@ -81,8 +81,7 @@ const IMAGE_RUNTIME_FUNCTION_ENTRY* mapped_pdata(const rt::Module& m, uint32_t* 
     return reinterpret_cast<const IMAGE_RUNTIME_FUNCTION_ENTRY*>(m.base + dir.VirtualAddress);
 }
 
-// The loader only initializes the thread that calls load(). install_tls_for_thread()/uninstall_tls_for_thread() are
-// the seam the runtime must use for every thread it creates; the worker case below exercises it.
+// load() installs the calling thread; the helper DLL's thread events install every thread started after it.
 void** module_tls_slots() { return reinterpret_cast<void**>(__readgsqword(0x58)); }
 
 template <class Fn>
@@ -163,25 +162,32 @@ void test_tls(const fs::path& dll) {
         check(detach_count() == 1 && last_reason() == DLL_PROCESS_DETACH,
               "the callback receives DLL_PROCESS_DETACH");
 
-        // A new thread starts with the helper DLL's block in the module slot. The runtime installs the mapped
-        // module's template through the thread seam, then removes it before the thread exits.
+        // A new thread already has its own copy of the template when its code starts (the helper DLL's
+        // DLL_THREAD_ATTACH installed it). install_tls_for_thread is then a no-op, and the copy is freed when the
+        // thread ends.
         int worker_before = -1;
         int worker_after = -1;
-        void* worker_previous = nullptr;
+        void* worker_block = nullptr;
+        void* worker_after_install = nullptr;
         std::thread worker([&] {
-            worker_previous = module_tls_slots()[m.tls_index];
-            loader.install_tls_for_thread(m);
+            worker_block = module_tls_slots()[m.tls_index];
             worker_before = get();
+            loader.install_tls_for_thread(m);
+            worker_after_install = module_tls_slots()[m.tls_index];
             set(99);
             worker_after = get();
-            loader.uninstall_tls_for_thread(m);
         });
         worker.join();
-        check(worker_previous != nullptr && worker_previous != m.tls_block,
-              "a new thread starts with the helper DLL's block, not the mapped module's data");
-        check(worker_before == 7, "the new thread sees the template value 7, not the main thread's 42");
+        check(worker_block != nullptr && worker_block != m.tls_block && worker_block != m.tls_saved_block,
+              "a new thread starts with its own block, not the main thread's or the helper DLL's");
+        check(worker_before == 7, "the new thread sees the template value 7 without an install call");
+        check(worker_after_install == worker_block, "install_tls_for_thread on that thread is a no-op");
         check(worker_after == 99, "the new thread's write is confined to its own block");
         check(get() == 42, "the main thread's TLS value is unchanged after the worker exit");
+        MEMORY_BASIC_INFORMATION worker_info{};
+        check(VirtualQuery(worker_block, &worker_info, sizeof(worker_info)) == 0 || worker_info.State == MEM_FREE,
+              "the worker's block is freed when the worker ends");
+        check(callback_count() == 2, "thread events don't run TLS callbacks before initialise()");
 
         const uint32_t first_index = m.tls_index;
         rt::Module& again = loader.load(dll);
