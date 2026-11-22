@@ -168,6 +168,17 @@ class TestWalk(unittest.TestCase):
         self.assertEqual(self.tree[f"{joaat('short'):08x}"], "abc")
         self.assertEqual(self.stats["short strings in place"], 1)
 
+    def test_struct_pointer_past_block_end_is_rejected(self):
+        # ItemThing is 8 bytes; pointing at offset 6 of an 8-byte block leaves only 2 bytes inside the block.
+        root = bytearray(0x90)
+        struct.pack_into("<Q", root, 0x58, ptr(2, 6))
+        blob = make_container([(ROOT_T, bytes(root)), (ITEM_T, struct.pack("<fI", 3.5, 30))], SCHEMA, ENUMS)
+        st = __import__("collections").Counter()
+        out = D.Walker(D.Container(blob), st, keep=True).run()
+        self.assertEqual(st["struct pointer resolved"], 0)
+        self.assertEqual(st["struct pointer past block end"], 1)
+        self.assertIsNone(out[f"{joaat('child'):08x}"])
+
     def test_enum_and_undecoded_type(self):
         self.assertEqual(self.tree[f"{joaat('kind'):08x}"], 1)
         self.assertEqual(self.stats["enum value listed"], 1)
