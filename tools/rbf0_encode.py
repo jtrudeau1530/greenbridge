@@ -9,7 +9,7 @@ its content in tree order; text and strings with the bytes and terminating NUL t
 The encoder fails closed. When the tree cannot hold the original bytes it raises EncodeError with a short reason
 instead of writing something else:
     status       the parse was not complete (bad, truncated, or bytes after the root closed)
-    utf8         a descriptor name, string or text had invalid UTF-8, which the decoder replaced with U+FFFD
+    utf8         a descriptor name, string or text had invalid UTF-8, or an edit contains an unpaired surrogate
     nan          a float or vec3 component was NaN, whose bits the tree renders as text (infinities are exact)
     order        a value counted as an attribute came after the element's content started
     descriptor   a descriptor index outside the table, or a first use out of order
@@ -184,7 +184,12 @@ def encode(doc):
     if not isinstance(tree, dict) or tree.get("kind") != "element":
         raise EncodeError("status", "no root element")
     w = _Writer(doc)
-    w.element(tree)
+    try:
+        w.element(tree)
+    except UnicodeEncodeError:
+        # JSON accepts escaped lone surrogates, but RBF0 strings must be UTF-8.
+        # Refuse the resource through the same path as invalid decoded UTF-8.
+        raise EncodeError("utf8", "a descriptor name, string or text contains an unpaired Unicode surrogate") from None
     return bytes(w.out)
 
 
