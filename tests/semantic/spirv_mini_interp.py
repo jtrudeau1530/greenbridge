@@ -13,7 +13,8 @@ Design rules (see tests/semantic/README.md):
     branches the translator emits: OpBranch / OpBranchConditional to a later label plus OpPhi at the merge block.
     Backward branches, loops, calls and switches are rejected. Function/Output/Input variables live in Python
     boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores (and 32-bit
-    atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary. Workgroup
+    atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary, so they
+    must be 32-bit integers at 4-byte-aligned addresses (anything else raises). Workgroup
     storage and images are rejected.
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
@@ -396,6 +397,13 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         box, i = p
         return box[i]
 
+    def psb_word(addr):
+        """The flat memory holds one 32-bit word per 4-byte-aligned byte address. Another address is undefined
+        under the translator's `Aligned 4` and would read a key nobody wrote, so it raises."""
+        if addr % 4:
+            raise UnsupportedConstruct(f"PhysicalStorageBuffer access at {addr:#x}, not 4-byte aligned")
+        return addr
+
     def wmask(type_id):
         return (1 << types.bits(type_id)) - 1
 
@@ -498,7 +506,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 w = p[1] // 4
                 values[res] = push_constants[w] if 0 <= w < len(push_constants) else 0
             elif p[0] == "psb":
-                values[res] = memory.get(p[1], 0)
+                if types.t[a[0]][:2] != ("int", 32):
+                    raise UnsupportedConstruct("PhysicalStorageBuffer load of a type that is not a 32-bit integer")
+                values[res] = memory.get(psb_word(p[1]), 0)
             else:
                 v = deref(p)
                 values[res] = list(v) if isinstance(v, list) else v
@@ -507,7 +517,11 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if p[0] == "pc":
                 raise UnsupportedConstruct("store to PushConstant")
             if p[0] == "psb":
-                memory[p[1]] = val(a[1])
+                v, t = val(a[1]), types.t.get(id_type.get(a[1]))
+                if isinstance(v, bool) or not isinstance(v, int) or v > MASK \
+                        or (t is not None and t[:2] != ("int", 32)):
+                    raise UnsupportedConstruct("PhysicalStorageBuffer store of a value that is not a 32-bit integer")
+                memory[psb_word(p[1])] = v
             else:
                 p[0][p[1]] = val(a[1])
         elif op in _ATOMICS:
@@ -518,7 +532,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 raise UnsupportedConstruct(f"{op} outside PhysicalStorageBuffer")
             if types.bits(a[0]) != 32:
                 raise UnsupportedConstruct(f"{op} on a non-32-bit integer")
-            old = memory.get(p[1], 0)
+            old = memory.get(psb_word(p[1]), 0)
             if op == "OpAtomicCompareExchange":
                 new = val(a[5]) if old == val(a[6]) & MASK else old
             else:
