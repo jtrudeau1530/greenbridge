@@ -788,7 +788,9 @@ def run_suite(a, work: str) -> int:
                 rc, msg = 1, f"missing {tool}"
             except OSError as e:
                 rc, msg = 1, start_failure(tool, e)
-            if name == "ps_texture_sample_d16" and rc == 0 and os.path.isfile(raw):
+            if rc == UNSUPPORTED:   # e.g. fewer push constant bytes than the texture tests need
+                results.append((name, None, unsupported_skip(msg)))
+            elif name == "ps_texture_sample_d16" and rc == 0 and os.path.isfile(raw):
                 with open(raw, "rb") as f:
                     f.seek((32 * 64 + 32) * 16)
                     r, g, b, alpha = struct.unpack("<4f", f.read(16))
@@ -811,8 +813,11 @@ def run_suite(a, work: str) -> int:
             if rc == 0 and os.path.isfile(raw):
                 data = Path(raw).read_bytes()
                 bad = 4096 if len(data) != 64 * 64 * 16 else sum(q != GATHER_WRAP for q in struct.iter_unpack("<4f", data))
-            results.append((name, rc == 0 and bad == 0, "4096/4096 pixels exact" if bad == 0 else
-                            f"{bad} pixels differ from {GATHER_WRAP}: {msg.splitlines()[-1] if msg else ''}"))
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            else:
+                results.append((name, rc == 0 and bad == 0, "4096/4096 pixels exact" if bad == 0 else
+                                f"{bad} pixels differ from {GATHER_WRAP}: {msg.splitlines()[-1] if msg else ''}"))
         elif name == "ps_tex":
             # A texture through the descriptor hash table and the bindless set. vk_bindless_test compares the
             # pixels itself, and exits 77 where the device lacks a feature the set or the shader needs.

@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     if (properties.limits.maxPushConstantsSize < push_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n",
                      push_bytes, properties.limits.maxPushConstantsSize);
-        return two_mip ? 77 : 1;
+        return 77;   // a device limit, not a wrong result: every texture test skips (128-byte devices, D3D-14)
     }
     uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn); vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qf.data());
