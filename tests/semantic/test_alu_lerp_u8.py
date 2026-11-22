@@ -42,6 +42,7 @@ SPIR-V Lowering in rdna2spirv:
 Standard library only: Python 3.9+ compatible, zero game data, synthetic shaders only.
 """
 import gc
+import itertools
 import os
 import random
 import struct
@@ -67,6 +68,8 @@ MASK8 = 0xFF
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
+
+EXTREME_BYTES = [0x00, 0x01, 0x02, 0x7E, 0x7F, 0x80, 0x81, 0xFE, 0xFF]
 
 _TMP_DIR: tempfile.TemporaryDirectory | None = None
 _SRC_PATH: str | None = None
@@ -151,6 +154,64 @@ def ref_lerp_fixed_point_blend(s0: int, s1: int, round_nearest: bool = True) -> 
     """Alternative formulation modeling fixed-point average with round-half-up bias."""
     r_word = 0x01010101 if round_nearest else 0
     return ref_lerp_u8_word(s0, s1, r_word)
+
+
+# ---------------------------------------------------------------------------
+# Flawed Reference Implementations for Negative Control Sensitivity Tests
+# ---------------------------------------------------------------------------
+
+def naive_unisolated_word_lerp(s0: int, s1: int, s2: int) -> int:
+    """Flawed implementation without byte lane isolation.
+
+    Treats the 32-bit registers as a single addition followed by right-shift by 1,
+    which causes byte sums >= 256 to leak carry into higher byte lanes.
+    """
+    s0 &= MASK32
+    s1 &= MASK32
+    s2_r = s2 & 0x01010101
+    return ((s0 + s1 + s2_r) >> 1) & MASK32
+
+
+def flawed_unmasked_s2_word_lerp(s0: int, s1: int, s2: int) -> int:
+    """Flawed implementation where full S2 bytes are added rather than bit 0."""
+    b0_0, b0_1, b0_2, b0_3 = unpack_bytes_u32(s0)
+    b1_0, b1_1, b1_2, b1_3 = unpack_bytes_u32(s1)
+    b2_0, b2_1, b2_2, b2_3 = unpack_bytes_u32(s2)
+    return pack_bytes_u32(
+        min(255, (b0_0 + b1_0 + b2_0) >> 1),
+        min(255, (b0_1 + b1_1 + b2_1) >> 1),
+        min(255, (b0_2 + b1_2 + b2_2) >> 1),
+        min(255, (b0_3 + b1_3 + b2_3) >> 1),
+    )
+
+
+def flawed_inverted_round_word_lerp(s0: int, s1: int, s2: int) -> int:
+    """Flawed implementation subtracting rather than adding the round bit."""
+    b0_0, b0_1, b0_2, b0_3 = unpack_bytes_u32(s0)
+    b1_0, b1_1, b1_2, b1_3 = unpack_bytes_u32(s1)
+    b2_0, b2_1, b2_2, b2_3 = unpack_bytes_u32(s2)
+    return pack_bytes_u32(
+        max(0, (b0_0 + b1_0 - (b2_0 & 1)) >> 1),
+        max(0, (b0_1 + b1_1 - (b2_1 & 1)) >> 1),
+        max(0, (b0_2 + b1_2 - (b2_2 & 1)) >> 1),
+        max(0, (b0_3 + b1_3 - (b2_3 & 1)) >> 1),
+    )
+
+
+def flawed_signed_byte_word_lerp(s0: int, s1: int, s2: int) -> int:
+    """Flawed implementation treating bytes as signed two's complement integers."""
+    def as_signed(b: int) -> int:
+        return b - 256 if b >= 128 else b
+
+    b0_0, b0_1, b0_2, b0_3 = unpack_bytes_u32(s0)
+    b1_0, b1_1, b1_2, b1_3 = unpack_bytes_u32(s1)
+    b2_0, b2_1, b2_2, b2_3 = unpack_bytes_u32(s2)
+    return pack_bytes_u32(
+        ((as_signed(b0_0) + as_signed(b1_0) + (b2_0 & 1)) >> 1) & 0xFF,
+        ((as_signed(b0_1) + as_signed(b1_1) + (b2_1 & 1)) >> 1) & 0xFF,
+        ((as_signed(b0_2) + as_signed(b1_2) + (b2_2 & 1)) >> 1) & 0xFF,
+        ((as_signed(b0_3) + as_signed(b1_3) + (b2_3 & 1)) >> 1) & 0xFF,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -352,23 +413,18 @@ class TestLerpU8ReferenceOracle(unittest.TestCase):
 
     def test_byte_level_basic_arithmetic(self) -> None:
         """Single-byte lane calculations with floor and ceiling rounding."""
-        # 0 + 0 + 0 >> 1 = 0
         self.assertEqual(ref_lerp_u8_byte(0, 0, 0), 0)
         self.assertEqual(ref_lerp_u8_byte(0, 0, 1), 0)
 
-        # 1 + 2 = 3; 3 >> 1 = 1; (3 + 1) >> 1 = 2
         self.assertEqual(ref_lerp_u8_byte(1, 2, 0), 1)
         self.assertEqual(ref_lerp_u8_byte(1, 2, 1), 2)
 
-        # 255 + 255 = 510; 510 >> 1 = 255; (510 + 1) >> 1 = 255
         self.assertEqual(ref_lerp_u8_byte(255, 255, 0), 255)
         self.assertEqual(ref_lerp_u8_byte(255, 255, 1), 255)
 
-        # 254 + 255 = 509; 509 >> 1 = 254; (509 + 1) >> 1 = 255
         self.assertEqual(ref_lerp_u8_byte(254, 255, 0), 254)
         self.assertEqual(ref_lerp_u8_byte(254, 255, 1), 255)
 
-        # 0 + 255 = 255; 255 >> 1 = 127; (255 + 1) >> 1 = 128
         self.assertEqual(ref_lerp_u8_byte(0, 255, 0), 127)
         self.assertEqual(ref_lerp_u8_byte(0, 255, 1), 128)
 
@@ -406,12 +462,9 @@ class TestLerpU8ReferenceOracle(unittest.TestCase):
         """Bits 1..7 of each byte in src2 must have zero impact on the computation."""
         patterns = [0xFE, 0xFC, 0x80, 0xAA, 0x54, 0x02]
         for p in patterns:
-            # When bit 0 is 0, any upper bits must still act as round 0
             self.assertEqual(ref_lerp_u8_byte(10, 20, p), ref_lerp_u8_byte(10, 20, 0))
-            # When bit 0 is 1, any upper bits must still act as round 1
             self.assertEqual(ref_lerp_u8_byte(10, 20, p | 1), ref_lerp_u8_byte(10, 20, 1))
 
-        # Word-level validation: masking S2 with 0x01010101 gives identical result
         s0 = 0x12345678
         s1 = 0x9ABCDEF0
         s2 = 0xFEDCBA98
@@ -422,7 +475,6 @@ class TestLerpU8ReferenceOracle(unittest.TestCase):
 
     def test_byte_lane_isolation_no_carry_leakage(self) -> None:
         """Carry out of lane i (up to 511) must not bleed into lane i+1."""
-        # Lane 0 has 255 + 255 + 1 = 511 -> 255. Lane 1 has 0.
         s0 = 0x000000FF
         s1 = 0x000000FF
         s2 = 0x00000001
@@ -430,7 +482,6 @@ class TestLerpU8ReferenceOracle(unittest.TestCase):
         self.assertEqual(res & 0xFF, 0xFF)
         self.assertEqual((res >> 8) & 0xFF, 0x00)
 
-        # Lane 1 has max sum, Lane 2 and Lane 0 have 0.
         s0 = 0x0000FF00
         s1 = 0x0000FF00
         s2 = 0x00000100
@@ -439,7 +490,6 @@ class TestLerpU8ReferenceOracle(unittest.TestCase):
         self.assertEqual((res >> 8) & 0xFF, 0xFF)
         self.assertEqual((res >> 16) & 0xFF, 0x00)
 
-        # Lane 2 has max sum.
         s0 = 0x00FF0000
         s1 = 0x00FF0000
         s2 = 0x00010000
@@ -448,7 +498,6 @@ class TestLerpU8ReferenceOracle(unittest.TestCase):
         self.assertEqual((res >> 16) & 0xFF, 0xFF)
         self.assertEqual((res >> 24) & 0xFF, 0x00)
 
-        # Lane 3 has max sum.
         s0 = 0xFF000000
         s1 = 0xFF000000
         s2 = 0x01000000
@@ -511,14 +560,12 @@ class TestSimdWaveLerpInterpreter(unittest.TestCase):
         wave = SimdWaveLerpInterpreter(wave_size=64)
         canary = 0xDEADBEEF
 
-        # Pre-populate all lanes with canary in destination v0
         for lane in range(64):
             wave.set_lane_vgpr(lane, 0, canary)
             wave.set_lane_vgpr(lane, 1, 0x11223344)
             wave.set_lane_vgpr(lane, 2, 0x55667788)
             wave.set_lane_vgpr(lane, 3, 0x01010101)
 
-        # Only lower 32 lanes active: EXEC = 0x00000000FFFFFFFF
         active_mask = 0xFFFFFFFF
         wave.set_exec_mask(active_mask)
 
@@ -526,11 +573,9 @@ class TestSimdWaveLerpInterpreter(unittest.TestCase):
 
         expected_active = ref_lerp_u8_word(0x11223344, 0x55667788, 0x01010101)
 
-        # Active lanes must be updated
         for lane in range(32):
             self.assertEqual(wave.get_lane_vgpr(lane, 0), expected_active)
 
-        # Inactive lanes must be unmodified
         for lane in range(32, 64):
             self.assertEqual(wave.get_lane_vgpr(lane, 0), canary)
 
@@ -545,7 +590,6 @@ class TestSimdWaveLerpInterpreter(unittest.TestCase):
             wave.set_lane_vgpr(lane, 2, 0xFF00FF00)
             wave.set_lane_vgpr(lane, 3, 0)
 
-        # Even lanes active: 0x55555555
         checkerboard = 0x55555555
         wave.set_exec_mask(checkerboard)
 
@@ -602,7 +646,6 @@ class TestSimdWaveLerpInterpreter(unittest.TestCase):
         for lane in range(32):
             wave.set_lane_vgpr(lane, 1, 0x60606060)
 
-        # src0=s4, src1=v1, src2=inline constant 1
         wave.v_lerp_u8(vdst=0, src0="s4", src1="v1", src2=1)
 
         expected = ref_lerp_u8_word(0x40404040, 0x60606060, 1)
@@ -627,9 +670,6 @@ class TestSimdWaveLerpInterpreter(unittest.TestCase):
         wave = SimdWaveLerpInterpreter(wave_size=32)
         wave.set_exec_mask(0xFFFFFFFF)
 
-        # Blend A and B into v3 with round 0
-        # Blend C and D into v4 with round 0
-        # Blend v3 and v4 into v0 with round 1
         va = 0x10203040
         vb = 0x50607080
         vc = 0x20304050
@@ -653,6 +693,190 @@ class TestSimdWaveLerpInterpreter(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr(lane, 3), ab)
             self.assertEqual(wave.get_lane_vgpr(lane, 4), cd)
             self.assertEqual(wave.get_lane_vgpr(lane, 0), expected_final)
+
+
+# ---------------------------------------------------------------------------
+# Commit 3 Tests: Boundary Value Matrix, Domain Sweeps, and Negative Controls
+# ---------------------------------------------------------------------------
+
+class TestLerpU8BoundaryMatrixAndDomainSweeps(unittest.TestCase):
+    """Exhaustive boundary sweeps, Cartesian matrix testing, and pattern sweeps."""
+
+    def test_full_256_byte_domain_sweep_against_zero(self) -> None:
+        """All 256 byte values blended with 0 under floor and ceiling rounding."""
+        for v in range(256):
+            expected_floor = v >> 1
+            expected_ceil = (v + 1) >> 1
+            self.assertEqual(ref_lerp_u8_byte(v, 0, 0), expected_floor)
+            self.assertEqual(ref_lerp_u8_byte(v, 0, 1), expected_ceil)
+            self.assertEqual(ref_lerp_u8_byte(0, v, 0), expected_floor)
+            self.assertEqual(ref_lerp_u8_byte(0, v, 1), expected_ceil)
+
+    def test_full_256_byte_domain_sweep_against_max(self) -> None:
+        """All 256 byte values blended with 255 (0xFF) under floor and ceiling rounding."""
+        for v in range(256):
+            expected_floor = (v + 255) >> 1
+            expected_ceil = (v + 255 + 1) >> 1
+            self.assertEqual(ref_lerp_u8_byte(v, 255, 0), expected_floor)
+            self.assertEqual(ref_lerp_u8_byte(v, 255, 1), expected_ceil)
+            self.assertEqual(ref_lerp_u8_byte(255, v, 0), expected_floor)
+            self.assertEqual(ref_lerp_u8_byte(255, v, 1), expected_ceil)
+
+    def test_extreme_bytes_cartesian_matrix(self) -> None:
+        """Full Cartesian product of boundary values across both sources and rounding."""
+        round_cases = [0, 1, 0xFE, 0xFF]
+        for s0, s1, r in itertools.product(EXTREME_BYTES, EXTREME_BYTES, round_cases):
+            expected = (s0 + s1 + (r & 1)) >> 1
+            res = ref_lerp_u8_byte(s0, s1, r)
+            self.assertEqual(res, expected)
+            self.assertTrue(0 <= res <= 255)
+            self.assertEqual(res, ref_lerp_u8_byte(s1, s0, r))
+
+    def test_alternating_byte_patterns(self) -> None:
+        """Packed word evaluation with checkerboard and alternating byte words."""
+        patterns = [
+            (0x55555555, 0xAAAAAAAA, 0),
+            (0x55555555, 0xAAAAAAAA, 0xFFFFFFFF),
+            (0x00FF00FF, 0xFF00FF00, 0),
+            (0x00FF00FF, 0xFF00FF00, 0x01010101),
+            (0x0F0F0F0F, 0xF0F0F0F0, 0),
+            (0x01020304, 0x04030201, 1),
+        ]
+        for s0, s1, s2 in patterns:
+            expected = ref_lerp_u8_word(s0, s1, s2)
+            # Reconstruct per-lane and verify
+            b0_0, b0_1, b0_2, b0_3 = unpack_bytes_u32(s0)
+            b1_0, b1_1, b1_2, b1_3 = unpack_bytes_u32(s1)
+            b2_0, b2_1, b2_2, b2_3 = unpack_bytes_u32(s2)
+            exp0 = (b0_0 + b1_0 + (b2_0 & 1)) >> 1
+            exp1 = (b0_1 + b1_1 + (b2_1 & 1)) >> 1
+            exp2 = (b0_2 + b1_2 + (b2_2 & 1)) >> 1
+            exp3 = (b0_3 + b1_3 + (b2_3 & 1)) >> 1
+            self.assertEqual(expected, pack_bytes_u32(exp0, exp1, exp2, exp3))
+
+    def test_multi_lane_independent_boundary_packing(self) -> None:
+        """Each byte lane independently exercises distinct boundary conditions simultaneously."""
+        # Lane 0: (0, 0) + 0 -> 0
+        # Lane 1: (0, 255) + 1 -> 128
+        # Lane 2: (255, 255) + 1 -> 255
+        # Lane 3: (128, 127) + 0 -> 127
+        s0 = pack_bytes_u32(0, 0, 255, 128)
+        s1 = pack_bytes_u32(0, 255, 255, 127)
+        s2 = pack_bytes_u32(0, 1, 1, 0)
+        res = ref_lerp_u8_word(s0, s1, s2)
+        expected = pack_bytes_u32(0, 128, 255, 127)
+        self.assertEqual(res, expected)
+
+    def test_shader_boundary_matrix_execution(self) -> None:
+        """End-to-end SPIR-V shader validation on extreme boundary configurations."""
+        vectors = [
+            (0x00000000, 0x00000000, 0x00000000),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+            (0x000000FF, 0x000000FF, 0x00000001),
+            (0xFF00FF00, 0x00FF00FF, 0x01010101),
+            (0x80808080, 0x7F7F7F7F, 0x00000000),
+            (0x80808080, 0x7F7F7F7F, 0x01010101),
+            (0xFEFEFEFE, 0x01010101, 0x00000000),
+            (0x01020304, 0x04030201, 0x01000100),
+        ]
+        for s0, s1, s2 in vectors:
+            with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                self.assertEqual(run_op(s0, s1, s2), ref_lerp_u8_word(s0, s1, s2))
+
+
+class TestLerpU8NegativeControlsAndSabotageSensitivities(unittest.TestCase):
+    """Negative controls proving test suite sensitivity against common implementation bugs."""
+
+    def test_negative_cross_byte_carry_leakage_detected(self) -> None:
+        """Naive unisolated 32-bit addition allows byte overflows to corrupt adjacent lanes."""
+        # Lane 0 has sum 511 (255 + 255 + 1), which in an unisolated 32-bit add generates
+        # a carry bit into Lane 1 (0x01FF + 0x00FF + 1 = 0x02FF).
+        # Shifting the whole word by 1 produces 0x017F (corrupting both Lane 0 and Lane 1).
+        s0 = 0x000001FF
+        s1 = 0x000000FF
+        s2 = 0x00000001
+
+        hw_result = ref_lerp_u8_word(s0, s1, s2)
+        flawed_result = naive_unisolated_word_lerp(s0, s1, s2)
+
+        # In hardware/oracle: Lane 0 is 255 (0xFF), Lane 1 is (1 + 0) >> 1 = 0 (0x00)
+        self.assertEqual(hw_result, 0x000000FF)
+        # Naive implementation yields 0x0000017F
+        self.assertEqual(flawed_result, 0x0000017F)
+        self.assertNotEqual(
+            hw_result,
+            flawed_result,
+            "Expected failure: naive 32-bit addition must not match isolated byte lerp",
+        )
+
+    def test_negative_unmasked_s2_detected(self) -> None:
+        """Adding full S2 byte values rather than only bit 0 produces invalid results."""
+        s0 = 0x10203040
+        s1 = 0x10203040
+        s2 = 0xFEFEFEFE  # Bit 0 is 0, but upper bits are set
+
+        hw_result = ref_lerp_u8_word(s0, s1, s2)
+        flawed_result = flawed_unmasked_s2_word_lerp(s0, s1, s2)
+
+        # Hardware ignores bits [7:1], giving exactly s0 (since s0 == s1 and bit 0 == 0)
+        self.assertEqual(hw_result, s0)
+        # Flawed implementation adds 254 before shifting, massively overshooting
+        self.assertNotEqual(
+            hw_result,
+            flawed_result,
+            "Expected failure: unmasked S2 upper bits must be rejected",
+        )
+
+    def test_negative_inverted_round_detected(self) -> None:
+        """Subtracting rather than adding the round bit produces incorrect values."""
+        s0 = 0x01010101
+        s1 = 0x02020202
+        s2 = 0x01010101
+
+        hw_result = ref_lerp_u8_word(s0, s1, s2)
+        flawed_result = flawed_inverted_round_word_lerp(s0, s1, s2)
+
+        # 1 + 2 + 1 = 4 >> 1 = 2
+        self.assertEqual(hw_result, 0x02020202)
+        # Inverted: 1 + 2 - 1 = 2 >> 1 = 1
+        self.assertEqual(flawed_result, 0x01010101)
+        self.assertNotEqual(hw_result, flawed_result)
+
+    def test_negative_signed_byte_interpretation_detected(self) -> None:
+        """Treating bytes as signed int8 produces incorrect averages on values >= 128."""
+        s0 = 0xFFFFFFFF  # 255 unsigned, -1 signed
+        s1 = 0x00000000  # 0
+        s2 = 0x00000000
+
+        hw_result = ref_lerp_u8_word(s0, s1, s2)
+        flawed_result = flawed_signed_byte_word_lerp(s0, s1, s2)
+
+        # Unsigned average: (255 + 0) >> 1 = 127 (0x7F)
+        self.assertEqual(hw_result, 0x7F7F7F7F)
+        # Signed average: (-1 + 0) >> 1 = -1 (0xFF)
+        self.assertNotEqual(
+            hw_result,
+            flawed_result,
+            "Expected failure: signed byte interpretation must diverge from unsigned lerp",
+        )
+
+    def test_negative_bit1_instead_of_bit0_detected(self) -> None:
+        """Sampling bit 1 instead of bit 0 in S2 produces divergence on asymmetric round masks."""
+        s0 = 0x01010101
+        s1 = 0x02020202
+        # s2 has bit 0 set, bit 1 cleared
+        s2_bit0_only = 0x01010101
+        # s2 has bit 1 set, bit 0 cleared
+        s2_bit1_only = 0x02020202
+
+        res_bit0 = ref_lerp_u8_word(s0, s1, s2_bit0_only)
+        res_bit1 = ref_lerp_u8_word(s0, s1, s2_bit1_only)
+
+        # Bit 0 produces rounding up (2)
+        self.assertEqual(res_bit0, 0x02020202)
+        # Bit 1 produces rounding down (1), because bit 0 is 0
+        self.assertEqual(res_bit1, 0x01010101)
+        self.assertNotEqual(res_bit0, res_bit1)
 
 
 # ---------------------------------------------------------------------------
