@@ -987,13 +987,10 @@ public:
     VkSemaphore semaphore() const { return fence_.semaphore(); }
 
     // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped.
-    bool claim(UINT64 value) {
-        UINT64 current = highest_.load();
-        while (value > current)
-            if (highest_.compare_exchange_weak(current, value)) return true;
-        std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
-                     static_cast<unsigned long long>(value), static_cast<unsigned long long>(current));
-        return false;
+    // A queue's claim also records the value as one the GPU will signal, which a later CPU signal must not overtake.
+    bool claim(UINT64 value, bool queue = false) {
+        std::lock_guard lock(claim_mutex_);
+        return claim_locked(value, queue);
     }
 
     UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
@@ -1001,8 +998,32 @@ public:
     }
     D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override { return flags_; }
 
+    // vkSignalSemaphore must stay below every signal still pending on the GPU
+    // (VUID-VkSemaphoreSignalInfo-value-03259). A CPU signal above a queue signal the GPU has not reached yet, or
+    // made while an earlier one is held, is held: the fence dispatcher applies it once the GPU passes that queue
+    // value, in the order the signals were made. Until then GetCompletedValue reads the GPU's progress, where D3D12
+    // would already read `value`.
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
-        if (claim(value) && !fence_.signal(value)) return E_FAIL;
+        std::lock_guard lock(claim_mutex_);
+        if (!claim_locked(value, false)) return S_OK;
+        const UINT64 queued = queued_;
+        if (held_->load() == 0 && fence_.completed() >= queued) return fence_.signal(value) ? S_OK : E_FAIL;
+        held_->fetch_add(1);
+        // The callback must not touch the fence, which may be released first. Released (cancel) or device lost,
+        // the queue value may not be reached, and signalling then would break the same rule: the signal is dropped.
+        leonida::VulkanContext* context = &context_;
+        const VkSemaphore semaphore = fence_.semaphore();
+        context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
+            std::uint64_t now = 0;
+            context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now);
+            if (now >= queued && now < value) {
+                VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+                info.semaphore = semaphore;
+                info.value = value;
+                context->vk.vkSignalSemaphore(context->device(), &info);
+            }
+            held->fetch_sub(1);
+        });
         return S_OK;
     }
 
@@ -1029,10 +1050,24 @@ public:
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
 
 private:
+    bool claim_locked(UINT64 value, bool queue) {
+        if (value <= highest_) {
+            std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
+                         static_cast<unsigned long long>(value), static_cast<unsigned long long>(highest_));
+            return false;
+        }
+        highest_ = value;
+        if (queue) queued_ = value;
+        return true;
+    }
+
     leonida::VulkanContext& context_;
     leonida::VulkanFence fence_;
     D3D12_FENCE_FLAGS flags_;
-    std::atomic<UINT64> highest_;
+    std::mutex claim_mutex_;
+    UINT64 highest_;     // the highest value claimed, from either side
+    UINT64 queued_ = 0;  // the highest value a queue will signal
+    std::shared_ptr<std::atomic<int>> held_ = std::make_shared<std::atomic<int>>(0);  // CPU signals not applied yet
 };
 
 class CommandQueue final
@@ -1147,7 +1182,7 @@ public:
         Fence* f = Fence::from(fence);
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        if (!f->claim(value)) return d3d12_trace::result(method, S_OK);
+        if (!f->claim(value, true)) return d3d12_trace::result(method, S_OK);
         return d3d12_trace::result(method, queue_.signal(f->semaphore(), value) ? S_OK : E_FAIL);
     }
 

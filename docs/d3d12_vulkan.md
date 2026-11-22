@@ -749,7 +749,10 @@ calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read th
 not wait on view creation), typeless volume RTVs, depth-stencil resolves to a destination offset other than
 the source rectangle's;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
-increase; such a signal is reported and dropped); instance step rates above 1 (they need vertex attribute
+increase; such a signal is reported and dropped); a CPU `Signal` above a queue `Signal` the GPU has not reached
+yet is held until it has (`vkSignalSemaphore` must stay below every pending signal,
+`VUID-VkSemaphoreSignalInfo-value-03259`), so `GetCompletedValue` shows it only then, and a fence released
+while it holds one drops it; instance step rates above 1 (they need vertex attribute
 divisors); read-only DSVs (the depth image always moves to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, which matters once
 depth SRVs are sampled next to a read-only DSV, M2); the index buffer is bound without its view's size
 (`vkCmdBindIndexBuffer2`, Vulkan 1.4, takes one).
@@ -759,8 +762,6 @@ Known gaps found in review, not fixed here:
   fence another queue signals later (`B->Wait(f, n)` recorded before `A->Signal(f, n)`) holds back that signal,
   and the GPU never progresses (woreksami's probe). Queues on separate Vulkan queues (#306 for copy and compute)
   or holding back a batch until its wait value is submitted would fix it.
-- **Fences:** a CPU `ID3D12Fence::Signal` checks only the semaphore's current value, so it can signal below a GPU
-  signal that is still pending (`VUID-VkSemaphoreSignalInfo-value-03258`).
 - **Lookups:** `buffer_at` searches every resource for each vertex and index view; an ordered map by VA would do
   when it shows.
 
