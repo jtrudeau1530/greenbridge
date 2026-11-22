@@ -2873,6 +2873,24 @@ class Gen:
             return g
         return v
 
+    def turn_angle(self, x):
+        """Reduce a turn count to [-0.5, 0.5) before scaling by 2*pi.
+
+        RDNA's v_sin/v_cos take turns and range-reduce in turns. Scaling first loses the fractional part for large
+        inputs (one f32 ulp at 255 turns is ~1.2e-4 rad) and leaves Sin outside the [-pi, pi] range where Vulkan
+        guarantees its precision. Fract first; keep -0 as -0 so Sin's sign survives. NaN and infinity stay NaN
+        through Fract/compare/select.
+        """
+        frac, gt, adj, sel, zero, t, arg = (self.tmp() for _ in range(7))
+        self.emit(f"{frac} = OpExtInst %float %glsl Fract {x}")
+        self.emit(f"{gt} = OpFOrdGreaterThan %bool {frac} {self.fconst(0.5)}")
+        self.emit(f"{adj} = OpFSub %float {frac} {self.fconst(1.0)}")
+        self.emit(f"{sel} = OpSelect %float {gt} {adj} {frac}")
+        self.emit(f"{zero} = OpFOrdEqual %bool {x} {self.fconst(0.0)}")
+        self.emit(f"{t} = OpSelect %float {zero} {x} {sel}")
+        self.emit(f"{arg} = OpFMul %float {t} {self.fconst(6.283185307179586)}")
+        return arg
+
     def fconst(self, x):
         bits = struct.unpack("<I", struct.pack("<f", x))[0]
         return self.tof(self.cu(bits))
@@ -3371,11 +3389,11 @@ class Gen:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             u = self.src_h(a[1])
-            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))
+            v2, f, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
             self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
             f = self.modify_f(f, a[1])
-            self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")
+            t = self.turn_angle(f)
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.clamp_mods(r, mods)
             self.write_lo16(a[0], self.f16_bits(r))    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
@@ -3402,10 +3420,10 @@ class Gen:
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
         elif op in ("v_sin_f32", "v_cos_f32"):
-            # RDNA takes the angle in turns: sin(x * 2*pi).
+            # RDNA takes the angle in turns: reduce in turns, then sin/cos(x * 2*pi).
             x = self.src_f(a[1])
-            t, r = self.tmp(), self.tmp()
-            self.emit(f"{t} = OpFMul %float {x} {self.fconst(6.283185307179586)}")
+            t = self.turn_angle(x)
+            r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_rndne_f32":
