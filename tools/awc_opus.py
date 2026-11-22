@@ -16,7 +16,7 @@ previous chunk's tail and are dropped (whole packets). The descriptor's `channel
 groups, not necessarily the packet channel count: an Opus packet's TOC stereo bit gives the real channel count,
 and the descriptor's `samples` counts interleaved samples across those packet channels.
 
-Output: <out>/<bank>/<stream id>.ogg (or .wav), plus a summary line per bank.
+Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each bank's relative path.
 
 For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
 """
@@ -267,10 +267,12 @@ def main() -> int:
     if os.path.isdir(a.src):
         banks = []
         for root, _, files in os.walk(a.src):
-            banks += [os.path.join(root, f) for f in files if f.lower().endswith(".awc")]
+            output_parent = os.path.join(a.out, os.path.relpath(root, a.src))
+            banks.extend((os.path.join(root, name), output_parent)
+                         for name in files if name.lower().endswith(".awc"))
         banks.sort()
     else:
-        banks = [a.src]
+        banks = [(a.src, a.out)]
     banks = banks[: a.limit] if a.limit else banks
     tot = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     jobs = max(1, a.jobs)
@@ -291,9 +293,9 @@ def main() -> int:
             print(f"  skip {os.path.basename(b)}: {e}")
 
     if jobs == 1:
-        for i, b in enumerate(banks):
+        for i, (b, output_parent) in enumerate(banks):
             try:
-                add(export_bank(b, a.out))
+                add(export_bank(b, output_parent))
             except (ValueError, struct.error, IndexError, OSError) as e:
                 skipped(b, e)
                 continue
@@ -301,7 +303,7 @@ def main() -> int:
                 print(f"  {i + 1}/{len(banks)} banks: {tot}", flush=True)
     else:
         with ProcessPoolExecutor(max_workers=jobs) as ex:
-            futures = {ex.submit(export_bank, b, a.out): b for b in banks}
+            futures = {ex.submit(export_bank, b, output_parent): b for b, output_parent in banks}
             for i, fut in enumerate(as_completed(futures), 1):
                 b = futures[fut]
                 try:
