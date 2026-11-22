@@ -279,6 +279,14 @@ class RegisterFile:
         dword = self.sgprs[idx]
         return ((dword >> 16) if hi else dword) & MASK16
 
+    def set_sgpr_half(self, idx: int, hi: bool, val: int) -> None:
+        val16 = val & MASK16
+        old = self.sgprs[idx]
+        if hi:
+            self.sgprs[idx] = (old & 0x0000FFFF) | (val16 << 16)
+        else:
+            self.sgprs[idx] = (old & 0xFFFF0000) | val16
+
 
 class DataType(enum.Enum):
     """Data types supported by the symbolic VALU AST."""
@@ -417,6 +425,48 @@ def parse_v_mul_f16_asm(asm_line: str) -> ASTInstruction:
     ast = ASTInstruction(opcode="v_mul_f16", dst=dst_op, src0=src0_op, src1=src1_op, clamp=clamp, omod=omod)
     ast.validate()
     return ast
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 v_mul_f16."""
+
+    def __init__(self, num_vgprs: int = 64, num_sgprs: int = 32):
+        self.reg_file = RegisterFile(num_vgprs=num_vgprs, num_sgprs=num_sgprs)
+
+    def resolve_operand(self, op: ASTOperand) -> int:
+        """Resolve an AST operand to its raw 16-bit binary representation."""
+        if op.kind == OperandKind.VGPR:
+            return self.reg_file.get_vgpr_half(op.reg_index, hi=op.hi)
+        elif op.kind == OperandKind.SGPR:
+            return self.reg_file.get_sgpr_half(op.reg_index, hi=op.hi)
+        elif op.kind in (OperandKind.LITERAL, OperandKind.INLINE_FLOAT):
+            return op.literal_val & MASK16
+        raise ValueError(f"Cannot resolve operand: {op}")
+
+    def execute_ast(self, inst: ASTInstruction) -> int:
+        """Execute a validated AST instruction and commit result to destination VGPR."""
+        inst.validate()
+        raw_s0 = self.resolve_operand(inst.src0)
+        raw_s1 = self.resolve_operand(inst.src1)
+
+        res = ref_mul_f16(
+            raw_s0,
+            raw_s1,
+            abs0=inst.src0.abs_mod,
+            neg0=inst.src0.neg_mod,
+            abs1=inst.src1.abs_mod,
+            neg1=inst.src1.neg_mod,
+            clamp=inst.clamp,
+            omod=inst.omod,
+        )
+
+        self.reg_file.set_vgpr_half(inst.dst.reg_index, hi=inst.dst.hi, val=res)
+        return res
+
+    def execute_asm(self, asm_line: str) -> int:
+        """Parse assembly string and execute on the scalar interpreter."""
+        inst = parse_v_mul_f16_asm(asm_line)
+        return self.execute_ast(inst)
 
 
 class TestValuMulF16Oracle(unittest.TestCase):
@@ -584,6 +634,44 @@ class TestSymbolicAST(unittest.TestCase):
                 omod="bad_omod",
             )
             bad_omod.validate()
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def test_scalar_vgpr_execution(self) -> None:
+        interp = ScalarInterpreter()
+        interp.reg_file.set_vgpr_half(1, hi=False, val=f16_to_bits(2.5))
+        interp.reg_file.set_vgpr_half(2, hi=False, val=f16_to_bits(4.0))
+
+        res = interp.execute_asm("v_mul_f16 v0.l, v1.l, v2.l")
+        self.assertEqual(bits_to_f16(res), 10.0)
+        self.assertEqual(interp.reg_file.get_vgpr_half(0, hi=False), f16_to_bits(10.0))
+
+    def test_scalar_sgpr_and_inline_execution(self) -> None:
+        interp = ScalarInterpreter()
+        interp.reg_file.set_sgpr_half(3, hi=True, val=f16_to_bits(-3.0))
+
+        res = interp.execute_asm("v_mul_f16 v4.h, s3.h, 2.0")
+        self.assertEqual(bits_to_f16(res), -6.0)
+        self.assertEqual(interp.reg_file.get_vgpr_half(4, hi=True), f16_to_bits(-6.0))
+
+    def test_scalar_destination_halfword_preservation(self) -> None:
+        interp = ScalarInterpreter()
+        # Initialize v5 with distinctive pattern 0xAAAA5555
+        interp.reg_file.set_vgpr(5, 0xAAAA5555)
+        interp.reg_file.set_vgpr_half(1, hi=False, val=POS_ONE_F16)
+        interp.reg_file.set_vgpr_half(2, hi=False, val=POS_TWO_F16)
+
+        # Write to v5.l, v5.h must remain 0xAAAA
+        interp.execute_asm("v_mul_f16 v5.l, v1.l, v2.l")
+        self.assertEqual(interp.reg_file.get_vgpr_half(5, hi=True), 0xAAAA)
+        self.assertEqual(interp.reg_file.get_vgpr_half(5, hi=False), POS_TWO_F16)
+
+        # Write to v5.h, v5.l must remain POS_TWO_F16
+        interp.execute_asm("v_mul_f16 v5.h, v1.l, 2.0")
+        self.assertEqual(interp.reg_file.get_vgpr_half(5, hi=False), POS_TWO_F16)
+        self.assertEqual(interp.reg_file.get_vgpr_half(5, hi=True), POS_TWO_F16)
 
 
 if __name__ == "__main__":
