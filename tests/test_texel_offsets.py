@@ -27,6 +27,9 @@ FORMS = [   # (instruction, SPIR-V op that takes the Offset, offset components)
     (f"image_sample_l_o v[4:5], v[10:12], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleExplicitLod", 2),
     (f"image_sample_b_o v[4:5], v[10:12], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleImplicitLod", 2),
     (f"image_sample_c_lz_o v4, v[10:12], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleDrefExplicitLod", 2),
+    (f"image_sample_c_o v4, v[10:13], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D", "OpImageSampleDrefImplicitLod", 2),
+    (f"image_sample_c_b_o v4, v[10:14], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D", "OpImageSampleDrefImplicitLod", 2),
+    (f"image_sample_c_o v4, v[10:12], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D a16", "OpImageSampleDrefImplicitLod", 2),
     (f"image_gather4_lz_o v[4:7], v[10:12], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D", "OpImageGather", 2),
 ]
 
@@ -102,14 +105,17 @@ def test_fallback_folds_the_offset(asm, op, n, tmp_path, fallback):
     assert _shift_fields(spv) == [(8 * k, 6, True) for k in range(n)]
     assert "OpImageQuerySizeLod" in spv and "OpImageQueryLevels" in spv
     assert re.search(r"= OpFDiv %(?:v\d)?float %\w+ %\w+", spv) and "OpCapability ImageQuery" in spv
-    implicit = asm.startswith(("image_sample_o ", "image_sample_b_o "))
+    implicit = asm.startswith(("image_sample_o ", "image_sample_b_o ", "image_sample_c_o ", "image_sample_c_b_o "))
     assert ("OpImageQueryLod" in spv) == implicit
     if implicit:
         # Grad with the derivatives of the unshifted coordinate: same LOD as the sample without the offset.
-        assert "OpImageSampleImplicitLod" not in spv
-        assert re.search(r"OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad %\w+ %\w+$", samples[0])
+        assert "OpImageSampleImplicitLod" not in spv and "OpImageSampleDrefImplicitLod" not in spv
+        if asm.startswith("image_sample_c"):
+            assert re.search(r"OpImageSampleDrefExplicitLod %float %\w+ %\w+ %\w+ Grad %\w+ %\w+$", samples[0])
+        else:
+            assert re.search(r"OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad %\w+ %\w+$", samples[0])
         assert "OpDPdx" in spv and "OpDPdy" in spv
-        assert ("Exp2" in spv) == asm.startswith("image_sample_b_o ")
+        assert ("Exp2" in spv) == asm.startswith(("image_sample_b_o ", "image_sample_c_b_o "))
     assert "OpCapability ImageGatherExtended" not in spv
 
 

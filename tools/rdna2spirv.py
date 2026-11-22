@@ -5676,8 +5676,9 @@ class Gen:
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
             self.dst(a[0], r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
-                    "image_sample_c_lz_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
-                    "image_sample_c_l", "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
+                    "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
+                    "image_sample_c_l", "image_sample_c", "image_sample_c_b",
+                    "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o"):
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
@@ -10345,12 +10346,13 @@ class Gen:
             if clamp:
                 kind = "_d"
                 self.uses_minlod = True
-            ref = None
-            if kind.startswith("_c"):
-                ref, f = f[0], f[1:]
+            # Address order after the offset: bias, z-compare, gradients, coordinates, LOD, clamp.
             bias = None
             if kind in ("_b", "_c_b"):
                 bias, f = f[0], f[1:]
+            ref = None
+            if kind.startswith("_c"):
+                ref, f = f[0], f[1:]
             grads = None
             if kind == "_d":
                 # Address order: all dP/dx components, all dP/dy components, then the coordinates.
@@ -10404,9 +10406,9 @@ class Gen:
                                       dmask, vdata, d16, sample)
                 return
             res = self.tmp()
-            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz"):
+            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
                 raise Unsupported(op)
-            implicit = kind in ("", "_b") and self.stage == "ps"
+            implicit = kind in ("", "_b", "_c", "_c_b") and self.stage == "ps"
             grads_fb = None
             if off is not None and TEXEL_OFFSET_FALLBACK:
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias)
@@ -10422,7 +10424,7 @@ class Gen:
                     self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad|MinLod {grads[0]} {grads[1]} {minlod}")
                 else:
                     self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads[0]} {grads[1]}")
-            elif grads_fb is not None:
+            elif grads_fb is not None and not kind.startswith("_c"):
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads_fb[0]} {grads_fb[1]}")
             elif kind == "":
                 self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('', '')}" if self.stage == "ps" else
@@ -10431,10 +10433,20 @@ class Gen:
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod)}")
             elif kind == "_b" and self.stage == "ps":
                 self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('Bias', bias)}")
-            elif kind in ("_c_lz", "_c_l"):
-                lod = f[ncoord] if kind == "_c_l" else "%f0"
+            elif kind in ("_c_lz", "_c_l", "_c", "_c_b"):
                 d = self.tmp()
-                self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', lod)}")
+                if kind in ("_c_lz", "_c_l") or (self.stage != "ps" and kind == "_c"):
+                    # _c outside the PS has no derivatives and samples LOD 0, like image_sample
+                    lod = f[ncoord] if kind == "_c_l" else "%f0"
+                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', lod)}")
+                elif self.stage != "ps":
+                    raise Unsupported(op)
+                elif grads_fb is not None:
+                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref} Grad {grads_fb[0]} {grads_fb[1]}")
+                elif kind == "_c_b":
+                    self.emit(f"{d} = OpImageSampleDrefImplicitLod %float {si} {uv} {ref}{opnd('Bias', bias)}")
+                else:
+                    self.emit(f"{d} = OpImageSampleDrefImplicitLod %float {si} {uv} {ref}{opnd('', '')}")
                 if d16:
                     # d16: the compare result is an f16 in the low half, as in the other d16 paths below. Until
                     # 2026-11-21 it was written as f32 bits, whose low half is 0 for every result (1.0 = 0x3f800000).
@@ -11210,7 +11222,7 @@ class Gen:
             self.emit(f"{q} = OpImageQueryLod %v2float {si} {uvs}")
             self.emit(f"{qx} = OpCompositeExtract %float {q} 0")
             level_f = qx
-            if kind == "_b" and bias is not None:
+            if kind in ("_b", "_c_b") and bias is not None:
                 qb = self.tmp()
                 self.emit(f"{qb} = OpFAdd %float {qx} {bias}")
                 level_f = qb
@@ -11246,7 +11258,7 @@ class Gen:
             dx, dy = self.tmp(), self.tmp()
             self.emit(f"{dx} = OpDPdx {vf} {uvs}")
             self.emit(f"{dy} = OpDPdy {vf} {uvs}")
-            if kind == "_b" and bias is not None:
+            if kind in ("_b", "_c_b") and bias is not None:
                 e, ev, sdx, sdy = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{e} = OpExtInst %float %glsl Exp2 {bias}")
                 if spatial == 1:
