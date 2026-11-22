@@ -19,12 +19,12 @@ Architectural model:
     Unlike sub-dword writes, v_pack_b32_f16 overwrites all 32 bits of the destination register.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 import math
 import struct
 import unittest
-from typing import Tuple, Union
+from typing import List, Tuple, Union
 
 # IEEE 754-2008 binary16 architectural bitwise masks & constants
 MASK32: int = 0xFFFF_FFFF
@@ -235,6 +235,66 @@ class VPackB32F16Instruction:
         return s
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_pack_b32_f16."""
+
+    def resolve_operand(self, op: VOP3Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.bits & MASK32
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VPackB32F16Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s0_raw = self.resolve_operand(instr.src0, state)
+        s1_raw = self.resolve_operand(instr.src1, state)
+
+        # Computation phase
+        result = oracle_v_pack_b32_f16(
+            src0_bits=s0_raw,
+            src1_bits=s1_raw,
+            op_sel=instr.op_sel,
+            abs0=instr.src0.abs_mod,
+            neg0=instr.src0.neg_mod,
+            abs1=instr.src1.abs_mod,
+            neg1=instr.src1.neg_mod,
+        )
+
+        # Write-back phase
+        state.set_vgpr(instr.dst.index, result)
+        return result
+
+
 class TestPackB32F16ModelAndOracle(unittest.TestCase):
     """Architectural model and mathematical reference oracle tests for v_pack_b32_f16."""
 
@@ -370,6 +430,65 @@ class TestSymbolicAST(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             VPackB32F16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(2, 0))
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_basic_step_vgprs(self) -> None:
+        self.state.set_vgpr(1, ONE)
+        self.state.set_vgpr(2, TWO)
+        instr = VPackB32F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, (TWO << 16) | ONE)
+        self.assertEqual(self.state.get_vgpr(0), (TWO << 16) | ONE)
+
+    def test_step_with_sgpr_and_literal(self) -> None:
+        self.state.set_sgpr(4, (FOUR << 16) | HALF)
+        instr = VPackB32F16Instruction(
+            dst=Reg(5, RegType.VGPR),
+            src0=VOP3Operand(Reg(4, RegType.SGPR)),
+            src1=VOP3Operand(Literal32(ONE)),
+            op_sel=(1, 0),
+        )
+        # src0 op_sel 1 extracts high half 4.0; src1 op_sel 0 extracts 1.0
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, (ONE << 16) | FOUR)
+        self.assertEqual(self.state.get_vgpr(5), (ONE << 16) | FOUR)
+
+    def test_step_with_modifiers(self) -> None:
+        self.state.set_vgpr(1, NEG_ONE)
+        self.state.set_vgpr(2, TWO)
+        instr = VPackB32F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR), abs_mod=True),
+            src1=VOP3Operand(Reg(2, RegType.VGPR), neg_mod=True),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, (NEG_TWO << 16) | ONE)
+        self.assertEqual(self.state.get_vgpr(0), (NEG_TWO << 16) | ONE)
+
+    def test_deterministic_repeatability(self) -> None:
+        self.state.set_vgpr(10, 0x12345678)
+        self.state.set_vgpr(11, 0x9ABCDEF0)
+        instr = VPackB32F16Instruction(
+            dst=Reg(12, RegType.VGPR),
+            src0=VOP3Operand(Reg(10, RegType.VGPR)),
+            src1=VOP3Operand(Reg(11, RegType.VGPR)),
+            op_sel=(1, 0),
+        )
+        res0 = self.interp.step(instr, self.state)
+        for _ in range(50):
+            res_n = self.interp.step(instr, self.state)
+            self.assertEqual(res0, res_n)
 
 
 if __name__ == "__main__":
