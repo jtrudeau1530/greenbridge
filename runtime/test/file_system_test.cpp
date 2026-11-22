@@ -99,7 +99,7 @@ int main() {
     write_path(package / "data" / "hello.txt", "package");
     write_path(package / "data" / "dup.txt", "package");
     write_path(package / "data" / "bye.txt", "package");
-    std::filesystem::create_directories(package / "data" / "sub");
+    write_path(package / "data" / "sub" / "nested.txt", "nested");
 
     rt::fs::configure(package, overlay);
     check(rt::fs::game_dir() == package, "configure() sets the game folder");
@@ -249,6 +249,15 @@ int main() {
         SetLastError(0);
         check(delete_w(L"GAME:\\nope\\missing.txt") == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
               "deleting a file that never existed reports ERROR_FILE_NOT_FOUND");
+
+        // Deleting a nested package file creates parent directories inside .gta6rt-deleted/; those marker parent
+        // directories must not hide the corresponding ancestor directories in the package.
+        check(delete_w(L"GAME:\\data\\sub\\nested.txt") != FALSE, "DeleteFileW accepts a nested package file");
+        const DWORD sub_attrs = attributes_w(L"GAME:\\data\\sub");
+        check(sub_attrs != INVALID_FILE_ATTRIBUTES && (sub_attrs & FILE_ATTRIBUTE_DIRECTORY) != 0,
+              "deleting a nested package file does not hide its parent folder");
+        check(contains(list(first_w, next_w, find_close, L"GAME:\\data\\*"), L"sub"),
+              "the parent folder stays listed after deleting a nested package file");
     }
 
     // Nothing leaves the package and the overlay.
