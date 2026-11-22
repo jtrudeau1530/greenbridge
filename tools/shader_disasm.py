@@ -165,6 +165,22 @@ def main():
         os.makedirs(out, exist_ok=True)
     except OSError as e:
         fail(f"cannot create the output folder {out}: {e.strerror or e}")
+    if os.path.isdir(a.src) and not a.limit:
+        # A shader dropped by a re-carve must not keep its old listing: the translator reads every .s in this folder,
+        # so a stale one would still be translated and indexed even though the corpus no longer has it. --limit is a
+        # partial run on purpose, so it leaves the rest of the folder alone.
+        stems = {os.path.splitext(os.path.basename(p))[0] for p in files}
+        stale = []
+        try:
+            with os.scandir(out) as entries:
+                stale = sorted(e.path for e in entries
+                               if e.name.endswith(".s") and e.is_file() and e.name[:-2] not in stems)
+            for path in stale:
+                os.remove(path)
+        except OSError as e:
+            fail(f"cannot prune stale .s files in {out}: {e.strerror or e}")
+        if stale:
+            print(f"removed {len(stale)} stale .s file(s) that no .fssm in {a.src} names")
     probe(a.mcpu)
     from collections import Counter
     with ThreadPoolExecutor(a.jobs) as ex:

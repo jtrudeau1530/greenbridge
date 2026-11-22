@@ -197,6 +197,32 @@ class DisasmInputTest(unittest.TestCase):
         self.assertEqual(os.listdir(out), ["current.s"])
         self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.fssm")))
 
+    def test_a_full_run_removes_listings_of_shaders_no_longer_there(self):
+        self.write("current.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        for name, body in (("stale.s", "; gone\n"), ("notes.txt", "keep\n")):
+            with open(os.path.join(out, name), "w", encoding="utf-8") as f:
+                f.write(body)
+        result = self.run_tool(self.src, "--out", out, "--jobs", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(os.listdir(out)), ["current.s", "notes.txt"])
+        self.assertIn("removed 1 stale .s file(s)", result.stdout)
+
+    def test_a_limited_run_leaves_the_other_listings_alone(self):
+        self.write("a_shader.fssm", fssm())
+        self.write("b_shader.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.makedirs(out)
+        with open(os.path.join(out, "b_shader.s"), "w", encoding="utf-8") as f:
+            f.write("; already there\n")
+        result = self.run_tool(self.src, "--out", out, "--limit", "1", "--jobs", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stale", result.stdout)
+        self.assertEqual(sorted(os.listdir(out)), ["a_shader.s", "b_shader.s"])
+        with open(os.path.join(out, "b_shader.s"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "; already there\n")
+
     def test_jobs_and_limit_must_be_at_least_one(self):
         self.write("one.fssm", fssm())
         out = os.path.join(self.dir, "out")
