@@ -746,6 +746,8 @@ def main():
     a = ap.parse_args()
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")
+    if a.frames < 0:
+        ap.error("--frames must be 0 or more")
     if a.decode is None and not a.out:
         ap.error("an output .json is required unless --decode is given")
     try:

@@ -543,6 +543,15 @@ class ArchiveTest(unittest.TestCase):
         for row in doc["dictionaries"]:      # per-dictionary rows hold counts, never values
             self.assertTrue(all(not isinstance(v, (list, dict)) for v in row.values()), row)
 
+    def test_decode_rejects_negative_frames(self):
+        result = subprocess.run(
+            [sys.executable, "-I", TOOL, self.rpf, "--decode", str(self.offsets[1]), "--frames", "-1"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--frames must be 0 or more", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_decode_prints_values(self):
         d = anim_clips.decode_one(self.rpf, self.offsets[1], 2)
         anim = d["packs"][0]["animations"][0]
