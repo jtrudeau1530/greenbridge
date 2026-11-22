@@ -92,7 +92,7 @@ the first system page of a resource; the page map at the `+0x08` pointer gives i
 
 ### `MoVE` container
 
-324 resources start with `"MoVE"` (325 zlib streams: 323 fit in a single RPF9 stream of 114–63,915 inflated bytes, and
+324 resources start with `"MoVE"` (325 zlib streams: 323 fit in a single RPF9 stream of 114–58,452 inflated bytes, and
 one at `0x105a7d000` spans a 65,536-byte stream plus a 5,563-byte continuation stream at `0x105a7f9c0`, for 71,099
 bytes). All 324 share the same 32-byte fixed header prefix:
 

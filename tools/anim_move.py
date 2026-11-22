@@ -240,6 +240,7 @@ def _parse_container(data, off, end_limit, stats):
         stats["transitions"] += len(transitions)
         stats["default_transitions"] += len(def_transitions)
         stats["child_states"] += n_children
+        stats[f"{kind}_children"] += n_children
         children = []
         for i, (ch_hash, ch_off) in enumerate(child_entries):
             ch_end = child_entries[i + 1][1] if i + 1 < n_children else children_end_limit

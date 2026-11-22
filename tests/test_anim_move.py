@@ -284,6 +284,8 @@ class AnimMoveTest(unittest.TestCase):
         self.assertEqual(c["container:state_machine"], 1)
         self.assertEqual(c["container:inlined_state_machine"], 1)
         self.assertEqual(c["container:motion_tree"], 3)
+        self.assertEqual(c["state_machine_children"], 2)
+        self.assertEqual(c["inlined_state_machine_children"], 1)
         self.assertEqual(c["inlined_state_machine_inputs"], 1)
         self.assertEqual(c["transitions"], 2)
         self.assertEqual(c["default_transitions"], 2)
