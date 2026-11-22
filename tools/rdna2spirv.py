@@ -1405,8 +1405,14 @@ class Gen:
         """global_atomic_<op> [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: a 32-bit atomic at the global_* address
         (RDNA2 ISA, FLAT/GLOBAL). With glc the pre-op value lands in vdst (the first operand); without it there is no
         vdst. cmpswap takes vdata as a pair {DATA, CMP}: M = (M == CMP) ? DATA : M. Inactive lanes don't touch memory
-        and keep vdst. The _x2 (64-bit) forms, inc/dec and the float atomics stay Unsupported."""
+        and keep vdst. and/or/xor/swap_x2 work on a 64-bit element (two dwords, low first) as one 32-bit atomic per
+        dword: a bitwise op or an exchange leaves the same memory that way, with no Int64 atomics. The returned pair is
+        two reads, so another lane's 64-bit op on the same element between them could be seen half done. The other
+        _x2 forms (add/sub/min/max carry or compare across the dwords, cmpswap_x2 compares all 64 bits), inc/dec and
+        the float atomics stay Unsupported."""
         kind = op[len("global_atomic_"):]
+        if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
+            return self.global_atomic_x2(op, kind[:-3], a, mods)
         if kind not in self.BUF_ATOMICS or any(m in mods for m in ("slc", "dlc", "lds")):
             raise Unsupported(op if kind not in self.BUF_ATOMICS else op + " form")
         rtn = "glc" in mods
@@ -1437,6 +1443,45 @@ class Gen:
         self.emit(f"{old} = OpPhi %uint {res} {lbl_do} {old_d} {pre}")
         if vdst is not None:
             self.store_reg("vgpr", vdst["r"], old)
+
+    def global_atomic_x2(self, op, kind, a, mods):
+        """global_atomic_{and,or,xor,swap}_x2 (see global_atomic): one 32-bit atomic per dword of the element."""
+        if any(m in mods for m in ("slc", "dlc", "lds")):
+            raise Unsupported(op + " form")
+        rtn = "glc" in mods
+        if len(a) != (4 if rtn else 3):
+            raise Unsupported(op + " operands")
+        vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != 2 or \
+                (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 2)):
+            raise Unsupported(op + " operands")
+        full = self.global_address(op, vaddr, saddr, mods)
+        vals = [self.load_reg("vgpr", vdata["r"] + w) for w in range(2)]
+        keep = [self.load_reg("vgpr", vdst["r"] + w) for w in range(2)] if vdst is not None else [self.cu(0)] * 2
+        spv = self.BUF_ATOMICS[kind][0]
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {self.active_b()} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        ptr = self.tmp()
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+        res = []
+        for w in range(2):
+            p, r = self.tmp(), self.tmp()
+            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
+            self.emit(f"{r} = {spv} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
+            res.append(r)
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        olds = []
+        for w in range(2):                     # both OpPhi first: they must open the merge block
+            old = self.tmp()
+            self.emit(f"{old} = OpPhi %uint {res[w]} {lbl_do} {keep[w]} {pre}")
+            olds.append(old)
+        if vdst is not None:
+            for w in range(2):
+                self.store_reg("vgpr", vdst["r"] + w, olds[w])
 
     def buffer_atomic(self, op, a, mods):
         """buffer_atomic_<op> vdata, vaddr, s[V#], soffset ...: 32-bit atomic at the element address (buffer device
