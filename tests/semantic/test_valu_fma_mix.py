@@ -226,5 +226,52 @@ class NegativeControls(unittest.TestCase):
         self.assertNotEqual(si.run_fragment(bad)["%out_mrt0"][0], good)
 
 
+class FmaMixF32DenormalOperandTests(unittest.TestCase):
+    """SHADER-298: an f32 operand of v_fma_mix* that is denormal reads as a zero of its sign (the game's MODE has
+    denorm_mode_32 = 0), measured on gfx1036 by @Sanonymous01 for 0x00000001, 0x807fffff and the integer inline
+    constants 1 and 64. The result is not flushed here (not measured), so 0 * y + denormal keeps the denormal only
+    when the denormal is not an operand, which cannot happen; the checks below use operands only."""
+
+    BIG = f2u(1.0e30)
+    ZERO = 0x00000000
+    NEG_ZERO = 0x80000000
+
+    def test_denormal_multiplicand_reads_as_zero(self):
+        # 1.4e-45 * 1e30 = 1.4e-15 if the denormal is kept; 0 if it is flushed.
+        for d in (0x00000001, 0x007FFFFF):
+            with self.subTest(denormal=hex(d), slot="src0"):
+                self.assertEqual(run("v_fma_mix_f32 v0, v1, v2, v3", d, self.BIG, self.ZERO), 0x00000000)
+            with self.subTest(denormal=hex(d), slot="src1"):
+                self.assertEqual(run("v_fma_mix_f32 v0, v1, v2, v3", self.BIG, d, self.ZERO), 0x00000000)
+
+    def test_negative_denormal_reads_as_negative_zero(self):
+        # (-0) * 1e30 + (-0) = -0; a kept denormal would give -1.1e-8-ish tiny non-zero.
+        for d in (0x80000001, 0x807FFFFF):
+            with self.subTest(denormal=hex(d)):
+                self.assertEqual(run("v_fma_mix_f32 v0, v1, v2, v3", d, self.BIG, self.NEG_ZERO), 0x80000000)
+
+    def test_denormal_addend_reads_as_zero(self):
+        # 0 * y + denormal: the denormal addend is flushed, so the result is +0 (kept it would be the denormal).
+        self.assertEqual(run("v_fma_mix_f32 v0, v1, v2, v3", self.ZERO, self.BIG, 0x00000001), 0x00000000)
+
+    def test_integer_inline_constants_are_denormal_f32_operands(self):
+        # `1` and `64` in an f32 operand slot are the words 0x00000001 and 0x00000040: denormal, flushed to +0.
+        for const in ("1", "64"):
+            with self.subTest(const=const):
+                self.assertEqual(run(f"v_fma_mix_f32 v0, {const}, v2, v3", self.ZERO, self.BIG, self.ZERO), 0x00000000)
+
+    def test_normal_operands_are_untouched(self):
+        a, b, c = f2u(2.5), f2u(-1.25), f2u(0.75)
+        self.assertEqual(run("v_fma_mix_f32 v0, v1, v2, v3", a, b, c), f2u(ref_fma(a, b, c, (0, 0, 0), (0, 0, 0))))
+        smallest_normal = 0x00800000      # 2**-126 is the first value that is not flushed
+        got = run("v_fma_mix_f32 v0, v1, v2, v3", smallest_normal, f2u(1.0), self.ZERO)
+        self.assertEqual(got, smallest_normal)
+
+    def test_the_flush_reaches_the_f16_result(self):
+        # 1.4e-45 * 3e37 = 4.2e-8 rounds to the f16 subnormal 0x0001 if the denormal is kept, and is 0 flushed.
+        got = run("v_fma_mixlo_f16 v0, v1, v2, v3", 0x00000001, f2u(3.0e37), self.ZERO, old=0xAAAA0000)
+        self.assertEqual(got, 0xAAAA0000)
+
+
 if __name__ == "__main__":
     unittest.main()
