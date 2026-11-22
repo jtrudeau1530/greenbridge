@@ -81,9 +81,12 @@ public:
     //   2 planes: the two share one token; plane 0 is presented and plane 1 (the GameDVR/SDR copy) is dropped; the
     //             missing composition (HDR, GameDVR) is logged once.
     //   More than 2: E_INVALIDARG (the UMD limit, section 4.5).
-    // Token: the one from WaitFrameEventX, once. Null, unknown (never issued), stale (not newer than the last
-    // presented) or repeated tokens give E_INVALIDARG and present nothing; a token whose frame was never presented
-    // may be skipped. While suspended: HRESULT_FROM_WIN32(ERROR_INVALID_STATE).
+    // Token: the one from WaitFrameEventX. Real behaviour for a null, repeated or out-of-order token is unmeasured and a
+    // title must not freeze on it, so those are presented anyway and logged once per kind; only a token that was never
+    // handed out gives E_INVALIDARG (nothing presented). Skipping a token is fine. Sources the GPU cannot blit
+    // (multisampled, integer, block-compressed) give DXGI_ERROR_UNSUPPORTED and present nothing; resolving a
+    // multisampled plane into a temporary is not done. While suspended: HRESULT_FROM_WIN32(ERROR_INVALID_STATE), also
+    // for a present that was waiting for a swapchain image when SuspendX came.
     // `params` may be null; ImmediateThresholdPercent is ignored (logged once).
     HRESULT PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
     // SuspendX drops the interval, the origin event and the frames in flight, and refuses presents. ResumeX allows
@@ -102,6 +105,7 @@ private:
     std::mutex present_mutex_;  // PresentX, SuspendX and ResumeX one at a time
     std::atomic<std::uint64_t> presents_{0};
     bool logged_planes_ = false, logged_threshold_ = false, logged_display_ = false;
+    bool logged_null_token_ = false, logged_stale_token_ = false, logged_repeated_token_ = false;
 };
 
 inline constexpr UINT xbox_frame_event_origin = leonida::frame_event_origin;

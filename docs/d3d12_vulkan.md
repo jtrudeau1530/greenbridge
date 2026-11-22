@@ -1331,18 +1331,26 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
   (bilinear, so the rectangle's outer texels blend with their neighbours). The blit converts between formats; an sRGB
   source gets an sRGB swapchain format and every other source a UNORM one, so the encoded bytes go through unchanged.
-  Integer, block-compressed and multisampled sources give `DXGI_ERROR_UNSUPPORTED`. 2 planes: plane 0 is shown, plane 1 is
+  A source the GPU cannot blit gives `DXGI_ERROR_UNSUPPORTED` and presents nothing: the checks are
+  `vkGetPhysicalDeviceFormatProperties` (`BLIT_SRC` on the source, `BLIT_DST` on the swapchain format, cached per
+  format; the scaling filter is linear only with `SAMPLED_IMAGE_FILTER_LINEAR`, else nearest), plus integer formats,
+  which a UNORM swapchain cannot take. Multisampled planes are refused the same way: resolving one into a temporary
+  image is not done. 2 planes: plane 0 is shown, plane 1 is
   dropped, and the missing HDR/GameDVR composition is logged once; they must share one token. More than 2 planes,
   null planes, or an empty/outside rectangle give `E_INVALIDARG`. A missing `ALLOW_DISPLAY` heap flag is logged once
   and presented anyway. `ImmediateThresholdPercent` is ignored (logged once when non-zero): a late frame waits for
   its vblank.
-- *Tokens*: the token of a plane must have been issued by a wait and be newer than the last presented one. Null,
-  never issued, stale and repeated tokens give `E_INVALIDARG` and present nothing (our decision; the samples only pass
-  the token they just received). Skipping a token is fine.
+- *Tokens*: what the console does with a null, repeated or out-of-order token is **unmeasured**, and a title that
+  presents a loading screen with `Token = 0`, presents again with one token, or presents from a render thread out of
+  order must not freeze. So those are presented anyway and logged once per kind; only a token that was never handed
+  out gives `E_INVALIDARG` (nothing presented). Skipping a token is fine.
 - *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
-  with `ERROR_INVALID_STATE` and refuses presents; resume allows presents again, but waits fail until
-  `SetFrameIntervalX` and `ScheduleFrameEventX` are called again, as the samples do. Tokens keep counting.
-- *Not done*: HDR/GameDVR plane composition, `ImmediateThresholdPercent`, a host-vblank clock (the timer drifts from the
+  with `ERROR_INVALID_STATE` and refuses presents (a `PresentX` waiting for a swapchain image polls the suspended
+  state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until
+  `SetFrameIntervalX` and `ScheduleFrameEventX` are called again, as the samples do. Tokens keep counting. Calling
+  `SetFrameIntervalX` again outside suspend keeps the origin event armed and re-bases the vblank grid on that moment.
+- *Not done*: HDR/GameDVR plane composition, resolving multisampled planes, a mutable-format swapchain (an sRGB/UNORM
+  alternation recreates the swapchain; `VK_KHR_swapchain_mutable_format` is not enabled on the device), `ImmediateThresholdPercent`, a host-vblank clock (the timer drifts from the
   display; with FIFO presents the swapchain holds the queue to the real refresh anyway), render statistics,
   `PercentScanned`, and the vtable wiring. Slots to measure (all unknown): the device's `SetFrameIntervalX`,
   `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` and the queue's `PresentX`, `SuspendX`, `ResumeX`

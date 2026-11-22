@@ -275,6 +275,7 @@ int main() {
         const std::uint64_t before = xbox.presents();
         const D3D12_RECT bad_rects[] = {{10, 10, 10, 20}, {20, 10, 10, 20}, {0, 0, LONG(width + 1), 10}, {-1, 0, 10, 10}};
         for (const D3D12_RECT& bad : bad_rects) {
+            clock.advance_us(4 * period);  // let the queued frames show: with latency 1 the wait holds for them
             EXPECT(next_token(token));
             plane = plane_of(split, token, &bad);
             EXPECT(xbox.PresentX(1, &plane, nullptr) == E_INVALIDARG);
@@ -341,19 +342,73 @@ int main() {
         EXPECT(grab(frame));
         EXPECT(region_is(frame, 0, 0, width, height, {0, 255, 0}, 0));
 
-        // Tokens: null, never issued, stale and repeated are refused and nothing is presented.
+        // Tokens: a token that was never handed out is refused and nothing is presented. A null, repeated or stale one
+        // is presented anyway (and logged once per kind, see the log lines above): alternate the sources so that
+        // each present shows on screen.
         const std::uint64_t presented_before = xbox.presents();
-        plane = plane_of(rgba, 0);
-        EXPECT(xbox.PresentX(1, &plane, nullptr) == E_INVALIDARG);
         plane = plane_of(rgba, xbox.pacer().tokens_issued() + 1);
         EXPECT(xbox.PresentX(1, &plane, nullptr) == E_INVALIDARG);
-        plane = plane_of(rgba, token);  // the token just used
-        EXPECT(xbox.PresentX(1, &plane, nullptr) == E_INVALIDARG);
-        plane = plane_of(rgba, 1);       // long gone
-        EXPECT(xbox.PresentX(1, &plane, nullptr) == E_INVALIDARG);
         EXPECT(xbox.presents() == presented_before);
+        EXPECT(grab(frame));
+        EXPECT(region_is(frame, 0, 0, width, height, {0, 255, 0}, 0));  // still the last frame
+        plane = plane_of(rgba, 0);  // null token, as a loading screen might
+        EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);
+        EXPECT(grab(frame));
+        EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
+        plane = plane_of(second, token);  // repeated: the token of the last tokened present
+        EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);
+        EXPECT(grab(frame));
+        EXPECT(region_is(frame, 0, 0, width, height, {0, 255, 0}, 0));
+        plane = plane_of(rgba, 1);  // stale: long gone
+        EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);
+        EXPECT(grab(frame));
+        EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
+        EXPECT(xbox.presents() == presented_before + 3);
+
+        // Sources the GPU cannot blit are refused with DXGI_ERROR_UNSUPPORTED and present nothing: multisampled,
+        // integer and block-compressed. The last frame stays on screen and the token is still usable afterwards.
+        {
+            const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+            const auto make_special = [&](DXGI_FORMAT format, UINT samples, D3D12_RESOURCE_FLAGS flags,
+                                          Ref<ID3D12Resource>& out) {
+                D3D12_RESOURCE_DESC desc{};
+                desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                desc.Width = width;
+                desc.Height = height;
+                desc.DepthOrArraySize = 1;
+                desc.MipLevels = 1;
+                desc.Format = format;
+                desc.SampleDesc.Count = samples;
+                desc.Flags = flags;
+                return SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_ALLOW_DISPLAY, &desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 IID_PPV_ARGS(&out.p)));
+            };
+            Ref<ID3D12Resource> msaa, integer, bc;
+            EXPECT(make_special(DXGI_FORMAT_R8G8B8A8_UNORM, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, msaa));
+            EXPECT(make_special(DXGI_FORMAT_R8G8B8A8_UINT, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, integer));
+            EXPECT(make_special(DXGI_FORMAT_BC1_UNORM, 1, D3D12_RESOURCE_FLAG_NONE, bc));
+            ID3D12Resource* unsupported[3] = {msaa.p, integer.p, bc.p};
+            clock.advance_us(4 * period);  // let the queued frames show: with latency 1 the wait holds for them
+            EXPECT(next_token(token));
+            const std::uint64_t before_unsupported = xbox.presents();
+            for (ID3D12Resource* resource : unsupported) {
+                const rt::d3d12::XboxPresentPlaneParameters p{token, 1, &resource, nullptr, 0};
+                EXPECT(xbox.PresentX(1, &p, nullptr) == DXGI_ERROR_UNSUPPORTED);
+            }
+            EXPECT(xbox.presents() == before_unsupported);
+            EXPECT(grab(frame));
+            EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
+            plane = plane_of(second, token);
+            EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);  // the same token, now with a supported source
+            EXPECT(grab(frame));
+            EXPECT(region_is(frame, 0, 0, width, height, {0, 255, 0}, 0));
+            std::printf("unsupported sources (MSAA, integer, BC) refused: ok\n");
+        }
+
         // Skipping a frame (waiting twice, presenting the second token) is fine.
         std::uint64_t skipped = 0;
+        clock.advance_us(4 * period);
         EXPECT(next_token(skipped) && next_token(token) && token == skipped + 1);
         plane = plane_of(rgba, token);
         EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);

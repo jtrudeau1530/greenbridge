@@ -23,9 +23,12 @@ void log_once(bool& done, const char* text) {
 XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock)
     : presenter_(std::move(presenter)),
       own_clock_(clock ? nullptr : std::make_unique<leonida::SteadyFrameClock>()),
-      pacer_(clock ? *clock : *own_clock_) {}
+      pacer_(clock ? *clock : *own_clock_) {
+    // A present waiting for a swapchain image gives up once SuspendX has been called.
+    presenter_->set_abort([this] { return pacer_.suspended(); });
+}
 
-XboxPresentation::~XboxPresentation() = default;
+XboxPresentation::~XboxPresentation() { presenter_->set_abort(nullptr); }
 
 HRESULT XboxPresentation::SetFrameIntervalX(IUnknown*, UINT interval_period_us, UINT latency, UINT flags) {
     return from_pacer(pacer_.set_frame_interval(interval_period_us, latency, flags));
@@ -71,12 +74,29 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         if (plane.Token != token || plane.ResourceCount == 0 || !plane.ppResources || !plane.ppResources[0])
             return E_INVALIDARG;
     }
-    if (const std::int32_t checked = pacer_.check_present_token(token); checked != hr::ok) return from_pacer(checked);
+    // Only a token that was never handed out is refused. Null, stale and repeated tokens are presented anyway (what the
+    // console does with them is unmeasured, and a title that does it must not freeze); each kind is logged once.
+    FramePacer::TokenIssue issue{};
+    if (const std::int32_t checked = pacer_.check_present_token(token, &issue); checked != hr::ok)
+        return from_pacer(checked);
+    switch (issue) {
+    case FramePacer::TokenIssue::null_token:
+        log_once(logged_null_token_, "PresentX with the null token: presented anyway (real behaviour unmeasured)");
+        break;
+    case FramePacer::TokenIssue::stale:
+        log_once(logged_stale_token_, "PresentX with a token older than the last presented: presented anyway");
+        break;
+    case FramePacer::TokenIssue::repeated:
+        log_once(logged_repeated_token_, "PresentX with the token of the last present again: presented anyway");
+        break;
+    case FramePacer::TokenIssue::none:
+        break;
+    }
 
     const XboxPresentPlaneParameters& plane = planes[0];
     ID3D12Resource* resource = plane.ppResources[0];
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return E_INVALIDARG;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
     D3D12_HEAP_PROPERTIES heap{};
     D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
     if (SUCCEEDED(resource->GetHeapProperties(&heap, &heap_flags)) && !(heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY))
@@ -91,20 +111,20 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         log_once(logged_planes_, "PresentX with 2 planes: only plane 0 is shown; HDR/GameDVR plane composition is not implemented");
 
     const HRESULT result = presenter_->present(resource, sync_interval, rect);
-    if (FAILED(result)) return result;
+    if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
     pacer_.commit_present_token(token, plane_count);
     ++presents_;
     return S_OK;
 }
 
+// SuspendX and ResumeX do not take present_mutex_: a PresentX stuck waiting for a swapchain image must not hold them
+// (it polls the suspended state and gives up). A present that was already past that point finishes normally.
 HRESULT XboxPresentation::SuspendX(UINT) {
-    std::lock_guard serialise(present_mutex_);
     pacer_.suspend();
     return S_OK;
 }
 
 HRESULT XboxPresentation::ResumeX() {
-    std::lock_guard serialise(present_mutex_);
     pacer_.resume();
     return S_OK;
 }
