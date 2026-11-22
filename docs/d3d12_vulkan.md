@@ -226,7 +226,13 @@ What is implemented (all of it testable without the game):
   slice, the same on both sides) runs in a rendering scope of its own with no draws: the multisampled plane is the
   depth or stencil attachment (load `LOAD`, store `NONE`), the destination its resolve target with the mode, the
   render area the source rectangle. Both move from their resolve layouts to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL` and
-  back around it; the destination's other plane is not attached and keeps its contents. The format is the depth
+  back around it; the destination's other plane is not attached and keeps its contents. A rectangle smaller than the
+  subresource has the texels around it copied into a scratch buffer before the scope and back after it, on every
+  GPU: Vulkan resolves only inside the render area, but MoltenVK (1.4.2 and 1.4.3, Apple M3 Max) resolves the whole
+  destination subresource, because it resolves through Metal's store action, which has no render area. Measured
+  with a raw Vulkan program (a 4x D32 attachment, render area (2,1) 5x4 of 8x6, `MIN`, `MAX` and `SAMPLE_ZERO`,
+  store `NONE` or `STORE`): MoltenVK writes all 48 destination texels, KosmicKrisp only the 20 inside. No device
+  property reports it, so nothing is gated. The format is the depth
   format or the plane's own (`R32_FLOAT`, `R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`, and the D32S8 pair, untested).
   What the PC runtime accepts was measured on an RTX 5070 (driver 621.24) and on WARP: `MIN` and `MAX` of either
   plane by either format, and `AVERAGE` of the depth plane by its own format only (its `Close` fails for `AVERAGE`
@@ -788,6 +794,9 @@ and any validation error fails them.
   be refused (an address past a binding or in none, no `vkCmdUpdateBuffer`, a copy or dependent range past its
   buffer, an unknown dependent resource, a subresource the resource does not have, and an explicit discard count of
   `UINT_MAX`, which is a range and not the whole resource).
+- `vk_command_replay_test`, part I: a 4x D32 `MIN` resolve of a rectangle; the texels around it must keep the
+  destination's clear value (MoltenVK overwrote all 28 of them before the scratch copy). It is skipped where the
+  device has no `MIN` depth resolve (llvmpipe), and without `copy_scratch` the list is refused.
 - `d3d12_vulkan_device_test` also runs both atomic copies and the discards through COM, and checks that
   `WriteBufferImmediate` is refused at execution while no buffer has a GPU virtual address on `main`.
 - `vk_bindless_test` (run by `runtime/test/shaders/check.py` and `scripts/run_gpu_tests.py`): the translator's
