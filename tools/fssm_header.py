@@ -242,15 +242,30 @@ def tally(rows, stages_known):
     }
 
 
+def non_negative(text):
+    """--limit: a count of blobs. A negative one would slice from the end (paths[:-1] drops the last blob)."""
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Read the FSSM pixel-shader input table.")
     ap.add_argument("path", help="an .fssm file or a directory of them")
     ap.add_argument("--json", action="store_true", help="print one JSON document instead of lines")
-    ap.add_argument("--limit", type=int, help="stop after this many blobs")
+    ap.add_argument("--limit", type=non_negative, help="stop after this many blobs")
     ap.add_argument("--bindings", action="store_true", help="also parse the post-code binding table")
     args = ap.parse_args(argv)
 
-    paths = files_of(args.path)
+    if not os.path.exists(args.path):
+        print(f"ERROR: {args.path} does not exist", file=sys.stderr)
+        return 2
+    try:
+        paths = files_of(args.path)
+    except OSError as e:
+        print(f"ERROR: cannot list {args.path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if args.limit is not None:
         paths = paths[:args.limit]
     stages = stage_index(args.path)

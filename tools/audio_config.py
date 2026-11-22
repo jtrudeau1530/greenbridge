@@ -203,8 +203,16 @@ def main():
     ap.add_argument("--max-ms", type=int, default=MAX_MS, help="maximum duration (default 2000000)")
     a = ap.parse_args()
 
-    names = load_names(a.names) if a.names else None
-    records = collect(a.src, a.min_ms, a.max_ms, names, a.join)
+    if not os.path.exists(a.src):
+        sys.exit(f"{a.src}: does not exist")
+    try:
+        names = load_names(a.names) if a.names else None
+    except OSError as e:
+        sys.exit(f"{a.names}: cannot read the name pool: {e.strerror or e}")
+    try:
+        records = collect(a.src, a.min_ms, a.max_ms, names, a.join)
+    except OSError as e:
+        sys.exit(f"{e.filename or a.src}: cannot read: {e.strerror or e}")
     if not records:
         sys.exit(f"{a.src}: no audio-config records found")
     summary = summarize(records)
