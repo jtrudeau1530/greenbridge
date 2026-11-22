@@ -170,6 +170,22 @@ class TestFolder(unittest.TestCase):
         self.assertEqual((stats["ogg files"], stats.get("tagged", 0), stats.get("without a name", 0)), (3, 1, 2))
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
 
+    def test_bank_label_as_is_wins_over_its_awc_spelling(self):
+        # "story/bank_02" and "story/bank_02.awc" for one id (a directory scan can give both, from bank_02.awc and
+        # bank_02.awc.awc): each folder keeps its own name, whatever the row order.
+        make_ogg(os.path.join(self.opus, "story", "bank_02.awc", "1FFFFFFF.ogg"), stream_id=0x1FFFFFFF)
+
+        def row(bank, name):
+            return {"source": "s", "bank": bank, "stream_id": "1fffffff", "name": name, "rule": "family"}
+
+        rows = [row("story/bank_02", "plain_label"), row("story/bank_02.awc", "awc_label")]
+        names = os.path.join(self.tmp.name, "both.csv")
+        for order in (rows, rows[::-1]):
+            write_csv(names, NAMES, order)
+            T.tag_folder(self.opus, T.load_names(names))
+            self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=plain_label"])
+            self.assertEqual(self.tags("story", "bank_02.awc", "1FFFFFFF.ogg"), ["TITLE=awc_label"])
+
     def test_cli(self):
         r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names, "--source", "story",
                             "--dialogue", self.dialogue], capture_output=True, text=True)
