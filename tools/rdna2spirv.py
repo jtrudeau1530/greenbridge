@@ -571,12 +571,31 @@ class Gen:
         return out
 
     def f16_in(self, s, hi=0):
-        """Read operand ``s`` as an f16 (low half, or high half when ``hi``) widened to f32, then apply its neg/abs."""
+        """Read operand ``s`` as an f16 (low half, or high half when ``hi``) widened to f32, then apply its neg/abs.
+
+        RDNA2's f16 MODE keeps denormals, but on NVIDIA (RTX 5060 Ti, 610.88) UnpackHalf2x16 gives 0 for a denormal
+        that an SDWA BYTE_1 select produced, from an inline constant or a VGPR alike (ps_sdwa_f16_const), while the
+        same denormal in a register or a literal widens right. A half with a zero exponent field is therefore
+        widened exactly with integer ops: sign * mantissa * 2^-24."""
         u = self.src_h(s)
         v2, f = self.tmp(), self.tmp()
         self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
         self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")
-        return self.modify_f(f, s)
+        h, ex, small, mant, mf, den, neg, isneg, sden, out = (self.tmp() for _ in range(10))
+        if hi:
+            self.emit(f"{h} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+        else:
+            self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+        self.emit(f"{ex} = OpBitwiseAnd %uint {h} {self.cu(0x7C00)}")
+        self.emit(f"{small} = OpIEqual %bool {ex} {self.cu(0)}")
+        self.emit(f"{mant} = OpBitwiseAnd %uint {h} {self.cu(0x3FF)}")
+        self.emit(f"{mf} = OpConvertUToF %float {mant}")
+        self.emit(f"{den} = OpFMul %float {mf} {self.fconst(2.0 ** -24)}")
+        self.emit(f"{neg} = OpFNegate %float {den}")
+        self.emit(f"{isneg} = OpUGreaterThanEqual %bool {h} {self.cu(0x8000)}")
+        self.emit(f"{sden} = OpSelect %float {isneg} {neg} {den}")
+        self.emit(f"{out} = OpSelect %float {small} {sden} {f}")
+        return self.modify_f(out, s)
 
     def fma_mix_srcs(self, a, mods):
         """Read the 3 operands of v_fma_mix*: f16 at op_sel[i] when op_sel_hi[i] is set (via src_h so fimm is binary16), else f32."""
