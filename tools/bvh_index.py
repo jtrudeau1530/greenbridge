@@ -304,7 +304,10 @@ def summarize(rows, source, span, zero, unread, elapsed):
 
 
 def scan_dir(path, max_inflate=1 << 28):
-    rpfs = sorted(glob.glob(os.path.join(path, "**", "*.rpf"), recursive=True))
+    # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
+    # class by glob and match nothing. The "**"/"*.rpf"/"*.bin" suffixes stay as glob patterns.
+    root = glob.escape(os.fspath(path))
+    rpfs = sorted(glob.glob(os.path.join(root, "**", "*.rpf"), recursive=True))
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
@@ -316,7 +319,7 @@ def scan_dir(path, max_inflate=1 << 28):
             rows += r
             summaries.extend(s)
         return rows, summaries
-    for p in sorted(glob.glob(os.path.join(path, "**", "*.bin"), recursive=True)):
+    for p in sorted(glob.glob(os.path.join(root, "**", "*.bin"), recursive=True)):
         size = os.path.getsize(p)
         with open(p, "rb") as f:
             head = f.read(HEAD)
