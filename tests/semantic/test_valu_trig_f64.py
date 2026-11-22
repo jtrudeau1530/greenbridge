@@ -1098,5 +1098,156 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(interp.vgpr.get_vgpr_pair(0), F64_POS_ZERO)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Isolation for v_trig_f64
+# ==============================================================================
+
+@dataclass
+class StatusFlags:
+    invalid_op: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    nan: bool = False
+
+
+def compute_trig_f64_status_flags(src0: int, result: int) -> StatusFlags:
+    flags = StatusFlags()
+    s0 = src0 & MASK64
+    res = result & MASK64
+
+    # Invalid operation: SNaN operand or Infinite operand (sin/cos of Inf is invalid)
+    if is_f64_snan(s0) or is_f64_inf(s0):
+        flags.invalid_op = True
+
+    if is_f64_nan(res):
+        flags.nan = True
+    else:
+        flags.negative = bool(f64_sign(res))
+        if is_f64_zero(res):
+            flags.zero = True
+        else:
+            # Check inexact: transcendental results on non-cardinal inputs are inexact
+            val = u64_to_f64(s0)
+            red = ref_turn_reduce_f64(val)
+            if red not in (0.0, 0.25, -0.25, 0.5, -0.5):
+                flags.inexact = True
+
+    return flags
+
+
+def ref_cmp_f64(op: str, src0: int, src1: int) -> bool:
+    """Evaluate double-precision IEEE-754 comparison condition codes."""
+    if op in ("u", "unordered"):
+        return is_f64_nan(src0) or is_f64_nan(src1)
+
+    if is_f64_nan(src0) or is_f64_nan(src1):
+        return op in ("neq", "ne", "!=")
+
+    v0 = u64_to_f64(src0)
+    v1 = u64_to_f64(src1)
+    if op in ("eq", "=="):
+        return v0 == v1
+    elif op in ("ne", "neq", "!="):
+        return v0 != v1
+    elif op in ("lt", "<"):
+        return v0 < v1
+    elif op in ("le", "<="):
+        return v0 <= v1
+    elif op in ("gt", ">"):
+        return v0 > v1
+    elif op in ("ge", ">="):
+        return v0 >= v1
+    raise ValueError(f"Unknown comparison operator: {op}")
+
+
+def generate_condition_mask_f64(op: str, src0_lanes: list[int], src1_lanes: list[int]) -> int:
+    """Generate a 32-bit or 64-bit condition mask (VCC) from per-lane comparisons."""
+    mask = 0
+    for lane, (s0, s1) in enumerate(zip(src0_lanes, src1_lanes)):
+        if ref_cmp_f64(op, s0, s1):
+            mask |= (1 << lane)
+    return mask
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_status_flags_invalid_operation(self) -> None:
+        # sin(Inf) -> Invalid operation exception and NaN
+        res_inf = ref_trig_f64(F64_POS_INF, mode=TrigMode.SIN)
+        flags_inf = compute_trig_f64_status_flags(F64_POS_INF, res_inf)
+        self.assertTrue(flags_inf.invalid_op)
+        self.assertTrue(flags_inf.nan)
+
+        # SNaN -> Invalid operation exception
+        snan = (F64_POS_INF | 0x0001000000000000) & ~F64_QUIET_BIT
+        res_snan = ref_trig_f64(snan, mode=TrigMode.SIN)
+        flags_snan = compute_trig_f64_status_flags(snan, res_snan)
+        self.assertTrue(flags_snan.invalid_op)
+        self.assertTrue(flags_snan.nan)
+
+    def test_status_flags_zero_and_negative(self) -> None:
+        # sin(-0.25 turns) = -1.0 (negative, non-zero)
+        res_neg = ref_trig_f64(F64_NEG_QUARTER, mode=TrigMode.SIN)
+        flags_neg = compute_trig_f64_status_flags(F64_NEG_QUARTER, res_neg)
+        self.assertTrue(flags_neg.negative)
+        self.assertFalse(flags_neg.zero)
+
+        # sin(-0.0 turns) = -0.0 (negative zero)
+        res_nzero = ref_trig_f64(F64_NEG_ZERO, mode=TrigMode.SIN)
+        flags_nzero = compute_trig_f64_status_flags(F64_NEG_ZERO, res_nzero)
+        self.assertTrue(flags_nzero.negative)
+        self.assertTrue(flags_nzero.zero)
+
+    def test_status_flags_inexact(self) -> None:
+        # 0.125 turn = 45 degrees -> sin(pi/4) is irrational and inexact
+        t = f64_to_u64(0.125)
+        res = ref_trig_f64(t, mode=TrigMode.SIN)
+        flags = compute_trig_f64_status_flags(t, res)
+        self.assertTrue(flags.inexact)
+
+    def test_vcc_and_scc_preserved(self) -> None:
+        # Floating point v_trig_f64 does not generate carry/borrow and never writes VCC or SCC
+        interp = ScalarInterpreter()
+        interp.vcc = 0x12345678_9ABCDEF0
+        interp.scc = 1
+        interp.vgpr.set_vgpr_pair(2, F64_QUARTER)
+
+        interp.execute_asm("v_trig_f64 v[0:1], v[2:3]")
+        self.assertEqual(interp.vcc, 0x12345678_9ABCDEF0)
+        self.assertEqual(interp.scc, 1)
+
+        sim = SIMDWavefront(wave_size=32)
+        sim.vcc = 0xCAFEBABE
+        sim.store_vgpr_pair_wave(2, [F64_QUARTER] * 32)
+        sim.step_v_trig_f64(0, 2)
+        self.assertEqual(sim.vcc, 0xCAFEBABE)
+
+    def test_condition_code_generation(self) -> None:
+        v_zero = [F64_POS_ZERO] * 4
+        # Four angles in turns: [-0.25 (sin=-1), 0.0 (sin=0), 0.25 (sin=1), Inf (sin=NaN)]
+        srcs = [F64_NEG_QUARTER, F64_POS_ZERO, F64_QUARTER, F64_POS_INF]
+        sins = [ref_trig_f64(a, mode=TrigMode.SIN) for a in srcs]
+
+        # Compare < 0: only lane 0 (-1.0 < 0) -> bit 0
+        mask_lt = generate_condition_mask_f64("<", sins, v_zero)
+        self.assertEqual(mask_lt, 0b0001)
+
+        # Compare == 0: only lane 1 (0.0 == 0) -> bit 1
+        mask_eq = generate_condition_mask_f64("==", sins, v_zero)
+        self.assertEqual(mask_eq, 0b0010)
+
+        # Compare > 0: only lane 2 (1.0 > 0) -> bit 2
+        mask_gt = generate_condition_mask_f64(">", sins, v_zero)
+        self.assertEqual(mask_gt, 0b0100)
+
+        # Compare unordered: only lane 3 (NaN) -> bit 3
+        mask_u = generate_condition_mask_f64("u", sins, v_zero)
+        self.assertEqual(mask_u, 0b1000)
+
+
 if __name__ == "__main__":
     unittest.main()
