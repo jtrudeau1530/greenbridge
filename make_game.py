@@ -580,6 +580,35 @@ def rpf9dump(work: str) -> str:
     return exe
 
 
+def ttpf_complete(pool_dir: str) -> bool:
+    """An older exporter could publish the manifest after a failed DDS write. Check its promised files on resume."""
+    try:
+        with open(os.path.join(pool_dir, "manifest.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        with os.scandir(pool_dir) as it:
+            have = {e.name for e in it if e.is_file()}
+    except (OSError, ValueError, RecursionError):
+        return False
+    if not isinstance(doc, dict):
+        return False
+    rows, count = doc.get("Textures"), doc.get("Count")
+    if not isinstance(rows, list) or type(count) is not int or count != len(rows):
+        return False
+    for row in rows:
+        if not isinstance(row, dict) or "File" not in row:
+            return False
+        name = row["File"]
+        if name is None:  # The catalog marked this texture unsupported.
+            continue
+        if not isinstance(name, str):
+            return False
+        if name not in have:
+            # An existing file may use another spelling on a case-insensitive volume.
+            if name != os.path.basename(name) or not os.path.isfile(os.path.join(pool_dir, name)):
+                return False
+    return True
+
+
 def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     get_exporter = functools.cache(rpf9dump)
     out = os.path.join(work, "assets")
@@ -600,7 +629,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
         name = os.path.splitext(os.path.basename(p))[0]
         parts = os.path.relpath(p, game).replace("\\", "/").split("/")
         dest = os.path.join(out, "ttpf_pack", parts[1]) if parts[0] == "pack" else os.path.join(out, "ttpf")
-        if os.path.isfile(os.path.join(dest, name, "manifest.json")):
+        if ttpf_complete(os.path.join(dest, name)):
             continue
         log(f"assets: texture pool {os.path.relpath(p, game)}")
         run([get_exporter(work), "ttpf", p, dest])

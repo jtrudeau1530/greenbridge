@@ -15,6 +15,12 @@ field.
 | exported at least one mip | 308,895 |
 | skipped | 48,220 |
 
+A skipped row has `File: null` and a `Limitation`. Either the catalog marks the texture as
+unextractable, or its content does not decode (`NotSupportedException`, `InvalidDataException`).
+Both are properties of the pool, so `rpf9dump` still exits 0 and publishes the manifest. A failure
+to read the pool or write a DDS is different. It exits 1 and withholds `manifest.json`, and a rerun
+resumes from the DDS files already written.
+
 **Bottom line:** the compact mip chain is decoded and validated below, and a clean-room
 stdlib-only BCPack decoder (`tools/bcpack.py`, `tools/bcpack_tables.py`,
 `tools/bcpack_tables_bptc.py`) now decodes the rANS entropy layer and rebuilds BC blocks
@@ -821,3 +827,10 @@ only the 24-byte RDS5 header, the chunk table, the ETPF records and the chunk ra
 wrote no texture data. `tools/ttpf_mips.py scan` is that mirror, now committed with the
 compact-layout and BCPack work; it reproduces the baseline split and adds the recovery
 columns.
+
+A pool's `manifest.json` is published only when the DDS of every `CanExtract` record was
+written or already present. If any write fails, `rpf9dump ttpf` keeps the DDS it did write,
+removes an older `manifest.json` for that pool and exits 1. Records with `File: null` are
+deliberate skips and do not fail the pool. The assets stage exports a pool again when its
+manifest is missing, unreadable or lists a `File` that is not on disk, so a manifest from an
+older build that names an absent DDS is repaired on the next run.
