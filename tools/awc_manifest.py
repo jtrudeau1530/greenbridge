@@ -33,6 +33,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 FIELDS = ("bank", "stream", "codec", "codec_name", "channels", "sample_rate", "declared_samples",
           "duration_s", "streamed_music", "data_offset", "data_size", "bank_size", "notes")
@@ -145,15 +146,6 @@ def _bank_rows(path: str, bank: str) -> list:
     return rows
 
 
-def _same_report_path(first: str, second: str) -> bool:
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def collect(src: str, *, out: str | None = None):
     """(parsed bank count, rows, streamed-music row count); one warning per skipped bank.
 
@@ -172,7 +164,7 @@ def collect(src: str, *, out: str | None = None):
         banks = [src]
     if out:
         for path in banks:
-            if _same_report_path(out, path):
+            if same_report_path(out, path):
                 raise ValueError(f"--out would overwrite the input {path}")
     rows = []
     parsed = 0

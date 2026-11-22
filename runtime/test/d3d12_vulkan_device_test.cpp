@@ -867,6 +867,28 @@ int compare_allocation_info(ID3D12Device* ours) {
         mismatch("no resources", empty_a, empty_b);
 
     Ref<ID3D12Device8> ours8;
+    // MULTISAMPLE_QUALITY_LEVELS with TILED_RESOURCE: the same answers as the host, except 128-bit formats at 4x,
+    // which the AMD drivers refuse and WARP and NVIDIA report (and GetResourceAllocationInfo allocates here).
+    for (const DXGI_FORMAT format : {rgba8, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+                                     DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_D32_FLOAT,
+                                     DXGI_FORMAT_R32G32B32_FLOAT}) {
+        for (const UINT samples : {1u, 2u, 4u, 8u, 16u}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS x{format, samples,
+                                                            D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE};
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS y = x;
+            const HRESULT hx = ours->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &x, sizeof(x));
+            const HRESULT hy = host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &y, sizeof(y));
+            const bool wide = format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+            if (hx == hy && (x.NumQualityLevels == y.NumQualityLevels ||
+                             (wide && samples == 4 && x.NumQualityLevels == 1 && y.NumQualityLevels == 0)))
+                continue;
+            if (mismatches++ < 24)
+                std::fprintf(stderr, "tiled quality levels format %d %ux: ours 0x%08lx %u, host 0x%08lx %u\n",
+                             int(format), samples, static_cast<unsigned long>(hx), x.NumQualityLevels,
+                             static_cast<unsigned long>(hy), y.NumQualityLevels);
+        }
+    }
+
     if (FAILED(ours->QueryInterface(IID_PPV_ARGS(&ours8.p)))) return mismatches + 1;
     const D3D12_RESOURCE_DESC mixed[] = {with(texture_desc(16, 16, rgba8, none), k4), buffer_desc(300),
                                          with(texture_desc(64, 64, rgba8, rt), 0, 4)};
@@ -1386,6 +1408,64 @@ int compare_depth_multisample_quality_levels(ID3D12Device* ours, VkSampleCountFl
     std::printf("Depth/stencil MSAA quality queries: %u compared, %u host-unsupported skipped, %d mismatches\n",
                 compared, skipped, mismatches);
     return mismatches;
+}
+
+bool check_plain_resolve_formats(ID3D12Device* device) {
+    struct Case { DXGI_FORMAT format; bool valid; bool depth = false; DXGI_FORMAT requested = DXGI_FORMAT_UNKNOWN; };
+    constexpr Case cases[] = {
+        {DXGI_FORMAT_R8G8B8A8_UINT, false},
+        {DXGI_FORMAT_R8G8B8A8_SINT, false},
+        {DXGI_FORMAT_R32_UINT, false},
+        {DXGI_FORMAT_R32_SINT, false},
+        {DXGI_FORMAT_R32G32B32A32_SINT, false},
+        {DXGI_FORMAT_R8G8B8A8_UINT, false, false, DXGI_FORMAT_R8G8B8A8_UNORM},
+        {DXGI_FORMAT_R8G8B8A8_UNORM, true},
+        {DXGI_FORMAT_R16G16B16A16_FLOAT, true},
+        {DXGI_FORMAT_D32_FLOAT, true, true},
+    };
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                         IID_PPV_ARGS(&list.p)))) return false;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    bool ok = true;
+    unsigned tested = 0, skipped = 0;
+    for (const auto& c : cases) {
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{c.format, 4};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality, sizeof(quality))))
+            return false;
+        if (!quality.NumQualityLevels) {
+            std::printf("plain resolve format %d: 4x MSAA unsupported, skipped\n", int(c.format));
+            ++skipped;
+            continue;
+        }
+        auto desc = texture_desc(8, 8, c.format, c.depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                                                         : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        desc.SampleDesc.Count = 4;
+        Ref<ID3D12Resource> src, dst;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                    D3D12_RESOURCE_STATE_RESOLVE_SOURCE, nullptr,
+                                                    IID_PPV_ARGS(&src.p)))) return false;
+        desc.SampleDesc.Count = 1;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                    D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+                                                    IID_PPV_ARGS(&dst.p)))) return false;
+        const DXGI_FORMAT requested = c.requested == DXGI_FORMAT_UNKNOWN ? c.format : c.requested;
+        list->ResolveSubresource(dst.p, 0, src.p, 0, requested);
+        const HRESULT result = list->Close();
+        if (result != (c.valid ? S_OK : E_INVALIDARG)) {
+            std::fprintf(stderr, "plain resolve format %d: Close returned 0x%08lx, expected 0x%08lx\n",
+                         int(c.format), static_cast<unsigned long>(result),
+                         static_cast<unsigned long>(c.valid ? S_OK : E_INVALIDARG));
+            ok = false;
+        }
+        ++tested;
+        if (FAILED(list->Reset(allocator.p, nullptr))) return false;
+    }
+    if (FAILED(list->Close())) return false;
+    std::printf("plain resolve format validation: %u tested, %u unsupported cases skipped\n", tested, skipped);
+    return ok;
 }
 
 // Compare the Vulkan-backed resolve output byte-for-byte with the host runtime for every common supported format,
@@ -2319,8 +2399,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
             const bool expect_ok = (type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
                                     type == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
                                     type == D3D12_COMMAND_LIST_TYPE_COPY) &&
-                                   (prio == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ||
-                                    prio == D3D12_COMMAND_QUEUE_PRIORITY_HIGH);
+                                   prio == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
             if (ours->CheckFeatureSupport(D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, &q, sizeof(q)) != S_OK ||
                 q.PriorityForTypeIsSupported != (expect_ok ? TRUE : FALSE))
                 fail("COMMAND_QUEUE_PRIORITY answer mismatch");
@@ -2776,16 +2855,6 @@ int compare_invalid_arguments(ID3D12Device* ours) {
     const auto device10 = [](ID3D12Device* d) {
         Ref<ID3D12Device10> newer;
         return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
-    };
-    const auto not_elevated = [](ID3D12Device*) {
-        HANDLE token = nullptr;
-        TOKEN_ELEVATION elevation{};
-        DWORD size = 0;
-        const bool elevated = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
-                              GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
-                              elevation.TokenIsElevated;
-        if (token) CloseHandle(token);
-        return !elevated;
     };
     static const Case cases[] = {
         // CreateCommittedResource: arguments.
@@ -3440,7 +3509,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"command queue: global realtime priority", [](ID3D12Device* d) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME});
-         }, +not_elevated},
+         }},
         {"command queue: compute", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COMPUTE}); }},
         {"command queue: copy", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COPY}); }},
         {"command queue: high priority", [](ID3D12Device* d) {
@@ -3827,6 +3896,7 @@ int main() {
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
         EXPECT(rt::d3d12_xs::is_device_proxy(device.p));
         EXPECT(rt::d3d12_xs::device_proxy_slot_count(device.p) == 80);  // ID3D12Device11
+        EXPECT(check_plain_resolve_formats(device.p));
 
         {
             Ref<ID3D12Device11> device11;
@@ -4231,8 +4301,40 @@ int main() {
             granted_q.reset();
             rt::d3d12::set_global_realtime_privilege_override_for_test(-1);
 
+            Ref<ID3D12Device> host;
+            create_host_device(host);
+            if (host.p) EXPECT(command_queue(device.p, rt_desc) == command_queue(host.p, rt_desc));
+
+            // SecurityAnonymous thread impersonation (OpenThreadToken fails with ERROR_CANT_OPEN_ANONYMOUS, not
+            // ERROR_NO_TOKEN) must fail closed instead of falling back to the process token, matching the host runtime.
+            const auto check_security_anonymous_impersonation = [&]() -> int {
+                HANDLE proc_token = nullptr;
+                if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &proc_token)) return 0;
+                HANDLE anon_imp = nullptr;
+                if (DuplicateTokenEx(proc_token, MAXIMUM_ALLOWED, nullptr, SecurityAnonymous, TokenImpersonation,
+                                     &anon_imp)) {
+                    if (SetThreadToken(nullptr, anon_imp)) {
+                        struct RevertImpersonation {
+                            ~RevertImpersonation() { RevertToSelf(); }
+                        } revert_impersonation;
+                        HANDLE opened = nullptr;
+                        EXPECT(!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &opened));
+                        EXPECT(GetLastError() == ERROR_CANT_OPEN_ANONYMOUS);
+                        if (opened) CloseHandle(opened);
+                        EXPECT(!rt::d3d12::has_global_realtime_privilege());
+                        EXPECT(command_queue(device.p, rt_desc) == DXGI_ERROR_ACCESS_DENIED);
+                        if (host.p) EXPECT(command_queue(host.p, rt_desc) == DXGI_ERROR_ACCESS_DENIED);
+                    }
+                    CloseHandle(anon_imp);
+                }
+                CloseHandle(proc_token);
+                return 0;
+            };
+            if (check_security_anonymous_impersonation() != 0) return 1;
+
             // When the process token holds SeIncreaseBasePriorityPrivilege (e.g. an elevated session), toggle the
-            // real token privilege and verify both states against the host D3D12 runtime.
+            // real token privilege and verify both states (plus SecurityAnonymous impersonation while the process
+            // token has the privilege enabled) against the host D3D12 runtime.
             HANDLE token = nullptr;
             LUID luid{};
             if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
@@ -4246,9 +4348,11 @@ int main() {
                         GetLastError() == ERROR_SUCCESS) {
                         EXPECT(rt::d3d12::has_global_realtime_privilege());
                         EXPECT(command_queue(device.p, rt_desc) == S_OK);
-                        Ref<ID3D12Device> host;
-                        if (create_host_device(host)) {
-                            EXPECT(command_queue(host.p, rt_desc) == S_OK);
+                        if (host.p) EXPECT(command_queue(host.p, rt_desc) == S_OK);
+                        if (check_security_anonymous_impersonation() != 0) {
+                            AdjustTokenPrivileges(token, FALSE, &prev, 0, nullptr, nullptr);
+                            CloseHandle(token);
+                            return 1;
                         }
                         tp.Privileges[0].Attributes = 0;
                         if (AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
@@ -5554,6 +5658,69 @@ int main() {
     {
         Ref<ID3D12Device> standalone;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone.p))));
+        // What translated shaders can declare beyond Int64/Float64 (the index's `features`) is enabled wherever the GPU
+        // has it: image stores and loads without a format, gather offsets, LOD clamps, a vertex shader's layer and
+        // viewport. Creating a module that declares one without it breaks VUID-VkShaderModuleCreateInfo-pCode-08740.
+        const rt::d3d12::VulkanDeviceInfo* made = rt::d3d12::vulkan_device_info(standalone.p);
+        EXPECT(made != nullptr);
+        if (made) {
+            const auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                made->get_instance_proc(made->instance, "vkGetPhysicalDeviceFeatures2"));
+            EXPECT(features2 != nullptr);
+            VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+            VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
+            if (features2) features2(made->physical, &have);
+            const VkPhysicalDeviceFeatures& on = made->features;
+            EXPECT(on.shaderStorageImageWriteWithoutFormat == have.features.shaderStorageImageWriteWithoutFormat);
+            EXPECT(on.shaderStorageImageReadWithoutFormat == have.features.shaderStorageImageReadWithoutFormat);
+            EXPECT(on.shaderImageGatherExtended == have.features.shaderImageGatherExtended);
+            EXPECT(on.shaderResourceMinLod == have.features.shaderResourceMinLod);
+            EXPECT(made->shader_output_layer == (have12.shaderOutputLayer == VK_TRUE));
+            EXPECT(made->shader_output_viewport_index == (have12.shaderOutputViewportIndex == VK_TRUE));
+            // The pixel-shader extensions (barycentrics, the POPS interlock, maintenance8's texel offsets): each is
+            // enabled exactly when the GPU offers the extension and its feature. A structure is chained into the
+            // query only when its extension is offered.
+            const auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                made->get_instance_proc(made->instance, "vkEnumerateDeviceExtensionProperties"));
+            EXPECT(enumerate != nullptr);
+            std::vector<VkExtensionProperties> offered;
+            std::uint32_t offered_count = 0;
+            if (enumerate && enumerate(made->physical, nullptr, &offered_count, nullptr) == VK_SUCCESS) {
+                offered.resize(offered_count);
+                enumerate(made->physical, nullptr, &offered_count, offered.data());
+                offered.resize(offered_count);
+            }
+            const auto has = [&](const char* name) {
+                return std::any_of(offered.begin(), offered.end(),
+                                   [&](const VkExtensionProperties& e) { return std::strcmp(e.extensionName, name) == 0; });
+            };
+            VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+            VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 ext_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            if (has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+                bary.pNext = ext_query.pNext;
+                ext_query.pNext = &bary;
+            }
+            if (has(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+                lock.pNext = ext_query.pNext;
+                ext_query.pNext = &lock;
+            }
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
+            VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+            if (has(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
+                m8.pNext = ext_query.pNext;
+                ext_query.pNext = &m8;
+            }
+#endif
+            if (features2) features2(made->physical, &ext_query);
+            EXPECT(made->fragment_shader_barycentric == (bary.fragmentShaderBarycentric == VK_TRUE));
+            EXPECT(made->fragment_shader_interlock == (lock.fragmentShaderPixelInterlock == VK_TRUE));
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
+            EXPECT(made->maintenance8 == (m8.maintenance8 == VK_TRUE));
+#endif
+        }
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
         Ref<ID3D12Fence> fence;

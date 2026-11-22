@@ -21,6 +21,9 @@ Usage:
     python -I tools/user_sgpr_census.py <spirv/index.json> [--json OUT]
     python -I tools/user_sgpr_census.py <spirv/index.json> --expect ps=8 vs=8 cs=4 ms=16
         (exit 1 if, for a listed stage, the most common lowest-pointer SGPR is not the expected one)
+
+An index that cannot be read, is not JSON or is not the shape tools/shader_meta.py writes, and a --json path that
+cannot be written, each give one ERROR line and exit 2.
 """
 import argparse
 import json
@@ -84,6 +87,36 @@ def census(index, base=None):
     return out
 
 
+def load_index(path):
+    """The index as {name: entry}. ValueError with a one-line reason when the file cannot be read, is not JSON or
+    is not the shape census() reads; the wording follows tools/root_sig_contract.py, which reads the same file."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError, RecursionError) as e:   # ValueError: not JSON, or not UTF-8
+        reason = getattr(e, "strerror", None) or e
+        raise ValueError(f"cannot read {path}: {reason}") from None
+    if not isinstance(index, dict):
+        raise ValueError(f"{path}: expected a JSON object of shader -> metadata entries")
+    for name, entry in index.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: {name}: each shader entry must be a JSON object")
+        if not isinstance(entry.get("stage", ""), str):
+            raise ValueError(f"{path}: {name}: 'stage' must be a string")
+        reads = entry.get("user_sgpr_reads") or []
+        if not isinstance(reads, list):
+            raise ValueError(f"{path}: {name}: 'user_sgpr_reads' must be a JSON array")
+        for read in reads:
+            if not isinstance(read, dict) or "sgpr" not in read or "kind" not in read:
+                raise ValueError(f"{path}: {name}: each read needs 'sgpr' and 'kind' fields")
+            sgpr = read["sgpr"]
+            if isinstance(sgpr, bool) or not isinstance(sgpr, int) or sgpr < 0:
+                raise ValueError(f"{path}: {name}: each read 'sgpr' must be a nonnegative integer")
+            if not isinstance(read["kind"], str):
+                raise ValueError(f"{path}: {name}: each read kind must be a string")
+    return index
+
+
 def stage_sgpr(text):
     stage, _, value = text.partition("=")
     message = f"expected STAGE=SGPR with a nonnegative SGPR: {text!r}"
@@ -109,10 +142,13 @@ def main(argv=None):
         try:
             if os.path.samefile(a.index, a.json):
                 ap.error("--json must not overwrite the input index")
-        except FileNotFoundError:
-            pass
-    with open(a.index, encoding="utf-8") as f:
-        index = json.load(f)
+        except OSError:
+            pass  # a missing or unreachable --json path is not the index; writing it reports the error
+    try:
+        index = load_index(a.index)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     summary = census(index, dict(a.base))
     for stage, s in summary.items():
         top = s["most_common_lowest_pointer_sgpr"]
@@ -121,8 +157,12 @@ def main(argv=None):
               f"pointer gaps {s['pointer_gap']}; after a ptr32 {s['after_ptr32']}"
               + (f"; below base {s['below_base']}" if "below_base" in s else ""))
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(summary, f, indent=1, sort_keys=True)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(summary, f, indent=1, sort_keys=True)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     bad = []
     for stage, sgpr in a.expect:
         got = summary.get(stage, {}).get("most_common_lowest_pointer_sgpr")
