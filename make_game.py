@@ -808,14 +808,23 @@ def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[s
                       sort_keys=True)
 
 
+def fspx_cache_complete(spirv: str) -> bool:
+    """Check that the FSPX translation index and its named modules are present."""
+    try:
+        index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
+    except ValueError:
+        return False
+    return isinstance(index, dict) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+
+
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
                  fallbacks: tuple[str, ...] = ()) -> None:
     """The FidelityFX DLL's compute programs (docs/fspx.md): tools/fspx_unpack.py unpacks and disassembles them into
     <work>/shaders/fspx, rdna2spirv.py translates them into <work>/shaders/spirv/fspx, where the runtime's shader
     library finds them by fspx_code_sha256. The game's own shaders neither feed nor depend on this step.
 
-    The 29 programs take seconds, so the step runs whole: it counts as finished when spirv/fspx/index.json is there
-    and fspx_build.json, written after it, matches this run's settings (fspx_settings)."""
+    The 29 programs take seconds, so the step runs whole. Reuse requires the translation index, its named modules
+    and a matching fspx_build.json (fspx_settings)."""
     dll = os.path.join(game, FSPX_DLL)
     unpacked = os.path.join(work, "shaders", "fspx")
     spirv = os.path.join(work, "shaders", "spirv", "fspx")
@@ -825,7 +834,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
         log(f"shaders: no {FSPX_DLL} in the game folder, so no FSPX programs to translate")
         return
     settings = fspx_settings(dll, mc_signature, emulate, fallbacks)
-    if os.path.isfile(translated) and read_shader_setting(settings_file) == settings:
+    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
         return
     log(f"shaders: unpacking and translating the FSPX programs of {FSPX_DLL}")
     drop(translated, settings_file)
