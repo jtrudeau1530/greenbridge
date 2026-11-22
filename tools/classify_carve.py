@@ -17,6 +17,9 @@ import sys
 import tempfile
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
 
 def classify(r):
     if r.get("type") == "bink2":
@@ -84,6 +87,7 @@ def main():
             json.dump(out, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(temp, published_mode(os.path.join(root, "types.json")))   # mkstemp creates 0600
         os.replace(temp, os.path.join(root, "types.json"))
     except BaseException:
         try:

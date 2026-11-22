@@ -348,13 +348,14 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                 pos = s + 1
                 continue
             consumed = 1
+            tail = s + used  # end of the last joined stream; `used` leaves out the padding between streams
             if is_meta:
                 # Large resources put the system page in one stream and a small continuation in the next.
                 # Append contiguous zlib streams until the resource's own schema resolves.
                 for _ in range(2):
                     if parse_resource(data) is not None and not _needs_continuation(data):
                         break
-                    nxt = (s + used + 15) & ~15
+                    nxt = (tail + 15) & ~15
                     if nxt >= end:
                         break
                     mt = ZHDR.match(m, nxt, end)
@@ -368,6 +369,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                         break
                     data += more
                     used += mused
+                    tail = nxt + mused
                     consumed += 1
                 row = parse_resource(data, collect)
                 if row is not None:
@@ -376,7 +378,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                     rows.append(row)
             streams += consumed
             scanned += used
-            pos = s + used
+            pos = tail
             if pos <= s:
                 pos = s + 1
         return rows, {"path": os.path.abspath(path), "bytes": size,

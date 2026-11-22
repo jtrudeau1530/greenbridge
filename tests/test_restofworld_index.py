@@ -247,6 +247,17 @@ class ArchiveTest(unittest.TestCase):
         self.assertGreater(summary["readable_fraction"], 0.5)
         self.assertEqual(summary["skipped_candidates"], 0)
 
+    def test_psin_longer_than_256_bytes_reads_the_whole_chain(self):
+        # Before: scan_rpf classified only the first 256 inflated bytes, so CHKS (at 0x140) was cut off.
+        data = (b"PSIN" + (16).to_bytes(4, "big") + struct.pack("<II", 22, 0)
+                + b"LSCH" + (8 + 300).to_bytes(4, "big") + bytes(300) + b"CHKS" + (16).to_bytes(4, "big") + bytes(8))
+        rpf = os.path.join(self.root, "long_psin.rpf")
+        with open(rpf, "wb") as f:
+            f.write(b"9FPR" + struct.pack("<I", 16) + bytes(8) + zlib.compress(data) + bytes(64))
+        (row,), _ = restofworld_index.scan_rpf(rpf)
+        self.assertEqual((row["signature"], row["count"], row["detail"]),
+                         ("psin", 2, "tags=LSCH,CHKS;field8=22;complete=1"))
+
     def test_scan_limit(self):
         limit = self.offsets[2] - 0x100 - 1
         rows, summary = restofworld_index.scan_rpf(self.rpf, limit=limit)

@@ -3568,6 +3568,16 @@ class Gen:
                     self.emit(f"{r} = {k} %uint {x} {y}")
                 else:
                     self.emit(f"{r} = OpExtInst %uint %glsl {'UMax' if 'max' in op else 'UMin'} {x} {y}")
+            if "clamp" in mods:
+                # VOP3 clamp saturates the unsigned add/sub to [0, 0xFFFF], as for the 32-bit ops (docs/design.md,
+                # "Integer clamp"). The operands are zero-extended, so a result past 0xFFFF is an overflow (add) or a
+                # borrow (sub). Other 16-bit ops: rejected rather than guessed.
+                if op not in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
+                    raise Unsupported(op + " clamp")
+                ov, sat = self.tmp(), self.tmp()
+                self.emit(f"{ov} = OpUGreaterThan %bool {r} {self.cu(0xFFFF)}")
+                self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0 if 'sub' in op else 0xFFFF)} {r}")
+                r = sat
             lo = self.tmp()
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
             if e64 and sb[2]:
@@ -4019,9 +4029,10 @@ class Gen:
             self.emit(f"{c2} = OpCompositeExtract %uint {s2} 1")
             self.emit(f"{carry} = OpBitwiseOr %uint {c1} {c2}")
             self.dst(vd, r)
-            m = self.tmp()
-            self.emit(f"{m} = OpSelect %uint {self.tmp_bool_nz(carry)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             if not (cd["k"] == "special" and cd["t"] == "null"):
+                cm, m = self.tmp(), self.tmp()
+                self.emit(f"{cm} = OpLogicalAnd %bool {self.tmp_bool_nz(carry)} {self.active_b()}")  # inactive lanes write 0
+                self.emit(f"{m} = OpSelect %uint {cm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(cd, m)
         elif op == "v_mul_legacy_f32":
             # Legacy multiply treats 0 * anything (inf/NaN included) as 0.
@@ -4795,8 +4806,9 @@ class Gen:
             self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, r_lo)
             self.dst({"k": "vgpr", "r": vd["r"] + 1, "n": 1}, r_hi)
             if not (sd["k"] == "special" and sd["t"] == "null"):
-                m = self.tmp()
-                self.emit(f"{m} = OpSelect %uint {self.tmp_bool_nz(bit64)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                bm, m = self.tmp(), self.tmp()
+                self.emit(f"{bm} = OpLogicalAnd %bool {self.tmp_bool_nz(bit64)} {self.active_b()}")  # inactive lanes write 0
+                self.emit(f"{m} = OpSelect %uint {bm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(sd, m)
         elif op in ("v_mad_u32_u16", "v_mad_i32_i16"):
             # D = S0.half * S1.half + S2 (RDNA ISA pseudocode), wrapping at 32 bits: the 16-bit halves zero-extended

@@ -250,7 +250,14 @@ class Wave32LaneDumps(unittest.TestCase):
     def test_uses_check_py_rule(self):
         import check
         self.assertIs(rgt.narrow_subgroup_skip, check.narrow_subgroup_skip)
+        self.assertIs(rgt.wave32_lane_skip, check.wave32_lane_skip)
         self.assertIs(rgt.WAVE32_LANE_DUMPS, check.WAVE32_LANE_DUMPS)
+        self.assertIs(rgt.WAVE32_LANE_ENV, check.WAVE32_LANE_ENV)
+
+    def test_unpinned_rule(self):
+        self.assertEqual(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32 not available\n"),
+                         "SKIP (the device can't run this shader at 32 lanes on request)")
+        self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32\n"))
 
     def test_rule(self):
         self.assertEqual(rgt.narrow_subgroup_skip("device: llvmpipe (subgroup 8..8)\n"),

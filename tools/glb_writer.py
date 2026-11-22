@@ -7,6 +7,7 @@ Reads a Wavefront OBJ file (positions, UVs, normals, faces, groups, objects, mat
 converts coordinates from RAGE Z-up to glTF Y-up (or keeps Y-up), computes smooth
 area-weighted vertex normals when explicit normals are absent, and serializes a strict
 glTF 2.0 binary (.glb) container with optional deduplicated embedded PNG textures.
+Simple planar polygon faces may be convex or concave.
 """
 from __future__ import annotations
 
@@ -138,6 +139,57 @@ def _resolve_obj_index(token: str, count: int) -> int | None:
     if 0 <= resolved < count:
         return resolved
     return None
+
+
+def _concave_triangles(points: list[tuple[float, float, float]]) -> list[tuple[int, int, int]] | None:
+    """Return corner triples for a simple planar face whose first-corner fan folds over.
+
+    None keeps the original fan for convex faces, already valid fans, or
+    degenerate input for which we cannot find a triangulation.
+    """
+    # Project onto the plane with the largest signed area. Work relative to one
+    # corner so translating the mesh far from the origin does not affect the sum.
+    origin = points[0]
+    rel = [(x - origin[0], y - origin[1], z - origin[2]) for x, y, z in points]
+    edges = list(zip(rel, rel[1:] + rel[:1]))
+    planes = ((1, 2), (2, 0), (0, 1))
+    areas = [sum(a[u] * b[v] - a[v] * b[u] for a, b in edges) for u, v in planes]
+    axis = max(range(3), key=lambda i: abs(areas[i]))
+    area = areas[axis]
+    if not area or not math.isfinite(area):
+        return None
+    u, v = planes[axis]
+    winding = 1 if area > 0 else -1
+    xy = [(p[u], p[v]) for p in rel]
+
+    def turn(a, b, c):
+        ax, ay = xy[a]
+        bx, by = xy[b]
+        cx, cy = xy[c]
+        return winding * ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+
+    if all(turn(0, i, i + 1) >= 0 for i in range(1, len(points) - 1)):
+        return None
+
+    # Clip ears in boundary order. A point on the ear's edge blocks it too:
+    # that corner may carry its own UV or normal and still needs a triangle.
+    ring = list(range(len(points)))
+    triangles = []
+    while len(ring) > 3:
+        for i, b in enumerate(ring):
+            a, c = ring[i - 1], ring[(i + 1) % len(ring)]
+            if turn(a, b, c) <= 0:
+                continue
+            if any(turn(a, b, p) >= 0 and turn(b, c, p) >= 0 and turn(c, a, p) >= 0
+                   for p in ring if p not in (a, b, c)):
+                continue
+            triangles.append((a, b, c))
+            del ring[i]
+            break
+        else:
+            return None
+    triangles.append(tuple(ring))
+    return triangles
 
 
 def parse_obj(
@@ -323,15 +375,16 @@ def parse_obj(
             if not valid_face or len(corners) < 3:
                 continue
 
-            # Fan-triangulate polygon (c0, c_i, c_{i+1}), skipping degenerate triangles
-            # that repeat the same vertex position index.
-            c0 = corners[0]
-            tris: list[tuple[tuple[int, int | None, int | None],
-                             tuple[int, int | None, int | None],
-                             tuple[int, int | None, int | None]]] = []
-            for i in range(1, len(corners) - 1):
-                c1 = corners[i]
-                c2 = corners[i + 1]
+            indices = ((0, 1, 2),)
+            if len(corners) > 3:
+                indices = None
+                if len({c[0] for c in corners}) == len(corners):
+                    indices = _concave_triangles([raw_v[c[0]] for c in corners])
+                if indices is None:
+                    indices = ((0, i, i + 1) for i in range(1, len(corners) - 1))
+            tris = []
+            for a, b, c in indices:
+                c0, c1, c2 = corners[a], corners[b], corners[c]
                 if c0[0] == c1[0] or c1[0] == c2[0] or c0[0] == c2[0]:
                     continue
                 tris.append((c0, c2, c1) if mirrored else (c0, c1, c2))

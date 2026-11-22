@@ -26,11 +26,13 @@ def test_format_codes_match_the_translator_table():
         "R16G16B16A16_SFLOAT": "GFX10_FORMAT_16_16_16_16_FLOAT",
         "R32G32B32A32_SFLOAT": "GFX10_FORMAT_32_32_32_32_FLOAT",
         "R32_SFLOAT": "GFX10_FORMAT_32_FLOAT",
+        "R8G8B8A8_UINT": "GFX10_FORMAT_8_8_8_8_UINT",
+        "R8G8B8A8_SINT": "GFX10_FORMAT_8_8_8_8_SINT",
     }
     assert set(gfx10_names) == set(imf.FORMATS)
     for name, (_, code, bpp, model) in imf.FORMATS.items():
         assert by_name[gfx10_names[name]] == code, name
-        assert bpp in (4, 8, 16) and model in ("unorm8", "half4", "float4", "float1"), name
+        assert bpp in (4, 8, 16) and model in ("unorm8", "half4", "float4", "float1", "uint8", "sint8"), name
 
 
 def test_unorm_oracle_divides_by_255():
@@ -91,9 +93,27 @@ def test_pixel_shader_uses_the_requested_dmask(mask):
 
 def test_dmask_schedule_covers_each_format_and_keeps_full_mask_first():
     formats = tuple(imf.FORMATS)
-    pairs = {(formats[i % len(formats)], imf.DMASKS[i % len(imf.DMASKS)]) for i in range(60)}
+    pairs = {(formats[i % len(formats)], imf.DMASKS[(i // len(formats)) % len(imf.DMASKS)])
+             for i in range(len(formats) * len(imf.DMASKS))}
     assert imf.DMASKS[0] == 0xf
     assert pairs == {(fmt, mask) for fmt in formats for mask in range(1, 16)}
+
+
+@pytest.mark.parametrize("fmt,want,kind", [
+    ("R8G8B8A8_UINT", [0, 127, 128, 255], "u32"),
+    ("R8G8B8A8_SINT", [0, 127, -128, -1], "i32"),
+])
+def test_integer_oracle_and_conversion(fmt, want, kind):
+    texels = bytes([0, 127, 128, 255]) * 64
+    assert imf.oracle(fmt, texels, 8, 8)[0] == want
+    asm = imf.pixel_shader(8, 8, 0x5, imf.FORMATS[fmt][3])
+    assert f"v_cvt_f32_{kind}_e32 v4, v4" in asm
+    assert f"v_cvt_f32_{kind}_e32 v5, v5" in asm
+    assert f"v_cvt_f32_{kind}_e32 v6, v6" not in asm
+    got = [want[0], want[2], 3.0, 4.0] * (imf.DRAW * imf.DRAW)
+    assert not imf.compare(fmt, texels, 8, 8, got, 0x5)
+    got[1] = want[1]
+    assert imf.compare(fmt, texels, 8, 8, got, 0x5)
 
 
 def test_compare_detects_wrong_dmask_order_and_unwritten_register():
