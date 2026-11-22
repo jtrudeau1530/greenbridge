@@ -439,6 +439,52 @@ class Positions4240Tests(unittest.TestCase):
                          (16, 21, 0))
 
 
+class MeshletCentreTests(unittest.TestCase):
+    BIAS = (-1.5, 2.25, 0.5)
+    SCALE = (2.0 ** -20, 2.0 ** -18, 2.0 ** -10)
+
+    def test_meshlet_centre(self):
+        self.assertEqual(mp.meshlet_centre(0x007FF7FF, 0x7FF), (0.0, 0.0, 0.0))
+        self.assertEqual(mp.meshlet_centre(0x0080F7EF, 0xFFFFF000), (-1.0, 1.0, -127.9375))
+        self.assertEqual(mp.meshlet_centre(0xFF000FFF, 0x00000FFF), (128.0, -127.9375, 128.0))
+
+    def grid_page(self, steps):
+        """A 4x4 grid in one meshlet whose stored centre is the vertex-box centre moved by `steps` (x, y, z)."""
+        packed = [(c * 4096, r * 4096, 3) for r in range(4) for c in range(4)]
+        blk = other_block(16, packed=packed, bias=self.BIAS, scale=self.SCALE)
+        pos = mp.positions_4240(page(blk), mp.parse_page(page(blk))[0])
+        centre = [(min(p[i] for p in pos) + max(p[i] for p in pos)) / 2 for i in range(3)]
+        f = [round(c * 16) + 2047 + s for c, s in zip(centre, steps)]
+        grp = bytearray(grid_group(4, 4))
+        struct.pack_into("<2I", grp, 12 + 8, f[0] | f[1] << 12, f[2])
+        return page(blk, bytes(grp))
+
+    def test_centre_agreement(self):
+        data = self.grid_page((0, 0, 0))
+        checks = mp.summarise_page(data, "p", centres=True)["checks"]
+        self.assertEqual((checks["centres_4240_meshlets"], checks["centres_4240_axes"], checks["centres_4240_axes_exact"],
+                          checks["centres_4240_axes_within_step"], checks["centres_4240_default_words"]),
+                         (1, 3, 3, 3, 0))
+        data = self.grid_page((1, 0, 5))
+        checks = mp.summarise_page(data, "p", centres=True)["checks"]
+        self.assertEqual((checks["centres_4240_axes_exact"], checks["centres_4240_axes_within_step"]), (1, 2))
+        self.assertNotIn("centres_4240_meshlets", mp.summarise_page(data, "p")["checks"])
+
+    def test_cli_centres(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "p.bin")
+            with open(src, "wb") as fh:
+                fh.write(self.grid_page((0, -1, 0)))
+            out = os.path.join(tmp, "r.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, src, "--centres", "--json", out, "--quiet"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out, encoding="utf-8") as fh:
+                checks = json.load(fh)["totals"]["checks"]
+        self.assertEqual((checks["centres_4240_axes_exact"], checks["centres_4240_axes_within_step"]), (2, 3))
+        self.assertNotIn("faces_4240_shared_edges", checks)
+
+
 class CliTests(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
