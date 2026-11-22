@@ -587,6 +587,12 @@ class Gen:
             self.emit(f"OpStore {p} {r}")
         elif a["k"] == "sgpr" and a.get("n", 1) == 1:
             self.store_reg(a["k"], a["r"], val)
+        elif self.wave64 and a["k"] == "special" and a["t"] in ("vcc_lo", "vcc_hi") and "vcc" in self.cur_masks:
+            # One half of a wave64 VCC lane mask (VCC_LO = VCC[31:0], VCC_HI = VCC[63:32]): the other half's lanes
+            # keep their bit, as for exec_lo / exec_hi. %vcc_hi still gets the word for a later read as data.
+            self.put_mask(a, val, a["t"][-2:])
+            if a["t"] == "vcc_hi":
+                self.emit(f"OpStore %vcc_hi {val}")
         elif a["k"] == "special" and a["t"] in ("vcc_lo", "vcc"):
             self.emit(f"OpStore %vcc {val}")
         elif a["k"] == "special" and a["t"] == "m0":
@@ -5070,8 +5076,8 @@ class Gen:
                 self.emit(f"{lbl_end} = OpLabel")
                 self.emit(f"{v} = OpPhi %uint {got} {lbl_do} {self.cu(0)} {pre}")
             if single_special:
-                if n == 2:          # vcc pair: low dword -> vcc_lo, high dword -> vcc_hi
-                    self.dst({"k": "special", "t": "vcc_lo" if i == 0 else "vcc_hi"}, v)
+                if n == 2:          # vcc pair: low dword -> vcc_lo, high dword -> vcc_hi (data, not a lane mask)
+                    self.emit(f"OpStore {'%vcc' if i == 0 else '%vcc_hi'} {v}")
                 else:
                     self.dst(d, v)
             else:
