@@ -976,5 +976,88 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(should_branch_execz(exec1))
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling in 64-bit masks."""
+
+    def test_float_sign_bit_inversion(self) -> None:
+        """XOR with SIGN_BIT_64 negates IEEE 754 doubles across normal, zero, and infinite values."""
+        test_floats = [1.0, -1.0, 42.5, -0.001953125, math.pi]
+        for f in test_floats:
+            bits = f64_to_u64(f)
+            saved, new_exec, scc = oracle_s_xor_saveexec_b64(bits, SIGN_BIT_64)
+            self.assertEqual(saved, bits)
+            self.assertEqual(new_exec, f64_to_u64(-f))
+            self.assertEqual(u64_to_f64(new_exec), -f)
+            self.assertEqual(scc, 1)
+
+    def test_signed_zero_inversion(self) -> None:
+        """XOR of +0.0 with SIGN_BIT_64 yields -0.0 and vice-versa."""
+        saved_pz, new_nz, scc_nz = oracle_s_xor_saveexec_b64(POS_ZERO_64, SIGN_BIT_64)
+        self.assertEqual(new_nz, NEG_ZERO_64)
+        self.assertEqual(math.copysign(1.0, u64_to_f64(new_nz)), -1.0)
+        self.assertEqual(scc_nz, 1)
+
+        saved_nz, new_pz, scc_pz = oracle_s_xor_saveexec_b64(NEG_ZERO_64, SIGN_BIT_64)
+        self.assertEqual(new_pz, POS_ZERO_64)
+        self.assertEqual(math.copysign(1.0, u64_to_f64(new_pz)), 1.0)
+        self.assertEqual(scc_pz, 0)  # +0.0 is integer 0, so SCC=0!
+
+    def test_canonical_and_signaling_nan_toggling(self) -> None:
+        """Toggling the quiet bit (bit 51) transitions between Signaling and Quiet NaN."""
+        snan = SIGNALING_NAN_64
+        self.assertTrue(is_snan_bits(snan))
+        self.assertFalse(is_qnan_bits(snan))
+
+        # Toggle QNAN bit
+        saved, qnan, scc = oracle_s_xor_saveexec_b64(snan, QNAN_BIT_64)
+        self.assertTrue(is_qnan_bits(qnan))
+        self.assertFalse(is_snan_bits(qnan))
+        self.assertTrue(math.isnan(u64_to_f64(qnan)))
+        self.assertEqual(scc, 1)
+
+        # Toggle back to snan
+        saved2, snan2, scc2 = oracle_s_xor_saveexec_b64(qnan, QNAN_BIT_64)
+        self.assertEqual(snan2, snan)
+        self.assertTrue(is_snan_bits(snan2))
+
+    def test_subnormal_boundary_masking(self) -> None:
+        """Subnormal floating point bit boundaries handled as 64-bit masks."""
+        min_subnormal = 0x0000_0000_0000_0001
+        max_subnormal = 0x000F_FFFF_FFFF_FFFF
+        min_normal = 0x0010_0000_0000_0000
+
+        self.assertTrue(is_subnormal_bits(min_subnormal))
+        self.assertTrue(is_subnormal_bits(max_subnormal))
+        self.assertFalse(is_subnormal_bits(min_normal))
+
+        # XOR max_subnormal with (max_subnormal ^ min_normal) transitions to min_normal
+        transition_mask = max_subnormal ^ min_normal
+        saved, new_exec, scc = oracle_s_xor_saveexec_b64(max_subnormal, transition_mask)
+        self.assertEqual(new_exec, min_normal)
+        self.assertFalse(is_subnormal_bits(new_exec))
+        self.assertEqual(scc, 1)
+
+    def test_infinity_arithmetic_boundaries(self) -> None:
+        """XOR of +inf and -inf yields SIGN_BIT_64 (-0.0 bit representation)."""
+        self.assertTrue(is_inf_bits(POS_INFINITY_64))
+        self.assertTrue(is_inf_bits(NEG_INFINITY_64))
+
+        saved, new_exec, scc = oracle_s_xor_saveexec_b64(POS_INFINITY_64, NEG_INFINITY_64)
+        self.assertEqual(saved, POS_INFINITY_64)
+        self.assertEqual(new_exec, SIGN_BIT_64)  # 0x8000_0000_0000_0000
+        self.assertEqual(scc, 1)
+
+    def test_nan_payload_preservation(self) -> None:
+        """Custom payload bits within NaN fraction field preserved under XOR."""
+        custom_payload = 0x000A_BCDE_1234_5678
+        nan_with_payload = EXP_MASK_64 | custom_payload
+        self.assertTrue(is_nan_bits(nan_with_payload))
+
+        saved, new_exec, scc = oracle_s_xor_saveexec_b64(nan_with_payload, 0)
+        self.assertEqual(new_exec, nan_with_payload)
+        self.assertTrue(is_nan_bits(new_exec))
+        self.assertEqual(new_exec & FRAC_MASK_64, custom_payload)
+
+
 if __name__ == "__main__":
     unittest.main()
