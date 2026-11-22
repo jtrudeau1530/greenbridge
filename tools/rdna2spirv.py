@@ -947,6 +947,15 @@ class Gen:
             raise Unsupported("s_mov_b64 source")
         self.store_reg("sgpr", d["r"], lo)
         self.store_reg("sgpr", d["r"] + 1, hi)
+        if d["k"] == "sgpr" and self.desc_cache_ok():
+            if s["k"] == "imm":
+                self.sgpr_imm[d["r"]] = v & 0xFFFFFFFF
+                self.sgpr_imm[d["r"] + 1] = (v >> 32) & 0xFFFFFFFF
+            elif s["k"] == "sgpr" and s.get("n") == 2:
+                if s["r"] in self.sgpr_imm:
+                    self.sgpr_imm[d["r"]] = self.sgpr_imm[s["r"]]
+                if s["r"] + 1 in self.sgpr_imm:
+                    self.sgpr_imm[d["r"] + 1] = self.sgpr_imm[s["r"] + 1]
 
     def compare(self, op, a, scalar, exec_only=False, mods=()):
         """v_cmp_* / s_cmp_*: lane result into VCC/SGPR mask (vector), SCC (scalar), or EXEC (v_cmpx)."""
@@ -3801,8 +3810,11 @@ class Gen:
                                  const)
         elif op == "v_mov_b32" or op == "s_mov_b32":
             self.dst(a[0], self.src_u(a[1]))
-            if op == "s_mov_b32" and a[0]["k"] == "sgpr" and a[1]["k"] == "imm" and self.desc_cache_ok():
-                self.sgpr_imm[a[0]["r"]] = a[1]["v"] & 0xFFFFFFFF      # a literal S# word, see gather_addr_modes
+            if op == "s_mov_b32" and a[0]["k"] == "sgpr" and self.desc_cache_ok():
+                if a[1]["k"] == "imm":
+                    self.sgpr_imm[a[0]["r"]] = a[1]["v"] & 0xFFFFFFFF      # a literal S# word, see gather_addr_modes
+                elif a[1]["k"] == "sgpr" and a[1]["r"] in self.sgpr_imm:
+                    self.sgpr_imm[a[0]["r"]] = self.sgpr_imm[a[1]["r"]]
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
@@ -5889,7 +5901,10 @@ class Gen:
             self.dst(a[0], self.tou(f))
         elif op == "s_movk_i32":
             v = a[1]["v"] & 0xFFFF
-            self.dst(a[0], self.cu(v - 0x10000 if v & 0x8000 else v))
+            val = (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF
+            self.dst(a[0], self.cu(val))
+            if a[0]["k"] == "sgpr" and self.desc_cache_ok():
+                self.sgpr_imm[a[0]["r"]] = val
         elif op in ("s_cmov_b32", "s_cmovk_i32"):
             # D = SCC ? S0 : D (s_cmovk_i32: S0 is the 16-bit immediate, sign-extended). SCC is read, not written.
             if a[0]["k"] != "sgpr":
