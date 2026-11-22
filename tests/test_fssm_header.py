@@ -95,32 +95,32 @@ class PixelInputTest(unittest.TestCase):
         self.assertEqual(fssm_header.interpolants(b), (2, 0))
 
 
-class InterpolationModeTest(unittest.TestCase):
-    """Flags bits 0-1: 1 = flat (v_interp_mov), 2 = linear (v_interp_p1/p2); SHADER-181."""
+class ReadMethodTest(unittest.TestCase):
+    """Flags bits 0-1, the read method: 1 = v_interp_mov (flat), 2 = v_interp_p1/p2 (interpolated); SHADER-181."""
 
-    def test_modes_by_table_position(self):
+    def test_read_methods_by_table_position(self):
         b = blob([record(1, 0xF, 0, 0, 0x02),
                   record(2, 0xF, 1, 1, 0x01),
                   record(3, 0x3, 2, 2, 0x1A),   # the corpus' 16-bit records: fp16 | bit 3 | linear
                   record(4, 0x1, 3, 3, 0x09)])
-        self.assertEqual(fssm_header.interpolation_modes(b), [2, 1, 2, 1])
+        self.assertEqual(fssm_header.read_methods(b), [2, 1, 2, 1])
 
-    def test_mode_bits_do_not_touch_the_fp16_mask(self):
+    def test_read_bits_do_not_touch_the_fp16_mask(self):
         b = blob([record(1, 0xF, 0, 0, 0x03), record(2, 0xF, 1, 1, 0x13)])
-        self.assertEqual(fssm_header.interpolation_modes(b), [3, 3])
+        self.assertEqual(fssm_header.read_methods(b), [3, 3])
         self.assertEqual(fssm_header.interpolants(b), (2, 0b10))
 
-    def test_no_table_no_modes(self):
-        self.assertEqual(fssm_header.interpolation_modes(blob(first=0)), [])
+    def test_no_table_no_read_methods(self):
+        self.assertEqual(fssm_header.read_methods(blob(first=0)), [])
 
     def test_names(self):
-        self.assertEqual([fssm_header.mode_name(m) for m in range(4)], ["mode0", "flat", "linear", "mode3"])
+        self.assertEqual([fssm_header.read_name(m) for m in range(4)], ["read0", "mov", "interp", "read3"])
 
-    def test_tally_counts_ps_modes_only(self):
+    def test_tally_counts_ps_read_methods_only(self):
         rows = [{"stage": "ps", "directory_ok": True, "entries": 2, "fp16_mask": 0,
                  "inputs": [{"flags": 0x02}, {"flags": 0x00}]},
                 {"stage": "vs", "directory_ok": True, "entries": 1, "fp16_mask": 0, "inputs": [{"flags": 0x01}]}]
-        self.assertEqual(fssm_header.tally(rows, True)["modes"], {"linear": 1, "mode0": 1})
+        self.assertEqual(fssm_header.tally(rows, True)["read_methods"], {"interp": 1, "read0": 1})
 
 
 class DirectoryTest(unittest.TestCase):
@@ -249,7 +249,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("2 files, directory_ok 2, PS with table 1, entries 2", p.stdout)
         self.assertIn("a.fssm: stage=ps directory_ok=True entries=2 fp16=0x1", p.stdout)
-        self.assertIn("interpolation modes: flat:1, linear:1", p.stdout)
+        self.assertIn("read methods: interp:1, mov:1", p.stdout)
 
     def test_json_tally(self):
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
@@ -258,7 +258,7 @@ class CliTest(unittest.TestCase):
         doc = json.loads(p.stdout)
         self.assertEqual(doc["tally"]["ps_with_table"], 1)
         self.assertEqual(doc["tally"]["entries"], 2)
-        self.assertEqual(doc["tally"]["modes"], {"flat": 1, "linear": 1})
+        self.assertEqual(doc["tally"]["read_methods"], {"interp": 1, "mov": 1})
 
     def test_table_only_entry_counts_exclude_blobs_without_a_table(self):
         os.remove(os.path.join(self.dir, "index.json"))

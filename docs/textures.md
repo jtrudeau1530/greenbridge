@@ -28,8 +28,10 @@ for all six active modes (BC1, BC3, BC4, BC5, BC6H and BC7 — 100% of BCPack co
 corpus). Strict confirmed-history mode is the default; `--allow-provisional` enables the
 provisional and last-resort history entries, and `--history <path>` supplies locally
 calibrated BC6H/BC7 initial history JSON tables at run time (no fitted BC6H/BC7 history
-data is embedded in the repository). `rpf9dump`'s C# `TtpfReader` still uses the baseline
-zlib/raw path until ported.
+data is embedded in the repository). `rpf9dump`'s C# `TtpfReader` (submodule pin `e293917`,
+`breadbbbb/rpf9-explorer#7`) now decodes compact 2D mip tails, multi-slice layouts, DXGI 11,
+and BCPack BC1, BC3, BC4 and BC5 chunks in strict mode; BC6H, BC7 and provisional-history
+chunks remain skipped by `rpf9dump` and can be completed by `tools/ttpf_assets.py`.
 
 The compact layout rule moves 206,661 2D textures into complete exports and 1,218 more into
 partial exports (`305,264` complete, `16,419` partial, `35,432` skipped under zlib/raw).
@@ -861,11 +863,12 @@ via `bcpack.decode_with_info`).
 
 ## Next step
 
-1. **Port the BCPack decoder to `TtpfReader` (`rpf9-explorer` / `tools/rpf9dump`; ASSET-44).**
-   The compact layout rule and multi-slice layouts are already upstream in `rpf9-explorer`
-   (carried by the `917e9b9` submodule pin); what remains is wiring BCPack behind
-   `TtpfReader.DecodeChunk`. Keep the lower-mip zlib/raw fallback for any chunk refused in
-   strict mode.
+1. **Port BC6H/BC7 BCPack decoders to `TtpfReader` (`rpf9-explorer` / `tools/rpf9dump`).**
+   Compact 2D mip tails, multi-slice layouts, DXGI 11, and strict BCPack BC1/BC3/BC4/BC5
+   decoding are now live in `rpf9-explorer` (carried by the `e293917` submodule pin,
+   `breadbbbb/rpf9-explorer#7`; `ASSET-44`). Remaining C# follow-ups are BC6H/BC7 block
+   rebuilders (plus optional external history tables) and preserving lower-mip zlib/raw
+   fallback when a higher mip is refused in strict mode.
 2. **Decode BC6H/BC7 in `tools/ttpf_mips.py` `check`.** `tools/ttpf_mips.py` currently
    decodes BC1/3/4/5 pixels for the downsample check; adding BC6H/BC7 pixel decoders extends
    chain-error validation to those two formats.
