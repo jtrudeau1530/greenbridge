@@ -1181,7 +1181,7 @@ class Gen:
                     is_int = o
             for i in range(0, len(outs), 2):
                 lo, hi = outs[i], (outs[i + 1] if i + 1 < len(outs) else self.cu(0))
-                ph = self.f16_pack2(self.tof(lo), self.tof(hi))
+                ph = self.pack_f16_pair_int(self.tof(lo), self.tof(hi))   # a memory d16 result, see there
                 il, ih, pi, r = (self.tmp() for _ in range(4))
                 self.emit(f"{il} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFF)}")
                 self.emit(f"{ih} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
