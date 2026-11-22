@@ -1113,10 +1113,10 @@ private:
         info.format = r.format;
         info.subresourceRange = range;
         // Attachment views need only color-attachment usage. Inheriting STORAGE usage from a mutable/extended
-        // resource (typeless RGBA8 sRGB views, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
+        // resource (typeless views such as RGBA8 sRGB, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
         usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (r.rgba8_typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
+        if (r.typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
             info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
         if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;

@@ -74,7 +74,7 @@ struct ResourceBinding {
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
-    bool rgba8_typeless = false;       // Original resource was R8G8B8A8_TYPELESS; views may reinterpret it.
+    bool typeless = false;  // A TYPELESS color resource: views name a format of its family (D3D-275).
     bool castable_view_formats = false;  // A creation-time castable list made the image mutable (D3D-85/D3D-90),
                                          // so views may reinterpret it as typeless resources do.
     // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (the GPU has no D24): footprint copies of the depth plane convert
@@ -960,24 +960,42 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     return value;
 }
 
-// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format. A typeless
-// resource or one created with a castable-format list (its image is mutable and lists the view formats) may be
-// reinterpreted; the reinterpretation itself is the UNORM image's.
+// The DXGI typeless family a color view format belongs to, by the Vulkan formats the layer maps its members to: the
+// same nonzero number for formats one typeless resource can be viewed as, 0 for a format of no such family.
+inline int typeless_view_family(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: return 1;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: return 2;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT: return 3;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: return 4;
+    case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: return 5;
+    case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: return 6;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 7;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: return 8;
+    case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: return 9;
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16_SINT: return 10;
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: return 11;
+    default: return 0;
+    }
+}
+
+// The format a color view clears or renders in. A view of the resource's own format keeps it (a typeless resource
+// has none, so it needs an explicit one). A typeless resource, or one created with a castable-format list (its image
+// is mutable and lists the view formats), may be viewed in another format of its family: the image is mutable, so
+// the view reinterprets its bits (D3D-275; before it only the RGBA8 family was). A volume keeps its own format.
 inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
     if (target.format == ColorViewFormat::resource)
-        return resource.rgba8_typeless ? VK_FORMAT_UNDEFINED : resource.format;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    switch (target.format) {
-    case ColorViewFormat::rgba8_unorm: format = VK_FORMAT_R8G8B8A8_UNORM; break;
-    case ColorViewFormat::rgba8_srgb: format = VK_FORMAT_R8G8B8A8_SRGB; break;
-    case ColorViewFormat::rgba8_uint: format = VK_FORMAT_R8G8B8A8_UINT; break;
-    case ColorViewFormat::rgba8_sint: format = VK_FORMAT_R8G8B8A8_SINT; break;
-    case ColorViewFormat::rgba8_snorm: format = VK_FORMAT_R8G8B8A8_SNORM; break;
-    default: return VK_FORMAT_UNDEFINED;
-    }
-    if (!resource.rgba8_typeless && !resource.castable_view_formats)
+        return resource.typeless ? VK_FORMAT_UNDEFINED : resource.format;
+    const auto format = static_cast<VkFormat>(target.format);
+    const int family = typeless_view_family(format);
+    if (!family) return VK_FORMAT_UNDEFINED;
+    if (!resource.typeless && !resource.castable_view_formats)
         return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.volume || resource.depth != 1)
+    if (family != typeless_view_family(resource.format) || resource.volume || resource.depth != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
 }
@@ -2081,7 +2099,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // Older ownerless replay callers omit the resource format for float-only clears. Preserve
             // that path; an explicit format or a typeless resource must still resolve a concrete RTV.
             if (p.clear_format == VK_FORMAT_UNDEFINED &&
-                (p.binding.rgba8_typeless || color_clear->target.format != ColorViewFormat::resource))
+                (p.binding.typeless || color_clear->target.format != ColorViewFormat::resource))
                 return ReplayResult::invalid_clear;
             const bool partial_volume = p.binding.volume &&
                 color_clear->target.layer_count != std::max(1u, p.binding.depth >> color_clear->target.mip);
