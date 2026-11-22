@@ -545,6 +545,30 @@ class OutputTest(unittest.TestCase):
         empty = next(r for r in rows if r["name"] == "Empty")
         self.assertEqual((empty["children"], empty["content_count"]), ("0", "0"))
 
+    def test_directory_skips_json_csv_reports_and_oversized_continuation(self):
+        b = bytearray(b"RBF0" + rbf0_tree.PROLOGUE)
+        b += bytes([0, 0x00]) + struct.pack("<H", 4) + b"Root" + struct.pack("<HHH", 0, 0, 0)
+        filler = b"x" * 4000
+        first = True
+        while len(b) < 70000:
+            b += bytes([1, 0x60]) + ((struct.pack("<H", 6) + b"filler") if first else b"")
+            b += struct.pack("<H", len(filler)) + filler
+            first = False
+        first_chunk = bytes(b[:rbf0_tree.MAX_CHUNK])
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(first_chunk)
+        for report in ("index.json", "nodes.CSV"):
+            with open(os.path.join(self.root, report), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{\"files\": []}\n")
+        docs, _ = rbf0_tree.decode_source(self.root)
+        self.assertEqual((docs[0]["chunks"], docs[0]["size"], docs[0]["status"]),
+                         (1, rbf0_tree.MAX_CHUNK, "truncated"))
+        # A stream larger than 64 KiB is not a split continuation chunk, matching rbf0_index.join_resource.
+        with open(os.path.join(self.root, "00010000.bin"), "wb") as f:
+            f.write(b"\x00" * (rbf0_tree.MAX_CHUNK + 1))
+        docs, _ = rbf0_tree.decode_source(self.root)
+        self.assertEqual((docs[0]["chunks"], docs[0]["size"]), (1, rbf0_tree.MAX_CHUNK))
+
 
 if __name__ == "__main__":
     unittest.main()
