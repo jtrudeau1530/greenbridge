@@ -1,0 +1,1128 @@
+from __future__ import annotations
+
+"""Semantic interpreter tests and reference mathematical oracle for RDNA2 buffer_atomic_smin.
+
+Models AMD RDNA2 / GFX10 MUBUF untyped buffer memory signed atomic minimum:
+  buffer_atomic_smin vdata, vaddr, srsrc, soffset [offset:N] [offen] [idxen] [glc] [slc]
+
+RDNA2 Buffer Atomic Architecture & Semantics:
+  1. Instruction Operands:
+     - vdata: VGPR containing the 32-bit dword value to compare atomically. If 'glc' is enabled,
+       the pre-operation dword value at memory is returned to vdata.
+     - vaddr: VGPR containing the byte or index offset (when offen or idxen is enabled).
+     - srsrc: 128-bit Buffer Resource Descriptor (4 SGPRs s[r:r+3]):
+         Dword 0: Base address low [31:0]
+         Dword 1: Base address high [15:0], STRIDE [31:16]
+         Dword 2: NUM_RECORDS (buffer capacity in bytes)
+         Dword 3: Format, element size, resource type
+     - soffset: Scalar SGPR or immediate byte offset.
+     - inst_offset: 12-bit unsigned immediate byte offset [0, 4095].
+  2. Addressing and Bounds Checking:
+     effective_offset = soffset + inst_offset + (vaddr if offen else 0)
+     If effective_offset + 4 > NUM_RECORDS:
+       Access is Out-Of-Bounds (OOB).
+       The atomic operation is suppressed (memory is NOT modified).
+       If 'glc' is set, 0 is returned to vdata.
+  3. Atomic Signed Minimum Operation:
+     For in-bounds accesses:
+       old_val = memory[effective_address]
+       new_val = min(signed32(old_val), signed32(vdata))
+       memory[effective_address] = unsigned32(new_val)
+       if glc: vdata = old_val
+  4. Inactive Lanes (EXEC mask):
+     Lanes disabled by EXEC mask never touch memory and do not modify their VGPRs.
+
+Standard library Python only; zero third-party dependencies; zero game data.
+Python 3.9+ compatible (from __future__ import annotations).
+"""
+
+import dataclasses
+import enum
+import struct
+import sys
+import unittest
+
+MASK32: int = 0xFFFFFFFF
+MASK64: int = 0xFFFFFFFFFFFFFFFF
+SIGN_BIT32: int = 0x80000000
+INT32_MIN: int = -2147483648
+INT32_MAX: int = 2147483647
+
+# Boundary constants
+U32_INT32_MIN: int = 0x80000000
+U32_INT32_MAX: int = 0x7FFFFFFF
+U32_MINUS_ONE: int = 0xFFFFFFFF
+U32_ZERO: int = 0x00000000
+
+
+def u32(val: int) -> int:
+    """Normalize integer to unsigned 32-bit range [0, 2^32 - 1]."""
+    return val & MASK32
+
+
+def s32(val: int) -> int:
+    """Interpret a 32-bit unsigned word as a signed two's-complement integer."""
+    val &= MASK32
+    return val - (1 << 32) if (val & SIGN_BIT32) else val
+
+
+def u64(val: int) -> int:
+    """Normalize integer to unsigned 64-bit range [0, 2^64 - 1]."""
+    return val & MASK64
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferResourceDescriptor:
+    """AMD GFX10 128-bit Buffer Resource Descriptor (V#)."""
+    base_address: int
+    stride: int
+    num_records: int
+    format_flags: int = 0
+
+    @classmethod
+    def from_dwords(cls, d0: int, d1: int, d2: int, d3: int) -> BufferResourceDescriptor:
+        base_lo = d0 & MASK32
+        base_hi = d1 & 0xFFFF
+        base = (base_hi << 32) | base_lo
+        stride = (d1 >> 16) & 0xFFFF
+        num_records = d2 & MASK32
+        return cls(base_address=base, stride=stride, num_records=num_records, format_flags=d3)
+
+    def to_dwords(self) -> tuple[int, int, int, int]:
+        d0 = self.base_address & MASK32
+        d1 = ((self.base_address >> 32) & 0xFFFF) | ((self.stride & 0xFFFF) << 16)
+        d2 = self.num_records & MASK32
+        d3 = self.format_flags & MASK32
+        return d0, d1, d2, d3
+
+
+class BufferMemory:
+    """Byte-addressable memory buffer simulating GPU global / buffer device memory."""
+
+    def __init__(self, size: int = 65536) -> None:
+        self.data: bytearray = bytearray(size)
+
+    def read_u32(self, addr: int) -> int:
+        if addr < 0 or addr + 4 > len(self.data):
+            return 0
+        return struct.unpack_from("<I", self.data, addr)[0]
+
+    def write_u32(self, addr: int, val: int) -> None:
+        if addr < 0 or addr + 4 > len(self.data):
+            return
+        struct.pack_into("<I", self.data, addr, val & MASK32)
+
+
+def ref_buffer_atomic_smin(
+    mem: BufferMemory,
+    desc: BufferResourceDescriptor,
+    soffset: int,
+    vaddr: int,
+    cmp_val: int,
+    inst_offset: int = 0,
+    glc: bool = False,
+    offen: bool = True,
+) -> tuple[int, bool]:
+    """Pure reference mathematical oracle for RDNA2 buffer_atomic_smin.
+
+    Computes:
+      effective_offset = soffset + inst_offset + (vaddr if offen else 0)
+      if effective_offset + 4 <= desc.num_records:
+        old_val = mem[effective_address]
+        new_val = min(s32(old_val), s32(cmp_val))
+        mem[effective_address] = u32(new_val)
+        return (old_val if glc else cmp_val), True
+      else:
+        return (0 if glc else cmp_val), False
+    """
+    effective_offset = (soffset & MASK32) + (inst_offset & 0xFFF)
+    if offen:
+        effective_offset += (vaddr & MASK32)
+
+    # Hardware bounds check against NUM_RECORDS
+    if effective_offset + 4 > desc.num_records:
+        # Out-of-bounds: memory untouched, returns 0 if glc
+        return (0 if glc else (cmp_val & MASK32)), False
+
+    phys_addr = (desc.base_address + effective_offset) & 0xFFFFFFFFFFFFFFFF
+    old_val = mem.read_u32(phys_addr)
+    min_val = min(s32(old_val), s32(cmp_val))
+    new_val = u32(min_val)
+    mem.write_u32(phys_addr, new_val)
+
+    ret_val = old_val if glc else (cmp_val & MASK32)
+    return ret_val, True
+
+
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= 256:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count not in (1, 2, 4):
+            raise ValueError(f"Unsupported register count: {self.count}")
+        if self.index + self.count > 256:
+            raise ValueError(f"Register range exceeds register file boundary: {self.index}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count > 1:
+            return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferAtomicModifiers:
+    """Modifiers and options for buffer atomic instructions."""
+    offset: int = 0
+    glc: bool = False
+    slc: bool = False
+    offen: bool = True
+    idxen: bool = False
+
+    def __post_init__(self) -> None:
+        if self.offset < 0 or self.offset > 4095:
+            raise ValueError(f"Immediate inst_offset must be in range [0, 4095]: {self.offset}")
+
+
+class Opcode(enum.Enum):
+    """Buffer atomic opcodes."""
+    BUFFER_ATOMIC_SMIN = "buffer_atomic_smin"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a buffer_atomic_smin instruction."""
+    opcode: Opcode
+    vdata: Register
+    vaddr: Register
+    srsrc: Register
+    soffset: Register | int
+    mods: BufferAtomicModifiers = dataclasses.field(default_factory=BufferAtomicModifiers)
+
+    def __post_init__(self) -> None:
+        if not self.vdata.is_vgpr or self.vdata.count != 1:
+            raise ValueError(f"vdata must be a single 32-bit VGPR: {self.vdata}")
+        if not self.vaddr.is_vgpr:
+            raise ValueError(f"vaddr must be a VGPR: {self.vaddr}")
+        if not self.srsrc.is_sgpr or self.srsrc.count != 4:
+            raise ValueError(f"srsrc must be a 128-bit SGPR group (count=4): {self.srsrc}")
+        if isinstance(self.soffset, Register) and not self.soffset.is_sgpr:
+            raise ValueError(f"soffset register must be an SGPR: {self.soffset}")
+
+    def to_assembly(self) -> str:
+        vd_str = self.vdata.format_asm()
+        va_str = self.vaddr.format_asm()
+        sr_str = self.srsrc.format_asm()
+        so_str = self.soffset.format_asm() if isinstance(self.soffset, Register) else str(self.soffset)
+
+        mod_parts: list[str] = []
+        if self.mods.offen:
+            mod_parts.append("offen")
+        if self.mods.idxen:
+            mod_parts.append("idxen")
+        if self.mods.offset != 0:
+            mod_parts.append(f"offset:{self.mods.offset}")
+        if self.mods.glc:
+            mod_parts.append("glc")
+        if self.mods.slc:
+            mod_parts.append("slc")
+
+        mods_str = (" " + " ".join(mod_parts)) if mod_parts else ""
+        return f"{self.opcode.value} {vd_str}, {va_str}, {sr_str}, {so_str}{mods_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of buffer instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferAtomicConditionCodes:
+    """Architectural integer condition codes for buffer atomic operations."""
+    zero: bool
+    negative: bool
+    positive: bool
+    updated: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferStatusFlags:
+    """Buffer memory status flags."""
+    in_bounds: bool
+    oob_fault: bool
+
+
+def compute_buffer_condition_codes(old_val: int, cmp_val: int, ret_val: int) -> BufferAtomicConditionCodes:
+    """Computes condition codes evaluating the result and minimum update."""
+    signed_ret = s32(ret_val)
+    new_val = min(s32(old_val), s32(cmp_val))
+    return BufferAtomicConditionCodes(
+        zero=(signed_ret == 0),
+        negative=(signed_ret < 0),
+        positive=(signed_ret > 0),
+        updated=(new_val != s32(old_val)),
+    )
+
+
+def compute_buffer_status_flags(in_bounds: bool) -> BufferStatusFlags:
+    """Computes buffer memory bounds flags."""
+    return BufferStatusFlags(
+        in_bounds=in_bounds,
+        oob_fault=not in_bounds,
+    )
+
+
+class ScalarBufferInterpreter:
+    """Deterministic scalar interpreter for buffer_atomic_smin."""
+
+    def __init__(self, mem_size: int = 65536) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.mem: BufferMemory = BufferMemory(mem_size)
+        self.vcc: int = 0
+        self.last_condition_codes: BufferAtomicConditionCodes | None = None
+        self.last_status_flags: BufferStatusFlags | None = None
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= 256) or (kind == RegKind.SGPR and idx >= 106):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        return (self.vgprs[idx] if kind == RegKind.VGPR else self.sgprs[idx]) & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= 256) or (kind == RegKind.SGPR and idx >= 106):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def set_buffer_descriptor(self, sgpr_base: int, desc: BufferResourceDescriptor) -> None:
+        d0, d1, d2, d3 = desc.to_dwords()
+        self.write_reg_u32(RegKind.SGPR, sgpr_base + 0, d0)
+        self.write_reg_u32(RegKind.SGPR, sgpr_base + 1, d1)
+        self.write_reg_u32(RegKind.SGPR, sgpr_base + 2, d2)
+        self.write_reg_u32(RegKind.SGPR, sgpr_base + 3, d3)
+
+    def get_buffer_descriptor(self, sgpr_base: int) -> BufferResourceDescriptor:
+        d0 = self.read_reg_u32(RegKind.SGPR, sgpr_base + 0)
+        d1 = self.read_reg_u32(RegKind.SGPR, sgpr_base + 1)
+        d2 = self.read_reg_u32(RegKind.SGPR, sgpr_base + 2)
+        d3 = self.read_reg_u32(RegKind.SGPR, sgpr_base + 3)
+        return BufferResourceDescriptor.from_dwords(d0, d1, d2, d3)
+
+    def step(self, inst: Instruction) -> None:
+        if inst.opcode != Opcode.BUFFER_ATOMIC_SMIN:
+            raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+        vdata_val = self.read_reg_u32(RegKind.VGPR, inst.vdata.index)
+        vaddr_val = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)
+        soffset_val = (
+            self.read_reg_u32(RegKind.SGPR, inst.soffset.index)
+            if isinstance(inst.soffset, Register)
+            else (inst.soffset & MASK32)
+        )
+        desc = self.get_buffer_descriptor(inst.srsrc.index)
+
+        ret_val, in_bounds = ref_buffer_atomic_smin(
+            mem=self.mem,
+            desc=desc,
+            soffset=soffset_val,
+            vaddr=vaddr_val,
+            cmp_val=vdata_val,
+            inst_offset=inst.mods.offset,
+            glc=inst.mods.glc,
+            offen=inst.mods.offen,
+        )
+
+        phys_addr = (desc.base_address + ((soffset_val & MASK32) + (inst.mods.offset & 0xFFF) + (vaddr_val & MASK32 if inst.mods.offen else 0))) & 0xFFFFFFFFFFFFFFFF
+        old_val = self.mem.read_u32(phys_addr) if in_bounds else 0
+        self.last_condition_codes = compute_buffer_condition_codes(old_val, vdata_val, ret_val)
+        self.last_status_flags = compute_buffer_status_flags(in_bounds)
+
+        if inst.mods.glc:
+            self.write_reg_u32(RegKind.VGPR, inst.vdata.index, ret_val)
+
+
+class SIMDBufferInterpreter:
+    """SIMD multi-lane interpreter supporting Wave32 and Wave64 with EXEC masking."""
+
+    def __init__(self, num_lanes: int = 64, mem_size: int = 65536) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"Unsupported lane count: {num_lanes} (must be 32 or 64)")
+        self.num_lanes = num_lanes
+        self.exec_mask: int = (1 << num_lanes) - 1
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(num_lanes)]
+        self.sgprs: list[int] = [0] * 106
+        self.mem: BufferMemory = BufferMemory(mem_size)
+        self.vcc: int = 0
+
+    def read_lane_vgpr(self, lane: int, idx: int) -> int:
+        return self.vgprs[lane][idx] & MASK32
+
+    def write_lane_vgpr(self, lane: int, idx: int, val: int) -> None:
+        self.vgprs[lane][idx] = val & MASK32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx] & MASK32
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def set_buffer_descriptor(self, sgpr_base: int, desc: BufferResourceDescriptor) -> None:
+        d0, d1, d2, d3 = desc.to_dwords()
+        self.write_sgpr(sgpr_base + 0, d0)
+        self.write_sgpr(sgpr_base + 1, d1)
+        self.write_sgpr(sgpr_base + 2, d2)
+        self.write_sgpr(sgpr_base + 3, d3)
+
+    def get_buffer_descriptor(self, sgpr_base: int) -> BufferResourceDescriptor:
+        d0 = self.read_sgpr(sgpr_base + 0)
+        d1 = self.read_sgpr(sgpr_base + 1)
+        d2 = self.read_sgpr(sgpr_base + 2)
+        d3 = self.read_sgpr(sgpr_base + 3)
+        return BufferResourceDescriptor.from_dwords(d0, d1, d2, d3)
+
+    def step(self, inst: Instruction) -> None:
+        if inst.opcode != Opcode.BUFFER_ATOMIC_SMIN:
+            raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+        soffset_val = (
+            self.read_sgpr(inst.soffset.index)
+            if isinstance(inst.soffset, Register)
+            else (inst.soffset & MASK32)
+        )
+        desc = self.get_buffer_descriptor(inst.srsrc.index)
+
+        # Execute across active lanes
+        for lane in range(self.num_lanes):
+            if not ((self.exec_mask >> lane) & 1):
+                continue
+
+            vdata_val = self.read_lane_vgpr(lane, inst.vdata.index)
+            vaddr_val = self.read_lane_vgpr(lane, inst.vaddr.index)
+
+            ret_val, _ = ref_buffer_atomic_smin(
+                mem=self.mem,
+                desc=desc,
+                soffset=soffset_val,
+                vaddr=vaddr_val,
+                cmp_val=vdata_val,
+                inst_offset=inst.mods.offset,
+                glc=inst.mods.glc,
+                offen=inst.mods.offen,
+            )
+
+            if inst.mods.glc:
+                self.write_lane_vgpr(lane, inst.vdata.index, ret_val)
+
+
+# ==============================================================================
+# Mutated Oracles for Mutation Testing and Negative Controls
+# ==============================================================================
+
+def mutant_unsigned_min(old_val: int, cmp_val: int) -> int:
+    """Mutant A: uses unsigned comparison instead of signed comparison."""
+    return min(u32(old_val), u32(cmp_val))
+
+
+def mutant_signed_max(old_val: int, cmp_val: int) -> int:
+    """Mutant B: computes maximum instead of minimum."""
+    return u32(max(s32(old_val), s32(cmp_val)))
+
+
+class TestBufferAtomicSminNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 4, count=3)
+
+    def test_syntax_rejection_invalid_offset_range(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+
+    def test_syntax_rejection_vgpr_as_soffset(self) -> None:
+        v_soffset = Register(RegKind.VGPR, 10)
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMIN,
+                vdata=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=v_soffset,
+            )
+
+    def test_mutation_detection_unsigned_vs_signed_min(self) -> None:
+        # For 10 vs -5 (0xFFFFFFFB):
+        # Signed min: -5 (0xFFFFFFFB)
+        # Unsigned min: 10 (since 0xFFFFFFFB > 10 unsigned)
+        val_a = 10
+        val_b = u32(-5)
+        correct = u32(min(s32(val_a), s32(val_b)))
+        mutant = mutant_unsigned_min(val_a, val_b)
+        self.assertEqual(s32(correct), -5)
+        self.assertEqual(mutant, 10)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_signed_max_vs_min(self) -> None:
+        val_a = -20
+        val_b = 30
+        correct = u32(min(s32(val_a), s32(val_b)))
+        mutant = mutant_signed_max(val_a, val_b)
+        self.assertEqual(s32(correct), -20)
+        self.assertEqual(s32(mutant), 30)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_oob_leak(self) -> None:
+        mem = BufferMemory(4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # OOB access at 200
+        mem.write_u32(200, 42)
+        _, in_bounds = ref_buffer_atomic_smin(mem, desc, 0, 200, -10, glc=True)
+        self.assertFalse(in_bounds)
+        self.assertEqual(mem.read_u32(200), 42)
+        # Mutant write
+        mem.write_u32(200, u32(-10))
+        self.assertNotEqual(mem.read_u32(200), 42)
+
+    def test_mutation_detection_inactive_lane_leak(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        sim.set_buffer_descriptor(4, desc)
+        sim.exec_mask = 0x0  # All lanes disabled
+        sim.mem.write_u32(0, 100)
+        sim.write_lane_vgpr(0, 0, u32(-50))
+        sim.write_lane_vgpr(0, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+        self.assertEqual(sim.mem.read_u32(0), 100)
+        # Mutant write
+        sim.mem.write_u32(0, u32(-50))
+        self.assertNotEqual(sim.mem.read_u32(0), 100)
+
+
+class TestBufferAtomicSminIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, integer ranges, and IEEE 754 bit-pattern handling."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+    def test_signed_zero_bit_patterns_as_integers(self) -> None:
+        # In float32: +0.0 is 0x00000000, -0.0 is 0x80000000
+        # In signed 32-bit int: 0x80000000 is -2147483648, 0x00000000 is 0
+        # min(0, -2147483648) = -2147483648 (0x80000000)
+        self.mem.write_u32(0, 0)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 0, 0x80000000, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.mem.read_u32(0), 0x80000000)
+
+    def test_signed_infinities_as_integers(self) -> None:
+        # +inf (0x7F800000 = +2139095040), -inf (0xFF800000 = -8388608)
+        self.mem.write_u32(4, 0x7F800000)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 4, 0xFF800000, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0x7F800000)
+        self.assertEqual(self.mem.read_u32(4), 0xFF800000)
+
+    def test_nan_bit_patterns_unaltered_and_no_traps(self) -> None:
+        # qNaN (0x7FC00000 = +2143289344) vs -1 (0xFFFFFFFF = -1) -> min is -1
+        self.mem.write_u32(8, 0x7FC00000)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 8, 0xFFFFFFFF, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0x7FC00000)
+        self.assertEqual(self.mem.read_u32(8), 0xFFFFFFFF)
+
+        # sNaN (0x7F800001 = +2139095041) vs +100 -> min is +100
+        self.mem.write_u32(12, 0x7F800001)
+        ret2, ok2 = ref_buffer_atomic_smin(self.mem, self.desc, 0, 12, 100, glc=True)
+        self.assertTrue(ok2)
+        self.assertEqual(ret2, 0x7F800001)
+        self.assertEqual(self.mem.read_u32(12), 100)
+
+    def test_subnormal_bit_patterns_as_integers(self) -> None:
+        # Smallest positive subnormal (0x00000001 = +1) vs -5 -> min is -5
+        self.mem.write_u32(16, 1)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 16, u32(-5), glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 1)
+        self.assertEqual(s32(self.mem.read_u32(16)), -5)
+
+    def test_last_valid_dword_boundary_and_oob(self) -> None:
+        # Buffer has 256 bytes. Last valid dword starts at 252 (252 + 4 = 256).
+        self.mem.write_u32(252, 100)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, 0, 252, 20, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 100)
+        self.assertEqual(self.mem.read_u32(252), 20)
+
+        # Offset 253 + 4 = 257 > 256 -> OOB
+        ret_oob, ok_oob = ref_buffer_atomic_smin(self.mem, self.desc, 0, 253, 5, glc=True)
+        self.assertFalse(ok_oob)
+        self.assertEqual(ret_oob, 0)
+
+
+class TestBufferAtomicSminConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_condition_codes_zero_pos_neg(self) -> None:
+        self.interp.mem.write_u32(0, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 10)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        # Pre-op return value is 0
+        self.interp.step(inst)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertFalse(cc.positive)
+
+        # Next smin: memory has min(0, 10) = 0. Compare with -5. Pre-op is 0.
+        self.interp.write_reg_u32(RegKind.VGPR, 0, u32(-5))
+        self.interp.step(inst)
+        # Now memory has -5. Compare with 10. Pre-op is -5 (negative).
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 10)
+        self.interp.step(inst)
+        cc_neg = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_neg)
+        assert cc_neg is not None
+        self.assertFalse(cc_neg.zero)
+        self.assertTrue(cc_neg.negative)
+        self.assertFalse(cc_neg.positive)
+
+    def test_status_flags_in_bounds_and_oob(self) -> None:
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 1)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 100)  # in bounds (< 1024)
+
+        inst_in = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst_in)
+        flags_in = self.interp.last_status_flags
+        self.assertIsNotNone(flags_in)
+        assert flags_in is not None
+        self.assertTrue(flags_in.in_bounds)
+        self.assertFalse(flags_in.oob_fault)
+
+        # OOB access
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 2000)
+        self.interp.step(inst_in)
+        flags_oob = self.interp.last_status_flags
+        self.assertIsNotNone(flags_oob)
+        assert flags_oob is not None
+        self.assertFalse(flags_oob.in_bounds)
+        self.assertTrue(flags_oob.oob_fault)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        canary = 0x1234567887654321
+        self.interp.vcc = canary
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, canary)
+
+
+class TestBufferAtomicSminRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_vdata_vaddr_same_register_non_glc(self) -> None:
+        # v0 used as both vdata and vaddr
+        # offset 0 in memory has 100
+        self.interp.mem.write_u32(0, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0)  # v0 = 0 (both addr 0 and cmp_val 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 0),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.step(inst)
+        # min(100, 0) = 0
+        self.assertEqual(self.interp.mem.read_u32(0), 0)
+        # Without glc, v0 remains 0
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0)
+
+    def test_vdata_vaddr_same_register_glc(self) -> None:
+        # Memory at 4 has 50
+        self.interp.mem.write_u32(4, 50)
+        # v0 = 4 (addr 4, and cmp_val 4)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 4)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 0),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        # min(50, 4) = 4
+        self.assertEqual(self.interp.mem.read_u32(4), 4)
+        # With glc, v0 receives pre-op value (50)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 50)
+
+    def test_srsrc_descriptor_sgprs_preserved(self) -> None:
+        d0, d1, d2, d3 = self.desc.to_dwords()
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+        )
+        self.interp.step(inst)
+        # Check SGPRs 4..7 untouched
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 4), d0)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 5), d1)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 6), d2)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 7), d3)
+
+    def test_multiple_lanes_aliased_same_address(self) -> None:
+        # 4 lanes all targeting memory address 0
+        sim = SIMDBufferInterpreter(num_lanes=32, mem_size=4096)
+        sim.set_buffer_descriptor(4, self.desc)
+        sim.exec_mask = 0xF  # 4 lanes
+        sim.mem.write_u32(0, 100)
+
+        values = [50, -20, 10, -5]
+        for lane in range(4):
+            sim.write_lane_vgpr(lane, 0, u32(values[lane]))
+            sim.write_lane_vgpr(lane, 1, 0)  # all addr 0
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+        # Global minimum across 100, 50, -20, 10, -5 is -20
+        self.assertEqual(s32(sim.mem.read_u32(0)), -20)
+
+
+class TestBufferAtomicSminSIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_full_exec(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+
+        for lane in range(32):
+            sim.write_lane_vgpr(lane, 0, u32(lane - 16))  # signed values in [-16, 15]
+            sim.write_lane_vgpr(lane, 1, lane * 4)        # address
+            sim.mem.write_u32(lane * 4, 0)                # memory initialized to 0
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+
+        for lane in range(32):
+            val = s32(lane - 16)
+            expected = min(0, val)
+            self.assertEqual(s32(sim.mem.read_u32(lane * 4)), expected)
+
+    def test_wave32_divergent_masking(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+        sim.exec_mask = 0x55555555  # Even lanes active
+
+        for lane in range(32):
+            sim.write_lane_vgpr(lane, 0, u32(-50))
+            sim.write_lane_vgpr(lane, 1, lane * 4)
+            sim.mem.write_u32(lane * 4, 100)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(s32(sim.mem.read_u32(lane * 4)), -50)
+            else:
+                self.assertEqual(s32(sim.mem.read_u32(lane * 4)), 100)
+
+    def test_wave64_full_exec(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=64, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+
+        for lane in range(64):
+            sim.write_lane_vgpr(lane, 0, u32(10))
+            sim.write_lane_vgpr(lane, 1, lane * 4)
+            sim.mem.write_u32(lane * 4, 50)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+
+        for lane in range(64):
+            self.assertEqual(sim.mem.read_u32(lane * 4), 10)
+
+    def test_wave64_divergent_masking(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=64, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+        sim.exec_mask = 0x00000000FFFFFFFF  # Low 32 lanes active
+
+        for lane in range(64):
+            sim.write_lane_vgpr(lane, 0, u32(-10))
+            sim.write_lane_vgpr(lane, 1, lane * 4)
+            sim.mem.write_u32(lane * 4, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(s32(sim.mem.read_u32(lane * 4)), -10)
+            else:
+                self.assertEqual(s32(sim.mem.read_u32(lane * 4)), 0)
+
+    def test_exec_mask_zero_no_modification(self) -> None:
+        sim = SIMDBufferInterpreter(num_lanes=64, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=2048)
+        sim.set_buffer_descriptor(4, desc)
+        sim.exec_mask = 0
+
+        for lane in range(64):
+            sim.write_lane_vgpr(lane, 0, u32(-100))
+            sim.write_lane_vgpr(lane, 1, lane * 4)
+            sim.mem.write_u32(lane * 4, 42)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        sim.step(inst)
+
+        for lane in range(64):
+            self.assertEqual(sim.mem.read_u32(lane * 4), 42)
+            self.assertEqual(s32(sim.read_lane_vgpr(lane, 0)), -100)
+
+
+class TestBufferAtomicSminScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_scalar_smin_positive_numbers(self) -> None:
+        # Initial memory has 50
+        self.interp.mem.write_u32(0, 50)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 30)  # vdata = 30
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)   # vaddr = 0
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.mem.read_u32(0), 30)
+        # Without glc, vdata in v0 remains 30
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 30)
+
+    def test_scalar_smin_negative_numbers(self) -> None:
+        self.interp.mem.write_u32(0, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, u32(-50))
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.step(inst)
+        self.assertEqual(s32(self.interp.mem.read_u32(0)), -50)
+
+    def test_scalar_smin_with_glc_return(self) -> None:
+        self.interp.mem.write_u32(16, 25)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 10)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 16)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        # Memory updated to min(25, 10) = 10
+        self.assertEqual(self.interp.mem.read_u32(16), 10)
+        # v0 receives pre-op return value (25)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 25)
+
+    def test_scalar_smin_oob_handling(self) -> None:
+        self.interp.mem.write_u32(0, 99)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 5)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 2048)  # OOB
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        # Memory at 0 untouched
+        self.assertEqual(self.interp.mem.read_u32(0), 99)
+        # glc on OOB returns 0 to vdata
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0)
+
+
+class TestBufferAtomicSminAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_definition(self) -> None:
+        self.assertEqual(Opcode.BUFFER_ATOMIC_SMIN.value, "buffer_atomic_smin")
+
+    def test_register_operand_validation(self) -> None:
+        v0 = Register(RegKind.VGPR, 0)
+        self.assertEqual(v0.format_asm(), "v0")
+        s_group = Register(RegKind.SGPR, 4, count=4)
+        self.assertEqual(s_group.format_asm(), "s[4:7]")
+
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 4, count=3)
+
+    def test_instruction_construction_and_formatting(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=Register(RegKind.SGPR, 8),
+            mods=BufferAtomicModifiers(offen=True, offset=64, glc=True),
+        )
+        self.assertEqual(
+            inst.to_assembly(),
+            "buffer_atomic_smin v0, v1, s[4:7], s8 offen offset:64 glc",
+        )
+
+    def test_instruction_with_immediate_soffset(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 3),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=False, slc=True),
+        )
+        self.assertEqual(inst.to_assembly(), "buffer_atomic_smin v2, v3, s[0:3], 0 slc")
+
+    def test_program_assembly(self) -> None:
+        prog = Program()
+        inst1 = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+        )
+        prog.append(inst1)
+        self.assertEqual(prog.to_assembly(), inst1.to_assembly())
+
+
+class TestBufferAtomicSminOracle(unittest.TestCase):
+    """Unit tests for the reference mathematical oracle and architectural model."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+
+    def test_signed_min_positive_numbers(self) -> None:
+        # Initial memory has 20, cmp with 10 -> min is 10
+        self.mem.write_u32(0, 20)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, soffset=0, vaddr=0, cmp_val=10, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 20)
+        self.assertEqual(self.mem.read_u32(0), 10)
+
+        # Compare with 30 -> min is still 10
+        ret2, ok2 = ref_buffer_atomic_smin(self.mem, self.desc, soffset=0, vaddr=0, cmp_val=30, glc=True)
+        self.assertTrue(ok2)
+        self.assertEqual(ret2, 10)
+        self.assertEqual(self.mem.read_u32(0), 10)
+
+    def test_signed_min_negative_numbers(self) -> None:
+        # Initial memory has 5, cmp with -10 (0xFFFFFFF6) -> min is -10
+        self.mem.write_u32(4, 5)
+        cmp_neg = u32(-10)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, soffset=0, vaddr=4, cmp_val=cmp_neg, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 5)
+        self.assertEqual(s32(self.mem.read_u32(4)), -10)
+
+        # Compare -10 with -20 -> min is -20
+        cmp_neg20 = u32(-20)
+        ret2, ok2 = ref_buffer_atomic_smin(self.mem, self.desc, soffset=0, vaddr=4, cmp_val=cmp_neg20, glc=True)
+        self.assertTrue(ok2)
+        self.assertEqual(s32(ret2), -10)
+        self.assertEqual(s32(self.mem.read_u32(4)), -20)
+
+    def test_signed_min_extremes(self) -> None:
+        # INT32_MAX (0x7FFFFFFF) vs INT32_MIN (0x80000000) -> min is INT32_MIN
+        self.mem.write_u32(8, U32_INT32_MAX)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, soffset=0, vaddr=8, cmp_val=U32_INT32_MIN, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, U32_INT32_MAX)
+        self.assertEqual(self.mem.read_u32(8), U32_INT32_MIN)
+
+    def test_signed_min_with_zero(self) -> None:
+        # 0 vs -1 -> min is -1
+        self.mem.write_u32(12, 0)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, soffset=0, vaddr=12, cmp_val=U32_MINUS_ONE, glc=True)
+        self.assertTrue(ok)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.mem.read_u32(12), U32_MINUS_ONE)
+
+    def test_oob_suppression_and_glc_zero(self) -> None:
+        # Buffer num_records is 1024, access at 1024 (1024 + 4 > 1024) -> OOB
+        self.mem.write_u32(100, 42)
+        ret, ok = ref_buffer_atomic_smin(self.mem, self.desc, soffset=0, vaddr=1024, cmp_val=-5, glc=True)
+        self.assertFalse(ok)
+        self.assertEqual(ret, 0)  # glc on OOB returns 0
+
+
+if __name__ == "__main__":
+    unittest.main()
