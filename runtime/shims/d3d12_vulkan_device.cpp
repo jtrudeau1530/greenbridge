@@ -1584,8 +1584,8 @@ bool equal_semantic(const std::string& a, const char* b) {
 }
 
 // Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
-// corpus), the one to build: the first that `fits` and declares no set-0 bindings, which pipelines do not bind yet;
-// else the first that fits; else the first without bindings; else the first. Null when there is none.
+// corpus), the one to build: the first that `fits` and declares no set-0 bindings (the cheaper pipeline); else the
+// first that fits; else the first without bindings; else the first. Null when there is none.
 template<typename Fits>
 const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEntry*>& candidates, Fits&& fits) {
     const leonida::ShaderEntry* fitting = nullptr;
@@ -1705,6 +1705,7 @@ public:
             std::vector<std::uint8_t> fssm;
         };
         Stage stages[2] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS}, {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
+        bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
         const Stage* code_stage = nullptr;
         for (Stage& stage : stages) {
@@ -1727,9 +1728,12 @@ public:
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
-                std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; pipelines do not bind set 0 yet\n",
-                             stage.entry->name.c_str());
-                return E_NOTIMPL;
+                if (!device_.bindless) {
+                    std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
+                                 stage.entry->name.c_str());
+                    return E_NOTIMPL;
+                }
+                uses_bindless = true;
             }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
@@ -1921,6 +1925,13 @@ public:
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (uses_bindless) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+            graphics_.bindless_set = device_.bindless->set();
+        }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
@@ -1977,10 +1988,10 @@ public:
             std::fprintf(stderr, "[rt] d3d12: no translated compute shader for FSSM sha256 %s\n", hash.c_str());
             return E_INVALIDARG;
         }
-        if (entry->binding_count) {
-            // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, pipelines do not
-            // declare or bind it yet (M2).
-            std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; pipelines do not bind set 0 yet\n",
+        // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
+        // shader declares bindings has it in its layout and has it bound at every dispatch.
+        if (entry->binding_count && !device_.bindless) {
+            std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
                          entry->name.c_str());
             return E_NOTIMPL;
         }
@@ -1999,6 +2010,13 @@ public:
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (entry->binding_count) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+            pipeline_.bindless_set = device_.bindless->set();
+        }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -4680,6 +4698,11 @@ VkDescriptorSet bindless_set(ID3D12Device* device) {
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
     const leonida::BindlessSet* set = bindless_of(device);
     return set ? set->layout() : VK_NULL_HANDLE;
+}
+
+std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]) {
+    const leonida::BindlessSet* set = bindless_of(device);
+    return set ? set->table().lookup(key) : 0;
 }
 
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)

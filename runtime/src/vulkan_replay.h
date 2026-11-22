@@ -651,6 +651,7 @@ struct ComputePipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::uint64_t code_base = 0;
+    VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every dispatch; null: none
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -660,6 +661,7 @@ struct GraphicsPipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderStageFlags push_stages = 0;   // the layout's push-constant range; vkCmdPushConstants must name the same
     std::uint64_t code_base = 0;
+    VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every draw; null: none
     std::vector<VkFormat> color_formats;  // by render-target slot
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags depth_aspects = 0;
@@ -707,6 +709,7 @@ struct ReplayFunctions {
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
     PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
     PFN_vkCmdPushConstants push_constants = nullptr;
+    PFN_vkCmdBindDescriptorSets bind_descriptor_sets = nullptr;  // set 0 of pipelines that declare bindings
     PFN_vkCmdDispatch dispatch = nullptr;
     std::function<const ComputePipeline*(std::uintptr_t)> compute_pipeline;
     PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers2 = nullptr;  // draws
@@ -2784,6 +2787,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+            if (p.pipeline.bindless_set)
+                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0, 1,
+                                        &p.pipeline.bindless_set, 0, nullptr);
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
@@ -2830,6 +2836,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.heap_base = vk.heap_base;
             data.code_base = p.graphics.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.pipeline);
+            if (p.graphics.bindless_set)
+                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.layout, 0, 1,
+                                        &p.graphics.bindless_set, 0, nullptr);
             vk.push_constants(command_buffer, p.graphics.layout, p.graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.

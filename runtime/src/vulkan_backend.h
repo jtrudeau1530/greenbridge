@@ -648,6 +648,7 @@ public:
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
         replay_.bind_pipeline = vk.vkCmdBindPipeline;
         replay_.push_constants = vk.vkCmdPushConstants;
+        replay_.bind_descriptor_sets = vk.vkCmdBindDescriptorSets;
         replay_.dispatch = vk.vkCmdDispatch;
         replay_.compute_pipeline = [this](std::uintptr_t id) -> const ComputePipeline* {
             const auto it = pipelines_.find(id);
