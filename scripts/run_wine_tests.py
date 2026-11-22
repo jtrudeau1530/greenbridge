@@ -169,10 +169,13 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
     detail = f"exit {code} in {elapsed:.1f} s\n{out}"
+    skip_patterns = regex_list(props.get("SKIP_REGULAR_EXPRESSION", []))
     required = regex_list(props.get("PASS_REGULAR_EXPRESSION", []))
     forbidden = regex_list(props.get("FAIL_REGULAR_EXPRESSION", []))
     # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
     try:
+        if any(re.search(pattern, out, re.DOTALL) for pattern in skip_patterns):
+            return "skip", f"matched CTest SKIP_REGULAR_EXPRESSION: {detail}"
         passed = any(re.search(pattern, out, re.DOTALL) for pattern in required) if required else code == 0
         if any(re.search(pattern, out, re.DOTALL) for pattern in forbidden):
             passed = False
