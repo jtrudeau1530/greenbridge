@@ -717,12 +717,16 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_debug_markers_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_debug_markers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_debug_markers_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_debug_markers COMMAND d3d12_debug_markers_test)
+    set_tests_properties(d3d12_debug_markers PROPERTIES SKIP_RETURN_CODE 77)
 
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
     add_executable(d3d12_fence_timing_test test/d3d12_fence_timing_test.cpp)
     target_link_libraries(d3d12_fence_timing_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_fence_timing_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_fence_timing_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_fence_timing COMMAND d3d12_fence_timing_test)
+    set_tests_properties(d3d12_fence_timing PROPERTIES SKIP_RETURN_CODE 77)
     # The countdown behind those event-backed waits, with no GPU: the full unsigned count, no wrap past zero.
     add_executable(d3d12_fence_waiter_test test/d3d12_fence_waiter_test.cpp)
     target_compile_definitions(d3d12_fence_waiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -802,12 +806,16 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_node_mask_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_node_mask_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_node_mask_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_node_mask COMMAND d3d12_node_mask_test)
+    set_tests_properties(d3d12_node_mask PROPERTIES SKIP_RETURN_CODE 77)
 
     # Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 presentation over a Win32 HWND.
     add_executable(dxgi_swapchain_test test/dxgi_swapchain_test.cpp)
     target_link_libraries(dxgi_swapchain_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(dxgi_swapchain_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dxgi_swapchain_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_swapchain COMMAND dxgi_swapchain_test)
+    set_tests_properties(dxgi_swapchain PROPERTIES SKIP_RETURN_CODE 77)
 
     # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
     add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)

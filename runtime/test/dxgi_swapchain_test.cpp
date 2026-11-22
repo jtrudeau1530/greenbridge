@@ -83,7 +83,7 @@ int main() {
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
     if (!gipa) {
         std::printf("SKIP: vulkan-1.dll not available\n");
-        return 0;
+        return 77;  // ctest skips
     }
     const auto create_inst = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
     const auto enum_layers =
@@ -138,7 +138,12 @@ int main() {
     }
 
     VkInstance instance = VK_NULL_HANDLE;
-    if (create_inst(&ici, nullptr, &instance) != VK_SUCCESS) return fail("vkCreateInstance");
+    const VkResult created = create_inst(&ici, nullptr, &instance);
+    if (created == VK_ERROR_INCOMPATIBLE_DRIVER) {  // no Vulkan driver at all, as on a GPU-less runner
+        std::printf("SKIP: no Vulkan driver\n");
+        return 77;
+    }
+    if (created != VK_SUCCESS) return fail("vkCreateInstance");
 
     const auto destroy_inst = reinterpret_cast<PFN_vkDestroyInstance>(gipa(instance, "vkDestroyInstance"));
     const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(gipa(instance, "vkGetDeviceProcAddr"));
@@ -188,7 +193,7 @@ int main() {
         std::printf("SKIP: no Vulkan 1.3 GPU found\n");
         if (messenger && destroy_dbg) destroy_dbg(instance, messenger, nullptr);
         destroy_inst(instance, nullptr);
-        return 0;
+        return 77;  // ctest skips
     }
 
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
