@@ -25,6 +25,7 @@ import os
 import re
 import statistics
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 
@@ -465,7 +466,52 @@ def file_document(path: str) -> dict:
     }
 
 
+def _make_parent(path: str) -> None:
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
+def _path_key(path):
+    path = os.path.normcase(os.path.realpath(path))
+    if _case_insensitive_volume(path):
+        # APFS and HFS+ also treat composed and decomposed accents as one name.
+        path = unicodedata.normalize("NFD", path.casefold())
+    return path
+
+
+def same_report_path(first: str, second: str) -> bool:
+    if _path_key(first) == _path_key(second):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def write_csv(path: str, rows: list) -> None:
+    _make_parent(path)
     fields = ["source", "offset_hex", "bytes", "chunks", "root", "category", "header", "complete",
               "well_formed", "fragment", "tail_only", "truncated", "malformed", "element_count",
               "max_depth", "comments", "attributes", "refs", "platform", "platform_total", "filename",
@@ -548,6 +594,18 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="validate well-formedness and report fragments")
     args = parser.parse_args()
 
+    if args.csv and args.json and same_report_path(args.csv, args.json):
+        parser.error("--csv and --json must use different paths")
+    for flag, path in (("--csv", args.csv), ("--json", args.json)):
+        if not path:
+            continue
+        if os.path.isdir(path):
+            parser.error(f"{flag} is a directory: {path}")
+        for target in args.targets:
+            source = os.path.join(target, "index.json") if os.path.isdir(target) else target
+            if same_report_path(path, source):
+                parser.error(f"{flag} would overwrite the input {source}")
+
     rows = []
     mode = document_mode(args.targets)
     try:
@@ -576,6 +634,7 @@ def main() -> int:
         print("wrote", args.csv)
     if args.json:
         public_rows = [{key: value for key, value in row.items() if key != "_scan"} for row in rows]
+        _make_parent(args.json)
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"summary": summary, "roots": agg["roots"], "rows": public_rows}, f, indent=1)
         print("wrote", args.json)
@@ -583,4 +642,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

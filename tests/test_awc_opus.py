@@ -272,7 +272,7 @@ class ExportBankTest(unittest.TestCase):
         bank = build_bank([
             (1, format_block(100, 22050, 0x00, 2), pcm16),
             (2, format_block(50, 48000, 0x02, 1), floats),
-            (3, format_block(2880, 48000, 0x0B, 2), bytes(opus)),
+            (3, format_block(1920, 48000, 0x0B, 1), bytes(opus)),
         ])
         path = os.path.join(self.tmp.name, "synthetic.awc")
         with open(path, "wb") as f:
@@ -331,6 +331,8 @@ class ExportBankTest(unittest.TestCase):
             ([bank, out_file], "is a file, not a folder"),
             ([bank, self.out, "--jobs", "0"], "--jobs must be at least 1"),
             ([bank, self.out, "--jobs", "-2"], "--jobs must be at least 1"),
+            ([bank, self.out, "--pre-skip", "-1"], "--pre-skip must be between 0 and 65535"),
+            ([bank, self.out, "--pre-skip", "65536"], "--pre-skip must be between 0 and 65535"),
         )
         for args, expected in cases:
             with self.subTest(args=args):
@@ -380,15 +382,101 @@ class ExportBankTest(unittest.TestCase):
             self.assertEqual(head["flags"] & 0x02, 0x02)       # beginning of stream
             self.assertEqual(head["body"][:8], b"OpusHead")
             version, channels, preskip, in_rate, gain, mapping = struct.unpack_from("<BBHIhB", head["body"], 8)
-            self.assertEqual((version, channels, preskip, in_rate, gain, mapping), (1, 2, 0, 48000, 0, 0))
+            self.assertEqual((version, channels, preskip, in_rate, gain, mapping), (1, 1, 312, 48000, 0, 0))
             tags = pages[1]
             self.assertEqual(tags["seq"], 1)
             self.assertEqual(tags["body"][:8], b"OpusTags")
             last = pages[-1]
             self.assertEqual(last["flags"] & 0x04, 0x04)       # end of stream
-            self.assertEqual(last["granule"], 960 + 1920)      # both packet TOCs, exact end trimming
+            self.assertEqual(last["granule"], 312 + 1920)      # pre-skip + declared real samples
             self.assertGreater(last["granule"], 0)
             self.assertEqual(last["serial"], 3)
+
+    def test_stereo_plain_stream_length_is_per_channel(self):
+        # A stereo format tag stores interleaved samples. Three 960-frame stereo packets carry
+        # 2880 frames per channel; the declared 3840 is twice the real per-channel length.
+        packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
+        opus = bytearray(3 * 2048)
+        for block in range(3):
+            struct.pack_into("<H", opus, block * 2048, len(packet))
+            opus[block * 2048 + 2:block * 2048 + 2 + len(packet)] = packet
+        bank = build_bank([(7, format_block(3840, 48000, 0x0B, 2), bytes(opus))])
+        path = os.path.join(self.tmp.name, "stereo.awc")
+        with open(path, "wb") as f:
+            f.write(bank)
+
+        awc.export_bank(path, self.out)
+        with open(os.path.join(self.out, "stereo", "00000007.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(pages[0]["body"][9], 2)
+        self.assertEqual(struct.unpack_from("<H", pages[0]["body"], 10)[0], 312)
+        self.assertEqual(pages[-1]["granule"], 312 + 1920)
+
+    def test_declared_samples_are_48khz_frames_not_scaled_by_rate(self):
+        # Four 960-frame packets are 3840 frames; the tag declares 2880 real frames and a 32 kHz
+        # source rate. Scaling by 48000/32000 would make the length 4320, so the last granule
+        # would stay at 312 + 3840 and the padding would not be trimmed.
+        packet = bytes([0x08])          # SILK 20 ms, code 0: 960 frames
+        opus = bytearray(4 * 2048)
+        for block in range(4):
+            struct.pack_into("<H", opus, block * 2048, len(packet))
+            opus[block * 2048 + 2:block * 2048 + 2 + len(packet)] = packet
+        bank = build_bank([(9, format_block(2880, 32000, 0x0B, 1), bytes(opus))])
+        path = os.path.join(self.tmp.name, "rate32k.awc")
+        with open(path, "wb") as f:
+            f.write(bank)
+
+        awc.export_bank(path, self.out)
+        with open(os.path.join(self.out, "rate32k", "00000009.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(pages[-1]["granule"], 312 + 2880)
+
+    def test_format_block_per_channel_frame_count_is_used(self):
+        # +0x0C is the per-channel Opus frame count and wins over dividing the +0 count:
+        # 9999 interleaved samples / 2 would be 4999 frames and would not trim the padding.
+        packet = bytes([0x9C])          # CELT 20 ms, code 0, stereo bit: 960 frames per channel
+        opus = bytearray(3 * 2048)
+        for block in range(3):
+            struct.pack_into("<H", opus, block * 2048, len(packet))
+            opus[block * 2048 + 2:block * 2048 + 2 + len(packet)] = packet
+        fmt = bytearray(format_block(9999, 48000, 0x0B, 2))
+        struct.pack_into("<I", fmt, 12, 1920)
+        bank = build_bank([(11, bytes(fmt), bytes(opus))])
+        path = os.path.join(self.tmp.name, "frames.awc")
+        with open(path, "wb") as f:
+            f.write(bank)
+
+        awc.export_bank(path, self.out)
+        with open(os.path.join(self.out, "frames", "0000000B.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(pages[-1]["granule"], 312 + 1920)
+
+    def test_cli_pre_skip_override(self):
+        bank, _, _ = self.make_bank()
+        subprocess.run([sys.executable, "-I", awc.__file__, bank, self.out, "--jobs", "1", "--pre-skip", "0"],
+                       check=True, capture_output=True)
+        with open(os.path.join(self.out, "synthetic", "00000003.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        self.assertEqual(struct.unpack_from("<H", pages[0]["body"], 10)[0], 0)
+        self.assertEqual(pages[-1]["granule"], 1920)
+
+
+class DuplicateIdTest(unittest.TestCase):
+    """Two streams in one bank can share a 29-bit id; the second used to overwrite the first's file."""
+
+    def test_streams_with_the_same_id_both_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "dup.awc")
+            fmt = format_block(2, 48000, 0x00, 1)
+            with open(path, "wb") as f:
+                f.write(build_bank([(0x123, fmt, struct.pack("<hh", 1, 2)),
+                                    (0x123, fmt, struct.pack("<hh", 3, 4))]))
+            counts = awc.export_bank(path, os.path.join(tmp, "out"))
+            od = os.path.join(tmp, "out", "dup")
+            self.assertEqual(counts["pcm"], 2)
+            self.assertEqual(sorted(os.listdir(od)), ["00000123.wav", "00000123~2.wav"])
+            self.assertNotEqual(read_wav(os.path.join(od, "00000123.wav")),
+                                read_wav(os.path.join(od, "00000123~2.wav")))
 
 
 class StreamedMusicTest(unittest.TestCase):
@@ -405,16 +493,16 @@ class StreamedMusicTest(unittest.TestCase):
         return counts, os.path.join(self.out, "streamed")
 
     def test_stereo_packets_export_one_stereo_ogg(self):
-        counts, od = self.export([[0xFC]], 1920)              # 2 x 960 interleaved samples
+        counts, od = self.export([[0xFC], [0xFC]], 1920)      # 2 x 960 interleaved samples
         self.assertEqual(counts, {"opus": 0, "pcm": 0, "other": 0, "music": 1})
         with open(os.path.join(od, "00000100.ogg"), "rb") as f:
             pages = parse_ogg_pages(f.read())
         version, channels, preskip, in_rate, gain, mapping = struct.unpack_from("<BBHIhB", pages[0]["body"], 8)
-        self.assertEqual((version, channels, preskip, in_rate, gain, mapping), (1, 2, 0, 48000, 0, 0))
-        self.assertEqual(pages[-1]["granule"], 960)
+        self.assertEqual((version, channels, preskip, in_rate, gain, mapping), (1, 2, 312, 48000, 0, 0))
+        self.assertEqual(pages[-1]["granule"], 312 + 960)
 
     def test_two_mono_groups_export_two_mono_oggs(self):
-        counts, od = self.export([[0x78, 0x78]], 960)
+        counts, od = self.export([[0x78, 0x78], [0x78, 0x78]], 960)
         self.assertEqual(counts, {"opus": 0, "pcm": 0, "other": 0, "music": 2})
         for sid in ("00000100", "00000101"):
             with self.subTest(sid=sid):
@@ -422,28 +510,28 @@ class StreamedMusicTest(unittest.TestCase):
                     pages = parse_ogg_pages(f.read())
                 channels = pages[0]["body"][9]
                 self.assertEqual(channels, 1)
-                self.assertEqual(pages[-1]["granule"], 960)
+                self.assertEqual(pages[-1]["granule"], 312 + 960)
 
     def test_two_stereo_groups_export_two_stereo_oggs(self):
-        counts, od = self.export([[0xFC, 0xFC]], 1920)
+        counts, od = self.export([[0xFC, 0xFC], [0xFC, 0xFC]], 1920)
         self.assertEqual(counts, {"opus": 0, "pcm": 0, "other": 0, "music": 2})
         for sid in ("00000100", "00000101"):
             with self.subTest(sid=sid):
                 with open(os.path.join(od, sid + ".ogg"), "rb") as f:
                     pages = parse_ogg_pages(f.read())
                 self.assertEqual(pages[0]["body"][9], 2)
-                self.assertEqual(pages[-1]["granule"], 960)
+                self.assertEqual(pages[-1]["granule"], 312 + 960)
 
     def test_channel_count_includes_later_blocks(self):
         for tocs in ((0xF8, 0xFC), (0xFC, 0xF8)):
             with self.subTest(tocs=tocs):
                 blocks = [[toc] for toc in tocs]
-                declared_frames = 1800
+                declared_frames = 1600
                 _, od = self.export(blocks, 2 * declared_frames)
                 with open(os.path.join(od, "00000100.ogg"), "rb") as f:
                     pages = parse_ogg_pages(f.read())
                 self.assertEqual(pages[0]["body"][9], 2)
-                self.assertEqual(pages[-1]["granule"], declared_frames)
+                self.assertEqual(pages[-1]["granule"], 312 + declared_frames)
                 self.assertEqual(pages[-1]["body"], bytes(tocs))
 
                 bank = build_music_bank(blocks, 2 * declared_frames)
@@ -543,6 +631,8 @@ class MalformedMusicGeometryTest(unittest.TestCase):
         od = os.path.join(self.out, "streamed")
         with open(os.path.join(od, "00000100.ogg"), "rb") as f:
             pages = parse_ogg_pages(f.read())
+        # One 20 ms packet is 960 decoded samples; the declared 960 leaves no room for the
+        # 312-sample pre-skip, so the final granule is the packet total.
         self.assertEqual(pages[-1]["granule"], 960)
         self.assertEqual(pages[-1]["body"], bytes([0x78]))
         self.assertTrue(os.path.isfile(os.path.join(od, "00000021.wav")))

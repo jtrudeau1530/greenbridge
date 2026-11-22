@@ -1127,5 +1127,28 @@ def encode_bc7_mode6_blocks(blocks, *, first_ep_history=None):
     return encode_lanes(lanes, 7)
 
 
+class UnknownBlockCountTest(unittest.TestCase):
+    """The provisional gate counts undetermined blocks. A BC6H or BC7 block whose endpoint and index both come
+    from unknown history entries is one block, not two."""
+
+    def test_a_block_with_both_roots_unknown_counts_once(self):
+        self.assertEqual(bcpack._unknown_blocks([255, 255, 7, -1], [255, 3, 255, -1], {255}, {255}), 3)
+        self.assertEqual(bcpack._unknown_blocks([-1, -1], [-1, -1], {255}, {255}), 0)
+
+    def test_bc7_gate_reports_distinct_blocks(self):
+        n = 4
+        lanes = [[] for _ in range(16)]
+        for i in range(n):
+            di = i + 1   # both lanes reach back past block 0: endpoint and index history entry 256 + i - di = 255
+            lanes[0].extend(_deint4(_zig(0)))
+            lanes[1].extend(_deint4(di))
+            for ln in range(2, 16):
+                lanes[ln].extend([0, 0])
+        from unittest import mock
+        with mock.patch.object(bcpack, "_bc7_check", return_value=[("endpoint", 255), ("index", 255)]):
+            with self.assertRaisesRegex(bcpack.BcpackProvisionalError, f" {n}/{n} blocks"):
+                bcpack._bc7_blocks(lanes, n, set())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
+#include "vk_shader_fma.h"
 #include "../src/vulkan_bindless.h"
 
 #include <array>
@@ -241,9 +242,14 @@ int main(int argc, char** argv) {
     qci.queueFamilyIndex = qi;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
+    leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
+    fma.query(gipa, inst, pd);
+    fma.link_after(&enable);
+    const char* fma_extension = fma.extension();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    if (fma.supported()) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &fma_extension; }
     VkDevice dev = VK_NULL_HANDLE;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LD(n) const auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(dev, #n))

@@ -218,7 +218,7 @@ int main() {
     const std::string movie_arg = env("LEONIDA_MOVIE_AUDIO");
     if (game_dir_arg.empty() || movie_arg.empty()) {
         std::printf("SKIP (no package/audio movie)\n");
-        return 0;
+        return 77;
     }
 
     const std::filesystem::path game_dir = game_dir_arg;

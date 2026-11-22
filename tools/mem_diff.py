@@ -15,13 +15,16 @@ Addressing modelled (AMD RDNA2 ISA, buffer resource descriptor and MUBUF/SMEM ad
   * s_buffer_load = V# base + soffset + imm.
 
 Every generated access lies inside its buffer (index < num_records for structured buffers, the whole access
-below num_records for raw ones), is dword aligned, and uses a word3 with no format (only OOB_SELECT: STRUCTURED with a stride, RAW without): out-of-bounds behaviour, the
+below num_records for raw ones) and is dword aligned. Untyped buffer accesses use a word3 with only OOB_SELECT
+(STRUCTURED with a stride, RAW without). Out-of-bounds behaviour, the
 s_buffer_load alignment truncation and swizzling depend on descriptor fields docs/design.md lists as not modelled,
 so they are left to a GPU-confirmed follow-up instead of being guessed here.
 
 Typed buffer loads (buffer_load_format_*, tbuffer_load_format_*) are decoded from the GFX10 format names in
-tools/gfx10_formats.json, not from the translator's table. Missing channels repeat (*c* mod *n*), UNORM/SNORM
-use correctly rounded division, and DST_SEL 1 is integer 1 for UINT/SINT (SHADER-86, RX 6700).
+tools/gfx10_formats.json, not from the translator's table. MUBUF applies DST_SEL and repeats missing channels
+(*c* mod *n*). MTBUF uses instruction-format channels in order, zero-fills absent channels and returns zero
+for an INVALID V# format. UNORM/SNORM use correctly rounded division, and MUBUF DST_SEL 1 is integer 1
+for UINT/SINT (SHADER-86, RX 6700).
 
 Usage:
     python -I tools/mem_diff.py [--programs N] [--seed S] [--max-ops N]
@@ -244,10 +247,16 @@ class RefMachine:
                 offset += self.v.get(regs.pop(0), 0)
             addr = base + (offset & MASK32)
             fm = next((m for m in mods if m.startswith("format:")), None)
-            if op.startswith("tbuffer"):
+            tbuffer = op.startswith("tbuffer")
+            descriptor_format = (d3 >> 12) & 0x7F
+            if tbuffer:
+                if descriptor_format == 0:
+                    for c in range(ncomp):
+                        self.v[vdata + c] = 0
+                    return
                 name = "GFX10_FORMAT_" + fm.split("BUF_FMT_")[-1].rstrip("]")
             else:
-                name = FORMAT_NAMES[(d3 >> 12) & 0x7F]
+                name = FORMAT_NAMES[descriptor_format]
             widths, kind = parse_format(name)
             nbytes = sum(widths) // 8
             raw = 0
@@ -255,6 +264,10 @@ class RefMachine:
                 a = addr + i
                 raw |= ((self.word(a & ~3) >> (8 * (a & 3))) & 0xFF) << (8 * i)
             comps = decode_element(raw, widths, kind)
+            if tbuffer:
+                for c in range(ncomp):
+                    self.v[vdata + c] = comps[c] if c < len(widths) else 0
+                return
             one = 1 if kind in ("UINT", "SINT") else ONE_F32
             for c in range(ncomp):
                 sel = (d3 >> (3 * c)) & 7
@@ -547,7 +560,7 @@ def gen_buffer_format(rng, prog):
     if tbuffer:
         fname = rng.choice(TBUFFER_FORMATS)
         widths, kind = parse_format("GFX10_FORMAT_" + fname)
-        word3 = XYZW                                   # tbuffer: format in the instruction, identity swizzle
+        word3 = (20 << 12) | XYZW                      # Bound 32_UINT V#; the instruction selects the format.
     else:
         code = rng.choice(_typed_codes())
         widths, kind = parse_format(FORMAT_NAMES[code])
@@ -737,4 +750,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -225,6 +225,58 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["files"], len(PAYLOADS))
         self.assertEqual(len(doc["files"]), len(PAYLOADS))
 
+    def test_csv_partial_staged_write_keeps_prior_bytes_and_cleans_up(self):
+        out = os.path.join(self.root, "out.csv")
+        with open(out, "w", encoding="utf-8", newline="") as f:
+            f.write("prior,bytes\r\n")
+        with open(out, "rb") as f:
+            prior = f.read()
+        rows = [{"offset": 0x100, "stored": 8, "size": 9, "signature": "psin",
+                 "version": None, "count": 1, "detail": ""},
+                {"offset": 0x200, "stored": 8, "size": 9, "signature": "text",
+                 "version": None, "count": None, "detail": "printable text"}]
+        real_csv_writer = csv.writer  # captured before story_index.csv (the csv module) is patched
+
+        class _FailingWriter:
+            """A csv writer that fails once the header and first row have hit the staged file."""
+
+            def __init__(self, fileobj):
+                self._w = real_csv_writer(fileobj)
+                self._n = 0
+
+            def writerow(self, row):
+                self._w.writerow(row)
+                self._n += 1
+                if self._n == 2:
+                    raise OSError("disk full")
+
+        before = sorted(os.listdir(self.root))
+        with self.assertRaises(OSError):
+            with mock.patch.object(story_index.csv, "writer", side_effect=_FailingWriter):
+                story_index.write_output(out, rows, {"files": 2})
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), prior)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def test_json_partial_staged_write_keeps_prior_bytes_and_cleans_up(self):
+        out = os.path.join(self.root, "out.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('{"prior": true}')
+        with open(out, "rb") as f:
+            prior = f.read()
+
+        def failing_dump(obj, f, **kwargs):
+            f.write('{"partial": ')
+            raise OSError("disk full")
+
+        before = sorted(os.listdir(self.root))
+        with self.assertRaises(OSError):
+            with mock.patch.object(story_index.json, "dump", side_effect=failing_dump):
+                story_index.write_output(out, [], {"files": 0})
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), prior)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
@@ -333,6 +385,70 @@ class ArchiveTest(unittest.TestCase):
             self.assertIn("single archive", p.stderr)
             self.assertEqual(p.stdout, "")
             self.assertFalse(os.path.exists(out))
+
+    def test_output_cannot_overwrite_source_archive(self):
+        with open(self.rpf, "rb") as f:
+            rpf_data = f.read()
+        arc = os.path.join(self.root, "archive.json")
+        with open(arc, "wb") as f:
+            f.write(rpf_data)
+
+        # Same path
+        p = subprocess.run([sys.executable, "-I", TOOL, arc, arc, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output must not overwrite the source", p.stderr)
+        with open(arc, "rb") as f:
+            self.assertEqual(f.read(), rpf_data)
+
+        # Hard-link alias
+        if hasattr(os, "link"):
+            alias = os.path.join(self.root, "alias.json")
+            try:
+                os.link(arc, alias)
+            except OSError:
+                alias = None
+            if alias:
+                p2 = subprocess.run([sys.executable, "-I", TOOL, arc, alias, "--quiet"],
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p2.returncode, 2)
+                self.assertIn("output must not overwrite the source", p2.stderr)
+                with open(arc, "rb") as f:
+                    self.assertEqual(f.read(), rpf_data)
+
+    def test_output_cannot_overwrite_carve_manifest(self):
+        folder = os.path.join(self.root, "carved_manifest")
+        os.makedirs(folder)
+        manifest = os.path.join(folder, "index.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            f.write('{"carve_manifest": true}')
+        with open(os.path.join(folder, "00000001.bin"), "wb") as f:
+            f.write(psin())
+
+        p = subprocess.run([sys.executable, "-I", TOOL, folder, manifest, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output would overwrite the carve manifest", p.stderr)
+        with open(manifest, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_output_cannot_overwrite_carved_input(self):
+        if not hasattr(os, "link"):
+            return
+        folder = os.path.join(self.root, "carved_linked")
+        os.makedirs(folder)
+        bin_path = os.path.join(folder, "00000001.bin")
+        with open(bin_path, "wb") as f:
+            f.write(psin())
+        linked_json = os.path.join(folder, "linked.json")
+        try:
+            os.link(bin_path, linked_json)
+        except OSError:
+            return
+        p = subprocess.run([sys.executable, "-I", TOOL, folder, linked_json, "--quiet"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("output would overwrite an input file", p.stderr)
 
 
 if __name__ == "__main__":

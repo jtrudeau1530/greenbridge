@@ -25,8 +25,13 @@ import re
 import stat
 import struct
 import sys
+import tempfile
 import time
 import zlib
+
+# -I keeps the script directory off sys.path; add it back so file_mode's helpers are importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -279,18 +284,32 @@ def summarise(rows, span, zero, unread):
 
 
 def write_output(path, rows, summary):
-    """Write CSV or JSON from the file extension."""
+    """Write CSV or JSON by staging it next to `path`, then atomically replacing `path` once closed.
+
+    The stage lives in a private TemporaryDirectory under the destination's parent, so os.replace
+    only ever renames within one filesystem. A late failure closes the stage and leaves any prior
+    report byte-for-byte intact. The destination is resolved first, so a report path that is a
+    symlink is published through to its target the way open(..., "w") did before.
+    """
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".json":
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"summary": summary, "files": rows}, f, indent=1)
-        return
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(COLUMNS)
-        for r in rows:
-            w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])
-                        for i, c in enumerate(COLUMNS)])
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest)
+    with tempfile.TemporaryDirectory(dir=parent) as staging:
+        staged = os.path.join(staging, "story_index" + ext)
+        if ext == ".json":
+            with open(staged, "w", encoding="utf-8") as f:
+                json.dump({"summary": summary, "files": rows}, f, indent=1)
+        else:
+            with open(staged, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(COLUMNS)
+                for r in rows:
+                    w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])
+                                for i, c in enumerate(COLUMNS)])
+        # os.replace hands the destination the staged file's bits; give them the destination's mode
+        # (an existing report's, or what open() would have made for a new file) so perms are stable.
+        os.chmod(staged, published_mode(dest))
+        os.replace(staged, dest)
 
 
 def byte_count(text):
@@ -315,20 +334,42 @@ def offset(text):
     return value
 
 
-def main():
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
     ap.add_argument("out", help="output path ending in .csv or .json")
     ap.add_argument("--start", type=offset, help="first byte to scan (default: the RPF data start)")
     ap.add_argument("--limit", type=byte_count, help="number of bytes to scan")
     ap.add_argument("--quiet", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(a.out):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     if os.path.splitext(a.out)[1].lower() not in (".json", ".csv"):
         ap.error("output must end in .json or .csv")
+    if same_output_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
+    if os.path.isdir(a.source):
+        manifest = os.path.join(a.source, "index.json")
+        if os.path.isfile(manifest) and same_output_path(manifest, a.out):
+            ap.error(f"output would overwrite the carve manifest: {a.out}")
+        if os.path.isfile(a.out):
+            for name in os.listdir(a.source):
+                inp = os.path.join(a.source, name)
+                if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
+                    if same_output_path(inp, a.out):
+                        ap.error(f"output would overwrite an input file: {a.out}")
     folder = os.path.dirname(os.path.abspath(a.out))
     if not os.path.isdir(folder):
         ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
@@ -360,4 +401,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

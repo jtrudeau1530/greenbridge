@@ -19,6 +19,10 @@ VKC_DUMP, and every word every thread stores is compared. docs/shader_validation
 Exit code: 0 when every program that ran matches (or differs only in a program with a hypothesis op), 1 on a
 mismatch or an untranslated program, 2 when the only failures are harness errors: vk_compute_test timed out or
 gave no dump for a program. Such a program is listed with the others (and kept with --keep) and the run goes on.
+A missing vk_compute_test for the translator oracle is one line and exit 1, before any program is generated.
+A wave32 program is skipped where vk_compute_test can't pin 32-lane subgroups ("compute subgroup size: 32 not
+available", e.g. Mesa llvmpipe at 8 lanes), and a run where every program was skipped exits 2. Wave64 programs
+translated with --wave64-emulate use no subgroup operations, so they are compared at any subgroup size.
 
 Needs LLVM_MC (llvm-mc with AMDGPU, as for the shaders stage), the Vulkan SDK and a built vk_compute_test
 (cmake --build runtime/build --target vk_compute_test). No game files.
@@ -793,6 +797,12 @@ class HarnessError(RuntimeError):
     """vk_compute_test did not give a result for one program: it hung, crashed or wrote no dump."""
 
 
+class Unpinned(RuntimeError):
+    """vk_compute_test ran a wave32 program but couldn't pin the 32-lane subgroups it needs, so its words came from
+    another wave size (Mesa llvmpipe: 8 lanes) and are no evidence either way: the program is skipped. Programs
+    translated with --wave64-emulate use no subgroup operations, so they are judged at any size."""
+
+
 GPU_TIMEOUT = 60    # seconds for one program; a translated program that never ends shows up as this
 
 
@@ -805,6 +815,11 @@ def run_gpu(exe, spv, prog, work, emulate):
         r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=GPU_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s") from None
+    import compute_fixture
+    lanes = compute_fixture.unpinned_subgroup(r.stdout + r.stderr) if prog.wave == 32 else None
+    if lanes:
+        raise Unpinned(f"the device can't run it at {lanes} lanes (vk_compute_test: compute subgroup size: {lanes} "
+                       "not available)")
     if not os.path.exists(dump):
         detail = " ".join(f"{r.stdout}{r.stderr}".split())
         raise HarnessError(f"vk_compute_test gave no dump (exit {r.returncode}){': ' + detail if detail else ''}")
@@ -861,7 +876,7 @@ def still_fails(prog, ops, mode, ctx):
             return False
         try:
             bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate"), ops)
-        except HarnessError:
+        except (HarnessError, Unpinned):
             return False                # a reduction that hangs or crashes is not the mismatch being reduced
         return bool(bad) and not hyp
 
@@ -886,11 +901,21 @@ def parse_modes(text):
     return modes
 
 
+def _at_least_one(text):
+    """--programs and --ops: a count below 1 ran nothing (or a program of no ops) and still printed a summary, which
+    reads as a clean pass. Refuse it as a usage error instead, as the other fuzzers do."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1 (got {value})")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--programs", type=int, default=100)
+    ap.add_argument("--programs", type=_at_least_one, default=100,
+                    help="programs per wave (at least 1; default 100)")
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--ops", type=int, default=24, help="ops per program")
+    ap.add_argument("--ops", type=_at_least_one, default=24, help="ops per program (at least 1; default 24)")
     ap.add_argument("--wave", choices=("32", "64", "both"), default="both")
     ap.add_argument("--modes", type=parse_modes, default="native,emulate",
                     help="native, emulate (wave64 only), or both (the default)")
@@ -930,6 +955,18 @@ def main():
     backends = tuple(dict.fromkeys(t.strip() for t in args.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
+    if args.wave == "32" and "emulate" in args.modes:
+        # emulate runs a wave64 program as two 32-lane halves, so a wave32-only selection has nothing to run: the run
+        # used to end after a bare `summary:` with exit 0, the same false pass #1452 fixed for a count below 1.
+        ap.error("--modes emulate needs wave64 programs: with --wave 32 nothing runs (use --wave 64 or both)")
+    if args.wave == "64" and "native" in args.modes and not args.w64_native:
+        # A wave64 program only runs natively when --w64-native asks for the documented cross-half approximation, so
+        # this combination was empty in the same silent way.
+        ap.error("--wave 64 --modes native runs nothing without --w64-native; pass it to run the documented "
+                 "cross-half approximation, or use --modes emulate")
+    if "translator" in backends and not os.path.isfile(args.exe):   # before any program is generated or run
+        sys.exit(f"vk_compute_test not found at {args.exe} or in its RelWithDebInfo/Release folder; build it first "
+                 "(cmake --build <build dir> --target vk_compute_test) or give its path with --exe")
     oracle = None
     if "hw" in backends:
         from hw_oracle import runner
@@ -994,7 +1031,12 @@ def main():
         print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))
     if any(st["mismatch"] or st["rejected"] for st in stats.values()):
         return 1
-    return 2 if any(st.get("harness_errors") for st in stats.values()) else 0
+    if any(st.get("harness_errors") for st in stats.values()):
+        return 2
+    if stats and not any(st["match"] or st["hyp_only"] for st in stats.values()):
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 def kept_source(prog, mode, ops, guard):
@@ -1085,7 +1127,7 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
                     continue
                 key = f"wave{p.wave} {mode}"
                 st = stats.setdefault(key, {"programs": 0, "match": 0, "mismatch": 0, "hyp_only": 0,
-                                            "rejected": 0, "harness_errors": 0})
+                                            "rejected": 0, "harness_errors": 0, "skipped": 0})
                 st["programs"] += 1
                 spv = os.path.join(spdir, p.name + ".spv")
                 if not os.path.exists(spv):
@@ -1099,6 +1141,10 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
                     # lose every result before it. It is reported like the other failures and the run goes on.
                     st["harness_errors"] += 1
                     fails.append((p, mode, f"harness error: {e}", None))
+                    continue
+                except Unpinned as e:
+                    st["skipped"] += 1
+                    print(f"SKIP {p.name} [{mode}]: {e}")
                     continue
                 if not bad:
                     st["match"] += 1
@@ -1141,4 +1187,8 @@ def self_test():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

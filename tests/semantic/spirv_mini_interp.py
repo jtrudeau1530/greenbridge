@@ -680,6 +680,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             for i in a[2:]:
                 v = v[int(i)]
             values[res] = v
+        elif op == "OpVectorExtractDynamic":
+            # SPIR-V: an Index outside the vector's component count gives an undefined value
+            v, i = val(a[1]), val(a[2])
+            if not isinstance(i, int) or not 0 <= i < len(v):
+                raise UnsupportedConstruct(f"OpVectorExtractDynamic index {i!r} outside the vector")
+            values[res] = v[i]
         elif op == "OpCompositeConstruct":
             values[res] = tuple(val(x) for x in a[1:])
         elif op == "OpBitwiseAnd":
@@ -830,6 +836,13 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = fn(x, y)
             else:
                 raise UnsupportedConstruct(f"{op} on non-float")
+        elif op == "OpFmaKHR":
+            # SPV_KHR_fma: x * y + z correctly rounded, the same exact single rounding as GLSL Fma above (fma_f32)
+            x, y, z = (val(t) for t in a[1:4])
+            if isinstance(x, tuple):
+                values[res] = tuple(fma_f32(p, q, s) for p, q, s in zip(x, y, z))
+            else:
+                values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
         elif op == "OpFDiv":
@@ -923,6 +936,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
                 values[res] = f32(abs(args[0]))
+            elif name == "FSign":
+                # GLSL.std.450: 1.0 if x > 0, 0.0 if x = 0 (keeping the zero's sign), -1.0 if x < 0
+                x = args[0]
+                if math.isnan(x):
+                    raise UnsupportedConstruct("GLSL.std.450 FSign of a NaN (result not specified)")
+                values[res] = 1.0 if x > 0 else -1.0 if x < 0 else x
             elif name == "SAbs":
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
                 values[res] = abs(_s32(args[0])) & MASK

@@ -309,6 +309,11 @@ def main() -> int:
             print(f"ERROR: {path} does not exist", file=sys.stderr)
             status = 1
             continue
+        if not os.path.isfile(path):
+            # A folder passed for an archive used to reach open() and end the whole run with PermissionError.
+            print(f"ERROR: {path} is not a file", file=sys.stderr)
+            status = 1
+            continue
         print(f"Processing {path}...")
         stats = process_archive(path, limit=args.limit)
         all_stats.append(stats)
@@ -345,4 +350,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

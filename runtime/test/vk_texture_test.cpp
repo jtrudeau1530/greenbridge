@@ -22,6 +22,7 @@
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
+#include "vk_shader_fma.h"
 
 #include <algorithm>
 #include <cmath>
@@ -110,8 +111,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
         return 2;
     }
-    uint32_t tsharp[8] = {0x11111111, 0x22222222, 0x33333333, 0x44444444,
-                          0x55555555, 0x66666666, 0x77777777, 0x88888888};   // any 8 dwords; only the key matters
+    // Word 1 also selects the numeric type when the shader fetches through this key.
+    const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x44444444,
+                          0x55555555, 0x66666666, 0x77777777, 0x88888888};
     const uint32_t tsharp_va = 256;
 
     gipa = load_vulkan();
@@ -184,6 +187,9 @@ int main(int argc, char** argv) {
         return 77;
     }
     std::vector<const char*> enable;
+    leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
+    fma.query(gipa, inst, pd);
+    if (fma.supported()) { enable.push_back(fma.extension()); fma.link_after(&f2); }
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
     // Older Vulkan headers (as on some CI images) do not declare maintenance8; the test is then unsupported.
@@ -310,7 +316,7 @@ int main(int argc, char** argv) {
             for (uint32_t l = 0; l < CUBE_LAYERS; l++)
                 cubes[(l * TW + y) * TW + x] = (x * 32u) | ((y * 32u) << 8) | ((l * 20u) << 16) | (255u << 24);
         }
-    const VkFormat tfmt[4] = {VK_FORMAT_R8G8B8A8_UNORM, dref ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM,
+    const VkFormat tfmt[4] = {VK_FORMAT_R8G8B8A8_UNORM, sampled_format,
                               VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
     VkImage timg[4]; VkImageView tview[4];
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
@@ -367,6 +373,9 @@ int main(int argc, char** argv) {
     VkSubpassDescription sd{}; sd.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sd.colorAttachmentCount = 1; sd.pColorAttachments = &ar;
     VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpi.attachmentCount = 1; rpi.pAttachments = &ad; rpi.subpassCount = 1; rpi.pSubpasses = &sd;
+    VkSubpassDependency copy_dep{0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    rpi.dependencyCount = 1; rpi.pDependencies = &copy_dep;
     VkRenderPass rp; CHECK(vkCreateRenderPass(dev, &rpi, nullptr, &rp));
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbi.renderPass = rp; fbi.attachmentCount = 1; fbi.pAttachments = &rtv; fbi.width = W; fbi.height = H; fbi.layers = 1;

@@ -373,14 +373,32 @@ def tally(rows):
 def files_of(path):
     if os.path.isfile(path):
         return [path]
-    return [os.path.join(path, n) for n in sorted(os.listdir(path)) if n.endswith(".dxbc")]
+    out = []
+    for n in sorted(os.listdir(path)):
+        if not n.endswith(".dxbc"):
+            continue
+        candidate = os.path.join(path, n)
+        if os.path.isfile(candidate):
+            out.append(candidate)
+    return out
+
+
+def _at_least_one(value):
+    """An integer option that must be at least 1: 0 and negatives used to export one shader."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1 (got {n})")
+    return n
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Decode PS interpolation modes (PSV0 + FSSM + disasm).")
     ap.add_argument("path", help="a .dxbc file or a directory of them")
     ap.add_argument("--json", action="store_true", help="print one JSON document")
-    ap.add_argument("--limit", type=int, default=None, help="stop after this many pixel shaders")
+    ap.add_argument("--limit", type=_at_least_one, default=None, help="stop after this many pixel shaders")
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.path):
@@ -432,4 +450,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

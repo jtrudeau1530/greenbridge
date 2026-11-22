@@ -35,6 +35,7 @@ import stat
 import struct
 import sys
 import tempfile
+import unicodedata
 import zlib
 from contextlib import contextmanager
 
@@ -400,13 +401,33 @@ def _directory_files(path):
             yield os.path.join(root, name)
 
 
+def _carve_successors(folder):
+    """{file: next file} for streams that were contiguous in the archive, from rpf9_carve.py's index.json in
+    `folder` (each file is <offset>.bin; the next stream starts at the 16-byte boundary after `stored`). Empty
+    when there is no readable index, so files are then parsed one by one."""
+    try:
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
+            entries = json.load(f).get("files", [])
+        by_off = {int(e["off"]): int(e["stored"]) for e in entries}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}
+    return {f"{off:012x}.bin": f"{(off + stored + 15) & ~15:012x}.bin"
+            for off, stored in by_off.items() if (off + stored + 15) & ~15 in by_off}
+
+
 def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None):
     """Scan an RPF9 archive, or every carved file in a directory."""
     if directory_files is not None or os.path.isdir(path):
         rows, stats = [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
         if directory_files is None:
             directory_files = _directory_files(path)
+        directory_files = list(directory_files)
+        listed = set(directory_files)
+        successors = {}   # folder -> _carve_successors(folder)
+        consumed = set()
         for p in directory_files:
+            if p in consumed:
+                continue
             with open(p, "rb") as f:
                 head = f.read(4)
             if head == b"9FPR":
@@ -419,9 +440,32 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
                 continue
             with open(p, "rb") as f:
                 b = f.read(max_inflate + 1)
-            row = parse_resource(b, collect)
             stats["files"] += 1
             stats["scanned_bytes"] += len(b)
+            # As in scan_rpf: a 0DRPz resource that needs a continuation takes the next stream, when the
+            # carve's index.json shows that stream started right after this one.
+            root = os.path.dirname(p)
+            if root not in successors:
+                successors[root] = _carve_successors(root)
+            nxt = successors[root]
+            current = os.path.basename(p)
+            for _ in range(2):
+                if b[0x10:0x15] != b"0DRPz" or (parse_resource(b) is not None and not _needs_continuation(b)):
+                    break
+                follow = nxt.get(current)
+                q = os.path.join(root, follow) if follow is not None else None
+                if q is None or q not in listed:
+                    break
+                if len(b) + os.path.getsize(q) > max_inflate:
+                    break
+                with open(q, "rb") as f:
+                    more = f.read()
+                b += more
+                consumed.add(q)
+                stats["files"] += 1
+                stats["scanned_bytes"] += len(more)
+                current = follow
+            row = parse_resource(b, collect)   # collect once, on the joined resource
             if row is not None:
                 row["offset"] = 0
                 row["size"] = len(b)
@@ -530,6 +574,64 @@ def _file_identity(path):
     return stat.st_dev, stat.st_ino
 
 
+def _resolve_report_path(path):
+    if os.name != "nt":
+        return os.path.realpath(path)
+    if not path.startswith("\\\\?\\"):
+        # GetFullPathName normalizes ordinary Windows paths the same way opening them does.
+        return os.path.realpath(os.path.abspath(path))
+
+    # realpath can trim literal trailing dots and spaces from missing verbatim components.
+    # Resolve the existing ancestor and append the missing components as written.
+    missing = []
+    while not os.path.lexists(path):
+        parent, name = os.path.split(path)
+        if not name:
+            break
+        missing.append(name)
+        path = parent
+    return os.path.join(os.path.realpath(path), *reversed(missing))
+
+
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path):
+    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
+    os.path.normcase folds case only on Windows, so on macOS `out/R.json` and `out/r.json` would pass as two
+    reports and the second write would replace the first."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True  # the macOS default; folding can only refuse a pair, never overwrite one
+
+
+def _pending_path_key(path):
+    path = os.path.normcase(_resolve_report_path(path))
+    if os.name != "nt":
+        if _case_insensitive_volume(path):
+            # APFS and HFS+ also treat composed and decomposed accents as one name.
+            path = unicodedata.normalize("NFD", path.casefold())
+        return path
+
+    # Drive and UNC paths can also be spelled using the extended-length prefix.
+    extended_prefix = "\\\\?\\"
+    unc_prefix = extended_prefix + "unc\\"
+    if path.startswith(unc_prefix):
+        return "\\\\" + path[len(unc_prefix):]
+    drive, _ = os.path.splitdrive(path)
+    if drive.startswith(extended_prefix) and len(drive) == len(extended_prefix) + 2 and drive.endswith(":"):
+        return path[len(extended_prefix):]
+    return path
+
+
 def _check_report_paths(parser, reports, source, directory_files):
     existing, pending = {}, {}
     for flag, path in reports:
@@ -537,7 +639,7 @@ def _check_report_paths(parser, reports, source, directory_files):
             continue
         key = _file_identity(path)
         if key is None:
-            key = os.path.normcase(os.path.realpath(path))
+            key = _pending_path_key(path)
             destinations = pending
         else:
             destinations = existing
@@ -547,7 +649,7 @@ def _check_report_paths(parser, reports, source, directory_files):
 
     source_id = _file_identity(source)
     if source_id is None:
-        flag = pending.get(os.path.normcase(os.path.realpath(source)))
+        flag = pending.get(_pending_path_key(source))
     else:
         flag = existing.get(source_id)
     if flag:
@@ -565,8 +667,9 @@ def _staged_entity_report(path):
         yield None
         return
 
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    destination = os.path.realpath(path)
+    destination = _resolve_report_path(path)
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, exist_ok=True)
     try:
         mode = os.stat(destination).st_mode
     except FileNotFoundError:
@@ -574,13 +677,21 @@ def _staged_entity_report(path):
     if mode is not None and not stat.S_ISREG(mode):
         raise OSError(f"placement report destination is not a regular file: {path}")
 
-    with tempfile.TemporaryDirectory(dir=os.path.dirname(destination), prefix=".world-index-") as directory:
-        staged = os.path.join(directory, "entities.jsonl")
+    # mkdtemp may normalize the returned parent on Windows. Keep the spelling used to create it.
+    directory = os.path.join(parent, os.path.basename(tempfile.mkdtemp(dir=parent, prefix=".world-index-")))
+    staged = os.path.join(directory, "entities.jsonl")
+    try:
         with open(staged, "w", encoding="utf-8", newline="\n") as handle:
             yield EntityRows(handle)
         if mode is not None:
             os.chmod(staged, mode & 0o777)
         os.replace(staged, destination)
+    finally:
+        if os.path.exists(staged):
+            if os.name == "nt":
+                os.chmod(staged, stat.S_IWRITE)
+            os.unlink(staged)
+        os.rmdir(directory)
 
 
 def main(argv=None):
@@ -655,4 +766,8 @@ def _write_reports(a, rows, stats, agg):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

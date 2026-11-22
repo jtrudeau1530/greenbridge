@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import pathlib
 import random
 import struct
 import subprocess
@@ -228,6 +229,114 @@ class ArchiveTests(unittest.TestCase):
     def test_negative_limit_is_an_error(self):
         r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
+
+    @staticmethod
+    def _archive(folder):
+        path = os.path.join(folder, "fake.rpf")
+        data = b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(block())
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path, data
+
+    def test_json_over_an_input_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, data = self._archive(tmp)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", path], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(r.stdout, "")
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_over_an_archive_found_in_an_input_folder_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "pack")
+            os.mkdir(sub)
+            path, data = self._archive(sub)
+            r = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", path], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_that_is_a_directory_is_refused_before_the_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(r.stdout, "")
+
+    def test_json_in_a_missing_folder_is_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            out = os.path.join(tmp, "reports", "vertex", "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["blocks"], 1)
+
+    def test_json_that_cannot_be_written_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "w", encoding="utf-8") as fh:
+                fh.write("a file, not a folder")
+            out = os.path.join(blocker, "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("cannot write", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn('"blocks"', r.stdout)
+
+
+class Rpf9ValidationTests(unittest.TestCase):
+    """RPF9 archive header validation in iter_blocks (contract shared with rpf9_names.scan_archive)."""
+
+    @staticmethod
+    def _run(args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+
+    def test_invalid_headers_are_errors(self):
+        cases = [
+            ("empty", b""),
+            ("short header", b"RPF9"),
+            ("wrong magic", b"XRP9" + struct.pack("<I", 16) + b"\0" * 8),
+            ("data start before the header", b"RPF9" + struct.pack("<I", 0) + b"\0" * 8),
+            ("data start inside the header", b"RPF9" + struct.pack("<I", 4) + b"\0" * 8),
+            ("data start past the end", b"RPF9" + struct.pack("<I", 0x7FFFFFFF) + b"\0" * 8),
+        ]
+        for name, data in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = pathlib.Path(tmp)
+                    path = root / "bad.rpf"
+                    path.write_bytes(data)
+                    out = root / "out.json"
+                    out.write_text('{"sentinel": true}', encoding="utf-8")
+                    r = self._run([str(path), "--json", str(out)])
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertEqual(r.stdout, "")
+                    self.assertIn(path.name, r.stderr)
+                    self.assertIn("RPF9", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertEqual(out.read_text(encoding="utf-8"), '{"sentinel": true}')
+
+    def test_valid_header_only_and_reversed_magic(self):
+        cases = [
+            ("header only", b"RPF9" + struct.pack("<I", 8), 0),
+            ("reversed magic", b"9FPR" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(block()), 1),
+        ]
+        for name, data, streams in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = pathlib.Path(tmp) / "ok.rpf"
+                    path.write_bytes(data)
+                    r = self._run([str(path)])
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(json.loads(r.stdout)["streams"], streams)
 
 
 if __name__ == "__main__":

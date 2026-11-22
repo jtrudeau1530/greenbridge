@@ -770,6 +770,12 @@ def _count(text, op):
     return len(re.findall(rf"= {op} ", text))
 
 
+def _gather_address_bit_offsets(text: str) -> list[int]:
+    constants = {name: int(value) for name, value in re.findall(r"(%\w+) = OpConstant %uint (\d+)", text)}
+    fields = re.findall(r"OpBitFieldUExtract %uint %\w+ (%\w+) (%\w+)", text)
+    return [constants[offset] for offset, width in fields if constants[width] == 3]
+
+
 @pytest.mark.parametrize("mx", range(4))
 @pytest.mark.parametrize("my", range(4))
 def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
@@ -781,7 +787,7 @@ def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, ma
     assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
     assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
     assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
-    assert "OpBitFieldUExtract" not in text      # the mode is known at translation time
+    assert _gather_address_bit_offsets(text) == []      # the sampler modes are literals
 
 
 def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
@@ -824,7 +830,7 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     shader = make_shader(_gather_l(0x12, dynamic=True))
     text = shader.translate()
     shader.validate(text)
-    assert _count(text, "OpBitFieldUExtract") == 2          # CLAMP_X and CLAMP_Y
+    assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
     assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
 
 
@@ -1138,7 +1144,8 @@ def test_gather_d16_avoids_packhalf2x16(make_shader, suffix, last_addr):
     sh2.validate(asm2)
     assert "PackHalf2x16" not in asm2
     assert "OpBitwiseOr %uint" in asm2 and "OpSelect %uint" in asm2
-    assert asm2.count("OpImageFetch ") == (0 if suffix == "lz" else 4)
+    for ty in ("%v4float", "%v4uint_st", "%v4int_st"):
+        assert asm2.count(f"OpImageFetch {ty} ") == (0 if suffix == "lz" else 4)
 
 
 def _load_mini_interp():
@@ -1293,6 +1300,40 @@ def test_unnormalized_buffer_store_keeps_nan_bits(fmt, make_shader):
     assert memory[0x1000] == 0xFFC01000
 
 
+# GFX10 32-bit integer formats by component count: UINT code, SINT code (gfx10_formats.json).
+INT32_FORMATS = [(1, 20, 21), (2, 62, 63), (3, 72, 73), (4, 75, 76)]
+
+
+@pytest.mark.parametrize("n, uint_fmt, sint_fmt", INT32_FORMATS)
+def test_int32_buffer_formats_load_and_store_raw_bits(n, uint_fmt, sint_fmt, make_shader):
+    """SHADER-257: the 32-bit SINT typed-buffer formats (and 32_32_32_UINT) load and store each dword unchanged, as
+    their UINT twins do. Negative values and NaN-like patterns must survive both ways; a load's missing channels
+    repeat the format's own, as for every other format (SHADER-86)."""
+    si = _load_mini_interp()
+    words = [0xFFFFFFFF, 0x80000000, 0x7FC01000, 0x00000005][:n]
+    for fmt in (uint_fmt, sint_fmt):
+        desc = (f"s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, {4 * n}\n"
+                f"s_mov_b32 s3, {0x31000fac | fmt << 12:#x}\n")
+        load = desc + ("buffer_load_format_xyzw v[4:7], off, s[0:3], 0\ns_waitcnt vmcnt(0)\n"
+                       "exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n")
+        shader = make_shader(load, name=f"ps_int32_load_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: w for i, w in enumerate(words)}
+        out = si.run_fragment(spv, memory=memory)["%out_mrt0"]
+        assert list(out) == [words[c % n] for c in range(4)], fmt
+
+        setup = "".join(f"v_mov_b32 v{4 + i}, {w:#x}\n" for i, w in enumerate(words))
+        regs = "v4" if n == 1 else f"v[4:{3 + n}]"
+        store = desc + setup + f"buffer_store_format_{'xyzw'[:n]} {regs}, off, s[0:3], 0\ns_endpgm\n"
+        shader = make_shader(store, name=f"ps_int32_store_{fmt}")
+        spv = shader.translate()
+        shader.validate(spv)
+        memory = {0x1000 + 4 * i: 0xDEADBEEF for i in range(5)}
+        si.run_fragment(spv, memory=memory)
+        assert [memory[0x1000 + 4 * i] for i in range(5)] == words + [0xDEADBEEF] * (5 - n), fmt
+
+
 @pytest.mark.parametrize("fmt, shifts, channels", [(56, (0, 8, 16, 24), (64, 128, 191, 255)),
                                                 (50, (0, 10, 20, 30), (256, 512, 767, 3))])
 @pytest.mark.parametrize("packed", [False, True])
@@ -1316,6 +1357,29 @@ def test_buffer_store_format_bgra(fmt, shifts, channels, packed, components, bgr
     _load_mini_interp().run_fragment(spv, memory=memory)
     expected = sum(channels[c] << shift for c, shift in zip(order, shifts) if c < components)
     assert memory[0x1000] == expected
+
+
+@pytest.mark.parametrize("fmt, packed, inputs, expected", [
+    (60, True, (0x01000101, 0x00fe00ff), (0xfeffffff,)),
+    (27, False, (65536, 65537), (0xffffffff,)),
+    (69, False, (65534, 65535, 65536, 0xffffffff), (0xfffffffe, 0xffffffff)),
+    (75, False, (65534, 65535, 65536, 0xffffffff), (65534, 65535, 65536, 0xffffffff)),
+])
+def test_uint_buffer_store_saturation(fmt, packed, inputs, expected, make_shader):
+    # Native gfx1036 clips each channel to the destination's width. The 32-bit control keeps every bit.
+    setup = "".join(f"v_mov_b32 v{4 + i}, {v:#x}\n" for i, v in enumerate(inputs))
+    selectors = 0x22c if fmt == 27 else 0xfac  # XY01 for RG16, XYZW for RGBA
+    components = 4 if packed else len(inputs)
+    op = "buffer_store_format_" + ("d16_" if packed else "") + "xyzw"[:components]
+    src = ("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 16\n"
+           f"s_mov_b32 s3, {0x31000000 | fmt << 12 | selectors:#x}\n" + setup +
+           f"{op} v[4:{3 + len(inputs)}], off, s[0:3], 0\ns_endpgm\n")
+    shader = make_shader(src, name="ps_store_uint")
+    spv = shader.translate()
+    shader.validate(spv)
+    memory = {0x1000 + 4 * i: 0xdeadbeef for i in range(4)}
+    _load_mini_interp().run_fragment(spv, memory=memory)
+    assert tuple(memory[0x1000 + 4 * i] for i in range(4)) == expected + (0xdeadbeef,) * (4 - len(expected))
 
 
 def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):

@@ -80,6 +80,11 @@ def streams(sig: bytes) -> set:
     return {struct.unpack_from("<I", sig, first + 32 * i)[0] for i in range(count)}
 
 
+def stage_name(row: dict) -> str:
+    stage = row.get("stage")
+    return stage if isinstance(stage, str) and stage else "?"
+
+
 def scan_dxbc(dxbc_dir: str, index: list) -> dict:
     stages = Counter()
     flags = defaultdict(Counter)  # flag -> stage -> shaders
@@ -90,9 +95,13 @@ def scan_dxbc(dxbc_dir: str, index: list) -> dict:
         if not isinstance(e, dict):
             missing += 1
             continue
-        stage = e.get("stage") or "?"
+        stage = stage_name(e)
         stages[stage] += 1
-        path = os.path.join(dxbc_dir, e.get("file") or "")
+        filename = e.get("file")
+        if not isinstance(filename, str) or not filename:
+            missing += 1
+            continue
+        path = os.path.join(dxbc_dir, filename)
         try:
             with open(path, "rb") as f:
                 p = parts(f.read())
@@ -257,7 +266,7 @@ def scan_spirv(spirv_index: str) -> dict:
     for m in entries:
         if not isinstance(m, dict):
             continue
-        stage = m.get("stage", "?")
+        stage = stage_name(m)
         total[stage] += 1
         code_base[stage] += bool(m.get("uses_code_base"))
     return {"translated": dict(total), "uses_code_base": {k: v for k, v in code_base.items() if v}}
@@ -292,8 +301,8 @@ def main() -> int:
     # Original names can be shared by variants, so indexed filenames take precedence.
     # Non-object rows are already counted as unreadable by scan_dxbc; skip them here too.
     rows = [e for e in index if isinstance(e, dict)]
-    stage_of = {e["name"]: e.get("stage") or "?" for e in rows if isinstance(e.get("name"), str)}
-    stage_of |= {os.path.splitext(e["file"])[0]: e.get("stage") or "?"
+    stage_of = {e["name"]: stage_name(e) for e in rows if isinstance(e.get("name"), str)}
+    stage_of |= {os.path.splitext(e["file"])[0]: stage_name(e)
                  for e in rows if isinstance(e.get("file"), str)}
     disasm = os.path.join(dxbc_dir, "disasm")
     if os.path.isdir(disasm):
@@ -343,4 +352,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -164,20 +164,37 @@ def read(p):
 INPUT_EXTENSIONS = (".jsav", ".asav", ".json", ".bin")
 
 
-def iter_inputs(paths):
-    """Yield (path, bytes) for every save file (.jsav, .asav, .bin or no extension) or .json under the given paths.
-
-    The path lets warnings name the offending file when a batch contains a bad save.
-    """
+def input_files(paths):
+    """Every save file (.jsav, .asav, .bin or no extension) or .json under the given paths, in reading order."""
     for p in paths:
         if os.path.isdir(p):
             for dp, _, fs in os.walk(p):
                 for f in sorted(fs):
                     if f.lower().endswith(INPUT_EXTENSIONS) or "." not in f:
-                        source = os.path.join(dp, f)
-                        yield source, read(source)
+                        yield os.path.join(dp, f)
         else:
-            yield p, read(p)
+            yield p
+
+
+def iter_inputs(paths):
+    """Yield (path, bytes) for every file input_files() lists.
+
+    The path lets warnings name the offending file when a batch contains a bad save.
+    """
+    for source in input_files(paths):
+        yield source, read(source)
+
+
+def out_problem(out, inputs, dicts):
+    """Why --out can't be written, checked before any work: it is one of the files read (the report would replace
+    the user's dictionary or a save), or its folder does not exist. "" when it is fine."""
+    if not os.path.isdir(os.path.dirname(os.path.abspath(out))):
+        return f"the folder for --out {out} does not exist"
+    if os.path.exists(out):
+        for p in list(input_files(inputs)) + list(dicts):
+            if os.path.exists(p) and os.path.samefile(out, p):   # samefile: a hard link or another spelling counts
+                return f"--out {out} is also an input ({p}); refusing to overwrite it"
+    return ""
 
 
 def collect_keys(paths):
@@ -268,6 +285,9 @@ def cmd_collect(a):
 
 
 def cmd_resolve(a):
+    if a.out and (problem := out_problem(a.out, a.inputs, a.dict)):
+        print("error:", problem, file=sys.stderr)
+        return 1
     keys = set(collect_keys(a.inputs))
     strings = harvest(a.dict)
     chance = len(strings) * len(keys) / 2 ** 32
@@ -296,9 +316,13 @@ def cmd_resolve(a):
             resolved[k] |= hits[k]
     print(f"  total (joaat)    {len(resolved):6} of {len(keys)} keys ({100 * len(resolved) / max(1, len(keys)):.1f}%)")
     if a.out:
-        with open(a.out, "w", encoding="utf-8") as f:
-            json.dump({"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())},
-                      f, indent=1)
+        try:
+            with open(a.out, "w", encoding="utf-8") as f:
+                json.dump({"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())},
+                          f, indent=1)
+        except OSError as e:
+            print(f"error: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 1
         print(f"wrote {a.out} (local only: it contains game names)")
 
 
@@ -313,9 +337,12 @@ def main(argv=None):
     r.add_argument("--compose", type=int, default=0, metavar="N")
     r.add_argument("--out")
     a = ap.parse_args(argv)
-    {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a)
-    return 0
+    return {"collect": cmd_collect, "resolve": cmd_resolve}[a.cmd](a) or 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

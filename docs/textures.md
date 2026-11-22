@@ -278,10 +278,11 @@ but uncompressed tiling is not validated, so they are not exported here.
 
 ### Sample validation
 
-`tools/ttpf_mips.py check` detiles one chain, decodes BC1/BC3/BC4/BC5 and compares each mip
-with a 2x2 box downsample of its parent at BC-block resolution (one block is 4x4 pixels). A
-correct chain is 0–4 levels, as in the SixNG notes; the control is the first tail mip detiled
-at origin (0,0).
+`tools/ttpf_mips.py check` detiles one chain, decodes BC1/BC3/BC4/BC5/BC6H/BC7 (pure stdlib;
+HDR BC6H formats 95/96 are compared after a signed Reinhard tone-map `255 * v / (1 + |v|)`)
+and compares each mip with a 2x2 box downsample of its parent at BC-block resolution (one block
+is 4x4 pixels). A correct chain is 0–4 levels, as in the SixNG notes; the control is the first
+tail mip detiled at origin (0,0).
 
 | Pool # | Descriptor | Mips | non_tail / first_tail | Max error | Tail control |
 |---|---|---:|---:|---:|---:|
@@ -294,15 +295,25 @@ at origin (0,0).
 | `maps_1_7` #1500 | 128×256 BC4 | 6 | 1 / 2 | 0.34 | 72.08 |
 | `decorations_0_3` #818 | 128×128 BC5 | 6 | 1 / 2 | 0.02 | 85.48 |
 | `interiors_1_3` #507 | 256×256 BC3 | 7 | 1 / 2 | 1.21 | 51.84 |
+| `terrain_4_7` #23 | 512×512 BC7 (`98`) | 3 | 3 / 3 | 0.49 | — |
+| `maps_4_7` #6034 | 1024×1024 BC7 (`98`, 64 KiB) | 9 | 3 / 3 | 0.33 | 94.76 |
+| `interiors_0_3` #3 | 512×512 BC7 sRGB (`99`) | 8 | 3 / 4 | 1.15 | 68.09 |
+| `interiors_2_3` #3268 | 1024×1024 BC6H UF16 (`95`, 64 KiB) | 9 | 3 / 3 | 0.35 | 110.21 |
+| `lighting` #346 | 512×512 BC6H SF16 (`96`) | 10 | 3 / 4 | 0.68 | 15.41 |
 
 `interiors_0_3` #19 is a partial export: the reader emits one mip, while all seven decode and
 match. `graphics` #43 and `interiors_2_3` #468 are tuples outside the table; `maps_0_7` #3217
 is mode 34 with `non_tail = 0`, which would leave zero standalone mips even if the mode gate
 passed.
 
-BC7 was checked on two samples with an external decoder (Pillow, not a dependency of the
-tool): `terrain_4_7` #23 (512×512, 3 mips, 0.35–0.49) and `maps_4_7` #6034 (1024×1024, mode
-32, 64 KiB, 0.00–0.33, control 4.44).
+The same BC6H/BC7 decoders also cover multi-slice chains and BCPack chains in `check`:
+`graphics` #236 (256×256×48 BC7 2D array, 9 mips, 64 KiB) passes all 48 slices (`max_error =
+0.37` vs slice-major control `40.74`), `lighting` #474 (256×256×6 BC6H UF16 cubemap, 7 mips)
+passes all 6 faces (`max_error = 0.25` vs tail control `95.82`), and `graphics` #86 (64×64×6
+BC7 cubemap, 7 mips) passes all 6 faces (`max_error = 3.46` vs tail control `40.1`).
+Note that prefiltered lighting profiles whose lower mips intentionally fade toward `1.0` or
+convolve with a specular lobe will naturally exceed the box-downsample threshold even when
+detiled accurately.
 
 For `interiors_0_3` #19 the tool reports the byte layout: mip 0 (512×256, 128×64 blocks) at
 24,576, mip 1 (256×128, 64×32) at 8,192, mip 2 (128×64, 32×16) at 4,096, then the 4 KiB tile
@@ -855,11 +866,40 @@ via `bcpack.decode_with_info`).
 - **Previously skipped examples above (`tools/ttpf_mips.py`):**
   - `graphics/ttdb_graphics.ttpf` #309 (128×128 BC1, 8 mips): `check` **pass** in strict mode (`max_error = 0.67`, `tail_origin_control = 102.3`).
   - `ui/ttdb_ui.ttpf` #0 (512×512 BC1, 1 mip): `check` **pass** in strict mode.
-  - `terrain/ttdb_terrain_0_7.ttpf` #1537 (512×1024 BC7, 8 mips): `export` without `--history` cleanly refuses unknown built-in history with a `--history <path>` hint; `export --history <local_dir> --allow-provisional` writes the full 8-mip DX10 DDS (699,188 bytes).
+  - `terrain/ttdb_terrain_0_7.ttpf` #1537 (512×1024 BC7, 8 mips): `export` without `--history` cleanly refuses unknown built-in history with a `--history <path>` hint; `export --history <local_dir> --allow-provisional` writes the full 8-mip DX10 DDS (699,188 bytes) and `check --history <local_dir> --allow-provisional` passes (`max_error = 0.95`, `tail_origin_control = 129.91`).
 - **Cross-codec verification:** 20/20 BC1 strict (`median_err = 0.68`), 7/7 BC3 provisional (`median_err = 1.44`, `max_err = 4.18`), 2/2 fitted BC4 provisional (`max_err = 0.43`; unfitted UI entries cleanly refused), 10/10 BC5 provisional (`median_err = 0.17`, `max_err = 0.85`).
 - **Full-corpus BC6H/BC7 chunk verification (all 57 pools, pure-Python `tools/bcpack.py`, using locally calibrated `bc6h.json` / `bc7.json` passed via `--history`):**
   - **BC6H (`codec 6`):** **268 / 268** chunks (100%) decode in provisional mode (`0` strict because every chunk references built-in history, `0` refused).
   - **BC7 (`codec 7`):** **583 / 5,167** chunks (11.3%) decode in strict mode; **5,150 / 5,167** (99.67%) decode in provisional mode; **17 / 5,167** (0.33%) cleanly refuse when unknown built-in history references exceed the consistency budget.
+
+## What `textures.rpf` holds
+
+The 192.6 MB archive has no composition table elsewhere in the docs (only census rows). `tools/rpf9_carve.py`
+reads 97.8% of its data span as 2,749 checksum-validated zlib streams (188.3 MB stored, 487.9 MB inflated;
+1.8% zero padding, 0.5% unread). By inflated size the streams fall into two groups:
+
+| Group | Streams | Inflated | Content |
+|---|---:|---:|---|
+| 400-byte + 32,768-byte pairs | 1,313 + 1,313 (+2 lone 400-byte) | 43.6 MB | a small texture-dictionary resource: system page, then graphics page |
+| everything else | 121 | 444.4 MB (91%) | 11 streams of 16 MB or more (largest 32 MB), 16 of exactly 64 KiB, 62 under 64 KiB |
+
+**The pairs are one template, filled 1,313 times.** Every 400-byte stream is immediately followed by a 32,768-byte
+one, and the 8 bytes stored just before 1,312 of the large streams are identical. The 400-byte system pages
+have only 4 distinct contents, and 1,312 of the 1,315 are byte-identical: a dictionary of two textures, each
+described as 128 x 128 with format code `0x5f` (95, `DXGI_FORMAT_BC6H_UF16` if the codes are DXGI numbers, as
+for the BC1/BC7 codes elsewhere in this document), one name per texture. Two 128 x 128 BC6H textures are
+2 x 16,384 = 32,768 bytes, exactly the graphics-page size. The graphics pages differ: 1,117 distinct contents
+among the 1,313 (the most repeated one 60 times). So the archive stores 1,313 instances of one HDR texture pair
+with per-instance data, the shape of a per-tile or per-cell map. One of the other three header variants describes
+172 x 172 textures with code `0x62` (98, BC7).
+
+**The 121 other streams** start with no known magic (`RDS5`, `0DRP`, `TTPF`, `RSC8`, `PSIN`, `RBF0`, DDS) in
+their first 4 KiB, and the large ones are high-entropy (7.3 to 7.7 bits per byte over the first 64 KiB, except
+one at 4.1). They are left as opaque raw data here; matching them to the `data/ttdb` texture pools is the
+obvious next check.
+
+Not measured here (hypothesis): what the 1,313 texture pairs are keyed by, and whether the format codes are
+DXGI values (the exact-size match supports it).
 
 ## Next step
 
@@ -869,13 +909,10 @@ via `bcpack.decode_with_info`).
    `breadbbbb/rpf9-explorer#7`; `ASSET-44`). Remaining C# follow-ups are BC6H/BC7 block
    rebuilders (plus optional external history tables) and preserving lower-mip zlib/raw
    fallback when a higher mip is refused in strict mode.
-2. **Decode BC6H/BC7 in `tools/ttpf_mips.py` `check`.** `tools/ttpf_mips.py` currently
-   decodes BC1/3/4/5 pixels for the downsample check; adding BC6H/BC7 pixel decoders extends
-   chain-error validation to those two formats.
-3. **Add DXGI 11 (`R16G16B16A16_UNORM`, 5 records) and validate 2D uncompressed tiling (formats
+2. **Add DXGI 11 (`R16G16B16A16_UNORM`, 5 records) and validate 2D uncompressed tiling (formats
    11, 28, 49, 56).** The 19 records formerly listed as DXGI 156/199/211/226 are resolved as
    two-slice 2D arrays (`docs/textures_arrays.md`).
-4. **Generate local BCPack history tables from `<work>` (optional follow-up).** Add a local
+3. **Generate local BCPack history tables from `<work>` (optional follow-up).** Add a local
    calibration script under `tools/` so players can derive `bc6h.json` / `bc7.json` (and, if
    desired, BC1–BC5 history tables) locally from their own texture pools into `<work>` and
    pass them via `--history <path>`.

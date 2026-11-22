@@ -227,6 +227,27 @@ bool clear_depth_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned dep
     readback->Unmap(0, &none);
     return true;
 }
+
+bool check_shared_exponent_target(ID3D12Device* device) {
+    constexpr auto format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    const FLOAT full[]{1, 2, 4, 0}, rect[]{4, 2, 1, 0};
+    std::vector<unsigned char> pixels;
+    CHECK(clear_and_read(device, format, 4, full, rect, pixels));
+    for (unsigned y = 0; y < 3; ++y) {
+        for (unsigned x = 0; x < 5; ++x) {
+            uint32_t got;
+            std::memcpy(&got, pixels.data() + (5 * y + x) * 4, 4);
+            const uint32_t expected = (y >= 1 && x >= 1 && x < 4) ? 0x91010100u : 0x94010040u;
+            if (got != expected) {
+                std::fprintf(stderr, "RGB9E5 (%u,%u): got %08x, expected %08x\n", x, y, got, expected);
+                return false;
+            }
+        }
+    }
+    std::puts("RGB9E5 RTV: full and rectangle clears match all 15 packed texels");
+    return true;
+}
+
 bool check_volume_rtvs(ID3D12Device* host, ID3D12Device* ours) {
     const FLOAT red[4]{1, 0, 0, 1}, green[4]{0, 1, 0, 1};
     std::vector<unsigned char> expected;
@@ -258,8 +279,9 @@ bool check_volume_rtvs(ID3D12Device* host, ID3D12Device* ours) {
 
 int main(int argc, char** argv) {
     const bool volume_only = argc == 2 && std::strcmp(argv[1], "--volume") == 0;
-    if (argc != 1 && !volume_only) {
-        std::fprintf(stderr, "usage: d3d12_clear_test [--volume]\n");
+    const bool rgb9e5_only = argc == 2 && std::strcmp(argv[1], "--rgb9e5") == 0;
+    if (argc != 1 && !volume_only && !rgb9e5_only) {
+        std::fprintf(stderr, "usage: d3d12_clear_test [--volume|--rgb9e5]\n");
         return 2;
     }
     vktest::Device vk;
@@ -278,6 +300,23 @@ int main(int argc, char** argv) {
         info.queue = vk.queue;
         info.queue_family = vk.family;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        if (rgb9e5_only) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
+            if (FAILED(ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))) return 1;
+            VkFormatProperties properties{};
+            auto query = vk.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+            query(vk.physical, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &properties);
+            const bool native_rtv = properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+            if (native_rtv != bool(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+                std::fprintf(stderr, "RGB9E5 render-target support disagrees with the native attachment capability\n");
+                return 1;
+            }
+            if (!(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+                std::puts("RGB9E5 render targets unavailable on this adapter");
+                return 77;
+            }
+            return check_shared_exponent_target(ours.p) ? 0 : 1;
+        }
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
@@ -399,8 +438,9 @@ int main(int argc, char** argv) {
     if (validation_errors)
         std::fprintf(stderr, "d3d12_clear_test: %llu new Vulkan validation error(s)\n",
             static_cast<unsigned long long>(validation_errors));
-    if (compare_failed || validation_errors) return 1;
-    if (volume_only) return 0;
+    if (validation_errors) return 1;
+    if (compare_failed) return compare_failed;
+    if (volume_only || rgb9e5_only) return 0;
     std::printf("RTV and DSV clears: %u full/rectangle readbacks matched WARP\n", cases_checked);
     return 0;
 }

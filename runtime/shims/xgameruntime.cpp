@@ -29,6 +29,73 @@ namespace {
 
 std::atomic<int> g_runtime_refs{0};
 
+// ---- The run-time entry points xgameruntime.lib looks up ----
+//
+// A title linked against xgameruntime.lib doesn't import XGameRuntimeInitialize: the static library's thunks load
+// "xgameruntime.dll" and GetProcAddress these five names (measured in the package's libHttpClient.GDK.dll and
+// XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
+// xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
+// XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. The classes'
+// method layouts are not known yet, so QueryApiImpl logs each class and interface id it is asked for and refuses
+// them; the first boot with the executable then lists the interfaces to implement.
+
+struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
+    uint32_t unknown;      // documented as always 1
+    BOOL is_inline;        // 1 when XGameRuntimeOptions::gameConfigSource is Inline
+    const char* game_config;
+};
+
+constexpr HRESULT kClassNotProvided = static_cast<HRESULT>(0x80070032);  // HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+
+std::atomic<int> g_api_refs{0};
+
+HRESULT api_initialize(const char* which, ULONG gdk_ver, ULONG gs_ver, int mode, const ApiImplOptions* options) {
+    if (g_api_refs.fetch_add(1) == 0)
+        std::fprintf(stderr, "[rt] xgameruntime: %s(gdk=%lu, gs=%lu, mode=%#x, options=%s) (offline)\n", which,
+                     gdk_ver, gs_ver, mode & 0xFF,
+                     options ? (options->is_inline ? "inline game config" : "default game config") : "none");
+    return S_OK;
+}
+
+HRESULT WINAPI InitializeApiImpl(ULONG gdk_ver, ULONG gs_ver) {
+    return api_initialize("InitializeApiImpl", gdk_ver, gs_ver, -1, nullptr);
+}
+
+HRESULT WINAPI InitializeApiImplEx(ULONG gdk_ver, ULONG gs_ver, char mode) {
+    return api_initialize("InitializeApiImplEx", gdk_ver, gs_ver, static_cast<unsigned char>(mode), nullptr);
+}
+
+HRESULT WINAPI InitializeApiImplEx2(ULONG gdk_ver, ULONG gs_ver, char mode, const ApiImplOptions* options) {
+    return api_initialize("InitializeApiImplEx2", gdk_ver, gs_ver, static_cast<unsigned char>(mode), options);
+}
+
+HRESULT WINAPI UninitializeApiImpl() {
+    int prev = g_api_refs.load();
+    while (prev > 0 && !g_api_refs.compare_exchange_weak(prev, prev - 1)) {}
+    return S_OK;
+}
+
+void print_guid(char (&out)[40], const GUID* g) {
+    if (!g) {
+        std::snprintf(out, sizeof out, "(null)");
+        return;
+    }
+    std::snprintf(out, sizeof out, "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x", g->Data1, g->Data2,
+                  g->Data3, g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3], g->Data4[4], g->Data4[5],
+                  g->Data4[6], g->Data4[7]);
+}
+
+HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
+    if (out) *out = nullptr;
+    char cls[40], iid[40];
+    print_guid(cls, class_id);
+    print_guid(iid, &interface_id);
+    static std::atomic<int> s_logged{0};
+    if (s_logged.fetch_add(1) < 256)   // one line per request, bounded
+        std::fprintf(stderr, "[rt] xgameruntime: QueryApiImpl(class %s, interface %s): not provided yet\n", cls, iid);
+    return kClassNotProvided;
+}
+
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
 HRESULT __stdcall XGameRuntimeInitialize() {
     if (g_runtime_refs.fetch_add(1) == 0) std::fprintf(stderr, "[rt] xgameruntime: initialized (offline)\n");
@@ -94,6 +161,12 @@ uint64_t __stdcall XSystemGetAppMemoryUsage() {
 }  // namespace
 
 SHIM_TABLE(xgameruntime,
+    // what xgameruntime.lib's thunks GetProcAddress (library_loader.cpp serves the LoadLibrary before it)
+    XGR(InitializeApiImpl),
+    XGR(InitializeApiImplEx),
+    XGR(InitializeApiImplEx2),
+    XGR(UninitializeApiImpl),
+    XGR(QueryApiImpl),
     XGR(XGameRuntimeInitialize),
     XGR(XGameRuntimeUninitialize),
     XGR(XSystemGetDeviceType),

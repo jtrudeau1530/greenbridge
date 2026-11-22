@@ -125,6 +125,18 @@ class SubDwordElements(unittest.TestCase):
 
 
 class D16DestinationHalves(unittest.TestCase):
+    def test_uint32_saturates_before_packing(self):
+        words = (0xfffe, 0x10000, 0x10001, 0xffffffff)
+        memory = {BASE + 4 * i: word for i, word in enumerate(words)}
+        for op, fmt, mods in (("buffer_load_format", FMT_U32X4, ""),
+                              ("tbuffer_load_format", FMT_U32, " format:[BUF_FMT_32_32_32_32_UINT]")):
+            with self.subTest(op=op):
+                self.assertEqual(load_format(fmt, 0, 4, memory=memory, op=op, mods=mods), words)
+                self.assertEqual(load_format(fmt, 0, 4, memory=memory, d16=True, op=op, mods=mods)[:2],
+                                 (0xfffffffe, 0xffffffff))
+                self.assertEqual(load_format(fmt, 0, 3, memory=memory, d16=True, op=op, mods=mods)[:2],
+                                 (0xfffffffe, 0xa9bcffff))
+
     def test_odd_and_even_component_writes(self):
         # Little-endian UINT8 components at byte 0 are 44,33,22,11 (hex).
         for offset, words in (
@@ -270,6 +282,17 @@ class TbufferDefaultFormat(unittest.TestCase):
                     else:
                         self.assertEqual(got, want)
         self.assertEqual(load_format(FMT_UINT8X4, 0, 4, dst_sel=1 << 9), (0, 0, 0, 1))
+
+    def test_invalid_descriptor_suppresses_fixed_format_load(self):
+        # Same address, 256-byte bound and instruction format. Only the V# FORMAT changes.
+        cases = ((False, 4, (0x44, 0x33, 0x22, 0x11), (0, 0, 0, 0)),
+                 (True, 3, (0x00330044, 0xa9bc0022), (0, 0xa9bc0000)))
+        for d16, n, bound, unbound in cases:
+            for fmt, want in ((FMT_U32, bound), (0, unbound)):
+                with self.subTest(d16=d16, fmt=fmt):
+                    got = load_format(fmt, 0, n, memory={BASE: 0x11223344}, d16=d16,
+                                      op="tbuffer_load_format", mods=" format:[BUF_FMT_8_8_8_8_UINT]")
+                    self.assertEqual(got[:len(want)], want)
 
     def test_packed_default_8_unorm(self):
         # The first byte is 0xff: 1.0 in f16 is 0x3c00. Preserve the upper destination half.

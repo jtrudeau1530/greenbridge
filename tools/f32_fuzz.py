@@ -1647,8 +1647,11 @@ def main(argv=None):
                     "model (mismatches must appear)")
     ap.add_argument("--negative-control", action="store_true",
                     help="after the hardware run, re-judge its words with every perturbed model; exit 1 if one is not caught")
+    ap.add_argument("--fma", choices=("glsl", "khr"), default="glsl",
+                    help="with the translator oracle: emit the fused multiply-adds as GLSL Fma (default) or OpFmaKHR")
     ap.add_argument("--keep", help="write the kernel body of every hardware mismatch to this folder")
     a = ap.parse_args(argv)
+    rdna2spirv.FMA_KHR = a.fma == "khr"
     if a.programs < 1:
         ap.error("--programs must be at least 1")
     if a.probes < 0:
@@ -1741,4 +1744,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

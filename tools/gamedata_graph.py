@@ -591,10 +591,33 @@ def main() -> int:
     parser.add_argument("--json", help="write the aggregate graph summary to this JSON")
     args = parser.parse_args()
 
+    if args.json:
+        if os.path.isdir(args.json):
+            parser.error(f"--json is a directory: {args.json}")
+        for target in args.targets:
+            source = os.path.join(target, "index.json") if os.path.isdir(target) else target
+            if gx.same_report_path(args.json, source):
+                parser.error(f"--json would overwrite the input {source}")
+            if os.path.isdir(target) and os.path.isfile(args.json):
+                root = os.path.normcase(os.path.abspath(target))
+                dest = os.path.normcase(os.path.abspath(args.json))
+                if os.path.dirname(dest) == root or dest.startswith(root + os.sep):
+                    if dest.endswith(".bin"):
+                        parser.error(f"--json would overwrite an input file: {args.json}")
+
     try:
         documents = list(gx.load_documents(args.targets))
     except FileNotFoundError as exc:
         print(f"not found: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # Same one-line contract as gamedata_xml.py and gamedata_index.py: a bad carve index is an error,
+        # not a traceback.
+        where = getattr(exc, "filename", None) or args.targets[0]
+        print(f"ERROR: cannot read {where}: {getattr(exc, 'strerror', None) or exc!r}", file=sys.stderr)
         return 2
     graph = build_graph(documents)
     graph["summary"]["mode"] = gx.document_mode(args.targets)
@@ -611,4 +634,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -1,0 +1,328 @@
+"""Tests for tools/bink_names.py, built from synthetic Bink 2 headers and mount lists (no game data).
+
+    python -I tests/test_bink_names.py
+"""
+import contextlib
+import csv
+import importlib.util
+import io
+import json
+import os
+import struct
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_module():
+    path = os.path.join(ROOT, "tools", "bink_names.py")
+    spec = importlib.util.spec_from_file_location("bink_names_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+names_mod = load_module()
+
+
+def make_stream(width, height, frames, body=64):
+    """A minimal Bink 2 stream that bink_index.parse_header accepts."""
+    extra = b"\x00\x05\xe9\x87"
+    total = 0x2C + len(extra) + 4 * frames + body
+    header = bytearray(0x2C)
+    header[0:4] = b"KB2n"
+    struct.pack_into("<10I", header, 4, total - 8, frames, body, frames,
+                     width, height, 30, 1, 0x40013, 0)
+    return bytes(header) + extra + bytes(4 * frames) + bytes(body)
+
+
+def stream(offset, width=1280, height=720, frames=100, source="a.rpf"):
+    return {"source": source, "offset": offset, "size": 0x100, "width": width, "height": height,
+            "frames": frames}
+
+
+def mount_xml(paths, ident="test_binks"):
+    items = "".join(f"<Item><filename>$(common)/movies/{p}</filename></Item>" for p in paths)
+    return (f"<?xml version=\"1.0\"?><CDataFileMgr__ContentChangeSetDef><id>{ident}</id>"
+            f"<filesToEnable>{items}</filesToEnable></CDataFileMgr__ContentChangeSetDef>")
+
+
+class TestListOrder(unittest.TestCase):
+    def write(self, tmp, name, text):
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_sorted_by_folder_then_name_without_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self.write(tmp, "a.xml", mount_xml(["zz/b.bk2", "Aa/clip_x.bk2", "aa/clipe.bk2"]))
+            b = self.write(tmp, "b.xml", mount_xml(["AA/CLIP_X.bk2", "mm/one.bk2"]))
+            got = names_mod.read_mount_lists([a, b])
+        # duplicates collapse case-insensitively; '_' (0x5F) sorts before 'e' (0x65)
+        self.assertEqual(got, ["Aa/clip_x.bk2", "aa/clipe.bk2", "mm/one.bk2", "zz/b.bk2"])
+
+    def test_name_without_extension_compared(self):
+        # "ab" is a prefix of "ab-1", so it sorts first; with the extension '-' (0x2D) < '.' (0x2E) would flip them
+        self.assertEqual(sorted(["f/ab-1.bk2", "f/ab.bk2"], key=names_mod.sort_key), ["f/ab.bk2", "f/ab-1.bk2"])
+
+    def test_directory_is_searched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "sub"))
+            self.write(tmp, "sub/1.bin", mount_xml(["q/x.bk2"]))
+            self.write(tmp, "2.bin", "<other>no movies here</other>")
+            self.assertEqual(names_mod.read_mount_lists([tmp]), ["q/x.bk2"])
+
+    def test_carve_list_split_across_streams(self):
+        # rpf9_carve.py layout: index.json plus one inflated <offset>.bin per zlib stream
+        doc = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+               + mount_xml(["s/a.bk2", "s/split_here.bk2", "s/z.bk2"]).split("?>", 1)[1]).encode()
+        cut = doc.index(b"split_") + 3
+        parts = [doc[:cut], doc[cut:]]
+        with tempfile.TemporaryDirectory() as tmp:
+            files, off = [], 0x1000
+            for part in parts:
+                with open(os.path.join(tmp, f"{off:012x}.bin"), "wb") as fh:
+                    fh.write(part)
+                files.append({"off": off, "stored": len(part), "size": len(part)})
+                off += 0x1000
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as fh:
+                json.dump({"files": files, "summary": {}}, fh)
+            self.assertEqual(names_mod.read_mount_lists([tmp]), ["s/a.bk2", "s/split_here.bk2", "s/z.bk2"])
+
+    def test_other_filenames_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "c.xml", "<filename>$(common)/data/x.meta</filename>"
+                                            "<filename>$(common)/movies/t/a.bk2</filename>")
+            self.assertEqual(names_mod.read_mount_lists([path]), ["t/a.bk2"])
+
+
+class TestAlign(unittest.TestCase):
+    def run_names(self, names, streams, pins=None):
+        rows, unmatched = names_mod.name_streams(names, streams, pins)
+        return [r["path"] for r in rows], [r["confidence"] for r in rows], unmatched
+
+    def test_equal_counts_zip(self):
+        names = ["f/a.bk2", "f/b.bk2", "f/c.bk2"]
+        paths, conf, unmatched = self.run_names(names, [stream(0), stream(1), stream(2)])
+        self.assertEqual(paths, names)
+        self.assertEqual(unmatched, [])
+        self.assertNotIn("positional", conf)
+
+    def test_height_hint_places_skip(self):
+        names = ["f/a_720.bk2", "f/b_1080.bk2", "f/c_720.bk2"]
+        streams = [stream(0, 1280, 720), stream(1, 1280, 720)]
+        paths, conf, unmatched = self.run_names(names, streams)
+        self.assertEqual(paths, ["f/a_720.bk2", "f/c_720.bk2"])
+        self.assertEqual(unmatched, ["f/b_1080.bk2"])
+        self.assertEqual(conf, ["anchored", "anchored"])
+
+    def test_family_siblings_share_shape(self):
+        # x_01/x_02 share a shape, y does not exist in the archive
+        names = ["f/x_01.bk2", "f/x_02.bk2", "f/y.bk2", "f/z.bk2"]
+        streams = [stream(0, 512, 512, 30), stream(1, 512, 512, 30), stream(2, 1920, 1080, 900)]
+        paths, conf, _ = self.run_names(names, streams)
+        self.assertEqual(paths[:2], ["f/x_01.bk2", "f/x_02.bk2"])
+        self.assertEqual(conf[:2], ["anchored", "anchored"])
+
+    def test_pins_verify_and_override(self):
+        names = ["f/a.bk2", "f/b.bk2", "f/c.bk2"]
+        streams = [stream(0), stream(1)]
+        pins = {("", 1): {"f/b.bk2"}}
+        paths, conf, unmatched = self.run_names(names, streams, pins)
+        self.assertEqual(paths, ["f/a.bk2", "f/b.bk2"])
+        self.assertEqual(conf[1], "verified")
+        self.assertEqual(unmatched, ["f/c.bk2"])
+        # an alternative-set pin anchors but does not verify
+        paths, conf, _ = self.run_names(names, streams, {("", 1): {"f/b.bk2", "f/c.bk2"}})
+        self.assertEqual(conf[1], "anchored")
+
+    def test_bracketed_vs_positional(self):
+        # two hinted anchors with a gap: equal counts between them -> bracketed
+        names = ["f/a_1080.bk2", "f/m.bk2", "f/n.bk2", "f/z_1080.bk2"]
+        streams = [stream(0, 1920, 1080, 1), stream(1, 640, 480, 2), stream(2, 800, 600, 3),
+                   stream(3, 1920, 1080, 4)]
+        _, conf, _ = self.run_names(names, streams)
+        self.assertEqual(conf, ["anchored", "bracketed", "bracketed", "anchored"])
+        # one extra unanchored name: the skip could be anywhere -> positional
+        names.insert(2, "f/extra.bk2")
+        _, conf, _ = self.run_names(names, streams)
+        self.assertEqual(conf[1:3], ["positional", "positional"])
+
+    def test_too_few_names(self):
+        with self.assertRaises(ValueError):
+            names_mod.name_streams(["f/a.bk2"], [stream(0), stream(1)])
+
+    def test_no_streams(self):
+        self.assertEqual(names_mod.name_streams(["f/a.bk2"], []), ([], ["f/a.bk2"]))
+
+
+class TestLoadPins(unittest.TestCase):
+    def test_repeated_rows_union_and_sources_stay_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "pins.csv")
+            with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=["offset", "path", "source"])
+                w.writeheader()
+                # same offset across two rows, different sources: each source accumulates independently
+                w.writerow({"offset": 0x10, "path": "f/a.bk2", "source": "a.rpf"})
+                w.writerow({"offset": 0x10, "path": "F/B.BK2", "source": "a.rpf"})
+                w.writerow({"offset": 0x10, "path": "f/c.bk2", "source": "b.rpf"})
+                # empty-source fallback stays separate and accumulates too
+                w.writerow({"offset": 0x20, "path": "g/x.bk2"})
+                w.writerow({"offset": 0x20, "path": "g/y.bk2"})
+            pins = names_mod.load_pins(csv_path)
+        self.assertEqual(pins[("a.rpf", 0x10)], {"f/a.bk2", "f/b.bk2"})
+        self.assertEqual(pins[("b.rpf", 0x10)], {"f/c.bk2"})
+        self.assertEqual(pins[("", 0x20)], {"g/x.bk2", "g/y.bk2"})
+
+    def test_single_pipe_row_and_split_rows_agree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            split = os.path.join(tmp, "split.csv")
+            pipe = os.path.join(tmp, "pipe.csv")
+            for name, rows in (
+                (split, [{"offset": 0x10, "path": "f/a.bk2"},
+                         {"offset": 0x10, "path": "f/b.bk2"}]),
+                (pipe, [{"offset": 0x10, "path": "f/a.bk2|f/b.bk2"}]),
+            ):
+                with open(name, "w", encoding="utf-8", newline="") as fh:
+                    w = csv.DictWriter(fh, fieldnames=["offset", "path"])
+                    w.writeheader()
+                    w.writerows(rows)
+            self.assertEqual(names_mod.load_pins(split), names_mod.load_pins(pipe))
+
+
+class TestCli(unittest.TestCase):
+    def test_archive_end_to_end(self):
+        shapes = [(1280, 720, 40), (1920, 1080, 50), (512, 512, 15)]
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = bytearray()
+            offsets = []
+            for shape in shapes:
+                blob += bytes((-len(blob)) % 0x1000)
+                offsets.append(len(blob))
+                blob += make_stream(*shape)
+            archive = os.path.join(tmp, "test.rpf")
+            with open(archive, "wb") as fh:
+                fh.write(blob)
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["b/d.bk2", "b/c_1080.bk2", "b/b_720.bk2", "b/a_720.bk2"]))
+            out_csv = os.path.join(tmp, "names.csv")
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                self.assertEqual(names_mod.main([archive, "--mount", xml, "--out", out_csv]), 0)
+            self.assertIn("4 list entries, 3 streams", log.getvalue())
+            with open(out_csv, encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual([int(r["offset"]) for r in rows], offsets)
+            # sorted list: a_720, b_720, c_1080, d; b_720 cannot sit on the 1080 stream, so it is the skip
+            self.assertEqual([r["path"] for r in rows], ["b/a_720.bk2", "b/c_1080.bk2", "b/d.bk2"])
+            self.assertEqual(rows[0]["source"], "test.rpf")
+
+            # a bink_index JSON as the source gives the same names
+            index = os.path.join(tmp, "index.json")
+            rows_idx, summary = names_mod.bink_index.scan_target(archive)
+            names_mod.bink_index.write_json(index, archive, rows_idx, summary, False)
+            out_json = os.path.join(tmp, "names.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(names_mod.main([index, "--mount", xml, "--out", out_json]), 0)
+            with open(out_json, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertEqual([r["path"] for r in doc["streams"]], [r["path"] for r in rows])
+            self.assertEqual(doc["summary"]["streams"], 3)
+            self.assertEqual(len(doc["unmatched_list_entries"]), 1)
+
+    def test_missing_input(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(names_mod.main(["/nonexistent.rpf", "--mount", "/nonexistent.xml"]), 2)
+
+    def test_refuses_to_overwrite_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["a/b.bk2"]))
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                names_mod.main([tmp, "--mount", xml, "--out", xml])
+
+    def test_refuses_to_overwrite_pins_input(self):
+        # --out targeting the same --pins CSV must be rejected before the file is opened for writing
+        with tempfile.TemporaryDirectory() as tmp:
+            pins = os.path.join(tmp, "pins.csv")
+            with open(pins, "w", encoding="utf-8", newline="") as fh:
+                fh.write("offset,path\n0,f/a.bk2\n")
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2", "f/b.bk2"]))
+            archive = os.path.join(tmp, "test.rpf")
+            with open(archive, "wb") as fh:
+                fh.write(make_stream(1280, 720, 40))
+            with open(pins, "rb") as fh:
+                before = fh.read()
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                names_mod.main([archive, "--mount", xml, "--pins", pins, "--out", pins])
+            with open(pins, "rb") as fh:
+                self.assertEqual(fh.read(), before, "the pins CSV must not be modified")
+
+
+class TestReportErrors(unittest.TestCase):
+    """Bad bink_index.csv/.json sources fail with a one-line, path-specific error and no report."""
+
+    def write(self, tmp, name, text):
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def run_cli(self, source, tmp):
+        xml = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
+        out = os.path.join(tmp, "names.csv")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = names_mod.main([source, "--mount", xml, "--out", out])
+        return code, err.getvalue(), out
+
+    def test_bad_sources_are_rejected(self):
+        # (extension, contents, expected error fragment or None to only require the path)
+        cases = [
+            ("index.json", '{"summary": {}, "target": "x.rpf"}', "streams"),
+            ("index.json", '[]', "streams"),
+            ("index.json", '{"streams": [{"source": "a", "offset": 0}]}', "stream 1"),
+            ("index.json", '{"streams": [', None),
+            ("index.csv", "source,offset,size,width,height\n", "frames"),
+            ("index.csv", "source,offset,size,width,height,frames\n"
+                          "a.rpf,0,0x100,1280,720,100\n"
+                          "a.rpf,bogus,0x100,1280,720,100\n", "row 3"),
+            ("index.csv", "", "frames"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text, needle in cases:
+                with self.subTest(name=name, text=text):
+                    source = self.write(tmp, name, text)
+                    code, err, out = self.run_cli(source, tmp)
+                    self.assertEqual(code, 1)
+                    self.assertIn(source, err)
+                    if needle is not None:
+                        self.assertIn(needle, err)
+                    self.assertFalse(os.path.exists(out))
+
+    def test_empty_sources_are_accepted(self):
+        cases = [
+            ("index.csv", "source,offset,size,width,height,frames\n"),
+            ("index.json", '{"streams": []}'),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text in cases:
+                with self.subTest(name=name):
+                    source = self.write(tmp, name, text)
+                    xml = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
+                    out = os.path.join(tmp, "names.csv")
+                    log = io.StringIO()
+                    with contextlib.redirect_stdout(log), contextlib.redirect_stderr(io.StringIO()):
+                        code = names_mod.main([source, "--mount", xml, "--out", out])
+                    self.assertEqual(code, 0)
+                    self.assertIn("1 list entries, 0 streams", log.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

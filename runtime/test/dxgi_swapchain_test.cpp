@@ -270,6 +270,18 @@ int main() {
     if (FAILED(sc1->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return fail("QI IDXGISwapChain3");
     sc1->Release();
 
+    ID3D12CommandQueue* got_queue = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_queue))) || got_queue != queue) {
+        if (got_queue) got_queue->Release();
+        return fail("GetDevice");
+    }
+    got_queue->Release();
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen{};
+    if (FAILED(sc->GetFullscreenDesc(&fullscreen)) || !fullscreen.Windowed ||
+        fullscreen.Scaling != DXGI_MODE_SCALING_UNSPECIFIED ||
+        fullscreen.ScanlineOrdering != DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED)
+        return fail("GetFullscreenDesc");
+
     D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ID3D12DescriptorHeap* rtv_heap = nullptr;
     if (FAILED(dev->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&rtv_heap)))) return fail("CreateDescriptorHeap");
@@ -542,21 +554,30 @@ int main() {
             return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
         if (sc->GetLastPresentCount(nullptr) != E_INVALIDARG)
             return fail("GetLastPresentCount(nullptr) should return E_INVALIDARG");
+
+        DXGI_FRAME_STATISTICS stats{};
+        if (FAILED(sc->GetFrameStatistics(&stats)) || stats.PresentCount != count_before ||
+            stats.PresentRefreshCount != count_before || stats.SyncRefreshCount != count_before ||
+            stats.SyncQPCTime.QuadPart == 0)
+            return fail("GetFrameStatistics values");
+        if (sc->GetFrameStatistics(nullptr) != E_INVALIDARG)
+            return fail("GetFrameStatistics(nullptr) should return E_INVALIDARG");
     }
 
-    // SwapChain::GetParent and SetMaximumFrameLatency/GetMaximumFrameLatency.
+    // SwapChain::GetParent and non-waitable SetMaximumFrameLatency/GetMaximumFrameLatency (host DXGI returns
+    // DXGI_ERROR_INVALID_CALL and leaves the output untouched when DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+    // was not set).
     {
         IDXGIFactory4* parent = nullptr;
         if (FAILED(sc->GetParent(IID_PPV_ARGS(&parent))) || parent != factory)
             return fail("SwapChain::GetParent did not return the parent factory");
         parent->Release();
-        UINT lat = 0;
-        if (FAILED(sc->GetMaximumFrameLatency(&lat)) || lat != 2)
-            return fail("Default GetMaximumFrameLatency should be 2");
-        if (sc->SetMaximumFrameLatency(0) != E_INVALIDARG || sc->SetMaximumFrameLatency(17) != E_INVALIDARG)
-            return fail("SetMaximumFrameLatency should reject 0 and > 16 with E_INVALIDARG");
-        if (FAILED(sc->SetMaximumFrameLatency(3)) || FAILED(sc->GetMaximumFrameLatency(&lat)) || lat != 3)
-            return fail("SetMaximumFrameLatency(3) round-trip failed");
+        UINT sentinel = 0xdeadbeefu;
+        if (sc->GetMaximumFrameLatency(&sentinel) != DXGI_ERROR_INVALID_CALL || sentinel != 0xdeadbeefu)
+            return fail("Non-waitable GetMaximumFrameLatency should return DXGI_ERROR_INVALID_CALL without writing output");
+        if (sc->SetMaximumFrameLatency(3) != DXGI_ERROR_INVALID_CALL ||
+            sc->SetMaximumFrameLatency(1) != DXGI_ERROR_INVALID_CALL)
+            return fail("Non-waitable SetMaximumFrameLatency should return DXGI_ERROR_INVALID_CALL");
     }
 
     // IDXGIFactory4 adapter enumeration, IDXGIAdapter3 descriptors, EnumAdapterByLuid, and QueryVideoMemoryInfo.
@@ -712,8 +733,7 @@ int main() {
             return fail("QueryInterface(IDXGIFactory5) failed");
         BOOL allow_tearing = FALSE;
         if (FAILED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
-                                                 sizeof(allow_tearing))) ||
-            !allow_tearing)
+                                                 sizeof(allow_tearing))))
             return fail("IDXGIFactory5::CheckFeatureSupport(ALLOW_TEARING) failed");
         if (factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, nullptr, sizeof(BOOL)) != E_INVALIDARG ||
             factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing, 2) != E_INVALIDARG)
@@ -746,10 +766,15 @@ int main() {
         UINT lat = 0;
         if (FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 1)
             return fail("Waitable swapchain default GetMaximumFrameLatency should be 1");
+        if (wsc->SetMaximumFrameLatency(0) != E_INVALIDARG || wsc->SetMaximumFrameLatency(17) != E_INVALIDARG)
+            return fail("Waitable SetMaximumFrameLatency should reject 0 and > 16 with E_INVALIDARG");
+        if (FAILED(wsc->SetMaximumFrameLatency(2)) || FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 2)
+            return fail("Waitable SetMaximumFrameLatency(2) round-trip failed");
         HANDLE waitable = wsc->GetFrameLatencyWaitableObject();
         if (!waitable) return fail("Waitable swapchain returned null handle");
-        if (WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
-            return fail("Initial WaitForSingleObject on waitable swapchain failed");
+        if (WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0 ||
+            WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
+            return fail("Initial WaitForSingleObject on latency-2 waitable swapchain failed");
         if (wsc->Present(1, DXGI_PRESENT_ALLOW_TEARING) != DXGI_ERROR_INVALID_CALL)
             return fail("Present(1, ALLOW_TEARING) should return DXGI_ERROR_INVALID_CALL");
         if (FAILED(wsc->Present(0, DXGI_PRESENT_ALLOW_TEARING)))

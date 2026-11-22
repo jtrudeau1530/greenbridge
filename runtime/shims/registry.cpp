@@ -302,6 +302,18 @@ void add_module_lookup(void* ctx, ModuleLookup fn) {
     g_lookups.push_back({ctx, fn});
 }
 
+bool mapped_image_base(uint64_t address, uint64_t& base) {
+    std::string module;
+    uint32_t rva = 0;
+    std::lock_guard lock(g_lookup_mutex);
+    for (auto& l : g_lookups)
+        if (l.fn(l.ctx, address, module, rva)) {
+            base = address - rva;
+            return true;
+        }
+    return false;
+}
+
 void remove_module_lookup(void* ctx) {
     std::lock_guard lock(g_lookup_mutex);
     for (auto it = g_lookups.begin(); it != g_lookups.end(); ++it)
@@ -318,6 +330,17 @@ Table::Table(const Entry* entries, size_t count) {
 void* find(const std::string& dll_lower, const std::string& name) {
     auto it = table().find(dll_lower + "!" + name);
     return it == table().end() ? nullptr : it->second;
+}
+
+bool owns_dll(const std::string& dll_lower) {
+    static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
+                                       "vulkan-1.dll", "ntdll.dll", "user32.dll"};
+    if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return false;
+    for (const char* h : host)
+        if (dll_lower == h) return false;
+    const std::string prefix = dll_lower + "!";
+    auto it = table().lower_bound(prefix);
+    return it != table().end() && it->first.compare(0, prefix.size(), prefix) == 0;
 }
 
 void* make_unimplemented_thunk(const std::string& dll, const std::string& name) {

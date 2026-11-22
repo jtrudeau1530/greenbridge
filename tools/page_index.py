@@ -368,14 +368,24 @@ def offset(text):
     return value
 
 
-def main():
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Index RPF9 0DRP page directories (read-only, no TOC decryption)")
     ap.add_argument("source", help="archive.rpf or a directory of carved <offset>.bin files")
     ap.add_argument("out", help="output .json or .csv")
     ap.add_argument("--start", type=offset, help="first archive offset (default: header u32@4)")
     ap.add_argument("--limit", type=byte_count, help="stop after this many bytes")
     ap.add_argument("--quiet", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(a.out):
@@ -383,6 +393,18 @@ def main():
     ext = os.path.splitext(a.out)[1].lower()
     if ext not in (".json", ".csv"):   # checked before the scan, which can take minutes on a large archive
         ap.error("output must end in .json or .csv")
+    if same_output_path(a.source, a.out):
+        ap.error("output must not overwrite the source")
+    if os.path.isdir(a.source):
+        manifest = os.path.join(a.source, "index.json")
+        if os.path.isfile(manifest) and same_output_path(manifest, a.out):
+            ap.error(f"output would overwrite the carve manifest: {a.out}")
+        if os.path.isfile(a.out):
+            for name in os.listdir(a.source):
+                inp = os.path.join(a.source, name)
+                if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
+                    if same_output_path(inp, a.out):
+                        ap.error(f"output would overwrite an input file: {a.out}")
     folder = os.path.dirname(os.path.abspath(a.out))
     if not os.path.isdir(folder):
         ap.error(f"{folder} is not a folder, so {a.out} cannot be written")
@@ -420,4 +442,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())
