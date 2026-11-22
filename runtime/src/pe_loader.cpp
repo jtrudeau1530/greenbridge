@@ -320,6 +320,16 @@ void redirect_pc_to_file_header(HMODULE host) {
     }
 }
 
+// The module a host import actually resolved into. GetProcAddress follows forwarders, so this can be another DLL
+// than the one imported (on Windows vcruntime140.dll implements _CxxThrowException itself); that module's
+// RtlPcToFileHeader import is the one the throw calls.
+void redirect_pc_to_file_header_at(const void* resolved) {
+    HMODULE owner = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(resolved), &owner) && owner)
+        redirect_pc_to_file_header(owner);
+}
+
 }  // namespace
 
 namespace {
@@ -710,6 +720,7 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
     FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
     if (!p) return nullptr;
+    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
     binding = Binding::Host;
     return reinterpret_cast<void*>(p);
 }
@@ -743,6 +754,7 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
         FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
         if (p) {
+            if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
             m.imports.push_back({dll, sym, Binding::Host});
             return reinterpret_cast<void*>(p);
         }
