@@ -1464,8 +1464,9 @@ public:
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
         D3D12_RESOURCE_DESC desc = desc_;
         if (!desc.Alignment) {
-            desc.Alignment = desc.SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
-                                                       : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            desc.Alignment = (desc.SampleDesc.Count > 1 && !is_tiled_layout(desc.Layout))
+                                 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                                 : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         }
         return desc;
     }
@@ -1941,6 +1942,7 @@ public:
     bool reserved() const { return reserved_; }
     VkDeviceSize offset() const { return offset_; }
     UINT64 bytes() const { return desc_.SizeInBytes; }
+    UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
     const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
     D3D12_HEAP_FLAGS flags() const { return desc_.Flags; }
 
@@ -4313,26 +4315,31 @@ public:
             return E_INVALIDARG;
         }
         const bool tiled = is_tiled_layout(desc->Layout);
+        const bool msaa = desc->SampleDesc.Count > 1;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
             if (desc->Width > heap->bytes() || heap_offset > heap->bytes() - desc->Width) return E_INVALIDARG;
-        } else if (heap_offset >= heap->bytes()) {
-            return E_INVALIDARG;
-        }
-        if (tiled) {
+        } else {
             if (heap->properties().Type == D3D12_HEAP_TYPE_UPLOAD ||
                 heap->properties().Type == D3D12_HEAP_TYPE_READBACK)
                 return E_INVALIDARG;
-            if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            if (tiled || msaa) {
+                if (tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                    return E_INVALIDARG;
+                if (msaa && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
+                if (msaa && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) return E_INVALIDARG;
+                const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(*desc);
+                if (alloc.SizeInBytes == UINT64_MAX || heap->alignment() < alloc.Alignment ||
+                    heap_offset % alloc.Alignment || alloc.SizeInBytes > heap->bytes() ||
+                    heap_offset > heap->bytes() - alloc.SizeInBytes)
+                    return E_INVALIDARG;
+                if (tiled && static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
+                    log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
+                             int(desc->Dimension));
+                }
+            } else if (heap_offset >= heap->bytes()) {
                 return E_INVALIDARG;
-            const D3D12_RESOURCE_ALLOCATION_INFO alloc = allocation(*desc);
-            if (alloc.SizeInBytes == UINT64_MAX || alloc.SizeInBytes > heap->bytes() ||
-                heap_offset > heap->bytes() - alloc.SizeInBytes)
-                return E_INVALIDARG;
-            if (static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
-                log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
-                         int(desc->Dimension));
             }
         }
         // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
@@ -4344,8 +4351,6 @@ public:
             hr = resource->create_placed_buffer();
         } else if (!tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
             log_once("placed resource dimension not supported:", int(desc->Dimension));
-        } else if (desc->SampleDesc.Count > 1) {
-            log_once("multisampled placed resource not supported; samples", int(desc->SampleDesc.Count));
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);
@@ -5112,21 +5117,19 @@ private:
         D3D12_RESOURCE_DESC resolved = desc;
         if (!resolved.MipLevels) resolved.MipLevels = full;
         if (resolved.MipLevels > full) return kInvalidAllocation;
-        if (samples > 1 && (volume || one_d || resolved.MipLevels != 1 ||
+        const bool depth_stencil = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (samples > 1 && (volume || one_d || resolved.MipLevels != 1 || !(desc.Flags & attachment) ||
+                            (desc.Flags & attachment) == attachment ||
                             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return kInvalidAllocation;
         // The PC runtime: simultaneous access only single-sampled and without depth-stencil, and no volume depth.
-        const bool depth_stencil = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
             (volume && depth_stencil))
             return kInvalidAllocation;
         const bool tiled = is_tiled_layout(desc.Layout);
         if (tiled) {
-            if (one_d) return kInvalidAllocation;
+            if (one_d || (samples > 1 && samples != 4)) return kInvalidAllocation;
             if (desc.Alignment && desc.Alignment != align_64k) return kInvalidAllocation;
-            // Tiled MSAA is 4x single-mip 2D attachment only (measured on RTX 5070 Ti and WARP).
-            if (samples > 1 && (samples != 4 || !(desc.Flags & attachment) || (desc.Flags & attachment) == attachment))
-                return kInvalidAllocation;
         } else if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
         }

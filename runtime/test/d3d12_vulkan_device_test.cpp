@@ -785,6 +785,9 @@ int compare_allocation_info(ID3D12Device* ours) {
              d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
              return d;
          }(), 0},
+        {"UNKNOWN 4x MSAA NONE (invalid)", with(texture_desc(256, 256, rgba8, none, 1), 0, 4), 0},
+        {"UNKNOWN 4x MSAA RT+DS (invalid)",
+         with(texture_desc(256, 256, rgba8, rt | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1), 0, 4), 0},
     };
     int mismatches = 0;
     const auto mismatch = [&](const char* name, const D3D12_RESOURCE_ALLOCATION_INFO& a,
@@ -4925,13 +4928,6 @@ int main() {
             EXPECT(!fail.p);
         }
         {
-            const D3D12_RESOURCE_DESC valid_4x = tiled_2d_msaa(4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-            Ref<ID3D12Resource> fail;
-            EXPECT(standalone->CreatePlacedResource(tiled_heap.p, 0, &valid_4x, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                    IID_PPV_ARGS(&fail.p)) == E_NOTIMPL);
-            EXPECT(!fail.p);
-        }
-        {
             Ref<ID3D12Resource> fail;
             EXPECT(standalone->CreatePlacedResource(upload_placed_heap.p, 0, &tiled_rt_desc,
                                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
@@ -5018,6 +5014,246 @@ int main() {
                         EXPECT(SUCCEEDED(our_r->GetHeapProperties(&ohp, nullptr)) &&
                                SUCCEEDED(host_r->GetHeapProperties(&hhp, nullptr)));
                         EXPECT(ohp.Type == hhp.Type);
+                        D3D12_TILE_SHAPE os{}, hs{};
+                        standalone->GetResourceTiling(our_r.p, nullptr, nullptr, &os, nullptr, 0, nullptr);
+                        host_dev->GetResourceTiling(host_r.p, nullptr, nullptr, &hs, nullptr, 0, nullptr);
+                        EXPECT(os.WidthInTexels == hs.WidthInTexels && os.HeightInTexels == hs.HeightInTexels &&
+                               os.DepthInTexels == hs.DepthInTexels);
+                    }
+                }
+            }
+        }
+
+        // D3D-222: multisampled placed textures (UNKNOWN and 4x tiled).
+        D3D12_HEAP_DESC msaa_heap_desc{};
+        msaa_heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        msaa_heap_desc.SizeInBytes = 16 * 1024 * 1024;
+        msaa_heap_desc.Alignment = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+        Ref<ID3D12Heap> msaa_heap;
+        EXPECT(SUCCEEDED(standalone->CreateHeap(&msaa_heap_desc, IID_PPV_ARGS(&msaa_heap.p))));
+        D3D12_HEAP_DESC deny_rt_desc = tiled_heap_desc;
+        deny_rt_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        Ref<ID3D12Heap> deny_rt_heap;
+        EXPECT(SUCCEEDED(standalone->CreateHeap(&deny_rt_desc, IID_PPV_ARGS(&deny_rt_heap.p))));
+
+        auto msaa_desc = [&](UINT w, UINT h, UINT samples, UINT64 align, D3D12_TEXTURE_LAYOUT layout,
+                             D3D12_RESOURCE_FLAGS flags, DXGI_FORMAT fmt = DXGI_FORMAT_R8G8B8A8_UNORM,
+                             UINT16 mips = 1) {
+            D3D12_RESOURCE_DESC d = texture_desc(w, h, fmt, flags, mips);
+            d.Alignment = align;
+            d.SampleDesc.Count = samples;
+            d.Layout = layout;
+            return d;
+        };
+        const D3D12_RESOURCE_DESC msaa_unk_rt_desc =
+            msaa_desc(256, 256, 4, 0, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        const D3D12_RESOURCE_DESC msaa_unk_small_desc = msaa_desc(
+            256, 256, 4, D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        const D3D12_RESOURCE_DESC msaa_unk_ds_desc =
+            msaa_desc(256, 256, 4, 0, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                      DXGI_FORMAT_D32_FLOAT);
+        const D3D12_RESOURCE_DESC msaa_tiled_rt_desc = tiled_2d_msaa(4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        D3D12_RESOURCE_DESC msaa_xbox_rt_desc = msaa_tiled_rt_desc;
+        msaa_xbox_rt_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+
+        Ref<ID3D12Resource> msaa_unk_rt, msaa_unk_small, msaa_unk_ds, msaa_tiled_rt, msaa_xbox_rt, msaa_cast_rt;
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(msaa_heap.p, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
+                                                          &msaa_unk_rt_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&msaa_unk_rt.p))));
+        EXPECT(msaa_unk_rt->GetGPUVirtualAddress() == 0);
+        EXPECT(msaa_unk_rt->GetDesc().Alignment == D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT);
+        EXPECT(msaa_unk_rt->GetDesc().SampleDesc.Count == 4);
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(tiled_heap.p, 65536, &msaa_unk_small_desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&msaa_unk_small.p))));
+        EXPECT(msaa_unk_small->GetDesc().Alignment == D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT);
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(msaa_heap.p, 8 * 1024 * 1024, &msaa_unk_ds_desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&msaa_unk_ds.p))));
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(tiled_heap.p, 65536, &msaa_tiled_rt_desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&msaa_tiled_rt.p))));
+        EXPECT(msaa_tiled_rt->GetDesc().Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+        UINT msaa_tiles = 0;
+        D3D12_TILE_SHAPE msaa_shape{};
+        standalone->GetResourceTiling(msaa_tiled_rt.p, &msaa_tiles, nullptr, &msaa_shape, nullptr, 0, nullptr);
+        EXPECT(msaa_tiles == 16 && msaa_shape.WidthInTexels == 64 && msaa_shape.HeightInTexels == 64);
+        EXPECT(SUCCEEDED(standalone->CreatePlacedResource(tiled_heap.p, 65536, &msaa_xbox_rt_desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&msaa_xbox_rt.p))));
+        EXPECT(msaa_xbox_rt->GetDesc().Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+        EXPECT(static_cast<UINT>(msaa_xbox_rt->GetDesc().Layout) == 0x101);
+
+        {
+            Ref<ID3D12Device10> standalone10;
+            EXPECT(SUCCEEDED(standalone->QueryInterface(IID_PPV_ARGS(&standalone10.p))));
+            D3D12_RESOURCE_DESC1 cast_msaa{};
+            cast_msaa.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            cast_msaa.Width = 64;
+            cast_msaa.Height = 64;
+            cast_msaa.DepthOrArraySize = 1;
+            cast_msaa.MipLevels = 1;
+            cast_msaa.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+            cast_msaa.SampleDesc.Count = 4;
+            cast_msaa.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            const DXGI_FORMAT cast_list[] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+            EXPECT(SUCCEEDED(standalone10->CreatePlacedResource2(
+                msaa_heap.p, 0, &cast_msaa, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 2, cast_list,
+                IID_PPV_ARGS(&msaa_cast_rt.p))));
+        }
+
+        // Refusals matching host D3D12 for MSAA placed resources.
+        {
+            struct BadMsaaCase {
+                ID3D12Heap* heap;
+                UINT64 offset;
+                D3D12_RESOURCE_DESC desc;
+            };
+            D3D12_RESOURCE_DESC msaa_3d =
+                msaa_desc(16, 16, 4, 0, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            msaa_3d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            msaa_3d.DepthOrArraySize = 8;
+            const BadMsaaCase bad_msaa[] = {
+                // 4 MiB-aligned UNKNOWN MSAA fails on a 64 KiB heap (even at offset 0) and at misaligned offsets.
+                {tiled_heap.p, 0, msaa_unk_rt_desc},
+                {msaa_heap.p, 65536, msaa_unk_rt_desc},
+                {msaa_heap.p, msaa_heap_desc.SizeInBytes - 65536, msaa_unk_small_desc},
+                {upload_placed_heap.p, 0, msaa_unk_small_desc},
+                {deny_rt_heap.p, 0, msaa_unk_small_desc},
+                {msaa_heap.p, 0,
+                 msaa_desc(256, 256, 4, 0, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE)},
+                {msaa_heap.p, 0,
+                 msaa_desc(256, 256, 4, 0, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)},
+                {msaa_heap.p, 0,
+                 msaa_desc(64, 64, 4, 0, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                           DXGI_FORMAT_R8G8B8A8_UNORM, 0)},
+                {msaa_heap.p, 0, msaa_3d},
+            };
+            for (const BadMsaaCase& bad : bad_msaa) {
+                Ref<ID3D12Resource> fail;
+                EXPECT(standalone->CreatePlacedResource(bad.heap, bad.offset, &bad.desc, D3D12_RESOURCE_STATE_COMMON,
+                                                        nullptr, IID_PPV_ARGS(&fail.p)) == E_INVALIDARG);
+                EXPECT(!fail.p);
+            }
+        }
+
+        // Clear placed 4x MSAA RTVs (UNKNOWN + tiled) and DSV, resolve, and read back to verify GPU execution.
+        {
+            const D3D12_RESOURCE_DESC resolved_desc =
+                texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1);
+            Ref<ID3D12Resource> msaa_resolved_unk, msaa_resolved_tiled;
+            D3D12_HEAP_PROPERTIES def_hp{D3D12_HEAP_TYPE_DEFAULT};
+            EXPECT(SUCCEEDED(standalone->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &resolved_desc,
+                                                                 D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&msaa_resolved_unk.p))));
+            EXPECT(SUCCEEDED(standalone->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &resolved_desc,
+                                                                 D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&msaa_resolved_tiled.p))));
+
+            D3D12_DESCRIPTOR_HEAP_DESC msaa_rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            D3D12_DESCRIPTOR_HEAP_DESC msaa_dsv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> msaa_rtv_heap, msaa_dsv_heap;
+            EXPECT(SUCCEEDED(standalone->CreateDescriptorHeap(&msaa_rtv_hd, IID_PPV_ARGS(&msaa_rtv_heap.p))));
+            EXPECT(SUCCEEDED(standalone->CreateDescriptorHeap(&msaa_dsv_hd, IID_PPV_ARGS(&msaa_dsv_heap.p))));
+            const UINT rtv_step = standalone->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            const D3D12_CPU_DESCRIPTOR_HANDLE rtv0 = msaa_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+            const D3D12_CPU_DESCRIPTOR_HANDLE rtv1{rtv0.ptr + rtv_step};
+            standalone->CreateRenderTargetView(msaa_unk_rt.p, nullptr, rtv0);
+            standalone->CreateRenderTargetView(msaa_tiled_rt.p, nullptr, rtv1);
+            standalone->CreateDepthStencilView(msaa_unk_ds.p, nullptr, msaa_dsv_heap->GetCPUDescriptorHandleForHeapStart());
+
+            EXPECT(SUCCEEDED(tiled_alloc->Reset()) && SUCCEEDED(tiled_list->Reset(tiled_alloc.p, nullptr)));
+            D3D12_RESOURCE_BARRIER barriers[] = {
+                transition(msaa_unk_rt.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                transition(msaa_tiled_rt.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                transition(msaa_unk_ds.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+            };
+            tiled_list->ResourceBarrier(3, barriers);
+            tiled_list->ClearRenderTargetView(rtv0, tiled_color, 0, nullptr);
+            tiled_list->ClearRenderTargetView(rtv1, tiled_color, 0, nullptr);
+            tiled_list->ClearDepthStencilView(msaa_dsv_heap->GetCPUDescriptorHandleForHeapStart(),
+                                              D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 0, nullptr);
+            D3D12_RESOURCE_BARRIER to_resolve[] = {
+                transition(msaa_unk_rt.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
+                transition(msaa_tiled_rt.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE),
+            };
+            tiled_list->ResourceBarrier(2, to_resolve);
+            tiled_list->ResolveSubresource(msaa_resolved_unk.p, 0, msaa_unk_rt.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            tiled_list->ResolveSubresource(msaa_resolved_tiled.p, 0, msaa_tiled_rt.p, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            D3D12_RESOURCE_BARRIER to_copy[] = {
+                transition(msaa_resolved_unk.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(msaa_resolved_tiled.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            };
+            tiled_list->ResourceBarrier(2, to_copy);
+            Ref<ID3D12Resource> msaa_rb;
+            const D3D12_RESOURCE_DESC msaa_rb_desc = buffer_desc(1024);
+            EXPECT(SUCCEEDED(standalone->CreateCommittedResource(&rb_props, D3D12_HEAP_FLAG_NONE, &msaa_rb_desc,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&msaa_rb.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_unk{}, fp_tiled{};
+            fp_unk.Offset = 0;
+            fp_unk.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+            fp_tiled = fp_unk;
+            fp_tiled.Offset = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+            const D3D12_TEXTURE_COPY_LOCATION dst_unk = footprint(msaa_rb.p, fp_unk);
+            const D3D12_TEXTURE_COPY_LOCATION src_unk = subresource(msaa_resolved_unk.p, 0);
+            const D3D12_TEXTURE_COPY_LOCATION dst_tiled = footprint(msaa_rb.p, fp_tiled);
+            const D3D12_TEXTURE_COPY_LOCATION src_tiled = subresource(msaa_resolved_tiled.p, 0);
+            tiled_list->CopyTextureRegion(&dst_unk, 0, 0, 0, &src_unk, &box);
+            tiled_list->CopyTextureRegion(&dst_tiled, 0, 0, 0, &src_tiled, &box);
+            EXPECT(SUCCEEDED(tiled_list->Close()));
+            queue->ExecuteCommandLists(1, tiled_lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 8)) && SUCCEEDED(fence->SetEventOnCompletion(8, nullptr)));
+            void* msaa_bytes = nullptr;
+            EXPECT(SUCCEEDED(msaa_rb->Map(0, nullptr, &msaa_bytes)));
+            const auto* out_bytes = static_cast<const std::uint8_t*>(msaa_bytes);
+            report("placed MSAA UNKNOWN RTV resolve", 0, out_bytes, want_rgba, 4);
+            report("placed MSAA tiled RTV resolve", 0, out_bytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, want_rgba, 4);
+            EXPECT(std::memcmp(out_bytes, want_rgba, 4) == 0);
+            EXPECT(std::memcmp(out_bytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, want_rgba, 4) == 0);
+            msaa_rb->Unmap(0, nullptr);
+        }
+
+        // Host parity for MSAA placed acceptance/refusals, layout, alignment, heap flags and tiled 4x shape.
+        if (host_dev.p) {
+            Ref<ID3D12Heap> host_heap64, host_heap4m;
+            if (SUCCEEDED(host_dev->CreateHeap(&tiled_heap_desc, IID_PPV_ARGS(&host_heap64.p))) &&
+                SUCCEEDED(host_dev->CreateHeap(&msaa_heap_desc, IID_PPV_ARGS(&host_heap4m.p)))) {
+                struct MsaaParityCase {
+                    ID3D12Heap* our_heap;
+                    ID3D12Heap* host_heap;
+                    UINT64 offset;
+                    D3D12_RESOURCE_DESC desc;
+                };
+                const MsaaParityCase parity[] = {
+                    {tiled_heap.p, host_heap64.p, 0, msaa_unk_rt_desc},
+                    {msaa_heap.p, host_heap4m.p, 65536, msaa_unk_rt_desc},
+                    {msaa_heap.p, host_heap4m.p, 0, msaa_unk_rt_desc},
+                    {tiled_heap.p, host_heap64.p, 65536, msaa_unk_small_desc},
+                    {tiled_heap.p, host_heap64.p, 65536, msaa_tiled_rt_desc},
+                };
+                for (const MsaaParityCase& mc : parity) {
+                    Ref<ID3D12Resource> our_r, host_r;
+                    const HRESULT our_hr = standalone->CreatePlacedResource(
+                        mc.our_heap, mc.offset, &mc.desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&our_r.p));
+                    const HRESULT host_hr = host_dev->CreatePlacedResource(
+                        mc.host_heap, mc.offset, &mc.desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&host_r.p));
+                    EXPECT(SUCCEEDED(our_hr) == SUCCEEDED(host_hr));
+                    if (FAILED(host_hr)) {
+                        EXPECT(our_hr == host_hr);
+                        continue;
+                    }
+                    EXPECT(our_r->GetDesc().Layout == host_r->GetDesc().Layout);
+                    EXPECT(our_r->GetDesc().Alignment == host_r->GetDesc().Alignment);
+                    EXPECT(our_r->GetDesc().SampleDesc.Count == host_r->GetDesc().SampleDesc.Count);
+                    D3D12_HEAP_PROPERTIES ohp{}, hhp{};
+                    EXPECT(SUCCEEDED(our_r->GetHeapProperties(&ohp, nullptr)) &&
+                           SUCCEEDED(host_r->GetHeapProperties(&hhp, nullptr)));
+                    EXPECT(ohp.Type == hhp.Type);
+                    if (mc.desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
                         D3D12_TILE_SHAPE os{}, hs{};
                         standalone->GetResourceTiling(our_r.p, nullptr, nullptr, &os, nullptr, 0, nullptr);
                         host_dev->GetResourceTiling(host_r.p, nullptr, nullptr, &hs, nullptr, 0, nullptr);
