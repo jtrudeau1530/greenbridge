@@ -530,8 +530,8 @@ class F16Family(Family):
         elif n == "v_pack_b32_f16":
             sel = op["opsel"]
             lo, hi = half(s[0], sel[0]), half(s[1], sel[1])
-            # a signaling NaN half is uncertain (a quiet NaN stays compared): gfx1150 quiets a signaling NaN here (0x7c96 -> 0x7e96); the model moves bits,
-            # and whether RDNA2 does the same is not known
+            # a signaling NaN half is uncertain (a quiet NaN stays compared): gfx1150 quiets a signaling NaN here (0x7c96 -> 0x7e96); the model moves
+            # bits, which is what RDNA2 does under IEEE mode 0 and not under mode 1 (0x7c01 -> 0xfe01 on gfx1036, SHADER-260)
             if "pack_swapped" in PERTURB:
                 lo, hi = hi, lo
             R[d] = Reg(lo | (hi << 16), unc(s[0], sel[0]) or is_f16_snan(lo), unc(s[1], sel[1]) or is_f16_snan(hi))

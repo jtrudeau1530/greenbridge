@@ -322,7 +322,7 @@ def write_json(path, pages, summary):
 
 def write_csv(path, pages):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w = csv.DictWriter(f, fieldnames=COLUMNS, lineterminator="\n")
         w.writeheader()
         for page in pages:
             records = page["q38_records"]

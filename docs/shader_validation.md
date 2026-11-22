@@ -826,6 +826,22 @@ denormal, 2,810 other not judged. The four MODE settings read back in the kernel
 `0x3c0`, so the float mode of the kernel descriptor reaches the hardware through that launcher as well.
 `--negative-control` catches all six wrong models there (3 to 25 mismatches each).
 
+The same seeds through the Windows HIP launcher (`hw_oracle.c`) on the integrated GPU of a Ryzen 7 9800X3D (gfx1036;
+Windows 10 22H2, AMD driver 32.0.13036.4, `amdhip64_6.dll`, AMD clang 23.0.0git from rocm-sdk-core 10.0.0, main at
+41f44826) give the same counts in every column: 38,858 programs, **28,671 match, 0 mismatch, 56 known deviation**
+(all `omod_neg_zero`), 4,224 skipped, 3,097 denormal, 2,810 other. `--negative-control` again catches all six (3 to
+25 mismatches). Two launchers on two machines and two operating systems agree on the hardware words.
+
+`v_rcp_iflag_f32` (SHADER-136; added to the rcp / rsq / sqrt / exp / log family after the run above, so it is not in
+its counts) on the same gfx1036 through the Windows launcher, `--ops v_rcp_iflag_f32 --programs 1000 --probes 24`,
+seeds 1 to 6: 6,552 programs, **5,971 match, 0 mismatch, 35 known deviation** (`omod_neg_zero`), 279 denormal, 267
+other. It shares `v_rcp_f32`'s model, and the clamp and omod bits behave as on the other ops (summed over the six
+seeds, per MODE setting flush / keep / no_dx10 / ieee): clamp makes a -0 result +0 in every mode (98 each) and a NaN
+result +0 except with DX10_CLAMP off, where the NaN passes (169); omod is applied with IEEE off, including with f32
+denormals kept (461 each; like the other transcendental ops), and ignored with IEEE on (461); a -0 result becomes +0
+under omod (35 each, none with IEEE on); a signalling NaN passes unchanged with IEEE off and is quieted with IEEE on
+(59); denormal operands read as zero and denormal results flush in every mode.
+
 What the hardware answered where the model does not judge (gfx1150; the RDNA2 run above agrees where it is cited):
 
 - **No model error found.** The model was right wherever it had an answer, in 30,577 programs; the min/max/med3
@@ -971,9 +987,75 @@ Results:
 | GPU | Driver | `translator` | `vulkan` | `hw` |
 |---|---|---|---|---|
 | NVIDIA GeForce RTX 5060 (Blackwell), Windows 11 | 621.24 | double | double, 8 of 8 words | not AMD |
+| AMD Radeon iGPU (RDNA2, gfx1036), Windows 11, HIP backend | 32.0.21044.64 | double | not run | **single**, 7 of 7 ties; control `0x4100` |
 
-The `hw` column is still empty: the question needs an RDNA GPU. On the RTX 5060, a translator copy changed to use
+RDNA2 rounds once. Every tie input gives the single-rounded word (A `0x3c01`, B `0x3c01`, C `0xbc01`, D `0x0001`,
+E `0x7bff`, F `0x3c01`, G `0x3c01`), so the translator is one f16 ulp off on exactly these inputs (SHADER-135; the
+translator is not changed here). On the RTX 5060, a translator copy changed to use
 `fma_mix_odd` in nearest mode gave the single-rounded word for all seven inputs on the `vulkan` side as well.
+
+### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
+
+*Measured on an RDNA2 iGPU (gfx1036), AMD Windows driver 32.0.21044.64, HIP backend, AMD clang 23.0.0git, `main`
+a0acd33d.* Raw kernels written by hand, one lane each. The MODE comes from the kernel descriptor (`ieee`,
+`dx10_clamp`, `denorm_mode_32`, `denorm_mode_16_64`). Every program writes one word, starting from a destination of
+`0x5a5a5a5a`, so a half the op must not write shows up. 1,385 programs assembled, each run in wave32 and wave64, and
+the two wave sizes agree on every word. `tools/fma_mix_probe.py --oracle hw` (the section above) and
+`tools/f16_trans_sweep.py --ops v_exp_f16,v_log_f16` ran on the same GPU.
+
+- **An omod on an f16 result acts only with IEEE 0 and f16 denormals flushed (`denorm_mode_16_64 = 0`).** In that
+  MODE `mul:2`, `mul:4` and `div:2` scale the results of `v_add_f16`, `v_mul_f16`, `v_fma_f16`, `v_fmac_f16_e64`,
+  `v_cvt_f16_f32_e64`, `v_exp_f16_e64` and `v_rcp_f16_e64` (`v_fmac_f16_e64` 0.75 · 1 + -0 `mul:4` gives `0x4200`).
+  With `denorm_mode_16_64 = 3` or IEEE 1 they leave the result as it is (`0x3a00`), and `denorm_mode_32` makes no
+  difference. The f32 control (`v_add_f32_e64 mul:2`) follows `denorm_mode_32` instead, as on gfx1150 above. Unlike
+  the f32 transcendentals there, `v_exp_f16` and `v_rcp_f16` obey the same rule as the ALU ops. When the omod acts, a
+  -0 result becomes +0 (`v_fmac_f16` -0 · 1 + -0 `mul:2` gives `0x0000`), and it comes before the clamp
+  (`v_cvt_f16_f32_e64` 0.75 `clamp mul:2` gives `0x3c00`, not `0x3e00`).
+- **clamp** on `v_cvt_f16_f32_e64`, `v_fmac_f16_e64`, `v_fma_mixlo_f16` and `v_fma_mix_f32` clamps to [0, 1] in every
+  MODE: -0.5 and -0 give +0, 3.0 and an overflow (1e5, 65504 · 2) give 1.0. A NaN gives +0 with DX10_CLAMP 1. With
+  DX10_CLAMP 0 it stays the NaN the op gives without clamp. This is SHADER-186's f32 rule, here for the f16 results and
+  the mix ops.
+- **Constants in `v_fma_mix*` operands.** A float inline constant is the f32 constant where `op_sel_hi` makes the
+  operand f32, and the f16 constant with a zero high half where it makes it f16. `1.0`, `-1.0`, `0.5`, `2.0` and
+  `-4.0` give their value either way. `0.15915494` gives `0x3e22f983` as f32 and `0x3118` as f16 (`0x3e230000` once
+  widened). With `op_sel_hi = 1` and `op_sel = 1`, every float constant reads +0.0. An integer inline constant is its
+  32-bit integer. As an f32 operand, `1` and `64` are f32 denormals (+0 with `denorm_mode_32 = 0`) and `-1` is the NaN
+  `0xffffffff`. As an f16 operand, `op_sel` picks a half: `1` gives `0x0001` low and +0 high, and `-1` gives `0xffff`
+  in both. `op_sel` is ignored for an f32 operand. For gfx10, llvm-mc rejects a 32-bit literal in these ops ("invalid
+  operand"). It encodes a literal equal to an f16 inline constant, such as `0x3c00`, as that constant (`0xf2`).
+- **Mix-op denormals follow the mode of their own width.** An f16 operand (`op_sel_hi = 1`) and an f16 result
+  (`mixlo`/`mixhi`) become a zero of their sign with `denorm_mode_16_64 = 0`, and are kept with 3, whatever
+  `denorm_mode_32` says. An f32 denormal is flushed with `denorm_mode_32 = 0` and kept with 3.
+- **Mix-op NaNs.** An f16 NaN operand widens with its payload (`0x7c01` → `0x7f802000`, `0xfe01` → `0xffc02000`).
+  `v_fma_mix_f32` keeps a signalling NaN, f16 or f32, with IEEE 0, and quiets it with IEEE 1, payload kept
+  (`0x7f800001` → `0x7fc00001`). `v_fma_mixlo_f16` quiets every NaN in every MODE and keeps the top payload bits
+  (`0x7c01` → `0x7e01`, `0x7d55` → `0x7f55`, f32 `0x7fa00000` → `0x7f00`, f32 `0x7f800001` → `0x7e00`).
+- **`v_exp_f16` and `v_log_f16` give gfx1031's counts exactly**, on all 65,536 inputs in the five MODEs of the f16
+  transcendentals section: 0 ulp on every input that is not a NaN, with f16 denormals kept. With them flushed, 831
+  `v_exp_f16` results and 1,023 `v_log_f16` operands become zero. Signalling NaNs are quieted only with IEEE 1, and
+  wave32 = wave64.
+
+**The translator against these words.** Each program was translated as a pixel shader and run on
+`tests/semantic/spirv_mini_interp.py`, then compared with the hardware under the MODE the translator assumes for the
+game (IEEE 0, DX10_CLAMP 1, f32 denormals flushed, f16 denormals kept). It gives the same word for the float
+constants in every `op_sel`/`op_sel_hi` combination, for the integer constants as f16 halves, for clamp on values that
+are not NaN, and for the f16 denormals. It differs in five ways, none fixed here:
+
+1. **f16 omod.** The translator applies `mul:2`/`mul:4`/`div:2` to every f16 result. The hardware ignores them in this
+   MODE (24 words: `v_add/mul/fma/fmac/exp/rcp_f16`). `v_cvt_f16_f32` drops its omod and clamp today, so its omod
+   matches by accident; #718 would make it apply. The two assumptions can't both hold for the game. Either its shaders
+   run with f16 denormals flushed, and keeping them is wrong, or every f16 omod in them does nothing. A corpus count
+   of omod on f16 instructions would decide, since a compiler that emits one expects it to act (LLVM folds an omod only
+   when "output denormals" are off, the `SIFoldOperands.cpp` comment quoted above). That count needs the game files.
+2. **clamp of a NaN.** The interpreter refuses `FClamp` with a NaN operand, which GLSL.std.450 leaves undefined. The
+   hardware gives +0 with DX10_CLAMP 1, for `v_fmac_f16`, `v_fma_mixlo_f16` and `v_fma_mix_f32` alike (SHADER-186).
+3. **Mix-op rounding.** The hardware rounds once (the section above).
+4. **f32 denormal operands of the mix ops.** They are not flushed with `denorm_mode_32 = 0`: `0x00000001`, `0x807fffff`
+   and the integer constants `1` and `64` used as f32 give the denormal, where the hardware gives a zero of its sign
+   (compare SHADER-118 for the mad ops).
+5. **NaN payloads.** Where the hardware keeps the payload and, with IEEE 0, the signalling bit, the translator writes
+   the canonical quiet NaN (`0x7fc00000`, `0x7e00`). For example, `v_fmac_f16` keeps `0x7c01`. This is the "not
+   modelled yet" note of the f16 transcendentals row in `docs/design.md`, here for these ops too.
 
 ## Coverage plan and cost
 

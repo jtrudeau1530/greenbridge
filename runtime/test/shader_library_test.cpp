@@ -325,6 +325,7 @@ int main() {
     const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_test";
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
+    const std::string hash2 = sha256_hex(bytes("another program"));
     {
         std::ofstream index(dir / "index.json", std::ios::binary);
         index << "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
@@ -339,6 +340,10 @@ int main() {
                  "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"outputs\": [0, 2]},\n"
+                 " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
+                 "\"subgroup_size\": 64},\n"
+                 " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
+                 "\"subgroup_size\": null, \"wave64_exchange\": \"workgroup\"},\n"
                  " \"ps_unhashed\": {\"stage\": \"ps\", \"bindings\": []}}";
         std::ofstream spv(dir / "cs_test.spv", std::ios::binary);
         const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
@@ -346,7 +351,7 @@ int main() {
     }
     ShaderLibrary library;
     std::string error;
-    CHECK(library.load(dir.string(), &error) && library.size() == 4);
+    CHECK(library.load(dir.string(), &error) && library.size() == 6);
     const ShaderEntry* vs = library.find("vs", hash);
     CHECK(vs && vs->input_signature.size() == 2 && vs->input_signature[0].semantic == "COLOR");
     CHECK(vs->input_signature[1].register_index == 2 && vs->input_signature[1].system_value == 6 &&
@@ -363,6 +368,13 @@ int main() {
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
     CHECK(!library.find("ms", hash));  // no mesh shader with this hash
+    // The subgroup fields of the index (wave64 / subgroup_size / wave64_exchange): absent, native and emulated.
+    CHECK(!entry->subgroup_size && entry->wave64_exchange.empty() && !entry->emulated());
+    const ShaderEntry* native = library.find("ps", hash2);
+    CHECK(native && native->wave64 && native->subgroup_size == 64 && !native->emulated());
+    const ShaderEntry* emulated = library.find("cs", hash2);
+    CHECK(emulated && emulated->wave64 && emulated->subgroup_size == 0 && emulated->wave64_exchange == "workgroup" &&
+          emulated->emulated());
     CHECK(library.spirv(*entry).size() == 5);
     CHECK(!library.load((dir / "missing").string(), &error) && !error.empty());
     {

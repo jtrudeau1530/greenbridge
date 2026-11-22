@@ -208,6 +208,9 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   through slot 62 and a bare kind-6 program, found by `fspx_code_sha256` in `<shaders>/fspx/index.json`, one
   dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs
   are refused with `E_INVALIDARG`.
+- `d3d12_set0_compute_test` — set 0 from the compute bind point: a compute PSO whose index entry lists set-0
+  bindings, and four dispatches that sample two SRVs, bytes no view was made for and a clamping sampler through
+  the bindless set the layer binds.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
   Vulkan, resizes it and presents 10 more, and checks the colour on screen. A driver double then injects an
   out-of-date and a suboptimal present, a failed semaphore during a swapchain recreation and a failed blit

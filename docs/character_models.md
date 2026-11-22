@@ -50,8 +50,8 @@ Two caveats that matter for any render:
   `cs_lucia_legacypedcs` clothed legacy ped. The decoded part is 1,748 vertices / 1,816
   triangles, and the manifest lists 874- and 640-vertex rows of the same drawable. Do not present
   it as Lucia's hero body.
-- **The head drawable has no texture references.** Its face cannot be textured from the material
-  keys alone.
+- **The head drawable has no material texture references**, but its face comes from a **head-skin
+  preset** keyed by the head name's `joaat32` (see Textures).
 
 `player_story000_00` (Lucia's slot prefix) has 104 unique names: **63 drawables** plus **41
 `char_bipedbounds` fragments**. The largest drawables:
@@ -97,7 +97,15 @@ and `0x8ADB8480` is a BC4 mask. A part without an explicit albedo keeps a flat m
 it must not be painted with a normal or ORM map.
 
 The hands and feet keys (`0x4D89F2311DBBB7A8`, `0xA54D9F8B51CA6034`) did not resolve in the
-scanned TTPF pools. The head has no texture reference at all.
+scanned TTPF pools. The head drawable has no material texture reference, but its face is selected by
+a **head-skin preset** keyed by the head name's `joaat32`:
+
+| Head | Face albedo | Face normal |
+|---|---|---|
+| `player_story000_00_head_fr1_lat_000_m` | `0x8EDB5664DA38C47E` | `0x953715153D75447C` |
+| `cs_monalisa_head_fr1_afr_000_m_full` | `0x53A2896F4E5A6BA6` | `0xE82C7F6E02C8B701` |
+
+The preset library covers 897 heads; `cs_lucia_head_fr1_lat_000_y_full` is not in it.
 
 ## Materials
 

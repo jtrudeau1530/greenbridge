@@ -38,6 +38,15 @@ class UnsupportedConstruct(NotImplementedError):
     """The module uses something this interpreter deliberately does not model."""
 
 
+class InvalidModule(AssertionError):
+    """The module breaks spirv-val's merge rule (see spirv_mini_interp.check_structure): a merge instruction must
+    directly precede its block's branch. Raised instead of running a shader no driver would accept."""
+
+
+_MERGE_FOLLOW = {"OpSelectionMerge": ("OpBranchConditional", "OpSwitch"),
+                 "OpLoopMerge": ("OpBranch", "OpBranchConditional")}
+
+
 class F:
     """A 32-bit float carried as its bit pattern."""
     __slots__ = ("bits",)
@@ -120,6 +129,7 @@ class _Module:
         self.id_type = {}
         cur = None
         in_body = False
+        merge_line = None           # (opcode, line) of a merge whose branch has not been seen yet
         for raw in text.splitlines():
             line = raw.strip()
             if not line:
@@ -130,6 +140,11 @@ class _Module:
             res, op, rest = m.groups()
             a = rest.split()
             if in_body:
+                if merge_line is not None:
+                    if op not in _MERGE_FOLLOW[merge_line[0]]:
+                        raise InvalidModule(f"{merge_line[1]!r} is followed by {line!r}, not by "
+                                            f"{' or '.join(_MERGE_FOLLOW[merge_line[0]])}")
+                    merge_line = None
                 if op == "OpFunctionEnd":
                     in_body = False
                     continue
@@ -149,6 +164,7 @@ class _Module:
                     cur.phis.append((res, a))
                 elif op in ("OpSelectionMerge", "OpLoopMerge"):
                     cur.merge = (op, a[0], a[1] if op == "OpLoopMerge" else None)
+                    merge_line = (op, line)
                 elif op in _TERMINATORS:
                     cur.term = (op, a)
                     cur = None
