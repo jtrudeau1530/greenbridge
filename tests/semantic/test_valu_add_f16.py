@@ -1091,5 +1091,89 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(carry0, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_addition_without_carry(self) -> None:
+        sub1 = 0x0001
+        sub2 = 0x0002
+        res = oracle_v_add_f16(sub1, sub2)
+        self.assertEqual(res, 0x0003)
+        self.assertTrue(is_subnormal(res))
+
+    def test_subnormal_to_normal_transition(self) -> None:
+        # Largest subnormal: 0x03FF
+        max_sub = 0x03FF
+        min_sub = 0x0001
+        # Sum is 0x0400 = smallest normal (2^-14)
+        res = oracle_v_add_f16(max_sub, min_sub)
+        self.assertEqual(res, 0x0400)
+        self.assertFalse(is_subnormal(res))
+        self.assertEqual(split_f16_bits(res)[1], 1)  # exponent = 1
+        self.assertEqual(split_f16_bits(res)[2], 0)  # fraction = 0
+
+    def test_subnormal_cancellation(self) -> None:
+        sub = 0x0123
+        neg_sub = sub | SIGN_MASK
+        res = oracle_v_add_f16(sub, neg_sub)
+        self.assertEqual(res, POS_ZERO)
+
+    def test_nan_signaling_to_quiet_conversion(self) -> None:
+        snan = 0x7C05  # fraction non-zero, quiet bit 9 is 0
+        self.assertTrue(is_snan(snan))
+        res = oracle_v_add_f16(snan, f16_to_bits(1.0))
+        self.assertTrue(is_qnan(res))
+        self.assertEqual(res, snan | QNAN_BIT)
+
+    def test_nan_payload_preservation(self) -> None:
+        payload = 0x02AB
+        qnan = EXP_MASK | payload
+        res = oracle_v_add_f16(qnan, f16_to_bits(10.0))
+        self.assertEqual(res, qnan)
+
+    def test_nan_with_modifiers(self) -> None:
+        qnan = 0x7E01
+        # abs should clear sign bit
+        res_abs = oracle_v_add_f16(qnan | SIGN_MASK, f16_to_bits(0.0), abs0=True)
+        self.assertEqual(res_abs & SIGN_MASK, 0)
+        self.assertTrue(is_qnan(res_abs))
+
+        # neg should toggle sign bit
+        res_neg = oracle_v_add_f16(qnan, f16_to_bits(0.0), neg0=True)
+        self.assertEqual(res_neg & SIGN_MASK, SIGN_MASK)
+
+    def test_nan_with_clamp(self) -> None:
+        qnan = CANONICAL_QNAN
+        res = oracle_v_add_f16(qnan, f16_to_bits(1.0), clamp=True)
+        self.assertEqual(res, POS_ZERO)
+
+    def test_infinity_arithmetic_boundaries(self) -> None:
+        self.assertEqual(oracle_v_add_f16(POS_INF, f16_to_bits(100.0)), POS_INF)
+        self.assertEqual(oracle_v_add_f16(NEG_INF, f16_to_bits(100.0)), NEG_INF)
+        self.assertEqual(oracle_v_add_f16(POS_INF, NEG_INF), CANONICAL_QNAN)
+        self.assertEqual(oracle_v_add_f16(NEG_INF, POS_INF), CANONICAL_QNAN)
+
+        # Infinity with clamp
+        self.assertEqual(oracle_v_add_f16(POS_INF, f16_to_bits(0.0), clamp=True), ONE_F16)
+        self.assertEqual(oracle_v_add_f16(NEG_INF, f16_to_bits(0.0), clamp=True), POS_ZERO)
+
+    def test_round_to_nearest_even_ties(self) -> None:
+        # In IEEE 754 half precision (11 bits significand):
+        # 1.0 has bits 0x3C00 (even LSB = 0)
+        # 1.0 + 2^-10 has bits 0x3C01 (odd LSB = 1)
+        # 2^-11 is exactly halfway between representable numbers.
+        half_ulp = 2.0 ** -11
+        one = 1.0
+        one_plus_ulp = bits_to_f16(0x3C01)
+
+        # Case 1: 1.0 (even LSB) + 2^-11: tie rounds to even (1.0)
+        res1 = oracle_v_add_f16(f16_to_bits(one), f16_to_bits(half_ulp))
+        self.assertEqual(res1, f16_to_bits(one))
+
+        # Case 2: (1.0 + 2^-10) (odd LSB) + 2^-11: tie rounds to even (1.0 + 2 * 2^-10)
+        res2 = oracle_v_add_f16(f16_to_bits(one_plus_ulp), f16_to_bits(half_ulp))
+        self.assertEqual(res2, 0x3C02)
+
+
 if __name__ == "__main__":
     unittest.main()
