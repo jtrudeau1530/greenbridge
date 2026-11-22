@@ -654,9 +654,26 @@ class PathAndGameSelectionTest(PreflightTestBase):
             self.assert_fails(make_game.choose_game,
                               match="More than one copy found: choose one with --game.")
 
+    def default_out_in(self, platform, icloud_documents):
+        """default_out() with a temporary home folder; icloud_documents makes the folder macOS keeps in iCloud
+        Drive when Desktop & Documents sync is on (~/Library/Mobile Documents/com~apple~CloudDocs/Documents)."""
+        with tempfile.TemporaryDirectory() as home:
+            if icloud_documents:
+                os.makedirs(os.path.join(home, "Library", "Mobile Documents", "com~apple~CloudDocs", "Documents"))
+            with mock.patch.object(make_game.os.path, "expanduser", lambda p: home + p[1:] if p.startswith("~") else p), \
+                    mock.patch.object(make_game.sys, "platform", platform):
+                return os.path.relpath(make_game.default_out(), home)
+
     def test_default_out_matches_documents_folder(self):
-        expected = os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
-        self.assertEqual(make_game.default_out(), expected)
+        for platform in ("win32", "linux", "darwin"):
+            self.assertEqual(self.default_out_in(platform, False), os.path.join("Documents", "Leonida"), platform)
+
+    def test_default_out_leaves_icloud_synced_documents_on_a_mac(self):
+        # Before: with iCloud Desktop & Documents sync on, ~/Documents/Leonida (and its work folder, hundreds of GB
+        # made from the game) went into iCloud Drive, which uploads it and can evict the work files from the disk.
+        self.assertEqual(self.default_out_in("darwin", True), "Leonida")
+        # Only macOS keeps Documents in iCloud Drive this way; elsewhere the folder means nothing.
+        self.assertEqual(self.default_out_in("linux", True), os.path.join("Documents", "Leonida"))
 
     def test_constants_definitions(self):
         self.assertEqual(make_game.STAGES, ["check", "shaders", "assets", "runtime", "pipelines"])
