@@ -389,24 +389,39 @@ def ref_fma_f32(
 
 _TMP_DIR = None
 _SRC_PATH = None
+_CS_PATH = None
+_CS_FSSM = None
+VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
+
+
+def _make_fssm(rsrc2: int, group: tuple[int, int, int]) -> bytes:
+    header = bytearray(0x148)
+    struct.pack_into("<4I", header, 0x138, rsrc2, *group)
+    return bytes(header)
 
 
 def setUpModule():
-    global _TMP_DIR, _SRC_PATH
+    global _TMP_DIR, _SRC_PATH, _CS_PATH, _CS_FSSM
     _TMP_DIR = tempfile.TemporaryDirectory()
     disasm_dir = os.path.join(_TMP_DIR.name, "disasm")
+    fssm_dir = os.path.join(_TMP_DIR.name, "fssm")
     os.mkdir(disasm_dir)
+    os.mkdir(fssm_dir)
     _SRC_PATH = os.path.join(disasm_dir, "ps_fma_f32_clamp.s")
+    _CS_PATH = os.path.join(disasm_dir, "cs_fma_f32_clamp.s")
+    _CS_FSSM = os.path.join(fssm_dir, "cs_fma_f32_clamp.fssm")
     with open(os.path.join(_TMP_DIR.name, "ps_fma_f32_clamp.dxbc"), "wb") as f:
         f.write(STUB_DXBC)
 
 
 def tearDownModule():
-    global _TMP_DIR, _SRC_PATH
+    global _TMP_DIR, _SRC_PATH, _CS_PATH, _CS_FSSM
     if _TMP_DIR is not None:
         _TMP_DIR.cleanup()
         _TMP_DIR = None
         _SRC_PATH = None
+        _CS_PATH = None
+        _CS_FSSM = None
 
 
 def translate_ps(lines: list[str]) -> str:
@@ -453,6 +468,159 @@ def run_ps_fma(
     spv = translate_ps(lines)
     res = si.run_fragment(spv)["%out_mrt0"][0]
     return spv, res
+
+
+def run_cs_fma_workgroup(
+    group_size: int,
+    in_s0: list[int],
+    in_s1: list[int],
+    in_s2: list[int],
+    *,
+    clamp: bool = False,
+) -> list[int]:
+    """Execute multi-lane compute shader evaluating v_fma_f32 with clamp across a workgroup."""
+    if _TMP_DIR is None:
+        setUpModule()
+
+    # Buffer layout:
+    # 0x000 .. 0x0FF: s0 inputs (4 bytes per lane)
+    # 0x100 .. 0x1FF: s1 inputs
+    # 0x200 .. 0x2FF: s2 inputs
+    # 0x300 .. 0x3FF: dst outputs
+    with open(_CS_FSSM, "wb") as f:
+        f.write(_make_fssm(0x0088, (group_size, 1, 1)))
+
+    mod_str = " clamp" if clamp else ""
+    asm_lines = [
+        "; cs_fma_f32_clamp",
+        "\tv_lshlrev_b32_e32 v4, 2, v0",            # v4 = lane * 4
+        "\tv_add_nc_u32_e32 v5, 0x100, v4",        # v5 = 0x100 + lane * 4
+        "\tv_add_nc_u32_e32 v6, 0x200, v4",        # v6 = 0x200 + lane * 4
+        "\tv_add_nc_u32_e32 v7, 0x300, v4",        # v7 = 0x300 + lane * 4
+        "\tbuffer_load_dword v1, v4, s[0:3], 0 offen",
+        "\tbuffer_load_dword v2, v5, s[0:3], 0 offen",
+        "\tbuffer_load_dword v3, v6, s[0:3], 0 offen",
+        "\ts_waitcnt vmcnt(0)",
+        f"\tv_fma_f32_e64 v0, v1, v2, v3{mod_str}",
+        "\tbuffer_store_dword v0, v7, s[0:3], 0 offen",
+        "\ts_endpgm",
+    ]
+    with open(_CS_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(asm_lines) + "\n")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        spv = rdna2spirv.translate(_CS_PATH)
+
+    mem: dict[int, int] = {}
+    for i in range(group_size):
+        mem[i * 4] = in_s0[i] & MASK32
+        mem[0x100 + i * 4] = in_s1[i] & MASK32
+        mem[0x200 + i * 4] = in_s2[i] & MASK32
+        mem[0x300 + i * 4] = OLD
+
+    res_mem = si.run_workgroup(
+        spv,
+        group_size,
+        group_size,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0)},
+        push_constants=VSHARP + [0] * 28,
+        memory=mem,
+    )
+    return [res_mem.get(0x300 + i * 4, OLD) for i in range(group_size)]
+
+
+# -----------------------------------------------------------------------------
+# SIMD Wave Vector Interpreter
+# -----------------------------------------------------------------------------
+
+class VectorALUWaveSimd:
+    """Deterministic SIMD wave simulator modeling RDNA2 VALU execution.
+
+    Models:
+      - 64 SIMD vector lanes (or 32 lanes)
+      - Vector general purpose registers (VGPRs: v0..v63)
+      - Scalar general purpose registers (SGPRs: s0..s105)
+      - Execution mask (EXEC: 64-bit mask gating active lanes)
+      - Saturation clamping to [0.0, 1.0] across all active vector lanes
+    """
+
+    def __init__(self, wave_size: int = 64, num_vgprs: int = 64, num_sgprs: int = 106):
+        self.wave_size = wave_size
+        self.num_vgprs = num_vgprs
+        self.num_sgprs = num_sgprs
+        self.vgprs = [[OLD] * wave_size for _ in range(num_vgprs)]
+        self.sgprs = [0] * num_sgprs
+        self.exec_mask = (1 << wave_size) - 1
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & ((1 << self.wave_size) - 1)
+
+    def set_vgpr_lane(self, reg: int, lane: int, val: int) -> None:
+        self.vgprs[reg][lane] = val & MASK32
+
+    def get_vgpr_lane(self, reg: int, lane: int) -> int:
+        return self.vgprs[reg][lane] & MASK32
+
+    def set_vgpr_vector(self, reg: int, values: list[int]) -> None:
+        for lane in range(min(self.wave_size, len(values))):
+            self.vgprs[reg][lane] = values[lane] & MASK32
+
+    def get_vgpr_vector(self, reg: int) -> list[int]:
+        return [self.vgprs[reg][lane] & MASK32 for lane in range(self.wave_size)]
+
+    def set_sgpr(self, reg: int, val: int) -> None:
+        self.sgprs[reg] = val & MASK32
+
+    def get_sgpr(self, reg: int) -> int:
+        return self.sgprs[reg] & MASK32
+
+    def execute_v_fma_f32(
+        self,
+        dst_reg: int,
+        src0: int | str,
+        src1: int | str,
+        src2: int | str,
+        *,
+        clamp: bool = False,
+        omod: str | None = None,
+        src0_neg: bool = False,
+        src0_abs: bool = False,
+        src1_neg: bool = False,
+        src1_abs: bool = False,
+        src2_neg: bool = False,
+        src2_abs: bool = False,
+    ) -> None:
+        """Execute v_fma_f32 across all wave lanes with EXEC mask gating."""
+        for lane in range(self.wave_size):
+            if not ((self.exec_mask >> lane) & 1):
+                continue
+
+            def resolve(src: int | str) -> int:
+                if isinstance(src, int):
+                    return src & MASK32
+                if src.startswith("v"):
+                    return self.vgprs[int(src[1:])][lane]
+                if src.startswith("s"):
+                    return self.sgprs[int(src[1:])]
+                raise ValueError(f"Unknown operand: {src}")
+
+            s0 = resolve(src0)
+            s1 = resolve(src1)
+            s2 = resolve(src2)
+            self.vgprs[dst_reg][lane] = ref_fma_f32(
+                s0,
+                s1,
+                s2,
+                clamp=clamp,
+                omod=omod,
+                src0_neg=src0_neg,
+                src0_abs=src0_abs,
+                src1_neg=src1_neg,
+                src1_abs=src1_abs,
+                src2_neg=src2_neg,
+                src2_abs=src2_abs,
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -644,6 +812,137 @@ class TestFmaF32ShaderTranslation(unittest.TestCase):
                 _, got = run_ps_fma(s0, s1, s2, clamp=True)
                 want = ref_fma_f32(s0, s1, s2, clamp=True)
                 self.assertEqual(got, want)
+
+
+# -----------------------------------------------------------------------------
+# Unit Tests: SIMD Multi-Lane Execution & [0.0, 1.0] Saturation Clamping
+# -----------------------------------------------------------------------------
+
+class TestFmaF32SimdMultiLane(unittest.TestCase):
+    """Verifies SIMD wave vector execution and [0.0, 1.0] saturation clamping."""
+
+    def test_wave64_linear_sweep_saturation_clamping(self):
+        """64-lane SIMD wave evaluating a linear sweep across clamp boundaries."""
+        simd = VectorALUWaveSimd(wave_size=64)
+
+        # S0: Linear ramp from -1.5 to +1.5 across 64 lanes
+        # S1: Uniform 1.0f
+        # S2: Uniform 0.0f
+        # S0 * S1 + S2 = S0
+        ramp = [f32_to_bits(-1.5 + (3.0 * i / 63.0)) for i in range(64)]
+        simd.set_vgpr_vector(1, ramp)
+        simd.set_vgpr_vector(2, [ONE] * 64)
+        simd.set_vgpr_vector(3, [POS_ZERO] * 64)
+
+        # 1. Unclamped execution: full dynamic range preserved
+        simd.execute_v_fma_f32(0, "v1", "v2", "v3", clamp=False)
+        out_unclamped = simd.get_vgpr_vector(0)
+        self.assertEqual(out_unclamped, ramp)
+
+        # 2. Clamped execution: saturates to [0.0, 1.0]
+        simd.execute_v_fma_f32(0, "v1", "v2", "v3", clamp=True)
+        out_clamped = simd.get_vgpr_vector(0)
+
+        for i in range(64):
+            val = -1.5 + (3.0 * i / 63.0)
+            got = out_clamped[i]
+            if val < 0.0:
+                self.assertEqual(got, POS_ZERO, f"Lane {i} (val={val}) must saturate to +0.0")
+            elif val > 1.0:
+                self.assertEqual(got, ONE, f"Lane {i} (val={val}) must saturate to 1.0")
+            else:
+                self.assertEqual(got, ramp[i], f"Lane {i} (val={val}) must pass through unmodified")
+
+    def test_wave32_and_wave64_exec_mask_gating(self):
+        """Active lanes compute clamped FMA; inactive lanes strictly retain prior register state."""
+        for wave_size in (32, 64):
+            with self.subTest(wave_size=wave_size):
+                simd = VectorALUWaveSimd(wave_size=wave_size)
+                simd.set_vgpr_vector(1, [TWO] * wave_size)   # 2.0
+                simd.set_vgpr_vector(2, [TWO] * wave_size)   # 2.0
+                simd.set_vgpr_vector(3, [ONE] * wave_size)   # 1.0 -> 5.0 -> clamped to 1.0
+
+                # 1. Even lanes active
+                even_mask = 0x5555555555555555 if wave_size == 64 else 0x55555555
+                simd.set_exec(even_mask)
+                simd.execute_v_fma_f32(0, "v1", "v2", "v3", clamp=True)
+                out = simd.get_vgpr_vector(0)
+                for lane in range(wave_size):
+                    if lane % 2 == 0:
+                        self.assertEqual(out[lane], ONE, f"Active lane {lane} should clamp to 1.0")
+                    else:
+                        self.assertEqual(out[lane], OLD, f"Inactive lane {lane} must retain OLD")
+
+                # 2. Inactive wave (exec = 0): no lanes modified
+                simd2 = VectorALUWaveSimd(wave_size=wave_size)
+                simd2.set_exec(0)
+                simd2.execute_v_fma_f32(0, "v1", "v2", "v3", clamp=True)
+                self.assertEqual(simd2.get_vgpr_vector(0), [OLD] * wave_size)
+
+    def test_wave_multi_channel_color_clamping(self):
+        """Simulates 64 pixels computing clamped color intensity: clamp((base * light) + ambient)."""
+        simd = VectorALUWaveSimd(wave_size=64)
+
+        base = []
+        light = []
+        ambient = []
+        expected = []
+
+        for i in range(64):
+            if i < 16:
+                b, l, a = 0.5, 0.8, 0.1  # 0.5 * 0.8 + 0.1 = 0.5
+                exp = f32_to_bits(0.5)
+            elif i < 32:
+                b, l, a = 0.9, 1.8, 0.2  # 0.9 * 1.8 + 0.2 = 1.82 -> clamped to 1.0
+                exp = ONE
+            elif i < 48:
+                b, l, a = 0.2, 0.5, -0.4  # 0.2 * 0.5 - 0.4 = -0.3 -> clamped to 0.0
+                exp = POS_ZERO
+            else:
+                b, l, a = 1.0, 1.0, 0.0   # 1.0 * 1.0 + 0.0 = 1.0
+                exp = ONE
+            base.append(f32_to_bits(b))
+            light.append(f32_to_bits(l))
+            ambient.append(f32_to_bits(a))
+            expected.append(exp)
+
+        simd.set_vgpr_vector(1, base)
+        simd.set_vgpr_vector(2, light)
+        simd.set_vgpr_vector(3, ambient)
+
+        simd.execute_v_fma_f32(0, "v1", "v2", "v3", clamp=True)
+        self.assertEqual(simd.get_vgpr_vector(0), expected)
+
+    def test_wave_scalar_sgpr_broadcast(self):
+        """Scalar SGPR operand broadcast across all lanes in the wave combined with per-lane VGPRs."""
+        simd = VectorALUWaveSimd(wave_size=64)
+
+        v1_in = [f32_to_bits(float(i) * 0.05 - 0.5) for i in range(64)]
+        simd.set_vgpr_vector(1, v1_in)
+
+        simd.set_sgpr(4, TWO)
+        simd.set_sgpr(5, f32_to_bits(0.25))
+
+        simd.execute_v_fma_f32(0, "v1", "s4", "s5", clamp=True)
+        out = simd.get_vgpr_vector(0)
+
+        for lane in range(64):
+            x = float(lane) * 0.05 - 0.5
+            want = ref_fma_f32(v1_in[lane], TWO, f32_to_bits(0.25), clamp=True)
+            self.assertEqual(out[lane], want, f"Lane {lane} mismatch for {x} * 2.0 + 0.25")
+
+    def test_compute_shader_multi_lane_workgroup(self):
+        """End-to-end multi-lane compute shader execution via spirv_mini_interp.run_workgroup."""
+        group_size = 16
+        in_s0 = [f32_to_bits(float(i) - 4.0) for i in range(group_size)]  # -4.0 .. 11.0
+        in_s1 = [HALF] * group_size                                       # * 0.5
+        in_s2 = [f32_to_bits(0.25)] * group_size                          # + 0.25
+
+        res = run_cs_fma_workgroup(group_size, in_s0, in_s1, in_s2, clamp=True)
+
+        for i in range(group_size):
+            want = ref_fma_f32(in_s0[i], in_s1[i], in_s2[i], clamp=True)
+            self.assertEqual(res[i], want, f"Compute shader lane {i} mismatch")
 
 
 if __name__ == "__main__":
