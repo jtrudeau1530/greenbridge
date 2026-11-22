@@ -48,7 +48,7 @@ class CvtF16Int16OutputMods(unittest.TestCase):
             "v_mov_b32 v2, 3",
             "v_cvt_f16_i16 v2, v2 div:2",
             "v_mov_b32 v3, 1",
-            "v_cvt_f16_u16 v3, v3 div:2 clamp",
+            "v_cvt_f16_u16 v3, v3 clamp div:2",
             "exp mrt0 v0, v1, v2, v3 done vm",
             "s_endpgm",
         ])
