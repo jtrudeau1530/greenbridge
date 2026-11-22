@@ -107,7 +107,14 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   sizes and runs the scheduler's head for every invocation: before the first barrier and at the top of each round no
   word of `%x_buf` is stored by two invocations, and the words cleared are exactly the mask words, the counts and
   the data slots of the lanes a partial wave lacks (SHADER-708). It also runs the program on 32-wide subgroups with
-  `test_loop_ballot_barrier.run_compute_workgroup`, whose Workgroup memory starts as 0xDEADBEEF.
+  `test_loop_ballot_barrier.run_compute_workgroup`, whose Workgroup memory starts as 0xDEADBEEF. A mesh shader
+  (its place in the workgroup is LocalInvocationIndex) gets the same check of its scheduler's head. The three other
+  places a round starts are each run a whole workgroup at a time by `test_wave64_emulate_opt.run_emulated_workgroup`,
+  with `%x_buf` starting as 0xDEADBEEF: the `%x_pre_*_fn` helpers of inline structured emulation (one wave and
+  several), the mini scheduler (twice in a program, and two back to back) and the tail scheduler after a mini
+  scheduler, at sizes with a partial last wave, a last wave of one invocation and three dimensions. That
+  interpreter raises when a word of `%x_buf` is stored by two invocations between two barriers, or stored by one
+  and loaded or updated atomically by another.
 - `test_wave64_subgroup_ops.py` runs eight more wave64 GPU tests the same way (`cs_w64x_ballot`,
   `_readfirstlane`, `_load_ballot_load`, `_partial`, `cs_wave64_ballot`, `cs_wm_bfm64`, `cs_wm_half_cmp`,
   `cs_wavemask`): on one 64-wide subgroup every word equals the GPU check; on two 32-wide subgroups the

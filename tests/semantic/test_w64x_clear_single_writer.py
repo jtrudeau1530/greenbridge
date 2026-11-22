@@ -24,12 +24,30 @@ many, a three-dimensional group):
   * The evaluator itself: with the guard of a clear removed from the text, it reports the shared word.
   * The results: the program run on 32-wide subgroups by `test_loop_ballot_barrier.run_compute_workgroup`, whose
     Workgroup memory starts as 0xDEADBEEF, gives the values counted by hand.
+  * A mesh shader, whose place in the workgroup is LocalInvocationIndex: the same check of its scheduler's head.
+
+That program is one block, so it only gets the round loop. The slot of the next round is freed in three more places,
+and each of them is run here as well, a whole workgroup at a time, by the lockstep interpreter of
+test_wave64_emulate_opt (`run_emulated_workgroup`). It raises when a word of `%x_buf` is stored by two invocations
+between two barriers, or stored by one and loaded or updated atomically by another, and here the buffer starts as
+0xDEADBEEF, so a word that is used without having been cleared gives a wrong result:
+
+  * the helper functions of inline structured emulation (`%x_pre_vote_fn`, `%x_pre_data_fn`, `%x_pre_mask_fn`,
+    `%x_pre_both_fn`), in a one-wave workgroup (the whole program is inline) and in one of several waves;
+  * the local round loop of a region the waves go through differently (a "mini scheduler"), twice in one program
+    and two of them back to back;
+  * the round loop that takes over at an early `s_endpgm` (the "tail scheduler"), right after a mini scheduler.
+
+Each loop goes around the three slots more than once, with a mask that shrinks from round to round, at workgroup
+sizes with a partial last wave, a last wave of one invocation, one invocation in all, and three dimensions.
 
 The programs are written here; no game data.
 """
 import os
 import re
+import struct
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +55,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)  # python -I leaves the script's folder off sys.path
 
 import test_loop_ballot_barrier as rounds  # noqa: E402  (translates a compute listing; runs a whole workgroup)
+import test_wave64_emulate_opt as opt  # noqa: E402  (the lockstep interpreter of an emulated workgroup)
 
 M32 = 0xFFFFFFFF
 
@@ -67,6 +86,31 @@ PROGRAM = [
 # mask and schedule words of one wave; exactly 12; one invocation; and two three-dimensional groups.
 SIZES = [(64, 1, 1), (128, 1, 1), (40, 1, 1), (200, 1, 1), (8, 1, 1), (12, 1, 1), (1, 1, 1), (4, 4, 4), (8, 5, 3)]
 
+# A mesh shader of 64 vertices and 64 triangles at most: the wave's count of lanes with (lane & 7) == 5 and its first
+# lane are the x and y of the positions it exports. Only its scheduler's head is looked at.
+MESH_PROGRAM = [
+    "v_mbcnt_lo_u32_b32 v0, -1, 0",
+    "v_mbcnt_hi_u32_b32 v0, -1, v0",
+    "v_and_b32_e32 v12, 7, v0",
+    "v_cmp_eq_u32_e64 s[6:7], 5, v12",
+    "s_bcnt1_i32_b64 s10, s[6:7]",
+    "v_readfirstlane_b32 s11, v0",
+    "v_cvt_f32_u32_e32 v1, s10",
+    "v_cvt_f32_u32_e32 v2, s11",
+    "v_mov_b32_e32 v6, 0",
+    "v_mov_b32_e32 v7, 1.0",
+    "s_mov_b32 m0, 0x1003",
+    "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)",
+    "v_cmpx_gt_u32_e32 3, v0",
+    "exp pos0 v1, v2, v6, v7 done",
+    "exp param0 v1, v2, v6, v7",
+    "v_cmpx_eq_u32_e32 0, v0",
+    "v_mov_b32_e32 v9, 0x200400",
+    "exp prim v9, off, off, off done",
+    "s_endpgm",
+]
+MESH_THREADS = [128, 100, 40, 1]
+
 _DEF = re.compile(r"(%\w+) = (Op\w+)(?: (.*))?$")
 
 
@@ -75,6 +119,38 @@ def translate(size):
     spv, gen = rounds._translate_cs("cs_w64x_clear_%dx%dx%d" % size, PROGRAM, threads=threads, emulate=True,
                                     size_xyz=size)
     assert gen.control_flow == "emulated wave64 rounds", gen.control_flow
+    return spv
+
+
+def mesh_container(threads):
+    """A DXBC container holding only PSV0, the runtime info the translator takes a mesh shader's limits from: stage
+    13 (mesh), `threads` x 1 x 1 invocations, at most 64 vertices and 64 primitives, triangles."""
+    info = bytearray(48)
+    struct.pack_into("<HH", info, 12, 64, 64)
+    info[24], info[27] = 13, 2
+    struct.pack_into("<III", info, 36, threads, 1, 1)
+    chunk = b"PSV0" + struct.pack("<II", 4 + len(info), len(info)) + bytes(info)
+    return b"DXBC" + bytes(16) + struct.pack("<IIII", 1, 36 + len(chunk), 1, 36) + chunk
+
+
+def translate_mesh(threads):
+    name = "ms_w64x_clear_%d" % threads
+    with tempfile.TemporaryDirectory() as tmp:
+        os.mkdir(os.path.join(tmp, "disasm"))
+        src = os.path.join(tmp, "disasm", name + ".s")
+        with open(src, "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"; {name} synthetic\n; mattr: +wavefrontsize64,-wavefrontsize32\n")
+            for text, size in rounds._resolve_labels(MESH_PROGRAM):
+                f.write(f"\t{text} ; encoding: [{','.join(['0x00'] * size)}]\n")
+        with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
+            f.write(mesh_container(threads))
+        emulate, rounds.rdna2spirv.WAVE64_EMULATE = rounds.rdna2spirv.WAVE64_EMULATE, True
+        try:
+            spv = rounds.rdna2spirv.translate(src)
+            gen = rounds.rdna2spirv.translate.last_gen
+        finally:
+            rounds.rdna2spirv.WAVE64_EMULATE = emulate
+    assert (gen.stage, gen.control_flow) == ("ms", "emulated wave64 rounds"), (gen.stage, gen.control_flow)
     return spv
 
 
@@ -199,26 +275,35 @@ def shared(writers):
 
 
 class ClearHasOneWriterPerWord(unittest.TestCase):
+    def check_clears(self, spv, size):
+        threads = size[0] * size[1] * size[2]
+        mod, first, per_round, values = clears(spv, size)
+        lanes, waves, mask, sched, words = layout(threads)
+        self.assertEqual(mod.buf_words, words)
+        self.assertEqual(shared(first), {}, "stored by several invocations before the first barrier")
+        # Everything the first round may read or add to: all mask words and counts, and both data slots
+        # of each lane the partial last wave lacks. The last word of the buffer is not one of them.
+        want = set(range(mask, sched + 6)) | set(range(threads, lanes)) | set(range(lanes + threads, 2 * lanes))
+        self.assertEqual(set(first), want)
+        for r, seen in enumerate(per_round):
+            self.assertEqual(shared(seen), {}, f"stored by several invocations at the top of round {r}")
+            slot = (r + 1) % 3                  # the slot round r + 1 writes
+            want = {mask + 2 * (slot * waves + w) + k for w in range(waves) for k in (0, 1)} | \
+                {sched + 2 * slot, sched + 2 * slot + 1}
+            self.assertEqual(set(seen), want, f"round {r}")
+        self.assertEqual(values, {0})
+
     def test_no_word_is_cleared_by_two_invocations_and_the_same_words_are_cleared(self):
         for size in SIZES:
-            threads = size[0] * size[1] * size[2]
             with self.subTest(size=size):
-                mod, first, per_round, values = clears(translate(size), size)
-                lanes, waves, mask, sched, words = layout(threads)
-                self.assertEqual(mod.buf_words, words)
-                self.assertEqual(shared(first), {}, "stored by several invocations before the first barrier")
-                # Everything the first round may read or add to: all mask words and counts, and both data slots
-                # of each lane the partial last wave lacks. The last word of the buffer is not one of them.
-                want = set(range(mask, sched + 6)) | set(range(threads, lanes)) | \
-                    set(range(lanes + threads, 2 * lanes))
-                self.assertEqual(set(first), want)
-                for r, seen in enumerate(per_round):
-                    self.assertEqual(shared(seen), {}, f"stored by several invocations at the top of round {r}")
-                    slot = (r + 1) % 3                  # the slot round r + 1 writes
-                    want = {mask + 2 * (slot * waves + w) + k for w in range(waves) for k in (0, 1)} | \
-                        {sched + 2 * slot, sched + 2 * slot + 1}
-                    self.assertEqual(set(seen), want, f"round {r}")
-                self.assertEqual(values, {0})
+                self.check_clears(translate(size), size)
+
+    def test_a_mesh_shader_s_clears_have_one_writer_per_word(self):
+        for threads in MESH_THREADS:
+            with self.subTest(threads=threads):
+                spv = translate_mesh(threads)
+                self.assertIn("%x_li = OpLoad %uint %local_index", spv)
+                self.check_clears(spv, (threads, 1, 1))
 
     def test_every_invocation_reaches_the_first_barrier(self):
         # The barrier has to stay in uniform control flow: each guard of a store is a selection of its own that
@@ -294,6 +379,283 @@ class ResultsWithUndefinedWorkgroupMemory(unittest.TestCase):
                     wave = range(base, min(base + 64, threads))
                     want = (len(wave), base, sum(1 for u in wave if u & 3 == 3), sum(1 for u in wave if u & 3 == 0))
                     self.assertEqual(tuple(mem.get(16 * t + 4 * k, -1) for k in range(4)), want, f"thread {t}")
+
+
+# ---- the other places a round starts: whole workgroups in the lockstep interpreter ----
+
+FILL = 0xDEADBEEF                          # what %x_buf holds at launch here (undefined on a GPU)
+PUSH = opt.VSHARP + [0] * 28               # s[0:3]: a raw buffer over every offset
+RSRC2 = 0x8088 | 2 << 11                   # opt._translate_encoded's default plus the thread ids y and z in v1, v2
+STORE = ["v_add_nc_u32_e32 v4, s21, v4",   # out[4 t] = the thread's value plus the wave's counts, out[4 t + 1] = s19
+         "v_mov_b32_e32 v5, s19",
+         "buffer_store_dword v4, v10, s[0:3], 0 offen offset:0",
+         "buffer_store_dword v5, v10, s[0:3], 0 offen offset:4",
+         "s_endpgm"]
+
+SINGLE_SIZES = [(64, 1, 1), (40, 1, 1), (1, 1, 1), (4, 4, 4), (5, 3, 2)]
+WAVES_SIZES = [(128, 1, 1), (200, 1, 1), (65, 1, 1), (8, 5, 3), (4, 4, 8)]
+
+
+def setup(size):
+    """v0 = the thread's index in the workgroup (it starts as the x of its id), v11 = its lane, v4 = its value
+    (the index to start with), v10 = 16 x index, s21 = 0."""
+    return ["s_mov_b64 exec, -1",
+            f"v_mul_u32_u24_e32 v6, {size[0]}, v1",
+            f"v_mul_u32_u24_e32 v7, {size[0] * size[1]}, v2",
+            "v_add_nc_u32_e32 v0, v0, v6",
+            "v_add_nc_u32_e32 v0, v0, v7",
+            "v_and_b32_e32 v11, 63, v0",
+            "v_lshlrev_b32_e32 v10, 4, v0",
+            "v_mov_b32_e32 v4, v0",
+            "s_mov_b32 s21, 0"]
+
+
+def loop(tag, lane, counter):
+    """While `counter` (an SGPR) is not 0: every thread adds the value of lane `lane` of its wave, s21 grows by
+    the number of the wave's lanes below `counter` (a mask that shrinks by one lane a time), counter -= 1. Two
+    exchanges a time around: a value and two mask words."""
+    return [f"loop_{tag}:",
+            f"v_readlane_b32 s18, v4, {lane}",
+            f"v_cmp_gt_u32_e64 s[6:7], {counter}, v11",
+            "s_bcnt1_i32_b64 s9, s[6:7]",
+            "s_add_u32 s21, s21, s9",
+            "v_add_nc_u32_e32 v4, s18, v4",
+            f"s_sub_u32 {counter}, {counter}, 1",
+            f"s_cmp_gt_u32 {counter}, 0",
+            f"s_cbranch_scc1 loop_{tag}"]
+
+
+def single_program(size):
+    """One wave. Four times: the first lane's value and the wave's active mask (%x_pre_both_fn), lane 5's value
+    (%x_pre_data_fn), a count of the lanes below 4, 3, 2, 1 (%x_pre_mask_fn); then a voted branch
+    (%x_pre_vote_fn)."""
+    return setup(size) + [
+        "s_mov_b32 s20, 4",
+        "loop:",
+        "v_readfirstlane_b32 s17, v4",
+        "v_readlane_b32 s18, v4, 5",
+        "v_cmp_gt_u32_e64 s[6:7], s20, v11",
+        "s_bcnt1_i32_b64 s9, s[6:7]",
+        "s_add_u32 s21, s21, s9",
+        "v_add_nc_u32_e32 v4, s17, v4",
+        "v_add_nc_u32_e32 v4, s18, v4",
+        "s_sub_u32 s20, s20, 1",
+        "s_cmp_gt_u32 s20, 0",
+        "s_cbranch_scc1 loop",
+        "v_readfirstlane_b32 s19, v0",
+        "v_cmp_gt_u32_e32 vcc, 2, v11",
+        "s_cbranch_vccz skip",                  # not taken: lane 0 is below 2
+        "s_add_u32 s21, s21, 100",
+        "skip:"] + STORE
+
+
+def hybrid_program(size):
+    """Several waves: inline exchanges at the top level (the helpers with a wave parameter), a loop only the first
+    wave runs (4 times) and a loop only the other waves run (5 times), each in a mini scheduler. The last block is
+    four inline exchanges in a row: a count of the lanes below 8, two values, a count of the lanes below 2, which
+    uses the mask slot of the first count again, freed by the helper of the exchange between them."""
+    return setup(size) + [
+        "v_readfirstlane_b32 s19, v0",          # the wave's first thread
+        "s_cmp_lt_u32 s19, 64",
+        "s_cbranch_scc0 second",
+        "s_mov_b32 s20, 4"] + loop("a", 37, "s20") + [
+        "second:",
+        "v_readlane_b32 s22, v4, 3",
+        "v_add_nc_u32_e32 v4, s22, v4",
+        "s_cmp_ge_u32 s19, 64",
+        "s_cbranch_scc0 last",
+        "s_mov_b32 s20, 5"] + loop("b", 9, "s20") + [
+        "last:",
+        "v_cmp_gt_u32_e64 s[6:7], 8, v11",
+        "s_bcnt1_i32_b64 s9, s[6:7]",
+        "s_add_u32 s21, s21, s9",
+        "v_readlane_b32 s25, v4, 1",
+        "v_add_nc_u32_e32 v4, s25, v4",
+        "v_readlane_b32 s25, v4, 2",
+        "v_add_nc_u32_e32 v4, s25, v4",
+        "v_cmp_gt_u32_e64 s[6:7], 2, v11",
+        "s_bcnt1_i32_b64 s9, s[6:7]",
+        "s_add_u32 s21, s21, s9"] + STORE
+
+
+def tail_program(size):
+    """Several waves: the first wave's loop (4 times) is a mini scheduler, which the other waves sit out, and
+    everything from there on, with an s_endpgm on either side of the branch, is the tail scheduler: the first wave
+    stores and ends in its first round, the other waves go around their loop twice after that."""
+    return setup(size) + [
+        "v_readfirstlane_b32 s19, v0",
+        "v_readlane_b32 s22, v4, 3",
+        "v_add_nc_u32_e32 v4, s22, v4",
+        "s_cmp_lt_u32 s19, 64",
+        "s_cbranch_scc0 other",
+        "s_mov_b32 s20, 4"] + loop("a", 37, "s20") + STORE + [
+        "other:",
+        "s_mov_b32 s20, 2"] + loop("b", 9, "s20") + STORE
+
+
+def loops_program(size):
+    """Several waves (four at most), two loops back to back that every wave runs, wave w the first one w + 2
+    times and the second one 4 - w times: two mini schedulers with nothing between them."""
+    return setup(size) + [
+        "v_readfirstlane_b32 s19, v0",
+        "s_lshr_b32 s24, s19, 6",
+        "s_add_u32 s20, s24, 2",
+        "s_sub_u32 s23, 4, s24"] + loop("a", 37, "s20") + loop("b", 9, "s23") + STORE
+
+
+def waves_of(size):
+    threads = size[0] * size[1] * size[2]
+    return [list(range(base, min(base + 64, threads))) for base in range(0, threads, 64)]
+
+
+def run_loop(value, wave, lane, trips):
+    """What loop() does to one wave: `value` (by thread) is updated; returns what s21 grows by."""
+    counts = 0
+    for left in range(trips, 0, -1):
+        got = value[wave[lane]] if lane < len(wave) else 0        # a lane the wave lacks reads as 0
+        counts += min(left, len(wave))
+        for t in wave:
+            value[t] += got
+    return counts
+
+
+def stored(value, s21, s19):
+    out = {}
+    for t, v in value.items():
+        out[16 * t], out[16 * t + 4] = (v + s21[t]) & M32, s19[t]
+    return out
+
+
+def single_expect(size):
+    wave, = waves_of(size)
+    value, counts = {t: t for t in wave}, 100
+    for left in (4, 3, 2, 1):
+        got = value[0] + (value[5] if len(wave) > 5 else 0)
+        counts += min(left, len(wave))
+        for t in wave:
+            value[t] += got
+    return stored(value, dict.fromkeys(wave, counts), dict.fromkeys(wave, 0))
+
+
+def waves_expect(kind, size):
+    value, s21, s19 = {}, {}, {}
+    for w, wave in enumerate(waves_of(size)):
+        value.update((t, t) for t in wave)
+        lane = lambda n: value[wave[n]] if len(wave) > n else 0                       # noqa: E731
+        counts = 0
+        if kind == "hybrid":
+            if w == 0:
+                counts += run_loop(value, wave, 37, 4)
+            got = lane(3)
+            for t in wave:
+                value[t] += got
+            if w:
+                counts += run_loop(value, wave, 9, 5)
+            for n in (1, 2):
+                got = lane(n)
+                for t in wave:
+                    value[t] += got
+            counts += min(8, len(wave)) + min(2, len(wave))
+        elif kind == "tail":
+            got = lane(3)
+            for t in wave:
+                value[t] += got
+            counts += run_loop(value, wave, 37, 4) if w == 0 else run_loop(value, wave, 9, 2)
+        else:
+            counts += run_loop(value, wave, 37, w + 2)
+            counts += run_loop(value, wave, 9, 4 - w)
+        s21.update(dict.fromkeys(wave, counts))
+        s19.update(dict.fromkeys(wave, wave[0]))
+    return stored(value, s21, s19)
+
+
+def run_workgroup(name, program, size):
+    """Translate with emulation and run the whole workgroup in the lockstep interpreter, in both orders of the
+    invocations between two barriers, %x_buf starting as FILL. Returns (gen, SPIR-V, memory, barriers passed)."""
+    spv, gen = opt._translate_encoded("cs_w64x_%s_%dx%dx%d" % ((name,) + size), rounds._resolve_labels(program),
+                                      size, emulate=True, rsrc2=RSRC2)
+    runs = [opt.run_emulated_workgroup(spv, size, push_constants=PUSH, reverse_order=rev, x_buf_fill=FILL)
+            for rev in (False, True)]
+    assert runs[0] == runs[1], "the result depends on the order the invocations run in"
+    return gen, spv, runs[0][0], runs[0][1]
+
+
+def steps(gen):
+    return [step[0] for step in gen.emulate_plan["steps"]]
+
+
+class EveryRoundStartHasOneWriterPerWord(unittest.TestCase):
+    def test_inline_helpers_of_a_single_wave(self):
+        for size in SINGLE_SIZES:
+            with self.subTest(size=size):
+                gen, spv, memory, barriers = run_workgroup("single", single_program(size), size)
+                self.assertEqual((gen.control_flow, gen.emulate_plan["mode"], gen.x_lanes),
+                                 ("emulated wave64 structured", "inline_all", 64))
+                self.assertEqual(sorted(gen.x_round_fns), ["both", "data", "mask", "vote"])
+                self.assertNotIn("OpSwitch", spv)
+                # The first clear, 4 x 3 exchanges in the loop, the first lane and the vote after it.
+                self.assertGreaterEqual(barriers, 15)
+                self.assertEqual(memory, single_expect(size))
+
+    def test_inline_helpers_and_mini_schedulers_of_several_waves(self):
+        for size in WAVES_SIZES:
+            with self.subTest(size=size):
+                gen, spv, memory, barriers = run_workgroup("hybrid", hybrid_program(size), size)
+                self.assertEqual((gen.control_flow, gen.emulate_plan["mode"]),
+                                 ("emulated wave64 structured", "structured_hybrid"))
+                self.assertGreater(gen.x_lanes, 64)
+                self.assertEqual(sorted(gen.x_round_fns), ["both", "data", "mask"])
+                self.assertEqual([s for s in steps(gen) if s != "inline_sync_free"],
+                                 ["inline_block", "mini_scheduler", "inline_block", "mini_scheduler", "inline_block"])
+                # No barrier of its own in front of either mini scheduler: its first round follows the reads of
+                # the inline exchange before it directly.
+                self.assertEqual([step[-1] for step in gen.emulate_plan["steps"] if step[0] == "mini_scheduler"],
+                                 [False, False])
+                self.assertGreater(barriers, 20)
+                self.assertEqual(memory, waves_expect("hybrid", size))
+
+    def test_tail_scheduler_after_a_mini_scheduler(self):
+        for size in WAVES_SIZES:
+            with self.subTest(size=size):
+                gen, spv, memory, barriers = run_workgroup("tail", tail_program(size), size)
+                self.assertEqual(steps(gen), ["inline_block", "mini_scheduler", "tail_scheduler"])
+                self.assertEqual([step[-1] for step in gen.emulate_plan["steps"][1:]], [False, False])
+                self.assertIn("%x_round = OpLabel", spv)
+                self.assertGreater(barriers, 20)
+                self.assertEqual(memory, waves_expect("tail", size))
+
+    def test_two_mini_schedulers_back_to_back(self):
+        for size in WAVES_SIZES:
+            with self.subTest(size=size):
+                gen, spv, memory, barriers = run_workgroup("loops", loops_program(size), size)
+                kinds = steps(gen)
+                self.assertEqual(kinds.count("mini_scheduler"), 2)
+                at = kinds.index("mini_scheduler")
+                self.assertEqual(kinds[at:at + 2], ["mini_scheduler", "mini_scheduler"])
+                self.assertNotIn("tail_scheduler", kinds)
+                self.assertGreater(barriers, 20)
+                self.assertEqual(memory, waves_expect("loops", size))
+
+    def test_the_interpreter_reports_a_store_another_invocation_reads_or_repeats(self):
+        size = (128, 1, 1)
+        spv, gen = opt._translate_encoded("cs_w64x_tail_check", rounds._resolve_labels(tail_program(size)), size,
+                                          emulate=True, rsrc2=RSRC2)
+        run = lambda text: opt.run_emulated_workgroup(text, size, push_constants=PUSH)   # noqa: E731
+        run(spv)
+        # The tail scheduler frees the slot of round + 2 instead: that is the slot of round - 1, which the wave's
+        # lanes read in this round. One writer still, but its store races with their loads.
+        freed = f"%x_n1 = OpIAdd %uint %x_itv {gen.consts[1]}"
+        self.assertEqual(spv.count(freed), 1)
+        with self.assertRaisesRegex(AssertionError, r"%x_buf word \d+ is (stored|read) by invocation \d+ and "
+                                                    r"(read|stored) by \d+ with no barrier"):
+            run(spv.replace(freed, f"%x_n1 = OpIAdd %uint %x_itv {gen.consts[2]}"))
+        # A clear without its guard, in the mini scheduler and in the tail scheduler: every lane stores.
+        for guard in ("OpBranchConditional %xm0_ml %xm0_ms %xm0_me", "OpBranchConditional %xm0_ql %xm0_qs %xm0_qe",
+                      "OpBranchConditional %x_ml %x_ms %x_me", "OpBranchConditional %x_ql %x_qs %x_qe"):
+            with self.subTest(guard=guard):
+                self.assertEqual(spv.count(guard), 1)
+                with self.assertRaisesRegex(AssertionError, r"%x_buf word \d+ is stored by invocations \d+ and \d+"):
+                    run(spv.replace(guard, guard.replace(guard.split()[1], "%true")))
 
 
 if __name__ == "__main__":
