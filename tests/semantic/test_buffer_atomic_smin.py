@@ -401,6 +401,95 @@ class SIMDBufferInterpreter:
                 self.write_lane_vgpr(lane, inst.vdata.index, ret_val)
 
 
+class TestBufferAtomicSminRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_vdata_vaddr_same_register_non_glc(self) -> None:
+        # v0 used as both vdata and vaddr
+        # offset 0 in memory has 100
+        self.interp.mem.write_u32(0, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0)  # v0 = 0 (both addr 0 and cmp_val 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 0),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.step(inst)
+        # min(100, 0) = 0
+        self.assertEqual(self.interp.mem.read_u32(0), 0)
+        # Without glc, v0 remains 0
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0)
+
+    def test_vdata_vaddr_same_register_glc(self) -> None:
+        # Memory at 4 has 50
+        self.interp.mem.write_u32(4, 50)
+        # v0 = 4 (addr 4, and cmp_val 4)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 4)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 0),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        # min(50, 4) = 4
+        self.assertEqual(self.interp.mem.read_u32(4), 4)
+        # With glc, v0 receives pre-op value (50)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 50)
+
+    def test_srsrc_descriptor_sgprs_preserved(self) -> None:
+        d0, d1, d2, d3 = self.desc.to_dwords()
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+        )
+        self.interp.step(inst)
+        # Check SGPRs 4..7 untouched
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 4), d0)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 5), d1)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 6), d2)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 7), d3)
+
+    def test_multiple_lanes_aliased_same_address(self) -> None:
+        # 4 lanes all targeting memory address 0
+        sim = SIMDBufferInterpreter(num_lanes=32, mem_size=4096)
+        sim.set_buffer_descriptor(4, self.desc)
+        sim.exec_mask = 0xF  # 4 lanes
+        sim.mem.write_u32(0, 100)
+
+        values = [50, -20, 10, -5]
+        for lane in range(4):
+            sim.write_lane_vgpr(lane, 0, u32(values[lane]))
+            sim.write_lane_vgpr(lane, 1, 0)  # all addr 0
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        sim.step(inst)
+        # Global minimum across 100, 50, -20, 10, -5 is -20
+        self.assertEqual(s32(sim.mem.read_u32(0)), -20)
+
+
 class TestBufferAtomicSminSIMD(unittest.TestCase):
     """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
 
