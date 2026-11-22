@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <utility>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -846,6 +847,12 @@ private:
     bool append(const Command& command) {
         if (closed_) return false;
         commands_.push_back(command);
+        return true;
+    }
+    // The recording calls pass a temporary: moved, so a command's rectangles are not copied a second time.
+    bool append(Command&& command) {
+        if (closed_) return false;
+        commands_.push_back(std::move(command));
         return true;
     }
 
