@@ -2,18 +2,31 @@
 // the family, read back byte for byte and compared with the host's D3D12 on the same adapter (matched by LUID, the
 // D3D-188 rule) and with WARP. Before D3D-275 only the RGBA8 family was reinterpreted: an R16_UINT or R32G32_UINT RTV
 // of a typeless texture cleared through the resource's own (float or UNORM) format.
+// Then draws: a full-screen pass writing a constant (integers for UINT views, floats for FLOAT and UNORM ones) into a
+// typed RTV of a typeless texture, whose PSO names the typed format, compared with the same pass on the host (HLSL
+// compiled by d3dcompiler_47). The layer's shaders are GLSL stand-ins for translated ones (test/glsl/vs_fullscreen.vert,
+// ps_typeless_float.frag, ps_typeless_uint.frag), found by the FSSM hash of their containers in a translator-style
+// index; without glslangValidator at build time only the clears run.
 // A view format the layer does not map yet (its CheckFeatureSupport gives no RENDER_TARGET) is reported and skipped,
 // so the R8 family and the 16-bit integer and normalized formats are covered as soon as their mapping lands.
 // Synthetic data only. LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
+#if defined(LEONIDA_TYPELESS_VS_SPV)
+#include "d3d12_test_shaders.h"
+#include "../src/shader_library.h"
+
+#include <d3dcompiler.h>
+#endif
 
 #include <dxgi1_4.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -35,10 +48,18 @@ struct Family {
 // a negative one (SINT / SNORM keep it, unsigned ones clamp it), one past every 8- and 16-bit integer range.
 constexpr float kValues[2][4] = {{0.5f, 7.0f, -1.0f, 300.0f}, {0.25f, 1.0f, -128.0f, 70000.0f}};
 
-// Clears a 4x4 TYPELESS texture through an RTV in `view` and reads it back. False when a step failed; `made` is false
-// when the device refused the texture or the view (an empty descriptor), which only our layer may do.
-bool clear_and_read(ID3D12Device* device, DXGI_FORMAT typeless, DXGI_FORMAT view, const float* value,
-                    std::vector<unsigned char>& bytes) {
+// A full-screen pass for one device: its root signature blob and VS / PS bytecode (shader containers for the layer,
+// DXBC for the host).
+struct Pass {
+    const std::vector<std::uint8_t>* root;
+    const std::vector<std::uint8_t>* vs;
+    const std::vector<std::uint8_t>* ps;
+};
+
+// Renders into a 4x4 TYPELESS texture through an RTV in `view` and reads it back: a clear to `value`, or (`pass`
+// given) a full-screen draw whose PSO names `view`. False when a step failed.
+bool render_and_read(ID3D12Device* device, DXGI_FORMAT typeless, DXGI_FORMAT view, const float* value,
+                     const Pass* pass, std::vector<unsigned char>& bytes) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = 4;
@@ -76,6 +97,26 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT typeless, DXGI_FORMAT view
     rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(texture.p, &rtv, handle);
+    Ref<ID3D12RootSignature> root;
+    Ref<ID3D12PipelineState> pso;
+    if (pass) {
+        if (FAILED(device->CreateRootSignature(0, pass->root->data(), pass->root->size(), IID_PPV_ARGS(&root.p))))
+            return false;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = root.p;
+        pd.VS = {pass->vs->data(), pass->vs->size()};
+        pd.PS = {pass->ps->data(), pass->ps->size()};
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = view;
+        pd.SampleDesc = {1, 0};
+        if (FAILED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p)))) return false;
+    }
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> alloc;
     Ref<ID3D12GraphicsCommandList> list;
@@ -86,7 +127,19 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT typeless, DXGI_FORMAT view
         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr, IID_PPV_ARGS(&list.p))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
         return false;
-    list->ClearRenderTargetView(handle, value, 0, nullptr);
+    if (pass) {
+        const D3D12_VIEWPORT viewport{0, 0, 4, 4, 0, 1};
+        const D3D12_RECT scissor{0, 0, 4, 4};
+        list->SetGraphicsRootSignature(root.p);
+        list->SetPipelineState(pso.p);
+        list->OMSetRenderTargets(1, &handle, FALSE, nullptr);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+    } else {
+        list->ClearRenderTargetView(handle, value, 0, nullptr);
+    }
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition = {texture.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -141,10 +194,48 @@ std::string hex(const std::vector<unsigned char>& bytes, std::size_t texel) {
     return s;
 }
 
+// The layer and the host report the format in the same way: no RENDER_TARGET support means the layer has no mapping.
+bool renders(ID3D12Device* device, DXGI_FORMAT typeless, DXGI_FORMAT view) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT typeless_support{typeless}, support{view};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &typeless_support,
+                                                 sizeof(typeless_support))) &&
+           (typeless_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) &&
+           SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+           (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
+}
+
+#if defined(LEONIDA_TYPELESS_VS_SPV)
+// HLSL for the host's pass, the same constants as the GLSL stand-ins.
+constexpr char kHostVs[] =
+    "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+    "    float2 corner = float2(id & 2, (id << 1) & 2);\n"
+    "    return float4(corner * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+constexpr char kHostPsFloat[] = "float4 main() : SV_Target { return float4(0.5, -2.0, 1.5, 0.25); }\n";
+constexpr char kHostPsUint[] = "uint4 main() : SV_Target { return uint4(7, 300, 1000, 3); }\n";
+
+bool compile_hlsl(pD3DCompile compile, const char* source, const char* target, std::vector<std::uint8_t>& out) {
+    ID3DBlob* code = nullptr;
+    ID3DBlob* errors = nullptr;
+    const HRESULT hr = compile(source, std::strlen(source), nullptr, nullptr, nullptr, "main", target, 0, 0, &code,
+                               &errors);
+    if (errors) {
+        std::fprintf(stderr, "%s\n", static_cast<const char*>(errors->GetBufferPointer()));
+        errors->Release();
+    }
+    if (FAILED(hr) || !code) return false;
+    const auto* p = static_cast<const std::uint8_t*>(code->GetBufferPointer());
+    out.assign(p, p + code->GetBufferSize());
+    code->Release();
+    return true;
+}
+#endif
+
 }  // namespace
 
 int main() {
     vktest::Device vk;
+    vk.request_buffer_device_address = true;
     const auto status = vk.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
     if (status != vktest::DeviceStatus::ready) return 1;
@@ -159,6 +250,33 @@ int main() {
     info.bindless = vk.bindless;
     info.bindless_partially_bound = vk.partially_bound;
     info.host_image_copy = vk.host_image_copy;
+    info.buffer_device_address = vk.buffer_device_address;
+#if defined(LEONIDA_TYPELESS_VS_SPV)
+    // The layer's pass: shader containers around synthetic FSSM programs, and the index that maps their hashes to the
+    // compiled GLSL stand-ins.
+    const auto vs_program = d3d12test::fssm_program({0x56530275, 0xbf810000});
+    const auto ps_float_program = d3d12test::fssm_program({0x50530275, 0xbf810000});
+    const auto ps_uint_program = d3d12test::fssm_program({0x50530276, 0xbf810000});
+    const auto vs_container = d3d12test::shader_container(vs_program);
+    const auto ps_float_container = d3d12test::shader_container(ps_float_program);
+    const auto ps_uint_container = d3d12test::shader_container(ps_uint_program);
+    const auto library = std::filesystem::temp_directory_path() / "leonida_typeless_families_test";
+    std::filesystem::create_directories(library);
+    const auto overwrite = std::filesystem::copy_options::overwrite_existing;
+    std::filesystem::copy_file(LEONIDA_TYPELESS_VS_SPV, library / "vs.spv", overwrite);
+    std::filesystem::copy_file(LEONIDA_TYPELESS_PS_FLOAT_SPV, library / "ps_float.spv", overwrite);
+    std::filesystem::copy_file(LEONIDA_TYPELESS_PS_UINT_SPV, library / "ps_uint.spv", overwrite);
+    {
+        std::ofstream index(library / "index.json", std::ios::binary);
+        index << "{\"vs\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []},\n"
+                 " \"ps_float\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_float_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]},\n"
+                 " \"ps_uint\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_uint_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+    }
+    info.shader_dir = library.string();
+#endif
     Ref<ID3D12Device> ours, host, warp;
     std::string adapter;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
@@ -196,14 +314,8 @@ int main() {
     };
     unsigned compared = 0, skipped = 0, failed = 0, warp_differs = 0;
     for (const auto& family : families) {
-        D3D12_FEATURE_DATA_FORMAT_SUPPORT typeless_support{family.typeless};
-        const bool texture = SUCCEEDED(ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &typeless_support,
-                                                                 sizeof(typeless_support))) &&
-                             (typeless_support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D);
         for (const DXGI_FORMAT view : family.views) {
-            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{view};
-            if (!texture || FAILED(ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
-                !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+            if (!renders(ours.p, family.typeless, view)) {
                 std::printf("typeless %d view %d: SKIP, the layer has no render target in this format yet\n",
                             int(family.typeless), int(view));
                 ++skipped;
@@ -211,11 +323,11 @@ int main() {
             }
             for (const auto& value : kValues) {
                 std::vector<unsigned char> mine, reference, software;
-                if (!clear_and_read(host.p, family.typeless, view, value, reference)) {
+                if (!render_and_read(host.p, family.typeless, view, value, nullptr, reference)) {
                     std::fprintf(stderr, "typeless %d view %d: the host refused\n", int(family.typeless), int(view));
                     return 1;
                 }
-                if (!clear_and_read(ours.p, family.typeless, view, value, mine)) {
+                if (!render_and_read(ours.p, family.typeless, view, value, nullptr, mine)) {
                     std::fprintf(stderr, "typeless %d view %d: the layer failed\n", int(family.typeless), int(view));
                     return 1;
                 }
@@ -223,7 +335,8 @@ int main() {
                 ++compared;
                 const bool same = mine == reference;
                 failed += !same;
-                if (warp.p && clear_and_read(warp.p, family.typeless, view, value, software) && software != reference)
+                if (warp.p && render_and_read(warp.p, family.typeless, view, value, nullptr, software) &&
+                    software != reference)
                     ++warp_differs;
                 std::printf("typeless %d view %d clear (%g, %g, %g, %g): host %s, layer %s%s%s\n", int(family.typeless),
                             int(view), value[0], value[1], value[2], value[3], hex(reference, texel).c_str(),
@@ -234,9 +347,70 @@ int main() {
     }
     std::printf("%u clears compared with %s, %u differ; %u view formats skipped; WARP differs from the host in %u\n",
                 compared, adapter.c_str(), failed, skipped, warp_differs);
+
+    unsigned drawn = 0, draws_failed = 0;
+#if defined(LEONIDA_TYPELESS_VS_SPV)
+    // Draws: the PSO names the typed format, the attachment must be a view of the typeless image in that format.
+    const HMODULE compiler = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto compile = compiler ? reinterpret_cast<pD3DCompile>(reinterpret_cast<void*>(
+                                        GetProcAddress(compiler, "D3DCompile")))
+                                  : nullptr;
+    std::vector<std::uint8_t> host_vs, host_ps_float, host_ps_uint;
+    if (!compile || !compile_hlsl(compile, kHostVs, "vs_5_0", host_vs) ||
+        !compile_hlsl(compile, kHostPsFloat, "ps_5_0", host_ps_float) ||
+        !compile_hlsl(compile, kHostPsUint, "ps_5_0", host_ps_uint)) {
+        std::fprintf(stderr, "d3dcompiler_47 could not compile the host's pass\n");
+        return 1;
+    }
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    const auto root_blob = d3d12test::serialize_root_signature(root_desc);
+    if (root_blob.empty()) return 1;
+    const Pass host_float{&root_blob, &host_vs, &host_ps_float}, host_uint{&root_blob, &host_vs, &host_ps_uint};
+    const Pass ours_float{&root_blob, &vs_container, &ps_float_container};
+    const Pass ours_uint{&root_blob, &vs_container, &ps_uint_container};
+    struct DrawCase {
+        DXGI_FORMAT typeless, view;
+        bool uint;
+    };
+    const DrawCase draws[] = {
+        {DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UINT, true},
+        {DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT, false},
+        {DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UNORM, false},
+        {DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, true},
+        {DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT, false},
+        {DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UINT, true},
+        {DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, false},
+        {DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UINT, true},
+    };
+    for (const auto& c : draws) {
+        if (!renders(ours.p, c.typeless, c.view)) {
+            std::printf("typeless %d view %d draw: SKIP, the layer has no render target in this format yet\n",
+                        int(c.typeless), int(c.view));
+            ++skipped;
+            continue;
+        }
+        std::vector<unsigned char> mine, reference;
+        if (!render_and_read(host.p, c.typeless, c.view, nullptr, c.uint ? &host_uint : &host_float, reference)) {
+            std::fprintf(stderr, "typeless %d view %d draw: the host refused\n", int(c.typeless), int(c.view));
+            return 1;
+        }
+        if (!render_and_read(ours.p, c.typeless, c.view, nullptr, c.uint ? &ours_uint : &ours_float, mine)) {
+            std::fprintf(stderr, "typeless %d view %d draw: the layer failed\n", int(c.typeless), int(c.view));
+            return 1;
+        }
+        ++drawn;
+        const bool same = mine == reference;
+        draws_failed += !same;
+        std::printf("typeless %d view %d draw (%s): host %s, layer %s%s\n", int(c.typeless), int(c.view),
+                    c.uint ? "7, 300, 1000, 3" : "0.5, -2, 1.5, 0.25", hex(reference, reference.size() / 16).c_str(),
+                    hex(mine, reference.size() / 16).c_str(), same ? "" : "  MISMATCH");
+    }
+    std::printf("%u draws compared with %s, %u differ\n", drawn, adapter.c_str(), draws_failed);
+#endif
     if (vk.validation_errors()) {
         std::fprintf(stderr, "%u Vulkan validation errors\n", vk.validation_errors());
         return 1;
     }
-    return failed ? 1 : 0;
+    return failed || draws_failed ? 1 : 0;
 }
