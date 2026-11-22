@@ -1307,7 +1307,10 @@ public:
             }
         } scratch_guard{context_.scratch_.get(), progress_, false};
         bindless_commit = context_.bindless_commit_;
-        std::vector<PreparedList> prepared(lists.size());
+        // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
+        // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
+        auto& prepared = prepared_;
+        prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
         std::uint64_t captures = 0;
         for (const auto* list : lists)
@@ -1699,6 +1702,9 @@ private:
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
+    // execute's working storage. Per queue like buffers_: one execute at a time on a queue, as acquire() and
+    // submit() already assume; other queues prepare concurrently with their own.
+    std::vector<PreparedList> prepared_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
 };
