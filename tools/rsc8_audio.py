@@ -883,6 +883,9 @@ def _new_summary(mode, source):
         "adat_banks": 0,
         "adat_streams": 0,
         "adat_bytes": 0,
+        "adat_banks_past_window": 0,
+        "adat_bytes_past_window": 0,
+        "window_starts_in_bank": None,
         "adat_tag_counts": {},
         "invalid_files": 0,
         "rsc8_decoded": 0,
@@ -980,8 +983,37 @@ def _accumulate_record(summary, rec, *, in_adat=True, has_audio=None):
         summary["audio_codecs"][ck] = summary["audio_codecs"].get(ck, 0) + 1
 
 
+def _bank_covering(fh, start, file_size):
+    """The `ADAT` bank that starts before `start` and runs past it, or `None`.
+
+    Looks back from `start` (at most `MAX_AWC_FILE_BYTES`) for the nearest header that parses as a bank; banks
+    do not overlap, so only that one can cover `start`.
+    """
+    floor = max(0, start - MAX_AWC_FILE_BYTES)
+    hi = start
+    while hi > floor:
+        lo = max(floor, hi - SCAN_CHUNK_BYTES)
+        fh.seek(lo)
+        buf = fh.read(hi - lo + len(ADAT_MAGIC) - 1)   # a magic that starts just before hi; none starts at hi
+        idx = buf.rfind(ADAT_MAGIC)
+        while idx >= 0:
+            bank = parse_adat_at_file(fh, lo + idx, file_size)
+            if bank is not None:
+                return bank if bank["end"] > start else None
+            idx = buf.rfind(ADAT_MAGIC, 0, idx + len(ADAT_MAGIC) - 1)
+        hi = lo
+    return None
+
+
 def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_records=True, progress=None):
-    """Scan an RPF9 archive sequentially for `ADAT` banks and `RSC8` v8001 resources."""
+    """Scan an RPF9 archive sequentially for `ADAT` banks and `RSC8` v8001 resources.
+
+    With a window (`start`/`limit`), `adat_bytes` counts the window's bytes that belong to a bank, so it never
+    exceeds `span` and adjacent windows add up to the whole archive. A bank that starts inside the window is
+    decoded whole and counted in `adat_banks`; its bytes past the window are `adat_bytes_past_window`. A bank that
+    starts before the window and covers `start` (its offset is `window_starts_in_bank`) is not decoded or counted
+    as a bank, and the `RSC8` headers inside it are not reported as outside `ADAT`.
+    """
     t0 = time.time()
     sz = os.path.getsize(path)
     if start < 0 or start > sz:
@@ -997,6 +1029,13 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
         def read_slice(off, n):
             f2.seek(off)
             return f2.read(n)
+
+        if start > 0:
+            earlier = _bank_covering(f2, start, sz)
+            if earlier is not None:
+                summary["window_starts_in_bank"] = earlier["offset"]
+                summary["adat_bytes"] += min(earlier["end"], scan_end) - start
+                adat_ranges.append((earlier["offset"], earlier["end"]))
 
         pos = start
         next_prog = start + 2 * 1024 * 1024 * 1024
@@ -1025,7 +1064,10 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
                     continue
                 summary["adat_banks"] += 1
                 summary["adat_streams"] += bank["count"]
-                summary["adat_bytes"] += bank["end"] - bank["offset"]
+                summary["adat_bytes"] += min(bank["end"], scan_end) - bank["offset"]
+                if bank["end"] > scan_end:
+                    summary["adat_banks_past_window"] += 1
+                    summary["adat_bytes_past_window"] += bank["end"] - scan_end
                 adat_ranges.append((bank["offset"], bank["end"]))
 
                 bank_size = bank["end"] - bank["offset"]

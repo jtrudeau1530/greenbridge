@@ -595,6 +595,57 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("output must not overwrite the source file", result.stderr)
 
+    def test_window_edges_inside_a_bank(self):
+        """--start/--limit inside a bank: adat_bytes stays within the span, and RSC8 headers in a bank that
+        started before the window are not reported as outside ADAT."""
+        c0 = build_synthetic_rsc8(stream_hash=0x20112233, frames=142)
+        c1 = build_synthetic_rsc8(stream_hash=0x80778899, frames=74, inline_dict_name=True)
+        bank = build_synthetic_awc([
+            {"id": 0x00112233, "rsc8": c0, "samples": 89600},
+            {"id": 0x00778899, "rsc8": c1, "samples": 28800},
+        ])
+        stray = build_synthetic_rsc8(stream_hash=0x11112222, frames=61)
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "synth.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<III", 0x100, 0, 0) + bytes(0xF0))
+                boff = f.tell()
+                f.write(bank)
+                f.write(bytes(0x80))
+                soff = f.tell()
+                f.write(stray)
+            _, full = rsc8_audio.scan_rpf(rpf)
+            bank_size = full["adat_bytes"]
+            self.assertGreater(bank_size, 4 * 256)
+
+            # The window ends halfway through the bank: decoded whole, counted up to the window's end.
+            _, w = rsc8_audio.scan_rpf(rpf, start=boff, limit=bank_size // 2)
+            self.assertEqual((w["adat_banks"], w["rsc8_in_adat"]), (1, 2))
+            self.assertEqual(w["adat_bytes"], w["span"])
+            self.assertEqual((w["adat_banks_past_window"], w["adat_bytes_past_window"]),
+                             (1, bank_size - bank_size // 2))
+            # The rest of the bank, in the next window, completes the archive's ADAT bytes.
+            _, rest = rsc8_audio.scan_rpf(rpf, start=boff + bank_size // 2)
+            self.assertEqual(w["adat_bytes"] + rest["adat_bytes"], bank_size)
+            self.assertEqual(rest["adat_banks"], 0)
+
+            # The window starts inside the bank (looked back over several scan chunks): only the stray clip
+            # after the bank is outside ADAT.
+            old_chunk = rsc8_audio.SCAN_CHUNK_BYTES
+            try:
+                rsc8_audio.SCAN_CHUNK_BYTES = 256
+                for st in (boff + 16, boff + bank_size - 64):
+                    _, w = rsc8_audio.scan_rpf(rpf, start=st)
+                    self.assertEqual((w["adat_banks"], w["rsc8_outside_adat"]), (0, 1), st)
+                    self.assertEqual(w["window_starts_in_bank"], boff)
+                    self.assertEqual(w["adat_bytes"], boff + bank_size - st)
+                # Past the bank's end, no bank covers the start.
+                _, w = rsc8_audio.scan_rpf(rpf, start=soff - 0x40)
+            finally:
+                rsc8_audio.SCAN_CHUNK_BYTES = old_chunk
+            self.assertEqual((w["rsc8_outside_adat"], w["window_starts_in_bank"]), (1, None))
+            self.assertEqual((full["adat_banks_past_window"], full["window_starts_in_bank"]), (0, None))
+
     def test_cli_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "missing.rpf")
