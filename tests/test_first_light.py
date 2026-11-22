@@ -192,6 +192,167 @@ class ShaderPreparationTests(unittest.TestCase):
                 self.assertEqual(manifest[stage]["fssm_sha256"], stage + "-fixture")
 
 
+LINK_KINDS = ("symlink", "junction") if os.name == "nt" else ("symlink",)
+
+
+def link_folder(kind: str, link: Path, target: Path) -> bool:
+    """Make a directory symlink or a Windows junction; False where this machine does not allow it."""
+    if kind == "junction":
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+        return made.returncode == 0
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+class RunFolderTests(unittest.TestCase):
+    """first_light/dxbc and first_light/spirv hold one run's pair, whatever an earlier run left there.
+
+    Fully synthetic: the containers are a few hand-written bytes, and the unpacker, the disassembler and the
+    translator are replaced by stand-ins that, like the real tools, take every file in the folder they are given.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="first-light-run-folders-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.work = self.tmp / "work"
+        self.staged = self.work / "first_light" / "dxbc"
+        self.spirv = self.work / "first_light" / "spirv"
+        carved = self.work / "shaders" / "dxbc"
+        carved.mkdir(parents=True)
+        entries = [
+            {"name": "vertex", "file": "vertex.dxbc", "stage": "vs"},
+            {"name": "first", "file": "first.dxbc", "stage": "ps"},
+            {"name": "second", "file": "second.dxbc", "stage": "ps"},
+        ]
+        (carved / "index.json").write_text(json.dumps(entries), encoding="utf-8", newline="\n")
+        for entry in entries:
+            (carved / entry["file"]).write_bytes(entry["name"].encode("ascii"))
+        self.handed = []  # per translator run: the listings it was given
+
+    def tools(self, argv: list[str]) -> None:
+        tool = Path(argv[0]).name
+        src = Path(argv[1])
+        if tool == "fssm_unpack.py":
+            (src / "fssm").mkdir(exist_ok=True)
+            for container in sorted(src.glob("*.dxbc")):
+                (src / "fssm" / f"{container.stem}.fssm").write_bytes(container.read_bytes())
+            return
+        out = Path(argv[argv.index("--out") + 1])
+        out.mkdir(exist_ok=True)
+        if tool == "shader_disasm.py":
+            for blob in sorted(src.glob("*.fssm")):
+                (out / f"{blob.stem}.s").write_bytes(blob.read_bytes())
+            return
+        self.assertEqual(tool, "rdna2spirv.py")
+        stages = {Path(e["file"]).stem: e["stage"]
+                  for e in json.loads((src.parent / "index.json").read_text(encoding="utf-8"))}
+        index_path = out / "index.json"  # the translator merges a small run into an index it finds
+        index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.is_file() else {}
+        listings = sorted(src.glob("*.s"))
+        for listing in listings:
+            (out / f"{listing.stem}.spv").write_bytes(b"spv " + listing.read_bytes())
+            index[listing.stem] = {"stage": stages.get(listing.stem, "?"), "fssm_sha256": listing.stem}
+        index_path.write_text(json.dumps(index), encoding="utf-8", newline="\n")
+        self.handed.append([listing.stem for listing in listings])
+
+    def prepare(self, ps: str, *extra: str) -> None:
+        with patch.object(fl, "run", side_effect=self.tools), redirect_stdout(io.StringIO()):
+            self.assertEqual(fl.main(["--game", str(self.tmp), "--work", str(self.work), "--no-fit",
+                                      "--vs", "vertex", "--ps", ps, *extra]), 0)
+
+    def files(self, folder: Path) -> list[str]:
+        return sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file())
+
+    def test_a_second_run_holds_only_its_own_pair(self) -> None:
+        other_out = self.work / "first_light" / "out_first"
+        self.prepare("first", "--out", str(other_out))
+        self.assertEqual(self.handed, [["first", "vertex"]])
+        (self.staged / "leftover.dxbc").write_bytes(b"leftover")  # a container no run selected
+        (self.spirv / "leftover.spvasm").write_bytes(b"leftover")
+        carved_before = {name: (self.work / "shaders" / "dxbc" / name).read_bytes()
+                         for name in self.files(self.work / "shaders" / "dxbc")}
+        other_out_before = {name: (other_out / name).read_bytes() for name in self.files(other_out)}
+
+        self.prepare("second")
+
+        self.assertEqual(self.handed[1], ["second", "vertex"])
+        self.assertEqual(self.files(self.staged),
+                         ["disasm/second.s", "disasm/vertex.s", "fssm/second.fssm", "fssm/vertex.fssm",
+                          "index.json", "second.dxbc", "vertex.dxbc"])
+        self.assertEqual(self.files(self.spirv), ["index.json", "second.spv", "vertex.spv"])
+        translated = json.loads((self.spirv / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual({stem: meta["stage"] for stem, meta in translated.items()},
+                         {"second": "ps", "vertex": "vs"})
+        out = self.work / "first_light" / "out"
+        self.assertEqual((out / "ps.dxbc").read_bytes(), b"second")
+        self.assertEqual((out / "ps.spv").read_bytes(), b"spv second")
+        # Only the two run folders are emptied: the carve and the other run's --out are as they were.
+        self.assertEqual({name: (self.work / "shaders" / "dxbc" / name).read_bytes()
+                          for name in self.files(self.work / "shaders" / "dxbc")}, carved_before)
+        self.assertEqual({name: (other_out / name).read_bytes() for name in self.files(other_out)},
+                         other_out_before)
+        self.assertEqual((other_out / "ps.dxbc").read_bytes(), b"first")
+
+    def linked(self, kind: str, where: str) -> tuple[Path, Path]:
+        """A work folder whose first_light/<where> is a link of this kind to a folder outside it."""
+        work, outside = self.tmp / kind / "work", self.tmp / kind / "outside"
+        (outside / "dxbc").mkdir(parents=True)
+        for keep in (outside / "keep.dxbc", outside / "dxbc" / "keep.dxbc"):
+            keep.write_bytes(b"keep")
+        link = work / "first_light" / where
+        link.parent.mkdir(parents=True)
+        if not link_folder(kind, link, outside):
+            self.skipTest(f"cannot create a {kind} here")
+        return work, outside
+
+    def test_a_link_inside_a_run_folder_is_removed_not_followed(self) -> None:
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.linked(kind, os.path.join("dxbc", "link"))
+                staged = work / "first_light" / "dxbc"
+                self.assertEqual(fl.reset_run_folders(str(work)), str(staged))
+                self.assertEqual(os.listdir(staged), [])
+                self.assertEqual(self.files(outside), ["dxbc/keep.dxbc", "keep.dxbc"])
+
+    def test_a_run_folder_that_is_a_link_is_refused(self) -> None:
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.linked(kind, "spirv")
+                staged = work / "first_light" / "dxbc"
+                staged.mkdir()
+                (staged / "earlier.dxbc").write_bytes(b"earlier")
+                with self.assertRaises(SystemExit) as refused:
+                    fl.reset_run_folders(str(work))
+                self.assertIn(str(work / "first_light" / "spirv"), str(refused.exception))
+                self.assertNotIn("\n", str(refused.exception))
+                self.assertEqual(self.files(outside), ["dxbc/keep.dxbc", "keep.dxbc"])
+                self.assertEqual(os.listdir(staged), ["earlier.dxbc"])  # refused before anything is removed
+
+    def test_a_first_light_folder_that_is_a_link_is_refused(self) -> None:
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.linked(kind, "")
+                with self.assertRaises(SystemExit) as refused:
+                    fl.reset_run_folders(str(work))
+                self.assertIn(str(work / "first_light" / "dxbc"), str(refused.exception))
+                self.assertEqual(self.files(outside), ["dxbc/keep.dxbc", "keep.dxbc"])
+
+    def test_a_file_that_cannot_be_removed_stops_the_run(self) -> None:
+        self.prepare("first")
+        held = self.staged / "first.dxbc"
+        denied = PermissionError(13, "Permission denied", str(held))
+        with patch.object(fl.shutil, "rmtree", side_effect=denied), self.assertRaises(SystemExit) as stopped:
+            self.prepare("second")
+        self.assertIn(str(held), str(stopped.exception))
+        self.assertIn("Permission denied", str(stopped.exception))
+        self.assertNotIn("\n", str(stopped.exception))
+        self.assertEqual(self.handed, [["first", "vertex"]])  # nothing was translated from the stale folder
+
+
 class OracleTests(unittest.TestCase):
     """The readback oracle on synthetic images: the controls run without a GPU or a game package."""
 

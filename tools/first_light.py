@@ -52,6 +52,42 @@ def run(argv, **kwargs):
     subprocess.run(cmd, check=True, **kwargs)
 
 
+def reset_run_folders(work: str) -> str:
+    """Remove <work>/first_light/dxbc and spirv as an earlier run left them; return a new, empty dxbc.
+
+    The unpacker, the disassembler and the translator each take every file in the folder they are given, and the
+    translator merges into an index.json it finds, so a container staged by an earlier run would be translated
+    again beside this run's pair. Both folders hold only copies from <work>/shaders and files derived from them,
+    so they are removed whole; first_light/out, another --out and <work>/shaders are not touched. A folder that
+    is a symlink or a junction, or is reached through one at first_light, is refused: nothing outside the work
+    folder is removed. shutil.rmtree unlinks a link inside a folder without entering it.
+    """
+    base = os.path.join(work, "first_light")
+    real_base = os.path.join(os.path.realpath(work), "first_light")
+    stale = [os.path.join(base, name) for name in ("dxbc", "spirv") if os.path.lexists(os.path.join(base, name))]
+    for folder in stale:  # both are checked before either is removed
+        real = os.path.join(real_base, os.path.basename(folder))
+        if not os.path.isdir(folder) or os.path.normcase(os.path.realpath(folder)) != os.path.normcase(real):
+            raise SystemExit(
+                f"{folder} is a symlink, a junction or a file, or first_light above it is a link: each run "
+                "removes this folder and does not follow a link to do it; remove it and run again"
+            )
+    for folder in stale:
+        try:
+            shutil.rmtree(folder)
+        except OSError as e:
+            raise SystemExit(
+                f"cannot remove {e.filename or folder} left by an earlier run ({e.strerror or e}); "
+                f"close what holds it or delete {folder}, then run again"
+            ) from e
+    dxbc = os.path.join(base, "dxbc")
+    try:
+        os.makedirs(dxbc)
+    except OSError as e:
+        raise SystemExit(f"cannot create {dxbc}: {e.strerror or e}") from e
+    return dxbc
+
+
 def carve_index(work: str) -> str:
     return os.path.join(work, "shaders", "dxbc", "index.json")
 
@@ -85,8 +121,7 @@ def choose(index_path: str, vs: str, ps: str) -> list[dict]:
 def translate(work: str, picked: list[dict]) -> dict:
     """Translate just the two chosen containers, in the layout rdna2spirv.py reads."""
     base = os.path.join(work, "first_light")
-    dxbc = os.path.join(base, "dxbc")
-    os.makedirs(dxbc, exist_ok=True)
+    dxbc = reset_run_folders(work)
     index = []
     for entry in picked:
         shutil.copy(
