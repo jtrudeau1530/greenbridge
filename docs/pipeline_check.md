@@ -19,6 +19,27 @@ For an index entry with `lds_bytes`, the checker compares the reported workgroup
 limit counts as a module failure before Vulkan receives the shader. Older indexes without this field still use the
 normal driver check. Mesh pipelines on devices without mesh shader support still use the existing feature skip.
 
+## Options
+
+`vk_pipeline_check <spirv dir> [cache.bin] [options]`
+
+| Option | Meaning |
+|---|---|
+| `cache.bin` | Optional positional pipeline cache. Loaded first if it exists, saved every 10 minutes and at the end, so a stopped run resumes. |
+| `--jobs N` | Compile on N threads (default: half the hardware threads). |
+| `--start I`, `--count N` | Check only the sorted index entries `[I, I+N)`. |
+| `--stage all\|cs\|graphics` | Which stages to check. `--compute-only` and `--graphics-only` are aliases. |
+| `--slow SEC` | Print pipelines slower than SEC (default 30); compiles past 60 s are named while running. |
+| `--max-bytes N` | Skip `.spv` files larger than N bytes (0 = no limit); every skip is named. |
+| `--large-module-bytes N` | Compile modules larger than N bytes alone (default 4 MiB; 0 disables isolation). |
+| `--stats FILE` | Write the driver's per-shader statistics as CSV rows `name,stage,statistic,value`. Needs `VK_KHR_pipeline_executable_properties`; use it without `cache.bin`, because a cached pipeline may come without statistics. |
+| `--cache-feedback` | Group successful pipeline creations by `VkPipelineCreationFeedback`: cache hits, no hit reported, and unavailable. |
+| `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
+| `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end; `make_game.py`'s pipelines stage reads it. |
+| `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. `make_game.py` writes F after a crash so the next run checks the rest. |
+
+`--isolate-child` is internal to the parent/child protocol and is not meant to be passed directly. A module with a missing partner stub is skipped; without `--isolate`, a driver crash ends the run.
+
 ## Check user-defined interfaces between stages
 
 `tools/shader_link_check.py` compares the binary SPIR-V declarations of the shaders you plan to put in the
