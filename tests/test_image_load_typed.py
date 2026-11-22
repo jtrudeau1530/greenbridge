@@ -122,6 +122,8 @@ class Module:
             assert var_op == "OpVariable" and v[1] == "Private", (var_op, v)
             words = self.defs[v[2]][1][1:]            # OpConstantComposite %fmt_mask_arr <words>
             return self.value(words[self.value(p[2], word1, index)], word1, index)
+        if op == "OpGroupNonUniformBroadcastFirst":   # desc_lookup makes the descriptor word uniform: one invocation
+            return self.value(a[2], word1, index)      # here, so the value itself (a[1] is the Subgroup scope)
         u = [self.value(y, word1, index) for y in a[1:]]
         if op == "OpBitcast":
             return u[0]

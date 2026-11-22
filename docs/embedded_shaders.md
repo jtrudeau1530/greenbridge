@@ -125,9 +125,6 @@ When this page was first written, 42 translated and 10 stopped at four rules. Th
 
 The disassembly count is unchanged: the same 42 programs have no invalid word, and 10 have invalid words in the
 code. All 10 of those translate; `Box16Rehydration` is one of the 42 clean ones.
-| `tools/rdna2spirv.py` | **51** translate and pass `spirv-val` |
-
-| `tools/rdna2spirv.py` | **51** translate and pass `spirv-val` |
 
 On current `main`, 51 of the 52 programs translate and pass `spirv-val`. The four earlier blockers were
 implemented in #1871 and #1968 (`427c1376`):
@@ -171,17 +168,10 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
 * **The missing rules were small, and only one is left.** `global_atomic_fmax`/`fmin` (6 programs),
   `buffer_load_ushort` (3) and `tbuffer_load_format_x` with format 8 (1) were ordinary translator rules, not a new
   compiler backend, and they are on `main`. The one left is `buffer_store_short` (#1864), for `Box16Rehydration`.
-* **The one missing rule is small and has real fixtures.** `buffer_store_short` (#1864) covers `Box16Rehydration`.
-  It is an ordinary translator rule, not a new compiler backend.
 * **The rehydration programs are the ones closest to the shipped data.** `Box16Rehydration`,
   `Box32Rehydration` and `LeafRehydration` are exactly the programs that would turn the dehydrated BVH packs
   into runtime trees ([bvh.md](bvh.md) §3.1). `LeafRehydration` translates since #1871, `Box32Rehydration`
   translates since #1968 (`427c1376`), and only `Box16Rehydration` awaits #1864 (`buffer_store_short`).
-  compiler backend, and they are on `main`. The one left is `buffer_store_short`, for `Box16Rehydration`.
-* **The rehydration programs are the ones closest to the shipped data.** `Box16Rehydration`,
-  `Box32Rehydration` and `LeafRehydration` are exactly the programs that would turn the dehydrated BVH packs
-  into runtime trees ([bvh.md](bvh.md) §3.1). `Box32Rehydration` and `LeafRehydration` translate;
-  `Box16Rehydration` needs `buffer_store_short`.
 * **What is still open.** None of the 52 has been executed on a GPU; translation and `spirv-val` do not prove the
   output. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
   above comes from `ILDN`, not from a runtime trace. The `STAT` metadata-only shape is consistent with reflection,

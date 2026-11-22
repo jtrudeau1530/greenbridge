@@ -80,6 +80,23 @@ def unwrap_dst_value(defs, sid):
     return sid
 
 
+def through_select(defs, vid):
+    """Past the OpSelects SHADER-388 puts on each size word (0 past the view's last level), to the queried value."""
+    while defs[vid][0] == "OpSelect":
+        vid = defs[vid][1][2]                     # [type, condition, in-range value, 0]
+    return vid
+
+
+def reaches(defs, vid, pred, seen=None):
+    """True when some definition feeding `vid` satisfies pred(op, args)."""
+    seen = set() if seen is None else seen
+    if vid in seen or vid not in defs:
+        return False
+    seen.add(vid)
+    op, args = defs[vid]
+    return pred(op, args) or any(reaches(defs, a, pred, seen) for a in args if a.startswith("%"))
+
+
 class ImageGetResinfoTranslateTests(unittest.TestCase):
     def test_2d_full_dmask_emits_image_query_and_all_four_channels(self):
         spv = translate_lines("ps_resinfo_2d", [
@@ -103,11 +120,12 @@ class ImageGetResinfoTranslateTests(unittest.TestCase):
         # docs/shader_validation.md and tests/test_image_query_probe.py — this test characterizes
         # current translator output and does not pin the hardware depth rule),
         # v7 <- levels (OpImageQueryLevels).
-        src_ops = [defs[defs[sid][1][1]][0] for _, sid in stores]
+        src_ops = [defs[through_select(defs, defs[sid][1][1])][0] for _, sid in stores]
         self.assertEqual(src_ops[0], "OpCompositeExtract")
         self.assertEqual(src_ops[1], "OpCompositeExtract")
         self.assertEqual(src_ops[2], "OpBitcast")  # as_int(cu(1)) -> Bitcast %uint
-        self.assertEqual(defs[defs[stores[2][1]][1][1]][1][1], "%c1")
+        # a 2D image's depth word is 0 on RDNA2 (SHADER-388, measured with tools/image_query_probe.py)
+        self.assertEqual(defs[defs[stores[2][1]][1][1]][1][1], "%c0")
         self.assertEqual(src_ops[3], "OpImageQueryLevels")
 
     def test_2d_array_uses_v3int_and_images_arr(self):
@@ -126,10 +144,9 @@ class ImageGetResinfoTranslateTests(unittest.TestCase):
         defs = parse_defs(spv)
         stores = [(idx, unwrap_dst_value(defs, sid)) for idx, sid in vgpr_stores(spv) if idx in (4, 5, 6, 7)]
         self.assertEqual([idx for idx, _ in stores], [4, 5, 6, 7])
-        # For 2D_ARRAY, channel 2 (v6) is extracted from SizeLod %v3int (axis 2), not constant 1.
-        c2_bitcast_src = defs[stores[2][1]][1][1]
-        self.assertEqual(defs[c2_bitcast_src][0], "OpCompositeExtract")
-        self.assertEqual(defs[c2_bitcast_src][1][2], "2")
+        # For 2D_ARRAY, channel 2 (v6) comes from SizeLod %v3int axis 2 (the layer count, minified since SHADER-388).
+        c2 = defs[stores[2][1]][1][1]
+        self.assertTrue(reaches(defs, c2, lambda op, a: op == "OpCompositeExtract" and a[2] == "2"))
 
     def test_partial_dmask_compacts_written_vgprs(self):
         # dmask:0x8 (bit 3 only -> mip levels) must write ONLY v4 (v[4:4]), not v5..v7.
@@ -154,7 +171,8 @@ class ImageGetResinfoTranslateTests(unittest.TestCase):
         defs_w_lv = parse_defs(spv_w_lv)
         written_w_lv = [(idx, unwrap_dst_value(defs_w_lv, sid)) for idx, sid in vgpr_stores(spv_w_lv) if idx >= 4]
         self.assertEqual([idx for idx, _ in written_w_lv], [4, 5])
-        self.assertEqual(defs_w_lv[defs_w_lv[written_w_lv[0][1]][1][1]][0], "OpCompositeExtract")
+        self.assertEqual(defs_w_lv[through_select(defs_w_lv, defs_w_lv[written_w_lv[0][1]][1][1])][0],
+                         "OpCompositeExtract")
         self.assertEqual(defs_w_lv[defs_w_lv[written_w_lv[1][1]][1][1]][0], "OpImageQueryLevels")
 
     def test_non_ps_stage_supports_resinfo(self):

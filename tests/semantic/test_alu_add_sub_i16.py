@@ -276,7 +276,8 @@ class AluAddSubI16Tests(unittest.TestCase):
                 rf"= OpBitwiseAnd %uint (%\S+) {re.escape(c65535)}\b", spv_mask
             )
         )
-        self.assertGreaterEqual(len(mask_matches), 3)
+        # one 16-bit mask at least: SHADER-315's constant folding removed the ones on the literal operands
+        self.assertGreaterEqual(len(mask_matches), 1)
         last = mask_matches[-1]
         spv_mask_mut = (
             spv_mask[: last.start()]

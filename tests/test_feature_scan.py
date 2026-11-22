@@ -460,7 +460,9 @@ def test_a_failed_check_fails_only_its_own_test():
     counted, failures = failures - before, before   # the failure above was staged: keep it out of this run's total
     check(raised == ["fails_a_check"], f"only the test with the failed check fails ({raised})")
     check(counted == 1, f"its failed check still counts toward the run's total ({counted})")
-    check(reported == ["FAIL fails_a_check: 1 check(s) failed"], f"with its own count in the message ({reported})")
+    # first line only: under pytest the assert's message gets pytest's "assert 1 == 0" explanation appended
+    check([r.splitlines()[0] for r in reported] == ["FAIL fails_a_check: 1 check(s) failed"],
+          f"with its own count in the message ({reported})")
     assert failures == 0, f"{failures} script-runner check(s) failed"
 
 

@@ -49,7 +49,7 @@ def run_on_silicon(name, asm_lines, wave_size=32, user_sgprs=None):
         os.mkdir(os.path.join(tmp, "disasm"))
         os.mkdir(os.path.join(tmp, "fssm"))
         s_path = os.path.join(tmp, "disasm", name + ".s")
-        with open(s_path, "w", encoding="utf-8") as f:
+        with open(s_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(f"; {name}\n")
             for ln in asm_lines:
                 f.write(f"\t{ln}\n")
@@ -63,7 +63,7 @@ def run_on_silicon(name, asm_lines, wave_size=32, user_sgprs=None):
         spv_text = rdna2spirv.translate(s_path)
         sa_path = os.path.join(tmp, name + ".spvasm")
         spv_path = os.path.join(tmp, name + ".spv")
-        with open(sa_path, "w", encoding="utf-8") as f:
+        with open(sa_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(spv_text)
         rdna2spirv.assemble_spirv(sa_path, spv_path)
         
@@ -363,4 +363,8 @@ def main():
     print("=" * 70)
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     main()

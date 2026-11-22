@@ -19,8 +19,10 @@ class PermKnownSelectorTests(unittest.TestCase):
         self.assertEqual(mrt0_words(self.spvasm), [0xFF008C80, 0xFF0000FF, 0x80808080, 0x13E49B80])
 
     def test_only_clobbered_selector_dispatches_at_runtime(self):
-        # The dynamic lowering emits one >= 13 check per byte.
-        self.assertEqual(self.spvasm.count("OpUGreaterThanEqual"), 4)
+        # The dynamic lowering emits one >= 13 check per byte, at most for the one clobbered selector; since SHADER-315
+        # folds scalar ALU on constants, the clobbered selector is known at translate time too and none is emitted.
+        # test_selector_values still checks every word.
+        self.assertIn(self.spvasm.count("OpUGreaterThanEqual"), (0, 4))
 
 
 if __name__ == "__main__":

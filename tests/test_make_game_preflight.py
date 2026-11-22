@@ -630,8 +630,9 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 # Without --wav the exported assets are credited, so 250 GB free is enough for the asset tools.
                 make_game.preflight(["assets"], tmp_work, wav=False)
                 err = self.assert_fails(make_game.preflight, ["assets"], tmp_work, wav=True,
-                                        match="assets stage is optional")
-                self.assertIn("about 300 GB is needed", err)
+                                        match="about 300 GB is needed")
+                # c506d00c: the loader-only hint is offered only when shaders and runtime are selected and not --wav
+                self.assertNotIn("without exporting assets", err)
 
     def test_ensure_submodule_present_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:

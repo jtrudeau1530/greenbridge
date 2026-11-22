@@ -885,7 +885,9 @@ def test_barrier_rounds_are_wave32_compute_only(make_shader, monkeypatch):
     monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
     shader.translate()
     gen = rdna2spirv.translate.last_gen
-    assert gen.emulate and not gen.bar_rounds and gen.control_flow == "emulated wave64 rounds"
+    # #2089: --wave64-emulate keeps structured control flow where it can (was a round loop per barrier)
+    assert gen.emulate and not gen.bar_rounds and gen.control_flow in ("emulated wave64 structured",
+                                                                       "emulated wave64 rounds")
 
 
 # SHADER-36: image_gather4_l(_o) runs every texel of its 2x2 footprint through the S#'s CLAMP_X/CLAMP_Y.

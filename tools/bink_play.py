@@ -58,7 +58,7 @@ def load_names(archive, mount, use_cache=True):
         part = cache.with_suffix(".part")
         with part.open("w", encoding="utf-8", newline="") as f:
             f.write("# " + key + "\n")
-            w = csv.writer(f)
+            w = csv.writer(f, lineterminator="\n")
             w.writerow(["path", "offset", "width", "height", "frames"])
             for r in rows:
                 w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
@@ -137,4 +137,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

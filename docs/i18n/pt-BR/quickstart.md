@@ -91,7 +91,6 @@ Os estágios executam nesta ordem: `check` → `shaders` → `assets` → `runti
 - **Flags de fallback do tradutor**: `--no-float-controls` (omite `SignedZeroInfNanPreserve`), `--bary-fallback` (lê baricêntricas de um input interpolado sem `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (incorpora offsets `image_sample*_o` na coordenada sem `VK_KHR_maintenance8`) e `--mesh-compute` (traduz mesh shaders como compute sem `VK_EXT_mesh_shader`) são repassadas ao tradutor e salvas junto aos shaders; alterá-las retraduz os shaders (veja [`docs/design.md`](../../design.md)).
 - **`--work`**: recomenda-se apontar para um disco com pelo menos 350 GB livres para o build completo (ou ~30 GB com `--stages check,shaders,runtime`); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
 - **`--wav`**: fica desativado por padrão porque WAV PCM de 16 bits é várias vezes maior que Ogg Opus; quando ativado, decodifica os streams Ogg Opus para `work\assets\audio\wav` e pula arquivos WAV já existentes ao retomar um build.
-- **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação automaticamente quando necessário.
 - **`--work`**: escolhe onde ficam os arquivos intermediários. O estágio `shaders` usa metade das threads da CPU por padrão (ajustável com `--jobs`).
 
 ### Build com pouco espaço em disco

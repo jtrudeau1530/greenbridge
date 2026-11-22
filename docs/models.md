@@ -519,6 +519,7 @@ file names), so the effect is recoverable from them. Measured on a 1.0.2.1 copy,
 | Compute programs named `<effect>:<entry>` | 2,689 (every CS), 564 effects |
 | Effects with `RaytracingResolve` CS programs | 341 (1,004 programs; 3 each for 324) |
 | Materials whose hash is the joaat of a carved effect name | 3,211 (96%), 8 of the 18 hashes |
+| Materials whose hash is the joaat of a native effect record's name (both SGD5 databases, below) | 3,340 (100%), 18 of the 18 hashes, one record each |
 
 So a material leads to its effect and that effect's ray-tracing resolve programs. It does **not** lead to the
 draw (VS/PS/MS) programs from the package alone:
@@ -532,7 +533,6 @@ draw (VS/PS/MS) programs from the package alone:
 
 The effect → technique → VS/PS table is therefore not in the carved programs' names, order or suffixes; it is
 presumably in the executable (RT-5). Until then, a real model is drawn with a chosen pair ([first_light.md](first_light.md)).
-| Materials whose hash is the joaat of a native effect record's name (both SGD5 databases, below) | 3,340 (100%), 18 of the 18 hashes, one record each |
 
 So a material leads to its effect. Through the carved compute names it reaches only 8 of the 18 hashes; the
 effect records' own names reach all 18 (@jeremygold02, `tools/sgd5_effects.py` in #3036). The draw (VS/PS/MS)

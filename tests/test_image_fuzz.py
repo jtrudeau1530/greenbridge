@@ -370,6 +370,10 @@ def test_translate_forwards_pc_tail_ubo(monkeypatch, tmp_path):
 
     def fake_run(cmd, **_kw):
         cmds.append(list(cmd))
+        out = cmd[cmd.index("--out") + 1]           # translate() now checks the two programs were emitted
+        os.makedirs(out, exist_ok=True)
+        for name in ("vs_ids.spv", "ps_image_load.spv"):
+            open(os.path.join(out, name), "wb").close()
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(imf.subprocess, "run", fake_run)

@@ -181,6 +181,7 @@ def main():
     from collections import Counter
     res = Counter()
     total = len(files)
+    every_stem = {os.path.splitext(os.path.basename(p))[0] for p in files}   # before --skip-existing narrows files
     if a.skip_existing:
         pending = []
         for path in files:
@@ -205,7 +206,9 @@ def main():
         # so a stale one would still be translated and indexed even though the corpus no longer has it. Prune only
         # after a successful decode, so a missing llvm-mc or a failed shader never deletes a usable listing. --limit
         # is a partial run on purpose and leaves the rest of the folder alone.
-        stems = {os.path.splitext(os.path.basename(p))[0] for p in files}
+        # Every input's stem, not just this run's `files`: --skip-existing leaves the reused listings out of `files`,
+        # and pruning against that list deleted every listing a resumed run had just reused.
+        stems = every_stem
         stale = []
         try:
             with os.scandir(out) as entries:
