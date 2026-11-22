@@ -5137,6 +5137,9 @@ class Gen:
             # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
             if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
                 raise Unsupported("s_getpc_b64 destination")
+            if not ins.get("enc"):
+                # Without the `; encoding:` bytes the instruction's size, and so the next PC, is unknown.
+                raise Unsupported("s_getpc_b64 without encoding")
             nxt = ins["pc"] + len(ins["enc"]) // 2
             lo, hi, s, rlo, c, rhi = (self.tmp() for _ in range(6))
             self.emit(f"{lo} = OpLoad %uint %ud_code_lo_p")
@@ -9360,6 +9363,10 @@ def translate(path):
     if stage == "ps":
         g.v_interp_copy = interp_copy_sources(insns)   # before v_interp runs: I/J guards (SHADER-177)
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
+    if any(base_op(i["op"]) in BRANCHES and not i.get("enc") for i in insns):
+        # A branch target is relative to the next PC, which needs the branch's `; encoding:` bytes (missing in a
+        # hand-written listing). Until 2026-11-22 this was a TypeError in next_pc.
+        raise Unsupported("branch without encoding")
     if not branchy and not g.emulate:
         g.park_masks(([insns], [[]]))
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
