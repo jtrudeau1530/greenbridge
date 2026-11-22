@@ -490,6 +490,35 @@ class MeshletCentreTests(unittest.TestCase):
             self.assertEqual((c["centres_4240_radius_covers"], c["centres_4240_radius_covers_within_rounding"],
                               c["centres_4240_radius_tight"]), want, radius)
 
+    def test_meshlet_cone(self):
+        self.assertIsNone(mp.meshlet_cone(0x7FF))
+        up = 32 << 14 | 32 << 20                        # octahedral u = v = 0.5 / 31.5: nearly +z
+        axis, cos_half = mp.meshlet_cone(up | 31 << 26)
+        self.assertAlmostEqual(axis[2], 1.0, places=3)
+        self.assertEqual(cos_half, 1.0)                  # f = 31: sin(half-angle) 0
+        self.assertEqual(mp.meshlet_cone(up)[1], 0.0)    # f = 0: half-angle 90 degrees
+        self.assertAlmostEqual(mp.meshlet_cone(up | 16 << 26)[1], math.sqrt(1 - (15 / 31) ** 2))
+        self.assertAlmostEqual(mp.meshlet_cone(63 << 14 | 32 << 20 | 1 << 26)[0][0], 1.0, places=3)   # +x
+
+    def test_cone_agreement(self):
+        # grid_page's grid is a plane of constant z; take the facing from its first triangle
+        data = bytearray(self.grid_page((0, 0, 0)))
+        blk, grp = mp.parse_page(bytes(data))
+        pos = mp.positions_4240(bytes(data), blk)
+        p, q, r = (pos[i] for i in next(mp.group_triangles(bytes(data), grp)))
+        nz = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+        up, down = 32 << 14 | 32 << 20, 0             # octahedral: nearly +z, and u = v = -1 folded onto -z
+        facing, away = (up, down) if nz > 0 else (down, up)
+        rec = grp["offset"] + 12
+        w2, w3 = struct.unpack_from("<2I", data, rec + 8)
+        # f = 31 is a zero half-angle: the 6-bit axis is not exactly the face normal, so only the 0.05 allowance holds
+        for cone, want in ((facing | 31 << 26, (1, 1, 0, 1)), (away | 31 << 26, (1, 0, 0, 0)),
+                           (facing | 16 << 26, (1, 1, 1, 1)), (0, (0, 0, 0, 0))):
+            struct.pack_into("<I", data, rec + 12, (w3 & 0xFFF) | cone)
+            c = mp.summarise_page(bytes(data), "p", cones=True)["checks"]
+            self.assertEqual((c["cones_4240_cones"], c["cones_4240_axis_within_25_degrees"], c["cones_4240_faces_inside"],
+                              c["cones_4240_faces_inside_within_0_05"]), want, hex(cone))
+
     def test_cli_centres(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "p.bin")
