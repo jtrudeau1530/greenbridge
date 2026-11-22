@@ -466,7 +466,9 @@ struct DeviceState {
         view_info.format = view_format;
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
-        if (!storage && image.type == g::ImageType::image_2d && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        const bool color_2d = (image.type == g::ImageType::image_2d || image.type == g::ImageType::image_2d_array) &&
+                              (aspects & VK_IMAGE_ASPECT_COLOR_BIT);
+        if (!storage && color_2d) {
             // Use the clamp in the T# itself: views with identical keys must sample identically.
             clamp.minLod = g::image_min_lod(words);
             if (clamp.minLod > float(image.first_mip + image.mip_count - 1)) {
