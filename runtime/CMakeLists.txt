@@ -1020,7 +1020,7 @@ if(TARGET Vulkan::Headers)
       add_custom_command(
         OUTPUT ${LEONIDA_M15_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M15_DIR}
-        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "PATH=${LEONIDA_SPIRV_TOOLS_NATIVE};$ENV{PATH}"
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M15_DIR} vs_m15 ps_m15
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
@@ -1048,7 +1048,7 @@ if(TARGET Vulkan::Headers)
       add_custom_command(
         OUTPUT ${LEONIDA_M2_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M2_DIR}
-        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "PATH=${LEONIDA_SPIRV_TOOLS_NATIVE};$ENV{PATH}"
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M2_DIR} vs_m2 ps_m2 ps_m2_uoff
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
@@ -1078,7 +1078,7 @@ if(TARGET Vulkan::Headers)
       add_custom_command(
         OUTPUT ${LEONIDA_M3_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M3_DIR}
-        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "PATH=${LEONIDA_SPIRV_TOOLS_NATIVE};$ENV{PATH}"
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M3_DIR} vs_m3 ps_m3 vs_m2 ps_m3_post
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
