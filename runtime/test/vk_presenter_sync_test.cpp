@@ -171,7 +171,7 @@ int main() {
     HWND window = CreateWindowExW(0, wc.lpszClassName, L"Leonida presenter sync test", WS_OVERLAPPEDWINDOW, 80, 80,
                                   fr.right - fr.left, fr.bottom - fr.top, nullptr, nullptr, wc.hInstance, nullptr);
     EXPECT(window);
-    ShowWindow(window, SW_SHOWNORMAL);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
     UpdateWindow(window);
     pump();
 
