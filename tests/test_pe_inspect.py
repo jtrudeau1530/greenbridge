@@ -323,6 +323,17 @@ class PeInspectTest(unittest.TestCase):
         self.assertEqual(r["pdata_functions"], 0)
         self.assertFalse(r["has_relocs"])
 
+    def test_cli_reports_an_unusable_output_directory(self):
+        out = os.path.join(self.dir, "report-file")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("keep me")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(pe_inspect.main([self.image, "--out", out]), 1)
+        self.assertIn(f"cannot create output directory {out}", stderr.getvalue())
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep me")
+
     def test_cli_writes_json_and_markdown(self):
         out = os.path.join(self.dir, "reports")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
