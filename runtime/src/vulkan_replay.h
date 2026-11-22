@@ -654,52 +654,51 @@ struct Prepared {
     QueryPool* queries = nullptr;  // query commands: the heap
 };
 
-// ClearRenderTargetView takes FLOATs even for integer RTVs. For the UINT formats currently exposed by
-// the device, Windows D3D12 (WARP and AMD) clamps to the component range and truncates fractions. Vulkan
-// instead interprets the matching union member as an integer already; copying float bits changes the value.
+// ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
+// component range and truncates fractions. Vulkan instead interprets the matching union member as an integer
+// already; copying float bits changes the value without a validation error.
 inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
-    // Integer formats convert the float numerically: NaN maps to zero, negatives clamp to the low end, positive
-    // overflow to the high end, and fractions truncate toward zero. Unsigned uses uint32, signed uses int32.
-    std::uint32_t unsigned_maximum = 0;
-    std::int64_t signed_minimum = 0, signed_maximum = 0;
-    bool is_signed = false;
+    // Integer formats convert the float numerically: NaN maps to zero, values below the range clamp to the low
+    // end, positive overflow (and +infinity) to the high end, and fractions truncate toward zero. Unsigned uses
+    // uint32, signed int32. A2B10G10R10 clamps RGB to 10 bits and alpha (channel 3) to 2 bits.
+    constexpr double u32_max = 4294967295.0, s32_min = -2147483648.0, s32_max = 2147483647.0;
+    double low = 0, high = 0, alpha_high = 0;
+    bool is_integer = true, is_signed = false;
     switch (format) {
-    case VK_FORMAT_R8G8B8A8_UINT: unsigned_maximum = 255; break;
+    case VK_FORMAT_R8_UINT:
+    case VK_FORMAT_R8G8_UINT:
+    case VK_FORMAT_R8G8B8A8_UINT: high = 255; break;
+    case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16B16A16_UINT: high = 65535; break;
     case VK_FORMAT_R32_UINT:
-    case VK_FORMAT_R32G32B32A32_UINT: unsigned_maximum = std::numeric_limits<std::uint32_t>::max(); break;
-    case VK_FORMAT_R8G8B8A8_SINT: signed_minimum = -128; signed_maximum = 127; is_signed = true; break;
+    case VK_FORMAT_R32G32_UINT:
+    case VK_FORMAT_R32G32B32A32_UINT: high = u32_max; break;
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: high = 1023; alpha_high = 3; break;
+    case VK_FORMAT_R8_SINT:
+    case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R8G8B8A8_SINT: low = -128; high = 127; is_signed = true; break;
+    case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16B16A16_SINT: low = -32768; high = 32767; is_signed = true; break;
     case VK_FORMAT_R32_SINT:
-    case VK_FORMAT_R32G32B32A32_SINT:
-        signed_minimum = std::numeric_limits<std::int32_t>::min();
-        signed_maximum = std::numeric_limits<std::int32_t>::max();
-        is_signed = true;
-        break;
-    default: break;
+    case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R32G32B32A32_SINT: low = s32_min; high = s32_max; is_signed = true; break;
+    default: is_integer = false; break;
     }
+    if (format != VK_FORMAT_A2B10G10R10_UINT_PACK32) alpha_high = high;
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
-        if (is_signed) {
-            const double v = double(input[i]);
-            std::int32_t out;
-            if (v != v) {
-                out = 0;  // NaN
-            } else if (v <= double(signed_minimum)) {
-                out = static_cast<std::int32_t>(signed_minimum);
-            } else if (v >= double(signed_maximum)) {
-                out = static_cast<std::int32_t>(signed_maximum);
-            } else {
-                out = static_cast<std::int32_t>(v);  // truncates toward zero
-            }
-            value.int32[i] = out;
-        } else if (!unsigned_maximum) {
+        if (!is_integer) {
             value.float32[i] = input[i];
-        } else if (!(input[i] > 0.0f)) {
-            value.uint32[i] = 0; // NaN, negative values and either zero; no out-of-range float-to-int cast.
-        } else if (double(input[i]) >= double(unsigned_maximum)) {
-            value.uint32[i] = unsigned_maximum; // Includes +infinity; UINT32_MAX itself is not representable as float.
-        } else {
-            value.uint32[i] = static_cast<std::uint32_t>(input[i]);
+            continue;
         }
+        const double maximum = i == 3 ? alpha_high : high;
+        const double v = double(input[i]);
+        // In range the cast truncates toward zero; out-of-range values never reach a float-to-int cast.
+        const double clamped = v != v ? 0.0 : v <= low ? low : v >= maximum ? maximum : v;
+        if (is_signed) value.int32[i] = static_cast<std::int32_t>(clamped);
+        else value.uint32[i] = static_cast<std::uint32_t>(clamped);
     }
     return value;
 }

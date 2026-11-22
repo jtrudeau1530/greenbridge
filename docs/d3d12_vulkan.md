@@ -1083,15 +1083,22 @@ The trace will enumerate them.
   17 unsupported/invalid frontend views fail `Close` without submission. Other typeless families, SINT/SNORM,
   typed-resource casts, MSAA and 3D typeless RTVs remain unsupported.
   Phase 2 adds 54 mip/array and 12 non-array higher-mip readbacks against WARP, including untouched sentinels.
-- **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For integer formats (`R8G8B8A8_UINT`,
-  `R32_UINT`, `R32G32B32A32_UINT`, `R8G8B8A8_SINT`, `R32_SINT`) convert those values numerically into
-  `VkClearColorValue` for both image and rectangle clears; copying float bits gives incorrect stored integers
+- **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For every integer RTV format the device
+  exposes (`R8G8`, `R8G8B8A8`, `R16G16`, `R16G16B16A16`, `R32`, `R32G32` and `R32G32B32A32` in `_UINT` and `_SINT`,
+  plus `R10G10B10A2_UINT`; `R8`/`R16` `_UINT`/`_SINT` are handled in replay too) convert those values numerically
+  into `VkClearColorValue` for both image and rectangle clears; copying float bits gives incorrect stored integers
   without a Vulkan validation error. **Measured:** Windows D3D12 on WARP clamps negatives/NaN to zero, positive
   overflow/infinity to the component maximum (and signed below the minimum), and truncates fractions; signed formats
-  use `int32` with the same NaN/overflow rules. `d3d12_clear_test` compares full and rectangular D3D12 readbacks with
-  WARP across UNORM, SNORM, FLOAT, UINT and SINT render targets and depth/stencil; `clear_color_test` checks both
-  replay paths without a GPU, including unchanged float values. SRGB clears are omitted from the comparison: the
+  use `int32` with the same NaN/overflow rules. `R10G10B10A2_UINT` clamps RGB to 1023 and alpha to 3 (inputs 4, 4.5
+  and 2^32 in alpha match WARP). `d3d12_clear_test` compares full and rectangular D3D12 readbacks with WARP across
+  UNORM, SNORM, FLOAT, all 15 exposed UINT/SINT render targets (11 value vectors, including 8-/16-/10-/2-bit range
+  boundaries) and depth/stencil; `clear_color_test` checks both replay paths for 19 integer formats without a GPU,
+  including unchanged float values. SRGB clears are omitted from the comparison: the
   linear→sRGB encoding rounds differently at the `.5` boundary on WARP vs Vulkan (a 1-ulp driver difference).
+  **Open:** on NVIDIA RTX 5080 (driver 616.56) clears that land exactly on a `.5` UNORM/SNORM step round down where
+  WARP rounds up: `R8G8B8A8_UNORM`/`SNORM` 0.5 store `7f`/`3f` vs WARP `80`/`40`, and a `D16_UNORM` 0.5 depth clear
+  stores `0x7fff` vs WARP `0x8000` (all on `main` before this change; same 1-ulp class as SRGB, not addressed here).
+  `D32_FLOAT` and `D32_FLOAT_S8X24_UINT` match WARP.
   This does not add typed-view reinterpretation of typeless resources.
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
