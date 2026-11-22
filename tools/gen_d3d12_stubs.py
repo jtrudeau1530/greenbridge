@@ -106,7 +106,8 @@ def implemented_names(paths):
     names = set()
     for path in paths:
         with open(path, encoding="utf-8", errors="replace") as f:
-            names.update(OVERRIDE.findall(f.read()))
+            source = COMMENTS_OR_LITERALS.sub(" ", f.read())
+            names.update(OVERRIDE.findall(source))
     return names
 
 

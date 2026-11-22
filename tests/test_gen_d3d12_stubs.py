@@ -218,6 +218,19 @@ class CoverageTests(unittest.TestCase):
             "open": ["IBase::Multi", "IBase::AfterComment", "IChild::Size"],
         }])
 
+    def test_coverage_ignores_comments_and_quoted_examples(self) -> None:
+        with open(self.source, "w", encoding="utf-8") as f:
+            f.write(
+                "void STDMETHODCALLTYPE DoThing(UINT a, UINT b);\n"
+                "// HRESULT STDMETHODCALLTYPE Multi(UINT first, UINT second);\n"
+                "/* HRESULT STDMETHODCALLTYPE GetThing(UINT index) const; */\n"
+                'const char* example = "HRESULT STDMETHODCALLTYPE AfterComment(void);";\n'
+            )
+        report = gen.coverage(IFACES, ["IChild"], [self.source])
+        self.assertEqual(report[0]["implemented"], 1)
+        self.assertEqual(report[0]["open"],
+                         ["IBase::Multi", "IBase::AfterComment", "IChild::GetThing", "IChild::Size"])
+
     def test_no_sources_means_every_method_is_open(self):
         report = gen.coverage(IFACES, ["IBase"], [])
         self.assertEqual(report[0]["implemented"], 0)
