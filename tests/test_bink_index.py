@@ -220,5 +220,49 @@ class TestCommandLine(unittest.TestCase):
                 self.assertIn(f"cannot write {path}", err.getvalue())
 
 
+    def test_output_cannot_overwrite_carve_manifest(self):
+        carve = os.path.join(self.tmp.name, "carve")
+        os.makedirs(carve, exist_ok=True)
+        manifest = os.path.join(carve, "index.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            f.write('{"carve_manifest": true}')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bink.main([carve, "--out", manifest])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite the carve manifest", err.getvalue())
+        with open(manifest, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_output_cannot_overwrite_a_carved_input(self):
+        carve = os.path.join(self.tmp.name, "carve2")
+        os.makedirs(carve, exist_ok=True)
+        payload = os.path.join(carve, "00000001.bin")
+        with open(payload, "wb") as f:
+            f.write(make_stream())
+        linked = os.path.join(carve, "linked.json")   # a .json alias of the .bin input
+        try:
+            os.link(payload, linked)
+        except OSError:
+            self.skipTest("hard links are not available")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bink.main([carve, "--out", linked])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite an input file", err.getvalue())
+        with open(payload, "rb") as f:
+            self.assertEqual(f.read(), make_stream())
+
+    def test_output_folder_is_rejected(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bink.main([self.path, "--out", self.tmp.name])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is a folder, not a report file", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
