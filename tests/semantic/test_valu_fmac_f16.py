@@ -1519,5 +1519,95 @@ class TestFmacF16ConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(carry0, 0)
 
 
+class TestFmacF16IEEE754BoundaryExtremes(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_addition_without_carry(self):
+        sub1 = 0x0001
+        sub2 = 0x0002
+        res = ref_fmac_f16_u16(sub1, F16_ONE, sub2)
+        self.assertEqual(res, 0x0003)
+        self.assertTrue(is_subnormal_f16(res))
+
+    def test_subnormal_to_normal_transition(self):
+        max_sub = 0x03FF  # largest subnormal (1023/1024) * 2^-14
+        min_sub = 0x0001  # smallest subnormal 2^-24
+        # (max_sub * 1.0) + min_sub = 0x0400 = smallest normal (2^-14)
+        res = ref_fmac_f16_u16(max_sub, F16_ONE, min_sub)
+        self.assertEqual(res, 0x0400)
+        self.assertFalse(is_subnormal_f16(res))
+        _, exp, frac = split_f16(res)
+        self.assertEqual(exp, 1)
+        self.assertEqual(frac, 0)
+
+    def test_subnormal_gradual_underflow(self):
+        min_normal = F16_MIN_NORMAL  # 0x0400 = 2^-14
+        res = ref_fmac_f16_u16(min_normal, F16_HALF, F16_POS_ZERO)
+        self.assertEqual(res, 0x0200)  # 2^-15 (subnormal)
+        self.assertTrue(is_subnormal_f16(res))
+
+    def test_subnormal_cancellation(self):
+        sub = 0x0123
+        neg_sub = sub | SIGN_MASK_F16
+        res = ref_fmac_f16_u16(sub, F16_ONE, neg_sub)
+        self.assertEqual(res, F16_POS_ZERO)
+
+    def test_nan_signaling_to_quiet_conversion(self):
+        snan = 0x7C05  # fraction != 0, quiet bit 9 is 0
+        self.assertTrue(is_snan_f16(snan))
+        res = ref_fmac_f16_u16(F16_ONE, F16_ONE, snan)
+        self.assertTrue(is_qnan_f16(res))
+        self.assertEqual(res, snan | QNAN_BIT_F16)
+
+    def test_nan_payload_preservation(self):
+        payload = 0x01AB
+        qnan = EXP_MASK_F16 | payload | QNAN_BIT_F16
+        res = ref_fmac_f16_u16(F16_TWO, F16_ONE, qnan)
+        self.assertEqual(res, qnan)
+
+    def test_nan_with_modifiers(self):
+        qnan = 0x7E01
+        # abs should clear sign bit on src0
+        res_abs = ref_fmac_f16_u16(qnan | SIGN_MASK_F16, F16_ONE, F16_POS_ZERO, abs0=True)
+        self.assertEqual(res_abs & SIGN_MASK_F16, 0)
+        self.assertTrue(is_qnan_f16(res_abs))
+
+        # neg should toggle sign bit on src0
+        res_neg = ref_fmac_f16_u16(qnan, F16_ONE, F16_POS_ZERO, neg0=True)
+        self.assertEqual(res_neg & SIGN_MASK_F16, SIGN_MASK_F16)
+
+    def test_nan_with_clamp(self):
+        qnan = F16_CANONICAL_QNAN
+        res = ref_fmac_f16_u16(F16_ONE, F16_ONE, qnan, clamp=True)
+        self.assertEqual(res, F16_POS_ZERO)
+
+    def test_infinity_arithmetic_boundaries(self):
+        self.assertEqual(ref_fmac_f16_u16(F16_POS_INF, f16_to_u16(100.0), F16_POS_ZERO), F16_POS_INF)
+        self.assertEqual(ref_fmac_f16_u16(F16_NEG_INF, f16_to_u16(100.0), F16_POS_ZERO), F16_NEG_INF)
+        self.assertEqual(ref_fmac_f16_u16(F16_POS_INF, F16_ONE, F16_NEG_INF), F16_CANONICAL_QNAN)
+        self.assertEqual(ref_fmac_f16_u16(F16_NEG_INF, F16_ONE, F16_POS_INF), F16_CANONICAL_QNAN)
+
+        # Infinity with clamp
+        self.assertEqual(ref_fmac_f16_u16(F16_POS_INF, F16_ONE, F16_POS_ZERO, clamp=True), F16_ONE)
+        self.assertEqual(ref_fmac_f16_u16(F16_NEG_INF, F16_ONE, F16_POS_ZERO, clamp=True), F16_POS_ZERO)
+
+    def test_round_to_nearest_even_ties(self):
+        # In IEEE 754 binary16 (10 bits significand):
+        # 1.0 has bits 0x3C00 (even LSB = 0)
+        # 1.0 + 2^-10 has bits 0x3C01 (odd LSB = 1)
+        # 2^-11 is exactly halfway between representable numbers.
+        half_ulp = 2.0 ** -11
+        one = 1.0
+        one_plus_ulp = u16_to_f16(0x3C01)
+
+        # Case 1: 1.0 (even LSB) + 2^-11: tie rounds to even (1.0)
+        res1 = ref_fmac_f16(1.0, half_ulp, one)
+        self.assertEqual(f16_to_u16(res1), F16_ONE)
+
+        # Case 2: (1.0 + 2^-10) (odd LSB) + 2^-11: tie rounds to even (1.0 + 2 * 2^-10) = 0x3C02
+        res2 = ref_fmac_f16(1.0, half_ulp, one_plus_ulp)
+        self.assertEqual(f16_to_u16(res2), 0x3C02)
+
+
 if __name__ == "__main__":
     unittest.main()
