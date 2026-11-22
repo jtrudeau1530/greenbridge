@@ -2,6 +2,8 @@
 
     python -I tests/test_file_mode.py -v
 """
+import contextlib
+import io
 import os
 from pathlib import Path
 import sys
@@ -11,7 +13,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import file_mode  # noqa: E402
+import awc_manifest  # noqa: E402
+import classify_carve  # noqa: E402
 import glb_writer  # noqa: E402
+import rbf0_tree  # noqa: E402
+import rsc8_audio  # noqa: E402
 import rtti_scan  # noqa: E402
 
 PRIMS = glb_writer.parse_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", is_path=False)
@@ -29,7 +35,18 @@ class NoUmaskFlipTests(unittest.TestCase):
         return [
             ("write_glb", Path(directory) / "mesh.glb", lambda p: glb_writer.write_glb(p, PRIMS)),
             ("write_report", os.path.join(directory, "x.rtti.json"), lambda p: rtti_scan.write_report(p, "{}")),
+            ("awc_manifest", os.path.join(directory, "audio.csv"),
+             lambda p: awc_manifest.write_manifest([], 0, 0, "csv", p)),
+            ("classify_carve", os.path.join(directory, "types.json"), self.classify_carve),
+            ("rbf0_tree", os.path.join(directory, "tree.json"), lambda p: rbf0_tree.write_json(p, [], {})),
+            ("rsc8_audio", os.path.join(directory, "rsc8.json"), lambda p: rsc8_audio.write_report(p, [], {})),
         ]
+
+    @staticmethod
+    def classify_carve(path):
+        with mock.patch.object(sys, "argv", ["classify_carve.py", os.path.dirname(path)]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            assert classify_carve.main() == 0
 
     def test_writes_never_call_umask(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch("os.umask", side_effect=no_umask):
@@ -38,7 +55,8 @@ class NoUmaskFlipTests(unittest.TestCase):
                     write(path)  # a new file: the case that used to read the umask
                     write(path)  # a replaced file
                     self.assertTrue(os.path.isfile(path))
-            self.assertEqual(sorted(os.listdir(directory)), ["mesh.glb", "x.rtti.json"])
+            self.assertEqual(sorted(os.listdir(directory)), sorted(os.path.basename(p) for _, p, _ in
+                                                                   self.writers(directory)))
 
     def test_new_file_mode_leaves_no_probe_behind(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch("os.umask", side_effect=no_umask):

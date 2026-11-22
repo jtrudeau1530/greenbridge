@@ -33,6 +33,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
 RSC8_MAGIC = b"RSC8"
 RSC8_VERSION = 8001
 RSC8_VERSION_FLAGGED = 0x01001F41
@@ -1221,6 +1224,7 @@ def _atomic_write_text(path, write_fn):
         ) as f:
             tmp = f.name
             write_fn(f)
+        os.chmod(tmp, published_mode(path))   # NamedTemporaryFile creates 0600
         os.replace(tmp, path)
     except BaseException:
         if tmp and os.path.isfile(tmp):
