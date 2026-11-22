@@ -592,16 +592,9 @@ public:
     static constexpr GUID kTag{0xb4c39e02, 0x6f71, 0x4d8a, {0xb2, 0x5e, 0x3e, 0x9d, 0x0f, 0x6c, 0x1a, 0x88}};
 
     Fence(leonida::VulkanContext& context, UINT64 initial, D3D12_FENCE_FLAGS flags)
-        : fence_(context, initial), flags_(flags), highest_(initial) {}
+        : context_(context), fence_(context, initial), flags_(flags), highest_(initial) {}
 
-    ~Fence() override {
-        {
-            std::lock_guard lock(mutex_);
-            stop_ = true;
-        }
-        changed_.notify_all();
-        if (waiter_.joinable()) waiter_.join();
-    }
+    ~Fence() override { context_.cancel_fence_waits(fence_.semaphore()); }
 
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
     VkSemaphore semaphore() const { return fence_.semaphore(); }
@@ -616,7 +609,9 @@ public:
         return false;
     }
 
-    UINT64 STDMETHODCALLTYPE GetCompletedValue() override { return fence_.completed(); }
+    UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
+        return context_.is_device_lost() ? UINT64_MAX : fence_.completed();
+    }
     D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override { return flags_; }
 
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
@@ -626,57 +621,31 @@ public:
 
     // A null event blocks until the value is reached, as D3D12 does.
     HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
-        if (!event) return fence_.completed() >= value || fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
-        notify(value, std::make_shared<FenceWaiter>(event, 1));
+        if (context_.is_device_lost() || fence_.completed() >= value) {
+            if (event) SetEvent(event);
+            return S_OK;
+        }
+        if (!event) return fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
+        context_.enqueue_fence_wait(fence_.semaphore(), value, event);
         return S_OK;
     }
 
-    // Counts `waiter` down once this fence reaches `value`: now if it has, else from the waiter thread.
+    // Counts `waiter` down once this fence reaches `value`: now if it has, else via the centralized dispatcher.
     void notify(UINT64 value, std::shared_ptr<FenceWaiter> waiter) {
-        if (fence_.completed() >= value) {
+        if (context_.is_device_lost() || fence_.completed() >= value) {
             waiter->hit();
             return;
         }
-        {
-            std::lock_guard lock(mutex_);
-            pending_.emplace_back(value, std::move(waiter));
-            if (!waiter_.joinable()) waiter_ = std::thread([this] { wait_loop(); });
-        }
-        changed_.notify_all();
+        context_.enqueue_fence_callback(fence_.semaphore(), value, [w = std::move(waiter)] { w->hit(); });
     }
 
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
 
 private:
-    void wait_loop() {
-        std::unique_lock lock(mutex_);
-        while (true) {
-            changed_.wait(lock, [this] { return stop_ || !pending_.empty(); });
-            if (stop_) return;
-            UINT64 lowest = UINT64_MAX;
-            for (const auto& entry : pending_) lowest = std::min(lowest, entry.first);
-            lock.unlock();
-            fence_.wait(lowest, 10'000'000);  // 10 ms, so destruction is never held up for long
-            const UINT64 done = fence_.completed();
-            lock.lock();
-            // An ANY wait that another fence already satisfied is dropped without waiting for this one.
-            std::erase_if(pending_, [done](const auto& entry) {
-                if (entry.second->done()) return true;
-                if (entry.first > done) return false;
-                entry.second->hit();
-                return true;
-            });
-        }
-    }
-
+    leonida::VulkanContext& context_;
     leonida::VulkanFence fence_;
     D3D12_FENCE_FLAGS flags_;
     std::atomic<UINT64> highest_;
-    std::mutex mutex_;
-    std::condition_variable changed_;
-    std::vector<std::pair<UINT64, std::shared_ptr<FenceWaiter>>> pending_;
-    std::thread waiter_;
-    bool stop_ = false;
 };
 
 class CommandQueue final
@@ -686,10 +655,16 @@ public:
     // {e1a85d76-0b3f-4c29-a7d4-58f2c6e0b913}
     static constexpr GUID kTag{0xe1a85d76, 0x0b3f, 0x4c29, {0xa7, 0xd4, 0x58, 0xf2, 0xc6, 0xe0, 0xb9, 0x13}};
 
+    static leonida::VulkanQueue::QueueKind queue_kind_for(D3D12_COMMAND_LIST_TYPE type) {
+        if (type == D3D12_COMMAND_LIST_TYPE_COPY) return leonida::VulkanQueue::QueueKind::copy;
+        if (type == D3D12_COMMAND_LIST_TYPE_COMPUTE) return leonida::VulkanQueue::QueueKind::compute;
+        return leonida::VulkanQueue::QueueKind::direct;
+    }
+
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
                  const D3D12_COMMAND_QUEUE_DESC& desc, const QueueClock& clock)
-        : desc_(desc), context_(context), queue_(context, queue, family), vk_queue_(queue), family_(family),
-          clock_(clock) {}
+        : desc_(desc), context_(context), queue_(context, queue, family, queue_kind_for(desc.Type)),
+          vk_queue_(queue), family_(family), clock_(clock) {}
 
     ~CommandQueue() override {
         if (!stamp_.pool) return;
@@ -954,6 +929,7 @@ HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D1
                      void** out, IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
+    context.set_signal_event_fn([](void* h) { SetEvent(static_cast<HANDLE>(h)); });
     auto* object = new Fence(context, initial_value, flags);
     if (!object->ok()) {
         object->Release();

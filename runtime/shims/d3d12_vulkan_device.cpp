@@ -416,9 +416,11 @@ struct DeviceState {
     }
 
     void release(const ImageEntry& entry) {  // descriptor_mutex held
-        bindless->remove_image(entry.dimension, entry.index);
-        context->vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
-        if (entry.storage) context->vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+        const std::uint64_t slot_handle =
+            (static_cast<std::uint64_t>(entry.dimension) << 32) | static_cast<std::uint64_t>(entry.index);
+        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
+        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.sampled);
+        if (entry.storage) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage);
     }
 
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
@@ -657,18 +659,16 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
 
     ~Resource() override {
-        auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
-            if (vk.vkDestroyAccelerationStructureKHR) vk.vkDestroyAccelerationStructureKHR(dev, accel_, nullptr);
+            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::acceleration_structure, accel_);
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
-        if (image_) vk.vkDestroyImage(dev, image_, nullptr);
-        if (buffer_) vk.vkDestroyBuffer(dev, buffer_, nullptr);
-        if (memory_) vk.vkFreeMemory(dev, memory_, nullptr);
+        if (image_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
+        if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
+        if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
     }
 
     leonida::ResourceId id() const { return resource_id(this); }
@@ -746,6 +746,9 @@ public:
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.buffer = buffer_;
         binding.size = desc_.Width;
+        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -1534,6 +1537,13 @@ public:
             state_.bindless.reset();
             return false;
         }
+        state_.context->set_bindless_release(
+            [](void* user, std::uint32_t dim, std::uint32_t idx) {
+                auto* st = static_cast<DeviceState*>(user);
+                std::lock_guard lock(st->descriptor_mutex);
+                if (st->bindless) st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
+            },
+            &state_);
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
             std::lock_guard lock(state_.descriptor_mutex);
             if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
@@ -1557,8 +1567,12 @@ public:
 
     ~Device() override {
         if (state_.context) {
-            std::lock_guard lock(state_.context->submit_mutex());
-            state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            {
+                std::lock_guard lock(state_.context->submit_mutex());
+                state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            }
+            state_.context->drain_deleted_resources(UINT64_MAX);
+            state_.context->set_bindless_release(nullptr, nullptr);
         }
         state_.staging_queue.reset();  // it uses the context
         if (state_.context && state_.bindless) {
@@ -1630,7 +1644,9 @@ public:
                                                                 HANDLE event) override {
         return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event);
     }
-    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
+        return (state_.context && state_.context->is_device_lost()) ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
+    }
 
     // Residency and power (D3D-33, docs/d3d12_vulkan.md section 4.1). Vulkan has no residency API: memory from
     // vkAllocateMemory stays usable by the device until vkFreeMemory, and paging under pressure is the kernel
