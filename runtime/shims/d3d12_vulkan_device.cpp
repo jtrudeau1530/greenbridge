@@ -3222,6 +3222,7 @@ public:
                     // Depth formats multisample as depth-stencil targets (MULTISAMPLE_QUALITY_LEVELS already
                     // reports their counts); the colour-attachment check above never sees them.
                     if (depth && !chosen.typeless && (s1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) &&
+                        state_.image_format_properties &&
                         state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
                                                        VK_IMAGE_TILING_OPTIMAL,
                                                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,

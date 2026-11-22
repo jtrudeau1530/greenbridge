@@ -1418,12 +1418,25 @@ bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physi
     return false;
 }
 
+bool integer_format(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_UINT:
+    case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R10G10B10A2_UINT:
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_UINT:
+    case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_R8_SINT: return true;
+    default: return false;
+    }
+}
+
 // FORMAT_SUPPORT bits that D3D12 defines per format rather than per GPU, for every format both the layer and the
 // host PC runtime on the same adapter support. The layer must not claim them where the format's rules forbid them
 // (1D block-compressed, 3D depth, integer resolves, TYPELESS formats used as anything but storage, depth formats as
 // shader resources), and must report the ones it provides: mips, gathers wherever it samples, typed UAV loads
-// wherever it stores, and R32_UINT atomics. Hardware-dependent bits (render targets, filtering, typed UAV formats)
-// are left to the Vulkan driver.
+// wherever it stores, and R32_UINT atomics. Hardware-dependent bits (render targets, filtering, typed UAV formats,
+// which float formats resolve) are left to the Vulkan driver.
 int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo& info) {
     Ref<ID3D12Device> host;
     std::string adapter;
@@ -1435,7 +1448,7 @@ int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo
                           D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE;
     constexpr UINT storage_only = dims | D3D12_FORMAT_SUPPORT1_MIP | D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT;
     constexpr UINT format_rules = D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE3D |
-                                  D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE | D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
+                                  D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
     constexpr UINT shader_reads = D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
                                   D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
     constexpr UINT atomics = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
@@ -1458,7 +1471,9 @@ int compare_format_support(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo
         const UINT o1 = UINT(o.Support1), o2 = UINT(o.Support2), h1 = UINT(h.Support1), h2 = UINT(h.Support2);
         if (!o1 || !h1) continue;  // one side has the format but not a single use for it
         ++compared;
-        if (o1 & format_rules & ~h1) fail(f, "1D, 3D, resolve or depth-stencil the format can't have", o1, o2, h1, h2);
+        if (o1 & format_rules & ~h1) fail(f, "1D, 3D or depth-stencil the format can't have", o1, o2, h1, h2);
+        if (integer_format(DXGI_FORMAT(f)) && (o1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE))
+            fail(f, "a resolve of an integer format", o1, o2, h1, h2);
         // A host answer of nothing but dimensions, mips and casts is a TYPELESS (storage-only) format.
         if ((h1 & dims) && !(h1 & ~storage_only) && !(h2 & ~UINT(D3D12_FORMAT_SUPPORT2_TILED)) &&
             ((o1 & ~storage_only) || o2))
