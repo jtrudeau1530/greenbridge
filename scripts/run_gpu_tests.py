@@ -32,6 +32,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PRO
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST
+from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan on Apple)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
@@ -325,7 +326,7 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     if rc != 0 or words is None:
         return False, msg
     vals = words[:len(want)]
-    return vals == want, " ".join((hex if hexwords else str)(x) for x in vals)
+    return words_match(vals, want), " ".join((hex if hexwords else str)(x) for x in vals)
 
 
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
@@ -993,9 +994,13 @@ def run_suite(a, work: str) -> int:
             if skip:   # e.g. Mesa llvmpipe's 8-wide subgroups: these 32-lane masks can't come out right
                 ok, detail = None, str(skip)
             else:
+                want = judged_words(name, msg, want)   # cs_signed_zero_nan on Apple: -0 products unjudged (#1203)
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16",
                                                              "cs_lds_b64_cmpst", "cs_signed_zero_nan"))
+                if ok and None in want:
+                    unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
+                    detail += f" (words {unjudged} not judged on Apple: -0 products, #1203)"
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])

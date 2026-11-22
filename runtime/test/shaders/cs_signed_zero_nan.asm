@@ -4,6 +4,8 @@
 ; SignedZeroInfNanPreserve so the driver may not assume they don't occur. Without it, on an RX 9070 XT (AMD
 ; 26.11.2) this test gets 0 in out[4..7]: the x != x NaN checks fold to false and the NaN conversion is lost. The
 ; f16 fuzzer there also saw -0 products come back +0, and NaN results narrowed with integer ops never stored.
+; Apple GPUs (MoltenVK) return +0 in out[0], out[2] and out[3] with or without the mode (#1203, SHADER-182), so
+; check.py and run_gpu_tests.py don't judge those three words on an Apple device; the other five still count.
 ; Thread 0 stores eight words:
 ;   out[0] v_mul_f32 -0.0 * 1.0                             = 0x80000000
 ;   out[1] v_add_f32 -0.0 + -0.0                            = 0x80000000

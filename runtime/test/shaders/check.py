@@ -635,6 +635,26 @@ def vcmpx_forms_narrow_skip(out):
     return None
 
 
+# cs_signed_zero_nan's words 0, 2 and 3 are -0 products (v_mul_f32, v_pk_mul_f16, v_mul_f16). Apple GPUs (MoltenVK)
+# return +0 for them with or without SignedZeroInfNanPreserve (#1203, SHADER-182), so there only its other words
+# (-0 + -0, the three NaN checks and the NaN conversion) are judged. Shared with run_gpu_tests.py.
+APPLE_UNJUDGED_WORDS = {"cs_signed_zero_nan": (0, 2, 3)}
+
+
+def judged_words(name, out, words):
+    """The expected words with None where nothing is judged: APPLE_UNJUDGED_WORDS when vk_compute_test's
+    "device: ..." line names an Apple GPU, else every word as given."""
+    if re.search(r"^device: Apple\b", out, re.MULTILINE) is None:
+        return list(words)
+    unjudged = APPLE_UNJUDGED_WORDS.get(name, ())
+    return [None if i in unjudged else w for i, w in enumerate(words)]
+
+
+def words_match(got, want):
+    """The dump's words against want, which may be shorter; a None in want is not judged."""
+    return len(got) >= len(want) and all(w is None or g == w for g, w in zip(got, want))
+
+
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
                  env=None):
     """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
@@ -670,7 +690,7 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
             return ""
     elif expected_words is not None:
         m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
-        if m and [int(x) for x in m.group(1).split()][:len(expected_words)] == expected_words:
+        if m and words_match([int(x) for x in m.group(1).split()], judged_words(name, out, expected_words)):
             return ""
     else:
         m = re.search(r"(\d+) mismatches", out)
