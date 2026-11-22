@@ -421,6 +421,8 @@ def main() -> int:
                     help="ffmpeg processes to run at once (default: half the CPU count)")
     ap.add_argument("--ffmpeg", help="ffmpeg executable (default: ffmpeg on PATH)")
     a = ap.parse_args()
+    if a.jobs < 1:
+        ap.error("--jobs must be at least 1")
 
     src = os.path.abspath(a.src)
     if os.path.isfile(src):
@@ -462,7 +464,6 @@ def main() -> int:
     if repaired:
         print(f"{repaired} file(s) needed distinct names on the output filesystem or beside an unverified WAV.")
 
-    jobs = max(1, a.jobs)
     t0 = time.time()
     written = skipped = 0
     todo = []
@@ -475,7 +476,7 @@ def main() -> int:
 
     failures = []
     done = 0
-    workers = min(jobs, len(todo)) if todo else 1
+    workers = min(a.jobs, len(todo)) if todo else 1
     if todo:
         print(f"Decoding {len(todo)} file(s) with {workers} job(s)...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
