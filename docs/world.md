@@ -211,6 +211,7 @@ world rotation (conjugate it for rendering). `scaleXY` applies to X/Y, `scaleZ` 
 | entity id | `1b60404d` | +0x08 | u64 | per-entity id (not a name key; not unique, see world_names.md) |
 | archetype key | `c8a7b90a` | +0x20 | u64 | per-archetype key: MurmurHash3 x64 128 low 64 of the name |
 | `lodLevel` | `6c8f1715` | +0x7e | u8 | 0 HD, 1 LOD, 2 SLOD1, 3 SLOD2, 4 SLOD3, 5 ORPHAN_HD, 6 SLOD4 |
+| terrain parent-map selector | `84799847` | +0x7f | i8 | zero-based slot in the source map's parent-map reference array, or -1 in the measured terminal rows |
 | `parentIndex` | `d89231bd` | +0x5c | i16 | parent entity index (signed; -1 = none) |
 | `parentInstance` | `e74c3c23` | +0x5e | i16 | parent batch instance |
 | `numChildren` | `a687ac89` | +0x68 | u32 | linked children |
@@ -497,8 +498,21 @@ matches the next map's `CMapData.name`. The child's signed `parentIndex` selects
 For all 127 HD/LOD pairs, the same name stem with the respective tier suffix reproduced both stored archetype
 keys (JOAAT and Murmur3-64). Following the reference from LOD grouped the 127 children under 32 SLOD1 entities.
 At both steps, every parent's incoming count matched its `numChildren`, and its `childLodDist` matched each
-child's `lodDist`. These measurements cover single-entry arrays. Selection among multiple map references and
-the runtime switching distance remain open.
+child's `lodDist`.
+
+Four terrain maps with two references show how an entity selects its parent map. Schema member `84799847` at
++0x7f is a signed byte (type `0x10`). Use its value as a zero-based index in the stored `75d16adf` array,
+then apply `parentIndex` to that map's `entities` array. In these maps, 64 children select slot 0 and 18
+select slot 1. For 42 children the same parent ordinal, tier and distance fields fit both maps. In every
+one of these cases the selected parent is closer to the child's XY position. Reversing
+the array while keeping the selector fixed sends those 42 to the other map and the remaining 40 to an
+out-of-range ordinal. Remapping the selector along with the array restores all 82 links.
+
+Including the adjacent single-reference maps, all 324 links agree with the declared child counts of all 34
+parents. Always selecting slot 0 gives incorrect child counts for ten parents. The six terminal entities
+have an empty map reference array, selector -1 and `parentIndex` -1.
+All 330 entities have `parentInstance` -1. These checks establish authored associations for the measured
+terrain records. Nondefault batch instances and the runtime switching distance remain open.
 
 ### Measured
 
