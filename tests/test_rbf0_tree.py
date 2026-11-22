@@ -336,6 +336,19 @@ class OutputTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_xml_preserves_carriage_returns_in_text(self) -> None:
+        source = os.path.join(self.root, "text.bin")
+        expected = "first\rsecond\r\n<last & final>"
+        with open(source, "wb") as f:
+            f.write(WIDE + _open(0, b"TestRoot") + _text(expected.encode("utf-8")) + CLOSE)
+        out = os.path.join(self.root, "tree.json")
+        xml_dir = os.path.join(self.root, "xml")
+
+        self.assertEqual(rbf0_tree.main([source, out, "--xml", xml_dir, "--quiet"]), 0)
+
+        tree = ET.parse(os.path.join(xml_dir, "00000000.xml"))
+        self.assertEqual(tree.findtext(".//text"), expected)
+
     def test_json_and_xml(self):
         blob = bytearray(WIDE)
         blob += _open(0, b"TestRoot", attrs=1)
