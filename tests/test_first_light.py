@@ -21,7 +21,12 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-CLEAR = -1.0
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import first_light as fl
+
+CLEAR = fl.CLEAR
+check_image = fl.check_image
+write_ppm = fl.write_ppm
 
 
 def harness() -> str | None:
@@ -32,52 +37,6 @@ def harness() -> str | None:
         if path and os.path.isfile(path):
             return path
     return None
-
-
-def check_image(data: bytes, manifest: dict) -> dict:
-    """The readback oracle: exact shape, coverage window, a clear corner and the centre UV."""
-    width, height = manifest["width"], manifest["height"]
-    if len(data) != width * height * 16:
-        raise AssertionError(
-            f"raw is {len(data)} bytes, expected {width * height * 16}"
-        )
-    pixels = struct.unpack(f"<{len(data) // 4}f", data)
-    covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
-    ratio = covered / (width * height)
-    if (
-        not manifest.get("min_coverage", 0.0)
-        <= ratio
-        <= manifest.get("max_coverage", 1.0)
-    ):
-        raise AssertionError(
-            f"coverage {ratio:.4f} outside "
-            f"[{manifest.get('min_coverage', 0.0)}, {manifest.get('max_coverage', 1.0)}]"
-        )
-    if (clear := manifest.get("clear_pixel")) is not None:
-        i = (clear[1] * width + clear[0]) * 4
-        want = manifest.get("clear", CLEAR)
-        if any(abs(pixels[i + c] - want) > 1e-5 for c in range(4)):
-            raise AssertionError(
-                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {want}"
-            )
-    if (uv := manifest.get("centre_uv")) is not None:
-        centre = manifest.get("centre_pixel") or [width // 2, height // 2]
-        i = (centre[1] * width + centre[0]) * 4
-        for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
-            if abs(pixels[i + c] - want) > 2e-3:
-                raise AssertionError(
-                    f"centre {centre} is {pixels[i : i + 4]}, expected {want} at {c}"
-                )
-    return {"covered": covered, "ratio": ratio, "pixels": pixels}
-
-
-def write_ppm(path: str, pixels, width: int, height: int) -> None:
-    with open(path, "wb") as f:
-        f.write(f"P6\n{width} {height}\n255\n".encode())
-        f.writelines(
-            bytes(max(0, min(255, round(pixels[i + c] * 255))) for c in range(3))
-            for i in range(0, len(pixels), 4)
-        )
 
 
 class FirstLightTests(unittest.TestCase):
@@ -131,6 +90,22 @@ class FirstLightTests(unittest.TestCase):
         )
         self.assertGreater(stats["covered"], 0)
 
+    def test_check_cli_matches_the_oracle(self):
+        """The tool's --check must accept and reject the same images the test does."""
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                os.path.join(ROOT, "tools", "first_light.py"),
+                "--check",
+                "--out",
+                self.out,
+                "--harness",
+                self.harness,
+            ],
+            check=True,
+        )
+
     def test_manifest_names_the_assets(self):
         self.assertGreater(self.manifest["vertex_count"], 0)
         self.assertGreater(self.manifest["triangle_count"], 0)
@@ -154,6 +129,7 @@ class OracleTests(unittest.TestCase):
             "max_coverage": 0.5,
             "centre_pixel": [2, 2],
             "centre_uv": [0.25, 0.75],
+            "uv_probes": [{"pixel": [2, 2], "uv": [0.25, 0.75]}],
             "clear_pixel": [0, 0],
             "clear": CLEAR,
         }

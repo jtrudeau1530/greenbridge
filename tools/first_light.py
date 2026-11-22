@@ -36,6 +36,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
@@ -233,6 +234,26 @@ def clear_pixel(vertices, indices, width: int, height: int):
     return None
 
 
+def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> list[dict]:
+    """Pixels whose predicted UV has U and V far apart, so a swapped-U/V image cannot pass.
+
+    The centre alone is not enough: a symmetric model can have U ~= V there. The scan is coarse (16 x 16 at
+    128 px) and uses the same last-triangle rule as the centre.
+    """
+    step = max(1, min(width, height) // 16)
+    found = []
+    for py in range(step // 2, height, step):
+        for px in range(step // 2, width, step):
+            uv = uv_at(vertices, indices, px, py, width, height)
+            if uv and abs(uv[0] - uv[1]) > 0.15:
+                found.append(
+                    {"pixel": [px, py], "uv": [round(uv[0], 6), round(uv[1], 6)]}
+                )
+    if len(found) > limit:
+        found = [found[int(i * len(found) / limit)] for i in range(limit)]
+    return found
+
+
 def find_harness(explicit: str | None) -> str:
     for candidate in (
         explicit,
@@ -246,9 +267,74 @@ def find_harness(explicit: str | None) -> str:
     )
 
 
+CLEAR = -1.0
+
+
+def check_image(data: bytes, manifest: dict) -> dict:
+    """The readback oracle: exact shape, coverage window, a clear corner and the centre UV.
+
+    tests/test_first_light.py imports this function, so the test and ``--check`` agree.
+    """
+    width, height = manifest["width"], manifest["height"]
+    if len(data) != width * height * 16:
+        raise AssertionError(
+            f"raw is {len(data)} bytes, expected {width * height * 16}"
+        )
+    pixels = struct.unpack(f"<{len(data) // 4}f", data)
+    covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
+    ratio = covered / (width * height)
+    if (
+        not manifest.get("min_coverage", 0.0)
+        <= ratio
+        <= manifest.get("max_coverage", 1.0)
+    ):
+        raise AssertionError(
+            f"coverage {ratio:.4f} outside "
+            f"[{manifest.get('min_coverage', 0.0)}, {manifest.get('max_coverage', 1.0)}]"
+        )
+    if (clear := manifest.get("clear_pixel")) is not None:
+        i = (clear[1] * width + clear[0]) * 4
+        want = manifest.get("clear", CLEAR)
+        if any(abs(pixels[i + c] - want) > 1e-5 for c in range(4)):
+            raise AssertionError(
+                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {want}"
+            )
+    if (uv := manifest.get("centre_uv")) is not None:
+        centre = manifest.get("centre_pixel") or [width // 2, height // 2]
+        i = (centre[1] * width + centre[0]) * 4
+        for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
+            if abs(pixels[i + c] - want) > 2e-3:
+                raise AssertionError(
+                    f"centre {centre} is {pixels[i : i + 4]}, expected {want} at {c}"
+                )
+    for probe in manifest.get("uv_probes", []):
+        px, py = probe["pixel"]
+        i = (py * width + px) * 4
+        u, v = probe["uv"]
+        for c, want in enumerate((u, v, 0.0, 1.0)):
+            if abs(pixels[i + c] - want) > 2e-3:
+                raise AssertionError(
+                    f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
+                )
+    return {"covered": covered, "ratio": ratio, "pixels": pixels}
+
+
+def write_ppm(path: str, pixels, width: int, height: int) -> None:
+    with open(path, "wb") as f:
+        f.write(f"P6\n{width} {height}\n255\n".encode())
+        f.writelines(
+            bytes(max(0, min(255, round(pixels[i + c] * 255))) for c in range(3))
+            for i in range(0, len(pixels), 4)
+        )
+
+
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
     harness = find_harness(args.harness)
-    raw = os.path.join(out_dir, "image.raw")
+    fd, raw = tempfile.mkstemp(prefix="first_light_", suffix=".raw", dir=out_dir)
+    os.close(fd)
+    os.unlink(
+        raw
+    )  # a harness that exits 0 without writing must not pass on a stale file
     env = dict(
         os.environ,
         VKH_DRAW_MESH=os.path.join(out_dir, "mesh.bin"),
@@ -263,35 +349,28 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         str(manifest["height"]),
     ]
     subprocess.run(cmd, check=True, env=env)
+    if not os.path.isfile(raw):
+        raise SystemExit(f"the harness exited successfully but did not write {raw}")
     with open(raw, "rb") as f:
         data = f.read()
-    pixels = struct.unpack(f"<{len(data) // 4}f", data)
-    covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
-    total = manifest["width"] * manifest["height"]
-    center = manifest["width"] // 2
-    ci = (manifest["height"] // 2 * manifest["width"] + center) * 4
+    try:
+        result = check_image(data, manifest)
+    except AssertionError as e:
+        raise SystemExit(str(e)) from e
     ppm = os.path.join(out_dir, "image.ppm")
-    with open(ppm, "wb") as f:
-        f.write(f"P6\n{manifest['width']} {manifest['height']}\n255\n".encode())
-        f.writelines(
-            bytes(max(0, min(255, round(pixels[i + c] * 255))) for c in range(3))
-            for i in range(0, len(pixels), 4)
-        )
-    result = {
-        "covered": covered,
-        "total": total,
-        "ratio": covered / total,
-        "center": list(pixels[ci : ci + 4]),
+    write_ppm(ppm, result["pixels"], manifest["width"], manifest["height"])
+    print(
+        f"covered {result['covered']}/{manifest['width'] * manifest['height']} "
+        f"({result['ratio']:.3f}); {ppm}"
+    )
+    manifest["result"] = {
+        "covered": result["covered"],
+        "total": manifest["width"] * manifest["height"],
+        "ratio": result["ratio"],
         "ppm": ppm,
     }
-    print(
-        f"covered {covered}/{total} ({result['ratio']:.3f}); centre {result['center']}; {ppm}"
-    )
-    if result["ratio"] < manifest["min_coverage"]:
-        raise SystemExit(
-            f"coverage {result['ratio']:.3f} below {manifest['min_coverage']}"
-        )
-    manifest["result"] = result
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=1)
     return result
 
 
@@ -355,6 +434,12 @@ def main(argv=None) -> int:
                 if e["stage"] in ("vs", "ps"):
                     print(f"{e['stage']} {e['name']}")
         return 0
+    existing = os.path.join(out_dir, "manifest.json")
+    if a.check and not a.game and os.path.isfile(existing):
+        with open(existing, encoding="utf-8") as f:
+            manifest = json.load(f)
+        run_draw(a, manifest, out_dir)
+        return 0
     if not a.game:
         raise SystemExit("--game is required")
     game = os.path.abspath(os.path.expanduser(a.game))
@@ -385,6 +470,7 @@ def main(argv=None) -> int:
         else None
     )
     clear = clear_pixel(vertices, indices, a.width, a.height) if vertices else None
+    probes = uv_probes(vertices, indices, a.width, a.height) if vertices else []
     manifest = {
         "vs": {
             "name": picked[0]["name"],
@@ -406,6 +492,7 @@ def main(argv=None) -> int:
         "centre_pixel": centre_pixel,
         "centre_uv": list(centre_uv) if centre_uv else None,
         "clear_pixel": clear,
+        "uv_probes": probes,
         "clear": -1.0,
         "files": {"vs": "vs.spv", "ps": "ps.spv", "mesh": "mesh.bin"},
     }

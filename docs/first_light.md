@@ -24,9 +24,12 @@ the pair compatible. At 128×128 the draw covers **12,804 of 16,384 pixels (0.78
 `(0.498, 0.496, 0.0, 1.0)`: the model is the disc its geometry projects to, and the colour is its own UV map. The
 test derives the expected centre UV from the mesh on the CPU (`0.4978, 0.4965`), so the GPU pixel has to match
 the geometry, not just be non-clear; it also requires the `[0, 0]` corner to keep the clear value and bounds the
-coverage at 0.5–0.99, which an all-opaque image cannot pass. The `OracleTests` run those checks on synthetic
-images without a GPU or a package: the accepted fixture, an all-opaque image, a swapped UV and a short buffer.
-The PPM the harness writes is a real image of the model; it stays in the user's folder.
+coverage at 0.5–0.99, which an all-opaque image cannot pass. Four extra probes where U and V differ by more than
+0.15 catch a swapped-U/V image even when the centre is symmetric (this model's centre has U ≈ V). The
+`OracleTests` run those checks on synthetic images without a GPU or a package: the accepted fixture, an
+all-opaque image, a swapped UV and a short buffer. The same `check_image` function backs the tool's `--check`, so
+the command line and the test agree. The PPM the harness writes is a real image of the model; it stays in the
+user's folder.
 
 ## 2. Why it matters
 
@@ -53,7 +56,12 @@ python -I tools/first_light.py --game "<package>" --work ~/leonida-work --list
 python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
     --obj ~/leonida-work/assets/data/models/<model>.obj --no-fit --run
 LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/out python -I tests/test_first_light.py -v
+python -I tools/first_light.py --check --out ~/leonida-work/first_light/out
 ```
+
+`--check` on an existing folder re-runs the harness through the same fresh path and `check_image` as the test; a
+harness that exits 0 without writing, an all-opaque image and a swapped-U/V image all exit 1. The test has seven
+cases: the two package-gated draw/manifest checks, the `--check` command and four oracle fixtures.
 
 `first_light.py` carves `shaders.rpf` if the work folder does not have it, translates only the chosen pair, converts
 the OBJ to the harness's mesh file (`u32 vertex_count, u32 index_count`, `(x,y,z,u,v) f32` vertices, `u32`
