@@ -118,5 +118,32 @@ class PhiRule(unittest.TestCase):
                         "%p = OpPhi %uint %a %x %c %y\nOpReturn\nOpFunctionEnd\n", wave=32)
 
 
+class FunctionVariableRule(unittest.TestCase):
+    """A Function-storage OpVariable belongs in the function's first block (SPIR-V 2.16.1)."""
+
+    def test_rule_directly(self):
+        lab = (None, "OpLabel", [], "%b = OpLabel")
+        var = ("%v", "OpVariable", ["%_ptr_Function_uint", "Function"], "%v = OpVariable %_ptr_Function_uint Function")
+        br = (None, "OpBranch", ["%c"], "OpBranch %c")
+        si.check_structure([lab, var, br, lab])
+        with self.assertRaisesRegex(si.InvalidModule, "first block"):
+            si.check_structure([lab, br, lab, var])
+        # a new function starts counting again
+        fn = ("%f", "OpFunction", [], "%f = OpFunction %void None %t")
+        si.check_structure([fn, lab, br, lab, fn, lab, var])
+
+    def test_translated_module_with_a_variable_moved(self):
+        lines = cs_spv().splitlines()
+        k = next(i for i, ln in enumerate(lines) if " OpVariable " in ln and " Function" in ln)
+        var = lines.pop(k)
+        last_label = max(i for i, ln in enumerate(lines) if ln.strip().endswith("= OpLabel"))
+        lines.insert(last_label + 1, var)
+        bad = "\n".join(lines) + "\n"
+        with self.assertRaisesRegex(si.InvalidModule, "first block"):
+            run_cs(bad)
+        with self.assertRaisesRegex(wi.InvalidModule, "first block"):
+            wi.run_wave(bad, wave=32)
+
+
 if __name__ == "__main__":
     unittest.main()

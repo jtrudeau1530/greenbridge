@@ -43,7 +43,7 @@ class InvalidModule(AssertionError):
 
 
 def check_structure(body):
-    """spirv-val's merge and phi rules (SPIR-V 2.16.2): OpSelectionMerge must be the second-to-last instruction of its block,
+    """spirv-val's merge, phi and Function-variable rules (SPIR-V 2.16.1-2): OpSelectionMerge must be the second-to-last instruction of its block,
     directly before OpBranchConditional or OpSwitch, and OpLoopMerge directly before OpBranch or
     OpBranchConditional. Until 2026-11-22 the interpreter skipped merges, so a translator change that put an
     instruction between a merge and its branch (#1633: OpLoad %active) passed every semantic test while every
@@ -54,10 +54,17 @@ def check_structure(body):
     # the first instructions of a block"). A phi emitted after an instruction of the merge block is rejected by
     # spirv-val, and every translator path that merges a guarded load (OpPhi of the loaded and the kept value)
     # depends on the order.
-    prev = None
-    for _, op, _, line in body:
+    # Function-storage OpVariable belongs in the function's first block (SPIR-V 2.16.1).
+    prev, blocks = None, 0
+    for _, op, a, line in body:
         if op == "OpPhi" and prev not in ("OpLabel", "OpPhi"):
             raise InvalidModule(f"{line!r} follows {prev or 'the start of the function'}, not OpLabel or OpPhi")
+        if op == "OpFunction":
+            blocks = 0
+        elif op == "OpLabel":
+            blocks += 1
+        elif op == "OpVariable" and a[1:2] == ["Function"] and blocks > 1:
+            raise InvalidModule(f"{line!r} is a Function variable outside the function's first block")
         prev = op
     for k, (_, op, _, line) in enumerate(body):
         if op in follow:
