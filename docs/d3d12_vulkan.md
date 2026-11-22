@@ -1439,8 +1439,14 @@ Pipeline creation:
 - Request the subgroup size each shader was translated for (`requiredSubgroupSize` 64 or 32) where the device lists the stage
   in `requiredSubgroupSizeStages`, and say so in the log where it cannot (section 3.2, "Subgroup size").
 - Pipeline caches: use a `VkPipelineCache` keyed by driver/pipeline-cache UUID; the `pipelines` build stage already
-  produces one. D3D12 `CachedPSO` blobs are driver-specific and are ignored (the PSO is rebuilt from its
-  descriptors). `ID3D12PipelineLibrary` is an in-memory map plus the Vulkan cache.
+  produces one. The PSO is always rebuilt from its descriptors: `GetCachedBlob` returns a small blob that holds no
+  pipeline, only what the PC runtime checks before it accepts one in `CachedPSO` (`runtime/src/cached_pso.h`:
+  vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description without `Flags`, sealed by a
+  checksum). The answers are the host's, measured on an RTX 3060 and WARP: the same description is accepted; another
+  shader, root signature content or state, a changed byte, a truncated blob or a pointer with size 0 give
+  `E_INVALIDARG`; a null pointer with a size is ignored; another adapter gives `D3D12_ERROR_ADAPTER_NOT_FOUND` and
+  another driver `D3D12_ERROR_DRIVER_VERSION_MISMATCH`. `ID3D12PipelineLibrary` is an in-memory map plus the Vulkan
+  cache.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
