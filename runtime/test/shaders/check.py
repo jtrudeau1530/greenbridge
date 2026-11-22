@@ -257,6 +257,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_vcmpx_forms": (0xf05b2a48, 0xf05e8a12, 0xb174be18, 0x15550000),
               "ps_med3_mods": (0x3f800000, 0x40400000, 0x40c00000, 0x3f400000),
               "ps_scc_minmax": (0x00030205, 0x00030207, 0x00030209, 0x00030203),
+              "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
+              "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
               "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
@@ -707,9 +709,10 @@ def subgroup_size(spirv, name):
         return None
 
 
-def bindless_test(tools, spirv):
-    """ps_tex: a texture found through the descriptor hash table and the bindless set (vk_bindless_test)."""
-    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", "ps_tex")]
+def bindless_test(tools, spirv, pixel="ps_tex"):
+    """ps_tex: a texture found through the descriptor hash table and the bindless set (vk_bindless_test).
+    ps_imgatomic: image atomics in a pixel shader through the set's r32ui storage arrays, checked per texel."""
+    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", pixel)]
     for path in shaders:
         if not os.path.isfile(path):
             return f"missing {os.path.basename(path)}"
@@ -717,6 +720,9 @@ def bindless_test(tools, spirv):
     if code == UNSUPPORTED:
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    if pixel == "ps_imgatomic":
+        m = re.search(r"ps_imgatomic: (\d+) of \d+ texels wrong.*; (\d+) of \d+ render-target pixels wrong", out)
+        return "" if code == 0 and m and m.group(1) == "0" and m.group(2) == "0" else failure(code, out, 3)
     m = re.search(r"(\d+) draws read back, (\d+) bad pixels", out)
     return "" if code == 0 and m and m.group(2) == "0" else failure(code, out, 3)
 
@@ -1254,6 +1260,7 @@ def main():
         results.append((name, texture_constant_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append(("ps_ssharp", sampler_test(tools, spirv)))
+    results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))
     for name in MIP_TEST_PASSES:
         results.append((name, texture_mip_test(tools, spirv, name)))
     for name in GRADIENT_TESTS:

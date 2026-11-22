@@ -1,0 +1,119 @@
+"""Unit tests for tools/int_hw_probe.py (SHADER-137). Standard library only; no GPU or game files needed."""
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+import unittest.mock
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOLS = ROOT / "tools"
+sys.dont_write_bytecode = True
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+import int_hw_probe as probe  # noqa: E402
+from hw_oracle import runner as hw_runner  # noqa: E402
+
+
+class IntHwProbeTests(unittest.TestCase):
+    def test_cases_unique_and_nonempty(self):
+        cases = probe.build_cases()
+        self.assertGreaterEqual(len(cases), 80)
+        names = [c.name for c in cases]
+        self.assertEqual(len(names), len(set(names)))
+        groups = {c.group for c in cases}
+        self.assertGreaterEqual(len(groups), 19)
+        for key in probe.KNOWN_DIVERGENCES:
+            self.assertIn(key, names)
+
+    def test_wave32_and_wave64_placeholder_expansion(self):
+        by_name = {c.name: c for c in probe.build_cases()}
+        c = by_name["v_mad_u64_u32_inactive_lane"]
+        w32 = "\n".join(c.lines(wave=32))
+        w64 = "\n".join(c.lines(wave=64))
+        self.assertIn("s_mov_b32 s14, exec_lo", w32)
+        self.assertIn("v_mad_u64_u32 v[8:9], vcc_lo", w32)
+        self.assertIn("s_mov_b64 s[14:15], exec", w64)
+        self.assertIn("v_mad_u64_u32 v[8:9], vcc,", w64)
+        self.assertNotIn("{", w32)
+        self.assertNotIn("{", w64)
+
+    def test_self_test_and_translator_groups(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = probe.main(["--self-test"])
+        self.assertEqual(rc, 0)
+        self.assertIn("self-test:", buf.getvalue())
+
+    def test_list_groups_and_unknown_group(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out):
+            rc = probe.main(["--list-groups"])
+        self.assertEqual(rc, 0)
+        self.assertIn("valu_cvt_pknorm", out.getvalue())
+
+        with redirect_stderr(err):
+            rc = probe.main(["--group", "does_not_exist"])
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown group", err.getvalue())
+
+    def test_hw_unavailable_returns_77(self):
+        err = io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", side_effect=hw_runner.Unavailable("no GPU")):
+            with redirect_stderr(err):
+                rc = probe.main(["--oracle", "hw", "--group", "salu_bfe_past31"])
+        self.assertEqual(rc, 77)
+        self.assertIn("no GPU", err.getvalue())
+
+    def test_known_divergence_vs_strict_and_json_output(self):
+        # Mock hardware oracle returning the measured gfx1035 words for valu_cvt_flr_rpi.
+        measured = {
+            "v_cvt_rpi_precision": [0x00000000, 0x00800001, 0x00FFFFFF, 0x00000000],
+            "v_cvt_flr_rpi_nan_inf": [0x7FFFFFFF, 0x80000000, 0x7FFFFFFF, 0x80000000],
+            "v_cvt_i32_f32_nan_control": [0x00000000, 0x00000000, 0x00000000, 0x00000000],
+            "v_cvt_flr_edges": [0xFFFFFFFE, 0x7FFFFFFF, 0x80000000, 0x7FFFFFFF],
+        }
+        fake_hw = ("device=mock arch=gfx1035", {32: measured, 64: measured})
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "out.json")
+            out = io.StringIO()
+            with unittest.mock.patch.object(probe, "run_hw", return_value=fake_hw):
+                with redirect_stdout(out):
+                    rc = probe.main(["--oracle", "both", "--group", "valu_cvt_flr_rpi", "--json", jpath])
+            self.assertEqual(rc, 0)
+            self.assertIn("2 match, 2 known divergence, 0 unexpected mismatch, 0 wave32/64 diff", out.getvalue())
+            data = json.loads(Path(jpath).read_text(encoding="utf-8"))
+            self.assertEqual(data["device"], "device=mock arch=gfx1035")
+            self.assertEqual(len(data["cases"]), 4)
+
+            out2 = io.StringIO()
+            with unittest.mock.patch.object(probe, "run_hw", return_value=fake_hw):
+                with redirect_stdout(out2):
+                    rc_strict = probe.main(["--oracle", "both", "--group", "valu_cvt_flr_rpi", "--strict"])
+            self.assertEqual(rc_strict, 1)
+
+            err = io.StringIO()
+            with unittest.mock.patch.object(probe, "run_hw", return_value=fake_hw):
+                with redirect_stderr(err):
+                    rc_dir = probe.main(["--oracle", "both", "--group", "valu_cvt_flr_rpi", "--json", tmp])
+            self.assertEqual(rc_dir, 2)
+
+    def test_unexpected_mismatch_and_wave_diff_fail(self):
+        bad_hw = ("device=mock arch=gfx1035", {
+            32: {"s_bfe_i32_past31": [1, 2, 3, 4], "s_bfe_u32_past31": [0, 0, 0, 0], "s_bfe_i32_width0": [0, 0, 0, 0]},
+            64: {"s_bfe_i32_past31": [1, 2, 3, 5], "s_bfe_u32_past31": [0, 0, 0, 0], "s_bfe_i32_width0": [0, 0, 0, 0]},
+        })
+        out = io.StringIO()
+        with unittest.mock.patch.object(probe, "run_hw", return_value=bad_hw):
+            with redirect_stdout(out):
+                rc = probe.main(["--oracle", "both", "--group", "salu_bfe_past31"])
+        self.assertEqual(rc, 1)
+        self.assertIn("WAVE_DIFF", out.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

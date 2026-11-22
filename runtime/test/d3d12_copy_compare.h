@@ -5,7 +5,8 @@
 // into a readback buffer prefilled with 0xcd, and the bytes are compared. Only the texels a footprint row holds are
 // compared (row padding is the driver's); everything else, including the 0xcd around a partial copy, must match.
 // Layouts come from the host's GetCopyableFootprints for both sides (those are compared separately).
-// LEONIDA_HOST_ADAPTER picks the host side: "warp", or part of an adapter name; unset is the default adapter.
+// LEONIDA_HOST_ADAPTER picks the host side: "warp", or part of an adapter name; unset is the layer's own adapter when
+// the test has set layer_adapter(), else the default adapter.
 #pragma once
 #include <windows.h>
 #include <d3d12.h>
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -110,12 +112,25 @@ inline bool try_create_host(Ptr<ID3D12Device>& host, std::string& name, const LU
     return true;
 }
 
-// A host device, or false when there is none (the comparisons are then skipped). When LEONIDA_HOST_ADAPTER names an
-// adapter that cannot be had, the run fails: a typo must not turn the comparisons into a silent pass.
+// The adapter behind the layer's Vulkan device (VkPhysicalDeviceIDProperties::deviceLUID), for a test that knows it.
+// On a PC with two GPUs D3D12's default adapter can be the other one, whose driver accepts other formats (an AMD
+// layer device accepts an R9G9B9E5 render target that the NVIDIA host refuses), so the comparison would be between
+// two GPUs instead of between the layer and the host runtime.
+inline std::optional<LUID>& layer_adapter() {
+    static std::optional<LUID> luid;
+    return luid;
+}
+
+// A host device, or false when there is none (the comparisons are then skipped). Without LEONIDA_HOST_ADAPTER it is
+// on the layer's own adapter when that is set and has a D3D12 device, else on the default adapter. When
+// LEONIDA_HOST_ADAPTER names an adapter that cannot be had, the run fails: a typo must not turn the comparisons into a
+// silent pass.
 inline bool create_host(Ptr<ID3D12Device>& host, std::string& name) {
-    if (try_create_host(host, name)) return true;
     char want[128] = {};
-    if (GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want)) && want[0]) {
+    const bool named = GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want)) && want[0];
+    if (!named && layer_adapter() && try_create_host(host, name, &*layer_adapter())) return true;
+    if (try_create_host(host, name)) return true;
+    if (named) {
         std::fprintf(stderr, "LEONIDA_HOST_ADAPTER=%s: no such adapter, or no D3D12 device on it\n", want);
         std::exit(1);
     }

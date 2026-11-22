@@ -88,15 +88,23 @@ The exporters ignore the remaining bytes.
 | `5` | XMA2 | `.xma.wav`, RIFF XMA2; ffmpeg decodes it to PCM WAV |
 
 Opus data is stored in 2048-byte blocks. Each block is a sequence of `[u16 length][packet]`; a zero length pads
-the rest of the block. The first 312 decoded samples are the encoder's lookahead (libopus at 48 kHz); the AWC does
-not store it, so the exporter writes that value as `OpusHead` pre-skip and sets the last page's granule to
-`pre-skip + declared samples`. Decoders then drop the priming and stop at the real end instead of the padded final
-frame. `--pre-skip` overrides the 312 default for a stream encoded with a different lookahead.
+the rest of the block. The first 312 decoded samples are the encoder's lookahead. Measured on 30 real streams from
+four banks: decoded with pre-skip 0, the 5% and 10% attack points are at 312 samples (median 312; the 10% point
+ranges 278..868, none near 1920), so 312 is the exporter's default. The AWC does not store the value, so
+`--pre-skip` overrides it for a stream encoded with a different lookahead.
+
+The exporter writes that value as `OpusHead` pre-skip and emits the EOS page at the first packet that reaches
+`pre-skip + declared samples`; later packets are encoder padding and are dropped. Clamping only the last page
+would let its granule go backwards when the trim point falls before that page starts, and decoders would keep the
+excess: a 27-packet real-libopus fixture decoded 24,960 frames for 24,000 declared, while the reaching-packet
+form decodes exactly 24,000. An oversized `--pre-skip` is clamped to the stream length so the final granule never
+falls below it.
 
 The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and `+0x0C` is the
-per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams). The
-exporter uses `+0x0C` and falls back to `+0 / channels` when a block leaves it zero; it never scales either count
-by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves up to a frame of padding untrimmed.
+per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams, 0.5% of
+the 1.6M-stream corpus). The exporter uses `+0x0C` only when it agrees with `+0` (`frames * channels == samples`)
+and otherwise falls back to `+0 / channels`, so a malformed block cannot silently truncate audio. It never scales
+either count by the rate field, because scaling a 32 kHz stream by 48000/32000 leaves padding untrimmed.
 
 Codec `5` is not handled by `tools/awc_opus.py`. `rpf9dump xma` writes it as RIFF XMA2, and ffmpeg does the decode.
 

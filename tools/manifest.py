@@ -22,7 +22,7 @@ DEFAULT = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.jso
 
 
 class ManifestError(Exception):
-    """A manifest that isn't valid JSON or doesn't have the layout create() writes."""
+    """An input or manifest error that the CLI reports without a traceback."""
 
 
 def default_jobs() -> int:
@@ -52,12 +52,32 @@ def below_normal() -> None:
         k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
 
 
-def sha256(path: str) -> str:
+def _file_stamp(st: os.stat_result) -> tuple[int, int, int]:
+    return st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def _hash_file(path: str, *, expected_size: int | None = None) -> tuple[int, str]:
+    """Return the size and digest of the same open file, or fail if it changes."""
     h = hashlib.sha256()
     with open(path, "rb", buffering=0) as f:
-        while chunk := f.read(CHUNK):
+        before = os.fstat(f.fileno())
+        size = before.st_size
+        if expected_size is not None and size != expected_size:
+            raise ManifestError(f"{path}: file size changed before hashing")
+        remaining = size
+        while remaining and (chunk := f.read(min(CHUNK, remaining))):
             h.update(chunk)
-    return h.hexdigest()
+            remaining -= len(chunk)
+        # Compare timestamps from the same handle. Windows can report different times by path.
+        # Compare the path by identity so a replacement of the open file is detected too.
+        if (remaining or _file_stamp(os.fstat(f.fileno())) != _file_stamp(before)
+                or not os.path.samestat(before, os.stat(path))):
+            raise ManifestError(f"{path}: file changed while hashing")
+    return size, h.hexdigest()
+
+
+def sha256(path: str) -> str:
+    return _hash_file(path)[1]
 
 
 def same_output_path(first: str, second: str) -> bool:
@@ -114,7 +134,8 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
         if same_output_path(out, path):
             raise ManifestError(f"--out would overwrite the input {path}; "
                                 "choose a manifest path that is not one of the hashed files")
-    total = sum(os.path.getsize(p) for _, p in files)
+    sizes = {path: os.path.getsize(path) for _, path in files}
+    total = sum(sizes.values())
     entries = {}
     done = count = 0
     t0 = time.time()
@@ -131,7 +152,8 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
         print(f"[{pct:6.1%}] {count}/{len(files)} files {rate:7.0f} MiB/s", flush=True)
 
     def work(rel: str, path: str) -> tuple[str, int, str]:
-        return rel, os.path.getsize(path), sha256(path)
+        size, digest = _hash_file(path, expected_size=sizes[path])
+        return rel, size, digest
 
     if jobs == 1:
         for rel, p in files:

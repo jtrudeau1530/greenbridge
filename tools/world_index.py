@@ -419,6 +419,15 @@ def _carve_successors(folder):
             for off, stored in by_off.items() if (off + stored + 15) & ~15 in by_off}
 
 
+def _read_carved(path, max_inflate):
+    """Read a carved file within the cap, or return None if it is too large."""
+    with open(path, "rb") as f:
+        if os.fstat(f.fileno()).st_size > max_inflate:
+            return None
+        data = f.read(max_inflate + 1)  # detect growth after fstat
+    return data if len(data) <= max_inflate else None
+
+
 def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, directory_files=None):
     """Scan an RPF9 archive, or every carved file in a directory."""
     if directory_files is not None or os.path.isdir(path):
@@ -440,10 +449,9 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
                 stats["files"] += 1
                 stats["scanned_bytes"] += sub["scanned_bytes"]
                 continue
-            if os.path.getsize(p) > max_inflate:
+            b = _read_carved(p, max_inflate)
+            if b is None:
                 continue
-            with open(p, "rb") as f:
-                b = f.read(max_inflate + 1)
             stats["files"] += 1
             stats["scanned_bytes"] += len(b)
             # As in scan_rpf: a 0DRPz resource that needs a continuation takes the next stream, when the
@@ -480,8 +488,9 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
         magic = f.read(4)
     if magic == b"9FPR":
         return scan_rpf(path, start, limit, max_inflate, collect)
-    with open(path, "rb") as f:
-        b = f.read(max_inflate + 1)
+    b = _read_carved(path, max_inflate)
+    if b is None:
+        return [], {"path": os.path.abspath(path), "files": 0, "scanned_bytes": 0}
     row = parse_resource(b, collect)
     return ([dict(row, offset=0, size=len(b), file=os.path.basename(path))] if row else [],
             {"path": os.path.abspath(path), "files": 1, "scanned_bytes": len(b)})

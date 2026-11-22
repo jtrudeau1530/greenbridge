@@ -78,7 +78,9 @@ class PeImage:
         magic = struct.unpack_from("<H", data, opt)[0]
         if magic not in (0x10B, 0x20B):
             raise PeFormatError(f"unknown optional header magic 0x{magic:x}")
-        if opt + 72 > len(data):  # the fixed fields read below end with DllCharacteristics at +70
+        # The declared optional header must contain every fixed field we read,
+        # and the complete declared header must fit inside the file.
+        if opt_size < 72 or opt + opt_size > len(data):
             raise PeFormatError("truncated optional header")
         self.is64 = magic == 0x20B
         self.entry_rva = struct.unpack_from("<I", data, opt + 16)[0]

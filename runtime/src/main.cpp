@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "base_reservation.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
@@ -73,6 +74,10 @@ int wmain(int argc, wchar_t** argv) {
     // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
     if (dry_run + init + run != 1) return usage();
     if (game_dir.empty()) game_dir = image.parent_path();
+    // An image without relocations whose range this process already uses (arm64 Wine on macOS) runs in a new
+    // process that has the range reserved from the start (base_reservation.h); that process does not do this again.
+    if (!rt::base_reservation::inherited())
+        if (const auto range = rt::base_reservation::needed(image)) return rt::base_reservation::relaunch(*range);
     // GAME: paths read under --game-dir; whatever a title writes lands in the overlay, never in the package.
     if (overlay_dir.empty()) overlay_dir = game_dir / "overlay";
     rt::fs::configure(game_dir, overlay_dir);

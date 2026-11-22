@@ -64,11 +64,14 @@ MESH_COMPUTE = False
 # `exp paramN` also exports the channel's two f16 halves decoded to f32, low halves at f16_half_location(N, 0) and high
 # halves at f16_half_location(N, 1), and a PS *_f16 read of attrN.c takes component c of that smooth input. The
 # interpolation is linear, so this is the same P0 + i(P1 - P0) + j(P2 - P0) of the decoded halves, rounded by the
-# device's interpolator instead of by explicit arithmetic. The halves sit below location F16_HALF_TOP (30: 31
-# locations is MoltenVK's limit, 124 components), counting down from param 0, so a producer with params 0..P-1 has
-# room for the halves of params 0..(29 - P) / 2; Gen.export skips the ones that would land on its own params.
+# device's interpolator instead of by explicit arithmetic. The halves count down from location F16_HALF_TOP (param 0's
+# high halves, its low halves one below), so a producer with params 0..P-1 has room for the halves of params
+# 0..(28 - P) / 2; Gen.export skips the ones that would land on its own params. The top is 29, not 30 (SHADER-291):
+# MoltenVK's maxVertexOutputComponents is 124 because Metal counts gl_Position in its 128 vertex-output scalars, and
+# the validation layer counts it too (VUID-RuntimeSpirv-Location-06272), so (29 + 1) * 4 + 4 = 124 is the most a VS
+# can use there.
 F16_HALVES = False
-F16_HALF_TOP = 30
+F16_HALF_TOP = 29
 
 
 def f16_half_location(n, half):
@@ -428,7 +431,10 @@ class Gen:
         selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
         sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
         hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
-        return [self.f16_in(src, sb[i]) if hb[i] else self.src_f(src) for i, src in enumerate(a[1:4])]
+        # An f32 operand reads as a zero of its sign when it is denormal: the game's MODE flushes f32 denormals
+        # (denorm_mode_32 = 0), measured on gfx1036 for 0x00000001, 0x807fffff and the integer inline constants 1 and
+        # 64 used as f32 operands (@Sanonymous01, SHADER-298). The f16 operands widen to normal f32 values.
+        return [self.f16_in(src, sb[i]) if hb[i] else self.flush_f32(self.src_f(src)) for i, src in enumerate(a[1:4])]
 
     def f16_bits(self, f, rtz=False):
         """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
@@ -6417,16 +6423,7 @@ class Gen:
             self.scc_nonzero(r)
         elif op in ("v_fma_mixlo_f16", "v_fma_mixhi_f16"):
             vals = self.fma_mix_srcs(a, mods)
-            r = self.tmp()
-            self.emit_fma(r, vals[0], vals[1], vals[2])
-            if self.round_mode:
-                # Toward zero the hardware rounds the exact fma once, to f16; round-to-odd at f32 narrows exactly.
-                # Nearest even keeps the f32 Fma then narrow (unchanged).
-                ro, m, isz, rs = self.fma_mix_odd(*vals), self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{m} = OpLoad %uint %mode_r16")
-                self.emit(f"{isz} = OpIEqual %bool {m} {self.cu(3)}")
-                self.emit(f"{rs} = OpSelect %float {isz} {ro} {r}")
-                r = rs
+            r = self.fma_mix_odd(*vals)
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, hi=(op == "v_fma_mixhi_f16"))
         elif op == "v_cvt_pk_u8_f32":
@@ -6845,6 +6842,24 @@ class Gen:
             self.emit(f"{m} = OpIMul %uint {hs[0]} {hs[1]}")
             self.emit(f"{r} = OpIAdd %uint {m} {self.src_u(a[3])}")
             self.dst(a[0], r)
+        elif op in ("v_dot4_i32_i8", "v_dot4c_i32_i8"):
+            # The four products of the signed bytes of two dwords, summed, plus an addend: the third source for
+            # v_dot4_i32_i8 (VOP3P), the destination's old value for v_dot4c_i32_i8 (VOP2). The sum wraps at 32 bits.
+            # Measured on RDNA2 hardware (docs/design.md, "Signed-byte dot products"), where clamp saturates
+            # v_dot4_i32_i8 to a signed 32-bit value and op_sel picks the 16-bit half of a source each half of the
+            # product reads. llvm-mc prints neither for the programs measured, so both forms are refused, not guessed.
+            if "clamp" in mods or any(m.startswith("op_sel") for m in mods):
+                raise Unsupported(op + (" clamp" if "clamp" in mods else " op_sel"))
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            acc = self.src_u(a[3]) if op == "v_dot4_i32_i8" else self.src_u(a[0])
+            for i in range(4):
+                xb, yb, prod, total = (self.tmp() for _ in range(4))
+                self.emit(f"{xb} = OpBitFieldSExtract %uint {x} {self.cu(8 * i)} {self.cu(8)}")
+                self.emit(f"{yb} = OpBitFieldSExtract %uint {y} {self.cu(8 * i)} {self.cu(8)}")
+                self.emit(f"{prod} = OpIMul %uint {xb} {yb}")
+                self.emit(f"{total} = OpIAdd %uint {acc} {prod}")
+                acc = total
+            self.dst(a[0], acc)
         elif op == "v_mad_u32_u24":
             x, y, z = (self.src_u(t) for t in a[1:4])
             xm, ym, p, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
@@ -9018,6 +9033,11 @@ def assemble(gen):
     used = set(gen.inputs.values())
     if len(used) != len(gen.inputs):    # --f16-interp-fallback: a decoded-half location is also an attribute
         raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
+    # The producer fills both halves of every attribute in f16_halves (the index's f16_halves lists the pair), so a
+    # raw attribute at the location of a half this shader doesn't read is overwritten all the same.
+    reserved = {f16_half_location(n, h) for n in gen.f16_halves for h in (0, 1)}
+    if any(not k.startswith("%in_f16h") and v in reserved for k, v in gen.inputs.items()):
+        raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
     gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
     bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs or bary:
@@ -9971,7 +9991,7 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16") or
+        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8") or
                 (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
@@ -10199,7 +10219,7 @@ def reg_reads_writes(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_fmac_f16") and a[0]["k"] == "vgpr":
+        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_fmac_f16", "v_dot4c_i32_i8") and a[0]["k"] == "vgpr":
             regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
@@ -10426,6 +10446,10 @@ def translate(path):
     if stage not in ("vs", "ps", "cs", "ms", "gs"):
         raise Unsupported(f"stage {stage}")
     insns = info["insns"]
+    if not insns:
+        # parse_file only reads tab-indented instructions, so a hand-written or re-indented .s parses to nothing
+        # and used to translate to a module that passes spirv-val and does no work at all. Refuse it instead.
+        raise Unsupported("no instructions (nothing tab-indented?)")
     if info["invalid"]:
         # Undecodable words are constant tables embedded in the code range (147/155 such VS/PS use s_getpc_b64 to
         # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then
@@ -11390,15 +11414,25 @@ def main():
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
+
+    def drop_stale(name):
+        # A shader that no longer translates must not stay published from an earlier run: remove its old
+        # module, and the index merge below drops its entry, exactly like a spirv-as/val rejection. The
+        # .spvasm text stays for diagnosis, as it does on a rejection.
+        Path(os.path.join(a.out, name + ".spv")).unlink(missing_ok=True)
+        invalid.add(name)
+
     for p in files:
         name = os.path.splitext(os.path.basename(p))[0]
         try:
             asm = translate(p)
         except Unsupported as e:
             why[str(e)] += 1
+            drop_stale(name)
             continue
         except (IndexError, KeyError, ValueError) as e:
             why[f"translator error {type(e).__name__}"] += 1
+            drop_stale(name)
             continue
         ok += 1
         sa = os.path.join(a.out, name + ".spvasm")
@@ -11414,7 +11448,7 @@ def main():
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
-            invalid.add(name)
+            drop_stale(name)
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
         if a.no_asm and os.path.exists(sa):
             os.remove(sa)

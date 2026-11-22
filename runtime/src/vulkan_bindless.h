@@ -47,6 +47,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -162,6 +163,35 @@ constexpr std::uint32_t r32ui_binding(ImageDimension dimension) {
     return dimension == ImageDimension::dim_2d ? 4 : dimension == ImageDimension::dim_3d ? 7 : no_binding;
 }
 
+// Set 0's descriptor set layout at features' counts: what create_layout creates and what size_bindings'
+// layout_supported asks vkGetDescriptorSetLayoutSupport about. It points into itself, so it is not copied.
+struct SetLayout {
+    std::array<VkDescriptorSetLayoutBinding, binding_count> entries{};
+    std::array<VkDescriptorBindingFlags, binding_count> flags{};
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+
+    explicit SetLayout(const BindlessFeatures& features) {
+        std::uint32_t count = 0;
+        for (std::uint32_t b = 0; b < binding_count; ++b) {
+            if (!binding_enabled(b, features)) continue;
+            entries[count] = {b, bindings[b].type, features.counts[b], VK_SHADER_STAGE_ALL, nullptr};
+            flags[count] = (features.update_after_bind ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0) |
+                           (features.partially_bound ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0);
+            ++count;
+        }
+        flags_info.bindingCount = count;
+        flags_info.pBindingFlags = flags.data();
+        info.pNext = &flags_info;
+        info.flags = features.update_after_bind ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
+        info.bindingCount = count;
+        info.pBindings = entries.data();
+    }
+    SetLayout(const SetLayout&) = delete;
+    SetLayout& operator=(const SetLayout&) = delete;
+};
+
 // What size_bindings() grows to where the device's limits allow. At 32-64 bytes a descriptor the whole set is then
 // 3-6 MiB (93793 descriptors on an RTX 5070).
 inline constexpr std::uint32_t max_2d_images = 65536;
@@ -183,10 +213,14 @@ inline constexpr std::uint32_t growth_headroom = 64;
 //      what is sure to work (vkGetDescriptorSetLayoutSupport may allow more), so it never shrinks step 1.
 // A storage array holds the smaller of the storage count and its dimension's images: add_image never gives a
 // storage view an index past the sampled array. The other bindings keep their default counts.
+// layout_supported, when given, answers vkGetDescriptorSetLayoutSupport for set 0 at the counts in its argument:
+// step 3 then also grows past maxPerSetDescriptors where the device says the layout works (Intel's Xe-LP reports
+// 6159 and supports the full sizes, D3D-219). It is asked only once the sum is above maxPerSetDescriptors.
 // Sets features.counts; returns false when a count is below its default because the device's limits are.
 inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimits& limits,
                           const VkPhysicalDeviceVulkan11Properties& v11,
-                          const VkPhysicalDeviceVulkan12Properties& v12) {
+                          const VkPhysicalDeviceVulkan12Properties& v12,
+                          const std::function<bool(const BindlessFeatures&)>& layout_supported = {}) {
     const bool uab = features.update_after_bind;
     const std::uint32_t sampled_limit =
         uab ? std::min(v12.maxPerStageDescriptorUpdateAfterBindSampledImages,
@@ -233,7 +267,8 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
         const auto within = [&](std::uint64_t n, std::uint32_t limit) { return n + headroom <= limit; };
         const std::uint64_t all = sampled + sampler + stored + buffers;
         return within(sampled, sampled_limit) && within(sampler, sampler_limit) && within(stored, storage_limit) &&
-               within(sampled + stored + buffers, resource_limit) && all <= pool_limit && all <= set_limit;
+               within(sampled + stored + buffers, resource_limit) && all <= pool_limit &&
+               (all <= set_limit || (layout_supported && layout_supported(features)));
     };
     // Raises n to the largest value up to `high` that fits; leaves it where it is when none does.
     const auto grow = [&](std::uint32_t& n, std::uint32_t high, std::uint32_t headroom, std::uint64_t set_limit) {
@@ -532,27 +567,12 @@ private:
     }
 
     bool create_layout() {
-        std::array<VkDescriptorSetLayoutBinding, bindless::bindings.size()> entries{};
-        std::array<VkDescriptorBindingFlags, bindless::bindings.size()> flags{};
+        const bindless::SetLayout layout(features_);
+        const std::uint32_t count = layout.info.bindingCount;
         std::array<VkDescriptorPoolSize, bindless::bindings.size()> sizes{};
-        std::uint32_t count = 0;
-        for (std::uint32_t b = 0; b < bindless::bindings.size(); ++b) {
-            if (!bindless::binding_enabled(b, features_)) continue;
-            entries[count] = {b, bindless::bindings[b].type, features_.counts[b], VK_SHADER_STAGE_ALL, nullptr};
-            flags[count] = (features_.update_after_bind ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0) |
-                           (features_.partially_bound ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0);
-            sizes[count] = {bindless::bindings[b].type, features_.counts[b]};
-            ++count;
-        }
-        VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
-            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-        flags_info.bindingCount = count;
-        flags_info.pBindingFlags = flags.data();
-        VkDescriptorSetLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &flags_info};
-        layout_info.flags = features_.update_after_bind ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
-        layout_info.bindingCount = count;
-        layout_info.pBindings = entries.data();
-        if (vk_.vkCreateDescriptorSetLayout(device_, &layout_info, nullptr, &layout_) != VK_SUCCESS) return false;
+        for (std::uint32_t i = 0; i < count; ++i)
+            sizes[i] = {layout.entries[i].descriptorType, layout.entries[i].descriptorCount};
+        if (vk_.vkCreateDescriptorSetLayout(device_, &layout.info, nullptr, &layout_) != VK_SUCCESS) return false;
 
         VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool_info.flags = features_.update_after_bind ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0;
