@@ -24,7 +24,11 @@ import argparse
 import os
 import struct
 import sys
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 # ---- Ogg ----
 _CRC = []
@@ -99,16 +103,26 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
 
 
 def write_file(path: str, data: bytes) -> None:
-    """Write under a temporary name and rename into place: a stopped run or a full disk never leaves a short file
-    under the final name, where a later run would keep it."""
-    tmp = path + ".part"
+    """Write under a private temporary name and rename into place: a stopped run or a full disk never leaves a
+    short file under the final name, where a later run would keep it. The staging file is created in the
+    destination directory (the same volume), so concurrent writers each publish a complete file (last wins)
+    instead of clobbering one shared ".part" sibling."""
+    out_path = os.fspath(path)
+    parent = os.path.dirname(os.path.abspath(out_path))
+    tmp_path = None
     try:
-        with open(tmp, "wb") as f:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=parent, prefix=".awc-", suffix=".tmp", delete=False) as f:
+            tmp_path = f.name
             f.write(data)
-        os.replace(tmp, path)
-    except OSError:
-        if os.path.isfile(tmp):
-            os.remove(tmp)
+        # NamedTemporaryFile creates 0600; give the staged file the mode of the file it replaces, or a new file's.
+        os.chmod(tmp_path, published_mode(out_path))
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        try:
+            if tmp_path is not None:
+                os.remove(tmp_path)
+        except OSError:
+            pass
         raise
 
 
