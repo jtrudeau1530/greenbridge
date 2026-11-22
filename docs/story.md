@@ -201,8 +201,8 @@ reads vertex slots. It sizes all 99,184 slot words of the archive's `63 30` and 
 | 0x42 | 2 | 8 | `63 30` 3, 4; `42 40` 0 (13,545), 3, 4, 14, 15 | 2 × f32; in `42 40` slot 0 the packed position |
 | 0x26 | 6 | 4 | `63 30` 1, 12; `42 40` 1, 12, 13 | RGBA8 colour |
 | 0x28 | 8 | 4 | `42 40` 3, 4, 14, 15 | 2 × snorm16 UV × the +0x7C scale (rpf9-explorer) |
-| 0x21 | 1 | 4 | `42 40` 2 (13,119) | not decoded |
-| 0x27 | 7 | 4 | `42 40` 2, 11, 18 | not decoded |
+| 0x21 | 1 | 4 | `42 40` 2 (13,119) | octahedral normal, 10 + 10 bits (below) |
+| 0x27 | 7 | 4 | `42 40` 2, 11, 18 | 10:10:10 unit vector: the normal in slot 2, a tangent in slots 11 and 18 (below) |
 
 The slots used in `42 40` blocks are 0-4, 11-15 and 18; slot 15 occurs in 78 blocks and slot 18 in 770.
 `tools/meshlet_page.py` sizes slots with this rule (`tag_stride`), for the types above only, and reads the same
@@ -258,6 +258,24 @@ stream. 520 streams end inside a group that continues in the next one; 5 stop at
 doesn't fit. The `63 30` checks are unchanged on the 3 extra blocks: all positions finite and all normals of unit
 length.
 
+**Slot 2 is the vertex normal.** With tag 0x21 (type 1) it is octahedral: u = bits 0-9 and v = bits 10-19, each
+read as unorm `x / 511.5 − 1`, unfolded as usual (z = 1 − |u| − |v|, and where z < 0, x and y become
+(1 − |v|)·sign(u) and (1 − |u|)·sign(v)). Bits 20-31 are not decoded; their top two bits are mostly 2 or 3, which
+would fit a tangent angle and sign. With tag 0x27 (type 7, 363 blocks) it is x, y, z in bits 0-9, 10-19 and 20-29,
+in the same unorm. The normals are in world order whatever the +0x6C axis word says, which also confirms the
+position reorder above. `tools/meshlet_page.py --normals` compares each stored normal with the sum of its vertex's
+face normals:
+
+| Archive | Vertices | Within 8° | Within 25° | Opposed |
+|---|---:|---:|---:|---:|
+| `shared_minigame000.rpf` | 14,411,107 | 12,394,835 (86.0%) | 13,271,947 (92.1%) | 210,301 (1.5%) |
+| `core_restofworld.rpf` | 451,593 | 299,356 (66.3%) | 331,910 (73.5%) | 51,184 (11.3%) |
+
+On a sample of 79,157 minigame vertices, the readings tried before this one stay well below it, at a mean dot of
+0.56-0.8: plain 10:10:10, a smallest-three quaternion, and 15- or 16-bit octahedral. In `core_restofworld`, 70%
+of the 347 groups with a type-1 normal have fewer than 5% opposed, and 2% are mostly opposed (more than half),
+which fits mirrored parts. The rest may be groups that the span rule binds to the wrong block.
+
 **Meshlet record words +8/+12 hold the meshlet's centre.** Three 12-bit fields give x, y and z: w2 bits 0-11,
 w2 bits 12-23 and w3 bits 0-11. Each is in 1/16 m steps around 2047, so the centre is `(field − 2047) / 16`, over
 ±128 m, and the default `0x007FF7FF / 0x7FF` is the origin. `tools/meshlet_page.py --centres` compares each stored
@@ -290,8 +308,20 @@ The other bits are not decoded:
   together with non-zero w3 bits 12-31.
 - **w0 bits 14-31** are not decoded either; bits 14-15 are clear in all 61,170 records of those streams.
 
-Still open: the +0x5C word, meshlet record bits 14-31 of word 0 and the cone-like bits above, and the
-`42 40 00 00` attribute encodings.
+**Slots 11 and 18 are tangents.** Their type-7 words are unit vectors in the same 10:10:10 unorm, perpendicular to the vertex's stored normal. Bits 30-31 are always 3 or 0, which fits the bitangent sign +1 or −1. Over the minigame archive (`--normals`, counts only):
+- 7,520,441 tangent words, 7,435,001 (98.9%) of them within |dot| < 0.05 of perpendicular;
+- sign bits 6,457,714 × 3 and 1,062,727 × 0, and never 1 or 2.
+
+`core_restofworld.rpf` has no tangent slots.
+
+**The rules hold in a second archive.** `core_restofworld.rpf` with `--faces --centres --normals`:
+- all 151 mesh streams parse, with 502 `42 40` blocks, 488,265 positions (all finite, all within 300 m) and
+  6,564 meshlets;
+- 69.4% of 699,618 shared edges have neighbouring faces within ~25°, and 0.37% are opposed;
+- 10,555 of 14,697 centre axes (71.8%) are in the same 1/16 m step, and 87.6% within one.
+
+Still open: the +0x5C word, meshlet record bits 14-31 of word 0 and the cone-like bits above, the type-1 normal's
+bits 20-31, and what the `42 40` colour and UV slots hold beyond rpf9-explorer's reading.
 
 ### `story000_script.rpf`, full
 

@@ -45,15 +45,20 @@ Meshlet group (first u32 has bit 31 set):
         a = bits 8-31 (24 bits), b = bits 32-47 << 8 | bits 0-7 (24 bits), c = bits 48-63 (16 bits)
         (a, b, c) = bias + scale * (a, b, c); axis 0 stores (z, y, x), axis 1 (y, z, x), axis 2 (x, y, z)
     This is the rule `third_party/rpf9-explorer/Core/RageModelDecoder.cs` uses for `(8, 16)` positions;
-    `docs/story.md` has the independent check over the minigame archive. The 4-byte attribute streams are not
-    decoded.
+    `docs/story.md` has the independent check over the minigame archive.
+    slot 2  the vertex normal, in world order whatever the axis word: tag 0x21 (type 1) is octahedral, u = bits
+        0-9 and v = bits 10-19 as unorm (x / 511.5 - 1), bits 20-31 not decoded; tag 0x27 (type 7) is x, y, z in
+        bits 0-9, 10-19, 20-29 as the same unorm.
+    slots 11 and 18  tag 0x27 (type 7): a tangent, x, y, z as in slot 2's type 7, perpendicular to the normal; bits
+        30-31 are 3 or 0, read here as the bitangent sign +1 or -1. Other 4-byte streams are not decoded.
 
 A page starts with a `63 30` block, a `42 40` block or a group (continuation pages). The walk stops, without an
 error, at a `42 40` block whose layout doesn't fit the rule above or at a group that continues past the end of
 the stream. Only counts and layout checks are written; no vertex, index or float value leaves this tool.
 
 Usage:
-    python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet] [--faces] [--centres]
+    python -I tools/meshlet_page.py <file|dir|archive.rpf> [...] [--json out.json] [--quiet]
+        [--faces] [--centres] [--normals]
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --geometry-offset <offset> [--json out.json]
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 """
@@ -76,8 +81,9 @@ SLOT_TAG = {0: 0x63, 1: 0x26, 2: 0x63, 3: 0x42, 4: 0x42}
 OTHER_HEADER_SIZE = 0x80
 # A slot tag byte is (stride / 4) << 5 | type, as rpf9-explorer's RageModelDecoder reads vertex slots. Types seen in
 # shared_minigame000.rpf: 1, 2, 3, 6, 7, 8; a tag of another type is not taken as a slot.
-SLOT_TYPES = {1: "4-byte, not decoded", 2: "2 x f32 or a packed position", 3: "3 x f32", 6: "RGBA8",
-              7: "4-byte, not decoded", 8: "2 x snorm16 UV, scaled by the 42 40 header's +0x7C"}
+SLOT_TYPES = {1: "octahedral normal, 10 + 10 bits unorm", 2: "2 x f32 or a packed position", 3: "3 x f32",
+              6: "RGBA8", 7: "3 x 10 bits unorm (the normal in slot 2, a tangent in slots 11 and 18)",
+              8: "2 x snorm16 UV, scaled by the 42 40 header's +0x7C"}
 
 
 def tag_stride(tag):
@@ -250,6 +256,96 @@ def centre_agreement(data, group, positions):
     return out
 
 
+def _unorm10(x):
+    return x / 511.5 - 1
+
+
+def _octahedral(u, v):
+    z = 1 - abs(u) - abs(v)
+    x, y = u, v
+    if z < 0:
+        x, y = (1 - abs(v)) * math.copysign(1, u), (1 - abs(u)) * math.copysign(1, v)
+    length = math.sqrt(x * x + y * y + z * z)
+    return x / length, y / length, z / length
+
+
+def normals_4240(data, block):
+    """Decode a `42 40` block's slot-2 normals (see the module docstring). Returns a list of unit (x, y, z), or None
+    when slot 2 is absent or of a type other than 1 or 7."""
+    slots = {i: (tag, off) for i, tag, off in block["slots"]}
+    if 2 not in slots or (slots[2][0] & 15) not in (1, 7) or tag_stride(slots[2][0]) != 4:
+        return None
+    tag, off = slots[2]
+    at, n = block["offset"] + off, block["vertices"]
+    out = []
+    for (w,) in struct.iter_unpack("<I", data[at:at + 4 * n]):
+        if tag & 15 == 1:
+            out.append(_octahedral(_unorm10(w & 1023), _unorm10((w >> 10) & 1023)))
+        else:
+            v = [_unorm10((w >> s) & 1023) for s in (0, 10, 20)]
+            length = math.sqrt(sum(c * c for c in v)) or 1.0
+            out.append(tuple(c / length for c in v))
+    return out
+
+
+def tangents_4240(data, block):
+    """Decode a `42 40` block's type-7 tangent slots (11 and 18). Returns {slot: [(x, y, z, sign), ...]}; sign is +1
+    for bits 30-31 = 3, -1 for 0, and 0 for anything else."""
+    out = {}
+    for slot, tag, off in block["slots"]:
+        if slot == 2 or tag & 15 != 7 or tag_stride(tag) != 4:
+            continue
+        at, n = block["offset"] + off, block["vertices"]
+        rows = []
+        for (w,) in struct.iter_unpack("<I", data[at:at + 4 * n]):
+            v = [_unorm10((w >> s) & 1023) for s in (0, 10, 20)]
+            length = math.sqrt(sum(c * c for c in v)) or 1.0
+            rows.append((v[0] / length, v[1] / length, v[2] / length, {3: 1, 0: -1}.get(w >> 30, 0)))
+        out[slot] = rows
+    return out
+
+
+def tangent_agreement(normals, tangents):
+    """Counts for tangents against the same vertex's stored normal: |dot| < 0.05 (perpendicular) and the sign bits."""
+    out = {"vertices": 0, "perpendicular": 0, "sign_plus": 0, "sign_minus": 0}
+    for rows in tangents.values():
+        for nrm, (x, y, z, sign) in zip(normals, rows):
+            out["vertices"] += 1
+            out["perpendicular"] += abs(nrm[0] * x + nrm[1] * y + nrm[2] * z) < 0.05
+            out["sign_plus"] += sign == 1
+            out["sign_minus"] += sign == -1
+    return out
+
+
+def normal_agreement(positions, normals, triangles):
+    """For each vertex the triangles use, compare its stored normal with the sum of its faces' (area-weighted)
+    normals. Counts vertices, dot > 0.99, dot > 0.9 and dot < 0."""
+    acc = {}
+    for a, b, c in triangles:
+        if max(a, b, c) >= min(len(positions), len(normals)):
+            raise PageError("triangle references a vertex past its block")
+        p, q, r = positions[a], positions[b], positions[c]
+        u = (q[0] - p[0], q[1] - p[1], q[2] - p[2])
+        v = (r[0] - p[0], r[1] - p[1], r[2] - p[2])
+        n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+        for k in (a, b, c):
+            s = acc.setdefault(k, [0.0, 0.0, 0.0])
+            s[0] += n[0]
+            s[1] += n[1]
+            s[2] += n[2]
+    out = {"vertices": 0, "within_8_degrees": 0, "within_25_degrees": 0, "opposed": 0}
+    for k, s in acc.items():
+        length = math.sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2])
+        if not length or not math.isfinite(length):
+            continue
+        d = sum(x * y / length for x, y in zip(normals[k], s))
+        out["vertices"] += 1
+        out["within_8_degrees"] += d > 0.99
+        out["within_25_degrees"] += d > 0.9
+        out["opposed"] += d < 0
+    return out
+
+
 def block4240_checks(data, block):
     """Count-only plausibility checks for one `42 40` block's decoded positions."""
     pos = positions_4240(data, block)
@@ -391,8 +487,9 @@ def block_checks(data, block):
     return out
 
 
-def summarise_page(data, name, faces=False, centres=False):
-    """Counts for one page. faces=True also runs face_agreement, and centres=True centre_agreement, on every group
+def summarise_page(data, name, faces=False, centres=False, normals=False):
+    """Counts for one page. faces=True also runs face_agreement, centres=True centre_agreement and normals=True
+    normal_agreement on every group
     whose vertex span matches a `42 40` block in the page (the nearest such block before it, else the first after
     it)."""
     try:
@@ -410,7 +507,12 @@ def summarise_page(data, name, faces=False, centres=False):
         for b in others:
             for k, v in block4240_checks(data, b).items():
                 checks[k] = checks.get(k, 0) + v
-        if faces or centres:
+            if normals:
+                nrm = normals_4240(data, b)
+                if nrm is not None:
+                    for k, v in tangent_agreement(nrm, tangents_4240(data, b)).items():
+                        checks["tangents_4240_" + k] = checks.get("tangents_4240_" + k, 0) + v
+        if faces or centres or normals:
             decoded = {}
             for g in groups:
                 same = [b for b in others if b["vertices"] == g["vertex_span"]]
@@ -426,6 +528,12 @@ def summarise_page(data, name, faces=False, centres=False):
                 if centres:
                     for k, v in centre_agreement(data, g, decoded[b["offset"]]).items():
                         checks["centres_4240_" + k] = checks.get("centres_4240_" + k, 0) + v
+                if normals:
+                    nrm = normals_4240(data, b)
+                    if nrm is not None:
+                        tris = list(group_triangles(data, g))
+                        for k, v in normal_agreement(decoded[b["offset"]], nrm, tris).items():
+                            checks["normals_4240_" + k] = checks.get("normals_4240_" + k, 0) + v
     except PageError as exc:
         return {"name": name, "size": len(data), "error": str(exc)}
     counts = {b["vertices"] for b in blocks}
@@ -654,6 +762,9 @@ def main(argv=None):
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--faces", action="store_true",
                     help="also count how often neighbouring faces of 42 40 geometry agree (slower)")
+    ap.add_argument("--normals", action="store_true",
+                    help="also compare 42 40 slot-2 normals with their vertices' face normals, and tangents with "
+                         "the normals (slower)")
     ap.add_argument("--centres", action="store_true",
                     help="also compare meshlet records' stored centres with their 42 40 vertices (slower)")
     ap.add_argument("--draw-system", help="inflated system segment paired with one graphics segment")
@@ -710,7 +821,8 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"error: {path} does not exist", file=sys.stderr)
             return 2
-    pages = [summarise_page(data, name, args.faces, args.centres) for name, data in iter_inputs(args.inputs)]
+    pages = [summarise_page(data, name, args.faces, args.centres, args.normals)
+             for name, data in iter_inputs(args.inputs)]
     total = totals(pages)
     if not args.quiet:
         for p in pages:

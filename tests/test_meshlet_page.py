@@ -5,6 +5,7 @@
 Every byte here is built by the test. No game file, value or name is used.
 """
 import json
+import math
 import os
 import struct
 import subprocess
@@ -503,6 +504,100 @@ class SlotTagTests(unittest.TestCase):
         bad = page(other_block(10, tags=((0, 0x42, 8), (2, 0x25, 4))), group([(10, 6)]))
         self.assertFalse(mp.is_mesh_page(bad))
         self.assertIn("error", mp.summarise_page(bad, "x"))
+
+
+class Normals4240Tests(unittest.TestCase):
+    UP = 512 | 512 << 10   # octahedral u = v = 0.5 / 511.5: nearly +z
+
+    def block_with_normals(self, words, tag=0x21, packed=None, n=None):
+        n = n or len(words)
+        tags = ((0, 0x42, 8), (2, tag, 4), (1, 0x26, 4))
+        data = bytearray(page(other_block(n, tags=tags, packed=packed or [(0, 0, 0)] * n, scale=(2.0 ** -20,) * 3)))
+        blk = mp.parse_page(bytes(data))[0]
+        off = dict((i, o) for i, _, o in blk["slots"])[2]
+        for k, w in enumerate(words):
+            struct.pack_into("<I", data, blk["offset"] + off + 4 * k, w)
+        return bytes(data), blk
+
+    def assertVector(self, got, want, places=2):
+        for g, w in zip(got, want):
+            self.assertAlmostEqual(g, w, places=places)
+
+    def test_octahedral_normals(self):
+        data, blk = self.block_with_normals([1023, self.UP, 1023 | 511 << 10, 0 | 1023 << 10, 0xC0000000 | self.UP])
+        n = mp.normals_4240(data, blk)
+        self.assertVector(n[0], (0, 0, -1))   # u = 1, v = -1 folds onto -z
+        self.assertVector(n[1], (0, 0, 1))
+        self.assertVector(n[2], (1, 0, 0))
+        self.assertVector(n[3], (0, 0, -1))
+        self.assertEqual(n[4], n[1])          # bits 20-31 don't change the normal
+        for v in n:
+            self.assertAlmostEqual(sum(c * c for c in v), 1.0)
+
+    def test_type7_normals_and_other_types(self):
+        data, blk = self.block_with_normals([1023 | 512 << 10 | 512 << 20, 512 | 512 << 10 | 0 << 20], tag=0x27)
+        n = mp.normals_4240(data, blk)
+        self.assertVector(n[0], (1, 0, 0))
+        self.assertVector(n[1], (0, 0, -1))
+        data, blk = self.block_with_normals([0, 0], tag=0x26)
+        self.assertIsNone(mp.normals_4240(data, blk))
+
+    def test_normal_agreement(self):
+        flat = [(x, y, 0.0) for y in range(3) for x in range(3)]
+        tris = [(0, 1, 3), (1, 4, 3), (1, 2, 4), (2, 5, 4)]
+        up = [(0.0, 0.0, 1.0)] * 9
+        self.assertEqual(mp.normal_agreement(flat, up, tris),
+                         {"vertices": 6, "within_8_degrees": 6, "within_25_degrees": 6, "opposed": 0})
+        tilt = math.radians(20)
+        mixed = list(up)
+        mixed[0] = (0.0, 0.0, -1.0)
+        mixed[4] = (math.sin(tilt), 0.0, math.cos(tilt))
+        self.assertEqual(mp.normal_agreement(flat, mixed, tris),
+                         {"vertices": 6, "within_8_degrees": 4, "within_25_degrees": 5, "opposed": 1})
+        with self.assertRaises(mp.PageError):
+            mp.normal_agreement(flat, up[:4], tris)
+
+    def test_tangents(self):
+        tags = ((0, 0x42, 8), (2, 0x21, 4), (11, 0x27, 4), (18, 0x27, 4))
+        data = bytearray(page(other_block(3, tags=tags, packed=[(0, 0, 0)] * 3)))
+        blk = mp.parse_page(bytes(data))[0]
+        offs = dict((i, o) for i, _, o in blk["slots"])
+        x_axis = 1023 | 512 << 10 | 512 << 20          # tangent +x, normal +z: perpendicular
+        z_axis = 512 | 512 << 10 | 1023 << 20
+        for k, (nw, t11, t18) in enumerate([(self.UP, 3 << 30 | x_axis, x_axis), (self.UP, x_axis, 1 << 30 | x_axis),
+                                             (self.UP, 3 << 30 | z_axis, 3 << 30 | x_axis)]):
+            struct.pack_into("<I", data, blk["offset"] + offs[2] + 4 * k, nw)
+            struct.pack_into("<I", data, blk["offset"] + offs[11] + 4 * k, t11)
+            struct.pack_into("<I", data, blk["offset"] + offs[18] + 4 * k, t18)
+        tan = mp.tangents_4240(bytes(data), blk)
+        self.assertEqual(sorted(tan), [11, 18])
+        self.assertVector(tan[11][0][:3], (1, 0, 0))
+        self.assertEqual([r[3] for r in tan[11]], [1, -1, 1])
+        self.assertEqual([r[3] for r in tan[18]], [-1, 0, 1])
+        got = mp.tangent_agreement(mp.normals_4240(bytes(data), blk), tan)
+        self.assertEqual(got, {"vertices": 6, "perpendicular": 5, "sign_plus": 3, "sign_minus": 2})
+        checks = mp.summarise_page(bytes(data), "p", normals=True)["checks"]
+        self.assertEqual(checks["tangents_4240_perpendicular"], 5)
+
+    def test_page_normals_and_cli(self):
+        cols, rows = 4, 4
+        packed = [(c * 4096, r * 4096, 5) for r in range(rows) for c in range(cols)]   # axis 2: a plane facing +z
+        data, _ = self.block_with_normals([self.UP] * (cols * rows), packed=packed)
+        data = page(data[:mp.parse_page(data)[0]["offset"] + 0x80 + (8 + 4 + 4) * cols * rows], grid_group(cols, rows))
+        checks = mp.summarise_page(data, "p", normals=True)["checks"]
+        self.assertEqual((checks["normals_4240_vertices"], checks["normals_4240_within_8_degrees"],
+                          checks["normals_4240_opposed"]), (16, 16, 0))
+        self.assertNotIn("normals_4240_vertices", mp.summarise_page(data, "p")["checks"])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "p.bin")
+            with open(src, "wb") as fh:
+                fh.write(data)
+            out = os.path.join(tmp, "r.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, src, "--normals", "--json", out, "--quiet"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["totals"]["checks"]["normals_4240_within_25_degrees"], 16)
 
 
 class CliTests(unittest.TestCase):
