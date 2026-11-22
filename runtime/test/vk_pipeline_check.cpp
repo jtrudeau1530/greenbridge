@@ -1032,14 +1032,20 @@ int main(int argc, char** argv) {
         const char* phase;   // "module" or "pipeline"
     };
     std::map<std::thread::id, InFlight> inflight;
-    // --inflight-file: rewrite the file from `inflight`, one "name<TAB>phase" line per module. Called with mu held, at
-    // the moments named in the header.
+    // Publish a complete snapshot at the moments named in the header. This keeps the last full report if the
+    // process dies while staging the next one. Called with mu held.
     auto write_inflight = [&] {
         if (inflight_path.empty()) return;
-        if (std::FILE* f = std::fopen(inflight_path.c_str(), "w")) {
-            for (const auto& [tid, job] : inflight) std::fprintf(f, "%s\t%s\n", job.name.c_str(), job.phase);
-            std::fclose(f);
+        std::string snapshot;
+        for (const auto& [tid, job] : inflight) {
+            snapshot += job.name;
+            snapshot += '\t';
+            snapshot += job.phase;
+            snapshot += '\n';
         }
+        if (const auto error = write_pipeline_cache_file(inflight_path, snapshot.data(), snapshot.size()))
+            std::fprintf(stderr, "in-flight snapshot save to %s failed: %s\n",
+                         inflight_path.c_str(), error.message().c_str());
     };
     const auto t_start = std::chrono::steady_clock::now();
     auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(); };
