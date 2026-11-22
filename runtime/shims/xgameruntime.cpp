@@ -366,19 +366,18 @@ HRESULT __stdcall XPackageGetCurrentProcessPackageIdentifier(size_t bufferSize, 
     return S_OK;
 }
 
-// HRESULT XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path).
-// Retrieves the installed filesystem path for the mounted package.
-// Reads LEONIDA_GAME_DIR when set, otherwise falls back to the current module's directory.
-HRESULT __stdcall XPackageGetMountPath(void* /*mount*/, size_t pathSize, char* path) {
-    if (!path || pathSize == 0) return E_INVALIDARG;
+// XPackageMountHandle: opaque 64-bit mount handle per GDK XPackage.h
+struct XPackageMountHandle {
+    uint64_t handle;
+};
 
-    char buf[MAX_PATH] = {};
-    const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", buf, sizeof(buf));
-    if (n == 0 || n >= sizeof(buf)) {
-        const DWORD mod_len = GetModuleFileNameA(nullptr, buf, sizeof(buf));
-        if (mod_len > 0 && mod_len < sizeof(buf)) {
-            char* slash = std::strrchr(buf, '\\');
-            char* fslash = std::strrchr(buf, '/');
+static HRESULT resolve_mount_path(char* out, size_t out_cap) {
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", out, static_cast<DWORD>(out_cap));
+    if (n == 0 || n >= out_cap) {
+        const DWORD mod_len = GetModuleFileNameA(nullptr, out, static_cast<DWORD>(out_cap));
+        if (mod_len > 0 && mod_len < out_cap) {
+            char* slash = std::strrchr(out, '\\');
+            char* fslash = std::strrchr(out, '/');
             char* last = slash > fslash ? slash : fslash;
             if (last) {
                 *last = '\0';
@@ -389,6 +388,31 @@ HRESULT __stdcall XPackageGetMountPath(void* /*mount*/, size_t pathSize, char* p
             return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
         }
     }
+    return S_OK;
+}
+
+// HRESULT XPackageGetMountPathSize(XPackageMountHandle mount, size_t* pathSize).
+// Retrieves the size of the buffer needed to store the mounted package path, including the null terminator.
+HRESULT __stdcall XPackageGetMountPathSize(XPackageMountHandle mount, size_t* pathSize) {
+    if (mount.handle == 0 || !pathSize) return E_INVALIDARG;
+
+    char buf[MAX_PATH] = {};
+    const HRESULT hr = resolve_mount_path(buf, sizeof(buf));
+    if (FAILED(hr)) return hr;
+
+    *pathSize = std::strlen(buf) + 1;
+    return S_OK;
+}
+
+// HRESULT XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path).
+// Retrieves the installed filesystem path for the mounted package.
+// Reads LEONIDA_GAME_DIR when set, otherwise falls back to the current module's directory.
+HRESULT __stdcall XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path) {
+    if (mount.handle == 0 || !path || pathSize == 0) return E_INVALIDARG;
+
+    char buf[MAX_PATH] = {};
+    const HRESULT hr = resolve_mount_path(buf, sizeof(buf));
+    if (FAILED(hr)) return hr;
 
     const size_t len = std::strlen(buf);
     if (pathSize < len + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
@@ -426,6 +450,7 @@ SHIM_TABLE(xgameruntime,
     XGR(XSystemGetAppMemoryUsage),
     XGR(XSystemGetAnalyticsInfo),
     XGR(XPackageGetCurrentProcessPackageIdentifier),
+    XGR(XPackageGetMountPathSize),
     XGR(XPackageGetMountPath),
     XGR(XPackageIsPackagedProcess),
     // XTaskQueue (third_party/xtaskqueue)
