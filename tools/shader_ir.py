@@ -162,7 +162,7 @@ def split_args(s):
 
 SENDMSG = re.compile(r"sendmsg\([^)]*\)")
 
-MODWORDS = re.compile(r"\b(offset:\S+|offen|idxen|glc|slc|dlc|lds|tfe|unorm|da|d16|a16|nv|r128|lwe|clamp|"
+MODWORDS = re.compile(r"\b(offset:(?:swizzle\([^)]*\)|\S+)|offen|idxen|glc|slc|dlc|lds|tfe|unorm|da|d16|a16|nv|r128|lwe|clamp|"
                       r"mul:\d+|div:\d+|op_sel(?:_hi)?:\[[^\]]*\]|neg_lo:\[[^\]]*\]|neg_hi:\[[^\]]*\]|"
                       r"dmask:\S+|dim:\S+|format:\S+|done|vm|compr|row_mask:\S+|bank_mask:\S+|"
                       r"bound_ctrl:\S+|fi:\S+|offset0:\S+|offset1:\S+|gds|inst_offset:\S+|"
