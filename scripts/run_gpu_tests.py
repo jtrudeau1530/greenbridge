@@ -875,6 +875,14 @@ def run_suite(a, work: str) -> int:
             vals = words[:len(USER_SGPRS_WORDS)] if words else []
             results.append((name, rc == 0 and vals == USER_SGPRS_WORDS,
                             " ".join(hex(x) for x in vals) if vals else msg))
+        elif name == "cs_f64_add":
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            if rc == 77:
+                results.append((name, None, "SKIP (no shaderFloat64 on this device)"))
+            else:
+                ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
+                                           hexwords=True)
+                results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
             wrong = []
