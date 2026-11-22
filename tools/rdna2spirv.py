@@ -3422,6 +3422,74 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpBitReverse %uint {x}")
             self.dst(a[0], r)
+        elif op in ("s_quadmask_b32", "s_quadmask_b64", "s_bitreplicate_b64_b32"):
+            # RDNA2 ISA SOP1, on scalar data (a lane-mask operand stays Unsupported: each invocation holds only its
+            # own lane's bit, and these ops read the other lanes of its quad or move bits between lanes):
+            #   s_quadmask_b32: D[i] = OR of S0[4i+3:4i], i in 0..7, D[31:8] = 0; SCC = D != 0.
+            #   s_quadmask_b64: the same for 16 quads of the 64-bit S0, D[63:16] = 0; SCC = D != 0.
+            #   s_bitreplicate_b64_b32: D[2i+1] = D[2i] = S0[i], i in 0..31; SCC is not written.
+            d, x = a[0], a[1]
+            wide_src = op == "s_quadmask_b64"
+            wide_dst = op != "s_quadmask_b32"
+            if self.is_mask_op(x) or (d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc"))):
+                raise Unsupported(op + " on a lane mask")
+            if wide_src:
+                lo, hi = self.src64_data(x, op)
+                words = [lo, hi]
+            else:
+                words = [self.src_u(x)]
+            if op == "s_bitreplicate_b64_b32":
+                out = []
+                for half in (0, 16):
+                    t = self.tmp()
+                    self.emit(f"{t} = OpShiftRightLogical %uint {words[0]} {self.cu(half)}")
+                    # Spread the 16 bits to the even positions, then copy each to the odd one above it.
+                    for sh, m in ((None, 0xFFFF), (8, 0x00FF00FF), (4, 0x0F0F0F0F), (2, 0x33333333),
+                                  (1, 0x55555555)):
+                        if sh is not None:
+                            u, o = self.tmp(), self.tmp()
+                            self.emit(f"{u} = OpShiftLeftLogical %uint {t} {self.cu(sh)}")
+                            self.emit(f"{o} = OpBitwiseOr %uint {t} {u}")
+                            t = o
+                        n = self.tmp()
+                        self.emit(f"{n} = OpBitwiseAnd %uint {t} {self.cu(m)}")
+                        t = n
+                    u, r = self.tmp(), self.tmp()
+                    self.emit(f"{u} = OpShiftLeftLogical %uint {t} {self.cu(1)}")
+                    self.emit(f"{r} = OpBitwiseOr %uint {t} {u}")
+                    out.append(r)
+                self.dst64_data(d, out[0], out[1], op)
+            else:
+                parts = []
+                for w in words:
+                    # Fold each nibble into its low bit, then pack bits 0, 4, ..., 28 into bits 0..7.
+                    t = w
+                    for sh in (1, 2):
+                        u, o = self.tmp(), self.tmp()
+                        self.emit(f"{u} = OpShiftRightLogical %uint {t} {self.cu(sh)}")
+                        self.emit(f"{o} = OpBitwiseOr %uint {t} {u}")
+                        t = o
+                    for sh, m in ((None, 0x11111111), (3, 0x03030303), (6, 0x000F000F), (12, 0xFF)):
+                        if sh is not None:
+                            u, o = self.tmp(), self.tmp()
+                            self.emit(f"{u} = OpShiftRightLogical %uint {t} {self.cu(sh)}")
+                            self.emit(f"{o} = OpBitwiseOr %uint {t} {u}")
+                            t = o
+                        n = self.tmp()
+                        self.emit(f"{n} = OpBitwiseAnd %uint {t} {self.cu(m)}")
+                        t = n
+                    parts.append(t)
+                r = parts[0]
+                if wide_src:
+                    u, o = self.tmp(), self.tmp()
+                    self.emit(f"{u} = OpShiftLeftLogical %uint {parts[1]} {self.cu(8)}")
+                    self.emit(f"{o} = OpBitwiseOr %uint {r} {u}")
+                    r = o
+                if wide_dst:
+                    self.dst64_data(d, r, self.cu(0), op)
+                else:
+                    self.dst(d, r)
+                self.scc_nonzero(r)
         elif op == "v_cvt_f16_f32":
             # Low 16 bits get the f16; on GFX10 the high half is kept (partial write: Mesa ACO instr_is_16bit lists
             # v_cvt_f16_f32 as 16-bit for gfx_level >= GFX10).
