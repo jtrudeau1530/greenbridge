@@ -93,9 +93,13 @@ scanned TTPF pools. The head has no texture reference at all.
 
 ## What is not decoded
 
-- **Fragment children.** All 2,865 fragments export as the flat 25-vertex / 32-triangle bounds
-  grid described above. A shared body that is only a child drawable would be invisible to the
-  current export.
+- **Fragment children (tested).** A SixNG fragment-child walk (2026-11-21 build) finds **no**
+  child drawables in any of the 2,865 character fragments; every one is the flat 25-vertex /
+  32-triangle grid. The path is alive on world fragments (`bus2_frag_hi`: 14 model structs, 11
+  children, a 650 KB `model_parts.glb`), so the negative is a property of the character files.
+  `ambient_femalebody` is a 596-bone skeleton plus the same 25-vertex grid; it has no skin mesh.
+  A body that exists only as a child drawable is therefore not present in `packs.rpf`'s character
+  fragments.
 - **A ped-variation table.** `common.rpf` contains `CPedVariationBodyTypeManager`
   (`0x226000`) and `CPedComponentSetManager` (`0x228000`), but neither maps a component variation
   index to a drawable plus texture. The first is height and body-shape presets
