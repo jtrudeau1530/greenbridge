@@ -166,6 +166,39 @@ class ComputedIJ(unittest.TestCase):
         self.assertEqual(floats(w_untaken[:2]), (2 * I, 2 * J))
         self.assertEqual(floats(w_taken[:2]), (0.0, 2 * J))
 
+    def test_exec_masked_overwrite_preserves_hardware_barycentrics_in_masked_lanes(self):
+        """EXEC can mask a VGPR write in straight-line code without a branch; masked lanes still hold hardware I/J."""
+        asm = [
+            "s_mov_b32 exec_lo, s0",
+            "v_mov_b32_e32 v0, 0",
+            "s_mov_b32 exec_lo, -1",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x",
+            "v_interp_p1_f32_e32 v3, v0, attr0.y",
+            "v_interp_p2_f32_e32 v3, v1, attr0.y",
+            "exp mrt0 v2, v3, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ij_exec", asm)
+        inputs = support.varyings(spv, {0: ATTR0}, BARY)
+        w_masked = support.mrt0_words(spv, inputs=inputs, push_constants=[0] * 36)
+        w_active = support.mrt0_words(spv, inputs=inputs, push_constants=[0xFFFFFFFF] + [0] * 35)
+        self.assertEqual(floats(w_masked[:2]), (2 * I, 2 * J))
+        self.assertEqual(floats(w_active[:2]), (0.0, 2 * J))
+
+        # Also check saveexec form loads both barycentric components in the prologue.
+        spv_save = support.translate_lines("ps_ij_saveexec", [
+            "s_and_saveexec_b32 s10, s0",
+            "v_mov_b32_e32 v0, 0",
+            "s_mov_b32 exec_lo, s10",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("%bc1 = OpCompositeExtract %float %bc 1", spv_save)
+        self.assertIn("%bc2 = OpCompositeExtract %float %bc 2", spv_save)
+
 
 class ComputedIJRefusals(unittest.TestCase):
     def refuse(self, asm, message):

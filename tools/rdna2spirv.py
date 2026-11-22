@@ -11466,14 +11466,15 @@ def translate(path):
         g.per_vertex |= interp_ij_analysis(insns, g)
         if any("ij" in i for i in insns):
             # Computed v_interp sites load their I/J VGPRs at runtime; no_bary above stripped all
-            # v_interp sources, so an untouched (or conditionally written) v0/v1 still needs
-            # BaryCoordKHR loaded into %vgpr[0]/%vgpr[1] in the prologue.
+            # v_interp sources, so an untouched (or conditionally/EXEC-masked written) v0/v1 still
+            # needs BaryCoordKHR loaded into %vgpr[0]/%vgpr[1] in the prologue.
             with_ij = [dict(i, args=[x for k, x in enumerate(i["args"])
                                      if not (i["op"].startswith("v_interp") and "ij" not in i
                                              and x["k"] == "vgpr" and k != 0)])
                        for i in insns]
             ij_reads = read_before_write_vgprs(with_ij)
-            ij_used = {r for i in insns if "ij" in i for r in i["ij"][2:]} if branchy else set()
+            conditional = branchy or any(writes_exec(i) for i in insns)
+            ij_used = {r for i in insns if "ij" in i for r in i["ij"][2:]} if conditional else set()
             for r, comp in ((0, "bary_i"), (1, "bary_j")):
                 if (r in ij_reads or r in ij_used) and r not in g.frag_inputs:
                     g.frag_inputs[r] = comp
