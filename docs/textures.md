@@ -543,8 +543,11 @@ rather than by array order:
 The counts in the 246-record character corpus are 215 references each for `0xC6F46E79`,
 `0x1E77BF4C` and `0x739E3D0D`, 164 for `0x8ADB8480`, and 64 for `0xC8E8C282`. The garment
 shaders (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`) do not declare a `0xC8E8C282` slot at all, so the
-jacket, crop tee and other garments have no albedo by shader design, not because a texture is
-missing. Exporters must **not** fall back to the first texture in that case; a `speculartex`
+jacket, the crop tee and every other garment on them have no albedo by shader design, not because
+a texture is missing. Not every garment is on them: the bikini top and the undies are on other
+shaders and account for nine of the `0xC8E8C282` references, six and three material rows
+([character_models.md](character_models.md)). Exporters must **not** fall back to the first
+texture when a material has no such slot; a `speculartex`
 sheet painted as a base colour is the usual symptom. The hashes are treated as measured corpus
 semantics, not as a claim that they are globally unique across every shader.
 
