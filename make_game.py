@@ -981,7 +981,8 @@ def runtime_gpu_per_vertex():
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
-                       "shader_meta.py", "spirv_stubs.py", "gfx10_formats.json")
+                       "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
+                       "gfx10_formats.json")
 
 
 def translation_sources_digest() -> str:
@@ -1425,7 +1426,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
         for n in suspects:
             log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
         crashed += suspects
-        with open(skip, "w", encoding="utf-8") as f:
+        with open(skip, "w", encoding="utf-8", newline="\n") as f:
             f.write("".join(n + "\n" for n in crashed))
     else:
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "

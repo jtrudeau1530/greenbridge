@@ -22,4 +22,3 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Español (`es`) | [`es/quickstart.md`](es/quickstart.md) | `003e7812` | `@NolanCotter` |
 | Italiano (`it`) | [`it/quickstart.md`](it/quickstart.md) | `4eb6155d` | `@MeNoSkills` |
 | Deutsch (`de`) | [`de/quickstart.md`](de/quickstart.md) | `4eb6155d` | `@zGLados` |
-| Español (`es`) | [`es/quickstart.md`](es/quickstart.md) | `4eb6155d` | `@chemokita13` |

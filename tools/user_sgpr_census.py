@@ -142,8 +142,8 @@ def main(argv=None):
         try:
             if os.path.samefile(a.index, a.json):
                 ap.error("--json must not overwrite the input index")
-        except FileNotFoundError:
-            pass
+        except OSError:
+            pass  # a missing or unreachable --json path is not the index; writing it reports the error
     try:
         index = load_index(a.index)
     except ValueError as e:

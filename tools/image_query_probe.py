@@ -292,7 +292,7 @@ def main(argv=None):
     finally:
         oracle.close()
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump(report, f, indent=1)
     total = len(report["resinfo"]) + len(report["lod"])
     print(f"{total - bad} of {total} results follow the rules, {bad} do not")
@@ -300,4 +300,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

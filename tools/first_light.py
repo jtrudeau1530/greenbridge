@@ -469,7 +469,7 @@ def main(argv=None) -> int:
             os.path.join(work, "shaders", "dxbc", entry["file"]),
             os.path.join(out_dir, f"{entry['stage']}.dxbc"),
         )
-    with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({"vs": meta["vs"], "ps": meta["ps"]}, f, indent=1)
     vertices, indices = read_obj(a.obj) if a.obj else ([], [])
     obj_sha256 = None

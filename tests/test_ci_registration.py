@@ -75,7 +75,7 @@ def tracked_under_tests(root):
     return names
 
 
-def test_files(root):
+def claimed_test_files(root):
     """Tracked files under tests/ that claim to be tests: by name, or because they define one."""
     found = []
     for rel in tracked_under_tests(root):
@@ -150,7 +150,7 @@ class RepositoryRegistrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.rules = ci_rules(ROOT)
-        cls.files = test_files(ROOT)
+        cls.files = claimed_test_files(ROOT)
 
     def test_the_scan_sees_the_repository(self):
         # A glob that stops matching, or a git call that fails, must not turn the checks below into no-ops.
@@ -211,7 +211,7 @@ class RepositoryRegistrationTest(unittest.TestCase):
             write("tests/semantic/pytest_style.py", "def test_looks_like_a_test():\n    pass\n")
 
             rules = ci_rules(tmp)
-            found = test_files(tmp)
+            found = claimed_test_files(tmp)
             selected = {rel: job_of(tmp, rel, rules) for rel in found}
 
             self.assertEqual(selected["tests/left_out_test.py"], None)

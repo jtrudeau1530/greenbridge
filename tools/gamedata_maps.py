@@ -66,6 +66,10 @@ import struct
 import sys
 import unicodedata
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 MAGIC = (b"MHIU", b"PAMH", b"SPS1Z")
 HEADER = 44
 
@@ -421,15 +425,6 @@ def _file_identity(path: str):
     except OSError:
         return None
     return st.st_dev, st.st_ino
-
-
-def same_report_path(first: str, second: str) -> bool:
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def _matches_candidate(out_key: str, out_id, out_in_carve: bool, out_name_folded: str,

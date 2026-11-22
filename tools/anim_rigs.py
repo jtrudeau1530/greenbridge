@@ -17,6 +17,10 @@ import struct
 import sys
 import zlib
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_clips  # noqa: E402
 import anim_index  # noqa: E402
@@ -137,16 +141,6 @@ def join_rbf0(dicts, rigs):
     c["keys"] = sum(len(k) for k in keys.values())
     c["keys_named_by_an_entry"] = sum(1 for name, k in keys.items() for h in k if (name, h) in used)
     return dict(sorted(c.items()))
-
-
-def same_report_path(first, second):
-    """True when writing first would replace second (same file, or a case/symlink alias of it)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def main():

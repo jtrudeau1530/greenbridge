@@ -33,6 +33,10 @@ import re
 import struct
 import sys
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 DXBC = b"DXBC"
 XDAT = b"XDAT"
 XBCH = b"XBCH"
@@ -183,16 +187,6 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
 def safe_stem(name: str | None, index: int) -> str:
     stem = SAFE_NAME.sub("_", name or "").strip("._")
     return stem or f"container_{index:02d}"
-
-
-def same_report_path(first: str, second: str) -> bool:
-    """True when writing first would replace second (same file, or a case/symlink alias of it)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:

@@ -241,7 +241,7 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
             name = doc.get("offset_hex") or doc.get("name") or str(n)
-            with open(os.path.join(out_dir, f"{tag}_{name}.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(out_dir, f"{tag}_{name}.json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(value, f, indent=1, default=str)
     return {"documents": read, "roots": len(roots), "per_root_documents": dict(roots),
             "not_well_formed": sum(failed.values()), "parse_errors": dict(failed),
