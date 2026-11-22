@@ -188,10 +188,17 @@ const keys = new Set(); let yaw = 0, pitch = -0.25, speed = 40, locked = false;
 // Pointer lock when the browser allows it; embedded views (iframes, preview panes) fall back to drag-to-look.
 const start = document.getElementById("start");
 let dragLook = false, dragging = false;
+function enableDragLook() {
+  if (locked || dragLook) return;
+  dragLook = true;
+  start.classList.add("hidden");
+  document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look");
+}
 start.onclick = async () => {
   try { await renderer.domElement.requestPointerLock(); }
-  catch { dragLook = true; start.classList.add("hidden"); document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look"); }
+  catch { enableDragLook(); }
 };
+document.addEventListener("pointerlockerror", enableDragLook);
 document.addEventListener("pointerlockchange", () => { locked = document.pointerLockElement === renderer.domElement; start.classList.toggle("hidden", locked || dragLook); });
 renderer.domElement.addEventListener("mousedown", e => { if (e.button === 0) dragging = true; });
 addEventListener("mouseup", e => { if (e.button === 0) dragging = false; });

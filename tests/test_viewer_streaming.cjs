@@ -84,16 +84,17 @@ test('a WebGL startup error replaces the fly prompt and preserves the original e
     assert.equal(attributes.get('role'), 'alert');
 });
 
-async function freecamFixture() {
+async function freecamFixture(requestPointerLock = async () => { throw new Error('pointer lock unavailable'); }) {
     const windowEvents = new Map(), canvasEvents = new Map(), documentEvents = new Map();
+    const helpMessages = [];
     const canvas = {
         addEventListener: (type, handler) => canvasEvents.set(type, handler),
-        requestPointerLock: async () => { throw new Error('pointer lock unavailable'); },
+        requestPointerLock,
     };
     const start = { classList: { add() {}, toggle() {} } };
     const document = {
         pointerLockElement: null,
-        getElementById: id => id === 'start' ? start : { insertAdjacentHTML() {} },
+        getElementById: id => id === 'start' ? start : { insertAdjacentHTML: (_, message) => helpMessages.push(message) },
         addEventListener: (type, handler) => documentEvents.set(type, handler),
     };
     const source = viewerModule.split('// ---------- freecam ----------')[1].split('// ---------- chunk streaming ----------')[0];
@@ -105,7 +106,9 @@ async function freecamFixture() {
     });
     return {
         ...state,
+        helpMessages,
         fallback: () => start.onclick(),
+        lockError: () => documentEvents.get('pointerlockerror')?.(),
         lock() { document.pointerLockElement = canvas; documentEvents.get('pointerlockchange')(); },
         down: button => canvasEvents.get('mousedown')({ button }),
         up: button => windowEvents.get('mouseup')({ button }),
@@ -114,6 +117,23 @@ async function freecamFixture() {
         blur: () => windowEvents.get('blur')(),
     };
 }
+
+test('a pointerlockerror without a rejected promise enables drag-to-look', async () => {
+    const cam = await freecamFixture(() => undefined);
+    await cam.fallback();
+    cam.lockError();
+    cam.down(0);
+    cam.move(1);
+    assert.ok(cam.yaw() < 0);
+    assert.equal(cam.helpMessages.length, 1);
+});
+
+test('a rejection and a pointerlockerror show the drag hint only once', async () => {
+    const cam = await freecamFixture();
+    await cam.fallback();
+    cam.lockError();
+    assert.equal(cam.helpMessages.length, 1);
+});
 
 test('drag-to-look requires a primary press and ignores a secondary release', async () => {
     const cam = await freecamFixture();
