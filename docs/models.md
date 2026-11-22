@@ -1,7 +1,8 @@
 # Model recovery
 
-Pre-fix measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the
-upstream `rpf9-explorer` fix that closes it. The fix is validated but not merged yet.
+Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the
+upstream `rpf9-explorer` fix that closes it. The fix is merged upstream and the submodule is
+pinned at `917e9b9`.
 
 Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
 dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
@@ -10,10 +11,12 @@ dropped valid models in three validation paths, all in `third_party/rpf9-explore
 ## Upstream status
 
 [Leonida issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
-fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is at head
-`c3708fb` and has now been validated on the package, including a full ten-archive pass; details
-below. It is awaiting upstream merge and a submodule pin bump. This page records the pre-PR gap, the
-independent validation, and the scope caveat; it is not a competing patch.
+fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged, and
+`third_party/rpf9-explorer` is pinned at upstream `917e9b9` (was `48557ea`). The later upstream
+commits add the `packs.rpf` drawable-dictionary roots (one drawable per entry), the TTPF
+array/cubemap/volume layouts, and the external drawable-skeleton reader. This page keeps the
+pre-pin measurements as the control and records the new pin's `packs.rpf` count below; it is not
+a competing patch.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
 Leonida, including 169 previously rejected candidates (also verified after archive readback). A
@@ -23,6 +26,14 @@ model names, and 2.22 billion triangles (the pre-fix export was 155,598 models /
 triangles). Issue #29's run uses its own recognized-candidate set and covers primary-LOD geometry;
 the pre-fix counts below use `rpf9dump`'s page-scan candidates and export every recovered
 drawable/LOD variant. The two sets are different scopes, not contradictory.
+
+### `packs.rpf` after the pin bump
+
+`packs.rpf`'s `.#dr` pages are drawable-dictionary roots, not drawables, so the old candidate
+scan never saw them. At the new pin the dictionary walk recovers **24,034 models** from that
+archive (23,720 dictionary children plus the 314 fragments), against 314 before. The 314
+`48557ea`/`c3708fb` entries in the table below are therefore the pre-pin control, not the
+current `packs.rpf` result. The other archive rows were not re-counted at `917e9b9`.
 
 ## Independent validation
 
@@ -60,6 +71,10 @@ reproduced the ten-archive total. The `48557ea` column is the pre-fix control:
 | `pack/core_restofworld/core_restofworld.rpf` | 88 | 37 | **88** |
 | `common`, `textures`, `story000_restofworld`, `core_restofworld001` | 0 | 0 | 0 |
 | **Total** | **190,792** | **155,598** | **190,792** |
+
+The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archive recovers
+24,034 models (see above), not 314. The other rows were measured before the dictionary-root
+change.
 
 At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
 failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
@@ -225,8 +240,9 @@ page records the reference-pose caveat rather than inventing a bind pose.
 
 ## What to do next
 
-1. Merge [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1).
-2. Bump `third_party/rpf9-explorer` from `48557ea` to the merged commit.
-3. Re-run `tools/rpf9dump models` over the full ten-archive set configured in Leonida.
+1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
+2. **Done:** the pin is `917e9b9` (was `48557ea`).
+3. Re-run `tools/rpf9dump models` over the full ten-archive set configured in Leonida at the new
+   pin. `packs.rpf` is measured (24,034); the other archives still carry the `c3708fb` counts.
 4. Replace the sample numbers in this page with the full counts, and keep the README and issue #29
    in sync.

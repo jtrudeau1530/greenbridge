@@ -63,107 +63,108 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
     valid zlib stream so the coverage of the pass is explicit.
     """
     with open(archive, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        size = len(m)
-        if size < 8 or m[:4] not in (b"RPF9", b"9FPR"):
+        if os.fstat(fh.fileno()).st_size < 8:
             raise ValueError("not an RPF9 archive")
-        data_start = struct.unpack_from("<I", m, 4)[0]
-        if not 8 <= data_start <= size:
-            raise ValueError("RPF9 data start is outside the archive")
-        pos = data_start if start is None else start
-        if not 0 <= pos <= size:
-            raise ValueError("--start is outside the archive")
-        end = min(size, pos + limit) if limit is not None else size
-        rows = []
-        last = pos
-        zero = 0
-        unread = 0
-        streams = 0
-        name_hits = 0
-        unique = {}
-        t0 = time.time()
-        while pos < end:
-            mt = ZHDR.search(m, pos, end)
-            if not mt:
-                break
-            s = mt.start()
-            if m[s:s + 3] == b"KB2":
-                pos = s + 3
-                continue
-            d = zlib.decompressobj()
-            prefix = bytearray()
-            total = 0
-            p = s
-            try:
-                while not d.eof and p < size:
-                    chunk = m[p:p + (1 << 20)]
-                    if not chunk:
-                        break
-                    data = d.decompress(chunk)
-                    total += len(data)
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            size = len(m)
+            if size < 8 or m[:4] not in (b"RPF9", b"9FPR"):
+                raise ValueError("not an RPF9 archive")
+            data_start = struct.unpack_from("<I", m, 4)[0]
+            if not 8 <= data_start <= size:
+                raise ValueError("RPF9 data start is outside the archive")
+            pos = data_start if start is None else start
+            if not 0 <= pos <= size:
+                raise ValueError("--start is outside the archive")
+            end = min(size, pos + limit) if limit is not None else size
+            rows = []
+            last = pos
+            zero = 0
+            unread = 0
+            streams = 0
+            name_hits = 0
+            unique = {}
+            t0 = time.time()
+            while pos < end:
+                mt = ZHDR.search(m, pos, end)
+                if not mt:
+                    break
+                s = mt.start()
+                if m[s:s + 3] == b"KB2":
+                    pos = s + 3
+                    continue
+                d = zlib.decompressobj()
+                prefix = bytearray()
+                total = 0
+                p = s
+                try:
+                    while not d.eof and p < size:
+                        chunk = m[p:p + (1 << 20)]
+                        if not chunk:
+                            break
+                        data = d.decompress(chunk)
+                        total += len(data)
+                        if len(prefix) < max_inflate:
+                            prefix.extend(data[:max_inflate - len(prefix)])
+                        p += len(chunk)
+                        if d.unused_data or d.eof:
+                            break
+                    tail = d.flush()
+                    total += len(tail)
                     if len(prefix) < max_inflate:
-                        prefix.extend(data[:max_inflate - len(prefix)])
-                    p += len(chunk)
-                    if d.unused_data or d.eof:
-                        break
-                tail = d.flush()
-                total += len(tail)
-                if len(prefix) < max_inflate:
-                    prefix.extend(tail[:max_inflate - len(prefix)])
-            except zlib.error:
-                pos = s + 1
-                continue
-            if not d.eof or total < 64:
-                pos = s + 1
-                continue
-            used = p - s - len(d.unused_data)
-            if used <= 0:
-                pos = s + 1
-                continue
-            gap = m[last:s]
-            if gap.count(0) == len(gap):
-                zero += len(gap)
+                        prefix.extend(tail[:max_inflate - len(prefix)])
+                except zlib.error:
+                    pos = s + 1
+                    continue
+                if not d.eof or total < 64:
+                    pos = s + 1
+                    continue
+                used = p - s - len(d.unused_data)
+                if used <= 0:
+                    pos = s + 1
+                    continue
+                gap = m[last:s]
+                if gap.count(0) == len(gap):
+                    zero += len(gap)
+                else:
+                    unread += len(gap)
+                streams += 1
+                names = extract_names(bytes(prefix), types)
+                if names:
+                    name_hits += len(names)
+                    for name, suffix in names:
+                        unique.setdefault(name, suffix)
+                    rows.append({"offset": s, "stored": used, "size": total,
+                                 "names": [name for name, _ in names]})
+                last = pos = s + used
+                if progress and streams % 2000 == 0:
+                    span = max(1, end - (data_start if start is None else start))
+                    progress(f"{streams} streams, {len(rows)} with names, "
+                             f"{(pos - (data_start if start is None else start)) / span:.1%}, "
+                             f"{time.time() - t0:.0f}s")
+            tail = m[last:end]
+            if tail.count(0) == len(tail):
+                zero += len(tail)
             else:
-                unread += len(gap)
-            streams += 1
-            names = extract_names(bytes(prefix), types)
-            if names:
-                name_hits += len(names)
-                for name, suffix in names:
-                    unique.setdefault(name, suffix)
-                rows.append({"offset": s, "stored": used, "size": total,
-                             "names": [name for name, _ in names]})
-            last = pos = s + used
-            if progress and streams % 2000 == 0:
-                span = max(1, end - (data_start if start is None else start))
-                progress(f"{streams} streams, {len(rows)} with names, "
-                         f"{(pos - (data_start if start is None else start)) / span:.1%}, "
-                         f"{time.time() - t0:.0f}s")
-        tail = m[last:end]
-        if tail.count(0) == len(tail):
-            zero += len(tail)
-        else:
-            unread += len(tail)
-        span = end - (data_start if start is None else start)
-        by_type = {}
-        for suffix in unique.values():
-            by_type[suffix] = by_type.get(suffix, 0) + 1
-        summary = {
-            "archive": os.path.abspath(archive),
-            "start": data_start if start is None else start,
-            "span": span,
-            "streams": streams,
-            "streams_with_names": len(rows),
-            "name_hits": name_hits,
-            "unique_names": len(unique),
-            "by_type": dict(sorted(by_type.items())),
-            "max_inflate": max_inflate,
-            "types": list(types),
-            "zero_padding": zero,
-            "unread_bytes": unread,
-        }
-        m.close()
-        return rows, summary
+                unread += len(tail)
+            span = end - (data_start if start is None else start)
+            by_type = {}
+            for suffix in unique.values():
+                by_type[suffix] = by_type.get(suffix, 0) + 1
+            summary = {
+                "archive": os.path.abspath(archive),
+                "start": data_start if start is None else start,
+                "span": span,
+                "streams": streams,
+                "streams_with_names": len(rows),
+                "name_hits": name_hits,
+                "unique_names": len(unique),
+                "by_type": dict(sorted(by_type.items())),
+                "max_inflate": max_inflate,
+                "types": list(types),
+                "zero_padding": zero,
+                "unread_bytes": unread,
+            }
+            return rows, summary
 
 
 def main(argv=None):
