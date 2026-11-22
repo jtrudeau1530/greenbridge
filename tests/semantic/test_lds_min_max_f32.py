@@ -1299,5 +1299,152 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertTrue(is_qnan(res_max))
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_opcodes(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_min_f32 v0, v1",
+            "ds_add_f32 v0, v1",
+            "ds_min_f64 v0, v1",
+            "ds_min_f32",
+            "ds_min_rtn_f32 v0, v1",  # returning needs 3 registers
+            "ds_min_f32 v0, v1, v2",  # non-returning takes 2 registers
+            "ds_min_f32 r0, v1",      # invalid reg prefix
+            "ds_min_f32 v0, s1",
+            "ds_min_f32 v256, v1",    # out of bounds register index
+            "ds_min_f32 v0, v1 offset:70000",  # out of bounds offset
+            "ds_min_f32 v0, v1 offset:-1",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSMinMaxInstruction.parse(asm)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        # Non-power-of-two LDS allocation
+        with self.assertRaises(ValueError):
+            LDSMemory(1000)
+        with self.assertRaises(ValueError):
+            LDSMemory(-64)
+
+        # Invalid wave size (not 32 or 64)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_mutation_detection_inverted_min_max(self) -> None:
+        # Mutant: swaps min and max
+        def mutant_min(a: int, b: int) -> int:
+            return oracle_max_f32(a, b)
+
+        # Valid oracle returns ONE_F32; mutant returns TWO_F32
+        self.assertNotEqual(mutant_min(ONE_F32, TWO_F32), oracle_min_f32(ONE_F32, TWO_F32))
+
+    def test_mutation_detection_no_nan_suppression(self) -> None:
+        # Mutant: fails to suppress NaN and returns NaN instead of valid float
+        def mutant_min(a: int, b: int) -> int:
+            if is_nan(a) or is_nan(b):
+                return CANONICAL_QNAN
+            return oracle_min_f32(a, b)
+
+        self.assertNotEqual(mutant_min(CANONICAL_QNAN, ONE_F32), oracle_min_f32(CANONICAL_QNAN, ONE_F32))
+
+    def test_mutation_detection_wrong_signed_zero(self) -> None:
+        # Mutant: treats -0.0 and +0.0 as identical, returning +0.0
+        def mutant_min(a: int, b: int) -> int:
+            if is_zero(a) and is_zero(b):
+                return POS_ZERO
+            return oracle_min_f32(a, b)
+
+        self.assertNotEqual(mutant_min(POS_ZERO, NEG_ZERO), oracle_min_f32(POS_ZERO, NEG_ZERO))
+
+    def test_mutation_detection_destructive_aliasing(self) -> None:
+        # Mutant interpreter that writes destination before reading source address
+        class DestructiveMutantInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMinMaxInstruction) -> Optional[int]:
+                if inst.opcode.is_return:
+                    # Bug: prematurely clobbers vdst with garbage before reading vaddr
+                    assert inst.vdst is not None
+                    state.set_vgpr(inst.vdst, 0xBAD00000)
+                return super().execute(state, inst)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(2, TEN_F32)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(VGPR(1), 8)  # dword 2
+        state.set_vgpr(VGPR(2), ONE_F32)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_RTN_F32, vaddr=VGPR(1), vdata=VGPR(2), vdst=VGPR(1))
+        mutant = DestructiveMutantInterpreter()
+        mutant.execute(state, inst)
+
+        # Destructive mutant clobbered address before reading, so dword 2 was never updated to 1.0!
+        self.assertNotEqual(lds.read_dword(2), ONE_F32)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        # Mutant SIMD interpreter that ignores exec_mask and processes inactive lanes
+        class MutantSIMDInterpreter(SIMDDSInterpreter):
+            def execute(self, state: SIMDWaveState, inst: DSMinMaxInstruction) -> Dict[int, int]:
+                # Bug: forces all lanes active
+                saved_mask = state.exec_mask
+                state.exec_mask = (1 << state.wave_size) - 1
+                try:
+                    return super().execute(state, inst)
+                finally:
+                    state.exec_mask = saved_mask
+
+        lds = LDSMemory(65536)
+        lds.write_dword(5, TEN_F32)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x0, lds=lds)  # all lanes masked off
+        for l in range(32):
+            wave.set_vgpr(l, VGPR(1), 20)
+            wave.set_vgpr(l, VGPR(2), ONE_F32)
+
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_F32, vaddr=VGPR(1), vdata=VGPR(2))
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+
+        # Mutant modified LDS despite exec_mask == 0!
+        self.assertEqual(lds.read_dword(5), ONE_F32)
+        # Normal interpreter leaves it at TEN_F32
+        lds.write_dword(5, TEN_F32)
+        SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_dword(5), TEN_F32)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        # Mutant interpreter that ignores offset
+        class DroppedOffsetInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMinMaxInstruction) -> Optional[int]:
+                # Bug: sets offset to 0
+                no_off_inst = DSMinMaxInstruction(
+                    opcode=inst.opcode,
+                    vaddr=inst.vaddr,
+                    vdata=inst.vdata,
+                    vdst=inst.vdst,
+                    offset=OffsetImmediate(0),
+                )
+                return super().execute(state, no_off_inst)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(1, TEN_F32)
+        lds.write_dword(2, TEN_F32)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(VGPR(1), 4)  # dword 1
+        state.set_vgpr(VGPR(2), ONE_F32)
+
+        # Offset 4 shifts target from dword 1 to dword 2
+        inst = DSMinMaxInstruction(DSOpcode.DS_MIN_F32, vaddr=VGPR(1), vdata=VGPR(2), offset=OffsetImmediate(4))
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+
+        # Mutant targeted dword 1 instead of dword 2
+        self.assertEqual(lds.read_dword(1), ONE_F32)
+        self.assertEqual(lds.read_dword(2), TEN_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
