@@ -102,6 +102,8 @@ def main():
         ap.error("--out would overwrite the input blob")
     if a.bpe < 1:
         ap.error("--bpe must be at least 1")
+    if a.bpe not in (8, 16):
+        ap.error("--bpe must be 8 or 16")
     if a.tile < a.bpe or a.tile % a.bpe:
         ap.error("--tile must be a multiple of --bpe and at least --bpe")
     blocks = a.tile // a.bpe
