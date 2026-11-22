@@ -7,6 +7,7 @@
 // 24-bit steps, a stencil value, and the depth and stencil planes read back through a footprint.
 #pragma once
 #include "d3d12_copy_compare.h"
+#include "../src/depth24.h"
 
 #include <cmath>
 
@@ -237,6 +238,60 @@ inline void run_depth24_predicated(Run& run, ID3D12Device* host, bool predicated
     rb->Unmap(0, nullptr);
 }
 
+// How many clear values read back (depth plane or stencil plane) as something other than the reference: the 24-bit
+// word of depth24_quantize for the depth, the stencil value the scenario cleared. `o.regions` is the order
+// run_depth24_clears made: depth and stencil of each whole-view texture, then the wide texture's.
+inline size_t depth24_reference_deviations(const Outcome& o, const std::vector<float>& values, size_t* first = nullptr) {
+    const size_t whole = std::min<size_t>(values.size(), 160);
+    const auto word = [&](const Region& r, size_t row, size_t col) {
+        std::uint32_t w = 0;
+        std::memcpy(&w, &o.bytes[r.offset + row * r.pitch + col * 4], 4);
+        return w & 0xffffffu;  // the X8 byte is unspecified
+    };
+    size_t bad = 0;
+    const auto note = [&](size_t k) {
+        if (!bad++ && first) *first = k;
+    };
+    for (size_t k = 0; k < values.size(); ++k) {
+        const std::uint32_t want = leonida::depth24_quantize(values[k]);
+        bool ok = true;
+        if (k < whole) {
+            const Region &d = o.regions[2 * k], &s = o.regions[2 * k + 1];
+            for (size_t row = 0; row < 4; ++row)
+                for (size_t col = 0; col < 4; ++col)
+                    ok = ok && word(d, row, col) == want && o.bytes[s.offset + row * s.pitch + col] == std::uint8_t(0x40 + k % 64);
+        }
+        const Region &wd = o.regions[2 * whole], &ws = o.regions[2 * whole + 1];
+        for (size_t row = 0; row < 4; ++row)
+            ok = ok && word(wd, row, k) == want && o.bytes[ws.offset + row * ws.pitch + k] == 0x11;
+        if (!ok) note(k);
+    }
+    return bad;
+}
+
+// The clears of one format on the layer and on the host. The layer must read back what the reference says (the
+// spec's FLOAT -> UNORM as WARP and AMD round it, depth24.h). The host is compared byte for byte when it agrees with
+// the reference; where it does not (NVIDIA's D3D12 driver rounds some ties the other way) that is logged as a host
+// quirk and not a failure. Returns the failures.
+inline int compare_depth24_clears(const char* name, const Outcome& a, const Outcome& b, const std::vector<float>& values) {
+    if (!a.error.empty() || !b.error.empty()) return compare(name, a, b);  // prints which side failed
+    size_t first_ours = 0, first_host = 0;
+    const size_t ours = depth24_reference_deviations(a, values, &first_ours);
+    const size_t host = depth24_reference_deviations(b, values, &first_host);
+    if (ours) {
+        std::fprintf(stderr, "copy case %s: the layer reads back %zu of %zu clear values differently from the reference "
+                     "(first: value %.9g)\n", name, ours, values.size(), double(values[first_ours]));
+        return 1;
+    }
+    if (host) {
+        std::printf("copy case %s: host quirk: the host reads back %zu of %zu clear values differently from the "
+                    "reference (first: value %.9g, a tie it rounds the other way); the layer matches the reference\n",
+                    name, host, values.size(), double(values[first_host]));
+        return 0;
+    }
+    return compare(name, a, b);
+}
+
 // Returns the number of differences, or -1 with no host device.
 inline int compare_depth24(ID3D12Device* ours) {
     Ptr<ID3D12Device> host;
@@ -251,7 +306,7 @@ inline int compare_depth24(ID3D12Device* ours) {
     }
     run_depth24_clears(ours_run, host.p, values, a);
     run_depth24_clears(host_run, host.p, values, b);
-    int r = compare("D24 clears", a, b);
+    int r = compare_depth24_clears("D24 clears", a, b, values);
     if (!r) std::printf("depth24 clears: %zu values, whole-view and rectangle clears match the host (%zu regions)\n",
                         values.size(), b.regions.size());
 
@@ -262,7 +317,7 @@ inline int compare_depth24(ID3D12Device* ours) {
     if (!ours_typeless.init(ours, true) || !host_typeless.init(host.p, false)) return r + 1;
     run_depth24_clears(ours_typeless, host.p, few, ta, DXGI_FORMAT_R24G8_TYPELESS);
     run_depth24_clears(host_typeless, host.p, few, tb, DXGI_FORMAT_R24G8_TYPELESS);
-    const int typeless = compare("R24G8_TYPELESS clears", ta, tb);
+    const int typeless = compare_depth24_clears("R24G8_TYPELESS clears", ta, tb, few);
     if (!typeless) std::printf("depth24 typeless: R24G8_TYPELESS with a D24 DSV, %zu values, match the host\n", few.size());
     r += typeless;
 

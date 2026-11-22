@@ -177,7 +177,7 @@ What is implemented (all of it testable without the game):
   scratch and the pass writes the words (a float is multiplied by 16777215 in float and rounded to nearest, ties to
   even, which is what WARP and AMD's D3D12 driver do; NaN and negatives are 0, 1 and above the maximum). Every
   24-bit word makes the round trip unchanged (checked on all 16777216 by `depth24_convert_test`). Texture to
-  texture copies move the floats as they are. `ClearDepthStencilView` stores the float of the quantised value,
+  texture copies move the floats as they are. `ClearDepthStencilView` of any D24 texture, native or stored as D32, clears with the float of the quantised value (an exact 24-bit value, so no driver tie rounding is left),
   so the texture reads back as D3D's quantisation of the clear value. The scratch buffers and descriptors live
   until the submission that used them completes. A copy larger than the device's `maxStorageBufferRange` (128 MiB at
   least) is split into several dispatches, by slices or by rows of one slice. The dispatch runs even under a
@@ -187,7 +187,7 @@ What is implemented (all of it testable without the game):
   fraction dropped, with a tolerance of 0.6 ULP on the integer side; read literally a tie rounds up, and 3.2.2
   lists this conversion as an exception to round-to-nearest-even without fixing ties. WARP and AMD's D3D12 driver
   were measured to round the float product to nearest even (2.5 gives 2, 0.5 gives 0), which the tolerance
-  allows; NVIDIA's D3D12 driver breaks some of those ties the other way (and so does its native D24 in Vulkan);
+  allows; NVIDIA's D3D12 driver (and a native D24 clear in its Vulkan driver) breaks some of those ties the other way;
   the layer follows WARP and AMD there, a measurement and not a rule of the spec. Not covered: a depth test or
   a depth write by the rasteriser works on D32 and may differ from D24 by up to the 24-bit step, and a depth
   texture sampled in a shader sees the float; only copies, clears and readbacks are bit-exact.
@@ -489,9 +489,9 @@ and any validation error fails them.
     (72 regions, byte for byte, upload, readback and copies). `d3d12_depth24_compare.h` clears 5215 depth values
     (steps, half steps and the floats around them, powers of two, random) as a whole-view clear of a 4x4 texture
     (the first 160) and as one rectangle clear per value of a wide texture, with a stencil value, and compares both
-    planes read back. The layer matches WARP and the Radeon host exactly; NVIDIA's host (and the RTX 5070's native
-    D24 through the layer) rounds some ties the other way and agrees with itself only. It also clears an
-    `R24G8_TYPELESS` texture through a typed D24 DSV (200 values, compared with the host), and reports whether
+    planes read back. The layer is checked against the reference (`depth24_quantize`), and against the host byte for byte
+    where the host agrees with it; NVIDIA's host rounds some ties the other way (478 of 5215 values) and is logged as a host quirk, not a failure. It also clears an
+    `R24G8_TYPELESS` texture through a typed D24 DSV (200 values, compared the same way), and reports whether
     shader-resource views of both planes (`R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`) write a descriptor. They do
     not: the layer has no T# format for the depth view (no Vulkan mapping for `R24_UNORM_X8_TYPELESS`) and refuses
     views of the stencil plane, with any depth format, so such an SRV is an empty slot. That is a known gap, not
