@@ -7060,16 +7060,17 @@ class Gen:
         off_val = self.imm_val(off)
         if off["k"] == "imm":
             imm = off["v"]                              # immediate-only form
-        elif off_val is not None:
-            off_trunc = off_val & ~3
-            imm = (imm & ~3) + off_trunc
-        else:
+        elif off_val is None:
             reg = self.src_u(off)
         if sbuf:
             imm &= 0xFFFFFFFF                           # unsigned (measured up to 0xffffc)
         else:
             imm = ((imm & 0x1FFFFF) ^ 0x100000) - 0x100000   # 21-bit signed
         imm &= ~3                                       # two's complement: -1 -> -4, -6 -> -8
+        if off["k"] != "imm" and off_val is not None:
+            # A known sOFF folds into the constant after each term is truncated, and the sum stays 64-bit like the
+            # register form: sOFF 0xfffffffc + IMM 8 is past any NUM_RECORDS (0 on gfx1036, SHADER-336), not +4.
+            imm += off_val & ~3
         # Byte offset from the 4-truncated base, in 64 bits: zext(sOFF & ~3) + imm, or the constant alone.
         if reg is not None:
             r4, r64 = self.tmp(), self.tmp()

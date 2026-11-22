@@ -660,9 +660,10 @@ class SmemHardwareRuleTests(unittest.TestCase):
 
     REGION = 0x0000000500002000
 
-    def run_line(self, line, sgpr, *, pointer=False, base_low=0):
+    def run_line(self, line, sgpr, *, pointer=False, base_low=0, known=None):
         ins = parse_line(line)
         g = rdna2spirv.Gen("ps")
+        g.sgpr_imm.update(known or {})                  # SGPRs the translator knows as constants (an s_mov before)
         g.scalar_load(ins["op"], ins["args"], ins["mods"])
         regs = dict(sgpr)
         address = self.REGION + base_low
@@ -749,6 +750,28 @@ class SmemHardwareRuleTests(unittest.TestCase):
 
     def test_num_records_zero_reads_nothing(self):
         self.check("s_buffer_load_dwordx4 s[12:15], s[24:27], 0x0", {"nr": 0}, [None] * 4, [])
+
+    # SHADER-336, measured on gfx1036 (Ryzen 9 9950X3D iGPU, tools/smem_neg_probe.py --oracle hw), wave32 = wave64.
+    # Each row runs twice: sOFF in a register, and sOFF known to the translator (folded into the constant).
+    def both(self, line, soff, want, reads, extra=None, **kw):
+        self.check(line, {40: soff, **(extra or {})}, want, reads, **kw)
+        self.check(line, {40: soff, **(extra or {})}, want, reads, known={40: soff}, **kw)
+
+    def test_s_load_negative_sum_is_a_64_bit_signed_offset(self):
+        self.check("s_load_dword s12, s[24:25], -0x4", {}, [-4], [-4], pointer=True)
+        self.check("s_load_dword s12, s[24:25], -0x40", {}, [-0x40], [-0x40], pointer=True)
+        self.both("s_load_dword s12, s[24:25], s40 offset:-0x8", 4, [-4], [-4], pointer=True)
+        self.both("s_load_dword s12, s[24:25], s40 offset:-0x1", 6, [0], [0], pointer=True)   # 4 + -4, not 5 & ~3
+        self.both("s_load_dword s12, s[24:25], s40 offset:-0x20", 0xC, [-0x14], [-0x14], pointer=True)
+        self.both("s_load_dwordx2 s[12:13], s[24:25], s40 offset:-0x10", 4, [-0xC, -8], [-0xC, -8], pointer=True)
+
+    def test_s_buffer_load_soffset_sum_does_not_wrap_at_32_bits(self):
+        # sOFF 0xfffffffc + IMM 8 is 0x1_0000_0004, past NUM_RECORDS: 0 on hardware, in both translator forms
+        self.both("s_buffer_load_dword s12, s[24:27], s40 offset:0x8", 0xFFFFFFFC, [None], [], extra={"nr": 0x100})
+        self.both("s_buffer_load_dword s12, s[24:27], s40 offset:0x20", 0xFFFFFFF0, [None], [], extra={"nr": 0x100})
+        for soff in (0xFFFFFFFC, 0x80000000, 0x7FFFFFFC):
+            self.both("s_buffer_load_dword s12, s[24:27], s40", soff, [None], [], extra={"nr": 0x100})
+        self.both("s_buffer_load_dword s12, s[24:27], s40", 8, [8], [8], extra={"nr": 0x100})
 
     # s_load: 64-bit pointer, no bound
     def test_s_load_truncates_pointer_and_offsets(self):
