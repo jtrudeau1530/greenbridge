@@ -83,7 +83,7 @@ class NumericType:
             raise InterfaceError("a 64-bit varying starts on an odd Component")
         if self.width != 64 and component + slots > 4:
             raise InterfaceError("a 16-bit or 32-bit varying extends beyond its Location")
-        if self.width == 64 and slots > 4 and component:
+        if self.width == 64 and component + slots > 4 and component:
             raise InterfaceError("a 64-bit vector spanning two locations needs Component 0")
         mask = ((1 << slots) - 1) << component
         if mask <= 0xf:
