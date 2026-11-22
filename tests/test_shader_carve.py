@@ -437,6 +437,20 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertIsNone(index[5]["sm"])
         self.assertIn("PRIV", index[5]["parts"])
 
+    def test_carve_rejects_unfinished_deflate_stream(self):
+        dxbc = make_dxbc([(b"DXIL", make_dxil_payload(0x66, 5))])
+        compressor = zlib.compressobj(wbits=-15)
+        compressed = compressor.compress(dxbc) + compressor.flush(zlib.Z_SYNC_FLUSH)
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("synthetic", 1, dxbc, compressed_override=compressed))
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("0 shaders carved, 1 candidates rejected", res.stdout)
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [])
+        self.assertEqual(os.listdir(self.out), ["index.json"])
+
     def test_carve_rejects_incomplete_parts_and_continues(self):
         valid = make_dxbc([(b"PRIV", bytes(range(32)))])
         short_directory = bytearray(valid)
