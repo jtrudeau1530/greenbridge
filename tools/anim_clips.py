@@ -859,6 +859,8 @@ def main():
         ap.error("--jobs must be at least 1")
     if a.frames < 0:
         ap.error("--frames must be 0 or more")
+    if math.isnan(a.budget) or a.budget < 0:
+        ap.error("--budget must be 0 or a finite positive value (or infinite)")
     if a.decode is None and not a.out:
         ap.error("an output .json is required unless --decode is given")
     if a.out:

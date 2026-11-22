@@ -1,10 +1,12 @@
 // ResolveQueryData is unconditional in D3D12, including un-ended slots zeroed via vkCmdFillBuffer. On Intel's
 // Windows Vulkan driver, vkCmdFillBuffer after PredicateReducer::capture's compute dispatch is suppressed inside
 // an active conditional rendering scope (D3D-148). Check that emit() suspends conditional rendering for the
-// entire ResolveQueryData loop (not only before helper dispatches) and restores it afterward. No GPU or game data.
+// entire ResolveQueryData loop (not only before helper dispatches) and restores it afterward. Cases 5 and 6 check
+// how a resolve inside a pipeline-statistics query is replayed (D3D-162). No GPU or game data.
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -57,9 +59,20 @@ VKAPI_ATTR void VKAPI_CALL mock_copy_query(VkCommandBuffer, VkQueryPool, std::ui
     g_trace->events.push_back("copy_query");
 }
 
+std::string query_event(const char* name, VkQueryPool pool, std::uint32_t index) {
+    return std::string(name) + " " + std::to_string(reinterpret_cast<std::uintptr_t>(pool)) + ":" +
+           std::to_string(index);
+}
+
 VKAPI_ATTR void VKAPI_CALL mock_reset_query(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
-VKAPI_ATTR void VKAPI_CALL mock_begin_query(VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {}
-VKAPI_ATTR void VKAPI_CALL mock_end_query(VkCommandBuffer, VkQueryPool, std::uint32_t) {}
+VKAPI_ATTR void VKAPI_CALL mock_begin_query(VkCommandBuffer, VkQueryPool pool, std::uint32_t index,
+                                            VkQueryControlFlags) {
+    g_trace->events.push_back(query_event("begin_query", pool, index));
+}
+VKAPI_ATTR void VKAPI_CALL mock_end_query(VkCommandBuffer, VkQueryPool pool, std::uint32_t index) {
+    g_trace->events.push_back(query_event("end_query", pool, index));
+}
+VKAPI_ATTR void VKAPI_CALL mock_destroy_pool(VkDevice, VkQueryPool, const VkAllocationCallbacks*) {}
 VKAPI_ATTR void VKAPI_CALL mock_write_timestamp(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, std::uint32_t) {}
 
 int failures = 0;
@@ -83,6 +96,8 @@ int main() {
     pred.size = 16;
 
     QueryPool heap{handle<VkQueryPool>(3), d3d12_query_heap::occlusion, 4, false, {false, true, false, true}, {}};
+    QueryPool statistics_heap{handle<VkQueryPool>(7), d3d12_query_heap::pipeline_statistics, 2, false,
+                              {false, false}, {}};
 
     const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
         if (id == 1) return &dst;
@@ -104,7 +119,13 @@ int main() {
     vk.write_timestamp = mock_write_timestamp;
     vk.copy_query_pool_results = mock_copy_query;
     vk.fill_buffer = mock_fill_buffer;
-    vk.query_pool = [&](QueryHeapId id) -> QueryPool* { return id == 1 ? &heap : nullptr; };
+    vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
+        return id == 1 ? &heap : id == 6 ? &statistics_heap : nullptr;
+    };
+    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer,
+                           VkDeviceSize) {
+        g_trace->events.push_back(query_event("sum_statistics", pool, first) + "+" + std::to_string(count));
+    };
     vk.resolve_binary_occlusion = [](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
                                      VkDeviceSize) {
         ++g_trace->binary_resolves;
@@ -174,6 +195,55 @@ int main() {
         expect(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success, "replay unpredicated resolve");
         expect(trace.fills == 2 && trace.binary_resolves == 1 && trace.cond_begins == 0 && trace.cond_ends == 0,
                "unpredicated resolve: conditional rendering untouched");
+    }
+
+    // 5. D3D-162 without a statistics segment pool (the single-list replay()): a binary resolve that dispatches
+    //    inside a pipeline-statistics query is still refused, while one that only writes zeros is replayed.
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList dispatches, zeros;
+        for (auto* list : {&dispatches, &zeros}) {
+            const std::uint32_t index = list == &dispatches ? 1 : 0;  // query 1 was ended, query 0 was not
+            expect(list->begin_query({6, d3d12_query::pipeline_statistics, 0}), "record statistics begin");
+            expect(list->resolve_queries({1, d3d12_query::binary_occlusion, index, 1, 1, 0}), "record inner resolve");
+            expect(list->end_query({6, d3d12_query::pipeline_statistics, 0}), "record statistics end");
+            expect(list->close(), "close statistics list");
+        }
+        expect(replay(dispatches, VK_NULL_HANDLE, resolve, vk) == ReplayResult::unsupported,
+               "no segment pool: a binary dispatch inside pipeline statistics is refused");
+        expect(replay(zeros, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success,
+               "no segment pool: a zero-fill binary resolve inside pipeline statistics is replayed");
+        expect(trace.binary_resolves == 0 && trace.fills == 1, "no segment pool: only the zero fill was recorded");
+    }
+
+    // 6. D3D-162 with a statistics segment pool: the statistics query is split around the resolve inside it, so
+    //    the normalisation dispatch runs between two segments, and resolving the query sums the segments.
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList list;
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "record split begin");
+        expect(list.resolve_queries({1, d3d12_query::binary_occlusion, 1, 1, 1, 0}), "record split inner resolve");
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 0}), "record split end");
+        expect(list.resolve_queries({6, d3d12_query::pipeline_statistics, 0, 1, 1, 0}), "record split resolve");
+        expect(list.close(), "close split list");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare split list");
+        expect(prepared.statistics_segment_count == 2, "split list: two statistics segments");
+        auto segments = std::make_shared<OcclusionSegmentPool>();
+        segments->pool = handle<VkQueryPool>(9);
+        segments->destroy = mock_destroy_pool;
+        QueryReplay queries;
+        expect(queries.plan(prepared, {}, 0, true, segments, 4) == ReplayResult::success, "plan split list");
+        expect(queries.needs_binary && queries.needs_statistics_sum, "split list: binary and statistics helpers");
+        emit(prepared, VK_NULL_HANDLE, vk);
+        queries.commit();
+        const std::vector<std::string> want{"begin_query 9:4", "end_query 9:4",  "binary",
+                                            "begin_query 9:5", "end_query 9:5", "sum_statistics 9:4+2"};
+        expect(trace.events == want, "split list: segments end before and begin after the helper dispatch");
+        expect(statistics_heap.occlusion.count(0) && statistics_heap.occlusion[0].count == 2,
+               "split list: the heap keeps the query's segments for later resolves");
     }
 
     if (failures) return 1;

@@ -717,11 +717,10 @@ struct DeviceState {
         }
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
-        const bool color_min_lod =
-            (image.type == g::ImageType::image_2d || image.type == g::ImageType::image_2d_array ||
-             image.type == g::ImageType::cube || image.type == g::ImageType::image_3d) &&
-            (aspects & VK_IMAGE_ASPECT_COLOR_BIT);
-        if (!storage && color_min_lod) {
+        const bool supports_lod_clamp = image.type == g::ImageType::image_1d || image.type == g::ImageType::image_2d ||
+                                        image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube ||
+                                        image.type == g::ImageType::image_3d;
+        if (!storage && supports_lod_clamp && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
             // Use the clamp in the T# itself: views with identical keys must sample identically.
             clamp.minLod = g::image_min_lod(words);
             if (clamp.minLod > float(image.first_mip + image.mip_count - 1)) {
@@ -730,7 +729,7 @@ struct DeviceState {
                     if (channel != g::select_one) channel = g::select_zero;
             } else if (clamp.minLod > float(image.first_mip)) {
                 if (!info.image_view_min_lod) {
-                    log_once("sampled colour SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
+                    log_once("SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
                     return false;
                 }
                 clamp.pNext = view_info.pNext;
@@ -2313,8 +2312,11 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     const bool msaa = g::multisampled(view.type);
-    if ((volume != (view.type == g::ImageType::image_3d)) ||
-        (!volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) || msaa != (desc.SampleDesc.Count > 1)) {
+    const bool line = view.type == g::ImageType::image_1d;
+    const auto dimension = line ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
+                           view.type == g::ImageType::image_3d ? D3D12_RESOURCE_DIMENSION_TEXTURE3D :
+                                                               D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    if (desc.Dimension != dimension || (line && desc.DepthOrArraySize != 1) || msaa != (desc.SampleDesc.Count > 1)) {
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
@@ -2681,6 +2683,10 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
+        // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
+        state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
+            return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        });
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
         // a 96-bit texture, which every GPU stores as RGBA32 (D3D-62): the converter is there whether or not the
         // GPU has a native D24_UNORM_S8_UINT. It costs nothing until a copy needs it (its pipeline is made on the
@@ -3478,7 +3484,9 @@ public:
         TextureView view{};
         if (!desc) {
             const bool array = r->desc().DepthOrArraySize > 1;
-            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array)
+                view.type = ImageType::image_1d;
+            else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                 view.type = ImageType::image_3d;
             else if (r->desc().SampleDesc.Count > 1)
                 view.type = array ? ImageType::image_2d_msaa_array : ImageType::image_2d_msaa;
@@ -3488,6 +3496,12 @@ public:
             view.format = desc->Format;
             view.mapping = desc->Shader4ComponentMapping;
             switch (desc->ViewDimension) {
+            case D3D12_SRV_DIMENSION_TEXTURE1D:
+                view.type = ImageType::image_1d;
+                view.first_mip = desc->Texture1D.MostDetailedMip;
+                view.mip_count = desc->Texture1D.MipLevels;
+                view.min_lod = desc->Texture1D.ResourceMinLODClamp;
+                break;
             case D3D12_SRV_DIMENSION_TEXTURE3D:
                 view.type = leonida::gfx10::ImageType::image_3d;
                 view.first_mip = desc->Texture3D.MostDetailedMip;
@@ -4314,7 +4328,12 @@ public:
             fs->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
             const Format fmt = texture_storage_format(fs->Format, false);
             const Format depth_fmt = vulkan_format(fs->Format, true);
-            const VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
+            VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
+            // Report what creation makes: a D24 texture on a GPU without Vulkan D24 (AMD) is a D32_SFLOAT_S8_UINT
+            // image (texture_format), so its features are D32S8's. Asking D24 itself gave Support1 = 0 there,
+            // although CreateCommittedResource(ALLOW_DEPTH_STENCIL) succeeds.
+            if (vk_fmt == VK_FORMAT_D24_UNORM_S8_UINT && !state_.depth_usable(vk_fmt))
+                vk_fmt = VK_FORMAT_D32_SFLOAT_S8_UINT;
             if (vk_fmt == VK_FORMAT_UNDEFINED || !state_.format_properties) {
                 return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             }
@@ -4407,10 +4426,69 @@ public:
             if ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
                 (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) {
                 s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-                s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
-                if ((optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT) ||
-                    (buffer & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT)) {
-                    s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+                // A typed UAV read is not a storage-image read: the translator reads the texture through its
+                // sampled binding with the T#'s numeric type (rdna2spirv.py image_read_typed), and a typed buffer
+                // through its address. So every typed UAV format can also be read.
+                s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE | D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+                // Image atomics go through the r32ui storage view, which only an R32_UINT texture gets
+                // (StorageViews::r32ui). The translator has no image_atomic_swap, so no exchange.
+                if (vk_fmt == VK_FORMAT_R32_UINT && (optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT)) {
+                    s2 |= D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
+                          D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
+                          D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
+                          D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+                }
+            }
+            {
+                // D3D12's per-format rules, as native D3D12 reports them (RX 9070 XT, AMD 26.11.2, and WARP):
+                // the Vulkan feature bits above say what the image can do, not what D3D12 lets the format do.
+                const Format& chosen = fmt.format != VK_FORMAT_UNDEFINED ? fmt : depth_fmt;
+                const bool depth = (chosen.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+                const bool block_compressed = vk_fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && vk_fmt <= VK_FORMAT_BC7_SRGB_BLOCK;
+                // Gathers read the sampled view like a sample does (OpImageGather); the host reports one with the other.
+                if (s1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) s1 |= D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
+                // A mip chain where the image can have one, with the usage it is created with.
+                if (s1 & (D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+                          D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
+                          D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL)) {
+                    const VkImageUsageFlags usage = depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                                          : VK_IMAGE_USAGE_SAMPLED_BIT;
+                    VkImageFormatProperties limits{};
+                    if (state_.image_format_properties &&
+                        state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
+                                                       VK_IMAGE_TILING_OPTIMAL, usage,
+                                                       chosen.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0,
+                                                       &limits) == VK_SUCCESS &&
+                        limits.maxMipLevels > 1)
+                        s1 |= D3D12_FORMAT_SUPPORT1_MIP;
+                    // Depth formats multisample as depth-stencil targets (MULTISAMPLE_QUALITY_LEVELS already
+                    // reports their counts); the colour-attachment check above never sees them.
+                    if (depth && !chosen.typeless && (s1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) &&
+                        state_.image_format_properties &&
+                        state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
+                                                       VK_IMAGE_TILING_OPTIMAL,
+                                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
+                                                       &limits) == VK_SUCCESS &&
+                        (limits.sampleCounts & d3d12_multisample_sample_counts))
+                        s1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET;
+                }
+                // No resolve of integer formats (ResolveSubresource takes float, UNORM and SNORM only).
+                if (DeviceState::numeric_class(vk_fmt) != 0) s1 &= ~D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+                // Block-compressed textures are 2D, 3D or cubes: 1D has no 4x4 blocks.
+                if (block_compressed) s1 &= ~D3D12_FORMAT_SUPPORT1_TEXTURE1D;
+                // Depth formats are 1D, 2D and cube resources whose shaders read them through a colour view
+                // (R32_FLOAT, R24_UNORM_X8_TYPELESS, ...), not 3D and not shader resources themselves.
+                if (depth)
+                    s1 &= ~(D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+                            D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
+                            D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER);
+                // A TYPELESS format is only storage: views give it a type, so it is a texture with mips and
+                // nothing a view would do (no buffer, shader, render-target or UAV use of its own).
+                if (chosen.typeless) {
+                    s1 &= D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+                          D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
+                          D3D12_FORMAT_SUPPORT1_MIP;
+                    s2 = D3D12_FORMAT_SUPPORT2_NONE;
                 }
             }
             if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && state_.r9g9b9e5_uav_emulated) {
@@ -4446,7 +4524,11 @@ public:
             if (levels->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && levels->SampleCount != 1)
                 return d3d12_trace::result(method, S_OK);  // single-sample 2D only; no quality levels
             Format format = texture_storage_format(levels->Format, false);
-            if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            // A typeless format that is only a texture as depth (R24G8_TYPELESS, R32G8X24_TYPELESS) has no colour
+            // format; creation makes it a depth image, so ask the same.
+            const bool depth_only_typeless = format.format == VK_FORMAT_UNDEFINED &&
+                                             (texture_storage_format(levels->Format, true).aspects & VK_IMAGE_ASPECT_DEPTH_BIT);
+            if ((format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) || depth_only_typeless) {
                 D3D12_RESOURCE_DESC depth_desc{};
                 depth_desc.Format = levels->Format;
                 depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;

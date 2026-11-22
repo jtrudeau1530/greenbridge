@@ -41,6 +41,7 @@ layout(set = 0, binding = 0) uniform texture2D images[];
 layout(set = 0, binding = 0) uniform utexture2D uimages[];
 layout(set = 0, binding = 1) uniform sampler samplers[];
 layout(set = 0, binding = 3) uniform texture2DArray layers[];
+layout(set = 0, binding = 5) uniform texture1D lines[];
 layout(set = 0, binding = 6) uniform texture3D volumes[];
 #endif
 layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
@@ -87,7 +88,9 @@ void main() {
 #else
     const uint smp = lookup(sampler_key);
     const vec2 uv = (vec2(i % 8, i / 8) + 0.5) / 8.0 + vec2(1.0, 0.0);
-    if ((pc.tsharp[3] >> 28) == 10u) {
+    if (pc.mode == 4) {
+        result[pc.first + i] = packUnorm4x8(textureLod(sampler1D(lines[image], samplers[smp]), uv.x, 0.0));
+    } else if ((pc.tsharp[3] >> 28) == 10u) {
         // A 4x4x4 grid, offset from nearest-sampling boundaries at both 8x8x4 and 4x4x2.
         const vec3 uvw = (vec3(i % 4, (i / 4) % 4, i / 16) + 0.625) / 4.0;
         result[pc.first + i] = packUnorm4x8(textureLod(sampler3D(volumes[image], samplers[smp]), uvw, 0.0));

@@ -273,6 +273,40 @@ class CliTest(unittest.TestCase):
         self.assertEqual(doc["tally"]["pair_class"], {"persp_center": 1})
         self.assertEqual(doc["tally"]["mode_by_kind"], {"kind0 mode2": 1})
 
+    def write_two_shaders(self, tmp):
+        """Two synthetic PS containers; the census tallies them without FSSM/disasm sidecars."""
+        for name in ("ps1", "ps2"):
+            with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
+                f.write(dxbc_container({b"PSV0": psv0([(0, 4, 0, 3, 2)]),
+                                        b"ISG1": isg1([(0, 0xF, "TEXCOORD0")])}))
+
+    def test_limit_below_one_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_two_shaders(tmp)
+            for bad in ("0", "-1"):
+                with self.subTest(limit=bad):
+                    p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", "--limit", bad],
+                                       capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 2)
+                    self.assertIn("must be at least 1", p.stderr)
+                    self.assertEqual(p.stdout, "")
+
+    def test_positive_limit_still_caps_the_census(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_two_shaders(tmp)
+            p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", "--limit", "1"],
+                               capture_output=True, text=True, check=True)
+            self.assertEqual(len(json.loads(p.stdout)["files"]), 1)
+
+    def test_directory_named_dxbc_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_two_shaders(tmp)
+            os.mkdir(os.path.join(tmp, "bogus.dxbc"))
+            p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(len(json.loads(p.stdout)["files"]), 2)
+
     def test_missing_path_is_an_error(self):
         out = subprocess.run([sys.executable, "-I", TOOL, "Z:/nope"],
                              capture_output=True, text=True)

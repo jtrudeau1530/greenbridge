@@ -176,6 +176,25 @@ def mixed_rows():
     ]
 
 
+class PlacementArchetypeParityTest(unittest.TestCase):
+    def test_integer_and_hex_string_parse_to_the_same_archetype(self):
+        rows = [
+            {"archetype": 10, "position": [0, 0, 0], "rotation": [0, 0, 0, 1], "lod_level": 0},
+            {"archetype": "a", "position": [0, 0, 0], "rotation": [0, 0, 0, 1], "lod_level": 0},   # 0xa == 10
+            {"archetype": True, "position": [0, 0, 0], "rotation": [0, 0, 0, 1], "lod_level": 0},  # bool stays invalid
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "entities.jsonl")
+            twp.write_entities(path, rows)
+            loaded, load_counts = world_build.load_placements(path)
+            iter_counts = world_build._placement_counts()
+            itered = list(world_build.iter_placements(path, iter_counts))
+        self.assertEqual([row["_arch"] for row in loaded], [10, 10])
+        self.assertEqual([row["_arch"] for row in itered], [10, 10])
+        self.assertEqual(load_counts, iter_counts)
+        self.assertEqual((load_counts["rows"], load_counts["malformed"], load_counts["selected"]), (3, 1, 2))
+
+
 class InstancedBuildTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

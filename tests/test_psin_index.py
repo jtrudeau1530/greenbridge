@@ -151,6 +151,51 @@ ENUMS = [
 ]
 
 
+def make_lsns(blocks):
+    """An LSNS payload: block count, (kind, bytes) table, then the blocks (filler records)."""
+    table = struct.pack("<I", len(blocks)) + b"".join(struct.pack("<II", k, len(d)) for k, d in blocks)
+    return table + b"".join(d for _k, d in blocks)
+
+
+class TestLsns(unittest.TestCase):
+    def test_blocks_fill_the_section(self):
+        payload = make_lsns([(0x101, bytes(range(32))), (0x207, b"\xab" * 48)])
+        self.assertEqual(P.decode_lsns(payload), [(0x101, 32), (0x207, 48)])
+        record = P.parse(make_psin([("LSCH", b""), ("LSNS", payload), ("LGID", b"")]))
+        self.assertTrue(record["complete"])
+        self.assertEqual((record["lsns_blocks"], record["lsns_records"], record["lsns_error"]), (2, 5, ""))
+        section = [s for s in record["sections"] if s["tag"] == "LSNS"][0]
+        self.assertEqual(section["blocks"], [{"kind": "0x101", "bytes": 32}, {"kind": "0x207", "bytes": 48}])
+
+    def test_empty_section(self):
+        record = P.parse(make_psin([("LSNS", struct.pack("<I", 0)), ("LGID", b"")]))
+        self.assertEqual((record["lsns_blocks"], record["lsns_records"]), (0, 0))
+        self.assertEqual(P.summarize([record])["lsns_empty"], 1)
+
+    def test_errors(self):
+        cases = {
+            "shorter than its block count": b"\x01",
+            "runs past the section": struct.pack("<I", 3) + bytes(8),
+            "not a multiple of 16": make_lsns([(0x101, bytes(20))]),
+            "do not fill the section": make_lsns([(0x101, bytes(16))]) + bytes(16),
+        }
+        for message, payload in cases.items():
+            with self.subTest(message):
+                with self.assertRaisesRegex(ValueError, message):
+                    P.decode_lsns(payload)
+                record = P.parse(make_psin([("LSNS", payload)]))
+                self.assertIn(message, record["lsns_error"])
+                self.assertIsNone(record["lsns_blocks"])
+                self.assertTrue(record["complete"])        # a bad LSNS does not break the section walk
+
+    def test_summary_kinds(self):
+        records = [P.parse(make_psin([("LSNS", make_lsns([(0x101, bytes(16)), (0x11c, bytes(32))]))])),
+                   P.parse(make_psin([("LSNS", make_lsns([(0x101, bytes(16))]))]))]
+        summary = P.summarize(records)
+        self.assertEqual(summary["lsns_kinds"], {"0x101": 2, "0x11c": 1})
+        self.assertEqual((summary["lsns_decoded"], summary["lsns_records"], summary["lsns_errors"]), (2, 4, 0))
+
+
 class TestSchema(unittest.TestCase):
     def test_lsch_layout(self):
         got = P.decode_lsch(make_lsch(SCHEMA))

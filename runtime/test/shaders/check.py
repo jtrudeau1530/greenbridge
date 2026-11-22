@@ -2,7 +2,8 @@
 
     python -I runtime/test/shaders/check.py <out dir of build.py> [dir with the test programs]
 
-The test programs are vk_compute_test, vk_store_test, vk_harness, vk_texture_test and vk_bindless_test (runtime/build by default). With
+The test programs are vk_compute_test, vk_store_test, vk_harness, vk_texture_test, vk_bindless_test and vk_sampler_test
+(runtime/build by default). With
 the Visual Studio generator they are in runtime/build/RelWithDebInfo, Release and so on: that subfolder is found by
 itself (the newest complete one if there are several) and its name is printed.
 Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
@@ -12,7 +13,8 @@ The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see 
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
 to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py builds the mesh fixtures and
 fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
-ps_tex is skipped when the device lacks a feature the bindless set or the shader needs.
+ps_tex is skipped when the device lacks a feature the bindless set or the shader needs, ps_ssharp when it lacks one
+vk_sampler_test needs.
 ps_texoff (texel offsets, on vk_texture_test's texture) is skipped on a device without VK_KHR_maintenance8.
 """
 import collections
@@ -77,7 +79,8 @@ CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc0038
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
-                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext")
+                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
+                "cs_w32_salu64")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -104,6 +107,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_permute", [218, 29, 8, 211, 0, 15, 99, 15]),
             # integer ops with CPU-only checks until now (derivations in cs_w32_int_ext.asm)
             ("cs_w32_int_ext", [1, 27, 1, 0x33332222, 0xC0000000, 0x4000, 18, 0x20304050]),
+            # 64-bit scalar data ops and v_mad_u64_u32 (derivations in cs_w32_salu64.asm)
+            ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
             # constant EXEC: each lane takes its own bit (Intel got 16-bit constants wrong for lanes 16-31)
@@ -209,14 +214,14 @@ W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
 PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_legacy_mul": (0, 0, 0, 0x40c00000),
-              "ps_ops": (0x48804300, 5, 7, 0xfffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xfffffffa, 7),
-              "ps_ops3": (0xfffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
+              "ps_ops": (0x48804300, 5, 7, 0xbffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xbffffffa, 7),
+              "ps_ops3": (0xbffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
               "ps_ops5": (0x12340010, 0xbeef0800, 0xaaaaffff, 0xdeadbc00),
               "ps_ops6": (0xf800ffff, 0x01000010, 0x00800800, 0x8000fff0),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
-              "ps_ops8": (0x80000000, 0xffffffff, 0x000f100e, 0x0f0f0f1f),
+              "ps_ops8": (0x80000000, 0xbfffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_f32_mods": (0xc0256a01, 0x3f800000, 0x41e00000, 0x3fc00000),
-              "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xfffefff2, 0x3c003344, 0xfff70000),
+              "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xbffefff2, 0x3c003344, 0xbff70000),
               "ps_vcc_x2": (0x11223344, 0x55667788, 0, 0),
               # v_cmpx_{eq,gt,le,lt,ngt,nle}_f32, f_i32, t_u32, {eq,gt,le}_i64, {ge,lt,ne}_u64 (.asm header)
               "ps_vcmpx_forms": (0xf05b2a48, 0xf05e8a12, 0xb174be18, 0x15550000),
@@ -243,7 +248,10 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
               "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
               "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
-              "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000)}
+              "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000),
+              # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (derivations in the .asm headers)
+              "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
+              "ps_valu16_subrev": (0xaaaabc00, 0xaaaac000, 0xaaaa3c00, 0x42003800)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
@@ -656,6 +664,87 @@ def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_gr
     return f"{wrong} of 4096 pixels differ; {first}" if wrong else ""
 
 
+def ssharp_words(mip_filter, min_lod=0.0, max_lod=15.0, bias=0.0):
+    """An S# with point min/mag filters, clamp-to-last-texel addressing and the given mip fields. Positions as
+    Mesa's gfx10-rsrc.json has them: WORD0 CLAMP_X/Y/Z [8:0], WORD1 MIN_LOD [11:0] and MAX_LOD [23:12] (4.8 fixed),
+    WORD2 LOD_BIAS [13:0] (signed 5.8 fixed) and MIP_FILTER [27:26] (0 none, 1 point, 2 linear)."""
+    clamp = 2 | 2 << 3 | 2 << 6
+    return (clamp, round(min_lod * 256) | round(max_lod * 256) << 12,
+            (round(bias * 256) & 0x3fff) | mip_filter << 26, 0)
+
+
+# (name, S#, (BASE_LEVEL, LAST_LEVEL) of the T#). Expected levels, explicit LOD 0 / implicit LOD 1:
+SAMPLER_CASES = [("point", ssharp_words(1), (0, 1)),                       # 0 / 1
+                 ("point max_lod 0", ssharp_words(1, max_lod=0), (0, 1)),  # 0 / 0
+                 ("point min_lod 1", ssharp_words(1, min_lod=1), (0, 1)),  # 1 / 1: MIN_LOD clamps an explicit LOD too
+                 ("point bias +1", ssharp_words(1, bias=1), (0, 1)),       # 1 / 1: the S# bias applies to an explicit LOD
+                 ("point bias -1", ssharp_words(1, bias=-1), (0, 1)),      # 0 / 0
+                 ("none", ssharp_words(0), (0, 1)),                        # 0 / 0: MIP_FILTER_NONE reads the base level
+                 ("none min_lod 1", ssharp_words(0, min_lod=1), (0, 1)),   # 0 / 0: and ignores the LOD clamp
+                 ("point base 1", ssharp_words(1), (1, 1))]                # 1 / 1: the T#'s BASE_LEVEL starts the view
+SAMPLER_SIZE = 64          # the target; the texture is twice as wide, so implicit sampling sees LOD 1
+GREY = 128 / 255
+
+
+def sampler_level(words, view, lod):
+    """The texture level one sample reads, from the S# fields and the T# view alone (not from gfx10_descriptors.h).
+    MIP_FILTER_NONE reads the view's base level whatever the LOD. Otherwise the LOD plus LOD_BIAS is clamped to
+    [MIN_LOD, MAX_LOD], a point mip filter takes the nearest level (ceil(lod + 0.5) - 1, as Vulkan's
+    VK_SAMPLER_MIPMAP_MODE_NEAREST does) and the result stays inside the view."""
+    base, last = view
+    if (words[2] >> 26) & 3 == 0:
+        return base
+    bias = ((words[2] & 0x3fff) ^ 0x2000) - 0x2000
+    lo, hi = (words[1] & 0xfff) / 256, (words[1] >> 12 & 0xfff) / 256
+    level = math.ceil(min(max(lod + bias / 256, lo), hi) + 0.5) - 1
+    return base + min(max(level, 0), last - base)
+
+
+def sampler_texel(level, x, y):
+    """(r, g) of the texel under pixel (x, y): level 0 is red, green, blue and yellow quadrants, level 1 grey."""
+    if level:
+        return (GREY, GREY)
+    half = SAMPLER_SIZE // 2
+    return ((1.0, 0.0), (0.0, 1.0), (0.0, 0.0), (1.0, 1.0))[2 * (y >= half) + (x >= half)]
+
+
+def sampler_mismatch(data, words, view):
+    """The first pixel whose (lz.r, lz.g, implicit.r, implicit.g) is not what the S# and T# select, or ""."""
+    if len(data) != SAMPLER_SIZE ** 2 * 16:
+        return f"expected {SAMPLER_SIZE ** 2} RGBA32F pixels, got {len(data)} bytes"
+    explicit, implicit = sampler_level(words, view, 0), sampler_level(words, view, 1)
+    for i, got in enumerate(struct.iter_unpack("<4f", data)):
+        y, x = divmod(i, SAMPLER_SIZE)
+        want = sampler_texel(explicit, x, y) + sampler_texel(implicit, x, y)
+        if any(abs(g - w) > 1e-6 for g, w in zip(got, want)):
+            return f"({x},{y}): {tuple(round(g, 4) for g in got)} != {tuple(round(w, 4) for w in want)}"
+    return ""
+
+
+def sampler_test(tools, spirv):
+    """ps_ssharp: every SAMPLER_CASES S#/T# pair drawn with vk_sampler_test and judged per pixel by sampler_level.
+    A grey level-1 texel differs from every level-0 texel in both channels, so a wrong level fails at each pixel."""
+    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", "ps_ssharp")]
+    for path in shaders:
+        if not os.path.isfile(path):
+            return f"missing {os.path.basename(path)}"
+    with tempfile.TemporaryDirectory(prefix="leonida-sampler-") as tmp:
+        for name, words, view in SAMPLER_CASES:
+            raw = Path(tmp) / "pixels.raw"
+            raw.unlink(missing_ok=True)
+            code, out = run(os.path.join(tools, "vk_sampler_test" + EXE), *shaders, raw,
+                            *(f"{w:x}" for w in words), *(str(v) for v in view))
+            if code == UNSUPPORTED:
+                m = re.search(r"unsupported: .*", out)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+            if code or not raw.is_file():
+                return f"{name}: {failure(code, out, 3)}"
+            problem = sampler_mismatch(raw.read_bytes(), words, view)
+            if problem:
+                return f"{name}: {problem}"
+    return ""
+
+
 def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
@@ -958,6 +1047,7 @@ def main():
         results.append((name, pixel_test(tools, spirv, name)))
     results.append(("ps_gather_wrap", gather_wrap_test(tools, spirv)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
+    results.append(("ps_ssharp", sampler_test(tools, spirv)))
     for name in MIP_TEST_PASSES:
         results.append((name, texture_mip_test(tools, spirv, name)))
     for name in GRADIENT_TESTS:
