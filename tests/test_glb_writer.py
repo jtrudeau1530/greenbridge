@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -474,6 +475,56 @@ class TestGlbMaterialsAndTextures(unittest.TestCase):
 
 class TestGlbWriterValidationAndErrors(unittest.TestCase):
     """Tests error cases and validation in build_glb and helper functions."""
+
+    def test_each_position_has_three_components_before_normals_are_generated(self):
+        # The total is nine floats, but flattening these rows moves 9 into the next vertex's X.
+        positions = [(0.0, 0.0, 0.0, 9.0), (1.0, 0.0), (0.0, 1.0, 0.0)]
+        for code in (glb_writer._FLOAT32_CODE, None):
+            for has_normals in (False, True):
+                with self.subTest(packing=code, has_normals=has_normals):
+                    prim = _simple_triangle_primitive(has_normals=has_normals)
+                    prim["positions"] = positions
+                    with mock.patch.object(glb_writer, "_FLOAT32_CODE", code):
+                        with self.assertRaisesRegex(glb_writer.GlbError, "expected 3 floats per vertex"):
+                            glb_writer.build_glb([prim])
+
+    def test_invalid_indices_without_normals_raise_glb_error(self):
+        for invalid in (3, -4):
+            with self.subTest(index=invalid):
+                prim = _simple_triangle_primitive(has_normals=False)
+                prim["indices"] = [0, 1, invalid]
+                with self.assertRaisesRegex(glb_writer.GlbError, "index out of range"):
+                    glb_writer.build_glb([prim])
+
+    def test_valid_triangle_packing_with_generated_and_explicit_normals(self):
+        positions = struct.pack("<9f", 0, 0, 0, 1, 0, 0, 0, 1, 0)
+        normals = struct.pack("<9f", 0, 0, 1, 0, 0, 1, 0, 0, 1)
+        indices = struct.pack("<3H", 0, 1, 2)
+        for code in (glb_writer._FLOAT32_CODE, None):
+            for has_normals in (False, True):
+                with self.subTest(packing=code, has_normals=has_normals):
+                    prim = _simple_triangle_primitive(has_normals=has_normals)
+                    with mock.patch.object(glb_writer, "_FLOAT32_CODE", code):
+                        packed = glb_writer.pack_primitive(prim)
+                    self.assertEqual(packed["positions"], positions)
+                    self.assertEqual(packed["normals"], normals)
+                    self.assertEqual(packed["indices"], indices)
+                    self.assertEqual(packed["min"], [0.0, 0.0, 0.0])
+                    self.assertEqual(packed["max"], [1.0, 1.0, 0.0])
+
+    def test_malformed_positions_do_not_replace_an_existing_glb(self):
+        prim = _simple_triangle_primitive()
+        prim["positions"] = [(0.0, 0.0, 0.0, 9.0), (1.0, 0.0), (0.0, 1.0, 0.0)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "model.glb")
+            previous = glb_writer.build_glb([_simple_triangle_primitive()])
+            with open(path, "wb") as f:
+                f.write(previous)
+            with self.assertRaisesRegex(glb_writer.GlbError, "expected 3 floats per vertex"):
+                glb_writer.write_glb(path, [prim])
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), previous)
+            self.assertEqual(os.listdir(folder), ["model.glb"])
 
     def test_empty_primitives_raises_error(self):
         with self.assertRaises(glb_writer.GlbError):
