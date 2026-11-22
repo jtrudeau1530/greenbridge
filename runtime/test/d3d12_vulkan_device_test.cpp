@@ -2252,6 +2252,28 @@ int main() {
                    E_INVALIDARG);
         }
         {
+            // Device5 methods answered as on a device without the feature (no meta commands, no serialized
+            // acceleration structures of ours).
+            Ref<ID3D12Device5> device5;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5.p))));
+            UINT meta_count = 7;
+            EXPECT(device5->EnumerateMetaCommands(&meta_count, nullptr) == S_OK && meta_count == 0);
+            EXPECT(device5->EnumerateMetaCommands(nullptr, nullptr) == E_INVALIDARG);
+            const GUID unknown_command{0x12345678, 0x1234, 0x1234, {1, 2, 3, 4, 5, 6, 7, 8}};
+            UINT total_size = 0, param_count = 0;
+            EXPECT(device5->EnumerateMetaCommandParameters(unknown_command, D3D12_META_COMMAND_PARAMETER_STAGE_CREATION,
+                                                           &total_size, &param_count, nullptr) == E_INVALIDARG);
+            void* meta = reinterpret_cast<void*>(1);
+            EXPECT(device5->CreateMetaCommand(unknown_command, 0, nullptr, 0, IID_ID3D12MetaCommand, &meta) ==
+                       E_INVALIDARG &&
+                   meta == nullptr);
+            D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER identifier{};
+            EXPECT(device5->CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE,
+                                                          &identifier) == D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED);
+            EXPECT(device5->CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_TYPE(1), &identifier) ==
+                   D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE);
+        }
+        {
             Ref<ID3D12Device4> device4;
             Ref<ID3D12GraphicsCommandList> closed;
             EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
@@ -3357,6 +3379,19 @@ int main() {
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
         EXPECT(cpu_copies(device.p, d.bc, host ? "host image copy" : "staging copy") == 0);
+    }
+
+    // RemoveDevice on a device of its own, since a removed device stays removed.
+    {
+        Ref<ID3D12Device> removable;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&removable.p))));
+        Ref<ID3D12Device5> removable5;
+        EXPECT(removable.p && SUCCEEDED(removable->QueryInterface(IID_PPV_ARGS(&removable5.p))));
+        if (removable5.p) {
+            EXPECT(removable5->GetDeviceRemovedReason() == S_OK);
+            removable5->RemoveDevice();
+            EXPECT(removable5->GetDeviceRemovedReason() == DXGI_ERROR_DEVICE_REMOVED);
+        }
     }
 
     // The path D3D12XboxCreateDevice takes with LEONIDA_D3D12=vulkan: a device on its own Vulkan instance.

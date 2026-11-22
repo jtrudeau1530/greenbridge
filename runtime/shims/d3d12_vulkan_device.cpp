@@ -1903,6 +1903,7 @@ public:
         return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event);
     }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
+        if (removed_.load(std::memory_order_acquire)) return DXGI_ERROR_DEVICE_REMOVED;
         return (state_.context && state_.context->is_device_lost()) ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
     }
 
@@ -1955,6 +1956,43 @@ public:
         if (event) SetEvent(event);
         return S_OK;
     }
+
+    // Device5 methods the game is not expected to need (docs/d3d12_vulkan.md, "not planned until the game's trace
+    // shows them"). They answer as D3D12 does on a device without the feature, as vkd3d-proton does, rather than
+    // with the generated E_NOTIMPL stub, so a caller that probes them takes its normal "unsupported" path.
+    //
+    // Meta commands are vendor extensions (DirectML, upscalers); the layer offers none, so the list is empty and
+    // every command GUID is unknown.
+    HRESULT STDMETHODCALLTYPE EnumerateMetaCommands(UINT* count, D3D12_META_COMMAND_DESC*) override {
+        if (!count) return E_INVALIDARG;
+        *count = 0;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumerateMetaCommandParameters(REFGUID, D3D12_META_COMMAND_PARAMETER_STAGE, UINT*,
+                                                             UINT*, D3D12_META_COMMAND_PARAMETER_DESC*) override {
+        return E_INVALIDARG;
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateMetaCommand(REFGUID, UINT, const void*, SIZE_T, REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return E_INVALIDARG;
+    }
+
+    // Serialized acceleration structures (CopyRaytracingAccelerationStructure SERIALIZE) are not produced by this
+    // layer, so no identifier is one it made. Any other data type is one D3D12 itself does not define.
+    D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE CheckDriverMatchingIdentifier(
+        D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER*) override {
+        return type == D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE
+                   ? D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED
+                   : D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+    }
+
+    // RemoveDevice puts the device in the removed state, which an application uses to test its device-lost path.
+    // Only the reported state is modelled: GetDeviceRemovedReason returns DXGI_ERROR_DEVICE_REMOVED from then on.
+    // The Vulkan device keeps working, so work already queued still completes (D3D12 would stop it and complete
+    // fences to UINT64_MAX).
+    void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
@@ -3553,6 +3591,7 @@ private:
     }
 
     DeviceState state_;
+    std::atomic<bool> removed_{false};   // set by RemoveDevice
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
