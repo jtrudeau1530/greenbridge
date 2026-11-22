@@ -115,6 +115,7 @@ With more than one GPU, pick one through the Vulkan loader, for example
 | `ps_bary` and `ps_uniform_branch` fail by about 0.9 | The GPU runs pixel shaders wave64 without fragment barycentrics (GCN3 and RDNA1 on RADV), or an old AMD Windows driver (22.40) | Current `main` skips them on such devices; on Windows, update the driver |
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |
+| A GPU test that uses `image_load` (or lighting built from real shaders) returns zero for every texel except pixel (0,0); the image is black | Reported by @Silliana in #603 (not reproduced here): the shader bounds-checks `image_load` against the width and height stored in the T# it reads from the descriptor, so a hand-built descriptor with no real size makes every other coordinate look out of range | Put the real width and height of the image in the T# (see `docs/d3d12_vulkan.md` §5.3, *Descriptor T#/S# parsing*); don't leave them zero |
 
 ## Posting your result
 
