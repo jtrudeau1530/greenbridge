@@ -862,5 +862,104 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), 0x1234)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src_same_half(self) -> None:
+        # In-place execution: v0.l = fract(v0.l)
+        state = ScalarMachineState()
+        state.set_vgpr16(0, RegHalf.LO, H_1P75)  # 1.75 -> 0.75
+        state.set_vgpr16(0, RegHalf.HI, 0xABCD)  # untouched high half
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.LO)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, H_0P75)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_0P75)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.HI), 0xABCD)
+
+    def test_dst_alias_src_cross_half_low_to_high(self) -> None:
+        # v0.h = fract(v0.l)
+        state = ScalarMachineState()
+        state.set_vgpr16(0, RegHalf.LO, H_NEG_0P25)  # -0.25 -> 0.75
+        state.set_vgpr16(0, RegHalf.HI, 0x1111)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.LO)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, H_0P75)
+        # v0.h is updated to 0.75, v0.l remains untouched (-0.25)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.HI), H_0P75)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_NEG_0P25)
+
+    def test_dst_alias_src_cross_half_high_to_low(self) -> None:
+        # v0.l = fract(v0.h)
+        state = ScalarMachineState()
+        state.set_vgpr16(0, RegHalf.HI, H_NEG_1P75)  # -1.75 -> 0.25
+        state.set_vgpr16(0, RegHalf.LO, 0x2222)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.HI)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, H_0P25)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_0P25)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.HI), H_NEG_1P75)
+
+    def test_inplace_iterative_fract_stepping(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr16(0, RegHalf.LO, H_3P75)  # 3.75
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.LO)),
+        )
+        # First iteration: 3.75 -> 0.75
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_0P75)
+
+        # Subsequent iterations: 0.75 -> 0.75 (idempotent fixed point)
+        for _ in range(50):
+            self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr16(0, RegHalf.LO), H_0P75)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32)
+        for lane in range(32):
+            state.set_vgpr16(lane, 4, RegHalf.LO, f16_to_bits(float(lane) + 0.5))
+
+        instr = VFractF16Instruction(
+            dst=Reg16(4, RegType.VGPR, RegHalf.LO),
+            src=VOP1Operand(Reg16(4, RegType.VGPR, RegHalf.LO)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr16(lane, 4, RegHalf.LO), H_0P5)
+
+    def test_simd_cross_half_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32)
+        for lane in range(32):
+            # Low half has negative offset (-1.25 -> 0.75)
+            state.set_vgpr16(lane, 0, RegHalf.LO, H_NEG_1P25)
+            state.set_vgpr16(lane, 0, RegHalf.HI, 0x5555)
+
+        instr = VFractF16Instruction(
+            dst=Reg16(0, RegType.VGPR, RegHalf.HI),
+            src=VOP1Operand(Reg16(0, RegType.VGPR, RegHalf.LO)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.HI), H_0P75)
+            self.assertEqual(state.get_vgpr16(lane, 0, RegHalf.LO), H_NEG_1P25)
+
+
 if __name__ == "__main__":
     unittest.main()
