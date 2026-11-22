@@ -118,7 +118,9 @@ def parse_line(line):
     code = code.strip()
     if not code:
         return None
-    op, _, rest = code.partition(" ")
+    fields = code.split(maxsplit=1)
+    op = fields[0]
+    rest = fields[1] if len(fields) > 1 else ""
     # sendmsg(MSG_GS, GS_OP_NOP) contains a comma: keep it as one operand.
     rest = SENDMSG.sub(lambda m: m.group(0).replace(", ", "|").replace(",", "|"), rest)
     mods = MODWORDS.findall(rest)
