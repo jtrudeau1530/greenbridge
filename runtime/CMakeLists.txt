@@ -1067,8 +1067,38 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_m2_textured_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m2_textured COMMAND d3d12_m2_textured_test)
       set_tests_properties(d3d12_m2_textured PROPERTIES SKIP_RETURN_CODE 77)
+
+      # M3 (synthetic part): frames with two render targets and a depth/stencil buffer, an occlusion query, resource
+      # barriers and a second pass that samples the first one's target, three frames in flight with a fence each.
+      # vs_m3.asm, ps_m3.asm (pass 1) and ps_m3_post.asm (pass 2, with vs_m2.asm) go through the same build.
+      set(LEONIDA_M3_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m3_shaders)
+      set(LEONIDA_M3_FILES ${LEONIDA_M3_DIR}/spirv/index.json ${LEONIDA_M3_DIR}/fssm/vs_m3.fssm
+                           ${LEONIDA_M3_DIR}/fssm/ps_m3.fssm ${LEONIDA_M3_DIR}/fssm/vs_m2.fssm
+                           ${LEONIDA_M3_DIR}/fssm/ps_m3_post.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_M3_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M3_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "PATH=${LEONIDA_SPIRV_TOOLS_NATIVE};$ENV{PATH}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_M3_DIR} vs_m3 ps_m3 vs_m2 ps_m3_post
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_post.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating vs_m3, ps_m3, vs_m2 and ps_m3_post for the frame test"
+        VERBATIM)
+      add_executable(d3d12_m3_frame_test test/d3d12_m3_frame_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M3_FILES})
+      target_link_libraries(d3d12_m3_frame_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_m3_frame_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_M3_DIR="${LEONIDA_M3_DIR}")
+      target_compile_options(d3d12_m3_frame_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_m3_frame COMMAND d3d12_m3_frame_test)
+      set_tests_properties(d3d12_m3_frame PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test and d3d12_m2_textured_test are not built")
+      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test and d3d12_m3_frame_test are not built")
     endif()
     # ID3D12Resource::GetHeapProperties and ID3D12DescriptorHeap::GetDesc (node masks, resolved heap flags) against the
     # host runtime and WARP; run explicitly on a Vulkan GPU.
