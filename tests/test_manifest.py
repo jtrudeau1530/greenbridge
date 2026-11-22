@@ -368,6 +368,7 @@ class ManifestCliTest(unittest.TestCase):
                         self.assertEqual(f.read(), original)
 
     def test_cli_verify_reports_a_damaged_manifest_without_a_traceback(self):
+        good_hash = hashlib.sha256(b"cli test payload bytes").hexdigest()
         damaged = {
             "truncated": b'{"created": "x", "files": {"sample.dat": {"si',
             "not_utf8": b'\xff\xfe{"files": {}}',
@@ -377,6 +378,17 @@ class ManifestCliTest(unittest.TestCase):
             "entry_is_a_number": b'{"files": {"sample.dat": 5}}',
             "no_sha256": b'{"files": {"sample.dat": {"size": 22}}}',
             "size_is_a_string": b'{"files": {"sample.dat": {"size": "22", "sha256": "00"}}}',
+            "dup_sha256": (
+                f'{{"files": {{"sample.dat": {{"size": 22, "sha256": "{"0" * 64}", "sha256": "{good_hash}"}}}}}}'
+            ).encode(),
+            "dup_file_entry": (
+                f'{{"files": {{"sample.dat": {{"size": 22, "sha256": "{"0" * 64}"}}, '
+                f'"sample.dat": {{"size": 22, "sha256": "{good_hash}"}}}}}}'
+            ).encode(),
+            "dup_top_files": (
+                f'{{"files": {{"sample.dat": {{"size": 22, "sha256": "{"0" * 64}"}}}}, '
+                f'"files": {{"sample.dat": {{"size": 22, "sha256": "{good_hash}"}}}}}}'
+            ).encode(),
         }
         for name, data in damaged.items():
             with self.subTest(name=name):
@@ -500,6 +512,133 @@ class ManifestAtomicCreateTest(unittest.TestCase):
                 self.create()
         with open(self.out, "rb") as f:
             self.assertEqual(f.read(), previous)
+
+
+class ManifestDigestCaseTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pkg = os.path.join(self.tmp.name, "pkg")
+        os.makedirs(self.pkg)
+        self.payloads = {
+            "sample.dat": b"synthetic digest case fixture\n",
+            "second.dat": b"a second file for parallel verification\n",
+        }
+        for rel, payload in self.payloads.items():
+            with open(os.path.join(self.pkg, rel), "wb") as f:
+                f.write(payload)
+        self.entries = {
+            rel: {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+            for rel, payload in self.payloads.items()
+        }
+        self.out = os.path.join(self.tmp.name, "manifest.json")
+
+    def write_manifest(self, case="lower"):
+        entries = {}
+        for rel, info in self.entries.items():
+            original = info["sha256"]
+            if case == "upper":
+                digest = original.upper()
+            elif case == "mixed":
+                digest = "".join(c.upper() if i % 2 else c for i, c in enumerate(original))
+                self.assertNotEqual(digest, original.upper())
+            else:
+                digest = original
+            if case != "lower":
+                self.assertNotEqual(digest, original)
+            entries[rel] = {"size": info["size"], "sha256": digest}
+        with open(self.out, "w", encoding="utf-8") as f:
+            json.dump({"files": entries}, f)
+        with open(self.out, "rb") as f:
+            return f.read()
+
+    def assert_files_unchanged(self, expected):
+        for rel, payload in expected.items():
+            with open(os.path.join(self.pkg, rel), "rb") as f:
+                self.assertEqual(f.read(), payload)
+
+    def run_cli(self, jobs):
+        return subprocess.run(
+            [sys.executable, "-I", "-B", TOOL, "verify", self.pkg,
+             "--manifest", self.out, "--jobs", str(jobs)],
+            capture_output=True, text=True)
+
+    def test_verify_accepts_hex_digest_case(self):
+        for case in ("lower", "upper", "mixed"):
+            for jobs in (1, 4):
+                with self.subTest(case=case, jobs=jobs):
+                    before = self.write_manifest(case)
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        self.assertEqual(manifest.verify(self.pkg, self.out, jobs=jobs), 0)
+                    self.assertEqual(output.getvalue(), "OK\n")
+                    self.assert_files_unchanged(self.payloads)
+                    with open(self.out, "rb") as f:
+                        self.assertEqual(f.read(), before)
+
+    def test_cli_verify_accepts_hex_digest_case(self):
+        for case in ("upper", "mixed"):
+            for jobs in (1, 2):
+                with self.subTest(case=case, jobs=jobs):
+                    before = self.write_manifest(case)
+                    result = self.run_cli(jobs)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "OK\n")
+                    self.assertEqual(result.stderr, "")
+                    self.assert_files_unchanged(self.payloads)
+                    with open(self.out, "rb") as f:
+                        self.assertEqual(f.read(), before)
+
+    def test_uppercase_digest_still_detects_changed_content(self):
+        self.entries["sample.dat"]["sha256"] = self.entries["sample.dat"]["sha256"].upper()
+        before = self.write_manifest()
+        original = self.payloads["sample.dat"]
+        changed = bytes([original[0] ^ 0xFF]) + original[1:]
+        with open(os.path.join(self.pkg, "sample.dat"), "wb") as f:
+            f.write(changed)
+        for jobs in (1, 4):
+            with self.subTest(jobs=jobs):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(manifest.verify(self.pkg, self.out, jobs=jobs), 1)
+                self.assertEqual(output.getvalue(), "CHANGED   sample.dat\n1 problem(s)\n")
+                self.assert_files_unchanged({**self.payloads, "sample.dat": changed})
+                with open(self.out, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_uppercase_digests_still_report_missing_and_size(self):
+        before = self.write_manifest("upper")
+        os.remove(os.path.join(self.pkg, "sample.dat"))
+        longer = self.payloads["second.dat"] + b"extra"
+        with open(os.path.join(self.pkg, "second.dat"), "wb") as f:
+            f.write(longer)
+        for jobs in (1, 4):
+            with self.subTest(jobs=jobs):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(manifest.verify(self.pkg, self.out, jobs=jobs), 1)
+                self.assertEqual(output.getvalue(), "MISSING   sample.dat\nSIZE      second.dat\n2 problem(s)\n")
+                self.assertFalse(os.path.exists(os.path.join(self.pkg, "sample.dat")))
+                self.assert_files_unchanged({"second.dat": longer})
+                with open(self.out, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_cli_verify_does_not_accept_malformed_digests(self):
+        original = self.entries["sample.dat"]["sha256"]
+        invalid = (" " + original.upper() + " ", " ".join(original[i:i + 2] for i in range(0, 64, 2)),
+                   "F" * 64, "Z" * 64, "", original[:-1])
+        for digest in invalid:
+            for jobs in (1, 2):
+                with self.subTest(digest=digest, jobs=jobs):
+                    self.entries["sample.dat"]["sha256"] = digest
+                    before = self.write_manifest()
+                    result = self.run_cli(jobs)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, "CHANGED   sample.dat\n1 problem(s)\n")
+                    self.assertEqual(result.stderr, "")
+                    self.assert_files_unchanged(self.payloads)
+                    with open(self.out, "rb") as f:
+                        self.assertEqual(f.read(), before)
 
 
 class ManifestBelowNormalTest(unittest.TestCase):

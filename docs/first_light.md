@@ -1,0 +1,93 @@
+# First light: a real game model with its own translated shaders
+
+**Status: measured** on the 1.0.2.1 package and an NVIDIA RTX 2060 SUPER (driver 620.73.04, Vulkan 1.4.357,
+CachyOS). This is the first draw of a real game model with its own translated VS and PS on a real GPU. The image
+stays in the user's work folder; this note records the counts and the recipe, not the model, the shaders or a
+screenshot.
+
+## 1. What was drawn
+
+The model is one static drawable exported from `data.rpf` by `rpf9dump models`: one mesh, 4,213 vertices and
+7,968 triangles, with positions and UVs and no bones or fragments. Its OBJ is the only `data.rpf` export with
+those counts and has SHA-256
+`a7178cf4b7a00c9df838fb072c59e2c048ceed52306620d859faae4d3991d6b9`; `manifest.json` records it. The tool that
+assembles it, `tools/first_light.py`, centres and fits X/Y to NDC and flattens Z (the chosen VS applies no
+matrix), so the draw is an orthographic projection of the model's own geometry.
+
+The shaders are two ordinary containers from `shaders.rpf`, carved and translated by the repository's own tools:
+
+| stage | FSSM SHA-256 | what it does |
+|---|---|---|
+| VS | `128867d3233a97ba5b203c313a24ab8a77df20c2a308091a5595bb9f669677f4` | forwards POSITION and TEXCOORD from the vertex fetch to clip space and a varying |
+| PS | `ed4147a5f7514947c2eb8d79255bd80f72761ac1ba2205dd811d3e050cf1b495` | writes the interpolated TEXCOORD as the colour; no bindings, no texture |
+
+Both disassemble with no invalid word, translate, and pass `spirv-val`; `tools/shader_link_check.py check` reports
+the pair compatible. At 128×128 the draw covers **12,804 of 16,384 pixels (0.781)** and the centre pixel is
+`(0.498, 0.496, 0.0, 1.0)`: the model is the disc its geometry projects to, and the colour is its own UV map. The
+test derives the expected centre UV from the mesh on the CPU (`0.4978, 0.4965`), so the GPU pixel has to match
+the geometry, not just be non-clear; it also requires the `[0, 0]` corner to keep the clear value and bounds the
+coverage at 0.5–0.99, which an all-opaque image cannot pass. Four extra probes where U and V differ by more than
+0.15 catch a swapped-U/V image even when the centre is symmetric (this model's centre has U ≈ V). The
+`OracleTests` run those checks on synthetic images without a GPU or a package: the accepted fixture, an
+all-opaque image, a swapped UV and a short buffer. The same `check_image` function backs the tool's `--check`, so
+the command line and the test agree. The PPM the harness writes is a real image of the model; it stays in the
+user's folder.
+
+## 2. Why it matters
+
+Until now the D3D12 draw tests (M1, M1.5, M2, M3) were met with hand-written RDNA2 or GLSL shaders and synthetic
+geometry, and the pipeline check compiles the game's 26,503 shaders without ever drawing with one
+([pipeline_check.md](pipeline_check.md)). This closes the "shaders of the game itself" gap for the native Vulkan
+path: a real model, a real translated VS/PS pair, a vertex buffer, a pipeline and a readback, end to end, on a
+consumer GPU. It does not need the executable and it does not use a synthetic stand-in for either side.
+
+The pieces it proves are the ones the D3D12 layer also relies on: ISG register → Vulkan vertex input location,
+the 144-byte push-constant block, the translator's SPIR-V for a graphics pair, and `vk_harness`'s device,
+pipeline and readback code. The remaining step to the port's own path is to run the same pair through the D3D12
+proxy under Wine, which needs a cross build with the MSVC SDK.
+
+## 3. Reproduce it
+
+```sh
+git submodule update --init
+dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
+DOTNET_ROLL_FORWARD=Major tools/rpf9dump/bin/Release/net8.0/rpf9dump models \
+    "<package>/data.rpf" ~/leonida-work/assets
+
+python -I tools/first_light.py --game "<package>" --work ~/leonida-work --list
+python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
+    --obj ~/leonida-work/assets/data/models/<model>.obj --no-fit --run
+# <model>.obj: 4,213 vertices, 7,968 triangles; the manifest records its SHA-256
+LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/out python -I tests/test_first_light.py -v
+python -I tools/first_light.py --check --out ~/leonida-work/first_light/out
+```
+
+`--check` on an existing folder re-runs the harness through the same fresh path and `check_image` as the test; a
+harness that exits 0 without writing, an all-opaque image and a swapped-U/V image all exit 1. The test has seven
+cases: the two package-gated draw/manifest checks, the `--check` command and four oracle fixtures.
+
+`first_light.py` carves `shaders.rpf` if the work folder does not have it, translates only the chosen pair, converts
+the OBJ to the harness's mesh file (`u32 vertex_count, u32 index_count`, `(x,y,z,u,v) f32` vertices, `u32`
+indices), writes `manifest.json` with the counts and FSSM hashes, and runs `vk_harness`. `--vs` and `--ps` take
+other names from the carve index; `--no-fit` keeps a model that is already in NDC (the sky dome is). The test is
+package-gated: without `LEONIDA_FIRST_LIGHT_DIR` it skips, and it writes its image to that folder.
+
+## 4. The harness mode
+
+`runtime/test/vk_harness.cpp` gained two environment options, inert when unset (the existing three-vertex and
+mesh-shader paths are unchanged): `VKH_DRAW_MESH=<file>` with `VKH_VERTEX_LAYOUT=0:3f,1:2f` reads the binary mesh,
+creates a vertex and an index buffer, and draws it with `vkCmdDrawIndexed`. The layout lists `location:components`
+and only float attributes. The first-light pair above uses no other harness option: the VS reads no user SGPRs and
+the PS has no bindings.
+
+## 5. Limits and next
+
+* The chosen VS applies no matrix; the tool's fit is an orthographic stand-in for the game's view/projection. A
+  real camera needs a VS that reads its constants, which is the next model/shader pair.
+* No texture: the PS writes the UV map. A texture path needs a TTPF albedo, BCPack decode, a T# in the bindless
+  set and the game's sampler.
+* One model and one draw. The `levels.rpf` windows have world props with POSITION/NORMAL/COLOUR/UV layouts that
+  match the `sga_dr_*`/`Rage_Transform*` families by signature; pairing one of those is the natural next image.
+* This is the native Vulkan harness, not the port's D3D12 layer. The same pair through `d3d12_translated_draw_test`
+  under Wine is the step that joins this result to the runtime.
+* The game still cannot boot: the executable is not in the package (RT-5), so no call site selects these programs.

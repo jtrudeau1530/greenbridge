@@ -29,6 +29,7 @@ _REG = re.compile(r"([sv])(\d+)")
 _REG_RANGE = re.compile(r"([sv])\[(\d+):(\d+)\]")
 _TTMP = re.compile(r"ttmp(\d+)|ttmp\[(\d+):(\d+)\]")
 _VLIST = re.compile(r"\[(v\d+(?:,\s*v\d+)+)\]")
+_SLIST = re.compile(r"\[((?:s\d+|vcc_lo|vcc_hi)(?:\s*,\s*(?:s\d+|vcc_lo|vcc_hi))+)\]")
 _ATTR = re.compile(r"attr(\d+)\.([xyzw])")
 _TARGET = re.compile(r"(pos|param|mrt|mrtz|null|prim)(\d*)")
 _INT = re.compile(r"-?(0x[0-9a-fA-F]+|\d+)")
@@ -99,6 +100,10 @@ def operand(tok):
     m = _VLIST.fullmatch(core)
     if m:  # NSA image address: non-contiguous VGPR list
         return {"k": "vlist", "r": [int(x.strip()[1:]) for x in m.group(1).split(",")]}
+    m = _SLIST.fullmatch(core)
+    if m:  # LLVM VCCTuple scalar register list, e.g. [s100,s101,s102,s103,s104,s105,vcc_lo,vcc_hi]
+        items = [int(x[1:]) if x.startswith("s") else x for x in (t.strip() for t in m.group(1).split(","))]
+        return {"k": "slist", "r": items, "n": len(items)}
     m = _ATTR.fullmatch(core)
     if m:
         return {"k": "attr", "a": int(m.group(1)), "c": "xyzw".index(m.group(2))}
