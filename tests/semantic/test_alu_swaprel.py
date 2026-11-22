@@ -213,5 +213,38 @@ class TestSwaprelChainedSequencesAndPreservation(unittest.TestCase):
         self.assertEqual(oracle.regs[6], sentinel(5))
 
 
+
+
+class TestSwaprelNegativeAndEdgeControls(unittest.TestCase):
+    """Negative controls, syntax rejection, and invalid operand validation."""
+
+    def test_reject_scalar_destination_operand(self) -> None:
+        lines = [
+            "s_mov_b32 m0, 0",
+            "v_swaprel_b32 s0, v1",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_lines("ps_bad_dest", lines)
+
+    def test_reject_scalar_source_operand(self) -> None:
+        lines = [
+            "s_mov_b32 m0, 0",
+            "v_swaprel_b32 v1, s0",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_lines("ps_bad_src", lines)
+
+    def test_reject_literal_operand(self) -> None:
+        lines = [
+            "s_mov_b32 m0, 0",
+            "v_swaprel_b32 v1, 1.0",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_lines("ps_bad_lit", lines)
+
+
 if __name__ == "__main__":
     unittest.main()
