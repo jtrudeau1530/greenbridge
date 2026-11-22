@@ -127,6 +127,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   `Fma`).
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
+- `test_dpp_eager_subgroup.py` (SHADER-529) checks that no DPP ballot or shuffle is left where SPIRV-Cross
+  (MoltenVK) would inline it into a short-circuiting `&&`/`||` or a ternary's arm, for 11 DPP16/DPP8 forms with
+  and without a lane off in EXEC, using a model of SPIRV-Cross's single-use forwarding (its own tests cover the
+  model). It also runs the same programs in `spirv_wave_interp.py` against a plain-Python DPP reference.
 
 Limits: single lane (or lanes in lockstep, one instruction per lane per round, that exchange values only through
 `OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), forward-only structured control flow (the fragment-exit discard test and the compute

@@ -304,6 +304,7 @@ class Gen:
         self.x_marks = []          # emulate: (index into body, segment) where a segment of the current block ends
         self.x_segs = {}           # emulate: continuation segment -> its SPIR-V lines
         self.x_spills = []         # emulate: (Function variable, pointer type) carrying a value across a round
+        self.eager_vars = []       # (Function variable, pointer type) a subgroup op's result is stored to (see eager)
         self.x_ptr_types = {}      # emulate: value type -> Function pointer type declared for spills
         self.x_dirty = set()       # emulate: (memory kind "lds"/"mem", "r"/"w") accessed since the last round
         self.x_tok = {}            # emulate: register -> the SSA id last stored to it in this block (its value's identity)
@@ -1137,6 +1138,21 @@ class Gen:
     def emit_land(self, a, b):
         r = self.tmp()
         self.emit(f"{r} = OpLogicalAnd %bool {a} {b}")
+        return r
+
+    def eager(self, ty, val):
+        """val (a %uint or %bool), stored to a Function variable of its own and loaded back (SHADER-529).
+
+        SPIRV-Cross (MoltenVK) inlines a result used once into the expression that uses it. On the right of an
+        OpLogicalAnd/OpLogicalOr that is a short-circuiting && / ||, and in an arm of a scalar OpSelect a ternary,
+        so a subgroup op there runs only in the lanes that get that far: a ballot misses the other lanes' bits and
+        a shuffle reads from lanes that never ran it. A store is a statement, which every lane runs."""
+        ptr = {"%uint": "%_ptr_Function_uint", "%bool": "%_ptr_Function_bool"}[ty]
+        var = f"%eager{len(self.eager_vars)}"
+        self.eager_vars.append((var, ptr))
+        self.emit(f"OpStore {var} {val}")
+        r = self.tmp()
+        self.emit(f"{r} = OpLoad {ty} {var}")
         return r
 
     def f16_pack2(self, lo, hi, exact_tiny=False):
@@ -5532,8 +5548,10 @@ class Gen:
                 ballot = self.tmp()
                 self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {self.active_b()}")
                 self.uses_ballot = True
-                active = self.tmp()
-                self.emit(f"{active} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {ballot} {safe_sg}")
+                bit = self.tmp()
+                self.emit(f"{bit} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {ballot} {safe_sg}")
+                # Every lane runs the ballot, also the out-of-row lanes whose bit another lane reads (SHADER-529).
+                active = self.eager("%bool", bit)
                 if in_bounds is not None:
                     both = self.tmp()
                     self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {active}")
@@ -5541,8 +5559,10 @@ class Gen:
                 src_ok = active
             if src.get("k") == "vgpr":
                 self.uses_subgroup = True
-                shuffled = self.tmp()
-                self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint {self.cu(3)} {src_val} {safe_sg}")
+                sh_val = self.tmp()
+                self.emit(f"{sh_val} = OpGroupNonUniformShuffle %uint {self.cu(3)} {src_val} {safe_sg}")
+                # The shuffle is read in the arms of selects below; every lane must still run it (SHADER-529).
+                shuffled = self.eager("%uint", sh_val)
             else:
                 shuffled = src_val
 
@@ -12847,7 +12867,8 @@ def assemble(gen):
           "%vcc_hi = OpVariable %_ptr_Function_uint Function %c0",
           "%scc = OpVariable %_ptr_Function_uint Function %c0",
           *(["%mode_r16 = OpVariable %_ptr_Function_uint Function %c0"] if gen.round_mode else []),
-          "%active = OpVariable %_ptr_Function_bool Function %true"]
+          "%active = OpVariable %_ptr_Function_bool Function %true",
+          *[f"{var} = OpVariable {ptr} Function" for var, ptr in gen.eager_vars]]
     if gen.vm_latch:
         fn += ["%vm_mask = OpVariable %_ptr_Function_bool Function %true",
                "%vm_set = OpVariable %_ptr_Function_bool Function %false"]
