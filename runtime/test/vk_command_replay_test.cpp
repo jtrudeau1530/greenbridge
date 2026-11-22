@@ -1192,7 +1192,12 @@ int part_i(vktest::Device& d) {
 
 int main() {
     vktest::Device device;
-    EXPECT(device.create());
+    const auto status = device.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
+        std::printf("vk_command_replay_test: no Vulkan device, skipped\n");
+        return 77;
+    }
+    EXPECT(status == vktest::DeviceStatus::ready);
     if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device) ||
         part_g(device) || part_h(device) || part_i(device))
         return 1;

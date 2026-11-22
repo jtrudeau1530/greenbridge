@@ -838,6 +838,11 @@ if(TARGET Vulkan::Headers)
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
+    # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).
+    foreach(test vk_command_replay vk_predicated_copy vk_predicate_capture)
+      add_test(NAME ${test} COMMAND ${test}_test)
+      set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
     # The XDXR BVH builder: the GPU writes every case, then tools/xdxr_bvh.py validates and traces them.
     set(LEONIDA_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/xdxr_build_cases")
     file(MAKE_DIRECTORY "${LEONIDA_XDXR_OUT}")
