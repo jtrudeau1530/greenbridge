@@ -260,3 +260,74 @@ def test_cli_unwritable_report_is_one_error_line(tmp_path, kind):
     assert json.loads(index.read_text(encoding="utf-8")) == INDEX
     if kind == "under-a-file":
         assert blocker.read_bytes() == b"keep"
+
+
+# --pairs (D3D-318): the VS and PS of one technique, named alike apart from the stage token.
+
+def test_technique_names():
+    assert usc.technique("!VS_Water_0123abcd_Wrapped", "vs") == "Water"
+    assert usc.technique("#PS_Water_89abcdef_Wrapped", "ps") == "Water"
+    assert usc.technique("PS_Water", "ps") == "Water"
+    assert usc.technique("!VS_Water_0123abcd_Wrapped", "ps") is None   # the token must match the stage
+    assert usc.technique("standard_0123abcd_Wrapped", "vs") is None
+
+
+def root_block(params, stage, omit_invisible):
+    """User-SGPR reads of `stage` for root parameters [(kind, {stages that can see it})] packed from s8, one dword
+    each: in root order with a hole for an invisible parameter (one block), or without it (per-stage omission)."""
+    out, sgpr = [], 8
+    for kind, stages in params:
+        if stage in stages:
+            out.append((sgpr, kind))
+        if stage in stages or not omit_invisible:
+            sgpr += 1
+    return reads(*out)
+
+
+# A, both stages; B, pixel only; C and D, both stages.
+PARAMS = [("ptr32_lo", {"vs", "ps"}), ("const32", {"ps"}), ("ptr32_lo", {"vs", "ps"}), ("const32", {"vs", "ps"})]
+
+
+def technique_index(omit_invisible):
+    return {f"{prefix}{stage.upper()}_Fog_{h}_Wrapped": {"stage": stage, "user_sgpr_reads":
+                                                         root_block(PARAMS, stage, omit_invisible)}
+            for prefix, stage, h in (("!", "vs", "0123abcd"), ("#", "ps", "89abcdef"))}
+
+
+def test_one_block_in_root_order_agrees():
+    pc = usc.pair_census(technique_index(omit_invisible=False))
+    assert pc["techniques_with_vs_and_ps"] == 1 and pc["combinations"] == 1
+    # VS s8 A, s10 C, s11 D; PS s8 A, s9 B, s10 C, s11 D: three shared reads, all the same kind.
+    assert (pc["shared_same_kind"], pc["shared_different_kind"]) == (3, 0)
+    assert pc["combinations_with_a_one_sided_sgpr_below_a_shared_one"] == 1
+    assert (pc["above_one_sided_same_kind"], pc["above_one_sided_different_kind"]) == (2, 0)
+
+
+def test_per_stage_omission_disagrees():
+    pc = usc.pair_census(technique_index(omit_invisible=True))
+    # VS s8 A, s9 C, s10 D against PS s8 A, s9 B, s10 C, s11 D: C and D sit one SGPR lower in the VS.
+    assert (pc["shared_same_kind"], pc["shared_different_kind"]) == (1, 2)
+
+
+def test_unpaired_shaders_only_feed_the_control():
+    index = {
+        "!VS_Sky_0123abcd_Wrapped": {"stage": "vs", "user_sgpr_reads": reads((8, "ptr32_lo"), (9, "const32"))},
+        "#PS_Rain_89abcdef_Wrapped": {"stage": "ps", "user_sgpr_reads": reads((8, "ptr32_lo"), (9, "ptr32_lo"))},
+        "c.cs": {"stage": "cs", "user_sgpr_reads": reads((8, "ptr32_lo"))},
+    }
+    pc = usc.pair_census(index)
+    assert pc["techniques_with_vs_and_ps"] == 0 and pc["combinations"] == 0
+    assert pc["control_all_vs_ps"] == {"combinations": 1, "shared_same_kind": 1, "shared_different_kind": 1}
+
+
+def test_pairs_cli_writes_the_report_and_no_names():
+    with tempfile.TemporaryDirectory() as tmp:
+        index = Path(tmp, "index.json")
+        report = Path(tmp, "report.json")
+        index.write_text(json.dumps(technique_index(omit_invisible=False)), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "user_sgpr_census.py"),
+                                 str(index), "--pairs", "--json", str(report)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert "VS/PS pairs: 1 techniques with both stages" in result.stdout
+        assert "Fog" not in result.stdout
+        assert json.loads(report.read_text(encoding="utf-8"))["vs_ps_pairs"]["shared_different_kind"] == 0
