@@ -116,7 +116,7 @@ def classify(head, size, tail=None):
     decompressor. `size` is the inflated size.
     """
     row = {"kind": "raw", "signature": "", "version": ""}
-    body = head[3:40] if head[:3] == b"\xef\xbb\xbf" else head[:40]
+    body = head[3:] if head[:3] == b"\xef\xbb\xbf" else head
     if body.startswith(b"<?xml"):
         row.update(kind="xml", signature="xml", fragment=False)
         rest = body
