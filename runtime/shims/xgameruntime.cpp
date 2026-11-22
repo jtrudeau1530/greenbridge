@@ -100,6 +100,7 @@ void print_guid(char (&out)[40], const GUID* g) {
 
 constexpr GUID kThreadingClass = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
 constexpr GUID kErrorClass = {0x8ca467f7, 0x22e8, 0x4096, {0x84, 0x56, 0xbb, 0x8a, 0xa1, 0x3f, 0x79, 0xd8}};
+constexpr GUID kNetworkingClass = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
 
 // A function's arguments after `this`, forwarded unchanged (x64 has one calling convention).
 // Specialised on the function's exact type, so a noexcept function matches only one form.
@@ -220,13 +221,130 @@ const void* const kErrorVtable[] = {
     reinterpret_cast<const void*>(&error_set_options),   // 5
 };
 
+// IXNetworkingImpl2: 18 methods (slots 3-20). XCurl.dll calls slots 11-17 (docs/runtime_imports.md):
+// the UTF-16 XNetworkingQuerySecurityInformationForUrl* trio, XNetworkingVerifyServerCertificate,
+// XNetworkingGetConnectivityHint, XNetworkingRegisterConnectivityHintChanged and
+// XNetworkingUnregisterConnectivityHintChanged. Offline, connectivity hints report an initialized
+// network with unrestricted internet access, certificate verification succeeds, and registered callbacks
+// are tracked safely.
+enum class XNetworkingConnectivityLevelHint : uint32_t {
+    Unknown = 0,
+    None = 1,
+    LocalAccess = 2,
+    InternetAccess = 3,
+    ConstrainedInternetAccess = 4,
+};
+
+enum class XNetworkingConnectivityCostHint : uint32_t {
+    Unknown = 0,
+    Unrestricted = 1,
+    Fixed = 2,
+    Variable = 3,
+};
+
+struct XNetworkingConnectivityHint {
+    XNetworkingConnectivityLevelHint connectivityLevelHint;
+    XNetworkingConnectivityCostHint connectivityCostHint;
+    uint32_t ianaInterfaceType;
+    bool networkInitialized;
+    bool approachingDataLimit;
+    bool overDataLimit;
+    bool roaming;
+};
+
+using XNetworkingConnectivityHintChangedCallback = void(CALLBACK*)(void* context, const XNetworkingConnectivityHint* hint);
+
+template <int Slot> uint64_t STDMETHODCALLTYPE networking_slot(void*) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XNetworkingImpl slot %d called; answering 0\n", Slot);
+    return 0;
+}
+
+// Slot 11: XNetworkingQuerySecurityInformationForUrlUtf16Async(const wchar_t* url, XAsyncBlock* async)
+HRESULT STDMETHODCALLTYPE networking_query_security_info_async(void*, const wchar_t*, XAsyncBlock* async) {
+    if (async) XAsyncComplete(async, S_OK, 0);
+    return S_OK;
+}
+
+// Slot 12: XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize(XAsyncBlock* async, size_t* size)
+HRESULT STDMETHODCALLTYPE networking_query_security_info_size(void*, XAsyncBlock*, size_t* size) {
+    if (size) *size = 0;
+    return S_OK;
+}
+
+// Slot 13: XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(XAsyncBlock*, size_t, size_t*, uint8_t*, void**)
+HRESULT STDMETHODCALLTYPE networking_query_security_info_result(void*, XAsyncBlock*, size_t, size_t* used, uint8_t*, void** info) {
+    if (used) *used = 0;
+    if (info) *info = nullptr;
+    return S_OK;
+}
+
+// Slot 14: XNetworkingVerifyServerCertificate(void* requestHandle, const void* securityInformation)
+HRESULT STDMETHODCALLTYPE networking_verify_server_cert(void*, void*, const void*) {
+    return S_OK;
+}
+
+// Slot 15: XNetworkingGetConnectivityHint(XNetworkingConnectivityHint* hint)
+HRESULT STDMETHODCALLTYPE networking_get_connectivity_hint(void*, XNetworkingConnectivityHint* hint) {
+    if (!hint) return E_POINTER;
+    hint->connectivityLevelHint = XNetworkingConnectivityLevelHint::InternetAccess;
+    hint->connectivityCostHint = XNetworkingConnectivityCostHint::Unrestricted;
+    hint->ianaInterfaceType = 6;  // MIB_IF_TYPE_ETHERNET
+    hint->networkInitialized = true;
+    hint->approachingDataLimit = false;
+    hint->overDataLimit = false;
+    hint->roaming = false;
+    return S_OK;
+}
+
+// Slot 16: XNetworkingRegisterConnectivityHintChanged(XTaskQueueHandle, void*, Callback, XTaskQueueRegistrationToken*)
+std::atomic<uint64_t> g_next_network_token{1};
+HRESULT STDMETHODCALLTYPE networking_register_connectivity_hint_changed(void*, XTaskQueueHandle, void*,
+                                                                       XNetworkingConnectivityHintChangedCallback,
+                                                                       XTaskQueueRegistrationToken* token) {
+    if (token) token->token = g_next_network_token.fetch_add(1);
+    return S_OK;
+}
+
+// Slot 17: XNetworkingUnregisterConnectivityHintChanged(XTaskQueueRegistrationToken token, bool wait)
+bool STDMETHODCALLTYPE networking_unregister_connectivity_hint_changed(void*, XTaskQueueRegistrationToken, bool) {
+    return true;
+}
+
+const void* const kNetworkingVtable[] = {
+    reinterpret_cast<const void*>(&object_query_interface),
+    reinterpret_cast<const void*>(&object_add_ref),
+    reinterpret_cast<const void*>(&object_release),
+    reinterpret_cast<const void*>(&networking_slot<3>),   // 3
+    reinterpret_cast<const void*>(&networking_slot<4>),   // 4
+    reinterpret_cast<const void*>(&networking_slot<5>),   // 5
+    reinterpret_cast<const void*>(&networking_slot<6>),   // 6
+    reinterpret_cast<const void*>(&networking_slot<7>),   // 7
+    reinterpret_cast<const void*>(&networking_slot<8>),   // 8
+    reinterpret_cast<const void*>(&networking_slot<9>),   // 9
+    reinterpret_cast<const void*>(&networking_slot<10>),  // 10
+    reinterpret_cast<const void*>(&networking_query_security_info_async),    // 11
+    reinterpret_cast<const void*>(&networking_query_security_info_size),     // 12
+    reinterpret_cast<const void*>(&networking_query_security_info_result),   // 13
+    reinterpret_cast<const void*>(&networking_verify_server_cert),           // 14
+    reinterpret_cast<const void*>(&networking_get_connectivity_hint),        // 15
+    reinterpret_cast<const void*>(&networking_register_connectivity_hint_changed),    // 16
+    reinterpret_cast<const void*>(&networking_unregister_connectivity_hint_changed),  // 17
+    reinterpret_cast<const void*>(&networking_slot<18>),  // 18
+    reinterpret_cast<const void*>(&networking_slot<19>),  // 19
+    reinterpret_cast<const void*>(&networking_slot<20>),  // 20
+};
+static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl2's 18 methods");
+
 RuntimeObject g_threading{kThreadingVtable, &kThreadingClass};
 RuntimeObject g_error{kErrorVtable, &kErrorClass};
+RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass};
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error})
+        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
     }
     char cls[40], iid[40];
