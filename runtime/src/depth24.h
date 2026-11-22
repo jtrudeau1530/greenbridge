@@ -50,8 +50,15 @@ inline float depth24_clear_value(float value) { return depth24_to_float(depth24_
 // One copy between a footprint (words of 24-bit depth) and the D32 aspect of a texture, as the compute pass sees it.
 // The pass converts between the application's buffer and a tight scratch buffer of floats; a copy command moves the
 // scratch to or from the image. vulkan_depth24.h fills the scratch and descriptor fields in `prepare`.
+//
+// The same pass, scratch and job repack 96-bit R32G32B32 texels (`rgb96`, D3D-62): the footprint then has three
+// words a texel and the scratch four (the layer's R32G32B32A32 image), copied as they are. The row and slice
+// distances stay in words; only the texel's width differs (app_texel_words, scratch_texel_words).
 struct Depth24Job {
     bool to_float = false;           // an upload (D24 words to floats); false: a readback (floats to words)
+    bool rgb96 = false;              // 96-bit texels: `to_float` is only the direction (true: the upload)
+    std::uint32_t app_texel_words() const { return rgb96 ? 3 : 1; }
+    std::uint32_t scratch_texel_words() const { return rgb96 ? 4 : 1; }
     VkBuffer app = VK_NULL_HANDLE;   // the application's buffer
     std::uint64_t app_offset = 0;    // bytes, a multiple of 4
     std::uint64_t app_size = 0;      // bytes in the buffer
@@ -59,7 +66,7 @@ struct Depth24Job {
     std::uint32_t app_row_words = 0;    // words between rows and between slices of the footprint
     std::uint32_t app_slice_words = 0;
     // Set by prepare:
-    VkBuffer scratch = VK_NULL_HANDLE;  // width * height * slices floats, tightly packed
+    VkBuffer scratch = VK_NULL_HANDLE;  // width * height * slices texels (floats, or four words), tightly packed
     VkDeviceSize scratch_offset = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
     std::uint32_t app_base_words = 0;   // the region's first word in the descriptor's window

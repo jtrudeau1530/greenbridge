@@ -1629,6 +1629,126 @@ int main() {
             std::printf("bindless capacity: the %uth SRV through the %uth sampler gave the texture\n", many_views + 1,
                         many_samplers);
         }
+
+        // 96-bit textures (D3D-62): R32G32B32_FLOAT holding the texture's red, green and blue as n/255,
+        // R32G32B32_UINT holding them as integers, and R32G32B32_TYPELESS holding the floats. Their texels are 12
+        // bytes; the layer keeps them in RGBA32 images whose fourth channel no upload writes, and a shader must
+        // read alpha as one. Default views of the typed textures, then the TYPELESS one through a FLOAT view and a
+        // UINT view (the bits of n/255 as integers: the shader clamps to 255, so 0 stays 0 and the rest is 255).
+        {
+            constexpr UINT rgb96_count = 3, rgb96_views = 4, rgb96_null = rgb96_views;
+            constexpr DXGI_FORMAT rgb96_formats[rgb96_count] = {DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32_UINT,
+                                                                DXGI_FORMAT_R32G32B32_TYPELESS};
+            constexpr UINT rgb96_view_texture[rgb96_views] = {0, 1, 2, 2};
+            constexpr bool rgb96_view_uint[rgb96_views] = {false, true, false, true};
+            Ref<ID3D12Resource> rgb96_textures[rgb96_count], rgb96_upload;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT rgb96_placed[rgb96_count]{};
+            const auto rgb96_upload_desc = buffer_desc(16384, D3D12_RESOURCE_FLAG_NONE);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &rgb96_upload_desc,
+                                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                             IID_PPV_ARGS(&rgb96_upload.p))));
+            void* rgb96_mapped = nullptr;
+            EXPECT(SUCCEEDED(rgb96_upload->Map(0, nullptr, &rgb96_mapped)));
+            for (UINT k = 0; k < rgb96_count; ++k) {
+                D3D12_RESOURCE_DESC rgb96_desc = texture_desc;
+                rgb96_desc.Format = rgb96_formats[k];
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rgb96_desc,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&rgb96_textures[k].p))));
+                device->GetCopyableFootprints(&rgb96_desc, 0, 1, k * 4096, &rgb96_placed[k], nullptr, nullptr, nullptr);
+                EXPECT(rgb96_placed[k].Footprint.Format == rgb96_formats[k]);
+                for (UINT y = 0; y < size; ++y)
+                    for (UINT x = 0; x < size; ++x)
+                        for (UINT c = 0; c < 3; ++c) {
+                            const float as_float = float(texel(x, y)[c]) / 255.0f;
+                            const std::uint32_t as_uint = texel(x, y)[c];
+                            std::memcpy(static_cast<std::uint8_t*>(rgb96_mapped) + rgb96_placed[k].Offset +
+                                            y * rgb96_placed[k].Footprint.RowPitch + x * 12 + c * 4,
+                                        k == 1 ? static_cast<const void*>(&as_uint) : static_cast<const void*>(&as_float), 4);
+                        }
+            }
+            rgb96_upload->Unmap(0, nullptr);
+
+            Ref<ID3D12DescriptorHeap> rgb96_heap;
+            const D3D12_DESCRIPTOR_HEAP_DESC rgb96_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, rgb96_views + 1,
+                                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&rgb96_heap_desc, IID_PPV_ARGS(&rgb96_heap.p))));
+            const std::uint64_t rgb96_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(rgb96_heap.p, 9))(rgb96_heap.p);
+            const auto rgb96_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(rgb96_cpu + i * step)}; };
+            const auto rgb96_bytes = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(rgb96_cpu + i * step); };
+            D3D12_SHADER_RESOURCE_VIEW_DESC rgb96_view{};
+            rgb96_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            rgb96_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            rgb96_view.Texture2D.MipLevels = 1;
+            for (UINT k = 0; k < rgb96_views; ++k) {
+                rgb96_view.Format = rgb96_view_uint[k] ? DXGI_FORMAT_R32G32B32_UINT : DXGI_FORMAT_R32G32B32_FLOAT;
+                device->CreateShaderResourceView(rgb96_textures[rgb96_view_texture[k]].p, k < 2 ? nullptr : &rgb96_view,
+                                                 rgb96_slot(k));
+                // The T# names the three-channel format (GFX10_FORMAT_32_32_32_UINT is 72, _FLOAT 74).
+                leonida::gfx10::ImageWords rgb96_words{};
+                std::memcpy(rgb96_words.data(), rgb96_bytes(k), sizeof(rgb96_words));
+                leonida::gfx10::Image rgb96_image{};
+                EXPECT(leonida::gfx10::is_image(rgb96_words) && leonida::gfx10::decode(rgb96_words, rgb96_image));
+                EXPECT(rgb96_image.format == (rgb96_view_uint[k] ? 72u : 74u));
+            }
+            // A 96-bit texture has no view of a four-channel format, a four-channel one none of a 96-bit format, and
+            // a typed 96-bit texture none of another type (only the TYPELESS one is cast).
+            const std::pair<ID3D12Resource*, DXGI_FORMAT> wrong[] = {
+                {rgb96_textures[0].p, DXGI_FORMAT_R32G32B32A32_FLOAT},
+                {texture.p, DXGI_FORMAT_R32G32B32_FLOAT},
+                {rgb96_textures[0].p, DXGI_FORMAT_R32G32B32_UINT},
+                {rgb96_textures[2].p, DXGI_FORMAT_R32G32B32A32_UINT}};
+            for (const auto& [resource, format] : wrong) {
+                rgb96_view.Format = format;
+                std::memset(rgb96_bytes(rgb96_null), 0x77, step);
+                device->CreateShaderResourceView(resource, &rgb96_view, rgb96_slot(rgb96_null));
+                EXPECT(std::all_of(rgb96_bytes(rgb96_null), rgb96_bytes(rgb96_null) + step,
+                                   [](std::uint8_t byte) { return byte == 0; }));
+            }
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            D3D12_TEXTURE_COPY_LOCATION to_rgb96{}, from_rgb96{};
+            to_rgb96.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from_rgb96.pResource = rgb96_upload.p;
+            from_rgb96.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            for (UINT k = 0; k < rgb96_count; ++k) {
+                to_rgb96.pResource = rgb96_textures[k].p;
+                from_rgb96.PlacedFootprint = rgb96_placed[k];
+                list->CopyTextureRegion(&to_rgb96, 0, 0, 0, &from_rgb96, nullptr);
+                const auto ready = transition(rgb96_textures[k].p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                list->ResourceBarrier(1, &ready);
+            }
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            d.fn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(d.device);
+
+            SampleKeys rgb96_keys[rgb96_views] = {};
+            for (UINT k = 0; k < rgb96_views; ++k) {
+                std::memcpy(rgb96_keys[k].tsharp, rgb96_bytes(k), sizeof(rgb96_keys[k].tsharp));
+                std::memcpy(rgb96_keys[k].ssharp, sampler_bytes, sizeof(rgb96_keys[k].ssharp));
+                rgb96_keys[k].first = k * texels;
+                rgb96_keys[k].mode = rgb96_view_uint[k] ? 1 : 0;
+            }
+            std::vector<std::uint8_t> rgb96_pixels(rgb96_views * bytes);
+            EXPECT(sample_through_set(d, set0, set0_layout, rgb96_keys, rgb96_pixels.data()));
+            const char* rgb96_names[rgb96_views] = {"FLOAT", "UINT", "TYPELESS as FLOAT", "TYPELESS as UINT"};
+            UINT rgb96_differ = 0;
+            for (UINT k = 0; k < rgb96_views; ++k)
+                for (UINT i = 0; i < texels; ++i) {
+                    std::array<std::uint8_t, 4> want = texel(i % size, i / size);
+                    if (k == 3)
+                        for (UINT c = 0; c < 3; ++c) want[c] = want[c] ? 255 : 0;
+                    want[3] = rgb96_view_uint[k] ? 1 : 255;  // alpha is one: 1 as an integer, 255 as UNORM
+                    const std::uint8_t* got = rgb96_pixels.data() + k * bytes + i * 4;
+                    if (std::memcmp(got, want.data(), 4) != 0 && rgb96_differ++ < 4)
+                        std::fprintf(stderr, "R32G32B32_%s texel %u: got %u,%u,%u,%u, want %u,%u,%u,%u\n", rgb96_names[k],
+                                     i, unsigned(got[0]), unsigned(got[1]), unsigned(got[2]), unsigned(got[3]),
+                                     unsigned(want[0]), unsigned(want[1]), unsigned(want[2]), unsigned(want[3]));
+                }
+            EXPECT(rgb96_differ == 0);
+        }
 #endif
 
         // A destroyed texture takes its views out of the set: the next ExecuteCommandLists writes that, and nothing
