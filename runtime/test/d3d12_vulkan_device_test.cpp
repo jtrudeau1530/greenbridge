@@ -2717,6 +2717,14 @@ HRESULT command_signature(ID3D12Device* device, UINT stride, std::initializer_li
     return released(device->CreateCommandSignature(&desc, nullptr, __uuidof(ID3D12CommandSignature), &out), &out);
 }
 
+// CheckFeatureSupport(FORMAT_SUPPORT) for `value`: the HRESULT, or Support1 when it succeeds (Support2 holds what the
+// GPU can do, such as TILED, which the layer doesn't offer, so it isn't compared).
+HRESULT format_support1(ID3D12Device* device, UINT value) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{static_cast<DXGI_FORMAT>(value)};
+    const HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support));
+    return SUCCEEDED(hr) ? static_cast<HRESULT>(support.Support1) : hr;
+}
+
 HRESULT fence(ID3D12Device* device, D3D12_FENCE_FLAGS flags, REFIID riid = __uuidof(ID3D12Fence)) {
     void* out = nullptr;
     return released(device->CreateFence(0, flags, riid, &out), &out);
@@ -3525,6 +3533,19 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              return command_queue(d, {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 1});
          }},
         // CreateFence.
+        // FORMAT_SUPPORT for values the runtime's format table has no entry for (E_FAIL), and for UNKNOWN (a buffer
+        // format: Support1 is compared, not Support2).
+        {"format support: UNKNOWN", [](ID3D12Device* d) { return format_support1(d, DXGI_FORMAT_UNKNOWN); }},
+        {"format support: 116, the first unused value", [](ID3D12Device* d) { return format_support1(d, 0x74u); }},
+        {"format support: 129", [](ID3D12Device* d) { return format_support1(d, 0x81u); }},
+        {"format support: 130, P208", [](ID3D12Device* d) { return format_support1(d, 0x82u); }},
+        {"format support: 131, V208", [](ID3D12Device* d) { return format_support1(d, 0x83u); }},
+        {"format support: 132, V408", [](ID3D12Device* d) { return format_support1(d, 0x84u); }},
+        {"format support: 133", [](ID3D12Device* d) { return format_support1(d, 0x85u); }},
+        {"format support: 188", [](ID3D12Device* d) { return format_support1(d, 0xbcu); }},
+        {"format support: 192, past A4B4G4R4", [](ID3D12Device* d) { return format_support1(d, 0xc0u); }},
+        {"format support: 1000", [](ID3D12Device* d) { return format_support1(d, 0x3e8u); }},
+        {"format support: -1", [](ID3D12Device* d) { return format_support1(d, 0xffffffffu); }},
         {"fence: null output", [](ID3D12Device* d) {
              return d->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), nullptr);
          }},
@@ -3936,8 +3957,20 @@ int main() {
         unsupported_quality.SampleDesc.Quality = 1;
         EXPECT(device->GetResourceAllocationInfo(0, 1, &unsupported_quality).SizeInBytes == UINT64_MAX);
 
-        D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{DXGI_FORMAT_UNKNOWN};
-        EXPECT(FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format))));
+        // UNKNOWN is a buffer format to the host runtime (S_OK, Support1 BUFFER; "format support: UNKNOWN" compares
+        // it), and a value past its format table is E_FAIL.
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT unknown_format{DXGI_FORMAT_UNKNOWN};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &unknown_format, sizeof(unknown_format)) ==
+                   S_OK &&
+               unknown_format.Support1 == D3D12_FORMAT_SUPPORT1_BUFFER);
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid_format{static_cast<DXGI_FORMAT>(116)};
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &invalid_format, sizeof(invalid_format)) ==
+               E_FAIL);
+        // The table's last entries before and after the gap are formats, whatever this GPU supports of them.
+        for (const UINT edge : {115u, 189u, 191u}) {  // B4G4R4A4_UNORM, SAMPLER_FEEDBACK_MIN_MIP_OPAQUE, A4B4G4R4_UNORM
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT known{static_cast<DXGI_FORMAT>(edge)};
+            EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &known, sizeof(known)) != E_FAIL);
+        }
 
         // D3D-61: XR_BIAS is a display-only format with the R10G10B10A2 bit layout. The layer can create and
         // copy it, and its views can cast to the ordinary 10:10:10:2 format, but it does not claim display or
