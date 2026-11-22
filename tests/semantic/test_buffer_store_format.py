@@ -41,6 +41,33 @@ if TOOLS_DIR not in sys.path:
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import rdna2spirv  # noqa: E402
+import shader_ir  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
+
+
+def make_fssm(rsrc2: int = 0x8088, group: tuple[int, int, int] = (64, 1, 1)) -> bytes:
+    """The compute-shader header words the translator reads: COMPUTE_PGM_RSRC2 and thread group size."""
+    header = bytearray(0x148)
+    struct.pack_into("<4I", header, 0x138, rsrc2, *group)
+    return bytes(header)
+
+
+CS_FSSM = make_fssm(0x8088, (64, 1, 1))
+OUT_VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
+
+
+def run_cs(spv: str, memory: dict[int, int], push_constants: list[int] | None = None) -> dict[str, tuple]:
+    """Execute compute shader through mini-interpreter with specified push constants and memory."""
+    pc = push_constants if push_constants is not None else (OUT_VSHARP + [0] * 28)
+    return si.run_fragment(
+        spv,
+        inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+        push_constants=pc,
+        memory=memory,
+    )
+
 MASK14 = 0x3FFF
 MASK16 = 0xFFFF
 MASK32 = 0xFFFFFFFF
@@ -764,6 +791,221 @@ class TestWaveBoundsAndSIMDDivergence(unittest.TestCase):
         expected_base = 0x6000 + 0x20 + 0x10
         for i, val in enumerate([100, 200, 300, 400]):
             self.assertEqual(wave.read_dword(expected_base + 4 * i), val)
+
+
+class TestSpirvEmission(unittest.TestCase):
+    def test_tbuffer_store_emits_storage_buffer_ops_not_image_write(self) -> None:
+        spv = support.translate_lines(
+            "cs_tbuf_spv_emission",
+            [
+                "v_mov_b32_e32 v20, 1.0",
+                "v_mov_b32_e32 v21, 2.0",
+                "v_mov_b32_e32 v22, 3.0",
+                "v_mov_b32_e32 v23, 4.0",
+                "v_mov_b32_e32 v5, 0x200",
+                "tbuffer_store_format_xyzw v[20:23], v5, s[0:3], 0 format:[BUF_FMT_32_32_32_32_FLOAT] offen",
+                "s_endpgm",
+            ],
+            fssm=CS_FSSM,
+        )
+        self.assertIn("OpConvertUToPtr", spv)
+        self.assertIn("OpStore", spv)
+        self.assertIn("OpBranchConditional", spv)
+        self.assertIn("OpSelectionMerge", spv)
+        self.assertNotIn("OpImageWrite", spv)
+
+    def test_image_store_contrast_emits_op_image_write(self) -> None:
+        g = rdna2spirv.Gen("cs")
+        ins = shader_ir.parse_line("image_store v[1:4], v[10:11], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D")
+        g.image_store(ins["args"], ins["mods"], "dim:SQ_RSRC_IMG_2D")
+        has_image_write = any("OpImageWrite" in ln for ln in g.body)
+        self.assertTrue(has_image_write)
+
+    def test_sub_dword_unorm8_emits_atomic_rmw(self) -> None:
+        spv = support.translate_lines(
+            "cs_tbuf_atomic_rmw",
+            [
+                "v_mov_b32_e32 v20, 1.0",
+                "v_mov_b32_e32 v5, 0x200",
+                "tbuffer_store_format_x v20, v5, s[0:3], 0 format:[BUF_FMT_8_UNORM] offen",
+                "s_endpgm",
+            ],
+            fssm=CS_FSSM,
+        )
+        self.assertIn("OpAtomicAnd", spv)
+        self.assertIn("OpAtomicOr", spv)
+
+
+class TestSpirvNegativeControls(unittest.TestCase):
+    def test_unsupported_format_raises_exception(self) -> None:
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines(
+                "cs_tbuf_unsupported_fmt",
+                [
+                    "v_mov_b32_e32 v20, 1.0",
+                    "v_mov_b32_e32 v5, 0x200",
+                    "tbuffer_store_format_x v20, v5, s[0:3], 0 format:[BUF_FMT_8_USCALED] offen",
+                    "s_endpgm",
+                ],
+                fssm=CS_FSSM,
+            )
+
+    def test_unsupported_modifier_lds_raises_exception(self) -> None:
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines(
+                "cs_tbuf_unsupported_mod",
+                [
+                    "v_mov_b32_e32 v20, 1.0",
+                    "v_mov_b32_e32 v5, 0x200",
+                    "tbuffer_store_format_x v20, v5, s[0:3], 0 lds format:[BUF_FMT_8_UNORM] offen",
+                    "s_endpgm",
+                ],
+                fssm=CS_FSSM,
+            )
+
+    def test_invalid_vsharp_sgpr_count_raises_exception(self) -> None:
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines(
+                "cs_tbuf_invalid_sgpr",
+                [
+                    "v_mov_b32_e32 v20, 1.0",
+                    "v_mov_b32_e32 v5, 0x200",
+                    "tbuffer_store_format_x v20, v5, s[0:1], 0 format:[BUF_FMT_8_UNORM] offen",
+                    "s_endpgm",
+                ],
+                fssm=CS_FSSM,
+            )
+
+
+class TestSpirvEndToEndExecution(unittest.TestCase):
+    def test_e2e_tbuffer_store_format_x_unorm8(self) -> None:
+        spv = support.translate_lines(
+            "cs_e2e_tbuf_u8",
+            [
+                "v_mov_b32_e32 v20, 1.0",
+                "v_mov_b32_e32 v5, 0x200",
+                "tbuffer_store_format_x v20, v5, s[0:3], 0 format:[BUF_FMT_8_UNORM] offen",
+                "s_endpgm",
+            ],
+            fssm=CS_FSSM,
+        )
+        memory = {0x200: 0x11223344}
+        run_cs(spv, memory)
+        self.assertEqual(memory[0x200], 0x112233FF)
+
+    def test_e2e_tbuffer_store_format_xy_f16(self) -> None:
+        spv = support.translate_lines(
+            "cs_e2e_tbuf_f16",
+            [
+                "v_mov_b32_e32 v20, 1.0",
+                "v_mov_b32_e32 v21, 2.0",
+                "v_mov_b32_e32 v5, 0x200",
+                "tbuffer_store_format_xy v[20:21], v5, s[0:3], 0 format:[BUF_FMT_16_16_FLOAT] offen",
+                "s_endpgm",
+            ],
+            fssm=CS_FSSM,
+        )
+        memory = {0x200: 0xDEADBEEF}
+        run_cs(spv, memory)
+        self.assertEqual(memory[0x200], 0x40003C00)
+
+    def test_e2e_tbuffer_store_format_xy_u32(self) -> None:
+        spv = support.translate_lines(
+            "cs_e2e_tbuf_u32",
+            [
+                "v_mov_b32_e32 v20, 0x12345678",
+                "v_mov_b32_e32 v21, 0x9ABCDEF0",
+                "v_mov_b32_e32 v5, 0x200",
+                "tbuffer_store_format_xy v[20:21], v5, s[0:3], 0 format:[BUF_FMT_32_32_UINT] offen",
+                "s_endpgm",
+            ],
+            fssm=CS_FSSM,
+        )
+        memory: dict[int, int] = {}
+        run_cs(spv, memory)
+        self.assertEqual(memory[0x200], 0x12345678)
+        self.assertEqual(memory[0x204], 0x9ABCDEF0)
+
+    def test_e2e_tbuffer_store_format_xyzw_f32(self) -> None:
+        spv = support.translate_lines(
+            "cs_e2e_tbuf_f32",
+            [
+                "v_mov_b32_e32 v20, 1.0",
+                "v_mov_b32_e32 v21, 2.0",
+                "v_mov_b32_e32 v22, 3.0",
+                "v_mov_b32_e32 v23, 4.0",
+                "v_mov_b32_e32 v5, 0x200",
+                "tbuffer_store_format_xyzw v[20:23], v5, s[0:3], 0 format:[BUF_FMT_32_32_32_32_FLOAT] offen",
+                "s_endpgm",
+            ],
+            fssm=CS_FSSM,
+        )
+        memory: dict[int, int] = {}
+        run_cs(spv, memory)
+        self.assertEqual(memory[0x200], 0x3F800000)
+        self.assertEqual(memory[0x204], 0x40000000)
+        self.assertEqual(memory[0x208], 0x40400000)
+        self.assertEqual(memory[0x20C], 0x40800000)
+
+    def test_e2e_oob_zero_clamp_beyond_num_records(self) -> None:
+        spv = support.translate_lines(
+            "cs_e2e_tbuf_oob_clamp",
+            [
+                "v_mov_b32_e32 v20, 1.0",
+                "v_mov_b32_e32 v5, 0x200",
+                "tbuffer_store_format_x v20, v5, s[0:3], 0 format:[BUF_FMT_8_UNORM] offen",
+                "s_endpgm",
+            ],
+            fssm=CS_FSSM,
+        )
+        memory = {0x200: 0xCAFEBABE}
+        # num_records is 0x100 (256 bytes), store target is 0x200 (512 bytes) -> OOB
+        oob_vsharp = [0, 0, 0x100, 0x31016FAC]
+        run_cs(spv, memory, push_constants=oob_vsharp + [0] * 28)
+        self.assertEqual(memory[0x200], 0xCAFEBABE)
+
+    def test_e2e_oob_zero_clamp_element_straddle(self) -> None:
+        spv = support.translate_lines(
+            "cs_e2e_tbuf_straddle_clamp",
+            [
+                "v_mov_b32_e32 v20, 1.0",
+                "v_mov_b32_e32 v21, 2.0",
+                "v_mov_b32_e32 v22, 3.0",
+                "v_mov_b32_e32 v23, 4.0",
+                "v_mov_b32_e32 v5, 0x200",
+                "tbuffer_store_format_xyzw v[20:23], v5, s[0:3], 0 format:[BUF_FMT_32_32_32_32_FLOAT] offen",
+                "s_endpgm",
+            ],
+            fssm=CS_FSSM,
+        )
+        memory = {
+            0x200: 0xDEADBEEF,
+            0x204: 0xDEADBEEF,
+            0x208: 0xDEADBEEF,
+            0x20C: 0xDEADBEEF,
+        }
+        # num_records is 0x204 (516 bytes). 16-byte store at 0x200 needs bytes up to 0x210 -> straddles end!
+        straddle_vsharp = [0, 0, 0x204, 0x31016FAC]
+        run_cs(spv, memory, push_constants=straddle_vsharp + [0] * 28)
+        for dword_addr in (0x200, 0x204, 0x208, 0x20C):
+            self.assertEqual(memory[dword_addr], 0xDEADBEEF)
+
+    def test_e2e_invalid_vsharp_format_suppressed(self) -> None:
+        spv = support.translate_lines(
+            "cs_e2e_tbuf_invalid_vsharp_fmt",
+            [
+                "v_mov_b32_e32 v20, 1.0",
+                "v_mov_b32_e32 v5, 0x200",
+                "tbuffer_store_format_x v20, v5, s[0:3], 0 format:[BUF_FMT_8_UNORM] offen",
+                "s_endpgm",
+            ],
+            fssm=CS_FSSM,
+        )
+        memory = {0x200: 0x55555555}
+        # V# format field (bits 18:12) set to 0 (GFX10_FORMAT_INVALID)
+        invalid_fmt_vsharp = [0, 0, 0xFFFFFFFF, 0x31000FAC]
+        run_cs(spv, memory, push_constants=invalid_fmt_vsharp + [0] * 28)
+        self.assertEqual(memory[0x200], 0x55555555)
 
 
 if __name__ == "__main__":
