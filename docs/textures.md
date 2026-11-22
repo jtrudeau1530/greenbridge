@@ -781,12 +781,6 @@ bytes of each BCPack chunk. The 200-chunk entropy check used the public MDU tabl
 `silicon-rans` on the same mip-pair selection. The probes are not committed because they
 duplicate `Pool` and add no decoder; they write no texture data.
 
-The BCPack counts above come from a read-only aggregation over the same `Pool` parser: it
-mmaps each pool, reads the RDS5 header, chunk table and ETPF records, then reads the first 64
-bytes of each BCPack chunk. The 200-chunk entropy check used the public MDU tables from
-`silicon-rans` on the same mip-pair selection. The probes are not committed because they
-duplicate `Pool` and add no decoder; they write no texture data.
-
 `rpf9dump ttpf` writes one `manifest.json` per pool with a `Limitation` field for every
 catalog record, and its summary line has the same `ok` / `skip` totals. The first split above
 came from a read-only mirror of `TtpfReader`'s catalog checks: it mmapped each pool and read
