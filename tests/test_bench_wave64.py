@@ -50,5 +50,18 @@ class PartialFailure(unittest.TestCase):
         self.assertIn("no reference output from AMD native", out)
 
 
+class ArgumentValidation(unittest.TestCase):
+    def test_positive_only(self):
+        for option in ("--groups", "--reps", "--procs"):
+            for value in ("0", "-1"):
+                with self.subTest(option=option, value=value), \
+                        patch.object(sys, "argv", ["bench_wave64.py", option, value]), \
+                        patch.object(bench_wave64, "build") as build:
+                    with self.assertRaises(SystemExit) as e:
+                        bench_wave64.main()
+                    self.assertEqual(e.exception.code, 2)
+                    build.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

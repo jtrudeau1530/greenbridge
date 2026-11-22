@@ -38,12 +38,13 @@ import unittest
 import support
 
 M = 0xFFFFFFFF
+FINITE_EXPORT_XOR = 0x40000000
 
 # Independent constants, written down by hand (see derivations in the reference functions below).
-EXPECTED_PS_SDWA = [0x000000F1, 0xFFFEFFF2, 0x3C003344, 0xFFF70000]
-EXPECTED_PS_OPS = [0x48804300, 0x00000005, 0x00000007, 0xFFFFFFFC]
-EXPECTED_PS_OPS2 = [0xABCD4400, 0x46001234, 0xFFFFFFFA, 0x00000007]
-EXPECTED_PS_OPS3 = [0xFFFFFFFA, 0x44660066, 0x44AABBCC, 0x00000010]
+EXPECTED_PS_SDWA = [0x000000F1, 0xBFFEFFF2, 0x3C003344, 0xBFF70000]
+EXPECTED_PS_OPS = [0x48804300, 0x00000005, 0x00000007, 0xBFFFFFFC]
+EXPECTED_PS_OPS2 = [0xABCD4400, 0x46001234, 0xBFFFFFFA, 0x00000007]
+EXPECTED_PS_OPS3 = [0xBFFFFFFA, 0x44660066, 0x44AABBCC, 0x00000010]
 EXPECTED_PS_OPS4 = [0x34000010, 0x00120800, 0xBEEF0000, 0x12343C00]
 EXPECTED_PS_LEGACY_MUL = [0x00000000, 0x00000000, 0x00000000, 0x40C00000]
 
@@ -77,7 +78,7 @@ def reference_ps_sdwa():
     r2 = (_half(1.0) << 16) | (0x11223344 & 0xFFFF)                  # WORD_1 <- f16(1.0), low half preserved
     field = (v0 & 0xFF) | (v1 & 0xFF)                                # BYTE_0 | BYTE_0 = 0xf7
     r3 = (field << 16) | (0xFF000000 if field & 0x80 else 0)         # BYTE_2, UNUSED_SEXT: sign above, zero below
-    return [r0, r1, r2, r3]
+    return [r0, r1 ^ FINITE_EXPORT_XOR, r2, r3 ^ FINITE_EXPORT_XOR]
 
 
 def reference_ps_ops():
@@ -88,7 +89,7 @@ def reference_ps_ops():
     r2 = max(7, _s32(0xFFFFFFF0), 5) & M                             # v_max3_i32 (signed)
     f = (0xFFFFFFF0 >> 2) & 0xF                                      # bits [5:2]
     r3 = (f - 16 if f & 8 else f) & M                                # v_bfe_i32 sign extension of a 4-bit field
-    return [r0, r1, r2, r3]
+    return [r0, r1, r2, r3 ^ FINITE_EXPORT_XOR]
 
 
 def reference_ps_ops2():
@@ -97,7 +98,7 @@ def reference_ps_ops2():
     r1 = (_half(_unhalf(v0 >> 16) * _unhalf(v1 & 0xFFFF) + 0.0) << 16) | (0x00001234 & 0xFFFF)  # op_sel:[1,0,0,1]
     r2 = (5 - 10 - 1) & M                                            # v_subrev_co_ci_u32: v4 - 10 - borrow(1)
     r3 = 7 if (0 == ((0 << 32) | 0)) else 0                          # v_cmp_eq_u64 -> v_cndmask_b32
-    return [r0, r1, r2, r3]
+    return [r0, r1, r2 ^ FINITE_EXPORT_XOR, r3]
 
 
 def reference_ps_ops3():
@@ -111,7 +112,7 @@ def reference_ps_ops3():
     sign = (v7 >> 31) & 1
     msb_diff = next((bit for bit in range(30, -1, -1) if ((v7 >> bit) & 1) != sign), None)
     r3 = M if msb_diff is None else (31 - msb_diff)                  # v_ffbh_i32
-    return [r0, v5, v6, r3]
+    return [r0 ^ FINITE_EXPORT_XOR, v5, v6, r3]
 
 
 def reference_ps_ops4():

@@ -222,9 +222,15 @@ def build_for_index(spirv_dir):
 
 
 def main(argv):
+    if argv[1:] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
     if len(argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2
+    if not os.path.isdir(argv[1]):
+        print(f"ERROR: {argv[1]}: not a directory", file=sys.stderr)
+        return 1
     try:
         built = build_for_index(argv[1])
     except RuntimeError as e:

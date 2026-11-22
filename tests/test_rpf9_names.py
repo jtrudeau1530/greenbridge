@@ -315,6 +315,45 @@ class NamesTest(unittest.TestCase):
                 with self.subTest(case=name):
                     self._assert_validation_error_closes_mmap(arc, start, message)
 
+    def test_refuses_output_that_is_the_input_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            make_archive(arc)
+            with open(arc, "rb") as f:
+                original = f.read()
+            p = self.run_tool(arc, arc, "--quiet")
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("input archive", p.stderr)
+            with open(arc, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+    def test_publish_creates_nested_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            make_archive(arc)
+            out = os.path.join(tmp, "nested", "missing", "index.json")
+            p = self.run_tool(arc, out, "--quiet")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["summary"]["unique_names"], 3, doc["summary"])
+
+    def test_publish_leaves_existing_tmp_sibling_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            out = os.path.join(tmp, "index.json")
+            make_archive(arc)
+            sibling = out + ".tmp"
+            with open(sibling, "wb") as f:
+                f.write(b"pre-existing sibling")
+            p = self.run_tool(arc, out, "--quiet")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["summary"]["unique_names"], 3, doc["summary"])
+            with open(sibling, "rb") as f:
+                self.assertEqual(f.read(), b"pre-existing sibling")
+
 
 if __name__ == "__main__":
     unittest.main()

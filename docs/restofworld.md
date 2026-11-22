@@ -149,7 +149,8 @@ Of the 2,309 containers, 2,118 have all six sections, 38 have `LSCH`+`LENM`, 4 h
 149 have no parseable chain. An all-offset scan finds 2,275 `0DRP` occurrences in the inflated set: the
 2,118 `LRSC` payloads plus 157 in page payloads. The tag/length chain is contiguous and ends at `CHKS`,
 which is the same layout measured for `script.rpf`. The `LSNS` payload is high-entropy (5.228-7.990
-bits/byte, median 7.888) and none of the 2,118 payloads decompresses with zlib. No `SCRP`, `YSC`,
+bits/byte, median 7.888) and none of the 2,118 payloads decompresses with zlib; its block layout (a block table
+and 16-byte records) is decoded in [psin.md](psin.md#lsns), the record contents are not. No `SCRP`, `YSC`,
 `RSCC`, `RSC8`, `RBF0`, `FSSM` or Bink magic occurs anywhere in the inflated set. One of the 258 raw
 streams begins with `LSCH` but has no `PSIN` header; it is a fragment, not a container.
 
@@ -231,8 +232,8 @@ The section shapes differ by an order of magnitude, and no inflated stream is by
 `0DRP` pages) and 2,547 streams / 472,245,792 inflated bytes at 14 GiB (780 `42 40 00 00` pages); neither
 has a `PSIN` stream or a hash in common with `story000_script`. That is sample evidence, not a full
 20 GB proof. It supports the reading that `story000_script` is its own script-metadata corpus, not a
-copy of the base `script.rpf` records; no compiled-script container was found in it. The `LSNS` bodies
-remain opaque.
+copy of the base `script.rpf` records; no compiled-script container was found in it. The `LSNS` record
+contents remain opaque.
 
 ### `core_restofworld` against `packs.rpf` and `levels.rpf`
 
@@ -449,7 +450,7 @@ and 0.31. Only 12.1% of vertices are unit length as snorm10 and 7.7% as snorm8. 
 edges (block-weighted medians 0.46 to 0.71 for bytes 0-2), so it varies with the surface, but none of these
 encodings is a plain per-vertex normal.
 
-Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` payloads, the bodies of the
+Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
 core graphics blocks, final-slot widths remain unresolved, and of the component types only `0x21`
 (see above). The stride check
@@ -470,7 +471,7 @@ The bytes support the existing **RPF9/RAGE family**, not a new container:
   metadata resource; in a `PSIN` `LRSC` payload it is an 80-byte page-directory record. Neither form
   carries map-placement structs here.
 - `PSIN` is a sectioned metadata container, not a compiled-script container. The six tags and the
-  big-endian length chain are measured; `LSNS` semantics are not.
+  big-endian length chain are measured; the `LSNS` block layout is decoded, its record contents are not.
 - `RBF0` records carry schema names (movie subtitles, VFX texture-atlas metadata); XML records carry
   content definitions.
 - `RSC8` appears only as raw headers in the story-rest unread gap. No `RSC7` was found.
@@ -490,7 +491,8 @@ The only UI-adjacent evidence is content-manifest XML and text; there is no UI c
    page-directory record. `docs/world.md` already validates the `0x7a` header and schema tables; this
    page adds the two placements.
 5. A `PSIN` section walker for `LSCH`, `LENM`, `LSNS`, `LGID`, `LRSC` and `CHKS`. The chain is
-   measured; `LSNS` is high-entropy and not zlib. Do not call it bytecode without evidence.
+   measured; `LSNS` is a block table and 16-byte records ([psin.md](psin.md#lsns)), not zlib. Do not call it
+   bytecode without evidence.
 6. A model-page joiner. `rpf9dump` already exports 37 core models; the 924 name-bearing system pages
    are the larger page population, but grouping them into complete resources needs the missing TOC or
    a page-graph rule.

@@ -22,6 +22,20 @@ inline unsigned& validation_error_count() {
     return count;
 }
 
+inline unsigned& known_validation_error_count() {
+    static unsigned count = 0;
+    return count;
+}
+
+// The NVIDIA validation layer checks an sRGB swapchain as if it also had VK_IMAGE_USAGE_STORAGE_BIT, which the
+// presenter never requests and sRGB swapchain formats cannot support on that driver. Its VUID 01778 covers the
+// first message and the max-layers/max-extent follow-ons, so match the VUID rather than only the first text. The
+// presenter's own usage is checked against supportedUsageFlags before creation, so this VUID is the known false
+// positive here. It is counted separately so a test can skip only when it is the sole validation error.
+inline bool known_srgb_swapchain_storage_error(const VkDebugUtilsMessengerCallbackDataEXT* data) {
+    return data && data->pMessage && data->messageIdNumber == 0xc036022f;
+}
+
 // Only validation-type errors fail a test. General messages come from the loader and the layers around the
 // application: a third-party implicit layer that fails to load (an overlay or capture tool, for example) reports a
 // general error that says nothing about this code, so it is printed but not counted.
@@ -29,8 +43,14 @@ inline VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityF
                                                     VkDebugUtilsMessageTypeFlagsEXT types,
                                                     const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
     const bool validation = (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
-    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) ++validation_error_count();
-    std::fprintf(stderr, "%s: %s\n", validation ? "validation" : "vulkan (not counted)",
+    const bool known = (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation &&
+                       known_srgb_swapchain_storage_error(data);
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) {
+        ++validation_error_count();
+        if (known) ++known_validation_error_count();
+    }
+    std::fprintf(stderr, "%s%s: %s\n", validation ? "validation" : "vulkan (not counted)",
+                 known ? " (known sRGB swapchain check)" : "",
                  data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
 }
@@ -117,6 +137,7 @@ public:
     }
 
     unsigned validation_errors() const { return validation_error_count(); }
+    unsigned known_validation_errors() const { return known_validation_error_count(); }
 
     // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
     bool create(bool presentation = false) { return initialize(presentation) == DeviceStatus::ready; }
