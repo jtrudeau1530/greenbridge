@@ -1424,5 +1424,107 @@ class TestFmaF64StatusFlagsAndConditionCodes(unittest.TestCase):
         self.assertEqual(vcc_lt >> 32, 0)
 
 
+class TestFmaF64IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_operands_and_results(self):
+        sub_min = u64_to_f64(F64_SUB_MIN)  # 2**-1074
+        min_norm = u64_to_f64(F64_MIN_NORMAL)  # 2**-1022
+
+        # subnormal * 1.0 + 0.0 retains subnormal
+        res = ref_fma_f64_u64(F64_SUB_MIN, F64_ONE, F64_POS_ZERO)
+        self.assertEqual(res, F64_SUB_MIN)
+
+        # subnormal * 2.0 + 0.0 scales subnormal mantissa
+        res2 = ref_fma_f64_u64(F64_SUB_MIN, F64_TWO, F64_POS_ZERO)
+        self.assertEqual(res2, 0x0000000000000002)
+
+        # normal * 0.5 produces maximum subnormal
+        res_sub = ref_fma_f64_u64(F64_MIN_NORMAL, F64_HALF, F64_POS_ZERO)
+        self.assertEqual(res_sub, 0x0008000000000000)
+
+        # subnormal underflow rounds to zero
+        # sub_min * 0.25 rounds to 0.0
+        u_quarter = f64_to_u64(0.25)
+        res_zero = ref_fma_f64_u64(F64_SUB_MIN, u_quarter, F64_POS_ZERO)
+        self.assertEqual(res_zero, F64_POS_ZERO)
+
+    def test_signed_zeros_bitwise_representation(self):
+        # +0.0 * +0.0 + +0.0 = +0.0 (0x0000000000000000)
+        res_pp = ref_fma_f64_u64(F64_POS_ZERO, F64_POS_ZERO, F64_POS_ZERO)
+        self.assertEqual(res_pp, F64_POS_ZERO)
+
+        # -0.0 * 1.0 + -0.0 = -0.0 (0x8000000000000000)
+        res_nn = ref_fma_f64_u64(F64_NEG_ZERO, F64_ONE, F64_NEG_ZERO)
+        self.assertEqual(res_nn, F64_NEG_ZERO)
+
+        # -0.0 * -1.0 + +0.0 = +0.0
+        res_np = ref_fma_f64_u64(F64_NEG_ZERO, F64_NEG_ONE, F64_POS_ZERO)
+        self.assertEqual(res_np, F64_POS_ZERO)
+
+        # Cancellation: 1.0 * 1.0 + -1.0 = +0.0 in round-to-nearest
+        res_cancel = ref_fma_f64_u64(F64_ONE, F64_ONE, F64_NEG_ONE)
+        self.assertEqual(res_cancel, F64_POS_ZERO)
+
+    def test_infinities_propagation_and_invalids(self):
+        # (+inf) * 2.0 + 10.0 = +inf
+        u_ten = f64_to_u64(10.0)
+        res_inf = ref_fma_f64_u64(F64_POS_INF, F64_TWO, u_ten)
+        self.assertEqual(res_inf, F64_POS_INF)
+
+        # (-inf) * 2.0 + 10.0 = -inf
+        res_ninf = ref_fma_f64_u64(F64_NEG_INF, F64_TWO, u_ten)
+        self.assertEqual(res_ninf, F64_NEG_INF)
+
+        # (+inf) * -2.0 + 10.0 = -inf
+        res_ninf2 = ref_fma_f64_u64(F64_POS_INF, f64_to_u64(-2.0), u_ten)
+        self.assertEqual(res_ninf2, F64_NEG_INF)
+
+        # (+inf) * 0.0 + 1.0 -> NaN
+        res_nan1 = ref_fma_f64(float("inf"), 0.0, 1.0)
+        self.assertTrue(math.isnan(res_nan1))
+
+        # (+inf) * 1.0 + (-inf) -> NaN
+        res_nan2 = ref_fma_f64(float("inf"), 1.0, float("-inf"))
+        self.assertTrue(math.isnan(res_nan2))
+
+    def test_nan_handling_and_clamp_mapping(self):
+        # NaN propagation: any NaN input produces NaN
+        self.assertTrue(math.isnan(ref_fma_f64(float("nan"), 1.0, 2.0)))
+        self.assertTrue(math.isnan(ref_fma_f64(1.0, float("nan"), 2.0)))
+        self.assertTrue(math.isnan(ref_fma_f64(1.0, 2.0, float("nan"))))
+
+        # RDNA2 clamp modifier: clamp maps NaN to +0.0 (0x0000000000000000)
+        clamped_nan = ref_fma_f64(float("nan"), 1.0, 2.0, clamp=True)
+        self.assertEqual(clamped_nan, 0.0)
+        self.assertEqual(f64_to_u64(clamped_nan), F64_POS_ZERO)
+
+        # Source modifiers on NaN bit patterns
+        # -NaN inverts sign bit
+        qnan_neg = apply_src_mods_u64(F64_CANONICAL_QNAN, neg=True)
+        self.assertEqual(qnan_neg, F64_CANONICAL_QNAN | F64_NEG_ZERO)
+
+        # | -NaN | clears sign bit
+        qnan_abs = apply_src_mods_u64(F64_CANONICAL_QNAN | F64_NEG_ZERO, abs_=True)
+        self.assertEqual(qnan_abs, F64_CANONICAL_QNAN)
+
+    def test_boundary_max_normal_extremes(self):
+        max_f64 = u64_to_f64(F64_MAX_NORMAL)
+
+        # MAX_NORMAL * 1.0 + 0.0 == MAX_NORMAL
+        res_max = ref_fma_f64(max_f64, 1.0, 0.0)
+        self.assertEqual(res_max, max_f64)
+
+        # MAX_NORMAL * 1.0 - ULP is less than MAX_NORMAL
+        # 1 ULP at 2**1024 is 2**(1024 - 53) = 2**971
+        ulp_max = 2.0 ** 971
+        res_minus_ulp = ref_fma_f64(max_f64, 1.0, -ulp_max)
+        self.assertLess(res_minus_ulp, max_f64)
+
+        # MAX_NORMAL * 2.0 overflows to +inf
+        res_overflow = ref_fma_f64(max_f64, 2.0, 0.0)
+        self.assertEqual(res_overflow, float("inf"))
+
+
 if __name__ == "__main__":
     unittest.main()
