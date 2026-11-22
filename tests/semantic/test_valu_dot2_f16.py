@@ -516,6 +516,117 @@ class ScalarInterpreter:
 
 
 # ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def get_vgpr(self, lane: int, index: int) -> int:
+        return self.vgprs[lane][index] & MASK32
+
+    def set_vgpr(self, lane: int, index: int, val: int) -> None:
+        self.vgprs[lane][index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_operand(self, op: VOP3Operand, state: SIMDState, lane: int) -> int:
+        if isinstance(op.source, Reg):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(lane, op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.bits
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(
+        self,
+        instr: Union[VDot2F16Instruction, VDot2AccF16Instruction],
+        state: SIMDState,
+    ) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+
+        # Atomic read phase across all lanes
+        s0_vals = [
+            self.resolve_lane_operand(instr.src0, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+        s1_vals = [
+            self.resolve_lane_operand(instr.src1, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+        s2_vals = None
+        if isinstance(instr, VDot2AccF16Instruction):
+            s2_vals = [
+                self.resolve_lane_operand(instr.src2, state, lane)
+                for lane in range(state.num_lanes)
+            ]
+
+        # Execution and masking phase
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                if isinstance(instr, VDot2F16Instruction):
+                    res = oracle_v_dot2_f16(
+                        src0_bits=s0_vals[lane],
+                        src1_bits=s1_vals[lane],
+                        abs0=(instr.src0.abs_lo, instr.src0.abs_hi),
+                        neg0=(instr.src0.neg_lo, instr.src0.neg_hi),
+                        abs1=(instr.src1.abs_lo, instr.src1.abs_hi),
+                        neg1=(instr.src1.neg_lo, instr.src1.neg_hi),
+                        op_sel=instr.op_sel,
+                        op_sel_hi=instr.op_sel_hi,
+                        clamp=instr.clamp,
+                    )
+                elif isinstance(instr, VDot2AccF16Instruction) and s2_vals is not None:
+                    res = oracle_v_dot2acc_f16(
+                        src0_bits=s0_vals[lane],
+                        src1_bits=s1_vals[lane],
+                        src2_acc_bits=s2_vals[lane],
+                        abs0=(instr.src0.abs_lo, instr.src0.abs_hi),
+                        neg0=(instr.src0.neg_lo, instr.src0.neg_hi),
+                        abs1=(instr.src1.abs_lo, instr.src1.abs_hi),
+                        neg1=(instr.src1.neg_lo, instr.src1.neg_hi),
+                        abs2=instr.src2.abs_lo,
+                        neg2=instr.src2.neg_lo,
+                        op_sel=instr.op_sel,
+                        op_sel_hi=instr.op_sel_hi,
+                        clamp=instr.clamp,
+                    )
+                else:
+                    raise TypeError(f"Unsupported instruction type: {type(instr)}")
+
+                state.set_vgpr(lane, instr.dst.index, res)
+                results[lane] = res
+
+        return results
+
+
+# ==============================================================================
 # Unit Tests: Architectural Model and Reference Oracle
 # ==============================================================================
 
@@ -818,6 +929,148 @@ class TestScalarInterpreter(unittest.TestCase):
             )
             runs.append(self.interp.step(instr, st))
         self.assertTrue(all(r == runs[0] for r in runs))
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD execution, lane divergence, and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_wave32_full_exec_uniform_and_divergent(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, pack_f16x2(f16_to_bits(float(lane)), ONE_F16))
+            state.set_vgpr(lane, 1, pack_f16x2(TWO_F16, THREE_F16))
+
+        instr = VDot2F16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            self.assertIsNotNone(results[lane])
+            # lane * 2.0 + 1.0 * 3.0 = 2 * lane + 3
+            expected = float(lane * 2 + 3)
+            self.assertEqual(bits_to_f16(state.get_vgpr(lane, 2)), expected)
+
+    def test_wave32_divergent_alternating_mask(self) -> None:
+        sentinel = 0xDEAD_BEEF
+        state = SIMDState(num_lanes=32, exec_mask=0x5555_5555)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, pack_f16x2(ONE_F16, ONE_F16))
+            state.set_vgpr(lane, 1, pack_f16x2(TWO_F16, TWO_F16))
+            state.set_vgpr(lane, 2, sentinel)
+
+        instr = VDot2F16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertIsNotNone(results[lane])
+                # 1*2 + 1*2 = 4.0
+                self.assertEqual(bits_to_f16(state.get_vgpr(lane, 2)), 4.0)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 2), sentinel)
+
+    def test_wave32_exec_zero_no_modification(self) -> None:
+        sentinel = 0xCAFE_BABE
+        state = SIMDState(num_lanes=32, exec_mask=0x0)
+        for lane in range(32):
+            state.set_vgpr(lane, 2, sentinel)
+
+        instr = VDot2F16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Literal32.from_f16x2(1.0, 1.0)),
+            src1=VOP3Operand(Literal32.from_f16x2(2.0, 2.0)),
+        )
+        results = self.interp.step(instr, state)
+        self.assertTrue(all(r is None for r in results))
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr(lane, 2), sentinel)
+
+    def test_wave64_full_exec_dot2acc(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=MASK64)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, pack_f16x2(ONE_F16, TWO_F16))
+            state.set_vgpr(lane, 1, pack_f16x2(THREE_F16, FOUR_F16))
+            state.set_vgpr(lane, 2, f16_to_bits(float(lane)))
+
+        instr = VDot2AccF16Instruction(
+            dst=Reg(3, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        results = self.interp.step(instr, state)
+        for lane in range(64):
+            self.assertIsNotNone(results[lane])
+            # 1*3 + 2*4 + lane = 11.0 + lane
+            self.assertEqual(bits_to_f16(state.get_vgpr(lane, 3)), 11.0 + float(lane))
+
+    def test_wave64_half_exec_lo_and_hi(self) -> None:
+        sentinel = 0x1234_5678
+        state = SIMDState(num_lanes=64, exec_mask=0x0000_0000_FFFF_FFFF)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, pack_f16x2(ONE_F16, ONE_F16))
+            state.set_vgpr(lane, 1, pack_f16x2(TWO_F16, TWO_F16))
+            state.set_vgpr(lane, 2, sentinel)
+
+        instr = VDot2F16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        self.interp.step(instr, state)
+        for lane in range(32):
+            self.assertEqual(bits_to_f16(state.get_vgpr(lane, 2)), 4.0)
+        for lane in range(32, 64):
+            self.assertEqual(state.get_vgpr(lane, 2), sentinel)
+
+    def test_wave32_uniform_sgpr_broadcast(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        state.set_sgpr(10, pack_f16x2(TWO_F16, THREE_F16))
+        for lane in range(32):
+            state.set_vgpr(lane, 0, pack_f16x2(f16_to_bits(float(lane)), ONE_F16))
+
+        instr = VDot2F16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(10, RegType.SGPR)),
+        )
+        self.interp.step(instr, state)
+        for lane in range(32):
+            # lane * 2.0 + 1.0 * 3.0 = 2*lane + 3
+            self.assertEqual(bits_to_f16(state.get_vgpr(lane, 2)), float(lane * 2 + 3))
+
+    def test_simd_lane_dependent_clamp(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        # Even lanes produce positive large values (> 1.0), odd lanes produce negative values
+        for lane in range(32):
+            if lane % 2 == 0:
+                state.set_vgpr(lane, 0, pack_f16x2(TWO_F16, TWO_F16))
+                state.set_vgpr(lane, 1, pack_f16x2(TWO_F16, TWO_F16))
+            else:
+                state.set_vgpr(lane, 0, pack_f16x2(NEG_TWO_F16, NEG_TWO_F16))
+                state.set_vgpr(lane, 1, pack_f16x2(ONE_F16, ONE_F16))
+
+        instr = VDot2F16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            clamp=True,
+        )
+        self.interp.step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(state.get_vgpr(lane, 2), ONE_F16)
+            else:
+                self.assertEqual(state.get_vgpr(lane, 2), POS_ZERO)
 
 
 if __name__ == "__main__":
