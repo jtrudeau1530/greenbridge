@@ -325,7 +325,7 @@ def plan_outputs(items, src, out, ffmpeg):
         for group in groups.values():
             repaired.update(native_collisions(group, named, target, unprobed))
         repaired.update(unprobed)
-    counters, digests = {}, {}
+    counters, digests, dest_digests = {}, {}, {}
 
     def holds_own_audio(i, stem):
         """True if stem.wav is free or already holds input i's decoded audio."""
@@ -339,8 +339,11 @@ def plan_outputs(items, src, out, ffmpeg):
             elif len(digests) % 100 == 0:
                 print(f"  Checked {len(digests)} input recordings...", flush=True)
             digests[i] = audio_digest(ffmpeg, path, source=True)
-        if digests[i] and os.path.isfile(dst) and audio_digest(ffmpeg, dst, source=False) == digests[i]:
-            return True
+        if digests[i] and os.path.isfile(dst):
+            if dst not in dest_digests:
+                dest_digests[dst] = audio_digest(ffmpeg, dst, source=False)
+            if dest_digests[dst] == digests[i]:
+                return True
         print(f"  Keeping {dst}: its audio could not be verified for {path}.", file=sys.stderr)
         return False
 

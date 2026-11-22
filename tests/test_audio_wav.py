@@ -286,6 +286,7 @@ class OpusInputSelectionTest(unittest.TestCase):
         self.assertEqual(skipped, 2)
 
     def test_plan_outputs_does_not_reserve_rejected_wav_slots_for_later_inputs(self) -> None:
+        from collections import Counter
         from unittest.mock import patch
 
         src = os.path.join("fake_src")
@@ -300,7 +301,14 @@ class OpusInputSelectionTest(unittest.TestCase):
             os.path.join(out, "a.ogg~3.wav"): "D1",
             os.path.join(out, "a.ogg~4.wav"): "D0",
         }
-        fake_digest = lambda _ff, p, source=False: src_dig[p] if source else wav_dig.get(p)
+        dst_calls = Counter()
+
+        def fake_digest(_ff, p, source=False):
+            if source:
+                return src_dig[p]
+            dst_calls[p] += 1
+            return wav_dig.get(p)
+
         with patch.object(audio_wav, "audio_digest", side_effect=fake_digest), \
                 patch("os.path.lexists", side_effect=lambda p: p in wav_dig), \
                 patch("os.path.isfile", side_effect=lambda p: p in wav_dig):
@@ -308,6 +316,7 @@ class OpusInputSelectionTest(unittest.TestCase):
         self.assertEqual([(os.path.basename(p), stem) for p, stem in planned],
                          [("a.ogg.opus", "a.ogg~4"), ("a.ogg~2.opus", "a.ogg~3")])
         self.assertEqual((renamed, moved), (0, 2))
+        self.assertEqual(max(dst_calls.values()), 1)
 
 
 class GranuleTest(unittest.TestCase):
