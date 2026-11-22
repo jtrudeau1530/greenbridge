@@ -19,7 +19,7 @@ translated, most of the game's code can run as-is. The work is everything around
 |---|---|---|
 | CPU code | Map the PE image and run it natively. Patch only what can't run on desktop (privileged instructions, console-only intrinsics). Each mapped image's `.pdata` is checked (in bounds, sorted, non-overlapping; zero-length entries allowed, as in System32's `symcryptk.dll`) and registered with `RtlAddFunctionTable`, so SEH/C++ exceptions and stack walks unwind through its frames; the host MSVC runtime's `RtlPcToFileHeader` import is redirected so an MSVC `throw` in a mapped image finds its image base. The loader installs static TLS for the calling thread and, through `gta6rt_tls_host.dll`'s thread events, for every thread started after the image was loaded. | `runtime/src` |
 | Imports (GameOS / GDK / Xbox DLLs) | Every imported `dll!function` goes to a shim. Unimplemented ones log once and return a failure, so the missing surface shows up at runtime. | `runtime/shims` |
-| Graphics | Xbox D3D12 (`d3d12_xs`) to Vulkan. Shaders ship as compiled RDNA2 machine code; `tools\rdna2spirv.py` translates all 26,503 to SPIR-V. The D3D12 layer is still to do. | `tools\` (translator), later (D3D12) |
+| Graphics | Xbox D3D12 (`d3d12_xs`) to Vulkan. Shaders ship as compiled RDNA2 machine code; `tools\rdna2spirv.py` translates all 26,503 to SPIR-V. The D3D12 layer replays on Vulkan and is still in progress ([d3d12_vulkan.md](d3d12_vulkan.md)). | `tools\` (translator), `runtime/shims/d3d12_*`, `runtime/src/vulkan_*` |
 | Assets | `.rpf` archives (RPF9) read through the runtime's file layer. | later |
 
 ## Layout

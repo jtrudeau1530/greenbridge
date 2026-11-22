@@ -4,8 +4,11 @@
 render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears, and query heaps)
 runs behind the Xbox-ABI device proxy, and a presenter puts back buffers in a window (section 3.2). The M0
 milestone passes in a synthetic test (section 6). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
-set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the game's own present
-entry point (DXGI or PresentX) are not implemented.** This is the plan for replacing the console's
+set and the host PC device otherwise. Root signatures (packed into the 32 user-data dwords), graphics and compute
+PSOs, draws, dispatches, `ExecuteIndirect`, and presentation through `PresentX` or a DXGI swapchain are implemented
+and have GPU tests; which present path the game uses is still open (question 6). Shader-resource views of buffers,
+pipeline-state streams (`CreatePipelineState`), tessellation and stream-output pipelines are not implemented, and
+mesh shaders and ray tracing are reported as not supported.** This is the plan for replacing the console's
 `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
 exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
 [design.md](design.md#translator-status-and-runtime-contract)).
