@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import enum
+from fractions import Fraction
 import math
 import struct
 from typing import List, Optional, Tuple, Union
@@ -474,6 +475,132 @@ class SIMDInterpreter:
 
 
 # -----------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Mantissa Carry Tracking
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """IEEE-754 architectural exception and status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    denormal: bool = False
+    zero: bool = False
+    negative: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_f16_mul_flags(s0: int, s1: int, res: int) -> FPStatusFlags:
+    """Evaluate architectural status flags for half-precision multiplication."""
+    s0 &= MASK16
+    s1 &= MASK16
+    res &= MASK16
+
+    # 1. Invalid operation & NaN
+    invalid = False
+    nan = is_f16_nan(res)
+    if is_f16_snan(s0) or is_f16_snan(s1):
+        invalid = True
+    if (is_f16_inf(s0) and is_f16_zero(s1)) or (is_f16_inf(s1) and is_f16_zero(s0)):
+        invalid = True
+
+    # 2. Denormal / Subnormal flag
+    denormal = is_f16_subnormal(s0) or is_f16_subnormal(s1) or is_f16_subnormal(res)
+
+    # 3. Finite multiplication flags (Overflow, Underflow, Inexact)
+    overflow = False
+    underflow = False
+    inexact = False
+
+    if not is_f16_nan(s0) and not is_f16_nan(s1):
+        if is_f16_inf(res) and not is_f16_inf(s0) and not is_f16_inf(s1):
+            overflow = True
+            inexact = True
+        elif not is_f16_inf(s0) and not is_f16_inf(s1) and not is_f16_zero(s0) and not is_f16_zero(s1):
+            # Check exact arithmetic via Fractions
+            f0 = Fraction(u16_to_f16(s0))
+            f1 = Fraction(u16_to_f16(s1))
+            exact_prod = f0 * f1
+            approx_res = Fraction(u16_to_f16(res))
+            if exact_prod != approx_res:
+                inexact = True
+            if is_f16_subnormal(res) or (is_f16_zero(res) and exact_prod != 0):
+                underflow = True
+
+    zero = is_f16_zero(res)
+    negative = bool(res & F16_SIGN_MASK)
+    infinite = is_f16_inf(res)
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        denormal=denormal,
+        zero=zero,
+        negative=negative,
+        infinite=infinite,
+        nan=nan,
+    )
+
+
+def evaluate_pk_mul_f16_flags(
+    s0_dword: int, s1_dword: int, res_dword: int
+) -> Tuple[FPStatusFlags, FPStatusFlags]:
+    """Evaluate status flags for both packed lanes (lo, hi)."""
+    s0_lo, s0_hi = unpack_f16x2(s0_dword)
+    s1_lo, s1_hi = unpack_f16x2(s1_dword)
+    res_lo, res_hi = unpack_f16x2(res_dword)
+
+    return (
+        evaluate_f16_mul_flags(s0_lo, s1_lo, res_lo),
+        evaluate_f16_mul_flags(s0_hi, s1_hi, res_hi),
+    )
+
+
+def generate_vcc_mask_pk_f16(pred: str, results: List[int], wave_size: int = 32) -> int:
+    """Generate Vector Condition Code (VCC) bitmask from packed half-precision outputs."""
+    mask = 0
+    for lane in range(min(len(results), wave_size)):
+        val = results[lane]
+        lo, hi = unpack_f16x2(val)
+        flo = u16_to_f16(lo)
+        fhi = u16_to_f16(hi)
+
+        passed = False
+        if pred == "eq_zero":
+            passed = is_f16_zero(lo) and is_f16_zero(hi)
+        elif pred == "has_nan":
+            passed = is_f16_nan(lo) or is_f16_nan(hi)
+        elif pred == "both_positive":
+            passed = (not is_f16_nan(lo) and flo > 0.0) and (not is_f16_nan(hi) and fhi > 0.0)
+        elif pred == "both_finite":
+            passed = (not is_f16_nan(lo) and not is_f16_inf(lo)) and (not is_f16_nan(fhi) and not is_f16_inf(hi))
+
+        if passed:
+            mask |= (1 << lane)
+
+    return mask
+
+
+def compute_f16_mantissa_product(s0: int, s1: int) -> Tuple[int, int]:
+    """Compute 11-bit mantissa multiplication and return (product, carry_shift).
+
+    In IEEE 754 binary16:
+      Normal significand has 1 implicit bit + 10 fraction bits = 11 bits.
+      Multiplying two 11-bit integers yields a 22-bit product in [2^20, 2^22 - 1].
+      If bit 21 is set (product >= 2.0), a mantissa carry-out occurs requiring 1-bit right shift.
+    """
+    m0 = (s0 & F16_MANT_MASK) | (0 if (s0 & F16_EXP_MASK) == 0 else 0x0400)
+    m1 = (s1 & F16_MANT_MASK) | (0 if (s1 & F16_EXP_MASK) == 0 else 0x0400)
+    prod = m0 * m1
+    carry_shift = (prod >> 21) & 1
+    return prod, carry_shift
+
+
+# -----------------------------------------------------------------------------
 # Unit Tests
 # -----------------------------------------------------------------------------
 
@@ -851,6 +978,125 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
             res_lo, res_hi = unpack_f16x2(res)
             self.assertAlmostEqual(u16_to_f16(res_lo), float(lane) ** 2)
             self.assertAlmostEqual(u16_to_f16(res_hi), 4.0)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        s0 = f16_to_u16(2.0)
+        s1 = f16_to_u16(3.0)
+        res = ref_mul_f16(s0, s1)
+        flags = evaluate_f16_mul_flags(s0, s1, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flag(self) -> None:
+        # In half-precision, 1.0009765625 * 1.0009765625 cannot be represented exactly in 10-bit fraction
+        s0 = 0x3C01  # 1.0 + 2^-10
+        s1 = 0x3C01
+        res = ref_mul_f16(s0, s1)
+        flags = evaluate_f16_mul_flags(s0, s1, res)
+        self.assertTrue(flags.inexact)
+
+    def test_overflow_to_infinity_flag(self) -> None:
+        s0 = F16_MAX_NORMAL  # 65504.0
+        s1 = F16_TWO         # 2.0
+        res = ref_mul_f16(s0, s1)
+        self.assertEqual(res, F16_POS_INF)
+        flags = evaluate_f16_mul_flags(s0, s1, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.infinite)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_underflow_and_denormal_flags(self) -> None:
+        s0 = F16_MIN_NORMAL  # 2^-14
+        s1 = F16_HALF        # 0.5 -> product 2^-15 is subnormal
+        res = ref_mul_f16(s0, s1)
+        self.assertTrue(is_f16_subnormal(res))
+        flags = evaluate_f16_mul_flags(s0, s1, res)
+        self.assertTrue(flags.denormal)
+        self.assertTrue(flags.underflow)
+
+    def test_invalid_operation_flag(self) -> None:
+        # inf * 0.0 is an invalid operation
+        res = ref_mul_f16(F16_POS_INF, F16_POS_ZERO)
+        self.assertTrue(is_f16_nan(res))
+        flags = evaluate_f16_mul_flags(F16_POS_INF, F16_POS_ZERO, res)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+
+        # signaling NaN operand triggers invalid operation flag
+        snan = 0x7C01  # exp=0x1F, mant=1 (bit 9 is 0)
+        self.assertTrue(is_f16_snan(snan))
+        res_snan = ref_mul_f16(snan, F16_ONE)
+        flags_snan = evaluate_f16_mul_flags(snan, F16_ONE, res_snan)
+        self.assertTrue(flags_snan.invalid)
+        self.assertTrue(flags_snan.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        # -2.0 * 3.0 = -6.0 -> negative flag
+        s0 = f16_to_u16(-2.0)
+        s1 = f16_to_u16(3.0)
+        res = ref_mul_f16(s0, s1)
+        flags = evaluate_f16_mul_flags(s0, s1, res)
+        self.assertTrue(flags.negative)
+        self.assertFalse(flags.zero)
+
+        # -0.0 * 5.0 = -0.0 -> zero flag and negative flag
+        res_nz = ref_mul_f16(F16_NEG_ZERO, f16_to_u16(5.0))
+        flags_nz = evaluate_f16_mul_flags(F16_NEG_ZERO, f16_to_u16(5.0), res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertTrue(flags_nz.negative)
+
+    def test_packed_flags_evaluation(self) -> None:
+        s0 = pack_f16x2(F16_POS_INF, f16_to_u16(2.0))
+        s1 = pack_f16x2(F16_POS_ZERO, f16_to_u16(3.0))
+        res = ref_v_pk_mul_f16(s0, s1)
+        flags_lo, flags_hi = evaluate_pk_mul_f16_flags(s0, s1, res)
+        self.assertTrue(flags_lo.invalid)
+        self.assertTrue(flags_lo.nan)
+        self.assertFalse(flags_hi.invalid)
+        self.assertAlmostEqual(u16_to_f16(unpack_f16x2(res)[1]), 6.0)
+
+    def test_vcc_condition_masks(self) -> None:
+        # Generate 4 results:
+        # Lane 0: both zero
+        # Lane 1: positive
+        # Lane 2: contains NaN
+        # Lane 3: both positive
+        r0 = pack_f16x2(F16_POS_ZERO, F16_NEG_ZERO)
+        r1 = pack_f16x2(f16_to_u16(1.0), f16_to_u16(2.0))
+        r2 = pack_f16x2(F16_CANONICAL_QNAN, f16_to_u16(1.0))
+        r3 = pack_f16x2(f16_to_u16(3.0), f16_to_u16(4.0))
+
+        results = [r0, r1, r2, r3]
+        mask_zero = generate_vcc_mask_pk_f16("eq_zero", results, 4)
+        self.assertEqual(mask_zero, 0b0001)
+
+        mask_nan = generate_vcc_mask_pk_f16("has_nan", results, 4)
+        self.assertEqual(mask_nan, 0b0100)
+
+        mask_pos = generate_vcc_mask_pk_f16("both_positive", results, 4)
+        self.assertEqual(mask_pos, 0b1010)
+
+    def test_mantissa_product_and_carry(self) -> None:
+        # 1.0 * 1.0: mantissas are 1024 * 1024 = 1048576 (2^20) -> carry_shift = 0
+        _, c0 = compute_f16_mantissa_product(F16_ONE, F16_ONE)
+        self.assertEqual(c0, 0)
+
+        # 1.5 * 1.5 = 2.25: product >= 2.0 -> carry_shift = 1
+        s_1p5 = f16_to_u16(1.5)
+        _, c1 = compute_f16_mantissa_product(s_1p5, s_1p5)
+        self.assertEqual(c1, 1)
 
 
 if __name__ == "__main__":
