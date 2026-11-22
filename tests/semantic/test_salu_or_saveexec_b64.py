@@ -681,7 +681,182 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(scc, 1)
 
 
+
+# ==============================================================================
+# Phase 4: SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDWaveState:
+    """SIMD wavefront state modeling per-lane execution masking and vector registers."""
+    wave_size: int = 64
+    scalar_state: ScalarMachineState = field(default_factory=ScalarMachineState)
+    vgprs: List[List[int]] = field(default_factory=lambda: [[0] * 256 for _ in range(64)])
+
+    def __post_init__(self) -> None:
+        if self.wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size {self.wave_size}, must be 32 or 64")
+        if len(self.vgprs) != self.wave_size:
+            self.vgprs = [[0] * 256 for _ in range(self.wave_size)]
+
+    @property
+    def active_mask(self) -> int:
+        limit = (1 << self.wave_size) - 1
+        return self.scalar_state.exec_mask & limit
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.wave_size):
+            return False
+        return bool((self.active_mask >> lane) & 1)
+
+    def active_lanes(self) -> List[int]:
+        return [i for i in range(self.wave_size) if self.is_lane_active(i)]
+
+    def inactive_lanes(self) -> List[int]:
+        return [i for i in range(self.wave_size) if not self.is_lane_active(i)]
+
+    def execute_vector_mov(self, dst_vgpr: int, val: int) -> None:
+        """v_mov_b32: writes value only to lanes currently enabled by EXEC."""
+        for lane in range(self.wave_size):
+            if self.is_lane_active(lane):
+                self.vgprs[lane][dst_vgpr] = u32(val)
+
+    def execute_vector_add(self, dst_vgpr: int, src0_vgpr: int, src1_vgpr: int) -> None:
+        """v_add_u32: adds src0 and src1 only for active lanes."""
+        for lane in range(self.wave_size):
+            if self.is_lane_active(lane):
+                a = self.vgprs[lane][src0_vgpr]
+                b = self.vgprs[lane][src1_vgpr]
+                self.vgprs[lane][dst_vgpr] = u32(a + b)
+
+
+class SIMDInterpreter:
+    """Coordinates scalar control flow with SIMD vector lane divergence."""
+
+    def __init__(self, wave_state: Optional[SIMDWaveState] = None) -> None:
+        self.wave = wave_state if wave_state is not None else SIMDWaveState()
+        self.scalar_interp = ScalarInterpreter(self.wave.scalar_state)
+
+    def step_scalar(self, inst: SOrSaveExecB64Instruction) -> Tuple[int, int, int]:
+        return self.scalar_interp.step(inst)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Verifies SIMD multi-lane divergence and EXEC masking under s_or_saveexec_b64."""
+
+    def test_active_inactive_lane_masking(self) -> None:
+        """Vector ops write only to active lanes; inactive lanes preserve old values."""
+        wave = SIMDWaveState(wave_size=64)
+        wave.scalar_state.exec_mask = EVEN_LANES_64  # Even lanes active (32 lanes active)
+
+        # Initialize v0 with 0xAAAA across all lanes
+        for lane in range(64):
+            wave.vgprs[lane][0] = 0xAAAA
+
+        # Execute vector mov with 0x5555
+        wave.execute_vector_mov(dst_vgpr=0, val=0x5555)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[lane][0], 0x5555, f"Even lane {lane} should be updated")
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 0xAAAA, f"Odd lane {lane} should remain untouched")
+
+    def test_lane_activation_expansion_via_or(self) -> None:
+        """s_or_saveexec_b64 expands active lanes and saves old execution mask."""
+        wave = SIMDWaveState(wave_size=64)
+        simd = SIMDInterpreter(wave)
+
+        # Initially, only lower 32 lanes active
+        wave.scalar_state.exec_mask = LOWER_HALF_ACTIVE_64
+        self.assertEqual(len(wave.active_lanes()), 32)
+
+        # Vector write in lower half
+        wave.execute_vector_mov(dst_vgpr=1, val=0x1111)
+
+        # Expand EXEC to include upper 32 lanes via s_or_saveexec_b64 s[4:5], UPPER_HALF
+        inst = SOrSaveExecB64Instruction(
+            dst=RegPair64(4, RegType.SGPR),
+            src=SaluOperand(Literal64.from_int(UPPER_HALF_ACTIVE_64)),
+        )
+        saved, new_exec, scc = simd.step_scalar(inst)
+
+        self.assertEqual(saved, LOWER_HALF_ACTIVE_64)
+        self.assertEqual(new_exec, ALL_LANES_ACTIVE_64)
+        self.assertEqual(scc, 1)
+        self.assertEqual(len(wave.active_lanes()), 64)
+
+        # Vector write in all 64 lanes
+        wave.execute_vector_mov(dst_vgpr=2, val=0x2222)
+        for lane in range(64):
+            self.assertEqual(wave.vgprs[lane][2], 0x2222)
+
+    def test_divergent_control_flow_merge(self) -> None:
+        """Simulate divergent execution join: Path A (lanes 0-15) merges with Path B (lanes 16-31)."""
+        wave = SIMDWaveState(wave_size=64)
+        simd = SIMDInterpreter(wave)
+
+        mask_a = 0x0000_0000_0000_FFFF  # Lanes 0..15
+        mask_b = 0x0000_0000_FFFF_0000  # Lanes 16..31
+
+        wave.scalar_state.exec_mask = mask_a
+        wave.execute_vector_mov(dst_vgpr=5, val=100)
+
+        # Merge Path B lanes into EXEC
+        inst = SOrSaveExecB64Instruction(
+            dst=RegPair64(0, RegType.SGPR),
+            src=SaluOperand(Literal64.from_int(mask_b)),
+        )
+        saved, new_exec, scc = simd.step_scalar(inst)
+
+        self.assertEqual(saved, mask_a)
+        self.assertEqual(new_exec, mask_a | mask_b)
+        self.assertEqual(scc, 1)
+        self.assertEqual(len(wave.active_lanes()), 32)
+
+    def test_wavefront_quadrant_activation(self) -> None:
+        """Step-by-step activation of 16-lane quadrants."""
+        wave = SIMDWaveState(wave_size=64)
+        simd = SIMDInterpreter(wave)
+        wave.scalar_state.exec_mask = 0
+
+        q0 = 0x0000_0000_0000_FFFF
+        q1 = 0x0000_0000_FFFF_0000
+        q2 = 0x0000_FFFF_0000_0000
+        q3 = 0xFFFF_0000_0000_0000
+
+        quadrants = [q0, q1, q2, q3]
+        expected_counts = [16, 32, 48, 64]
+
+        for i, (q, count) in enumerate(zip(quadrants, expected_counts)):
+            inst = SOrSaveExecB64Instruction(
+                dst=RegPair64(i * 2, RegType.SGPR),
+                src=SaluOperand(Literal64.from_int(q)),
+            )
+            simd.step_scalar(inst)
+            self.assertEqual(len(wave.active_lanes()), count)
+
+        self.assertEqual(wave.active_mask, ALL_LANES_ACTIVE_64)
+
+    def test_wave32_and_wave64_execution_boundaries(self) -> None:
+        """Verify active mask semantics when wave_size=32 versus wave_size=64."""
+        wave32 = SIMDWaveState(wave_size=32)
+        wave32.scalar_state.exec_mask = ALL_LANES_ACTIVE_64
+        # In Wave32 mode, active mask only considers lower 32 bits
+        self.assertEqual(wave32.active_mask, 0xFFFF_FFFF)
+        self.assertEqual(len(wave32.active_lanes()), 32)
+        self.assertFalse(wave32.is_lane_active(32))
+
+        wave64 = SIMDWaveState(wave_size=64)
+        wave64.scalar_state.exec_mask = ALL_LANES_ACTIVE_64
+        self.assertEqual(wave64.active_mask, ALL_LANES_ACTIVE_64)
+        self.assertEqual(len(wave64.active_lanes()), 64)
+        self.assertTrue(wave64.is_lane_active(32))
+        self.assertTrue(wave64.is_lane_active(63))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
