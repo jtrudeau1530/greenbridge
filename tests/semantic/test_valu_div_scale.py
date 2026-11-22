@@ -1678,8 +1678,260 @@ class TestDivScaleIEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res_gt, F32_ONE)
 
 
+def parse_operand_asm(op_str: str, *, is_f64: bool = False, is_sdst: bool = False) -> ASTOperand:
+    op_str = op_str.strip()
+    neg = False
+    abs_ = False
+
+    if op_str.startswith("-"):
+        neg = True
+        op_str = op_str[1:].strip()
+
+    if op_str.startswith("|") and op_str.endswith("|"):
+        abs_ = True
+        op_str = op_str[1:-1].strip()
+
+    if op_str == "vcc":
+        return ASTOperand.vcc()
+
+    if op_str.startswith("v[") and op_str.endswith("]"):
+        inner = op_str[2:-1]
+        parts = inner.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"Malformed VGPR pair: {op_str}")
+        lo = int(parts[0])
+        hi = int(parts[1])
+        if hi != lo + 1:
+            raise ValueError(f"VGPR pair must be consecutive registers [n:n+1], got {op_str}")
+        return ASTOperand.vgpr_pair(lo, neg=neg, abs_=abs_)
+
+    if op_str.startswith("s[") and op_str.endswith("]"):
+        inner = op_str[2:-1]
+        parts = inner.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"Malformed SGPR pair: {op_str}")
+        lo = int(parts[0])
+        hi = int(parts[1])
+        if hi != lo + 1:
+            raise ValueError(f"SGPR pair must be consecutive registers [n:n+1], got {op_str}")
+        return ASTOperand.sgpr_pair(lo, neg=neg, abs_=abs_)
+
+    if op_str.startswith("v") and op_str[1:].isdigit():
+        return ASTOperand.vgpr(int(op_str[1:]), neg=neg, abs_=abs_)
+
+    if op_str.startswith("s") and op_str[1:].isdigit():
+        return ASTOperand.sgpr(int(op_str[1:]), neg=neg, abs_=abs_)
+
+    try:
+        val = float(op_str)
+        return ASTOperand.inline_const(val, neg=neg, abs_=abs_)
+    except ValueError:
+        raise ValueError(f"Unrecognized operand syntax: {op_str}")
+
+
+def parse_div_scale_asm(line: str) -> ASTInstruction:
+    line = line.strip()
+    if not line:
+        raise ValueError("Empty assembly line")
+
+    tokens = line.split(None, 1)
+    if not tokens:
+        raise ValueError("Empty assembly line")
+
+    op_str = tokens[0]
+    if op_str == Opcode.V_DIV_SCALE_F32.value:
+        opcode = Opcode.V_DIV_SCALE_F32
+        is_f64 = False
+    elif op_str == Opcode.V_DIV_SCALE_F64.value:
+        opcode = Opcode.V_DIV_SCALE_F64
+        is_f64 = True
+    else:
+        raise ValueError(f"Invalid opcode for div_scale: '{op_str}'")
+
+    if len(tokens) < 2:
+        raise ValueError("Missing operands in instruction")
+
+    rest = tokens[1].strip()
+    parts = [p.strip() for p in rest.split(",")]
+    if len(parts) != 5:
+        raise ValueError(f"Expected exactly 5 comma-separated operand fields, got {len(parts)}")
+
+    dst_str = parts[0]
+    sdst_str = parts[1]
+    src0_str = parts[2]
+    src1_str = parts[3]
+
+    last_tokens = parts[4].split()
+    if not last_tokens:
+        raise ValueError("Missing src2 operand")
+    src2_str = last_tokens[0]
+    mod_tokens = last_tokens[1:]
+
+    clamp = False
+    omod = OMod.NONE
+
+    for mod in mod_tokens:
+        if mod == "clamp":
+            clamp = True
+        elif mod == "mul:2":
+            omod = OMod.MUL2
+        elif mod == "mul:4":
+            omod = OMod.MUL4
+        elif mod == "div:2":
+            omod = OMod.DIV2
+        else:
+            raise ValueError(f"Unknown modifier: '{mod}'")
+
+    dst = parse_operand_asm(dst_str, is_f64=is_f64)
+    sdst = parse_operand_asm(sdst_str, is_sdst=True)
+    src0 = parse_operand_asm(src0_str, is_f64=is_f64)
+    src1 = parse_operand_asm(src1_str, is_f64=is_f64)
+    src2 = parse_operand_asm(src2_str, is_f64=is_f64)
+
+    inst = ASTInstruction(
+        opcode=opcode,
+        dst=dst,
+        sdst=sdst,
+        src0=src0,
+        src1=src1,
+        src2=src2,
+        clamp=clamp,
+        omod=omod,
+    )
+    inst.validate()
+    return inst
+
+
+# Mutants for mutation detection
+def mutant_omit_scale(s0: float, s1: float, s2: float, **kwargs) -> tuple[float, int]:
+    """Mutant 1: Fails to scale, always returns s0 and vcc=0."""
+    return s0, 0
+
+
+def mutant_invert_scale_direction(s0: float, s1: float, s2: float, **kwargs) -> tuple[float, int]:
+    """Mutant 2: Uses scale down (2^-64) when it should scale up (2^64)."""
+    res, vcc = ref_div_scale_f32(s0, s1, s2, **kwargs)
+    if vcc == 1 and abs(s1) <= THRESH_F32_SMALL:
+        return s0 * SCALE64_NEG, 1
+    return res, vcc
+
+
+def mutant_omit_vcc_flag(s0: float, s1: float, s2: float, **kwargs) -> tuple[float, int]:
+    """Mutant 3: Computes scaled result but fails to set VCC flag."""
+    res, _ = ref_div_scale_f32(s0, s1, s2, **kwargs)
+    return res, 0
+
+
+def mutant_clamp_nan_to_nan(u0: int, u1: int, u2: int, *, clamp: bool = False, **kwargs) -> tuple[int, int]:
+    """Mutant 4: Clamps numbers but fails to map NaN to +0.0."""
+    res_u32, vcc = ref_div_scale_f32_u32(u0, u1, u2, clamp=False, **kwargs)
+    if clamp and not is_f32_nan(res_u32):
+        val = u32_to_f32(res_u32)
+        if val < 0.0:
+            return F32_POS_ZERO, vcc
+        elif val > 1.0:
+            return F32_ONE, vcc
+    return res_u32, vcc
+
+
+def mutant_snan_not_quieted(u0: int, u1: int, u2: int, **kwargs) -> tuple[int, int]:
+    """Mutant 5: Returns SNaN directly without quieting."""
+    if is_f32_snan(u0):
+        return u0, 0
+    return ref_div_scale_f32_u32(u0, u1, u2, **kwargs)
+
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, and mutation detection."""
+
+    def test_syntax_rejection_bad_opcodes(self):
+        for bad_op in ("v_div_scale_f16", "v_add_f32", "s_div_scale_f32", "foo"):
+            with self.assertRaises(ValueError):
+                parse_div_scale_asm(f"{bad_op} v0, vcc, v1, v1, v2")
+
+    def test_syntax_rejection_operand_count(self):
+        # Too few operands
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f32 v0, vcc, v1, v1")
+        # Too many operands
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f32 v0, vcc, v1, v1, v2, v3")
+
+    def test_syntax_rejection_destination_modifiers(self):
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f32 -v0, vcc, v1, v1, v2")
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f32 |v0|, vcc, v1, v1, v2")
+
+    def test_syntax_rejection_destination_sgpr(self):
+        with self.assertRaises(TypeError):
+            parse_div_scale_asm("v_div_scale_f32 s0, vcc, v1, v1, v2")
+
+    def test_syntax_rejection_non_consecutive_pair(self):
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f64 v[0:2], vcc, v[2:3], v[2:3], v[4:5]")
+
+    def test_syntax_rejection_register_out_of_bounds(self):
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f32 v256, vcc, v1, v1, v2")
+
+    def test_mutation_detection_all_mutants_caught(self):
+        small = 2.0 ** -100
+
+        # Mutant 1: omit scale
+        good_res, good_vcc = ref_div_scale_f32(small, small, 1.0)
+        bad_res1, bad_vcc1 = mutant_omit_scale(small, small, 1.0)
+        self.assertNotEqual(good_res, bad_res1)
+        self.assertNotEqual(good_vcc, bad_vcc1)
+
+        # Mutant 2: invert scale direction
+        bad_res2, _ = mutant_invert_scale_direction(small, small, 1.0)
+        self.assertNotEqual(good_res, bad_res2)
+
+        # Mutant 3: omit VCC flag
+        _, bad_vcc3 = mutant_omit_vcc_flag(small, small, 1.0)
+        self.assertNotEqual(good_vcc, bad_vcc3)
+
+        # Mutant 4: clamp NaN to NaN
+        good_clamp, _ = ref_div_scale_f32_u32(F32_CANONICAL_QNAN, F32_ONE, F32_TWO, clamp=True)
+        bad_clamp, _ = mutant_clamp_nan_to_nan(F32_CANONICAL_QNAN, F32_ONE, F32_TWO, clamp=True)
+        self.assertEqual(good_clamp, F32_POS_ZERO)
+        self.assertNotEqual(good_clamp, bad_clamp)
+
+        # Mutant 5: SNaN not quieted
+        good_snan, _ = ref_div_scale_f32_u32(F32_SNAN, F32_ONE, F32_TWO)
+        bad_snan, _ = mutant_snan_not_quieted(F32_SNAN, F32_ONE, F32_TWO)
+        self.assertTrue(is_f32_qnan(good_snan))
+        self.assertTrue(is_f32_snan(bad_snan))
+        self.assertNotEqual(good_snan, bad_snan)
+
+    def test_mutation_detection_simd_exec_mask_leak(self):
+        wave = SIMDWaveState(wave_size=32)
+        wave.exec_mask = 0  # All lanes inactive
+        sentinel = 777.0
+        for l in range(32):
+            wave.set_lane_vgpr_f32(l, 0, sentinel)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+
+        interp = SIMDInterpreter(wave)
+        interp.step(inst)
+
+        # Inactive lanes must be strictly preserved
+        for l in range(32):
+            self.assertEqual(wave.get_lane_vgpr_f32(l, 0), sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
