@@ -39,6 +39,7 @@ import stat
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
@@ -997,7 +998,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     # Every run: decodes what a stopped or failed run left, and everything once ffmpeg is installed later.
     ff = shutil.which("ffmpeg")
     if ff:
-        decode_xma(ff, xma_dir)
+        decode_xma(ff, xma_dir, jobs)
     else:
         log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
     log("assets: done")
@@ -1019,15 +1020,15 @@ def pending_xma(xma_dir: str) -> list:
     return todo
 
 
-def decode_xma(ff: str, xma_dir: str) -> None:
+def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
     """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
     temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
     todo = pending_xma(xma_dir)
     if not todo:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")
-    bad = []
-    for src in sorted(todo):
+
+    def one(src: str) -> bool:
         dst = src[:-8] + ".wav"
         tmp = dst + ".part"
         # No stdin: ffmpeg reads it for key commands, which stops a build started in the background of a terminal.
@@ -1035,10 +1036,16 @@ def decode_xma(ff: str, xma_dir: str) -> None:
                            stdin=subprocess.DEVNULL)
         if r.returncode == 0 and os.path.isfile(tmp):
             os.replace(tmp, dst)
-        else:
-            bad.append(src)
-            if os.path.isfile(tmp):
-                os.remove(tmp)
+            return True
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        return False
+
+    todo = sorted(todo)
+    # One ffmpeg per stream, `jobs` at a time; the threads only wait on their process. map keeps the order, so the
+    # first failure reported is the same as one at a time.
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        bad = [src for src, good in zip(todo, ex.map(one, todo)) if not good]
     if bad:
         log(f"assets: ffmpeg could not decode {len(bad)} XMA2 stream(s), first {os.path.relpath(bad[0], xma_dir)}. "
             "They stay as .xma.wav; the next run tries them again.")
