@@ -2,7 +2,11 @@
 
 Uses tools/glb_writer.py to process entire directories of OBJ models
 with multi-core parallelism and progress reporting. Can optionally link
-and embed textures (.png or .dds) directly into glTF materials.
+and embed textures (.png or .dds) directly into glTF materials. A texture
+that cannot be read or decoded is left out of that model and reported (one
+line each, counted in the summary), never dropped silently; a model that
+fails to convert is named with its error. Exit status is 1 only when a
+model failed.
 
 Usage:
     python -I tools/batch_glb.py <in_dir> <out_dir> [--jobs N] [--up z|y] [--textures <dir>]
@@ -37,24 +41,29 @@ def _build_texture_index(texture_dir: str | None) -> dict[str, str]:
     return index
 
 
-def _load_png_bytes(tex_path: str, max_size: int = 0) -> bytes | None:
-    """Load PNG bytes from file or decode DDS directly to PNG bytes."""
+def _load_png_bytes(tex_path: str, max_size: int = 0) -> tuple[bytes | None, str]:
+    """(PNG bytes from file or DDS decode, or None and why it cannot be embedded: a texture the model
+    can live without is skipped and reported, never a silent hole in the output)."""
     lower = tex_path.lower()
     if lower.endswith(".png"):
-        with open(tex_path, "rb") as f:
-            return f.read()
+        try:
+            with open(tex_path, "rb") as f:
+                return f.read(), ""
+        except OSError as exc:
+            return None, str(exc)
     elif lower.endswith(".dds"):
         try:
-            return dds_png.dds_file_to_png_bytes(tex_path, max_size=max_size)
-        except Exception:
-            return None
-    return None
+            return dds_png.dds_file_to_png_bytes(tex_path, max_size=max_size), ""
+        except Exception as exc:
+            return None, f"DDS decode: {exc}"
+    return None, "not a .png or .dds"
 
 
 def convert_single(
-    args_tuple: tuple[str, str, str, dict[str, str], int, dict[str, bytes]],
-) -> tuple[bool, str, str]:
+    args_tuple: tuple[str, str, str, dict[str, str], int, dict[str, tuple[bytes | None, str]]],
+) -> tuple[bool, str, str, list[tuple[str, str]]]:
     in_path, out_path, up_axis, tex_index, max_tex_size, tex_cache = args_tuple
+    dropped: list[tuple[str, str]] = []
     try:
         primitives = glb_writer.parse_obj(in_path, is_path=True, up_axis=up_axis)
         materials: dict[str, dict] = {}
@@ -87,11 +96,13 @@ def convert_single(
                         break
 
                 if found_path:
-                    png_bytes = tex_cache.get(found_path)
-                    if png_bytes is None:
-                        png_bytes = _load_png_bytes(found_path, max_size=max_tex_size)
-                        if png_bytes:
-                            tex_cache[found_path] = png_bytes
+                    cached = tex_cache.get(found_path)
+                    if cached is None:
+                        cached = _load_png_bytes(found_path, max_size=max_tex_size)
+                        tex_cache[found_path] = cached      # failures too: decode a broken DDS once
+                    png_bytes, why_not = cached
+                    if why_not:
+                        dropped.append((found_path, why_not))
                     if png_bytes:
                         mat_key = mat_name if mat_name else clean_stem
                         prim["material"] = mat_key
@@ -101,9 +112,9 @@ def convert_single(
                         }
 
         glb_writer.write_glb(out_path, primitives, materials=materials if materials else None)
-        return True, in_path, ""
+        return True, in_path, "", dropped
     except Exception as exc:
-        return False, in_path, str(exc)
+        return False, in_path, str(exc), dropped
 
 
 def batch_convert(
@@ -123,7 +134,7 @@ def batch_convert(
     ]
 
     tex_index = _build_texture_index(texture_dir)
-    tex_cache: dict[str, bytes] = {}
+    tex_cache: dict[str, tuple[bytes | None, str]] = {}
 
     tasks = [
         (
@@ -140,17 +151,27 @@ def batch_convert(
     total = len(tasks)
     succeeded = 0
     failed = 0
+    failures: list[tuple[str, str]] = []          # (model, error): counted and named
+    dropped_textures: list[tuple[str, str, str]] = []
 
     max_workers = jobs if jobs and jobs > 0 else (os.cpu_count() or 4)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for ok, path, err in executor.map(convert_single, tasks):
+        for ok, path, err, dropped in executor.map(convert_single, tasks):
             if ok:
                 succeeded += 1
             else:
                 failed += 1
+                failures.append((path, err))
+            dropped_textures.extend((path, tex, why) for tex, why in dropped)
 
-    return {"total": total, "succeeded": succeeded, "failed": failed}
+    return {
+        "total": total,
+        "succeeded": succeeded,
+        "failed": failed,
+        "failures": failures,
+        "dropped_textures": dropped_textures,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -196,9 +217,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     elapsed = time.monotonic() - t0
 
+    for path, err in stats["failures"]:
+        print(f"batch_glb: {path}: {err}")
+    for model, tex, why in stats["dropped_textures"]:
+        print(f"batch_glb: {os.path.basename(model)}: texture {tex} not embedded: {why}")
+    dropped = len(stats["dropped_textures"])
+    note = f", {dropped} unembedded texture" + ("" if dropped == 1 else "s") if dropped else ""
     print(
         f"batch_glb: converted {stats['succeeded']}/{stats['total']} models "
-        f"({stats['failed']} failed) in {elapsed:.2f}s"
+        f"({stats['failed']} failed{note}) in {elapsed:.2f}s"
     )
     return 0 if stats["failed"] == 0 else 1
 
