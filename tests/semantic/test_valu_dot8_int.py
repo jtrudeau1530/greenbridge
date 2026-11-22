@@ -237,5 +237,231 @@ class TestValuDot8IntMathematicalOracle(unittest.TestCase):
         self.assertNotEqual(u_res, i_res)
 
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+from enum import Enum, auto
+import re
+from typing import Optional, Union, List
+
+
+class Opcode(Enum):
+    """VALU opcode enumerations for packed 4-bit integer dot products."""
+    V_DOT8_I32_I4 = "v_dot8_i32_i4"
+    V_DOT8_U32_U4 = "v_dot8_u32_u4"
+    V_MOV_B32 = "v_mov_b32_e32"
+
+
+class OperandKind(Enum):
+    """Operand storage classification."""
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+    INLINE_INT = auto()
+
+
+class TypeKind(Enum):
+    """Data representation types for operands and expressions."""
+    I32 = "i32"
+    U32 = "u32"
+    I4 = "i4"
+    U4 = "u4"
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    """Symbolic instruction operand representation."""
+    kind: OperandKind
+    reg_num: int = 0
+    literal_value: int = 0
+    type_kind: TypeKind = TypeKind.U32
+
+    def to_asm(self) -> str:
+        if self.kind == OperandKind.VGPR:
+            return f"v{self.reg_num}"
+        elif self.kind == OperandKind.SGPR:
+            return f"s{self.reg_num}"
+        elif self.kind == OperandKind.LITERAL:
+            if self.literal_value >= 0x1000:
+                return f"0x{self.literal_value:X}"
+            return str(self.literal_value)
+        elif self.kind == OperandKind.INLINE_INT:
+            return str(self.literal_value)
+        return "?"
+
+
+@dataclass(frozen=True)
+class ASTInstruction:
+    """Symbolic instruction AST representation."""
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    src2: Optional[ASTOperand] = None
+    clamp: bool = False
+
+    def to_asm(self) -> str:
+        parts = [self.opcode.value, self.dst.to_asm(), self.src0.to_asm(), self.src1.to_asm()]
+        if self.src2 is not None:
+            parts.append(self.src2.to_asm())
+        res = f"{parts[0]} {', '.join(parts[1:])}"
+        if self.clamp:
+            res += " clamp"
+        return res
+
+
+@dataclass
+class TypedExpr:
+    """Base class for typed symbolic expressions."""
+    type_kind: TypeKind
+
+
+@dataclass
+class VariableExpr(TypedExpr):
+    """Symbolic variable representing a register source."""
+    name: str
+
+
+@dataclass
+class LiteralExpr(TypedExpr):
+    """Symbolic literal value."""
+    val: int
+
+
+@dataclass
+class Dot8ComponentProductExpr(TypedExpr):
+    """Component product of nibble i: src0.nibble[i] * src1.nibble[i]."""
+    nibble_index: int
+    left: TypedExpr
+    right: TypedExpr
+
+
+@dataclass
+class Dot8Expr(TypedExpr):
+    """Full dot8 expression: accumulator + sum(component products), with optional clamp."""
+    opcode: Opcode
+    src0: TypedExpr
+    src1: TypedExpr
+    acc: TypedExpr
+    clamp: bool = False
+
+
+def parse_operand(token: str, default_type: TypeKind = TypeKind.U32) -> ASTOperand:
+    """Parse an assembly operand token into an ASTOperand."""
+    token = token.strip()
+    if token.startswith("v") and token[1:].isdigit():
+        return ASTOperand(kind=OperandKind.VGPR, reg_num=int(token[1:]), type_kind=default_type)
+    elif token.startswith("s") and token[1:].isdigit():
+        return ASTOperand(kind=OperandKind.SGPR, reg_num=int(token[1:]), type_kind=default_type)
+    else:
+        val = int(token, 0)
+        if -16 <= val <= 64:
+            return ASTOperand(kind=OperandKind.INLINE_INT, literal_value=val, type_kind=default_type)
+        return ASTOperand(kind=OperandKind.LITERAL, literal_value=val, type_kind=default_type)
+
+
+def parse_instruction(line: str) -> ASTInstruction:
+    """Parse a single assembly instruction string into an ASTInstruction."""
+    line = line.strip()
+    if not line or line.startswith("//") or line.startswith(";"):
+        raise ValueError(f"Empty or comment line cannot be parsed: '{line}'")
+
+    clamp = "clamp" in line.split()
+    line_clean = re.sub(r"\bclamp\b", "", line).strip()
+
+    tokens = line_clean.split(None, 1)
+    op_name = tokens[0].lower()
+    operands_str = tokens[1] if len(tokens) > 1 else ""
+
+    opcode = None
+    for op in Opcode:
+        if op.value == op_name:
+            opcode = op
+            break
+    if opcode is None:
+        raise NotImplementedError(f"Unsupported or unrecognized opcode: '{op_name}'")
+
+    op_parts = [p.strip() for p in operands_str.split(",") if p.strip()]
+
+    if opcode == Opcode.V_MOV_B32:
+        if len(op_parts) != 2:
+            raise ValueError(f"v_mov_b32 expects 2 operands, got {len(op_parts)}")
+        dst = parse_operand(op_parts[0])
+        src0 = parse_operand(op_parts[1])
+        return ASTInstruction(opcode=opcode, dst=dst, src0=src0, src1=src0, clamp=clamp)
+
+    if opcode == Opcode.V_DOT8_I32_I4:
+        elem_type = TypeKind.I4
+        acc_type = TypeKind.I32
+    else:
+        elem_type = TypeKind.U4
+        acc_type = TypeKind.U32
+
+    if len(op_parts) == 3:
+        dst = parse_operand(op_parts[0], acc_type)
+        src0 = parse_operand(op_parts[1], elem_type)
+        src1 = parse_operand(op_parts[2], elem_type)
+        src2 = ASTOperand(kind=OperandKind.INLINE_INT, literal_value=0, type_kind=acc_type)
+        return ASTInstruction(opcode=opcode, dst=dst, src0=src0, src1=src1, src2=src2, clamp=clamp)
+    elif len(op_parts) == 4:
+        dst = parse_operand(op_parts[0], acc_type)
+        src0 = parse_operand(op_parts[1], elem_type)
+        src1 = parse_operand(op_parts[2], elem_type)
+        src2 = parse_operand(op_parts[3], acc_type)
+        return ASTInstruction(opcode=opcode, dst=dst, src0=src0, src1=src1, src2=src2, clamp=clamp)
+    else:
+        raise ValueError(f"{opcode.value} expects 3 or 4 operands, got {len(op_parts)}: '{line}'")
+
+
+class TestValuDot8IntSymbolicAST(unittest.TestCase):
+    """Symbolic AST definitions and typed expression unit tests for v_dot8_int."""
+
+    def test_ast_parse_v_dot8_i32_i4(self) -> None:
+        instr = parse_instruction("v_dot8_i32_i4 v0, v1, v2, v3")
+        self.assertEqual(instr.opcode, Opcode.V_DOT8_I32_I4)
+        self.assertEqual(instr.dst, ASTOperand(OperandKind.VGPR, reg_num=0, type_kind=TypeKind.I32))
+        self.assertEqual(instr.src0, ASTOperand(OperandKind.VGPR, reg_num=1, type_kind=TypeKind.I4))
+        self.assertEqual(instr.src1, ASTOperand(OperandKind.VGPR, reg_num=2, type_kind=TypeKind.I4))
+        self.assertEqual(instr.src2, ASTOperand(OperandKind.VGPR, reg_num=3, type_kind=TypeKind.I32))
+        self.assertFalse(instr.clamp)
+
+    def test_ast_parse_v_dot8_u32_u4_three_operands(self) -> None:
+        instr = parse_instruction("v_dot8_u32_u4 v5, s2, v3")
+        self.assertEqual(instr.opcode, Opcode.V_DOT8_U32_U4)
+        self.assertEqual(instr.dst, ASTOperand(OperandKind.VGPR, reg_num=5, type_kind=TypeKind.U32))
+        self.assertEqual(instr.src0, ASTOperand(OperandKind.SGPR, reg_num=2, type_kind=TypeKind.U4))
+        self.assertEqual(instr.src1, ASTOperand(OperandKind.VGPR, reg_num=3, type_kind=TypeKind.U4))
+        self.assertEqual(instr.src2, ASTOperand(OperandKind.INLINE_INT, literal_value=0, type_kind=TypeKind.U32))
+
+    def test_ast_parse_with_clamp(self) -> None:
+        instr = parse_instruction("v_dot8_u32_u4 v10, v11, v12, v13 clamp")
+        self.assertEqual(instr.opcode, Opcode.V_DOT8_U32_U4)
+        self.assertEqual(instr.dst.reg_num, 10)
+        self.assertTrue(instr.clamp)
+
+    def test_ast_roundtrip_formatting(self) -> None:
+        asm = "v_dot8_i32_i4 v4, v1, v2, v3 clamp"
+        instr = parse_instruction(asm)
+        self.assertEqual(instr.to_asm(), asm)
+
+    def test_ast_typed_expression_nodes(self) -> None:
+        src0_expr = VariableExpr(TypeKind.I4, "v1")
+        src1_expr = VariableExpr(TypeKind.I4, "v2")
+        acc_expr = VariableExpr(TypeKind.I32, "v3")
+
+        expr = Dot8Expr(
+            type_kind=TypeKind.I32,
+            opcode=Opcode.V_DOT8_I32_I4,
+            src0=src0_expr,
+            src1=src1_expr,
+            acc=acc_expr,
+            clamp=True,
+        )
+        self.assertEqual(expr.type_kind, TypeKind.I32)
+        self.assertTrue(expr.clamp)
+
+
 if __name__ == "__main__":
     unittest.main()
