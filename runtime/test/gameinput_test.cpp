@@ -393,6 +393,33 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     }
     check(monotonic && polls < 100 && sticks_at_rest(st), "keyboard pad: right stick decays to 0 when the mouse stops");
 
+    // LEONIDA_MOUSE_SENSITIVITY scales the axis units per count: 2 doubles, 0.5 halves; out of range clamps.
+    auto settle = [&] {
+        for (int i = 0; i < 200 && !sticks_at_rest(pad_state(input, kb)); ++i) rt::gameinput::poll();
+    };
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "2");
+    rt::gameinput::reload_config();
+    g_cursor_x += 10;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 20480 / 32767.0f), "keyboard pad: mouse sensitivity 2 doubles the stick");
+    settle();
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "0.5");
+    rt::gameinput::reload_config();
+    g_cursor_x -= 10;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, -5120 / 32767.0f), "keyboard pad: mouse sensitivity 0.5 halves the stick");
+    settle();
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "100");
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().mouse_sensitivity == 10.0f, "keyboard pad: mouse sensitivity clamps to 10");
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "0");
+    rt::gameinput::reload_config();
+    check(approx(rt::gameinput::config().mouse_sensitivity, 0.1f), "keyboard pad: mouse sensitivity clamps to 0.1");
+    set_env("LEONIDA_MOUSE_SENSITIVITY", nullptr);
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().mouse_sensitivity == 1.0f && rt::gameinput::config().ds_trigger_gain == 1.0f,
+          "keyboard pad: mouse sensitivity defaults to 1 and leaves the trigger gain alone");
+
     g_keys[VK_RBUTTON] = true;
     rt::gameinput::poll();
     st = pad_state(input, kb);
