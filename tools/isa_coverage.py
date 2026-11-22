@@ -125,11 +125,26 @@ def _op_compare_names(test, positive_only=False):
     """Mnemonics a test compares `op` with (== / in, and unless positive_only != / not in)."""
     names = []
     allowed = (ast.Eq, ast.In) if positive_only else (ast.Eq, ast.NotEq, ast.In, ast.NotIn)
-    for n in ast.walk(test):
+    work = [test]
+    while work:
+        n = work.pop()
+        if positive_only and isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+            continue
         if isinstance(n, ast.Compare) and _is_op(n.left) and all(isinstance(o, allowed) for o in n.ops):
             for c in n.comparators:
                 names.extend(_mnemonics(c))
+        work.extend(reversed(list(ast.iter_child_nodes(n))))
     return names
+
+
+def _unconditional_op_names(test):
+    """Mnemonics `test` matches unconditionally (a positive op == / op in compare, or an `or` of them)."""
+    if isinstance(test, ast.Compare) and _is_op(test.left) and all(isinstance(o, (ast.Eq, ast.In)) for o in test.ops):
+        return [m for c in test.comparators for m in _mnemonics(c)]
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        parts = [_unconditional_op_names(v) for v in test.values]
+        return [m for p in parts for m in p] if parts and all(parts) else []
+    return []
 
 
 def _mnemonic_collection(node):
@@ -164,12 +179,12 @@ def scan_translator(path):
             for m in _mnemonic_collection(node):
                 exact[m].add("table")
         if isinstance(node, ast.If):
+            uncond = _unconditional_op_names(node.test)
             names = _op_compare_names(node.test, positive_only=True)
-            if names:
-                if _only_raises_unsupported(node.body):
-                    refused.update(names)
-                elif _raises_unsupported(node.body):
-                    partial.update(names)
+            if uncond and _only_raises_unsupported(node.body):
+                refused.update(uncond)
+            elif names and _raises_unsupported(node.body):
+                partial.update(names)
     # Prefix families count only where the instruction dispatch is: Gen._insn and the methods it hands `op` to
     # (self.image_op(op, ...), self.lds_op(op, ...)). Other op.startswith calls in the file (read/write analysis,
     # memory ordering) say nothing about which instructions are translated.
@@ -209,8 +224,8 @@ def accepted_names(path):
         tree = ast.parse(f.read(), path)
     skip = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.If) and _op_compare_names(node.test, True) and _only_raises_unsupported(node.body):
-            skip.update(id(x) for x in ast.walk(node.test))
+        if isinstance(node, ast.If) and _unconditional_op_names(node.test) and _only_raises_unsupported(node.body):
+            skip.update(id(x) for x in ast.walk(node.test) if isinstance(x, ast.expr))
     names = set()
     for node in ast.walk(tree):
         if id(node) in skip:
@@ -224,7 +239,7 @@ def accepted_names(path):
 
 
 def _in_skipped(node, skip):
-    return any(id(x) in skip for x in ast.walk(node))
+    return any(id(x) in skip for x in ast.walk(node) if isinstance(x, ast.expr))
 
 
 def probe_llvm_mc(llvm_mc, names, mcpu="gfx1013"):
