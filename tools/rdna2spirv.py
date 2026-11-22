@@ -5276,17 +5276,42 @@ class Gen:
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{r} = OpFAdd %float {m} {z}")
             self.dst(a[0], self.tou(r))
-        elif op in ("v_bfi_b32", "v_lshl_or_b32", "v_lshl_add_u32", "v_add_lshl_u32", "v_or3_b32", "v_xor3_b32",
+        elif op == "v_bfi_b32":
+            mask = None if "sdwa_sel" in a[1] else self.imm_val(a[1])
+            y, z = (self.src_u(t) for t in a[2:4])
+            if mask == 0:
+                self.dst(a[0], z)
+                return
+            if mask == 0xFFFFFFFF:
+                self.dst(a[0], y)
+                return
+            if mask is not None:
+                offset = (mask & -mask).bit_length() - 1
+                width = mask.bit_count()
+                if mask == ((1 << width) - 1) << offset:
+                    # RDNA takes the field from its final bit positions; SPIR-V takes its low bits.
+                    if offset:
+                        shifted = self.tmp()
+                        self.emit(f"{shifted} = OpShiftRightLogical %uint {y} {self.cu(offset)}")
+                        y = shifted
+                    r = self.tmp()
+                    self.emit(f"{r} = OpBitFieldInsert %uint {z} {y} {self.cu(offset)} {self.cu(width)}")
+                    self.dst(a[0], r)
+                    return
+                x, n = self.cu(mask), self.cu(~mask)
+            else:
+                x, n = self.src_u(a[1]), self.tmp()
+                self.emit(f"{n} = OpNot %uint {x}")
+            p, q, r = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{p} = OpBitwiseAnd %uint {x} {y}")
+            self.emit(f"{q} = OpBitwiseAnd %uint {n} {z}")
+            self.emit(f"{r} = OpBitwiseOr %uint {p} {q}")
+            self.dst(a[0], r)
+        elif op in ("v_lshl_or_b32", "v_lshl_add_u32", "v_add_lshl_u32", "v_or3_b32", "v_xor3_b32",
                     "v_add3_u32", "v_and_or_b32_"):
             x, y, z = (self.src_u(t) for t in a[1:4])
             r = self.tmp()
-            if op == "v_bfi_b32":
-                p, n, q = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{p} = OpBitwiseAnd %uint {x} {y}")
-                self.emit(f"{n} = OpNot %uint {x}")
-                self.emit(f"{q} = OpBitwiseAnd %uint {n} {z}")
-                self.emit(f"{r} = OpBitwiseOr %uint {p} {q}")
-            elif op in ("v_lshl_or_b32", "v_lshl_add_u32"):
+            if op in ("v_lshl_or_b32", "v_lshl_add_u32"):
                 s, m = self.tmp(), self.tmp()
                 self.emit(f"{m} = OpBitwiseAnd %uint {y} {self.cu(31)}")
                 self.emit(f"{s} = OpShiftLeftLogical %uint {x} {m}")
