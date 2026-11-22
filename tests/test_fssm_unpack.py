@@ -375,7 +375,7 @@ class TestMainBadSource(unittest.TestCase):
     def test_unlistable_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = io.StringIO()
-            with mock.patch.object(fssm_unpack.os, "listdir", side_effect=PermissionError(13, "Permission denied")), \
+            with mock.patch.object(fssm_unpack.os, "scandir", side_effect=PermissionError(13, "Permission denied")), \
                     mock.patch.object(sys, "stderr", out):
                 self.assertEqual(fssm_unpack.main([tmp]), 2)
             self.assertIn("cannot list", out.getvalue())
@@ -443,6 +443,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
             f.write(dxbc_short_fssm)
         with open(os.path.join(self.src, "ignored.txt"), "w") as f:
             f.write("not a dxbc container")
+        os.mkdir(os.path.join(self.src, "cache.dxbc"))
 
         res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
