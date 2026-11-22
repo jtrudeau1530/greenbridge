@@ -378,7 +378,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
     a = ap.parse_args(argv)
-    os.makedirs(a.out, exist_ok=True)
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:
+        print(f"cannot create output directory {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 1
     rc = 0
     seen_paths: set[tuple[str, str]] = set()
     used_names: set[str] = set()
