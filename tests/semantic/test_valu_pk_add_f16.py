@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import struct
 import unittest
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from fractions import Fraction
 from typing import List, Optional, Tuple, Union
 
@@ -216,6 +218,101 @@ def oracle_v_pk_add_f16(
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg32:
+    """Represents an architectural 32-bit register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """Represents a 32-bit literal or inline constant holding packed 2xf16 values."""
+    dword: int
+
+    @classmethod
+    def from_floats(cls, lo: float, hi: float) -> Literal32:
+        return cls(pack_2xf16(f16_to_bits(lo), f16_to_bits(hi)))
+
+    @property
+    def lo_float(self) -> float:
+        return bits_to_f16(self.dword & 0xFFFF)
+
+    @property
+    def hi_float(self) -> float:
+        return bits_to_f16((self.dword >> 16) & 0xFFFF)
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.dword:08x}"
+
+
+@dataclass(frozen=True)
+class VOP3POperand:
+    """Typed VOP3P operand with op_sel, neg, and abs modifiers."""
+    source: Union[Reg32, Literal32]
+    op_sel_lo: int = 0  # 0 for lo half, 1 for hi half
+    op_sel_hi: int = 1  # 0 for lo half, 1 for hi half
+    neg_lo: bool = False
+    neg_hi: bool = False
+    abs_lo: bool = False
+    abs_hi: bool = False
+
+    def __post_init__(self) -> None:
+        if self.op_sel_lo not in (0, 1) or self.op_sel_hi not in (0, 1):
+            raise ValueError(f"Invalid op_sel values ({self.op_sel_lo}, {self.op_sel_hi}), must be 0 or 1")
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        mods = []
+        if self.abs_lo or self.abs_hi:
+            mods.append(f"abs:[{int(self.abs_lo)},{int(self.abs_hi)}]")
+        if self.neg_lo or self.neg_hi:
+            mods.append(f"neg:[{int(self.neg_lo)},{int(self.neg_hi)}]")
+        if self.op_sel_lo != 0 or self.op_sel_hi != 1:
+            mods.append(f"op_sel:[{self.op_sel_lo},{self.op_sel_hi}]")
+        if mods:
+            return f"{s} {' '.join(mods)}"
+        return s
+
+
+@dataclass(frozen=True)
+class VPkAddF16Instruction:
+    """Symbolic AST node representing a RDNA2 v_pk_add_f16 VOP3P instruction."""
+    dst: Reg32
+    src0: VOP3POperand
+    src1: VOP3POperand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        s = f"v_pk_add_f16 {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -339,6 +436,68 @@ class TestF16ModelAndOracle(unittest.TestCase):
         # Clamping NaN yields +0.0
         res_clamped_nan = oracle_add_f16(snan, f16_to_bits(1.0), clamp=True)
         self.assertEqual(res_clamped_nan, POS_ZERO_F16)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg32_validation_and_naming(self) -> None:
+        v0 = Reg32(0, RegType.VGPR)
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(v0.index, 0)
+
+        s15 = Reg32(15, RegType.SGPR)
+        self.assertEqual(s15.name, "s15")
+        self.assertEqual(s15.index, 15)
+
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+
+    def test_literal32_representation(self) -> None:
+        lit = Literal32.from_floats(1.0, 2.0)
+        self.assertAlmostEqual(lit.lo_float, 1.0)
+        self.assertAlmostEqual(lit.hi_float, 2.0)
+        self.assertTrue(lit.name.startswith("0x"))
+
+    def test_vop3p_operand_disassembly(self) -> None:
+        v1 = Reg32(1, RegType.VGPR)
+        op_plain = VOP3POperand(v1)
+        self.assertEqual(op_plain.disassemble(), "v1")
+
+        op_mods = VOP3POperand(v1, op_sel_lo=1, op_sel_hi=0, neg_lo=True, abs_hi=True)
+        self.assertIn("abs:[0,1]", op_mods.disassemble())
+        self.assertIn("neg:[1,0]", op_mods.disassemble())
+        self.assertIn("op_sel:[1,0]", op_mods.disassemble())
+
+        with self.assertRaises(ValueError):
+            VOP3POperand(v1, op_sel_lo=2)
+
+    def test_v_pk_add_f16_instruction_ast(self) -> None:
+        dst = Reg32(0, RegType.VGPR)
+        src0 = VOP3POperand(Reg32(2, RegType.VGPR), neg_lo=True)
+        src1 = VOP3POperand(Reg32(4, RegType.SGPR))
+        instr = VPkAddF16Instruction(dst=dst, src0=src0, src1=src1, clamp=True)
+        dis = instr.disassemble()
+        self.assertTrue(dis.startswith("v_pk_add_f16 v0, v2 neg:[1,0], s4 clamp"))
+
+        # Destination must be VGPR
+        with self.assertRaises(TypeError):
+            VPkAddF16Instruction(dst=Reg32(0, RegType.SGPR), src0=src0, src1=src1)
+
+    def test_structural_equality(self) -> None:
+        i1 = VPkAddF16Instruction(
+            Reg32(0, RegType.VGPR),
+            VOP3POperand(Reg32(1, RegType.VGPR)),
+            VOP3POperand(Literal32(0)),
+        )
+        i2 = VPkAddF16Instruction(
+            Reg32(0, RegType.VGPR),
+            VOP3POperand(Reg32(1, RegType.VGPR)),
+            VOP3POperand(Literal32(0)),
+        )
+        self.assertEqual(i1, i2)
 
 
 if __name__ == "__main__":
