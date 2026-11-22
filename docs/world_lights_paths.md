@@ -12,8 +12,9 @@ python -I tools/world_lights_paths.py <levels.rpf> --jobs 24 --out reports/world
 `--lights-out` writes one JSON line per placed light (position, direction, colour, type, ...). It is derived
 from your own copy of the game, so it stays in your local work folder.
 
-`--limit` bounds the byte range scanned and must be at least 1 (decimal or `0x` hex); a smaller value stops with a
-one-line error and exit code 2 before any scan or report is written.
+`--limit` caps where a scanned resource may start (a resource that starts inside it is still read to its end). It
+must be at least 1 (decimal or `0x` hex); a smaller value stops with a one-line error and exit code 2 before any
+scan or report is written.
 
 ## Names
 
