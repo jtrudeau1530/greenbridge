@@ -93,10 +93,8 @@ def convert_single(
                         if png_bytes:
                             tex_cache[found_path] = png_bytes
                     if png_bytes:
-                        mat_key = mat_name if mat_name else clean_stem
-                        prim["material"] = mat_key
-                        materials[mat_key] = {
-                            "name": mat_key,
+                        materials[mat_name] = {
+                            "name": mat_name or clean_stem,
                             "png_bytes": png_bytes,
                         }
 
@@ -186,14 +184,18 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     t0 = time.monotonic()
-    stats = batch_convert(
-        args.in_dir,
-        args.out_dir,
-        up_axis=args.up,
-        jobs=args.jobs,
-        texture_dir=args.textures,
-        max_tex_size=args.max_tex_size,
-    )
+    try:
+        stats = batch_convert(
+            args.in_dir,
+            args.out_dir,
+            up_axis=args.up,
+            jobs=args.jobs,
+            texture_dir=args.textures,
+            max_tex_size=args.max_tex_size,
+        )
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     elapsed = time.monotonic() - t0
 
     print(

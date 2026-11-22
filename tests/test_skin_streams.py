@@ -5,6 +5,8 @@
 Every byte here is built by the test: a synthetic drawable system page, a synthetic graphics page and a
 synthetic RPF9-style archive made of page-aligned zlib streams. No game file, value or name is used.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "skin_streams.py")
@@ -295,6 +298,42 @@ class TestValidate(unittest.TestCase):
         self.assertEqual(t["weight-sum-min"], 155)
         self.assertEqual(t["weight-sum-max"], 255)
 
+    def test_weight_sum_min_max_without_255_vertex(self):
+        # All vertices sum below 255 (200) or above 255 (265): min/max must not be clamped to 255.
+        s_low, g_low = build_resource({
+            0: (8, 16, 128, quantized_position(4, 128)),
+            16: (4, 28, 96, bytes([100, 50, 30, 20] * 4)),
+            20: (4, 30, 96 + 16, bytes([0, 1, 2, 3] * 4)),
+        }, 4, 6)
+        m_low = ss.walk_resource(s_low, "drawable")[0]
+        t_low = ss.validate(m_low, g_low, "weighted-4inf-8bit")
+        self.assertEqual((t_low["weight-sum-min"], t_low["weight-sum-max"]), (200, 200))
+
+        s_high, g_high = build_resource({
+            0: (8, 16, 128, quantized_position(4, 128)),
+            16: (4, 28, 96, bytes([200, 40, 10, 5] * 4)),
+            17: (4, 28, 96 + 16, bytes([10, 0, 0, 0] * 4)),
+            20: (4, 30, 96 + 32, bytes([0, 1, 2, 3] * 4)),
+            21: (4, 30, 96 + 48, bytes([0, 0, 0, 0] * 4)),
+        }, 4, 6)
+        m_high = ss.walk_resource(s_high, "drawable")[0]
+        t_high = ss.validate(m_high, g_high, "weighted-8inf-8bit")
+        self.assertEqual((t_high["weight-sum-min"], t_high["weight-sum-max"]), (265, 265))
+
+    def test_non_graphics_vb_pointer_is_rejected(self):
+        system, gfx, mesh = weighted_mesh("weighted-4inf-8bit", vertices=4, bones=6)
+        patched = bytearray(system)
+        pos = patched.index(struct.pack("<Q", 0x60000000))
+        for bad_ptr in (0, 0x50000000, 0x60000000 - len(gfx) - 16, 0x60000000 + ss.MAX_GFX):
+            with self.subTest(bad_ptr=hex(bad_ptr)):
+                struct.pack_into("<Q", patched, pos, bad_ptr)
+                with self.assertRaises(ss.Skip):
+                    ss.walk_resource(bytes(patched), "drawable")
+        neg_mesh = ss.Mesh(mesh.vertices, mesh.bones, mesh.slots, -len(gfx) - 16, mesh.gfx_len)
+        padded_gfx = b"\x00" * 1024 + gfx + b"\x00" * 16
+        self.assertEqual(ss.validate(neg_mesh, padded_gfx, "weighted-4inf-8bit"),
+                         {"buffer-short": 1, "vertices": mesh.vertices})
+
 
 def build_archive(system, gfx, unaligned_copy=None):
     """A synthetic RPF9-style file: page-aligned zlib streams, each preceded by 16 zero bytes."""
@@ -504,6 +543,19 @@ class TestCli(unittest.TestCase):
                     self.assertEqual(r.returncode, 2, r.stderr)
                     self.assertIn("--sample must be at least 1", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
+
+    def test_unreadable_archive_reports_its_path_without_writing_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            out = os.path.join(tmp, "report.json")
+            stderr = io.StringIO()
+            error = PermissionError(13, "input is locked", path)
+            with (mock.patch.object(ss, "open", create=True, side_effect=error),
+                  contextlib.redirect_stderr(stderr)):
+                self.assertEqual(ss.main([path, "--json", out]), 2)
+            self.assertEqual(stderr.getvalue().splitlines(),
+                             [f"error: cannot read {path}: input is locked"])
+            self.assertFalse(os.path.exists(out))
 
     def test_missing_or_directory_input_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

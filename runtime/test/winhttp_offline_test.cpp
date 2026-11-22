@@ -126,6 +126,30 @@ int main() {
               "request headers are accepted");
         check(set_timeouts(request, 1000, 1000, 1000, 1000) != FALSE, "timeouts are accepted");
 
+        // The same answers the host's winhttp.dll gives (measured on Windows 11 26300).
+        const auto rejects = [](BOOL ok) { return ok == FALSE && GetLastError() == ERROR_INVALID_PARAMETER; };
+        SetLastError(0);
+        check(rejects(add_headers(request, nullptr, 0, WINHTTP_ADDREQ_FLAG_ADD)), "a null header block is rejected");
+        SetLastError(0);
+        check(rejects(add_headers(request, L"", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
+              "an empty header block is rejected");
+        SetLastError(0);
+        check(rejects(add_headers(request, L"nocolon", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
+              "a header with no colon is rejected");
+        SetLastError(0);
+        check(rejects(add_headers(request, L"X-C: b", 2, WINHTTP_ADDREQ_FLAG_ADD)),
+              "a length that cuts the header before its colon is rejected");
+        check(add_headers(request, L"X-D: b", 6, WINHTTP_ADDREQ_FLAG_ADD) != FALSE,
+              "an explicit length that covers the colon is accepted");
+        check(set_timeouts(request, 0, 0, 0, 0) != FALSE && set_timeouts(request, -1, -1, -1, -1) != FALSE,
+              "timeouts of 0 and -1 (infinite) are accepted");
+        for (int field = 0; field < 4; ++field) {
+            int t[4] = {0, 0, 0, 0};
+            t[field] = -2;
+            SetLastError(0);
+            check(rejects(set_timeouts(request, t[0], t[1], t[2], t[3])), "a timeout below -1 is rejected");
+        }
+
         SetLastError(0);
         const auto start = std::chrono::steady_clock::now();
         const BOOL sent = send(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);

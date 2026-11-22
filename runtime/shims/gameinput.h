@@ -1,7 +1,9 @@
 // GameInput shim on SDL3: runtime-side controls and test seams. The GameInput API itself is reached the way a title
 // reaches it, through GameInputCreate in the shim registry (gameinput.dll / xgameruntime.dll). See docs/gameinput.md.
 #pragma once
+#include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace rt::gameinput {
 
@@ -80,6 +82,37 @@ void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus);
 // replaces GetCursorPos. nullptr restores the default.
 using CursorPosFn = bool (*)(int* x, int* y);
 void set_cursor_source(CursorPosFn cursor_pos);
+
+// Raw HID (RT-175, docs/gameinput.md "Raw HID"). One report a HID report descriptor declares: its kind
+// (GameInputRawDeviceReportKind: 0 input, 1 output, 2 feature), its report id (0 when the descriptor declares none)
+// and its payload size in bytes, without the id byte.
+struct RawReportSize {
+    int kind;
+    uint32_t id;
+    uint32_t bytes;
+};
+// Reads the reports out of a HID report descriptor, sorted by kind then id. Main items Input/Output/Feature add
+// Report Size x Report Count bits to the current report id; Push and Pop save and restore the globals; long items are
+// skipped. False on a truncated descriptor, a Report ID of 0 or above 255, a Pop without a Push, or a report over
+// 64 KiB.
+bool parse_report_descriptor(const uint8_t* data, size_t size, std::vector<RawReportSize>* out);
+
+// Where the shim does a pad's HID I/O. The default is SDL's hidapi (SDL_hid_*). Report buffers follow hidapi: they
+// start with the report id byte (0 for a device without ids) for write, get_feature and send_feature, and read
+// returns it first only when the device uses ids. read never blocks: it returns 0 when nothing is pending. Every
+// call returns a byte count, or a negative value on error.
+struct HidBackend {
+    void* (*open)(const char* path, uint16_t vendor, uint16_t product);  // nullptr: no HID device for this pad
+    void (*close)(void* hid);
+    int (*descriptor)(void* hid, uint8_t* buf, size_t size);
+    int (*read)(void* hid, uint8_t* buf, size_t size);
+    int (*write)(void* hid, const uint8_t* buf, size_t size);
+    int (*get_feature)(void* hid, uint8_t* buf, size_t size);
+    int (*send_feature)(void* hid, const uint8_t* buf, size_t size);
+};
+// Test seam: the backend for pads opened from now on (pads already open keep theirs until they reconnect). nullptr
+// restores SDL's.
+void set_hid_backend(const HidBackend* backend);
 
 // One row of the keyboard pad's key map: a Windows virtual-key code and the SDL gamepad button it presses.
 struct KeyBinding {

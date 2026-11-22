@@ -12,7 +12,9 @@ What it reports
       handled-exact   its name is a string the translator compares the opcode with (a == / in test, or a key of
                       a mnemonic table such as NOOPS or F2);
       handled-family  no exact name, but it starts with a prefix the translator tests with op.startswith(...)
-                      (v_cmp_, ds_, buffer_atomic_ ...);
+                      (v_cmp_, ds_, buffer_atomic_ ...), or ends with a suffix it tests with op.endswith(...) where
+                      the test has no startswith (s_*_saveexec_b64 ...; a `<stem> in self.TABLE` beside it limits
+                      the family to the stems that table holds);
       refused         the name sits in a test whose whole body is `raise Unsupported(...)`;
       unknown         none of the above: the translator reaches its final `raise Unsupported(op)` for it, or
                       handles it by a rule this static scan cannot see;
@@ -21,7 +23,8 @@ What it reports
 
 Method and limits (static, by ast): the translator dispatches with a long if/elif chain on the opcode string, so
 the scan collects the string constants that are compared with `op` (== / != / in / not in, also base_op(...)),
-the keys and elements of every dict / set / tuple that holds mnemonics, and the prefixes given to op.startswith.
+the keys and elements of every dict / set / tuple that holds mnemonics, the prefixes given to op.startswith and the
+suffixes given to op.endswith.
 It cannot see: a branch that accepts an instruction and then rejects some operand forms (reported separately as
 `partial`, when the branch body contains a raise Unsupported), names built by string formatting, and whether the
 emitted code is right. "handled" means "has a rule", not "is correct". A broad prefix such as ds_ marks every
@@ -166,6 +169,8 @@ def scan_translator(path):
         tree = ast.parse(f.read(), path)
     exact = collections.defaultdict(set)      # name -> {source kind}
     prefixes = collections.defaultdict(set)   # prefix -> {line}
+    suffixes = collections.defaultdict(set)
+    tables = {}
     refused, partial = set(), set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Compare) and _is_op(node.left):
@@ -173,6 +178,13 @@ def scan_translator(path):
                 for m in _mnemonics(c):
                     exact[m].add("compare")
         elif isinstance(node, ast.Assign):          # NOOPS = {...}, F2 = {"v_add_f32": ...}, BRANCHES = {...}
+            keys = (node.value.keys if isinstance(node.value, ast.Dict) else
+                    node.value.elts if isinstance(node.value, (ast.Set, ast.Tuple, ast.List)) else [])
+            strs = [k.value for k in keys if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+            if strs:
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        tables[t.id] = tuple(sorted(strs))
             for m in _mnemonic_collection(node.value):
                 exact[m].add("table")
         elif isinstance(node, ast.Dict):            # a table written inline
@@ -203,8 +215,52 @@ def scan_translator(path):
                 for p in _strings(node):
                     if re.match(r"^[a-z0-9_]+$", p):
                         prefixes[p].add(node.lineno)
+        for node in _chain_ifs(methods[name].body):
+            if _only_raises_unsupported(node.body):
+                continue
+            for suffix, stems in _suffix_tests(node.test, tables):
+                suffixes[(suffix, stems)].add(node.lineno)
     return {"exact": {k: sorted(v) for k, v in exact.items()}, "prefixes": {k: sorted(v) for k, v in prefixes.items()},
+            "suffixes": {k: sorted(v) for k, v in suffixes.items()},
             "refused": sorted(refused), "partial": sorted(partial)}
+
+
+def _op_call(node, attr):
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == attr
+            and _is_op(node.func.value))
+
+
+def _chain_ifs(body):
+    out = []
+    for st in body:
+        while isinstance(st, ast.If):
+            out.append(st)
+            st = st.orelse[0] if len(st.orelse) == 1 and isinstance(st.orelse[0], ast.If) else None
+    return out
+
+
+def _suffix_tests(test, tables):
+    parts = test.values if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And) else [test]
+    stems = None
+    for x in parts:
+        if _op_call(x, "endswith"):
+            continue
+        t = x.comparators[0] if isinstance(x, ast.Compare) and len(x.ops) == 1 and isinstance(x.ops[0], ast.In) else None
+        key = t.attr if isinstance(t, ast.Attribute) else t.id if isinstance(t, ast.Name) else None
+        if key not in tables or stems is not None:
+            return []
+        stems = tables[key]
+    return [(s, stems) for x in parts if _op_call(x, "endswith") for s in _strings(x)
+            if re.match(r"^_[a-z0-9_]+$", s)]
+
+
+def in_suffix_family(name, suffixes):
+    for suffix, stems in suffixes:
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            if stems is None or any(stem.endswith("_" + k) for k in stems):
+                return True
+    return False
 
 
 def classify(name, scan, handled_elsewhere):
@@ -213,7 +269,7 @@ def classify(name, scan, handled_elsewhere):
         return "handled-exact"
     if name in scan["refused"]:
         return "refused"
-    if any(name.startswith(p) for p in scan["prefixes"]):
+    if any(name.startswith(p) for p in scan["prefixes"]) or in_suffix_family(name, scan.get("suffixes", ())):
         return "handled-family"
     return "unknown"
 
@@ -299,6 +355,8 @@ def build_report(isa, scan, accepted):
                              if n in dead_stem else {})} for n in extra],
         "prefixes": {p: sum(1 for n in names_in_xml if n.startswith(p)) for p in sorted(scan["prefixes"])},
         "prefixes_without_rdna2_match": empty_prefixes,
+        "suffixes": {s: sum(1 for n in names_in_xml if in_suffix_family(n, [(s, st)]))
+                     for s, st in sorted(scan.get("suffixes", ()), key=lambda k: (k[0], k[1] or ()))},
     }
 
 
@@ -332,6 +390,9 @@ def markdown(rep, list_unknown=False):
         lines.append("None.")
     lines += ["", "Prefix families the dispatch tests with op.startswith (RDNA2 instructions each one matches): " +
               ", ".join(f"`{p}` {c}" for p, c in rep["prefixes"].items())]
+    if rep["suffixes"]:
+        lines += ["", "Suffix families the dispatch tests with op.endswith (RDNA2 instructions each one matches): " +
+                  ", ".join(f"`{s}` {c}" for s, c in rep["suffixes"].items())]
     if rep["prefixes_without_rdna2_match"]:
         lines += ["", "Prefixes (op.startswith) that match no RDNA2 instruction: " +
                   ", ".join(f"`{p}`" for p in rep["prefixes_without_rdna2_match"])]

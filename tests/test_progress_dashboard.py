@@ -204,8 +204,30 @@ class Corpus(unittest.TestCase):
                                    ("compute", "implemented"): 1, ("compute", "failed"): 1})
             m = next(m for m in col.metrics if m["id"] == "corpus.validated")
             self.assertEqual((m["numerator"], m["denominator"]), (2, 5))
-            self.assertNotIn(SENTINEL, json.dumps({"c": col.components, "s": col.sources, "m": col.metrics}))
-            self.assertNotIn(tmp, json.dumps(col.sources))
+            # everything the collector holds can reach the page (notes and panels included), so check all of it
+            held = json.dumps(vars(col), default=str)
+            self.assertNotIn(SENTINEL, held)
+            self.assertNotIn(tmp, held)
+            self.assertNotIn(json.dumps(tmp)[1:-1], held)
+
+
+class Scrub(unittest.TestCase):
+    def test_paths_outside_the_repository_lose_their_file_name(self):
+        sep = os.sep
+        work = os.path.join(tempfile.gettempdir(), "work", "shaders", "dxbc", f"{SENTINEL}.fssm")
+        self.assertEqual(pd.scrub(f"FAIL: cannot read {work}"), "FAIL: cannot read <path>")
+        self.assertEqual(pd.scrub(f"see /home/someone/work/{SENTINEL}.fssm now"), "see <path> now")
+        self.assertEqual(pd.scrub("in " + os.path.join(pd.HOME, "work", f"{SENTINEL}.fssm")), "in <path>")
+        self.assertEqual(pd.scrub(f"C:{sep}work{sep}{SENTINEL}_a.fssm, C:{sep}{SENTINEL}_b.fssm"), "<path> <path>")
+
+    def test_paths_inside_the_repository_become_relative(self):
+        line = "Error: " + os.path.join(ROOT, "tools", "text_tables.py") + " line 3"
+        self.assertEqual(pd.scrub(line), "Error: tools/text_tables.py line 3")
+
+    def test_urls_and_relative_paths_stay(self):
+        self.assertEqual(pd.scrub("see https://github.com/ItsNotRexed/Leonida/issues/1"),
+                         "see https://github.com/ItsNotRexed/Leonida/issues/1")
+        self.assertEqual(pd.scrub("tests/test_x.py failed"), "tests/test_x.py failed")
 
 
 class Outputs(unittest.TestCase):

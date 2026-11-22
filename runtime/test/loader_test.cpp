@@ -20,6 +20,7 @@
 
 #include "../shims/shims.h"
 #include "../src/pe_loader.h"
+#include "free_image_base.h"
 
 namespace {
 
@@ -56,7 +57,7 @@ std::vector<uint8_t> make_image() {
     nt->FileHeader.NumberOfSections = 1;
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-    nt->OptionalHeader.ImageBase = 0x140000000;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x140000000);
     nt->OptionalHeader.AddressOfEntryPoint = 0x1000;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = 0x2000;
@@ -101,7 +102,7 @@ std::filesystem::path write_image_as(const std::vector<uint8_t>& bytes, const st
 std::vector<uint8_t> make_forwarder_image(const char* target, uint64_t image_base) {
     auto img = make_image();
     std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});  // real tables end in a zero descriptor
-    nt_of(img)->OptionalHeader.ImageBase = image_base;
+    nt_of(img)->OptionalHeader.ImageBase = leonida_test::free_image_base(image_base);
     auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
     ed->Base = 1;
     ed->NumberOfFunctions = 1;
@@ -381,6 +382,56 @@ void test_exports() {
     }
 }
 
+void test_empty_named_export() {
+    const char* what = "an empty named export stays unresolved without hiding valid exports";
+    auto img = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
+    ed->NumberOfFunctions = 3;
+    ed->NumberOfNames = 3;
+    nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = 0x1A0;
+    auto* funcs = reinterpret_cast<uint32_t*>(img.data() + 0x300);
+    funcs[1] = 0;
+    funcs[2] = 0x11C0;  // a code export outside the export directory
+    auto* names = reinterpret_cast<uint32_t*>(img.data() + 0x320);
+    names[0] = 0x1188;
+    names[1] = 0x1180;
+    names[2] = 0x1190;
+    auto* ords = reinterpret_cast<uint16_t*>(img.data() + 0x340);
+    ords[0] = 1;
+    ords[1] = 0;
+    ords[2] = 2;
+    std::memcpy(img.data() + 0x388, "empty\0", 6);
+    std::memcpy(img.data() + 0x390, "valid\0", 6);
+    auto provider = write_image_as(img, "empty_exports.dll");
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(provider);
+        for (const char* sym : {"empty", "#2"}) {
+            bool owns = false;
+            if (m.exports.count(sym) || m.forwarders.count(sym) ||
+                loader.resolve_module_export(m.base, sym, owns) || !owns)
+                return failed(what, std::string(sym) + " did not remain absent from the mapped module");
+        }
+        for (const char* sym : {"valid", "#3", "fwd", "#1"}) {
+            bool owns = false;
+            void* expected = (std::strcmp(sym, "valid") == 0 || std::strcmp(sym, "#3") == 0)
+                ? m.base + 0x11C0 : host_symbol("kernel32.dll", "GetCurrentProcessId");
+            if (!expected || loader.resolve_module_export(m.base, sym, owns) != expected || !owns)
+                return failed(what, std::string(sym) + " no longer resolves to its valid target");
+        }
+        auto importer = write_image_as(make_import_image("empty_exports.dll", "empty"), "empty_import.exe");
+        rt::Module& importing = loader.load(importer);
+        if (importing.imports.size() != 1 || importing.imports[0].binding != rt::Binding::Unimplemented)
+            return failed(what, "an import of the empty slot did not bind as unimplemented");
+        void* bound = *reinterpret_cast<void**>(importing.base + 0x1180);
+        if (!bound || bound == m.base)
+            return failed(what, "the empty import was not given a failure thunk");
+        pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 void test_imports() {
     {
         auto img = make_image();
@@ -416,6 +467,42 @@ void test_imports() {
         dir.VirtualAddress = 0x1000;
         dir.Size = sizeof(IMAGE_IMPORT_DESCRIPTOR);
         expect_rejects("an import thunk table that runs past the image", img);
+    }
+}
+
+void test_import_name_rvas() {
+    for (bool delay : {false, true}) {
+        auto img = make_import_image("testshim.dll", "F");
+        if (delay) {
+            std::fill(img.begin() + 0x200, img.begin() + 0x240, uint8_t{0});
+            auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
+            d->Attributes.AllAttributes = 1;
+            d->DllNameRVA = 0x1060;
+            d->ImportNameTableRVA = 0x1100;
+            d->ImportAddressTableRVA = 0x1180;
+            auto* nt = nt_of(img);
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {};
+            auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+            dir.VirtualAddress = 0x1000;
+            dir.Size = 2 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+        }
+        const char* valid = delay ? "a valid delay-import name RVA loads" : "a valid import name RVA loads";
+        std::string error;
+        if (load(write_image(img), error) != 0)
+            failed(valid, error);
+        else
+            pass(valid);
+
+        *reinterpret_cast<uint64_t*>(img.data() + 0x300) = (1ull << 32) | 0x1120;
+        const char* invalid = delay ? "a delay-import name RVA with high bits is rejected"
+                                    : "an import name RVA with high bits is rejected";
+        error.clear();
+        if (load(write_image(img), error) == 0)
+            failed(invalid, "the image loaded");
+        else if (error.find("an import name runs past the image") == std::string::npos)
+            failed(invalid, error);
+        else
+            pass(invalid);
     }
 }
 
@@ -469,8 +556,6 @@ void emit_store_stub(std::vector<uint8_t>& img, size_t off, uint64_t addr, uint3
     img[n++] = 0xC3;
 }
 
-constexpr uint64_t kInitBase = 0x140000000;
-
 // make_image() plus a TLS directory and an entry point, both aimed at real machine code: a stub that stores a
 // sentinel in this process, so the test can tell a callback ran rather than only that it was parsed.
 std::vector<uint8_t> make_init_image() {
@@ -478,7 +563,8 @@ std::vector<uint8_t> make_init_image() {
     auto* nt = nt_of(img);
     nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
     nt->OptionalHeader.AddressOfEntryPoint = 0x1040;
-    auto va = [](uint32_t rva) { return kInitBase + rva; };
+    const uint64_t base = nt->OptionalHeader.ImageBase;  // the TLS callback addresses below are absolute
+    auto va = [base](uint32_t rva) { return base + rva; };
     constexpr size_t text = 0x200;  // file offset of RVA 0x1000
     emit_store_stub(img, text + 0x00, reinterpret_cast<uint64_t>(&g_tls_ran), 1, 0);
     emit_store_stub(img, text + 0x40, reinterpret_cast<uint64_t>(&g_main_ran), 2, 1);
@@ -555,7 +641,7 @@ void test_initialise_rejects() {
     {
         auto img = make_init_image();
         auto* callbacks = reinterpret_cast<uint64_t*>(img.data() + 0x290);  // file offset of RVA 0x1090
-        callbacks[0] = kInitBase + 0x9000;                                  // well past SizeOfImage
+        callbacks[0] = nt_of(img)->OptionalHeader.ImageBase + 0x9000;         // well past SizeOfImage
         expect_init_rejects("a TLS callback outside the image is rejected", img);
     }
     {
@@ -753,7 +839,7 @@ void test_process_detach_without_entry() {
     reset_notifications();
     auto first = make_lifecycle_image();
     auto second = make_image();
-    nt_of(second)->OptionalHeader.ImageBase = 0x180000000;
+    nt_of(second)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x180000000);
     nt_of(second)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
     emit_jump_stub(second, 0x200, reinterpret_cast<uint64_t>(&observe_dllmain));
     void* first_base = nullptr;
@@ -803,6 +889,26 @@ void test_process_detach_dependencies() {
     if (g_detach_state_live) pass("all dependency mappings remain live until notifications finish");
     else failed("all dependency mappings remain live until notifications finish", "a dependency was unmapped early");
     g_live_modules.clear();
+}
+
+// A dependency whose import table is corrupt fails while the parent binds it. Neither must stay findable by name:
+// a later load or GetModuleHandle would otherwise get a mapped image whose imports were never bound.
+void test_failed_dependency_not_registered() {
+    const char* what = "a failed load leaves neither the module nor its failed dependency loaded";
+    auto dep = make_import_image("kernel32.dll", "GetCurrentProcessId");
+    reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(dep.data() + 0x200)->Name = 0x5000;  // past SizeOfImage
+    const auto dep_path = write_image_as(dep, "fail_dep.dll");
+    const auto parent_path = write_image_as(make_import_image("fail_dep.dll", "x"), "fail_parent.dll");
+    rt::Loader loader(g_dir);
+    auto throws = [&](const std::filesystem::path& p) {
+        try { loader.load(p); return false; } catch (const std::exception&) { return true; }
+    };
+    if (!throws(parent_path)) return failed(what, "the parent loaded over a corrupt dependency");
+    if (loader.find_loaded_module("fail_dep.dll") || loader.find_loaded_module("fail_parent.dll"))
+        return failed(what, "a failed module is still found by name");
+    if (!throws(dep_path)) return failed(what, "a second load of the dependency returned the half-loaded module");
+    if (!throws(parent_path)) return failed(what, "a second load of the parent returned the half-loaded module");
+    pass(what);
 }
 
 void test_forwarded_exports() {
@@ -1134,7 +1240,9 @@ int main() {
         test_truncation();
         test_relocations();
         test_exports();
+        test_empty_named_export();
         test_imports();
+        test_import_name_rvas();
         test_delay_imports();
         test_initialise();
         test_initialise_rejects();
@@ -1142,6 +1250,7 @@ int main() {
         test_process_detach_invalid_tls();
         test_process_detach_without_entry();
         test_process_detach_dependencies();
+        test_failed_dependency_not_registered();
         test_delay_descriptor_fields();
         test_forwarded_exports();
         test_export_bounds();

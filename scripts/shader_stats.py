@@ -165,7 +165,10 @@ def main():
     for (name, stage), st in sorted(stats.items()):
         src = os.path.join(disasm, name + ".s")
         if os.path.isfile(src):
-            rows.append(shader_row(name, stage, st, src))
+            try:
+                rows.append(shader_row(name, stage, st, src))
+            except OSError as e:
+                sys.exit(f"{src}: {e.strerror or e}")
     if not rows:
         sys.exit("no shader is in both the statistics and the disasm folder")
     if "--details" in sys.argv:
@@ -199,4 +202,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1131,6 +1131,18 @@ class SyntheticPoolTest(unittest.TestCase):
         self.assertIn("not every requested mip uses a supported codec", err.getvalue())
         self.assertFalse(os.path.exists(full))
 
+    def test_export_write_error_names_the_output_without_a_traceback(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        out = os.path.join(self.tmp.name, "destination")
+        os.mkdir(out)
+        error = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(error):
+            self.assertEqual(ttpf.export(self.pool, 0, out, force=True), 1)
+        self.assertIn(out, error.getvalue())
+        self.assertIn("cannot write", error.getvalue())
+
     def test_scan_reports_the_whitelist_gate(self):
         # The synthetic tuple is validated, so it is not gated: the partial export is
         # the descriptor non_tail limit, not the 319-byte profile table.
@@ -1310,6 +1322,23 @@ def build_bc1_bcpack_pool(path, width=64, height=64, mips=5, non_tail=1, mode=4,
     with open(path, "wb") as f:
         f.write(blob)
     return layout, linear, bytes(payload)
+
+
+class PoolCacheTest(unittest.TestCase):
+    def test_shared_cache_keeps_matching_chunk_offsets_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            record = pack_etpf_record(4, 4, 1, 0, 71, 1, 1, 4, 4096)
+            pools = []
+            payloads = (bytes((0x11,)) * 4096, bytes((0x22,)) * 4096)
+            for i, payload in enumerate(payloads):
+                path = os.path.join(temp, f"pool_{i}.ttpf")
+                write_rds5_pool(path, [record], [payload])
+                pools.append(stack.enter_context(closing(ttpf.Pool(path))))
+            self.assertEqual(pools[0].chunks, pools[1].chunks)
+            cache = {}
+            for pool, payload in zip(pools, payloads):
+                self.assertEqual(pool.read_range(4096, 4096, cache), payload)
+            self.assertEqual(pools[0].read_range(4096, 4096, cache), payloads[0])
 
 
 class SyntheticBcpackPoolTest(unittest.TestCase):

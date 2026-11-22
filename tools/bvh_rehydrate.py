@@ -51,6 +51,7 @@ input error.
 """
 import argparse
 import math
+import os
 import struct
 import sys
 
@@ -442,6 +443,17 @@ def main(argv=None):
     ap.add_argument("--transform")
     ap.add_argument("--compare")
     a = ap.parse_args(argv)
+    # The output must never replace a file the tool was asked to read. samefile also catches a
+    # case-only difference on Windows and macOS's default volume (tools/hashdict.py).
+    if os.path.exists(a.out):
+        inputs = [a.dehydrated]
+        inputs += [p for spec in a.geom for p in spec.split(",") if p]
+        if a.compare:
+            inputs.append(a.compare)
+        for path in inputs:
+            if os.path.isfile(path) and os.path.samefile(a.out, path):
+                print("error: --out must not overwrite the input %s" % path, file=sys.stderr)
+                return 2
     try:
         transform = parse_transform(a.transform) if a.transform else None
         geometries = []

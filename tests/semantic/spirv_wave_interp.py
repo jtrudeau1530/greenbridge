@@ -232,6 +232,7 @@ class _Module:
             self.consts[res] = False
         elif op == "OpConstantNull":
             self.consts[res] = self.zero(a[0])
+            self.id_type[res] = a[0]
         elif op == "OpConstantComposite":
             self.consts[res] = tuple(self.consts[x] for x in a[1:])
         elif op == "OpVariable":
@@ -494,8 +495,9 @@ class _Wave:
             return a[1] if self.bool_of(lane, a[0]) else a[2]
         if op == "OpSwitch":
             sel = self.int_of(lane, a[0])
+            mask = (1 << self.m.bits(self.m.id_type[a[0]])) - 1
             for k in range(2, len(a) - 1, 2):
-                if int(a[k], 0) == sel:
+                if (int(a[k], 0) & mask) == sel:
                     return a[k + 1]
             return a[1]
         raise UnsupportedConstruct(op)

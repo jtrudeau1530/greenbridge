@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "../shims/d3d12_com.h"
+#include "host_adapter.h"
 
 namespace copycmp {
 
@@ -66,31 +67,17 @@ inline bool try_create_host(Ptr<ID3D12Device>& host, std::string& name, const LU
     if (!create || !create_factory) return false;
     Ptr<IDXGIFactory4> factory;
     if (FAILED(create_factory(IID_PPV_ARGS(&factory.p)))) return false;
-    char want[128] = {};
-    GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want));
+    // The variable and the name match are host_adapter.h's, shared with the tests that create their host devices
+    // themselves.
+    const std::string needle = hostadapter::wanted();
     Ptr<IDXGIAdapter1> adapter;
     if (luid) {
         if (FAILED(factory->EnumAdapterByLuid(*luid, IID_PPV_ARGS(&adapter.p)))) return false;
-    } else if (want[0]) {
-        std::string needle(want);
-        std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-        if (needle == "warp") {
-            if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) return false;
-        } else {
-            for (UINT i = 0;; ++i) {
-                Ptr<IDXGIAdapter1> candidate;
-                if (FAILED(factory->EnumAdapters1(i, &candidate.p))) return false;
-                DXGI_ADAPTER_DESC1 desc{};
-                candidate->GetDesc1(&desc);
-                std::string text;
-                for (const wchar_t* c = desc.Description; *c; ++c) text += char(std::tolower(*c < 128 ? *c : '?'));
-                if (text.find(needle) != std::string::npos) {
-                    adapter.p = candidate.p;
-                    candidate.p = nullptr;
-                    break;
-                }
-            }
-        }
+    } else if (needle == "warp") {
+        if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) return false;
+    } else if (!needle.empty()) {
+        adapter.p = hostadapter::named(factory.p, needle);
+        if (!adapter.p) return false;
     }
     if (FAILED(create(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return false;
     Ptr<IDXGIAdapter1> used;

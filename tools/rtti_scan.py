@@ -145,23 +145,33 @@ def scan_pe64_rtti(data: bytes) -> dict:
 
     # 3. Class hierarchies.
     classes = {}
+    chd_ok = set()
     for rva, col in cols.items():
         td = col["td"]
-        if td in classes:
+        if td in chd_ok:
             continue
         chd = col["chd"]
-        try:
-            _, attrs, nbase, rarr = struct.unpack_from("<4I", img, chd)
-            bases = []
-            for i in range(1, min(nbase, 256)):
-                bcd = u32(rarr + 4 * i)
-                btd = u32(bcd)
-                if btd in tds:
-                    bases.append(simple_name(tds[btd]))
-        except struct.error:
-            attrs, bases = 0, []
-        classes[td] = {"name": simple_name(tds[td]), "mangled": tds[td], "td_rva": td,
-                       "multiple": bool(attrs & 1), "virtual": bool(attrs & 2), "bases": bases}
+        valid_chd = False
+        attrs, bases = 0, []
+        if chd > 0:
+            try:
+                sig, attrs, nbase, rarr = struct.unpack_from("<4I", img, chd)
+                if sig == 0 and rarr > 0:
+                    for i in range(1, min(nbase, 256)):
+                        bcd = u32(rarr + 4 * i)
+                        btd = u32(bcd)
+                        if btd in tds:
+                            bases.append(simple_name(tds[btd]))
+                    valid_chd = True
+                else:
+                    attrs = 0
+            except struct.error:
+                attrs, bases = 0, []
+        if valid_chd or td not in classes:
+            classes[td] = {"name": simple_name(tds[td]), "mangled": tds[td], "td_rva": td,
+                           "multiple": bool(attrs & 1), "virtual": bool(attrs & 2), "bases": bases}
+        if valid_chd:
+            chd_ok.add(td)
 
     # 4. Vtables: a qword equal to (image base + COL rva), followed by code pointers.
     vtables = []
@@ -171,7 +181,7 @@ def scan_pe64_rtti(data: bytes) -> dict:
             continue
         lo = sec["virtual_address"]
         hi = min(lo + sec["virtual_size"], len(img))
-        for p in range(lo - lo % 8, hi - 8, 8):
+        for p in range((lo + 7) & ~7, hi - 8, 8):
             q = struct.unpack_from("<Q", img, p)[0]
             if q in col_vas:
                 vt = p + 8

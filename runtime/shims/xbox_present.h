@@ -23,10 +23,14 @@
 
 #include "d3d12_com.h"
 #include "../src/frame_pacer.h"
+#include "../src/vulkan_present.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 namespace rt::d3d12 {
 
@@ -116,7 +120,7 @@ public:
     //   Composed: a plane with pDestPlacementBase, a point or linear ScaleFilter, or the HDR10 colour space (and any
     //             second plane that is an overlay) is composed by a compute pass (VulkanPresenter::present_planes): plane 0
     //             from its source rectangle to its destination placement, plane 1 alpha-blended over it, colour spaces
-    //             converted to the swapchain's (HDR10 when the surface has it, else HDR10 is clipped to SDR). Needs sampled,
+    //             converted to the swapchain's (HDR10 when the surface has it, else HDR10 is tone mapped to SDR). Needs sampled,
     //             single-sample, non-integer sources; others give DXGI_ERROR_UNSUPPORTED.
     //   2 planes: the two share one token. Plane 1 is composed over plane 0 only when xbox_plane_flag_overlay is set on it
     //             (hypothesis); otherwise it is not shown (the GameDVR copy of the public HDR sample), logged once.
@@ -137,9 +141,17 @@ public:
     HRESULT SuspendX(UINT flags);
     HRESULT ResumeX();
 
-    // What SDR white is in nits when SDR and HDR10 planes meet (default 203, ITU-R BT.2408's reference white; hypothesis:
-    // the console's value is a user setting). Applies to the next PresentX.
-    void set_sdr_white_nits(float nits) { sdr_white_nits_ = nits > 0.0f ? nits : 203.0f; }
+    // What SDR white is in nits when SDR and HDR10 planes meet (docs section 4.5). `nits` > 0 overrides everything; 0 goes
+    // back to automatic: while the swapchain is HDR10, the SDR content brightness Windows has for the output the window
+    // is on (a background thread refreshes it once a second; PresentX only reads the cached value), else 203 (ITU-R
+    // BT.2408's reference white). Applies to the next PresentX. The setters may be called from any thread.
+    void set_sdr_white_nits(float nits) { sdr_white_override_ = nits > 0.0f ? nits : 0.0f; }
+    // How SDR planes are decoded and an SDR output is encoded: piecewise sRGB (default) or gamma 2.2. The environment
+    // variable LEONIDA_SDR_EOTF=gamma22 (or 2.2; any case; "srgb" is the default; other values are logged once and
+    // ignored) chooses when the object is made.
+    void set_sdr_eotf(leonida::PresentPlanes::SdrEotf eotf) { sdr_eotf_ = eotf; }
+    // Peak of HDR10 content in nits, the white point of the tone map onto an SDR output (default 1000; no metadata is read).
+    void set_hdr_peak_nits(float nits) { hdr_peak_nits_ = nits > 0.0f ? nits : 1000.0f; }
 
     leonida::FramePacer& pacer() { return pacer_; }
     WindowPresenter& presenter() { return *presenter_; }
@@ -148,6 +160,8 @@ public:
     std::uint64_t immediate_presents() const { return pacer_.immediate_presents(); }
 
 private:
+    float effective_sdr_white_nits();  // override, else the cached Windows setting while HDR10, else 203
+    void display_white_worker();       // refreshes display_white_ off the present path
     std::unique_ptr<WindowPresenter> presenter_;
     std::unique_ptr<leonida::FrameClock> own_clock_;
     leonida::FramePacer pacer_;
@@ -155,7 +169,17 @@ private:
     std::atomic<std::uint64_t> presents_{0};
     bool logged_planes_ = false, logged_threshold_ = false, logged_display_ = false, logged_color_space_ = false,
          logged_extras_ = false, logged_resource_count_ = false;
-    float sdr_white_nits_ = 203.0f;
+    std::atomic<float> sdr_white_override_{0.0f};  // > 0: set_sdr_white_nits
+    std::atomic<leonida::PresentPlanes::SdrEotf> sdr_eotf_{leonida::PresentPlanes::SdrEotf::srgb};
+    std::atomic<float> hdr_peak_nits_{1000.0f};
+    // The last good Windows SDR white level (nits, 0: none yet), refreshed by display_white_thread_ about once a second while
+    // an HDR10 swapchain is in use (white_wanted_); a failed query keeps the previous value.
+    std::atomic<float> display_white_{0.0f};
+    std::atomic<bool> white_wanted_{false};
+    std::mutex worker_mutex_;
+    std::condition_variable worker_wake_;
+    bool worker_stop_ = false;
+    std::thread display_white_thread_;
     bool logged_null_token_ = false, logged_stale_token_ = false, logged_repeated_token_ = false;
 };
 

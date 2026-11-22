@@ -48,6 +48,10 @@ FIXTURE_XML = (
     + _ins("IMAGE_LOAD", "ENC_MIMG", "MIMG_NSA1")
     + _ins("S_ENDPGM", "ENC_SOPP")
     + _ins("EXP", "ENC_EXP")
+    + _ins("S_AND_SAVEEXEC_B64", "ENC_SOP1")
+    + _ins("S_XOR_SAVEEXEC_B64", "ENC_SOP1")
+    + _ins("V_SHR_HI", "ENC_VOP1")
+    + _ins("V_SHR_LO", "ENC_VOP1")
     + "</Instructions></ISA></Spec>")
 
 FIXTURE_SRC = '''
@@ -60,6 +64,8 @@ def base_op(op):
 
 
 class Gen:
+    LOGIC = {"and": 1, "or": 2}
+
     def _insn(self, ins):
         op = base_op(ins["op"])
         if op in ("s_denorm_mode",):
@@ -75,6 +81,12 @@ class Gen:
                 raise Unsupported(op + " form")
         elif op == "exp":
             pass
+        elif op.endswith("_saveexec_b64") and op[2:].split("_saveexec")[0] in self.LOGIC:
+            pass
+        elif op.endswith("_hi") and flag:
+            pass
+        elif op.endswith("_lo"):
+            raise Unsupported(op)
         else:
             raise Unsupported(op)
 
@@ -147,7 +159,16 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(c["v_fancy_f32"], "unknown")
         # op.startswith("global_") sits in a helper that is not the dispatch, so it must not count.
         self.assertEqual(c["global_load_dword"], "unknown")
-        self.assertEqual(self.rep["totals"], {"handled-exact": 6, "handled-family": 1, "refused": 1, "unknown": 3})
+        self.assertEqual(self.rep["totals"], {"handled-exact": 6, "handled-family": 2, "refused": 1, "unknown": 6})
+
+    def test_suffix_families(self):
+        c = self.rep["class"]
+        self.assertEqual(c["s_and_saveexec_b64"], "handled-family")
+        self.assertEqual(c["s_xor_saveexec_b64"], "unknown")
+        self.assertEqual(c["v_shr_hi"], "unknown")
+        self.assertEqual(c["v_shr_lo"], "unknown")
+        self.assertEqual(self.rep["suffixes"], {"_saveexec_b64": 1})
+        self.assertIn("Suffix families the dispatch tests with op.endswith", ic.markdown(self.rep))
 
     def test_partial_refusal_is_flagged_but_handled(self):
         self.assertEqual(self.rep["class"]["image_load"], "handled-exact")
@@ -227,7 +248,7 @@ class FixtureTests(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(ic.main(["--isa", self.xml, "--translator", self.src, "--json"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["instructions"], 11)
+        self.assertEqual(json.loads(out.getvalue())["instructions"], 15)
 
 
 class TranslatorScanTests(unittest.TestCase):
@@ -269,6 +290,10 @@ class RealIsaTests(unittest.TestCase):
         "v_mac_legacy_f32": "gfx1013 per llvm-mc (VOP2 v_mac_legacy_f32_e32), missing from the XML",
         "v_add_u16": "internal: v_add_nc_u16 is re-dispatched under this GFX9 spelling",
         "v_sub_u16": "internal: v_sub_nc_u16 is re-dispatched under this GFX9 spelling",
+        "v_add_i16": "internal: v_add_nc_i16 is re-dispatched under this name",
+        "v_sub_i16": "internal: v_sub_nc_i16 is re-dispatched under this name",
+        "s_atc_probe": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
+        "s_atc_probe_buffer": "gfx1013 per llvm-mc, missing from the XML (a no-op in NOOPS)",
         "v_subrev_u16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
         "v_and_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
         "v_or_b16": "GFX9 spelling, no RDNA2 form (llvm-mc rejects it for gfx1013)",
@@ -290,6 +315,12 @@ class RealIsaTests(unittest.TestCase):
 
     def test_every_prefix_matches_something(self):
         self.assertEqual(self.rep["prefixes_without_rdna2_match"], [])
+
+    def test_saveexec_family_is_handled(self):
+        stems = ("and", "andn1", "andn2", "nand", "nor", "or", "orn1", "orn2", "xnor", "xor")
+        for w in ("b32", "b64"):
+            for k in stems:
+                self.assertEqual(self.rep["class"][f"s_{k}_saveexec_{w}"], "handled-family", (k, w))
 
 
 if __name__ == "__main__":

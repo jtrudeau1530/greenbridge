@@ -47,7 +47,9 @@ D3D12_CPU_DESCRIPTOR_HANDLE heap_start(ID3D12DescriptorHeap* heap) {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU (hosted CI): ctest skips
+    EXPECT(device_status == vktest::DeviceStatus::ready);
 
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
@@ -87,6 +89,11 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
+        if (rt::d3d12::device_push_constants_need_fallback(inner)) {
+            std::printf("d3d12_msaa_draw_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
+                        rt::d3d12::device_max_push_constants_size(inner));
+            return 77;
+        }
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;

@@ -779,9 +779,8 @@ def main():
         print(f"{arch}: {len(t)} texture headers", flush=True)
         allt += t
     parent = os.path.dirname(os.path.abspath(path))
-    if parent:      # the scan is already done; a missing folder used to lose it in a FileNotFoundError
-        os.makedirs(parent, exist_ok=True)
     try:
+        os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(allt, f)
     except OSError as e:

@@ -15,6 +15,7 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import Mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -678,6 +679,31 @@ class ReferenceInversionTest(unittest.TestCase):
                 )
             self.assertEqual(bcpack.decode(raw_bc1, 1, 8, history=rep_json), blk_bc1)
 
+    def test_reference_dds_preserves_both_mips_in_one_tail_tile(self) -> None:
+        width = height = 16
+        fmt, codec = 71, 1
+        layout = ttpf.surface_layout(width, height, fmt, 2, ttpf.tile_bytes(4))
+        first, second = layout["mips"]
+        self.assertTrue(first["in_tail"] and second["in_tail"])
+        self.assertEqual(first["offset"], second["offset"])
+        mips = [bytes.fromhex("00 f8 00 00 00 00 00 00") * 16,
+                bytes.fromhex("e0 07 00 00 00 00 00 00") * 4]
+        region = first["region"]
+        raw = encode_lanes([[0] * (region // 8) for _ in bcpack.LANE_WIDTHS[codec]], codec)
+        record = _pack_etpf(width, height, 2, 0, fmt, 4096)
+
+        with tempfile.TemporaryDirectory() as temp:
+            pool_path = os.path.join(temp, "tail.ttpf")
+            dds_path = os.path.join(temp, "tail.dds")
+            _write_custom_rds5_pool(pool_path, [record], [(codec, region, raw)])
+            _write_dx10_dds(dds_path, fmt, width, height, mips)
+            calibrator = Mock()
+            calib.apply_ref_dds(pool_path, 0, dds_path, {codec: calibrator})
+
+        self.assertEqual(calibrator.add_reference_chunk.call_count, 1)
+        _, reference, _ = calibrator.add_reference_chunk.call_args.args
+        self.assertEqual([ttpf.detile(layout, mip, reference) for mip in (first, second)], mips)
+
     def test_ref_dds_with_synthetic_ttpf_pool_and_ttpf_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             width, height, mips_n, fmt = 64, 64, 2, 98  # DXGI_FORMAT_BC7_UNORM
@@ -753,6 +779,166 @@ class ReferenceInversionTest(unittest.TestCase):
             self.assertEqual(ttpf.main(["export", pool_path, "0", exp_dds, "--history", hist_dir]), 0)
             _, _, _, exp_mips = calib.read_dds(exp_dds)
             self.assertEqual(exp_mips, mip_linear)
+
+
+class Bc6hConfirmationDepthTest(unittest.TestCase):
+    """Exact references confirm only the leading bits their modes consume."""
+
+    @staticmethod
+    def lanes(modes, *, endpoints=True, indices=False, chain=False):
+        lanes = [[] for _ in range(16)]
+        for i, mode in enumerate(modes):
+            block = [[0, 0] for _ in range(16)]
+            de = (1 if chain else i + 1) if endpoints else 0
+            di = (1 if chain else i + 1) if indices else 0
+            block[0] = list(_deint4(_zig(de - di)))
+            block[1] = list(_deint4(di))
+            block[15] = [mode - 1, 0]
+            reg = bcpack._BC6H_INFO[bcpack._BC6H_CODE[mode]][3]
+            delta = 0 if di else _zig(-4 if reg == 2 else -8)
+            for y in range(4):
+                block[11 + y] = [_pack_ix_pair(delta, delta, y)] * 2
+            for lane, symbols in zip(lanes, block):
+                lane.extend(symbols)
+        return lanes
+
+    @staticmethod
+    def truth():
+        return {
+            "endpointHistory": {"255": [[32768, 544, 0, 0] for _ in range(3)]},
+            "endpointClass": {"255": 3},
+            "indexHistory": {"255": [1] * 16},
+            "indexClass": {"255": 3},
+        }
+
+    def calibrate(self, lanes):
+        raw = encode_lanes(lanes, 6)
+        reference = bcpack.decode(raw, 6, len(lanes[0]) * 8, history=self.truth())
+        cal = calib.Bc6hCalibrator()
+        cal.add_reference_chunk(lanes, reference, len(lanes[0]) // 2)
+        self.assertEqual(cal.conflicts, 0)
+        doc, _stats = cal.build_document()
+        self.assertEqual(bcpack.decode(raw, 6, len(reference), history=doc), reference)
+        return doc
+
+    def test_endpoint_reference_does_not_confirm_unobserved_fields(self):
+        doc = self.calibrate(self.lanes([14]))
+        raw = encode_lanes(self.lanes([1]), 6)
+        expected = bcpack.decode(raw, 6, 16, history=self.truth())
+        actual, labels = bcpack.decode_with_info(raw, 6, 16, history=doc, allow_provisional=True)
+        self.assertNotEqual(actual, expected)
+        with self.assertRaisesRegex(bcpack.BcpackProvisionalError, "unconfirmed.*endpoint.*255"):
+            bcpack.decode(raw, 6, 16, history=doc)
+        self.assertTrue(any("endpoint history 255" in label for label in labels))
+        self.assertEqual(doc["endpointConfirmedBits"][255], [[16, 4, 0, 0]] * 3)
+
+    def test_index_reference_does_not_confirm_unobserved_low_bit(self):
+        doc = self.calibrate(self.lanes([1], endpoints=False, indices=True))
+        raw = encode_lanes(self.lanes([14], endpoints=False, indices=True), 6)
+        self.assertNotEqual(
+            bcpack.decode(raw, 6, 16, history=doc, allow_provisional=True),
+            bcpack.decode(raw, 6, 16, history=self.truth()),
+        )
+        with self.assertRaisesRegex(bcpack.BcpackProvisionalError, "unconfirmed.*index.*255"):
+            bcpack.decode(raw, 6, 16, history=doc)
+        _actual, labels = bcpack.decode_with_info(raw, 6, 16, history=doc, allow_provisional=True)
+        self.assertTrue(any("index history 255" in label for label in labels))
+        self.assertEqual(doc["indexConfirmedBits"][255], [3] * 16)
+
+    def test_endpoint_chain_uses_reconstructed_state_after_truncation(self):
+        doc = self.calibrate(self.lanes([14]))
+        lanes = self.lanes([14, 1], chain=True)
+        raw = encode_lanes(lanes, 6)
+        self.assertEqual(
+            bcpack.decode(raw, 6, 32, history=doc),
+            bcpack.decode(raw, 6, 32, history=self.truth()),
+        )
+        # A later mode cannot make an earlier incomplete history read safe.
+        raw = encode_lanes(self.lanes([1, 14], chain=True), 6)
+        with self.assertRaises(bcpack.BcpackProvisionalError):
+            bcpack.decode(raw, 6, 32, history=doc)
+
+    def test_every_channel_and_field_must_have_sufficient_depth(self):
+        raw = encode_lanes(self.lanes([1]), 6)
+        for channel in range(3):
+            for field, needed in enumerate((10, 5, 5, 5)):
+                doc = self.truth()
+                bits = [[10, 5, 5, 5] for _ in range(3)]
+                doc["endpointConfirmedBits"] = {"255": bits}
+                bcpack.decode(raw, 6, 16, history=doc)
+                bits[channel][field] = needed - 1
+                with self.subTest(channel=channel, field=field):
+                    with self.assertRaises(bcpack.BcpackProvisionalError):
+                        bcpack.decode(raw, 6, 16, history=doc)
+
+    def test_every_index_pixel_must_have_sufficient_depth(self):
+        raw = encode_lanes(self.lanes([14], endpoints=False, indices=True), 6)
+        for pixel in range(16):
+            doc = self.truth()
+            bits = [4] * 16
+            doc["indexConfirmedBits"] = {"255": bits}
+            bits[pixel] = 3
+            with self.subTest(pixel=pixel):
+                with self.assertRaises(bcpack.BcpackProvisionalError):
+                    bcpack.decode(raw, 6, 16, history=doc)
+
+    def test_all_reference_modes_keep_their_own_blocks_strict(self):
+        for mode in range(1, 15):
+            with self.subTest(mode=mode):
+                self.calibrate(self.lanes([mode], indices=True))
+
+    def test_reference_can_serve_a_different_lower_precision_mode(self):
+        # Mode 2 observes 7/6/6/6 bits; mode 10 needs only 6/6/6/6.
+        doc = self.calibrate(self.lanes([2], indices=True))
+        raw = encode_lanes(self.lanes([10], indices=True), 6)
+        self.assertEqual(
+            bcpack.decode(raw, 6, 16, history=doc),
+            bcpack.decode(raw, 6, 16, history=self.truth()),
+        )
+        # Mode 1 needs ten base bits, more than that reference observed.
+        raw = encode_lanes(self.lanes([1], indices=True), 6)
+        with self.assertRaises(bcpack.BcpackProvisionalError):
+            bcpack.decode(raw, 6, 16, history=doc)
+
+    def test_explicit_depth_does_not_upgrade_provisional_classes(self):
+        raw = encode_lanes(self.lanes([1], indices=True), 6)
+        for kind in ("endpoint", "index"):
+            doc = self.truth()
+            doc["endpointConfirmedBits"] = {"255": [[16, 10, 6, 6]] * 3}
+            doc["indexConfirmedBits"] = {"255": [4] * 16}
+            doc[kind + "Class"]["255"] = 1
+            with self.subTest(kind=kind):
+                with self.assertRaises(bcpack.BcpackProvisionalError):
+                    bcpack.decode(raw, 6, 16, history=doc)
+
+    def test_partial_index_chain_uses_reconstructed_four_bit_state(self):
+        doc = self.calibrate(self.lanes([1], endpoints=False, indices=True))
+        lanes = self.lanes([1, 14], endpoints=False, indices=True, chain=True)
+        raw = encode_lanes(lanes, 6)
+        self.assertEqual(
+            bcpack.decode(raw, 6, 32, history=doc),
+            bcpack.decode(raw, 6, 32, history=self.truth()),
+        )
+
+    def test_confirmation_depth_survives_json_and_schema_validation(self):
+        doc = self.calibrate(self.lanes([14]))
+        raw = encode_lanes(self.lanes([1]), 6)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bc6h.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"bc6h": doc}, fh)
+            self.assertIn("bc6h", calib.validate_history_schema(path, [6]))
+            for history in (path, tmp):
+                with self.subTest(history=history):
+                    with self.assertRaises(bcpack.BcpackProvisionalError):
+                        bcpack.decode(raw, 6, 16, history=history)
+            doc["endpointConfirmedBits"][255][0][0] = 17
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"bc6h": doc}, fh)
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                self.assertEqual(calib.main(["--verify", path, "--codec", "bc6h"]), 2)
+            self.assertIn("bit depth out of bounds", err.getvalue())
 
 
 class PoolSelfCalibrationTest(unittest.TestCase):

@@ -10,7 +10,9 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "binary_occlusion_spirv.h"
+#include "buffer_va_index.h"
 #include "occlusion_sum_spirv.h"
+#include "queue_holds.h"
 #include "retire_tickets.h"
 #include "statistics_sum_spirv.h"
 #include "vulkan13_features.h"
@@ -35,6 +37,7 @@
 #include <unordered_set>
 #include <shared_mutex>
 #include <span>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -504,6 +507,9 @@ public:
 
     using SignalEventFn = void (*)(void* event_handle);
 
+    // Longest single vkWaitSemaphores call in run(): bounds how long the thread can sit in an uninterruptible wait.
+    static constexpr std::uint64_t kWaitSliceNs = 100'000'000;  // 100 ms
+
     FenceWaitDispatcher(VkDevice device, const VulkanDeviceFunctions& vk, std::atomic<bool>& device_lost)
         : device_(device), vk_(vk), device_lost_(device_lost) {
         VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -668,7 +674,12 @@ private:
             wi.semaphoreCount = static_cast<std::uint32_t>(semaphores_.size());
             wi.pSemaphores = semaphores_.data();
             wi.pValues = values_.data();
-            const VkResult res = vk_.vkWaitSemaphores(device_, &wi, UINT64_MAX);
+            // A bounded slice, not UINT64_MAX. Under GPU paravirtualization (measured in Windows Sandbox on an
+            // RTX 5060 Ti) this wait is a kernel wait the OS cannot interrupt: a process that exits while a wait
+            // is pending (d3d12_queue_wait_timeout's _Exit, or quitting with a fence outstanding) never finishes
+            // exiting, and TerminateProcess cannot end it either. A timeout returns here and the loop re-arms the
+            // same wait; completions still wake it at once through the ANY wait.
+            const VkResult res = vk_.vkWaitSemaphores(device_, &wi, kWaitSliceNs);
 
             lock.lock();
             waiting_ = false;
@@ -849,18 +860,19 @@ public:
             const auto it = graphics_pipelines_.find(id);
             return it == graphics_pipelines_.end() ? nullptr : &it->second;
         };
-        // Called with resource_mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
+        // Called with resource_mutex_ held. A binary search of the buffers' VA ranges (buffer_va_index.h), kept in step
+        // with resources_ by set_resource_locked and remove_resource.
         // A range that runs past its buffer is cut at the buffer's end (`size` is updated): D3D12 reads past a view's
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
-            for (const auto& [id, b] : resources_) {
-                if (b.image || !b.buffer || !b.va || va < b.va || va - b.va >= b.size) continue;
-                buffer = b.buffer;
-                offset = b.buffer_offset + (va - b.va);
-                size = std::min<std::uint64_t>(size, b.size - (va - b.va));
-                return true;
-            }
-            return false;
+            BufferVaIndex<ResourceId>::Hit hit{};
+            if (!buffer_vas_.find(va, hit)) return false;
+            const ResourceBinding* b = resolve(hit.id);
+            if (!b) return false;
+            buffer = b->buffer;
+            offset = b->buffer_offset + (va - b->va);
+            size = std::min<std::uint64_t>(size, b->size - (va - b->va));
+            return true;
         };
         if (xdxr && loaded_) {
             xdxr_ = std::make_unique<XdxrBuilder>(get, device);
@@ -958,11 +970,11 @@ public:
     // The image must already be in that layout, e.g. transitioned from UNDEFINED at creation.
     void add_resource(ResourceId id, const ResourceBinding& binding) {
         std::unique_lock lock(resource_mutex_);
-        resources_[id] = binding;
+        set_resource_locked(id, binding);
     }
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::unique_lock rlock(resource_mutex_);
-        resources_[id] = binding;
+        set_resource_locked(id, binding);
         if (binding.image) {
             std::lock_guard tlock(tracker_mutex_);
             tracker_.track(id, binding, current_layout);
@@ -980,7 +992,7 @@ public:
 
     void add_sparse_buffer(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseBuffer> buffer) {
         std::unique_lock lock(resource_mutex_);
-        resources_[id] = binding;
+        set_resource_locked(id, binding);
         sparse_buffers_.emplace(id, std::move(buffer));
     }
 
@@ -991,6 +1003,7 @@ public:
             const auto it = resources_.find(id);
             if (it == resources_.end()) return;
             img = it->second.image;
+            unindex_buffer(id, it->second);
             resources_.erase(it);
             sparse_buffers_.erase(id);
         }
@@ -1260,9 +1273,29 @@ public:
         if (fence_dispatcher_) fence_dispatcher_->cancel(sem);
     }
 
+    // Cross-queue Wait-before-Signal: per fence, the highest value a Signal was submitted for, and the queues that
+    // hold batches until one is (queue_holds.h).
+    QueueHolds<VkSemaphore>& holds() { return holds_; }
+
 private:
     friend class VulkanQueue;
     friend class VulkanPresenter;
+
+    // buffer_at finds a buffer by VA: one with no image, a VkBuffer, a VA and bytes (what the linear search it replaced
+    // accepted). Both are called with resource_mutex_ held uniquely.
+    static bool addressable(const ResourceBinding& b) { return !b.image && b.buffer && b.va && b.size; }
+    void unindex_buffer(ResourceId id, const ResourceBinding& b) {
+        if (addressable(b)) buffer_vas_.erase(b.va, id);
+    }
+    // resources_[id] = binding, with the VA index kept in step (a re-registered ID drops its old range first).
+    void set_resource_locked(ResourceId id, const ResourceBinding& binding) {
+        auto [it, inserted] = resources_.try_emplace(id, binding);
+        if (!inserted) {
+            unindex_buffer(id, it->second);
+            it->second = binding;
+        }
+        if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
+    }
 
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
@@ -1305,7 +1338,9 @@ private:
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
+    QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     std::unordered_map<ResourceId, std::shared_ptr<SparseBuffer>> sparse_buffers_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
@@ -1349,9 +1384,12 @@ public:
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         if (context.vk.vkCreateSemaphore(context.device(), &info, nullptr, &semaphore_) != VK_SUCCESS)
             semaphore_ = VK_NULL_HANDLE;
+        if (semaphore_) context.holds().add_fence(semaphore_, initial);
     }
     ~VulkanFence() {
-        if (semaphore_) context_.vk.vkDestroySemaphore(context_.device(), semaphore_, nullptr);
+        if (!semaphore_) return;
+        context_.holds().remove_fence(semaphore_);  // batches held on it can never run: dropped and reported
+        context_.vk.vkDestroySemaphore(context_.device(), semaphore_, nullptr);
     }
     VulkanFence(const VulkanFence&) = delete;
     VulkanFence& operator=(const VulkanFence&) = delete;
@@ -1371,7 +1409,10 @@ public:
         VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
         info.semaphore = semaphore_;
         info.value = value;
-        return context_.vk.vkSignalSemaphore(context_.device(), &info) == VK_SUCCESS;
+        if (context_.vk.vkSignalSemaphore(context_.device(), &info) != VK_SUCCESS) return false;
+        context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
+        context_.holds().pump_ready();
+        return true;
     }
 
     // true when the value was reached within the timeout.
@@ -1388,9 +1429,16 @@ private:
     VkSemaphore semaphore_ = VK_NULL_HANDLE;
 };
 
-// One D3D12 command queue on one VkQueue. Not thread-safe by itself: D3D12 lets one thread use a queue at a time
-// per call, and the COM wrapper serialises its calls.
-class VulkanQueue {
+// One D3D12 command queue on one VkQueue. D3D12 lets one thread use a queue at a time per call and the COM wrapper
+// serialises its calls; state_mutex_ additionally serialises them against the thread that releases a held batch
+// (Wait-before-Signal, queue_holds.h), the only other thread that touches a queue.
+//
+// A Wait on a fence value no Signal has been submitted for yet holds the next batch (ExecuteCommandLists or Signal)
+// on the CPU, with everything the queue is asked to do after it, instead of replaying it against layouts from before
+// the work it waits for: Vulkan itself would accept the wait (timeline semaphores allow wait-before-signal), but the
+// layout tracker follows replay order. Holding on the CPU also keeps a Wait and the Signal that satisfies it from
+// landing on one VkQueue in the wrong order, which would never make progress on the GPU.
+class VulkanQueue : private QueueHolds<VkSemaphore>::Holder {
 public:
     enum class QueueKind : std::uint8_t { direct, compute, copy };
 
@@ -1419,10 +1467,13 @@ public:
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
+        context_.holds().attach(this);
     }
 
     ~VulkanQueue() {
         auto& vk = context_.vk;
+        context_.holds().detach(this);  // no thread releases into this queue from here on
+        report_held_at_teardown();
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
@@ -1452,6 +1503,7 @@ public:
     template<typename GetHeap>
     bool update_tiles(ResourceId id, std::span<const BufferTileRegion> regions,
                       std::span<const BufferTileRange> ranges, GetHeap&& get_heap) {
+        std::lock_guard state(state_mutex_);  // outermost: held batches are released from other threads
         std::unique_lock lock(context_.resource_mutex_);
         const auto it = context_.sparse_buffers_.find(id);
         if (it == context_.sparse_buffers_.end()) return false;
@@ -1497,6 +1549,7 @@ public:
     }
 
     bool copy_tile_mappings(ResourceId dst, std::uint64_t dst_first, ResourceId src, BufferTileRegion src_region) {
+        std::lock_guard state(state_mutex_);
         std::unique_lock lock(context_.resource_mutex_);
         const auto source = context_.sparse_buffers_.find(src), target = context_.sparse_buffers_.find(dst);
         if (source == context_.sparse_buffers_.end() || target == context_.sparse_buffers_.end() ||
@@ -1512,8 +1565,82 @@ public:
     }
 
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
-    // the layout tracker as it was. Pending Wait()s are attached to this submission.
+    // the layout tracker as it was. Pending Wait()s are attached to this submission. When one of them (or an
+    // earlier held operation) waits for a fence value no Signal has been submitted for, the lists are copied and
+    // held instead, and the call succeeds: the batch is replayed by the thread that submits the Signal (or the CPU
+    // Signal), which is also where its errors are reported.
     ReplayResult execute(std::span<const CommandList* const> lists) {
+        ReplayResult result = ReplayResult::success;
+        bool held = false;
+        {
+            std::lock_guard state(state_mutex_);
+            if (!must_hold()) {
+                result = execute_now(lists);
+            } else if (context_.is_device_lost()) {
+                result = ReplayResult::unsupported;
+            } else {
+                Deferred op;
+                op.kind = Deferred::Kind::batch;
+                op.lists.reserve(lists.size());
+                for (const CommandList* list : lists) op.lists.push_back(*list);
+                hold(std::move(op));
+                held = true;
+            }
+        }
+        if (held) context_.holds().pump_ready();  // a Signal may have been submitted since the check
+        return result;
+    }
+
+    // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far. Held behind earlier
+    // held operations, so the fence does not run ahead of the work it follows.
+    bool signal(VkSemaphore fence, std::uint64_t value) {
+        bool ok = true;
+        {
+            std::lock_guard state(state_mutex_);
+            if (must_hold()) {
+                Deferred op;
+                op.kind = Deferred::Kind::signal;
+                op.fence = fence;
+                op.value = value;
+                hold(std::move(op));
+            } else {
+                ok = submit(VK_NULL_HANDLE, fence, value);
+            }
+        }
+        context_.holds().pump_ready();  // this Signal, or the hold above, may have made a held batch ready
+        return ok;
+    }
+
+    // ID3D12CommandQueue::Wait: later submissions wait for the fence. A wait in a Vulkan batch only holds back that
+    // batch, so it is kept and attached to the next submission (held on the CPU if no Signal reaches it yet).
+    void wait(VkSemaphore fence, std::uint64_t value) {
+        std::lock_guard state(state_mutex_);
+        waits_.push_back(fence);
+        wait_values_.push_back(value);
+    }
+
+    // ID3D12CommandQueue::SetMarker/BeginEvent/EndEvent: queue labels, between the submissions around them. An end
+    // with no begin open on this queue is dropped, as Vulkan requires a matching begin. No-ops without the extension.
+    void marker(DebugMarker::Kind kind, const char* label) {
+        std::lock_guard state(state_mutex_);
+        if (!held_.empty()) {  // behind the held work, so behind it in the queue's labels too
+            Deferred op;
+            op.kind = Deferred::Kind::marker;
+            op.marker_kind = kind;
+            op.label = label ? label : "";
+            hold(std::move(op));
+            return;
+        }
+        marker_now(kind, label);
+    }
+
+    bool idle() {
+        std::lock_guard lock(context_.submit_mutex());
+        return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
+    }
+
+private:
+    ReplayResult execute_now(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
@@ -1847,19 +1974,7 @@ public:
         return submitted ? ReplayResult::success : ReplayResult::unsupported;
     }
 
-    // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far.
-    bool signal(VkSemaphore fence, std::uint64_t value) { return submit(VK_NULL_HANDLE, fence, value); }
-
-    // ID3D12CommandQueue::Wait: later submissions wait for the fence. A wait in a Vulkan batch only holds back that
-    // batch, so it is kept and attached to the next submission.
-    void wait(VkSemaphore fence, std::uint64_t value) {
-        waits_.push_back(fence);
-        wait_values_.push_back(value);
-    }
-
-    // ID3D12CommandQueue::SetMarker/BeginEvent/EndEvent: queue labels, between the submissions around them. An end
-    // with no begin open on this queue is dropped, as Vulkan requires a matching begin. No-ops without the extension.
-    void marker(DebugMarker::Kind kind, const char* label) {
+    void marker_now(DebugMarker::Kind kind, const char* label) {
         const DebugLabelFunctions& f = context_.labels_;
         if (!f.complete()) return;
         if (kind == DebugMarker::Kind::end && !open_labels_) return;
@@ -1877,12 +1992,118 @@ public:
         }
     }
 
-    bool idle() {
-        std::lock_guard lock(context_.submit_mutex());
-        return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
+    // ---- Wait-before-Signal: operations held on the CPU (queue_holds.h) ----
+
+    // One held operation, with the waits that were pending when it was asked for.
+    struct Deferred {
+        enum class Kind : std::uint8_t { batch, signal, marker };
+        Kind kind = Kind::batch;
+        std::vector<VkSemaphore> waits;
+        std::vector<std::uint64_t> wait_values;
+        std::vector<CommandList> lists;  // batch: copies, so the application may Reset its lists after the call
+        VkSemaphore fence = VK_NULL_HANDLE;  // signal
+        std::uint64_t value = 0;
+        DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
+        std::string label;
+    };
+
+    bool waits_pending(const std::vector<VkSemaphore>& semaphores, const std::vector<std::uint64_t>& values) const {
+        for (std::size_t i = 0; i < semaphores.size(); ++i)
+            if (context_.holds().pending(semaphores[i], values[i])) return true;
+        return false;
     }
 
-private:
+    // The next batch or Signal has to be held: something is held ahead of it (queue order), or a Wait it carries
+    // has no submitted Signal yet. Called with state_mutex_ held.
+    bool must_hold() const { return !held_.empty() || waits_pending(waits_, wait_values_); }
+
+    // Appends `op`, which takes the pending waits with it (a marker has none). Called with state_mutex_ held.
+    void hold(Deferred&& op) {
+        if (op.kind != Deferred::Kind::marker) {
+            op.waits = std::move(waits_);
+            op.wait_values = std::move(wait_values_);
+            waits_.clear();
+            wait_values_.clear();
+        }
+        held_.push_back(std::move(op));
+        context_.holds().held_changed(1);
+    }
+
+    // Runs one held operation as the call would have, with its own waits and none of the ones queued since.
+    void run(Deferred& op) {
+        auto later_waits = std::move(waits_);
+        auto later_values = std::move(wait_values_);
+        waits_ = std::move(op.waits);
+        wait_values_ = std::move(op.wait_values);
+        switch (op.kind) {
+        case Deferred::Kind::batch: {
+            std::vector<const CommandList*> lists;
+            for (const CommandList& list : op.lists) lists.push_back(&list);
+            const ReplayResult result = execute_now(lists);
+            if (result != ReplayResult::success)
+                std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released (result %d); "
+                                     "nothing was submitted\n", static_cast<int>(result));
+            break;
+        }
+        case Deferred::Kind::signal:
+            if (!submit(VK_NULL_HANDLE, op.fence, op.value))
+                std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
+            break;
+        case Deferred::Kind::marker:
+            marker_now(op.marker_kind, op.label.c_str());
+            break;
+        }
+        waits_ = std::move(later_waits);  // a failed submission leaves its waits behind: drop them with the batch
+        wait_values_ = std::move(later_values);
+    }
+
+    bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
+
+    // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
+    bool release_ready() override {
+        std::lock_guard state(state_mutex_);
+        bool released = false;
+        while (!held_.empty() && (context_.is_device_lost() || ready(held_.front()))) {
+            Deferred op = std::move(held_.front());
+            held_.pop_front();
+            context_.holds().held_changed(-1);
+            if (!context_.is_device_lost()) run(op);
+            released = true;
+        }
+        return released;
+    }
+
+    // Holder: the fence is released, so what waits on it can never run.
+    void discard_waiting_on(VkSemaphore semaphore) override {
+        std::lock_guard state(state_mutex_);
+        for (auto it = held_.begin(); it != held_.end();) {
+            if (std::find(it->waits.begin(), it->waits.end(), semaphore) == it->waits.end()) {
+                ++it;
+                continue;
+            }
+            std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work waiting on it; "
+                                 "that work is dropped\n");
+            it = held_.erase(it);
+            context_.holds().held_changed(-1);
+        }
+    }
+
+    // A queue destroyed with held work: the fence it waits on was never signaled. Reported, not waited for; nothing
+    // was submitted for it, so the VkQueue is idle and the destructor goes on.
+    void report_held_at_teardown() {
+        std::lock_guard state(state_mutex_);
+        if (held_.empty()) return;
+        std::uint64_t value = 0;
+        for (const Deferred& op : held_)
+            for (std::size_t i = 0; i < op.waits.size() && !value; ++i)
+                if (context_.holds().pending(op.waits[i], op.wait_values[i])) value = op.wait_values[i];
+        std::fprintf(stderr, "[rt] d3d12: queue destroyed with %zu held operation(s) never submitted: waits for a "
+                             "fence value (%llu) that no Signal reached; the fence was never signaled\n",
+                     held_.size(), static_cast<unsigned long long>(value));
+        context_.holds().held_changed(-static_cast<std::int64_t>(held_.size()));
+        held_.clear();
+    }
+
     struct CommandSlot {
         VkCommandBuffer buffer;
         std::uint64_t ticket;
@@ -2087,6 +2308,7 @@ private:
         }
         const bool ok = (res == VK_SUCCESS);
         if (ok) {
+            if (fence) context_.holds().signaled(fence, value);  // held batches waiting for it: the caller pumps
             submitted_ = ticket;
             waits_.clear();
             wait_values_.clear();
@@ -2116,6 +2338,10 @@ private:
     std::vector<PreparedList> prepared_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
+    // Wait-before-Signal. state_mutex_ is outermost (before resource_mutex_ -> tracker_mutex_ -> submit_mutex_) and
+    // guards the members above that execute, signal, wait and marker touch.
+    std::mutex state_mutex_;
+    std::deque<Deferred> held_;
 };
 
 } // namespace leonida

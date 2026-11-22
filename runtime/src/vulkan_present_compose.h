@@ -15,15 +15,17 @@
 
 namespace leonida {
 
-// Mirrors the shader's push constants (96 bytes).
+// Mirrors the shader's push constants (112 bytes).
 struct PresentComposePush {
     float dest0[4], dest1[4];  // destination rectangles in output pixels: left, top, right, bottom
     float src0[4], src1[4];    // source rectangles in texels
     std::uint32_t flags0, flags1, plane_count, out_hdr;
     float sdr_white;
-    std::uint32_t width, height, pad;
+    std::uint32_t width, height, sdr_eotf;  // sdr_eotf: PresentPlanes::SdrEotf
+    float hdr_peak;
+    std::uint32_t pad[3];
 };
-static_assert(sizeof(PresentComposePush) == 96);
+static_assert(sizeof(PresentComposePush) == 112);
 
 namespace compose_flag {
 inline constexpr std::uint32_t point = 1, srgb_source = 2, hdr10 = 4, straight_alpha = 8;

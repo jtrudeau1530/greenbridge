@@ -152,7 +152,10 @@ def check_preview_path(out, blob):
     if same_report_path(out, blob):
         raise SystemExit(f"--out would overwrite the input {blob}")
     out_dir = os.path.dirname(os.path.abspath(out))
-    os.makedirs(out_dir, exist_ok=True)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:  # a regular file where the folder should be: one line, not a traceback
+        raise SystemExit(f"--out {out}: cannot create {out_dir}: {e.strerror or e}")
 
 
 def main():

@@ -58,13 +58,19 @@ struct PresentPlane {
     bool has_source_rect = false;
     float dest[4] = {0, 0, 1, 1};  // left, top, right, bottom as fractions of the output (0..1)
     bool point_filter = false;     // nearest texel; otherwise bilinear inside the source rectangle
-    bool hdr10 = false;            // the texture holds ST.2084 (PQ) Rec.2020 values; otherwise G2.2 Rec.709 ones
+    bool hdr10 = false;            // the texture holds ST.2084 (PQ) Rec.2020 values; otherwise sRGB or G2.2 (PresentPlanes::sdr_eotf) Rec.709 ones
     bool straight_alpha = false;   // plane 1 only: alpha is not premultiplied into the colour
 };
 struct PresentPlanes {
     PresentPlane plane[2];
     std::uint32_t count = 1;
-    float sdr_white_nits = 203.0f;  // what SDR white maps to in an HDR10 output, and what HDR10 is divided by for SDR
+    // What SDR white maps to in an HDR10 output, and what HDR10 is divided by for an SDR one (the white of the SDR output).
+    float sdr_white_nits = 203.0f;
+    // How SDR planes (and an SDR output) are encoded: piecewise sRGB (default; what Windows applies to SDR content in HDR
+    // mode, community-sourced, docs section 4.5) or a pure power of 2.2.
+    enum class SdrEotf : std::uint32_t { srgb = 0, gamma22 = 1 };
+    SdrEotf sdr_eotf = SdrEotf::srgb;
+    float hdr_peak_nits = 1000.0f;  // peak of the HDR10 content: the white point of the tone map on an SDR output
 };
 
 namespace detail {
@@ -230,13 +236,15 @@ public:
     // destination rectangle of the window, plane 1 blended over plane 0, composed by a compute pass into an RGBA16F image
     // that is then copied to the swapchain image. Colour spaces are converted to the swapchain's: when a plane is HDR10 and
     // the surface lists an HDR10 (ST.2084) format the swapchain uses it (hdr_active()), else the HDR10 planes are
-    // converted to SDR by clipping (no tone mapping). The swapchain is always UNORM here; sRGB-format sources are
+    // tone mapped to SDR (shoulder above 0.8 of SDR white, then clipped). Planes are filtered and blended in linear light. The swapchain
+    // is always UNORM here; sRGB-format sources are
     // encoded again by the pass. Sources must be single-sample, sampled (no DENY_SHADER_RESOURCE) float/UNORM/sRGB
     // colour textures; others are refused (VK_ERROR_FORMAT_NOT_SUPPORTED). Rectangles outside their range give
     // VK_ERROR_UNKNOWN. vsync and `tear` as for present().
     VkResult present_planes(const PresentPlanes& planes, bool vsync, bool tear = false) {
         if (planes.count < 1 || planes.count > 2) return VK_ERROR_UNKNOWN;
         if (!(planes.sdr_white_nits > 0.0f) || !std::isfinite(planes.sdr_white_nits)) return VK_ERROR_UNKNOWN;
+        if (!(planes.hdr_peak_nits > 0.0f) || !std::isfinite(planes.hdr_peak_nits)) return VK_ERROR_UNKNOWN;
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             const PresentPlane& plane = planes.plane[i];
             ResourceBinding binding;
@@ -676,6 +684,8 @@ private:
         push.plane_count = planes.count;
         push.out_hdr = (hdr_active_ || force_hdr_encoding_) ? 1u : 0u;
         push.sdr_white = planes.sdr_white_nits;
+        push.sdr_eotf = std::uint32_t(planes.sdr_eotf);
+        push.hdr_peak = planes.hdr_peak_nits;
         push.width = extent_.width;
         push.height = extent_.height;
         composer_->record(commands, slot, frame.views[0], read_layout[0], frame.views[1] ? frame.views[1] : frame.views[0],
@@ -903,7 +913,7 @@ private:
             if (!found && !warned_hdr_) {
                 warned_hdr_ = true;
                 std::fprintf(stderr, "[rt] present: the surface has no HDR10 (ST.2084) format; HDR10 planes are converted to "
-                                     "SDR by clipping\n");
+                                     "SDR by tone mapping\n");
             }
         }
         for (const VkFormat wanted : srgb ? std::array<VkFormat, 2>{VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB}

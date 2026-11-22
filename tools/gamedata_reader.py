@@ -42,7 +42,8 @@ if HERE not in sys.path:
 
 BOM = b"\xef\xbb\xbf"
 VECTOR_KEYS = ("x", "y", "z", "w")
-CONVENTION_KEYS = frozenset(("type", "content", "value", "ref", "key") + VECTOR_KEYS)
+BASE_CONVENTION_KEYS = frozenset(("type", "content", "value", "ref", "key"))
+CONVENTION_KEYS = BASE_CONVENTION_KEYS | frozenset(VECTOR_KEYS)
 GROUPS = {"vector2_array": 2, "vec3v_array": 3, "matrix33": 3, "matrix34": 3}
 INT = re.compile(r"[-+]?\d+")
 HEX = re.compile(r"0x[0-9A-Fa-f]+")
@@ -50,6 +51,19 @@ FLOAT = re.compile(r"[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?f?|[-+]?(inf|nan)", re
 
 ROOT_HANDLERS = {}
 TYPE_HANDLERS = {}
+
+
+def _is_vector(attrib):
+    """True when ``attrib`` carries ``x`` and every present ``x``/``y``/``z``/``w`` attribute is a float."""
+    return "x" in attrib and all(FLOAT.fullmatch(attrib[k]) for k in VECTOR_KEYS if k in attrib)
+
+
+def _uses_vector_keys(attrib):
+    """True when ``attrib`` resolves via the vector convention rather than another attribute convention."""
+    return (attrib.get("type") != "NULL"
+            and "content" not in attrib
+            and "value" not in attrib
+            and _is_vector(attrib))
 
 
 def register_root(tag):
@@ -108,18 +122,22 @@ class Reader:
         self.type_handlers = TYPE_HANDLERS if type_handlers is None else type_handlers
         self.stats = Counter()
         self.types = Counter()
+        self._active_type_elements = set()
 
     def convert(self, el, use_type_handler=True):
         """The generic value of element ``el`` (a registered ``type`` handler first, unless told not to). Attributes
         no convention uses (``name``, ``userFlags``, ...) are kept as ``"@name"`` entries."""
+        in_handler = id(el) in self._active_type_elements
         value = self._convert(el, use_type_handler)
-        return self.with_attributes(el.attrib, value)
+        return self.with_attributes(el.attrib, value, count_stats=not in_handler)
 
-    def with_attributes(self, attrib, value):
-        extra = {f"@{k}": parse_scalar(v) for k, v in attrib.items() if k not in CONVENTION_KEYS}
+    def with_attributes(self, attrib, value, count_stats=True):
+        consumed = CONVENTION_KEYS if _uses_vector_keys(attrib) else BASE_CONVENTION_KEYS
+        extra = {f"@{k}": parse_scalar(v) for k, v in attrib.items() if k not in consumed}
         if not extra:
             return value
-        self.stats["extra attributes"] += 1
+        if count_stats:
+            self.stats["extra attributes"] += 1
         if isinstance(value, dict):
             return {**value, **extra}
         return {"$value": value, **extra} if value not in ("", None) else extra
@@ -131,18 +149,23 @@ class Reader:
             self.stats["null"] += 1
             return None
         if t is not None:
-            self.types[t] += 1
+            if id(el) not in self._active_type_elements:
+                self.types[t] += 1
             handler = self.type_handlers.get(t) if use_type_handler else None
             if handler:
                 self.stats["type handler"] += 1
-                return handler(el, self)
+                self._active_type_elements.add(id(el))
+                try:
+                    return handler(el, self)
+                finally:
+                    self._active_type_elements.discard(id(el))
         if "content" in a:
             self.stats["array"] += 1
             return parse_content(a["content"], el.text)
         if "value" in a:
             self.stats["scalar"] += 1
             return parse_scalar(a["value"])
-        if "x" in a and all(k in VECTOR_KEYS or k in ("type", "key") for k in a):
+        if _is_vector(a):
             self.stats["vector"] += 1
             return tuple(_float(a[k]) for k in VECTOR_KEYS if k in a)
         if "ref" in a:
@@ -152,13 +175,26 @@ class Reader:
         if not kids:
             self.stats["text"] += 1
             return (el.text or "").strip()
-        out = self.children(kids)
-        if t is not None:
-            self.stats["object"] += 1
-            if not isinstance(out, dict):
-                out = {"$items": out}
-            out = {"$type": t, **out}
-        return out
+        return self._typed_object(t, self.children(kids))
+
+    def _typed_object(self, t, value):
+        """Wrap an assembled child container in a polymorphic ``$type`` dict when ``t`` is set."""
+        if t is None:
+            return value
+        self.stats["object"] += 1
+        if not isinstance(value, dict):
+            value = {"$items": value}
+        return {"$type": t, **value}
+
+    def _streams_children(self, root):
+        """True when top-level children can be converted and dropped piecemeal instead of keeping the whole root."""
+        if root.tag in self.root_handlers:
+            return False
+        a = root.attrib
+        t = a.get("type")
+        if t == "NULL" or (t is not None and t in self.type_handlers):
+            return False
+        return not ("content" in a or "value" in a or _is_vector(a) or "ref" in a)
 
     def children(self, kids):
         """Child elements as a list (all ``Item``), a dict by ``key`` (all keyed) or a dict by tag."""
@@ -188,18 +224,20 @@ class Reader:
         """One document (bytes) -> ``(root tag, root type, value)``. Fields are converted as their end tag arrives
         and then dropped from the tree. Raises ``ET.ParseError`` for a document that is not well-formed."""
         stream = io.BytesIO(data[len(BOM):] if data.startswith(BOM) else data)
-        depth, root, parts = 0, None, []
+        depth, root, parts, stream_kids = 0, None, [], False
         for event, el in ET.iterparse(stream, events=("start", "end")):
             if event == "start":
                 depth += 1
                 if root is None:
                     root = el
+                    stream_kids = self._streams_children(root)
                 continue
             depth -= 1
-            if depth == 1 and root.tag not in self.root_handlers:
-                # a top-level field is complete: convert it now and drop its sub-tree
+            if depth == 1 and stream_kids:
+                # a top-level field is complete: convert it now and drop its sub-tree and root reference
                 parts.append((el.tag, el.attrib.get("key"), self.convert(el)))
                 el.clear()
+                del root[:]
         handler = self.root_handlers.get(root.tag)
         if handler:
             self.stats["root handler"] += 1
@@ -208,12 +246,10 @@ class Reader:
             return root.tag, root.attrib.get("type"), self.convert(root)
         attrib = dict(root.attrib)
         value = self.assemble(parts)
-        t = root.attrib.get("type")
-        if t is not None and t != "NULL":
+        t = attrib.get("type")
+        if t is not None:
             self.types[t] += 1
-            if not isinstance(value, dict):
-                value = {"$items": value}
-            value = {"$type": t, **value}
+            value = self._typed_object(t, value)
         return root.tag, t, self.with_attributes(attrib, value)
 
 
@@ -227,6 +263,7 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
     """Read every document; returns a summary of counts (no names of entries, no values)."""
     reader = reader or Reader()
     roots, failed, read = Counter(), Counter(), 0
+    written_names = set()
     for n, doc in enumerate(documents(targets)):
         hint = doc.get("root_hint")
         if root_filter and hint != root_filter:
@@ -241,7 +278,15 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
             name = doc.get("offset_hex") or doc.get("name") or str(n)
-            with open(os.path.join(out_dir, f"{tag}_{name}.json"), "w", encoding="utf-8", newline="\n") as f:
+            stem = f"{tag}_{name}"
+            filename = f"{stem}.json"
+            suffix = 2
+            # Another input can have the same basename or carve offset. Keep existing names on ordinary reruns.
+            while filename.casefold() in written_names:
+                filename = f"{stem}_{suffix}.json"
+                suffix += 1
+            written_names.add(filename.casefold())
+            with open(os.path.join(out_dir, filename), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(value, f, indent=1, default=str)
     return {"documents": read, "roots": len(roots), "per_root_documents": dict(roots),
             "not_well_formed": sum(failed.values()), "parse_errors": dict(failed),
@@ -256,10 +301,18 @@ def main(argv=None):
     ap.add_argument("--root", help="only documents with this root tag")
     ap.add_argument("--out", help="write one JSON file per document here (game data: keep it local)")
     a = ap.parse_args(argv)
+    if a.out and os.path.exists(a.out) and not os.path.isdir(a.out):
+        print(f"ERROR: --out {a.out} exists and is not a directory", file=sys.stderr)
+        return 2
     try:
         s = run(a.targets, a.root, a.out)
     except FileNotFoundError as e:
         print(f"ERROR: {e} does not exist", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        # an unreadable file, or a carve folder whose index.json is not JSON or not the rpf9_carve.py shape
+        where = getattr(e, "filename", None) or ", ".join(a.targets)
+        print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
         return 2
     print(f"{s['documents']} documents read, {s['roots']} roots, {s['not_well_formed']} not well-formed "
           f"{s['parse_errors'] or ''}".rstrip())

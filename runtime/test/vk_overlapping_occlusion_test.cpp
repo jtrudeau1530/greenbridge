@@ -211,6 +211,10 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     EXPECT(copy_control.create(d, context, properties.limits));
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok() && gate.semaphore());
+    // The gate stalls the GPU while the queue replays (the point of this test). A Wait on a fence with no submitted
+    // Signal is held on the CPU instead (queue_holds.h), so the gate is declared as having one: its Signal is
+    // "submitted" and the CPU completes it later, as a GPU-side signal behind long work would be.
+    context.holds().signaled(gate.semaphore(), 1);
     struct OpenGate { VulkanFence& fence; ~OpenGate() { fence.signal(1); } } open_gate{gate};
     constexpr QueryHeapId a = 1, b = 2, stats = 3;
     constexpr auto occ = d3d12_query::occlusion;

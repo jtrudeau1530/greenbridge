@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -27,7 +28,7 @@ struct Ref {
     T* operator->() const { return p; }
 };
 
-int exercise_shader_cache(ID3D12Device9* dev, const char* label) {
+int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool test_null_in_params) {
     // {7c83f2a1-4b5e-4d19-9a32-1f2e3d4c5b6a}
     const GUID id1 = {0x7c83f2a1, 0x4b5e, 0x4d19, {0x9a, 0x32, 0x1f, 0x2e, 0x3d, 0x4c, 0x5b, 0x6a}};
     const GUID id2 = {0x1b74e9d0, 0x2c3a, 0x4f81, {0x8e, 0x11, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f}};
@@ -40,7 +41,12 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label) {
     desc.Version = 1;
 
     // 1. CreateShaderCacheSession argument validation & capability check (null output -> S_FALSE).
-    EXPECT(dev->CreateShaderCacheSession(nullptr, __uuidof(ID3D12ShaderCacheSession), nullptr) == E_INVALIDARG);
+    // Passing nullptr for SAL _In_/_Inout_ parameters (pDesc, pKey, pValue, pValueSize) is undefined
+    // behaviour on older in-box Windows D3D12 runtimes (e.g. Win11 23H2 22621.5415 AVs), so those
+    // null-pointer guards are exercised only on the Vulkan layer.
+    if (test_null_in_params) {
+        EXPECT(dev->CreateShaderCacheSession(nullptr, __uuidof(ID3D12ShaderCacheSession), nullptr) == E_INVALIDARG);
+    }
     EXPECT(dev->CreateShaderCacheSession(&desc, __uuidof(ID3D12ShaderCacheSession), nullptr) == S_FALSE);
 
     D3D12_SHADER_CACHE_SESSION_DESC bad = desc;
@@ -75,13 +81,18 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label) {
     UINT sz = sizeof(out_v);
     EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, &sz) == DXGI_ERROR_NOT_FOUND);
     EXPECT(sz == sizeof(out_v));
-    EXPECT(s1->FindValue(nullptr, sizeof(k1), &out_v, &sz) == E_INVALIDARG);
+    if (test_null_in_params) {
+        EXPECT(s1->FindValue(nullptr, sizeof(k1), &out_v, &sz) == E_INVALIDARG);
+    }
     EXPECT(s1->FindValue(&k1, 0, &out_v, &sz) == E_INVALIDARG);
-    EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, nullptr) == E_INVALIDARG);
-
-    EXPECT(s1->StoreValue(nullptr, sizeof(k1), &v1, sizeof(v1)) == E_INVALIDARG);
+    if (test_null_in_params) {
+        EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, nullptr) == E_INVALIDARG);
+        EXPECT(s1->StoreValue(nullptr, sizeof(k1), &v1, sizeof(v1)) == E_INVALIDARG);
+    }
     EXPECT(s1->StoreValue(&k1, 0, &v1, sizeof(v1)) == E_INVALIDARG);
-    EXPECT(s1->StoreValue(&k1, sizeof(k1), nullptr, sizeof(v1)) == E_INVALIDARG);
+    if (test_null_in_params) {
+        EXPECT(s1->StoreValue(&k1, sizeof(k1), nullptr, sizeof(v1)) == E_INVALIDARG);
+    }
     EXPECT(s1->StoreValue(&k1, sizeof(k1), &v1, 0) == E_INVALIDARG);
     EXPECT(s1->StoreValue(&k1, sizeof(k1), &v1, sizeof(v1)) == S_OK);
     EXPECT(s1->StoreValue(&k1, sizeof(k1), &v1, sizeof(v1)) == DXGI_ERROR_ALREADY_EXISTS);
@@ -150,6 +161,7 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label) {
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     vktest::Device d;
     const auto status = d.initialize();
     if (status == vktest::DeviceStatus::unavailable) {
@@ -169,14 +181,16 @@ int main() {
 
     Ref<ID3D12Device9> device;
     EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
-    EXPECT(exercise_shader_cache(device.p, "Vulkan layer") == 0);
+    EXPECT(exercise_shader_cache(device.p, "Vulkan layer", true) == 0);
 
-    // Layer-specific ShaderCacheControl CLEAR / DISABLE / ENABLE and entry/byte limit checks.
+    // Layer-specific ShaderCacheControl CLEAR / DISABLE / ENABLE, default limits, DXGI_ERROR_CACHE_FULL,
+    // version-mismatch handling, MEMORY teardown discard, and malformed-disk-file bounds checks.
     {
         const GUID id_ctrl = {0x4a12b3c4, 0x5d6e, 0x47f8, {0x90, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07}};
         D3D12_SHADER_CACHE_SESSION_DESC desc{};
         desc.Identifier = id_ctrl;
         desc.Mode = D3D12_SHADER_CACHE_MODE_MEMORY;
+        desc.Version = 1;
         desc.MaximumInMemoryCacheEntries = 1;
         desc.MaximumInMemoryCacheSizeBytes = 8;
         Ref<ID3D12ShaderCacheSession> s;
@@ -185,13 +199,27 @@ int main() {
         const std::uint32_t k1 = 1, k2 = 2;
         const std::uint64_t v1 = 0x1122334455667788ull;
         EXPECT(s->StoreValue(&k1, sizeof(k1), &v1, sizeof(v1)) == S_OK);
-        EXPECT(s->StoreValue(&k2, sizeof(k2), &v1, sizeof(v1)) == E_OUTOFMEMORY);
+        // Full cache must return DXGI_ERROR_CACHE_FULL (not E_OUTOFMEMORY).
+        EXPECT(s->StoreValue(&k2, sizeof(k2), &v1, sizeof(v1)) == DXGI_ERROR_CACHE_FULL);
 
+        // Opening the same Identifier with a different Version while a session is live returns DXGI_ERROR_ALREADY_EXISTS.
+        D3D12_SHADER_CACHE_SESSION_DESC v2_desc = desc;
+        v2_desc.Version = 2;
+        Ref<ID3D12ShaderCacheSession> conflict;
+        EXPECT(device->CreateShaderCacheSession(&v2_desc, IID_PPV_ARGS(&conflict.p)) == DXGI_ERROR_ALREADY_EXISTS &&
+               !conflict.p);
+
+        // DISABLE must return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE on CreateShaderCacheSession, FindValue, and StoreValue.
         EXPECT(device->ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
                                           D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) == S_OK);
+        Ref<ID3D12ShaderCacheSession> disabled_s;
+        EXPECT(device->CreateShaderCacheSession(&desc, IID_PPV_ARGS(&disabled_s.p)) ==
+                   DXGI_ERROR_NOT_CURRENTLY_AVAILABLE &&
+               !disabled_s.p);
         std::uint64_t out = 0;
         UINT sz = sizeof(out);
-        EXPECT(s->FindValue(&k1, sizeof(k1), &out, &sz) == DXGI_ERROR_NOT_FOUND);
+        EXPECT(s->FindValue(&k1, sizeof(k1), &out, &sz) == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+        EXPECT(s->StoreValue(&k2, sizeof(k2), &v1, sizeof(v1)) == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
 
         EXPECT(device->ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
                                           D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE) == S_OK);
@@ -202,7 +230,27 @@ int main() {
                                           D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR) == S_OK);
         sz = sizeof(out);
         EXPECT(s->FindValue(&k1, sizeof(k1), &out, &sz) == DXGI_ERROR_NOT_FOUND);
-        s->SetDeleteOnDestroy();
+        s.reset();
+
+        // Zero limits select documented defaults (1 KiB in-memory bytes, 128 entries) and MEMORY discards on final release.
+        D3D12_SHADER_CACHE_SESSION_DESC def_desc{};
+        def_desc.Identifier = id_ctrl;
+        def_desc.Mode = D3D12_SHADER_CACHE_MODE_MEMORY;
+        def_desc.Version = 3;
+        Ref<ID3D12ShaderCacheSession> def_s;
+        EXPECT(SUCCEEDED(device->CreateShaderCacheSession(&def_desc, IID_PPV_ARGS(&def_s.p))) && def_s.p);
+        const std::vector<std::uint8_t> over_1k(1025, 0xAB);
+        EXPECT(def_s->StoreValue(&k1, sizeof(k1), over_1k.data(), static_cast<UINT>(over_1k.size())) ==
+               DXGI_ERROR_CACHE_FULL);
+        const std::vector<std::uint8_t> fit_1k(512, 0xCD);
+        EXPECT(def_s->StoreValue(&k1, sizeof(k1), fit_1k.data(), static_cast<UINT>(fit_1k.size())) == S_OK);
+        def_s.reset();  // final release without SetDeleteOnDestroy must still discard MEMORY contents
+        Ref<ID3D12ShaderCacheSession> reopened;
+        EXPECT(SUCCEEDED(device->CreateShaderCacheSession(&def_desc, IID_PPV_ARGS(&reopened.p))) && reopened.p);
+        sz = static_cast<UINT>(fit_1k.size());
+        std::vector<std::uint8_t> read_buf(512);
+        EXPECT(reopened->FindValue(&k1, sizeof(k1), read_buf.data(), &sz) == DXGI_ERROR_NOT_FOUND);
+        reopened.reset();
     }
 
     // Cross-device process-wide sharing: two distinct ID3D12Device9 objects in the same process share the store.
@@ -279,7 +327,26 @@ int main() {
             std::uint64_t out = 0;
             UINT sz = sizeof(out);
             EXPECT(s_b->FindValue(&k, sizeof(k), &out, &sz) == S_OK && sz == sizeof(v) && out == v);
-            s_b->SetDeleteOnDestroy();
+            // Opening with a different Version while s_b is live returns DXGI_ERROR_ALREADY_EXISTS.
+            D3D12_SHADER_CACHE_SESSION_DESC bad_ver = disk_desc;
+            bad_ver.Version = 8;
+            Ref<ID3D12ShaderCacheSession> conflict;
+            EXPECT(dev_b->CreateShaderCacheSession(&bad_ver, IID_PPV_ARGS(&conflict.p)) == DXGI_ERROR_ALREADY_EXISTS &&
+                   !conflict.p);
+        }
+        // Reopening with a new Version after all sessions closed clears and recreates the disk cache.
+        {
+            D3D12_SHADER_CACHE_SESSION_DESC v8_desc = disk_desc;
+            v8_desc.Version = 8;
+            Ref<ID3D12Device9> dev_v8;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&dev_v8.p))));
+            Ref<ID3D12ShaderCacheSession> s_v8;
+            EXPECT(SUCCEEDED(dev_v8->CreateShaderCacheSession(&v8_desc, IID_PPV_ARGS(&s_v8.p))) && s_v8.p);
+            std::uint64_t out = 0;
+            UINT sz = sizeof(out);
+            EXPECT(s_v8->FindValue(&k, sizeof(k), &out, &sz) == DXGI_ERROR_NOT_FOUND);
+            EXPECT(s_v8->StoreValue(&k, sizeof(k), &v, sizeof(v)) == S_OK);
+            s_v8->SetDeleteOnDestroy();
         }
         // After SetDeleteOnDestroy + release, the file must be gone and a fresh session must miss.
         bool file_remains = false;
@@ -287,17 +354,52 @@ int main() {
             if (entry.is_regular_file() && entry.path().extension() == L".bin") file_remains = true;
         }
         EXPECT(!file_remains);
+        // Corrupt/truncated disk file with huge claimed sizes must be rejected safely without huge allocation.
         {
+            const std::filesystem::path bad_file =
+                temp_dir / L"leonida_sc_31415926535849798323846264338327.bin";
+            std::ofstream out(bad_file, std::ios::binary | std::ios::trunc);
+            const std::uint32_t hdr[4] = {0x3143534Cu, 2u, 1u, 0u};
+            const std::uint64_t ver = 7;
+            const std::uint32_t huge_lens[2] = {0x7FFFFFFFu, 0x7FFFFFFFu};
+            out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+            out.write(reinterpret_cast<const char*>(&ver), sizeof(ver));
+            out.write(reinterpret_cast<const char*>(huge_lens), sizeof(huge_lens));
+            out.close();
+
             Ref<ID3D12Device9> dev_c;
             EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&dev_c.p))));
             Ref<ID3D12ShaderCacheSession> s_c;
             EXPECT(SUCCEEDED(dev_c->CreateShaderCacheSession(&disk_desc, IID_PPV_ARGS(&s_c.p))) && s_c.p);
-            std::uint64_t out = 0;
-            UINT sz = sizeof(out);
-            EXPECT(s_c->FindValue(&k, sizeof(k), &out, &sz) == DXGI_ERROR_NOT_FOUND);
+            std::uint64_t val = 0;
+            UINT sz = sizeof(val);
+            EXPECT(s_c->FindValue(&k, sizeof(k), &val, &sz) == DXGI_ERROR_NOT_FOUND);
             s_c->SetDeleteOnDestroy();
         }
-        std::printf("shader cache (disk persistence + cross-device sharing): OK\n");
+        // Inactive non-USE_WORKING_DIR disk file must be removed by ShaderCacheControl CLEAR.
+        {
+            const GUID id_inactive = {0x27182818, 0x2845, 0x4045, {0x92, 0x35, 0x36, 0x02, 0x87, 0x47, 0x13, 0x52}};
+            D3D12_SHADER_CACHE_SESSION_DESC def_disk{};
+            def_disk.Identifier = id_inactive;
+            def_disk.Mode = D3D12_SHADER_CACHE_MODE_DISK;
+            def_disk.Version = 1;
+            {
+                Ref<ID3D12ShaderCacheSession> s_in;
+                EXPECT(SUCCEEDED(device->CreateShaderCacheSession(&def_disk, IID_PPV_ARGS(&s_in.p))) && s_in.p);
+                EXPECT(s_in->StoreValue(&k, sizeof(k), &v, sizeof(v)) == S_OK);
+            }
+            EXPECT(device->ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
+                                              D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR) == S_OK);
+            {
+                Ref<ID3D12ShaderCacheSession> s_after;
+                EXPECT(SUCCEEDED(device->CreateShaderCacheSession(&def_disk, IID_PPV_ARGS(&s_after.p))) && s_after.p);
+                std::uint64_t val = 0;
+                UINT sz = sizeof(val);
+                EXPECT(s_after->FindValue(&k, sizeof(k), &val, &sz) == DXGI_ERROR_NOT_FOUND);
+                s_after->SetDeleteOnDestroy();
+            }
+        }
+        std::printf("shader cache (disk persistence + cross-device sharing + clear + bounds): OK\n");
     }
 
     // Compare the same scenarios against the host Windows D3D12 runtime when ID3D12Device9 is available.
@@ -307,7 +409,7 @@ int main() {
         if (copycmp::create_host(host, adapter_name)) {
             Ref<ID3D12Device9> host9;
             if (SUCCEEDED(host.p->QueryInterface(IID_PPV_ARGS(&host9.p))) && host9.p) {
-                EXPECT(exercise_shader_cache(host9.p, adapter_name.c_str()) == 0);
+                EXPECT(exercise_shader_cache(host9.p, adapter_name.c_str(), false) == 0);
             }
         }
     }

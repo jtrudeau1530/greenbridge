@@ -12,19 +12,23 @@
 // the same functions under that name too; nothing else changes.
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "file_system.h"
 #include "shims.h"
 
 namespace {
@@ -40,7 +44,8 @@ std::atomic<int> g_runtime_refs{0};
 // XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
 // XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
-// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below); for any other class QueryApiImpl
+// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below), and XPersistentLocalStorageImpl from
+// the public docs' layout (no caller in the shipped DLLs to measure); for any other class QueryApiImpl
 // logs the class and interface id and refuses it, so the first boot with the executable lists the interfaces to
 // implement next.
 
@@ -154,6 +159,17 @@ template <int Slot> uint64_t STDMETHODCALLTYPE private_slot(void*) {
     return 0;
 }
 
+// Slot 8, XAsyncBeginAlloc: private (no public page) and never called by the package's DLLs, so its signature here
+// is not measured. Refuse it: answering S_OK would tell the caller its async call has begun while no provider ever
+// receives XAsyncOp::Begin, so its completion never arrives.
+HRESULT STDMETHODCALLTYPE begin_alloc_not_provided(void*) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XThreadingImpl slot 8 (XAsyncBeginAlloc) called; not provided, "
+                             "returning E_NOTIMPL\n");
+    return E_NOTIMPL;
+}
+
 // XThreadSetTimeSensitive / XThreadIsTimeSensitive / XThreadAssertNotTimeSensitive. The flag is per thread, as in
 // the GDK; nothing is enforced offline (a time-sensitive thread may still block).
 thread_local bool t_time_sensitive = false;
@@ -173,7 +189,7 @@ const void* const kThreadingVtable[] = {
     XM(XAsyncCancel),                       // 5
     XM(XAsyncRun),                          // 6
     XM(XAsyncBegin),                        // 7
-    reinterpret_cast<const void*>(&private_slot<8>),  // 8  XAsyncBeginAlloc (private, not called by the package)
+    reinterpret_cast<const void*>(&begin_alloc_not_provided),  // 8  XAsyncBeginAlloc (private, not called by the package)
     XM(XAsyncSchedule),                     // 9
     XM(XAsyncComplete),                     // 10
     XM(XAsyncGetResult),                    // 11
@@ -332,19 +348,147 @@ const void* const kNetworkingVtable[] = {
 #undef NM
 static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl's 15 + IXNetworkingImpl2's 3");
 
+// ---- XPersistentLocalStorageImpl (IXPersistentLocalStorageImpl .. 3), a folder beside the overlay ----
+//
+// The package declares persistent local storage (MicrosoftGame.Config, PersistentLocalStorage, 2048 MB), so the title
+// can ask where it may keep its cache. Slots 3-7 follow Microsoft's XPersistentLocalStorage reference and the ids and
+// layout in the public xgameruntime-docs and Wine IDL (facts only): GetPathSize, GetPath, GetSpaceInfo,
+// PromptUserForSpaceAsync and PromptUserForSpaceResult; IXPersistentLocalStorageImpl3 adds MountForPackage at slot 8.
+// The storage is <overlay>\persistent, so the package stays read-only and --overlay moves it with everything else a
+// title writes. Offline there is nobody to ask for more room: a prompt for space the quota can hold succeeds, one it
+// cannot fails with ERROR_DISK_FULL.
+
+constexpr GUID kPersistentStorageClass = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
+constexpr GUID kPersistentStorage2 = {0xd29411df, 0x0794, 0x4553, {0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d}};
+constexpr GUID kPersistentStorage3 = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
+constexpr uint64_t kPersistentQuotaBytes = 2048ull * 1024 * 1024;  // MicrosoftGame.Config of package 1.0.2.1
+
+// XPersistentLocalStorageSpaceInfo: four 64-bit counts.
+struct PersistentSpaceInfo {
+    uint64_t available_free_bytes;  // what the title can still write: the quota left, capped by the host volume
+    uint64_t total_free_bytes;      // the quota left
+    uint64_t used_bytes;
+    uint64_t total_bytes;           // the quota
+};
+static_assert(sizeof(PersistentSpaceInfo) == 32, "XPersistentLocalStorageSpaceInfo is four UINT64");
+
+// The storage folder, created on first use. Empty when there is no overlay (no place to keep files) or the folder
+// cannot be created.
+std::filesystem::path persistent_storage_dir() {
+    const std::filesystem::path overlay = rt::fs::overlay_dir();
+    if (overlay.empty()) return {};
+    std::filesystem::path dir = overlay / L"persistent";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return ec ? std::filesystem::path{} : dir;
+}
+
+std::string utf8_of(const std::filesystem::path& path) {
+    const std::wstring& wide = path.native();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string utf8(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), utf8.data(), n, nullptr, nullptr);
+    return utf8;
+}
+
+uint64_t folder_bytes(const std::filesystem::path& dir) {
+    uint64_t total = 0;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(dir, std::filesystem::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        std::error_code file_ec;
+        if (!it->is_regular_file(file_ec) || file_ec) continue;
+        const uintmax_t size = it->file_size(file_ec);
+        if (!file_ec) total += size;
+    }
+    return total;
+}
+
+HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
+    if (!path_size) return E_POINTER;
+    *path_size = 0;
+    const std::string path = utf8_of(persistent_storage_dir());
+    if (path.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    *path_size = path.size() + 1;  // with the terminating NUL
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size_t* path_used) {
+    if (path_used) *path_used = 0;
+    if (!path) return E_POINTER;
+    const std::string folder = utf8_of(persistent_storage_dir());
+    if (folder.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    if (path_size < folder.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(path, folder.c_str(), folder.size() + 1);
+    if (path_used) *path_used = folder.size() + 1;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE pls_get_space_info(void*, PersistentSpaceInfo* info) {
+    if (!info) return E_POINTER;
+    *info = {};
+    const std::filesystem::path dir = persistent_storage_dir();
+    if (dir.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    const uint64_t used = folder_bytes(dir);
+    const uint64_t left = used < kPersistentQuotaBytes ? kPersistentQuotaBytes - used : 0;
+    std::error_code ec;
+    const std::filesystem::space_info host = std::filesystem::space(dir, ec);
+    info->total_bytes = kPersistentQuotaBytes;
+    info->used_bytes = used;
+    info->total_free_bytes = left;
+    info->available_free_bytes = ec || left < host.available ? left : host.available;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE pls_prompt_async(void*, uint64_t requested_bytes, XAsyncBlock* async) {
+    if (!async) return E_POINTER;
+    const std::filesystem::path dir = persistent_storage_dir();
+    const bool fits = !dir.empty() && requested_bytes <= kPersistentQuotaBytes - (std::min)(folder_bytes(dir), kPersistentQuotaBytes);
+    if (fits) return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return S_OK; });
+    return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return HRESULT_FROM_WIN32(ERROR_DISK_FULL); });
+}
+
+HRESULT STDMETHODCALLTYPE pls_prompt_result(void*, XAsyncBlock* async) {
+    if (!async) return E_POINTER;
+    return XAsyncGetStatus(async, false);
+}
+
+// IXPersistentLocalStorageImpl3's package mount has nothing to mount offline; the handle is left empty.
+HRESULT STDMETHODCALLTYPE pls_mount_for_package(void*, const char*, void** mount_handle) {
+    if (!mount_handle) return E_POINTER;
+    *mount_handle = nullptr;
+    return E_NOTIMPL;
+}
+
+#define PLS(fn) reinterpret_cast<const void*>(&fn)
+const void* const kPersistentStorageVtable[] = {
+    PLS(object_query_interface), PLS(object_add_ref), PLS(object_release),
+    PLS(pls_get_path_size),      // 3 XPersistentLocalStorageGetPathSize
+    PLS(pls_get_path),           // 4 XPersistentLocalStorageGetPath
+    PLS(pls_get_space_info),     // 5 XPersistentLocalStorageGetSpaceInfo
+    PLS(pls_prompt_async),       // 6 XPersistentLocalStoragePromptUserForSpaceAsync
+    PLS(pls_prompt_result),      // 7 XPersistentLocalStoragePromptUserForSpaceResult
+    PLS(pls_mount_for_package),  // 8 XPersistentLocalStorageMountForPackage (IXPersistentLocalStorageImpl3)
+};
+#undef PLS
+static_assert(std::size(kPersistentStorageVtable) == 9, "IUnknown + IXPersistentLocalStorageImpl's 5 + Impl3's 1");
+
 // The ids xgameruntime-docs and the xgameruntime IDL give: XThreadingImpl's and XErrorImpl's class id is also their
 // one interface's; IXNetworkingImpl's id is the class id, and IXNetworkingImpl2 derives from it.
 const GUID* const kNetworkingIids[] = {&kNetworking2, nullptr};
 RuntimeObject g_threading{kThreadingVtable, &kThreadingClass, nullptr};
 RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
 RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids};
+const GUID* const kPersistentStorageIids[] = {&kPersistentStorage2, &kPersistentStorage3, nullptr};
+RuntimeObject g_persistent_storage{kPersistentStorageVtable, &kPersistentStorageClass, kPersistentStorageIids};
 
 RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem functions it serves
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object()})
+        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &system_object()})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
     }
     char cls[40], iid[40];

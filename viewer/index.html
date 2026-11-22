@@ -66,7 +66,7 @@ function manifestError(world) {
     if (!isPosition(b, 6) || b[0] > b[3] || b[1] > b[4] || b[2] > b[5])
       return `chunks[${i}].bounds must contain six finite, ordered coordinates`;
     if (chunk.lod !== undefined) {
-      const band = world.lod_bands?.[chunk.lod];
+      const band = isNonemptyString(chunk.lod) ? world.lod_bands?.[chunk.lod] : undefined;
       if (!isPosition(band, 2) || band[0] < 0 || band[0] > band[1])
         return `chunks[${i}].lod must name a lod_bands entry with two finite, ordered distances`;
       const c = chunk.cell;
@@ -199,10 +199,17 @@ const keys = new Set(); let yaw = 0, pitch = -0.25, speed = 40, locked = false;
 // Pointer lock when the browser allows it; embedded views (iframes, preview panes) fall back to drag-to-look.
 const start = document.getElementById("start");
 let dragLook = false, dragging = false;
+function enableDragLook() {
+  if (locked || dragLook) return;
+  dragLook = true;
+  start.classList.add("hidden");
+  document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look");
+}
 start.onclick = async () => {
   try { await renderer.domElement.requestPointerLock(); }
-  catch { dragLook = true; start.classList.add("hidden"); document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look"); }
+  catch { enableDragLook(); }
 };
+document.addEventListener("pointerlockerror", enableDragLook);
 document.addEventListener("pointerlockchange", () => { locked = document.pointerLockElement === renderer.domElement; start.classList.toggle("hidden", locked || dragLook); });
 renderer.domElement.addEventListener("mousedown", e => { if (e.button === 0) dragging = true; });
 addEventListener("mouseup", e => { if (e.button === 0) dragging = false; });
@@ -291,9 +298,8 @@ function dist(c, p) {
   const dx = Math.max(b[0] - p.x, 0, p.x - b[3]), dy = Math.max(b[1] - p.y, 0, p.y - b[4]), dz = Math.max(b[2] - p.z, 0, p.z - b[5]);
   return Math.hypot(dx, dy, dz);
 }
-// LOD sets: every grid cell has one chunk per detail tier, and a tier is shown only while the camera's
-// horizontal distance to the cell lies in that tier's band, so one tier per cell is drawn. LOD_SLACK
-// keeps a loaded tier a little past its band so crossing an edge does not reload it every frame.
+// Choose one loaded tier per cell. Prefer the tier whose band contains the camera's horizontal
+// distance, and use a cached tier within LOD_SLACK while the preferred tier is unavailable.
 const LOD_SLACK = 32;
 function cellDist(c, p) {
   const r = c.cell;
@@ -342,11 +348,23 @@ async function loadChunk(entry) {
 }
 function stream(now = performance.now()) {
   const p = camera.position;
+  const visibleTiers = new Map();
   for (const [id, c] of live) {
     if (!c.obj && !c.loading) continue;
     const { load, keep } = range(c.def, p);
     if (keep) {
-      if (c.obj && c.def.lod !== undefined) c.obj.visible = load;
+      // Orphan HD has its own band and no replacement in the LOD chain.
+      if (c.obj && c.def.lod === "orphan_hd") {
+        c.obj.visible = load;
+      } else if (c.obj && c.def.lod !== undefined) {
+        const cell = c.def.cell.join(",");
+        const current = visibleTiers.get(cell);
+        c.obj.visible = !current || (load && !current.inBand);
+        if (c.obj.visible) {
+          if (current) current.obj.visible = false;
+          visibleTiers.set(cell, { obj: c.obj, inBand: load });
+        }
+      }
       continue;
     }
     drop(id);

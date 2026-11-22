@@ -91,7 +91,9 @@ def dds_bytes(w, h, fmt, payload):
 
 def score_image(w, h, fmt, payload, bpe):
     a = None
-    if fmt in PILLOW_OK:
+    if fmt == 56:  # R16_UNORM
+        a = np.frombuffer(payload, "<u2").reshape(h, w).astype(np.float32)
+    elif fmt in PILLOW_OK:
         try:
             from PIL import Image
 
@@ -217,21 +219,35 @@ def main():
         print(f"ERROR: cannot create {a.out}: {e.strerror or e}", file=sys.stderr)
         return 2
     res, cache, pngs = Counter(), {}, Counter()
+    io_failures = 0
+    first_io_error = None
     for i, t in enumerate(texs, 1):
         try:
             r = export_one(t, a.carve, a.out, cache, a.png)
         except Exception as e:  # noqa: BLE001
             r = "error:" + type(e).__name__
+            if isinstance(e, OSError):
+                io_failures += 1
+                if first_io_error is None:
+                    first_io_error = str(e)
         res[r] += 1
         if r.startswith("ok:") and "png" in t["export"]:  # an "export" read from the index may be stale
             pngs[t["export"]["png"]] += 1
         if i % 2000 == 0:
             print(f"[{i}/{len(texs)}] {dict(res)}", flush=True)
-    with open(os.path.join(a.out, "export_log.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump(texs, f)
+    report = os.path.join(a.out, "export_log.json")
+    try:
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(texs, f)
+    except OSError as e:
+        print(f"ERROR: cannot write {report}: {e.strerror or e}", file=sys.stderr)
+        return 1
     print(f"{len(texs)} textures: {dict(res)} -> {a.out}")
     if a.png:
         print(f"png: {dict(pngs)}")
+    if io_failures:
+        print(f"ERROR: {io_failures} texture(s) could not be read or written, first: {first_io_error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

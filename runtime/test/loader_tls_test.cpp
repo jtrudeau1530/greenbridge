@@ -443,6 +443,149 @@ void test_multiple_tls_modules(const fs::path& dll, const fs::path& temp) {
     }
 }
 
+// A worker thread that outlives Loader #1 keeps an orphaned g_thread_tls_slots[slot] record until it exits.
+// Even if Loader #2 reuses the same TLS slot (and even the same Module* address), the generation token must
+// prevent Loader #2 from mistaking the orphaned entry for its own on install_tls_for_thread or DLL_THREAD_DETACH.
+void test_orphan_slot_generation_reuse(const fs::path& dll) {
+    std::printf("\n-- orphan thread slot generation vs reused slot --\n");
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    struct Ctx {
+        HANDLE ready;
+        HANDLE go;
+    } ctx{ready, go};
+
+    HANDLE thread = nullptr;
+    uint32_t old_slot = rt::kNoTlsIndex;
+    {
+        rt::Loader loader1(dll.parent_path());
+        rt::Module& m1 = loader1.load(dll);
+        loader1.initialise();
+        old_slot = m1.tls_slot;
+        thread = CreateThread(
+            nullptr, 0,
+            [](void* p) -> DWORD {
+                auto* c = static_cast<Ctx*>(p);
+                SetEvent(c->ready);
+                WaitForSingleObject(c->go, INFINITE);
+                return 0;
+            },
+            &ctx, 0, nullptr);
+        WaitForSingleObject(ready, INFINITE);
+    }  // loader1 destroyed while worker thread is still alive
+
+    rt::Loader loader2(dll.parent_path());
+    rt::Module& m2 = loader2.load(dll);
+    loader2.initialise();
+    check(m2.tls_slot == old_slot, "second loader reuses the released TLS slot");
+
+    auto watch = find_export<void(__cdecl*)(DWORD)>(m2, "tiny_tls_watch_thread");
+    auto td = find_export<int(__cdecl*)()>(m2, "tiny_tls_thread_detach_count");
+    watch(GetThreadId(thread));
+
+    SetEvent(go);
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    CloseHandle(go);
+    CloseHandle(ready);
+
+    check(td() == 0, "orphaned worker exit does not dispatch DLL_THREAD_DETACH to the new generation's module");
+}
+
+// Spawns cmd.exe to obtain one guaranteed-dead PID and one guaranteed-live one for the purge-ownership checks.
+struct ChildProcess {
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+    explicit ChildProcess(const wchar_t* args) {
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        std::wstring cmd = std::wstring(L"cmd.exe ") + args;
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
+                            &pi))
+            throw std::runtime_error("CreateProcessW for cmd.exe failed");
+        CloseHandle(pi.hThread);
+        process = pi.hProcess;
+        pid = pi.dwProcessId;
+    }
+    ChildProcess(const ChildProcess&) = delete;
+    ChildProcess& operator=(const ChildProcess&) = delete;
+    void wait_exit() {
+        WaitForSingleObject(process, INFINITE);
+        CloseHandle(process);
+        process = nullptr;
+    }
+    ~ChildProcess() {
+        if (process) {
+            TerminateProcess(process, 0);
+            WaitForSingleObject(process, INFINITE);
+            CloseHandle(process);
+        }
+    }
+};
+
+// Clone files live in the temp root (the loader's clone directory), named with this process's PID.
+std::vector<fs::path> own_clone_files() {
+    const std::wstring own = L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_";
+    std::vector<fs::path> found;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((fs::temp_directory_path() / (own + L"*.dll")).c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return found;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            found.push_back(fs::temp_directory_path() / fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+}
+
+// The startup purge must delete only clones whose owning process is gone and that nothing holds open: a concurrent
+// process between its CopyFileW and its LoadLibraryExW must keep its file. Runs before any other clone-creating
+// test, because the sweep fires once per process.
+void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
+    std::printf("\n-- startup purge deletes only ownerless clones --\n");
+    ChildProcess dead(L"/c exit 0");
+    dead.wait_exit();
+    ChildProcess live(L"/c timeout /t 30 /nobreak > nul");
+
+    const fs::path clone_root = fs::temp_directory_path();
+    // An own-PID name stands in for a leftover of a dead run whose PID this process reused: the sweep runs before
+    // this process has created any clone, so such a file is always ownerless here.
+    const fs::path stale_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_31.dll");
+    const fs::path held_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(dead.pid) + L"_32.dll");
+    const fs::path live_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(live.pid) + L"_33.dll");
+    const char bytes[8] = "purgeXX";
+    write_file(stale_file, bytes, 8);
+    write_file(held_file, bytes, 8);
+    write_file(live_file, bytes, 8);
+    // An open handle without FILE_SHARE_DELETE stands in for another process's guard or mapped image: the purge's
+    // exclusive-open probe must fail against it.
+    HANDLE held = CreateFileW(held_file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(held != INVALID_HANDLE_VALUE, "opened the held clone stand-in without FILE_SHARE_DELETE");
+
+    const fs::path second = temp / "tiny_tls_purge_second.dll";
+    check(CopyFileW(dll.c_str(), second.c_str(), FALSE) != 0, "copied the TLS fixture for the purge test");
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& first = loader.load(dll);  // slot 0: primary helper, no clone
+        rt::Module& mapped_second = loader.load(second);  // slot 1: clone; the purge sweep runs here
+        check(first.tls_index != rt::kNoTlsIndex && mapped_second.tls_index != rt::kNoTlsIndex,
+              "the purge test loads two simultaneous TLS modules");
+    }
+    const auto clone_of_this_process = own_clone_files();
+    check(clone_of_this_process.size() == 1, "this process owns exactly one clone file after the two-module load");
+
+    check(!fs::exists(stale_file), "the purge deleted the clone whose owner process is gone");
+    check(fs::exists(held_file), "the purge skipped the clone another handle holds open");
+    check(fs::exists(live_file), "the purge skipped the clone whose owner process is still alive");
+
+    CloseHandle(held);
+    std::error_code ec;
+    fs::remove(held_file, ec);
+    fs::remove(live_file, ec);
+}
+
 void print_result() {
     if (g_failures == 0)
         std::printf("\nloader_tls_test: OK (%d checks)\n", g_checks);
@@ -470,10 +613,18 @@ int main(int argc, char** argv) {
         }
 
         TempDir temp;
+        test_purge_ownership_scoping(tls_dll, temp.path);  // first: the sweep fires once per process
         test_tls(tls_dll);
         test_thread_events(tls_dll);
         test_thread_outlives_loader(tls_dll);
         test_multiple_tls_modules(tls_dll, temp.path);
+        test_orphan_slot_generation_reuse(tls_dll);
+
+        // The --run path calls cleanup_tls_clones() before ExitProcess because atexit never runs there.
+        std::printf("\n-- explicit clone cleanup (the ExitProcess path) --\n");
+        check(!own_clone_files().empty(), "TLS helper clone files exist before explicit cleanup");
+        rt::cleanup_tls_clones();
+        check(own_clone_files().empty(), "cleanup_tls_clones deletes every clone file of this process");
     } catch (const std::exception& e) {
         ++g_checks;
         ++g_failures;

@@ -9,6 +9,7 @@ import io
 import json
 import os
 import struct
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -240,6 +241,54 @@ class TestCli(unittest.TestCase):
             with open(conv, "rb") as f:
                 self.assertEqual(f.read(), original)
 
+    def test_rejects_output_aliasing_recursive_inputs(self):
+        for source in ("bank", "conversation"):
+            for alias in ("path", "parent", "hardlink"):
+                with self.subTest(source=source, alias=alias), tempfile.TemporaryDirectory() as tmp:
+                    banks = os.path.join(tmp, "banks")
+                    conversations = os.path.join(tmp, "conversations")
+                    os.makedirs(os.path.join(banks, "nested"))
+                    os.makedirs(os.path.join(conversations, "nested"))
+                    bank_data = make_bank(["zz_rootau_abcd_01"])
+                    conv_data = b"ZZ_ROOTAU_ABCD\x00ZZ_A\x00"
+                    bank = write(os.path.join(banks, "nested", "one.AWC"), bank_data)
+                    conv = write(os.path.join(conversations, "nested", "labels.bin"), conv_data)
+                    target = bank if source == "bank" else conv
+                    if alias == "parent":
+                        out = os.path.join(os.path.dirname(target), "..", "nested", os.path.basename(target))
+                    elif alias == "hardlink":
+                        out = os.path.join(tmp, "names.csv")
+                        os.link(target, out)
+                    else:
+                        out = target
+                    err = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                        with self.assertRaises(SystemExit) as cm:
+                            A.main([banks, "--conversations", conversations, "--out", out])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("--out must not overwrite an input", err.getvalue())
+                    for path, original in ((bank, bank_data), (conv, conv_data)):
+                        with open(path, "rb") as fh:
+                            self.assertEqual(fh.read(), original)
+
+    def test_allows_report_inside_bank_directory(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                banks = os.path.join(tmp, "banks")
+                os.makedirs(os.path.join(banks, "nested"))
+                bank_data = make_bank(["zz_rootau_abcd_01"])
+                bank = write(os.path.join(banks, "nested", "one.awc"), bank_data)
+                conv = write(os.path.join(tmp, "labels.bin"), b"ZZ_ROOTAU_ABCD\x00ZZ_A\x00")
+                out = os.path.join(banks, "nested", "names.csv")
+                if existing:
+                    write(out, "old report\n")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(A.main([banks, "--conversations", conv, "--out", out]), 0)
+                with open(out, encoding="utf-8", newline="") as fh:
+                    self.assertEqual(len(list(csv.DictReader(fh))), 1)
+                with open(bank, "rb") as fh:
+                    self.assertEqual(fh.read(), bank_data)
+
     def test_hashdict_json_words(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = write(os.path.join(tmp, "hashes.json"), json.dumps({"0000abcd": "Some_Word"}))
@@ -252,6 +301,39 @@ class TestCli(unittest.TestCase):
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)
+
+    @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
+    def test_locked_words_input_reports_rc_2_without_traceback(self):
+        # An exclusively locked (share-none) existing file passes the os.path.exists check, so the
+        # read_words() open must turn PermissionError into the one-line rc-2 error, not a traceback.
+        import ctypes
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "locked.awc")
+            with open(blob, "wb") as fh:
+                fh.write(b"\x00" * 16)
+            k32 = ctypes.windll.kernel32
+            handle = k32.CreateFileW(blob, 0x80000000, 0, None, 3, 0x80, None)
+            self.assertNotIn(handle, (0, -1), "could not lock the probe file")
+            try:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = A.main([blob, "--words", blob])
+            finally:
+                k32.CloseHandle(handle)
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot read", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+    def test_unreadable_json_words_report_rc_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.json"), "{not json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = A.main([tmp, "--words", words])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot read", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":

@@ -211,6 +211,7 @@ world rotation (conjugate it for rendering). `scaleXY` applies to X/Y, `scaleZ` 
 | entity id | `1b60404d` | +0x08 | u64 | per-entity id (not a name key; not unique, see world_names.md) |
 | archetype key | `c8a7b90a` | +0x20 | u64 | per-archetype key: MurmurHash3 x64 128 low 64 of the name |
 | `lodLevel` | `6c8f1715` | +0x7e | u8 | 0 HD, 1 LOD, 2 SLOD1, 3 SLOD2, 4 SLOD3, 5 ORPHAN_HD, 6 SLOD4 |
+| terrain parent-map selector | `84799847` | +0x7f | i8 | zero-based slot in the source map's parent-map reference array, or -1 in the measured terminal rows |
 | `parentIndex` | `d89231bd` | +0x5c | i16 | parent entity index (signed; -1 = none) |
 | `parentInstance` | `e74c3c23` | +0x5e | i16 | parent batch instance |
 | `numChildren` | `a687ac89` | +0x68 | u32 | linked children |
@@ -463,6 +464,16 @@ output is aggregate (one row per resource). `--entities-out` adds a local-only J
 complete entity (archetype hash and key, position, stored rotation, scales, LOD fields), the input of
 `world_build.py --placements` below.
 
+For a complete placement uniquely referenced by the map root, `map_name` is the source map's 32-bit name
+hash (eight lowercase hex digits) and `entity_index` is its zero-based ordinal in the authored `entities`
+array. Other classes may occupy slots in that array. The JSONL keeps its physical record order.
+For the ordinary terrain case (`parentInstance == -1`, a nonnegative `parent_index` and a valid signed
+map selector), `parent_map_name` holds the selected map hash in the same format. Match
+`(parent_map_name, parent_index)` to a unique `(map_name, entity_index)` across the input maps.
+These fields are optional. Older exports, unavailable references and unsupported parent forms can lack
+the corresponding keys. A missing or ambiguous target stays unresolved, including when a scan covers only
+part of the map set.
+
 `tools/world_census.py` scans the whole `levels.rpf` data area in shards and counts every validated
 `0x7a` map resource and placement entity. The measured full pass is 23,535 maps / 1,670,442 entities
 with 98.32% stream coverage; the exactness condition and byte accounting are in
@@ -561,9 +572,32 @@ From HD to SLOD2, each tier's median `lodDist` is within 5% of the next tier's m
 450/450, 1,000/1,000, 2,000/1,976), so the two fields agree on the bands. For SLOD3 they differ (4,000 and
 6,043.5), and the band follows `childLodDist`.
 
-This is an approximation of point 5, per cell and per tier. Per-entity `lodDist` overrides and the
-`parentIndex`/`numChildren` links are not used: an entity row doesn't say which map file it came from, and
-`parentIndex` is an index into that file's entity table.
+The viewer approximates point 5 with distance bands per cell and tier. To follow an individual parent link,
+a loader needs the selected map's name and the target placement's original ordinal in that map's `entities` array.
+
+Two terrain regions on Xbox 1.0.2.1 give a cross-map example. In each tested HD and LOD map, `CMapData.parent` is zero.
+The schema member `75d16adf` at +0x58 is an array with one 32-bit hash in a block of type `0x4a`. That hash
+matches the next map's `CMapData.name`. The child's signed `parentIndex` selects an ordinal in **that map's**
+`entities` reference array. Looking up the index in the HD map itself returns the child in all 127 cases.
+
+For all 127 HD/LOD pairs, the same name stem with the respective tier suffix reproduced both stored archetype
+keys (JOAAT and Murmur3-64). Following the reference from LOD grouped the 127 children under 32 SLOD1 entities.
+At both steps, every parent's incoming count matched its `numChildren`, and its `childLodDist` matched each
+child's `lodDist`.
+
+Four terrain maps with two references show how an entity selects its parent map. Schema member `84799847` at
++0x7f is a signed byte (type `0x10`). Use its value as a zero-based index in the stored `75d16adf` array,
+then apply `parentIndex` to that map's `entities` array. In these maps, 64 children select slot 0 and 18
+select slot 1. For 42 children the same parent ordinal, tier and distance fields fit both maps. In every
+one of these cases the selected parent is closer to the child's XY position. Reversing
+the array while keeping the selector fixed sends those 42 to the other map and the remaining 40 to an
+out-of-range ordinal. Remapping the selector along with the array restores all 82 links.
+
+Including the adjacent single-reference maps, all 324 links agree with the declared child counts of all 34
+parents. Always selecting slot 0 gives incorrect child counts for ten parents. The six terminal entities
+have an empty map reference array, selector -1 and `parentIndex` -1.
+All 330 entities have `parentInstance` -1. These checks establish authored associations for the measured
+terrain records. Nondefault batch instances and the runtime switching distance remain open.
 
 ### Measured
 

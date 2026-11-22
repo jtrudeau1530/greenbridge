@@ -83,7 +83,9 @@ std::array<std::uint32_t, 4> make_vsharp(std::uint64_t base, std::uint32_t recor
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
+    EXPECT(device_status == vktest::DeviceStatus::ready);
 
     // The translator-style library the build wrote, and the FSSM programs its index entries are keyed by.
     const std::filesystem::path root_dir = LEONIDA_TEST_M15_DIR;

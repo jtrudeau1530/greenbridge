@@ -262,6 +262,11 @@ def effect_lights(meta, eo):
     return out
 
 
+def _local_light_position(light: dict, offset: list[float]) -> list[float]:
+    position = light.get("position120", light.get("posn", (0.0, 0.0, 0.0)))
+    return [position[i] + offset[i] for i in range(3)]
+
+
 def quat_rotate(q, v):
     """Rotate v by the unit quaternion q = (x, y, z, w)."""
     x, y, z, w = q
@@ -279,10 +284,14 @@ def place(
 ) -> tuple[list[float], list[float] | None]:
     """World position and direction of a model-space light under an entity's stored transform.
 
-    The stored quaternion is the inverse of the entity rotation (docs/world.md), so it is conjugated here.
+    Normalize and conjugate the stored quaternion to match the rotation used for placed geometry.
     """
     x, y, z, w = rotation
-    q = (-x, -y, -z, w)
+    length = math.hypot(x, y, z, w)
+    if length and math.isfinite(length):
+        q = (-x / length, -y / length, -z / length, w / length)
+    else:
+        q = (0.0, 0.0, 0.0, 1.0)
     xy = 1.0 if scale_xy is None else scale_xy
     z_scale = 1.0 if scale_z is None else scale_z
     scaled = [local[0] * xy, local[1] * xy, local[2] * z_scale]
@@ -539,7 +548,7 @@ def inspect_resource(data, lights_out=False):
                 t = _entity_transform(meta, oo)
                 if lights_out and t["position"] and t["rotation"]:
                     for L in lights:
-                        local = [off[k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
+                        local = _local_light_position(L, off)
                         p, d = place(local, L.get("direction"), t["position"], t["rotation"],
                                      t["scaleXY"], t["scaleZ"])
                         world.append(_light_row(p, d, L, "entity", t["archetypeName"]))
@@ -674,9 +683,12 @@ def summarize(total, entities=None, lights_out=None):
     }
     placed = collections.Counter()
     out = None
+    staged = None
     try:
         if lights_out:
-            out = open(lights_out, "w", encoding="utf-8", newline="\n")
+            # Stage the report: a bad --entities row below must not truncate a report from an earlier run.
+            staged = lights_out + ".partial"
+            out = open(staged, "w", encoding="utf-8", newline="\n")
             for row in total["world_lights"]:
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
         placed["entity_lights_in_maps"] = len(total["world_lights"]) if lights_out else lights.get("lights_entity_in_map_placed", 0)
@@ -697,14 +709,32 @@ def summarize(total, entities=None, lights_out=None):
                     placed["archetype_lights_placed"] += len(ls)
                     if out is not None and e.get("position") and e.get("rotation"):
                         for L in ls:
-                            local = [L["offset"][k] + L.get("position120", [0, 0, 0])[k] for k in range(3)]
+                            local = _local_light_position(L, L["offset"])
                             p, d = place(local, L.get("direction"), e["position"], e["rotation"],
                                          e.get("scale_xy"), e.get("scale_z"))
                             out.write(json.dumps(_light_row(p, d, L, "archetype", a),
                                                  separators=(",", ":")) + "\n")
+    except BaseException:
+        if out is not None:
+            try:
+                out.close()
+            except OSError:
+                pass
+            out = None
+        if staged is not None and os.path.exists(staged):
+            os.remove(staged)
+        raise
     finally:
         if out is not None:
             out.close()
+    if staged is not None:
+        try:
+            os.replace(staged, lights_out)
+        except BaseException:
+            # A destination that is a directory (or read-only) must not leave the staged copy behind.
+            if os.path.exists(staged):
+                os.remove(staged)
+            raise
     summary["placement"] = dict(placed)
     nodes = [n for part in total["nodes"] for n in part]
     links = [l for part in total["links"] for l in part]
@@ -761,6 +791,9 @@ def main(argv=None):
     if a.jobs < 1:
         print("ERROR: --jobs must be at least 1", file=sys.stderr)
         return 2
+    if a.start is not None and a.start < 0:
+        print("ERROR: --start must be non-negative", file=sys.stderr)
+        return 2
     if a.limit is not None and a.limit < 1:
         print("ERROR: --limit must be at least 1", file=sys.stderr)
         return 2
@@ -773,7 +806,14 @@ def main(argv=None):
     if a.out and a.lights_out and same_report_path(a.out, a.lights_out):
         ap.error("--out and --lights-out must use different paths")
     total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
-    summary = summarize(total, a.entities, a.lights_out)
+    try:
+        summary = summarize(total, a.entities, a.lights_out)
+    except ValueError as e:            # a bad --entities row, or an archetype that is not a number
+        print(f"ERROR: {a.entities}: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     text = json.dumps(summary, indent=1, sort_keys=True)
     if a.out:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:

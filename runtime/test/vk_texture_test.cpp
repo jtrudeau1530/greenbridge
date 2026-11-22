@@ -512,6 +512,14 @@ int main(int argc, char** argv) {
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rc{}; rc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; rc.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &rc);
+    VkBufferMemoryBarrier readback{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    readback.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    readback.srcQueueFamilyIndex = readback.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    readback.buffer = rb;
+    readback.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &readback, 0, nullptr);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CHECK(vkQueueWaitIdle(q));

@@ -31,6 +31,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(".github", "workflows", "ci.yml")
@@ -69,9 +70,12 @@ def ci_rules(root):
 
 
 def tracked_under_tests(root):
-    result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True, text=True)
-    if result.returncode == 0:
-        return [n for n in result.stdout.split("\0") if n]
+    try:
+        result = subprocess.run(["git", "ls-files", "-z", "--", "tests"], cwd=root, capture_output=True, text=True)
+        if result.returncode == 0:
+            return [n for n in result.stdout.split("\0") if n]
+    except OSError:
+        pass
     names = []                                     # no git: walk, as tests/test_docs_links.py does
     for base, dirs, files in os.walk(os.path.join(root, "tests")):
         dirs[:] = [d for d in dirs if d not in (".git", "third_party", "__pycache__")]
@@ -158,6 +162,40 @@ def defines_a_test(source, require_test_case=False):
     return False
 
 
+def semantic_job_text(workflow):
+    """The `semantic-tests:` job of the workflow, up to the next job."""
+    match = re.search(r"^  semantic-tests:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow, re.M | re.S)
+    if not match:
+        raise AssertionError("ci.yml no longer has a `semantic-tests:` job; update tests/test_ci_registration.py")
+    return match.group(1)
+
+
+def spirv_gated_semantic_files(root, files):
+    """tests/semantic files that skip when spirv-as / spirv-val are not installed."""
+    gated = []
+    for rel in files:
+        if not rel.startswith("tests/semantic/") or not rel.endswith(".py"):
+            continue
+        source = read(root, rel)
+        if re.search(r"which\(\s*[\"']spirv-(?:as|val)[\"']", source) and re.search(r"skip(?:Unless|Test|If)\b", source):
+            gated.append(rel)
+    return gated
+
+
+def spirv_tools_problem(workflow, gated):
+    """Why the semantic job cannot run `gated` tests, or None: it needs an apt install of spirv-tools and the
+    LEONIDA_REQUIRE_SPIRV_TOOLS=1 switch that makes a missing tool fail."""
+    if not gated:
+        return None
+    job = semantic_job_text(workflow)
+    problems = []
+    if not re.search(r"apt-get\s+install[^\n]*\bspirv-tools\b", job):
+        problems.append("it does not `apt-get install` spirv-tools")
+    if not re.search(r"LEONIDA_REQUIRE_SPIRV_TOOLS:[^\n]*['\"]1['\"]", job):
+        problems.append("it never sets LEONIDA_REQUIRE_SPIRV_TOOLS to 1")
+    return "; ".join(problems) or None
+
+
 def has_main_guard(source):
     """A real ``if __name__ == "__main__":`` block that runs something.
 
@@ -196,6 +234,12 @@ class RepositoryRegistrationTest(unittest.TestCase):
         self.assertGreaterEqual(len(self.files), 300, f"only {len(self.files)} test files found: {self.files[:5]}")
         self.assertTrue(any(f.startswith("tests/semantic/") for f in self.files))
 
+    def test_the_scan_falls_back_when_git_is_missing(self):
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("git")):
+            files = tracked_under_tests(ROOT)
+            self.assertGreaterEqual(len(files), 300)
+            self.assertTrue(any(f.startswith("tests/semantic/") for f in files))
+
     def test_every_test_file_is_selected_by_a_job(self):
         unselected = [f for f in self.files if job_of(ROOT, f, self.rules) is None]
         self.assertEqual(unselected, [],
@@ -225,6 +269,35 @@ class RepositoryRegistrationTest(unittest.TestCase):
                      if job_of(ROOT, f, self.rules) == "stdlib" and not has_main_guard(read(ROOT, f))]
         self.assertEqual(guardless, [], "the check loop runs these with python -I, which executes no test:\n" +
                          "\n".join(f"  {f}: no `if __name__ == \"__main__\":` block" for f in guardless))
+
+    def test_the_semantic_job_installs_what_its_spirv_gated_tests_need(self):
+        # A test that skips without spirv-as / spirv-val runs only where something installed them. The runner images
+        # have neither, so a job that skips instead of installing reports green for tests that never ran.
+        gated = spirv_gated_semantic_files(ROOT, self.files)
+        self.assertGreaterEqual(len(gated), 3, f"the scan found only {gated}")
+        for expected in ("tests/semantic/test_fma_khr.py", "tests/semantic/test_bary_fallback.py",
+                         "tests/semantic/test_image_coherent.py"):
+            self.assertIn(expected, gated)
+        problem = spirv_tools_problem(read(ROOT, WORKFLOW), gated)
+        self.assertIsNone(problem, "the `semantic-tests` job in ci.yml runs tests that skip without SPIRV-Tools, but " +
+                          str(problem) + ".\nInstall spirv-tools on the Linux leg and set LEONIDA_REQUIRE_SPIRV_TOOLS "
+                          "to '1' there (see tests/semantic/test_spirv_tools_required.py).")
+
+    def test_the_spirv_tools_check_flags_a_job_that_installs_nothing(self):
+        workflow = read(ROOT, WORKFLOW)
+        gated = ["tests/semantic/test_fma_khr.py"]
+        self.assertIsNone(spirv_tools_problem(workflow, gated))
+        self.assertIsNone(spirv_tools_problem(workflow, []))
+        no_install = workflow.replace("sudo apt-get install -y --no-install-recommends spirv-tools\n",
+                                      "sudo apt-get install -y --no-install-recommends curl\n", 1)
+        self.assertNotEqual(no_install, workflow)
+        self.assertIn("apt-get", no_install)
+        # the translator-tests job above installs spirv-tools too; only the semantic job's own text may count
+        self.assertIn("does not `apt-get install` spirv-tools", spirv_tools_problem(no_install, gated) or "")
+        no_switch = workflow.replace("LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && '1' || '0' }}",
+                                     "LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && 'yes' || 'no' }}")
+        self.assertNotEqual(no_switch, workflow)
+        self.assertIn("never sets LEONIDA_REQUIRE_SPIRV_TOOLS", spirv_tools_problem(no_switch, gated) or "")
 
     def test_the_scan_flags_an_unlisted_file_and_a_file_pytest_cannot_collect(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -29,6 +29,7 @@ import statistics
 import sys
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
+from xml.parsers.expat import errors
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -131,6 +132,7 @@ def scan_xml(data: bytes) -> dict:
     report = {
         "root": "",
         "well_formed": False,
+        "mismatched_tag": False,
         "error": "",
         "element_count": 0,
         "max_depth": 0,
@@ -193,6 +195,8 @@ def scan_xml(data: bytes) -> dict:
     except (ET.ParseError, LookupError, ValueError) as exc:
         # The parser also raises LookupError or ValueError for unsupported encoding declarations.
         report["error"] = str(exc)
+        report["mismatched_tag"] = (isinstance(exc, ET.ParseError)
+                                    and exc.code == errors.codes[errors.XML_ERROR_TAG_MISMATCH])
         # The parser stops at the error, so the comments after it would go uncounted (a truncated or tail-only
         # document): count them in the bytes instead, still skipping comment-like text inside CDATA.
         report["comments"] = raw_comment_count(data)
@@ -234,6 +238,26 @@ def file_row(doc: dict, scan: dict) -> dict:
     elif doc.get("from_carve"):
         tail_only = not header
         fragment = not root or not doc.get("complete", True)
+    elif scan["mismatched_tag"]:
+        # A cut inside a comment or CDATA changes the lexical meaning of the
+        # retained tags. Accept that explanation only if restoring the opener
+        # produces a complete document; a terminator alone is not evidence.
+        repaired_root = ""
+        data = doc["data"]
+        closing_root = gi.tail_root(data)
+        if not header and closing_root:
+            body = data[3:] if data.startswith(BOM) else data
+            for opener, terminator in ((b"<!--", b"-->"), (b"<![CDATA[", b"]]>")):
+                if terminator not in body:
+                    continue
+                try:
+                    ET.fromstring(b"<" + closing_root.encode("ascii") + b">" + opener + body)
+                except (ET.ParseError, LookupError, ValueError):
+                    continue
+                repaired_root = closing_root
+                break
+        root = repaired_root or gi.xml_root(data) or scan["root"]
+        tail_only, fragment = bool(repaired_root), False
     else:
         tail_only = looks_truncated(doc["data"], root)
         fragment = not root
@@ -495,7 +519,8 @@ def load_documents(targets: list):
 def file_document(path: str) -> dict:
     with open(path, "rb") as f:
         data = f.read()
-    root = gi.tail_root(data) or gi.xml_root(data)
+    head, tail = gi.xml_root(data), gi.tail_root(data)
+    root = head if (head and (gi.has_xml_decl(data) or not gi.xml_complete(head, data))) else (tail or head)
     return {
         "data": data,
         "from_carve": False,

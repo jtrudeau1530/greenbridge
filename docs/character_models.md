@@ -32,14 +32,14 @@ The decoded export used by the previews contains 13 parts:
 | head L2 | same | 599 | 514 | same preset |
 | eyes | `…_head_fr1_lat_000_m_eyes.#dr` | 434 | 816 | `0x429453B7A2EB9980` (sRGB + alpha) |
 | eyecap | `…_head_fr1_lat_000_m_eyecap.#dr` | 214 | 304 | `0x5CE55BAA340248BD` (sRGB + alpha) |
-| hands | `hand_fr1_000_nude_cull.#dr` | 10,440 | 13,534 | unresolved — key does not decode here |
-| feet | `feet_fr1_000_full.#dr` | 2,309 | 4,082 | unresolved — key does not decode here |
+| hands | `hand_fr1_000_nude_cull.#dr` | 10,440 | 13,534 | none in the package — `0x4D89F2311DBBB7A8` is in no TTPF pool (see [Hands and feet](#hands-and-feet)) |
+| feet | `feet_fr1_000_full.#dr` | 2,309 | 4,082 | none in the package — `0xA54D9F8B51CA6034` is in no TTPF pool (see [Hands and feet](#hands-and-feet)) |
 | body (legacy) | `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full.#dr` | 874 | 908 | `0x996FDBA2DB30CC12` |
 | legacy head | `cs_lucia_legacyheadcs_fr1_001_regular_ws00_full.#dr` | 592 | 1,028 | `0x707771F769AA3542` |
 | jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | none — `speculartex` only (`0xF5073AA039BB3CED`) |
 | crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_full.#dr` | 4,932 | 6,756 | none — `speculartex` only (`0x46E8FA9436E9D43C`) |
-| bikini top | `brabikini_fr1_012_regular_ws00_full.#dr` | 6,547 | 5,697 | none / unverified — likely `speculartex` only (`0xDF3615ADFB1F4787`) |
-| undies | `undiesgstring_fr1_002_slim_hw_full.#dr` | 961 | 913 | none / unverified — likely `speculartex` only (`0xCFD339832A9C724A`) |
+| bikini top | `brabikini_fr1_012_regular_ws00_full.#dr` | 6,547 | 5,697 | `0xDF3615ADFB1F4787` (sRGB + alpha) |
+| undies | `undiesgstring_fr1_002_slim_hw_full.#dr` | 961 | 913 | `0xCFD339832A9C724A` (sRGB + alpha) |
 
 ### Higher-detail variants
 
@@ -109,15 +109,29 @@ component table.
 The character export requested 215 texture keys and matched **184**. The only sRGB albedo slot is
 `0xC8E8C282` (`diffusetex`); `0xC6F46E79` is `speculartex` (specular/gloss pack), `0x1E77BF4C` is
 `bumptex` (the tangent-space normal), `0x739E3D0D` is `speculartex2` (packed ORM), and
-`0x8ADB8480` is `materialid` (an ID/palette map, declared but unbound on the jacket). The garment
-shaders (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`) do not declare a `0xC8E8C282` slot at all, so no
-clothing item in this wardrobe has an albedo. A part without one keeps a flat colour; it must not
+`0x8ADB8480` is `materialid` (an ID/palette map). The jacket's and the crop tee's material rows
+reference one (`0x6CD70ED1054EF726`, `0xF0722B975F329141`, both `BC4_UNORM` textures in the
+`ttdb_peds` pools); the bikini top's and the undies' rows have no such slot. Whether a shader
+samples it is not measured. The garment
+shaders (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`) do not declare a `0xC8E8C282` slot at all: none of
+their 7,948 material rows in the export has one. The jacket and the crop tee are on them, so they
+have no albedo. A part without one keeps a flat colour; it must not
 be painted with `speculartex` or an ORM map. The garments' `_COLOR0` vertex data is baked shading
-(alpha 255 on every vertex), not a tint; `materialid` is unbound on all four, and the shader
-declares no tint or palette slot. No authored base colour exists to recover.
+(alpha 255 on every vertex), not a tint, and the shader
+declares no tint or palette slot. No authored base colour exists to recover for those two.
 
-The hands and feet keys (`0x4D89F2311DBBB7A8`, `0xA54D9F8B51CA6034`) did not resolve in the
-scanned TTPF pools. The head drawable has no material texture reference, but its face is selected by
+The bikini top and the undies are not on the garment shaders, and they do have an albedo. All
+three records of each drawable bind `0xC8E8C282` to the key in the table: the bikini top on
+shaders `84af5c61` and `81153bcc` (`76c45dd8` and `428b44d6` in its smallest record), the undies
+on `a9dfb1e7` (`428b44d6` in its smallest record). Every material row on those five shaders in
+the export binds the slot (1,372 of 1,372). Both keys are 512x256 `BC3_UNORM_SRGB` textures with
+7 mips in the `ttdb_peds` pools: an sRGB format with an alpha channel, as the eyes' and eyecap's
+`BC7_UNORM_SRGB` keys are. Their `speculartex` keys are
+other textures (`0x93CB433D30220BA6` and `0x5D237CCCD91F8E4D`, 256x128 `BC7_UNORM`), where the
+jacket's and the crop tee's table keys are `BC7_UNORM` `speculartex` sheets themselves.
+
+The hands and feet bind an albedo key that is not in the package (see [Hands and feet](#hands-and-feet)).
+The head drawable has no material texture reference, but its face is selected by
 a **head-skin preset** keyed by the head name's `joaat32`:
 
 | Head | Face albedo | Face normal |
@@ -126,6 +140,47 @@ a **head-skin preset** keyed by the head name's `joaat32`:
 | `cs_monalisa_head_fr1_afr_000_m_full` | `0x53A2896F4E5A6BA6` | `0xE82C7F6E02C8B701` |
 
 The preset library covers 897 heads; `cs_lucia_head_fr1_lat_000_y_full` is not in it.
+
+### Hands and feet
+
+Measured against the catalogs of all 57 TTPF pools (357,115 textures). The hands and the feet bind
+the four maps on the same two shaders (`210FBC6A`, `8D69EDAB`), and **only the normal maps are in
+the package**:
+
+| Part | `diffusetex` | `speculartex` | `bumptex` (normal) | `speculartex2` (ORM) |
+|---|---|---|---|---|
+| hands (`hand_fr1_000_*`) | `0x4D89F2311DBBB7A8` — none | `0xA805B9A446CCE950` — none | `0x9D337DABCA636906` — `ttdb_peds_2_3`, 512×1024 BC5 | `0x09D2C98C5B40D16C` — none |
+| feet (`feet_fr1_000_*`) | `0xA54D9F8B51CA6034` — none | `0x752EA8A7A086558F` — none | `0x5091E86DE6196BC3` — `ttdb_peds_3_3`, 512×1024 BC7 | `0xD5C8D2A180326DE7` — none |
+
+Each material has ten slots; the other six bind `0x5D7A3A87CC19967D` on both shaders, which is in
+no pool either: it reads as an engine-supplied default, not a missing asset.
+
+**They are not textured on their own.** The hands and feet share their maps with the body skin
+pieces in `pack/core_restofworld/core_restofworld.rpf`:
+
+- `bodynipplesgen_fr1_000_regular_ws00_full`, the female upper body, binds **the same four keys**
+  as the hands, on the same two shaders. The hands are drawn with the upper-body skin sheet.
+- `bodygenitalsgen_f{r,b,o}1_008_regular_ws00_full`, the female lower body (and the `fr1`
+  `_alt_00`–`_02` variants), binds the feet's
+  `speculartex`, `bumptex` and `speculartex2`, and its own `diffusetex` `0x5B6829CFEC0F41A1`, also in
+  no pool.
+- The male lower body, `bodygenitalsgen_mr1_000_*`, has all four maps in the pools
+  (`diffusetex` `0xBCE4D91DA23689C7`).
+
+So the female body skin has no albedo, specular or ORM map in the package, for the hands and feet
+and for the body pieces that share their sheets. The skin colour has to come from data outside these
+materials, as the face comes from the head-skin preset. That data was not found: none of the keys
+above appears in another resource of `data.rpf`, `common.rpf`, `script.rpf`, `packs.rpf`,
+`anim.rpf`, `core_restofworld.rpf` or `core_restofworld001.rpf` (`story000.rpf` and
+`story000_restofworld.rpf` recover no entries with this reader).
+
+The pattern holds across the set. Of the 56 `hand_`/`feet_` drawables in `packs.rpf`, 52 bind only a
+`diffusetex` key that is in no pool; the four exceptions with all four maps shipped are
+`hand_fsk1_000_nude_cull`, `feet_fsk1_000_nude_cull` and the first-person hands
+`hand_mb1_000_nude_cull_fp` and `hand_mo1_000_nude_cull_fp`. The male hands and feet
+(`hand_mr1_000_nude_cull`, `feet_mr1_000_nude_cull`) also ship only their normal maps, and male and
+female feet bind the same `diffusetex` key. Until the skin data is decoded, render these parts with
+their normal map and a flat skin tone; do not borrow another part's albedo.
 
 ## Materials
 
@@ -162,6 +217,10 @@ entry, unnamed pages and the >3 MiB band included; 25.6 GB compressed / 56.3 GB 
 and 73 anim clips. **0** combined a ped skeleton with the skin/flesh shader, and 0 of the 908
 resources on that shader contained a single `SKEL_*` bone name. The unnamed-resource route
 therefore does not add a body.
+2,631 ped-skeleton resources: 342 animal bounds, 2,212 `char_bipedbounds_*` fragments,
+4 mannequins and 73 anim clips. **0** combined a ped skeleton with the skin/flesh shader, and
+0 of the 908 resources that use the skin/flesh shader contained a single `SKEL_*` bone name.
+The unnamed-resource route therefore does not add a body.
 
 The only **nude** continuous human-skeleton meshes are a **generic female mannequin** in
 `levels.rpf`: `gmt_mannequin_proxy_f_01a` (15,488 vertices / 27,725 triangles, 95 bones,
@@ -201,14 +260,16 @@ silhouette is geometry, not a painted-on atlas.
   index to a drawable plus texture. The first is height and body-shape presets
   (`SCALE_PLAYER_STORY000_00` is 1.62 m); the second lists gameplay components. Slot selection
   from names is a heuristic, not the game's rule.
-- **Lucia's hair.** The `packs.rpf` manifest lists ten `player_story000_00` hair drawables
-  (`hairbob`, `hairpixie`, `hairponytail`, `hairbuzzcut`); all ten decode to **3 vertices / 1
-  triangle**. Across `packs.rpf`, 219 of the 247 measurable hair entries are <=3 v / 1 t. The 68
-  larger rows are accessories (`hairaccsband`, 7,016 / 7,251 v), SLOD proxies (71-147 v), or the
-  one fused male head `cs_wyman_head_mr1_cau_000_o_hair_alt0` (13,529 v); no stand-alone
-  full-resolution female hair mesh exists. `levels.rpf` and `story000.rpf` have zero character
-  hair rows. A static Lucia export is bald by design; a render needs a clearly labelled
-  placeholder, not a missing decode.
+- **Lucia's hair.** The `packs.rpf` manifest has three `player_story000_00` hair rows
+  (`hairbob`, `hairpixie`, `hairponytail`), each **3 vertices / 1 triangle**; `hairbuzzcut`
+  appears only in male `_mr1` rows. All 54 non-SLOD rows of those four styles are 3 v / 1 t.
+  Across `packs.rpf`, 219 of the 267 measurable hair rows are <=3 v / 1 t. The 48 larger rows
+  are 29 accessories (`hairaccsband`, `hairaccsclip`, `hairaccessoriescuff`; up to 7,251 v), 10
+  SLOD proxies (71-147 v), 3 fused `cs_wyman_head_mr1_cau_000_o_hair_alt0` rows (up to 13,529 v),
+  3 `hairbun` and 1 `hairlob` unit-box stubs (24 v / 12 t), and 2 blowfly
+  `cri_fly_blow_m_00_hair_00` rows (1,436 / 2,040 v); no stand-alone full-resolution female hair
+  mesh exists. `levels.rpf` and `story000.rpf` have zero character hair rows. A static Lucia
+  export is bald by design; a render needs a clearly labelled placeholder, not a missing decode.
 - **`levels.rpf`.** The full archive was name-enumerated: 1,116,073 streams, 98.32% inflated,
   235,814 named streams, 318,266 unique names. It contains no Lucia, Mandy, `player_story` or
   `ambient_female` drawable; the Lucia and Mandy hits are props (photos, frames, luggage, a
@@ -248,6 +309,45 @@ names = sorted({i["Name"] for i in items})
 print(len(items), len(names))
 print(sum(1 for i in items if i.get("IsFragment")), "fragments")
 print([n for n in names if "lucia" in n.lower()])
+```
+
+The material rows are in the same manifest, one per shader of a record, each with the texture
+references by slot:
+
+```python
+import json
+
+items = json.load(open(r"<outdir>/packs/models/manifest.json", encoding="utf-8"))["Items"]
+for item in items:
+    if item["Name"] == "brabikini_fr1_012_regular_ws00_full.#dr":
+        for material in item["Materials"]:
+            print(material["Shader"], {t["Param"]: t["Id64"] for t in material["Textures"]})
+```
+
+A key's size and format come from the pool that holds it: the `AssetKey`, `Width`, `Height`,
+`DxgiFormat` and `Mips` fields of the manifest `rpf9dump ttpf <pool.ttpf> <outdir>` writes.
+
+The [Hands and feet](#hands-and-feet) tables also need `core_restofworld.rpf` and the 57 pool
+catalogs (`AssetKey` in each pool's `manifest.json`):
+
+```powershell
+rpf9dump models <pack\core_restofworld\core_restofworld.rpf> <outdir>
+rpf9dump ttpf <each .ttpf under data\ttdb and pack\*\data\ttdb> <outdir>\ttpf\<pool>
+```
+
+```python
+import glob, json
+
+maps = {"C8E8C282": "diffusetex", "C6F46E79": "speculartex", "1E77BF4C": "bumptex", "739E3D0D": "speculartex2"}
+pooled = {t["AssetKey"] for m in glob.glob(r"<outdir>/ttpf/*/manifest.json")
+          for t in json.load(open(m, encoding="utf-8"))["Textures"]}
+items = [i for m in (r"<outdir>/packs/models/manifest.json", r"<outdir>/core_restofworld/models/manifest.json")
+         for i in json.load(open(m, encoding="utf-8"))["Items"]]
+for name in ("hand_fr1_000_nude_cull.#dr", "feet_fr1_000_full.#dr", "bodynipplesgen_fr1_000_regular_ws00_full.#dr",
+             "bodygenitalsgen_fr1_008_regular_ws00_full.#dr", "bodygenitalsgen_mr1_000_regular_ws00_full.#dr"):
+    keys = {maps[t["Param"]]: t["Id64"] for i in items if i["Name"] == name
+            for mat in i["Materials"] for t in mat["Textures"] if t["Param"] in maps}
+    print(name, {k: (v, v in pooled) for k, v in keys.items()})
 ```
 
 The fragment and skinning fields are in the same manifest; the skeleton measurements are in

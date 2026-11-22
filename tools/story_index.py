@@ -36,6 +36,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from anim_index import aux_table  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -159,9 +160,6 @@ def classify(data, offset, stored):
     return record
 
 
-def _gap(gap):
-    return (len(gap), 0) if gap.count(0) == len(gap) else (0, len(gap))
-
 
 def scan_rpf(path, start=None, limit=None, progress=None):
     """Walk an RPF9 data area. Returns (records, summary). No tables of contents are read or decrypted."""
@@ -192,7 +190,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                z, u = _gap(m[last:s])
+                z, u = gap_split(m, last, s)
                 zero += z
                 unread += u
                 record = classify(head, s, blen)
@@ -217,14 +215,14 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            z, u = _gap(m[last:s])
+            z, u = gap_split(m, last, s)
             zero += z
             unread += u
             rows.append(classify(out, s, used))
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
-        z, u = _gap(m[last:end])
+        z, u = gap_split(m, last, end)
         zero += z
         unread += u
         if size:

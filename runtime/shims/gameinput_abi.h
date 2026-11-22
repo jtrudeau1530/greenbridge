@@ -359,8 +359,54 @@ struct GameInputVersion {
     uint16_t major, minor, build, revision;
 };
 
-struct GameInputRawDeviceReportInfo;
-struct GameInputRawDeviceReportItemInfo;
+// Raw HID reports (RT-175). Layouts and order match Microsoft's v0 header (NuGet Microsoft.GameInput
+// 0.2303.22621.3038), checked with offsetof against it (docs/gameinput.md, "ABI"); the shim fills reportInfo with
+// each report's kind, id and size and no items (itemCount 0, see docs/gameinput.md "Raw HID").
+enum GameInputRawDeviceReportKind : int32_t {
+    GameInputRawInputReport = 0,
+    GameInputRawOutputReport = 1,
+    GameInputRawFeatureReport = 2,
+};
+
+struct GameInputRawDeviceItemCollectionInfo {
+    int32_t kind;  // GameInputRawDeviceItemCollectionKind
+    uint32_t childCount;
+    uint32_t siblingCount;
+    uint32_t usageCount;
+    const GameInputUsage* usages;
+    const GameInputRawDeviceItemCollectionInfo* parent;
+    const GameInputRawDeviceItemCollectionInfo* firstSibling;
+    const GameInputRawDeviceItemCollectionInfo* previousSibling;
+    const GameInputRawDeviceItemCollectionInfo* nextSibling;
+    const GameInputRawDeviceItemCollectionInfo* lastSibling;
+    const GameInputRawDeviceItemCollectionInfo* firstChild;
+    const GameInputRawDeviceItemCollectionInfo* lastChild;
+};
+
+struct GameInputRawDeviceReportItemInfo {
+    uint32_t bitOffset;
+    uint32_t bitSize;
+    int64_t logicalMin;
+    int64_t logicalMax;
+    double physicalMin;
+    double physicalMax;
+    int32_t physicalUnits;  // GameInputRawDevicePhysicalUnitKind
+    uint32_t rawPhysicalUnits;
+    int32_t rawPhysicalUnitsExponent;
+    uint32_t flags;  // GameInputRawDeviceReportItemFlags
+    uint32_t usageCount;
+    const GameInputUsage* usages;
+    const GameInputRawDeviceItemCollectionInfo* collection;
+    const GameInputString* itemString;
+};
+
+struct GameInputRawDeviceReportInfo {
+    GameInputRawDeviceReportKind kind;
+    uint32_t id;
+    uint32_t size;
+    uint32_t itemCount;
+    const GameInputRawDeviceReportItemInfo* items;
+};
 
 struct GameInputControllerAxisInfo {
     uint32_t mappedInputKinds;  // GameInputKind
@@ -497,6 +543,13 @@ static_assert(offsetof(GameInputDeviceInfo, inputReportInfo) == 160);
 static_assert(offsetof(GameInputDeviceInfo, gamepadInfo) == 256);
 static_assert(offsetof(GameInputDeviceInfo, displayName) == 296);
 static_assert(sizeof(GameInputDeviceInfo) == 320);
+static_assert(sizeof(GameInputRawDeviceItemCollectionInfo) == 80);
+static_assert(offsetof(GameInputRawDeviceItemCollectionInfo, usages) == 16);
+static_assert(offsetof(GameInputRawDeviceReportItemInfo, physicalUnits) == 40);
+static_assert(offsetof(GameInputRawDeviceReportItemInfo, usages) == 64);
+static_assert(sizeof(GameInputRawDeviceReportItemInfo) == 88);
+static_assert(offsetof(GameInputRawDeviceReportInfo, items) == 16);
+static_assert(sizeof(GameInputRawDeviceReportInfo) == 24);
 
 // The force-feedback and haptic layouts, transcribed from the public v0 header (GameInput.h, the same GDK release
 // as the rest of this file). They were not compiled against that header here — it is not in the repository — so
@@ -542,6 +595,8 @@ constexpr GUID IID_IGameInput = {0x11BE2A7E, 0x4254, 0x445A, {0x9C, 0x09, 0xFF, 
 constexpr GUID IID_IGameInputReading = {0x2156947A, 0xE1FA, 0x4DE0, {0xA3, 0x0B, 0xD8, 0x12, 0x93, 0x1D, 0xBD, 0x8D}};
 // {31DD86FB-4C1B-408A-868F-439B3CD47125}
 constexpr GUID IID_IGameInputDevice = {0x31DD86FB, 0x4C1B, 0x408A, {0x86, 0x8F, 0x43, 0x9B, 0x3C, 0xD4, 0x71, 0x25}};
+// {61F08CF1-1FFC-40CA-A2B8-E1AB8BC5B6DC}
+constexpr GUID IID_IGameInputRawDeviceReport = {0x61F08CF1, 0x1FFC, 0x40CA, {0xA2, 0xB8, 0xE1, 0xAB, 0x8B, 0xC5, 0xB6, 0xDC}};
 // {415EED2E-98CB-42C2-8F28-B94601074E31}
 constexpr GUID IID_IGameInputDispatcher = {0x415EED2E, 0x98CB, 0x42C2, {0x8F, 0x28, 0xB9, 0x46, 0x01, 0x07, 0x4E, 0x31}};
 // {51BDA05E-F742-45D9-B085-9444AE48381D}
@@ -635,6 +690,18 @@ struct IGameInputDevice : IUnknown {
                                                                 void* outputBuffer, size_t* outputSize) = 0;
     virtual bool STDMETHODCALLTYPE AcquireExclusiveRawDeviceAccess(uint64_t timeoutInMicroseconds) = 0;
     virtual void STDMETHODCALLTYPE ReleaseExclusiveRawDeviceAccess() = 0;
+};
+
+struct IGameInputRawDeviceReport : IUnknown {
+    virtual void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) = 0;
+    virtual const GameInputRawDeviceReportInfo* STDMETHODCALLTYPE GetReportInfo() = 0;
+    virtual size_t STDMETHODCALLTYPE GetRawDataSize() = 0;
+    virtual size_t STDMETHODCALLTYPE GetRawData(size_t bufferSize, void* buffer) = 0;
+    virtual bool STDMETHODCALLTYPE SetRawData(size_t bufferSize, const void* buffer) = 0;
+    virtual bool STDMETHODCALLTYPE GetItemValue(uint32_t itemIndex, int64_t* value) = 0;
+    virtual bool STDMETHODCALLTYPE SetItemValue(uint32_t itemIndex, int64_t value) = 0;
+    virtual bool STDMETHODCALLTYPE ResetItemValue(uint32_t itemIndex) = 0;
+    virtual bool STDMETHODCALLTYPE ResetAllItems() = 0;
 };
 
 // What CreateForceFeedbackEffect returns: the effect's parameters, gain and run state, and one reference on the

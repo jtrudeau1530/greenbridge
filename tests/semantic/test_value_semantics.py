@@ -46,6 +46,11 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
     into EXEC or VCC
+  v_cmp(x)_*_f32        GE/LG/O and the other ordered compares are false when either source is NaN; the N forms
+                          (NGE = !(S0 >= S1), NGT, NLE, NLT, NEQ) are their negations, so true on NaN; F = 0, TRU = 1.
+  v_cmp(x)_*_u64/_i64   the whole 64-bit values compared unsigned / signed (the low word is never signed).
+  s_andn2_saveexec_b32  D = EXEC; EXEC = S0 & ~EXEC; SCC = (EXEC != 0).
+  s_andn2_wrexec_b32    EXEC = S0 & ~EXEC; D = EXEC (the new one); SCC = (EXEC != 0).
 
 The appended cases for ps_ops5/ps_ops6 also pin the op_sel source-half selection for packed shifts, which the
 GPU-checked ps_ops4 does not exercise. cs_bounds (compute) pins the buffer num_records bounds checks: an
@@ -58,6 +63,7 @@ import os
 import struct
 import sys
 import unittest
+from unittest import mock
 
 import support
 import spirv_mini_interp as si
@@ -86,6 +92,12 @@ EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
 # ps_sdwa_f16_const, measured on gfx1036 (the .asm header): f16 inline constant, then src_sel
 EXPECTED_SDWA_F16_CONST = [0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0]
+EXPECTED_VCMP_F32_NAN = [0x0000376C, 0x0000FD5B, 0x0000D36C, 0x00000FE7]   # derivation in ps_vcmp_f32_nan.asm
+EXPECTED_VCMP_64 = [0x0000B3C4, 0x000091E6, 0x00006787, 0x00007C93]        # derivation in ps_vcmp_64.asm
+EXPECTED_ANDN2_EXEC = [1, 8, 16, 2064, 2068, 3, 20, 1544]                   # derivation in cs_w32_andn2_exec.asm
+VCMP_F32_HEAP = (0x7FC10001, 0x3F800000, 0x40000000)                        # NaN, 1.0, 2.0
+# Four (A, B) pairs as A.lo A.hi B.lo B.hi (ps_vcmp_64.asm header).
+VCMP_64_HEAP = (0x80000000, 0, 1, 0, 0xFFFFFFFF, 0xFFFFFFFF, 1, 0, 1, 0, 0x80000000, 0, 7, 5, 7, 5)
 
 
 def _f32_bits(x):
@@ -341,6 +353,57 @@ def reference_sdwa_f16_const():
     return [0xAAAA0000 | _half(v) for v in (x, y, z, w)]
 
 
+def _pack_nibbles(ops, pairs, test):
+    """Bit 4*k + i of the word: op k on pair i."""
+    return sum(int(test(op, *pair)) << (4 * k + i) for k, op in enumerate(ops) for i, pair in enumerate(pairs))
+def reference_vcmp_f32_nan():
+    nan = float("nan")
+    pairs = ((nan, 1.0), (1.0, 2.0), (2.0, 1.0), (1.0, 1.0))
+    ordered = {"lt": lambda a, b: a < b, "le": lambda a, b: a <= b, "gt": lambda a, b: a > b,
+               "ge": lambda a, b: a >= b, "eq": lambda a, b: a == b, "lg": lambda a, b: a < b or a > b,
+               "o": lambda a, b: not (math.isnan(a) or math.isnan(b)), "f": lambda a, b: False}
+    def test(op, a, b):
+        if op == "tru":
+            return True
+        if op.startswith("n"):                        # nge/ngt/nle/nlt/neq: the negated ordered compare
+            return not ordered[op[1:]](a, b)
+        return ordered[op](a, b)
+    return [_pack_nibbles(ops, pairs, test) for ops in (("ge", "lg", "neq", "nge"), ("ngt", "nle", "nlt", "tru"),
+                                                         ("ge", "lg", "nge", "nlt"), ("neq", "o", "tru", "f"))]
+def reference_vcmp_64():
+    w = VCMP_64_HEAP
+    pairs = [((w[4 * i + 1] << 32) | w[4 * i], (w[4 * i + 3] << 32) | w[4 * i + 2]) for i in range(4)]
+    def test(op, a, b):
+        cond, ty = op.split("_")
+        if ty == "i64":
+            a, b = (x - (1 << 64) if x >> 63 else x for x in (a, b))
+        return {"lt": a < b, "le": a <= b, "gt": a > b, "ge": a >= b, "eq": a == b, "ne": a != b}[cond]
+    return [_pack_nibbles(ops, pairs, test) for ops in (("lt_u64", "le_u64", "gt_u64", "ge_u64"),
+                                                         ("lt_i64", "le_i64", "gt_i64", "ge_i64"),
+                                                         ("ne_u64", "eq_i64", "ne_i64", "lt_i64"),
+                                                         ("gt_u64", "ge_i64", "le_u64", "ne_i64"))]
+def reference_andn2_exec():
+    def popcount(m):
+        return bin(m).count("1")
+    def ff1(m):
+        return (m & -m).bit_length() - 1 if m else -1
+    lanes = range(32)
+    mask = lambda f: sum(1 << i for i in lanes if f(i))                         # noqa: E731
+    out = []
+    # 1) saveexec, VCC = bit 3 clear, EXEC = 0xffff
+    vcc, exec_ = mask(lambda i: i & 8 == 0), 0x0000FFFF
+    d, exec_ = exec_, vcc & ~exec_ & 0xFFFFFFFF
+    out += [1 if exec_ else 2, popcount(exec_), popcount(d), popcount(exec_) << 8 | ff1(exec_)]
+    # 2) wrexec, VCC = lanes 16..31, EXEC = 0x0f0f0f0f
+    vcc, exec_ = mask(lambda i: i >= 16), 0x0F0F0F0F
+    exec_ = vcc & ~exec_ & 0xFFFFFFFF
+    d = exec_
+    out += [popcount(exec_) << 8 | ff1(exec_), 3 if exec_ else 4, ff1(d)]
+    # 3) both with an S0 inside EXEC: EXEC and SCC become 0
+    vcc = mask(lambda i: i < 8)
+    e1, e2 = vcc & ~0x0000FFFF & 0xFFFFFFFF, vcc & ~0xFFFFFFFF & 0xFFFFFFFF
+    out.append((5 if e1 else 6) << 8 | (7 if e2 else 8))
+    return out
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -393,6 +456,9 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
         self.assertEqual(reference_sdwa_f16_const(), EXPECTED_SDWA_F16_CONST)
+        self.assertEqual(reference_vcmp_f32_nan(), EXPECTED_VCMP_F32_NAN)
+        self.assertEqual(reference_vcmp_64(), EXPECTED_VCMP_64)
+        self.assertEqual(reference_andn2_exec(), EXPECTED_ANDN2_EXEC)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -468,6 +534,17 @@ class TranslatorValueSemantics(unittest.TestCase):
         # 1.0 in v_add_f16_sdwa is 0x00003c00, so src0_sel:WORD_1 reads +0.0 and BYTE_1 of 2.0 is the denormal
         # 0x0040; an SGPR source and v_cvt_f16_u16 reading the f32 bits of 1.0 are narrowed the same way.
         self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
+
+    def test_f16_denormal_operand_does_not_rely_on_unpack_half(self):
+        # On NVIDIA (RTX 5060 Ti, 610.88) UnpackHalf2x16 gives 0 for the denormal 0x0040 that word y's BYTE_1
+        # select produces. Here every denormal is flushed, so y stays 0x1c00 only if they skip UnpackHalf2x16.
+        real = si.half_to_float
+
+        def flushing(h):
+            return math.copysign(0.0, -1.0 if h & 0x8000 else 1.0) if (h & 0x7C00) == 0 else real(h)
+
+        with mock.patch.object(si, "half_to_float", flushing):
+            self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
@@ -555,10 +632,69 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address in (0x98, 0xAC, 0xCC):
             self.assertNotIn(address, memory)
 
+    def test_d16_xyz_typed_buffers(self):
+        # cs_fmt_d16_xyz.asm (derivation in its header): buffer_load_format_d16_xyz, tbuffer_load_format_d16_xy /
+        # _d16_xyz and buffer_store_format_d16_xyz.
+        def f16(x):
+            return struct.unpack("<H", struct.pack("<e", x))[0]
+
+        def f32(x):
+            return struct.unpack("<I", struct.pack("<f", x))[0]
+
+        def pack(lo, hi):
+            return (hi & 0xFFFF) << 16 | (lo & 0xFFFF)
+
+        sat16 = lambda v: min(v, 0xFFFF)             # unsigned 32-bit channel narrowed to 16 bits (docs/design.md)
+        keep_hi = lambda seed, lo: (seed & 0xFFFF0000) | lo   # an odd final component writes bits 15:0 only
+        spv = support.translate_fixture("cs_fmt_d16_xyz", fssm=CS_BOUNDS_FSSM)
+        memory = {}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x140, 0x31016FAC] + [0] * 28, memory=memory)
+        expected = {
+            0x00: pack(0x1234, 0xABCD), 0x04: keep_hi(0xA5A55A5A, 0x7FFF),                 # L1 16_16_16_16_UINT
+            0x08: pack(5, sat16(0x10000)), 0x0C: keep_hi(0x12345678, sat16(0xFFFFFFFF)),    # L2 32_32_32_UINT
+            0x10: pack(f16(1.0), f16(-2.0)),                                                  # L3 16_16_FLOAT
+            0x14: pack(f16(1.0), f16(-2.0)), 0x18: keep_hi(0xBEEF7777, 0x3555),             # L4 16_16_16_16_FLOAT
+            0x1C: pack(f16(255 / 255), f16(0 / 255)), 0x20: keep_hi(0xCAFE1111, f16(1.0)),  # L5 8_8_8_8_UNORM
+            0x24: pack(5, 0xFFFF), 0x28: keep_hi(0x0BAD0BAD, 0xFFFF),                       # L6 MTBUF 32_32_32_UINT
+            0x40: 0x0007, 0x44: 0x8001, 0x48: 0xFFFE,                                         # S1 to 32_32_32_UINT
+            0x50: f32(1.0), 0x54: f32(-2.0), 0x58: f32(0.5),                                  # S2 to 32_32_32_FLOAT
+        }
+        self.assertEqual(expected[0x00], 0xABCD1234)
+        self.assertEqual(expected[0x10], 0xC0003C00)
+        for address, word in expected.items():
+            with self.subTest(address=hex(address)):
+                self.assertEqual(f"{memory.get(address, 0):#010x}", f"{word:#010x}")
+        for address in (0x2C, 0x4C, 0x5C):
+            self.assertNotIn(address, memory)
+
     def test_s_ff0_s_ff1_read_an_immediate_as_a_value(self):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
         # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
         self.check("ps_sff_imm", EXPECTED_SFF_IMM)
+
+    def test_vcmp_f32_ordered_and_unordered_with_nan(self):
+        # ge/lg/o (ordered) are false with a NaN source, nge/ngt/nle/nlt/neq (unordered) true; v_cmp e32 into VCC,
+        # e64 into an SGPR, and v_cmpx, whose EXEC is copied out and put back. Inputs come from memory.
+        self.check("ps_vcmp_f32_nan", EXPECTED_VCMP_F32_NAN, push_constants=[0x1000, 0, 16, 0] + [0] * 28,
+                   memory={0x1000 + 4 * i: w for i, w in enumerate(VCMP_F32_HEAP)})
+
+    def test_vcmp_64_bit_integer_compares(self):
+        # lt/le/gt/ge of u64 and i64, ne/eq: the high words decide, equal high words compare the low words
+        # unsigned for both signednesses (0x80000000 > 1); v_cmpx forms too.
+        self.check("ps_vcmp_64", EXPECTED_VCMP_64, push_constants=[0x1000, 0, 64, 0] + [0] * 28,
+                   memory={0x1000 + 4 * i: w for i, w in enumerate(VCMP_64_HEAP)})
+
+    def test_s_andn2_saveexec_and_wrexec_b32(self):
+        # A 32-thread wave32: saveexec returns the old EXEC, wrexec the new one; EXEC = S0 & ~EXEC and SCC is
+        # whether it is non-zero (cs_w32_andn2_exec.asm).
+        spv = support.translate_fixture("cs_w32_andn2_exec", fssm=_fssm(0x8088, (32, 1, 1)))
+        memory = si.run_workgroup(
+            spv, 32, 32, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+            push_constants=[0, 0, 0x1000, 0x31016FAC] + [0] * 28, memory={})
+        self.assertEqual(sorted(memory), list(range(0, 32, 4)), "lane 0 stores out[0..7] only")
+        self.assertEqual([memory[4 * k] for k in range(8)], EXPECTED_ANDN2_EXEC)
 
 
 class ReadLog(dict):

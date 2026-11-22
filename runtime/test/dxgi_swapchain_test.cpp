@@ -1,4 +1,4 @@
-// Real Win32 HWND GPU test for the Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 COM shim
+// Real Win32 HWND GPU test for the Vulkan-backed IDXGIFactory7 / IDXGISwapChain3 COM shim
 // (runtime/shims/dxgi_swapchain.h, runtime/shims/dxgi_com.{h,cpp}).
 // No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation
 // (Core + Synchronization Validation); any validation error fails the test.
@@ -263,6 +263,17 @@ int main() {
     if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&factory))) || !factory)
         return fail("create_dxgi_factory");
 
+    // Host-measured on Windows 11: MakeWindowAssociation takes DXGI_MWA_NO_WINDOW_CHANGES, DXGI_MWA_NO_ALT_ENTER
+    // and DXGI_MWA_NO_PRINT_SCREEN together or alone; any other bit is DXGI_ERROR_INVALID_CALL.
+    {
+        constexpr UINT known = DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_PRINT_SCREEN;
+        if (FAILED(factory->MakeWindowAssociation(hwnd, known))) return fail("MakeWindowAssociation(known flags)");
+        for (const UINT bad : {0x8u, 0x40u, known | 0x8u}) {
+            if (factory->MakeWindowAssociation(hwnd, bad) != DXGI_ERROR_INVALID_CALL)
+                return fail("MakeWindowAssociation accepted an unknown flag bit");
+        }
+    }
+
     D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
     ID3D12CommandQueue* queue = nullptr;
     ID3D12CommandAllocator* alloc = nullptr;
@@ -499,6 +510,44 @@ int main() {
         return 0;
     };
 
+    {
+        DXGI_SWAP_CHAIN_DESC1 before{}, after{};
+        if (FAILED(sc->GetDesc1(&before)) || before.BufferCount < 2)
+            return fail("GetDesc1 before ResizeBuffers1 argument tests");
+        std::vector<UINT> masks(before.BufferCount, 1);
+        std::vector<IUnknown*> queues(before.BufferCount, queue);
+        const auto resize = [&](UINT count) {
+            return sc->ResizeBuffers1(count, before.Width + 1, before.Height, DXGI_FORMAT_UNKNOWN, 0,
+                                      masks.data(), queues.data());
+        };
+        for (UINT invalid_mask : {2u, 3u}) {
+            masks.back() = invalid_mask;
+            if (resize(0) != DXGI_ERROR_INVALID_CALL) return fail("ResizeBuffers1 invalid node mask with count zero");
+        }
+        masks.back() = 1;
+        queues.back() = dev;
+        if (resize(before.BufferCount) != DXGI_ERROR_INVALID_CALL)
+            return fail("ResizeBuffers1 should reject a non-queue object");
+
+        D3D12_COMMAND_QUEUE_DESC copy_desc{};
+        copy_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        ID3D12CommandQueue* copy = nullptr;
+        if (FAILED(dev->CreateCommandQueue(&copy_desc, IID_PPV_ARGS(&copy))) || !copy)
+            return fail("CreateCommandQueue for ResizeBuffers1 copy queue test");
+        queues.back() = copy;
+        const HRESULT copy_hr = resize(0);
+        copy->Release();
+        if (copy_hr != DXGI_ERROR_INVALID_CALL) return fail("ResizeBuffers1 should reject a copy queue");
+
+        if (FAILED(sc->GetDesc1(&after)) || after.Width != before.Width || after.Height != before.Height ||
+            after.BufferCount != before.BufferCount)
+            return fail("Invalid ResizeBuffers1 arguments changed the swapchain");
+        queues.back() = queue;
+        masks.front() = 0;
+        if (FAILED(sc->ResizeBuffers1(0, before.Width, before.Height, DXGI_FORMAT_UNKNOWN, 0, masks.data(), queues.data())))
+            return fail("ResizeBuffers1 should accept node masks zero and one with direct queues");
+    }
+
     // Invalid counts must leave the initial back buffers usable for the first frame.
     {
         DXGI_SWAP_CHAIN_DESC1 before_resize{};
@@ -516,6 +565,26 @@ int main() {
         if (FAILED(sc->GetDesc1(&after_resize)) || after_resize.BufferCount != before_resize.BufferCount ||
             after_resize.Width != before_resize.Width || after_resize.Height != before_resize.Height)
             return fail("Invalid resize changed swapchain buffers");
+    }
+
+    {
+        DXGI_SWAP_CHAIN_DESC1 buffer_desc{};
+        if (FAILED(sc->GetDesc1(&buffer_desc)) || buffer_desc.BufferCount == 0)
+            return fail("GetDesc1 before testing GetBuffer indices");
+        ID3D12Resource* last = nullptr;
+        if (FAILED(sc->GetBuffer(buffer_desc.BufferCount - 1, IID_PPV_ARGS(&last))) || !last)
+            return fail("GetBuffer should return the last back buffer");
+        last->Release();
+
+        for (UINT index : {buffer_desc.BufferCount, buffer_desc.BufferCount + 1, ~0u}) {
+            void* rejected = reinterpret_cast<void*>(1);
+            const HRESULT hr = sc->GetBuffer(index, __uuidof(ID3D12Resource), &rejected);
+            if (hr != DXGI_ERROR_INVALID_CALL || rejected != nullptr) {
+                std::fprintf(stderr, "FAIL: GetBuffer(%u) returned 0x%08lx, expected DXGI_ERROR_INVALID_CALL and null\n",
+                             index, static_cast<unsigned long>(hr));
+                return 1;
+            }
+        }
     }
 
     // Frame 1: 128x128 clear to (64, 128, 255, 255), read back all 16,384 pixels, Present.
@@ -846,6 +915,20 @@ int main() {
             adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, nullptr) != E_INVALIDARG)
             return fail("QueryVideoMemoryInfo invalid args should return E_INVALIDARG");
 
+        // Budget-change notification (Microsoft: IDXGIAdapter3::RegisterVideoMemoryBudgetChangeNotificationEvent
+        // returns a success code and a cookie for UnregisterVideoMemoryBudgetChangeNotification).
+        HANDLE budget_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        DWORD budget_cookie = 0, budget_cookie2 = 0;
+        if (adapter3->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_ev, &budget_cookie) != S_OK ||
+            budget_cookie == 0)
+            return fail("RegisterVideoMemoryBudgetChangeNotificationEvent should succeed with a cookie");
+        if (adapter3->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_ev, &budget_cookie2) != S_OK ||
+            budget_cookie2 == 0 || budget_cookie2 == budget_cookie)
+            return fail("a second budget-change registration should get its own cookie");
+        adapter3->UnregisterVideoMemoryBudgetChangeNotification(budget_cookie);
+        adapter3->UnregisterVideoMemoryBudgetChangeNotification(budget_cookie2);
+        CloseHandle(budget_ev);
+
         adapter3->Release();
         adapter1->Release();
     }
@@ -917,6 +1000,37 @@ int main() {
         }
     }
 
+    // ResizeTarget on a windowed swapchain resizes the target's client area to the mode; the back buffers keep
+    // their size until ResizeBuffers(0, 0, 0) takes the new client area.
+    {
+        // Host-measured on Windows 11 / RX 7900 XTX: a null target is DXGI_ERROR_INVALID_CALL, and 0x0 is accepted
+        // (the window's minimum tracking size decides the resulting client area).
+        if (sc->ResizeTarget(nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("ResizeTarget(nullptr) should be DXGI_ERROR_INVALID_CALL");
+        DXGI_MODE_DESC mode{};
+        mode.Width = 234;
+        mode.Height = 156;
+        mode.RefreshRate.Numerator = 60;
+        mode.RefreshRate.Denominator = 1;
+        mode.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (FAILED(sc->ResizeTarget(&mode))) return fail("ResizeTarget");
+        RECT cr{};
+        GetClientRect(hwnd, &cr);
+        if (cr.right != 234 || cr.bottom != 156) {
+            std::fprintf(stderr, "FAIL: ResizeTarget gave a %ldx%ld client area, want 234x156\n", cr.right, cr.bottom);
+            return 1;
+        }
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        if (FAILED(sc->GetDesc1(&d))) return fail("GetDesc1 after ResizeTarget");
+        if (d.Width != 300 || d.Height != 200)
+            return fail("ResizeTarget should leave the back buffers for ResizeBuffers");
+        if (FAILED(sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers after ResizeTarget");
+        if (FAILED(sc->GetDesc1(&d)) || d.Width != 234 || d.Height != 156) {
+            std::fprintf(stderr, "FAIL: ResizeBuffers after ResizeTarget gave %ux%u, want 234x156\n", d.Width, d.Height);
+            return 1;
+        }
+    }
+
     // IDXGIFactory5::CheckFeatureSupport, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, and waitable frame-latency swapchains.
     {
         IDXGIFactory5* factory5 = nullptr;
@@ -930,6 +1044,90 @@ int main() {
             factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing, 2) != E_INVALIDARG)
             return fail("CheckFeatureSupport should reject null data or wrong size with E_INVALIDARG");
         factory5->Release();
+
+        // IDXGIFactory6/7 (D3D-2). Every answer below is the host dxgi.dll's (Windows 11, RTX 3070).
+        IDXGIFactory6* factory6 = nullptr;
+        IDXGIFactory7* factory7 = nullptr;
+        if (FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory6))) || !factory6 ||
+            FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory7))) || !factory7)
+            return fail("QueryInterface(IDXGIFactory6/7) failed");
+        IDXGIFactory7* created7 = nullptr;
+        if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&created7))) || !created7)
+            return fail("create_dxgi_factory(IID_IDXGIFactory7) failed");
+        created7->Release();
+
+        DXGI_ADAPTER_DESC1 enum_desc{};
+        {
+            IDXGIAdapter1* first = nullptr;
+            if (FAILED(factory->EnumAdapters1(0, &first)) || !first || FAILED(first->GetDesc1(&enum_desc)))
+                return fail("EnumAdapters1(0) for the preference comparison");
+            first->Release();
+        }
+        // The host accepts a preference outside the enum, so -1 and 3 are checked as well.
+        for (const int preference : {0, 1, 2, 3, -1}) {
+            const auto pref = static_cast<DXGI_GPU_PREFERENCE>(preference);
+            IDXGIAdapter1* by_pref = nullptr;
+            DXGI_ADAPTER_DESC1 pref_desc{};
+            if (FAILED(factory6->EnumAdapterByGpuPreference(0, pref, IID_PPV_ARGS(&by_pref))) || !by_pref ||
+                FAILED(by_pref->GetDesc1(&pref_desc)))
+                return fail("EnumAdapterByGpuPreference(0) failed");
+            by_pref->Release();
+            if (pref_desc.AdapterLuid.LowPart != enum_desc.AdapterLuid.LowPart ||
+                pref_desc.AdapterLuid.HighPart != enum_desc.AdapterLuid.HighPart)
+                return fail("EnumAdapterByGpuPreference(0) is not EnumAdapters1(0)'s adapter");
+            void* missing = reinterpret_cast<void*>(1);
+            if (factory6->EnumAdapterByGpuPreference(1, pref, __uuidof(IDXGIAdapter1), &missing) !=
+                    DXGI_ERROR_NOT_FOUND || missing != nullptr)
+                return fail("EnumAdapterByGpuPreference past the last adapter should be DXGI_ERROR_NOT_FOUND");
+        }
+        if (factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_UNSPECIFIED, __uuidof(IDXGIAdapter1),
+                                                 nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("EnumAdapterByGpuPreference(out = null) should be DXGI_ERROR_INVALID_CALL");
+        {
+            void* wrong = reinterpret_cast<void*>(1);
+            if (factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_UNSPECIFIED, __uuidof(IDXGIFactory),
+                                                     &wrong) != E_NOINTERFACE || wrong != nullptr)
+                return fail("EnumAdapterByGpuPreference with a non-adapter riid should be E_NOINTERFACE");
+        }
+
+        HANDLE changed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE changed2 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!changed || !changed2) return fail("CreateEventW (adapters changed)");
+        DWORD c_null = 0xDEAD, c1 = 0, c2 = 0, c3 = 0;
+        if (factory7->RegisterAdaptersChangedEvent(nullptr, &c_null) != DXGI_ERROR_INVALID_CALL || c_null != 0xDEAD)
+            return fail("RegisterAdaptersChangedEvent(null event) should be DXGI_ERROR_INVALID_CALL");
+        if (factory7->RegisterAdaptersChangedEvent(changed, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterAdaptersChangedEvent(null cookie) should be DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory7->RegisterAdaptersChangedEvent(changed, &c1)) || c1 != 1)
+            return fail("RegisterAdaptersChangedEvent should succeed with cookie 1");
+        if (factory7->RegisterAdaptersChangedEvent(changed, &c2) != DXGI_ERROR_INVALID_CALL)
+            return fail("RegisterAdaptersChangedEvent with an event already registered should be DXGI_ERROR_INVALID_CALL");
+        if (FAILED(factory7->RegisterAdaptersChangedEvent(changed2, &c3)) || c3 == c1)
+            return fail("RegisterAdaptersChangedEvent with a second event should get its own cookie");
+        if (WaitForSingleObject(changed, 0) != WAIT_TIMEOUT)
+            return fail("registering must not signal the adapters-changed event");
+        DWORD occlusion = 0;
+        if (FAILED(factory7->RegisterOcclusionStatusEvent(changed, &occlusion)))
+            return fail("RegisterOcclusionStatusEvent (cookie space check)");
+        if (occlusion != c1 && occlusion != c3 &&
+            factory7->UnregisterAdaptersChangedEvent(occlusion) != DXGI_ERROR_NOT_FOUND)
+            return fail("an occlusion cookie should not unregister an adapters-changed event");
+        factory7->UnregisterOcclusionStatus(occlusion);
+        if (FAILED(factory7->UnregisterAdaptersChangedEvent(c1)) ||
+            factory7->UnregisterAdaptersChangedEvent(c1) != DXGI_ERROR_NOT_FOUND ||
+            factory7->UnregisterAdaptersChangedEvent(0) != DXGI_ERROR_NOT_FOUND ||
+            factory7->UnregisterAdaptersChangedEvent(12345) != DXGI_ERROR_NOT_FOUND)
+            return fail("UnregisterAdaptersChangedEvent: a cookie unregisters once, an unknown one is NOT_FOUND");
+        // After unregistering, the same event can be registered again.
+        DWORD c4 = 0;
+        if (FAILED(factory7->RegisterAdaptersChangedEvent(changed, &c4)) ||
+            FAILED(factory7->UnregisterAdaptersChangedEvent(c4)) ||
+            FAILED(factory7->UnregisterAdaptersChangedEvent(c3)))
+            return fail("re-registering an unregistered event");
+        CloseHandle(changed);
+        CloseHandle(changed2);
+        factory7->Release();
+        factory6->Release();
 
         constexpr UINT tearing_flag = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
         constexpr UINT waitable_flag = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -979,8 +1177,9 @@ int main() {
         UINT lat = 0;
         if (FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 1)
             return fail("Waitable swapchain default GetMaximumFrameLatency should be 1");
-        if (wsc->SetMaximumFrameLatency(0) != E_INVALIDARG || wsc->SetMaximumFrameLatency(17) != E_INVALIDARG)
-            return fail("Waitable SetMaximumFrameLatency should reject 0 and > 16 with E_INVALIDARG");
+        if (wsc->SetMaximumFrameLatency(0) != DXGI_ERROR_INVALID_CALL ||
+            FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 1)
+            return fail("Waitable SetMaximumFrameLatency(0) should return INVALID_CALL and preserve latency");
         if (FAILED(wsc->SetMaximumFrameLatency(2)) || FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 2)
             return fail("Waitable SetMaximumFrameLatency(2) round-trip failed");
         HANDLE waitable = wsc->GetFrameLatencyWaitableObject();
@@ -1001,6 +1200,13 @@ int main() {
         if (FAILED(wsc->Present(0, DXGI_PRESENT_ALLOW_TEARING)) ||
             WaitForSingleObject(waitable, 5000) != WAIT_OBJECT_0)
             return fail("Present or wait after resizing the waitable swapchain failed");
+        if (FAILED(wsc->SetMaximumFrameLatency(40)) || FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 40)
+            return fail("Waitable SetMaximumFrameLatency(40) round-trip failed");
+        if (WaitForSingleObject(waitable, 0) != WAIT_OBJECT_0)
+            return fail("Waitable handle was not signaled after increasing latency from 2 to 40");
+        if (wsc->SetMaximumFrameLatency(41) != DXGI_ERROR_INVALID_CALL ||
+            FAILED(wsc->GetMaximumFrameLatency(&lat)) || lat != 40)
+            return fail("Waitable SetMaximumFrameLatency(41) should return INVALID_CALL and preserve latency");
         CloseHandle(waitable);
         wsc->Release();
         DestroyWindow(hwnd3);

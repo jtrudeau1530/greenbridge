@@ -179,7 +179,36 @@ UINT WINAPI XMemResetWriteWatch(void* base_address, SIZE_T region_size) {
     return ResetWriteWatch(base_address, region_size);
 }
 
+// kernel32!VirtualAlloc as a title calls it. The console's allocation type has two bits of its own, MEM_GRAPHICS
+// (0x10000000, memory the GPU reads) and MEM_TITLE (0x40000000, the title's own heap). On a PC the host rejects both
+// with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
+// 0x10000000, PAGE_READWRITE) returns NULL; so does 0x40000000), so an engine allocating its heaps this way gets
+// NULL at boot. Both are hints about where the memory lives; the host has no such split, so they are dropped and
+// the rest is passed through. Not done: the console protection bits, and whether graphics memory has to come from
+// an arena the D3D12 layer can see (#313).
+constexpr DWORD kMemGraphics = 0x10000000;
+constexpr DWORD kMemTitle = 0x40000000;
+
+LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
+    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), protect);
+}
+
 }  // namespace
+
+#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
+
+// The classic libraries and the memory api sets a title's imports name.
+SHIM_TABLE(title_memory,
+    TITLE_VIRTUAL_ALLOC("kernel32.dll"),
+    TITLE_VIRTUAL_ALLOC("kernelbase.dll"),
+    TITLE_VIRTUAL_ALLOC("api-ms-win-core-memory-l1-1-0.dll"),
+    TITLE_VIRTUAL_ALLOC("api-ms-win-core-memory-l1-1-1.dll"),
+    TITLE_VIRTUAL_ALLOC("api-ms-win-core-memory-l1-1-2.dll"),
+    TITLE_VIRTUAL_ALLOC("api-ms-win-core-memory-l1-1-3.dll"),
+    TITLE_VIRTUAL_ALLOC("api-ms-win-core-memory-l1-1-4.dll"),
+    TITLE_VIRTUAL_ALLOC("api-ms-win-core-memory-l1-1-5.dll"),
+    TITLE_VIRTUAL_ALLOC("api-ms-win-core-memory-l1-1-6.dll"),
+);
 
 SHIM_TABLE(xmem,
     {"xmem.dll", "XMemAlloc", reinterpret_cast<void*>(&XMemAlloc)},

@@ -616,6 +616,47 @@ Over 5,000 programs the reference and translator match bit for bit; breaking the
 A mutation check (inst offset dropped, V# stride narrowed, the SMEM pointer's high word dropped) makes
 76, 45 and 42 of 150 programs fail, so the runner does catch address errors.
 
+### Sum-of-absolute-differences family (`tools/sad_diff.py`)
+
+The subset interpreter `cpu_ref.py` has no SAD ops, so the family gets its own runner, like the memory
+instructions above. The family is seven opcodes — `v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16`, `v_sad_u32`,
+`v_msad_u8` and the packed quad forms `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`. `tools/sad_diff.py`
+carries a small reference written from the ISA pseudocode recorded in `docs/design.md`'s contract rows
+(the "Sum of absolute differences" row hardware-verified on gfx1035 through SHADER-137's `int_hw_probe`
+run; the `v_qsad` row bit-exact on an RTX 3060 in #623) and compares it with the translation run in
+`spirv_mini_interp`, the four exported mrt0 words, bit for bit (everything here is integer, so a
+mismatch can never be a rounding convention).
+
+Programs are straight-line: seeds in v8..v15 and s4..s7, then family ops whose destinations stay inside
+v8..v11 (the quad ops write pairs inside that), then `exp mrt0 v8, v9, v10, v11`, so every result is
+observed and later ops chain on earlier ones. Every operand position takes every source kind the
+encoding allows: VGPR, SGPR, a hex literal, an inline constant and `null` for the 32-bit sources; the
+quad ops' 64-bit S0/S2 take VGPR/SGPR pairs, a hex literal (zero high word) or an inline constant
+(sign-extended) — the 64-bit constant rule of the contract table, pinned both ways: a hex literal reads
+the same as the register pair holding its word and a zero high word, while a negative inline constant
+sign-extends, so the two constant forms differ in the high word.
+
+Two modes run one after the other: a sweep over the whole source-kind space (every (S0, S1, S2) kind
+combination, 125 per plain op, 80 per quad op, 785 programs) with values drawn from byte/half edge
+words, and random seeded programs that widen the value coverage over the same kind space. Not
+generated, on purpose: `clamp` (the contract rows say the translator rejects it; pinned as expected
+rejections in `--self-test`), `op_sel`/`neg`/`abs` (the ISA does not define them for these opcodes),
+`v_mqsad_u32_u8` (open PRs #1926/#2163 are on that op) and `null` as a 64-bit quad source (PR #2650's
+subject).
+
+```powershell
+python -I tools/sad_diff.py --programs 2000 --seed 7
+python -I tools/sad_diff.py --self-test
+python -I tests/test_sad_diff.py
+```
+
+Across seeds 1, 2, 3, 7, 11 and 12 (the last pair with `--max-ops 12`) 12,810 programs match bit for
+bit, zero mismatches and zero skips; the seed-7 headline run alone is 785 + 2,000 programs with about
+1,050 to 1,175 cases per op. Two mutations of the translator's SAD rule — the per-byte `UMax`/`UMin`
+pair replaced by a wrapped subtraction, and the `v_sad_hi_u8` shift dropped — make 36 and 17 of 60
+programs fail (`--programs 60 --seed 2 --max-ops 5 --no-sweep`), so the runner does catch arithmetic
+errors.
+
 ### Images on the GPU (`tools/image_fuzz.py`)
 
 `tools/image_fuzz.py` starts on the image path, where the T# format, the view type and the binding layout
@@ -623,6 +664,13 @@ meet the driver. Each case assembles a pixel shader that reads one texel with `i
 T# in `s[8:15]`), runs it through `runtime/test/vk_image_fuzz.cpp` against a synthetic texture of a chosen
 format, and compares every RGBA32F pixel with an oracle that models the RDNA2 texel fetch for that format: a
 fetch is a memory read, so there is no filter, border or LOD to model.
+
+The comparison is bit exact (any NaN matches any NaN) with one exception. The translated shader fetches a UNORM
+texel through a float view, so the 8-bit to float conversion is the driver's. RDNA2 returns the correctly rounded
+c / 255. llvmpipe multiplies by an f32 1/255, which is one ulp above that for 126 of the 256 byte values (27 gives
+0x3dd8d8da, not 0x3dd8d8d9), and a run stops at its first mismatch, so on llvmpipe no case after the first
+`R8G8B8A8_UNORM` one ran. The translator oracle therefore accepts one ulp on a UNORM8 texel component, never on
+another format or on a sentinel, and the summary says how many components needed it. `--oracle hw` stays bit exact.
 
 ```sh
 cmake --build runtime/build --target vk_image_fuzz
@@ -1149,6 +1197,15 @@ python -I tools/fmisc_diff.py --programs 3000 --seed 11 --max-ops 8
 python -I tools/fmisc_diff.py --oracle hw --programs 500 --seed 1
 python -I tests/test_fmisc_diff.py
 ```
+**Default-mode DX9 multiply regression.** `v_mul_legacy_f32` now explicitly flushes each f32 operand before the
+DX9 `0 * anything => +0` override, and flushes the nonzero product before its VOP3 output modifier. The output is
+flushed again before the active omod's `-0 => +0` rule. Previously it emitted an unguarded `OpFMul`, so on a Vulkan
+driver that keeps f32 denormals, a subnormal input times a large number or an underflowing normal product yielded
+nonzero results even though the inferred RDNA2 `MODE.denorm_mode_32 = 0` requires zero. The standalone semantic
+test `test_valu_mul_legacy_denorm.py` checks the exact bit patterns and the two GPU fixtures
+`ps_mul_legacy_denorm` / `ps_mul_legacy_denorm_mods` exercise signed input/output FTZ, legacy zero override, and
+output scaling. This is a translation for the **inferred game MODE**, not a claim of correctly handling dynamic
+denormal-preserving or IEEE modes; native gfx1013 measurements of these new fixtures were not available.
 
 
 ### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
@@ -1401,8 +1458,6 @@ RDNA2 rounds once. Every tie input gives the single-rounded word (A `0x3c01`, B 
 E `0x7bff`, F `0x3c01`, G `0x3c01`), so the translator is one f16 ulp off on exactly these inputs (SHADER-135; the
 translator is not changed here). On the RTX 5060, a translator copy changed to use
 `fma_mix_odd` in nearest mode gave the single-rounded word for all seven inputs on the `vulkan` side as well.
-| NVIDIA GeForce RTX 5060 (Blackwell), Windows 11 | 621.24 | single | single, 8 of 8 words | not AMD |
-| AMD Radeon gfx1036 (RDNA2), Linux / Windows | | single | single, 8 of 8 words | single, 8 of 8 words |
 
 Measurement on AMD RDNA2 (gfx1036) confirmed single rounding across all 7 discriminating cases (finding 7079901079).
 Using `fma_mix_odd` produces the exact hardware single-rounded words in both nearest-even and toward-zero modes.
@@ -1453,6 +1508,31 @@ SHADER-363 fixes the translator. It keeps the f32 product p and its exact error 
 on k + 0.5, the error's sign gives floor(p) + 1 or floor(p), and a zero error keeps `RoundEven` (an exact tie). The
 probe then exits 0 on the same iGPU: all 134 words equal the translator's in all ten runs (wave32 and wave64, five
 MODEs), including the 28 near ties.
+
+### `v_mad_f32`, `v_mac_f32`, `v_mad_legacy_f32` denormal flush on RDNA1 (`tools/mad_denorm_probe.py`, SHADER-340)
+
+`docs/design.md` ("Denormal flush in `v_mad_f32`, `v_mac_f32`, `v_mad_legacy_f32`") had no hardware measurement: GFX10.3+
+dropped these opcodes, and flushing only after `omod` (`div:2`/`mul:2`/`mul:4`) was an unverified assumption. The probe
+covers 48 cases across six groups: subnormal operands in each source slot (`input`, 15), normal operands with a subnormal
+product (`product`, 7), normal operands/products with a subnormal sum (`result`, 6), `omod`/`clamp` crossing the
+subnormal threshold (`omod`, 8), `v_mad_legacy_f32`'s `0 * anything -> +0` with subnormals (`legacy`, 5), and controls
+(`control`, 7). A `v_mul_f32(FLT_MIN, 0.5)` sanity kernel checks that `MODE.denorm32=3` actually keeps f32 denormals on
+the device (`0x00000000` with `denorm32=0`, `0x00400000` with `denorm32=3`).
+
+```
+python -I tools/mad_denorm_probe.py                             # the translator, on the CPU interpreter
+python -I tools/mad_denorm_probe.py --oracle hw                 # also the native instruction on an AMD GPU
+```
+
+Results (48 cases per run, wave32 and wave64 across 5 MODEs; `tests/test_mad_denorm_probe.py` checks the translator side):
+
+| GPU | Driver | `game` / `dx10clamp0` / `denorm32_kept` | `ieee1` / `ieee1_dx10clamp0` (non-`omod` + `omod` ignored) |
+|---|---|---|---|
+| AMD Radeon RX 5600 XT (`gfx1010`, RDNA1), Windows, HIP backend (`amdhip64_6.dll`), AMD clang (`rocm-sdk-core 10.0.0`) | 32.0.21045.29003 | 48 of 48 (wave32 and wave64) | 48 of 48 (wave32 and wave64) |
+
+Two findings from the RDNA1 measurement:
+- **Subnormal inputs, products, sums, and legacy rules flush regardless of `MODE.denorm32`** (40 of 40 non-`omod` cases match bit-for-bit across all 5 MODEs, including `denorm32=3`). Under `MODE.IEEE=1`, hardware ignores `mul:2`/`mul:4`/`div:2` (`FLT_MIN div:2` gives `FLT_MIN`, as for other f32 VALU ops).
+- **Hardware flushes both before and after `omod`.** Before SHADER-340, the translator flushed only after `clamp_mods`, so `(1.5*2^-126 - 2^-126) mul:2` gave `0x00800000` (`FLT_MIN`) and `mul:4` gave `0x01000000`, whereas the RX 5600 XT returns `+0` (`0x00000000`) in `game`, `dx10clamp0`, and `denorm32_kept`. `Gen.flush_f32_mods` now flushes the sum before `clamp_mods` and flushes again after it (`FLT_MIN div:2` → `+0`, `-FLT_MIN div:2` → `-0`), leaving non-modified `v_mad*`/`v_mac*` instructions byte-identical.
 
 ### f16 output modifiers, clamp and `v_fma_mix*` operands on RDNA2 (SHADER-135)
 
@@ -1555,6 +1635,72 @@ Hardware validation was executed via `tools/hw_oracle` and `tools/salu_diff.py` 
 - **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
 - **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
 - **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
+### Pixel-shader ISA on the hardware (`tools/ps_oracle.py`, EGEN-TOOL-PS-ORACLE)
+
+`tools/hw_oracle` only launches compute kernels, so what only a pixel shader has (`v_interp_*` and the parameter
+words the SPI writes into LDS, the barycentric VGPRs, exports and their formats, helper lanes) could not be
+measured there. `tools/ps_oracle.py` runs hand-written RDNA2 pixel-shader ISA in a real draw on an AMD GPU, through
+Vulkan's `VK_KHR_pipeline_binary`:
+
+1. `vk_harness` builds a pipeline from a template vertex + pixel shader and writes its binary (`VKH_BINARY_OUT`).
+   On the AMD Windows driver that is one PAL ELF: `.text` with `_amdgpu_gs_main` (the vertex stage) and
+   `_amdgpu_ps_main`, and a `.note` with the PAL metadata in msgpack, from which the driver programs the register
+   counts and the SPI setup (`spi_ps_input_ena/addr`, `spi_ps_input_cntl` per parameter, `spi_shader_col_format`).
+2. The code under test is assembled with AMD clang (`LEONIDA_AMD_CLANG`, as for hw_oracle) and replaces
+   `_amdgpu_ps_main`; `.text` grows if needed and the pixel stage's VGPR/SGPR counts are raised to the registers
+   the code names. `--set PATH=JSON` changes a metadata entry as well, e.g.
+   `.graphics_registers/.spi_ps_input_cntl/0/.fp16_interp_mode=true`.
+3. `vk_harness` builds the pipeline from the patched binary (`VKH_BINARY_IN`), draws one full-screen triangle into
+   an RGBA32F target and reads every pixel's four mrt0 dwords back bit for bit.
+
+The template sets what the code finds when it starts, so `--show-template` prints the template's own ISA and SPI
+metadata to copy the conventions from. With the built-in `interp2` template on gfx1036 the pixel stage is wave64,
+the perspective I/J barycentrics are in v0/v1, M0 comes from s2 (`s_mov_b32 m0, s2`), and parameters 0 and 1 are
+the vertex shader's locations 0 = (u, v, 0, 1) and 1 = (u, v, 0, 0), u and v going 0..2 across the screen.
+
+```powershell
+$env:LEONIDA_VK_DEVICE = "radeon"
+python -I tools/ps_oracle.py --build <runtime build> --template interp2 --show-template
+python -I tools/ps_oracle.py --build <runtime build> --template interp2 --asm body.s --size 4 1 [--json out.json]
+```
+
+Checked on an AMD Radeon iGPU (gfx1036, Windows driver 26.10.1): the driver accepts a patched binary (there is no
+check over the code), the patched code runs as the pixel shader, and `v_interp_p1/p2_f32` of `attr0.x` at the four
+pixel centres of a 4 x 1 target gives u = 0.125, 0.375, 0.625, 0.875, with `v_interp_mov_f32` reading the
+parameter words P0 = 0 and P10 = 2.0 (`tests/test_ps_oracle.py`, which runs it on hardware when
+`LEONIDA_PS_ORACLE_BUILD` names a runtime build). On other drivers the binary is not a single PAL ELF (the NVIDIA
+driver returns two blobs) and the tool exits 77. Limits: one draw of one triangle, mrt0 as RGBA32F only; the vertex
+stage is the template's, compiled by the driver; the SPI behaviour comes from the driver's metadata, so a `--set`
+the hardware does not support is not refused here.
+
+**On Linux (RADV).** Mesa's RADV returns the pipeline as one binary per stage, as `radv_shader_serialize` writes it
+(Mesa 26.3 `radv_pipeline_cache.c`, structs in `radv_shader.h`): a type word, `struct ac_shader_config` (`num_sgprs`,
+`num_vgprs`, ..., `rsrc1`), `struct radv_shader_info`, `total_size`, then `code_size`, `exec_size` and the other
+sizes, then stats, code, IR and disassembly. The info struct's size changes between Mesa versions, so the tool finds
+the fields from their values: the size block whose sizes add up to `total_size`, the pixel stage from the
+`wave_size, ., stage = 4 (fragment), next_stage = none` bytes in the info, and `rsrc1` as the config word whose
+VGPRS field is `(num_vgprs - 1) / (wave32 ? 8 : 4)` (`radv_postprocess_binary_config`) and whose FLOAT_MODE equals
+`float_mode`. A layout where these do not agree is refused (exit 77), not guessed. The code is replaced, the sizes
+are fixed, and `num_vgprs`/`num_sgprs` and rsrc1's VGPRS are raised; RADV builds an imported binary with
+`radv_shader_create_uncached` (no cache lookup by key) and programs `SPI_SHADER_PGM_RSRC1_PS` from `rsrc1`. Two
+limits: `--set` is refused (RADV keeps the SPI setup in its own structs, so a template has to ask for what it
+needs), and only GFX10 (RDNA1/RDNA2) devices are taken, from the chip name RADV puts in the device name; GFX11 and
+later interpolate with `lds_param_load` instead of `v_interp_*`, so e.g. an RX 9070 XT (`RADV GFX1201`) gets
+`unsupported architecture` and exit 77.
+
+Mesa optimises varyings across stages, so a template's parameter layout can differ from the Windows driver's:
+RADV moves `interp2`'s `in0 + in1` into the vertex shader and the pixel shader reads one parameter, attr0 =
+(2u, 2v, 0, 1); `--show-template` shows the layout a run gets.
+
+```sh
+LEONIDA_VK_DEVICE=raphael python -I tools/ps_oracle.py --build <runtime build> --template interp2 --show-template
+```
+
+Checked on the Ryzen 7 9800X3D iGPU (`RADV RAPHAEL_MENDOCINO`, gfx1036, wave64 pixel stage, Mesa 26.3.1, CachyOS):
+the Windows check's `attr0.x` code (with `v40`, past the template's 8 VGPRs) gives u = 0.25, 0.75, 1.25, 1.75,
+P0 = 0 and P10 = 4.0 for the single parameter, and a second patch with another constant changes the result (nothing
+is cached).
+
 
 ## Coverage plan and cost
 

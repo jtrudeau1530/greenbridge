@@ -56,7 +56,8 @@ namespace {
 
 constexpr uint32_t kBaseKinds =
     GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
-constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion;  // everything a reading may carry
+// Everything a reading may carry: motion on pads with sensors, raw reports on pads opened through HID (RT-175).
+constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion | GameInputKindRawDeviceReport;
 constexpr uint32_t kAxisCount = 6;  // LX, LY, RX, RY, LT, RT
 constexpr uint32_t kButtonCount = SDL_GAMEPAD_BUTTON_COUNT;
 constexpr uint32_t kConnectedStatus = GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
@@ -185,12 +186,18 @@ struct Snapshot {
     bool guide = false;
     GameInputMotionState motion{};  // valid only when has_motion; does not take part in operator==
     bool has_motion = false;
+    // The newest raw input report of a pad opened through HID (RT-175): its report id and payload, without the id
+    // byte. A new report with other bytes is a change, so it makes a reading of its own.
+    bool has_raw = false;
+    uint32_t raw_id = 0;
+    std::vector<uint8_t> raw;
     bool operator==(const Snapshot& o) const {  // field by field: the padding is not initialised
         const GameInputGamepadState &a = gamepad, &b = o.gamepad;
         return a.buttons == b.buttons && a.leftTrigger == b.leftTrigger && a.rightTrigger == b.rightTrigger &&
                a.leftThumbstickX == b.leftThumbstickX && a.leftThumbstickY == b.leftThumbstickY &&
                a.rightThumbstickX == b.rightThumbstickX && a.rightThumbstickY == b.rightThumbstickY && ui == o.ui &&
-               std::memcmp(buttons, o.buttons, sizeof buttons) == 0 && guide == o.guide;
+               std::memcmp(buttons, o.buttons, sizeof buttons) == 0 && guide == o.guide && has_raw == o.has_raw &&
+               raw_id == o.raw_id && raw == o.raw;
     }
 };
 
@@ -217,15 +224,13 @@ public:
     }
 
     uint32_t STDMETHODCALLTYPE GetInputKind() override {
-        return s_.has_motion ? kSupportedKinds : kBaseKinds;  // a reading of a pad without sensors carries no motion
+        // A reading of a pad without sensors carries no motion, and one without a raw report no raw report.
+        return kBaseKinds | (s_.has_motion ? GameInputKindMotion : 0u) | (s_.has_raw ? GameInputKindRawDeviceReport : 0u);
     }
     uint64_t STDMETHODCALLTYPE GetSequenceNumber(uint32_t) override { return seq_; }
     uint64_t STDMETHODCALLTYPE GetTimestamp() override { return ts_; }
     void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) override;
-    bool STDMETHODCALLTYPE GetRawReport(void** report) override {
-        if (report) *report = nullptr;
-        return false;
-    }
+    bool STDMETHODCALLTYPE GetRawReport(void** report) override;
     uint32_t STDMETHODCALLTYPE GetControllerAxisCount() override { return kAxisCount; }
     uint32_t STDMETHODCALLTYPE GetControllerAxisState(uint32_t count, float* out) override {
         const uint32_t n = out ? std::min(count, kAxisCount) : 0;
@@ -450,16 +455,11 @@ public:
     void STDMETHODCALLTYPE SetInputSynchronizationState(bool) override {}
     void STDMETHODCALLTYPE SendInputSynchronizationHint() override {}
     void STDMETHODCALLTYPE PowerOff() override {}
-    HRESULT STDMETHODCALLTYPE CreateRawDeviceReport(uint32_t, int32_t, void** report) override {
-        if (report) *report = nullptr;
-        return E_NOTIMPL;
-    }
-    HRESULT STDMETHODCALLTYPE GetRawDeviceFeature(uint32_t, void** report) override {
-        if (report) *report = nullptr;
-        return E_NOTIMPL;
-    }
-    HRESULT STDMETHODCALLTYPE SetRawDeviceFeature(void*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE SendRawDeviceOutput(void*) override { return E_NOTIMPL; }
+    // Raw HID (RT-175): reports of the pad's HID device through rt::gameinput::HidBackend (SDL_hid_* by default).
+    HRESULT STDMETHODCALLTYPE CreateRawDeviceReport(uint32_t reportId, int32_t reportKind, void** report) override;
+    HRESULT STDMETHODCALLTYPE GetRawDeviceFeature(uint32_t reportId, void** report) override;
+    HRESULT STDMETHODCALLTYPE SetRawDeviceFeature(void* report) override;
+    HRESULT STDMETHODCALLTYPE SendRawDeviceOutput(void* report) override;
     HRESULT STDMETHODCALLTYPE SendRawDeviceOutputWithResponse(void*, void** response) override {
         if (response) *response = nullptr;
         return E_NOTIMPL;
@@ -513,6 +513,17 @@ public:
     uint64_t motors_sent_at = 0, triggers_sent_at = 0, battery_at = 0;
     bool ds_sent_once = false;
 
+    // Raw HID (RT-175). hid is the backend's handle, null when the pad has no HID device the backend could open;
+    // hid_mu serialises every call on it, from the poll thread (reads) and the title's threads (output, features).
+    // The report tables come from the HID report descriptor; info.input/output/featureReportInfo point into them.
+    std::mutex hid_mu;
+    void* hid = nullptr;
+    const rt::gameinput::HidBackend* hid_backend = nullptr;  // the backend hid was opened with
+    bool hid_ids = false;  // the descriptor declares report ids, so an input report starts with its id byte
+    std::vector<GameInputRawDeviceReportInfo> raw_in, raw_out, raw_feature;
+    const GameInputRawDeviceReportInfo* find_raw(int32_t kind, uint32_t report_id) const;
+    HRESULT send_raw(void* report, GameInputRawDeviceReportKind kind);
+
 private:
     std::atomic<ULONG> refs_{1};
 };
@@ -527,6 +538,179 @@ void Reading::GetDevice(IGameInputDevice** device) {
     device_->AddRef();
     *device = device_;
 }
+
+// ---- raw HID (RT-175) -------------------------------------------------------------------------------------------
+
+// One raw report: its own copy of the report info (so it outlives a reconnect that rebuilds the device's tables) and
+// payload. There are no item tables (itemCount 0), so the item calls answer false; see docs/gameinput.md "Raw HID".
+class RawReport final : public IGameInputRawDeviceReport {
+public:
+    RawReport(Device* device, const GameInputRawDeviceReportInfo& info, const uint8_t* data, size_t size)
+        : device_(device), info_(info), data_(info.size, 0) {
+        info_.itemCount = 0;
+        info_.items = nullptr;
+        if (data) std::memcpy(data_.data(), data, std::min(size, data_.size()));
+        device_->AddRef();
+    }
+    ~RawReport() { device_->Release(); }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (same_guid(riid, IID_IUnknown) || same_guid(riid, IID_IGameInputRawDeviceReport)) {
+            AddRef();
+            *out = static_cast<IGameInputRawDeviceReport*>(this);
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --refs_;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) override;
+    const GameInputRawDeviceReportInfo* STDMETHODCALLTYPE GetReportInfo() override { return &info_; }
+    size_t STDMETHODCALLTYPE GetRawDataSize() override { return data_.size(); }
+    size_t STDMETHODCALLTYPE GetRawData(size_t bufferSize, void* buffer) override {
+        const size_t n = buffer ? std::min(bufferSize, data_.size()) : 0;
+        if (n) std::memcpy(buffer, data_.data(), n);
+        return n;
+    }
+    // The whole payload at once: a buffer of another size is refused, so a report is never half old, half new.
+    bool STDMETHODCALLTYPE SetRawData(size_t bufferSize, const void* buffer) override {
+        if (!buffer || bufferSize != data_.size()) return false;
+        std::memcpy(data_.data(), buffer, bufferSize);
+        return true;
+    }
+    bool STDMETHODCALLTYPE GetItemValue(uint32_t, int64_t* value) override {
+        if (value) *value = 0;
+        return false;
+    }
+    bool STDMETHODCALLTYPE SetItemValue(uint32_t, int64_t) override { return false; }
+    bool STDMETHODCALLTYPE ResetItemValue(uint32_t) override { return false; }
+    bool STDMETHODCALLTYPE ResetAllItems() override { return false; }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    Device* device_;
+    GameInputRawDeviceReportInfo info_;
+    std::vector<uint8_t> data_;
+};
+
+void RawReport::GetDevice(IGameInputDevice** device) {
+    if (!device) return;
+    device_->AddRef();
+    *device = device_;
+}
+
+// The default backend: SDL's hidapi. A pad is opened by the path SDL reports for it; with no such HID path, by its
+// vendor and product id when exactly one game-pad collection (usage page 1, usage 5) matches, so twins never mix.
+// A pad without a path (SDL virtual joysticks, the keyboard pad) gets no HID device.
+void* sdl_hid_open(const char* path, uint16_t vendor, uint16_t product) {
+    if (!path || !*path) return nullptr;
+    static const bool ok = SDL_hid_init() == 0;
+    if (!ok) return nullptr;
+    if (SDL_hid_device* h = SDL_hid_open_path(path)) return h;
+    SDL_hid_device_info* list = SDL_hid_enumerate(vendor, product);
+    const char* only = nullptr;
+    int matches = 0;
+    for (SDL_hid_device_info* i = list; i; i = i->next)
+        if (i->usage_page == 0x01 && i->usage == 0x05 && ++matches == 1) only = i->path;
+    SDL_hid_device* h = (matches == 1 && only) ? SDL_hid_open_path(only) : nullptr;
+    SDL_hid_free_enumeration(list);
+    return h;
+}
+void sdl_hid_close(void* h) { SDL_hid_close(static_cast<SDL_hid_device*>(h)); }
+int sdl_hid_descriptor(void* h, uint8_t* buf, size_t size) {
+    return SDL_hid_get_report_descriptor(static_cast<SDL_hid_device*>(h), buf, size);
+}
+int sdl_hid_read(void* h, uint8_t* buf, size_t size) {
+    return SDL_hid_read_timeout(static_cast<SDL_hid_device*>(h), buf, size, 0);
+}
+int sdl_hid_write(void* h, const uint8_t* buf, size_t size) {
+    return SDL_hid_write(static_cast<SDL_hid_device*>(h), buf, size);
+}
+int sdl_hid_get_feature(void* h, uint8_t* buf, size_t size) {
+    return SDL_hid_get_feature_report(static_cast<SDL_hid_device*>(h), buf, size);
+}
+int sdl_hid_send_feature(void* h, const uint8_t* buf, size_t size) {
+    return SDL_hid_send_feature_report(static_cast<SDL_hid_device*>(h), buf, size);
+}
+const rt::gameinput::HidBackend kSdlHid = {sdl_hid_open,  sdl_hid_close,       sdl_hid_descriptor, sdl_hid_read,
+                                           sdl_hid_write, sdl_hid_get_feature, sdl_hid_send_feature};
+std::atomic<const rt::gameinput::HidBackend*> g_hid{&kSdlHid};
+
+bool Reading::GetRawReport(void** report) {
+    if (!report) return false;
+    *report = nullptr;
+    if (!s_.has_raw) return false;
+    const GameInputRawDeviceReportInfo* info = device_->find_raw(GameInputRawInputReport, s_.raw_id);
+    if (!info) return false;
+    *report = static_cast<IGameInputRawDeviceReport*>(new RawReport(device_, *info, s_.raw.data(), s_.raw.size()));
+    return true;
+}
+
+const GameInputRawDeviceReportInfo* Device::find_raw(int32_t kind, uint32_t report_id) const {
+    const std::vector<GameInputRawDeviceReportInfo>* list = kind == GameInputRawInputReport    ? &raw_in
+                                                           : kind == GameInputRawOutputReport  ? &raw_out
+                                                           : kind == GameInputRawFeatureReport ? &raw_feature
+                                                                                               : nullptr;
+    if (!list) return nullptr;
+    for (const GameInputRawDeviceReportInfo& r : *list)
+        if (r.id == report_id) return &r;
+    return nullptr;
+}
+
+HRESULT Device::CreateRawDeviceReport(uint32_t reportId, int32_t reportKind, void** report) {
+    if (!report) return E_POINTER;
+    *report = nullptr;
+    std::lock_guard lock(hid_mu);
+    if (!hid) return E_NOTIMPL;  // no raw I/O on this pad (GameInputDeviceRawIoEnabled is not set)
+    const GameInputRawDeviceReportInfo* ri = find_raw(reportKind, reportId);
+    if (!ri) return E_INVALIDARG;
+    *report = static_cast<IGameInputRawDeviceReport*>(new RawReport(this, *ri, nullptr, 0));
+    return S_OK;
+}
+
+HRESULT Device::GetRawDeviceFeature(uint32_t reportId, void** report) {
+    if (!report) return E_POINTER;
+    *report = nullptr;
+    std::lock_guard lock(hid_mu);
+    if (!hid) return E_NOTIMPL;
+    const GameInputRawDeviceReportInfo* ri = find_raw(GameInputRawFeatureReport, reportId);
+    if (!ri) return E_INVALIDARG;
+    std::vector<uint8_t> buf(ri->size + 1, 0);
+    buf[0] = static_cast<uint8_t>(reportId);  // hidapi: the id goes first, 0 for a device without ids
+    const int n = hid_backend->get_feature(hid, buf.data(), buf.size());
+    if (n < 1) return E_FAIL;
+    *report = static_cast<IGameInputRawDeviceReport*>(new RawReport(this, *ri, buf.data() + 1, static_cast<size_t>(n) - 1));
+    return S_OK;
+}
+
+// SetRawDeviceFeature and SendRawDeviceOutput: any IGameInputRawDeviceReport of the right kind whose id this pad
+// declares; the payload is sent with the id byte in front, as hidapi takes it.
+HRESULT Device::send_raw(void* report, GameInputRawDeviceReportKind kind) {
+    if (!report) return E_INVALIDARG;
+    auto* r = static_cast<IGameInputRawDeviceReport*>(report);
+    const GameInputRawDeviceReportInfo* given = r->GetReportInfo();
+    std::lock_guard lock(hid_mu);
+    if (!hid) return E_NOTIMPL;
+    if (!given || given->kind != kind) return E_INVALIDARG;
+    const GameInputRawDeviceReportInfo* ri = find_raw(kind, given->id);
+    if (!ri) return E_INVALIDARG;
+    std::vector<uint8_t> buf(ri->size + 1, 0);
+    buf[0] = static_cast<uint8_t>(ri->id);
+    r->GetRawData(ri->size, buf.data() + 1);
+    const rt::gameinput::HidBackend* b = hid_backend;
+    const int n = kind == GameInputRawFeatureReport ? b->send_feature(hid, buf.data(), buf.size())
+                                                     : b->write(hid, buf.data(), buf.size());
+    return n < 0 ? E_FAIL : S_OK;
+}
+HRESULT Device::SetRawDeviceFeature(void* report) { return send_raw(report, GameInputRawFeatureReport); }
+HRESULT Device::SendRawDeviceOutput(void* report) { return send_raw(report, GameInputRawOutputReport); }
 
 // ---- callbacks --------------------------------------------------------------------------------------------------
 
@@ -700,31 +884,32 @@ bool deliver() {
     return !s.queue.empty();
 }
 
-// IGameInputDispatcher::Dispatch: runs queued events oldest first, at least one even with a quota of 0, and takes no
-// further event once quota_us microseconds have passed (an event already started runs to the end, so the quota is a
-// target, as on Windows). While events remain the wait handle is signalled again, so a title that waits on it before
-// each call comes back for the rest. Returns whether events remain.
+// IGameInputDispatcher::Dispatch: runs the events queued when the call starts, oldest first: at least one even with a
+// quota of 0, and no further event once quota_us microseconds have passed (an event already started runs to the end,
+// so the quota is a target, as on Windows). Events queued during the call wait for the next one, so a busy poll thread
+// cannot keep the title inside Dispatch even with an unlimited quota. Events left over go back to the front of the
+// queue, ahead of newer ones, and the wait handle is signalled again while any remain. Returns whether events remain.
 bool deliver_within(uint64_t quota_us) {
     State& s = g();
     std::lock_guard dl(s.deliver_mu);
     const auto start = std::chrono::steady_clock::now();
+    std::vector<Event> batch;
+    {
+        std::lock_guard lock(s.mu);
+        batch.swap(s.queue);
+    }
     s.delivering_thread = GetCurrentThreadId();
-    for (bool first = true;; first = false) {
-        if (!first) {
+    size_t next = 0;
+    while (next < batch.size()) {
+        if (next > 0) {
             const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
             if (static_cast<uint64_t>(spent.count()) >= quota_us) break;
         }
-        Event e;
-        {
-            std::lock_guard lock(s.mu);
-            if (s.queue.empty()) break;
-            e = s.queue.front();
-            s.queue.erase(s.queue.begin());
-        }
-        deliver_event(e);
+        deliver_event(batch[next++]);
     }
     s.delivering_thread = 0;
     std::lock_guard lock(s.mu);
+    if (next < batch.size()) s.queue.insert(s.queue.begin(), batch.begin() + static_cast<std::ptrdiff_t>(next), batch.end());
     const bool remaining = !s.queue.empty();
     if (remaining && s.wait_event) SetEvent(s.wait_event);
     return remaining;
@@ -930,6 +1115,92 @@ Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
     return h.back();
 }
 
+// Raw HID (RT-175): opens the pad's HID device with the current backend and builds the report tables from its report
+// descriptor. A pad the backend cannot open, or whose descriptor cannot be read or declares no report, gets no raw
+// I/O: no GameInputKindRawDeviceReport, no report tables, and E_NOTIMPL from the raw device calls. Under g().mu.
+void open_raw(Device* d, const char* path) {
+    std::lock_guard lock(d->hid_mu);
+    if (d->hid) d->hid_backend->close(d->hid);
+    d->hid = nullptr;
+    d->hid_ids = false;
+    d->raw_in.clear();
+    d->raw_out.clear();
+    d->raw_feature.clear();
+    const rt::gameinput::HidBackend* b = g_hid.load();
+    void* h = b->open(path, d->info.vendorId, d->info.productId);
+    if (!h) {
+        // SDL reads Xbox pads on Windows through XInput ("XInput#n"); SDL's hidapi skips their XInput HID interface
+        // (&IG_ in the path), which carries no full HID reports, so they have no raw I/O here.
+        const bool xinput = path && std::strncmp(path, "XInput#", 7) == 0;
+        std::fprintf(stderr, "[rt] gameinput: %s: no raw HID (%s)\n", d->name.c_str(),
+                     xinput             ? "an XInput pad: SDL's hidapi does not open XInput HID interfaces"
+                     : path && *path    ? "its HID device could not be opened"
+                                        : "SDL reports no device path");
+        return;
+    }
+    std::vector<uint8_t> desc(4096);
+    const int n = b->descriptor(h, desc.data(), desc.size());
+    std::vector<rt::gameinput::RawReportSize> reports;
+    const bool parsed = n > 0 && rt::gameinput::parse_report_descriptor(desc.data(), static_cast<size_t>(n), &reports);
+    if (!parsed || reports.empty()) {
+        std::fprintf(stderr, "[rt] gameinput: %s: no raw HID (%s)\n", d->name.c_str(),
+                     n <= 0 ? "no report descriptor" : !parsed ? "malformed report descriptor" : "no reports declared");
+        b->close(h);
+        return;
+    }
+    for (const rt::gameinput::RawReportSize& r : reports) {
+        const GameInputRawDeviceReportInfo info{static_cast<GameInputRawDeviceReportKind>(r.kind), r.id, r.bytes, 0, nullptr};
+        (r.kind == GameInputRawInputReport ? d->raw_in : r.kind == GameInputRawOutputReport ? d->raw_out : d->raw_feature)
+            .push_back(info);
+        d->hid_ids |= r.id != 0;
+    }
+    d->hid = h;
+    d->hid_backend = b;
+    GameInputDeviceInfo& i = d->info;
+    i.supportedInput |= GameInputKindRawDeviceReport;
+    i.inputReportCount = static_cast<uint32_t>(d->raw_in.size());
+    i.inputReportInfo = d->raw_in.empty() ? nullptr : d->raw_in.data();
+    i.outputReportCount = static_cast<uint32_t>(d->raw_out.size());
+    i.outputReportInfo = d->raw_out.empty() ? nullptr : d->raw_out.data();
+    i.featureReportCount = static_cast<uint32_t>(d->raw_feature.size());
+    i.featureReportInfo = d->raw_feature.empty() ? nullptr : d->raw_feature.data();
+}
+
+void close_raw(Device* d) {
+    std::lock_guard lock(d->hid_mu);
+    if (d->hid) d->hid_backend->close(d->hid);
+    d->hid = nullptr;
+}
+
+// Drains the input reports pending since the last poll; the newest one the pad declares goes into snap. With none
+// pending, snap keeps the previous report, so a quiet pad makes no new reading. Poll thread.
+void read_raw(Device* d, Snapshot* snap) {
+    snap->has_raw = d->last_snap.has_raw;
+    snap->raw_id = d->last_snap.raw_id;
+    snap->raw = d->last_snap.raw;
+    std::lock_guard lock(d->hid_mu);
+    if (!d->hid) return;
+    std::vector<uint8_t> buf(4096);
+    for (int k = 0; k < 64; ++k) {  // bounded: a pad that floods cannot hold up the poll
+        const int n = d->hid_backend->read(d->hid, buf.data(), buf.size());
+        if (n <= 0) break;
+        uint32_t id = 0;
+        const uint8_t* p = buf.data();
+        size_t len = static_cast<size_t>(n);
+        if (d->hid_ids) {
+            id = buf[0];
+            ++p;
+            --len;
+        }
+        const GameInputRawDeviceReportInfo* info = d->find_raw(GameInputRawInputReport, id);
+        if (!info) continue;
+        snap->has_raw = true;
+        snap->raw_id = id;
+        snap->raw.assign(p, p + std::min(len, static_cast<size_t>(info->size)));
+        snap->raw.resize(info->size, 0);
+    }
+}
+
 void open_pad(SDL_JoystickID jid, uint64_t ts) {
     State& s = g();
     SDL_Gamepad* p = SDL_OpenGamepad(jid);
@@ -1040,6 +1311,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->motors_sent_at = d->triggers_sent_at = d->battery_at = 0;
     d->wanted = {};
     fill_info(d, p, id);
+    open_raw(d, path);
 
     // Player LEDs and SDL's default lightbar colour follow the slot: the lowest one not in use.
     int player = 0;
@@ -1055,6 +1327,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
 
     uint32_t status = kConnectedStatus;
     if (d->info.capabilities & GameInputDeviceCapabilityWireless) status |= GameInputDeviceWireless;
+    if (d->hid) status |= GameInputDeviceRawIoEnabled;
     d->status = status;
     s.connected.push_back(d);
 
@@ -1073,6 +1346,7 @@ void close_pad(Device* d, uint64_t ts) {
     std::lock_guard lock(s.mu);
     const uint32_t old = d->status.exchange(GameInputDeviceNoStatus);
     SDL_CloseGamepad(d->pad);
+    close_raw(d);
     d->pad = nullptr;
     d->player = -1;
     // The haptic device belongs to the joystick, which goes with the gamepad. Effects a title still holds stay alive
@@ -1539,7 +1813,8 @@ void poll_once() {
         connected = s.connected;
     }
     for (Device* d : connected) {
-        const Snapshot snap = read_pad(d);
+        Snapshot snap = read_pad(d);
+        read_raw(d, &snap);
         const bool guide_changed = d->last_snap.guide != snap.guide;
         const bool changed = !(d->last_snap == snap);
         d->last_snap = snap;
@@ -2192,6 +2467,72 @@ const KeyBinding* keyboard_bindings(int* count) {
     if (count) *count = static_cast<int>(std::size(kKeyBindings));
     return kKeyBindings;
 }
+
+// HID 1.11 section 6.2.2: a short item is one prefix byte (bSize in bits 0-1, 3 meaning 4 bytes; bType in bits 2-3;
+// bTag in bits 4-7) and up to four data bytes, little-endian. 0xFE starts a long item (data size, tag, data).
+bool parse_report_descriptor(const uint8_t* data, size_t size, std::vector<RawReportSize>* out) {
+    if (!out || (!data && size)) return false;
+    out->clear();
+    struct Globals {
+        uint32_t report_size = 0, report_count = 0, report_id = 0;
+    };
+    Globals g;
+    std::vector<Globals> stack;
+    struct Key {
+        int kind;
+        uint32_t id;
+        uint64_t bits;
+    };
+    std::vector<Key> reports;  // first-seen order; sorted at the end
+    size_t i = 0;
+    while (i < size) {
+        const uint8_t prefix = data[i++];
+        if (prefix == 0xFE) {  // long item: bDataSize, bLongItemTag, data
+            if (i + 2 > size) return false;
+            i += 2 + data[i];
+            if (i > size) return false;
+            continue;
+        }
+        const size_t n = (prefix & 3) == 3 ? 4 : (prefix & 3);
+        if (i + n > size) return false;
+        uint32_t v = 0;
+        for (size_t k = 0; k < n; ++k) v |= static_cast<uint32_t>(data[i + k]) << (8 * k);
+        i += n;
+        const int type = (prefix >> 2) & 3, tag = prefix >> 4;
+        if (type == 1) {  // global
+            if (tag == 7) g.report_size = v;
+            else if (tag == 8) {
+                if (v == 0 || v > 255) return false;
+                g.report_id = v;
+            } else if (tag == 9) g.report_count = v;
+            else if (tag == 10) stack.push_back(g);
+            else if (tag == 11) {
+                if (stack.empty()) return false;
+                g = stack.back();
+                stack.pop_back();
+            }
+        } else if (type == 0) {  // main: Input 8, Output 9, Feature 11 (Collection 10 and End Collection 12 add nothing)
+            const int kind = tag == 8 ? 0 : tag == 9 ? 1 : tag == 11 ? 2 : -1;
+            if (kind < 0) continue;
+            const uint64_t add = static_cast<uint64_t>(g.report_size) * g.report_count;
+            Key* k = nullptr;
+            for (Key& r : reports)
+                if (r.kind == kind && r.id == g.report_id) k = &r;
+            if (!k) {
+                reports.push_back({kind, g.report_id, 0});
+                k = &reports.back();
+            }
+            k->bits += add;
+            if (k->bits > 65536ull * 8) return false;
+        }
+    }
+    for (const Key& k : reports) out->push_back({k.kind, k.id, static_cast<uint32_t>((k.bits + 7) / 8)});
+    std::sort(out->begin(), out->end(),
+              [](const RawReportSize& a, const RawReportSize& b) { return a.kind != b.kind ? a.kind < b.kind : a.id < b.id; });
+    return true;
+}
+
+void set_hid_backend(const HidBackend* backend) { g_hid = backend ? backend : &kSdlHid; }
 
 }  // namespace rt::gameinput
 

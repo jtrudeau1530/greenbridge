@@ -176,6 +176,50 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertIn("1 malformed", p.stdout)
         self.assertIn("line 1", p.stdout)
 
+        # An end-truncated file that starts at <COther> and cuts off right after a closed child </x>
+        # must keep root "COther" and report malformed (not tail_only under bogus root "x").
+        cut = self.write("cut.xml", b"<COther><x>1</x>")
+        out = os.path.join(self.root, "cut.json")
+        p = self.run_tool(cut, "--check", "--json", out)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            row = json.load(f)["rows"][0]
+        self.assertEqual(row["root"], "COther")
+        self.assertFalse(row["tail_only"])
+        self.assertFalse(row["truncated"])
+        self.assertTrue(row["malformed"])
+
+    def test_check_crossed_tags(self):
+        cases = (
+            (b"<R><x></R></x>", "R"),
+            (b'<?xml version="1.0"?><R><x></R></x>', "R"),
+            (b'<n:R xmlns:n="urn:test"><!-- </n:R> --><x><![CDATA[</x>]]></n:R></x>', "n:R"),
+        )
+        for payload, root in cases:
+            with self.subTest(payload=payload):
+                doc = self.write("crossed.xml", payload)
+                p = self.run_tool(doc, "--check")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("malformed " + root + " @", p.stdout)
+                self.assertIn("0 truncated at the start", p.stdout)
+
+    def test_check_crossed_text_in_missing_comment_or_cdata_prefix(self):
+        for opener, suffix in ((b"<!-- ", b" -->"), (b"<![CDATA[", b"]]>")):
+            payload = b"<A><B></A></B>" + suffix + b"</R>"
+            with self.subTest(opener=opener):
+                # Establish that these are tails of a well-formed document.
+                import xml.etree.ElementTree as ET
+                ET.fromstring(b"<R>" + opener + payload)
+                doc = self.write("lexical_tail.xml", payload)
+                p = self.run_tool(doc, "--check")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("1 truncated at the start", p.stdout)
+                self.assertIn("truncated R @", p.stdout)
+                # A stray terminator must not hide malformed text after it.
+                broken = self.write("lexical_broken.xml", payload[:-4] + b"<C><D></C></D></R>")
+                p = self.run_tool(broken, "--check")
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+
     def test_check_reports_unknown_encoding_as_malformed(self):
         unknown = self.write("unknown.xml", b'<?xml version="1.0" encoding="not-a-charset"?><root/>')
         valid = self.write("valid.xml", b"<root/>")

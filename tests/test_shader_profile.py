@@ -636,6 +636,32 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         with open(shader_file, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), original_content)
 
+    def test_unreadable_listing_reports_its_path_and_preserves_report(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        self.write("cs_main", "\ts_endpgm\n")
+        listing = os.path.join(self.disasm_dir, "cs_main.s")
+        report = os.path.join(self.tmp.name, "profile.json")
+        original = b'{"previous": true}\n'
+        with open(report, "wb") as f:
+            f.write(original)
+
+        def open_listing(path, *args, **kwargs):
+            if path == listing:
+                raise PermissionError(13, "Cannot read listing", listing)
+            return open(path, *args, **kwargs)
+
+        stderr = StringIO()
+        with (patch.object(P, "open", open_listing, create=True),
+              patch.object(sys, "argv", ["shader_profile.py", self.disasm_dir, "--out", report]),
+              patch.object(sys, "stderr", stderr)):
+            self.assertEqual(P.main(), 2)
+
+        self.assertEqual(stderr.getvalue().splitlines(), [f"ERROR: cannot read {listing}: Cannot read listing"])
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

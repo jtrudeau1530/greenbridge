@@ -28,7 +28,7 @@ import sys
 
 # Left out: anything that writes memory or images, LDS, and the rare instructions the harness has no setup for.
 # Loads are fine: with empty user data they read zeros from the start of the harness's heap, the same for both.
-NEEDS = re.compile(r"^\t(image_store|image_atomic|buffer_store|tbuffer_|global_store|global_atomic|ds_|s_swappc|"
+NEEDS = re.compile(r"^\t(image_store|image_atomic|buffer_(?:store|atomic)|tbuffer_|global_store|global_atomic|ds_|s_swappc|"
                    r"s_getpc|s_sendmsg|s_sleep)", re.M)
 BRANCH = re.compile(r"^\ts_c?branch", re.M)
 BACK = re.compile(r"^\ts_c?branch\S* (\d+)", re.M)
@@ -206,6 +206,15 @@ def main(argv=None):
     a = ap.parse_args(argv)
     disasm = os.path.join(a.shaders, "dxbc", "disasm")
     old = os.path.join(a.shaders, "spirv")
+    import json
+    with open(os.path.join(old, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    names = supported_pixel_shaders(index)
+    print(f"{len(names)} pixel shaders use only the bindings and features the harness provides")
+    picked = select_candidates(index, disasm, old, count=a.count, loops=a.loops, names_file=a.names)
+    if not picked:
+        print("ERROR: no shader candidates for the control-flow comparison", file=sys.stderr)
+        return 1
     new = os.path.join(a.out, "new")
     os.makedirs(new, exist_ok=True)
     # The texture test's harness: it binds a heap, a descriptor table, a fallback texture and a sampler.
@@ -213,17 +222,10 @@ def main(argv=None):
     harness = a.harness or os.path.join(a.repo, "runtime", "build", exe)
     vs = test_vertex_shader(a.out)
 
-    import json
-    with open(os.path.join(old, "index.json"), encoding="utf-8") as f:
-        index = json.load(f)
-    names = supported_pixel_shaders(index)
-    print(f"{len(names)} pixel shaders use only the bindings and features the harness provides")
-    picked = select_candidates(index, disasm, old, count=a.count, loops=a.loops, names_file=a.names)
     branches = sorted(len(BRANCH.findall(open(os.path.join(disasm, name + ".s"), encoding="utf-8",
                                                  errors="replace").read())) for name in picked)
     print(f"{len(picked)} branchy pixel shaders picked ({'with loops' if a.loops == 'only' else 'loop-free'}); "
-          f"branches per shader: median {branches[len(branches) // 2] if branches else 0}, "
-          f"max {branches[-1] if branches else 0}")
+          f"branches per shader: median {branches[len(branches) // 2]}, max {branches[-1]}")
 
     # Both forms from the current translator, so the control-flow arrangement is the only difference.
     loopdir = os.path.join(a.out, "dispatch")

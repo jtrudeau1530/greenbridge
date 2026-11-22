@@ -4,6 +4,7 @@
 
 Zero game data: all tests use deterministic, synthetic byte sequences constructed in-memory.
 """
+import errno
 import io
 import json
 import os
@@ -456,6 +457,39 @@ class TestCrcAndChecksumBounds(unittest.TestCase):
         dxbc = make_dxbc([(b"DXIL", dxil)])
         with self.assertRaises(zlib.error):
             fssm_unpack.unpack(dxbc)
+
+
+class TestMainBadOutput(unittest.TestCase):
+    def test_file_at_output_directory_is_preserved(self):
+        with tempfile.TemporaryDirectory() as src:
+            out = os.path.join(src, "fssm")
+            with open(out, "wb") as f:
+                f.write(b"keep me")
+
+            res = subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True)
+
+            self.assertEqual(res.returncode, 2)
+            self.assertEqual(res.stdout, "")
+            self.assertEqual(len(res.stderr.splitlines()), 1, res.stderr)
+            self.assertIn(f"cannot create output directory {out}", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertEqual(os.listdir(src), ["fssm"])
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"keep me")
+
+    def test_output_directory_creation_errors_name_the_path(self):
+        with tempfile.TemporaryDirectory() as src:
+            out = os.path.join(src, "fssm")
+            for error in (PermissionError(errno.EACCES, "Permission denied"),
+                          OSError(errno.ENOSPC, "No space left on device")):
+                with self.subTest(error=error), mock.patch.object(fssm_unpack.os, "makedirs",
+                                                                 side_effect=error) as mkdir, \
+                        mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
+                    self.assertEqual(fssm_unpack.main([src]), 2)
+                    mkdir.assert_called_once_with(out, exist_ok=True)
+                    self.assertEqual(stderr.getvalue().splitlines(),
+                                     [f"ERROR: cannot create output directory {out}: {error.strerror}"])
+                    self.assertEqual(os.listdir(src), [])
 
 
 class TestMainBadSource(unittest.TestCase):

@@ -19,8 +19,10 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <map>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "base_reservation.h"
@@ -76,7 +78,16 @@ int wmain(int argc, wchar_t** argv) {
     if (image.empty()) return usage();
     // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
     if (dry_run + init + run != 1) return usage();
-    if (game_dir.empty()) game_dir = image.parent_path();
+    // The console folders are fixed once, as absolute paths. A bare image name (`gta6rt --run game.exe` from the
+    // game folder) has an empty parent path, which left GAME: with no root; and a relative --game-dir or --overlay
+    // would follow the title's later SetCurrentDirectory. If absolute() fails the path stays as given.
+    const auto absolute_or_same = [](const std::filesystem::path& p) {
+        std::error_code ec;
+        std::filesystem::path a = std::filesystem::absolute(p, ec);
+        return ec ? p : a;
+    };
+    game_dir = game_dir.empty() ? absolute_or_same(image).parent_path() : absolute_or_same(game_dir);
+    if (!overlay_dir.empty()) overlay_dir = absolute_or_same(overlay_dir);
     // An image without relocations whose range this process already uses (arm64 Wine on macOS) runs in a new
     // process that has the range reserved from the start (base_reservation.h); that process does not do this again.
     if (!rt::base_reservation::inherited())
@@ -129,7 +140,22 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
             return 1;
         }
-        std::printf("console paths: GAME: -> %ls, writes -> %ls\n", game_dir.c_str(), overlay_dir.c_str());
+        const std::wstring paths = L"console paths: GAME: -> " + game_dir.native() + L", writes -> " + overlay_dir.native();
+        const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode;
+        bool printed = false;
+        if (GetConsoleMode(out, &mode)) {
+            std::fflush(stdout);
+            const std::wstring line = paths + L"\r\n";
+            DWORD written;
+            printed = WriteConsoleW(out, line.data(), static_cast<DWORD>(line.size()), &written, nullptr) != FALSE;
+        }
+        if (!printed) {
+            const auto game = game_dir.u8string();
+            const auto overlay = overlay_dir.u8string();
+            std::printf("console paths: GAME: -> %s, writes -> %s\n",
+                        reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()));
+        }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
@@ -141,6 +167,8 @@ int wmain(int argc, wchar_t** argv) {
         std::fflush(stderr);
         // Not `return`: a normal host exit runs the CRT's atexit table, which the game shares with gta6rt (its
         // handlers would run against a game that has stopped) and whose last word decides the exit status.
+        // ExitProcess also skips atexit, so the TLS clone cleanup registered there is run here instead.
+        rt::cleanup_tls_clones();
         ExitProcess(static_cast<UINT>(code));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

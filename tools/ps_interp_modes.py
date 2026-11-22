@@ -422,15 +422,24 @@ def main(argv=None):
         return 2
     base = args.path if os.path.isdir(args.path) else os.path.dirname(args.path)
     stages = fssm_header.stage_index(base)
+    try:
+        paths = files_of(args.path)
+    except OSError as e:
+        print(f"ERROR: cannot list {args.path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     rows = []
     skipped = Counter()
-    for path in files_of(args.path):
+    for path in paths:
         stem = os.path.splitext(os.path.basename(path))[0]
         if stages and stages.get(stem) != "ps":
             continue
         fssm = os.path.join(base, "fssm", stem + ".fssm")
         disasm = os.path.join(base, "disasm", stem + ".s")
-        row = shader_row(path, fssm, disasm)
+        try:
+            row = shader_row(path, fssm, disasm)
+        except OSError as e:
+            print(f"ERROR: cannot read {e.filename or path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         if row is None:
             skipped["no psv0"] += 1
             continue

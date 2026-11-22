@@ -508,10 +508,10 @@ def triangle_test(v, org, d, remap=REMAP_IDENTITY):
     if missed:
         return (INF, 1.0, 0.0, 0.0)
     e = (U, V, W)
-    i_num = e[remap & 3] if remap & 3 < 3 else U          # selector 3 falls back to U, as the public path does
-    j_num = e[(remap >> 2) & 3] if (remap >> 2) & 3 < 3 else U
-    if (i_num < 0 < t_den) or (i_num > 0 > t_den):
-        i_num, j_num = -i_num, -j_num
+    # t_den carries dd[2], so scale i_num/j_num by dd[2] too: i_num / t_den = e_i / (U + V + W),
+    # which is both ray-scale invariant and non-negative even when i_num == 0 and dd[2] < 0.
+    i_num = (e[remap & 3] if remap & 3 < 3 else U) * dd[2]   # selector 3 falls back to U, as the public path does
+    j_num = (e[(remap >> 2) & 3] if (remap >> 2) & 3 < 3 else U) * dd[2]
     return (t_num, t_den, i_num, j_num)
 
 
@@ -677,15 +677,18 @@ def validate(data, expect_bottom=None):
             errs.append(f"{'leaf' if kind <= TRI3 or kind == INSTANCE else 'node'} {p:#x} reached twice")
             continue
         seen.add(p)
-        if parent is not None and kind > TRI3 and parents_off:
+        if kind > TRI3 and parents_off:
             u = (off - elements_off) // UNIT
             entry = parents_off + 4 * u
             # Only the entries that lie between the header and offsetToElements are stored in the structure; the
             # others (the low units) are not, so there is nothing to compare (docs/bvh.md 3.1).
-            if HEADER_SIZE <= entry and entry + 4 <= elements_off:
+            if entry + 4 > len(data):
+                errs.append(f"parent table entry of {p:#x} is outside the buffer")
+            elif HEADER_SIZE <= entry and entry + 4 <= elements_off:
                 stored = struct.unpack_from("<I", data, entry)[0]
-                if stored != parent:
-                    errs.append(f"parent table entry of {p:#x} is {stored:#x}, expected {parent:#x}")
+                expected = INVALID if parent is None else parent
+                if stored != expected:
+                    errs.append(f"parent table entry of {p:#x} is {stored:#x}, expected {expected:#x}")
         if kind <= TRI3:
             if not bottom:
                 errs.append(f"triangle node {p:#x} in a top-level BVH")

@@ -18,6 +18,11 @@ fragments, while world fragments do have them; see
 Source resource: `ambient_femalebody_upper_nohead.#ft` in `packs.rpf`, stream offset
 `0x45449F70` (stored 17,434 bytes, inflated 42,384 bytes).
 
+This stream is the **name table**, not the skeleton fragment. `tools/anim_glb.py --skeleton` takes a
+fragment offset; on 1.0.2.1 the sibling `ambient_femalebody_head.#ft` at `0x45417010` exports the
+596-joint skeleton with a 5.13e-6 bind error, while passing `0x45449F70` fails with
+`page directory: not a system pointer`.
+
 | Range | Contents |
 |---|---|
 | `0x0008..0x7FF8` | 4,095-slot hash table, 8 bytes per slot: `u32 joaat32(name)`, `u32 boneIndex` |
@@ -226,6 +231,9 @@ python -I tools/anim_glb.py <package>\packs.rpf --coverage --skeleton <fragment 
     --anim <package>\anim.rpf --jobs 8 --report <work>\coverage.json
 ```
 
+On 1.0.2.1, `--skeleton 0x45417010` names the `ambient_femalebody_head.#ft` fragment;
+`0x45449F70` in the section above is the name-table stream, not a fragment.
+
 Offsets are zlib stream offsets (as `tools/skin_streams.py` and `rpf9dump` report them). The
 output is a standard glTF 2.0 file; Blender and the three.js editor play its animations. What
 it does and why:
@@ -300,6 +308,13 @@ section offsets are also in `drawable.buffers[vertex_buffer].mesh_blob.sections`
 | jacket | 9 | `JOINTS_1` | 314,304 | `0x25` | 39,272 |
 | jacket | 6 | `WEIGHTS_0` | 196,488 | `0x26` | 39,272 |
 | jacket | 7 | `WEIGHTS_1` | 235,760 | `0x26` | 39,272 |
+| *packed layout* | 8, 9 | `JOINTS_0/1`, 4 x u32 | section entry | `0x8C` | 16 x vertices |
+
+Joint slots may also use the packed `R32G32B32A32_UINT` layout, format `0x8C`: 16 bytes
+per vertex, four little-endian u32 words whose low 12 bits are the joint index (bits
+12–31 are a separate unidentified field). The exporter converts it to the same 4 x u8 row
+as `0x25` and rejects an index above 255. Only `0x8C` is accepted: no `0x8B` joint layout
+has been measured, so `0x8B` is rejected rather than guessed.
 
 The output has one skin. Its joints are the full ped skeleton plus any drawable-local helper
 joints named by the palette; a palette hash that resolves nowhere is emitted as
@@ -411,6 +426,11 @@ values are not recoverable by name enumeration. `common.rpf` contains one variat
 `joaat32` of all 67 keys gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for
 Lucia and Monalisa) is a body/height scale, not a name. There is no component/outfit-name
 manager in `common.rpf`; `outfit_NN` exists only as a hash in the packs table.
+values are not recoverable by name enumeration. `common.rpf` holds `CPedVariationBodyTypeManager`
+(77,422 bytes, 67 keys) and `CPedComponentSetManager`; neither maps a variation index to a
+drawable plus texture. The first manager's keys are literal model names, and `joaat32` of all
+67 gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for Lucia and Monalisa) is a
+per-character scale, not a name; `outfit_NN` exists only as a hash in the packs table.
 
 The entities linked to Mandy carry three different per-state archetype hashes
 (`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not
@@ -433,7 +453,7 @@ table, not a unique `mandy` drawable.
 Steps 1-4 were measured with local tools that are not part of this repository; a reader can
 reproduce them with a standard zlib/RPF9 reader:
 
-1. Inflate the `.#ft` stream at `0x45449F70`; parse the 4,095-slot hash table and the
+1. Inflate the `.#ft` **name-table** stream at `0x45449F70`; parse the 4,095-slot hash table and the
    NUL-separated names; verify `joaat32` lowercased.
 2. Inflate the following 131,072-byte graphics page at `0x4544F010`; parse the records at
    `0x110 + 0x50*i`: rotation at +0x00, translation at +0x10, hash at +0x1C, parent at +0x46
