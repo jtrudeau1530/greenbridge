@@ -2,14 +2,16 @@
 
 The input is the GPU test runtime/test/shaders/ps_bary (hand-written, no game data; fixture from regen_fixtures.py).
 It reads the raw barycentric pair (v0 = i, v1 = j) next to v_interp. By default the translator gives the pair as
-BaryCoordKHR.y / .z. With --bary-fallback the same values come from an ordinary vec3 input one location past the
-attributes; tools/bary_fallback_gs.py writes the pass-through geometry shader that fills it. On the GPU,
+BaryCoordKHR.y / .z. With --bary-fallback the same values come from an ordinary vec3 input at the lowest location no
+attribute uses; tools/bary_fallback_gs.py writes the pass-through geometry shader that fills it. On the GPU,
 run_gpu_tests.py / check.py with LEONIDA_BARY_FALLBACK=1 check ps_bary through that GS. Here:
-* the module declares neither the capability nor the extension nor the builtin, and the metadata names the input;
+* the module declares neither the capability nor the extension nor the builtin, and the metadata names the input
+  (the lowest free location, also for sparse attributes such as attr30 alone);
 * the shader reads i and j from the new input exactly as it reads them from BaryCoordKHR (one-lane interpreter);
 * a shader that doesn't read the pair translates to the same module with and without the flag;
 * the GS text has the vertex count, the one-hot weights and the locations the PS expects, and refuses a collision.
 """
+import gc
 import os
 import re
 import shutil
@@ -17,6 +19,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+import warnings
 
 import support
 import rdna2spirv
@@ -57,11 +60,41 @@ class BaryFallbackModule(unittest.TestCase):
         self.assertNotIn("SPV_KHR_fragment_shader_barycentric", spv)
         self.assertNotIn("fragmentShaderBarycentric", meta["features"])
         loc = meta["bary_fallback_input"]["location"]
-        self.assertEqual(loc, max(meta["inputs"]) + 1)
+        self.assertEqual(loc, min(set(range(len(meta["inputs"]) + 1)) - set(meta["inputs"])))   # lowest free
         self.assertIn(f"OpDecorate %bary Location {loc}", spv)
         # Perspective-correct like BaryCoordKHR: no Flat / NoPerspective on it.
         self.assertIsNone(re.search(r"OpDecorate %bary (Flat|NoPerspective)", spv))
         self.assertRegex(spv, r"%bary = OpVariable %_ptr_Input_v3f Input")
+
+    def test_sparse_attributes_take_the_lowest_free_location(self):
+        # A PS whose only attribute is attr30 (#804 review): one past the highest would be 31, beyond what drivers
+        # with 128 fragment input components accept; the lowest free location is 0.
+        with open(os.path.join(support.FIXTURE_DIR, "ps_bary.s"), encoding="utf-8") as f:
+            text = f.read().replace("attr0.", "attr30.")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "disasm"))
+            src = os.path.join(tmp, "disasm", "ps_bary_sparse.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            with open(os.path.join(tmp, "ps_bary_sparse.dxbc"), "wb") as f:
+                f.write(support.STUB_DXBC)
+            old = rdna2spirv.BARY_FALLBACK
+            rdna2spirv.BARY_FALLBACK = True
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", ResourceWarning)
+                    spv = rdna2spirv.translate(src)
+                    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+                    gc.collect()
+            finally:
+                rdna2spirv.BARY_FALLBACK = old
+        self.assertEqual(meta["inputs"], [30])
+        self.assertEqual(meta["bary_fallback_input"], {"location": 0})
+        self.assertIn("OpDecorate %bary Location 0", spv)
+        self.assertIn("OpDecorate %in_attr30 Location 30", spv)
+        gs = bary_fallback_gs.gs_spvasm(meta["inputs"], 0)
+        self.assertIn("OpDecorate %out_bary Location 0", gs)
+        self.assertIn("OpDecorate %out30 Location 30", gs)
 
     def test_same_values_from_either_source(self):
         for fallback in (False, True):

@@ -6369,8 +6369,11 @@ def assemble(gen):
             iface += ["%out_viewport"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"]
     bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values())
-    # --bary-fallback: %bary is a plain input one location past the attributes, so no capability or extension.
-    gen.bary_location = (max(gen.inputs.values(), default=-1) + 1) if bary and BARY_FALLBACK else None
+    # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
+    # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
+    # past what drivers with 128 input components accept (#804 review).
+    used = set(gen.inputs.values())
+    gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
     bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs:
         iface += ["%frag_coord"] + (["%front_facing"] if "front" in gen.frag_inputs.values() else []) +             (["%bary"] if bary else [])
