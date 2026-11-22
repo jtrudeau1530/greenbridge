@@ -166,7 +166,9 @@ when the Vulkan SDK is found:
   that fails to load, are printed but don't fail the run; to silence one, set
   `VK_LOADER_LAYERS_DISABLE=<layer name pattern>`.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
-  Vulkan, resizes it, and checks the colour on screen. Set
+  Vulkan, resizes it and presents 10 more, and checks the colour on screen. A driver double then injects an
+  out-of-date and a suboptimal present, a failed semaphore during a swapchain recreation and a failed blit
+  submission, which the presenter must survive. Set
   `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.
 - `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--max-bytes N]` -
   creates a shader module and, for compute shaders, a pipeline for every entry in the translator's

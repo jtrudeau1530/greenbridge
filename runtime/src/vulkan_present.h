@@ -100,7 +100,13 @@ public:
 
     // Blits the colour texture `source` (mip 0, layer 0, in D3D12's PRESENT state) to the window and presents it.
     // vsync: FIFO; otherwise MAILBOX or IMMEDIATE when the surface has them. VK_SUCCESS also covers a skipped
-    // present (minimised window); VK_ERROR_OUT_OF_DATE_KHR only if recreating the swapchain failed.
+    // present (minimised window) and one the surface reported out of date (the swapchain is recreated next time);
+    // VK_ERROR_OUT_OF_DATE_KHR means recreating the swapchain failed, and the next present tries again.
+    //
+    // A failure after an image was acquired (the blit's submission) is recovered here, so the next present does not
+    // wait on a fence nothing will signal: an empty batch takes the acquire semaphore and signals the frame's fence,
+    // and the swapchain is recreated next time, which gives back the image that was never presented. If even that
+    // batch fails, the presenter stops (ok() is false) and its owner has to make a new one.
     VkResult present(ResourceId source, bool vsync) {
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
         if (vsync != vsync_ || stale_) {
@@ -110,10 +116,12 @@ public:
             stale_ = true;
             return VK_SUCCESS;
         }
+        if (!presentable(source)) return VK_ERROR_UNKNOWN;  // checked before an image is acquired for it
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         Frame& frame = frames_[frame_index_ % frames_.size()];
-        vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX);
+        if (const VkResult waited = vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX); waited != VK_SUCCESS)
+            return stop(waited);
 
         std::uint32_t image = 0;
         VkResult acquired = vkAcquireNextImageKHR_(device, swapchain_, UINT64_MAX, frame.acquired, VK_NULL_HANDLE, &image);
@@ -122,17 +130,21 @@ public:
             if (!swapchain_) return VK_SUCCESS;
             acquired = vkAcquireNextImageKHR_(device, swapchain_, UINT64_MAX, frame.acquired, VK_NULL_HANDLE, &image);
         }
-        if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;
+        if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;  // nothing was acquired
         if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
 
+        bool recorded = false;
         {
             // The back buffer's layout is tracked like any other texture; this holds the context while it is read.
             std::lock_guard lock(context_.mutex_);
             const ResourceBinding* binding = context_.resolve(source);
-            if (!binding || !binding->image || binding->aspects != VK_IMAGE_ASPECT_COLOR_BIT) return VK_ERROR_UNKNOWN;
-            record(frame.commands, *binding, source, image);
+            if (binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
+                record(frame.commands, *binding, source, image);
+                recorded = true;
+            }
         }
-        vkResetFences_(device, 1, &frame.done);
+        if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since presentable()
+        if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) return stop(reset);
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.waitSemaphoreCount = 1;
@@ -148,19 +160,21 @@ public:
         present.swapchainCount = 1;
         present.pSwapchains = &swapchain_;
         present.pImageIndices = &image;
-        VkResult result;
+        VkResult submitted, result = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
-            result = vk.vkQueueSubmit(queue_, 1, &submit, frame.done);
-            if (result != VK_SUCCESS) return result;
-            result = vkQueuePresentKHR_(queue_, &present);
+            submitted = vk.vkQueueSubmit(queue_, 1, &submit, frame.done);
+            if (submitted == VK_SUCCESS) result = vkQueuePresentKHR_(queue_, &present);
         }
+        if (submitted != VK_SUCCESS) return give_back(frame, submitted);
         ++frame_index_;
+        // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
+        // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) ++presented_;
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
             stale_ = true;
             result = VK_SUCCESS;
         }
-        if (result == VK_SUCCESS) ++presented_;
         return result;
     }
 
@@ -170,6 +184,41 @@ private:
         VkFence done = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
     };
+
+    // Whether `source` is a colour texture the device knows, so present() can refuse it before acquiring an image.
+    bool presentable(ResourceId source) {
+        std::lock_guard lock(context_.mutex_);
+        const ResourceBinding* binding = context_.resolve(source);
+        return binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT;
+    }
+
+    // An image was acquired into `frame` but its blit was not submitted. An empty batch waits on the acquire
+    // semaphore and signals the frame's fence, so both are usable again; the swapchain is recreated on the next
+    // present, which gives back the image that was never presented. Returns `failure`, the error to report.
+    VkResult give_back(Frame& frame, VkResult failure) {
+        const VkDevice device = context_.device();
+        if (vkResetFences_(device, 1, &frame.done) != VK_SUCCESS) return stop(failure);
+        const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.waitSemaphoreCount = 1;
+        submit.pWaitSemaphores = &frame.acquired;
+        submit.pWaitDstStageMask = &wait_stage;
+        VkResult submitted;
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            submitted = context_.vk.vkQueueSubmit(queue_, 1, &submit, frame.done);
+        }
+        if (submitted != VK_SUCCESS) return stop(failure);
+        stale_ = true;
+        return failure;
+    }
+
+    // The frame's fence or acquire semaphore can no longer be trusted: no more presents (ok() is false), and the
+    // owner makes a new presenter. Returns `failure`.
+    VkResult stop(VkResult failure) {
+        ok_ = false;
+        return failure;
+    }
 
     void record(VkCommandBuffer commands, const ResourceBinding& binding, ResourceId source, std::uint32_t image) {
         auto& vk = context_.vk;
@@ -222,7 +271,9 @@ private:
     }
 
     // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
-    // swapchain and is retried on the next present.
+    // swapchain and is retried on the next present. Nothing is published until every piece exists: on any failure
+    // the presenter is left with no swapchain and stale_ set, so the next present tries again, and no image is ever
+    // acquired without its per-image semaphore.
     bool recreate(bool vsync) {
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
@@ -230,17 +281,21 @@ private:
             std::lock_guard lock(context_.submit_mutex());
             vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
         }
+        stale_ = true;  // until this succeeds
         VkSurfaceCapabilitiesKHR caps{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
-        vsync_ = vsync;
-        stale_ = false;
         VkSwapchainKHR old = swapchain_;
         swapchain_ = VK_NULL_HANDLE;
         if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
             release(old);
+            vsync_ = vsync;
+            stale_ = false;
             return true;
         }
-        if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return false;
+        if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            release(old);
+            return false;
+        }
 
         std::uint32_t count = 0;
         vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr);
@@ -282,22 +337,35 @@ private:
         info.presentMode = mode;
         info.clipped = VK_TRUE;
         info.oldSwapchain = old;
-        const VkResult created = vkCreateSwapchainKHR_(device, &info, nullptr, &swapchain_);
-        release(old);
-        if (created != VK_SUCCESS) {
-            swapchain_ = VK_NULL_HANDLE;
+        VkSwapchainKHR fresh = VK_NULL_HANDLE;
+        const VkResult created = vkCreateSwapchainKHR_(device, &info, nullptr, &fresh);
+        release(old);  // retired by the creation attempt, whether or not it succeeded
+        if (created != VK_SUCCESS) return false;
+
+        std::vector<VkImage> images;
+        std::vector<VkSemaphore> ready;
+        const auto discard = [&] {
+            for (VkSemaphore semaphore : ready) vk.vkDestroySemaphore(device, semaphore, nullptr);
+            vkDestroySwapchainKHR_(device, fresh, nullptr);
             return false;
+        };
+        if (vkGetSwapchainImagesKHR_(device, fresh, &count, nullptr) != VK_SUCCESS || !count) return discard();
+        images.resize(count);
+        if (vkGetSwapchainImagesKHR_(device, fresh, &count, images.data()) != VK_SUCCESS) return discard();
+        images.resize(count);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            VkSemaphore semaphore = VK_NULL_HANDLE;
+            if (vk.vkCreateSemaphore(device, &semaphore_info, nullptr, &semaphore) != VK_SUCCESS) return discard();
+            ready.push_back(semaphore);
         }
+        swapchain_ = fresh;
+        images_ = std::move(images);
+        ready_ = std::move(ready);
         format_ = chosen.format;
         extent_ = caps.currentExtent;
-        vkGetSwapchainImagesKHR_(device, swapchain_, &count, nullptr);
-        images_.resize(count);
-        vkGetSwapchainImagesKHR_(device, swapchain_, &count, images_.data());
-        ready_.assign(count, VK_NULL_HANDLE);
-        for (VkSemaphore& semaphore : ready_) {
-            VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-            if (vk.vkCreateSemaphore(device, &semaphore_info, nullptr, &semaphore) != VK_SUCCESS) return false;
-        }
+        vsync_ = vsync;
+        stale_ = false;
         return true;
     }
 

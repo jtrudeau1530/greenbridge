@@ -319,7 +319,8 @@ What is implemented (all of it testable without the game):
 
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it, as it does
   `occlusionQueryPrecise` and `pipelineStatisticsQuery` for the query heaps.
-- **Presentation** (`runtime/src/vulkan_present.h`, `rt::d3d12::create_window_presenter`). This is the part every
+- **Presentation** (`leonida::VulkanPresenter` in `runtime/src/vulkan_present.h`, which
+  `rt::d3d12::create_window_presenter` makes for a device and a window). This is the part every
   present front end needs; DXGI or `PresentX` is still open (question 6). It takes a back buffer, an ordinary
   texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image, scaling when the window
   size differs. The blit goes on the same `VkQueue` after the application's work, so the frame contains everything
@@ -328,7 +329,16 @@ What is implemented (all of it testable without the game):
   - FIFO when vsync is asked for, otherwise MAILBOX or IMMEDIATE;
   - the swapchain is recreated on resize or when the surface reports it out of date or suboptimal, and a minimised
     window skips presents;
-  - a back buffer that was never written is zero-filled like any other texture.
+  - a back buffer that was never written is zero-filled like any other texture;
+  - `presented()` counts the presents the engine took (`VK_SUCCESS` or `VK_SUBOPTIMAL_KHR`), not ones it reported
+    out of date;
+  - a recreation is published only when the swapchain, its images and every per-image semaphore exist. On a
+    failure the partial objects are released and the next present tries again, so no image is acquired without
+    its semaphore;
+  - if the blit's submission fails after an image was acquired, an empty batch takes the acquire semaphore and
+    signals the frame's fence, and the swapchain is recreated next time to get the image back. The next present
+    therefore does not wait forever on a fence nothing signals. If even that batch fails, or a fence wait or reset
+    fails, the presenter stops (`ok()` is false) and its owner makes a new one.
 
   The device needs `VK_KHR_swapchain` (and the instance the surface extensions). The standalone device enables
   them when present.
@@ -552,8 +562,18 @@ and any validation error fails them.
     destroyed, from the view's own bytes.
 - `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
   the back buffer `PRESENT` → `RENDER_TARGET`, clear, move it back, execute, present, signal a fence. It then
-  resizes the window, which recreates the swapchain and scales the blit, and switches to unsynchronised presents.
-  Last, it reads the colour on screen with GDI when the window is in front.
+  resizes the window and presents 10 more (70 in all), which recreates the swapchain, scales the blit and switches
+  to unsynchronised presents. Last, it reads the colour on screen with GDI when the window is in front.
+  - The device and the presenter get their Vulkan functions through a driver double in the test. It forwards to
+    the real driver, counts the presents the driver reports out of date (the frame counts allow for them), and
+    tracks the binary semaphores alive.
+  - Through the double, the test reports one successful present as out of date (not counted) and one as
+    suboptimal (counted).
+  - It fails the second per-image semaphore of a recreation: only the two acquire semaphores may remain, and a
+    retry at the same vsync must make a complete swapchain.
+  - It fails one blit submission: the next four presents must go through without hanging.
+  - Run against the presenter before these fixes, the test fails at the frame count after the resize, where the
+    driver reported a real out-of-date present (RTX 5060 Ti, driver 621.24).
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.

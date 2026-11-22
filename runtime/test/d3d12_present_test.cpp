@@ -10,6 +10,9 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <string_view>
+#include <vector>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -49,6 +52,86 @@ void set_client_size(HWND window, int width, int height) {
                  SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
 }
 
+// A driver double around the real driver: the device and the presenter get their functions through it
+// (VulkanDeviceInfo::get_instance_proc). It forwards every call, and when armed makes one queue submission fail
+// without submitting, reports one present that succeeded as another status, or fails one semaphore allocation. It
+// also counts the presents the real driver reported out of date, and the binary semaphores alive.
+namespace driver {
+PFN_vkGetInstanceProcAddr real_get_instance = nullptr;
+PFN_vkGetDeviceProcAddr real_get_device = nullptr;
+PFN_vkQueueSubmit real_submit = nullptr;
+PFN_vkQueuePresentKHR real_present = nullptr;
+PFN_vkCreateSemaphore real_create_semaphore = nullptr;
+PFN_vkDestroySemaphore real_destroy_semaphore = nullptr;
+VkResult fail_next_submit = VK_SUCCESS;  // armed: the next vkQueueSubmit returns this and submits nothing
+VkResult next_present = VK_SUCCESS;      // armed: the next present that succeeds reports this instead
+int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore from now fails
+unsigned out_of_date = 0;                // presents the real driver reported out of date
+std::vector<VkSemaphore> binary;         // binary semaphores alive (the device's fences are timeline ones)
+
+VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits,
+                                            VkFence fence) {
+    if (fail_next_submit != VK_SUCCESS) {
+        const VkResult failure = fail_next_submit;
+        fail_next_submit = VK_SUCCESS;
+        return failure;
+    }
+    return real_submit(queue, count, submits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue queue, const VkPresentInfoKHR* info) {
+    VkResult result = real_present(queue, info);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) ++out_of_date;
+    if (result == VK_SUCCESS && next_present != VK_SUCCESS) {
+        result = next_present;
+        next_present = VK_SUCCESS;
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL create_semaphore(VkDevice device, const VkSemaphoreCreateInfo* info,
+                                                const VkAllocationCallbacks* allocator, VkSemaphore* out) {
+    if (fail_semaphore_in && --fail_semaphore_in == 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    const VkResult result = real_create_semaphore(device, info, allocator, out);
+    bool timeline = false;
+    for (auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next; next = next->pNext)
+        if (next->sType == VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO)
+            timeline = reinterpret_cast<const VkSemaphoreTypeCreateInfo*>(next)->semaphoreType ==
+                       VK_SEMAPHORE_TYPE_TIMELINE;
+    if (result == VK_SUCCESS && !timeline) binary.push_back(*out);
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_semaphore(VkDevice device, VkSemaphore semaphore,
+                                            const VkAllocationCallbacks* allocator) {
+    std::erase(binary, semaphore);
+    real_destroy_semaphore(device, semaphore, allocator);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
+    const std::string_view n = name;
+    if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
+    if (n == "vkQueuePresentKHR") return reinterpret_cast<PFN_vkVoidFunction>(queue_present);
+    if (n == "vkCreateSemaphore") return reinterpret_cast<PFN_vkVoidFunction>(create_semaphore);
+    if (n == "vkDestroySemaphore") return reinterpret_cast<PFN_vkVoidFunction>(destroy_semaphore);
+    return real_get_device(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
+    if (std::string_view(name) == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    return real_get_instance(instance, name);
+}
+
+void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDevice device) {
+    real_get_instance = instance_proc;
+    real_get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(instance, "vkGetDeviceProcAddr"));
+    real_submit = reinterpret_cast<PFN_vkQueueSubmit>(real_get_device(device, "vkQueueSubmit"));
+    real_present = reinterpret_cast<PFN_vkQueuePresentKHR>(real_get_device(device, "vkQueuePresentKHR"));
+    real_create_semaphore = reinterpret_cast<PFN_vkCreateSemaphore>(real_get_device(device, "vkCreateSemaphore"));
+    real_destroy_semaphore = reinterpret_cast<PFN_vkDestroySemaphore>(real_get_device(device, "vkDestroySemaphore"));
+}
+}  // namespace driver
+
 }  // namespace
 
 int main() {
@@ -77,8 +160,9 @@ int main() {
     const FLOAT colour[4] = {0.2f, 0.6f, 0.9f, 1.0f};
     bool screen_checked = false;
     {
+        driver::install(d.instance_proc, d.instance, d.device);
         rt::d3d12::VulkanDeviceInfo info{};
-        info.get_instance_proc = d.instance_proc;
+        info.get_instance_proc = driver::get_instance;
         info.instance = d.instance;
         info.physical = d.physical;
         info.device = d.device;
@@ -132,7 +216,8 @@ int main() {
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         ID3D12CommandList* lists[] = {list.p};
         UINT64 signalled = 0;
-        const auto frame = [&](UINT sync_interval) -> bool {
+        // `arm` runs just before the present, so an injection it sets up hits the presenter, not the list's work.
+        const auto frame = [&](UINT sync_interval, const std::function<void()>& arm = {}) -> bool {
             pump();
             if (FAILED(fence->SetEventOnCompletion(signalled, nullptr))) return false;  // the list's last run is done
             if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return false;
@@ -146,12 +231,19 @@ int main() {
             if (FAILED(list->Close())) return false;
             queue->ExecuteCommandLists(1, lists);
             if (rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success) return false;
-            if (FAILED(presenter->present(back_buffer.p, sync_interval))) return false;
+            if (arm) arm();
+            const HRESULT presented = presenter->present(back_buffer.p, sync_interval);
+            driver::fail_next_submit = VK_SUCCESS;  // whatever the present did not use
+            driver::next_present = VK_SUCCESS;
+            driver::fail_semaphore_in = 0;
+            if (FAILED(presented)) return false;
             return SUCCEEDED(queue->Signal(fence.p, ++signalled));
         };
 
+        // Every present is counted unless the surface reported it out of date, which the driver may do around a
+        // resize; the double counts those.
         for (int i = 0; i < 60; ++i) EXPECT(frame(1));
-        EXPECT(presenter->presented() == 60);
+        EXPECT(presenter->presented() == 60 - driver::out_of_date);
         const VkExtent2D first = presenter->extent();
         EXPECT(first.width == width && first.height == height);
 
@@ -160,8 +252,45 @@ int main() {
         set_client_size(window, 400, 300);
         for (int i = 0; i < 10; ++i) EXPECT(frame(i < 5 ? 1 : 0));
         EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
-        EXPECT(presenter->presented() == 70);
+        EXPECT(presenter->presented() == 70 - driver::out_of_date);
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
+        const unsigned real_out_of_date = driver::out_of_date;
+
+        // Failures injected by the driver double (VictorJulianiR's review of the presenter):
+        // 1. Present statuses: OUT_OF_DATE was not shown, so it is not counted; SUBOPTIMAL was, so it is.
+        std::uint64_t before = presenter->presented();
+        EXPECT(frame(0, [] { driver::next_present = VK_ERROR_OUT_OF_DATE_KHR; }));
+        EXPECT(presenter->presented() == before);
+        EXPECT(frame(0));  // recreates the swapchain the out-of-date present asked for
+        before = presenter->presented();
+        EXPECT(frame(0, [] { driver::next_present = VK_SUBOPTIMAL_KHR; }));
+        EXPECT(presenter->presented() == before + 1);
+        EXPECT(frame(0));
+
+        // 2. A swapchain recreation (here for a vsync change) whose second per-image semaphore cannot be made fails
+        //    whole: the half-made semaphores and swapchain go, and a retry at the same vsync makes a complete one
+        //    instead of acquiring an image without its semaphore (validation would report a null semaphore).
+        //    The device makes only timeline semaphores, so the binary ones are the presenter's: one acquire
+        //    semaphore per frame in flight (2) and one per swapchain image.
+        EXPECT(driver::binary.size() > 2);
+        EXPECT(!frame(1, [] { driver::fail_semaphore_in = 2; }));
+        EXPECT(driver::binary.size() == 2);  // the old swapchain's went, and nothing of the new set is left
+        before = presenter->presented();
+        EXPECT(frame(1));
+        EXPECT(presenter->presented() == before + 1 && driver::binary.size() > 2);
+
+        // 3. A submit that fails after an image was acquired: present reports it, and the next present neither
+        //    waits forever on the frame's fence nor reuses a semaphore that is still pending.
+        before = presenter->presented();
+        EXPECT(!frame(1, [] { driver::fail_next_submit = VK_ERROR_OUT_OF_HOST_MEMORY; }));
+        EXPECT(presenter->presented() == before);
+        const unsigned out_of_date_before = driver::out_of_date;
+        for (int i = 0; i < 4; ++i) EXPECT(frame(1));  // both frames in flight come round again
+        EXPECT(presenter->presented() == before + 4 - (driver::out_of_date - out_of_date_before));
+        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
+        std::printf("injected: out-of-date and suboptimal presents counted apart, a failed swapchain recreation "
+                    "released and retried, a failed blit submission recovered (%u real out-of-date presents)\n",
+                    real_out_of_date);
 
         // What reached the screen: the centre of the client area, if the window is in front.
         Sleep(200);
