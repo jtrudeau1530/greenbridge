@@ -129,6 +129,7 @@ class Oracle:
         self.workdir = workdir or tempfile.mkdtemp(prefix="leonida-hw-oracle-")
         self.exe = self._build_launcher()
         self.device = self._probe()
+        self._probe_waves()
 
     def _build_launcher(self):
         src = os.path.join(HERE, "hw_oracle.c")
@@ -159,6 +160,21 @@ class Oracle:
         if "arch=" in head and self.arch not in head:
             raise Unavailable(f"device reports {head!r} but assembling for {self.arch} (set LEONIDA_HW_ARCH)")
         return head.lstrip("# ")
+
+    def _probe_waves(self):
+        """Each wave size really runs as that size: a 64-thread group stores v_mbcnt lane ids. In a wave64 kernel
+        thread 32 is lane 32 (mbcnt_hi adds 32); in a wave32 kernel it is lane 0 of the second wave. A runtime that
+        ignored the wave size in the code object would fail here instead of producing plausible-looking data."""
+        store = "global_store_b32" if asm.family(self.arch) == "gfx11" else "global_store_dword"
+        tail = ["v_lshlrev_b32 v2, 2, v0", f"{store} v2, v1, s[2:3]", "s_endpgm"]
+        lo = ["v_mbcnt_lo_u32_b32 v1, -1, 0"]
+        k64 = asm.Kernel(lo + ["v_mbcnt_hi_u32_b32 v1, -1, v1"] + tail, 64, 64, 64, raw=True)
+        k32 = asm.Kernel(lo + tail, 32, 64, 64, raw=True)
+        w64, w32 = self.run([k64, k32], words=64)
+        if w64 != list(range(64)):
+            raise RuntimeError(f"wave64 probe: lane ids {w64!r}; the runtime did not run the kernel as wave64")
+        if w32 != list(range(32)) * 2:
+            raise RuntimeError(f"wave32 probe: lane ids {w32!r}; the runtime did not run the kernel as wave32")
 
     def _assemble(self, text, wave=32):
         s = os.path.join(self.workdir, "k.s")

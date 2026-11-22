@@ -418,7 +418,13 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   without them matched too, so the generator does not reach a hazard on this GPU). With `translator,hw`, a program
   where the hardware differs from the model also prints what the translator did with it.
   `hyp_confirmed` counts programs with a hypothesis op that matched on the hardware, split into `hyp_permlane`
-  (FI = 0 source lane off in EXEC keeps vD) and `hyp_dpp` (DPP8 source lane off in EXEC with fi = 0 reads 0).
+  (FI = 0 source lane off in EXEC keeps vD; the claim comes from the oracle measurements in #374 on RDNA2 and
+  RDNA3.5, and #580 models it in the translator) and `hyp_dpp` (DPP8 source lane off in EXEC with fi = 0 reads 0;
+  the claim is #238's, and nothing measured it before this oracle). On the hardware path a hypothesis that fails
+  is a falsified claim: it counts as a mismatch (exit 1) and in `hyp_only`, and `--minimize` marks the
+  hypothesis ops that remain. A startup probe checks that a wave64 kernel runs as wave64 (lane 32 reads 32) and a
+  wave32 kernel as wave32, so a runtime that ignored the wave size would fail loudly. `--keep` writes the kernel
+  body that ran.
   GFX11 differences looked at, none of which changes a result for what the generator emits: the assembler takes
   the same `row_share`/`row_xmask`/`dpp8`/`fi`/`bound_ctrl:1` and `v_permlane16/x16` spellings for gfx1030 and
   gfx1150; `row_newbcast`, `row_bcast` and `wave_shl` exist on neither (not generated); `v_cmpx_*_e32` writes EXEC
@@ -428,9 +434,11 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   needed a skip, so `hw_skip_reason` returns none and the only skips are assembler rejections (none seen). It is
   still gfx1150, not RDNA2.
   First results (Radeon 880M, driver 26.11.2): 24,000 programs on the hardware, half wave32 and half native
-  wave64, seeds 11 to 16, with and without `--dpp`, 12 to 60 ops, with and without `--no-maskdata`: 0 mismatches
-  and 0 assembler rejections. Of them 7,000 or so contained a permlane with an inactive source lane or a DPP8
-  with an inactive source lane, and all of those matched, so both hypotheses are now measured on gfx1150 as well.
+  wave64, seeds 11 to 16 (4,000 programs each), with and without `--dpp`, 12 to 60 ops, with and without
+  `--no-maskdata` and `--no-hw-guard`: match 24,000, mismatch 0, hyp_only 0, rejected 0. 7,652 of them contained
+  a permlane with an inactive source lane or a DPP8 with an inactive source lane (`hyp_confirmed`: 3,567 in
+  wave32, 4,085 in wave64) and every one matched, so both hypotheses hold on gfx1150 in both wave sizes. RDNA2
+  itself is not measured by this run.
   Against the translator (`translator,hw`, 200 programs, seed 7): every translator mismatch of this build had
   masks read as plain data (#293); with `--no-maskdata` it has 0 mismatches and only the known permlane
   `hyp_only` cases (#580). The hardware agrees with the model on both, so those are translator gaps, not model

@@ -953,18 +953,20 @@ def main():
             if args.keep:
                 os.makedirs(args.keep, exist_ok=True)
                 with open(os.path.join(args.keep, f"{p.name}_{mode}.asm"), "w", encoding="utf-8") as f:
-                    f.write(p.source())
-            if args.minimize and bad and what == "mismatch":
+                    f.write(kept_source(p, mode, None, not args.no_hw_guard))
+            if args.minimize and bad and what.startswith("mismatch"):
                 if mode == "hw":
                     ops = minimize_hw(p, oracle, not args.no_hw_guard)
                 elif mc is not None:
                     ops = minimize(p, mode, (mc, args.exe))
                 else:
                     continue
-                print("  minimized:\n\t" + "\n\t".join(o.text for o in ops))
+                hyp_ops = p.expected(ops)[1]
+                print("  minimized:\n\t" + "\n\t".join(o.text + ("   ; hypothesis op" if i in hyp_ops else "")
+                                                         for i, o in enumerate(ops)))
                 if args.keep:
                     with open(os.path.join(args.keep, f"{p.name}_{mode}_min.asm"), "w", encoding="utf-8") as f:
-                        f.write(p.source(ops))
+                        f.write(kept_source(p, mode, ops, not args.no_hw_guard))
     finally:
         if oracle:
             oracle.close()
@@ -972,6 +974,13 @@ def main():
     for key, st in sorted(stats.items()):
         print(f"  {key}: " + ", ".join(f"{k} {v}" for k, v in st.items()))
     return 1 if any(st["mismatch"] or st["rejected"] for st in stats.values()) else 0
+
+
+def kept_source(prog, mode, ops, guard):
+    """What --keep writes: for a hardware failure the kernel body that actually ran, else the translator input."""
+    if mode == "hw":
+        return "\n".join(prog.hw_lines(ops, guard)) + "\n"
+    return prog.source(ops)
 
 
 def hw_skip_reason(prog, arch):
@@ -1010,12 +1019,13 @@ def run_hw(oracle, progs, stats, fails, guard=True):
             for kind in sorted({t for i in hyp for t in getattr(p.ops[i], "tags", {p.ops[i].tag})
                                 if t in ("permlane", "dpp")}):
                 st["hyp_" + kind] = st.get("hyp_" + kind, 0) + 1
-        elif hyp:
-            st["hyp_only"] += 1
-            fails.append((p, "hw", "mismatch (program has a hypothesis op)", bad))
         else:
+            # On the hardware a failing hypothesis is a falsified claim, and it could hide a model bug elsewhere in
+            # the program, so it is a mismatch like any other (hyp_only counts the ones that had a hypothesis op).
             st["mismatch"] += 1
-            fails.append((p, "hw", "mismatch", bad))
+            if hyp:
+                st["hyp_only"] += 1
+            fails.append((p, "hw", "mismatch" + (" (program has a hypothesis op)" if hyp else ""), bad))
 
 
 def minimize_hw(prog, oracle, guard=True):
@@ -1027,8 +1037,7 @@ def minimize_hw(prog, oracle, guard=True):
                                      prog.group * len(OUT_REGS), raw=True)])[0]
         if isinstance(got, str):
             return False
-        bad, hyp = compare(prog, got, ops)
-        return bool(bad) and not hyp
+        return bool(compare(prog, got, ops)[0])
     ops = list(prog.ops)
     for i in range(len(ops) - 1, -1, -1):
         trial = ops[:i] + ops[i + 1:]

@@ -276,8 +276,11 @@ class HardwareOracle(unittest.TestCase):
             X.run_hw(oracle, progs, stats, fails)
         finally:
             oracle.close()
-        self.assertEqual([(p.name, w) for p, _, w, _ in fails if w.startswith("mismatch")], [])
+        self.assertEqual([(p.name, w) for p, _, w, _ in fails], [])
         self.assertEqual(sum(st["programs"] for st in stats.values()), 12)
+        self.assertEqual(sum(st["match"] for st in stats.values()), 12)
+        for st in stats.values():
+            self.assertEqual((st["mismatch"], st["hyp_only"], st["rejected"]), (0, 0, 0))
 
 
 if __name__ == "__main__":
