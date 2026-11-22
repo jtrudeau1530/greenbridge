@@ -16,6 +16,7 @@ foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -Filter *.rpf | Sort-Ob
     if (-not (Test-Path -LiteralPath (Join-Path $dest "index.json"))) {
         Write-Host ("{0:HH:mm:ss} carving {1} ({2:N1} GiB)" -f (Get-Date), $rel, ($f.Length / 1GB))
         python -I $tool $f.FullName $dest | Select-Object -Last 1
+        if ($LASTEXITCODE -ne 0) { throw "Carving $rel failed (exit $LASTEXITCODE)" }
     }
     $s = (Get-Content -LiteralPath (Join-Path $dest "index.json") -Raw | ConvertFrom-Json).summary
     $rows += [pscustomobject]@{ archive = $rel; files = $s.files; bink2 = $s.bink2_files; span = $s.span
