@@ -275,6 +275,7 @@ def is_scanned_input(path, input_path, pattern):
         return True
     if not os.path.isdir(input_path) or not os.path.isfile(path):
         return False
+    pattern = pattern or "*.bin"
     # Walk up from the report path and compare each folder like same_report_path does (normcase, realpath,
     # samefile), so a spelling that differs only in case, or goes through a link, is still inside the input.
     target = os.path.abspath(path)
@@ -282,15 +283,13 @@ def is_scanned_input(path, input_path, pattern):
     while not same_report_path(root, input_path):
         parent = os.path.dirname(root)
         if parent == root:
-            return False
+            break
         root = parent
-    pattern = pattern or "*.bin"
-    if (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
-            or fnmatch.fnmatch(os.path.basename(target), pattern)):
-        return True
-    # The spelling may not match while the file is still one the scan reads: fnmatch folds case only on Windows,
-    # so CARVE/PAGE.BIN on a case-insensitive macOS or Linux volume, or a hard link, slips past the pattern. Ask
-    # the scan's own glob whether any file it reads is this one.
+    else:
+        if (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
+                or fnmatch.fnmatch(os.path.basename(target), pattern)):
+            return True
+    # A different spelling or a hard link anywhere can still refer to a scanned file.
     return any(same_report_path(target, scanned)
                for scanned in glob.iglob(
                    os.path.join(glob.escape(os.fspath(input_path)), "**", pattern), recursive=True))
