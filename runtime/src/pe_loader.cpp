@@ -357,8 +357,8 @@ void* bundled_find_loaded(void* ctx, const std::string& dll_lower) {
     return static_cast<Loader*>(ctx)->find_loaded_module(dll_lower);
 }
 
-void* bundled_load(void* ctx, const std::string& dll_lower, bool& handled) {
-    return static_cast<Loader*>(ctx)->load_runtime_module(dll_lower, handled);
+void* bundled_load(void* ctx, const std::string& dll_lower, uint32_t flags, bool& handled) {
+    return static_cast<Loader*>(ctx)->load_runtime_module(dll_lower, flags, handled);
 }
 
 void* bundled_get_proc(void* ctx, void* module, const std::string& sym, bool& owns_handle) {
@@ -448,16 +448,32 @@ void* Loader::find_loaded_module(const std::string& dll_lower) const {
     return it == by_name_.end() ? nullptr : static_cast<void*>(it->second->base);
 }
 
-void* Loader::load_runtime_module(const std::string& dll_lower, bool& handled) {
+void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
     handled = false;
     if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
 
     std::lock_guard lock(mutex_);
-    if (auto it = by_name_.find(dll_lower); it != by_name_.end()) {
-        handled = true;
+    const auto existing = by_name_.find(dll_lower);
+    const std::filesystem::path candidate = game_dir_ / dll_lower;
+    std::error_code ec;
+    const bool is_bundled = existing != by_name_.end() || std::filesystem::is_regular_file(candidate, ec);
+    if (!is_bundled) return nullptr;
+
+    handled = true;
+    // Win32 DONT_RESOLVE_DLL_REFERENCES (0x1) forbids resolving dependencies or running TLS/DllMain; refuse it
+    // explicitly instead of silently performing a normal resolving + initialising load.
+    if ((flags & DONT_RESOLVE_DLL_REFERENCES) != 0) {
+        std::fprintf(stderr,
+                     "[rt] loader: LoadLibraryEx(%s, DONT_RESOLVE_DLL_REFERENCES) is not supported for bundled DLLs\n",
+                     dll_lower.c_str());
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+
+    if (existing != by_name_.end()) {
         try {
             initialise();
-            return static_cast<void*>(it->second->base);
+            return static_cast<void*>(existing->second->base);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[rt] loader: run-time initialise of %s failed: %s\n", dll_lower.c_str(), e.what());
             SetLastError(ERROR_DLL_INIT_FAILED);
@@ -465,11 +481,6 @@ void* Loader::load_runtime_module(const std::string& dll_lower, bool& handled) {
         }
     }
 
-    const std::filesystem::path candidate = game_dir_ / dll_lower;
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(candidate, ec)) return nullptr;
-
-    handled = true;
     try {
         Module& m = load(candidate);
         initialise();
