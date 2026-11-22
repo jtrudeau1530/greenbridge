@@ -1156,6 +1156,53 @@ class StructuredEmulationTests(unittest.TestCase):
         for lane in range(64):
             self.assertEqual(mem[lane * 4], lane + 64, f"lane {lane}")
 
+    def test_monotone_dirty_transfer_no_phantom_clear_after_x_round(self):
+        # Regression: an x_round (v_readlane_b32) clears g.x_dirty in codegen before a subsequent
+        # buffer_store + ds_read. A non-monotone transfer_superblock that cleared on phantom conflicts
+        # with an earlier block's ('lds','w') wiped ('mem','w') from dirty_in[blk3] and dropped the
+        # OpControlBarrier required before blk3's cross-half buffer_load.
+        insns = [
+            ("s_or_b64 exec, exec, exec", 4),
+            ("s_mov_b32 s4, 0", 4),
+            ("s_cmp_eq_u32 s4, 0", 4),
+            ("v_lshlrev_b32_e32 v10, 2, v0", 4),
+            ("v_add_nc_u32_e32 v1, 7, v0", 4),
+            ("ds_write_b32 v10, v1", 8),
+            ("s_cbranch_scc0 1", 4),
+            ("s_nop 0", 4),
+            ("v_readlane_b32 s5, v0, 33", 4),
+            ("buffer_store_dword v1, v10, s[0:3], 0 offen", 8),
+            ("ds_read_b32 v2, v10", 8),
+            ("s_branch 0", 4),
+            # Read the opposite half of the wave (lane ^ 32) from global memory: requires a barrier!
+            ("v_xor_b32_e32 v11, 32, v0", 4),
+            ("v_lshlrev_b32_e32 v11, 2, v11", 4),
+            ("buffer_load_dword v3, v11, s[0:3], 0 offen", 8),
+            ("v_add_nc_u32_e32 v3, v3, v2", 4),
+            ("buffer_store_dword v3, v10, s[0:3], 0 offen offset:512", 8),
+            ("s_endpgm", 4),
+        ]
+        for lx, expected_mode in ((64, "inline_all"), (128, "structured_hybrid")):
+            spv, gen = _translate_encoded(f"cs_monotone_dirty_{lx}", insns, (lx, 1, 1), emulate=True, rsrc2=0x20088)
+            self.assertEqual(gen.control_flow, "emulated wave64 structured")
+            self.assertEqual(gen.emulate_plan["mode"], expected_mode)
+            self.assertIn(("mem", "w"), gen.emulate_plan["dirty_in"][3])
+            lines = spv.splitlines()
+            i2 = next(i for i, l in enumerate(lines) if l.strip().startswith("%blk2 = OpLabel"))
+            i3 = next(i for i, l in enumerate(lines) if l.strip().startswith("%blk3 = OpLabel"))
+            blk2_to_end = lines[i2:]
+            store_idx = next(i for i, l in enumerate(blk2_to_end)
+                             if "OpStore" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
+            i3_rel = i3 - i2
+            load_idx = next(i for i, l in enumerate(blk2_to_end[i3_rel:], i3_rel)
+                            if "OpLoad %uint" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
+            self.assertTrue(any("OpControlBarrier" in l for l in blk2_to_end[store_idx:load_idx]),
+                            f"missing OpControlBarrier between blk2 buffer_store and blk3 buffer_load ({expected_mode})")
+            mem, _ = run_emulated_workgroup(spv, (lx, 1, 1), push_constants=VSHARP + [0] * 28)
+            for lane in range(lx):
+                partner = lane ^ 32
+                self.assertEqual(mem[512 + lane * 4], (partner + 7) + (lane + 7), f"lx={lx} lane={lane}")
+
 
 if __name__ == "__main__":
     unittest.main()

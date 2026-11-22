@@ -1040,7 +1040,13 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
         sb_mem_stats[b] = (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w)
 
     def transfer_superblock(b, d_in):
-        """Conservative under-approximate barrier clearing + exact x_memory_order dirty transfer."""
+        """Strictly monotone GEN/KILL dirty transfer over superblock `b`.
+
+        Only unconditional barriers (`s_barrier` and voted branches `s_cbranch_execz/nz/vccz/nz`) clear `d`.
+        Never clears on `d_in`-induced or intra-block memory conflicts: if an earlier `x_round` (e.g.
+        `v_readlane_b32`) or an earlier conflict cleared `g.x_dirty` in codegen, a phantom clear here could
+        wipe a live dirty domain written afterward and drop a required cross-block `OpControlBarrier`.
+        """
         d = set(d_in)
         chain = chain_of[b]
         for idx_c, cur in enumerate(chain):
@@ -1060,16 +1066,12 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
                 acc = _x_memory_order_access(op)
                 if acc is not None:
                     kind, r, w = acc
-                    if (kind, "w") in d or (w and (kind, "r") in d):
-                        d.clear()
                     if r:
                         d.add((kind, "r"))
                     if w:
                         d.add((kind, "w"))
             if cur in folds:
                 fd = folds[cur]
-                if _dirty_conflicts(d, fd["mem_reads"], fd["mem_writes"]):
-                    d.clear()
                 for k in fd["mem_reads"]:
                     d.add((k, "r"))
                 for k in fd["mem_writes"]:
