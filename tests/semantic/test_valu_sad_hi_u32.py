@@ -25,6 +25,8 @@ Mathematical Properties and Bounds:
       ((v_sad_hi_u32(s0, s1, s2) << 32) | v_sad_u32(s0, s1, s2)) == |src0 - src1| + src2.
 """
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
 import unittest
 
@@ -73,6 +75,74 @@ def ref_sad_full_64(s0: int, s1: int, s2: int) -> Tuple[int, int, int]:
     lo = sum64 & MASK32
     hi = (sum64 >> 32) & MASK32
     return lo, hi, sum64
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a register operand or inline literal constant."""
+    reg_type: RegType
+    index: int = 0
+    literal_value: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_value is None:
+                raise ValueError("Literal operand requires literal_value")
+            if not (0 <= self.literal_value <= MASK32):
+                raise ValueError(f"Literal value {self.literal_value:#x} out of range [0, 0xFFFFFFFF]")
+
+    @classmethod
+    def vgpr(cls, index: int) -> Operand:
+        return cls(RegType.VGPR, index=index)
+
+    @classmethod
+    def sgpr(cls, index: int) -> Operand:
+        return cls(RegType.SGPR, index=index)
+
+    @classmethod
+    def literal(cls, value: int) -> Operand:
+        return cls(RegType.LITERAL, literal_value=u32(value))
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        if self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        assert self.literal_value is not None
+        return f"0x{self.literal_value:08X}"
+
+
+@dataclass(frozen=True)
+class VSadHiU32Instruction:
+    """Symbolic AST node for RDNA2 v_sad_hi_u32 instruction."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        return f"v_sad_hi_u32 {self.dst.disassemble()}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+
 
 
 # ==============================================================================
@@ -165,6 +235,56 @@ class TestValuSadHiU32Oracle(unittest.TestCase):
                 reconstructed = (hi << 32) | lo
                 expected = ref_abs_diff_u32(s0, s1) + u32(s2)
                 self.assertEqual(reconstructed, expected)
+
+
+class TestValuSadHiU32SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_operand_creation_and_disassembly(self) -> None:
+        v0 = Operand.vgpr(0)
+        v255 = Operand.vgpr(255)
+        s10 = Operand.sgpr(10)
+        lit = Operand.literal(0x12345678)
+
+        self.assertEqual(v0.disassemble(), "v0")
+        self.assertEqual(v255.disassemble(), "v255")
+        self.assertEqual(s10.disassemble(), "s10")
+        self.assertEqual(lit.disassemble(), "0x12345678")
+
+    def test_operand_index_bounds_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_instruction_construction_and_disassembly(self) -> None:
+        instr = VSadHiU32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(4),
+            src2=Operand.literal(1),
+        )
+        self.assertEqual(instr.disassemble(), "v_sad_hi_u32 v0, v1, s4, 0x00000001")
+
+    def test_destination_must_be_vgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            VSadHiU32Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
+        with self.assertRaises(TypeError):
+            VSadHiU32Instruction(
+                dst=Operand.literal(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
 
 
 if __name__ == "__main__":
