@@ -1196,7 +1196,8 @@ public:
         };
         std::shared_ptr<OcclusionSegmentPool> physical, statistics;
         if (segments && !segment_pool(VK_QUERY_TYPE_OCCLUSION, segments, physical)) return ReplayResult::unsupported;
-        if (statistics_segments &&
+        // Without the compute helper a split query could not be summed: leave statistics queries whole, as before.
+        if (statistics_segments && can_resolve_occlusion &&
             !segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
             return ReplayResult::unsupported;
         QueryReplay queries;
