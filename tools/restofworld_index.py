@@ -269,11 +269,28 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     return rows, summary
 
 
+def _carve_index(path):
+    """rpf9_carve.py's index.json in `path`: ({file name: stored bytes}, summary), or ({}, {}) without one."""
+    try:
+        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        stored = {f"{int(e['off']):012x}.bin": int(e["stored"]) for e in index.get("files", [])}
+        summary = index.get("summary", {})
+        return stored, summary if isinstance(summary, dict) else {}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}, {}
+
+
 def scan_dir(path, max_inflate=MAX_INFLATE):
-    """Index already-carved files. A leading hexadecimal file name supplies the offset."""
+    """Index already-carved files. A leading hexadecimal file name supplies the offset.
+
+    With rpf9_carve.py's index.json in the folder, each file's stored (compressed) size and the carve's span,
+    zero padding and unread bytes come from it, so compressed_bytes and readable_fraction mean what they mean in
+    archive mode. Without it, a file's stored size can only be its length on disk (the inflated size)."""
     rows = []
     skipped = 0
     t0 = time.time()
+    carve_stored, carve_summary = _carve_index(path)
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         if not os.path.isfile(full) or not (name.endswith(".bin") or name.endswith(".bk2")):
@@ -285,13 +302,18 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
         offset = int(found.group(1), 16) if found else len(rows)
         with open(full, "rb") as f:
             data = f.read()
+        stored = carve_stored.get(name, len(data))
         if len(data) >= 3 and data[:3] == b"KB2":
-            row = classify(data, offset, len(data))
+            row = classify(data, offset, stored)
         else:
-            row = classify(data, offset, len(data))
+            row = classify(data, offset, stored)
             row["size"] = len(data)
         rows.append(row)
-    summary = summarise(rows, sum(r["stored"] for r in rows), 0, 0)
+    if carve_stored and "span" in carve_summary:
+        summary = summarise(rows, int(carve_summary["span"]), int(carve_summary.get("zero_padding", 0)),
+                            int(carve_summary.get("unread_bytes", 0)))
+    else:
+        summary = summarise(rows, sum(r["stored"] for r in rows), 0, 0)
     summary.update(mode="directory", directory=path, elapsed_seconds=round(time.time() - t0, 3),
                    skipped_candidates=skipped)
     return rows, summary

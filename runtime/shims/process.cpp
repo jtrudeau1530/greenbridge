@@ -38,8 +38,6 @@ std::wstring g_wcmdline;
 int g_argc = 0;
 char** g_argv_ptr = nullptr;
 wchar_t** g_wargv_ptr = nullptr;
-char** g_env = nullptr;
-wchar_t** g_wenv = nullptr;
 
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_exited{false};
@@ -130,17 +128,40 @@ C* after_program_name(C* p) {
 char* __cdecl game_get_narrow_winmain_command_line() { return after_program_name(g_cmdline.data()); }
 wchar_t* __cdecl game_get_wide_winmain_command_line() { return after_program_name(g_wcmdline.data()); }
 
+// The host CRT's environment tables, read when the game asks (RT-136). _environ and _wenviron are not stable: the host
+// CRT builds the wide table only when a wide environment function first runs (a host started through main() has
+// none until then), and _putenv/_wputenv reallocate both, so a pointer taken in set_command_line would be null or
+// dangling by the time a wide-character startup calls __wgetmainargs. A lookup of a name no one sets makes the CRT
+// create the table if it does not exist yet (from the other table or the OS block) without changing it.
+// Like the msvcrt.dll original, the returned table is the CRT's own and is only valid until the next _putenv: a CRT
+// startup reads it once, before the game has other threads, and a host that edits its environment concurrently with
+// a game's startup is not covered.
+char** current_environment() {
+    if (!_environ) {
+        size_t size = 0;
+        (void)getenv_s(&size, nullptr, 0, "LEONIDA_RT_ENV_INIT");
+    }
+    return _environ;
+}
+wchar_t** current_wide_environment() {
+    if (!_wenviron) {
+        size_t size = 0;
+        (void)_wgetenv_s(&size, nullptr, 0, L"LEONIDA_RT_ENV_INIT");
+    }
+    return _wenviron;
+}
+
 // msvcrt.dll: int __getmainargs(int* argc, char*** argv, char*** env, int expand, void* startinfo)
 int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int, void*) {
     *argc = g_argc;
     *argv = g_argv_ptr;
-    if (env) *env = g_env;
+    if (env) *env = current_environment();
     return 0;
 }
 int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, void*) {
     *argc = g_argc;
     *argv = g_wargv_ptr;
-    if (env) *env = g_wenv;
+    if (env) *env = current_wide_environment();
     return 0;
 }
 
@@ -179,8 +200,6 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
     g_argc = static_cast<int>(g_args.size());
     g_argv_ptr = g_argv.data();
     g_wargv_ptr = g_wargv.data();
-    g_env = _environ;
-    g_wenv = _wenviron;
 }
 
 int run_entry(void* entry, size_t stack_bytes) {

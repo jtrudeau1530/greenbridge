@@ -434,5 +434,34 @@ class ArchiveTest(unittest.TestCase):
                     m.close()
 
 
+
+class FolderModeStoredBytesTest(unittest.TestCase):
+    """A carve folder's stored (compressed) sizes and span come from rpf9_carve.py's index.json, as in archive mode;
+    without an index the length on disk is all there is."""
+
+    def make(self, tmp, with_index):
+        data = b"raw bytes " * 100                                   # 1,000 inflated bytes
+        with open(os.path.join(tmp, "000000001000.bin"), "wb") as f:
+            f.write(data)
+        if with_index:
+            index = {"summary": {"span": 2000, "zero_padding": 500, "unread_bytes": 1200},
+                     "files": [{"off": 0x1000, "stored": 300, "size": 1000}]}
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                json.dump(index, f)
+
+    def test_index_json_supplies_stored_bytes_and_span(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, with_index=True)
+            rows, summary = restofworld_index.scan_dir(tmp)
+        self.assertEqual(rows[0]["stored"], 300)
+        self.assertEqual((summary["compressed_bytes"], summary["inflated_bytes"]), (300, 1000))
+        self.assertAlmostEqual(summary["readable_fraction"], 300 / 2000, places=4)
+
+    def test_without_an_index_the_length_on_disk_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, with_index=False)
+            rows, summary = restofworld_index.scan_dir(tmp)
+        self.assertEqual((rows[0]["stored"], summary["compressed_bytes"]), (1000, 1000))
+
 if __name__ == "__main__":
     unittest.main()
