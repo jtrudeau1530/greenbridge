@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 
@@ -35,7 +36,12 @@ namespace rt::startup_trace {
 
 namespace detail {
 inline std::atomic<bool> on{false};
-inline std::mutex mutex;
+// Intentionally immortal: vectored exception handlers or late teardown paths can still run after normal statics would
+// have been destroyed.
+inline std::mutex& mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
 inline FILE* file = nullptr;
 inline unsigned long long seq = 0;
 inline std::chrono::steady_clock::time_point start;
@@ -65,7 +71,7 @@ inline void append_escaped(std::string& out, const char* s, size_t n) {
 }
 }  // namespace detail
 
-inline bool enabled() noexcept { return detail::on.load(std::memory_order_relaxed); }
+inline bool enabled() noexcept { return detail::on.load(std::memory_order_acquire); }
 
 // A JSON string literal, quotes included.
 inline std::string quote(const std::string& s) {
@@ -87,7 +93,7 @@ inline std::string where(uint64_t address) { return shims::module_offset(address
 // `fields` is the rest of the object, already JSON: `"module":"a.dll","result":1`. Empty is allowed.
 inline void event(const char* kind, const std::string& fields = {}) {
     if (!enabled()) return;
-    const std::lock_guard lock(detail::mutex);
+    const std::lock_guard lock(detail::mutex());
     if (!detail::file) return;
     const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - detail::start).count();
     std::fprintf(detail::file, "{\"seq\":%llu,\"t\":%.6f,\"kind\":\"%s\"%s%s}\n", ++detail::seq, t, kind,
@@ -151,10 +157,8 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
     return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
-inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
-    if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
-    in_handler = true;
-    const EXCEPTION_RECORD& r = *info->ExceptionRecord;
+inline void log_exception(const EXCEPTION_POINTERS& info) {
+    const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
         if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
             std::string text = debug_text(r);
@@ -169,23 +173,43 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
-            if (info->ContextRecord) f += ",\"stack\":" + stack_from(*info->ContextRecord);
+            if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }
     } catch (...) {
         // Out of memory while formatting: drop the event rather than disturb the process.
     }
+}
+
+inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
+    if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    in_handler = true;
+#ifdef _MSC_VER
+    // Under /EHsc, catch(...) does not catch SEH faults (e.g. a bad DBG_PRINTEXCEPTION_C pointer or corrupt unwind).
+    // Keep the __try frame free of C++ destructors so in_handler is always reset and the exception still propagates.
+    __try {
+        log_exception(*info);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+#else
+    struct Reset {
+        ~Reset() { in_handler = false; }
+    } reset;
+    log_exception(*info);
+#endif
     in_handler = false;
     return EXCEPTION_CONTINUE_SEARCH;
 }
 }  // namespace detail
+
+inline void close();
 
 // Creates the trace file and installs the exception handler. The file must not exist yet ("x" mode): the trace is
 // opened before the loader reads anything, so overwriting would let `--trace` destroy an input, such as the image
 // itself. Returns false if the file exists or cannot be created; `error`, when given, receives the errno.
 inline bool open(const wchar_t* path, int* error = nullptr) {
     {
-        const std::lock_guard lock(detail::mutex);
+        const std::lock_guard lock(detail::mutex());
         if (detail::file) return true;
         const errno_t e = _wfopen_s(&detail::file, path, L"wxb");
         if (e != 0 || !detail::file) {
@@ -195,19 +219,21 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
         }
         detail::start = std::chrono::steady_clock::now();
         detail::seq = 0;
+        static const int atexit_registered = std::atexit(&close);
+        (void)atexit_registered;
     }
-    detail::on.store(true, std::memory_order_relaxed);
     detail::veh = AddVectoredExceptionHandler(1, &detail::handler);
+    detail::on.store(true, std::memory_order_release);
     event("trace_open", "\"pid\":" + std::to_string(GetCurrentProcessId()));
     return true;
 }
 
-// Removes the handler and closes the file (tests; gta6rt keeps the trace open until the process ends).
+// Removes the handler and closes the file (tests and process exit via atexit).
 inline void close() {
-    detail::on.store(false, std::memory_order_relaxed);
+    detail::on.store(false, std::memory_order_release);
     if (detail::veh) RemoveVectoredExceptionHandler(detail::veh);
     detail::veh = nullptr;
-    const std::lock_guard lock(detail::mutex);
+    const std::lock_guard lock(detail::mutex());
     if (detail::file) std::fclose(detail::file);
     detail::file = nullptr;
 }

@@ -160,7 +160,8 @@ def main():
         data = f.read()[a.offset:]
     # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
     block = 4 if a.bpe in (8, 16) else 1
-    wb, hb = a.width // block, a.height // block
+    wb = (a.width + block - 1) // block
+    hb = (a.height + block - 1) // block
     res = []
     for tname, entries in tables.items():
         bits = block_bits(tname)

@@ -103,13 +103,71 @@ class FallbackPixelShader(unittest.TestCase):
         words = support.mrt0_words(spv, inputs={k: v for k, v in self.inputs().items() if k != "%in_f16h0_1"})
         self.assertEqual([f"{w & 0xFFFF:#06x}" for w in words[:2]], ["0x3f00", "0x3f00"])
 
-    def test_location_clash_is_rejected(self):
-        """attr28 read as f32 sits where attr0's low halves go: refuse instead of reading the wrong data."""
+    def test_location_clash_packs_dynamically(self):
+        """SHADER-378: attr28 read as f32 sits where attr0's canonical low half (28) would go: pack attr0's halves
+        into the highest free locations <= 29 instead of rejecting."""
         clash = ["v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
                  "v_interp_p1_f32_e32 v3, v0, attr28.x", "v_interp_p2_f32_e32 v3, v1, attr28.x",
                  "exp mrt0 v2, v3, v3, v3 done vm", "s_endpgm"]
-        with self.assertRaises(rdna2spirv.Unsupported):
-            translate("ps_f16_clash", clash)
+        spv, meta = translate("ps_f16_packed", clash)
+        self.assertEqual(meta["f16_halves"], {"0": [27, 29]})
+        self.assertIn("OpDecorate %in_f16h0_0 Location 27", spv)
+        self.assertIn("OpDecorate %in_attr28 Location 28", spv)
+        self.assertEqual(meta["inputs"], [27, 28])
+        words = support.mrt0_words(spv, inputs={"%in_f16h0_0": (lerp(LO), 0.0, 0.0, 0.0),
+                                                "%in_attr28": (0.6875, 0.0, 0.0, 0.0)})
+        self.assertEqual(f"{words[0] & 0xFFFF:#06x}", "0x3f00")
+        self.assertEqual(f32(words[1]), 0.6875)
+
+    def test_corpus_high_attr_patterns_pack_within_moltenvk_budget(self):
+        """SHADER-378: corpus PS patterns (raw attrs 0..14 with f16 reads on attrs >= 7, up to attr12) pack all
+        decoded halves into free locations <= 29 without colliding with any raw attribute."""
+        lines = []
+        for a in range(15):
+            lines += [f"v_interp_p1_f32_e32 v{10 + a}, v0, attr{a}.x",
+                      f"v_interp_p2_f32_e32 v{10 + a}, v1, attr{a}.x"]
+        for i, a in enumerate((0, 4, 5, 6, 7)):
+            v = 30 + i
+            lines += [f"v_interp_p1ll_f16 v{v}, v0, attr{a}.x",
+                      f"v_interp_p2_f16 v{v}, v1, attr{a}.x, v{v}"]
+        lines += ["v_interp_p1ll_f16 v40, v0, attr7.x high",
+                  "v_interp_p2_f16 v40, v1, attr7.x, v40 high",
+                  "exp mrt0 v34, v40, v24, v10 done vm", "s_endpgm"]
+        spv, meta = translate("ps_f16_corpus_pack", lines)
+        self.assertEqual(meta["f16_halves"], {
+            "0": [28, 29], "4": [26, 27], "5": [24, 25], "6": [22, 23], "7": [20, 21],
+        })
+        self.assertLessEqual(max(meta["inputs"]), 29)
+        self.assertEqual(len(meta["inputs"]), len(set(meta["inputs"])))
+        inputs = {f"%in_attr{a}": (float(a), 0.0, 0.0, 0.0) for a in range(15)}
+        for a in (0, 4, 5, 6):
+            inputs[f"%in_f16h{a}_0"] = (0.0, 0.0, 0.0, 0.0)
+        inputs["%in_f16h7_0"] = (lerp(LO), 0.0, 0.0, 0.0)
+        inputs["%in_f16h7_1"] = (lerp(HI), 0.0, 0.0, 0.0)
+        words = support.mrt0_words(spv, inputs=inputs)
+        self.assertEqual(f"{words[0] & 0xFFFF:#06x}", "0x3f00")      # attr7 low: 1.75
+        self.assertEqual(f"{words[1] & 0xFFFF:#06x}", "0x4880")      # attr7 high: 9.0
+        self.assertEqual(f32(words[2]), 14.0)                         # raw attr14
+
+    def test_high_attr_negative_canonical_slot_packs_dynamically(self):
+        """attr15 has canonical slot 28 - 30 = -2; dynamic packing still places it in 0..29."""
+        lines = ["v_interp_p1ll_f16 v2, v0, attr15.x", "v_interp_p2_f16 v2, v1, attr15.x, v2",
+                 "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]
+        spv, meta = translate("ps_f16_attr15", lines)
+        self.assertEqual(meta["f16_halves"], {"15": [28, 29]})
+        self.assertIn("OpDecorate %in_f16h15_0 Location 28", spv)
+
+    def test_location_budget_overflow_is_rejected(self):
+        """29 raw attributes (0..28) plus 1 f16 attribute needs 31 locations > 30: still rejected."""
+        lines = []
+        for a in range(29):
+            lines += [f"v_interp_p1_f32_e32 v{10 + a}, v0, attr{a}.x",
+                      f"v_interp_p2_f32_e32 v{10 + a}, v1, attr{a}.x"]
+        lines += ["v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
+                  "exp mrt0 v2, v10, v10, v10 done vm", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported) as ctx:
+            translate("ps_f16_overflow", lines)
+        self.assertIn("decoded-half locations", str(ctx.exception))
 
     def test_off_by_default(self):
         spv, meta = translate("ps_f16_fallback", SHADER.splitlines(), fallback=False)
@@ -169,6 +227,42 @@ class FallbackVertexShader(unittest.TestCase):
         spv, meta = translate("vs_f16_fallback", VS.splitlines(), fallback=False)
         self.assertNotIn("%out_f16h", spv)
         self.assertNotIn("f16_halves", meta)
+
+
+class FallbackStagePair(unittest.TestCase):
+    def test_producer_output_budget_at_the_pixel_inputs(self):
+        # Each vertex writes the same values, so smooth interpolation preserves them.
+        vs = ["v_mov_b32_e32 v1, 0x42004000",  # packed f16: low 2.0, high 3.0
+              "v_mov_b32_e32 v2, 0x40a00000",  # ordinary f32: 5.0
+              "v_mov_b32_e32 v3, 0x40e00000",  # ordinary f32: 7.0
+              "exp pos0 v1, v1, v1, v1 done", "exp param0 v1, v1, v1, v1"]
+        ps = ["v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
+              "v_interp_p1ll_f16 v3, v0, attr0.x high", "v_interp_p2_f16 v3, v1, attr0.x, v3 high",
+              "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"]
+        pixel, pixel_meta = translate("ps_budget", ps)
+        self.assertEqual(pixel_meta["f16_halves"], {"0": [28, 29]})
+        for exports, expected in (
+                (["exp param27 v2, v2, v2, v2"], (2.0, 3.0)),
+                (["exp param28 v2, v2, v2, v2"], (5.0, None)),
+                (["exp param28 v2, v2, v2, v2", "exp param29 v3, v3, v3, v3"], (5.0, 7.0))):
+            with self.subTest(exports=exports):
+                vertex, vertex_meta = translate("vs_budget", vs + exports + ["s_endpgm"])
+                fits = expected == (2.0, 3.0)
+                self.assertEqual(vertex_meta.get("f16_halves", {}), pixel_meta["f16_halves"] if fits else {})
+                outputs = run_fragment(vertex)
+                # Link the two translated modules by their emitted SPIR-V Location decorations.
+                locations = {loc: tuple(f32(w) for w in outputs[var]) for var, loc in
+                             re.findall(r"OpDecorate (%out_\w+) Location (\d+)", vertex)}
+                pixel_inputs = dict(re.findall(r"OpDecorate (%in_\w+) Location (\d+)", pixel))
+                if expected[1] is None:
+                    # The high-half input is unbound. Check the interface without inventing its value.
+                    self.assertEqual(set(pixel_inputs.values()) - locations.keys(), {"29"})
+                    self.assertEqual(locations[pixel_inputs["%in_f16h0_0"]][0], expected[0])
+                    continue
+                inputs = {var: locations[loc] for var, loc in pixel_inputs.items()}
+                words = support.mrt0_words(pixel, inputs=inputs)
+                actual = tuple(struct.unpack("<e", struct.pack("<H", w & 0xffff))[0] for w in words[:2])
+                self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":

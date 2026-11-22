@@ -358,7 +358,8 @@ public:
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
-        render_targets_.assign(count, {});
+        render_targets_.fill({});
+        render_target_count_ = count;
         for (UINT i = 0; i < count && targets; ++i) {
             const SIZE_T handle = single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr;
             if (handle) render_targets_[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
@@ -978,7 +979,8 @@ private:
     leonida::IndexBufferView index_{};
     leonida::Viewport viewport_{};
     leonida::Rect scissor_{};
-    std::vector<leonida::TargetView> render_targets_;
+    std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets_{};
+    UINT render_target_count_ = 0;
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
 
@@ -1041,7 +1043,8 @@ private:
         index_ = {};
         viewport_ = {};
         scissor_ = {};
-        render_targets_.clear();
+        render_targets_.fill({});
+        render_target_count_ = 0;
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
         set_pipeline(state);
@@ -1071,10 +1074,10 @@ private:
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
         leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
-                           {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
+                           vertex_buffers_, index_, topology_, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
-                           base_vertex, first_instance};
-        check(list_.draw(draw));
+                           base_vertex, first_instance, render_target_count_};
+        check(list_.draw(std::move(draw)));
     }
 };
 

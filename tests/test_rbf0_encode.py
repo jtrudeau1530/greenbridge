@@ -182,6 +182,27 @@ class Refusals(unittest.TestCase):
         doc["tree"]["content"][0]["value"] = 2**32
         self.assertEqual(self.reason(doc=doc), "value")
 
+    def test_float32_overflow_and_direct_nan(self):
+        doc = rbf0_tree.parse_resource(Stream(False).open("r").float("f", 1.5).close().bytes())
+        doc["tree"]["content"][0]["value"] = 1e40
+        self.assertEqual(self.reason(doc=doc), "value")
+        doc["tree"]["content"][0]["value"] = math.nan
+        self.assertEqual(self.reason(doc=doc), "nan")
+
+    def test_bool_rejected_for_descriptor_and_attrs_declared(self):
+        doc = rbf0_tree.parse_resource(every_record(True))
+        doc["tree"]["attrs_declared"] = True
+        self.assertEqual(self.reason(doc=doc), "value")
+        doc = rbf0_tree.parse_resource(every_record(True))
+        doc["tree"]["attributes"][0]["descriptor"] = True
+        self.assertEqual(self.reason(doc=doc), "descriptor")
+
+    def test_non_dict_doc_and_non_str_text(self):
+        self.assertEqual(self.reason(doc="not-a-dict"), "value")
+        doc = rbf0_tree.parse_resource(Stream(True).open("r").text(b"hi\x00").close().bytes())
+        doc["tree"]["content"][0]["text"] = 123
+        self.assertEqual(self.reason(doc=doc), "value")
+
 
 class Cli(unittest.TestCase):
     def setUp(self):
@@ -235,6 +256,33 @@ class Cli(unittest.TestCase):
                      ["only-report.json"], ["--check", os.path.join(self.tmp.name, "missing")]):
             with self.subTest(argv=argv), self.assertRaises(SystemExit), redirect_stdout(io.StringIO()),                     redirect_stderr(io.StringIO()):
                 rbf0_encode.main(argv)
+
+    def test_malformed_reports_raise_clean_system_exit(self):
+        cases = {
+            "bad-json.json": "{not valid json",
+            "list-root.json": "[]",
+            "bad-resources.json": json.dumps({"tool": "rbf0_tree", "resources": "bad"}),
+        }
+        for filename, content in cases.items():
+            report = os.path.join(self.tmp.name, filename)
+            with open(report, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+            out_dir = os.path.join(self.tmp.name, "out-" + filename)
+            with self.subTest(filename=filename), self.assertRaises(SystemExit):
+                self.run_main(report, out_dir)
+            self.assertFalse(os.path.exists(out_dir))
+
+    def test_write_all_handles_non_int_offset_and_non_dict_resource(self):
+        doc = rbf0_tree.parse_resource(every_record(True))
+        doc["offset"] = "0x100"
+        report = os.path.join(self.tmp.name, "mixed.json")
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"tool": "rbf0_tree", "resources": [doc, "not-a-dict"]}, f)
+        out_dir = os.path.join(self.tmp.name, "out-mixed")
+        code, out = self.run_main(report, out_dir)
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 resource(s) written, 1 refused", out)
+        self.assertTrue(os.path.isfile(os.path.join(out_dir, "00000000.rbf")))
 
 
 if __name__ == "__main__":

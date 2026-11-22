@@ -539,6 +539,15 @@ missing. Exporters must **not** fall back to the first texture in that case; a `
 sheet painted as a base colour is the usual symptom. The hashes are treated as measured corpus
 semantics, not as a claim that they are globally unique across every shader.
 
+`tools/character_textures.py` classifies a decoded `model.json`: it prints each material's slot
+hash, role and texture name, resolves only the five measured character slots, and reports any
+other hash as `unknown 0x...`. A garment-shader material (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`)
+with no `0xC8E8C282` binding is flagged `garment-no-albedo`, so a renderer keeps that part clay
+instead of painting `speculartex` as colour. `--json` and `--csv` write the same rows to a
+report, which may not overwrite an input:
+
+    python -I tools/character_textures.py <model.json|dir> [--json FILE] [--csv FILE]
+
 ### Map material texture parameters
 
 The character table above covers 246 records. Map drawables (buildings, roads, terrain, props) use more

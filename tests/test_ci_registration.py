@@ -15,7 +15,12 @@ drift) and fails on the three ways a test goes missing without CI turning red --
   ``PYTEST_FILE_MARKERS`` and keeps its checks under ``if __name__ == "__main__":`` -- the loop skips it and
   pytest imports it, collects nothing, and the job stays green because the other files supply items; and
 * a file the loop runs with ``python -I`` that only *mentions* ``__main__`` (the loop decides with
-  ``grep -q '__main__'``, which a comment satisfies).
+  ``grep -q '__main__'``, which a comment satisfies), or whose guard is inverted
+  (``if __name__ != "__main__":``) and runs nothing;
+* a semantic file with only module-level ``test*`` functions: ``unittest discover`` collects nothing
+  there, even though pytest would; and
+* a nested ``tests/*/test_*.cjs`` file that ``fnmatch`` matches across ``/`` but the non-recursive
+  ``node --test tests/test_*.cjs`` command never runs.
 
 Only the tracked test files and the workflow are read; no game files, no build tools, no pytest.
 """
@@ -91,12 +96,23 @@ def claimed_test_files(root):
     return sorted(found)
 
 
+def matches_nonrecursive_glob(rel, pattern):
+    """Match the way the shell and ``node --test`` do: ``*`` does not cross ``/``.
+
+    ``fnmatch`` lets ``tests/test_*.cjs`` match ``tests/sub/test_x.cjs``, but the workflow command
+    only expands the top level, so those files would be selected by this test and never run.
+    """
+    directory, _, name = rel.rpartition("/")
+    pattern_dir, _, pattern_name = pattern.rpartition("/")
+    return directory == pattern_dir and fnmatch.fnmatchcase(name, pattern_name)
+
+
 def job_of(root, rel, rules):
     """Which job runs ``rel``: 'stdlib', 'pytest', 'semantic', 'viewer', or None for no job at all."""
     markers, pruned, loop_glob, semantic, viewer = rules
     if rel.startswith(semantic + "/"):
         return "semantic" if fnmatch.fnmatchcase(rel.rsplit("/", 1)[-1], "test*.py") else None
-    if fnmatch.fnmatchcase(rel, viewer):
+    if matches_nonrecursive_glob(rel, viewer):
         return "viewer"
     if rel.startswith(pruned + "/"):
         return None                                # the Python scans prune this whole tree
@@ -108,8 +124,13 @@ def job_of(root, rel, rules):
     return None
 
 
-def defines_a_test(source):
-    """Would the runner find a test here? TestCase subclasses (through local bases) and test* functions."""
+def defines_a_test(source, require_test_case=False):
+    """Would the runner find a test here? TestCase subclasses (through local bases) and test* functions.
+
+    ``unittest discover`` only collects TestCase subclasses, so the semantic job passes
+    ``require_test_case=True``: a module with only ``def test_x(): ...`` runs zero cases there even
+    though pytest would collect it.
+    """
     tree = ast.parse(source)
     bases = {node.name: [ast.unparse(b).rsplit(".", 1)[-1] for b in node.bases]
              for node in tree.body if isinstance(node, ast.ClassDef)}
@@ -127,22 +148,40 @@ def defines_a_test(source):
         return False
 
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-            return True
         if isinstance(node, ast.ClassDef) and is_test_case(node.name):
             if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
                    for item in node.body):
                 return True
+        if not require_test_case and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name.startswith("test"):
+            return True
     return False
 
 
 def has_main_guard(source):
-    """A real ``if __name__ == "__main__":`` block, not just the word in a comment or a docstring."""
+    """A real ``if __name__ == "__main__":`` block that runs something.
+
+    A comment or docstring mentioning ``__main__`` is not enough, and neither is an inverted guard
+    such as ``if __name__ != "__main__": unittest.main()``: ``python -I`` imports the file, the
+    comparison is true, ``unittest.main()`` is skipped, and the process still exits 0.
+    """
+    def is_name(node):
+        return isinstance(node, ast.Name) and node.id == "__name__"
+
+    def is_main(node):
+        return isinstance(node, ast.Constant) and node.value == "__main__"
+
     for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.If):
-            test = ast.dump(node.test)
-            if "__main__" in test and "__name__" in test:
-                return True
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq):
+            continue
+        left, right = test.left, test.comparators[0]
+        if not ((is_name(left) and is_main(right)) or (is_main(left) and is_name(right))):
+            continue
+        if any(isinstance(item, ast.Call) for item in ast.walk(node)):
+            return True
     return False
 
 
@@ -172,7 +211,7 @@ class RepositoryRegistrationTest(unittest.TestCase):
             job = job_of(ROOT, rel, self.rules)
             if job not in ("pytest", "semantic") or not rel.endswith(".py"):
                 continue
-            if not defines_a_test(read(ROOT, rel)):
+            if not defines_a_test(read(ROOT, rel), require_test_case=(job == "semantic")):
                 silent.append((job, rel))
         self.assertEqual(silent, [], "selected by CI, but the runner would collect no test:\n" + "\n".join(
             f"  {rel}: {job} imports it and collects nothing, so the job stays green. Give it a unittest.TestCase "
@@ -191,6 +230,7 @@ class RepositoryRegistrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, ".github", "workflows"))
             os.makedirs(os.path.join(tmp, "tests", "semantic"))
+            os.makedirs(os.path.join(tmp, "tests", "test_nested_dir"))
             with open(os.path.join(tmp, WORKFLOW), "w", encoding="utf-8") as f:
                 f.write(read(ROOT, WORKFLOW))
             def write(name, text):
@@ -209,6 +249,14 @@ class RepositoryRegistrationTest(unittest.TestCase):
             write("tests/semantic/test_case.py", "import unittest\n"
                   "class T(unittest.TestCase):\n    def test_ok(self):\n        pass\n")
             write("tests/semantic/pytest_style.py", "def test_looks_like_a_test():\n    pass\n")
+            # unittest discover ignores module-level test functions, so the semantic job would run zero.
+            write("tests/semantic/test_function_only.py", "def test_passes():\n    pass\n")
+            # The inverted guard passes a substring test but runs nothing under python -I.
+            write("tests/test_inequality_guard.py", "import unittest\n"
+                  "class T(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+                  "if __name__ != \"__main__\":\n    unittest.main()\n")
+            # fnmatch would match this against tests/test_*.cjs, but node --test does not recurse.
+            write("tests/test_nested_dir/test_nested.cjs", "const test = require('node:test');\n")
 
             rules = ci_rules(tmp)
             found = claimed_test_files(tmp)
@@ -219,7 +267,13 @@ class RepositoryRegistrationTest(unittest.TestCase):
             self.assertEqual(selected["tests/test_numpy_probe.py"], "pytest")
             self.assertFalse(defines_a_test(read(tmp, "tests/test_numpy_probe.py")))
             self.assertTrue(defines_a_test(read(tmp, "tests/test_plain.py")))
+            self.assertTrue(has_main_guard(read(tmp, "tests/test_plain.py")))
             self.assertEqual(selected["tests/semantic/test_case.py"], "semantic")
+            self.assertEqual(selected["tests/semantic/test_function_only.py"], "semantic")
+            self.assertFalse(defines_a_test(read(tmp, "tests/semantic/test_function_only.py"),
+                                            require_test_case=True))
+            self.assertFalse(has_main_guard(read(tmp, "tests/test_inequality_guard.py")))
+            self.assertEqual(selected["tests/test_nested_dir/test_nested.cjs"], None)
 
 
 if __name__ == "__main__":

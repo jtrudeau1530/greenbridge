@@ -13,9 +13,11 @@
 // AMD's PC runtime does on RDNA2 and RDNA4 (D3D-65; the console is AMD): 47 measured layouts, see
 // resource_tiling_test. A standard mip may be smaller than a tile and then takes one tile on that axis. An NVIDIA
 // GPU packs from the first mip smaller than a tile on any axis and WARP packs nothing; the test accepts all of
-// them. The packed size is their tight
-// linear size rounded up to whole tiles (at least one); NVIDIA sometimes reports one more. Applications read the
-// numbers rather than assume them, and this layer backs reserved textures fully, so any split is consistent.
+// them. The packed tail takes one tile per tile-depth slice it spans: ceil(depth of the first packed mip / tile
+// depth), so 1 for 2D, as AMD's PC runtime reports on RDNA2 and RDNA4 (83 measured layouts, see
+// resource_tiling_test), and never fewer than the tail's tight linear size in whole tiles. NVIDIA sometimes reports
+// one more. Applications read the numbers rather than assume them, and this layer backs reserved textures fully, so
+// any split is consistent.
 
 #include <algorithm>
 #include <cstdint>
@@ -137,6 +139,7 @@ inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
     // One array slice: standard mips while wider than half a tile or taller than a tile, then the packed tail.
     std::vector<SubresourceTiling> slice(desc.mips);
     std::uint64_t standard_tiles = 0, packed_bytes = 0;
+    std::uint32_t tail_depth = 0;   // depth of the first packed mip
     for (std::uint32_t mip = 0; mip < desc.mips; ++mip) {
         const std::uint64_t w = mip >= 64 ? 1 : std::max<std::uint64_t>(1, desc.width >> mip);
         const std::uint32_t h = mip >= 32 ? 1u : std::max(1u, desc.height >> mip);
@@ -160,11 +163,15 @@ inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
                 up(w, desc.block) * up(h, desc.block) * desc.element_bytes * desc.samples;
             if (d > (max_packed_bytes - packed_bytes) / row_slice_bytes) return false;
             packed_bytes += row_slice_bytes * d;
+            if (result.packed_mips == 0) tail_depth = d;
             ++result.packed_mips;
         }
     }
+    // One tile per tile-depth slice of the tail (AMD), at least its tight size; 1 for 2D.
     const std::uint64_t packed_tiles =
-        result.packed_mips ? std::max<std::uint64_t>(1, up(packed_bytes, tile_size_in_bytes)) : 0;
+        result.packed_mips ? std::max<std::uint64_t>({1, up(packed_bytes, tile_size_in_bytes),
+                                                      up(tail_depth, result.shape.depth)})
+                           : 0;
     if (packed_tiles > max_tiles - standard_tiles) return false;
     const std::uint64_t per_slice = standard_tiles + packed_tiles;
     if (per_slice > max_tiles / layers) return false;
