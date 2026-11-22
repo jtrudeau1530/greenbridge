@@ -326,6 +326,28 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
         self.assertEqual(self.run_stage(), [])
 
+    def test_legacy_completion_marker_with_a_missing_listing_disassembles_everything_again(self):
+        # A disasm.done from before the listings were recorded holds only the llvm-mc signature: with a listing
+        # missing it can't tell which ones are current, so the whole disassembly runs again, not a resume.
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        self.touch(self.spirv, "index.json")
+        with open(os.path.join(self.dxbc, "disasm.done"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(make_game.llvm_mc_signature() + "\n")
+        os.makedirs(os.path.join(self.dxbc, "disasm"))
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+
+        original = self.fake_py
+
+        def disassemble(tool, *args):
+            self.assertNotIn("--skip-existing", args)
+            original(tool, *args)
+
+        with mock.patch.object(self, "fake_py", side_effect=disassemble):
+            self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), [])
+
     def test_old_disassembly_layout_is_rebuilt_in_the_current_location(self):
         self.touch(self.dxbc, "index.json")
         self.touch(self.dxbc, "fssm_index.json")

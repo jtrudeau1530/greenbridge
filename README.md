@@ -124,8 +124,8 @@ Ogg Opus size (the preflight prints this choice when the assets stage is what do
 can sit on another drive. The runtime maps the package in place, so a read-only package drive needs
 `gta6rt --overlay <writable folder>`; `--overlay` is a `gta6rt` option, not a `make_game.py` one. Leave the `.s`
 files in `work/shaders/dxbc/disasm` in place: the next run checks them against the list in `disasm.done` and
-disassembles the missing ones again, then translates every shader again. A `disasm` folder that is a symlink is
-refused when the stage has to clear it.
+disassembles the missing ones again (all of them for a folder whose `disasm.done` predates that list), then
+translates every shader again. A `disasm` folder that is a symlink is refused when the stage has to clear it.
 
 **From a terminal**, with the same behaviour and more control:
 
