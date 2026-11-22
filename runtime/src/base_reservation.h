@@ -41,8 +41,9 @@ inline std::optional<Range> inherited() {
     const DWORD length = GetEnvironmentVariableW(kVariable, value, 64);
     if (!length || length >= 64) return std::nullopt;
     Range r{};
-    if (std::swscanf(value, L"%llx:%llx", reinterpret_cast<unsigned long long*>(&r.base),
-                     reinterpret_cast<unsigned long long*>(&r.size)) != 2 ||
+    // swscanf_s, not swscanf (MSVC's C4996): integer conversions take no buffer sizes, so the parse is the same.
+    if (swscanf_s(value, L"%llx:%llx", reinterpret_cast<unsigned long long*>(&r.base),
+                  reinterpret_cast<unsigned long long*>(&r.size)) != 2 ||
         !r.size)
         return std::nullopt;
     return r;
