@@ -684,6 +684,32 @@ struct DeviceState {
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
     std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
     std::map<leonida::DescriptorKey, VkSampler> sampler_entries;
+    struct CustomBorderColor {
+        bool is_int = false;
+        VkClearColorValue value{};
+        bool operator==(const CustomBorderColor& o) const {
+            return is_int == o.is_int && std::memcmp(&value, &o.value, sizeof(value)) == 0;
+        }
+    };
+    std::vector<CustomBorderColor> border_color_table;
+
+    std::uint32_t register_border_color(bool is_int, const void* components) {
+        std::lock_guard lock(descriptor_mutex);
+        CustomBorderColor entry{};
+        entry.is_int = is_int;
+        std::memcpy(&entry.value, components, sizeof(entry.value));
+        for (std::size_t i = 0; i < border_color_table.size(); ++i) {
+            if (border_color_table[i] == entry) return std::uint32_t(i);
+        }
+        if (border_color_table.size() >= 4000) {
+            log_once("custom sampler border colour table is full (4000 entries); clamping index",
+                     int(border_color_table.size()));
+            return 3999;
+        }
+        const std::uint32_t idx = std::uint32_t(border_color_table.size());
+        border_color_table.push_back(entry);
+        return idx;
+    }
     // A T# names a texture by an address of its own: above 4 GiB, which the GPU address arena for buffers (docs
     // section 3.3) stays below, and 256 bytes apart (the T# keeps addresses in 256-byte units). Nothing
     // dereferences it.
@@ -900,9 +926,23 @@ struct DeviceState {
                          int(sampler.filter_mode));
             }
         }
-        if (sampler.border_color == g::BorderColor::table)
-            log_once("custom sampler border colours are transparent black for now; index",
-                     int(sampler.border_color_index));
+        VkSamplerCustomBorderColorCreateInfoEXT custom_border{
+            VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
+        if (sampler.border_color == g::BorderColor::table) {
+            if (info.custom_border_color && info.custom_border_color_without_format &&
+                sampler.border_color_index < border_color_table.size()) {
+                const auto& entry = border_color_table[sampler.border_color_index];
+                custom_border.customBorderColor = entry.value;
+                custom_border.format = VK_FORMAT_UNDEFINED;
+                sampler_info.borderColor =
+                    entry.is_int ? VK_BORDER_COLOR_INT_CUSTOM_EXT : VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+                custom_border.pNext = sampler_info.pNext;
+                sampler_info.pNext = &custom_border;
+            } else {
+                log_once("custom sampler border colours without VK_EXT_custom_border_color; transparent black instead, index",
+                         int(sampler.border_color_index));
+            }
+        }
         VkSampler vk_sampler = VK_NULL_HANDLE;
         if (!context->vk.vkCreateSampler ||
             context->vk.vkCreateSampler(info.device, &sampler_info, nullptr, &vk_sampler) != VK_SUCCESS)
@@ -2778,7 +2818,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
 }
 
 // The S# of a D3D12 sampler.
-leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc) {
+leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc, DeviceState* state = nullptr) {
     namespace g = leonida::gfx10;
     const auto address = [](D3D12_TEXTURE_ADDRESS_MODE mode) {
         switch (mode) {
@@ -2823,7 +2863,8 @@ leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc) {
     } else if (border[0] == 1 && border[1] == 1 && border[2] == 1 && border[3] == 1) {
         out.border_color = g::BorderColor::opaque_white;
     } else {
-        out.border_color = g::BorderColor::table;  // a colour of the application's: no table is kept for it yet
+        out.border_color = g::BorderColor::table;
+        if (state) out.border_color_index = state->register_border_color(false, border);
     }
     return out;
 }
@@ -4049,7 +4090,7 @@ public:
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc) return;
-        const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler_descriptor(*desc));
+        const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler_descriptor(*desc, &state_));
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         state_.bind_sampler(words);
     }
@@ -4071,17 +4112,23 @@ public:
                                 desc->MipLODBias, desc->MaxAnisotropy, desc->ComparisonFunc, {},
                                 desc->MinLOD,   desc->MaxLOD};
         if (!uint_border) std::memcpy(base.BorderColor, desc->FloatBorderColor, sizeof(base.BorderColor));
-        leonida::gfx10::Sampler sampler = sampler_descriptor(base);
+        leonida::gfx10::Sampler sampler = sampler_descriptor(base, uint_border ? nullptr : &state_);
         if (uint_border) {
             // The S#'s border types are the float ones', plus the layer's integer mark (kIntegerBorderPtr), which
             // gives the integer border its own key and VK_BORDER_COLOR_INT_* in Vulkan.
             namespace g = leonida::gfx10;
             const UINT* c = desc->UintBorderColor;
             const bool black = c[0] == 0 && c[1] == 0 && c[2] == 0;
-            sampler.border_color = black && c[3] == 0                                 ? g::BorderColor::transparent_black
-                                   : black && c[3] == 1                               ? g::BorderColor::opaque_black
-                                   : c[0] == 1 && c[1] == 1 && c[2] == 1 && c[3] == 1 ? g::BorderColor::opaque_white
-                                                                                      : g::BorderColor::table;
+            if (black && c[3] == 0) {
+                sampler.border_color = g::BorderColor::transparent_black;
+            } else if (black && c[3] == 1) {
+                sampler.border_color = g::BorderColor::opaque_black;
+            } else if (c[0] == 1 && c[1] == 1 && c[2] == 1 && c[3] == 1) {
+                sampler.border_color = g::BorderColor::opaque_white;
+            } else {
+                sampler.border_color = g::BorderColor::table;
+                sampler.border_color_index = state_.register_border_color(true, c);
+            }
             sampler.integer_border = true;
         }
         sampler.unnormalized = desc->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
@@ -6174,6 +6221,27 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
 #endif
     info.swapchain_maintenance1 = swapchain_m1_name != nullptr;
 
+    // Optional: VK_EXT_custom_border_color lets samplers use custom float and integer border colours.
+    const bool has_custom_border = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME) == 0;
+    });
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    if (has_custom_border) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &custom_border};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+    }
+    const char* custom_border_name = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+    info.custom_border_color = has_custom_border && custom_border.customBorderColors;
+    info.custom_border_color_without_format = has_custom_border && custom_border.customBorderColorWithoutFormat;
+    if (info.custom_border_color) {
+        custom_border.pNext = enable13.pNext;
+        enable13.pNext = &custom_border;
+    } else {
+        std::fprintf(stderr,
+                     "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
+    }
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
@@ -6195,6 +6263,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
     info.presentation = has_swapchain && instance_has_surface;
+    if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

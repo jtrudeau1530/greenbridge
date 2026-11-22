@@ -141,6 +141,11 @@ struct VulkanDeviceInfo {
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;
+    // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on
+    // `device`: samplers with custom border colours pass them through to Vulkan. Without it, custom border
+    // colours fall back to transparent black.
+    bool custom_border_color = false;
+    bool custom_border_color_without_format = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive

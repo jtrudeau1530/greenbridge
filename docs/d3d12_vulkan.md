@@ -390,9 +390,14 @@ What is implemented (all of it testable without the game):
     with `BORDER_COLOR_PTR = 0x800` (`gfx10::kIntegerBorderPtr`). The hardware reads that pointer only for a table
     colour, and Mesa writes it only for `SQ_TEX_BORDER_COLOR_REGISTER`. The mark gives the integer border its own
     key in the descriptor hash table, so it does not share the float border's `VkSampler`, and `vulkan_sampler`
-    makes it `VK_BORDER_COLOR_INT_*`. Any other colour is a table colour, still transparent black like
-    `CreateSampler`'s custom colours, with no integer mark yet. That includes the bits of `1.0f`, which as integers
-    are not white.
+    makes it `VK_BORDER_COLOR_INT_*`. Any other colour is a table colour (`BorderColor::table`). With
+    `VK_EXT_custom_border_color` (D3D-73), the layer registers custom float and UINT border colours in a device-wide
+    table of up to 4000 entries; the table index is stored in `BORDER_COLOR_PTR [11:0]` of the S#, so distinct custom
+    colours produce distinct keys in the descriptor hash table and distinct `VkSampler` objects. On sampler creation,
+    `VkSamplerCustomBorderColorCreateInfoEXT` passes the colour components with `VK_BORDER_COLOR_FLOAT_CUSTOM_EXT` or
+    `VK_BORDER_COLOR_INT_CUSTOM_EXT` and `format = VK_FORMAT_UNDEFINED` (via `customBorderColorWithoutFormat`). Without
+    the extension, custom colours fall back to transparent black with a diagnostic log line. An integer border colour
+    with the bits of `1.0f` is not white and receives a table colour index.
     `D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES` sets `FORCE_UNNORMALIZED` (word 0, bit 15) and changes nothing
     else; `vulkan_sampler` makes it `unnormalizedCoordinates`. The layer answers `D3D12_OPTIONS17` with
     `NonNormalizedCoordinateSamplersSupported` (core Vulkan, with the same restrictions) and no
@@ -558,7 +563,7 @@ the execute-time scan of section 3.4 (only descriptors made through the device a
 of root signatures, which are not registered yet; the literal S#s of shaders (`literal_samplers` in the index),
 which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
 pipeline creation comes with the shader index, #291);
-custom border colours, and minimum/maximum filters, anisotropy or mirror-once addressing without the Vulkan
+custom border colours without VK_EXT_custom_border_color, and minimum/maximum filters, anisotropy or mirror-once addressing without the Vulkan
 feature, each logged and approximated (note: in Vulkan, `VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT` is
 per-format; because bindless set 0 hashes `T#` and `S#` independently in the shader, `bind_sampler` cannot know
 which image format a sampler will be paired with — on Radeon iGPUs `BC*` formats lack `MINMAX` while uncompressed
@@ -904,6 +909,9 @@ and any validation error fails them.
   - 10 descriptions without flags, which must be byte for byte the same;
   - 6 UINT and float-bit border colours against their float equivalents (the three built-in UINT colours with
     the integer mark, which must decode to `VK_BORDER_COLOR_INT_*`);
+  - custom float and UINT border colours registered in the table on `VK_EXT_custom_border_color` (D3D-73),
+    verifying index reuse for identical colours and distinct S# descriptors for distinct colours or integer vs
+    float representations;
   - 3 non-normalized samplers, which must be `CreateSampler`'s S# with `FORCE_UNNORMALIZED` set;
   - the `D3D12_OPTIONS17` answer;
   - the 22 written-or-refused cases behind the table in section 3.2, compared with the host's PC runtime when

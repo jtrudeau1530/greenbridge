@@ -218,6 +218,8 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.custom_border_color = d.custom_border_color;
+        info.custom_border_color_without_format = d.custom_border_color_without_format;
         Ref<ID3D12Device11> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
         Slots slots;
@@ -276,9 +278,29 @@ int main() {
                     : c[0] == 0 ? VK_BORDER_COLOR_INT_OPAQUE_BLACK
                                 : VK_BORDER_COLOR_INT_OPAQUE_WHITE));
         }
-        EXPECT(via2(with_uint_border(border2, 7, 9, 0, 1)) == via1(with_border(border, 0.25f, 0, 0, 1)));
+        // Custom float border colours and custom UINT border colours are registered in the device table
+        // (D3D-73) and mapped to VK_BORDER_COLOR_FLOAT_CUSTOM_EXT / VK_BORDER_COLOR_INT_CUSTOM_EXT via
+        // VK_EXT_custom_border_color. Identical colours share the table index; distinct colours or integer vs
+        // float with the same bit pattern get distinct table indices and distinct S# descriptors.
+        const std::vector<unsigned char> custom_float_1 = via1(with_border(border, 0.25f, 0, 0, 1));
+        const std::vector<unsigned char> custom_float_2 = via1(with_border(border, 0.25f, 0, 0, 1));
+        EXPECT(custom_float_1 == custom_float_2);
+        const leonida::gfx10::Sampler s_cust_f = leonida::gfx10::decode(words_of(custom_float_1));
+        EXPECT(s_cust_f.border_color == leonida::gfx10::BorderColor::table);
+
+        const std::vector<unsigned char> custom_uint_1 = via2(with_uint_border(border2, 7, 9, 0, 1));
+        const std::vector<unsigned char> custom_uint_2 = via2(with_uint_border(border2, 7, 9, 0, 1));
+        EXPECT(custom_uint_1 == custom_uint_2);
+        const leonida::gfx10::Sampler s_cust_u = leonida::gfx10::decode(words_of(custom_uint_1));
+        EXPECT(s_cust_u.border_color == leonida::gfx10::BorderColor::table);
+        EXPECT(custom_uint_1 != custom_float_1);
+        EXPECT(s_cust_f.border_color_index != s_cust_u.border_color_index);
+
+        // Integer border with 1.0f bits is not white; it is a custom integer table colour.
         const UINT one = 0x3f800000;
-        EXPECT(via2(with_uint_border(border2, one, one, one, one)) == via1(with_border(border, 0.25f, 0, 0, 1)));
+        const std::vector<unsigned char> custom_uint_one = via2(with_uint_border(border2, one, one, one, one));
+        EXPECT(custom_uint_one != via1(with_border(border, 1, 1, 1, 1)));
+        EXPECT(leonida::gfx10::decode(words_of(custom_uint_one)).border_color == leonida::gfx10::BorderColor::table);
         // ...and without the flag, the union's bits are floats.
         D3D12_SAMPLER_DESC2 float_bits = border2;
         for (UINT& c : float_bits.UintBorderColor) c = one;

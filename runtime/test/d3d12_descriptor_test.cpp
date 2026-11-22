@@ -318,6 +318,8 @@ int main() {
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
         info.sampler_filter_minmax = d.sampler_filter_minmax;
+        info.custom_border_color = d.custom_border_color;
+        info.custom_border_color_without_format = d.custom_border_color_without_format;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
