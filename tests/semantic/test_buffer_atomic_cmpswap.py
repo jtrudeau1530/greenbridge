@@ -1466,5 +1466,240 @@ class TestBufferAtomicCmpswapFlags(unittest.TestCase):
         self.assertFalse(flags_no_carry.carry)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+F32_POS_ZERO: int = 0x00000000
+F32_NEG_ZERO: int = 0x80000000
+F32_POS_INF: int = 0x7F800000
+F32_NEG_INF: int = 0xFF800000
+F32_QUIET_NAN: int = 0x7FC00000
+F32_SIGNALING_NAN: int = 0x7F800001
+F32_MIN_SUBNORMAL: int = 0x00000001
+F32_MAX_SUBNORMAL: int = 0x007FFFFF
+F32_MIN_NORMAL: int = 0x00800000
+F32_MAX_NORMAL: int = 0x7F7FFFFF
+
+
+def is_f32_nan(bits: int) -> bool:
+    """Check if 32-bit pattern represents an IEEE 754 NaN."""
+    exp = (bits >> 23) & 0xFF
+    mant = bits & 0x7FFFFF
+    return exp == 0xFF and mant != 0
+
+
+def is_f32_subnormal(bits: int) -> bool:
+    """Check if 32-bit pattern represents a denormalized/subnormal float."""
+    exp = (bits >> 23) & 0xFF
+    mant = bits & 0x7FFFFF
+    return exp == 0 and mant != 0
+
+
+class TestBufferAtomicCmpswapIEEE754(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_bitwise_exact_zeros_do_not_match(self) -> None:
+        # In float math +0.0 == -0.0, but in atomic cmpswap bitwise equality is required.
+        addr = 64
+        self.interp.mem.write_u32(addr, F32_POS_ZERO)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x1234)        # src
+        self.interp.write_reg_u32(RegKind.VGPR, 1, F32_NEG_ZERO)  # cmp (-0.0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)          # vaddr
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        # +0.0 does NOT bitwise match -0.0
+        self.assertFalse(swapped)
+        self.assertEqual(ret, F32_POS_ZERO)
+        self.assertEqual(self.interp.mem.read_u32(addr), F32_POS_ZERO)
+
+    def test_bitwise_exact_zeros_match_when_identical(self) -> None:
+        addr = 64
+        self.interp.mem.write_u32(addr, F32_NEG_ZERO)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, F32_POS_ZERO)  # src
+        self.interp.write_reg_u32(RegKind.VGPR, 1, F32_NEG_ZERO)  # cmp (-0.0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertTrue(swapped)
+        self.assertEqual(ret, F32_NEG_ZERO)
+        self.assertEqual(self.interp.mem.read_u32(addr), F32_POS_ZERO)
+
+    def test_quiet_nan_identical_payload_matches(self) -> None:
+        nan_val = 0x7FC01234
+        self.assertTrue(is_f32_nan(nan_val))
+        addr = 128
+        self.interp.mem.write_u32(addr, nan_val)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0xCAFE)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, nan_val)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertTrue(swapped)
+        self.assertEqual(ret, nan_val)
+        self.assertEqual(self.interp.mem.read_u32(addr), 0xCAFE)
+
+    def test_quiet_nan_differing_payloads_do_not_match(self) -> None:
+        nan1 = 0x7FC00001
+        nan2 = 0x7FC00002
+        addr = 128
+        self.interp.mem.write_u32(addr, nan1)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x9999)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, nan2)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertFalse(swapped)
+        self.assertEqual(ret, nan1)
+        self.assertEqual(self.interp.mem.read_u32(addr), nan1)
+
+    def test_signaling_nan_preserved_without_quietening(self) -> None:
+        self.assertTrue(is_f32_nan(F32_SIGNALING_NAN))
+        addr = 200
+        self.interp.mem.write_u32(addr, 0x1111)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, F32_SIGNALING_NAN)  # src
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x1111)             # cmp
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertTrue(swapped)
+        # Signaling NaN stored bit-for-bit, bit 22 remains 0 (signaling)
+        stored = self.interp.mem.read_u32(addr)
+        self.assertEqual(stored, F32_SIGNALING_NAN)
+        self.assertEqual(stored & 0x00400000, 0)
+
+    def test_infinities_distinct_and_preserved(self) -> None:
+        addr = 256
+        self.interp.mem.write_u32(addr, F32_POS_INF)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, F32_NEG_INF)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        # +inf != -inf
+        self.assertFalse(swapped)
+        self.assertEqual(self.interp.mem.read_u32(addr), F32_POS_INF)
+
+        # Now compare with +inf -> matches
+        self.interp.write_reg_u32(RegKind.VGPR, 0, F32_NEG_INF)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, F32_POS_INF)
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(swapped)
+        self.assertEqual(self.interp.mem.read_u32(addr), F32_NEG_INF)
+
+    def test_subnormals_preserved_no_denorm_flush_to_zero(self) -> None:
+        self.assertTrue(is_f32_subnormal(F32_MIN_SUBNORMAL))
+        self.assertTrue(is_f32_subnormal(F32_MAX_SUBNORMAL))
+
+        addr = 300
+        self.interp.mem.write_u32(addr, F32_MIN_SUBNORMAL)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, F32_MAX_SUBNORMAL)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, F32_MIN_SUBNORMAL)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, swapped, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertTrue(swapped)
+        self.assertEqual(ret, F32_MIN_SUBNORMAL)
+        self.assertEqual(self.interp.mem.read_u32(addr), F32_MAX_SUBNORMAL)
+        self.assertNotEqual(self.interp.mem.read_u32(addr), 0)
+
+    def test_integer_extremes_boundary_values(self) -> None:
+        extremes = [0x00000000, 0xFFFFFFFF, 0x7FFFFFFF, 0x80000000, 0x00000001, 0xFFFFFFFE]
+        addr = 400
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        for i in range(len(extremes) - 1):
+            curr_val = extremes[i]
+            next_val = extremes[i + 1]
+            self.interp.mem.write_u32(addr, curr_val)
+            self.interp.write_reg_u32(RegKind.VGPR, 0, next_val)  # src
+            self.interp.write_reg_u32(RegKind.VGPR, 1, curr_val)  # cmp
+
+            inst = Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_CMPSWAP,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+                mods=BufferAtomicModifiers(glc=True),
+            )
+            ret, swapped, in_bounds = self.interp.step(inst)
+            self.assertTrue(swapped)
+            self.assertEqual(ret, curr_val)
+            self.assertEqual(self.interp.mem.read_u32(addr), next_val)
+
+
 if __name__ == "__main__":
     unittest.main()
