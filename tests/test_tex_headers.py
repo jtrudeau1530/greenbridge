@@ -1094,6 +1094,85 @@ class TestTextureDictionaryParsing(unittest.TestCase):
         self.assertEqual(len(res), 1)
         self.assertEqual(res[0]["name"], "waterfog2")
 
+    def test_tag_validation_rejects_synthetic_0x150000000_offset_zero(self):
+        buf = bytearray(self._create_synthetic_page())
+        # 0x150000000 has high nibble 5 if masked with & 0xF, but high tag is 0x15 != 5
+        struct.pack_into("<Q", buf, 0x170, 0x150000000)
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["name"], "waterfog")
+
+    def test_shifted_table_mixed_dimensions_bc3(self):
+        # 400-byte stream with longer names in 0x140..0x178 shifting table by 8 bytes:
+        # pointers at +0x178 and +0x180, hashes at +0x188 and +0x18C.
+        # mixed dimensions: 64x64 and 512x512 with format 77 (BC3_UNORM).
+        buf = bytearray(400)
+        names = b"water_deep_caustic\x00water_foam\x00"
+        buf[0x140:0x140 + len(names)] = names
+
+        h0 = tex_headers.joaat("water_deep_caustic")
+        h1 = tex_headers.joaat("water_foam")
+        struct.pack_into("<QQ", buf, 0x178, 0x50000040, 0x50000090)
+        struct.pack_into("<II", buf, 0x188, h0, h1)
+
+        # desc 0: 64x64 format 77 (BC3_UNORM)
+        struct.pack_into("<Q", buf, 0x40 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x40 + 0x18, 0x60000000)
+        struct.pack_into("<HHHBB", buf, 0x40 + 0x38, 64, 64, 1, 0, 77)
+        struct.pack_into("<Q", buf, 0x40 + 0x40, (1 << 16) | 0x1)
+
+        # desc 1: 512x512 format 77 (BC3_UNORM)
+        struct.pack_into("<Q", buf, 0x90 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x90 + 0x18, 0x60001000)
+        struct.pack_into("<HHHBB", buf, 0x90 + 0x38, 512, 512, 1, 0, 77)
+        struct.pack_into("<Q", buf, 0x90 + 0x40, (1 << 16) | 0x1)
+
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["name"], "water_deep_caustic")
+        self.assertEqual(res[0]["hash"], h0)
+        self.assertEqual(res[0]["width"], 64)
+        self.assertEqual(res[0]["height"], 64)
+        self.assertEqual(res[0]["format"], 77)
+        self.assertEqual(res[0]["format_name"], "BC3_UNORM")
+
+        self.assertEqual(res[1]["name"], "water_foam")
+        self.assertEqual(res[1]["hash"], h1)
+        self.assertEqual(res[1]["width"], 512)
+        self.assertEqual(res[1]["height"], 512)
+        self.assertEqual(res[1]["format"], 77)
+        self.assertEqual(res[1]["format_name"], "BC3_UNORM")
+
+    def test_header_pointers_used_when_present(self):
+        # Header with pointers explicitly defined in pgDictionary header at +0x20 and +0x30
+        buf = bytearray(400)
+        names = b"water_deep_caustic\x00water_foam\x00"
+        buf[0x140:0x140 + len(names)] = names
+
+        h0 = tex_headers.joaat("water_deep_caustic")
+        h1 = tex_headers.joaat("water_foam")
+        struct.pack_into("<Q", buf, 0x20, 0x50000188)  # hashes at 0x188
+        struct.pack_into("<Q", buf, 0x30, 0x50000178)  # pointers at 0x178
+        struct.pack_into("<H", buf, 0x38, 2)           # count = 2
+
+        struct.pack_into("<QQ", buf, 0x178, 0x50000040, 0x50000090)
+        struct.pack_into("<II", buf, 0x188, h0, h1)
+
+        struct.pack_into("<Q", buf, 0x40 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x40 + 0x18, 0x60000000)
+        struct.pack_into("<HHHBB", buf, 0x40 + 0x38, 64, 64, 1, 0, 77)
+        struct.pack_into("<Q", buf, 0x40 + 0x40, (1 << 16) | 0x1)
+
+        struct.pack_into("<Q", buf, 0x90 + 0x10, 0x980)
+        struct.pack_into("<Q", buf, 0x90 + 0x18, 0x60001000)
+        struct.pack_into("<HHHBB", buf, 0x90 + 0x38, 512, 512, 1, 0, 77)
+        struct.pack_into("<Q", buf, 0x90 + 0x40, (1 << 16) | 0x1)
+
+        res = tex_headers.parse_texture_dict_page(bytes(buf))
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0]["width"], 64)
+        self.assertEqual(res[1]["width"], 512)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

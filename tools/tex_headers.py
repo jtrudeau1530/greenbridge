@@ -219,13 +219,24 @@ def joaat(s: str) -> int:
     return (h + (h << 15)) & 0xFFFFFFFF
 
 
+def is_system_pointer(val: int, max_len: int) -> bool:
+    """Validate that the pointer is strictly in the system page segment (0x50000000..0x5FFFFFFF)."""
+    if (val >> 28) != 5:
+        return False
+    offset = val & 0x0FFFFFFF
+    return 0 < offset + 8 <= max_len
+
+
 def parse_texture_dict_page(data: bytes):
     """Parse a small RAGE texture dictionary system page (e.g. the 400-byte stream in textures.rpf).
 
     Layout:
-      +0x140..+0x170: null-separated lower-case ASCII texture names
-      +0x170: array of 64-bit pointers to grcTexture descriptors (tagged 0x5... system page)
-      +0x180: array of 32-bit joaat32 name hashes
+      +0x20: 64-bit pointer to hash array (optional in synthetic tests)
+      +0x30: 64-bit pointer to grcTexture descriptor pointer array (optional in synthetic tests)
+      +0x38: u16 texture count (optional in synthetic tests)
+      +0x140..pointers_off: null-separated lower-case ASCII texture names
+      pointers_off (+0x170 or +0x178): array of 64-bit pointers to grcTexture descriptors (tagged 0x5...)
+      hashes_off (+0x180 or +0x188): array of 32-bit joaat32 name hashes
       Within each grcTexture descriptor:
         +0x10: dtype (0x980)
         +0x18: data pointer (0x60000000 + GPU data offset)
@@ -235,24 +246,53 @@ def parse_texture_dict_page(data: bytes):
     if len(data) < 400:
         raise ValueError(f"texture dictionary page truncated: expected >= 400 bytes, got {len(data)}")
 
-    p0 = struct.unpack_from("<Q", data, 0x170)[0]
-    p1 = struct.unpack_from("<Q", data, 0x178)[0]
-    h0 = struct.unpack_from("<I", data, 0x180)[0]
-    h1 = struct.unpack_from("<I", data, 0x184)[0]
+    pointers_off = None
+    hashes_off = None
+    count = 2
 
-    names_raw = data[0x140:0x170]
+    # Check pgDictionary header at 0x20 / 0x30
+    if len(data) >= 0x40:
+        h_cand = struct.unpack_from("<Q", data, 0x20)[0]
+        p_cand = struct.unpack_from("<Q", data, 0x30)[0]
+        cnt = struct.unpack_from("<H", data, 0x38)[0]
+        if is_system_pointer(h_cand, len(data)) and is_system_pointer(p_cand, len(data)):
+            h_off = h_cand & 0x0FFFFFFF
+            p_off = p_cand & 0x0FFFFFFF
+            if 0 < cnt <= 64 and p_off + cnt * 8 <= len(data) and h_off + cnt * 4 <= len(data):
+                pointers_off = p_off
+                hashes_off = h_off
+                count = cnt
+
+    if pointers_off is None:
+        # Fallback probe for shifted or unheadered layouts:
+        # 1. Standard layout: pointers start at 0x170
+        # 2. Shifted layout (longer names in 0x140..): pointers start at 0x178, so both 0x178 and 0x180 are system pointers
+        if is_system_pointer(struct.unpack_from("<Q", data, 0x170)[0], len(data)):
+            pointers_off = 0x170
+            hashes_off = 0x180
+        elif is_system_pointer(struct.unpack_from("<Q", data, 0x178)[0], len(data)) and is_system_pointer(struct.unpack_from("<Q", data, 0x180)[0], len(data)):
+            pointers_off = 0x178
+            hashes_off = 0x188
+        else:
+            pointers_off = 0x170
+            hashes_off = 0x180
+
+    names_raw = data[0x140:pointers_off]
     names = [s.decode("latin1") for s in names_raw.split(b"\x00") if s]
     names_by_hash = {joaat(n): n for n in names}
 
     textures = []
-    for raw_ptr, thash in [(p0, h0), (p1, h1)]:
-        if raw_ptr == 0:
-            continue
-        # Validate that the pointer is in the system page segment (0x5...)
-        if (raw_ptr >> 28) & 0xF != 5:
+    for i in range(count):
+        if pointers_off + (i + 1) * 8 > len(data):
+            break
+        raw_ptr = struct.unpack_from("<Q", data, pointers_off + i * 8)[0]
+        thash = struct.unpack_from("<I", data, hashes_off + i * 4)[0] if hashes_off + (i + 1) * 4 <= len(data) else 0
+
+        # Validate that the pointer is strictly in the system page segment (0x5...)
+        if (raw_ptr >> 28) != 5:
             continue
         ptr = raw_ptr & 0x0FFFFFFF
-        if ptr + 0x48 > len(data):
+        if ptr == 0 or ptr + 0x48 > len(data):
             continue
         dtype = struct.unpack_from("<Q", data, ptr + 0x10)[0]
         data_off = struct.unpack_from("<Q", data, ptr + 0x18)[0] & 0x0FFFFFFF
