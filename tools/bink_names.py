@@ -157,7 +157,7 @@ def load_pins(path):
     with open(path, encoding="utf-8", newline="") as fh:
         for row in csv.DictReader(fh):
             key = (row.get("source") or "", _int(row["offset"]))
-            pins[key] = {p.strip().lower() for p in row["path"].split("|") if p.strip()}
+            pins.setdefault(key, set()).update(p.strip().lower() for p in row["path"].split("|") if p.strip())
     return pins
 
 
