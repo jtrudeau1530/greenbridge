@@ -261,6 +261,63 @@ class Validate(unittest.TestCase):
         self.assertEqual(X.validate(b"\0" * 10), ["buffer shorter than the 64-byte header"])
 
 
+
+def console_layout(data, k):
+    """The same structure with the parent table laid out as the console writes it: offsetToParents negative, the entries
+    of the first k units (the leaves) before the header and not stored, the rest stored from the header end on."""
+    flags, units, crc, n, *rest = struct.unpack_from("<4I6fIiIIiI", data, 0)
+    nodes, remap, root, elements, parents, cp = rest[6:]
+    out = bytearray(data)
+    slots = (elements - parents) // 4
+    entries = [struct.unpack_from("<I", data, parents + 4 * u)[0] for u in range(slots)]
+    kept = entries[k:] + [0] * k
+    for i, e in enumerate(kept):
+        struct.pack_into("<I", out, parents + 4 * i, e)
+    struct.pack_into("<4I6fIiIIiI", out, 0, flags, units, crc, n, *rest[0:6], nodes, remap, root, elements,
+                     parents - 4 * k, cp)
+    return bytes(out), parents - 4 * k
+
+
+class ConsoleParentTable(unittest.TestCase):
+    """RT-151 review: real console structures have offsetToParents negative and store only the entries from the header
+    end on (docs/bvh.md 3.1); validate() used to raise struct.error on them."""
+
+    def build(self):
+        tris = [((i * 0.1, 0, 0), (i * 0.1 + 1, 0, 0), (i * 0.1, 1, 0)) for i in range(20)]
+        data, info = X.build_blas(tris)
+        return data, info
+
+    def test_a_negative_offset_to_parents_validates(self):
+        data, info = self.build()
+        k = (info["node_offset"] - info["elements"]) // 64           # the leaf units
+        con, off = console_layout(data, k)
+        self.assertLess(off, 0)
+        self.assertEqual(X.validate(con), [])
+
+    def test_a_wrong_stored_entry_is_still_caught(self):
+        data, info = self.build()
+        k = (info["node_offset"] - info["elements"]) // 64
+        con, off = console_layout(data, k)
+        bad = bytearray(con)
+        for entry in range(64, info["elements"], 4):                # every stored entry
+            struct.pack_into("<I", bad, entry, struct.unpack_from("<I", bad, entry)[0] ^ 0x10)
+        self.assertTrue(any("parent table entry" in e for e in X.validate(bytes(bad))))
+
+    def test_unstored_entries_are_not_compared(self):
+        data, info = self.build()
+        k = (info["node_offset"] - info["elements"]) // 64
+        con, off = console_layout(data, k)
+        self.assertLess(off + 4 * (k - 1), 64)                      # the last leaf entry lies before the header end
+        self.assertEqual(X.validate(con), [])
+
+    def test_a_runtime_build_keeps_its_offset_and_is_still_checked(self):
+        data, info = self.build()
+        self.assertEqual(X.validate(data), [])
+        bad = bytearray(data)
+        for entry in range(64, info["elements"], 4):
+            struct.pack_into("<I", bad, entry, struct.unpack_from("<I", bad, entry)[0] ^ 0x10)
+        self.assertTrue(any("parent table entry" in e for e in X.validate(bytes(bad))))
+
 class CheckBuild(unittest.TestCase):
     """check-build on cases written the way vk_xdxr_build_test writes them, built here by the reference."""
 

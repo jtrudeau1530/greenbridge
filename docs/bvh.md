@@ -104,7 +104,8 @@ The offsets are relative to the header at `0x100`, not to the start of the paylo
 `offsetToNodes` therefore addresses `0x59580` and `offsetToElements` addresses `0x4380`. The node and element
 regions are not necessarily the simple `0x140` onward array that the first indexer assumed. `offsetToPrimRemap`
 is source type `int32_t`, so the indexer keeps it signed. `offsetToParents` is source type `uint32_t`, so the
-indexer keeps its raw value; its signed/relative interpretation is still **Open**.
+indexer keeps its raw value; it is a signed offset from the start of the structure (RT-151: rehydrated console BLASes
+have it negative), and only the entries from the header end to `offsetToElements` are stored.
 
 The `flags` word has version `6` in its low 16 bits. It also sets `0x80000000` (bottom level), `0x00020000`
 (offline) and `0x01000000` (dehydrated). It does not set `0x00010000` (compressed). The sample is therefore a
