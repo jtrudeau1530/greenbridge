@@ -48,6 +48,16 @@ class HashFamilies(unittest.TestCase):
 
 
 class Resolve(unittest.TestCase):
+    def test_rejects_negative_compose_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = os.path.join(ROOT, "tools", "save_keys.py")
+            result = subprocess.run(
+                [sys.executable, "-I", tool, "resolve", tmp, "--dict", tmp, "--compose", "-1"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--compose must be 0 or more", result.stderr)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = self.tmp.name
