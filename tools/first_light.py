@@ -40,6 +40,9 @@ import sys
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
+sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
+from compute_fixture import find_test_program  # noqa: E402
+
 DEFAULT_VS = "VS_main_170e32e6_Wrapped"
 DEFAULT_PS = "$PS_Rage_Untextured_14f8529b_Wrapped"
 DEFAULT_TEXTURED_PS = "PS_Copy_3ea4b38a_Wrapped"
@@ -383,16 +386,20 @@ def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> lis
 
 
 def find_harness(explicit: str | None) -> str:
-    exe = ".exe" if os.name == "nt" else ""
+    executable = "vk_harness.exe" if os.name == "nt" else "vk_harness"
+    build = os.path.join(ROOT, "runtime", "build")
+    build_dirs = (os.path.join(build, "linux"), os.path.join(build, "windows"), build)
     for candidate in (
         explicit,
         os.environ.get("LEONIDA_VK_HARNESS"),
-        os.path.join(ROOT, "runtime", "build", "linux", f"vk_harness{exe}"),
-        os.path.join(ROOT, "runtime", "build", "windows", f"vk_harness{exe}"),
-        os.path.join(ROOT, "runtime", "build", f"vk_harness{exe}"),
+        *(os.path.join(folder, executable) for folder in build_dirs),
     ):
         if candidate and os.path.isfile(candidate):
             return candidate
+    for folder in build_dirs:
+        configured = find_test_program(folder, "vk_harness")
+        if configured:
+            return os.path.join(configured, executable)
     raise SystemExit(
         "vk_harness not found: build runtime/build/linux or runtime/build/windows (target vk_harness), "
         "or set --harness/LEONIDA_VK_HARNESS"
