@@ -253,18 +253,36 @@ BOOL WINAPI query_headers(HINTERNET request, DWORD, LPCWSTR, LPVOID, LPDWORD, LP
     return receive_response(request, nullptr);
 }
 
-// Headers WinHTTP would reject. Measured against the host's winhttp.dll (Windows 11 26300): a null or empty block, and
-// a block with no ':' in it (which includes one cut short by an explicit length), fail with ERROR_INVALID_PARAMETER;
-// a length of (DWORD)-1 means the text is NUL-terminated. Nothing is stored: no request is ever sent.
+// Headers WinHTTP would reject. Measured against the host's winhttp.dll (Windows 10/11): a null or empty block,
+// embedded NULs, a line with no ':', an empty header name (": v"), or whitespace/control characters in a header
+// name ("X A: 1") fail with ERROR_INVALID_PARAMETER; a length of (DWORD)-1 means the text is NUL-terminated.
+// Nothing is stored: no request is ever sent.
 bool header_block_valid(LPCWSTR headers, DWORD length) {
     if (!headers) return false;
     const size_t count = length == static_cast<DWORD>(-1) ? wcslen(headers) : static_cast<size_t>(length);
     if (count == 0) return false;
-    for (size_t i = 0; i < count; ++i) {
+    bool saw_header = false;
+    size_t i = 0;
+    while (i < count) {
         if (headers[i] == L'\0') return false;
-        if (headers[i] == L':') return true;
+        size_t line_start = i;
+        while (i < count && headers[i] != L'\r' && headers[i] != L'\n') {
+            if (headers[i] == L'\0') return false;
+            ++i;
+        }
+        const size_t line_end = i;
+        if (i < count && headers[i] == L'\r') ++i;
+        if (i < count && headers[i] == L'\n') ++i;
+        if (line_end == line_start) continue;
+        size_t colon = line_start;
+        while (colon < line_end && headers[colon] != L':') ++colon;
+        if (colon == line_start || colon == line_end) return false;
+        for (size_t k = line_start; k < colon; ++k) {
+            if (headers[k] <= 0x20) return false;
+        }
+        saw_header = true;
     }
-    return false;
+    return saw_header;
 }
 
 BOOL WINAPI add_request_headers(HINTERNET request, LPCWSTR headers, DWORD length, DWORD) {
@@ -276,11 +294,12 @@ BOOL WINAPI add_request_headers(HINTERNET request, LPCWSTR headers, DWORD length
     return TRUE;
 }
 
-// Measured the same way: 0 and -1 (infinite) are accepted; any other negative value, in any of the four, fails with
-// ERROR_INVALID_PARAMETER.
+// Measured the same way: valid on session and request handles (connect handles fail with
+// ERROR_WINHTTP_INCORRECT_HANDLE_TYPE); 0 and -1 (infinite) are accepted; any other negative value, in any of the
+// four, fails with ERROR_INVALID_PARAMETER.
 BOOL WINAPI set_timeouts(HINTERNET handle, int resolve, int connect, int send, int receive) {
     DWORD error = 0;
-    Handle* h = acquire(handle, true, true, true, error);
+    Handle* h = acquire(handle, true, false, true, error);
     if (!h) return fail(error);
     release(h);
     if (resolve < -1 || connect < -1 || send < -1 || receive < -1) return fail(ERROR_INVALID_PARAMETER);
@@ -288,14 +307,21 @@ BOOL WINAPI set_timeouts(HINTERNET handle, int resolve, int connect, int send, i
 }
 
 BOOL WINAPI set_option(HINTERNET handle, DWORD option, LPVOID buffer, DWORD length) {
-    if (!handle) return TRUE;  // process-wide options: accepted, nothing to apply
+    if (!handle) {
+        if (option == WINHTTP_OPTION_CONTEXT_VALUE) return fail(ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
+        return TRUE;  // process-wide options: accepted, nothing to apply
+    }
     DWORD error = 0;
     Handle* h = acquire(handle, true, true, true, error);
     if (!h) return fail(error);
     if (option == WINHTTP_OPTION_CONTEXT_VALUE) {
-        if (!buffer || length < sizeof(DWORD_PTR)) {
+        if (!buffer) {
             release(h);
             return fail(ERROR_INVALID_PARAMETER);
+        }
+        if (length < sizeof(DWORD_PTR)) {
+            release(h);
+            return fail(ERROR_INSUFFICIENT_BUFFER);
         }
         std::lock_guard lock(h->mutex);
         h->context = *static_cast<const DWORD_PTR*>(buffer);
@@ -338,6 +364,10 @@ BOOL WINAPI query_option(HINTERNET handle, DWORD option, LPVOID buffer, LPDWORD 
 
 WINHTTP_STATUS_CALLBACK WINAPI set_status_callback(HINTERNET handle, WINHTTP_STATUS_CALLBACK callback,
                                                    DWORD notifications, DWORD_PTR) {
+    if (!handle) {
+        SetLastError(ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
+        return WINHTTP_INVALID_STATUS_CALLBACK;
+    }
     DWORD error = 0;
     Handle* h = acquire(handle, true, true, true, error);
     if (!h) {
