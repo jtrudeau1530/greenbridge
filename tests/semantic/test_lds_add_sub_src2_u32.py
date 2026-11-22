@@ -496,7 +496,7 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.lds.read_dword(lane * 2), 50)
 
     def test_lane_divergence_same_address_atomic_accumulate(self) -> None:
-        exec_mask = 0xFF  # 8 active lanes
+        exec_mask = 0xFF
         state = SIMDState(num_lanes=32, exec_mask=exec_mask, lds_dwords=1024)
         v0 = RegisterOperand(0, RegType.VGPR)
         instr = DSSrc2Instruction(
@@ -509,11 +509,10 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         state.lds.write_dword(1, 10)
 
         self.interp.execute(instr, state)
-        # 100 + 8 * 10 = 180
         self.assertEqual(state.lds.read_dword(0), 180)
 
     def test_lane_divergence_same_address_atomic_decrement(self) -> None:
-        exec_mask = 0x0F  # 4 active lanes
+        exec_mask = 0x0F
         state = SIMDState(num_lanes=32, exec_mask=exec_mask, lds_dwords=1024)
         v0 = RegisterOperand(0, RegType.VGPR)
         instr = DSSrc2Instruction(
@@ -526,8 +525,93 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         state.lds.write_dword(1, 5)
 
         self.interp.execute(instr, state)
-        # 50 - 4 * 5 = 30
         self.assertEqual(state.lds.read_dword(0), 30)
+
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_base_address_vgpr_preservation_scalar(self) -> None:
+        state = ScalarMachineState(lds_dwords=1024)
+        for reg in range(DEFAULT_NUM_VGPRS):
+            state.set_vgpr(reg, 0xABC00000 | reg)
+
+        v5 = RegisterOperand(5, RegType.VGPR)
+        state.set_vgpr(5, 0x200)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v5, offset0=0, offset1=1),
+        )
+        self.scalar_interp.execute(instr, state)
+
+        self.assertEqual(state.get_vgpr(5), 0x200)
+        for reg in range(DEFAULT_NUM_VGPRS):
+            if reg != 5:
+                self.assertEqual(state.get_vgpr(reg), 0xABC00000 | reg)
+
+    def test_base_address_vgpr_preservation_simd(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=MASK64, lds_dwords=1024)
+        for lane in range(64):
+            for reg in range(8):
+                state.set_lane_vgpr(lane, reg, (lane << 16) | reg)
+
+        v2 = RegisterOperand(2, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_SUB_SRC2_U32,
+            LDSAddressExpression(v2, offset0=0, offset1=1),
+        )
+        self.simd_interp.execute(instr, state)
+
+        for lane in range(64):
+            for reg in range(8):
+                self.assertEqual(state.get_lane_vgpr(lane, reg), (lane << 16) | reg)
+
+    def test_secondary_memory_operand_preservation(self) -> None:
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0x40)
+        state.set_lds(16, 50)
+        state.set_lds(17, 30)
+
+        v0 = RegisterOperand(0, RegType.VGPR)
+        for opcode in (DSOpcode.DS_ADD_SRC2_U32, DSOpcode.DS_SUB_SRC2_U32):
+            instr = DSSrc2Instruction(opcode, LDSAddressExpression(v0, offset0=0, offset1=1))
+            self.scalar_interp.execute(instr, state)
+            self.assertEqual(state.get_lds(17), 30)
+
+    def test_address_aliasing_same_cell_add(self) -> None:
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=3, offset1=3),
+        )
+
+        state.set_lds(3, 40)
+        self.scalar_interp.execute(instr, state)
+        self.assertEqual(state.get_lds(3), 80)
+
+        state.set_lds(3, 0x80000000)
+        self.scalar_interp.execute(instr, state)
+        self.assertEqual(state.get_lds(3), 0)
+
+    def test_address_aliasing_same_cell_sub(self) -> None:
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_SUB_SRC2_U32,
+            LDSAddressExpression(v0, offset0=2, offset1=2),
+        )
+
+        for val in (0, 1, 100, 0x7FFFFFFF, MASK32):
+            state.set_lds(2, val)
+            self.scalar_interp.execute(instr, state)
+            self.assertEqual(state.get_lds(2), 0)
 
 
 if __name__ == "__main__":
