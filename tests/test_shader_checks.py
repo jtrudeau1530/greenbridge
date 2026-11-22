@@ -27,12 +27,24 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# All check.py cases, including the four vk_store_test shaders and the three mesh fixtures.
+# All check.py cases, including the four vk_store_test shaders and the three mesh fixtures, and TEST-184's
+# vk_store_test "words" fixtures and image_get_lod draws.
 TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
+         + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
          + 10)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat, cs_fma_fused, ps_gather_wrap and ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
+
+
+def words_output(name, flip=None):
+    """What vk_store_test prints in "words" mode when the shader left check.store_words(name) in the three images;
+    flip = (image, word index) changes one word."""
+    lines = ["device: fake"]
+    for image, words in zip(check.STORE_IMAGES, check.store_words(name)):
+        words = [w ^ 1 if flip == (image, i) else w for i, w in enumerate(words)]
+        lines.append(f"{image} words: " + " ".join(f"{w:#010x}" for w in words))
+    return "\n".join(lines) + "\n"
 
 
 def cvt_answer(env, wrong_for=None):
@@ -117,13 +129,16 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
             if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
+            if name in check.STORE_WORDS:     # vk_store_test "words": the three images, judged by check.py
+                self.assertEqual(args, ("words",))
+                return 0, words_output(name)
             return 0, "0 mismatches\n"
 
         with tempfile.TemporaryDirectory() as tmp:
             spirv = Path(tmp) / "spirv"
             spirv.mkdir()
             (spirv / "cs_wavemask.spv").touch()
-            for name in WAVE64_DUMPS:
+            for name in (*WAVE64_DUMPS, *check.STORE_WORDS):
                 (spirv / f"{name}.spv").touch()
             if not missing_ballot:
                 (spirv / "cs_wave64_ballot.spv").touch()
@@ -134,6 +149,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
                   patch.object(check, "gather_wrap_test", return_value=""),
+                  patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
@@ -410,6 +426,137 @@ class GradientSampleChecks(unittest.TestCase):
             failure = check.texture_gradient_a16_test("tools", "spirv", "ps_texture_grad_cl_a16")
         self.assertNotIsInstance(failure, check.Skip)
         self.assertIn("device lost", failure)
+
+class StoreWordsChecks(unittest.TestCase):
+    """TEST-184: the image atomics and image_get_resinfo fixtures, judged from vk_store_test's three word lines."""
+
+    def test_words_of_the_asm_headers(self):
+        uint, sint, volume = check.store_words("cs_imgatomic")
+        self.assertEqual(uint[:17], [0x54, 0xFFFFFF9D, 6, 0xF067, 0x97, 0xFFFFFFF0, 106, 107, 200, 109, 5,
+                                     0xFFFFFFF0, 112, 0xC0FFEE, 114, 122, 180])
+        self.assertEqual(uint[17:], [100 + i for i in range(17, 64)])
+        self.assertEqual(sint[:16], [*range(100, 115), 7])
+        self.assertEqual(sint[16:], [0x100000000 - 2 * i for i in range(16, 64)])
+        self.assertEqual(volume, [200 + i for i in range(64)])
+        uint, sint, volume = check.store_words("cs_imgatomic3d")
+        self.assertEqual(uint, [100 + i for i in range(64)])
+        self.assertEqual(sint[:6], [257, 219, 244, 206, 230, 0xFF])
+        # texel i = 16z + 4y + x of the six cases: (1,2,3), (3,0,1), (0,3,2), (2,1,0), (2,3,1), (3,1,2)
+        self.assertEqual({i: w for i, w in enumerate(volume) if w != 200 + i},
+                         {57: 257 + 16, 19: 3, 6: 0xD00D, 39: 239 ^ 0xFF})
+        self.assertEqual((volume[44], volume[30]), (244, 230))      # smax with -16 and the missed cmpswap keep theirs
+        uint, sint, volume = check.store_words("cs_resinfo")
+        self.assertEqual(uint[:19], [16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD, 115, 2, 5, 5])
+        self.assertEqual((sint, volume), ([-2 * i & 0xFFFFFFFF for i in range(64)], [200 + i for i in range(64)]))
+
+    def test_expected_words_pass_and_any_other_word_fails(self):
+        for name in check.STORE_WORDS:
+            with self.subTest(name=name):
+                self.assertEqual(check.store_words_problem(words_output(name), name), "")
+                for image in check.STORE_IMAGES:
+                    for index in (0, 20, 63):     # a word the fixture changes or one it must leave alone
+                        problem = check.store_words_problem(words_output(name, flip=(image, index)), name)
+                        self.assertIn(f"1 of 64 {image} words differ; first word {index}:", problem)
+
+    def test_one_fixture_is_not_another(self):
+        for printed, judged_as in (("cs_resinfo", "cs_imgatomic"), ("cs_imgatomic", "cs_imgatomic3d"),
+                                   ("cs_imgatomic3d", "cs_resinfo")):
+            with self.subTest(printed=printed, judged_as=judged_as):
+                self.assertIn("uint words differ", check.store_words_problem(words_output(printed), judged_as))
+
+    def test_missing_or_short_lines_fail(self):
+        full = words_output("cs_imgatomic")
+        self.assertIn("printed no volume words", check.store_words_problem(full.rsplit("volume", 1)[0], "cs_imgatomic"))
+        self.assertIn("printed no uint words", check.store_words_problem("device: fake\n", "cs_imgatomic"))
+        short = full.replace(" 0x00000054", "", 1)                   # 63 words in the first line
+        self.assertIn("printed no uint words", check.store_words_problem(short, "cs_imgatomic"))
+
+    def test_the_tool_runs_in_words_mode_and_its_exit_codes_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cs_imgatomic.spv").touch()
+            with patch.object(check, "run", return_value=(0, words_output("cs_imgatomic"))) as run:
+                self.assertEqual(check.store_words_test("tools", tmp, "cs_imgatomic"), "")
+            self.assertIn("vk_store_test", run.call_args.args[0])
+            self.assertEqual(run.call_args.args[2:], ("words",))
+            answer = 77, "unsupported: shaderStorageImageWriteWithoutFormat=0 shaderInt64=1\n"
+            with patch.object(check, "run", return_value=answer):
+                skip = check.store_words_test("tools", tmp, "cs_imgatomic")
+            self.assertIsInstance(skip, check.Skip)
+            self.assertIn("shaderStorageImageWriteWithoutFormat=0", skip)
+            with patch.object(check, "run", return_value=(1, "FAILED vkCreateComputePipelines -> -3\n")):
+                failure = check.store_words_test("tools", tmp, "cs_imgatomic")
+            self.assertNotIsInstance(failure, check.Skip)
+            self.assertIn("exit 1", failure)
+            self.assertEqual(check.store_words_test("tools", tmp, "cs_resinfo"), "missing cs_resinfo.spv")
+
+
+class GetLodChecks(unittest.TestCase):
+    """TEST-184: image_get_lod frames, (clamped, calculated) pairs within a sixteenth of a level."""
+
+    @staticmethod
+    def frame(pixel):
+        return struct.pack("<4f", *pixel) * (64 * 64)
+
+    def run_test(self, name, frames, code=0, out=""):
+        """get_lod_test with a fake vk_texture_test that writes frames[S# word 1]; returns (result, calls)."""
+        calls = []
+
+        def harness(_tool, _vs, _fs, raw, *args, env=None):
+            calls.append(args)
+            if not code:
+                Path(raw).write_bytes(frames[args[2]])
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for shader in ("vk_texture_test" + check.EXE, "vs_ids.spv", name + ".spv"):
+                (Path(tmp) / shader).touch()
+            with patch.object(check, "run", side_effect=harness):
+                return check.get_lod_test(tmp, tmp, name), calls
+
+    def test_expected_frames_pass_within_the_tolerance(self):
+        for name, draws in check.GET_LOD_TESTS.items():
+            with self.subTest(name=name):
+                frames = {limits: self.frame(want) for limits, _, want in draws}
+                result, calls = self.run_test(name, frames)
+                self.assertEqual(result, "")
+                self.assertEqual([c[2] for c in calls], [limits for limits, _, _ in draws])
+                self.assertEqual(["--two-mip" in c for c in calls], [two_mip for _, two_mip, _ in draws])
+        want = check.GET_LOD_TESTS["ps_get_lod"][0][2]
+        near = tuple(v + 1 / 32 for v in want)
+        self.assertEqual(check.get_lod_problem(self.frame(near), want), "")
+        self.assertIn("4096 of 4096 pixels differ", check.get_lod_problem(self.frame(tuple(v + 1 / 8 for v in want)), want))
+
+    def test_swapped_results_an_unclamped_lod_and_bad_frames_fail(self):
+        clamped_first = check.GET_LOD_TESTS["ps_get_lod"][1][2]           # (0, 1, 3, 0) under MAX_LOD 0.25
+        for what, pixel in (("calculated LOD first", (1.0, 0.0, 3.0, 0.0)),
+                            ("sampler limit not applied", (1.0, 1.0, 3.0, 1.0)),
+                            ("LOD of the unscaled coordinate", (0.0, 1.0, 1.0, 0.0)),
+                            ("NaN", (0.0, float("nan"), 3.0, 0.0))):
+            with self.subTest(what):
+                self.assertIn("pixels differ", check.get_lod_problem(self.frame(pixel), clamped_first))
+        one_bad = bytearray(self.frame(clamped_first))
+        struct.pack_into("<f", one_bad, 16 * (64 * 5 + 7) + 4, 0.5)
+        self.assertIn("1 of 4096 pixels differ", check.get_lod_problem(bytes(one_bad), clamped_first))
+        self.assertIn("first at (7,5)", check.get_lod_problem(bytes(one_bad), clamped_first))
+        self.assertIn("got 65520 bytes", check.get_lod_problem(self.frame(clamped_first)[:-16], clamped_first))
+
+    def test_second_draw_is_judged_and_named(self):
+        draws = check.GET_LOD_TESTS["ps_get_lod"]
+        frames = {limits: self.frame(draws[0][2]) for limits, _, _ in draws}    # the wide sampler's frame twice
+        result, _ = self.run_test("ps_get_lod", frames)
+        self.assertTrue(result.startswith("S# word 1 40000: 4096 of 4096 pixels differ"), result)
+
+    def test_unsupported_device_skips_and_other_failures_fail(self):
+        result, _ = self.run_test("ps_get_lod", {}, code=77,
+                                  out="unsupported: need 144 push constant bytes, device has 128\n")
+        self.assertIsInstance(result, check.Skip)
+        self.assertIn("144 push constant bytes", result)
+        result, _ = self.run_test("ps_get_lod", {}, code=1, out="FAILED vkCreateGraphicsPipelines -> -3\n")
+        self.assertNotIsInstance(result, check.Skip)
+        self.assertIn("exit 1", result)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check.get_lod_test(tmp, tmp, "ps_get_lod"), "missing vk_texture_test" + check.EXE)
+
 
 class TexelOffsetChecks(unittest.TestCase):
     """ps_texoff (image_sample*_o, image_gather4_lz_o): the judgement of a dump, and the skip without maintenance8."""
