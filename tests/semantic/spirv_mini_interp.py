@@ -16,7 +16,8 @@ Design rules (see tests/semantic/README.md):
     atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary, so they
     must be 32-bit integers at 4-byte-aligned addresses (anything else raises). Workgroup variables (LDS) are
     zero-initialised per invocation like Function ones, so they are only meaningful with one invocation
-    (run_workgroup does not share them between invocations); images are rejected.
+    (run_workgroup does not share them between invocations); 32-bit atomics on them (and on Function variables)
+    are read-combine-write like the physical-storage-buffer ones. Images are rejected.
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
 
@@ -557,12 +558,19 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         elif op in _ATOMICS:
             # One invocation, so an atomic is read, combine, write; the result is the original value (SPIR-V spec,
             # 3.42.18). Operands: result type, pointer, scope, semantics(, unequal semantics), value(, comparator).
+            # The pointer is a physical-storage-buffer word or an element of a variable (a Workgroup array is LDS):
+            # the same pointers OpLoad / OpStore take. Push constants are read-only.
             p = pointers[a[1]]
-            if p[0] != "psb":
-                raise UnsupportedConstruct(f"{op} outside PhysicalStorageBuffer")
+            if p[0] == "pc":
+                raise UnsupportedConstruct(f"{op} on a PushConstant")
             if types.bits(a[0]) != 32:
                 raise UnsupportedConstruct(f"{op} on a non-32-bit integer")
-            old = memory.get(psb_word(p[1]), 0)
+            if p[0] == "psb":
+                old = memory.get(psb_word(p[1]), 0)
+            else:
+                old = deref(p)
+                if isinstance(old, bool) or not isinstance(old, int) or old > MASK:
+                    raise UnsupportedConstruct(f"{op} on a variable element that is not a 32-bit integer")
             if op == "OpAtomicCompareExchange":
                 new = val(a[5]) if old == val(a[6]) & MASK else old
             else:
@@ -571,7 +579,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                        "OpAtomicUMax": max(old, v), "OpAtomicSMin": old if _s32(old) <= _s32(v) else v,
                        "OpAtomicSMax": old if _s32(old) >= _s32(v) else v, "OpAtomicAnd": old & v,
                        "OpAtomicOr": old | v, "OpAtomicXor": old ^ v, "OpAtomicExchange": v}[op]
-            memory[p[1]] = new & MASK
+            if p[0] == "psb":
+                memory[p[1]] = new & MASK
+            else:
+                p[0][p[1]] = new & MASK
             values[res] = old
         elif op == "OpSelect":
             if not isinstance(val(a[1]), bool):
