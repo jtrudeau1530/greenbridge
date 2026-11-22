@@ -2394,6 +2394,26 @@ class Gen:
                     olds.append(old)
             for k, old in enumerate(olds):           # every exchange before the first write (vdst may alias)
                 self.dst({"k": "vgpr", "r": d["r"] + k, "n": 1}, old)
+        elif name in ("ds_and_b64", "ds_or_b64", "ds_xor_b64"):
+            # M = M op D on a 64-bit LDS element (the dwords at ADDR and ADDR + 4, low first); the _rtn_ form returns
+            # the old 64 bits in a VGPR pair. A bitwise op works on each bit alone, so one 32-bit atomic per dword
+            # leaves exactly the memory a 64-bit atomic would, with no Int64 atomics on Workgroup memory (optional in
+            # Vulkan). The returned pair is two reads, so a 64-bit op from another lane on the same element between
+            # them could be seen half done; the memory result is exact either way.
+            d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
+            if dat["k"] != "vgpr" or dat.get("n") != 2 or (d is not None and (d["k"] != "vgpr" or d.get("n") != 2)):
+                raise Unsupported(op + " operands")
+            k = {"ds_and_b64": "OpAtomicAnd", "ds_or_b64": "OpAtomicOr", "ds_xor_b64": "OpAtomicXor"}[name]
+            addr = self.src_u(ad)
+            vals = [self.load_reg("vgpr", dat["r"] + w) for w in range(2)]
+            olds = []
+            for w in range(2):
+                old = self.tmp()
+                self.emit(f"{old} = {k} %uint {self.lds_ptr(addr, off + 4 * w)} {sc} {sem} {vals[w]}")
+                olds.append(old)
+            if d is not None:
+                for w in range(2):
+                    self.dst({"k": "vgpr", "r": d["r"] + w, "n": 1}, olds[w])
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
             # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
