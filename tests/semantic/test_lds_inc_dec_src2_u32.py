@@ -34,6 +34,8 @@ Architecture & Specification:
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
+import struct
 import sys
 import unittest
 
@@ -43,6 +45,19 @@ DEFAULT_LDS_DWORDS = 16384  # 64 KiB default capacity in dwords (16384 * 4 bytes
 DEFAULT_NUM_LANES = 64     # Wave64 default width
 DEFAULT_NUM_VGPRS = 256    # Standard GFX10 vector register file size
 DEFAULT_NUM_SGPRS = 106    # Standard GFX10 scalar register file size
+
+# IEEE 754 Single-Precision Boundary Constants
+POS_ZERO_F32 = 0x00000000
+NEG_ZERO_F32 = 0x80000000
+POS_INF_F32 = 0x7F800000
+NEG_INF_F32 = 0xFF800000
+QNAN_F32 = 0x7FC00000
+SNAN_F32 = 0x7F800001
+MIN_NORMAL_F32 = 0x00800000
+MIN_SUBNORMAL_F32 = 0x00000001
+MAX_SUBNORMAL_F32 = 0x007FFFFF
+MAX_NORMAL_F32 = 0x7F7FFFFF
+ONE_F32 = 0x3F800000
 
 
 def u32(val: int) -> int:
@@ -54,6 +69,26 @@ def s32(val: int) -> int:
     """Interpret a 32-bit unsigned dword as a signed two's-complement integer."""
     val &= MASK32
     return val - (1 << 32) if (val & 0x80000000) else val
+
+
+def bits_to_f32(bits: int) -> float:
+    """Interpret 32-bit unsigned integer as IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def f32_to_bits(val: float) -> int:
+    """Pack IEEE 754 single-precision float into 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def is_f32_nan(bits: int) -> bool:
+    """Test if 32-bit bit pattern is an IEEE 754 NaN."""
+    return (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0
+
+
+def is_f32_subnormal(bits: int) -> bool:
+    """Test if 32-bit bit pattern is an IEEE 754 subnormal float."""
+    return (bits & 0x7F800000) == 0 and (bits & 0x007FFFFF) != 0
 
 
 def ref_ds_inc_src2_u32(val_a: int, val_b: int) -> int:
@@ -361,22 +396,19 @@ def evaluate_src2_status_flags(
     wrapped = False
 
     if opcode == DSOpcode.DS_ADD_SRC2_U32:
-        # Unsigned carry occurs when the sum exceeds 32 bits
         carry = (a + b) > MASK32
-        # Signed overflow: adding two positive numbers yields negative, or two negative yields positive
         sa, sb, sres = s32(a), s32(b), s32(res)
         overflow = ((sa > 0 and sb > 0 and sres < 0) or (sa < 0 and sb < 0 and sres > 0))
     elif opcode == DSOpcode.DS_SUB_SRC2_U32:
-        # Unsigned borrow occurs when minuend is strictly less than subtrahend
         borrow = (a < b)
         sa, sb, sres = s32(a), s32(b), s32(res)
         overflow = ((sa > 0 and sb < 0 and sres < 0) or (sa < 0 and sb > 0 and sres > 0))
     elif opcode == DSOpcode.DS_INC_SRC2_U32:
         wrapped = (a >= b)
-        carry = wrapped  # Carry out occurs upon wrap reset to zero
+        carry = wrapped
     elif opcode == DSOpcode.DS_DEC_SRC2_U32:
         wrapped = (a == 0 or a > b)
-        borrow = wrapped  # Borrow out occurs upon wrapping to limit b
+        borrow = wrapped
 
     return ArithmeticStatusFlags(
         zero=zero,
@@ -398,18 +430,14 @@ class TestReferenceModelAndOracle(unittest.TestCase):
         self.assertEqual(ref_ds_inc_src2_u32(4, 5), 5)
 
     def test_inc_src2_wrap_equal_and_greater(self) -> None:
-        # Equal to threshold wraps to 0
         self.assertEqual(ref_ds_inc_src2_u32(5, 5), 0)
-        # Greater than threshold wraps to 0
         self.assertEqual(ref_ds_inc_src2_u32(6, 5), 0)
         self.assertEqual(ref_ds_inc_src2_u32(100, 5), 0)
         self.assertEqual(ref_ds_inc_src2_u32(MASK32, 5), 0)
 
     def test_inc_src2_boundary_zero_and_max(self) -> None:
-        # When limit is 0, any unsigned value >= 0 wraps to 0
         self.assertEqual(ref_ds_inc_src2_u32(0, 0), 0)
         self.assertEqual(ref_ds_inc_src2_u32(1, 0), 0)
-        # When limit is MASK32
         self.assertEqual(ref_ds_inc_src2_u32(0, MASK32), 1)
         self.assertEqual(ref_ds_inc_src2_u32(MASK32 - 1, MASK32), MASK32)
         self.assertEqual(ref_ds_inc_src2_u32(MASK32, MASK32), 0)
@@ -421,9 +449,7 @@ class TestReferenceModelAndOracle(unittest.TestCase):
         self.assertEqual(ref_ds_dec_src2_u32(1, 5), 0)
 
     def test_dec_src2_wrap_zero_and_greater(self) -> None:
-        # 0 wraps to limit b
         self.assertEqual(ref_ds_dec_src2_u32(0, 5), 5)
-        # Greater than limit wraps to limit b
         self.assertEqual(ref_ds_dec_src2_u32(6, 5), 5)
         self.assertEqual(ref_ds_dec_src2_u32(100, 5), 5)
         self.assertEqual(ref_ds_dec_src2_u32(MASK32, 5), 5)
@@ -458,16 +484,10 @@ class TestReferenceModelAndOracle(unittest.TestCase):
         self.assertEqual(idx_b, (0x1010 >> 2) & 1023)
 
     def test_self_referencing_aliasing_oracle(self) -> None:
-        # Same memory location for both operands: val_a == val_b == 4
-        # inc: val_a >= val_b (4 >= 4) -> 0
         self.assertEqual(ref_ds_inc_src2_u32(4, 4), 0)
-        # dec: val_a == 4, val_b == 4 -> 4 - 1 = 3
         self.assertEqual(ref_ds_dec_src2_u32(4, 4), 3)
-        # dec: val_a == 0, val_b == 0 -> 0
         self.assertEqual(ref_ds_dec_src2_u32(0, 0), 0)
-        # add: 4 + 4 = 8
         self.assertEqual(ref_ds_add_src2_u32(4, 4), 8)
-        # sub: 4 - 4 = 0
         self.assertEqual(ref_ds_sub_src2_u32(4, 4), 0)
 
 
@@ -498,7 +518,6 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(addr.offset0, 10)
         self.assertEqual(addr.offset1, 20)
 
-        # Invalid offsets
         with self.assertRaises(ValueError):
             LDSAddressExpression(base_reg=v5, offset0=-1)
         with self.assertRaises(ValueError):
@@ -506,7 +525,6 @@ class TestSymbolicAST(unittest.TestCase):
         with self.assertRaises(ValueError):
             LDSAddressExpression(base_reg=v5, offset1=300)
 
-        # Base register must be VGPR
         s0 = RegisterOperand(0, RegType.SGPR)
         with self.assertRaises(TypeError):
             LDSAddressExpression(base_reg=s0)
@@ -542,9 +560,6 @@ class TestScalarInterpreter(unittest.TestCase):
         self.state = ScalarMachineState(lds_dwords=1024)
 
     def test_scalar_ds_inc_src2_u32_execution(self) -> None:
-        # Base address v0 = 0x40 (dword 16)
-        # offset0 = 0 -> idx_a = 16
-        # offset1 = 1 -> idx_b = 17
         self.state.set_vgpr(0, 0x40)
         self.state.set_lds(16, 2)
         self.state.set_lds(17, 3)
@@ -554,20 +569,15 @@ class TestScalarInterpreter(unittest.TestCase):
             DSOpcode.DS_INC_SRC2_U32,
             LDSAddressExpression(v0, offset0=0, offset1=1),
         )
-        # Execution 1: 2 < 3 -> becomes 3
         self.interp.execute(instr, self.state)
         self.assertEqual(self.state.get_lds(16), 3)
 
-        # Execution 2: 3 >= 3 -> wraps to 0
         self.interp.execute(instr, self.state)
         self.assertEqual(self.state.get_lds(16), 0)
-
-        # VGPR v0 remains untouched
         self.assertEqual(self.state.get_vgpr(0), 0x40)
 
     def test_scalar_ds_dec_src2_u32_execution(self) -> None:
         self.state.set_vgpr(1, 0x80)
-        # idx_a = 32, idx_b = 33
         self.state.set_lds(32, 2)
         self.state.set_lds(33, 5)
 
@@ -576,15 +586,12 @@ class TestScalarInterpreter(unittest.TestCase):
             DSOpcode.DS_DEC_SRC2_U32,
             LDSAddressExpression(v1, offset0=0, offset1=1),
         )
-        # 2 -> 1
         self.interp.execute(instr, self.state)
         self.assertEqual(self.state.get_lds(32), 1)
 
-        # 1 -> 0
         self.interp.execute(instr, self.state)
         self.assertEqual(self.state.get_lds(32), 0)
 
-        # 0 -> wraps to 5
         self.interp.execute(instr, self.state)
         self.assertEqual(self.state.get_lds(32), 5)
 
@@ -600,7 +607,7 @@ class TestScalarInterpreter(unittest.TestCase):
         )
         self.interp.execute(instr, self.state)
         self.assertEqual(self.state.get_lds(0), 150)
-        self.assertEqual(self.state.get_lds(1), 50)  # Operand B unchanged
+        self.assertEqual(self.state.get_lds(1), 50)
 
     def test_scalar_ds_sub_src2_u32_execution(self) -> None:
         self.state.set_vgpr(3, 0)
@@ -612,7 +619,6 @@ class TestScalarInterpreter(unittest.TestCase):
             DSOpcode.DS_SUB_SRC2_U32,
             LDSAddressExpression(v3, offset0=0, offset1=1),
         )
-        # 40 - 50 = -10 -> 0xFFFFFFFF - 9 = 0xFFFFFFF6
         self.interp.execute(instr, self.state)
         self.assertEqual(self.state.get_lds(0), u32(-10))
         self.assertEqual(self.state.get_lds(1), 50)
@@ -856,7 +862,6 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
     """Unit tests for condition codes, status flags, and carry/borrow generation."""
 
     def test_add_carry_generation(self) -> None:
-        # 0xFFFFFFFF + 1 = 0 (carry out)
         flags = evaluate_src2_status_flags(
             DSOpcode.DS_ADD_SRC2_U32, MASK32, 1, 0
         )
@@ -865,7 +870,6 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags.sign)
         self.assertFalse(flags.borrow)
 
-        # Normal addition without carry
         flags_norm = evaluate_src2_status_flags(
             DSOpcode.DS_ADD_SRC2_U32, 10, 20, 30
         )
@@ -874,7 +878,6 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags_norm.sign)
 
     def test_add_signed_overflow(self) -> None:
-        # Positive + Positive yielding Negative
         flags = evaluate_src2_status_flags(
             DSOpcode.DS_ADD_SRC2_U32, 0x7FFFFFFF, 1, 0x80000000
         )
@@ -883,7 +886,6 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags.carry)
 
     def test_sub_borrow_generation(self) -> None:
-        # 0 - 1 = 0xFFFFFFFF (borrow out)
         flags = evaluate_src2_status_flags(
             DSOpcode.DS_SUB_SRC2_U32, 0, 1, MASK32
         )
@@ -892,7 +894,6 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(flags.sign)
         self.assertFalse(flags.carry)
 
-        # Equal values subtraction: 10 - 10 = 0 (zero flag, no borrow)
         flags_zero = evaluate_src2_status_flags(
             DSOpcode.DS_SUB_SRC2_U32, 10, 10, 0
         )
@@ -900,7 +901,6 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(flags_zero.zero)
 
     def test_inc_wrap_flag_generation(self) -> None:
-        # val_a < val_b: no wrap
         flags_no_wrap = evaluate_src2_status_flags(
             DSOpcode.DS_INC_SRC2_U32, 2, 5, 3
         )
@@ -908,7 +908,6 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags_no_wrap.carry)
         self.assertFalse(flags_no_wrap.zero)
 
-        # val_a == val_b: wrap triggered
         flags_wrap = evaluate_src2_status_flags(
             DSOpcode.DS_INC_SRC2_U32, 5, 5, 0
         )
@@ -916,7 +915,6 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(flags_wrap.carry)
         self.assertTrue(flags_wrap.zero)
 
-        # val_a > val_b: wrap triggered
         flags_over = evaluate_src2_status_flags(
             DSOpcode.DS_INC_SRC2_U32, 10, 5, 0
         )
@@ -925,7 +923,6 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(flags_over.zero)
 
     def test_dec_wrap_flag_generation(self) -> None:
-        # val_a == 0: wraps to val_b
         flags_zero = evaluate_src2_status_flags(
             DSOpcode.DS_DEC_SRC2_U32, 0, 8, 8
         )
@@ -933,19 +930,70 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(flags_zero.borrow)
         self.assertFalse(flags_zero.zero)
 
-        # val_a > val_b: wraps to val_b
         flags_greater = evaluate_src2_status_flags(
             DSOpcode.DS_DEC_SRC2_U32, 12, 8, 8
         )
         self.assertTrue(flags_greater.wrapped)
         self.assertTrue(flags_greater.borrow)
 
-        # 0 < val_a <= val_b: normal decrement
         flags_norm = evaluate_src2_status_flags(
             DSOpcode.DS_DEC_SRC2_U32, 5, 8, 4
         )
         self.assertFalse(flags_norm.wrapped)
         self.assertFalse(flags_norm.borrow)
+
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_nan_as_wrap_threshold_inc(self) -> None:
+        # With threshold = QNAN_F32 (0x7FC00000)
+        # val_a = 0 < 0x7FC00000 -> increments to 1
+        self.assertEqual(ref_ds_inc_src2_u32(0, QNAN_F32), 1)
+
+        # val_a = QNAN_F32 >= QNAN_F32 -> wraps to 0
+        self.assertEqual(ref_ds_inc_src2_u32(QNAN_F32, QNAN_F32), 0)
+
+        # val_a = NEG_ZERO_F32 (0x80000000) > QNAN_F32 (0x7FC00000) -> wraps to 0
+        self.assertEqual(ref_ds_inc_src2_u32(NEG_ZERO_F32, QNAN_F32), 0)
+
+    def test_subnormal_increment_and_transitions(self) -> None:
+        # Incrementing minimum subnormal yields next subnormal
+        val = MIN_SUBNORMAL_F32
+        res = ref_ds_inc_src2_u32(val, POS_INF_F32)
+        self.assertEqual(res, 0x00000002)
+        self.assertTrue(is_f32_subnormal(res))
+
+        # Boundary transition from MAX_SUBNORMAL to MIN_NORMAL
+        res_norm = ref_ds_inc_src2_u32(MAX_SUBNORMAL_F32, POS_INF_F32)
+        self.assertEqual(res_norm, MIN_NORMAL_F32)
+        self.assertFalse(is_f32_subnormal(res_norm))
+
+    def test_float_zeros_unsigned_asymmetry(self) -> None:
+        # In float +0.0 == -0.0, but in u32: POS_ZERO (0) < NEG_ZERO (0x80000000)
+        self.assertEqual(ref_ds_inc_src2_u32(POS_ZERO_F32, NEG_ZERO_F32), 1)
+        self.assertEqual(ref_ds_inc_src2_u32(NEG_ZERO_F32, POS_ZERO_F32), 0)
+
+        # In dec: 0 wraps to limit
+        self.assertEqual(ref_ds_dec_src2_u32(POS_ZERO_F32, NEG_ZERO_F32), NEG_ZERO_F32)
+        # In dec: NEG_ZERO > POS_ZERO (0x80000000 > 0) wraps to 0
+        self.assertEqual(ref_ds_dec_src2_u32(NEG_ZERO_F32, POS_ZERO_F32), POS_ZERO_F32)
+
+        # Adding NEG_ZERO to NEG_ZERO wraps modulo 2^32 to POS_ZERO
+        self.assertEqual(ref_ds_add_src2_u32(NEG_ZERO_F32, NEG_ZERO_F32), POS_ZERO_F32)
+
+    def test_infinity_threshold_arithmetic(self) -> None:
+        # Adding 1 to MAX_NORMAL_F32 (0x7F7FFFFF) produces POS_INF_F32 (0x7F800000)
+        self.assertEqual(ref_ds_add_src2_u32(MAX_NORMAL_F32, 1), POS_INF_F32)
+        # Subtracting 1 from POS_INF_F32 produces MAX_NORMAL_F32
+        self.assertEqual(ref_ds_sub_src2_u32(POS_INF_F32, 1), MAX_NORMAL_F32)
+
+    def test_integer_boundary_extremes(self) -> None:
+        # Wrapping at 0xFFFFFFFF
+        self.assertEqual(ref_ds_inc_src2_u32(MASK32, MASK32), 0)
+        self.assertEqual(ref_ds_dec_src2_u32(0, MASK32), MASK32)
+        self.assertEqual(ref_ds_add_src2_u32(MASK32, MASK32), MASK32 - 1)
+        self.assertEqual(ref_ds_sub_src2_u32(0, MASK32), 1)
 
 
 if __name__ == "__main__":
