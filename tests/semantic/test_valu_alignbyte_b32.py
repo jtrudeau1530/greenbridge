@@ -759,5 +759,165 @@ class TestValuAlignbyteB32SIMD(unittest.TestCase):
             self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), expected)
 
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestValuAlignbyteB32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_aliasing_dst_equals_src0(self) -> None:
+        interp = ScalarVALUInterpreter()
+        s0_val = 0x88776655
+        s1_val = 0x44332211
+        interp.write_reg_u32(RegKind.VGPR, 0, s0_val)
+        interp.write_reg_u32(RegKind.VGPR, 1, s1_val)
+
+        # v0 = alignbyte(v0, v1, 2)
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Immediate(2),
+        )
+        res = interp.step(inst)
+        expected = ref_alignbyte_b32(s0_val, s1_val, 2)
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), expected)
+        # v1 (src1) remains completely preserved
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), s1_val)
+
+    def test_aliasing_dst_equals_src1(self) -> None:
+        interp = ScalarVALUInterpreter()
+        s0_val = 0x88776655
+        s1_val = 0x44332211
+        interp.write_reg_u32(RegKind.VGPR, 0, s0_val)
+        interp.write_reg_u32(RegKind.VGPR, 1, s1_val)
+
+        # v1 = alignbyte(v0, v1, 1)
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 1),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Immediate(1),
+        )
+        res = interp.step(inst)
+        expected = ref_alignbyte_b32(s0_val, s1_val, 1)
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), expected)
+        # v0 (src0) remains completely preserved
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), s0_val)
+
+    def test_aliasing_dst_equals_src2_shift_amount(self) -> None:
+        interp = ScalarVALUInterpreter()
+        s0_val = 0x88776655
+        s1_val = 0x44332211
+        shift_reg = 3
+        interp.write_reg_u32(RegKind.VGPR, 0, s0_val)
+        interp.write_reg_u32(RegKind.VGPR, 1, s1_val)
+        interp.write_reg_u32(RegKind.VGPR, 2, shift_reg)
+
+        # v2 = alignbyte(v0, v1, v2)
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 2),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Register(RegKind.VGPR, 2),
+        )
+        res = interp.step(inst)
+        expected = ref_alignbyte_b32(s0_val, s1_val, shift_reg)
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 2), expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), s0_val)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), s1_val)
+
+    def test_aliasing_in_place_rotate_dst_src0_src1(self) -> None:
+        interp = ScalarVALUInterpreter()
+        val = 0x12345678
+        interp.write_reg_u32(RegKind.VGPR, 5, val)
+
+        # v5 = alignbyte(v5, v5, 1) -> 32-bit rotate right by 1 byte
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 5),
+            src0=Register(RegKind.VGPR, 5),
+            src1=Register(RegKind.VGPR, 5),
+            src2=Immediate(1),
+        )
+        res = interp.step(inst)
+        expected = 0x78123456
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 5), expected)
+
+    def test_aliasing_all_four_operands_identical(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # Value 2 in v0: shift count is (2 & 3) == 2 bytes
+        interp.write_reg_u32(RegKind.VGPR, 0, 2)
+
+        # v0 = alignbyte(v0, v0, v0)
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+            src2=Register(RegKind.VGPR, 0),
+        )
+        res = interp.step(inst)
+        expected = ref_alignbyte_b32(2, 2, 2)
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), expected)
+
+    def test_unmodified_registers_preserved(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # Seed registers 10..29 with canary patterns
+        for idx in range(10, 30):
+            interp.write_reg_u32(RegKind.VGPR, idx, 0xABC00000 + idx)
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0x11111111),
+            src1=Immediate(0x22222222),
+            src2=Immediate(1),
+        )
+        interp.step(inst)
+
+        for idx in range(10, 30):
+            self.assertEqual(interp.read_reg_u32(RegKind.VGPR, idx), 0xABC00000 + idx)
+
+    def test_simd_aliasing_with_divergent_exec_mask(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        exec_mask = 0x0000000F  # Only lanes 0..3 active
+        simd.set_exec_mask(exec_mask)
+
+        # In all lanes: v0 = 0x88776655, v1 = 0x44332211
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, 0x88776655)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 0x44332211)
+
+        # v0 = alignbyte(v0, v1, 2)
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Immediate(2),
+        )
+        results = simd.step(inst)
+        expected = ref_alignbyte_b32(0x88776655, 0x44332211, 2)
+
+        for lane in range(32):
+            if lane < 4:
+                self.assertEqual(results[lane], expected)
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), expected)
+            else:
+                self.assertIsNone(results[lane])
+                # Inactive lanes retain original v0
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 0x88776655)
+
+
 if __name__ == "__main__":
     unittest.main()
