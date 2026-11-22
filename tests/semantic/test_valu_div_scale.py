@@ -1261,8 +1261,135 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertAlmostEqual(wave.get_lane_vgpr_f32(l, 0), (2.0 ** -100) * (2.0 ** 64))
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_inplace_dst_equals_src0_and_src1_f32(self):
+        interp = ScalarInterpreter()
+        small = 2.0 ** -100
+        interp.rf.set_vgpr_f32(1, small)
+        interp.rf.set_vgpr_f32(2, 5.0)
+
+        # v1 = v_div_scale_f32 v1, vcc, v1, v1, v2
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(1),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        res, vcc = interp.step(inst)
+        self.assertEqual(vcc, 1)
+        self.assertAlmostEqual(res, small * (2.0 ** 64))
+        self.assertAlmostEqual(interp.rf.get_vgpr_f32(1), small * (2.0 ** 64))
+        # src2 (v2) must remain intact
+        self.assertEqual(interp.rf.get_vgpr_f32(2), 5.0)
+
+    def test_inplace_dst_equals_src0_and_src2_f32(self):
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr_f32(1, 2.0)
+        interp.rf.set_vgpr_f32(2, 10.0)
+
+        # v2 = v_div_scale_f32 v2, vcc, v2, v1, v2
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(2),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        res, vcc = interp.step(inst)
+        self.assertEqual(vcc, 0)
+        self.assertEqual(res, 10.0)
+        self.assertEqual(interp.rf.get_vgpr_f32(2), 10.0)
+        # src1 (v1) must remain intact
+        self.assertEqual(interp.rf.get_vgpr_f32(1), 2.0)
+
+    def test_inplace_f64_self_aliasing(self):
+        interp = ScalarInterpreter()
+        small = 2.0 ** -800
+        interp.rf.set_vgpr_pair_f64(0, small)
+
+        # v[0:1] = v_div_scale_f64 v[0:1], vcc, v[0:1], v[0:1], v[0:1]
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr_pair(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr_pair(0),
+            src1=ASTOperand.vgpr_pair(0),
+            src2=ASTOperand.vgpr_pair(0),
+        )
+        res, vcc = interp.step(inst)
+        self.assertEqual(vcc, 1)
+        self.assertAlmostEqual(res, small * (2.0 ** 128))
+        self.assertAlmostEqual(interp.rf.get_vgpr_pair_f64(0), small * (2.0 ** 128))
+
+    def test_f64_partially_overlapping_register_pairs(self):
+        interp = ScalarInterpreter()
+        # s0 in v[0:1], s1 in v[2:3], dst in v[1:2] (overlaps v1 and v2)
+        v0_raw = 0xAAAA5555
+        v3_raw = 0x3333CCCC
+        interp.rf.set_vgpr_u32(0, v0_raw)
+        interp.rf.set_vgpr_u32(1, 0x11111111)
+        interp.rf.set_vgpr_u32(2, 0x22222222)
+        interp.rf.set_vgpr_u32(3, v3_raw)
+
+        s0_val = interp.rf.get_vgpr_pair_f64(0)
+        s1_val = interp.rf.get_vgpr_pair_f64(2)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr_pair(1),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr_pair(0),
+            src1=ASTOperand.vgpr_pair(0),
+            src2=ASTOperand.vgpr_pair(2),
+        )
+        res, vcc = interp.step(inst)
+
+        # v[1:2] must hold result
+        self.assertEqual(interp.rf.get_vgpr_pair_f64(1), res)
+        # Boundary dwords v[0] and v[3] must remain untouched!
+        self.assertEqual(interp.rf.get_vgpr_u32(0), v0_raw)
+        self.assertEqual(interp.rf.get_vgpr_u32(3), v3_raw)
+
+    def test_simd_inplace_divergent_mask(self):
+        wave = SIMDWaveState(wave_size=32)
+        # Odd lanes active
+        wave.exec_mask = 0xAAAAAAAA
+        interp = SIMDInterpreter(wave)
+
+        small = 2.0 ** -100
+        for l in range(32):
+            wave.set_lane_vgpr_f32(l, 0, float(l + 1))
+            wave.set_lane_vgpr_f32(l, 1, small)
+            wave.set_lane_vgpr_f32(l, 2, 1.0)
+
+        # v0 = v_div_scale_f32 v0, vcc, v1, v1, v2
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        res, vcc = interp.step(inst)
+        self.assertEqual(vcc, 0xAAAAAAAA)
+        for l in range(32):
+            if l % 2 == 1:
+                # Active lane: updated to scaled value
+                self.assertAlmostEqual(wave.get_lane_vgpr_f32(l, 0), small * (2.0 ** 64))
+            else:
+                # Inactive lane: retained original float(l + 1)
+                self.assertEqual(wave.get_lane_vgpr_f32(l, 0), float(l + 1))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
