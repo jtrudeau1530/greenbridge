@@ -85,7 +85,9 @@ A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file 
 and the `api-ms-win-core-file-*` sets a GDK title links against.
 
 - A `GAME:` path (any case, `\` or `/`) maps under `--game-dir`. A path without the prefix is a host path and is
-  passed to the host unchanged.
+  passed to the host unchanged. `--game-dir` defaults to the image's folder. `gta6rt` makes it and `--overlay`
+  absolute at startup, so a bare image name (`gta6rt --run game.exe` from the game folder) and a relative folder
+  both keep naming the same place after the title changes its current directory (CTest `run_tiny_game_dir`).
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
   write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes; a delete of a
   package file leaves an empty marker under `<overlay>\.gta6rt-deleted`, which reads and listings treat as gone. The
