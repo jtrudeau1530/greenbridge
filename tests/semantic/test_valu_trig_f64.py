@@ -838,5 +838,183 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(interp.vgpr.get_vgpr_pair(4), F64_POS_ZERO)
 
 
+# ==============================================================================
+# SIMD Wavefront Execution Model (Wave32 / Wave64) for v_trig_f64
+# ==============================================================================
+
+def ref_simd_trig_f64(
+    src0_lanes: list[int],
+    wave_size: int = 64,
+    exec_mask: int | None = None,
+    prev_dst: list[int] | None = None,
+    *,
+    mode: TrigMode = TrigMode.SIN,
+    clamp: bool = False,
+    src0_neg: bool = False,
+    src0_abs: bool = False,
+) -> list[int]:
+    """Reference SIMD execution oracle across wavefront lanes."""
+    if wave_size not in (32, 64):
+        raise ValueError(f"Unsupported wave size: {wave_size}")
+    if len(src0_lanes) != wave_size:
+        raise ValueError(f"Operand length must match wave_size ({wave_size})")
+
+    active_mask = (1 << wave_size) - 1 if exec_mask is None else (exec_mask & ((1 << wave_size) - 1))
+    fallback = [0] * wave_size if prev_dst is None else prev_dst
+    if len(fallback) != wave_size:
+        raise ValueError(f"prev_dst length must match wave_size ({wave_size})")
+
+    output = list(fallback)
+    for lane in range(wave_size):
+        if (active_mask >> lane) & 1:
+            output[lane] = ref_trig_f64(
+                src0_lanes[lane],
+                mode=mode,
+                clamp=clamp,
+                src0_neg=src0_neg,
+                src0_abs=src0_abs,
+            )
+    return output
+
+
+class SIMDWavefront:
+    """SIMD wavefront simulator modeling multi-lane execution and EXEC masking."""
+
+    def __init__(self, wave_size: int = 64, num_vgprs: int = 256) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self.num_vgprs = num_vgprs
+        self.lanes = [VALURegisterFile(num_vgprs=num_vgprs) for _ in range(wave_size)]
+        self.exec_mask = (1 << wave_size) - 1
+        self.vcc = 0
+        self.sgprs = [0] * 106
+
+    def store_vgpr_pair_wave(self, reg_idx: int, values: list[int]) -> None:
+        if len(values) != self.wave_size:
+            raise ValueError(f"Value count ({len(values)}) does not match wave_size ({self.wave_size})")
+        for lane in range(self.wave_size):
+            self.lanes[lane].set_vgpr_pair(reg_idx, values[lane])
+
+    def load_vgpr_pair_wave(self, reg_idx: int) -> list[int]:
+        return [self.lanes[lane].get_vgpr_pair(reg_idx) for lane in range(self.wave_size)]
+
+    def step_v_trig_f64(
+        self,
+        dst_reg: int,
+        src0_reg: int,
+        *,
+        mode: TrigMode = TrigMode.SIN,
+        clamp: bool = False,
+        src0_neg: bool = False,
+        src0_abs: bool = False,
+    ) -> list[int]:
+        active_mask = self.exec_mask & ((1 << self.wave_size) - 1)
+        for lane in range(self.wave_size):
+            if (active_mask >> lane) & 1:
+                s0 = self.lanes[lane].get_vgpr_pair(src0_reg)
+                res = ref_trig_f64(
+                    s0,
+                    mode=mode,
+                    clamp=clamp,
+                    src0_neg=src0_neg,
+                    src0_abs=src0_abs,
+                )
+                self.lanes[lane].set_vgpr_pair(dst_reg, res)
+        return self.load_vgpr_pair_wave(dst_reg)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and EXEC masking."""
+
+    def test_wave32_full_exec(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        angles = [f64_to_u64(i / 32.0) for i in range(32)]
+        wave.store_vgpr_pair_wave(2, angles)
+
+        res = wave.step_v_trig_f64(0, 2, mode=TrigMode.SIN)
+        expected = ref_simd_trig_f64(angles, wave_size=32, mode=TrigMode.SIN)
+        self.assertEqual(res, expected)
+
+    def test_wave64_full_exec(self) -> None:
+        wave = SIMDWavefront(wave_size=64)
+        angles = [f64_to_u64(i / 64.0) for i in range(64)]
+        wave.store_vgpr_pair_wave(4, angles)
+
+        res = wave.step_v_trig_f64(0, 4, mode=TrigMode.COS)
+        expected = ref_simd_trig_f64(angles, wave_size=64, mode=TrigMode.COS)
+        self.assertEqual(res, expected)
+
+    def test_wave32_partial_exec_preservation(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        sentinel = join_dwords(OLD_VGPR_SENTINEL, OLD_VGPR_SENTINEL)
+        wave.store_vgpr_pair_wave(0, [sentinel] * 32)
+
+        angles = [F64_QUARTER] * 32
+        wave.store_vgpr_pair_wave(2, angles)
+
+        # Alternating mask: even lanes active
+        wave.exec_mask = 0x55555555
+        res = wave.step_v_trig_f64(0, 2, mode=TrigMode.SIN)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(res[lane], F64_ONE, f"Active lane {lane} failed to update")
+            else:
+                self.assertEqual(res[lane], sentinel, f"Inactive lane {lane} was mutated")
+
+    def test_wave64_upper_half_exec(self) -> None:
+        wave = SIMDWavefront(wave_size=64)
+        sentinel = join_dwords(OLD_VGPR_SENTINEL, OLD_VGPR_SENTINEL)
+        wave.store_vgpr_pair_wave(0, [sentinel] * 64)
+
+        angles = [F64_QUARTER] * 64
+        wave.store_vgpr_pair_wave(2, angles)
+
+        # Only upper 32 lanes active
+        wave.exec_mask = 0xFFFFFFFF00000000
+        res = wave.step_v_trig_f64(0, 2, mode=TrigMode.SIN)
+
+        for lane in range(64):
+            if lane >= 32:
+                self.assertEqual(res[lane], F64_ONE, f"Active upper lane {lane} failed to update")
+            else:
+                self.assertEqual(res[lane], sentinel, f"Inactive lower lane {lane} was overwritten")
+
+    def test_wave_exec_all_zero(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        sentinel = join_dwords(OLD_VGPR_SENTINEL, OLD_VGPR_SENTINEL)
+        wave.store_vgpr_pair_wave(0, [sentinel] * 32)
+        wave.store_vgpr_pair_wave(2, [F64_QUARTER] * 32)
+
+        wave.exec_mask = 0x00000000
+        res = wave.step_v_trig_f64(0, 2, mode=TrigMode.SIN)
+        self.assertEqual(res, [sentinel] * 32)
+
+    def test_wave_single_active_lane(self) -> None:
+        wave = SIMDWavefront(wave_size=64)
+        sentinel = join_dwords(OLD_VGPR_SENTINEL, OLD_VGPR_SENTINEL)
+        wave.store_vgpr_pair_wave(0, [sentinel] * 64)
+        wave.store_vgpr_pair_wave(2, [F64_QUARTER] * 64)
+
+        # Only lane 42 active
+        wave.exec_mask = 1 << 42
+        res = wave.step_v_trig_f64(0, 2, mode=TrigMode.SIN)
+
+        for lane in range(64):
+            if lane == 42:
+                self.assertEqual(res[lane], F64_ONE)
+            else:
+                self.assertEqual(res[lane], sentinel)
+
+    def test_wave_size_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=128)
+        with self.assertRaises(ValueError):
+            ref_simd_trig_f64([0] * 16, wave_size=16)
+
+
 if __name__ == "__main__":
     unittest.main()
