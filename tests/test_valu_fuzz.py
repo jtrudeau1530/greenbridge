@@ -175,3 +175,33 @@ def test_model_only_runs_every_family(capsys, monkeypatch):
         monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", family, "--programs", "4", "--model-only"])
         assert vf.main() == 0
     assert "programs generated and modelled" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("extra", [
+    ["--programs", "0"],
+    ["--programs", "-5"],
+    ["--max-report", "0"],
+    ["--max-report", "-1"],
+])
+def test_cli_rejects_non_positive_programs_and_max_report(extra, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--model-only", *extra])
+    with pytest.raises(SystemExit) as exc:
+        vf.main()
+    assert exc.value.code == 2
+    assert "--programs and --max-report must be at least 1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["", "1", "a:b", "1:2:64:99", "1:-1", "1:2:16"])
+def test_cli_rejects_invalid_show(bad, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--show", bad])
+    with pytest.raises(SystemExit) as exc:
+        vf.main()
+    assert exc.value.code == 2
+    assert "--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("spec", ["1:0", "1:2:32", "1:2:64"])
+def test_cli_show_valid_formats(spec, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--show", spec])
+    assert vf.main() == 0
+    assert "; model, thread 0:" in capsys.readouterr().out
