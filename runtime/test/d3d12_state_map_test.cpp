@@ -227,6 +227,48 @@ int main() {
     CHECK(!(vulkan_access(s::predication, false).access & VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT));
     CHECK(!(vulkan_access(s::copy_dest, false, true).stages & VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT));
 
+    // Primitive topology: a D3D12_PRIMITIVE_TOPOLOGY value maps to a VkPrimitiveTopology, and strip topologies are
+    // the ones a primitive-restart index cuts. A wrong map draws the wrong primitive; a wrong strip classification
+    // restarts (or fails to restart) an indexed strip. The D3D12 values are the public D3D_PRIMITIVE_TOPOLOGY enum.
+    {
+        using detail::strip_topology;
+        using detail::vulkan_topology;
+#ifdef _WIN32
+        static_assert(D3D_PRIMITIVE_TOPOLOGY_POINTLIST == 1 && D3D_PRIMITIVE_TOPOLOGY_LINELIST == 2 &&
+                          D3D_PRIMITIVE_TOPOLOGY_LINESTRIP == 3 && D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST == 4 &&
+                          D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP == 5 && D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ == 10 &&
+                          D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ == 11 && D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ == 12 &&
+                          D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ == 13,
+                      "D3D_PRIMITIVE_TOPOLOGY values the topology map is keyed on");
+#endif
+        struct TopoCase {
+            std::uint32_t d3d;
+            VkPrimitiveTopology vk;
+            bool strip;
+        };
+        static constexpr TopoCase topos[] = {
+            {1, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, false},                      // POINTLIST
+            {2, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false},                      // LINELIST
+            {3, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true},                      // LINESTRIP
+            {5, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, true},                  // TRIANGLESTRIP
+            {10, VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY, false},      // LINELIST_ADJ
+            {11, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY, true},      // LINESTRIP_ADJ
+            {12, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY, false},  // TRIANGLELIST_ADJ
+            {13, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY, true},  // TRIANGLESTRIP_ADJ
+        };
+        for (const auto& t : topos) {
+            CHECK(vulkan_topology(t.d3d) == t.vk);
+            CHECK(strip_topology(t.vk) == t.strip);
+        }
+        // TRIANGLELIST (4), UNDEFINED (0) and any unmapped value fall back to the triangle list, which is not a strip.
+        CHECK(vulkan_topology(4) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        CHECK(vulkan_topology(0) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        CHECK(vulkan_topology(99) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        CHECK(!strip_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST));
+        CHECK(!strip_topology(VK_PRIMITIVE_TOPOLOGY_LINE_LIST));
+        CHECK(!strip_topology(VK_PRIMITIVE_TOPOLOGY_POINT_LIST));
+    }
+
     // Subresource indices: mip + layer * mips + plane * mips * layers.
     VkImageSubresourceRange range{};
     ResourceBinding color{};
@@ -666,6 +708,24 @@ int main() {
             {VK_FORMAT_R32_UINT, 4, 1},             {VK_FORMAT_R8G8_UNORM, 2, 1},
             {VK_FORMAT_R16_SFLOAT, 2, 1},           {VK_FORMAT_R16_UNORM, 2, 1},
             {VK_FORMAT_R8_UNORM, 1, 1},
+            // Integer and additional packed formats the DXGI map also produces: each SINT/SNORM/UINT variant is the
+            // size of its UNORM/SFLOAT sibling, and the PACK16/PACK32 formats are 2 and 4 bytes.
+            {VK_FORMAT_R32G32B32A32_SINT, 16, 1},
+            {VK_FORMAT_R16G16B16A16_SNORM, 8, 1},   {VK_FORMAT_R16G16B16A16_UINT, 8, 1},
+            {VK_FORMAT_R16G16B16A16_SINT, 8, 1},    {VK_FORMAT_R32G32_UINT, 8, 1},
+            {VK_FORMAT_R32G32_SINT, 8, 1},
+            {VK_FORMAT_A2B10G10R10_UINT_PACK32, 4, 1}, {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 4, 1},
+            {VK_FORMAT_R8G8B8A8_SNORM, 4, 1},       {VK_FORMAT_R8G8B8A8_SINT, 4, 1},
+            {VK_FORMAT_R16G16_UNORM, 4, 1},         {VK_FORMAT_R16G16_SNORM, 4, 1},
+            {VK_FORMAT_R16G16_UINT, 4, 1},          {VK_FORMAT_R16G16_SINT, 4, 1},
+            {VK_FORMAT_R32_SINT, 4, 1},
+            {VK_FORMAT_R5G6B5_UNORM_PACK16, 2, 1},  {VK_FORMAT_A1R5G5B5_UNORM_PACK16, 2, 1},
+            {VK_FORMAT_A4R4G4B4_UNORM_PACK16, 2, 1}, {VK_FORMAT_R4G4B4A4_UNORM_PACK16, 2, 1},
+            {VK_FORMAT_R8G8_SNORM, 2, 1},           {VK_FORMAT_R8G8_UINT, 2, 1},
+            {VK_FORMAT_R8G8_SINT, 2, 1},            {VK_FORMAT_R16_SNORM, 2, 1},
+            {VK_FORMAT_R16_UINT, 2, 1},             {VK_FORMAT_R16_SINT, 2, 1},
+            {VK_FORMAT_R8_SNORM, 1, 1},             {VK_FORMAT_R8_UINT, 1, 1},
+            {VK_FORMAT_R8_SINT, 1, 1},
             // Block-compressed: one 4x4 block is 8 bytes (BC1, BC4) or 16 bytes (BC2, BC3, BC5, BC6H, BC7).
             {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, 8, 4},
             {VK_FORMAT_BC4_UNORM_BLOCK, 8, 4},      {VK_FORMAT_BC4_SNORM_BLOCK, 8, 4},
