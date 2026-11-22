@@ -52,15 +52,61 @@ def s32(u):
 
 
 def half_to_float(h):
-    return struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0]
+    # Bit-level f16 -> f32; every non-NaN result is exact. struct's '<e' is not used because its NaN result
+    # depends on the Python version: before 3.14 it drops the payload and returns the canonical quiet NaN, from
+    # 3.14 it keeps sign and payload (CPython gh-130317). Pinned rule, the one CI's 3.12 sees: a NaN half expands
+    # to the canonical quiet NaN with its sign, payload dropped.
+    h &= 0xFFFF
+    sign = (h >> 15) << 31
+    exp = (h >> 10) & 0x1F
+    frac = h & 0x3FF
+    if exp == 0x1F:
+        bits = sign | (0x7FC00000 if frac else 0x7F800000)     # NaN: canonical quiet, payload dropped; infinity
+    elif exp == 0 and frac:
+        b = frac.bit_length()
+        bits = sign | ((b + 102) << 23) | ((frac << (24 - b)) & 0x7FFFFF)   # subnormal half -> normal f32
+    elif exp == 0:
+        bits = sign                                            # +-0
+    else:
+        bits = sign | ((exp + 112) << 23) | (frac << 13)       # normal half -> f32, exact
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
 
 
 def float_to_half(x):
-    """Round to nearest even; overflow gives infinity (the struct module raises instead)."""
-    try:
-        return struct.unpack("<H", struct.pack("<e", x))[0]
-    except OverflowError:
-        return 0xFC00 if x < 0 else 0x7C00
+    # Bit-level double -> f16, round to nearest even; overflow gives infinity (struct's '<e' raised OverflowError
+    # here, which the old except mapped to the same words). '<e' is not used for the same version dependence as
+    # half_to_float (gh-130317); pinned rule: any NaN becomes the canonical quiet NaN with the operand's sign,
+    # payload dropped. Rounding runs on the operand's own 64-bit pattern, so normal, subnormal and tie results
+    # cannot change with the Python version, and the double is rounded once, as struct's '<e' rounded it.
+    bits = struct.unpack("<Q", struct.pack("<d", x))[0]
+    sign = (bits >> 63) << 15
+    exp = (bits >> 52) & 0x7FF
+    mant = bits & ((1 << 52) - 1)
+    if exp == 0x7FF:
+        return sign | (0x7E00 if mant else 0x7C00)             # NaN: canonical quiet, sign kept; infinity
+    if exp == 0:
+        return sign                                            # +-0 and double subnormals sit far below the half grid
+    e = exp - 1023
+    full = (1 << 52) | mant
+    if e < -14:
+        drop = 28 - e                                          # subnormal grid: multiples of 2**-24
+        n = full >> drop
+        rem = full & ((1 << drop) - 1)
+        if rem > (1 << (drop - 1)) or (rem == (1 << (drop - 1)) and n & 1):
+            n += 1
+        if n > 0x3FF:                                          # rounds up to the smallest normal
+            return sign | 0x0400
+        return sign | n
+    n = full >> 42                                             # keep the top 11 significand bits, RNE the rest
+    rem = full & ((1 << 42) - 1)
+    if rem > (1 << 41) or (rem == (1 << 41) and n & 1):
+        n += 1
+    if n > 0x7FF:                                              # significand carry bumps the exponent
+        e += 1
+        n = 0x400
+    if e > 15:                                                 # overflow, incl. the 65520 RNE tie
+        return sign | 0x7C00
+    return sign | ((e + 15) << 10) | (n & 0x3FF)
 
 
 class Result:
