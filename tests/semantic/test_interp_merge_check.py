@@ -1,4 +1,4 @@
-"""spirv_mini_interp and spirv_wave_interp reject a module that breaks spirv-val's merge rule.
+"""spirv_mini_interp and spirv_wave_interp reject a module that breaks spirv-val's merge or phi rule.
 
 OpSelectionMerge must directly precede OpBranchConditional / OpSwitch, and OpLoopMerge directly precede OpBranch /
 OpBranchConditional (SPIR-V 2.16.2). Both interpreters used to skip merges, so #1633's first version, with an
@@ -72,6 +72,50 @@ class MergeRule(unittest.TestCase):
             si.check_structure([ok[0], (None, "OpIAdd", [], "%x = OpIAdd %uint %a %b"), ok[1]])
         with self.assertRaisesRegex(si.InvalidModule, "end of the function"):
             si.check_structure([ok[0]])
+
+
+CS_LINES = ["v_mov_b32_e32 v1, 0x40", "global_load_dword v2, v1, s[0:1]", "s_waitcnt vmcnt(0)",
+            "v_mov_b32_e32 v3, 0", "buffer_store_dword v2, v3, s[0:3], 0 offen", "s_endpgm"]
+
+
+def cs_spv():
+    from test_salu64_bitwise_data import translate_cs
+    text = translate_cs(CS_LINES)
+    assert " = OpPhi " in text
+    return text
+
+
+def run_cs(text):
+    mem = {0x40: 0x1234}
+    si.run_workgroup(text, 1, 64, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                     push_constants=[0, 0, 0x1000, 0x31016FAC] + [0] * 32, memory=mem)
+    return mem
+
+
+class PhiRule(unittest.TestCase):
+    """OpPhi must be the first instructions of its block: only OpLabel or OpPhi before it (SPIR-V 2.16.2)."""
+
+    def test_translated_module_runs(self):
+        self.assertEqual(run_cs(cs_spv())[0], 0x1234)
+
+    def test_phi_after_another_instruction(self):
+        lines = cs_spv().splitlines()
+        k = next(i for i, ln in enumerate(lines) if " = OpPhi " in ln)
+        lines[k], lines[k + 1] = lines[k + 1], lines[k]     # the phi now follows a non-phi instruction
+        bad = "\n".join(lines) + "\n"
+        with self.assertRaisesRegex(si.InvalidModule, "OpPhi"):
+            run_cs(bad)
+
+    def test_rule_directly(self):
+        lab = (None, "OpLabel", [], "%b = OpLabel")
+        phi = ("%p", "OpPhi", [], "%p = OpPhi %uint %a %x %c %y")
+        add = ("%q", "OpIAdd", [], "%q = OpIAdd %uint %a %a")
+        si.check_structure([lab, phi, phi, add])
+        with self.assertRaisesRegex(si.InvalidModule, "OpPhi"):
+            si.check_structure([lab, add, phi])
+        with self.assertRaisesRegex(wi.InvalidModule, "OpPhi"):
+            wi.run_wave("OpFunction %void None %f\n%b = OpLabel\n%q = OpIAdd %uint %a %a\n"
+                        "%p = OpPhi %uint %a %x %c %y\nOpReturn\nOpFunctionEnd\n", wave=32)
 
 
 if __name__ == "__main__":

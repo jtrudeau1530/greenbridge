@@ -161,6 +161,9 @@ class _Module:
                 if res and a and op != "OpStore":
                     self.id_type[res] = a[0]
                 if op == "OpPhi":
+                    if cur.body:
+                        raise InvalidModule(f"{line!r} follows a non-phi instruction of its block (spirv-val: "
+                                            "OpPhi must come first)")
                     cur.phis.append((res, a))
                 elif op in ("OpSelectionMerge", "OpLoopMerge"):
                     cur.merge = (op, a[0], a[1] if op == "OpLoopMerge" else None)
