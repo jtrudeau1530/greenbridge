@@ -493,10 +493,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json_path:
         try:
+            text = json.dumps(report, indent=2, allow_nan=False) + "\n"
+        except (TypeError, ValueError) as exc:
+            print(f"error: cannot write {args.json_path}: {exc}", file=sys.stderr)
+            return 2
+        try:
             with open(args.json_path, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(report, handle, indent=2, allow_nan=False)
-                handle.write("\n")
-        except (OSError, ValueError) as exc:
+                handle.write(text)
+        except OSError as exc:
             print(f"error: cannot write {args.json_path}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
             return 2
     print(format_report(report))

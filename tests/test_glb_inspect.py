@@ -355,6 +355,24 @@ class GlbInspectTests(unittest.TestCase):
             self.assertIn("cannot write", result.stderr)
             self.assertEqual(result.stdout.strip(), "")
 
+    def test_json_serialization_failure_does_not_create_a_partial_report(self):
+        payload = (
+            b'{"asset":{"version":"2.0"},"materials":[{"name":"Huge",'
+            b'"pbrMetallicRoughness":{"baseColorFactor":[1e400,0,0,1]}}]}'
+        )
+        payload += b" " * ((-len(payload)) % 4)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "model.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(container(payload))
+            result = self.run_tool(path, "--json", out)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot write", result.stderr)
+            self.assertIn("Out of range float values", result.stderr)
+            self.assertEqual(result.stdout.strip(), "")
+            self.assertFalse(os.path.exists(out), "a serialization failure left a partial report")
+
     def test_json_round_trip_and_input_alias_refusal(self):
         with tempfile.TemporaryDirectory() as folder:
             source = os.path.join(folder, "model.glb")
