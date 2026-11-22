@@ -958,6 +958,7 @@ UINT resolve_pixel_size(DXGI_FORMAT format) {
     switch (format) {
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
     case DXGI_FORMAT_R10G10B10A2_UNORM: return 4;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
     case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
@@ -1091,6 +1092,48 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
     const D3D12_RANGE written{0, 0};
     readback->Unmap(0, &written);
 #undef RESOLVE_CHECK
+    return true;
+}
+
+// Compare RGB9E5 capability queries with the sample counts of the actual Vulkan attachment, then
+// resolve green over a red single-sample destination and check its packed shared-exponent texels.
+bool check_rgb9e5_resolves(ID3D12Device* device, const vktest::Device& vk) {
+    constexpr auto format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImageFormatProperties properties{};
+    const auto query = vk.instance_fn<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
+    const auto result = query(vk.physical, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_IMAGE_TYPE_2D,
+                              VK_IMAGE_TILING_OPTIMAL, usage, 0, &properties);
+    if (result != VK_SUCCESS && result != VK_ERROR_FORMAT_NOT_SUPPORTED) return false;
+    const VkSampleCountFlags counts = result == VK_SUCCESS ? properties.sampleCounts : 0;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))) return false;
+    constexpr UINT bits = D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+    const bool multisampled = (counts & (2u | 4u | 8u | 16u | 32u)) != 0;
+    if ((UINT(support.Support1) & bits) != (multisampled ? bits : 0u)) {
+        std::fprintf(stderr, "RGB9E5 Support1=0x%x, Vulkan sample counts=0x%x\n", UINT(support.Support1), counts);
+        return false;
+    }
+    for (UINT samples : {2u, 4u, 8u, 16u, 32u}) {
+        const bool supported = (counts & samples) != 0;
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{format, samples};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality, sizeof(quality))) ||
+            quality.NumQualityLevels != UINT(supported)) return false;
+        if (!supported) continue;
+        std::vector<std::uint8_t> pixels;
+        if (!capture_resolve(device, format, samples, ResolveScenario::full, pixels) || pixels.size() != 8 * 8 * 4)
+            return false;
+        for (size_t i = 0; i < pixels.size(); i += 4) {
+            std::uint32_t packed;
+            std::memcpy(&packed, pixels.data() + i, sizeof(packed));
+            if (packed != 0x80020000u) {  // green mantissa 256, shared exponent 16
+                std::fprintf(stderr, "RGB9E5 %ux resolve: pixel %zu got 0x%08x, expected 0x80020000\n",
+                             samples, i / 4, packed);
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -2256,6 +2299,7 @@ int main() {
             std::printf("Depth/stencil MSAA quality queries: no host D3D12 device to compare with, skipped\n");
         EXPECT(depth_quality_mismatches <= 0);
 
+        EXPECT(check_rgb9e5_resolves(device.p, d));
         const int resolve_mismatches = compare_resolves(device.p, color_sample_counts);
         if (resolve_mismatches < 0)
             std::printf("Resolve comparison: no host D3D12 device to compare with, skipped\n");
