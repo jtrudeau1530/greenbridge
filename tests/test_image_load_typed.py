@@ -218,6 +218,39 @@ class LoadOnlyShaders(unittest.TestCase):
             comps = sorted(int(args[2]) for _, op, args in m.order if op == "OpCompositeExtract" and args[1] == bits)
             self.assertEqual(comps, [0, 3], "dmask 0x9: R into v0, A into v1")
 
+    def test_d16_odd_dmask_preserves_trailing_vgpr_high_half(self):
+        # Odd component counts (1 or 3) must keep the trailing destination VGPR's high 16 bits via write_lo16
+        # in all three typed branches (sint, uint, float), while even counts overwrite the whole register.
+        for dmask, dest_reg, expect_preserve in ((0x1, 0, True), (0x7, 1, True), (0x3, 0, False), (0xF, 1, False)):
+            with self.subTest(dmask=hex(dmask)):
+                reg = "v0" if dest_reg == 0 else "v[0:1]"
+                m = Module(translate([
+                    "v_mov_b32 v0, 0x5a5a0000",
+                    "v_mov_b32 v1, 0x5a5a0000",
+                    "v_mov_b32 v4, 1",
+                    "v_mov_b32 v5, 2",
+                    f"image_load {reg}, v[4:5], s[0:7] dmask:0x{dmask:x} dim:SQ_RSRC_IMG_2D unorm d16",
+                    "s_waitcnt vmcnt(0)",
+                ]))
+                # write_lo16 emits: OpBitwiseAnd %uint <copy_of_old_vgpr> %uint_0xFFFF0000.
+                hi_masks = 0
+                for _, op, args in m.order:
+                    if op != "OpBitwiseAnd":
+                        continue
+                    rhs = m.defs.get(args[2])
+                    if not rhs or rhs[0] != "OpConstant" or int(rhs[1][1], 0) != 0xFFFF0000:
+                        continue
+                    copy = m.defs.get(args[1])
+                    if not copy or copy[0] != "OpCopyObject":
+                        continue
+                    load = m.defs.get(copy[1][1])
+                    if not load or load[0] != "OpLoad":
+                        continue
+                    ptr = m.defs.get(load[1][1])
+                    if ptr and ptr[0] == "OpAccessChain" and ptr[1][1] == "%vgpr" and m.value(ptr[1][2], 0, 0) == dest_reg:
+                        hi_masks += 1
+                self.assertEqual(hi_masks, 3 if expect_preserve else 0)
+
 
 class TypedGatherShaders(unittest.TestCase):
     def test_2d_gather_picks_the_sampled_type_and_selected_component(self):
@@ -274,6 +307,24 @@ class Validation(unittest.TestCase):
                     sa, sv = os.path.join(tmp, f"{dim}.spvasm"), os.path.join(tmp, f"{dim}.spv")
                     with open(sa, "w", encoding="utf-8") as f:
                         f.write(load_shader(dim))
+                    result = rdna2spirv.assemble_spirv(sa, sv)
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_spirv_val_accepts_d16_odd_dmask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for dmask, reg in ((0x1, "v0"), (0x7, "v[0:1]")):
+                with self.subTest(dmask=hex(dmask)):
+                    sa = os.path.join(tmp, f"d16_{dmask:x}.spvasm")
+                    sv = os.path.join(tmp, f"d16_{dmask:x}.spv")
+                    with open(sa, "w", encoding="utf-8") as f:
+                        f.write(translate([
+                            "v_mov_b32 v0, 0x5a5a0000",
+                            "v_mov_b32 v1, 0x5a5a0000",
+                            "v_mov_b32 v4, 1",
+                            "v_mov_b32 v5, 2",
+                            f"image_load {reg}, v[4:5], s[0:7] dmask:0x{dmask:x} dim:SQ_RSRC_IMG_2D unorm d16",
+                            "s_waitcnt vmcnt(0)",
+                        ]))
                     result = rdna2spirv.assemble_spirv(sa, sv)
                     self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 

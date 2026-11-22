@@ -228,6 +228,39 @@ class PortArgumentTest(unittest.TestCase):
         self.assertIn("must be 0-65535", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_the_cli_reports_a_port_in_use_without_a_traceback(self):
+        with socket.socket() as taken:
+            taken.bind(("127.0.0.1", 0))
+            taken.listen(1)
+            port = taken.getsockname()[1]
+            result = subprocess.run(
+                [sys.executable, "-I", str(VIEWER / "serve.py"), "--port", str(port)],
+                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"can't listen on port {port}", result.stderr)
+        self.assertIn("--port 0", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    @unittest.skipIf(os.name == "nt", "sends SIGINT, which a Windows child started this way does not get")
+    def test_ctrl_c_stops_the_viewer_without_a_traceback(self):
+        import signal
+        # A test runner started in the background has SIGINT ignored, and a child inherits that: Python then
+        # leaves it ignored and Ctrl+C would never arrive. Give the child the default disposition back.
+        proc = subprocess.Popen([sys.executable, "-I", str(VIEWER / "serve.py"), "--port", "0"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+        try:
+            self.assertIn("viewer: http://127.0.0.1:", proc.stdout.readline())   # it is serving now
+            proc.send_signal(signal.SIGINT)
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("viewer: stopped", out)
+        self.assertNotIn("Traceback", err)
+
 
 if __name__ == "__main__":
     unittest.main()

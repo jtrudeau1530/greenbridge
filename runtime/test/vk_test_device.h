@@ -22,13 +22,16 @@ inline unsigned& validation_error_count() {
     return count;
 }
 
+// Only validation-type errors fail a test. General messages come from the loader and the layers around the
+// application: a third-party implicit layer that fails to load (an overlay or capture tool, for example) reports a
+// general error that says nothing about this code, so it is printed but not counted.
 inline VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                                     VkDebugUtilsMessageTypeFlagsEXT types,
                                                     const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
-    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
-        (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
-        ++validation_error_count();
-    std::fprintf(stderr, "validation: %s\n", data && data->pMessage ? data->pMessage : "(no message)");
+    const bool validation = (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) ++validation_error_count();
+    std::fprintf(stderr, "%s: %s\n", validation ? "validation" : "vulkan (not counted)",
+                 data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
 }
 
@@ -112,9 +115,10 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
 
-    bool create() { return initialize() == DeviceStatus::ready; }
+    // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
+    bool create(bool presentation = false) { return initialize(presentation) == DeviceStatus::ready; }
 
-    DeviceStatus initialize() {
+    DeviceStatus initialize(bool presentation = false) {
         const auto failure = [](const char* call, VkResult result) {
             std::fprintf(stderr, "%s failed (VkResult %d)\n", call, static_cast<int>(result));
             return DeviceStatus::failed;
@@ -152,6 +156,11 @@ public:
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instance_info.pApplicationInfo = &app;
+        std::vector<const char*> instance_extensions;
+        if (presentation) {
+            instance_extensions.push_back("VK_KHR_surface");
+            instance_extensions.push_back("VK_KHR_win32_surface");
+        }
         if (validation) {
             std::vector<VkLayerProperties> layers;
             const VkResult layer_result = enumerate_all(layers, enumerate_layers);
@@ -177,9 +186,10 @@ public:
                 debug_utils = debug_utils || std::strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
         }
         if (debug_utils) {
-            instance_info.enabledExtensionCount = 1;
-            instance_info.ppEnabledExtensionNames = &debug_utils_name;
+            instance_extensions.push_back(debug_utils_name);
         }
+        instance_info.enabledExtensionCount = std::uint32_t(instance_extensions.size());
+        instance_info.ppEnabledExtensionNames = instance_extensions.data();
         VkResult result = create_instance(&instance_info, nullptr, &instance);
         if (result == VK_ERROR_INCOMPATIBLE_DRIVER) return DeviceStatus::unavailable;
         if (result != VK_SUCCESS) return failure("vkCreateInstance", result);
@@ -345,6 +355,8 @@ public:
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+        const char* swapchain = "VK_KHR_swapchain";
+        if (presentation) device_extensions.push_back(swapchain);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

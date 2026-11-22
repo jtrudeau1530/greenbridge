@@ -1,5 +1,6 @@
 // Synthetic byte-for-byte CopyBufferRegion oracle. --warp-only measures the native reference without Vulkan.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 #include <array>
@@ -189,12 +190,18 @@ bool run_query_copy(ID3D12Device* device, D3D12_QUERY_TYPE query_type, D3D12_PRE
 int main(int argc,char** argv) {
     const bool native_only=argc==2&&std::strcmp(argv[1],"--warp-only")==0;
     if(argc!=1&&!native_only) return 2;
+    if(hostwine::host_is_wine()) return 77;  // WARP is the reference for every case
     vktest::Device vk;
     Ref<IDXGIFactory4> factory; Ref<IDXGIAdapter> adapter; Ref<ID3D12Device> host,ours;
     if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) || FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p))) ||
        FAILED(D3D12CreateDevice(adapter.p,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&host.p)))) return 1;
     if(!native_only) {
-        if(!vk.create())return 77;   // no Vulkan GPU: ctest skips (SKIP_RETURN_CODE 77), as the other registered runtime tests do
+        const auto status = vk.initialize();
+        if (status == vktest::DeviceStatus::unavailable) {
+            std::puts("predicated buffer copies: skipped (no Vulkan device)");
+            return 77;
+        }
+        if (status != vktest::DeviceStatus::ready) return 1;
         if(!vk.conditional_rendering || !vk.storage_buffer_8bit) {
             std::puts("predicated buffer copies: skipped (requires conditional rendering and storageBuffer8BitAccess)");
             return 0;

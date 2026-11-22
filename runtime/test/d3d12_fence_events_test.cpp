@@ -3,6 +3,7 @@
 // as one fence reached, ANY is satisfied), and SetEventOnMultipleFenceCompletion with no fences is E_INVALIDARG and
 // sets nothing. No shaders or game data. LEONIDA_VK_VALIDATION=1 fails the test on any validation error.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 
@@ -90,7 +91,7 @@ int main() {
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         failures += check(ours.p, "vulkan");
         Ref<IDXGIFactory4> factory;
-        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
+        if (!hostwine::host_is_wine() && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
             for (const bool warp : {false, true}) {  // the reference the expectations were measured on
                 Ref<IDXGIAdapter> adapter;
                 Ref<ID3D12Device> host;
