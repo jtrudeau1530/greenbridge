@@ -447,6 +447,32 @@ test('a valid LOD manifest is accepted', async () => {
     assert.equal(world.test, false);
 });
 
+test('orphan HD draws independently of the LOD chain in its cell', async () => {
+    const f = fixture(0);
+    f.context.world = {
+        test: false,
+        lod_bands: { hd: [0, 130], orphan_hd: [0, 100] },
+        chunks: [
+            { ...worldChunk, id: 'hd', url: 'hd.glb', lod: 'hd', cell: [0, 0, 256, 256] },
+            { ...worldChunk, id: 'orphan', url: 'orphan.glb', lod: 'orphan_hd', cell: [0, 0, 256, 256] },
+        ],
+    };
+    const hd = Object.assign(f.object(), { visible: true });
+    const orphan = Object.assign(f.object(), { visible: true });
+    f.frame();
+    await f.succeed(0, hd);
+    await f.succeed(1, orphan);
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(orphan.visible, true);
+
+    f.context.camera.position.x = 366; // 110 m from the cell, inside the orphan's unload slack.
+    f.frame();
+    assert.equal(hd.visible, true);
+    assert.equal(orphan.visible, false);
+    assert.ok(f.state.live.has('orphan'));
+});
+
 test('LOD sets show one tier per cell by horizontal distance, with slack before unloading', async () => {
     const f = fixture(0);
     const cell = [0, 0, 256, 256];
@@ -488,4 +514,3 @@ test('LOD sets show one tier per cell by horizontal distance, with slack before 
     assert.ok(!f.state.live.has('lod'));
     assert.equal(f.requests.at(-1).url, 'slod1.glb');
 });
-

@@ -316,7 +316,10 @@ function stream(now = performance.now()) {
     if (!c.obj && !c.loading) continue;
     const { load, keep } = range(c.def, p);
     if (keep) {
-      if (c.obj && c.def.lod !== undefined) {
+      // Orphan HD has its own band and no replacement in the LOD chain.
+      if (c.obj && c.def.lod === "orphan_hd") {
+        c.obj.visible = load;
+      } else if (c.obj && c.def.lod !== undefined) {
         const cell = c.def.cell.join(",");
         const current = visibleTiers.get(cell);
         c.obj.visible = !current || (load && !current.inBand);
