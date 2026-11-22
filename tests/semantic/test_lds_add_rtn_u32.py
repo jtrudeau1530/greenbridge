@@ -727,7 +727,163 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(addr), 999)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_aliasing_vdst_equals_vaddr(self) -> None:
+        # ds_add_rtn_u32 v0, v0, v1
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x60
+        initial_mem = 300
+        addend = 50
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(0, addr)    # v0 = addr (also vdst)
+        state.set_vgpr(1, addend)  # v1 = addend
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_mem, initial_mem + addend)
+        self.assertEqual(state.get_vgpr(0), initial_mem) # v0 received old_val
+        self.assertEqual(state.get_vgpr(1), addend)      # v1 preserved
+        self.assertEqual(state.lds.read_dword(addr), initial_mem + addend)
+
+    def test_aliasing_vdst_equals_vdata0(self) -> None:
+        # ds_add_rtn_u32 v1, v0, v1
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x80
+        initial_mem = 1000
+        addend = 250
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(0, addr)    # v0 = addr
+        state.set_vgpr(1, addend)  # v1 = addend (also vdst)
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(1, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_mem, initial_mem + addend)
+        self.assertEqual(state.get_vgpr(0), addr)        # v0 preserved
+        self.assertEqual(state.get_vgpr(1), initial_mem) # v1 received old_val
+        self.assertEqual(state.lds.read_dword(addr), initial_mem + addend)
+
+    def test_aliasing_vaddr_equals_vdata0(self) -> None:
+        # ds_add_rtn_u32 v2, v0, v0
+        state = ScalarState(lds_size_dwords=1024)
+        addr_and_addend = 0x40  # 64 bytes -> dword index 16
+        initial_mem = 100
+
+        state.lds.write_dword(addr_and_addend, initial_mem)
+        state.set_vgpr(0, addr_and_addend) # v0 is both addr and addend
+        state.set_vgpr(2, 0xCAFEBABE)      # v2 is vdst
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(2, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(0, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_mem, initial_mem + addr_and_addend)
+        self.assertEqual(state.get_vgpr(2), initial_mem)
+        self.assertEqual(state.get_vgpr(0), addr_and_addend) # v0 untouched
+        self.assertEqual(state.lds.read_dword(addr_and_addend), initial_mem + addr_and_addend)
+
+    def test_triple_aliasing_vdst_vaddr_vdata0(self) -> None:
+        # ds_add_rtn_u32 v0, v0, v0
+        state = ScalarState(lds_size_dwords=1024)
+        val = 0x20
+        initial_mem = 500
+
+        state.lds.write_dword(val, initial_mem)
+        state.set_vgpr(0, val)
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(0, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_mem, initial_mem + val)
+        self.assertEqual(state.get_vgpr(0), initial_mem) # Overwritten with old_val
+        self.assertEqual(state.lds.read_dword(val), initial_mem + val)
+
+    def test_unreferenced_registers_preservation(self) -> None:
+        state = ScalarState(lds_size_dwords=1024)
+        state.set_vgpr(1, 0x100) # vaddr
+        state.set_vgpr(2, 10)    # vdata0
+
+        # Fill background registers
+        for r in range(3, 20):
+            state.set_vgpr(r, 0x1000 + r)
+        for s in range(10):
+            state.set_sgpr(s, 0x2000 + s)
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        self.interp.execute(instr, state)
+
+        for r in range(3, 20):
+            self.assertEqual(state.get_vgpr(r), 0x1000 + r)
+        for s in range(10):
+            self.assertEqual(state.get_sgpr(s), 0x2000 + s)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF, lds_size_dwords=1024)
+        simd_interp = SIMDInterpreter()
+
+        # Each lane has vdst == vaddr: v0 is both dst and addr
+        for lane in range(32):
+            addr = lane * 4
+            state.lds.write_dword(addr, 50 + lane)
+            state.set_lane_vgpr(lane, 0, addr) # v0 is addr and dst
+            state.set_lane_vgpr(lane, 1, 100)  # v1 is addend
+
+        instr = DSAddRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+        )
+
+        results = simd_interp.execute(instr, state)
+
+        for lane in range(32):
+            self.assertEqual(results[lane], 50 + lane)
+            self.assertEqual(state.get_lane_vgpr(lane, 0), 50 + lane) # Received old_val
+            self.assertEqual(state.get_lane_vgpr(lane, 1), 100)       # Addend preserved
+            self.assertEqual(state.lds.read_dword(lane * 4), 150 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
