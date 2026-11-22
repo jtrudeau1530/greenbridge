@@ -1428,13 +1428,26 @@ bool is_device_proxy(const void* device) {
     return device && *reinterpret_cast<void* const*>(device) == reinterpret_cast<void*>(get_vtable());
 }
 
-void set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {
-    if (is_device_proxy(device)) static_cast<DeviceProxy*>(device)->adapter_provider = provider;
-}
-
 void* device_proxy_from_dxgi_device(void* dxgi_device) {
     if (!dxgi_device || *static_cast<void***>(dxgi_device) != get_dxgi_vtable()) return nullptr;
     return dxgi_owner(dxgi_device);
+}
+
+void* device_proxy_primary(void* device) {
+    if (is_device_proxy(device)) return device;
+    return device_proxy_from_dxgi_device(device);
+}
+
+bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) {
+        // Not installing one silently would leave the host's adapter in its place.
+        std::fprintf(stderr, "[rt] d3d12_xs: set_device_adapter_provider: %p is not a device proxy; no provider set\n",
+                     device);
+        return false;
+    }
+    proxy->adapter_provider = provider;
+    return true;
 }
 
 bool is_heap_proxy(const void* heap) {

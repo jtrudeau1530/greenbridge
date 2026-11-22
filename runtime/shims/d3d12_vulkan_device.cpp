@@ -6907,9 +6907,14 @@ std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, c
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     Device* d = Device::from<Device>(device);
     if (!d) return;
+    // A caller passes what create_device_proxy returned, which is the proxy's DXGI pointer when the title asked
+    // for IDXGIDevice1: the device's outer identity is the proxy itself either way.
+    if (void* proxy = rt::d3d12_xs::device_proxy_primary(outer)) outer = static_cast<IUnknown*>(proxy);
     d->set_outer(outer);
-    // The proxy's IDXGIDevice1::GetAdapter (d3d12_xs_device.h) hands out this layer's adapter, the one
-    // create_dxgi_factory enumerates, so a title on the Vulkan device never gets a host DXGI object from it.
+    // Second job, for an outer that is the Xbox-ABI proxy: its IDXGIDevice1::GetAdapter (d3d12_xs_device.h) hands
+    // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
+    // a host DXGI object from it.
+    if (!rt::d3d12_xs::is_device_proxy(outer)) return;
     rt::d3d12_xs::set_device_adapter_provider(outer, [](ID3D12Device* real, REFIID riid, void** out) {
         IDXGIFactory1* factory = nullptr;
         HRESULT hr = create_dxgi_factory(real, __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
