@@ -89,7 +89,11 @@ def main(argv=None) -> int:
     os.makedirs(out, exist_ok=True)
     index, seen, used, bad = [], {}, set(), 0
     with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        for mt in ENTRY.finditer(m):
+        pos = 0
+        while (mt := ENTRY.search(m, pos)) is not None:
+            # A rejected header is rescanned past its name (a real entry can start inside it); a carved
+            # shader resumes after its stored bytes, so deflate output never becomes a name or a match.
+            pos = mt.end(1) + 1
             name = mt.group(1).decode("latin-1")
             stored = struct.unpack("<I", mt.group(3))[0]
             size = struct.unpack("<I", mt.group(5))[0]
@@ -111,6 +115,7 @@ def main(argv=None) -> int:
             except ValueError:
                 bad += 1
                 continue
+            pos = start + stored
             fname = file_name(name, seen, used)
             with open(os.path.join(out, fname), "wb") as f:
                 f.write(data)
