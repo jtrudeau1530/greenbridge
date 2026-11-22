@@ -700,6 +700,24 @@ principle, but it needs the loaded code to be 256-byte aligned, which the kernel
 section above records a 4096-word output cap there, while a 64x64 case stores 16,384 words. The RDNA2 results above
 are from the Windows HIP launcher only.
 
+### 32-bit integer VALU in every encoding (`tools/vint_diff.py`)
+
+`tools/shader_diff.py` checks the common integer opcodes with VGPR sources in their e32 form. `tools/vint_diff.py`
+adds the rest of the 32-bit integer VALU a compiler emits: the VOP1/VOP2 opcodes as e32 and e64, the VOP3-only ones
+(`v_add3_u32`, `v_lshl_add_u32`, `v_alignbit/alignbyte/perm_b32`, `v_min3/max3/med3`, the 24- and 16-bit
+multiplies with `op_sel`, `v_bcnt`, `v_bfm`, `v_ffbh/ffbl`, `v_cvt_pk_*16_*32`, ...) and VOPC e64 into a mask with
+`v_cndmask_b32_e64`, with VGPR, SGPR, integer and float inline-constant and literal sources in every position the
+encoding allows (one literal and two scalar values per VOP3). It runs one lane through
+`tests/semantic/spirv_mini_interp.py` against its own ISA model, with the shrinking, skips and exit codes of
+`salu_diff.py`; a compare's mask read as VALU data (#293) is left out unless `--known`. `--oracle hw` runs the same
+programs on an AMD GPU; on an RDNA2 iGPU (gfx1036) 1,500 programs, the known form included, matched the reference. A 32-bit literal in a 16-bit source of `v_mad_u32_u16`/`v_mad_i32_i16` does not assemble, so literals there have 16 bits (zero-extended, measured).
+
+```
+python -I tools/vint_diff.py --programs 2000 --seed 1
+python -I tools/vint_diff.py --oracle hw --programs 500 --seed 1
+python -I tests/test_vint_diff.py
+```
+
 ### 16-bit and memory ops on the GPU (`tools/valu_fuzz.py`, FUZZ-2, FUZZ-5)
 
 `tools/valu_fuzz.py --family f16|mem` uses the same runner shape as `lds_fuzz.py`. It generates seeded
