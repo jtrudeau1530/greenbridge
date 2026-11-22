@@ -1689,27 +1689,32 @@ class Gen:
         self.uses_psb = True
         return self.lconsts[v]
 
+    def local_index(self):
+        """LocalInvocationIndex of a compute or mesh shader invocation (thread i of its workgroup): the mesh shader
+        loads the built-in; a compute shader flattens LocalInvocationId with the group size from its header."""
+        li = self.tmp()
+        if self.stage == "ms":
+            self.emit(f"{li} = OpLoad %uint %local_index")
+            return li
+        lid, x, y, z, lx, t1, t2 = (self.tmp() for _ in range(7))
+        sx, sy, _ = self.cs["size"]
+        self.emit(f"{lid} = OpLoad %v3uint %local_id")
+        self.emit(f"{x} = OpCompositeExtract %uint {lid} 0")
+        self.emit(f"{y} = OpCompositeExtract %uint {lid} 1")
+        self.emit(f"{z} = OpCompositeExtract %uint {lid} 2")
+        self.emit(f"{t1} = OpIMul %uint {y} {self.cu(sx)}")
+        self.emit(f"{t2} = OpIMul %uint {z} {self.cu(sx * sy)}")
+        self.emit(f"{lx} = OpIAdd %uint {x} {t1}")
+        self.emit(f"{li} = OpIAdd %uint {lx} {t2}")
+        return li
+
     def wave_lane(self):
         """This invocation's hardware lane within its wave. Compute and mesh shaders: LocalInvocationIndex mod the
         wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane, which is
         the hardware lane when the runtime runs them with subgroup size == wave size."""
         lane = self.tmp()
-        if self.stage == "ms":
-            li = self.tmp()
-            self.emit(f"{li} = OpLoad %uint %local_index")
-            self.emit(f"{lane} = OpBitwiseAnd %uint {li} {self.cu(63 if self.wave64 else 31)}")
-        elif self.stage == "cs":
-            lid, x, y, z, lx, lxy, t1, t2, li = (self.tmp() for _ in range(9))
-            sx, sy, _ = self.cs["size"]
-            self.emit(f"{lid} = OpLoad %v3uint %local_id")
-            self.emit(f"{x} = OpCompositeExtract %uint {lid} 0")
-            self.emit(f"{y} = OpCompositeExtract %uint {lid} 1")
-            self.emit(f"{z} = OpCompositeExtract %uint {lid} 2")
-            self.emit(f"{t1} = OpIMul %uint {y} {self.cu(sx)}")
-            self.emit(f"{t2} = OpIMul %uint {z} {self.cu(sx * sy)}")
-            self.emit(f"{lx} = OpIAdd %uint {x} {t1}")
-            self.emit(f"{li} = OpIAdd %uint {lx} {t2}")
-            self.emit(f"{lane} = OpBitwiseAnd %uint {li} {self.cu(63 if self.wave64 else 31)}")
+        if self.stage in ("cs", "ms"):
+            self.emit(f"{lane} = OpBitwiseAnd %uint {self.local_index()} {self.cu(63 if self.wave64 else 31)}")
         else:
             self.uses_subgroup = True
             self.emit(f"{lane} = OpLoad %uint %sg_lane")
@@ -3927,6 +3932,14 @@ class Gen:
             self.emit(f"{ovf} = OpBitwiseOr %uint {out} {c}")
             self.dst(a[0], r)
             self.scc_nonzero(ovf)
+        elif op == "s_get_waveid_in_workgroup":
+            # D = this wave's index in its workgroup: thread i of a group is in wave i / W (W = 64 or 32), the rule
+            # wave_lane uses for the lane. Only compute and mesh shaders have a workgroup. SCC is not written.
+            if self.stage not in ("cs", "ms"):
+                raise Unsupported(op + " outside compute")
+            r = self.tmp()
+            self.emit(f"{r} = OpShiftRightLogical %uint {self.local_index()} {self.cu(6 if self.wave64 else 5)}")
+            self.dst(a[0], r)
         elif op == "s_getpc_b64":
             # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
             # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
