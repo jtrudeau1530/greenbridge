@@ -160,8 +160,9 @@ def main(argv=None):
             if parent:
                 os.makedirs(parent, exist_ok=True)
             render(data, a.bpe, a.tile, res[0][1], res[0][2], a.out)
-        except OSError as e:
-            print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+        except (OSError, ValueError) as e:
+            detail = getattr(e, "strerror", None) or str(e)
+            print(f"ERROR: cannot write {a.out}: {detail}", file=sys.stderr)
             return 2
         print("preview ->", a.out)
 

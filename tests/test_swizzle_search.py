@@ -614,6 +614,22 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
             self.assertFalse((root / "never_created").exists())
             self.assertIn("ERROR:", err.getvalue())
 
+    def test_render_valueerror_unknown_extension_returns_exit_2(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            blob = root / "blob.bin"
+            blob.write_bytes(bytes(512))
+            bad_ext_out = root / "preview.unrecognized"
+            err = io.StringIO()
+            with mock.patch.object(self.mod, "search", return_value=[(1.0, 64, "xyxy")]), \
+                 mock.patch.object(self.mod, "render", side_effect=ValueError("unknown file extension: .unrecognized")), \
+                 mock.patch.object(sys, "stderr", err):
+                rc = self.mod.main([str(blob), "--bpe", "8", "--tile", "128", "--widths", "64", "--out", str(bad_ext_out)])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", err.getvalue())
+            self.assertIn("unknown file extension: .unrecognized", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
 
 def test_preview_with_no_fitting_layout_reports_the_problem(tmp_path=None):
     """Module-level compatibility wrapper for pytest with tmp_path fixture."""
