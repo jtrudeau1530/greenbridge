@@ -4,6 +4,7 @@ Run from the repository root:  python -m pytest tests
 Needs llvm-mc (AMDGPU target) and spirv-tools; the tests skip themselves when those are missing.
 """
 import glob
+import math
 import os
 import re
 
@@ -683,8 +684,8 @@ def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
     text = shader.translate()
     shader.validate(text)
     defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
-    rounded, = (expr for expr in defs.values() if " RoundEven " in expr)
-    clamp = defs[rounded.split()[-1]].split()
+    biassed, = (expr for expr in defs.values() if expr.startswith("OpFAdd ") and expr.endswith(" %fhalf_g"))
+    clamp = defs[biassed.split()[-2]].split()
     assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FClamp"]
     for limit, bits in zip(clamp[-2:], (0x3e800000, 0x3f400000)):
         cast, scalar, value = defs[limit].split()
@@ -723,6 +724,55 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
 def test_gather4_l_literal_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
     with pytest.raises(rdna2spirv.Unsupported):
         make_shader(_gather_l(word0)).translate()
+
+
+# SHADER-152: the explicit-LOD gather's mip is floor(LOD + 0.5), ties up, like the native gather on Radeon
+# (LOD 0.5 with bounds [0,1] picked mip 1); the old RoundEven picked mip 0 there.
+def _gather_l_at_lod(lod):
+    return program(
+        "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+        "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+        # S# word 1: MIN_LOD 0, MAX_LOD 1.0 (unsigned 4.8), so the clamp below is [0, 1].
+        "s_mov_b32 s16, 0\ns_mov_b32 s17, 0x100000\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
+        f"v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, {lod}\n"
+        "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
+
+
+def test_gather4_l_rounds_the_lod_tie_up(make_shader):
+    """The LOD is clamped to the S# bounds first, then biased by +0.5 and floored; the result is not rounded to
+    even (which would send a 0.5 tie to mip 0)."""
+    shader = make_shader(_gather_l_at_lod(0.5))
+    text = shader.translate()
+    shader.validate(text)
+    clamp = re.search(r"(%\w+) = OpExtInst %float %glsl FClamp (%\w+) (%\w+) (%\w+)", text)
+    add = re.search(r"(%\w+) = OpFAdd %float (%\w+) %fhalf_g", text)
+    assert clamp and add, text
+    assert add.group(2) == clamp.group(1)              # the clamped LOD, not the raw one
+    assert re.search(rf"= OpExtInst %float %glsl Floor {add.group(1)}\b", text), text
+    assert "= OpExtInst %float %glsl RoundEven" not in text
+
+
+def _gather_mip(lod, levels):
+    """Reference for the translated sequence: clamp to [0, levels-1] after floor(lod + 0.5)."""
+    return min(max(math.floor(lod + 0.5), 0), levels - 1)
+
+
+@pytest.mark.parametrize("lod, levels, mip", [
+    (-2.0, 4, 0), (-1.5, 4, 0), (-0.5, 4, 0), (-0.1, 4, 0),
+    (0.0, 4, 0), (0.25, 4, 0), (0.499, 4, 0),
+    (0.5, 4, 1), (0.501, 4, 1), (0.75, 4, 1),
+    (1.5, 4, 2), (2.5, 4, 3), (3.5, 4, 3), (3.6, 4, 3),     # the last two are clamped to levels-1
+    (0.5, 2, 1), (1.5, 2, 1), (10.0, 1, 0),
+])
+def test_gather_mip_rounds_ties_up_and_clamps_to_the_level_range(lod, levels, mip):
+    assert _gather_mip(lod, levels) == mip
+
+
+def test_gather_mip_old_round_even_differs_only_at_ties():
+    # Negative control for the rule: Python's round() is round-half-to-even, the old translator's choice.
+    assert (_gather_mip(0.5, 4), round(0.5)) == (1, 0)
+    assert (_gather_mip(2.5, 4), round(2.5)) == (3, 2)
+    assert (_gather_mip(1.5, 4), round(1.5)) == (2, 2)
 # ---- Irreducible CFG node splitting (compute shaders) ----
 
 IRREDUCIBLE_PATTERNS = {
