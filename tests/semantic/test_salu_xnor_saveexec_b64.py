@@ -240,6 +240,81 @@ def parse_salu_instruction(line: str) -> SXnorSaveexecB64Instruction:
     return SXnorSaveexecB64Instruction(dst=dst, src0=src_op)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register state for RDNA2 SALU execution."""
+    sgprs: List[int] = field(default_factory=lambda: [0] * 128)
+    exec_mask: int = MASK64
+    scc: int = 0
+    vcc: int = 0
+
+    def get_sgpr64(self, index: int) -> int:
+        """Read 64-bit value from aligned SGPR pair s[index:index+1]."""
+        if index < 0 or index + 1 >= len(self.sgprs):
+            raise IndexError(f"SGPR index out of range: {index}")
+        return join_dwords(self.sgprs[index], self.sgprs[index + 1])
+
+    def set_sgpr64(self, index: int, val: int) -> None:
+        """Write 64-bit value into aligned SGPR pair s[index:index+1]."""
+        if index < 0 or index + 1 >= len(self.sgprs):
+            raise IndexError(f"SGPR index out of range: {index}")
+        lo, hi = split_dwords(val)
+        self.sgprs[index] = lo
+        self.sgprs[index + 1] = hi
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for s_xnor_saveexec_b64."""
+
+    def resolve_source(self, op: SALUSourceOperand, state: ScalarMachineState) -> int:
+        """Resolve a 64-bit source operand against machine state."""
+        if isinstance(op.source, RegPair):
+            return state.get_sgpr64(op.source.index)
+        elif isinstance(op.source, SpecialRegOperand):
+            if op.source.reg == SpecialReg.EXEC:
+                return state.exec_mask & MASK64
+            elif op.source.reg == SpecialReg.VCC:
+                return state.vcc & MASK64
+            elif op.source.reg == SpecialReg.NULL:
+                return 0
+            else:
+                raise ValueError(f"Unsupported source special register: {op.source.reg}")
+        elif isinstance(op.source, Literal64):
+            return op.source.bits & MASK64
+        else:
+            raise TypeError(f"Unknown source operand type: {type(op.source)}")
+
+    def step(self, instr: SXnorSaveexecB64Instruction, state: ScalarMachineState) -> Tuple[int, int, int]:
+        """Execute one s_xnor_saveexec_b64 instruction deterministically."""
+        # 1. Atomic read phase
+        src0_val = self.resolve_source(instr.src0, state)
+        incoming_exec = state.exec_mask & MASK64
+
+        # 2. Mathematical evaluation
+        saved_exec, new_exec, scc = oracle_s_xnor_saveexec_b64(src0_val, incoming_exec)
+
+        # 3. Write-back phase
+        # Destination register write
+        if isinstance(instr.dst, RegPair):
+            state.set_sgpr64(instr.dst.index, saved_exec)
+        elif isinstance(instr.dst, SpecialRegOperand):
+            if instr.dst.reg == SpecialReg.VCC:
+                state.vcc = saved_exec
+            elif instr.dst.reg == SpecialReg.EXEC:
+                # If destination is EXEC, EXEC will be overwritten by new_exec in final state
+                pass
+
+        # EXEC and SCC update
+        state.exec_mask = new_exec
+        state.scc = scc
+
+        return saved_exec, new_exec, scc
+
+
 class TestSXnorSaveexecB64ModelAndOracle(unittest.TestCase):
     """Reference mathematical oracle and architectural model tests."""
 
@@ -429,6 +504,110 @@ class TestSymbolicAST(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises((ValueError, TypeError)):
                     parse_salu_instruction(bad)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Deterministic scalar instruction interpreter tests."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_single_step_execution(self) -> None:
+        """Verify basic scalar instruction execution and register updates."""
+        # Setup initial state
+        self.state.exec_mask = 0xFFFFFFFF00000000
+        self.state.set_sgpr64(2, 0xAAAAAAAAAAAAAAAA)
+        self.state.scc = 0
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[4:5], s[2:3]")
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        # Saved EXEC should be previous EXEC
+        self.assertEqual(saved, 0xFFFFFFFF00000000)
+        self.assertEqual(self.state.get_sgpr64(4), 0xFFFFFFFF00000000)
+
+        # New EXEC should be ~(0xAAAAAAAAAAAAAAAA ^ 0xFFFFFFFF00000000)
+        expected_new = (~(0xAAAAAAAAAAAAAAAA ^ 0xFFFFFFFF00000000)) & MASK64
+        self.assertEqual(new_exec, expected_new)
+        self.assertEqual(self.state.exec_mask, expected_new)
+
+        # SCC should be non-zero (1)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_zero_result_scc_cleared(self) -> None:
+        """Verify SCC is 0 when new EXEC becomes all zeros."""
+        # When ssrc0 == ~EXEC, ~(ssrc0 ^ EXEC) == ~(~EXEC ^ EXEC) == ~(-1) == 0
+        incoming = 0x1234567890ABCDEF
+        self.state.exec_mask = incoming
+        self.state.set_sgpr64(0, (~incoming) & MASK64)
+        self.state.scc = 1  # Pre-set SCC to 1 to verify transition to 0
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[6:7], s[0:1]")
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        self.assertEqual(saved, incoming)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(self.state.exec_mask, 0)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_literal_operand_execution(self) -> None:
+        """Verify execution with 64-bit literal constant."""
+        self.state.exec_mask = MASK64
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[8:9], 0x5555555555555555")
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        self.assertEqual(saved, MASK64)
+        self.assertEqual(self.state.get_sgpr64(8), MASK64)
+        self.assertEqual(new_exec, 0x5555555555555555)
+        self.assertEqual(self.state.exec_mask, 0x5555555555555555)
+        self.assertEqual(scc, 1)
+
+    def test_special_reg_vcc_source(self) -> None:
+        """Verify reading from VCC special register."""
+        self.state.vcc = 0x0123456789ABCDEF
+        self.state.exec_mask = MASK64
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[10:11], vcc")
+        saved, new_exec, scc = self.interp.step(instr, self.state)
+
+        self.assertEqual(saved, MASK64)
+        self.assertEqual(new_exec, 0x0123456789ABCDEF)
+        self.assertEqual(self.state.exec_mask, 0x0123456789ABCDEF)
+        self.assertEqual(scc, 1)
+
+    def test_sequential_instruction_chaining(self) -> None:
+        """Verify a chain of saveexec instructions accurately passes EXEC state."""
+        self.state.exec_mask = 0x00000000FFFFFFFF
+        self.state.set_sgpr64(0, 0x00000000FFFFFFFF)
+        self.state.set_sgpr64(2, 0xFFFFFFFFFFFFFFFF)
+
+        # Step 1: s[4:5] = EXEC (0x00000000FFFFFFFF); EXEC = ~(s[0:1] ^ EXEC) = ~0 = MASK64
+        instr1 = parse_salu_instruction("s_xnor_saveexec_b64 s[4:5], s[0:1]")
+        s1, e1, c1 = self.interp.step(instr1, self.state)
+        self.assertEqual(s1, 0x00000000FFFFFFFF)
+        self.assertEqual(e1, MASK64)
+        self.assertEqual(c1, 1)
+
+        # Step 2: s[6:7] = EXEC (MASK64); EXEC = ~(s[2:3] ^ EXEC) = ~(MASK64 ^ MASK64) = MASK64
+        instr2 = parse_salu_instruction("s_xnor_saveexec_b64 s[6:7], s[2:3]")
+        s2, e2, c2 = self.interp.step(instr2, self.state)
+        self.assertEqual(s2, MASK64)
+        self.assertEqual(e2, MASK64)
+        self.assertEqual(c2, 1)
+
+    def test_determinism_repeatability(self) -> None:
+        """Ensure repeating same step on identical state produces identical output."""
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[0:1], s[2:3]")
+        for _ in range(5):
+            st = ScalarMachineState()
+            st.exec_mask = 0x1122334455667788
+            st.set_sgpr64(2, 0x8877665544332211)
+            saved, new_exec, scc = self.interp.step(instr, st)
+            self.assertEqual(saved, 0x1122334455667788)
+            self.assertEqual(new_exec, (~(0x8877665544332211 ^ 0x1122334455667788)) & MASK64)
+            self.assertEqual(scc, 1)
 
 
 if __name__ == "__main__":
