@@ -2,12 +2,8 @@
 
 Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the
 upstream `rpf9-explorer` fixes that close it. The fixes are merged upstream and the submodule is
-pinned at `e293917`, where a full ten-archive re-count recovers **382,781 models** (**2.64 billion
-triangles**, **0 decode failures**), up from 350,248 at `917e9b9` and 190,792 at `c3708fb`.
-upstream `rpf9-explorer` fix that closes it. The fix is merged upstream and the submodule is
-pinned at `e293917` (the 350,251-model counts below were measured at `917e9b9`, before
-upstream `v1.2` PRs #8-#12 landed; the non-`levels.rpf` archives were then re-counted at
-`e293917`).
+pinned at `e293917`, where a full ten-archive re-count recovers **382,781 models** (**0 decode
+failures**), up from 350,251 at `917e9b9` and 190,792 at `c3708fb`.
 
 Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
 dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
@@ -23,13 +19,11 @@ per entry), the TTPF compact/array/cubemap/volume layouts, and the external draw
 reader. Commits `917e9b9..e293917` add upstream `v1.2` model-discovery changes (PRs #8–#12:
 optional fragment pointers, skipping texture dictionaries in drawable-dictionary scans, 16-bit
 bone-palette indices, probe-count parity, and zero-radius drawables) plus BCPack BC1/BC3/BC4/BC5
-decoding (PR #7). A full ten-archive re-count at `e293917` recovers **382,781 models** (**+32,533**
-over `917e9b9`'s 350,248) and **2,636,248,990 triangles** with **0 decode failures**; the earlier
+decoding (PR #7). A full ten-archive re-count at `e293917` recovers **382,781 models** (**+32,530**
+over `917e9b9`'s 350,251) with **0 decode failures**; the `levels.rpf` fragment, bone-binding and
+triangle cells are not independently reproduced (see the table note), and the earlier
 `917e9b9`, `c3708fb`, and `48557ea` measurements are kept below as controls. This page records the
 measured state; it is not a competing patch.
-decoding (PR #7). The 350,251-model counts below were measured at `917e9b9` and are kept as the
-control; the `e293917` re-count for the non-`levels.rpf` archives is in the table below. This page
-records both, and is not a competing patch.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
 Leonida, including 169 previously rejected candidates (also verified after archive readback). A
@@ -63,18 +57,25 @@ effect of upstream `v1.2` PRs #8–#12:
 | `data.rpf` | 2,921 | **3,175** | 268 | 2,907 | 1,758 | 2,891 | 3,387,016 | 0 | +594 |
 | `pack/shared_minigame000/...` | 1,058 | **1,294** | 317 | 977 | 10 | 18 | 16,843,903 | 0 | +6 |
 | `pack/core_restofworld/...` | 924 | **936** | 808 | 128 | 53 | 849 | 1,239,596 | 0 | +51 |
-| `pack/story000_restofworld/...` | 1 | **3** | 3 | 0 | 0 | 0 | 2,620 | 0 | +3 |
+| `pack/story000_restofworld/...` | 1 | **3** | 3 | 0 | 0 | 0 | 2,620 | 0 | 0 |
 | `pack/story000/story000.rpf` | 4,195 | **7,461** | 4,156 | 3,305 | 0 | 0 | 39,861,747 | 0 | +1 |
 | `packs.rpf` | 26,389 | **26,585** | 23,720 | 2,865 | 2,865 | 26,585 | 64,966,572 | 0 | +2,551 |
-| `levels.rpf` | 235,330 | **343,327** | 130,239 | 213,088 | 50,731 | 59,544 | 2,509,947,536 | 71 | +29,327 |
+| `levels.rpf` | 235,330 | **343,327** | 130,239 | 213,088 | † | † | † | 71 | +29,327 |
 | `textures.rpf` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 |
 | `common.rpf`, `core_restofworld001` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| **Total** | **270,819** | **382,781** | **159,511** | **223,270** | **55,417** | **89,887** | **2,636,248,990** | **72** | **+32,533** |
+| **Total** | **270,819** | **382,781** | **159,511** | **223,270** | **†** | **†** | **†** | **72** | **+32,530** |
+
+† `levels.rpf` was counted with `count.exe recover --verify`, which reports candidates, models,
+dictionary children, standalone models, rejects and decode failures only: no `levels.rpf` manifest
+exists and the harness emits no fragment, bone-binding or triangle field. Those three `levels.rpf`
+cells, and the totals that would include them, are therefore **not independently reproduced**. The
+other archives measure 4,686 fragments, 30,343 bone-bound and 126,301,454 triangles.
 
 Every recovered entry was read back from its archive segments and decoded through
-`RageModelDecoder.Decode`: **382,781 / 382,781 decoded, 0 decode failures**, **4,090,898 meshes**,
-**2,468,402,149 vertices**, **2,636,248,990 triangles (2.64 billion)**, and **1,805 embedded
-textures**.
+`RageModelDecoder.Decode`: **382,781 / 382,781 decoded, 0 decode failures**. The other archives
+measure **236,311 meshes**, **104,183,438 vertices**, **126,301,454 triangles** and **512 embedded
+textures**; the `levels.rpf` mesh/vertex/triangle/embedded cells are not independently reproduced
+(see the table note).
 
 What moved between `917e9b9` and `e293917`:
 
@@ -89,13 +90,13 @@ What moved between `917e9b9` and `e293917`:
   `data.rpf` (75 → 0), `core_restofworld` (140 → 0), and `shared_minigame000` (18 → 0). Only one
   texture-dictionary candidate remains across all ten archives (in `textures.rpf`; rejected cleanly,
   and recovered by `Rpf9TextureRecovery`).
-- **Probe caps and zero-radius drawables (+28 dictionary children plus capped standalones).**
+- **Probe caps and zero-radius drawables (+25 dictionary children plus capped standalones).**
   Upstream [rpf9-explorer#11](https://github.com/breadbbbb/rpf9-explorer/pull/11) recovers the 29
   previously capped candidates (+1 in `story000.rpf`, and +14 dictionary children plus capped
   standalones in `levels.rpf`). Upstream
   [rpf9-explorer#12](https://github.com/breadbbbb/rpf9-explorer/pull/12) recovers all 11 zero-radius
-  dictionary children in `core_restofworld` (797 → 808) and 1 drawable dictionary (3 models) in
-  `story000_restofworld.rpf`, which previously recovered 0 models.
+  dictionary children in `core_restofworld` (797 → 808); `story000_restofworld.rpf` already
+  recovered its 3 models at `917e9b9`, so its delta is 0.
 - **Remaining 72 rejects (down from 1,282 at `917e9b9`).** Aside from the single texture-dictionary
   candidate in `textures.rpf`, all 71 remaining rejects are in `levels.rpf` (0 texture dictionaries,
   0 zlib checksum errors). Sampled headers are fragment candidates (`LooksLikeFragment == true`)
@@ -165,7 +166,7 @@ pages. `core_restofworld` recovers 873 of its 1,024 candidates (885 models); the
 models**, 130,225 dictionary children, 183,775 standalone. 1,037 candidates are rejected: the
 1,009 in the last shard are texture dictionaries, not models, and 28 more in shards 1 to 7 are
 models the probe caps reject (see [rejected candidates](#rejected-candidates-at-917e9b9)). The
-`levels.rpf` full export was not re-run, so its triangle total is still the old measurement.
+`levels.rpf` full export was not re-run, so its triangle total is not re-run here.
 
 ### Rejected candidates at `917e9b9`
 
@@ -248,11 +249,8 @@ The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archiv
 24,034 models (26,585 at `e293917`), and the other archives' new-pin counts are in the table above.
 The rows here are the `c3708fb` measurements (190,792 models); the `917e9b9` re-count is 350,251,
 and the `e293917` re-count outside `levels.rpf` is 39,454. Triangle totals have not been re-run at
-either new pin.
-24,034 models (26,585 at `e293917`), and the other archives' counts are in the tables above. The
-rows here are the `c3708fb` measurements (190,792 models); the `917e9b9` re-count is 350,248.
-Triangle totals for that pin have not been re-run; the current `e293917` totals are in the
-full-archive table above.
+either new pin; the `e293917` `levels.rpf` geometry cells are not independently reproduced (see
+the table note above).
 
 At `c3708fb`, every candidate is recovered, read back and decoded: 0 decode failures, 0 readback
 failures, no duplicate model names, and 2.22 billion triangles (1.95 billion before). The
@@ -505,7 +503,8 @@ own light bones).
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
 2. **Done:** the pin is `e293917` (was `917e9b9`, originally `48557ea`).
 3. **Done:** all ten `MODEL_ARCHIVES` were re-counted and read-back decoded at `e293917` (**382,781
-   models**, **2,636,248,990 triangles**, **0 decode failures**; table above).
+   models**, **0 decode failures**; table above; the `levels.rpf` geometry cells are not
+   independently reproduced).
 4. Investigate the 71 remaining unrecovered fragment candidates in `levels.rpf` (and the 1
    texture-dictionary candidate in `textures.rpf`) if further upstream recovery is wanted.
 5. Keep issue #29 in sync with the `e293917` counts.
