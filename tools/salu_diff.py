@@ -475,7 +475,7 @@ def main(argv=None):
     ap.add_argument("--programs", type=int, default=300)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-ops", type=int, default=6)
-    ap.add_argument("--ops", default="", help="comma-separated opcodes (default: all)")
+    ap.add_argument("--ops", default=None, help="comma-separated opcodes (default: all)")
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--all-failures", action="store_true", help="print every failing program, not just the first")
@@ -494,11 +494,16 @@ def main(argv=None):
         return 0
     if a.self_test:
         return 0 if self_test() else 1
-    ops = sorted(a.ops.split(",")) if a.ops else sorted(o for o in OPS if o not in LANE_MASK_OPS)
+    if a.ops is not None:
+        tokens = [t.strip() for t in a.ops.split(",")]
+        if not any(tokens) or any(not t for t in tokens):
+            ap.error("--ops must be a comma-separated list of opcodes")
+        ops = sorted(set(tokens))
+    else:
+        ops = sorted(o for o in OPS if o not in LANE_MASK_OPS)
     unknown = [o for o in ops if o not in OPS]
     if unknown:
-        print("unknown ops: " + ", ".join(unknown))
-        return 2
+        ap.error("unknown ops: " + ", ".join(unknown))
     counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops)
     skips = sum(counts["skip"].values())
     print(f"{a.programs} programs (seed {a.seed}): {counts['pass']} pass, {counts['mismatch']} mismatch, {skips} skipped")

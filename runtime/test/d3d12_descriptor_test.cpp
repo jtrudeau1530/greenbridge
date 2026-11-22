@@ -580,7 +580,6 @@ int main() {
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
 
-
         const VkDescriptorSet set0 = rt::d3d12::bindless_set(device.p);
         const VkDescriptorSetLayout set0_layout = rt::d3d12::bindless_set_layout(device.p);
         EXPECT(set0 && set0_layout);

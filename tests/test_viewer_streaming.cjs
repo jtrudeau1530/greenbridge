@@ -79,7 +79,7 @@ function fixture(count = 1) {
         AbortController,
         fetch: (url, { signal }) => new Promise((resolve, reject) => {
             const request = { url, signal, reject };
-            request.headers = () => resolve({ ok: true, arrayBuffer: () => new Promise((body, fail) => {
+            request.headers = (url = '') => resolve({ ok: true, url, arrayBuffer: () => new Promise((body, fail) => {
                 request.completeBody = () => body(request);
                 signal.addEventListener('abort', () => fail(signal.reason), { once: true });
             }) });
@@ -87,8 +87,8 @@ function fixture(count = 1) {
             requests.push(request);
         }),
         GLTFLoader: class {
-            parseAsync(request) {
-                return new Promise((resolve, reject) => { request.parse = { resolve, reject }; });
+            parseAsync(request, resourcePath) {
+                return new Promise((resolve, reject) => { request.parse = { resolve, reject, resourcePath }; });
             }
         },
         scene: { add: obj => added.push(obj), remove() {} },
@@ -108,13 +108,34 @@ function fixture(count = 1) {
         async fail(index, time = now) {
             now = time; requests[index].reject(new Error('synthetic load failure')); await settle();
         },
-        async receive(index) {
-            requests[index].headers(); await settle(); requests[index].completeBody(); await settle();
+        async receive(index, responseUrl) {
+            requests[index].headers(responseUrl); await settle(); requests[index].completeBody(); await settle();
         },
         async finish(index, obj) { requests[index].parse.resolve({ scene: obj }); await settle(); },
         async succeed(index, obj) { await this.receive(index); await this.finish(index, obj); },
     };
 }
+
+test('chunk dependencies resolve relative to the final response directory', async t => {
+    const cases = [
+        ['redirected chunk', 'world/source/cell.glb',
+            'https://cdn.example/served/cell.glb?signature=one/two', 'https://cdn.example/served/'],
+        ['response without a URL', 'world/source/cell.glb?signature=one/two', '', 'world/source/'],
+    ];
+    for (const [label, url, responseUrl, resourcePath] of cases) {
+        await t.test(label, async () => {
+            const f = fixture();
+            f.context.world.chunks[0].url = url;
+            f.frame();
+            assert.equal(f.requests[0].url, url);
+            await f.receive(0, responseUrl);
+            assert.equal(f.requests[0].parse.resourcePath, resourcePath);
+            const obj = f.object();
+            await f.finish(0, obj);
+            assert.equal(f.state.live.get('chunk_0').obj, obj);
+        });
+    }
+});
 
 test('a transient failure retries only after backoff, then loads the chunk', async () => {
     const f = fixture();
