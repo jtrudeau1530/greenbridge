@@ -1083,5 +1083,159 @@ class TestSaluAndn2SaveexecB64IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(interp.scc, 1)
 
 
+# --- Mutants for Mutation Testing ---
+
+def mutant_and_instead_of_andn2(s0: int, exec_val: int) -> Tuple[int, int, int]:
+    """Mutant A: computes s0 & exec_val instead of s0 & ~exec_val."""
+    saved_exec = exec_val & MASK64
+    new_exec = (s0 & saved_exec) & MASK64
+    return saved_exec, new_exec, ref_scc(new_exec)
+
+
+def mutant_inverted_operands(s0: int, exec_val: int) -> Tuple[int, int, int]:
+    """Mutant B: computes ~s0 & exec_val instead of s0 & ~exec_val."""
+    saved_exec = exec_val & MASK64
+    new_exec = ((~s0 & MASK64) & saved_exec) & MASK64
+    return saved_exec, new_exec, ref_scc(new_exec)
+
+
+def mutant_no_save_exec(interp: ScalarSaluInterpreter, ast: InstructionAST) -> None:
+    """Mutant C: forgets to write old EXEC to SDST register."""
+    src0_val = interp.resolve_src0(ast.src0)
+    saved_exec = interp.exec & MASK64
+    new_exec = ref_andn2_b64(src0_val, saved_exec)
+    # Skip writing saved_exec to ast.dst
+    interp.exec = new_exec
+    interp.scc = ref_scc(new_exec)
+
+
+def mutant_write_before_read(interp: ScalarSaluInterpreter, ast: InstructionAST) -> None:
+    """Mutant D: overwrites SDST before resolving SSRC0 (breaks aliased instructions)."""
+    saved_exec = interp.exec & MASK64
+    assert ast.dst.reg_index is not None
+    interp.set_sgpr_u64(ast.dst.reg_index, saved_exec)
+    # Now resolving src0 sees saved_exec if src0 aliased dst!
+    src0_val = interp.resolve_src0(ast.src0)
+    new_exec = ref_andn2_b64(src0_val, saved_exec)
+    interp.exec = new_exec
+    interp.scc = ref_scc(new_exec)
+
+
+def mutant_exec_low32_only(s0: int, exec_val: int) -> Tuple[int, int, int]:
+    """Mutant E: only updates low 32 bits of EXEC, leaving high 32 bits untouched."""
+    saved_exec = exec_val & MASK64
+    full_new = ref_andn2_b64(s0, saved_exec)
+    new_exec = (saved_exec & (MASK32 << 32)) | (full_new & MASK32)
+    return saved_exec, new_exec, ref_scc(new_exec)
+
+
+def mutant_scc_inverted(s0: int, exec_val: int) -> Tuple[int, int, int]:
+    """Mutant F: inverts SCC logic (1 if new_exec == 0 else 0)."""
+    saved_exec, new_exec, scc = ref_andn2_saveexec_b64(s0, exec_val)
+    return saved_exec, new_exec, 0 if scc else 1
+
+
+# --- Negative Controls, Syntax Rejection, and Mutation Detection ---
+
+class TestSaluAndn2SaveexecB64NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_opcode(self):
+        with self.assertRaises(ValueError):
+            parse_sop1_andn2_saveexec_b64("s_and_saveexec_b64 s[0:1], s[2:3]")
+
+    def test_syntax_rejection_insufficient_operands(self):
+        with self.assertRaises(ValueError):
+            parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s[0:1]")
+
+    def test_syntax_rejection_excess_operands(self):
+        with self.assertRaises(ValueError):
+            parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s[0:1], s[2:3], s[4:5]")
+
+    def test_syntax_rejection_single_sgpr_destination(self):
+        with self.assertRaises(TypeError):
+            parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s0, s[2:3]")
+
+    def test_syntax_rejection_non_contiguous_registers(self):
+        with self.assertRaises(ValueError):
+            parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s[0:2], s[2:3]")
+        with self.assertRaises(ValueError):
+            parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s[0:1], s[2:4]")
+
+    def test_syntax_rejection_out_of_bounds_registers(self):
+        with self.assertRaises(ValueError):
+            parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s[106:107], s[0:1]")
+        with self.assertRaises(ValueError):
+            parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s[0:1], s[106:107]")
+
+    def test_syntax_rejection_malformed_tokens(self):
+        with self.assertRaises(ValueError):
+            parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64")
+        with self.assertRaises(ValueError):
+            parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s[0:1], @invalid")
+
+    def test_mutation_detection_and_instead_of_andn2(self):
+        s0 = 0xF0F0F0F0F0F0F0F0
+        old_exec = 0xF0F0F0F0F0F0F0F0
+        # Correct: S0 & ~EXEC = 0
+        _, correct_new, _ = ref_andn2_saveexec_b64(s0, old_exec)
+        # Mutant: S0 & EXEC = 0xF0F0F0F0F0F0F0F0
+        _, mutant_new, _ = mutant_and_instead_of_andn2(s0, old_exec)
+        self.assertEqual(correct_new, 0)
+        self.assertNotEqual(correct_new, mutant_new)
+
+    def test_mutation_detection_inverted_operands(self):
+        s0 = 0xFFFFFFFF00000000
+        old_exec = 0x0000000000000000
+        # Correct: S0 & ~0 = S0
+        _, correct_new, _ = ref_andn2_saveexec_b64(s0, old_exec)
+        # Mutant: ~S0 & 0 = 0
+        _, mutant_new, _ = mutant_inverted_operands(s0, old_exec)
+        self.assertEqual(correct_new, s0)
+        self.assertNotEqual(correct_new, mutant_new)
+
+    def test_mutation_detection_no_save_exec(self):
+        interp = ScalarSaluInterpreter()
+        interp.exec = 0xCAFEBABE12345678
+        ast = parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s[0:1], 0")
+        mutant_no_save_exec(interp, ast)
+        # Mutant fails to update s[0:1] with old EXEC
+        self.assertNotEqual(interp.get_sgpr_u64(0), 0xCAFEBABE12345678)
+
+    def test_mutation_detection_write_before_read(self):
+        interp = ScalarSaluInterpreter()
+        interp.exec = 0x5555555555555555
+        interp.set_sgpr_u64(0, 0xAAAAAAAAAAAAAAAA)
+        ast = parse_sop1_andn2_saveexec_b64("s_andn2_saveexec_b64 s[0:1], s[0:1]")
+        mutant_write_before_read(interp, ast)
+        # Mutant computes saved_exec & ~saved_exec = 0 instead of S0 & ~saved_exec
+        self.assertEqual(interp.exec, 0)
+        # Correct execution gives 0xAAAAAAAAAAAAAAAA
+        correct_interp = ScalarSaluInterpreter()
+        correct_interp.exec = 0x5555555555555555
+        correct_interp.set_sgpr_u64(0, 0xAAAAAAAAAAAAAAAA)
+        correct_interp.execute(ast)
+        self.assertEqual(correct_interp.exec, 0xAAAAAAAAAAAAAAAA)
+        self.assertNotEqual(interp.exec, correct_interp.exec)
+
+    def test_mutation_detection_exec_low32_only(self):
+        s0 = 0xFFFFFFFF00000000
+        old_exec = 0x0000000000000000
+        _, correct_new, _ = ref_andn2_saveexec_b64(s0, old_exec)
+        _, mutant_new, _ = mutant_exec_low32_only(s0, old_exec)
+        self.assertEqual(correct_new, 0xFFFFFFFF00000000)
+        self.assertEqual(mutant_new, 0x0000000000000000)
+        self.assertNotEqual(correct_new, mutant_new)
+
+    def test_mutation_detection_scc_inverted(self):
+        s0 = 0x0
+        old_exec = 0x0
+        _, _, correct_scc = ref_andn2_saveexec_b64(s0, old_exec)
+        _, _, mutant_scc = mutant_scc_inverted(s0, old_exec)
+        self.assertEqual(correct_scc, 0)
+        self.assertEqual(mutant_scc, 1)
+        self.assertNotEqual(correct_scc, mutant_scc)
+
+
 if __name__ == "__main__":
     unittest.main()
