@@ -16,7 +16,8 @@ import os
 import shutil
 import struct
 import sys
-import tempfile
+import time
+import uuid
 
 SPIRV_MAGIC = 0x07230203
 SPIRV_VERSION_1_0 = 0x00010000
@@ -219,6 +220,19 @@ def required_stubs_for_meta(meta):
     return []
 
 
+def _replace_stub(source, target):
+    # Windows can briefly deny the rename while another writer publishes the same stub.
+    for delay in (0.01, 0.02, 0.04) if os.name == "nt" else ():
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32, 33):
+                raise
+            time.sleep(delay)
+    os.replace(source, target)
+
+
 def generate_for_index(spirv_dir, index):
     """Write all deduplicated partner stubs needed by `index` into <spirv_dir>/stubs/. Returns filenames written."""
     needed = set()
@@ -239,21 +253,29 @@ def generate_for_index(spirv_dir, index):
     stubs_dir = os.path.join(spirv_dir, "stubs")
     os.makedirs(stubs_dir, exist_ok=True)
     written = []
-    with tempfile.TemporaryDirectory(prefix=".stubs-", dir=stubs_dir) as staging:
-        for kind, locs in sorted(needed):
-            fname = stub_name(kind, locs)
-            data = build_vs_stub(locs) if kind == "vs" else build_ps_stub(locs)
-            staged = os.path.join(staging, fname)
-            target = os.path.join(stubs_dir, fname)
-            with open(staged, "wb") as f:
+    for kind, locs in sorted(needed):
+        fname = stub_name(kind, locs)
+        data = build_vs_stub(locs) if kind == "vs" else build_ps_stub(locs)
+        target = os.path.join(stubs_dir, fname)
+        # A sibling file inherits the output directory's permissions.
+        staged = os.path.join(stubs_dir, f".stub-{uuid.uuid4().hex}.tmp")
+        stream = open(staged, "xb")
+        try:
+            with stream as f:
                 f.write(data)
             if os.name == "posix":
                 try:
                     shutil.copymode(target, staged)
                 except FileNotFoundError:
                     pass
-            os.replace(staged, target)
-            written.append(fname)
+            _replace_stub(staged, target)
+        except BaseException:
+            try:
+                os.remove(staged)
+            except OSError:
+                pass
+            raise
+        written.append(fname)
     return written
 
 

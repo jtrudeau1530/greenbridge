@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -88,10 +89,18 @@ class SpirvStubsTests(unittest.TestCase):
     def test_failed_rebuild_keeps_existing_stub(self):
         index = {"ps": {"stage": "ps", "inputs": [0, 2]}}
 
+        @contextmanager
         def interrupted_open(path, mode):
-            with open(path, mode) as partial:
-                partial.write(b"partial")
-            raise OSError("injected write failure")
+            self.assertEqual(Path(path).parent, target.parent)
+            with open(path, mode) as f:
+                write = f.write
+
+                def interrupted_write(data):
+                    write(data[:7])
+                    raise OSError("injected write failure")
+
+                with patch.object(f, "write", interrupted_write):
+                    yield f
 
         failures = (
             ("write", patch.object(spirv_stubs, "open", interrupted_open, create=True)),
@@ -107,6 +116,24 @@ class SpirvStubsTests(unittest.TestCase):
                     spirv_stubs.generate_for_index(tmp, index)
                 self.assertEqual(target.read_bytes(), original)
                 self.assertEqual(list(target.parent.iterdir()), [target])
+
+    @unittest.skipUnless(os.name == "nt", "Windows replacement sharing")
+    def test_rebuild_retries_transient_windows_replace_denial(self):
+        index = {"ps": {"stage": "ps", "inputs": [0, 2]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            written = spirv_stubs.generate_for_index(tmp, index)
+            replace = os.replace
+            error = OSError(0, "injected sharing denial", None, 5)
+
+            def retry_replace(src, dst):
+                if attempt.call_count == 1:
+                    raise error
+                replace(src, dst)
+
+            with patch.object(spirv_stubs.os, "replace", side_effect=retry_replace) as attempt:
+                self.assertEqual(spirv_stubs.generate_for_index(tmp, index), written)
+            self.assertEqual(attempt.call_count, 2)
+            self.assertEqual(os.listdir(os.path.join(tmp, "stubs")), written)
 
     @unittest.skipUnless(os.name == "posix", "POSIX file mode")
     def test_rebuild_preserves_existing_mode(self):
