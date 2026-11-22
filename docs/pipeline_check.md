@@ -152,9 +152,9 @@ tool, not a pass: a skipped module has not been validated.
 `make_game.py` runs the pipelines stage in fresh checker processes over at most **500 index entries** each, on
 Windows and POSIX. The ranges partition the same name-sorted index as `--start` / `--count`, including the final
 short range. Each finished process saves to the same `pipeline_cache.bin`, and the next loads that checkpoint.
-This releases allocations that the driver's compiler otherwise retains over a full-corpus process. A work folder
-with at most 500 entries keeps the single invocation. An older checker without the range options keeps the older
-invocation; rebuild the runtime to get batching.
+This bounds each invocation to a range that can be split further if concurrent heavy compiles exceed available
+memory. A work folder with at most 500 entries keeps the single invocation. An older checker without the range
+options keeps the older invocation; rebuild the runtime to get batching.
 
 If a batch crashes, its in-flight modules are checked alone in fresh processes. A module that reproducibly crashes
 is recorded as failed, and the rest is checked. If none crashes alone, the entire failed range is retried in
@@ -162,8 +162,13 @@ smaller processes, down to one entry; healthy modules are not added to the crash
 an interrupted check or a setup error stops the stage. A validation failure in one batch remains a failure even
 when subsequent batches succeed; it does not prevent those later batches from being checked.
 
-The batch size limits how much compilation accumulates between process exits, **not total memory usage**. Loading
-a large saved cache or compiling one large shader can still exceed a process's available memory; a range that
+The native checker returns 1 for initialization failures as well as validation failures. A completed shader pass
+writes/clears its in-flight report even when validation fails. Exit 1 without a new report stops the stage instead
+of repeating failed setup for the remaining batches; diagnostic probes use the same distinction. Each process
+starts with a cleared report path, so an earlier process's report cannot hide an initialization failure.
+
+The batch size limits the index range, **not total memory usage**. Concurrent heavy modules, loading a large
+saved cache or compiling one large shader can still exceed a process's available memory; a range that
 cannot complete even alone fails with a diagnostic rather than being counted as checked.
 
 `tests/test_make_game_pipeline_batches.py` runs the real build-stage orchestration against scripted child processes:
@@ -246,10 +251,16 @@ in between.
 **One process per chunk.** A single `vk_pipeline_check --jobs 4` run over the emulated corpus reached
 21,000 of 26,503 pipelines with no failures. Then the driver's compiler ran out of memory
 (`LLVM ERROR: out of memory`). With 2 jobs, one process later grew past 100 GB of committed memory.
-Driver compiler memory isn't returned between pipelines; the original workaround used one checker process per
-300–500 entries. The build stage now uses at most 500 per process, with smaller retries when needed (above).
+In those earlier runs, compiler allocations were reported to persist between pipelines; the original workaround
+used one checker process per 300–500 entries. The build stage now uses at most 500 per process, with smaller
+retries when needed (above).
 Each process seeds from and saves to the same cache file, so the chunks resume. Since #903 the checker also
 compiles modules over 4 MiB alone.
+
+For BUILD-1030, [the reporter's later measurements](https://github.com/ItsNotRexed/Leonida/pull/3623#issuecomment-7085912874)
+found no accumulation over a 1,500-entry range and cheap loading of the full cache; the large peaks came from
+individual heavy modules. The recovery therefore splits the failed range until fewer such modules compile at
+once, without treating the initial cache-growth hypothesis as established.
 
 **The ScreenProbes shaders.** `indirect_diffuse_lighting`'s ScreenProbes_ActivateProbes,
 ActivateProbesTarget and ActivateRays compute shaders were 60, 60 and 32 MB of SPIR-V. Their 3,281

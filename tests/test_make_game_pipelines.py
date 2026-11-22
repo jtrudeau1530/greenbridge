@@ -89,6 +89,10 @@ class PipelinesCrashRetryTest(unittest.TestCase):
             args = [str(a) for a in args]
             self.calls.append(args)
             code = script(args, len(self.calls))
+            if code in (0, 1) and "--inflight-file" in args:
+                # A native checker that finishes its shader pass clears this report, even on validation failure.
+                with open(args[args.index("--inflight-file") + 1], "w", encoding="utf-8", newline="\n") as f:
+                    f.write("")
             if check and code != 0:   # as run() does
                 raise SystemExit(1)
             return code

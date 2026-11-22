@@ -43,8 +43,9 @@ def record(event):
     with (spirv / "calls.jsonl").open("a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(dict(event=event, pid=os.getpid(), selected=selected, active=active, args=args)) + "\n")
 record("started")
-if config.get("setup_error"):
-    sys.exit(2)
+if config.get("setup_error") or config.get("probe_setup_error") and count == 1 and option("--jobs") == "1":
+    print("no Vulkan physical devices found", file=sys.stderr)
+    sys.exit(config.get("setup_exit", 2))
 if config.get("interrupt") or config.get("interrupt_probe") and count == 1 and option("--jobs") == "1":
     if os.name == "nt":
         import ctypes
@@ -173,6 +174,17 @@ class PipelineBatchesTest(unittest.TestCase):
                 code, _, _ = self.invoke(control)
                 self.assertNotEqual(code, 0)
                 self.assertEqual(len(self.calls()), 1)
+
+    def test_native_setup_exit_one_stops_instead_of_checking_every_range(self):
+        code, _, _ = self.invoke({"setup_error": True, "setup_exit": 1})
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_native_setup_exit_one_in_a_probe_stops_before_splitting(self):
+        code, _, _ = self.invoke({"max_batch": 2, "probe_setup_error": True, "setup_exit": 1})
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertFalse((self.out / "pipeline_crashes.txt").exists())
 
     def test_a_crash_before_work_cannot_retry_forever_or_claim_success(self):
         code, _, err = self.invoke({"crash_before_work": True})

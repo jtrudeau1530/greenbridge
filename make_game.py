@@ -1485,8 +1485,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
         log("pipelines: done")
         return
     base += ["--inflight-file", inflight]
-    # The compiler can keep allocations until its process exits, even after each pipeline is destroyed. Start a
-    # fresh checker for bounded ranges instead of growing one process over the whole corpus (BUILD-1030).
+    # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
+    # exceed available memory, without starting the entire corpus again (BUILD-1030).
     names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
     crashed: "list[str]" = []
 
@@ -1496,13 +1496,18 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
         for _ in range(PIPELINE_CRASH_RETRIES + 1):
             drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
             code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
+            # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
+            # fail validation; setup failures return before writing it. Do not repeat setup for every batch.
+            if code == 1 and not os.path.isfile(inflight):
+                fail("vk_pipeline_check exited with 1 before writing its work report; check Vulkan initialization "
+                     "and report-file access in the output above")
             if code in (0, 1, 2) or interrupted(code):
                 return code
             suspects = list(dict.fromkeys(n for n in read_names(inflight)
                                           if n not in crashed and (allowed is None or n in allowed)))
-            # Even one in-flight module can be innocent when allocations accumulated earlier in this batch.
+            # Even the last in-flight module can be innocent after other heavy compiles in the batch.
             if count is not None or len(suspects) > 1:
-                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n)]
+                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight)]
             if not suspects:
                 if count is not None and count > 1:
                     # All suspects survived in fresh processes: do not blacklist them. Re-check the entire failed
@@ -1599,12 +1604,19 @@ def pipeline_names(spirv: str) -> "list[str]":
     return sorted(index, key=lambda n: n.encode("utf-8"))
 
 
-def crashes_alone(exe: str, spirv: str, cache: str, name: str) -> bool:
+def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None) -> bool:
     """Whether one module takes vk_pipeline_check down on its own, using its global index position."""
     names = pipeline_names(spirv)
     if name not in names:
         return False
-    code = run([exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"], check=False)
+    args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"]
+    if inflight:
+        drop(inflight)
+        args += ["--inflight-file", inflight]
+    code = run(args, check=False)
+    if code == 1 and inflight and not os.path.isfile(inflight):
+        fail(f"pipelines: checking {name} alone exited with 1 before writing its work report; "
+             "check Vulkan initialization and report-file access in the output above")
     if interrupted(code) or code == 2:
         fail(f"pipelines: checking {name} alone stopped with {exit_label(code)}")
     return code not in (0, 1, 2) and not interrupted(code)
