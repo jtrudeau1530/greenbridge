@@ -711,6 +711,13 @@ The compute path, end to end:
     reproducible with `--warp-msaa4`, separately from CTest's 1x software comparison. Vulkan's 4x oracle remains
     strict. The GPU test needs the current graphics path's 144-byte push-constant support; CPU capability checks
     do not need a GPU. No game-pass usage is claimed by these synthetic tests.
+    `d3d12_conservative_tier3_reference` is a native D3D12 reference probe, not Tier 3 support in the Vulkan layer.
+    It reports the selected Vulkan device's `fullyCoveredFragmentShaderInputVariable`, matches that device to its
+    native D3D12 adapter by LUID, then checks the adapter's Tier 3 `SV_InnerCoverage` output on four synthetic
+    triangles. On Windows with Visual Studio 2022 and Windows SDK 10.0.26100 or newer, run
+    `.\scripts\run_conservative_tier3_reference.ps1 -Device 3080` from the repository root. It builds only this
+    test, needs no glslang, and fetches the pinned Vulkan headers only if none are installed. The verbose CTest output
+    reports the capability and result; it skips if the selected device lacks a matching native D3D12 adapter or Tier 3.
   - **Formats:** dynamic rendering takes the RTV and DSV formats. A draw that leaves a slot unbound for which the
     PSO names a format (D3D12 allows it and discards those writes) uses a variant of the pipeline with that format
     undefined, built on first use and kept with the PSO. Bit i of the variant key is colour slot i, and bit 8 is

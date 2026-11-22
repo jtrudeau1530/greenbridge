@@ -1854,6 +1854,14 @@ if(TARGET Vulkan::Headers)
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
     endif()
 
+    # Native D3D12 SV_InnerCoverage reference; its HLSL is compiled at runtime, so glslang is not needed.
+    add_executable(d3d12_conservative_tier3_reference_test test/d3d12_conservative_tier3_reference_test.cpp)
+    target_link_libraries(d3d12_conservative_tier3_reference_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_conservative_tier3_reference_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_conservative_tier3_reference_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_conservative_tier3_reference COMMAND d3d12_conservative_tier3_reference_test)
+    set_tests_properties(d3d12_conservative_tier3_reference PROPERTIES SKIP_RETURN_CODE 77)
+
     # Subgroup size control in PSOs, end to end: runtime/test/shaders/cs_w64x_readlane.asm translated natively and with
     # --wave64-emulate, and cs_wqm_w32.asm, built here with tools/rdna2spirv.py through test/shaders/build.py. Needs
     # llvm-mc with the AMDGPU target (LLVM_MC in the environment, as for the other shader tests, or llvm-mc on PATH)
