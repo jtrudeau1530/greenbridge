@@ -76,6 +76,9 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2")
+# Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
+# narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is.
+WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
@@ -246,8 +249,17 @@ def partial_wave_test(tools, spirv, name, expected_words):
     return failure(code, out, 2)
 
 
-def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None):
-    """Return an empty string for a pass, None for unsupported wave64, or a failure diagnostic."""
+def narrow_subgroup_skip(out):
+    """A Skip when vk_compute_test's "device: ... (subgroup MIN..MAX)" line says MAX is below 32 lanes, else None."""
+    m = re.search(r"subgroup \d+\.\.(\d+)", out)
+    if m and int(m.group(1)) < 32:
+        return Skip(f"SKIP (subgroup {m.group(1)} is narrower than 32 lanes)")
+    return None
+
+
+def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False):
+    """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
+    narrower than 32 lanes (needs_32_lanes), or a failure diagnostic."""
     shader = os.path.join(spirv, name + ".spv")
     args = []
     if require_wave64:
@@ -257,6 +269,8 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args)
     if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
         return None
+    if needs_32_lanes and (skip := narrow_subgroup_skip(out)):
+        return skip
     if code != 0:
         return failure(code, out, 2)
     if require_wave64 and "compute subgroup size: 64" not in out.splitlines():
@@ -559,7 +573,7 @@ def main():
     for name, want in CS_DUMPS:   # all but cs_store need a 64-wide subgroup unless wave64 is emulated
         results.append((name, compute_test(tools, spirv, name, "1", "dump",
                                            require_wave64=name not in WAVE32_DUMPS and not W64_EMULATED,
-                                           expected_words=want)))
+                                           expected_words=want, needs_32_lanes=name in WAVE32_LANE_DUMPS)))
     for name, want in BOUNDS:
         results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",

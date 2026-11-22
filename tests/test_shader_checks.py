@@ -349,5 +349,50 @@ class TexelOffsetChecks(unittest.TestCase):
         self.assertEqual(result, "SKIP (unsupported: VK_KHR_maintenance8 (non-constant texel Offset))")
 
 
+class Wave32LaneDumps(unittest.TestCase):
+    """cs_wqm_w32 and cs_w32_lane_wrap need 32 lanes: skipped where the widest subgroup is narrower (llvmpipe: 8)."""
+    def run_dump(self, name, code, out):
+        want = dict(check.CS_DUMPS)[name]
+        with patch.object(check, "run", return_value=(code, out)):
+            return check.compute_test("tools", "spirv", name, "1", "dump", expected_words=want,
+                                      needs_32_lanes=name in check.WAVE32_LANE_DUMPS)
+
+    @staticmethod
+    def words(name, flip=False):
+        w = list(dict(check.CS_DUMPS)[name])
+        if flip:
+            w[0] ^= 1
+        return "out[0..7] = " + " ".join(map(str, (w + [0] * 8)[:8])) + "\n"
+
+    def test_lane_dumps_are_wave32_dumps(self):
+        self.assertTrue(set(check.WAVE32_LANE_DUMPS) <= set(check.WAVE32_DUMPS))
+        self.assertTrue(set(check.WAVE32_LANE_DUMPS) <= set(dict(check.CS_DUMPS)))
+
+    def test_skipped_below_32_lanes_whatever_the_words(self):
+        for name in check.WAVE32_LANE_DUMPS:
+            for flip in (False, True):
+                with self.subTest(name=name, flip=flip):
+                    problem = self.run_dump(name, 0, "device: llvmpipe (subgroup 8..8)\n" + self.words(name, flip))
+                    self.assertIsInstance(problem, check.Skip)
+                    self.assertEqual(problem, "SKIP (subgroup 8 is narrower than 32 lanes)")
+
+    def test_judged_on_32_lanes_and_wider(self):
+        for name in check.WAVE32_LANE_DUMPS:
+            for dev in ("device: gpu (subgroup 32..32)\n", "device: gpu (subgroup 32..64)\n",
+                        "device: gpu (subgroup 8..32)\n", ""):
+                with self.subTest(name=name, dev=dev):
+                    self.assertEqual(self.run_dump(name, 0, dev + self.words(name)), "")
+                    problem = self.run_dump(name, 0, dev + self.words(name, flip=True))
+                    self.assertTrue(problem)
+                    self.assertNotIsInstance(problem, check.Skip)
+
+    def test_other_dumps_are_not_skipped_on_narrow_devices(self):
+        out = "device: llvmpipe (subgroup 8..8)\nout[0..7] = 1 2 3 4 5 6 7 8\n"
+        with patch.object(check, "run", return_value=(0, out)):
+            problem = check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
+        self.assertTrue(problem)
+        self.assertNotIsInstance(problem, check.Skip)
+
+
 if __name__ == "__main__":
     unittest.main()
