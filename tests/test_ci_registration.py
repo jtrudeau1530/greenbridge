@@ -29,6 +29,7 @@ import fnmatch
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -111,11 +112,17 @@ def matches_nonrecursive_glob(rel, pattern):
     return directory == pattern_dir and fnmatch.fnmatchcase(name, pattern_name)
 
 
-def job_of(root, rel, rules):
+def job_of(root: str, rel: str, rules: tuple[str, str, str, str, str]) -> str | None:
     """Which job runs ``rel``: 'stdlib', 'pytest', 'semantic', 'viewer', or None for no job at all."""
     markers, pruned, loop_glob, semantic, viewer = rules
     if rel.startswith(semantic + "/"):
-        return "semantic" if fnmatch.fnmatchcase(rel.rsplit("/", 1)[-1], "test*.py") else None
+        directory, _, name = rel.rpartition("/")
+        # unittest discovery only descends into packages beneath its start directory.
+        while directory != semantic:
+            if not os.path.isfile(os.path.join(root, directory, "__init__.py")):
+                return None
+            directory = directory.rpartition("/")[0]
+        return "semantic" if fnmatch.fnmatchcase(name, "test*.py") else None
     if matches_nonrecursive_glob(rel, viewer):
         return "viewer"
     if rel.startswith(pruned + "/"):
@@ -245,7 +252,7 @@ class RepositoryRegistrationTest(unittest.TestCase):
         self.assertEqual(unselected, [],
                          "no CI job runs these test files: " + ", ".join(unselected) + "\n"
                          "Rename them to tests/test_*.py (or tests/test_*.cjs), put them under tests/semantic/ "
-                         "as test*.py, or add the pattern to the job that should run them in ci.yml.")
+                         "as test*.py with an __init__.py in each nested directory, or add the pattern to ci.yml.")
 
     def test_every_selected_file_exposes_a_test_to_its_runner(self):
         # Selection is not execution: pytest imports a file it is handed and reports zero items without
@@ -347,6 +354,30 @@ class RepositoryRegistrationTest(unittest.TestCase):
                                             require_test_case=True))
             self.assertFalse(has_main_guard(read(tmp, "tests/test_inequality_guard.py")))
             self.assertEqual(selected["tests/test_nested_dir/test_nested.cjs"], None)
+
+    def test_semantic_selection_matches_discovery_through_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rules = ci_rules(ROOT)
+            semantic = rules[3]
+            cases = ("test_root.py", "packaged/test_packaged.py", "bare/test_bare.py",
+                     "bare/leaf/test_bare_ancestor.py")
+            for case in cases:
+                path = os.path.join(tmp, semantic, case)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("import unittest\nclass Case(unittest.TestCase):\n    def test_ok(self):\n        pass\n")
+            for package in ("packaged", "bare/leaf"):
+                with open(os.path.join(tmp, semantic, package, "__init__.py"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("# Package for unittest discovery.\n")
+
+            result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", semantic, "-v"],
+                                    cwd=tmp, capture_output=True, text=True, timeout=15, check=True)
+            for case in cases:
+                with self.subTest(case=case):
+                    module = case.removesuffix(".py").replace("/", ".")
+                    discovered = f"({module}.Case.test_ok)" in result.stderr
+                    self.assertEqual(job_of(tmp, f"{semantic}/{case}", rules) == "semantic", discovered, result.stderr)
+            self.assertIn("Ran 2 tests", result.stderr)
 
 
 if __name__ == "__main__":
