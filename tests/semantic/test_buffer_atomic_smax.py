@@ -225,5 +225,213 @@ class TestBufferAtomicSmaxOracle(unittest.TestCase):
         self.assertEqual(ret, 0)  # glc on OOB returns 0
 
 
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= 256:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count not in (1, 2, 4):
+            raise ValueError(f"Unsupported register count: {self.count}")
+        if self.index + self.count > 256:
+            raise ValueError(f"Register range exceeds register file boundary: {self.index}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count > 1:
+            return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferAtomicModifiers:
+    """Modifiers and options for buffer atomic instructions."""
+    offset: int = 0
+    glc: bool = False
+    slc: bool = False
+    offen: bool = True
+    idxen: bool = False
+
+    def __post_init__(self) -> None:
+        if self.offset < 0 or self.offset > 4095:
+            raise ValueError(f"Immediate inst_offset must be in range [0, 4095]: {self.offset}")
+
+
+class Opcode(enum.Enum):
+    """Buffer atomic opcodes."""
+    BUFFER_ATOMIC_SMAX = "buffer_atomic_smax"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a buffer_atomic_smax instruction."""
+    opcode: Opcode
+    vdata: Register
+    vaddr: Register
+    srsrc: Register
+    soffset: Register | int
+    mods: BufferAtomicModifiers = dataclasses.field(default_factory=BufferAtomicModifiers)
+
+    def __post_init__(self) -> None:
+        if not self.vdata.is_vgpr or self.vdata.count != 1:
+            raise ValueError(f"vdata must be a single 32-bit VGPR: {self.vdata}")
+        if not self.vaddr.is_vgpr:
+            raise ValueError(f"vaddr must be a VGPR: {self.vaddr}")
+        if not self.srsrc.is_sgpr or self.srsrc.count != 4:
+            raise ValueError(f"srsrc must be a 128-bit SGPR group (count=4): {self.srsrc}")
+        if isinstance(self.soffset, Register) and not self.soffset.is_sgpr:
+            raise ValueError(f"soffset register must be an SGPR: {self.soffset}")
+
+    def to_assembly(self) -> str:
+        vd_str = self.vdata.format_asm()
+        va_str = self.vaddr.format_asm()
+        sr_str = self.srsrc.format_asm()
+        so_str = self.soffset.format_asm() if isinstance(self.soffset, Register) else str(self.soffset)
+
+        mod_parts: list[str] = []
+        if self.mods.offen:
+            mod_parts.append("offen")
+        if self.mods.idxen:
+            mod_parts.append("idxen")
+        if self.mods.offset != 0:
+            mod_parts.append(f"offset:{self.mods.offset}")
+        if self.mods.glc:
+            mod_parts.append("glc")
+        if self.mods.slc:
+            mod_parts.append("slc")
+
+        mods_str = (" " + " ".join(mod_parts)) if mod_parts else ""
+        return f"{self.opcode.value} {vd_str}, {va_str}, {sr_str}, {so_str}{mods_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of buffer instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class BufferAtomicSmaxExpr:
+    """Typed symbolic expression for buffer_atomic_smax."""
+
+    def __init__(
+        self,
+        soffset: int,
+        vaddr: int,
+        cmp_val: int,
+        inst_offset: int = 0,
+        glc: bool = False,
+        offen: bool = True,
+    ) -> None:
+        self.soffset = soffset
+        self.vaddr = vaddr
+        self.cmp_val = cmp_val
+        self.inst_offset = inst_offset
+        self.glc = glc
+        self.offen = offen
+
+    def evaluate(self, mem: BufferMemory, desc: BufferResourceDescriptor) -> tuple[int, bool]:
+        return ref_buffer_atomic_smax(
+            mem,
+            desc,
+            self.soffset,
+            self.vaddr,
+            self.cmp_val,
+            self.inst_offset,
+            self.glc,
+            self.offen,
+        )
+
+
+class TestBufferAtomicSmaxAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_definition(self) -> None:
+        self.assertEqual(Opcode.BUFFER_ATOMIC_SMAX.value, "buffer_atomic_smax")
+
+    def test_register_operand_validation(self) -> None:
+        v0 = Register(RegKind.VGPR, 0)
+        self.assertEqual(v0.format_asm(), "v0")
+        s_group = Register(RegKind.SGPR, 4, count=4)
+        self.assertEqual(s_group.format_asm(), "s[4:7]")
+
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 4, count=3)
+
+    def test_instruction_construction_and_formatting(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=Register(RegKind.SGPR, 8),
+            mods=BufferAtomicModifiers(offen=True, offset=64, glc=True),
+        )
+        self.assertEqual(
+            inst.to_assembly(),
+            "buffer_atomic_smax v0, v1, s[4:7], s8 offen offset:64 glc",
+        )
+
+    def test_instruction_with_immediate_soffset(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 3),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=False, slc=True),
+        )
+        self.assertEqual(inst.to_assembly(), "buffer_atomic_smax v2, v3, s[0:3], 0 slc")
+
+    def test_program_assembly(self) -> None:
+        prog = Program()
+        inst1 = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+        )
+        prog.append(inst1)
+        self.assertEqual(prog.to_assembly(), inst1.to_assembly())
+
+    def test_typed_expression_evaluation(self) -> None:
+        mem = BufferMemory(256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        mem.write_u32(0, u32(-50))
+
+        expr = BufferAtomicSmaxExpr(soffset=0, vaddr=0, cmp_val=u32(-10), glc=True)
+        ret, ok = expr.evaluate(mem, desc)
+        self.assertTrue(ok)
+        self.assertEqual(s32(ret), -50)
+        self.assertEqual(s32(mem.read_u32(0)), -10)
+
+
 if __name__ == "__main__":
     unittest.main()
