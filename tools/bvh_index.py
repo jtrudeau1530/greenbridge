@@ -338,12 +338,22 @@ def scan_dir(path, max_inflate=1 << 28):
     return rows, [summary]
 
 
+def _make_parent(path):
+    """Create the folder a report lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_outputs(rows, summaries, out, csv_path):
     if out:
+        _make_parent(out)
         payload = summaries if len(summaries) > 1 else (summaries[0] if summaries else {})
         with open(out, "w", encoding="utf-8") as f:
             json.dump({"summary": payload, "streams": rows}, f, indent=0)
     if csv_path:
+        _make_parent(csv_path)
         cols = ["source", "offset", "stored", "size", "kind", "signature", "version", "node_count",
                 "node_bytes", "declared_bytes", "tail_offset", "flags", "crc32", "num_elements",
                 "offset_to_nodes", "offset_to_prim_remap", "root_node_ptr", "root_node_index",
@@ -409,6 +419,23 @@ def main(argv=None):
         ap.error("--out must not overwrite the source")
     if a.csv and same_output_path(a.target, a.csv):
         ap.error("--csv must not overwrite the source")
+    for flag, path in (("--out", a.out), ("--csv", a.csv)):
+        if path and os.path.isdir(path):
+            ap.error(f"{flag} is a folder, not a report file: {path}")
+    if os.path.isdir(a.target):
+        manifest = os.path.join(a.target, "index.json")
+        for flag, path in (("--out", a.out), ("--csv", a.csv)):
+            if not path:
+                continue
+            if os.path.isfile(manifest) and same_output_path(path, manifest):
+                ap.error(f"{flag} would overwrite the carve manifest: {path}")
+            if os.path.isfile(path):
+                for root, _dirs, names in os.walk(a.target):
+                    for name in names:
+                        if name.lower().endswith((".json", ".csv")):
+                            continue
+                        if same_output_path(os.path.join(root, name), path):
+                            ap.error(f"{flag} would overwrite an input file: {path}")
     if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()

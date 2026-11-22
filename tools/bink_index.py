@@ -301,6 +301,19 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.out and same_output_path(a.target, a.out):
         ap.error("--out must not overwrite the source")
+    if a.out and os.path.isdir(a.out):
+        ap.error(f"--out is a folder, not a report file: {a.out}")
+    if a.out and os.path.isdir(a.target):
+        manifest = os.path.join(a.target, "index.json")
+        if os.path.isfile(manifest) and same_output_path(a.out, manifest):
+            ap.error(f"--out would overwrite the carve manifest: {a.out}")
+        if os.path.isfile(a.out):
+            for root, _dirs, names in os.walk(a.target):
+                for name in names:
+                    if name.lower().endswith((".json", ".csv")):
+                        continue
+                    if same_output_path(os.path.join(root, name), a.out):
+                        ap.error(f"--out would overwrite an input file: {a.out}")
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2
