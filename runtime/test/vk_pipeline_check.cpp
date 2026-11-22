@@ -18,6 +18,9 @@
 //                 instructions, registers, spills, scratch, waves...) as CSV rows name,stage,statistic,value. Only
 //                 the executable that runs the translated shader is written, not the partner stub's. Use without
 //                 cache.bin: a pipeline loaded from the cache may come without statistics.
+//   --cache-feedback  count each stage's successful pipelines by VkPipelineCreationFeedback: hits (VALID and
+//                 APPLICATION_PIPELINE_CACHE_HIT), no hit reported (VALID only) and unavailable (no VALID bit, or a
+//                 pre-1.3 device without VK_EXT_pipeline_creation_feedback). The three add up to the ok count.
 #include "vulkan_loader.h"
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
@@ -335,6 +338,7 @@ struct StageStats {
     uint32_t w64_ok = 0;
     uint32_t w64_bad = 0;
     uint32_t w64_unforced = 0;
+    uint32_t feedback[3] = {};  // --cache-feedback, successful pipelines only, indexed by feedback_outcome
     double seconds = 0.0;
     double max_sec = 0.0;
     std::string max_name;
@@ -353,13 +357,27 @@ static_assert(shader_slice(7, 2, 0) == std::pair<size_t, size_t>{2, 7});
 static_assert(shader_slice(7, 8, 3) == std::pair<size_t, size_t>{7, 7});
 static_assert(shader_slice(7, 2, std::numeric_limits<size_t>::max()) == std::pair<size_t, size_t>{2, 7});
 
+// --cache-feedback class of a successful pipeline: 0 hit, 1 no hit reported, 2 unavailable. A hit counts only with
+// VALID; the duration and base-pipeline bits are not classified.
+constexpr int feedback_outcome(VkPipelineCreationFeedbackFlags f) {
+    if (!(f & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)) return 2;
+    return (f & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) ? 0 : 1;
+}
+
+static_assert(feedback_outcome(0) == 2);
+static_assert(feedback_outcome(VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) == 2);
+static_assert(feedback_outcome(VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) == 1);
+static_assert(feedback_outcome(VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT |
+                               VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) == 0);
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
-            "[--max-bytes N] [--stage all|cs|graphics | --compute-only | --graphics-only]\n");
+            "[--max-bytes N] [--stage all|cs|graphics | --compute-only | --graphics-only] [--stats FILE] "
+            "[--cache-feedback]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
@@ -368,6 +386,7 @@ int main(int argc, char** argv) {
     size_t start = 0, count = 0, max_bytes = 0;
     double slow = 30.0;
     std::string stage_filter = "all";
+    bool cache_feedback = false;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         auto val = [&] { return i + 1 < argc ? std::string(argv[++i]) : std::string("0"); };
@@ -380,6 +399,7 @@ int main(int argc, char** argv) {
         else if (a == "--graphics-only") stage_filter = "graphics";
         else if (a == "--max-bytes") max_bytes = std::stoull(val());
         else if (a == "--stats") stats_path = val();
+        else if (a == "--cache-feedback") cache_feedback = true;
         else cache_path = a;
     }
     if (stage_filter != "all" && stage_filter != "cs" && stage_filter != "graphics") {
@@ -490,6 +510,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--stats: the device has no %s\n", VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
         return 1;
     }
+    // --cache-feedback: core in Vulkan 1.3 (no feature bit). A pre-1.3 device needs VK_EXT_pipeline_creation_feedback;
+    // without it nothing is chained and every successful pipeline counts as unavailable.
+    const bool fb_ext = cache_feedback && props.apiVersion < VK_API_VERSION_1_3 &&
+                        has(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+    if (fb_ext) enable.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+    const bool feedback = cache_feedback && (props.apiVersion >= VK_API_VERSION_1_3 || fb_ext);
+    if (cache_feedback && !feedback)
+        std::fprintf(stderr, "note: --cache-feedback: no Vulkan 1.3 or %s; every pipeline is counted unavailable\n",
+                     VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = chain;
     vkGetPhysicalDeviceFeatures2(pd, &f2);            // fills every linked struct with what's supported
@@ -696,7 +725,7 @@ int main(int argc, char** argv) {
     };
 
     auto record_pipe = [&](const std::string& name, const std::string& stage, uint32_t sg, bool sg_forced,
-                           VkResult r, double sec) {
+                           VkResult r, double sec, VkPipelineCreationFeedbackFlags fb_flags) {
         std::lock_guard<std::mutex> g(mu);
         inflight.erase(std::this_thread::get_id());
         auto& st = stats[stage];
@@ -712,6 +741,7 @@ int main(int argc, char** argv) {
             std::printf("PIPELINE FAIL %s (%s w%u, %d)\n", name.c_str(), stage.c_str(), sg, r);
         } else {
             st.pipes_ok++;
+            if (cache_feedback) st.feedback[feedback_outcome(fb_flags)]++;
             if (sg == 64) st.w64_ok++; else st.w32_ok++;
         }
         uint32_t n_done = ++total_pipes_done;
@@ -764,6 +794,11 @@ int main(int argc, char** argv) {
                     if (sg_forced) cpi.stage.pNext = &reqSg;
                     cpi.layout = pl;
                     cpi.flags = capture;
+                    // Only whole-pipeline feedback is reported.
+                    VkPipelineCreationFeedback fb{};
+                    VkPipelineCreationFeedbackCreateInfo fci{
+                        VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, nullptr, &fb, 0, nullptr};
+                    if (feedback) cpi.pNext = &fci;
                     const auto t0 = std::chrono::steady_clock::now();
                     { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
                     VkPipeline p = VK_NULL_HANDLE;
@@ -771,7 +806,7 @@ int main(int argc, char** argv) {
                     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     if (r == VK_SUCCESS) write_stats(name, stage, VK_SHADER_STAGE_COMPUTE_BIT, p);
                     if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
-                    record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
+                    record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec, fb.flags);
                 }
             } else if (mod_ok && is_graphics_stage(stage)) {
                 const std::string miss = check_missing_feature(meta);
@@ -927,6 +962,11 @@ int main(int argc, char** argv) {
                         gpci.layout = pl;
                         gpci.renderPass = VK_NULL_HANDLE;
                         gpci.flags = capture;
+                        // Zeroed per call and read after it returns; per-stage entries are required but not reported.
+                        VkPipelineCreationFeedback fb{};
+                        VkPipelineCreationFeedbackCreateInfo fci{
+                            VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, &rend, &fb, 0, nullptr};
+                        if (feedback) gpci.pNext = &fci;  // keeps rend chained behind it
 
                         const auto t0 = std::chrono::steady_clock::now();
                         { std::lock_guard<std::mutex> g(mu); inflight[std::this_thread::get_id()] = {name, t0}; }
@@ -935,7 +975,7 @@ int main(int argc, char** argv) {
                         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                         if (r == VK_SUCCESS) write_stats(name, stage, stage_bit(stage), p);
                         if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
-                        record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec);
+                        record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec, fb.flags);
                     }
                 }
             } else if (mod_ok) {
@@ -997,6 +1037,9 @@ int main(int argc, char** argv) {
             const uint32_t compiled = s.pipes_ok + s.pipes_bad;
             std::printf("%s pipelines: %u ok, %u failed, %u skipped\n",
                         st.c_str(), s.pipes_ok, s.pipes_bad, s.pipes_skipped);
+            if (cache_feedback)
+                std::printf("  %s cache feedback: %u hits, %u no hit reported, %u unavailable\n",
+                            st.c_str(), s.feedback[0], s.feedback[1], s.feedback[2]);
             if (!s.skip_reasons.empty()) {
                 for (const auto& [reason, cnt] : s.skip_reasons)
                     std::printf("  %s skipped (%s): %u\n", st.c_str(), reason.c_str(), cnt);
