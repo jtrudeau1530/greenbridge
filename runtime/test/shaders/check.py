@@ -205,7 +205,8 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
-PIXEL_BITS = {"ps_legacy_mul": (0, 0, 0, 0x40c00000),
+PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
+              "ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_ops": (0x48804300, 5, 7, 0xfffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xfffffffa, 7),
               "ps_ops3": (0xfffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
               "ps_ops5": (0x12340010, 0xbeef0800, 0xaaaaffff, 0xdeadbc00),
@@ -880,7 +881,7 @@ def clip_test(tools, spirv, name):
         raw = Path(tmp) / "pixels.raw"
         for clip_x, clip_y in ((False, False), (True, False), (False, True), (True, True)):
             code, output = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, name + ".spv"),
-                               os.path.join(spirv, "ps_ops.spv"), raw, "64", "64",
+                               os.path.join(spirv, "ps_clip_color.spv"), raw, "64", "64",
                                "0" if clip_x else "4", "0" if clip_y else "4")
             if code == UNSUPPORTED:
                 return Skip("SKIP (shaderClipDistance unavailable)")
@@ -897,7 +898,7 @@ def clip_test(tools, spirv, name):
             for i, pixel in enumerate(struct.iter_unpack("<4I", data)):
                 inside = (not clip_x or i % 64 < 32) and (not clip_y or i // 64 < 16)
                 drawn = inside or name == "vs_clip_undeclared"
-                wrong += pixel != (PIXEL_BITS["ps_ops"] if drawn else clear)
+                wrong += pixel != (PIXEL_BITS["ps_clip_color"] if drawn else clear)
             if wrong:
                 return f"x={clip_x} y={clip_y}: {wrong} of 4096 pixels differ"
     return ""

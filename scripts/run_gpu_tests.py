@@ -507,7 +507,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_gather_wrap": "vs_ids.asm",
-              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm",
+              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm"}
 
@@ -984,6 +984,7 @@ def run_suite(a, work: str) -> int:
                 results.append((name, False, msg))
                 continue
             const_wants = {
+                "ps_clip_color": (0x3E800000, 0x3F000000, 0x3F400000, 0x3F800000),
                 "ps_ops": (0x48804300, 5, 7, 0xFFFFFFFC),
                 "ps_ops2": (0xABCD4400, 0x46001234, 0xFFFFFFFA, 7),
                 "ps_ops3": (0xFFFFFFFA, 0x44660066, 0x44AABBCC, 16),
