@@ -380,7 +380,9 @@ What is implemented (all of it testable without the game):
   Swapchain backbuffers are real `ID3D12Resource` COM objects (`BackBufferResource` inheriting from
   `ID3D12ResourceStubs`) registered directly with `VulkanContext`, supporting `CreateSwapChainForHwnd`,
   `GetCurrentBackBufferIndex`, `GetBuffer`, `CreateRenderTargetView`, `Present`, and `ResizeBuffers` (preserving
-  explicit buffer dimensions even when the HWND client size is unchanged via an offscreen backbuffer + blit path).
+  explicit buffer dimensions even when the HWND client size is unchanged via an offscreen backbuffer + blit path,
+  and exposing exactly the requested `BufferCount` even when Vulkan's native image count differs, in which case the
+  offscreen ring is the app-visible swapchain and each present blits the current slot into the acquired image).
 
     | Argument | Answer |
     |---|---|

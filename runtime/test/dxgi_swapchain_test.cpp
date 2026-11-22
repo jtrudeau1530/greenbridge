@@ -316,6 +316,16 @@ int main() {
     if (FAILED(sc1->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return fail("QI IDXGISwapChain3");
     sc1->Release();
 
+    // DXGI reports the BufferCount the app created with, never a larger native/Vulkan image count (D3D-389).
+    {
+        DXGI_SWAP_CHAIN_DESC1 created_desc{};
+        DXGI_SWAP_CHAIN_DESC created_desc0{};
+        if (FAILED(sc->GetDesc1(&created_desc)) || created_desc.BufferCount != scd.BufferCount)
+            return fail("GetDesc1 BufferCount is not the requested count");
+        if (FAILED(sc->GetDesc(&created_desc0)) || created_desc0.BufferCount != scd.BufferCount)
+            return fail("GetDesc BufferCount is not the requested count");
+    }
+
     if (!check_statistics_disjoint(sc)) return fail("initial frame-statistics disjoint notification");
 
     ID3D12Device* got_device = nullptr;
@@ -390,6 +400,7 @@ int main() {
             return 1;
         }
         const UINT idx = sc->GetCurrentBackBufferIndex();
+        if (idx >= cur_desc.BufferCount) return fail("GetCurrentBackBufferIndex >= BufferCount");
         ID3D12Resource* bb = nullptr;
         if (FAILED(sc->GetBuffer(idx, IID_PPV_ARGS(&bb))) || !bb) return fail("GetBuffer");
 
@@ -541,6 +552,7 @@ int main() {
             return fail("GetDesc1 did not preserve 37x19 R10G10B10A2_UNORM");
 
         const UINT idx = sc->GetCurrentBackBufferIndex();
+        if (idx >= d10.BufferCount) return fail("GetCurrentBackBufferIndex >= BufferCount (10-bit)");
         ID3D12Resource* bb = nullptr;
         if (FAILED(sc->GetBuffer(idx, IID_PPV_ARGS(&bb))) || !bb) return fail("GetBuffer (10-bit)");
         const D3D12_RESOURCE_DESC bb_desc = bb->GetDesc();
