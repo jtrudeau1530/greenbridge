@@ -161,6 +161,27 @@ CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
+# cs_fmt_int_narrow.asm: 8- and 16-bit UINT/SINT typed buffer loads and stores (layout in the .asm header). The
+# words are the same program's output on gfx1036 run natively (tools/hw_oracle, wave32 and wave64 identical).
+FMT_INT_NARROW_WORDS = [
+    0x00000080, 0x00000080, 0x00000080, 0x00000080, 0xFFFFFF80, 0xFFFFFF80, 0xFFFFFF80, 0xFFFFFF80,
+    0x0000FF80, 0x0000FF80, 0x0000FF80, 0x0000FF80, 0xFFFFFF80, 0xFFFFFF80, 0xFFFFFF80, 0xFFFFFF80,
+    0x00000080, 0x000000FF, 0x00000080, 0x000000FF, 0xFFFFFF80, 0xFFFFFFFF, 0xFFFFFF80, 0xFFFFFFFF,
+    0xFFFFFF80, 0x00007F01, 0xFFFFFF80, 0x00007F01, 0xFFFFFF80, 0xFFFFFFFF, 0x00000001, 0x0000007F,
+    0xFFFFFF80, 0x00007F01, 0xFFFFFFFF, 0xFFFF8000, 0xFFFFFF80, 0x00000000, 0x00000001, 0x00000001,
+    0x0000FF80, 0x00000000, 0x00000001, 0x00000001, 0xFF80FF80, 0xFF80FF80, 0xFFFFFF80, 0x007F0001,
+    0x7F01FF80, 0x8000FFFF, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEE7F, 0xEEEEEEEE, 0xEEEEEE7F, 0xEEEEEEEE, 0xEEEE7FFF, 0xEEEEEEEE, 0xEEEE7FFF, 0xEEEEEEEE,
+    0xEEEE807F, 0xEEEEEEEE, 0xEEEE7F7F, 0xEEEEEEEE, 0x7FFF7FFF, 0xEEEEEEEE, 0x80807F7F, 0xEEEEEEEE,
+    0x7FFF7FFF, 0x80008000, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0x7F01FF80, 0x8000FFFF, 0x12345678, 0x9ABCDEF0, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+]
 # cs_fmt_sint32.asm: hand-derived full-width and D16 load results, inputs, stores, and untouched words.
 FMT_SINT32_WORDS = [
     0x80000000, 0x7FFFFFFF, 0x80000000, 1,
@@ -473,6 +494,10 @@ def dump_test(tools, spirv, name, want, words, env=None):
 def fmt_1010102_test(tools, spirv, env=None):
     """Check both packed stores and the untouched tail of a single group's 64 words."""
     return dump_test(tools, spirv, "cs_fmt_1010102", FMT_1010102_WORDS + [0xEEEEEEEE] * 48, 64, env)
+
+
+def fmt_int_narrow_test(tools, spirv, env=None):
+    return dump_test(tools, spirv, "cs_fmt_int_narrow", FMT_INT_NARROW_WORDS, len(FMT_INT_NARROW_WORDS), env)
 
 
 def fmt_sint32_test(tools, spirv, env=None):
@@ -1290,6 +1315,7 @@ def main():
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
+    results.append(("cs_fmt_int_narrow", fmt_int_narrow_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
