@@ -12272,6 +12272,21 @@ def main():
                          "need, or the shader is refused (Unsupported). The device's own maxComputeSharedMemorySize "
                          "(32768 on some drivers) is checked by the runtime against lds_bytes in index.json")
     a = ap.parse_args()
+    # A file at --out (or one above it) can never become a folder. Refuse it here, before
+    # --merge publishes an index or os.makedirs raises a traceback. Same check as #1607's
+    # shader_disasm.py and #1632's tex_export.py.
+    if os.path.lexists(a.out) and not os.path.isdir(a.out):
+        ap.error(f"{a.out} is a file, not a folder")
+    # realpath resolves symlink components before '..' is applied, so a symlinked parent
+    # does not make the walk inspect a different tree than os.makedirs will use.
+    ancestor = os.path.dirname(os.path.realpath(a.out))
+    while ancestor and not os.path.exists(ancestor):
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:  # a root that doesn't exist, e.g. an unmapped Windows drive
+            ap.error(f"cannot create {a.out}: {ancestor} is not a folder")
+        ancestor = parent
+    if ancestor and not os.path.isdir(ancestor):
+        ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     FMA_KHR = a.fma == "khr"
@@ -12307,7 +12322,10 @@ def main():
         si, sn = a.shard
         files = files[si::sn]
         shard = si
-    os.makedirs(a.out, exist_ok=True)
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:  # a trailing separator on a file, or a symlink changed since the check above
+        ap.error(f"cannot create {a.out}: {e.strerror or e}")
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
