@@ -14109,7 +14109,12 @@ def translate(path):
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
     if stage == "gs":
-        ins_sig = [(reg, sv) for reg, mask, sv, ctype in input_signature(path, info["name"])]
+        ins_by_reg = {}
+        for reg, mask, sv, ctype in input_signature(path, info["name"]):
+            if reg in ins_by_reg and (ins_by_reg[reg] == 1) != (sv == 1):
+                raise Unsupported("gs signature")
+            ins_by_reg.setdefault(reg, sv)
+        ins_sig = sorted(ins_by_reg.items())
         outs = output_signature(path, info["name"])
         if not ins_sig or not outs:
             raise Unsupported("gs signature")
