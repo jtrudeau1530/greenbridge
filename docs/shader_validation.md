@@ -334,6 +334,12 @@ that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, ea
 - **Reports.** A mismatch names the thread, the register or LDS word, and the op that last wrote it.
   `--no-exec KIND` drops one op kind's masks without changing the rest of the program, to separate
   a known finding from new ones.
+- **Subgroup size.** Wave32 programs, and wave64 ones built with `--emulate`, ask `vk_compute_test` for
+  32-lane subgroups (`VKC_SUBGROUP_SIZE=32`). Where the device can't pin that size, `vk_compute_test`
+  prints `compute subgroup size: 32 not available` and runs at the driver's choice, and the wave32
+  program is a skip, not a mismatch: its words come from another wave size. Mesa llvmpipe (8 lanes)
+  is such a device. Emulated wave64 uses no subgroup operations, so it is still compared there.
+  `valu_fuzz.py` and `crosslane_fuzz.py` follow the same rule.
 
 First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and with
 `--wave64-emulate` at subgroup 32:
@@ -450,11 +456,13 @@ this. Images have their own fuzzer (`tools/image_fuzz.py`, below).
 The `buffer_format` family covers `buffer_load_format_*` on every format the translator decodes, with a
 random DST_SEL of 0/1/X/Y/Z/W, and `tbuffer_load_format_*` on the five formats the 1.0.2.1 corpus uses
 (`16_16_SNORM`, `8_8_8_8_UNORM`, `8_8_8_8_UINT`, `2_10_10_10_UNORM`, `16_16_16_16_UINT`, about 53,000
-instructions) with an identity swizzle. Its reference decodes each element from the GFX10 format *name*
-(`tools/gfx10_formats.json`; channel widths listed from the top bit), not from the translator's own
-table: UNORM/SNORM correctly rounded (`x/(2ⁿ−1)`), missing channels *c* mod *n*, DST_SEL 1 = integer 1
-for UINT/SINT and 1.0f otherwise (SHADER-86, RX 6700). Elements are naturally aligned. Left out: whether
-`tbuffer` applies the V#'s DST_SEL (unmeasured).
+instructions). Generated MTBUF cases use a bound 32_UINT V# and take their data format from the
+instruction. The reference decodes elements from the GFX10 format *name* in `tools/gfx10_formats.json`
+(channel widths listed from the top bit). UNORM/SNORM values use correctly rounded division.
+MUBUF repeats missing channels (*c* mod *n*) and DST_SEL 1 gives integer 1 for UINT/SINT and 1.0f
+otherwise (SHADER-86, RX 6700). MTBUF loads return instruction-format channels in order, zero-fill
+missing channels and return zero for an INVALID V# format (native gfx1036, wave32 and wave64).
+Elements are naturally aligned.
 
 Over 5,000 programs the reference and translator match bit for bit; breaking the `16_16_SNORM` kind, the
 `8_8_8_8_UINT` widths or the DST_SEL order in the translator makes 33, 37 and 191 of 300 programs fail.
@@ -838,6 +846,49 @@ reset in the kernel log.
   model produces: about half the results 1 ulp off. The kernel layout is checked without a GPU: each of the 65,536
   inputs is computed once and stored in its own half (`tests/test_f16_trans_sweep.py`). On a GPU the test checks
   exp2 of integers and wave32 = wave64.
+
+### `v_fma_mix*` f16 rounding in nearest mode (`tools/fma_mix_probe.py`)
+
+`docs/design.md` leaves one f16 question open. In round-to-nearest mode, does `v_fma_mixlo_f16` / `v_fma_mixhi_f16`
+round the exact x · y + z once, straight to f16? Or does it round to f32 first and then narrow, which is what the
+translator does (f32 `Fma`, then `f16_res`)? The RX 6800 word behind the toward-zero rule can't answer this. For
+1 · 2 - 2^-30 both readings give 0x4000 in nearest mode, and toward zero two truncations equal one.
+
+The two readings only differ when the f32 rounding lands exactly on an f16 tie, or moves a value off one. The probe has
+seven such inputs, each one f16 ulp apart under the two rules, plus one control:
+- a tie just above and just below, for both signs;
+- the subnormal tie at 2^-25;
+- the overflow tie at 65520 (inf against 65504);
+- a tie made by the product rather than by z;
+- the same with f16 operands (`op_sel_hi:[1,1,1]`).
+
+Every side reports which rule its words follow:
+
+```
+python -I tools/fma_mix_probe.py                       # the translator, on the CPU interpreter
+python -I tools/fma_mix_probe.py --oracle hw           # also the native instruction on an AMD GPU (hardware oracle)
+python -I tools/fma_mix_probe.py --oracle vulkan --build runtime/build   # also the translated shader on this GPU
+```
+
+The `hw` side is the measurement. It runs one wave32 lane per input, under the MODE inferred for the game: IEEE 0,
+DX10_CLAMP 1, f32 denormals flushed, f16 denormals kept, nearest. The `vulkan` side only shows that a driver runs the
+translator's sequence as written. Its operands come in user SGPRs, so the driver can't fold them. Exit 0 means every
+side follows the same rule. Exit 1 means they differ, or a side follows neither rule. Exit 77 means a requested side
+is unavailable.
+
+`tests/test_fma_mix_probe.py` checks the expected words against a derivation written out by hand. It also checks that
+the translator follows the double rule today, and that the compute shader gives the pixel shader's words on the
+interpreter. If the hardware rounds once, the fix is to use `Gen.fma_mix_odd` in nearest mode as well. Round-to-odd at
+f32 then narrows exactly. With that change the translator gives the single-rounded word on all seven inputs.
+
+Results:
+
+| GPU | Driver | `translator` | `vulkan` | `hw` |
+|---|---|---|---|---|
+| NVIDIA GeForce RTX 5060 (Blackwell), Windows 11 | 621.24 | double | double, 8 of 8 words | not AMD |
+
+The `hw` column is still empty: the question needs an RDNA GPU. On the RTX 5060, a translator copy changed to use
+`fma_mix_odd` in nearest mode gave the single-rounded word for all seven inputs on the `vulkan` side as well.
 
 ## Coverage plan and cost
 

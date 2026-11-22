@@ -382,13 +382,13 @@ private:
             const std::uint32_t eq = binop(spv_op::kOpIEqual, ty_bool_, v, params[j]);
             match = binop(spv_op::kOpLogicalAnd, ty_bool_, match, eq);
         }
-        const std::uint32_t idx_off = binop(spv_op::kOpIAdd, ty_uint_, base, c9);
-        const std::uint32_t idx_ptr = access2(ptr_sb_u_, map_var, c0, idx_off);
-        const std::uint32_t idx_val = load(ty_uint_, idx_ptr);
         emit(funcs_, spv_op::kOpSelectionMerge, {lbl_next, 0u});
         emit(funcs_, spv_op::kOpBranchConditional, {match, lbl_hit, lbl_next});
 
         emit(funcs_, spv_op::kOpLabel, {lbl_hit});
+        const std::uint32_t idx_off = binop(spv_op::kOpIAdd, ty_uint_, base, c9);
+        const std::uint32_t idx_ptr = access2(ptr_sb_u_, map_var, c0, idx_off);
+        const std::uint32_t idx_val = load(ty_uint_, idx_ptr);
         emit(funcs_, spv_op::kOpStore, {iv, idx_val});
         emit(funcs_, spv_op::kOpStore, {kv, c8});
         emit(funcs_, spv_op::kOpBranch, {lbl_next});

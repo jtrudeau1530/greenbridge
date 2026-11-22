@@ -196,6 +196,19 @@ class GamedataMapsTest(unittest.TestCase):
         p = gamedata_maps.parse_pamh(bytes(head))
         self.assertEqual(p["grid"]["full_width_rows"], 1)
 
+    def test_bounds_reject_nan_and_infinity(self):
+        for off, args, field in (
+                (0x0C, (3, 1, [(0, 3, [1, 2, 3])], b""), "mhiu"),
+                (0x10, (3, 1, [1, 2, 3], [0, 0, 0]), "pamh")):
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                payload = (mhiu_payload if field == "mhiu" else pamh_payload)(*args)
+                head = bytearray(payload)
+                struct.pack_into("<f", head, off, bad)
+                parser = gamedata_maps.parse_mhiu if field == "mhiu" \
+                    else gamedata_maps.parse_pamh
+                with self.assertRaisesRegex(ValueError, "non-finite bound"):
+                    parser(bytes(head))
+
     def test_pamh_rejects_a_short_row_body(self):
         payload = pamh_payload(2, 2, [1, 2, 3, 4], [0, 1, 2, 3])
         head = bytearray(payload[:-1])

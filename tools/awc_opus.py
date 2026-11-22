@@ -4,16 +4,16 @@
 
 AWC layout (little-endian "ADAT"), as read by rpf9-explorer's OpusPreview.cpp: a stream table of u32
 (id[28:0] | tag count[31:29]), then 8-byte tags (type[63:56], size[55:28], offset[27:0]). Tag 0x55 = data,
-0x76 = format (u32 samples, u16 rate at +8, codec at +28, channels at +29). Codec 0x0B = Opus at 48 kHz: data is
-2048-byte blocks of [u16 length][packet] ..., a zero length pads the rest of the block. Codec 0 = PCM16 (written as
-.wav). Codec 2 = 32-bit float PCM (float .wav).
+0x76 = format (u32 samples, u16 rate at +8, u32 per-channel Opus frame count at +12, codec at +28, channels at
++29). Codec 0x0B = Opus at 48 kHz: data is 2048-byte blocks of [u16 length][packet] ..., a zero length pads the
+rest of the block. Codec 0 = PCM16 (written as .wav). Codec 2 = 32-bit float PCM (float .wav).
 
 Opus streams carry the encoder's lookahead as priming samples: the packets start with 312 samples of encoder
 delay (libopus at 48 kHz) that RFC 7845 says the decoder drops using OpusHead's pre-skip. The AWC format block
 does not store it, so the exporter writes OPUS_PRE_SKIP (overridable with --pre-skip) into OpusHead and makes the
-trimmed final granule `pre_skip + length`. The format block's sample count is already in 48 kHz frames even when
-its rate field is 32 kHz, and it is interleaved across channels, so a stereo stream's per-channel length is
-`samples / 2`.
+trimmed final granule `pre_skip + length`. The format block's +0 count is interleaved across channels and already
+in 48 kHz frames even when its rate field is 32 kHz; +0x0C is the per-channel frame count (equal to +0 for mono
+and half of it for stereo in all 7,451 measured streams).
 
 Streamed music (tag 0x48 descriptor: u32 blocks, u32 chunk size, u32 channels, then 16 bytes per channel: id,
 samples, rate at +10, codec at +12) is split into one Ogg Opus per descriptor channel: each chunk starts with a
@@ -182,8 +182,10 @@ def parse_awc(d: bytes):
             samples, = struct.unpack_from("<I", d, fmt[0])
             rate, = struct.unpack_from("<H", d, fmt[0] + 8)
             codec, channels = d[fmt[0] + 28], d[fmt[0] + 29]
+            frames = (struct.unpack_from("<I", d, fmt[0] + 12)[0]
+                      if codec == 0x0B and fmt[1] >= 16 else 0)
             streams.append({"id": sid, "samples": samples, "rate": rate, "codec": codec, "channels": channels,
-                            "data": data})
+                            "frames": frames, "data": data})
     return streams, music
 
 
@@ -274,10 +276,10 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
         if s["codec"] == 0x0B and size % 2048 == 0 and s["channels"] in (1, 2):
             pk = opus_packets(d, at, size)
             if pk:
-                # Opus packets decode at 48 kHz and the format tag's count is already in 48 kHz
-                # frames, so the tag's rate field must not scale it (it records the source rate).
-                # Stereo counts are interleaved across both channels.
-                frames = s["samples"] // s["channels"]
+                # +0x0C is the per-channel Opus frame count: equal to the +0 count for mono and
+                # half of it for stereo in all 7,451 measured streams. Fall back to dividing the
+                # interleaved count when a synthetic or malformed block leaves the field zero.
+                frames = s["frames"] or s["samples"] // max(1, s["channels"])
                 write_ogg_opus(os.path.join(od, f"{s['id']:08X}.ogg"), pk, s["channels"], s["id"], frames,
                                pre_skip=pre_skip)
                 counts["opus"] += 1

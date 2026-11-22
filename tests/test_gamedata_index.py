@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "gamedata_index.py")
@@ -263,6 +264,37 @@ class XmlGroupingRegressionTest(GamedataIndexTest):
         self.assertEqual(row["chunks"], 2)
         self.assertTrue(row["header"])
         self.assertFalse(row["complete"])
+
+
+class BuildRowsReadCountTest(unittest.TestCase):
+    """The XML-shaped text branch must join the chunks it already read, not reinflate the group twice."""
+
+    def test_text_group_with_late_close_reads_each_member_once(self):
+        tool = load_tool()
+        head = b"<SyntheticRoot>" + b" " * (65536 - len(b"<SyntheticRoot>"))
+        tail = b"</SyntheticRoot>"
+        rows = [
+            {"off": 0x1000, "stored": len(head), "size": 65536, "head": head[:16].hex(), "type": ""},
+            {"off": 0x2000, "stored": len(tail), "size": len(tail), "head": tail[:16].hex(), "type": ""},
+        ]
+        chunks_by_offset = {0x1000: head, 0x2000: tail}
+        source = mock.Mock()
+        source.read.side_effect = lambda row: chunks_by_offset[row["off"]]
+
+        out = tool.build_rows(rows, source)
+
+        self.assertEqual(len(out), 1)
+        row = out[0]
+        self.assertEqual(row["type"], "xml")
+        self.assertEqual(row["root"], "SyntheticRoot")
+        self.assertTrue(row["complete"])
+        self.assertFalse(row["header"])
+        self.assertEqual(row["chunks"], 2)
+        self.assertEqual(row["size"], 65536 + len(tail))
+        self.assertEqual(row["stored"], len(head) + len(tail))
+        self.assertEqual(source.read.call_count, 2)
+        self.assertEqual([call.args[0]["off"] for call in source.read.call_args_list],
+                         [0x1000, 0x2000])
 
 
 if __name__ == "__main__":
