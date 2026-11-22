@@ -12291,6 +12291,18 @@ def branch_condition(g, op):
         g.emit(f"{s} = OpLoad %uint %vcc")
         lane = g.tmp()
         g.emit(f"{lane} = OpINotEqual %bool {s} {g.cu(0)}")
+        if g.wave64 and "vcc" not in g.cur_masks:
+            # VCC holds data, not a lane mask: VCCZ/VCCNZ test all 64 bits, so the high word matters too.
+            # Each invocation holds the same data word, and the subgroup vote below reduces the bool once.
+            # A VCC certified as a lane mask keeps one bit per lane in %vcc; %vcc_hi is not the other half
+            # of the vote there, because that vote already covers both halves of the wave.
+            hi = g.tmp()
+            g.emit(f"{hi} = OpLoad %uint %vcc_hi")
+            hi_nz = g.tmp()
+            g.emit(f"{hi_nz} = OpINotEqual %bool {hi} {g.cu(0)}")
+            both = g.tmp()
+            g.emit(f"{both} = OpLogicalOr %bool {lane} {hi_nz}")
+            lane = both
     else:
         lane = g.active_b()
     any_ = g.tmp()
