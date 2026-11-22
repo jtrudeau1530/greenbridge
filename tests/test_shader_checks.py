@@ -908,6 +908,48 @@ class SamplerMipChecks(unittest.TestCase):
         self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
 
 
+class FmaFusedChecks(unittest.TestCase):
+    """cs_fma_fused: strict single-rounded words under --fma khr, fused-or-split f32 under --fma glsl (Mesa RADV)."""
+    RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
+
+    def run_fma(self, words, *, khr_index=False, code=0, raw_out=None):
+        out = raw_out if raw_out is not None else "out[0..7] = " + " ".join(map(str, words)) + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            if khr_index:
+                Path(tmp, "index.json").write_text(
+                    json.dumps({"cs_fma_fused": {"features": ["shaderFmaFloat32"]}}), encoding="utf-8")
+            with patch.dict(check.os.environ, {}, clear=False):
+                check.os.environ.pop("LEONIDA_FMA", None)
+                with patch.object(check, "run", return_value=(code, out)) as run:
+                    res = check.fma_fused_test("tools", tmp)
+                self.assertEqual(run.call_args.kwargs["env"]["VKC_SGPRS"], check.FMA_FUSED_ENV["VKC_SGPRS"])
+        return res
+
+    def test_fused_passes_under_both_modes(self):
+        self.assertEqual(self.run_fma(check.FMA_FUSED, khr_index=False), "")
+        self.assertEqual(self.run_fma(check.FMA_FUSED, khr_index=True), "")
+
+    def test_radv_split_passes_under_glsl_and_fails_under_khr(self):
+        self.assertEqual(self.run_fma(self.RADV_SPLIT, khr_index=False), "")
+        ok, detail = check.judge_fma_fused(self.RADV_SPLIT, khr=False)
+        self.assertTrue(ok)
+        self.assertIn("5/7 split", detail)
+        problem = self.run_fma(self.RADV_SPLIT, khr_index=True)
+        self.assertIn("word 0", problem)
+        self.assertIn("OpFmaKHR", problem)
+
+    def test_wrong_f16_or_garbage_f32_fails_under_both_modes(self):
+        bad_f16 = check.FMA_FUSED[:7] + [0x00007352]
+        bad_f32 = [0x12345678] + check.FMA_FUSED[1:]
+        for khr in (False, True):
+            self.assertIn("word 7", self.run_fma(bad_f16, khr_index=khr))
+            self.assertIn("word 0", self.run_fma(bad_f32, khr_index=khr))
+
+    def test_missing_shader_fma_extension_skips(self):
+        res = self.run_fma([], khr_index=True, code=77, raw_out="unsupported: cs_fma_fused.spv needs VK_KHR_shader_fma\n")
+        self.assertIsInstance(res, check.Skip)
+        self.assertIn("VK_KHR_shader_fma", res)
+
 if __name__ == "__main__":
     unittest.main()
 

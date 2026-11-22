@@ -246,10 +246,13 @@ USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
 # cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
-# them; the words are the exact fused results (derivations in the .asm header). The same with --fma glsl and --fma khr
-# (LEONIDA_FMA=khr for build.py): GLSL Fma may be split into two roundings by a driver, OpFmaKHR may not.
+# them; FMA_FUSED are the exact single-rounded words and FMA_SPLIT are the exact split-rounded words (derivations in
+# the .asm header; out[7] is f16 round-to-odd, never GLSL Fma, so it is always 0x7351). Under --fma khr
+# (LEONIDA_FMA=khr, shaderFmaFloat32 in index.json) every word must match FMA_FUSED; under default --fma glsl a
+# spec-compliant driver (e.g. Mesa RADV 26.2.6) may legally split GLSL.std.450 Fma.
 FMA_FUSED_ENV = {"VKC_SGPRS": "0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002"}
 FMA_FUSED = [0x33800000, 0xa8800000, 0x3a000400, 0x33800000, 0x33800000, 0x33800000, 0x28800000, 0x00007351]
+FMA_SPLIT = [0x00000000, 0x00000000, 0x3a000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00007351]
 # cs_cvt_f32_sat.asm (#300): s4 is a binary32 input, out[0] = v_cvt_u32_f32, out[1] = v_cvt_i32_f32 (truncate,
 # saturate, NaN -> 0). One dispatch per input through VKC_SGPRS; the inputs of tests/semantic/test_float_to_int.py.
 CVT_F32_SAT_CASES = (
@@ -764,6 +767,63 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         if m and m.group(1) == "0":
             return ""
     return failure(code, out, 2)
+
+
+def shader_features(spirv, name):
+    """The Vulkan feature names recorded for a shader in index.json, or an empty set."""
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            feats = json.load(f).get(name, {}).get("features") or ()
+            return set(feats)
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def judge_fma_fused(words, khr):
+    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr every word must be exact fused; under --fma glsl
+    each of the 7 f32 words may be either fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the
+    f16 round-to-odd word out[7] must always be exact 0x00007351."""
+    if not words or len(words) < 8:
+        return False, "missing out[0..7] dump"
+    if khr:
+        for i, (got, want) in enumerate(zip(words, FMA_FUSED)):
+            if got != want:
+                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} (OpFmaKHR)"
+        return True, "8/8 fused exact (OpFmaKHR)"
+    if words[7] != FMA_FUSED[7]:
+        return False, f"word 7 (f16): got {words[7]:#010x}, want {FMA_FUSED[7]:#010x}"
+    n_split = 0
+    for i in range(7):
+        got, fused, split = words[i], FMA_FUSED[i], FMA_SPLIT[i]
+        if got == fused:
+            continue
+        if got == split:
+            n_split += 1
+            continue
+        return False, f"word {i}: got {got:#010x}, want fused {fused:#010x} or split {split:#010x}"
+    if n_split == 0:
+        return True, "8/8 fused exact (GLSL Fma)"
+    return True, f"{7 - n_split}/7 f32 fused, {n_split}/7 split (GLSL Fma; LEONIDA_FMA=khr for OpFmaKHR), f16 exact"
+
+
+def fma_fused_test(tools, spirv):
+    """Run cs_fma_fused and judge against FMA_FUSED (strict under --fma khr, fused-or-split f32 under --fma glsl)."""
+    shader = os.path.join(spirv, "cs_fma_fused.spv")
+    khr = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
+           or os.environ.get("LEONIDA_FMA") == "khr")
+    code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
+                    env=dict(os.environ, **FMA_FUSED_ENV))
+    if code == UNSUPPORTED:
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    if code != 0:
+        return failure(code, out, 2)
+    m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
+    if not m:
+        return failure(code, out, 2)
+    words = [int(x) for x in m.group(1).split()]
+    ok, detail = judge_fma_fused(words, khr=khr)
+    return "" if ok else detail
 
 
 def cvt_f32_sat_test(tools, spirv):
@@ -1414,8 +1474,7 @@ def main():
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
-    results.append(("cs_fma_fused", compute_test(tools, spirv, "cs_fma_fused", "1", "dump", expected_words=FMA_FUSED,
-                                                 env=FMA_FUSED_ENV)))
+    results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
