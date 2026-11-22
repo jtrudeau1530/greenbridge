@@ -183,10 +183,11 @@ clothed, so it is not a high-detail nude body.
   `ambient_female` drawable; the Lucia and Mandy hits are props (photos, frames, luggage, a
   curtain). The only human-skeleton meshes in `levels.rpf` are the generic mannequin pair in
   **Bodies**.
-- **Bind pose and full skinning.** The delivered GLBs use identity inverse-bind matrices and do
-  not apply the 8-influence bone-palette skinning. Prior art places inverse bind matrices at the
-  skeleton header `+0x08`; that is not yet reproduced here, so the reference TRS remains the only
-  measured pose.
+- **Bind pose and full skinning.** The `rpf9dump` GLBs use identity inverse-bind matrices and do
+  not apply the 8-influence bone-palette skinning. The inverse bind matrices are at skeleton header
+  `+0x30` (the drawable's `+0x18` points at the header) and agree with the default bone transforms;
+  `tools/anim_glb.py` exports a part with them as a glTF skin, with clips (see
+  [character_skeleton.md](character_skeleton.md#animated-gltf-export)).
 
 ## Reproduce
 
