@@ -116,13 +116,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends wine wine64 xvfb xauth mesa-vulkan-drivers libvulkan1
           wine --version
       - name: Create the Wine prefix
+        # wineserver -w inside the same X session: once Xvfb is gone, a Wine process left waiting for the display
+        # (explorer.exe) can keep wineserver -w waiting until the job's timeout.
+        timeout-minutes: 5
         env:
           WINEPREFIX: ${{ runner.temp }}/wineprefix
           WINEDLLOVERRIDES: "mscoree,mshtml="
           WINEDEBUG: "-all"
-        run: |
-          xvfb-run -a wineboot --init
-          wineserver -w
+        run: xvfb-run -a sh -c 'wineboot --init && wineserver -w'
       - name: Windows tests under Wine
         env:
           WINEPREFIX: ${{ runner.temp }}/wineprefix
