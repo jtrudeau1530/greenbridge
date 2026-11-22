@@ -745,5 +745,83 @@ class TestValuDot8IntSIMDMultiLane(unittest.TestCase):
             self.assertEqual(wave.vgprs[lane][0], expected)
 
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation Tests
+# ---------------------------------------------------------------------------
+
+class TestValuDot8IntRegisterAliasing(unittest.TestCase):
+    """Register aliasing, self-overwrite, and in-place operand preservation unit tests."""
+
+    def test_aliasing_dst_equals_src0(self) -> None:
+        interp = Dot8IntScalarInterpreter()
+        initial_v1 = pack_u4(1, 2, 3, 4, 1, 2, 3, 4)
+        v2 = pack_u4(2, 2, 2, 2, 2, 2, 2, 2)
+        interp.rf.write_vgpr(1, initial_v1)
+        interp.rf.write_vgpr(2, v2)
+
+        # 2 * (1+2+3+4+1+2+3+4) = 2 * 20 = 40
+        interp.execute_asm(["v_dot8_u32_u4 v1, v1, v2, 0"])
+        self.assertEqual(interp.rf.vgprs[1], 40)
+
+    def test_aliasing_dst_equals_src1(self) -> None:
+        interp = Dot8IntScalarInterpreter()
+        v1 = pack_i4(-1, 1, -1, 1, -1, 1, -1, 1)
+        v2 = pack_i4(2, 3, 2, 3, 2, 3, 2, 3)
+        interp.rf.write_vgpr(1, v1)
+        interp.rf.write_vgpr(2, v2)
+
+        # 4 * ((-1)*2 + 1*3) = 4 * (-2 + 3) = 4 * 1 = 4
+        interp.execute_asm(["v_dot8_i32_i4 v2, v1, v2, 0"])
+        self.assertEqual(interp.rf.vgprs[2], 4)
+
+    def test_aliasing_dst_equals_src2_accumulator(self) -> None:
+        interp = Dot8IntScalarInterpreter()
+        v1 = pack_u4(1, 1, 1, 1, 1, 1, 1, 1)
+        v2 = pack_u4(2, 2, 2, 2, 2, 2, 2, 2)
+        interp.rf.write_vgpr(1, v1)
+        interp.rf.write_vgpr(2, v2)
+        interp.rf.write_vgpr(3, 500)
+
+        # 8 * 2 = 16; 500 + 16 = 516
+        interp.execute_asm(["v_dot8_u32_u4 v3, v1, v2, v3"])
+        self.assertEqual(interp.rf.vgprs[3], 516)
+
+    def test_aliasing_dst_equals_src0_and_src1_squared(self) -> None:
+        interp = Dot8IntScalarInterpreter()
+        # Vector squared norm: v1 . v1
+        v1 = pack_u4(1, 2, 1, 2, 1, 2, 1, 2)
+        interp.rf.write_vgpr(1, v1)
+
+        # 4*(1^2) + 4*(2^2) = 4 + 16 = 20; acc = 10 -> 30
+        interp.execute_asm(["v_dot8_u32_u4 v1, v1, v1, 10"])
+        self.assertEqual(interp.rf.vgprs[1], 30)
+
+    def test_full_aliasing_dst_src0_src1_src2(self) -> None:
+        interp = Dot8IntScalarInterpreter()
+        # Single register v0 serves as dst, src0, src1, and src2
+        v0 = pack_u4(1, 1, 1, 1, 1, 1, 1, 1)  # 0x11111111
+        interp.rf.write_vgpr(0, v0)
+
+        # Sum = 8 * 1 = 8; acc = 0x11111111 -> 0x11111119
+        interp.execute_asm(["v_dot8_u32_u4 v0, v0, v0, v0"])
+        self.assertEqual(interp.rf.vgprs[0], 0x1111_1119)
+
+    def test_simd_multi_lane_aliased_accumulation(self) -> None:
+        wave = SIMDWaveState(wave_size=32)
+        wave.exec_mask = 0x5555_5555
+        for lane in range(32):
+            wave.write_vgpr_lane(lane, 0, 100)
+            wave.write_vgpr_lane(lane, 1, pack_u4(1, 1, 1, 1, 1, 1, 1, 1))
+            wave.write_vgpr_lane(lane, 2, pack_u4(2, 2, 2, 2, 2, 2, 2, 2))
+
+        # Active lanes: 100 + 8*2 = 116; Inactive: 100
+        wave.execute_asm(["v_dot8_u32_u4 v0, v1, v2, v0"])
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[lane][0], 116)
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 100)
+
+
 if __name__ == "__main__":
     unittest.main()
