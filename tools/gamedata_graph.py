@@ -12,7 +12,8 @@ rebuilt the same way as the index and catalog. For each parsed document the grap
 
 * a document node;
 * a content-set node for every ``<id>`` (a top-level id or an id inside ``<contentSets>``);
-* a target node for every ``<filename>``, ``<loadPath>``, ``parentPath`` and ``parentFile`` value.
+* a target node for every ``<filename>``, ``parentPath`` and ``parentFile`` value and every
+  ``<loadPath>`` value in ``<includedChangesets>``.
 
 Edges are ``defines`` (document to its sets), ``includes`` (document to an ``<includedSets>`` id),
 ``contains_file`` (set or document to a filename target), ``loads_changeset`` (document to a
@@ -91,10 +92,13 @@ def _direct_id(element) -> str:
     return ""
 
 
-def _add_filename_refs(report: dict, file_list, owner: str) -> None:
-    if file_list is None:
+def _add_filename_refs(report: dict, scope, owner: str, seen: set) -> None:
+    if scope is None:
         return
-    for filename in file_list.iter("filename"):
+    for filename in scope.iter("filename"):
+        if filename in seen:
+            continue
+        seen.add(filename)
         value = _text(filename)
         if value:
             report["refs"].append({"kind": "filename", "target": value, "owner": owner})
@@ -136,13 +140,16 @@ def scan_document(doc: dict) -> dict:
     report["sets"] = [set_id for set_id in report["sets"]
                       if not (set_id in seen or seen.add(set_id))]
 
-    _add_filename_refs(report, root.find("fileList"), own)
+    filenames = set()
+    _add_filename_refs(report, root.find("fileList"), own, filenames)
 
     if content_sets is not None:
         for item in content_sets:
             set_id = _direct_id(item)
             if set_id:
-                _add_filename_refs(report, item.find("fileList"), set_id)
+                _add_filename_refs(report, item.find("fileList"), set_id, filenames)
+
+    _add_filename_refs(report, root, "", filenames)
 
     changesets = root.find("includedChangesets")
     if changesets is not None:

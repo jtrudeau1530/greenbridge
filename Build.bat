@@ -4,8 +4,16 @@ rem Documents\Leonida. Extra options pass through, e.g.  Build.bat --out D:\Game
 setlocal
 cd /d "%~dp0"
 set "PY="
-where py >nul 2>nul && set "PY=py -3"
-if not defined PY where python >nul 2>nul && set "PY=python"
+for %%V in (3.14 3.13 3.12 3) do (
+  if not defined PY (
+    py -%%V -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && set "PY=py -%%V"
+  )
+)
+if not defined PY (
+  where python >nul 2>nul && (
+    python -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && set "PY=python"
+  )
+)
 if not defined PY (
   echo Python 3.12 or newer is needed: https://www.python.org/downloads/
   echo Tick "Add python.exe to PATH" during setup, then run Build.bat again.

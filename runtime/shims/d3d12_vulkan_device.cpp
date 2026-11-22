@@ -2463,7 +2463,7 @@ public:
             if (family.timestampValidBits)
                 state_.context->set_timestamp_period(properties.limits.timestampPeriod);
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
-                state_.context->set_binary_occlusion_memory(state_.memory);
+                state_.context->set_occlusion_resolve_memory(state_.memory);
         }
 
         if (info.debug_utils) {
@@ -4709,8 +4709,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
-    instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
-    instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
     const char* layer = "VK_LAYER_KHRONOS_validation";
     const VkValidationFeatureEnableEXT sync_validation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
     VkValidationFeaturesEXT validation_features{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
@@ -4734,10 +4732,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         enumerate(nullptr, &extension_count, extensions.data());
         for (const auto& e : extensions) has_debug_utils = has_debug_utils || std::strcmp(e.extensionName, debug_utils) == 0;
     }
-    if (has_debug_utils) {
-        instance_info.enabledExtensionCount = 1;
-        instance_info.ppEnabledExtensionNames = &debug_utils;
-    }
+    // One list: the surface extensions above (for DXGI presentation) and debug utils both go on the instance.
+    const bool instance_has_surface = !inst_exts.empty();
+    if (has_debug_utils) inst_exts.push_back(debug_utils);
+    instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
+    instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
     OwnedRuntime owned{};
     if (create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
         std::fprintf(stderr, "[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed\n");
@@ -4983,7 +4982,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     if (calibrated) device_extensions.push_back(calibrated);
     info.presentation = surfaces && has_swapchain;
-    if (has_swapchain) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
+    if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);

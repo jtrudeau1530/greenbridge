@@ -1635,19 +1635,24 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
 - **Queries never ended.** D3D12 leaves their result undefined; a Vulkan copy with `WAIT_BIT` would wait for them
   forever. Each heap records on the host which queries were ended, in submission order, and a resolve writes zeros
   (`vkCmdFillBuffer`) for the ones that were not.
+- **Overlapping ordinary occlusion.** On a graphics queue with compute, the replay opens a new physical query
+  whenever the set of active ordinary queries changes. Each logical query keeps a contiguous range in the
+  submission's physical pool. Resolving it sums the 64-bit counts on the GPU, then copies the result to the
+  destination. Both occlusion compute helpers reuse one scratch buffer per queue. Logical results and in-flight
+  submissions retain the pool independently, so later resolves and
+  overwrites can be recorded before the earlier commands complete. `vk_overlapping_occlusion` checks crossing
+  and nested scopes, more than one scratch chunk, alternating binary and ordinary resolves under a predicate,
+  and gated submissions on a GPU.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 
 Not implemented yet:
 
-- **Overlapping queries.** Vulkan allows one active query of each type in a command buffer
-  (`VUID-vkCmdBeginQuery-queryPool-01922`); D3D12 lets occlusion queries overlap. A list that begins an occlusion
-  query (either kind) or a pipeline-statistics query while another of the same kind runs is refused with
-  `ReplayResult::unsupported`. The fix is virtual queries: end the running Vulkan query, start another, and sum the
-  pieces when resolving (a compute pass). The trace will show whether the game overlaps them.
-- **Binary occlusion during an active pipeline-statistics query** is refused at preparation because the helper
-  dispatch would otherwise change the application's compute-invocation count. The binary resolve also needs
-  compute support on the graphics queue.
+- **Overlapping queries.** Replay refuses overlapping pipeline-statistics queries or occlusion overlaps involving
+  a binary query with `ReplayResult::unsupported`.
+- **Occlusion resolves during a pipeline-statistics query.** Replay refuses binary resolves and ordinary resolves
+  that need a sum while pipeline statistics are active, since the internal dispatch would change the reported
+  compute-invocation count. Both dispatch paths need compute support on the graphics queue.
 - `GetClockCalibration` (from `VK_EXT_calibrated_timestamps`), stream-output and mesh-shader statistics.
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
@@ -2248,10 +2253,25 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   compute PSOs (slot 62, 53 of 53 `S_OK`), CS bytecode 4–75 KB each. `~XboxBvhBuilder` returns and makes no device
   call. Created is not the same as correct: the shaders are Xbox DXIL with `@xbox.*` intrinsics (section 7.2), and
   nothing has been dispatched yet.
-- On an **RTX 4090** (driver 621.24) the first 48 PSOs return `S_OK`, and creating the 49th ends the process
-  with `0xC0000409` (fail-fast) on repeated runs; one run returned `E_OUTOFMEMORY` for it instead, which the
-  constructor threw. So the NVIDIA driver does not survive the builder's shaders as they are. The layer should not
-  hand Xbox DXIL to the PC driver.
+- **NVIDIA (RT-54).** On an RTX 3060 (616.64), an RTX 4090 (621.14) and an RTX 5070 Ti (621.24), all on Windows 11,
+  the first 48 PSOs return `S_OK`, and the 49th (38,248 bytes) never does. Some runs return `E_OUTOFMEMORY` for it,
+  which the constructor throws. Other runs end the process inside `nvwgf2umx.dll` with `0xC0000409`, after the
+  driver's LLVM 7.0.1 bitcode reader prints `Invalid record` or `Never resolved value found in function`. That
+  can't be caught. The D3D12 debug layer prints nothing first.
+  - **Cause: the input, not Leonida.** The proxy passes the bytecode through unchanged, so nothing is wrong in what
+    it forwards. The input is the problem: `LEONIDA_BVH_RECORD62=1 LEONIDA_BVH_DXIL=1` shows that every one of the
+    53 containers is signed, has the same 9 parts, and is shader model 6.5 / DXIL 1.5. But dxil.dll (Windows SDK
+    10.0.26100) rejects all 53 (`0x80aa0009`): the target triple is `dxil-ms-xb2` and the module carries
+    `xbox.compiler.options` metadata. Most also have Xbox-only externals (44 of 53), `extractvalue` on non-DXIL types
+    (16) or other disallowed instruction types (5). No PC driver has to accept this, and WARP happens to.
+  - **What sets the 49th apart: one error kind.** It is the only shader of the 53 that the validator reports for a
+    resource in a function signature (a non-entry function that takes a resource). Its other counts are 265
+    `extractvalue`, 6 Xbox externals and 514 `i64` mentions; the 36th shader has the same 265 and 468 and is created.
+  - **Workaround: the test switches to WARP on NVIDIA.** On an NVIDIA adapter (PCI vendor `0x10DE`), `bvh_builder_test`
+    now uses WARP unless `LEONIDA_BVH_HARDWARE=1`, and it prints the reason. WARP creates all 53 PSOs, and the
+    constructor and destructor return. It isn't known whether AMD hardware takes these shaders.
+  - **The runtime itself still shouldn't hand Xbox DXIL to a PC driver.** These shaders need lowering to PC DXIL or a
+    translation of their own (section 7.2, M6) before they can run on hardware.
 
 ### A.3 `amd_fidelityfx_upscaler_xbox.dll`
 
