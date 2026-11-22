@@ -393,6 +393,7 @@ class TestSwizzleSearchCliAndRender(unittest.TestCase):
         """Bad --bpe/--tile/--widths/--tiles must be usage errors, not arithmetic tracebacks."""
         cases = [
             (["--bpe", "0"], "--bpe must be at least 1"),
+            (["--bpe", "4"], "--bpe must be 8 or 16"),
             (["--tile", "0"], "--tile must be a multiple"),
             (["--tile", "1"], "--tile must be a multiple"),
             (["--tile", "3"], "--tile must be a multiple"),
