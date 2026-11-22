@@ -350,6 +350,17 @@ def default_out() -> str:
     return os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
 
 
+def icloud_default_notes() -> list:
+    """The log lines when default_out() left iCloud-synced Documents: why, and where a build made before this change
+    is, so its resumable work folder isn't silently left behind."""
+    notes = ["iCloud syncs Documents on this Mac: building into ~/Leonida instead, so the game's files stay off iCloud"]
+    earlier = os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
+    if os.path.isdir(earlier):
+        notes.append(f"an earlier build is in {earlier}: move it to {default_out()} to resume it there, "
+                     f'or pass --out "{earlier}" to keep using it')
+    return notes
+
+
 # ---------------------------------------------------------------- preflight
 MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
@@ -1350,7 +1361,8 @@ def main() -> int:
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)
     if not a.out and icloud_documents():
-        log("iCloud syncs Documents on this Mac: building into ~/Leonida instead, so the game's files stay off iCloud")
+        for note in icloud_default_notes():
+            log(note)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
