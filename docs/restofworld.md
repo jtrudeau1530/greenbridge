@@ -423,16 +423,38 @@ descriptor supplies meshlet, triangle and reference counts that must agree with 
 pointed-to group's header. This check also validates the packed triangles, vertex
 reference bounds and padded index-buffer length.
 
-All 311 target blocks have one distinct validated group address under this check.
-Geometry records reached through resource-root model lists account for 303. For
-the other eight, a search of aligned system records found the same pointer layout
-and a primary-LOD geometry list containing the record. The path from the resource
-root to that list is still unknown. The pointer search reproduced the addresses
-without selecting on the proposed vertex count. The layout count and the group's
-dense range subsequently agreed in all 311. This includes the six uniquely paired
-page walks and seven walks with a repeated target block count.
+The original check found one distinct validated group address for each of the
+311 target blocks. The regular drawable LOD lists reached 303. For the other
+eight, a search of aligned system records found the same pointer layout and a
+geometry list containing the record. The layout count and the group's dense range
+agreed in all 311. This includes the six uniquely paired page walks and seven
+walks with a repeated target block count.
 
-| Pointed-to group start relative to the target stream | Blocks |
+**The eight auxiliary root paths (ASSET-273).** An independent scan of all 22
+archives reproduced 311 outliers and verified all 311 draw bindings. The regular
+drawable lists reached 264 blocks through LOD 0 and another 39 through LODs 1–3.
+The eight records reached through auxiliary paths each have a verified geometry
+record and graphics-group address:
+
+- **Seven standalone drawables:** follow the root drawable's pointer at `+0xD0`.
+  In the auxiliary header, `+0x30` points to a table of system pointers and
+  `+0x38` holds its 16-bit count, which matched capacity in these cases. Each
+  relevant table entry points to a record whose `+0x68` field leads to the
+  structure with the geometry list at `+0x50`.
+- **One fragment:** start with the fragment root's pointer at `+0x90`, then
+  follow pointer fields at `+0x130`, `+0x20` and `+0x70`. In that table, entry 1
+  (zero-based) reaches the record whose `+0x68` pointer leads to the structure
+  with the geometry list at `+0x50`. These offsets are one measured route.
+
+One regular LOD 0 binding needs a compressed final system page that inflates to
+48 bytes. The diagnostic scan's 64-byte minimum excluded that page. When the
+first page's map declares the final system continuation, the archive diagnostic
+accepts a nonempty short page at the next 16-byte boundary with zero padding
+and a valid zlib checksum. That restores the normal draw binding. Both the
+diagnostic and the pinned model reader recover the containing dictionary's 11
+children.
+
+| Pointed-to group start relative to the target stream (original survey) | Blocks |
 |---|---:|
 | Preceding stream | 68 |
 | Same stream | 228 |
@@ -444,9 +466,10 @@ different group even with an exact match in hand.
 
 For an already separated system/graphics resource pair, the following command
 walks the primary LOD from the drawable offset reported by the model manifest.
-Use `--geometry-offset` for a known individual geometry record. Both offsets
-are relative to the start of the system segment. Unsupported or inconsistent
-bindings are reported as unresolved.
+Use `--lod 1`, `--lod 2` or `--lod 3` with the same drawable offset to select a
+lower LOD, or use `--geometry-offset` for a known individual geometry record.
+Both offsets are relative to the start of the system segment. Unsupported or
+inconsistent bindings are reported as unresolved.
 
 ```powershell
 python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
