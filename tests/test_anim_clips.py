@@ -460,6 +460,15 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual(d["name"], "short@name")
         self.assertEqual(d["hash"], joaat32("short@name"))
 
+    def test_motion_with_an_inline_name(self):
+        b = bytearray(two_sequence_dictionary())
+        motion = {k & 0xFFFFFFFF: v for k, v in self.s.atmap(0x48)}[2]
+        b[motion + 0x30:motion + 0x40] = b"walk.motion".ljust(15, b"\x00") + bytes([0x80 | 11])
+        d = anim_clips.parse_dictionary(anim_clips.System(bytes(b)))
+        self.assertEqual(sorted((c["kind"], c["name"]) for c in d["clips"]),
+                         [("clip", "pack:/one.clip"), ("motion", "walk.motion"),
+                          ("motionmatcher", "pack:/one.motionmatcher")])
+
     def test_rig_root_is_not_a_clip_dictionary(self):
         b = bytearray(two_sequence_dictionary())
         b[0x70:0x78] = b"RIG\x02\x10\x00\x00\x00"
