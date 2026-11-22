@@ -1,0 +1,53 @@
+# Progress dashboard
+
+`tools/progress_dashboard.py` turns outcomes the project already produces into one page that answers three questions:
+what works, what changed since it last passed, and what blocks next. It runs locally, reads only, and writes nothing
+into the repository.
+
+```powershell
+python -I tools/progress_dashboard.py --out ..\leonida_progress --run-tests --github
+start ..\leonida_progress\progress.html
+```
+
+`--out` must be outside the repository; the tool refuses a folder inside it, so its output can't be committed by accident.
+The page is one self-contained HTML file: no network, no packages, it opens from disk.
+
+## Sources
+
+Each source is optional. A missing one is listed under "Sources" on the page; it is never counted as zero or as a failure.
+
+| Panel | Source | Unit |
+|---|---|---|
+| Unit tests | `--run-tests` runs `tests/test_*.py` with the selection `ci.yml` uses (standard-library files with a `__main__` block), one process each; the outcome and the commit it ran on are kept in `<out>/unit_results.json` | test file |
+| Runtime tests | `runtime/build/Testing/Temporary/LastTest.log` and any `--junit` file (CTest `--output-junit` or pytest `--junitxml`) | test |
+| Translator contract | the contract table in [design.md](design.md#translator-status-and-runtime-contract), each row classified by how it says it was confirmed | contract row |
+| Runtime imports | the measured tables in [runtime_imports.md](runtime_imports.md) | import |
+| Shader corpus | `--work <work>`: counts per stage from `<work>/dxbc/index.json` and `<work>/spirv/index.json` | shaders, aggregated per stage |
+| D3D12 layer | `--github`: the `D3D-` table of [#313](https://github.com/ItsNotRexed/Leonida/issues/313), read through `gh` | item |
+| CI on main | `--github`: the latest completed run of each workflow on `main` | workflow |
+
+With `--github --login <account>` the page also lists that account's claims in the coordination issue (and the issue
+it continues) and its pull requests. Nothing is posted: every `gh` call is a read.
+
+## How a status is decided
+
+| Status | Unit tests and CTest | Contract row | Import | D3D- item |
+|---|---|---|---|---|
+| VERIFIED | passed, and nothing it depends on changed since | names a GPU check and leaves nothing open | image with 0 unimplemented imports | — |
+| IMPLEMENTED | — | confirmed by an LLVM/Mesa reference, a corpus count or a CPU test, not a GPU | bound to a shim, the host or a module | merged on `main` |
+| PARTIAL | passed before a change to the test, `tools/`, `scripts/` or `make_game.py` (CTest: before the last commit touching `runtime/`) | waits for a GPU measurement, or names a GPU check with an item still open | — | pull request open |
+| FAILED | failed on its last run | — | — | — |
+| MISSING | — | — | unimplemented | unclaimed |
+| UNKNOWN | skipped, or git can't tell what changed | states no confirmation method | — | claimed, no code yet |
+
+The contract classification reads the row's own words; the matched words are shown in each cell's details, so a
+wrong class is visible and the rule list in the tool (`CONFIRMATION`) can be corrected.
+
+Each metric is a ratio with its numerator, denominator and formula on the page. There is no overall percentage: the
+panels count different things. The trend chart breaks a line where a metric's formula changed between snapshots.
+
+## No game data
+
+The page and the JSON carry counts, pass/fail, error classes and the project's own document text. The corpus panel
+stores per-stage numbers only: no shader name, carved file name or path into the game copy. One-line failure details
+are kept with the home folder and drive paths reduced to their last component.
