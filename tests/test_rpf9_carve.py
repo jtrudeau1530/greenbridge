@@ -233,5 +233,39 @@ class UnreadRangesTest(unittest.TestCase):
         self.assertEqual(doc["unread"][0]["sampled"], 1 << 20)
 
 
+def load_carve():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rpf9_carve_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class AllZeroTest(unittest.TestCase):
+    """A gap is checked in chunks, never sliced whole: a whole multi-gigabyte gap ran out of memory."""
+
+    def test_chunked_check_matches_the_whole_slice(self):
+        carve_tool = load_carve()
+        buf = bytes(100) + b"\x01" + bytes(99)
+        for a, b in ((0, 100), (0, 101), (101, 200), (50, 150), (100, 101), (7, 7)):
+            for chunk in (1, 3, 16, 64, 1 << 20):
+                with self.subTest(a=a, b=b, chunk=chunk):
+                    self.assertEqual(carve_tool.all_zero(buf, a, b, chunk), buf[a:b].count(0) == b - a)
+
+    def test_reads_at_most_one_chunk_at_a_time(self):
+        carve_tool = load_carve()
+
+        class Probe(bytes):
+            largest = 0
+
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    Probe.largest = max(Probe.largest, len(range(*key.indices(len(self)))))
+                return bytes.__getitem__(self, key)
+
+        self.assertTrue(carve_tool.all_zero(Probe(bytes(1000)), 0, 1000, 64))
+        self.assertEqual(Probe.largest, 64)
+
+
 if __name__ == "__main__":
     unittest.main()

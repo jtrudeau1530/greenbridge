@@ -29,6 +29,19 @@ import zlib
 MAGIC = b"9FPR"
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 ENTROPY_SAMPLE = 1 << 20   # bytes of an unread range used for its entropy
+GAP_CHUNK = 1 << 20        # a gap is checked this many bytes at a time: one can be gigabytes long
+
+
+def all_zero(buf, a, b, chunk=GAP_CHUNK):
+    """Whether buf[a:b] is all zero bytes, reading at most `chunk` bytes at a time.
+
+    Slicing a whole gap of a multi-gigabyte archive at once ran out of memory (a 20 GB archive in this package).
+    """
+    for p in range(a, b, chunk):
+        piece = buf[p:min(p + chunk, b)]
+        if piece.count(0) != len(piece):
+            return False
+    return True
 
 
 def entropy(sample):
@@ -108,13 +121,12 @@ def main() -> int:
         def account(a, b):
             """Count the gap m[a:b] as zero padding, or as an unread range that is also listed."""
             nonlocal zero, unread
-            gap = m[a:b]
-            if gap.count(0) == len(gap):
-                zero += len(gap)
+            if all_zero(m, a, b):
+                zero += b - a
                 return
-            unread += len(gap)
-            sample = gap[:ENTROPY_SAMPLE]
-            unread_ranges.append({"off": a, "size": len(gap), "entropy": round(entropy(sample), 3),
+            unread += b - a
+            sample = m[a:min(b, a + ENTROPY_SAMPLE)]
+            unread_ranges.append({"off": a, "size": b - a, "entropy": round(entropy(sample), 3),
                                   "sampled": len(sample)})
 
         t0 = time.time()
