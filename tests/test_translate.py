@@ -72,7 +72,7 @@ def test_translation_is_deterministic(make_shader):
 
 def test_unsupported_instruction_is_reported_not_guessed(make_shader):
     """Anything outside the supported set must raise Unsupported rather than emit a wrong program."""
-    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]"))
+    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_sat_pk_u8_i16 v0, v1"))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
 
@@ -95,6 +95,24 @@ def test_depth_compare_sample_result_width(make_shader, d16):
     as_f16 = re.search(rf"^\s*%\w+ = OpShiftRightLogical %uint {bc} %c10$", spvasm, re.M)
     assert bool(as_f16) == d16
 
+
+
+@pytest.mark.parametrize("export,depth", [
+    ("exp mrtz v2, off, off, off vm", True),               # Z only (SPI_SHADER_32_R)
+    ("exp mrtz v2, v3, off, off vm", True),                # Z and stencil (32_GR)
+    ("exp mrtz off, v3, off, off vm", False),              # stencil only (32_GR)
+    ("exp mrtz off, off, v3, off vm", False),              # sample mask only, 32-bit
+    ("exp mrtz v2, v2, v3, v3 compr vm", False),           # stencil and sample mask, 16-bit (UINT16_ABGR)
+], ids=["z", "z-stencil", "stencil", "mask", "compr"])
+def test_mrtz_depth_only_from_an_enabled_x(make_shader, export, depth):
+    """exp mrtz carries Z in x only when x is on in an uncompressed export; the 16-bit form holds stencil and sample
+    mask, never Z (Mesa ac_nir_lower_ps_late.c emit_ps_mrtz_export). Without a depth the shader must not replace it."""
+    shader = make_shader("v_mov_b32 v2, 0.5\nv_mov_b32 v3, 1\n" + export + "\nexp mrt0 v2, v2, v2, v2 done vm\n"
+                         "s_endpgm\n", "ps_mrtz")
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert ("BuiltIn FragDepth" in spvasm) == depth
+    assert ("DepthReplacing" in spvasm) == depth
 
 def test_a16_sample_gradients_use_full_vgprs(make_shader):
     path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
@@ -604,6 +622,49 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
     shader.validate(emulated, KNOWN_VAL_ISSUES.get(stem))
     assert "OpGroupNonUniform" not in emulated and "%sg_lane" not in emulated
     assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
+
+
+# SHADER-36: image_gather4_l(_o) runs every texel of its 2x2 footprint through the S#'s CLAMP_X/CLAMP_Y.
+def _gather_l(s_word0, dynamic=False):
+    return program(
+        "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
+        "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
+        f"s_mov_b32 s16, {s_word0}\ns_mov_b32 s17, 0\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
+        + ("s_add_u32 s16, s16, 0\n" if dynamic else "")
+        + "v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, 0\n"
+        "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
+
+
+def _count(text, op):
+    return len(re.findall(rf"= {op} ", text))
+
+
+@pytest.mark.parametrize("mx", range(4))
+@pytest.mark.parametrize("my", range(4))
+def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
+    """CLAMP_X = bits [2:0], CLAMP_Y = [5:3]; 0 wrap, 1 mirror, 2 clamp, 3 mirror once. Each axis maps its two
+    texel coordinates: wrap = 1 OpSMod, mirror = 1 OpSMod + 1 OpSLessThan, mirror once = 1 OpSGreaterThanEqual."""
+    shader = make_shader(_gather_l(mx | my << 3))
+    text = shader.translate()
+    shader.validate(text)
+    assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
+    assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
+    assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
+    assert "OpBitFieldUExtract" not in text      # the mode is known at translation time
+
+
+def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
+    shader = make_shader(_gather_l(0x12, dynamic=True))
+    text = shader.translate()
+    shader.validate(text)
+    assert _count(text, "OpBitFieldUExtract") == 2          # CLAMP_X and CLAMP_Y
+    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
+
+
+@pytest.mark.parametrize("word0", [4, 0x30, 0x7, 0x8000])
+def test_gather4_l_literal_border_or_unnormalized_sampler_is_unsupported(word0, make_shader):
+    with pytest.raises(rdna2spirv.Unsupported):
+        make_shader(_gather_l(word0)).translate()
 # ---- Irreducible CFG node splitting (compute shaders) ----
 
 IRREDUCIBLE_PATTERNS = {
@@ -983,3 +1044,33 @@ def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):
     spv2 = sh2.translate()
     sh2.validate(spv2)
     assert "PackHalf2x16" not in spv2
+
+
+WAVE64_SCMP_MASK_CASES = """\
+; mattr: +wavefrontsize64,-wavefrontsize32
+v_cmp_lt_u32_e64 vcc, v0, 17
+s_and_b64 s[6:7], vcc, exec
+s_cmp_eq_u32 vcc_lo, vcc_hi
+s_cmp_lg_u32 exec_lo, exec_hi
+s_cmp_eq_u32 s6, s7
+s_cmp_eq_u32 vcc_lo, 0x80000003
+s_cmp_lt_u32 exec_hi, s4
+s_cmp_gt_i32 s6, 0
+s_cmp_eq_u64 vcc, s[4:5]
+s_cmp_lg_u64 exec, 0x12345678
+s_endpgm
+"""
+
+
+@pytest.mark.parametrize("emulate", [False, True], ids=["wave64", "wave64-emulate"])
+def test_wave64_scmp_mask_halves_and_scalars_validate(emulate, make_shader, monkeypatch):
+    """Opposite-half s_cmp_*_u32, ordering compares on mask halves, and mask-vs-scalar/imm u32/u64
+    compares translate and pass spirv-val in both native wave64 and --wave64-emulate modes."""
+    shader = make_shader(WAVE64_SCMP_MASK_CASES, name="cs_w64_scmp_masks")
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", emulate)
+    spv = shader.translate()
+    shader.validate(spv)
+    if emulate:
+        assert "OpGroupNonUniform" not in spv
+    else:
+        assert "OpGroupNonUniformBitwiseOr" in spv

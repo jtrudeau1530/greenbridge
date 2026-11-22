@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import struct
 import sys
 import tempfile
@@ -189,9 +190,21 @@ def scan_pe64_rtti(data: bytes) -> dict:
     }
 
 
+def _report_mode(path):
+    """The permission bits the report should end up with: those of the report it replaces, or what open() would
+    give a new file (0666 minus the umask). NamedTemporaryFile creates its file 0600."""
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mask = os.umask(0)
+        os.umask(mask)
+        return 0o666 & ~mask
+
+
 def write_report(path, text):
     """Write the report next to its destination and swap it in, so a write that fails part-way (a full disk, a
-    locked range) leaves the previous report as it was instead of an empty or truncated file."""
+    locked range) leaves the previous report as it was instead of an empty or truncated file. The result keeps
+    the previous report's permission bits, or gets the usual ones for a new file."""
     parent = os.path.dirname(os.path.abspath(path))
     tmp = None
     try:
@@ -199,6 +212,7 @@ def write_report(path, text):
                                          delete=False) as f:
             tmp = f.name
             f.write(text)
+        os.chmod(tmp, _report_mode(path))
         os.replace(tmp, path)
     except BaseException:
         if tmp is not None:

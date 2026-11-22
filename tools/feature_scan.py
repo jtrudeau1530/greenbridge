@@ -53,6 +53,9 @@ MMA = re.compile(r"^\s*(v_mfma\w*|v_wmma\w*|v_smfmac\w*)\b")
 # ds_consume are included as the other counter-style DS ops (LDS unless they carry `gds`, which GDS below catches).
 ORDERED = re.compile(r"^\s*(ds_ordered_count|ds_gws_\w+|ds_append|ds_consume|ds_add_gs_reg\w*|ds_sub_gs_reg\w*)\b")
 GDS = re.compile(r"^\s*ds_\w+\b[^;]*\bgds\b")
+REG_SINGLE = re.compile(r"^([sv])(\d+)$")
+REG_RANGE = re.compile(r"^([sv])\[(\d+):(\d+)\]$")
+CONST_MOV_OPS = frozenset(("s_mov_b32", "s_mov_b32_e32", "v_mov_b32", "v_mov_b32_e32", "v_mov_b32_e64"))
 
 
 def parts(d: bytes) -> dict:
@@ -115,22 +118,95 @@ def getpc_for_data(ops: list) -> bool:
     return any(op == "s_getpc_b64" and "s_setpc_b64" not in ops[i + 1:i + 4] for i, op in enumerate(ops))
 
 
+def _parse_imm(tok: str):
+    """Parse a decimal or 0x-hex integer immediate, or return None."""
+    try:
+        return int(tok, 0) & 0xFFFFFFFF
+    except ValueError:
+        return None
+
+
+def _written_regs(tok: str) -> list:
+    """Return individual sN/vN register names covered by a destination operand token."""
+    m = REG_SINGLE.match(tok)
+    if m:
+        return [tok]
+    m = REG_RANGE.match(tok)
+    if m:
+        prefix, lo, hi = m.group(1), int(m.group(2)), int(m.group(3))
+        if lo <= hi <= lo + 32:
+            return [f"{prefix}{i}" for i in range(lo, hi + 1)]
+    return []
+
+
+def _update_const_regs(const_reg: dict, op: str, operands: list) -> None:
+    """Track single-register immediate loads and invalidate any destination register written."""
+    if not operands:
+        return
+    dst = operands[0].split()[0] if operands[0].split() else ""
+    if op in CONST_MOV_OPS and len(operands) >= 2 and REG_SINGLE.match(dst):
+        src_tok = operands[1].split()[0] if operands[1].split() else ""
+        imm = _parse_imm(src_tok)
+        if imm is not None:
+            const_reg[dst] = imm
+            return
+    for r in _written_regs(dst):
+        const_reg.pop(r, None)
+
+
 def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
     mma, ordered, gds, code_data = Counter(), Counter(), Counter(), Counter()
     mma_ops, ordered_ops = Counter(), Counter()
+    vperm_shaders = Counter()
+    vperm_insns = vperm_imm = vperm_creg = vperm_unres = 0
+    vperm_sext_shaders = vperm_sext_insns = 0
+    vperm_classes = {"0_7": 0, "8_11": 0, "12": 0, "13_plus": 0}
     files = 0
     for fn in os.listdir(disasm_dir):
         if not fn.endswith(".s"):
             continue
         files += 1
         stage = stage_of.get(fn[:-2], "?")
-        seen_mma = seen_ord = seen_gds = False
+        seen_mma = seen_ord = seen_gds = seen_vperm = seen_vperm_sext = False
         ops = []
+        const_reg = {}
         with open(os.path.join(disasm_dir, fn), encoding="utf-8", errors="replace") as f:
             for line in f:
-                head = line.split(None, 1)
-                if head and not head[0].startswith((";", ".")):
-                    ops.append(head[0])
+                code = line.split(";", 1)[0].strip()
+                head = code.split(None, 1)
+                if head and not head[0].startswith("."):
+                    op = head[0]
+                    ops.append(op)
+                    operands = [x.strip() for x in head[1].split(",")] if len(head) > 1 else []
+                    if op in ("v_perm_b32", "v_perm_b32_e64") and len(operands) >= 4:
+                        seen_vperm = True
+                        vperm_insns += 1
+                        sel_tok = operands[3].split()[0] if operands[3].split() else ""
+                        sel_val = _parse_imm(sel_tok)
+                        if sel_val is not None:
+                            vperm_imm += 1
+                        elif sel_tok in const_reg:
+                            sel_val = const_reg[sel_tok]
+                            vperm_creg += 1
+                        else:
+                            vperm_unres += 1
+                        if sel_val is not None:
+                            has_sext = False
+                            for shift in (0, 8, 16, 24):
+                                b = (sel_val >> shift) & 0xFF
+                                if b <= 7:
+                                    vperm_classes["0_7"] += 1
+                                elif b <= 11:
+                                    vperm_classes["8_11"] += 1
+                                    has_sext = True
+                                elif b == 12:
+                                    vperm_classes["12"] += 1
+                                else:
+                                    vperm_classes["13_plus"] += 1
+                            if has_sext:
+                                vperm_sext_insns += 1
+                                seen_vperm_sext = True
+                    _update_const_regs(const_reg, op, operands)
                 m = MMA.match(line)
                 if m:
                     mma_ops[m.group(1)] += 1
@@ -144,11 +220,23 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
         mma[stage] += seen_mma
         ordered[stage] += seen_ord
         gds[stage] += seen_gds
+        vperm_shaders[stage] += seen_vperm
+        vperm_sext_shaders += int(seen_vperm_sext)
         code_data[stage] += getpc_for_data(ops)
     nz = lambda c: {k: v for k, v in c.items() if v}
     return {"files": files, "wave_mma_shaders": nz(mma), "wave_mma_ops": dict(mma_ops),
             "ordered_or_gws_shaders": nz(ordered), "ordered_or_gws_ops": dict(ordered_ops), "gds_shaders": nz(gds),
-            "getpc_for_data_shaders": nz(code_data)}
+            "getpc_for_data_shaders": nz(code_data),
+            "v_perm_b32": {
+                "shaders": nz(vperm_shaders),
+                "insns": vperm_insns,
+                "immediate": vperm_imm,
+                "const_reg": vperm_creg,
+                "unresolved": vperm_unres,
+                "sign_extend_8_11_shaders": vperm_sext_shaders,
+                "sign_extend_8_11_insns": vperm_sext_insns,
+                "selector_classes": vperm_classes,
+            }}
 
 
 def scan_spirv(spirv_index: str) -> dict:
@@ -213,6 +301,11 @@ def main() -> int:
         print(f"disasm: {s['files']} files | wave MMA shaders {s['wave_mma_shaders'] or 0} | ordered-count/GWS shaders "
               f"{s['ordered_or_gws_shaders'] or 0} {s['ordered_or_gws_ops'] or ''} | GDS shaders {s['gds_shaders'] or 0}")
         print("s_getpc_b64 used for code-embedded data (not a far branch), by stage:", s["getpc_for_data_shaders"] or 0)
+        vp = s["v_perm_b32"]
+        print(f"v_perm_b32: {sum(vp['shaders'].values())} shaders {vp['shaders'] or 0} | {vp['insns']} insns "
+              f"(imm {vp['immediate']}, const_reg {vp['const_reg']}, unresolved {vp['unresolved']}) | "
+              f"selectors 8-11: {vp['sign_extend_8_11_shaders']} shaders / {vp['sign_extend_8_11_insns']} insns | "
+              f"bytes {vp['selector_classes']}")
     else:
         print("disasm: not there yet (run the shaders stage)")
     if "spirv" in result:

@@ -129,7 +129,14 @@ interleaved sample count is divided by that channel count.
 
 `audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count. For a single stream
 it trims to the final Ogg Opus granule minus pre-skip. Chained streams have a separate granule timeline for each
-link, so ffmpeg handles their end trimming. Existing `.wav` files are skipped, so a stopped run continues.
+link, so ffmpeg handles their end trimming. Existing WAVs are normally skipped on resume. If the destination
+filesystem treats two output names as the same file, the converter keeps the input extensions and adds a counter
+where needed. It leaves a previously shared WAV untouched. Before reusing a name ending in `.ogg.wav` or `.opus.wav`
+(including counters such as `.ogg~2.wav`), it decodes the source again and compares the PCM, rate and channel
+layout. These checks read the full streams serially during planning. If the audio differs (including decoding
+differences between ffmpeg versions) or the existing WAV cannot be verified, it stays in place and the converter
+tries the next counter. Plain existing WAVs are
+trusted by name, so resuming into the same output folder assumes the same set of inputs.
 With no `--out`, a directory writes to `<src>/wav` and a single file writes next to itself.
 
 ## How `make_game.py --wav` uses them
