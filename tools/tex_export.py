@@ -91,7 +91,9 @@ def dds_bytes(w, h, fmt, payload):
 
 def score_image(w, h, fmt, payload, bpe):
     a = None
-    if fmt in PILLOW_OK:
+    if fmt == 56:  # R16_UNORM
+        a = np.frombuffer(payload, "<u2").reshape(h, w).astype(np.float32)
+    elif fmt in PILLOW_OK:
         try:
             from PIL import Image
 
