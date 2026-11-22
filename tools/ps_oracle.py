@@ -25,19 +25,27 @@ Templates: `const` (no inputs), `interp2` (two smooth vec4 varyings: location 0 
 Checked on an AMD Radeon iGPU (gfx1036, Windows driver 26.10.1): the driver accepts a patched binary and the patched
 code runs as the pixel shader (no checksum over the code). The pixel stage there is compiled as wave64.
 
+On Linux, RADV (Mesa) returns one binary per stage instead (radv_shader_serialize's layout, see the RADV section
+below); the pixel stage's code, sizes and register counts are found by their values and patched there. RADV takes
+GFX10 (RDNA1/RDNA2) devices only (GFX11+ is refused: no v_interp), --set is PAL-only, and Mesa may merge a template's
+varyings (interp2 becomes one parameter, attr0 = (2u, 2v, 0, 1)). Checked on gfx1036 with Mesa 26.3.1.
+
 Usage:
     python -I tools/ps_oracle.py --build <runtime build> --template interp2 --show-template
     python -I tools/ps_oracle.py --build <runtime build> --template interp2 --asm body.s [--size 8 8] [--json out.json]
 
 Select the AMD GPU with LEONIDA_VK_DEVICE (e.g. radeon). Standard library only; needs vk_harness from the runtime
-build, AMD clang (LEONIDA_AMD_CLANG, as tools/hw_oracle), llvm-objdump next to it for --show-template, and
-spirv-as on PATH for the templates. Exit codes: 0 ran, 1 the GPU run failed, 2 usage or a bad input, 77 the
-device or a tool is missing (no VK_KHR_pipeline_binary, not an AMD PAL binary, no clang).
+build, AMD clang (LEONIDA_AMD_CLANG, as tools/hw_oracle), llvm-objdump (llvm-mc on RADV) next to it for
+--show-template, and spirv-as on PATH for the templates. Exit codes: 0 ran, 1 the GPU run failed, 2 usage or a
+bad input, 77 the device or a tool is missing (no VK_KHR_pipeline_binary, neither a PAL nor a RADV binary, a RADV
+GPU other than GFX10, no clang).
 """
 import argparse
+import collections
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -331,6 +339,99 @@ def is_wave64(elf_bytes):
     return bool(word & W64_BIT)
 
 
+# ---- RADV (Mesa) stage binaries ----
+# RADV hands back one binary per stage, as radv_shader_serialize writes it (Mesa 26.3, radv_pipeline_cache.c; the
+# structs in radv_shader.h): uint32 type (0 = legacy), struct ac_shader_config (ac_binary.h: num_sgprs, num_vgprs
+# first, rsrc1 later), struct radv_shader_info (its size changes between Mesa versions; wave_size, a byte, stage,
+# next_stage sit together in it), uint32 total_size (padded to 8), then code_size, exec_size, ir_size, disasm_size,
+# stats_size, debug_info_size, then the data: stats, code, ir, disasm, debug info. Debug strings may follow
+# total_size. RADV builds an imported binary with radv_shader_create_uncached (no cache lookup) and programs
+# SPI_SHADER_PGM_RSRC1_PS from config.rsrc1, whose VGPRS field is (num_vgprs - 1) / (wave32 ? 8 : 4)
+# (radv_postprocess_binary_config). Only the two leading config fields are read at a fixed place; the rest is found
+# from values that must agree with each other, so a Mesa with another layout is refused instead of misread.
+
+RadvLayout = collections.namedtuple("RadvLayout", "code code_size exec_size sizes_at total_at vgprs sgprs rsrc1_at "
+                                                  "wave is_ps")
+MESA_FRAGMENT, MESA_NONE = 4, 0xFF
+# Mesa's chip names (amd_family.c) of GFX10 with their LLVM targets (ac_get_llvm_processor_name)
+RADV_GFX10 = {"NAVI10": "gfx1010", "NAVI12": "gfx1011", "NAVI14": "gfx1012", "GFX1013": "gfx1013",
+              "NAVI21": "gfx1030", "NAVI22": "gfx1031", "NAVI23": "gfx1032", "VANGOGH": "gfx1033",
+              "NAVI24": "gfx1034", "REMBRANDT": "gfx1035", "RAPHAEL_MENDOCINO": "gfx1036"}
+
+
+def radv_layout(data):
+    """Where the code, its sizes and the register counts are in one RADV stage binary (RadvLayout), or Unavailable."""
+    u32 = lambda at: struct.unpack_from("<I", data, at)[0]   # noqa: E731
+    if len(data) < 64 or u32(0) != 0:
+        raise Unavailable("not a legacy RADV shader binary")
+    hits = []
+    for at in range(8, len(data) - 23, 4):
+        code, exe, ir, dis, stats, dbg = struct.unpack_from("<6I", data, at)
+        end = at + 24 + stats + code + ir + dis + dbg
+        if code and not code % 4 and not exe % 4 and 0 < exe <= code and end <= len(data):
+            hits += [(at, t) for t in (at - 4, at - 8) if u32(t) == end]
+    if len(hits) != 1:
+        raise Unavailable("the RADV binary's code sizes were not found (an unknown Mesa layout)")
+    sizes_at, total_at = hits[0]
+    code_size, exec_size, stats = (u32(sizes_at), u32(sizes_at + 4), u32(sizes_at + 16))
+    stage = [i for i in range(8, total_at - 3)
+             if data[i] in (32, 64) and data[i + 2:i + 4] == bytes([MESA_FRAGMENT, MESA_NONE])]
+    sgprs, vgprs = u32(4), u32(8)
+    code_at = sizes_at + 24 + stats
+    if len(stage) != 1:      # another stage (the vertex one): nothing in it is patched
+        return RadvLayout(code_at, code_size, exec_size, sizes_at, total_at, vgprs, sgprs, None, None, False)
+    wave = data[stage[0]]
+    granule = 8 if wave == 32 else 4
+    # rsrc1: VGPRS = (num_vgprs - 1) / granule and FLOAT_MODE = config.float_mode, an earlier config word
+    rsrc1 = [k for k in range(12, min(total_at, 96), 4)
+             if u32(k) & 0x3F == (vgprs - 1) // granule and u32(k) >> 12 & 0xFF
+             and any(u32(j) == u32(k) >> 12 & 0xFF for j in range(12, k, 4))]
+    if len(rsrc1) != 1:
+        raise Unavailable("the RADV binary's rsrc1 was not found (an unknown Mesa layout)")
+    return RadvLayout(code_at, code_size, exec_size, sizes_at, total_at, vgprs, sgprs, rsrc1[0], wave, True)
+
+
+def radv_ps_index(bins):
+    """Which of RADV's stage binaries is the pixel stage."""
+    ps = [i for i, (_ks, _key, data) in enumerate(bins) if radv_layout(data).is_ps]
+    if len(ps) != 1:
+        raise Unavailable(f"{len(ps)} of the {len(bins)} RADV binaries are a pixel stage (expected one)")
+    return ps[0]
+
+
+def radv_arch(device):
+    """The LLVM target of a RADV device name ('... (RADV RAPHAEL_MENDOCINO)'), Unavailable when it is not GFX10."""
+    m = re.search(r"\(RADV ([A-Z0-9_]+)\)", device or "")
+    if not m:
+        raise Unavailable(f"the pipeline came back as several binaries and the device ({device or '?'}) is not RADV")
+    if m.group(1) not in RADV_GFX10:
+        raise Unavailable(f"unsupported architecture: {m.group(1)} ({device}); on RADV this tool runs GFX10 "
+                          "(RDNA1/RDNA2) pixel shaders only (GFX11+ interpolates with lds_param_load, not v_interp)")
+    return RADV_GFX10[m.group(1)]
+
+
+def patch_radv_ps(data, code, lines=()):
+    """The RADV pixel-stage binary with its code replaced by `code` (raw instruction bytes, padded with s_code_end),
+    the sizes fixed and num_vgprs/num_sgprs and rsrc1's VGPRS raised to cover the registers `lines` name."""
+    lay = radv_layout(data)
+    if not lay.is_ps:
+        raise ValueError("not the pixel-stage binary")
+    padded = bytes(code) + S_CODE_END * ((-len(code) % 64) // 4 + 64)    # the hardware prefetches past the end
+    out = bytearray(data[:lay.code]) + padded + data[lay.code + lay.code_size:]
+    put = lambda at, v: struct.pack_into("<I", out, at, v)               # noqa: E731
+    put(lay.total_at, struct.unpack_from("<I", data, lay.total_at)[0] + len(padded) - lay.code_size)
+    put(lay.sizes_at, len(padded))
+    put(lay.sizes_at + 4, len(code))
+    v, s = regs_used(lines)
+    granule = 8 if lay.wave == 32 else 4
+    vgprs = max(lay.vgprs, -(-v // granule) * granule)
+    put(8, vgprs)
+    put(4, max(lay.sgprs, s))
+    rsrc1 = struct.unpack_from("<I", data, lay.rsrc1_at)[0]
+    put(lay.rsrc1_at, rsrc1 & ~0x3F | (vgprs - 1) // granule)
+    return bytes(out)
+
+
 # ---- templates ----
 
 VS_TRI = """\
@@ -543,16 +644,22 @@ class Oracle:
             raise RuntimeError("vk_harness could not build the template:\n" + r.stderr.strip()[-800:])
         self.device = next((m.group(1) for m in re.finditer(r"device[:=]\s*(.+)", r.stderr)), "")
         self.bins = read_binaries(out_bin)
-        if len(self.bins) != 1:
-            raise Unavailable(f"the pipeline came back as {len(self.bins)} binaries (expected one PAL ELF)")
-        self.elf = self.bins[0][2]
-        self.meta = Elf(self.elf).metadata()
-        self.wave64 = is_wave64(self.elf)
+        if len(self.bins) == 1:          # the AMD driver: one PAL ELF
+            self.backend, self.ps_index = "pal", 0
+            self.elf = self.bins[0][2]
+            self.meta = Elf(self.elf).metadata()
+            self.wave64 = is_wave64(self.elf)
+        else:                            # RADV: one binary per stage
+            self.arch = radv_arch(self.device)
+            self.backend, self.ps_index = "radv", radv_ps_index(self.bins)
+            self.wave64 = radv_layout(self.bins[self.ps_index][2]).wave == 64
         self.template_pixels = pixels(os.path.join(self.work, "template.raw"), self.size)
 
     def show(self):
         """The template's pixel-shader ISA (llvm-objdump) and the SPI part of its metadata."""
         from hw_oracle import runner
+        if self.backend == "radv":
+            return self._show_radv(runner)
         path = os.path.join(self.work, "template.elf")
         with open(path, "wb") as f:
             f.write(self.elf)
@@ -573,13 +680,37 @@ class Oracle:
         lines.append("pixel stage: " + json.dumps(ps_stage(self.meta), indent=1, default=str))
         return "\n".join(lines)
 
+    def _show_radv(self, runner):
+        """The RADV template's pixel-shader ISA (llvm-mc) and register counts."""
+        data = self.bins[self.ps_index][2]
+        lay = radv_layout(data)
+        code = data[lay.code:lay.code + lay.exec_size]
+        lines = [f"pixel stage ({self.arch}): wave{lay.wave}, {lay.exec_size} bytes of code, {lay.vgprs} VGPRs, "
+                 f"{lay.sgprs} SGPRs, rsrc1 0x{struct.unpack_from('<I', data, lay.rsrc1_at)[0]:08x}"]
+        try:
+            mc = os.path.join(os.path.dirname(runner.find_clang()), "llvm-mc" + (".exe" if os.name == "nt" else ""))
+            mc = mc if os.path.exists(mc) else shutil.which("llvm-mc") or mc
+            r = subprocess.run([mc, "--disassemble", "-arch=amdgcn", f"-mcpu={self.mcpu}",
+                                f"-mattr=+wavefrontsize{lay.wave}"], input=" ".join(f"0x{b:02x}" for b in code),
+                               capture_output=True, text=True)
+            lines += [ln for ln in r.stdout.splitlines() if ln.strip() and not ln.lstrip().startswith(".")]
+        except (runner.Unavailable, OSError) as e:
+            lines.append(f"(no disassembly: {e})")
+        lines.append("(RADV keeps the SPI setup in its own structs; RADV_DEBUG=shaders prints it with the ISA)")
+        return "\n".join(lines)
+
     def run(self, lines, sets=()):
         """Every pixel's mrt0 words (row-major, size[0] x size[1]) with the pixel shader replaced by `lines` and the
         metadata changes `sets` ((path, value) pairs, see set_meta) applied."""
+        if sets and self.backend == "radv":
+            raise ValueError("--set edits PAL metadata; RADV binaries have none (use a template that sets it up)")
         code = assemble(lines, self.mcpu, self.wave64, self.work)
-        patched = patch_ps(self.elf, code, lines, sets)
+        bins = list(self.bins)
+        ks, key, data = bins[self.ps_index]
+        bins[self.ps_index] = (ks, key, patch_ps(data, code, lines, sets) if self.backend == "pal"
+                               else patch_radv_ps(data, code, lines))
         path = os.path.join(self.work, "patched.bin")
-        write_binaries(path, [(self.bins[0][0], self.bins[0][1], patched)])
+        write_binaries(path, bins)
         raw = os.path.join(self.work, "patched.raw")
         if os.path.exists(raw):
             os.remove(raw)
