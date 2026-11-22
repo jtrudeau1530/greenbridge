@@ -294,6 +294,7 @@ int main() {
     constexpr UINT size = 8, texels = size * size, bytes = texels * 4;
     std::vector<std::uint8_t> results(4 * bytes), after_destruction(bytes), borders(3 * bytes);
     bool sampled_through_set = false;
+    UINT lod_mismatches = 0;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -539,7 +540,7 @@ int main() {
             {0, 3, 0.25f}, {0, 3, 0.75f}, {1, 2, 1.75f}, {0, 2, 1.75f}, {1, 2, 0.75f}, {0, 2, 1.75f, true}
         };
         constexpr UINT first_lod_slot = 10;
-        constexpr float array_clamps[] = {1.0f, 1.75f, 2.25f};
+        constexpr float array_clamps[] = {1.0f, 1.75f, 2.0f, 2.25f};
         // Keep multisample views after the preceding volume and minimum-LOD views.
         enum : UINT {
             array_lod_slot = first_lod_slot + std::size(lod_views),
@@ -1253,6 +1254,7 @@ int main() {
             lod_keys[i].first = i * texels;
         }
         EXPECT(sample_through_set(d, set0, set0_layout, lod_keys, lod_pixels.data()));
+        std::array<UINT, std::size(lod_views)> lod_errors{};
         for (UINT i = 0; i < texels; ++i) {
             using Pixel = std::array<std::uint8_t, 4>;
             const Pixel expected[] = {
@@ -1264,13 +1266,16 @@ int main() {
             static_assert(std::size(expected) == std::size(lod_views));
             for (UINT view = 0; view < std::size(lod_views); ++view) {
                 const auto* sample = &lod_pixels[view * bytes + 4 * i];
-                if (std::memcmp(sample, expected[view].data(), 4)) {
+                if (std::memcmp(sample, expected[view].data(), 4) && lod_errors[view]++ == 0) {
                     std::fprintf(stderr, "minimum LOD view %u texel %u: got %u %u %u %u, expected %u %u %u %u\n",
                                  view, i, sample[0], sample[1], sample[2], sample[3],
                                  expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
-                    return 1;
                 }
             }
+        }
+        for (UINT view = 0; view < lod_errors.size(); ++view) {
+            if (lod_errors[view]) std::fprintf(stderr, "2D LOD view %u: %u/%u mismatched\n", view, lod_errors[view], texels);
+            lod_mismatches += lod_errors[view];
         }
 
         SampleKeys array_keys[std::size(array_clamps)]{};
@@ -1281,22 +1286,31 @@ int main() {
         }
         std::array<std::uint8_t, std::size(array_keys) * bytes> array_pixels{};
         EXPECT(sample_through_set(d, set0, set0_layout, array_keys, array_pixels.data()));
+        std::array<UINT, std::size(array_clamps)> array_errors{};
         for (UINT i = 0; i < texels; ++i) {
             const UINT layer = 1 + i / 32;
             const std::array<std::uint8_t, 4> zero{};
-            const std::array expected{array_color(layer, 1), d.image_view_min_lod ? array_color(layer, 2) : zero, zero};
+            const auto mip2 = d.image_view_min_lod ? array_color(layer, 2) : zero;
+            const std::array expected{array_color(layer, 1), mip2, mip2, zero};
+            static_assert(expected.size() == std::size(array_clamps));
             for (UINT view = 0; view < expected.size(); ++view) {
                 const auto* got = array_pixels.data() + view * bytes + i * 4;
-                if (std::memcmp(got, expected[view].data(), 4)) {
+                if (std::memcmp(got, expected[view].data(), 4) && array_errors[view]++ == 0) {
                     std::fprintf(stderr, "array LOD %.2f, layer %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
                                  array_clamps[view], layer, got[0], got[1], got[2], got[3],
                                  expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
-                    return 1;
                 }
             }
         }
-        std::printf("array minimum LOD: %u samples matched across two layers and three views\n",
-                    UINT(array_pixels.size() / 4));
+        UINT array_mismatches = 0;
+        for (UINT view = 0; view < array_errors.size(); ++view) {
+            if (array_errors[view]) std::fprintf(stderr, "array LOD %.2f: %u/%u mismatched\n",
+                                                array_clamps[view], array_errors[view], texels);
+            array_mismatches += array_errors[view];
+        }
+        lod_mismatches += array_mismatches;
+        std::printf("array minimum LOD: %u/%u samples matched across two layers and four views\n",
+                    UINT(array_pixels.size() / 4) - array_mismatches, UINT(array_pixels.size() / 4));
 
         const D3D12_CPU_DESCRIPTOR_HANDLE volume_slots[] = {view_slot(volume_all), view_slot(volume_mip),
                                                             linear_slot, srgb_slot};
@@ -1607,6 +1621,7 @@ int main() {
                              i % 4, unsigned(got), unsigned(border_values[k]));
         }
     EXPECT(!mismatches);
+    EXPECT(lod_mismatches == 0);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

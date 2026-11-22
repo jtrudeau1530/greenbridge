@@ -196,11 +196,6 @@ def walk_stream(data):
             pos += 4
     return blocks
 
-def _u32(data, at):
-    if at + 4 > len(data):
-        raise ValueError(f"truncated at +0x{at:x}")
-    return struct.unpack_from("<I", data, at)[0]
-
 def process_archive(archive_path, limit=None):
     """Process an RPF9 archive and return stats on 4240 blocks."""
     stats = {
@@ -263,7 +258,10 @@ def process_archive(archive_path, limit=None):
                     stats["block_formats"][fmt_sig] = stats["block_formats"].get(fmt_sig, 0) + 1
                     
                 except ValueError as e:
-                    pass
+                    # Advance past the rejected block: staying on the same word parsed it again for ever.
+                    stats["errors"] += 1
+                    stats.setdefault("first_error", str(e))
+                    pos += 4
             elif word == BLOCK_MAGIC:
                 stats["blocks_6330"] += 1
                 pos += HEADER_SIZE
@@ -286,18 +284,30 @@ def process_archive(archive_path, limit=None):
     
     return stats
 
-def main():
+def positive_int(text):
+    """--limit: 0 is falsy and scanned everything, and a negative number scanned one stream."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze 42 40 00 00 vertex blocks in RPF9 archives")
     parser.add_argument("inputs", nargs="+", help="RPF9 archive paths")
     parser.add_argument("--json", help="Write results to JSON file")
-    parser.add_argument("--limit", type=int, help="Limit streams per archive")
+    parser.add_argument("--limit", type=positive_int, help="Limit streams per archive")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
     
-    all_stats = []
+    all_stats, status = [], 0
     for path in args.inputs:
         if not os.path.exists(path):
-            print(f"File not found: {path}", file=sys.stderr)
+            print(f"ERROR: {path} does not exist", file=sys.stderr)
+            status = 1
             continue
         print(f"Processing {path}...")
         stats = process_archive(path, limit=args.limit)
@@ -326,8 +336,13 @@ def main():
             s_copy["strides_from_slot0"] = {str(k): v for k, v in s["strides_from_slot0"].items()}
             s_copy["slot_tag_counts"] = {str(k): v for k, v in s["slot_tag_counts"].items()}
             output.append(s_copy)
-        with open(args.json, "w") as f:
+        parent = os.path.dirname(os.path.abspath(args.json))
+        if parent:      # every archive has been read by now; a missing folder used to lose the run
+            os.makedirs(parent, exist_ok=True)
+        with open(args.json, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2)
+    return status
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

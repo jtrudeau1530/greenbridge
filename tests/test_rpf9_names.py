@@ -96,6 +96,7 @@ class NamesTest(unittest.TestCase):
             make_archive(arc)
             p = self.run_tool(arc, out, "--quiet")
             self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout, "")
             with open(out, encoding="utf-8") as f:
                 doc = json.load(f)
             summary = doc["summary"]
@@ -114,6 +115,7 @@ class NamesTest(unittest.TestCase):
             make_archive(arc, magic=b"9FPR")
             p = self.run_tool(arc, out, "--quiet")
             self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout, "")
             with open(out, encoding="utf-8") as f:
                 doc = json.load(f)
             self.assertEqual(doc["summary"]["unique_names"], 3, doc["summary"])
@@ -156,15 +158,35 @@ class NamesTest(unittest.TestCase):
             make_archive(arc)
             cases = [
                 ("--start", "-1"),
+                ("--start", "nope"),
                 ("--limit", "0"),
+                ("--limit", "nope"),
                 ("--max-inflate", "0"),
+                ("--max-inflate", "nope"),
                 ("--types", "bad suffix"),
             ]
             for i, args in enumerate(cases):
                 out = os.path.join(tmp, f"out{i}.json")
                 p = self.run_tool(arc, out, *args)
                 self.assertEqual(p.returncode, 2, (args, p.stdout, p.stderr))
+                self.assertNotIn("<lambda>", p.stderr)
                 self.assertFalse(os.path.exists(out), args)
+
+    def test_scan_limit_excludes_crossing_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            streams = make_archive(arc)
+            stored = len(streams[0])
+            rows, summary = rpf9_names.scan_archive(arc, start=0x40, limit=stored)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(summary["streams"], 1)
+            self.assertEqual(summary["unread_bytes"], 0)
+
+            rows, summary = rpf9_names.scan_archive(arc, start=0x40, limit=stored - 1)
+            self.assertEqual(rows, [])
+            self.assertEqual(summary["streams"], 0)
+            self.assertEqual(summary["unread_bytes"], stored - 1)
+            self.assertEqual(summary["span"], stored - 1)
 
     def test_missing_archive(self):
         with tempfile.TemporaryDirectory() as tmp:

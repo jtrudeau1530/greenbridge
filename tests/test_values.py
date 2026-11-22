@@ -82,6 +82,11 @@ CASES = {
     "v_pack_b32_f16": ("v_pack_b32_f16 v3, v1, v2", 0xAAAA3C00, 0xBBBB4000, 0, 0x40003C00),
     "v_pack_b32_f16_sel": ("v_pack_b32_f16 v3, v1, v2 op_sel:[1,0,0]", 0x3C00BBBB, 0xAAAA4000, 0, 0x4000 << 16 | 0x3C00),
     "v_pack_b32_f16_sel_hi": ("v_pack_b32_f16 v3, v1, v2 op_sel:[0,1,0]", 0xAAAA3C00, 0x4000BBBB, 0, 0x4000 << 16 | 0x3C00),
+    # 16-bit float add keeps the other half of the destination (GFX10 partial write; see docs/design.md).
+    # These pin the translator's keep; they do not reproduce the AMD driver quirk in valu_fuzz f16
+    # seed 3 programme 38, where the same keep is lost on the GPU (driver 26.11.1, RX 9070).
+    "v_add_f16_e64_keep_hi": ("v_mov_b32 v3, 0xCD524000\nv_add_f16_e64 v3, v3, v1", 0x3C00, 0, 0, 0xCD524200),
+    "v_add_f16_e32_keep_hi": ("v_mov_b32 v3, 0xCD524000\nv_add_f16 v3, v1, v2", 0x3C00, 0x4200, 0, 0xCD524400),
     # 16-bit integer (VOP3 form keeps the high half of the destination; see docs/design.md)
     "v_add_u16_e64": ("v_add_u16_e64 v3, v1, v2", 0xFFFF, 2, 0, 1),
 }

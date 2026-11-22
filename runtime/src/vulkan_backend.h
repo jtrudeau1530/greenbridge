@@ -8,6 +8,7 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include "binary_occlusion_spirv.h"
 #include "vulkan_depth24.h"
 #include "vulkan_replay.h"
 
@@ -55,20 +56,22 @@ struct VulkanDeviceFunctions {
     X(vkCmdDrawIndexedIndirectCount) X(vkCmdDispatchIndirect) X(vkGetBufferDeviceAddress)                      \
     X(vkGetAccelerationStructureBuildSizesKHR) X(vkCreateAccelerationStructureKHR)                             \
     X(vkDestroyAccelerationStructureKHR) X(vkGetAccelerationStructureDeviceAddressKHR)                         \
-    X(vkCmdBuildAccelerationStructuresKHR)                                                                     \
-    X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch)                                                \
-    X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)      \
-    X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindVertexBuffers2)                                \
-    X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology)                \
-    X(vkCmdSetStencilReference) X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed)                     \
-    X(vkCreateGraphicsPipelines)
+    X(vkCmdBuildAccelerationStructuresKHR)                                                                    \
+    X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)                   \
+    X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)                          \
+    X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateShaderModule) X(vkDestroyShaderModule)      \
+    X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)            \
+    X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
+    X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
+    X(vkCmdSetPrimitiveTopology) X(vkCmdSetStencilReference) X(vkCmdSetBlendConstants) X(vkCmdDraw)            \
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
 
     // The Vulkan 1.3 entry points may be null on older devices, the extension ones (conditional rendering) when the
     // extension is not enabled, and the query functions are optional (a list that uses queries without them is
-    // unsupported); everything else is required.
+    // unsupported). The compute and descriptor functions are needed only for binary occlusion resolves.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
@@ -94,6 +97,157 @@ struct VulkanDeviceFunctions {
     bool graphics_complete() const {
         return vkCmdBeginRendering && vkCmdEndRendering && vkCmdBindVertexBuffers2 && vkCmdSetPrimitiveTopology;
     }
+};
+
+// The scratch buffer belongs to one queue. Each chunk copies raw results into it, normalizes them in place,
+// then transfers UINT64s to the application buffer, which needs no storage-buffer usage.
+class BinaryOcclusionResolve {
+public:
+    BinaryOcclusionResolve(const VulkanDeviceFunctions& vk, VkDevice device) : vk_(vk), device_(device) {}
+    BinaryOcclusionResolve(const BinaryOcclusionResolve&) = delete;
+    BinaryOcclusionResolve& operator=(const BinaryOcclusionResolve&) = delete;
+
+    ~BinaryOcclusionResolve() {
+        if (pipeline_) vk_.vkDestroyPipeline(device_, pipeline_, nullptr);
+        if (layout_) vk_.vkDestroyPipelineLayout(device_, layout_, nullptr);
+        if (pool_) vk_.vkDestroyDescriptorPool(device_, pool_, nullptr);
+        if (set_layout_) vk_.vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
+        if (scratch_) vk_.vkDestroyBuffer(device_, scratch_, nullptr);
+        if (memory_) vk_.vkFreeMemory(device_, memory_, nullptr);
+    }
+
+    bool initialize(const VkPhysicalDeviceMemoryProperties& memory) {
+        if (!vk_.vkCreateDescriptorSetLayout || !vk_.vkDestroyDescriptorSetLayout ||
+            !vk_.vkCreateDescriptorPool || !vk_.vkDestroyDescriptorPool || !vk_.vkAllocateDescriptorSets ||
+            !vk_.vkUpdateDescriptorSets || !vk_.vkCreatePipelineLayout || !vk_.vkDestroyPipelineLayout ||
+            !vk_.vkCreateShaderModule || !vk_.vkDestroyShaderModule || !vk_.vkCreateComputePipelines ||
+            !vk_.vkDestroyPipeline || !vk_.vkCmdBindPipeline || !vk_.vkCmdBindDescriptorSets ||
+            !vk_.vkCmdPushConstants || !vk_.vkCmdDispatch)
+            return false;
+
+        VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        buffer.size = scratch_size;
+        buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (vk_.vkCreateBuffer(device_, &buffer, nullptr, &scratch_) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vk_.vkGetBufferMemoryRequirements(device_, scratch_, &requirements);
+        auto type = memory.memoryTypeCount;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            if (!(requirements.memoryTypeBits & (1u << i))) continue;
+            if (type == memory.memoryTypeCount) type = i;
+            if (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                type = i;
+                break;
+            }
+        }
+        if (type == memory.memoryTypeCount) return false;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = type;
+        if (vk_.vkAllocateMemory(device_, &allocation, nullptr, &memory_) != VK_SUCCESS ||
+            vk_.vkBindBufferMemory(device_, scratch_, memory_, 0) != VK_SUCCESS)
+            return false;
+
+        const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                                   VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo set_layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        set_layout.bindingCount = 1;
+        set_layout.pBindings = &binding;
+        if (vk_.vkCreateDescriptorSetLayout(device_, &set_layout, nullptr, &set_layout_) != VK_SUCCESS) return false;
+        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+        VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pool.maxSets = 1;
+        pool.poolSizeCount = 1;
+        pool.pPoolSizes = &size;
+        if (vk_.vkCreateDescriptorPool(device_, &pool, nullptr, &pool_) != VK_SUCCESS) return false;
+        VkDescriptorSetAllocateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        set.descriptorPool = pool_;
+        set.descriptorSetCount = 1;
+        set.pSetLayouts = &set_layout_;
+        if (vk_.vkAllocateDescriptorSets(device_, &set, &set_) != VK_SUCCESS) return false;
+        const VkDescriptorBufferInfo storage{scratch_, 0, scratch_size};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = set_;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &storage;
+        vk_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t)};
+        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &set_layout_;
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &count;
+        if (vk_.vkCreatePipelineLayout(device_, &layout, nullptr, &layout_) != VK_SUCCESS) return false;
+        VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module.codeSize = sizeof(binary_occlusion_spirv);
+        module.pCode = binary_occlusion_spirv;
+        VkShaderModule shader = VK_NULL_HANDLE;
+        if (vk_.vkCreateShaderModule(device_, &module, nullptr, &shader) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                          VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", nullptr};
+        pipeline.layout = layout_;
+        const VkResult result = vk_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pipeline_);
+        vk_.vkDestroyShaderModule(device_, shader, nullptr);
+        return result == VK_SUCCESS;
+    }
+
+    void record(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
+                VkBuffer dst, VkDeviceSize offset) const {
+        constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        constexpr auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vk_.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
+        while (count) {
+            const std::uint32_t chunk = std::min(count, scratch_count);
+            const VkDeviceSize bytes = VkDeviceSize(chunk) * result_size;
+            // Reuse is ordered even across submissions on this queue. Each previous copy has read the scratch
+            // words before the query pool can write them again.
+            scratch_barrier(cb, transfer, transfer, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            vk_.vkCmdCopyQueryPoolResults(cb, queries, first, chunk, scratch_, 0, result_size,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            scratch_barrier(cb, transfer, compute, VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(chunk), &chunk);
+            vk_.vkCmdDispatch(cb, (chunk + group_size - 1) / group_size, 1, 1);
+            scratch_barrier(cb, compute, transfer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            const VkBufferCopy copy{0, offset, bytes};
+            vk_.vkCmdCopyBuffer(cb, scratch_, dst, 1, &copy);
+            first += chunk;
+            count -= chunk;
+            offset += bytes;
+        }
+    }
+
+private:
+    void scratch_barrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+                         VkAccessFlags src_access, VkAccessFlags dst_access) const {
+        VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        barrier.srcAccessMask = src_access;
+        barrier.dstAccessMask = dst_access;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = scratch_;
+        barrier.size = scratch_size;
+        vk_.vkCmdPipelineBarrier(cb, src, dst, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+    }
+
+    static constexpr std::uint32_t scratch_count = 1024;
+    static constexpr std::uint32_t group_size = 64;  // local_size_x in binary_occlusion.comp
+    static constexpr VkDeviceSize result_size = sizeof(std::uint64_t);
+    static constexpr VkDeviceSize scratch_size = scratch_count * result_size;
+    const VulkanDeviceFunctions& vk_;
+    VkDevice device_;
+    VkBuffer scratch_ = VK_NULL_HANDLE;
+    VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool pool_ = VK_NULL_HANDLE;
+    VkDescriptorSet set_ = VK_NULL_HANDLE;
+    VkPipelineLayout layout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
 };
 
 // Per device: what the queues share. Resources are registered by their stable ID (the COM resource pointer).
@@ -281,6 +435,11 @@ public:
         graphics_pipelines_[id] = pipeline;
     }
 
+    // Configure before queue creation, when the selected queue family supports compute.
+    void set_binary_occlusion_memory(const VkPhysicalDeviceMemoryProperties& memory) {
+        binary_occlusion_memory_ = memory;
+    }
+
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(mutex_);
@@ -395,6 +554,7 @@ private:
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
+    VkPhysicalDeviceMemoryProperties binary_occlusion_memory_{};
     ReplayFunctions replay_;
     DebugLabelFunctions labels_;
 };
@@ -490,10 +650,24 @@ public:
         std::lock_guard lock(context_.mutex_);
         if (context_.depth24_) context_.depth24_->collect();
         std::vector<PreparedList> prepared(lists.size());
+        ReplayFunctions replay = context_.replay_;
+        if (context_.binary_occlusion_memory_.memoryTypeCount) {
+            replay.resolve_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                      std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                binary_occlusion_->record(cb, pool, first, count, dst, offset);
+            };
+        }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
+        bool binary_occlusion_needed = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
-            const auto result = prepare(*lists[i], resolve, context_.replay_, prepared[i]);
+            const auto result = prepare(*lists[i], resolve, replay, prepared[i]);
             if (result != ReplayResult::success) return result;
+            binary_occlusion_needed |= prepared[i].binary_occlusion;
+        }
+        if (binary_occlusion_needed && !binary_occlusion_) {
+            auto helper = std::make_unique<BinaryOcclusionResolve>(context_.vk, context_.device());
+            if (!helper->initialize(context_.binary_occlusion_memory_)) return ReplayResult::unsupported;
+            binary_occlusion_ = std::move(helper);
         }
         VkCommandBuffer command_buffer = acquire();
         if (!command_buffer) return ReplayResult::unsupported;
@@ -508,8 +682,8 @@ public:
             return ReplayResult::unsupported;
         }
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
-        for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_, &open_labels);
-        close_labels(command_buffer, context_.replay_, open_labels);
+        for (const auto& list : prepared) emit(list, command_buffer, replay, &context_.tracker_, &open_labels);
+        close_labels(command_buffer, replay, open_labels);
         // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
         // readback buffers are read through Map once the application has waited.
         VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -622,6 +796,7 @@ private:
     std::vector<std::pair<VkCommandBuffer, std::uint64_t>> buffers_;  // buffer, ticket that frees it
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
+    std::unique_ptr<BinaryOcclusionResolve> binary_occlusion_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
 };

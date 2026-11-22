@@ -10,14 +10,13 @@ Covers:
 Per docs/design.md ("16-bit results"), all five write one 16-bit half of the destination VGPR while preserving the
 other 16-bit half (VOP2 _e32 writes the low half; VOP3 _e64 op_sel:[src,dst] selects source/destination halves).
 
-v_floor_f16, v_ceil_f16, v_trunc_f16 and v_rndne_f16 are executed end-to-end through tools/rdna2spirv.py and
-tests/semantic/spirv_mini_interp.py across finite values, subnormals, +-0.0, .5 ties, +-inf, NaNs, op_sel:[src,dst],
-VOP3 source/output modifiers, inline f16 constants, SGPR sources, destination aliasing, and EXEC masking.
+All five ops are executed end-to-end through tools/rdna2spirv.py and tests/semantic/spirv_mini_interp.py across
+finite values, subnormals, +-0.0, .5 ties, +-inf, NaNs, op_sel:[src,dst], VOP3 source/output modifiers, inline f16
+constants, SGPR sources, destination aliasing, and EXEC masking.
 
-Finding (unchanged here): tools/rdna2spirv.py lowers v_fract_f16 to GLSL.std.450 Fract, which
-tests/semantic/spirv_mini_interp.py does not yet implement (raising UnsupportedConstruct). v_fract_f16 is therefore
-checked via an independent IEEE-754 binary16 oracle plus SPIR-V structural translation verification rather than
-end-to-end interpreter execution.
+tools/rdna2spirv.py lowers v_fract_f16 to GLSL.std.450 Fract, which tests/semantic/spirv_mini_interp.py computes
+exactly. A Fract result that rounded up to 1.0 is mapped to 0x3bff (the largest f16 below 1.0); ref_fract_f16 below
+models that fix-up for the end-to-end cases.
 """
 import itertools
 import math
@@ -86,6 +85,7 @@ H_NEG_INF = 0xFC00          # -inf
 H_QNAN = 0x7E01             # +qNaN
 H_NEG_QNAN = 0xFE01         # -qNaN
 H_SNAN = 0x7C01             # +sNaN
+H_NEAR_ONE = 0x3BFF         # largest f16 below 1.0 (the translator's Fract fix-up result)
 
 
 def h2f(h: int) -> float:
@@ -127,6 +127,12 @@ def ref_fract(h: int) -> int:
     if not math.isfinite(x):
         return H_QNAN
     return f2h(x - math.copysign(float(math.floor(x)), x))
+
+
+def ref_fract_f16(h: int) -> int:
+    """Oracle for end-to-end v_fract_f16: ref_fract plus the translator's 0x3c00 -> 0x3bff fix-up."""
+    r = ref_fract(h)
+    return H_NEAR_ONE if r == H_1P0 else r
 
 
 def merge_half(old: int, half: int, dst_hi: int) -> int:
@@ -339,6 +345,91 @@ class FractF16TranslationTests(unittest.TestCase):
         self.assertRegex(spv, r"OpExtInst %float %glsl FClamp %\w+ %f0 %f1")
         # op_sel:[1,1]: fract of the high half (-1.25 -> 0.75 = 0x3a00) into the high half; the low half is kept.
         self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], (0x3A00 << 16) | (OLD & 0xFFFF))
+
+    def test_edge_values_across_e32_e64_and_bare(self):
+        samples = [
+            H_POS_ZERO, H_NEG_ZERO,
+            H_SUB_MIN, H_NEG_SUB_MIN, H_SUB_MAX, H_NEG_SUB_MAX,
+            H_0P25, H_NEG_0P25, H_0P5, H_NEG_0P5, H_0P75, H_NEG_0P75,
+            H_1P0, H_NEG_1P0, H_1P25, H_NEG_1P25, H_1P5, H_NEG_1P5, H_1P75, H_NEG_1P75,
+            H_2P0, H_NEG_2P0, H_2P5, H_NEG_2P5, H_3P5, H_NEG_3P5,
+            H_1022P5, H_1023P5, H_NEG_1022P5, H_NEG_1023P5,
+            H_MAX, H_NEG_MAX,
+        ]
+        for suffix in ("_e32", "_e64", ""):
+            for h in samples:
+                v1 = 0x55550000 | h
+                with self.subTest(op="v_fract_f16" + suffix, h=hex(h)):
+                    got = run_op(f"v_fract_f16{suffix} v0, v1", v1)
+                    self.assertEqual(got, merge_half(OLD, ref_fract_f16(h), 0))
+
+    def test_inf_and_nan_give_nan_and_keep_other_half(self):
+        for h in (H_POS_INF, H_NEG_INF, H_QNAN, H_NEG_QNAN, H_SNAN):
+            for suffix in ("_e32", "_e64"):
+                with self.subTest(h=hex(h), suffix=suffix):
+                    got = run_op(f"v_fract_f16{suffix} v0, v1", 0xCAFE0000 | h)
+                    self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
+                    self.assertTrue(is_f16_nan(got & 0xFFFF), f"expected NaN in low half, got {got:#x}")
+
+    def test_op_sel_all_combinations(self):
+        # v1 = (hi: -1.25, lo: 2.5) -> distinct fractions 0.75 and 0.5 across every src/dst half.
+        v1 = (H_NEG_1P25 << 16) | H_2P5
+        for src_hi, dst_hi in itertools.product((0, 1), repeat=2):
+            h_in = H_NEG_1P25 if src_hi else H_2P5
+            line = f"v_fract_f16_e64 v0, v1 op_sel:[{src_hi},{dst_hi}]"
+            with self.subTest(line=line):
+                self.assertEqual(run_op(line, v1), merge_half(OLD, ref_fract_f16(h_in), dst_hi))
+
+    def test_vop3_source_and_output_modifiers(self):
+        v1 = (H_NEG_1P25 << 16) | H_2P5
+        # Source modifiers apply to the selected half before Fract.
+        self.assertEqual(run_op("v_fract_f16_e64 v0, -v1 op_sel:[0,0]", v1), merge_half(OLD, H_0P5, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, |v1| op_sel:[1,1]", v1), merge_half(OLD, H_0P25, 1))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, -|v1| op_sel:[1,0]", v1), merge_half(OLD, H_0P75, 0))
+
+        # Output modifiers scale Fract's result; the 0x3c00 fix-up applies to Fract alone, not to omod.
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", v1), merge_half(OLD, H_1P0, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:4", v1), merge_half(OLD, H_2P0, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 div:2", v1), merge_half(OLD, H_0P25, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2 clamp", v1), merge_half(OLD, H_1P0, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 op_sel:[1,1] clamp", v1), merge_half(OLD, H_0P75, 1))
+
+    def test_inline_constants_sgpr_and_aliasing(self):
+        self.assertEqual(run_op("v_fract_f16_e32 v0, 0.5", 0), merge_half(OLD, H_0P5, 0))
+        self.assertEqual(run_op("v_fract_f16_e32 v0, -0.5", 0), merge_half(OLD, H_0P5, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, -1.0", 0), merge_half(OLD, H_POS_ZERO, 0))
+
+        s4 = (H_NEG_1P25 << 16) | H_0P25
+        self.assertEqual(run_op("v_fract_f16_e32 v0, s4", 0, s4=s4), merge_half(OLD, H_0P25, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, s4 op_sel:[1,1]", 0, s4=s4), merge_half(OLD, H_0P75, 1))
+
+        # In-place aliasing: dst == src reading the high half keeps the original high half.
+        v0_init = (H_3P5 << 16) | H_0P25
+        self.assertEqual(run_ps([f"v_mov_b32 v0, {v0_init:#x}", "v_fract_f16_e64 v0, v0 op_sel:[1,0]"]),
+                         (H_3P5 << 16) | H_0P5)
+
+    def test_exec_masking(self):
+        # Inactive single lane preserves pre-existing v0.
+        got = run_ps([
+            f"v_mov_b32 v1, {H_1P5:#x}",
+            f"v_mov_b32 v0, {OLD:#x}",
+            "s_mov_b32 exec_lo, 0",
+            "v_fract_f16_e32 v0, v1",
+            "s_mov_b32 exec_lo, 1",
+        ])
+        self.assertEqual(got, OLD)
+
+        # Disabled ops leave both halves untouched; re-enabling EXEC runs the subsequent op.
+        got_toggled = run_ps([
+            f"v_mov_b32 v1, {(H_NEG_1P25 << 16) | H_2P5:#x}",
+            f"v_mov_b32 v0, {OLD:#x}",
+            "s_mov_b32 exec_lo, 0",
+            "v_fract_f16_e64 v0, v1 op_sel:[0,0]",
+            "v_fract_f16_e64 v0, v1 op_sel:[1,1]",
+            "s_mov_b32 exec_lo, 1",
+            "v_fract_f16_e64 v0, v1 op_sel:[1,0]",
+        ])
+        self.assertEqual(got_toggled, merge_half(OLD, H_0P75, 0))
 
 
 if __name__ == "__main__":

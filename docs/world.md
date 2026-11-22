@@ -348,6 +348,49 @@ For a 76 GB archive always bound the run with `--start/--limit`; the tool record
 A 0x7a resource split beyond the first continuation, or a map whose entity block lives in a graphics page, is
 reported with fewer entities or as `meta` rather than guessed.
 
+## Instanced props and grass
+
+Map resources can carry two instance lists besides `CEntityDef`. All four struct names are the case-sensitive
+joaat of the GTA V class names, and every member below is named by the resource's own member table.
+`tools/instance_lists.py` reads them through that table (by name hash) and writes counts only.
+
+| Hash | Struct | Size | Members (offset) |
+|---|---|---:|---|
+| `0xBA049770` | `rage__fwPropInstanceListDef` | 0x170 | `CEntityDef` members, `InstanceList` 0x90, `BatchAABB` 0xA0, `ScaleRange` 0x160, `InstanceLodDist` 0x168 |
+| `0xEA6B3A96` | `rage__fwPropInstanceListDef__InstanceData` | 0x40 | `InstMat` 0x0 (3x4 floats, translation in the last column), `Tint` 0x34 |
+| `0x7C475B5D` | `rage__fwGrassInstanceListDef` | 0x1A0 | `CEntityDef` members, `BatchAABB` 0x80, `ScaleRange` 0xA0, `LodFadeStartDist` 0xB8, `InstanceLodDist` 0xBC, `OrientToTerrain` 0xC0, `slodID` 0xB0, `IsSLODList` 0x150, `SLODArchetypeList` 0x158 (array), `InstanceList` 0x178 |
+| `0xED86F522` | `rage__fwGrassInstanceListDef__InstanceData` | 0x10 | `Position` 0x0 (3 x u16 in `BatchAABB`), `NormalX` 0x6, `NormalY` 0x7, `Color` 0x8 (3 bytes), `Scale` 0xB, `ScaleZ` 0xC, `RotationIdx` 0xD |
+
+Two more grass-list members are named by joaat from a brute force over common engine words: `slodID` (0xB0, member hash `9fe78fd1`) and `SLODArchetypeList` (0x158, `b451fc98`), so grass lists carry their own link to an SLOD archetype set next to `IsSLODList`. The other unnamed members stay as hashes in the schema.
+
+An `InstanceList` is a u64 (low 12 bits: 1-based block index; bits 20+: offset in that block) and a u16 count.
+Instance blocks are usually in the physical buffer, so the tool joins each resource's virtual and physical
+streams from its block map (+0x08 -> +8 virtual count, +9 physical count).
+
+Full run over `levels.rpf`, `story000.rpf` and `shared_minigame000.rpf` (stream occurrences, duplicates
+included):
+
+| Archive | Map resources | With lists | Prop lists | Prop instances | Grass lists | Grass instances |
+|---|---:|---:|---:|---:|---:|---:|
+| `levels.rpf` | 188,447 | 135,560 | 690,779 | 24,778,818 | 202,143 | 219,453,097 |
+| `story000.rpf` | 48,084 | 2,683 | 4,833 | 1,652,980 | 5,504 | 5,641,657 |
+| `shared_minigame000.rpf` | 787 | 472 | 3,317 | 51,795 | 592 | 437,849 |
+| total | 237,318 | 138,715 | 698,929 | 26,483,593 | 208,239 | 225,532,603 |
+
+Struct sizes and every member offset in the table match the schema in all 98,722 resources with prop lists
+and all 57,650 with grass lists. 29,482 prop lists and 8,015 grass lists point to a block outside the
+streams the tool joined; their instances are not counted.
+
+Props (26,483,593 instances): every matrix is right-handed; 26,046,778 have orthonormal axes (within 0.01),
+25,936,781 are uniformly scaled and 4,692,108 have unit scale; the translation is inside the list's
+`BatchAABB` for 26,386,624. List `lodLevel`: LOD 424,012, HD 116,660, ORPHAN_HD 93,958, SLOD1 64,299. Every
+list has an ordered `ScaleRange` and `0 < InstanceLodDist <= lodDist`.
+
+Grass (225,532,603 instances): 225,379,032 `NormalX`/`NormalY` pairs (byte / 127.5 - 1) are inside the unit
+disc; `RotationIdx` is 0 to 72; `ScaleZ` equals `Scale` in 52,021,564 and `Scale` is 0 in 47,679,734, so
+`ScaleZ` is its own value, not ambient occlusion. `OrientToTerrain` is 1.0 in all 208,239 lists, `IsSLODList`
+is set in 5,802, and `lodLevel` is ORPHAN_HD in 205,181 and SLOD1 in 3,058.
+
 ## No-sharing rule
 
 Everything here is aggregate. Do not commit archives, carved streams, extracted models/textures, entity

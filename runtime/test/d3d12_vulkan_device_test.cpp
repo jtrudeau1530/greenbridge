@@ -427,6 +427,58 @@ int compare_format_info(ID3D12Device* ours, const vktest::Device& vk) {
     return mismatches;
 }
 
+// D3D-122: descriptions GetCopyableFootprints must refuse (false) or answer (true), as the PC runtime does. All were
+// measured on WARP. Also on an NVIDIA GPU: texture Width/Height 0, Count 0, Count 4 without a render-target or depth
+// flag, Count 3; buffer Width 0, Height 2, Format, MipLevels 0, Layout, Count 0; and the buffer render-target, extra
+// mip, ROW_MAJOR and Quality 1 controls. compare_footprints checks them against the host, the main test on their own.
+std::vector<std::pair<D3D12_RESOURCE_DESC, bool>> footprint_validity_cases() {
+    const auto rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const auto rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    std::vector<std::pair<D3D12_RESOURCE_DESC, bool>> cases;
+    const auto add = [&](D3D12_RESOURCE_DESC d, bool valid, auto&& change) {
+        change(d);
+        cases.push_back({d, valid});
+    };
+    const auto buffer = buffer_desc(256);
+    add(buffer, false, [](auto& d) { d.Width = 0; });
+    add(buffer, false, [](auto& d) { d.Height = 2; });
+    add(buffer, false, [](auto& d) { d.DepthOrArraySize = 2; });
+    add(buffer, false, [](auto& d) { d.MipLevels = 0; });
+    add(buffer, false, [](auto& d) { d.MipLevels = 2; });
+    add(buffer, false, [&](auto& d) { d.Format = rgba; });
+    add(buffer, false, [](auto& d) { d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; });
+    add(buffer, false, [](auto& d) { d.SampleDesc.Count = 0; });
+    add(buffer, false, [](auto& d) { d.SampleDesc.Count = 2; });
+    add(buffer, false, [](auto& d) { d.SampleDesc.Quality = 1; });
+    add(buffer, false, [](auto& d) { d.Alignment = 4096; });
+    add(buffer, true, [&](auto& d) { d.Flags = rt; });
+    add(buffer, true, [](auto& d) { d.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; });
+
+    const auto texture = texture_desc(16, 16, rgba, D3D12_RESOURCE_FLAG_NONE);
+    add(texture, false, [](auto& d) { d.Width = 0; });
+    add(texture, false, [](auto& d) { d.Height = 0; });
+    add(texture, false, [](auto& d) { d.DepthOrArraySize = 0; });
+    add(texture, false, [](auto& d) { d.SampleDesc.Count = 0; });
+    add(texture, false, [](auto& d) { d.SampleDesc.Count = 4; });  // no render-target or depth flag
+    add(texture, false, [](auto& d) { d.SampleDesc.Count = 4, d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; });
+    add(texture, false, [&](auto& d) { d.SampleDesc.Count = 3, d.Flags = rt; });
+    add(texture, false, [&](auto& d) { d.SampleDesc.Count = 4, d.Flags = rt, d.MipLevels = 2; });
+    add(texture, false, [&](auto& d) { d.SampleDesc.Count = 4, d.Flags = rt, d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; });
+    add(texture, true, [&](auto& d) { d.SampleDesc.Count = 4, d.Flags = rt; });
+    add(texture, true, [](auto& d) { d.MipLevels = 9; });  // past the full chain
+    add(texture, true, [](auto& d) { d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; });
+    add(texture, true, [](auto& d) { d.SampleDesc.Quality = 1; });
+    add(texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL), true,
+        [](auto& d) { d.SampleDesc.Count = 4; });
+
+    add(line_desc(16, 1, 1, rgba), false, [](auto& d) { d.Width = 0; });
+    add(line_desc(16, 1, 1, rgba), false, [&](auto& d) { d.SampleDesc.Count = 2, d.Flags = rt; });
+    add(volume_desc(1), false, [](auto& d) { d.DepthOrArraySize = 0; });
+    add(volume_desc(1), false, [](auto& d) { d.Height = 0; });
+    add(volume_desc(1), false, [&](auto& d) { d.SampleDesc.Count = 2, d.Flags = rt; });
+    return cases;
+}
+
 // GetCopyableFootprints must match the PC runtime's exactly, since applications size and fill upload buffers from
 // it. Unaligned block-compressed cases are skipped when the host runtime cannot answer them, so the rest still
 // run. Returns the number of mismatches, or -1 when the host has no D3D12 device to compare with.
@@ -439,7 +491,7 @@ int compare_footprints(ID3D12Device* ours) {
         D3D12_RESOURCE_DESC desc;
         UINT subresources;
     };
-    const Case cases[] = {
+    std::vector<Case> cases = {
         {volume_desc(5), 5},
         {line_desc(13, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM), 4},
         {line_desc(5, 3, 2, DXGI_FORMAT_R8G8B8A8_UNORM), 6},
@@ -472,6 +524,7 @@ int compare_footprints(ID3D12Device* ours) {
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_UINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
         {texture_desc(16, 16, DXGI_FORMAT_R8G8_SINT, D3D12_RESOURCE_FLAG_NONE, 3), 3},
     };
+    for (const auto& c : footprint_validity_cases()) cases.push_back({c.first, 1});
     int mismatches = 0;
     for (const Case& c : cases) {
         if (!unaligned_blocks && uses_unaligned_blocks(c.desc)) {
@@ -1956,6 +2009,18 @@ int main() {
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");
         EXPECT(footprint_mismatches <= 0);
+        {
+            // D3D-122: the same refusals without a host device (CI's llvmpipe), so they can't regress unseen.
+            const auto cases = footprint_validity_cases();
+            for (size_t i = 0; i < cases.size(); ++i) {
+                UINT64 total = 0;
+                device->GetCopyableFootprints(&cases[i].first, 0, 1, 0, nullptr, nullptr, nullptr, &total);
+                if ((total != UINT64_MAX) != cases[i].second)
+                    std::fprintf(stderr, "footprint validity case %zu: total %llu, expected %s\n", i,
+                                 (unsigned long long)total, cases[i].second ? "a footprint" : "the failure answer");
+                EXPECT((total != UINT64_MAX) == cases[i].second);
+            }
+        }
 
         // Shader model and root signature (D3D-86): the answers are only useful if the game can rely on them, so
         // pin both the ceiling and the refusal cases rather than just comparing with the host.

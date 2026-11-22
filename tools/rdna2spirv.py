@@ -38,6 +38,12 @@ import shader_meta as _shader_meta  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
+# --bary-fallback: raw barycentric reads come from an ordinary perspective-interpolated vec3 input (the location is
+# in the metadata as "bary_fallback_input") instead of BuiltIn BaryCoordKHR, for devices without
+# VK_KHR_fragment_shader_barycentric. Whatever feeds the stage before the PS (a pass-through geometry shader) writes
+# (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
+# barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
+BARY_FALLBACK = False
 
 # GFX10 buffer format codes (Mesa src/amd/registers/gfx10-rsrc.json, enum GFX10_FORMAT).
 import json as _json  # noqa: E402
@@ -5093,22 +5099,30 @@ class Gen:
         return tuple(out)
 
     def clamp_gather_lod(self, lod: str, word_reg: int) -> str:
-        """Clamp to S# word 1's unsigned 4.8 MIN_LOD and MAX_LOD before choosing the fetch mip."""
+        """Clamp to S# word 1's unsigned 4.8 MIN_LOD and MAX_LOD before choosing the fetch mip.
+
+        A literal S# uses FClamp. A run-time S# clamps with FMax then FMin: LLPC 26.10.1 (32.0.32015.7029)
+        miscompiles the run-time FClamp here and leaves the gather at mip 0 when MIN_LOD should raise it (#1032).
+        The two-instruction form is the FClamp result for min <= max and passes on that driver."""
         literal = self.sgpr_imm.get(word_reg)
         if literal is not None:
             limits = [self.fconst(((literal >> bit) & 0xfff) / 256.0) for bit in (0, 12)]
-        else:
-            word = self.load_reg("sgpr", word_reg)
-            scale = self.fconst(1.0 / 256.0)
-            limits = []
-            for bit in (0, 12):
-                raw, value, scaled = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{raw} = OpBitFieldUExtract %uint {word} {self.cu(bit)} {self.cu(12)}")
-                self.emit(f"{value} = OpConvertUToF %float {raw}")
-                self.emit(f"{scaled} = OpFMul %float {value} {scale}")
-                limits.append(scaled)
+            clamped = self.tmp()
+            self.emit(f"{clamped} = OpExtInst %float %glsl FClamp {lod} {limits[0]} {limits[1]}")
+            return clamped
+        word = self.load_reg("sgpr", word_reg)
+        scale = self.fconst(1.0 / 256.0)
+        limits = []
+        for bit in (0, 12):
+            raw, value, scaled = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{raw} = OpBitFieldUExtract %uint {word} {self.cu(bit)} {self.cu(12)}")
+            self.emit(f"{value} = OpConvertUToF %float {raw}")
+            self.emit(f"{scaled} = OpFMul %float {value} {scale}")
+            limits.append(scaled)
+        lower = self.tmp()
+        self.emit(f"{lower} = OpExtInst %float %glsl FMax {lod} {limits[0]}")
         clamped = self.tmp()
-        self.emit(f"{clamped} = OpExtInst %float %glsl FClamp {lod} {limits[0]} {limits[1]}")
+        self.emit(f"{clamped} = OpExtInst %float %glsl FMin {lower} {limits[1]}")
         return clamped
 
     def gather_addr(self, c, n, mode):
@@ -5320,7 +5334,11 @@ class Gen:
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
                 lod = self.clamp_gather_lod(f[2], a[3]["r"] + 1)
-                self.emit(f"{rl} = OpExtInst %float %glsl RoundEven {lod}")
+                # Native gather rounds the LOD to the nearest mip with ties up, not to even (SHADER-152: on
+                # Radeon Graphics 26.10.1, LOD 0.5 with bounds [0,1] selected mip 1, where RoundEven selected 0).
+                biased = self.tmp()
+                self.emit(f"{biased} = OpFAdd %float {lod} %fhalf_g")
+                self.emit(f"{rl} = OpExtInst %float %glsl Floor {biased}")
                 self.emit(f"{mi} = OpConvertFToS %int {rl}")
                 self.emit(f"{mz} = OpExtInst %int %glsl SMax {mi} {self.as_int(self.cu(0))}")
                 self.emit(f"{mc} = OpExtInst %int %glsl SMin {mz} {lvm}")
@@ -5605,7 +5623,7 @@ class Gen:
                               + (" d16" if "d16" in mods else ""))
         di, _, _, nc = self.STORE_DIMS[dim]
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0xf")
-        ncomp = bin(int(dm.split(":")[1], 0)).count("1")
+        dmask = int(dm.split(":")[1], 0)
         vdata, addr = a[0], self.addr_regs(a[1])
         raw = [self.load_reg("vgpr", r) for r in addr]
         if "a16" in mods:
@@ -5619,7 +5637,9 @@ class Gen:
             raw = halves
         if len(raw) < nc:
             raise Unsupported("image_store coords")
-        vals = [self.load_reg("vgpr", vdata["r"] + i) for i in range(ncomp)] + [self.cu(0)] * (4 - ncomp)
+        # The enabled components come from consecutive VGPRs, in component order (dmask 0x9: R = vD, A = vD+1).
+        regs = iter(range(vdata["r"], vdata["r"] + 4))
+        vals = [self.load_reg("vgpr", next(regs)) if dmask >> c & 1 else self.cu(0) for c in range(4)]
         coords = [self.as_int(c) for c in raw[:nc]]
         idx = self.desc_lookup_sgpr(a[2], 8)
         t1 = self.load_reg("sgpr", a[2]["r"] + 1)
@@ -6453,6 +6473,12 @@ def assemble(gen):
             iface += ["%out_viewport"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"]
     bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values())
+    # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
+    # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
+    # past what drivers with 128 input components accept (#804 review).
+    used = set(gen.inputs.values())
+    gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
+    bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs:
         iface += ["%frag_coord"] + (["%front_facing"] if "front" in gen.frag_inputs.values() else []) +             (["%bary"] if bary else [])
     for i in range(USER_SGPRS):          # index constants for the user-data copy at entry
@@ -6461,7 +6487,8 @@ def assemble(gen):
     caps = ["Shader"] + (["Int64", "PhysicalStorageBufferAddresses"] if psb else []) + \
         (["RuntimeDescriptorArray"] if tex else []) + (["GroupNonUniform", "GroupNonUniformShuffle"] if sg else []) + \
         (["ImageQuery"] if gen.uses_query else []) + (["Sampled1D"] if gen.uses_tex_1d else []) + \
-        (["MinLod"] if gen.uses_minlod else []) + (["ImageGatherExtended"] if gen.uses_img_offset else []) +         (["FragmentBarycentricKHR"] if bary else [])
+        (["MinLod"] if gen.uses_minlod else []) + (["ImageGatherExtended"] if gen.uses_img_offset else []) + \
+        (["FragmentBarycentricKHR"] if bary_builtin else [])
     if gen.uses_vote:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformVote") if c not in caps]
     if gen.uses_ballot:
@@ -6492,7 +6519,7 @@ def assemble(gen):
         caps.append("ShaderViewportIndex")
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
-    if bary:
+    if bary_builtin:
         exts.append("SPV_KHR_fragment_shader_barycentric")
     if ms:
         exts.append("SPV_EXT_mesh_shader")
@@ -6787,7 +6814,9 @@ def assemble(gen):
             if not tex:
                 types += ["%v3float = OpTypeVector %float 3"]
             types += ["%_ptr_Input_v3f = OpTypePointer Input %v3float"]
-            dec += ["OpDecorate %bary BuiltIn BaryCoordKHR"]
+            # Default (smooth) interpolation is perspective-correct, matching BaryCoordKHR (not BaryCoordNoPerspKHR).
+            dec += ["OpDecorate %bary BuiltIn BaryCoordKHR" if bary_builtin
+                    else f"OpDecorate %bary Location {gen.bary_location}"]
             gvars += ["%bary = OpVariable %_ptr_Input_v3f Input"]
     if gen.vertex_inputs:
         types += ["%v4uint_in = OpTypeVector %uint 4", "%v4int_in = OpTypeVector %int 4",
@@ -8056,6 +8085,10 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["writes_depth"] = True
     if g.inputs:
         m["inputs"] = sorted(g.inputs.values())
+    if getattr(g, "bary_location", None) is not None:
+        # --bary-fallback: the raw barycentrics are a perspective-interpolated vec3 at this location; the stage
+        # before the PS must write (1,0,0), (0,1,0), (0,0,1) at the triangle's vertices (see BARY_FALLBACK).
+        m["bary_fallback_input"] = {"location": g.bary_location}
     if g.build_meta:
         m.update(g.build_meta)
     return m
@@ -8132,10 +8165,15 @@ def main():
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
+    ap.add_argument("--bary-fallback", action="store_true",
+                    help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
+                         "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
+                         "VK_KHR_fragment_shader_barycentric (e.g. NVIDIA Pascal)")
     a = ap.parse_args()
-    global STRUCTURED, WAVE64_EMULATE
+    global STRUCTURED, WAVE64_EMULATE, BARY_FALLBACK
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
+    BARY_FALLBACK = a.bary_fallback
     if a.merge:
         import glob as _gl, json as _js
         merged = {}

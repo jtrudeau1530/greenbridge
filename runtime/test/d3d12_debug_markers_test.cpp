@@ -281,7 +281,9 @@ int run_private_data(ID3D12Device* device) {
 int main() {
     vktest::Device d;
     d.request_debug_utils = true;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     g_real = d.instance_proc;
 
     if (d.debug_utils) {

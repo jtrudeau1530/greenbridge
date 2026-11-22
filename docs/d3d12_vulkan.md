@@ -948,7 +948,12 @@ The layer's descriptor model:
 - View creation maps `D3D12_SRV_DIMENSION`/`D3D12_UAV_DIMENSION` to `VkImageViewType`, the mip and layer ranges,
   sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. Single-sampled 2D and 2D-array colour SRVs
   apply the T# minimum LOD in resource mip coordinates. A clamp inside the exposed mip range uses
-  `VK_EXT_image_view_min_lod`. If the logical device lacks the feature, the runtime logs the unsupported view
+  `VK_EXT_image_view_min_lod`. Vulkan allows the image-view minimum to be rounded down to an integer.
+  With nearest mip filtering, the UHD 770 and Arrow Lake Xe-LPG returned mip 0 for a 2D minimum of 0.75.
+  The Xe-LPG also returned mip 1 for a 2D-array minimum of 1.75. RTX and Radeon returned mips 1 and 2.
+  See [Vulkan image-level selection](https://docs.vulkan.org/spec/latest/chapters/textures.html#textures-image-level-selection)
+  and the [Intel readbacks](https://github.com/ItsNotRexed/Leonida/pull/1015#issuecomment-7075135647).
+  If the logical device lacks the feature, the runtime logs the unsupported view
   and its descriptor resolves to the fallback. A clamp at or below the first mip needs no extension. Above the
   last mip, the view retains its dimensions and maps sampled channels to zero while preserving constant channels.
 - Set 0 is a fixed bindless layout. The GPU tests use 4096 sampled 2D images, 1024 samplers, 1024 2D-array
@@ -1622,6 +1627,11 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   `vkCmdWriteTimestamp` at `BOTTOM_OF_PIPE` (every earlier command finished). `ResolveQueryData` is
   `vkCmdCopyQueryPoolResults` with `VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT`. A query keeps its result
   across executions until it is begun or written again, as in D3D12.
+- **Binary occlusion.** The queue resolves to a scratch buffer in chunks, reduces each 64-bit value to 0 or 1
+  with a compute dispatch, and copies it into the destination. This works with readback buffers, which need
+  only transfer-destination usage. The helper runs outside conditional rendering so a predicate cannot suppress
+  the resolve. `vk_binary_occlusion` checks more than one scratch chunk, gaps, suballocated destinations,
+  consecutive submissions and an ordinary occlusion count on a real Vulkan device.
 - **Queries never ended.** D3D12 leaves their result undefined; a Vulkan copy with `WAIT_BIT` would wait for them
   forever. Each heap records on the host which queries were ended, in submission order, and a resolve writes zeros
   (`vkCmdFillBuffer`) for the ones that were not.
@@ -1635,9 +1645,9 @@ Not implemented yet:
   query (either kind) or a pipeline-statistics query while another of the same kind runs is refused with
   `ReplayResult::unsupported`. The fix is virtual queries: end the running Vulkan query, start another, and sum the
   pieces when resolving (a compute pass). The trace will show whether the game overlaps them.
-- **Binary occlusion** is not clamped: Vulkan writes the sample count (or, without the precise bit, any non-zero
-  value) where D3D12 writes 1. Predication only compares with zero, but a game that reads the value needs the clamp,
-  a small compute pass over the resolved range once the compute path (D3D-3) exists.
+- **Binary occlusion during an active pipeline-statistics query** is refused at preparation because the helper
+  dispatch would otherwise change the application's compute-invocation count. The binary resolve also needs
+  compute support on the graphics queue.
 - `GetClockCalibration` (from `VK_EXT_calibrated_timestamps`), stream-output and mesh-shader statistics.
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
