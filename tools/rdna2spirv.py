@@ -14364,12 +14364,14 @@ def _read_shard_markers(out):
 
 
 def merge_shard_parts(out):
-    """{shader: meta} from index.part*.json, after checking the set is complete.
+    """{shader: meta} from index.part*.json, after checking the set is complete and not empty.
 
     A --shard i/n run writes index.part<i>.json and shard<i>.json ({"index": i, "count": n}); the markers say how
     many parts the set has. Parts from before the markers existed fall back to make_game.py's shards.json plan.
     When neither exists the count is unknown, so the parts must at least be contiguous from 0: the merge fails
-    closed instead of publishing a partial index that make_game.py would take as a finished translation."""
+    closed instead of publishing a partial index that make_game.py would take as a finished translation. A
+    complete set of empty parts fails closed the same way: `index.json` is the marker that says the corpus was
+    translated, so publishing {} claims a translation of nothing."""
     import glob as _gl, json as _js
     parts = sorted(_gl.glob(os.path.join(out, "index.part*.json")))
     if not parts:
@@ -14430,6 +14432,9 @@ def merge_shard_parts(out):
         if not isinstance(doc, dict):
             raise ShardSetError(f"{part} does not contain a shader index object")
         merged.update(doc)
+    if not merged:
+        raise ShardSetError(f"the shard set in {out} holds no shaders: every part is empty; "
+                            "check the disassembly (llvm-mc output and the .s files) before --merge")
     return merged
 
 
