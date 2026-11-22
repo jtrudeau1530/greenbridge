@@ -12821,7 +12821,16 @@ def translate(path):
         reads = {r for r in read_before_write_vgprs(insns) if r >= 4}
         if not reads <= predicted:
             raise Unsupported("fetch mapping")
-        g.vertex_inputs = [(reg, ctype) for reg, _, _, ctype in sig]
+        # SHADER-644: ISG1 can pack several elements into one register (xy and zw). They all become one vec4
+        # Vulkan input; emitting one %vin{reg} per element redefines the same Id and fails spirv-val. Keep the
+        # first component type for the register, and reject a genuinely conflicting type instead of guessing.
+        input_types = {}
+        for reg, _, _, ctype in sig:
+            kind = ctype if ctype in (1, 2) else 3
+            if reg in input_types and input_types[reg] != kind:
+                raise Unsupported(f"vertex input register {reg} has conflicting component types")
+            input_types[reg] = kind
+        g.vertex_inputs = list(input_types.items())
         g.vertex_signature = [{"register": reg, "mask": mask, "system_value": sv, "component_type": ctype}
                               for reg, mask, sv, ctype in sig]
         for reg, _ in g.vertex_inputs:          # register the VGPR index constants before assembly
