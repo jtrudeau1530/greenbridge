@@ -10844,7 +10844,15 @@ def assemble(gen):
               "%mix = OpCompositeConstruct %v3uint %mi0 %mi1 %mi2",
               "%mixp = OpAccessChain %_ptr_Out_v3u_ms %ms_prim_idx %mli", "OpStore %mixp %mix",
               f"%mnb = OpShiftRightLogical %uint %mpr {c(31)}", "%mnull = OpINotEqual %bool %mnb %c0",
-              f"%mcp = OpAccessChain %_ptr_Out_bool_ms %ms_cull %mli {c(0)}", "OpStore %mcp %mnull",
+              f"%mcp = OpAccessChain %_ptr_Out_bool_ms %ms_cull %mli {c(0)}",
+              # CullPrimitiveEXT gets a constant on each side of a branch, not the computed bool: llvmpipe
+              # (Mesa 25.2.8, LLVM 20) aborts compiling a computed per-primitive bool store in the wave64-emulated
+              # mesh epilogue ("Cannot emit physreg copy instruction"), and Mesa 26.3.1 drew no primitives for the
+              # same shaders (SHADER-575). Same result on every driver.
+              "OpSelectionMerge %ms_cend None", "OpBranchConditional %mnull %ms_cull1 %ms_cull0",
+              "%ms_cull1 = OpLabel", "OpStore %mcp %true", "OpBranch %ms_cend",
+              "%ms_cull0 = OpLabel", "OpStore %mcp %false", "OpBranch %ms_cend",
+              "%ms_cend = OpLabel",
               "OpBranch %ms_pend", "%ms_pend = OpLabel"]
         end_lock = "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L) + end_lock
     if gen.uses_active and gen.stage == "ps":
