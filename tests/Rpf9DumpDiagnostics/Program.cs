@@ -44,6 +44,14 @@ try
 finally { Directory.Delete(dir, true); }
 Console.WriteLine("Atomic write tests passed.");
 
+// Scan counts round-trip through the index cache's coverage text, including older culture-formatted caches.
+Check(ScanCounts.Candidates(ScanCounts.Coverage(183801, 149811)) == 183801, "invariant coverage");
+Check(ScanCounts.Candidates("rpf9dump full scan, 183,801 candidates, 149,811 recovered") == 183801, "comma-grouped coverage");
+Check(ScanCounts.Candidates("rpf9dump full scan, 183\u00A0801 candidates, 149\u00A0811 recovered") == 183801, "space-grouped coverage");
+Check(ScanCounts.Candidates("App scan of the first 16 MiB") is null, "coverage written by another tool");
+Check(ScanCounts.Candidates(null) is null, "no cache");
+Console.WriteLine("Scan count tests passed.");
+
 static void Check(bool ok, string what)
 {
     if (!ok) throw new Exception($"Failed: {what}");

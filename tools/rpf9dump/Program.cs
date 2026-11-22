@@ -77,6 +77,7 @@ else if (mode is "models" or "textures")
 {
     byte[] header; using (var f = File.OpenRead(src)) { header = new byte[64]; f.ReadExactly(header); }
     var cached = RecoveryIndexCache.Load(mode, src, length, header);
+    int? candidates = ScanCounts.Candidates(cached?.Coverage);
     if (cached == null)
     {
         long last = -1;
@@ -92,12 +93,17 @@ else if (mode is "models" or "textures")
             if ((i / 32) % 200 == 0) Console.WriteLine($"  validated {i + chunk.Length:N0}/{cands.Count:N0} -> {entries.Count:N0} ({sw.Elapsed.TotalSeconds:0}s)");
         }
         entries = entries.OrderBy(e => e.Offset).Select((e, k) => e with { Index = k }).ToList();
-        RecoveryIndexCache.Save(mode, src, entries, $"rpf9dump full scan, {cands.Count:N0} candidates, {entries.Count:N0} recovered");
+        RecoveryIndexCache.Save(mode, src, entries, ScanCounts.Coverage(cands.Count, entries.Select(e => e.Offset).Distinct().Count()));
+        candidates = cands.Count;
     }
     var doc = ArchiveReader.Open(src);
     string want = mode == "models" ? "Recovered model" : "Recovered texture dictionary";
     var list = doc.Entries.Where(e => e.Compression == want).ToList();
     Console.WriteLine($"  {list.Count:N0} {mode} entries ({sw.Elapsed.TotalSeconds:0}s)");
+    // A drawable dictionary yields one entry per child, all with the candidate's offset: count resources by offset.
+    int recovered = list.Select(e => e.Offset).Distinct().Count();
+    if (candidates is int c && c > recovered)
+        Console.WriteLine($"  {c - recovered:N0} of {c:N0} scan candidates were not recovered (rejected before decoding)");
     string sub = Path.Combine(outDir, mode); Directory.CreateDirectory(sub);
     // The manifest is streamed row by row: holding 150k rows (each capturing its decoded model through lazy
     // projections) ran out of memory on levels.rpf. Written to a .partial file and renamed when complete.
@@ -107,6 +113,16 @@ else if (mode is "models" or "textures")
     writer.WriteStartObject();
     writer.WriteString("src", src);
     writer.WriteNumber("Count", list.Count);
+    // Scan-level counts. Candidates the recovery step rejects never reach the per-item loop or
+    // ModelDecodeFailures, so NotRecovered is the only place they show up. Recovered counts resources (candidate
+    // offsets); Entries counts manifest items (one per dictionary child). Null when a cached index does not record
+    // the candidate count.
+    writer.WriteStartObject("Scan");
+    if (candidates is int scanned) writer.WriteNumber("Candidates", scanned); else writer.WriteNull("Candidates");
+    writer.WriteNumber("Recovered", recovered);
+    if (candidates is int total) writer.WriteNumber("NotRecovered", total - recovered); else writer.WriteNull("NotRecovered");
+    writer.WriteNumber("Entries", list.Count);
+    writer.WriteEndObject();
     writer.WriteStartArray("Items");
     void Row(object row) => JsonSerializer.Serialize(writer, row, json);
     int embedded = 0;
