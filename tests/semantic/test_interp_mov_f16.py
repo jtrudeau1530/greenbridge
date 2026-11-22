@@ -20,6 +20,7 @@ Architectural model:
     Flat copying of provoking vertex (p0) or slope parameters (p10, p20).
 """
 
+from enum import Enum, auto
 import math
 import struct
 import sys
@@ -211,6 +212,213 @@ class TestInterpMovF16MathematicalOracle(unittest.TestCase):
         # Other channels remain 0
         self.assertEqual(buf.read_param_channel(0, 5, 0), 0)
         self.assertEqual(buf.read_param_channel(1, 5, 1), 0)
+
+
+class Opcode(Enum):
+    V_INTERP_MOV_F16 = "v_interp_mov_f16"
+
+
+class ParamType(Enum):
+    P0 = "p0"
+    P10 = "p10"
+    P20 = "p20"
+
+    @property
+    def index(self) -> int:
+        if self == ParamType.P0:
+            return 0
+        elif self == ParamType.P10:
+            return 1
+        elif self == ParamType.P20:
+            return 2
+        raise ValueError(f"Unknown param type: {self}")
+
+
+class Channel(Enum):
+    X = 0
+    Y = 1
+    Z = 2
+    W = 3
+
+    @classmethod
+    def from_str(cls, s: str) -> Channel:
+        s_lower = s.lower()
+        if s_lower == "x":
+            return cls.X
+        elif s_lower == "y":
+            return cls.Y
+        elif s_lower == "z":
+            return cls.Z
+        elif s_lower == "w":
+            return cls.W
+        raise ValueError(f"Invalid channel string: {s}")
+
+    def to_str(self) -> str:
+        return self.name.lower()
+
+
+class AttributeRef:
+    """Reference to an attribute index (0..31) and component channel (X, Y, Z, W)."""
+
+    def __init__(self, attr_index: int, channel: Channel) -> None:
+        if not (0 <= attr_index <= 31):
+            raise ValueError(f"Attribute index must be 0..31, got {attr_index}")
+        self.attr_index = attr_index
+        self.channel = channel
+
+    def disasm(self) -> str:
+        return f"attr{self.attr_index}.{self.channel.to_str()}"
+
+    def __repr__(self) -> str:
+        return f"AttributeRef({self.disasm()})"
+
+
+class ASTOperand:
+    """Destination VGPR operand with high/low half selection."""
+
+    def __init__(self, vgpr_index: int, *, high: bool = False) -> None:
+        if not (0 <= vgpr_index <= 255):
+            raise ValueError(f"VGPR index must be 0..255, got {vgpr_index}")
+        self.vgpr_index = vgpr_index
+        self.high = high
+
+    def disasm(self) -> str:
+        return f"v{self.vgpr_index}"
+
+    def __repr__(self) -> str:
+        half_str = "high" if self.high else "low"
+        return f"ASTOperand(v{self.vgpr_index}, {half_str})"
+
+
+class ASTInstruction:
+    """Symbolic AST instruction representation for v_interp_mov_f16."""
+
+    def __init__(
+        self,
+        opcode: Opcode,
+        dst: ASTOperand,
+        param: ParamType,
+        attr: AttributeRef,
+        *,
+        high_src: bool = False,
+        clamp: bool = False,
+    ) -> None:
+        self.opcode = opcode
+        self.dst = dst
+        self.param = param
+        self.attr = attr
+        self.high_src = high_src
+        self.clamp = clamp
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.V_INTERP_MOV_F16:
+            raise ValueError(f"Invalid opcode: {self.opcode}")
+        if not (0 <= self.dst.vgpr_index <= 255):
+            raise ValueError(f"VGPR index out of range: {self.dst.vgpr_index}")
+        if not (0 <= self.attr.attr_index <= 31):
+            raise ValueError(f"Attribute index out of range: {self.attr.attr_index}")
+
+    def disasm(self) -> str:
+        parts = [
+            self.opcode.value,
+            f"{self.dst.disasm()},",
+            f"{self.param.value},",
+            self.attr.disasm(),
+        ]
+        if self.high_src:
+            parts.append("high")
+        if self.clamp:
+            parts.append("clamp")
+        return " ".join(parts)
+
+    def __repr__(self) -> str:
+        return f"ASTInstruction({self.disasm()})"
+
+
+class TypedExpr:
+    """Base class for typed symbolic expressions."""
+
+    def evaluate(self, env: AttributeBuffer, old_dst_u32: int) -> int:
+        raise NotImplementedError
+
+
+class InterpMovExpr(TypedExpr):
+    """Symbolic expression tree for interpolation attribute move."""
+
+    def __init__(
+        self,
+        param: ParamType,
+        attr: AttributeRef,
+        *,
+        high_src: bool = False,
+        high_dst: bool = False,
+        clamp: bool = False,
+    ) -> None:
+        self.param = param
+        self.attr = attr
+        self.high_src = high_src
+        self.high_dst = high_dst
+        self.clamp = clamp
+
+    def evaluate(self, env: AttributeBuffer, old_dst_u32: int) -> int:
+        attr_word = env.read_param_channel(
+            self.param.index,
+            self.attr.attr_index,
+            self.attr.channel.value,
+        )
+        return ref_interp_mov_f16(
+            attr_word,
+            high_src=self.high_src,
+            high_dst=self.high_dst,
+            old_dst_u32=old_dst_u32,
+            clamp=self.clamp,
+        )
+
+    def __repr__(self) -> str:
+        return f"InterpMovExpr({self.param.value}, {self.attr.disasm()}, high_src={self.high_src}, clamp={self.clamp})"
+
+
+class TestInterpMovF16SymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_disasm(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(2, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(3, Channel.Y),
+            high_src=True,
+            clamp=True,
+        )
+        inst.validate()
+        self.assertEqual(inst.disasm(), "v_interp_mov_f16 v2, p0, attr3.y high clamp")
+
+    def test_ast_validation_errors(self):
+        # Attribute index out of range (> 31)
+        with self.assertRaises(ValueError):
+            AttributeRef(32, Channel.X)
+
+        # VGPR index out of range (> 255)
+        with self.assertRaises(ValueError):
+            ASTOperand(256)
+
+    def test_typed_expression_evaluation(self):
+        buf = AttributeBuffer()
+        # Set p0 attr 1 chan X to (hi: 2.0, lo: 0.5)
+        word = pack_f16_pair(H_HALF, H_TWO)
+        buf.write_param_channel(0, 1, Channel.X.value, word)
+
+        expr = InterpMovExpr(
+            param=ParamType.P0,
+            attr=AttributeRef(1, Channel.X),
+            high_src=True,   # selects 2.0
+            high_dst=False,
+            clamp=True,      # 2.0 clamped to 1.0 (0x3C00)
+        )
+        old_val = 0xAAAA0000
+        res = expr.evaluate(buf, old_val)
+        # Should write 0x3C00 to low half, keeping 0xAAAA in high half
+        self.assertEqual(res, 0xAAAA3C00)
 
 
 if __name__ == "__main__":
