@@ -379,6 +379,38 @@ int main() {
     merged.forget(1);
     CHECK(!merged.tracked(1));
 
+    // DiscardResource by subresource range (D3D-26), through prepare(): each listed subresource becomes one range,
+    // and the command loop goes on to the next command after a discard's own loop.
+    {
+        ResourceBinding target{};
+        target.image = reinterpret_cast<VkImage>(std::uintptr_t{3});
+        target.mip_levels = 3;
+        target.array_layers = 2;
+        const auto resolve = [&](ResourceId id) -> const ResourceBinding* { return id == 3 ? &target : nullptr; };
+        CommandList list;
+        CHECK(list.discard({3, 1, 3, false}));  // mips 1 and 2 of layer 0, mip 0 of layer 1
+        CHECK(list.discard({3, 5, 1, false}));  // mip 2 of layer 1, the last subresource
+        CHECK(list.discard({3, 0, 2, true}));   // a partial discard keeps the contents: nothing to record
+        CHECK(list.close());
+        PreparedList prepared;
+        CHECK(prepare(list, resolve, ReplayFunctions{}, prepared) == ReplayResult::success);
+        CHECK(prepared.commands.size() == 3);
+        const auto& first = prepared.commands[0].discards;
+        CHECK(first.size() == 3);
+        CHECK(first[0].baseMipLevel == 1 && first[0].baseArrayLayer == 0 && first[0].levelCount == 1);
+        CHECK(first[1].baseMipLevel == 2 && first[1].baseArrayLayer == 0);
+        CHECK(first[2].baseMipLevel == 0 && first[2].baseArrayLayer == 1 && first[2].layerCount == 1);
+        const auto& second = prepared.commands[1].discards;
+        CHECK(second.size() == 1 && second[0].baseMipLevel == 2 && second[0].baseArrayLayer == 1);
+        CHECK(prepared.commands[2].discards.empty());
+
+        // One subresource past the end is refused.
+        CommandList past;
+        CHECK(past.discard({3, 4, 3, false}));
+        CHECK(past.close());
+        CHECK(prepare(past, resolve, ReplayFunctions{}, prepared) == ReplayResult::invalid_subresource);
+    }
+
     // Resizable BAR detection (D3D-96) on the heap layouts real cards report.
     {
         constexpr VkDeviceSize mib = VkDeviceSize(1) << 20;
@@ -417,6 +449,7 @@ int main() {
         CHECK(!resizable_bar(VkPhysicalDeviceMemoryProperties{}));
     }
 
-    std::printf("state map, enhanced barriers, subresource decoding, layout tracking and BAR detection OK\n");
+    std::printf("state map, enhanced barriers, subresource decoding, layout tracking, discard ranges and BAR "
+                "detection OK\n");
     return 0;
 }

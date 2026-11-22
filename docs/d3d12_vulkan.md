@@ -412,8 +412,9 @@ affect.
 Build `runtime/` (Vulkan SDK and Python 3 on `PATH`) and run `ctest --test-dir <build> --output-on-failure` for the
 CPU tests:
 - `command_list_test` covers the recording rules.
-- `d3d12_state_map_test` covers both state tables, subresource and barrier-range decoding, and layout tracking. On
-  Windows it also checks every D3D12 constant the IR copies against the SDK's `d3d12.h`.
+- `d3d12_state_map_test` covers both state tables, subresource and barrier-range decoding, layout tracking, the
+  subresource ranges `DiscardResource` prepares, and Resizable BAR detection. On Windows it also checks every D3D12
+  constant the IR copies against the SDK's `d3d12.h`.
 - `gfx10_descriptors_test` covers the T#, S# and V#: every field alone at its bit position, round trips, what
   decoding refuses and ignores, the T#s the image test shaders build, sampler words as radv writes them, and the
   format table. `tests/test_gfx10_descriptors.py` compares that table with `tools/gfx10_formats.json`.
