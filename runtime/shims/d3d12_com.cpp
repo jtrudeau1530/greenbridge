@@ -471,9 +471,19 @@ public:
 
     // The format picks the member of a typeless family to resolve as; the textures' own format is used.
     void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* dst, UINT dst_subresource, ID3D12Resource* src,
-                                              UINT src_subresource, DXGI_FORMAT) override {
+                                              UINT src_subresource, DXGI_FORMAT format) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResolveSubresource");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        const auto integer_color = [](ID3D12Resource* resource) {
+            if (!resource) return false;
+            const auto desc = resource->GetDesc();
+            return !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+                   color_resolve_format_is_integer(desc.Format);
+        };
+        if (color_resolve_format_is_integer(format) || integer_color(dst) || integer_color(src)) {
+            note_once("ResolveSubresource refused: integer colour formats cannot be resolved");
+            return check(false);
+        }
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource}));
     }
 
