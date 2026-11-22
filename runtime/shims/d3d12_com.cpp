@@ -230,7 +230,9 @@ public:
     }
 
     // The bound heaps matter to direct heap indexing, which is still open (section 3.4); tables carry their VAs.
-    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {}
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps", "ignored");
+    }
 
     void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) override {
         constants(compute_, index, 1, &value, offset);
@@ -266,6 +268,7 @@ public:
         address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
     }
     void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable");
         address(graphics_, index, table.ptr, rt::rootsig::ParamType::Table);
     }
 
