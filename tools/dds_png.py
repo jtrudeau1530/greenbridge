@@ -20,6 +20,8 @@ DDS_MAGIC = b"DDS "
 DDS_HEADER_SIZE = 128
 DDS_DX10_HEADER_SIZE = 148
 DDSD_PITCH = 0x8
+DDS_ALPHA_MODE_MASK = 0x7
+DDS_ALPHA_MODE_OPAQUE = 3
 
 DDPF_ALPHAPIXELS = 0x1
 DDPF_FOURCC = 0x4
@@ -716,6 +718,13 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
         rgba = _decode_bc5(data, offset, width, height, signed=True)
     else:
         raise DdsError(f"Unsupported DDS format: {fmt}")
+
+    if offset == DDS_DX10_HEADER_SIZE:
+        misc_flags2 = struct.unpack_from("<I", data, 144)[0]
+        if misc_flags2 & DDS_ALPHA_MODE_MASK == DDS_ALPHA_MODE_OPAQUE:
+            opaque = bytearray(rgba)
+            opaque[3::4] = b"\xff" * (width * height)
+            rgba = bytes(opaque)
 
     return width, height, rgba
 
