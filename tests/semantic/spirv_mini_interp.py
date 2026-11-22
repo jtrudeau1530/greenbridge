@@ -713,9 +713,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             x, y = val(a[1]), val(a[2])
 
             def _fdiv(p, q):
-                if q != 0.0:
-                    return f32(p / q)
-                return f32(math.copysign(math.inf, p) if p != 0.0 else math.nan)
+                # SPIR-V leaves OpFDiv by zero undefined: refuse it, as the interpreter does for every undefined case
+                if q == 0.0:
+                    raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")
+                if math.isinf(p) and math.isinf(q):
+                    return math.nan
+                return f32(p / q)       # x/inf is a signed zero, as in Python
 
             fn = {"OpFAdd": (lambda p, q: f32(p + q)), "OpFSub": (lambda p, q: f32(p - q)),
                   "OpFMul": (lambda p, q: f32(p * q)), "OpFDiv": _fdiv}[op]

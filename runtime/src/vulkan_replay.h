@@ -1496,13 +1496,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             auto pieces = detail::current(tracker, id, p.range, layout);
             detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker);
             if (p.rects.empty()) {
-                detail::round_trip(vk, command_buffer, p.binding.image, pieces, layout, state,
+                detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
                                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
                     vk.clear_color_image(command_buffer, p.binding.image, layout, &p.clear_color, 1, &p.range);
                 });
                 continue;
             }
-            detail::round_trip(vk, command_buffer, p.binding.image, pieces, layout, state,
+            detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
                                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, [&] {
                 VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
