@@ -47,11 +47,13 @@ EXPECT = {
     "vs_w64_c_bcnt_export": ("C", ["lane-count"], None),
     "vs_w64_c_readlane": ("C", ["cross-lane"], None),
     "vs_w64_c_lane_id": ("C", ["lane-id"], None),
+    "gs_w64_a_ring": ("A", [], []),
+    "gs_w64_c_lane_id": ("C", ["lane-id"], None),
 }
 
 
 def test_every_fixture_has_a_tier_and_a_gpu_check():
-    asm = {f[:-4] for f in os.listdir(SHADERS) if f.startswith(("ps_w64_", "vs_w64_")) and f.endswith(".asm")}
+    asm = {f[:-4] for f in os.listdir(SHADERS) if f.startswith(("ps_w64_", "vs_w64_", "gs_w64_")) and f.endswith(".asm")}
     assert asm == set(EXPECT) == set(w64_graphics.FIXTURES)
     for name, (tier, _, _) in EXPECT.items():
         assert w64_graphics.FIXTURES[name][0] == tier
@@ -144,5 +146,5 @@ def test_vs_probe_and_radv_perftest(monkeypatch):
     monkeypatch.setenv("RADV_PERFTEST", "gewave32,nggc")
     assert w64_graphics._radv_perftest(64) == "nggc"                # the user's other flags stay, gewave32 goes
     assert w64_graphics._radv_perftest(32) == "nggc,gewave32"
-    assert w64_graphics.FIXTURES[w64_graphics.VS_PROBE][0] == "C"
+    assert all(w64_graphics.FIXTURES[p][0] == "C" and p.startswith(s) for s, p in w64_graphics.PROBES.items())
     assert w64_graphics.VS_RECORDS * 4 >= 0x100 + 4 * w64_graphics.VS_VERTICES   # the atomic's slots end below the records

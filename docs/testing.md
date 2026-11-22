@@ -168,6 +168,43 @@ To test the wave64 emulation that makes them exact on these GPUs, set `LEONIDA_W
 `check.py`, the shaders are checked against the emulated expectations without being emulated, and every wave64 test
 fails.
 
+## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
+
+Graphics stages have no emulation: on a 32-wide subgroup a wave64 VS, PS or GS runs as two 32-lane halves, and the
+translator marks each one tier A, B or C by whether that can change its results (`docs/design.md`, "Wave64 graphics:
+partition invariance"). `runtime/test/shaders/w64_graphics.py` checks those tiers on a GPU by running each `ps_w64_*`,
+`vs_w64_*` and `gs_w64_*` fixture at wave64 and at wave32: tier A and B must give the same words both ways, tier C
+must differ. CI has no GPU, and the CPU wave interpreter (`tests/semantic/test_wave64_halves.py`) runs vertex shaders
+only, so this comparison needs real hardware.
+
+Vulkan can require a subgroup size for pixel shaders (`VKH_SUBGROUP_SIZE`) but not for vertex or geometry shaders, so
+those two use a RADV switch instead: on GFX10 and newer, RADV runs them as wave64 by default and as wave32 with
+`RADV_PERFTEST=gewave32`. The runner sets it itself and checks the result with a probe fixture per stage
+(`vs_w64_c_lane_id`, `gs_w64_c_lane_id`): the largest lane id must reach 32 at wave64 and stay below 32 at wave32. On
+other drivers (AMD Windows, NVIDIA, Intel) the probe sees no change, and only the default-size checks run; tier C is
+then a `SKIP`, not a failure.
+
+Build and run it on Linux with RADV, pinned to one GPU (`LEONIDA_VK_DEVICE`, see "Choosing the GPU"):
+
+```sh
+cmake -S runtime -B runtime/build/linux -G Ninja && cmake --build runtime/build/linux --target vk_harness
+python3 -I runtime/test/shaders/build.py /tmp/w64g
+LEONIDA_VK_DEVICE=9070 python3 -I runtime/test/shaders/w64_graphics.py /tmp/w64g runtime/build/linux
+LEONIDA_VK_DEVICE=9070 python3 -I runtime/test/shaders/w64_graphics.py /tmp/w64g runtime/build/linux gs_w64_a_ring
+```
+
+Each line prints `ok`, a `SKIP` with its reason, or what differed. To add a fixture:
+
+1. Write `runtime/test/shaders/{ps,vs,gs}_w64_<tier>_<name>.asm` with `; mattr: +wavefrontsize64,-wavefrontsize32`
+   and a header that says what every result word is. Vertex and geometry fixtures store four words per vertex or
+   per triangle to the heap record at `0x1000 + 16 * i`, and every word of a tier A or B fixture is a function of
+   `i` alone, never of the lane (copy the store from `vs_w64_a_skip` or `gs_w64_a_ring`).
+2. Add it to `FIXTURES` in `w64_graphics.py` with its tier and a function that gives the expected words for record
+   `i` (`None` for a word that may depend on the wave size).
+3. Add it to `EXPECT` in `tests/test_wave64_halves_fixtures.py` with the tier, reasons and idioms the translator
+   should give it, and run `python -m pytest tests/test_wave64_halves_fixtures.py`.
+4. Run `w64_graphics.py` on a RADV GPU and say which GPU and Mesa version in the pull request.
+
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 
 Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that
