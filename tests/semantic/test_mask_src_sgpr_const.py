@@ -73,5 +73,42 @@ class SgprConstantMask(unittest.TestCase):
         self.assertEqual(active_lanes(lines, 64), list(range(41, 64)))
 
 
+class MaskAndConstantIntoAnSgpr(unittest.TestCase):
+    """@Pierre-Kookis's case on #1792 (GPU-reproduced on AMD RDNA2 and an RTX 4070 Ti SUPER): an SOP2 of EXEC with a
+    constant into a plain SGPR is data, and s_bcnt1 counts the wave's bits. The first version of this fix put each
+    lane's bit there and got 32 / 0 instead of 1 / 8."""
+
+    def test_s_and_of_exec_with_a_constant_counts_the_wave_bits(self):
+        import struct
+        import tempfile
+        import warnings
+        import spirv_mini_interp as si
+        from support import STUB_DXBC, rdna2spirv
+        lines = ["s_and_b32 s20, exec_lo, 1", "s_bcnt1_i32_b32 s21, s20", "s_and_b32 s22, exec_lo, 0xff00",
+                 "s_bcnt1_i32_b32 s23, s22", "v_lshlrev_b32 v3, 3, v0", "v_mov_b32_e32 v1, s21",
+                 "buffer_store_dword v1, v3, s[0:3], 0 offen", "v_add_nc_u32 v3, 4, v3", "v_mov_b32_e32 v1, s23",
+                 "buffer_store_dword v1, v3, s[0:3], 0 offen", "s_endpgm"]
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, "disasm"))
+            os.mkdir(os.path.join(tmp, "fssm"))
+            with open(os.path.join(tmp, "cs_bcnt.dxbc"), "wb") as f:
+                f.write(STUB_DXBC)
+            hdr = bytearray(0x148)
+            struct.pack_into("<4I", hdr, 0x138, 0x88, 32, 1, 1)
+            with open(os.path.join(tmp, "fssm", "cs_bcnt.fssm"), "wb") as f:
+                f.write(hdr)
+            src = os.path.join(tmp, "disasm", "cs_bcnt.s")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("; cs_bcnt\n" + "".join(f"\t{ln}\n" for ln in lines))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                spv = rdna2spirv.translate(src)
+        mem = si.run_workgroup(spv, 32, 32, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0),
+                                                                   "%sg_lane": i},
+                               push_constants=[0, 0, 0x1000, 0x31016FAC] + [0] * 28, memory={})
+        for lane in range(32):
+            self.assertEqual((mem[8 * lane], mem[8 * lane + 4]), (1, 8), f"lane {lane}")
+
+
 if __name__ == "__main__":
     unittest.main()
