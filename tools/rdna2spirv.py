@@ -11781,11 +11781,13 @@ def assemble(gen):
     if gen.uses_viewport:
         caps.append("ShaderViewportIndex")
     if FLOAT_CONTROLS:
-        # RDNA2 float ops are IEEE: NaN, +-inf and -0 come out as computed. Without this execution mode Vulkan lets
-        # the driver assume none of them occur, and AMD's compiler does: a -0 product came back +0, and a NaN result
-        # narrowed to f16 with integer ops was never stored (RX 9070 XT; docs/design.md, "Float controls").
-        # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks shaderSignedZeroInfNanPreserveFloat32.
-        caps.append("SignedZeroInfNanPreserve")
+        # RDNA2 float ops are IEEE: NaN, +-inf and -0 come out as computed, and f16 denormals are kept. Without these
+        # execution modes Vulkan lets the driver assume none of them occur, and drivers do: AMD's compiler folded a
+        # -0 product to +0 and lost a NaN result narrowed to f16 with integer ops (RX 9070 XT), and NVIDIA flushed
+        # an f16 denormal on its way into f32 (SHADER-526: the 0x0040 that _sdwa src0_sel:BYTE_1 selects read as
+        # +0, RTX 3090 and RTX 4070 SUPER; docs/design.md, "Float controls").
+        # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks the properties in "float_controls".
+        caps += ["SignedZeroInfNanPreserve", "DenormPreserve"]
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if gen.uses_fma_khr:
@@ -11822,7 +11824,8 @@ def assemble(gen):
         if gen.writes_depth:
             hdr.append("OpExecutionMode %main DepthReplacing")
     if FLOAT_CONTROLS:
-        hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 32")
+        hdr += ["OpExecutionMode %main SignedZeroInfNanPreserve 32",
+                "OpExecutionMode %main DenormPreserve 16"]
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -14381,8 +14384,11 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
     if "SignedZeroInfNanPreserve" in caps:
-        # A property, not a feature: VkPhysicalDeviceFloatControlsProperties members the device must report true.
+        # Properties, not features: VkPhysicalDeviceFloatControlsProperties members the device must report true.
+        # DenormPreserve 16 is the second: the driver may otherwise flush an f16 denormal (SHADER-526).
         m["float_controls"] = ["shaderSignedZeroInfNanPreserveFloat32"]
+        if "DenormPreserve" in caps:
+            m["float_controls"].append("shaderDenormPreserveFloat16")
     if g.uses_codebase:
         m["uses_code_base"] = True
     if g.cs:
@@ -14669,8 +14675,9 @@ def main():
     ap.add_argument("--dispatch-loop", action="store_true",
                     help="emit control flow the old way, as one loop around a switch (to compare with the default)")
     ap.add_argument("--no-float-controls", action="store_true",
-                    help="don't declare SignedZeroInfNanPreserve (for a driver whose "
-                         "shaderSignedZeroInfNanPreserveFloat32 is false); NaN, inf and -0 are then not guaranteed")
+                    help="don't declare SignedZeroInfNanPreserve or DenormPreserve (for a driver whose "
+                         "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16 is false); NaN, inf, "
+                         "-0 and f16 denormals are then not guaranteed")
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
