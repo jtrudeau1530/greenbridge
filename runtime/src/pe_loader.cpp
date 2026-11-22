@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -264,6 +265,59 @@ bool prefer_host_copy(const std::string& dll) {
     for (auto* n : names)
         if (dll == n) return true;
     return false;
+}
+
+// MSVC C++ exceptions in a mapped image. _CxxThrowException (vcruntime140.dll) puts the throwing image's base in the
+// exception record, from RtlPcToFileHeader(pThrowInfo); the frame handler adds the ThrowInfo's RVAs (catchable types,
+// copy constructor, destructor) to it. RtlPcToFileHeader only knows images the Windows loader mapped, so for ours the
+// base is 0 and the exception can't be matched to a catch. The host copies the loader binds get their import of it
+// redirected: the Windows answer first, then the modules a live Loader has mapped (shims::mapped_image_base).
+using PcToFileHeaderFn = PVOID(NTAPI*)(PVOID, PVOID*);
+std::atomic<PcToFileHeaderFn> g_host_pc_to_file_header{nullptr};
+
+PVOID NTAPI pc_to_file_header(PVOID pc, PVOID* base) {
+    if (PVOID found = g_host_pc_to_file_header.load()(pc, base)) return found;
+    uint64_t mapped = 0;
+    if (!shims::mapped_image_base(reinterpret_cast<uint64_t>(pc), mapped)) {
+        *base = nullptr;
+        return nullptr;
+    }
+    *base = reinterpret_cast<PVOID>(mapped);
+    return *base;
+}
+
+// Points every import of RtlPcToFileHeader by name in a host module at pc_to_file_header, once per module. The
+// module is a system DLL the Windows loader has already validated and bound, so its tables are read unchecked.
+// The redirect stays for the process lifetime; with no live Loader it answers exactly as Windows does.
+void redirect_pc_to_file_header(HMODULE host) {
+    static std::mutex mutex;
+    static std::vector<HMODULE> done;
+    std::lock_guard lock(mutex);
+    if (std::find(done.begin(), done.end(), host) != done.end()) return;
+    done.push_back(host);
+
+    auto* base = reinterpret_cast<uint8_t*>(host);
+    auto* nt = at<IMAGE_NT_HEADERS64>(base, reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.Size || !dir.VirtualAddress) return;
+    for (auto* d = at<IMAGE_IMPORT_DESCRIPTOR>(base, dir.VirtualAddress); d->Name; ++d) {
+        if (!d->OriginalFirstThunk) continue;  // no name table to match against
+        auto* names = at<IMAGE_THUNK_DATA64>(base, d->OriginalFirstThunk);
+        auto* iat = at<IMAGE_THUNK_DATA64>(base, d->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++iat) {
+            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) continue;
+            auto* by_name = at<IMAGE_IMPORT_BY_NAME>(base, static_cast<uint32_t>(names->u1.AddressOfData));
+            if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), "RtlPcToFileHeader") != 0) continue;
+            auto* slot = reinterpret_cast<void**>(&iat->u1.Function);
+            if (*slot == reinterpret_cast<void*>(&pc_to_file_header)) continue;
+            PcToFileHeaderFn expected = nullptr;  // the first bound address is the Windows function
+            g_host_pc_to_file_header.compare_exchange_strong(expected, reinterpret_cast<PcToFileHeaderFn>(*slot));
+            DWORD old = 0;
+            if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) continue;
+            *slot = reinterpret_cast<void*>(&pc_to_file_header);
+            VirtualProtect(slot, sizeof(void*), old, &old);
+        }
+    }
 }
 
 }  // namespace
@@ -653,6 +707,7 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
 
     HMODULE h = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!h) return nullptr;
+    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
     FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
     if (!p) return nullptr;
     binding = Binding::Host;
@@ -685,6 +740,7 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
     }
     // Host Windows: system DLLs and API sets. LOAD_LIBRARY_SEARCH_SYSTEM32 keeps the game folder out of the search.
     if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
         FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
         if (p) {
             m.imports.push_back({dll, sym, Binding::Host});
