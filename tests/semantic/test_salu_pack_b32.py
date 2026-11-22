@@ -22,6 +22,7 @@ Standard library only; zero game data, zero proprietary assets.
 from __future__ import annotations
 
 import os
+import random
 import struct
 import sys
 import tempfile
@@ -192,6 +193,121 @@ class TestSaluPackB32ExecutionBasics(unittest.TestCase):
             expected = ref_pack(op, s0, s1)
             got, _ = run_pack_op(op, s0, s1, scc_in=0)
             self.assertEqual(got, expected, f"Failed on op={op}")
+
+
+class TestSaluPackB32PermutationsAndRouting(unittest.TestCase):
+    """Exhaustive testing of halfword permutations, register routing, and constants."""
+
+    def test_native_halfword_permutation_matrix(self):
+        # S0: hi=0x1111, lo=0x2222; S1: hi=0x3333, lo=0x4444
+        s0 = 0x11112222
+        s1 = 0x33334444
+
+        # s_pack_ll_b32_b16: S1[15:0] as hi, S0[15:0] as lo -> 0x44442222
+        res_ll, _ = run_pack_op("s_pack_ll_b32_b16", s0, s1)
+        self.assertEqual(res_ll, 0x44442222)
+        self.assertEqual(res_ll, ref_pack_ll_b32_b16(s0, s1))
+
+        # s_pack_lh_b32_b16: S1[31:16] as hi, S0[15:0] as lo -> 0x33332222
+        res_lh, _ = run_pack_op("s_pack_lh_b32_b16", s0, s1)
+        self.assertEqual(res_lh, 0x33332222)
+        self.assertEqual(res_lh, ref_pack_lh_b32_b16(s0, s1))
+
+        # s_pack_hh_b32_b16: S1[31:16] as hi, S0[31:16] as lo -> 0x33331111
+        res_hh, _ = run_pack_op("s_pack_hh_b32_b16", s0, s1)
+        self.assertEqual(res_hh, 0x33331111)
+        self.assertEqual(res_hh, ref_pack_hh_b32_b16(s0, s1))
+
+    def test_halfword_permutation_matrix_second_vector(self):
+        # S0: hi=0xAAAA, lo=0x5555; S1: hi=0xCCCC, lo=0x3333
+        s0 = 0xAAAA5555
+        s1 = 0xCCCC3333
+
+        res_ll, _ = run_pack_op("s_pack_ll_b32_b16", s0, s1)
+        self.assertEqual(res_ll, 0x33335555)
+        self.assertEqual(res_ll, ref_pack_ll_b32_b16(s0, s1))
+
+        res_lh, _ = run_pack_op("s_pack_lh_b32_b16", s0, s1)
+        self.assertEqual(res_lh, 0xCCCC5555)
+        self.assertEqual(res_lh, ref_pack_lh_b32_b16(s0, s1))
+
+        res_hh, _ = run_pack_op("s_pack_hh_b32_b16", s0, s1)
+        self.assertEqual(res_hh, 0xCCCCAAAA)
+        self.assertEqual(res_hh, ref_pack_hh_b32_b16(s0, s1))
+
+    def test_synthesized_hl_packing_via_operand_swap(self):
+        # RDNA2 lacks an s_pack_hl instruction. HL packing (S0[31:16] as hi, S1[15:0] as lo)
+        # is synthesized by executing s_pack_lh with swapped source registers:
+        # s_pack_lh D, S1, S0 places S1[15:0] in D[15:0] and S0[31:16] in D[31:16].
+        s0 = 0x11112222
+        s1 = 0x33334444
+        lines = [
+            f"s_mov_b32 s2, {s0:#x}",
+            f"s_mov_b32 s3, {s1:#x}",
+            "s_pack_lh_b32_b16 s0, s3, s2",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+        ]
+        got, _ = run_assembly_lines(lines)
+        self.assertEqual(got, 0x11114444)
+
+    def test_register_routing_different_sgpr_banks(self):
+        # Test routing through non-contiguous and higher-index SGPRs
+        lines = [
+            "s_mov_b32 s6, 0x01234567",
+            "s_mov_b32 s8, 0x89ABCDEF",
+            "s_pack_ll_b32_b16 s10, s6, s8",
+            "s_pack_lh_b32_b16 s12, s6, s8",
+            "s_pack_hh_b32_b16 s14, s6, s8",
+            "v_mov_b32 v0, s10",
+            "v_mov_b32 v1, s12",
+        ]
+        res0, res1 = run_assembly_lines(lines)
+        self.assertEqual(res0, 0xCDEF4567)
+        self.assertEqual(res1, 0x89AB4567)
+
+    def test_scc_preservation_across_all_opcodes(self):
+        # Test that both SCC=0 and SCC=1 are unmodified by all three pack opcodes
+        for op in PACK_OPS:
+            for scc_in in (0, 1):
+                with self.subTest(op=op, scc_in=scc_in):
+                    _, scc_out = run_pack_op(op, 0x12345678, 0x9ABCDEF0, scc_in=scc_in)
+                    self.assertEqual(scc_out, scc_in, f"SCC corrupted for {op}: expected {scc_in}, got {scc_out}")
+
+    def test_literal_and_inline_constant_operands(self):
+        lines = [
+            "s_mov_b32 s2, 0x11112222",
+            "s_pack_ll_b32_b16 s0, 0x1234, -1",
+            "s_pack_lh_b32_b16 s1, s2, 0x56780000",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+        ]
+        res0, res1 = run_assembly_lines(lines)
+        self.assertEqual(res0, 0xFFFF1234)
+        self.assertEqual(res1, 0x56782222)
+
+        lines2 = [
+            "s_pack_hh_b32_b16 s0, 0xABCD0000, 0x12340000",
+            "s_pack_ll_b32_b16 s1, 0, 1",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+        ]
+        res2_0, res2_1 = run_assembly_lines(lines2)
+        self.assertEqual(res2_0, 0x1234ABCD)
+        self.assertEqual(res2_1, 0x00010000)
+
+    def test_seeded_pseudo_random_combinations(self):
+        rng = random.Random(0x5A1C)
+        for i in range(15):
+            op = rng.choice(list(PACK_OPS.keys()))
+            s0 = rng.getrandbits(32)
+            s1 = rng.getrandbits(32)
+            scc_in = i % 2
+            expected = ref_pack(op, s0, s1)
+            with self.subTest(i=i, op=op, s0=hex(s0), s1=hex(s1), scc=scc_in):
+                got, scc_out = run_pack_op(op, s0, s1, scc_in=scc_in)
+                self.assertEqual(got, expected)
+                self.assertEqual(scc_out, scc_in)
 
 
 if __name__ == "__main__":
