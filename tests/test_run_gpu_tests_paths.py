@@ -74,5 +74,119 @@ class RelativePaths(unittest.TestCase):
                 self.assertEqual(Path(got).resolve(), want.resolve())
 
 
+class BuildConfigurations(unittest.TestCase):
+    def test_single_configuration_directory_is_preferred(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for directory in (root, root / "RelWithDebInfo"):
+                directory.mkdir(exist_ok=True)
+                for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                    (directory / (tool + ".exe")).touch()
+            self.assertEqual(run_gpu_tests.find_test_programs(str(root), ".exe"), str(root))
+
+    def test_visual_studio_relwithdebinfo_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp)
+            config = build / "RelWithDebInfo"
+            config.mkdir()
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                (config / (tool + ".exe")).touch()
+            self.assertEqual(run_gpu_tests.find_test_programs(str(build), ".exe"), str(config))
+
+    def test_visual_studio_release_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp)
+            config = build / "Release"
+            config.mkdir()
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                (config / (tool + ".exe")).touch()
+            self.assertEqual(run_gpu_tests.find_test_programs(str(build), ".exe"), str(config))
+
+    def test_incomplete_configuration_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp)
+            incomplete = build / "RelWithDebInfo"
+            release = build / "Release"
+            incomplete.mkdir()
+            release.mkdir()
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS[:-1]:
+                (incomplete / (tool + ".exe")).touch()
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                (release / (tool + ".exe")).touch()
+            self.assertEqual(run_gpu_tests.find_test_programs(str(build), ".exe"), str(release))
+
+    def test_missing_programs_returns_no_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(run_gpu_tests.find_test_programs(tmp, ".exe"))
+
+
+    def test_relwithdebinfo_is_preferred_over_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp)
+            for config_name in run_gpu_tests.BUILD_CONFIGS:
+                config = build / config_name
+                config.mkdir()
+                for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                    (config / (tool + ".exe")).touch()
+            self.assertEqual(run_gpu_tests.find_test_programs(str(build), ".exe"),
+                             str(build / "RelWithDebInfo"))
+
+    def test_extensionless_executables_are_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                (Path(tmp) / tool).touch()
+            self.assertEqual(run_gpu_tests.find_test_programs(tmp, ""), tmp)
+
+    def test_programs_are_not_combined_across_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp)
+            (build / "RelWithDebInfo").mkdir()
+            (build / "Release").mkdir()
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS[:2]:
+                (build / "RelWithDebInfo" / (tool + ".exe")).touch()
+            for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS[2:]:
+                (build / "Release" / (tool + ".exe")).touch()
+            self.assertIsNone(run_gpu_tests.find_test_programs(str(build), ".exe"))
+
+    def test_missing_program_error_lists_per_directory_files(self):
+        ext = ".exe" if os.name == "nt" else ""
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / "build output"
+            rel = build / "RelWithDebInfo"
+            rel.mkdir(parents=True)
+            (rel / ("vk_compute_test" + ext)).touch()
+            (rel / ("vk_store_test" + ext)).touch()
+            with (patch.object(sys, "argv", ["run_gpu_tests.py", "--build", str(build)]),
+                  self.assertRaises(SystemExit) as caught):
+                run_gpu_tests.main()
+            message = str(caught.exception)
+            self.assertIn(str(build), message)
+            self.assertIn(str(rel), message)
+            self.assertIn("vk_harness" + ext, message)
+            self.assertIn("--config RelWithDebInfo", message)
+            self.assertIn("--target vk_compute_test vk_store_test vk_harness", message)
+
+    def test_main_passes_visual_studio_config_directory_to_suite(self):
+        ext = ".exe" if os.name == "nt" else ""
+        for config_name in run_gpu_tests.BUILD_CONFIGS:
+            with self.subTest(config=config_name), tempfile.TemporaryDirectory() as tmp:
+                build = Path(tmp) / "build"
+                config = build / config_name
+                config.mkdir(parents=True)
+                for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+                    (config / (tool + ext)).touch()
+                seen = {}
+
+                def suite(a, work):
+                    seen["build"] = a.build
+                    return 0
+
+                with (patch.object(sys, "argv", [
+                          "run_gpu_tests.py", "--build", str(build), "--work", str(Path(tmp) / "work")]),
+                      patch.object(run_gpu_tests, "run_suite", side_effect=suite)):
+                    self.assertEqual(run_gpu_tests.main(), 0)
+                self.assertEqual(Path(seen["build"]).resolve(), config.resolve())
+
+
 if __name__ == "__main__":
     unittest.main()

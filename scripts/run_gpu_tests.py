@@ -426,6 +426,24 @@ def with_draw_shaders(asm_files: list[str]) -> list[str]:
     return build
 
 
+REQUIRED_TEST_PROGRAMS = ("vk_compute_test", "vk_store_test", "vk_harness")
+BUILD_CONFIGS = ("RelWithDebInfo", "Release")
+
+
+def find_test_programs(build: str, ext: str) -> str | None:
+    """Return the directory containing all required GPU test programs.
+
+    Single-configuration generators (Ninja, Makefiles) put executables directly
+    in the build directory. Visual Studio and other multi-configuration
+    generators put them in a configuration subdirectory.
+    """
+    candidates = [build, *(os.path.join(build, config) for config in BUILD_CONFIGS)]
+    for directory in candidates:
+        if all(os.path.isfile(os.path.join(directory, name + ext)) for name in REQUIRED_TEST_PROGRAMS):
+            return directory
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
@@ -448,6 +466,23 @@ def main() -> int:
     missing = [t for t in required if not os.path.isfile(os.path.join(a.build, t))]
     if missing:
         sys.exit(not_found_message(a.build, missing))
+    requested_build = a.build
+    resolved_build = find_test_programs(requested_build, ext)
+    if resolved_build is None:
+        searched = [requested_build, *(os.path.join(requested_build, config) for config in BUILD_CONFIGS)]
+        details = []
+        for directory in searched:
+            missing = [name + ext for name in REQUIRED_TEST_PROGRAMS
+                       if not os.path.isfile(os.path.join(directory, name + ext))]
+            details.append(f"  {directory}: {', '.join(missing)}")
+        sys.exit("Required GPU test programs were not found together in one build directory.\n"
+                 "Missing files by searched directory:\n" + "\n".join(details) + "\n"
+                 "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
+                 "For Visual Studio, use: cmake --build <build-dir> --config RelWithDebInfo "
+                 "--target vk_compute_test vk_store_test vk_harness.\n"
+                 "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
+                 "Vulkan headers (vulkan-headers on Arch) and configure again.")
+    a.build = resolved_build
 
     work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
     try:
