@@ -1363,6 +1363,15 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         raise
     bad = [f"shard {i} exited with {r}" for i, r in zip(todo, codes) if r != 0]
     if bad:
+        # An older index describes the corpus from the run before: keeping it would make the next run take the
+        # failed translation as finished. The next successful --merge writes it again.
+        index = os.path.join(spirv, "index.json")
+        try:
+            os.remove(index)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log(f"  cannot remove the stale {index}: {e}")
         fail("rdna2spirv.py: " + ", ".join(bad))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
     index = os.path.join(spirv, "index.json")
