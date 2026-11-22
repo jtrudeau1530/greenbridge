@@ -31,6 +31,8 @@ import re
 import struct
 import sys
 import unittest
+from dataclasses import dataclass
+from enum import Enum, auto
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -332,6 +334,258 @@ class TestValuMed3Oracle(unittest.TestCase):
         self.assertEqual(ref_med3_f32(b1, b1, b1, omod="mul:2"), f32_to_bits(2.0))
         self.assertEqual(ref_med3_f32(b1, b1, b1, omod="mul:4"), f32_to_bits(4.0))
         self.assertEqual(ref_med3_f32(b1, b1, b1, omod="div:2"), f32_to_bits(0.5))
+
+
+class DataType(Enum):
+    """Data types supported by RDNA2 VALU median instructions."""
+    F32 = auto()
+    I32 = auto()
+    U32 = auto()
+
+
+class OperandKind(Enum):
+    """Classification of instruction operands."""
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL_I32 = auto()
+    LITERAL_U32 = auto()
+    LITERAL_F32 = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass
+class Operand:
+    """Typed operand representation in symbolic AST."""
+    kind: OperandKind
+    data_type: DataType
+    reg_index: int = 0
+    literal_val: int = 0
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def validate(self) -> None:
+        if self.kind == OperandKind.VGPR:
+            if not (0 <= self.reg_index < 256):
+                raise ValueError(f"VGPR index {self.reg_index} out of valid range [0, 256)")
+        elif self.kind == OperandKind.SGPR:
+            if not (0 <= self.reg_index < 106):
+                raise ValueError(f"SGPR index {self.reg_index} out of valid range [0, 106)")
+
+    def to_asm(self) -> str:
+        s = ""
+        if self.kind == OperandKind.VGPR:
+            s = f"v{self.reg_index}"
+        elif self.kind == OperandKind.SGPR:
+            s = f"s{self.reg_index}"
+        elif self.kind == OperandKind.LITERAL_I32:
+            s = str(s32(self.literal_val))
+        elif self.kind == OperandKind.LITERAL_U32:
+            s = f"0x{self.literal_val:08X}"
+        elif self.kind == OperandKind.LITERAL_F32:
+            s = f"{bits_to_f32(self.literal_val)}"
+        elif self.kind == OperandKind.INLINE_CONST:
+            s = str(self.literal_val)
+
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass
+class InstructionAST:
+    """Symbolic AST node for v_med3_f32 / v_med3_i32 / v_med3_u32."""
+    opcode: str
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+    omod: str = "none"
+
+    def validate(self) -> None:
+        if self.opcode not in ("v_med3_f32", "v_med3_i32", "v_med3_u32"):
+            raise ValueError(f"Unsupported opcode {self.opcode}")
+        if self.dst.kind != OperandKind.VGPR:
+            raise TypeError("Destination must be a 32-bit VGPR")
+        if self.dst.abs_mod or self.dst.neg_mod:
+            raise ValueError("Destination does not support input modifiers")
+
+        expected_type = (
+            DataType.F32 if self.opcode == "v_med3_f32"
+            else (DataType.I32 if self.opcode == "v_med3_i32" else DataType.U32)
+        )
+        if self.dst.data_type != expected_type:
+            raise TypeError(f"Destination type must be {expected_type}")
+
+        for i, src in enumerate((self.src0, self.src1, self.src2)):
+            if src.data_type != expected_type:
+                raise TypeError(f"src{i} must be {expected_type}")
+            if self.opcode != "v_med3_f32" and (src.abs_mod or src.neg_mod):
+                raise ValueError(f"Integer opcode {self.opcode} does not support float abs/neg modifiers")
+
+        if self.opcode != "v_med3_f32" and self.omod != "none":
+            raise ValueError(f"Integer opcode {self.opcode} does not support omod modifier")
+        if self.omod not in ("none", "mul:2", "mul:4", "div:2"):
+            raise ValueError(f"Invalid omod modifier '{self.omod}'")
+
+        self.dst.validate()
+        self.src0.validate()
+        self.src1.validate()
+        self.src2.validate()
+
+    def to_asm(self) -> str:
+        tokens = [f"{self.opcode} {self.dst.to_asm()}, {self.src0.to_asm()}, {self.src1.to_asm()}, {self.src2.to_asm()}"]
+        if self.clamp:
+            tokens.append("clamp")
+        if self.omod != "none":
+            tokens.append(self.omod)
+        return " ".join(tokens)
+
+
+def parse_vop3_med3(asm_line: str) -> InstructionAST:
+    """Parse assembly string into an InstructionAST."""
+    line = asm_line.strip()
+    if ";" in line:
+        line = line.split(";", 1)[0].strip()
+    if "//" in line:
+        line = line.split("//", 1)[0].strip()
+
+    parts = line.split(None, 1)
+    if len(parts) < 2:
+        raise ValueError(f"Incomplete instruction: {line}")
+
+    opcode = parts[0]
+    if opcode not in ("v_med3_f32", "v_med3_i32", "v_med3_u32"):
+        raise ValueError(f"Unsupported opcode: {opcode}")
+
+    d_type = (
+        DataType.F32 if opcode == "v_med3_f32"
+        else (DataType.I32 if opcode == "v_med3_i32" else DataType.U32)
+    )
+
+    tokens = [t.strip() for t in parts[1].split(",") if t.strip()]
+    if len(tokens) < 4:
+        raise ValueError(f"{opcode} requires 4 operand sections, got {len(tokens)}")
+
+    dst_str = tokens[0]
+    src0_str = tokens[1]
+    src1_str = tokens[2]
+    last_tokens = tokens[3].split()
+    src2_str = last_tokens[0]
+    mod_tokens = [m.lower() for m in last_tokens[1:]]
+
+    clamp = "clamp" in mod_tokens
+    omod = "none"
+    for m in mod_tokens:
+        if m in ("mul:2", "mul:4", "div:2"):
+            omod = m
+
+    m_dst = re.match(r"^v(\d+)$", dst_str.strip())
+    if not m_dst:
+        raise ValueError(f"Invalid VGPR destination format: {dst_str}")
+    dst_op = Operand(kind=OperandKind.VGPR, data_type=d_type, reg_index=int(m_dst.group(1)))
+
+    def parse_src(s_raw: str) -> Operand:
+        s = s_raw.strip()
+        neg = False
+        abs_m = False
+        if d_type == DataType.F32:
+            if s.startswith("-"):
+                neg = True
+                s = s[1:].strip()
+            if s.startswith("|") and s.endswith("|"):
+                abs_m = True
+                s = s[1:-1].strip()
+
+        m_v = re.match(r"^v(\d+)$", s)
+        m_s = re.match(r"^s(\d+)$", s)
+        if m_v:
+            return Operand(kind=OperandKind.VGPR, data_type=d_type, reg_index=int(m_v.group(1)), abs_mod=abs_m, neg_mod=neg)
+        elif m_s:
+            return Operand(kind=OperandKind.SGPR, data_type=d_type, reg_index=int(m_s.group(1)), abs_mod=abs_m, neg_mod=neg)
+        else:
+            if d_type == DataType.F32:
+                try:
+                    if s.startswith("0x") or s.startswith("0X"):
+                        val = int(s, 16)
+                    else:
+                        val = f32_to_bits(float(s))
+                    return Operand(kind=OperandKind.LITERAL_F32, data_type=d_type, literal_val=val, abs_mod=abs_m, neg_mod=neg)
+                except ValueError:
+                    raise ValueError(f"Unrecognized f32 literal: {s_raw}")
+            elif d_type == DataType.I32:
+                val = int(s, 16) if (s.startswith("0x") or s.startswith("0X")) else int(s)
+                return Operand(kind=OperandKind.LITERAL_I32, data_type=d_type, literal_val=val, abs_mod=abs_m, neg_mod=neg)
+            else:
+                val = int(s, 16) if (s.startswith("0x") or s.startswith("0X")) else int(s)
+                return Operand(kind=OperandKind.LITERAL_U32, data_type=d_type, literal_val=val & MASK32, abs_mod=abs_m, neg_mod=neg)
+
+    src0_op = parse_src(src0_str)
+    src1_op = parse_src(src1_str)
+    src2_op = parse_src(src2_str)
+
+    ast = InstructionAST(
+        opcode=opcode,
+        dst=dst_op,
+        src0=src0_op,
+        src1=src1_op,
+        src2=src2_op,
+        clamp=clamp,
+        omod=omod,
+    )
+    ast.validate()
+    return ast
+
+
+class TestValuMed3SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_validation(self):
+        dst = Operand(OperandKind.VGPR, DataType.F32, reg_index=0)
+        s0 = Operand(OperandKind.VGPR, DataType.F32, reg_index=1)
+        s1 = Operand(OperandKind.SGPR, DataType.F32, reg_index=2)
+        s2 = Operand(OperandKind.LITERAL_F32, DataType.F32, literal_val=ONE_F32)
+        ast = InstructionAST("v_med3_f32", dst, s0, s1, s2, clamp=True, omod="mul:2")
+        ast.validate()
+        self.assertEqual(ast.to_asm(), "v_med3_f32 v0, v1, s2, 1.0 clamp mul:2")
+
+    def test_parser_opcodes(self):
+        ast_f = parse_vop3_med3("v_med3_f32 v0, v1, v2, v3")
+        self.assertEqual(ast_f.opcode, "v_med3_f32")
+        self.assertEqual(ast_f.dst.data_type, DataType.F32)
+
+        ast_i = parse_vop3_med3("v_med3_i32 v5, v6, s7, -42")
+        self.assertEqual(ast_i.opcode, "v_med3_i32")
+        self.assertEqual(ast_i.dst.reg_index, 5)
+        self.assertEqual(ast_i.src2.literal_val, -42)
+
+        ast_u = parse_vop3_med3("v_med3_u32 v10, v11, v12, 0x80000000")
+        self.assertEqual(ast_u.opcode, "v_med3_u32")
+        self.assertEqual(ast_u.src2.literal_val, 0x80000000)
+
+    def test_parser_modifiers(self):
+        ast = parse_vop3_med3("v_med3_f32 v0, -|v1|, v2, s3 clamp mul:4")
+        self.assertTrue(ast.src0.abs_mod)
+        self.assertTrue(ast.src0.neg_mod)
+        self.assertTrue(ast.clamp)
+        self.assertEqual(ast.omod, "mul:4")
+
+    def test_ast_type_validation_errors(self):
+        dst_bad = Operand(OperandKind.SGPR, DataType.F32, reg_index=0)
+        s0 = Operand(OperandKind.VGPR, DataType.F32, reg_index=1)
+        s1 = Operand(OperandKind.VGPR, DataType.F32, reg_index=2)
+        s2 = Operand(OperandKind.VGPR, DataType.F32, reg_index=3)
+        with self.assertRaises(TypeError):
+            InstructionAST("v_med3_f32", dst_bad, s0, s1, s2).validate()
+
+        s0_mod = Operand(OperandKind.VGPR, DataType.I32, reg_index=1, neg_mod=True)
+        dst_i = Operand(OperandKind.VGPR, DataType.I32, reg_index=0)
+        s1_i = Operand(OperandKind.VGPR, DataType.I32, reg_index=2)
+        s2_i = Operand(OperandKind.VGPR, DataType.I32, reg_index=3)
+        with self.assertRaises(ValueError):
+            InstructionAST("v_med3_i32", dst_i, s0_mod, s1_i, s2_i).validate()
 
 
 if __name__ == "__main__":
