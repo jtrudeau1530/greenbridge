@@ -92,6 +92,49 @@ class Unavailable(unittest.TestCase):
             with self.assertRaises(runner.Unavailable):
                 runner.find_hip_dll()
 
+    def test_host_compiler_choice(self):
+        here = str(Path(__file__))   # any file that exists stands in for a compiler
+        cl = str(Path(here).with_name("cl.exe"))
+        which = {"gcc": None, "cl": None}
+        real_isfile = os.path.isfile
+        no_msys = lambda p: False if "msys64" in p else real_isfile(p)   # noqa: E731 (hide an installed MSYS2)
+        with unittest.mock.patch.object(runner.shutil, "which", side_effect=lambda n: which.get(n)), \
+                unittest.mock.patch.object(runner.os.path, "isfile", side_effect=no_msys), \
+                unittest.mock.patch.object(runner, "find_vcvars", return_value=None), \
+                unittest.mock.patch.dict(os.environ, {"LEONIDA_HOST_CC": ""}):
+            with self.assertRaises(runner.Unavailable) as cm:
+                runner.find_cc()
+            self.assertIn("Visual Studio", str(cm.exception))
+            which["gcc"] = here
+            self.assertEqual(runner.find_cc(), ("gcc", here))                  # gcc stays first
+            if os.name == "nt":
+                which["gcc"], which["cl"] = None, here
+                self.assertEqual(runner.find_cc(), ("msvc", here))             # a Developer shell's cl
+                which["cl"] = None
+                with unittest.mock.patch.object(runner, "find_vcvars", return_value=here):
+                    self.assertEqual(runner.find_cc(), ("vcvars", here))       # VS found through vswhere
+            with unittest.mock.patch.dict(os.environ, {"LEONIDA_HOST_CC": here}):
+                self.assertEqual(runner.find_cc(), ("gcc", here))
+        with unittest.mock.patch.object(runner.os.path, "isfile", return_value=True), \
+                unittest.mock.patch.dict(os.environ, {"LEONIDA_HOST_CC": cl}):
+            self.assertEqual(runner.find_cc(), ("msvc", cl))                   # the override may be cl.exe
+
+    def test_host_compiler_commands(self):
+        work = os.path.join(os.sep, "w")
+        self.assertEqual(runner.build_command("gcc", "gcc", "a.c", "o.exe", work), ["gcc", "-O1", "a.c", "-o", "o.exe"])
+        cl = runner.build_command("msvc", "cl.exe", "a.c", "o.exe", work)
+        self.assertEqual(cl[:4], ["cl.exe", "/nologo", "/O1", "a.c"])
+        self.assertIn("/Feo.exe", cl)
+        self.assertIn("/Fo" + os.path.join(work, ""), cl)                      # objects stay out of the cwd
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = runner.build_command("vcvars", r"C:\VS 2022\vcvars64.bat", "a.c", "o.exe", tmp)
+            self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
+            script = Path(argv[3]).read_text(encoding="ascii")
+            self.assertIn('call "C:\\VS 2022\\vcvars64.bat"', script)          # quoted: the path has a space
+            self.assertIn("cl /nologo /O1 a.c /Feo.exe", script)
+            self.assertIn("Installer", script)                                 # vcvars needs vswhere on PATH
+
     def test_salu_diff_exits_77_without_the_tools(self):
         env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOLS / "no-such-clang.exe"))
         r = subprocess.run([sys.executable, "-I", str(TOOLS / "salu_diff.py"), "--oracle", "hw", "--programs", "3"],
