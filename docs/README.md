@@ -17,7 +17,7 @@ method, scope and caveats. No game data is included.
 
 | Document | Measured content |
 |---|---|
-| [models.md](models.md) | 155,598 models at the `48557ea` pin; `917e9b9` adds the `packs.rpf` dictionary roots (24,034 models there). |
+| [models.md](models.md) | 350,248 models at the `917e9b9` pin, including 159,483 drawable-dictionary children; the re-count table is in models.md. |
 | [resource_names.md](resource_names.md) | RPF9 named-resource index: bounded-inflate lookup for `name.#dr`/`#ft`/`#dd` without the TOC. |
 | [textures.md](textures.md) | 308,895 TTPF textures exported; 48,220 skips, mostly BCPack. |
 | [textures_arrays.md](textures_arrays.md) | 678 TTPF array/volume descriptors: 90 tile-mode-9 cubes have a validated 6-slice allocation layout; 588 remain unresolved. |
