@@ -100,6 +100,26 @@ MODE_FIELDS = {
 }
 
 
+# MODE fields a kernel descriptor can no longer set: GFX11.7 and GFX12 have fixed IEEE / DX10_CLAMP behaviour, and AMD
+# clang (rocm-sdk-core 10.0.0) rejects .amdhsa_ieee_mode and .amdhsa_dx10_clamp for gfx1201 with "directive
+# unsupported on gfx1170+" (FUZZ-43, found by @Dom-in in #1548). The four denormal and rounding fields still assemble.
+_MODE_FIXED = ("ieee", "dx10_clamp")
+
+
+def mode_skip_reason(mode, arch):
+    """Why a kernel's starting MODE cannot be set on this architecture, or None. A kernel that asks for one of
+    _MODE_FIXED on gfx1170+ (GFX11.7 and GFX12) is reported as not runnable there, rather than reaching the assembler,
+    which rejects the directive and, when every kernel of a chunk sets it, the whole chunk."""
+    fam = family(arch)
+    if not (fam == "gfx12" or (fam == "gfx11" and int(arch[5], 16) >= 7)):
+        return None
+    fixed = sorted(k for k in (mode or {}) if k in _MODE_FIXED)
+    if not fixed:
+        return None
+    return (f"MODE {', '.join(fixed)} cannot be set on {arch}: {', '.join(MODE_FIELDS[k] for k in fixed)} "
+            "is unsupported on gfx1170+ (the behaviour is fixed there)")
+
+
 # The global memory instructions GFX11 renamed, under their GFX10 names. A raw kernel body is written with the
 # GFX11 ones (crosslane_fuzz stores with global_store_b32); a GFX10 assembler only takes the old spelling.
 _GFX10_NAMES = {f"global_{kind}_b{bits}": f"global_{kind}_dword{suffix}"

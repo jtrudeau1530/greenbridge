@@ -178,6 +178,32 @@ class ToolchainFallbacks(unittest.TestCase):
             self.assertEqual(o.run([kernel], words=1), [[0x3C00]])
             self.assertEqual("v8.l" in texts[0], true16)
 
+    def test_a_mode_the_architecture_cannot_set_is_never_assembled(self):
+        # FUZZ-43: gfx1170+ rejects .amdhsa_ieee_mode / .amdhsa_dx10_clamp. Those kernels come back as a reason; the
+        # others in the same run are still assembled and launched.
+        o = self.oracle("gfx1201")
+        o.true16, texts = False, []
+        o._assemble = lambda text, wave=32: (texts.append(text) or "k.co", "")
+        o._launch = lambda co, names, words=4: (0, "".join(f"{n.split(':')[0]} 0000002a\n" for n in names), "")
+        body = ["s_endpgm"]
+        kernels = [asm.Kernel(body, words=1, raw=True, mode={"ieee": 0}),
+                   asm.Kernel(body, words=1, raw=True, mode={"denorm32": 3}),
+                   asm.Kernel(body, words=1, raw=True, mode={"dx10_clamp": 1, "round32": 1})]
+        got = o.run(kernels, words=1)
+        self.assertIn("MODE ieee cannot be set on gfx1201", got[0])
+        self.assertEqual(got[1], [0x2A])
+        self.assertIn("MODE dx10_clamp cannot be set on gfx1201", got[2])
+        self.assertEqual(len(texts), 1)
+        self.assertNotIn(".amdhsa_ieee_mode", texts[0])
+        self.assertNotIn(".amdhsa_dx10_clamp", texts[0])
+
+    def test_every_kernel_skipped_is_not_a_broken_chunk(self):
+        o = self.oracle("gfx1201")
+        o.true16 = False
+        o._assemble = lambda text, wave=32: self.fail("nothing should be assembled")
+        got = o.run([asm.Kernel(["s_endpgm"], words=1, raw=True, mode={"ieee": 1}) for _ in range(3)], words=1)
+        self.assertTrue(all(isinstance(g, str) and "unsupported on gfx1170+" in g for g in got))
+
 
 class Filters(unittest.TestCase):
     def test_literals(self):
@@ -188,6 +214,17 @@ class Filters(unittest.TestCase):
         self.assertEqual(asm.literals("s_and_b32 s4, -1000, 0xfffffc18"), {0xFFFFFC18})   # one 32-bit value
         self.assertEqual(asm.literals("s_cmpk_lt_u32 s4, 0x8000"), set())     # SIMM16, not a literal
         self.assertEqual(asm.literals("s_movk_i32 s4, 0xffff"), set())
+
+    def test_mode_skip_reasons(self):
+        for arch in ("gfx1013", "gfx1030", "gfx1100", "gfx1150", "gfx1151"):
+            self.assertIsNone(asm.mode_skip_reason({"ieee": 0, "dx10_clamp": 0}, arch), arch)
+        for arch in ("gfx1170", "gfx1200", "gfx1201"):
+            self.assertIn("ieee", asm.mode_skip_reason({"ieee": 0}, arch))
+            self.assertIn(".amdhsa_dx10_clamp", asm.mode_skip_reason({"dx10_clamp": 1, "denorm32": 3}, arch))
+            # the denormal and rounding fields still assemble there
+            self.assertIsNone(asm.mode_skip_reason({"denorm32": 3, "denorm16_64": 0, "round32": 1,
+                                                    "round16_64": 2}, arch), arch)
+            self.assertIsNone(asm.mode_skip_reason(None, arch))
 
     def test_skip_reasons(self):
         self.assertIsNone(asm.skip_reason(PROG, "gfx1150"))

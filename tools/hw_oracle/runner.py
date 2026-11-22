@@ -281,10 +281,15 @@ class Oracle:
 
     def run(self, programs, words=4):
         """Run each program (a list of lines). Returns one entry per program: a list of `words` ints, or a str
-        explaining why it could not run (assembler rejection)."""
+        explaining why it could not run (assembler rejection, or a MODE field this architecture cannot set)."""
         results = [None] * len(programs)
+        for i, p in enumerate(programs):
+            why = asm.mode_skip_reason(p.mode, self.arch) if isinstance(p, asm.Kernel) else None
+            if why:
+                results[i] = why            # never assembled: the directive would fail its whole chunk
         for wave in (32, 64):
-            todo = [i for i, p in enumerate(programs) if (p.wave if isinstance(p, asm.Kernel) else 32) == wave]
+            todo = [i for i, p in enumerate(programs) if results[i] is None and
+                    (p.wave if isinstance(p, asm.Kernel) else 32) == wave]
             for lo in range(0, len(todo), self.chunk):
                 self._run_chunk(programs, todo[lo:lo + self.chunk], results, words, wave)
         return results
