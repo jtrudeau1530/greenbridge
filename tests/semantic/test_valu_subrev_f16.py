@@ -611,6 +611,90 @@ def parse_subrev_f16_asm(asm_text: str) -> InstructionAST:
 
 
 # ============================================================================
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ============================================================================
+
+class ScalarMachineState:
+    """Deterministic scalar machine state representing VGPRs, SGPRs, and status registers."""
+
+    def __init__(self) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
+
+    def get_vgpr(self, index: int) -> int:
+        if not (0 <= index < 256):
+            raise IndexError(f"VGPR index {index} out of bounds.")
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        if not (0 <= index < 256):
+            raise IndexError(f"VGPR index {index} out of bounds.")
+        self.vgprs[index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        if not (0 <= index < 106):
+            raise IndexError(f"SGPR index {index} out of bounds.")
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        if not (0 <= index < 106):
+            raise IndexError(f"SGPR index {index} out of bounds.")
+        self.sgprs[index] = val & MASK32
+
+    def read_reg16(self, reg: Register, op_sel_hi: bool = False) -> int:
+        """Read a 16-bit halfword from a VGPR or SGPR."""
+        use_hi = reg.hi or op_sel_hi
+        word = self.get_vgpr(reg.index) if reg.kind == RegKind.VGPR else self.get_sgpr(reg.index)
+        return extract_half(word, use_hi)
+
+    def write_vgpr16(self, index: int, val16: int, hi: bool = False) -> None:
+        """Write 16-bit halfword into VGPR, preserving the opposite 16-bit half."""
+        old_word = self.get_vgpr(index)
+        new_word = insert_half(old_word, val16, dst_hi=hi)
+        self.set_vgpr(index, new_word)
+
+    def eval_operand(self, op: Operand, op_sel_hi: bool = False) -> int:
+        """Evaluate an operand to an unsigned 16-bit bit pattern, applying abs/neg."""
+        if op.is_register():
+            assert op.reg is not None
+            raw = self.read_reg16(op.reg, op_sel_hi=op_sel_hi)
+        elif op.is_literal():
+            assert op.imm_val is not None
+            if isinstance(op.imm_val, float):
+                raw = f16_to_bits(op.imm_val)
+            else:
+                raw = op.imm_val & MASK16
+        else:
+            raise ValueError("Invalid operand.")
+        return apply_f16_input_mods(raw, op.abs_mod, op.neg_mod)
+
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar instruction interpreter for v_subrev_f16."""
+
+    def step(self, instr: Union[InstructionAST, str], state: ScalarMachineState) -> int:
+        """Execute a single v_subrev_f16 instruction against scalar machine state."""
+        if isinstance(instr, str):
+            ast = parse_subrev_f16_asm(instr)
+        else:
+            ast = instr
+        ast.validate()
+
+        src0_hi = ast.mods.op_sel[0]
+        src1_hi = ast.mods.op_sel[1]
+        dst_hi = ast.mods.op_sel[2] or ast.dst.hi
+
+        s0 = state.eval_operand(ast.src0, op_sel_hi=src0_hi)
+        s1 = state.eval_operand(ast.src1, op_sel_hi=src1_hi)
+
+        # In reverse subtraction: D = S1 - S0
+        res16 = ref_subrev_f16(s0, s1, clamp=ast.mods.clamp, omod=ast.mods.omod)
+        state.write_vgpr16(ast.dst.index, res16, hi=dst_hi)
+        return res16
+
+
+# ============================================================================
 # Unit Tests
 # ============================================================================
 
@@ -853,6 +937,84 @@ class TestValuSubrevF16SymbolicAST(unittest.TestCase):
         op = Operand(reg=Register(RegKind.VGPR, 1), dtype=DataType.F32)
         with self.assertRaises(TypeError):
             op.validate()
+
+
+class TestValuSubrevF16ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter for v_subrev_f16."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_step_basic_vgpr_sources(self) -> None:
+        # Set v1 = 1.0 (low half), v2 = 3.0 (low half), canary in high half
+        self.state.set_vgpr(0, 0xDEAD0000)
+        self.state.set_vgpr(1, pack_half(ONE_F16, 0x1234))
+        self.state.set_vgpr(2, pack_half(THREE_F16, 0x5678))
+
+        res = self.interp.step("v_subrev_f16_e32 v0, v1, v2", self.state)
+        self.assertEqual(res, TWO_F16)
+        v0_val = self.state.get_vgpr(0)
+        lo, hi = unpack_half(v0_val)
+        self.assertEqual(lo, TWO_F16)
+        self.assertEqual(hi, 0xDEAD)
+
+    def test_scalar_step_sgpr_and_literal_sources(self) -> None:
+        # S0 is literal 1.5, S1 is VGPR with 4.5 -> D = 4.5 - 1.5 = 3.0
+        self.state.set_vgpr(1, f16_to_bits(4.5))
+        res = self.interp.step("v_subrev_f16_e64 v0, 1.5, v1", self.state)
+        self.assertEqual(bits_to_f16(res), 3.0)
+        self.assertEqual(bits_to_f16(self.state.read_reg16(Register(RegKind.VGPR, 0))), 3.0)
+
+        # S0 is SGPR with 0.5, S1 is VGPR with 2.0 -> D = 2.0 - 0.5 = 1.5
+        self.state.set_sgpr(5, HALF_F16)
+        self.state.set_vgpr(2, TWO_F16)
+        res2 = self.interp.step("v_subrev_f16_e32 v0, s5, v2", self.state)
+        self.assertEqual(bits_to_f16(res2), 1.5)
+
+    def test_scalar_step_vop3_input_modifiers(self) -> None:
+        # S0 = -1.0, S1 = 2.0. With -|s0|, S0 becomes -1.0. S1 - (-1.0) = 3.0
+        self.state.set_sgpr(0, NEG_ONE_F16)
+        self.state.set_vgpr(1, TWO_F16)
+        res = self.interp.step("v_subrev_f16_e64 v0, -|s0|, v1", self.state)
+        self.assertEqual(bits_to_f16(res), 3.0)
+
+    def test_scalar_step_vop3_clamp_and_omod(self) -> None:
+        # S0 = 3.0, S1 = 1.0 -> 1.0 - 3.0 = -2.0. Clamped to 0.0
+        self.state.set_vgpr(1, THREE_F16)
+        self.state.set_vgpr(2, ONE_F16)
+        res = self.interp.step("v_subrev_f16_e64 v0, v1, v2 clamp", self.state)
+        self.assertEqual(res, POS_ZERO_F16)
+
+        # S0 = 0.5, S1 = 1.5 -> (1.5 - 0.5) * 4 = 4.0
+        self.state.set_vgpr(1, HALF_F16)
+        self.state.set_vgpr(2, f16_to_bits(1.5))
+        res2 = self.interp.step("v_subrev_f16_e64 v0, v1, v2 mul:4", self.state)
+        self.assertEqual(bits_to_f16(res2), 4.0)
+
+    def test_scalar_step_op_sel_halves(self) -> None:
+        # v1 has lo=0.25, hi=1.0. v2 has lo=2.0, hi=5.0
+        self.state.set_vgpr(1, pack_half(QUARTER_F16, ONE_F16))
+        self.state.set_vgpr(2, pack_half(TWO_F16, f16_to_bits(5.0)))
+        self.state.set_vgpr(0, pack_half(0x1111, 0x2222))
+
+        # op_sel:[1, 0, 1] reads v1.h (1.0) and v2.l (2.0), writes to v0.h:
+        # D = 2.0 - 1.0 = 1.0 into v0.h. v0.l preserves 0x1111.
+        res = self.interp.step("v_subrev_f16_e64 v0.h, v1, v2 op_sel:[1,0,1]", self.state)
+        self.assertEqual(res, ONE_F16)
+        v0_val = self.state.get_vgpr(0)
+        lo, hi = unpack_half(v0_val)
+        self.assertEqual(lo, 0x1111)
+        self.assertEqual(hi, ONE_F16)
+
+    def test_scalar_step_determinism(self) -> None:
+        s_a = ScalarMachineState()
+        s_b = ScalarMachineState()
+        for s in (s_a, s_b):
+            s.set_vgpr(1, pack_half(ONE_F16, TWO_F16))
+            s.set_vgpr(2, pack_half(THREE_F16, FOUR_F16))
+            self.interp.step("v_subrev_f16_e32 v0, v1, v2", s)
+        self.assertEqual(s_a.vgprs, s_b.vgprs)
 
 
 if __name__ == "__main__":
