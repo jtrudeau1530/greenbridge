@@ -24,6 +24,9 @@
 #include "../src/vulkan13_features.h"
 
 #include <vulkan/vulkan_win32.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "advapi32.lib")
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -58,6 +61,8 @@ static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 // "unsupported" at boot. Raise these when a front end for the higher version lands.
 constexpr D3D_SHADER_MODEL kHighestShaderModel = D3D_SHADER_MODEL_6_0;
 constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+
+std::atomic<int> g_global_realtime_privilege_override{-1};
 
 void log_once(const char* what, int value) {
     static std::mutex mutex;
@@ -3471,8 +3476,8 @@ public:
             log_once("CreateCommandQueue refused (type, priority, flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
-        // Global realtime priority needs a privilege the host grants only on request; without it, this answer.
-        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+        // Global realtime priority needs SeIncreaseBasePriorityPrivilege enabled in the token; without it, this answer.
+        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME && !has_global_realtime_privilege()) {
             log_once("CreateCommandQueue refused (global realtime priority), type", desc->Type);
             return d3d12_trace::result(method, DXGI_ERROR_ACCESS_DENIED);
         }
@@ -6368,6 +6373,31 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         return E_FAIL;
     }
     return hand_out(device, riid, out);
+}
+
+bool has_global_realtime_privilege() {
+    const int override_state = g_global_realtime_privilege_override.load(std::memory_order_relaxed);
+    if (override_state >= 0) return override_state != 0;
+    HANDLE token = nullptr;
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token) &&
+        !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    LUID luid{};
+    BOOL enabled = FALSE;
+    if (LookupPrivilegeValueW(nullptr, L"SeIncreaseBasePriorityPrivilege", &luid)) {
+        PRIVILEGE_SET set{};
+        set.PrivilegeCount = 1;
+        set.Control = PRIVILEGE_SET_ALL_NECESSARY;
+        set.Privilege[0].Luid = luid;
+        set.Privilege[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (!PrivilegeCheck(token, &set, &enabled)) enabled = FALSE;
+    }
+    CloseHandle(token);
+    return enabled != FALSE;
+}
+
+void set_global_realtime_privilege_override_for_test(int state) {
+    g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
 }
 
 }  // namespace rt::d3d12
