@@ -2144,6 +2144,28 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   recording. The resolve fallback is unchanged: only resolves needing dispatches are refused there.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
+- **Timestamp resolves on MoltenVK.** On Apple GPUs, MoltenVK delays every `vkCmdWriteTimestamp` to the end of
+  the current Metal encoder, where it is sampled by a blit pass of its own (`encodeTimestampStageCounterSamples`,
+  because Apple GPUs sample only at stage boundaries). `vkCmdCopyQueryPoolResults` resolves the counters with a
+  blit that nothing orders after that pass. The copy then reads the previous value, or 0 for a timestamp never
+  written before. This happens when the copy is in the timestamp's open blit encoder, in a later encoder, in a later
+  command buffer or in the next `vkQueueSubmit`. The spec needs no barrier here: `WAIT_BIT` waits for the query.
+  `vkGetQueryPoolResults` on the host is right. A minimal Vulkan program (two timestamps around a
+  `vkCmdCopyBuffer`, resolved with `64_BIT | WAIT_BIT`, compared with `vkGetQueryPoolResults`, 200 runs per case
+  on an M3 Max, macOS 27.3) got the right values 0 to 13 times out of 200 for each of these placements with
+  MoltenVK 1.4.3 (`main` 5189f8de). With a pipeline barrier or a fill before the copy it was 9 and 3 out of 200.
+  MoltenVK 1.4.2 got 0 to 43 out of 200, measured while other GPU work ran. Every case was right 200/200 on
+  KosmicKrisp (Mesa 26.3.1) and llvmpipe. Two things order the copy on MoltenVK, right in every run (200 or 500
+  runs, both versions). One is `vkCmdSetEvent` + `vkCmdWaitEvents` on a fresh event before the copy, which MoltenVK
+  encodes as a Metal event signal and wait on the command buffer. The other, across submissions, is a timeline
+  semaphore wait for the earlier submission. So where `driverID` is `VK_DRIVER_ID_MOLTENVK` (Wine reports the
+  host's driver), the queue sets and waits for an event before each timestamp resolve that copies, and a
+  submission with such a resolve waits on the queue's own timeline for the submission before it. The values are
+  still the GPU's own timestamps, nothing is emulated. MoltenVK picks at submit time, from the event's host state,
+  whether a set or wait does anything. So each resolve gets an event of its own, which goes back to the queue's pool
+  after a host `vkResetEvent` once the submission completes. `d3d12_vulkan_device` checks the same list (timestamp,
+  clear, copy, timestamp, resolve) and a resolve in the next execution with no wait between them. Under Wine
+  (CrossOver 26.3, MoltenVK 1.4.3) the first case failed every run before this change (`t1` read 0).
 
 Not implemented yet:
 

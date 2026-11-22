@@ -3370,6 +3370,21 @@ public:
             const auto& family = families[info.queue_family];
             if (family.timestampValidBits)
                 state_.context->set_timestamp_period(properties.limits.timestampPeriod);
+            // MoltenVK (1.4.2 and 1.4.3 measured) resolves a timestamp before the write that precedes it lands, unless
+            // something orders the two (docs/d3d12_vulkan.md section 4.6).
+            const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                info.get_instance_proc ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2")
+                                       : nullptr);
+            if (family.timestampValidBits && get_props2) {
+                VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+                VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+                get_props2(info.physical, &props);
+                if (driver.driverID == VK_DRIVER_ID_MOLTENVK) {
+                    state_.context->set_order_timestamp_copies(true);
+                    log_once("timestamp resolves wait for the timestamps before them (MoltenVK); driver",
+                             int(driver.driverID));
+                }
+            }
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
                 state_.context->set_occlusion_resolve_memory(state_.memory);
         }

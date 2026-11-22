@@ -80,7 +80,8 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)                                      \
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -1002,6 +1003,10 @@ public:
     // (timestampValidBits 0). Set by the device before any queue uses it.
     double timestamp_period() const { return timestamp_period_; }
     void set_timestamp_period(double period) { timestamp_period_ = period; }
+    // True where a timestamp resolve must be ordered explicitly after the timestamps it copies (MoltenVK on Apple
+    // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
+    bool order_timestamp_copies() const { return order_timestamp_copies_; }
+    void set_order_timestamp_copies(bool order) { order_timestamp_copies_ = order; }
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
@@ -1283,6 +1288,7 @@ private:
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
+    bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     ReplayFunctions replay_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
@@ -1395,6 +1401,8 @@ public:
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
+        for (auto& slot : buffers_) free_events_.insert(free_events_.end(), slot.events.begin(), slot.events.end());
+        for (VkEvent event : free_events_) vk.vkDestroyEvent(context_.device(), event, nullptr);
     }
 
     VulkanQueue(const VulkanQueue&) = delete;
@@ -1628,6 +1636,24 @@ public:
         CommandSlot* slot = acquire();
         if (!slot) return ReplayResult::unsupported;
         command_buffer = slot->buffer;
+        // MoltenVK writes a timestamp at the end of a Metal encoder and resolves it with a blit that nothing orders
+        // after that write, so a copy in the same or the next command buffer reads the old value (docs section 4.6).
+        // An event set and waited for in this command buffer orders it after this submission's timestamps; a wait for
+        // this queue's previous submission orders it after earlier ones still running.
+        bool ordered_timestamps = false;
+        const auto& events = context_.vk;
+        if (context_.order_timestamp_copies() && events.vkCreateEvent && events.vkDestroyEvent && events.vkResetEvent &&
+            events.vkCmdSetEvent && events.vkCmdWaitEvents)
+            replay.order_timestamp_copy = [this, slot, &ordered_timestamps](VkCommandBuffer cb) {
+                const VkEvent event = take_event();
+                if (!event) return;
+                slot->events.push_back(event);
+                const auto& vk = context_.vk;
+                vk.vkCmdSetEvent(cb, event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                vk.vkCmdWaitEvents(cb, 1, &event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, 0, nullptr, 0, nullptr);
+                ordered_timestamps = true;
+            };
         const auto discard = [&] {
             if (context_.vk.vkResetCommandBuffer(command_buffer, 0) == VK_SUCCESS) slot->ticket = 0;
         };
@@ -1724,6 +1750,11 @@ public:
         }
         const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
+        const bool wait_previous = ordered_timestamps && submitted_;
+        if (wait_previous) {
+            waits_.push_back(progress_);
+            wait_values_.push_back(submitted_);
+        }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
         if (!submitted && !storage_images.empty()) {  // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);
@@ -1735,6 +1766,10 @@ public:
             context_.storage_init_value_ = submitted_;
             ++context_.storage_init_version_;
             storage_init_seen_ = context_.storage_init_version_;
+        }
+        if (wait_previous && !submitted && !waits_.empty()) {  // a failed submit keeps the waits for the next one
+            waits_.pop_back();
+            wait_values_.pop_back();
         }
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
@@ -1798,6 +1833,7 @@ private:
         VkCommandBuffer buffer;
         std::uint64_t ticket;
         std::vector<std::shared_ptr<const OcclusionSegmentPool>> segments;
+        std::vector<VkEvent> events;  // order_timestamp_copy's, reset and reused once the slot completes
         std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
     };
@@ -1907,6 +1943,10 @@ private:
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
             slot.segments.clear();
+            for (VkEvent event : slot.events)
+                if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
+                else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);
+            slot.events.clear();
             if (!reuse) reuse = &slot;
         }
         if (reuse) {
@@ -1925,6 +1965,20 @@ private:
             return nullptr;
         buffers_.push_back({command_buffer, UINT64_MAX});
         return &buffers_.back();
+    }
+
+    // An unsignaled event for order_timestamp_copy, or null. MoltenVK decides when the command buffer is submitted
+    // whether a set or wait does anything, from the event's state then, so each use gets an event of its own.
+    VkEvent take_event() {
+        if (!free_events_.empty()) {
+            const VkEvent event = free_events_.back();
+            free_events_.pop_back();
+            return event;
+        }
+        VkEventCreateInfo info{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+        VkEvent event = VK_NULL_HANDLE;
+        if (context_.vk.vkCreateEvent(context_.device(), &info, nullptr, &event) != VK_SUCCESS) return VK_NULL_HANDLE;
+        return event;
     }
 
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
@@ -1996,6 +2050,7 @@ private:
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
     std::uint64_t submitted_ = 0;
     std::vector<CommandSlot> buffers_;
+    std::vector<VkEvent> free_events_;  // unsignaled, for order_timestamp_copy
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::uint64_t last_sparse_ = 0;
