@@ -20,8 +20,8 @@
 #include <cstddef>
 #include <cstring>
 
-#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV)
-#error "LEONIDA_TEST_VS_SPV and LEONIDA_TEST_PS_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_INT_SPV)
+#error "LEONIDA_TEST_VS_SPV, LEONIDA_TEST_PS_SPV and LEONIDA_TEST_VS_INT_SPV must name the compiled test shaders"
 #endif
 
 #define EXPECT(condition) do { \
@@ -59,13 +59,17 @@ int main() {
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
     const auto fullscreen_program = fssm_program({0x56530002, 0xbf810000});
+    const auto vs_int_program = fssm_program({0x56530003, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const auto fullscreen_container = shader_container(fullscreen_program);
+    const auto vs_int_container = shader_container(vs_int_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_draw_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_VS_INT_SPV, library / "vs_draw_int.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -73,6 +77,12 @@ int main() {
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": ["
                  "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
                  "\"system_value\": 0, \"component_type\": \"float\"}, "
+                 "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
+                 "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
+                 " \"vs_draw_int\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_int_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": ["
+                 "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
+                 "\"system_value\": 0, \"component_type\": \"int\"}, "
                  "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
                  "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
                  " \"vs_fullscreen\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fullscreen_program)
@@ -145,6 +155,23 @@ int main() {
         pso_desc.InputLayout = {elements, 1};  // COLOR missing: D3D12 rejects a layout that leaves an input unfed
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unfed.p)) == E_INVALIDARG && !unfed.p);
         pso_desc.InputLayout = {elements, 2};
+
+        // The narrow signed IA formats the draw path used to refuse; each maps to a Vulkan vertex format, so a PSO
+        // whose COLOR input uses one is created.
+        const DXGI_FORMAT narrow_signed_formats[] = {
+            DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R8G8_SNORM,
+            DXGI_FORMAT_R8G8_SINT, DXGI_FORMAT_R8_SNORM, DXGI_FORMAT_R8_SINT};
+        for (DXGI_FORMAT format : narrow_signed_formats) {
+            D3D12_INPUT_ELEMENT_DESC narrow_elements[2] = {elements[0], elements[1]};
+            narrow_elements[1].Format = format;
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC narrow_desc = pso_desc;
+            narrow_desc.InputLayout = {narrow_elements, 2};
+            // SINT formats feed an integer shader input; SNORM formats feed the float shader.
+            if (format == DXGI_FORMAT_R16_SINT || format == DXGI_FORMAT_R8G8_SINT || format == DXGI_FORMAT_R8_SINT)
+                narrow_desc.VS = {vs_int_container.data(), vs_int_container.size()};
+            Ref<ID3D12PipelineState> narrow;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&narrow_desc, IID_PPV_ARGS(&narrow.p))));
+        }
 
         // Two render-target formats and a depth format, of which draws bind only RTV 0: a variant with the other
         // formats undefined is used at draw time.
