@@ -1442,6 +1442,12 @@ class VulkanQueue : private QueueHolds<VkSemaphore>::Holder {
 public:
     enum class QueueKind : std::uint8_t { direct, compute, copy };
 
+    // The most command buffers a queue holds at once. At that many, a caller that outruns the GPU waits for the oldest
+    // submitted one to finish instead of allocating without bound. A GPU that makes no progress for kQueuedWaitNs does
+    // not block the caller for good: the buffer is allocated anyway, as it was before the cap.
+    static constexpr std::size_t kMaxQueuedCommandBuffers = 64;
+    static constexpr std::uint64_t kQueuedWaitNs = 5'000'000'000;
+
     static constexpr VkPipelineStageFlags2 queue_supported_stages(QueueKind kind) noexcept {
         switch (kind) {
         case QueueKind::copy:
@@ -2209,9 +2215,8 @@ private:
         if (last_sparse_ <= done) last_sparse_ = 0;
     }
 
-    CommandSlot* acquire() {
-        if (context_.is_device_lost()) return nullptr;
-        context_.drain_deleted_resources(context_.completed_retire_ticket());
+    // Releases what every finished command buffer holds; the first of them, or null when none has finished.
+    CommandSlot* recycle_finished() {
         const auto done = completed();
         collect_bindings(done);
         CommandSlot* reuse = nullptr;
@@ -2224,6 +2229,28 @@ private:
             slot.events.clear();
             if (!reuse) reuse = &slot;
         }
+        return reuse;
+    }
+
+    // Waits for the oldest submitted command buffer. False when none is submitted yet, or it does not finish in time.
+    bool wait_oldest_submitted() {
+        std::uint64_t oldest = UINT64_MAX;
+        for (const auto& slot : buffers_)
+            if (slot.ticket < oldest) oldest = slot.ticket;
+        if (oldest == UINT64_MAX) return false;  // all still being recorded
+        VkSemaphoreWaitInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        info.semaphoreCount = 1;
+        info.pSemaphores = &progress_;
+        info.pValues = &oldest;
+        return context_.vk.vkWaitSemaphores(context_.device(), &info, kQueuedWaitNs) == VK_SUCCESS;
+    }
+
+    CommandSlot* acquire() {
+        if (context_.is_device_lost()) return nullptr;
+        context_.drain_deleted_resources(context_.completed_retire_ticket());
+        CommandSlot* reuse = recycle_finished();
+        if (!reuse && buffers_.size() >= kMaxQueuedCommandBuffers && wait_oldest_submitted())
+            reuse = recycle_finished();
         if (reuse) {
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
             reuse->predicate.reset();
