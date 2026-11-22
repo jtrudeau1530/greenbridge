@@ -255,6 +255,48 @@ class SIMDInterpreter:
         return results
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class SadStatusFlags:
+    """Architectural condition codes and status flags for v_sad_hi_u32."""
+    carry: bool
+    zero: bool
+    diff_zero: bool
+    acc_zero: bool
+    both_zero: bool
+    diff_max: bool
+    acc_max: bool
+    overflow_64: bool
+
+
+def compute_sad_hi_carry_details(s0: int, s1: int, s2: int) -> Tuple[int, int, int, int]:
+    """Compute intermediate difference, accumulator, full 64-bit sum, and carry bit."""
+    diff = ref_abs_diff_u32(s0, s1)
+    acc = u32(s2)
+    full_sum = diff + acc
+    carry = 1 if (full_sum >= (1 << 32)) else 0
+    return diff, acc, full_sum, carry
+
+
+def evaluate_sad_hi_flags(s0: int, s1: int, s2: int, res: int) -> SadStatusFlags:
+    """Evaluate architectural status flags and carry generation for v_sad_hi_u32."""
+    diff, acc, full_sum, carry = compute_sad_hi_carry_details(s0, s1, s2)
+    return SadStatusFlags(
+        carry=bool(carry),
+        zero=(res == 0),
+        diff_zero=(diff == 0),
+        acc_zero=(acc == 0),
+        both_zero=(diff == 0 and acc == 0),
+        diff_max=(diff == MASK32),
+        acc_max=(acc == MASK32),
+        overflow_64=False,  # Max sum 0x1FFFFFFFE fits well within 64 bits
+    )
+
+
+
 
 
 
@@ -731,6 +773,60 @@ class TestValuSadHiU32RegisterAliasing(unittest.TestCase):
                 self.assertEqual(state.vgprs[lane][0], expected)
             else:
                 self.assertEqual(state.vgprs[lane][0], orig[lane])
+
+
+class TestValuSadHiU32StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_carry_flag_matches_result(self) -> None:
+        test_cases = [
+            (0, 0, 0, 0),
+            (0xFFFF_FFFF, 0, 1, 1),
+            (0x8000_0000, 0, 0x8000_0000, 1),
+            (0x8000_0000, 0, 0x7FFF_FFFF, 0),
+            (100, 50, 200, 0),
+        ]
+        for s0, s1, s2, expected in test_cases:
+            with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                res = ref_sad_hi_u32(s0, s1, s2)
+                self.assertEqual(res, expected)
+                flags = evaluate_sad_hi_flags(s0, s1, s2, res)
+                self.assertEqual(flags.carry, bool(expected))
+                self.assertEqual(flags.zero, (expected == 0))
+
+    def test_diff_zero_eliminates_carry(self) -> None:
+        # When s0 == s1, diff is 0, so carry can never be generated
+        res = ref_sad_hi_u32(0x12345678, 0x12345678, 0xFFFF_FFFF)
+        flags = evaluate_sad_hi_flags(0x12345678, 0x12345678, 0xFFFF_FFFF, res)
+        self.assertTrue(flags.diff_zero)
+        self.assertFalse(flags.carry)
+        self.assertTrue(flags.zero)
+        self.assertTrue(flags.acc_max)
+
+    def test_both_zero(self) -> None:
+        res = ref_sad_hi_u32(0, 0, 0)
+        flags = evaluate_sad_hi_flags(0, 0, 0, res)
+        self.assertTrue(flags.both_zero)
+        self.assertTrue(flags.diff_zero)
+        self.assertTrue(flags.acc_zero)
+        self.assertFalse(flags.carry)
+        self.assertTrue(flags.zero)
+
+    def test_diff_max_and_acc_max(self) -> None:
+        res = ref_sad_hi_u32(0xFFFF_FFFF, 0, 0xFFFF_FFFF)
+        flags = evaluate_sad_hi_flags(0xFFFF_FFFF, 0, 0xFFFF_FFFF, res)
+        self.assertTrue(flags.diff_max)
+        self.assertTrue(flags.acc_max)
+        self.assertTrue(flags.carry)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.overflow_64)
+
+    def test_carry_details_computation(self) -> None:
+        diff, acc, full_sum, carry = compute_sad_hi_carry_details(0xFFFF_FFFF, 0, 1)
+        self.assertEqual(diff, 0xFFFF_FFFF)
+        self.assertEqual(acc, 1)
+        self.assertEqual(full_sum, 0x1_0000_0000)
+        self.assertEqual(carry, 1)
 
 
 if __name__ == "__main__":
