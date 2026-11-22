@@ -789,5 +789,118 @@ class TestBufferAtomicSmaxSIMDMultiLane(unittest.TestCase):
             self.assertEqual(simd.vgprs[lane][0], self.CANARY_OLD)
 
 
+class TestBufferAtomicSmaxRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_vdata_aliases_vaddr_with_glc(self) -> None:
+        # v0 acts as both vdata and vaddr
+        # v0 = 16 (so address is 16, and compare value is 16)
+        mem = BufferMemory(256)
+        mem.write_u32(16, u32(-5))
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(0, 16)
+
+        interp = ScalarBufferInterpreter(mem, rf)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        interp.set_buffer_descriptor(0, desc)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 0),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True, glc=True),
+        )
+        ret, ok = interp.step(inst)
+        self.assertTrue(ok)
+        # Memory at 16 updated to max(-5, 16) = 16
+        self.assertEqual(mem.read_u32(16), 16)
+        # Pre-op value (-5) written back to v0
+        self.assertEqual(s32(ret), -5)
+        self.assertEqual(s32(rf.read_vgpr(0)), -5)
+
+    def test_adjacent_registers_untouched(self) -> None:
+        mem = BufferMemory(256)
+        mem.write_u32(0, 10)
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(0, 50)          # vdata
+        rf.write_vgpr(1, 0)           # vaddr
+        rf.write_vgpr(2, 0x12345678)  # adjacent canary
+        rf.write_vgpr(3, 0x87654321)  # adjacent canary
+
+        interp = ScalarBufferInterpreter(mem, rf)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        interp.set_buffer_descriptor(0, desc)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True, glc=True),
+        )
+        interp.step(inst)
+        # Check adjacent registers are preserved exactly
+        self.assertEqual(rf.read_vgpr(2), 0x12345678)
+        self.assertEqual(rf.read_vgpr(3), 0x87654321)
+
+    def test_chained_inplace_atomic_smax(self) -> None:
+        mem = BufferMemory(256)
+        mem.write_u32(0, u32(-100))
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(0, u32(-50))
+        rf.write_vgpr(1, 0)
+
+        interp = ScalarBufferInterpreter(mem, rf)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        interp.set_buffer_descriptor(0, desc)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True, glc=True),
+        )
+        # Step 1: memory becomes -50, v0 receives -100
+        interp.step(inst)
+        self.assertEqual(s32(mem.read_u32(0)), -50)
+        self.assertEqual(s32(rf.read_vgpr(0)), -100)
+
+        # Step 2: v0 is -100, compare with memory (-50) -> memory remains -50, v0 receives -50
+        interp.step(inst)
+        self.assertEqual(s32(mem.read_u32(0)), -50)
+        self.assertEqual(s32(rf.read_vgpr(0)), -50)
+
+    def test_simd_multi_lane_aliased_operands(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=1024)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        simd.set_buffer_descriptor(0, desc)
+
+        # Each lane uses v0 as both data and addr
+        for lane in range(32):
+            simd.mem.write_u32(lane * 4, u32(-10))
+            simd.vgprs[lane][0] = lane * 4  # v0 is both address and value
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 0),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True, glc=True),
+        )
+        simd.step(inst)
+
+        for lane in range(32):
+            # Memory should be max(-10, lane * 4) = lane * 4
+            self.assertEqual(simd.mem.read_u32(lane * 4), lane * 4)
+            # v0 receives pre-op value -10
+            self.assertEqual(s32(simd.vgprs[lane][0]), -10)
+
+
 if __name__ == "__main__":
     unittest.main()
