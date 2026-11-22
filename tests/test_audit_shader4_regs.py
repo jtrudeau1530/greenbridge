@@ -1,4 +1,6 @@
 """Unit tests for scripts/audit_shader4_regs.py (standard library only, synthetic .s/.fssm/.dxbc)."""
+import contextlib
+import io
 import json
 import os
 import struct
@@ -33,6 +35,42 @@ def make_ms_psv0(tx=128, ty=1, tz=1, maxv=64, maxp=64, topo=2):
 
 
 class AuditShader4RegsTests(unittest.TestCase):
+    def test_inline_immediate_reads_destination_before_write(self):
+        insns = [audit_mod.shader_ir.parse_line(line) for line in (
+            "\ts_addk_i32 s3, 1",
+            "\ts_addk_i32 s3, 2",
+            "\ts_mulk_i32 s4, 2",
+            "\ts_cmovk_i32 s5, 3",
+            "\ts_movk_i32 s6, 0",
+        )]
+        self.assertEqual(audit_mod.rbw_registers(insns), ([3, 4, 5], [], ["s_addk_i32 s3, 1"]))
+
+    def test_negative_limit_is_rejected_before_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            for name in ("a_cs", "b_cs"):
+                with open(os.path.join(disasm, name + ".s"), "w", encoding="utf-8") as f:
+                    f.write("\ts_endpgm\n")
+            with open(os.path.join(disasm, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"a_cs": {"stage": "cs"}, "b_cs": {"stage": "cs"}}, f)
+
+            out_json = os.path.join(tmp, "report.json")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    audit_mod.main([disasm, "--limit", "-1", "--json", out_json])
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+            self.assertIn("--limit", stderr.getvalue())
+            self.assertFalse(os.path.exists(out_json))
+
+            with self.assertRaisesRegex(ValueError, "limit"):
+                audit_mod.audit(disasm, limit=-1)
+            for limit, count in ((None, 2), (0, 0), (1, 1)):
+                self.assertEqual(audit_mod.audit(disasm, limit=limit)["cs"]["count"], count)
+
     def test_synthetic_cs_ms_gs_audit_and_s3_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
