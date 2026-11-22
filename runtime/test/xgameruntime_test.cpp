@@ -286,14 +286,14 @@ void check_run_time_load() {
             return true;
         };
         using SetCallback = void(STDMETHODCALLTYPE*)(void*, Callback, void*);
-        using Report = void(STDMETHODCALLTYPE*)(void*, HRESULT, const char*);
+        using Report = HRESULT(STDMETHODCALLTYPE*)(void*, HRESULT, const char*);
         reinterpret_cast<SetCallback>(slot(e, 4))(e, on_error, &seen);
-        reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
-        check(seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
+        const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
+        check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
-        using SetOptions = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);
-        check(reinterpret_cast<SetOptions>(slot(e, 5))(e, 0, 0) == S_OK, "slot 5 is XErrorSetOptions");
+        using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
+        reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
         release(e);
     }
 
