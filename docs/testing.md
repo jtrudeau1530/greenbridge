@@ -76,6 +76,27 @@ To test the wave64 emulation that makes them exact on these GPUs, set `LEONIDA_W
 `check.py`, the shaders are checked against the emulated expectations without being emulated, and every wave64 test
 fails.
 
+## Without a GPU: Mesa llvmpipe
+
+Mesa's llvmpipe is a software Vulkan driver (`mesa-vulkan-drivers` on Debian and Ubuntu). CI runs the suite on it
+for every pull request (`.github/workflows/runtime.yml`), and you can do the same on Linux without a GPU:
+
+```sh
+sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers vulkan-tools spirv-tools llvm-18
+cmake -S runtime -B runtime/build/linux && cmake --build runtime/build/linux --parallel
+python -I scripts/run_gpu_tests.py --build runtime/build/linux --llvm-mc /usr/lib/llvm-18/bin/llvm-mc
+LEONIDA_W64_EMULATE=1 python -I scripts/run_gpu_tests.py --build runtime/build/linux \
+    --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --filter cs_
+```
+
+With Mesa 25.2 (llvmpipe, LLVM 20) the first run passes 31 of 60 and skips 29, the second passes 33 of 33. The
+skips are expected: llvmpipe has 8-wide subgroups (so every wave64 test and `ps_bitmask_perm` skip without
+emulation) and no `VK_KHR_fragment_shader_barycentric` (`ps_bary`, `ps_uniform_branch`). With
+`LEONIDA_W64_EMULATE=1` the mesh tests abort inside llvmpipe's compiler ("LLVM ERROR: Cannot emit physreg copy
+instruction"), which is why the second run is limited to compute. llvmpipe is not a substitute for a result from a
+real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
+differences.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example

@@ -1,299 +1,237 @@
-# TTPF arrays and volumes
+# TTPF arrays, cubemaps, and 3D volumes
 
-Measured on 2026-11-21 from the same retail Xbox Series install (1.0.2.1) and the same 57
-RDS5 pools as `docs/textures.md`. The scan read the 24-byte RDS5 header, the chunk table, the
-ETPF records and the chunk ranges, then decompressed only enough zlib/raw chunks to count
-zero-filled blocks. It wrote no texture data. Every number below is an aggregate, a descriptor
-field or a byte offset; no texture, DDS or carved bytes are included.
-
-This page is a measurement note, not an exporter. It adds no reader code and does not change
-`tools/tex_headers.py` or `tools/ttpf_mips.py`.
+Measured across all 57 retail Xbox Series RDS5 texture pools (1.0.2.1; 357,115 TTPF descriptors,
+1,026,833 chunks) via `python -I tools/ttpf_mips.py scan`. The layouts and decoders described
+below are implemented in `tools/tex_headers.py` and `tools/ttpf_mips.py`. No texture bytes, DDS
+files, or carved payloads are included; every number below is an aggregate, a descriptor field,
+a byte offset, or a validation metric.
 
 ## Outcome
 
 | | Records |
 |---|---:|
 | TTPF descriptors scanned | 357,115 |
-| array/volume descriptors (`dimension != 1` or `depth != 1`) | 678 |
-| cube-shaped (`dimension = 2`, `depth = 3`, tile modes 9-12) | 567 |
-| 2D arrays (`dimension = 1`, `depth > 1`, tile modes 0/1) | 108 |
-| 3D volumes (`dimension = 3`, `depth = 4/16`, tile mode 1) | 3 |
-| **validated allocation-and-padding layout** | **90** |
-| **still without a validated slice layout** | **588** |
+| multi-slice descriptors (`dimension != 1` or `depth > 1`) | 697 |
+| 2D arrays (`dimension = 1`, `depth > 1`, `mode = 1`) | 127 |
+| cubemaps (`dimension = 2`, `depth = 6`, `mode = 18/20/22/24`) | 567 |
+| 3D volumes (`dimension = 3`, `depth > 1`, `mode = 2`, `mips = 1`) | 3 |
+| **layout-validated (byte-exact span)** | **697 / 697 (0 mismatches)** |
+| **complete / partial / skipped (zlib/raw only)** | **690 / 4 / 3** |
+| **complete / partial / skipped (with BCPack BC1/BC3/BC4/BC5)** | **694 / 3 / 0** |
+| **43-bit `(meta, extra)` chunk-page metadata validated** | **357,115 / 357,115 (0 failures)** |
 
-The 90 validated records are all `dimension = 2, depth = 3, mode = 18` (tile mode 9). Their
-allocation is six copies of the 2D compact 4 KiB mip chain, and the zero-filled padding in a
-16x16 sample lands on the AMD mip-tail offsets. The other 588 are measured below but have no
-validated slice order, so the reader's `array/volume descriptor` skip remains correct for them.
+All 697 multi-slice descriptors — the 678 formerly flagged as arrays/volumes plus the 19
+two-slice 2D arrays formerly miscounted as unknown-format 2D records — have exact, validated
+layouts and DX10 DDS export support (`Texture2DArray`, `TextureCube`, and float16 `Texture3D`)
+in `tools/ttpf_mips.py`.
 
-The 111 tile-mode-0/1 records are not all two-slice: 99 have `depth = 2`, nine have
-`depth = 4..32` and three are `dimension = 3`. The depth field alone therefore does not reduce
-the non-cube group to a two-slice case.
+## Descriptor word `b` bitfields
 
-## Descriptor fields that select these records
+The 16-byte ETPF descriptor record is decoded by `parse_etpf_texture_record` in
+`tools/tex_headers.py`. Word `b` packs five fields:
 
-The 16-byte ETPF record is decoded by `parse_etpf_texture_record` in `tools/tex_headers.py`.
-The fields that matter here:
+| Field | Expression | Bits | Meaning |
+|---|---|---:|---|
+| `non_tail` | `b & 7` | 0..2 (3) | streaming snapshot count (cubemaps) / non-tail mip count |
+| `format` | `(b >> 3) & 0x7F` | 3..9 (7) | DXGI format ID (`0..127`) |
+| `depth` | `((b >> 10) & 0x7FF) + 1` | 10..20 (11) | slice count, face count (`6`), or volume depth |
+| `dimension` | `(b >> 21) & 3` | 21..22 (2) | `1` = 2D / 2D array, `2` = cubemap, `3` = 3D volume |
+| `mode` | `b >> 23` | 23..31 (9) | low flag bit plus 4-bit Gfx10 tile mode `(mode >> 1) & 0xF` |
 
-| Field | Bits | Measured meaning |
-|---|---|---|
-| width | `a & 0x3FFF`, +1 | top-mip width |
-| height | `(a >> 14) & 0x3FFF`, +1 | top-mip height |
-| packed mips | `a >> 28` | packed-tail part of the mip count |
-| non-tail | `b & 7` | mip-tail selector; the reader's `NonTailMipCount` for compact 2D |
-| format | `(b >> 3) & 255` | DXGI id plus a high bit; see below |
-| depth | `((b >> 11) & 1023) + 1` | slice/depth field |
-| dimension | `(b >> 21) & 3` | 1 = 2D/array, 2 = cube-shaped, 3 = volume-shaped (observed) |
-| mode | `b >> 23` | low flag bit plus the 4-bit Gfx10 tile mode at bit 1 |
-| base | `(c & 0x1FFFFF) * 4096` | allocation offset, 4 KiB aligned |
+### Why the earlier reading saw `format >= 128` and halved depths
 
-`gfx10_tile_mode(mode) = (mode >> 1) & 0xF`. The observed tile modes split cleanly:
+An earlier reading took 8 bits for `format` (`(b >> 3) & 0xFF`) and started `depth` at bit 11,
+which stole bit 10 (bit 0 of `depth - 1`). Whenever the true `depth` was even (`depth - 1` odd,
+bit 10 = `1`), `format` gained `+128` and `depth` was halved:
 
-| `(mode >> 1) & 0xF` | Mode value | Shape | Records |
+- **19 two-slice 2D arrays** (`depth = 2`, `depth - 1 = 1`) appeared as `depth = 1` with raw
+  formats `156/199/211/226` (`28/71/83/98 | 0x80`).
+- **99 three-slice 2D arrays** (`depth = 3`, `depth - 1 = 2`) appeared as `depth = 2` with low
+  formats (`28/71/83`) and "3 chains".
+- **9 even-depth 2D arrays** (`depth` in `{8, 16, 32, 48, 64}`) appeared as `depth` in
+  `{4, 8, 16, 24, 32}` with `format >= 128` and `2 * depth` chains.
+- **567 cubemaps** (`depth = 6`, `depth - 1 = 5`) appeared as `depth = 3` with `format >= 128`.
+- **3 volumes** (`depth = 8` or `32`) appeared as `depth = 4` or `16` with `format >= 128`.
+
+With the 7-bit `format` and 11-bit `depth` fields, every multi-slice descriptor carries a valid
+DXGI format ID in `0..127` and its true slice/face/depth count.
+
+The observed `(mode >> 1) & 0xF` tile modes partition the 697 multi-slice descriptors cleanly:
+
+| `(mode >> 1) & 0xF` | `mode` | Shape | Records |
 |---:|---:|---|---:|
-| 0 | 1 | 2D array (`dimension = 1`, `depth 2..32`) | 108 |
-| 1 | 2 | 3D volume (`dimension = 3`, `depth 4/16`) | 3 |
-| 9 | 18 | cube-shaped | 90 |
-| 10 | 20 | cube-shaped | 75 |
-| 11 | 22 | cube-shaped | 122 |
-| 12 | 24 | cube-shaped | 280 |
+| 0 | 1 | 2D array (`dimension = 1`, `depth` in `{2, 3, 8, 16, 32, 48, 64}`) | 127 |
+| 1 | 2 | 3D volume (`dimension = 3`, `depth` in `{8, 32}`, `mips = 1`) | 3 |
+| 9 | 18 | cubemap (`dimension = 2`, `depth = 6`, `non_tail = 0`) | 90 |
+| 10 | 20 | cubemap (`dimension = 2`, `depth = 6`, `non_tail = 1`) | 75 |
+| 11 | 22 | cubemap (`dimension = 2`, `depth = 6`, `non_tail = 2`) | 122 |
+| 12 | 24 | cubemap (`dimension = 2`, `depth = 6`, `non_tail = 3`) | 280 |
 
-All 678 allocation spans are exact `next_base - base` values: **678 exact, 0 mismatch**, there
-is no descriptor base inside any span, and every base is 4 KiB aligned (34 are also 64 KiB
-aligned). The span is therefore the full allocation for the descriptor, not a truncated
-prefix.
+## 2D arrays (`dimension = 1`, `depth > 1`, `mode = 1`) — 127 records
 
-## The format high bit is a second-layer flag
+### Layout
 
-Every array/volume record with `format >= 128` resolves through `format & 0x7F` to a known
-DXGI format:
+Implemented in `array_surface_layout` (`tools/tex_headers.py`):
 
-| Raw format | Effective DXGI | Element bytes (block) | Records |
-|---:|---|---:|---:|
-| 138 | 10 `R16G16B16A16_FLOAT` | 8 (1) | 2 |
-| 157 | 29 `R8G8B8A8_UNORM_SRGB` | 4 (1) | 1 |
-| 182 | 54 `R16_FLOAT` | 2 (1) | 1 |
-| 199 | 71 `BC1_UNORM` | 8 (4) | 9 |
-| 200 | 72 `BC1_UNORM_SRGB` | 8 (4) | 102 |
-| 211 | 83 `BC5_UNORM` | 16 (4) | 4 |
-| 215 | 87 `B8G8R8A8_UNORM` | 4 (1) | 1 |
-| 223 | 95 `BC6H_UF16` | 16 (4) | 95 |
-| 224 | 96 `BC6H_SF16` | 16 (4) | 1 |
-| 226 | 98 `BC7_UNORM` | 16 (4) | 363 |
+- Tile mode is `SW_64KB_D` (64 KiB tiles), in **mip-major** order.
+- Total allocation span is exact `depth * single_slice_size` (127 / 127 byte-exact, 0
+  mismatches).
+- When `first_tail < mips`, the packed mip tail sits at offset `0` and occupies `depth * 65536`
+  bytes, with slice `s` at `s * 65536`.
+- Standalone mips follow from `first_tail - 1` down to `0`. Each standalone mip occupies
+  `depth * region` bytes, with slice `s` at `mip_offset + s * region`.
 
-That is 579 of 678 records. The other 99 already use low formats 28 (`4 (1)`), 71 (`8 (4)`)
-and 83 (`16 (4)`). So **all 678 have a known element size**; the old "unknown element size"
-label does not apply to the array/volume set.
+### Corpus breakdown
 
-The bit is not part of the DXGI id. It behaves like a second-layer flag:
+| True `depth` | Records | Full (zlib/raw) | Partial (zlib/raw) | All-BCPack (zlib/raw) |
+|---:|---:|---:|---:|---:|
+| 2 | 19 | 18 | 1 | 0 |
+| 3 | 99 | 99 | 0 | 0 |
+| 8 | 2 | 2 | 0 | 0 |
+| 16 | 1 | 0 | 1 | 0 |
+| 32 | 2 | 0 | 1 | 1 |
+| 48 | 2 | 1 | 1 | 0 |
+| 64 | 2 | 0 | 0 | 2 |
+| **Total** | **127** | **120** | **4** | **3** |
 
-- 19 2D descriptors outside this set have a raw format of 156, 199, 211 or 226 and
-  `dimension = 1, depth = 1`. All 19 spans are exactly **two** compact chains; the 18 with
-  zlib/raw data have two populated compact blocks (the 19th is BCPack).
-- The 9 `dimension = 1` arrays with `depth >= 4` all have `2 * depth` compact 64 KiB chains:
-  depth 4 -> 8, 8 -> 16, 16 -> 32, 24 -> 48, 32 -> 64. All 9 are byte-exact.
-- The 567 cube-shaped records also carry a high-bit format, and `2 * depth = 6` matches the
-  six-chain layout of tile mode 9.
+Under zlib/raw only, 120 arrays export complete chains, 4 are partial (mip 0 touches BCPack on
+some slices while lower mips are zlib/raw), and 3 are all-BCPack. With `tools/bcpack.py`
+(BC1/BC3/BC4/BC5), the 4 partial arrays complete (**124 complete**) and the 3 all-BCPack arrays
+move to partial (**3 partial, 0 skipped**).
 
-The high bit therefore explains the 19 "DXGI 156/199/211/226" compact records in
-`docs/textures.md`: their element size is known and their allocation is two layers. It is not,
-by itself, a complete slice rule for tile modes 10-12 or for the 3D volumes.
+### Pixel validation
 
-## Exact size fits
+Verified with `tools/ttpf_mips.py check` (BC5 downsample MAE per slice vs. a slice-major
+negative control):
 
-Candidate formulas are evaluated against the exact allocation span. "Compact 4K" and
-"compact 64K" are `compact_surface_layout(width, height, mips, element_bytes, block, 4096 or
-65536)` from `tools/tex_headers.py`.
+| Pool / index | Dimensions | Format / mips | Per-slice max error | Overall max | Slice-major control |
+|---|---|---|---:|---:|---:|
+| `ttdb_peds_0_3.ttpf` #4429 | 512×512×2 | BC5, 8 mips | 0.24 / 0.24 | 0.24 | 57.81 |
+| `ttdb_peds_0_3.ttpf` #299 | 512×512×3 | BC5, 8 mips | 0.17 / 0.22 / 0.17 | 0.22 | 56.93 |
+| `ttdb_graphics.ttpf` #300 | 256×256×8 | BC5, 9 mips | `[0.18, 0.33, 3.67, 2.67, 0.17, 4.1, 2.12, 0.0]` | 4.10 | 87.73 |
 
-| Candidate | Records tested | Exact | Mismatch |
-|---|---:|---:|---:|
-| 6 x compact 4K, tile mode 9 | 90 | 90 | 0 |
-| 6 x compact 4K, tile mode 10 | 75 | 0 | 75 |
-| N x compact 4K, tile mode 10, N = 8 or 9 | 75 | 75 | 0 |
-| 6 x compact 4K, tile mode 11 | 122 | 0 | 122 |
-| 11 x compact 4K, tile mode 11 | 122 | 122 | 0 |
-| N x compact 4K, tile mode 12 | 280 | 0 | 280 |
-| `depth` x compact 64K, 2D arrays | 108 | 0 | 108 |
-| 3 x compact 64K, `depth = 2` arrays | 99 | 99 | 0 |
-| `2 * depth` x compact 64K, `depth >= 4` arrays | 9 | 9 | 0 |
-| compact 4K, 3D volumes | 3 | 0 | 3 |
+`ttdb_peds_0_3.ttpf` #4429 is one of the 19 former "format 211" 2D records, confirming that
+those 19 entries are standard 2-slice mip-major 2D arrays.
 
-The N in the tile-mode 10 row is not predicted by a descriptor field: 64x64 records use 9
-chains and 128x128 records use 8. The 11-chain tile-mode 11 row is a size fit only; two of the
-eleven chains are entirely zero (see below).
+## Cubemaps (`dimension = 2`, `depth = 6`, `mode = 18 + 2 * non_tail`) — 567 records
 
-## Validated subset: tile mode 9 cubes (90 records)
+### Layout
 
-Tile mode 9, `mode = 18`, is the only group with a complete allocation-and-padding layout.
-It is **six slices**, each a full compact 4 KiB mip chain:
+Implemented in `cubemap_surface_layout` (`tools/tex_headers.py`):
 
-| Width x height | Mips | Raw -> DXGI | Records | Slice bytes | Span |
-|---|---:|---|---:|---:|---:|
-| 256 x 256 | 1 | 199 -> BC1_UNORM | 8 | 32,768 | 196,608 |
-| 16 x 16 | 1 | 215 -> B8G8R8A8_UNORM | 1 | 4,096 | 24,576 |
-| 128 x 128 | 1 | 223 -> BC6H_UF16 | 1 | 16,384 | 98,304 |
-| 256 x 256 | 1 | 223 -> BC6H_UF16 | 6 | 65,536 | 393,216 |
-| 128 x 128 | 1 | 224 -> BC6H_SF16 | 1 | 16,384 | 98,304 |
-| 16 x 16 | 5 | 226 -> BC7_UNORM | 2 | 4,096 | 24,576 |
-| 32 x 32 | 1 | 226 -> BC7_UNORM | 2 | 4,096 | 24,576 |
-| 32 x 32 | 6 | 226 -> BC7_UNORM | 4 | 4,096 | 24,576 |
-| 64 x 64 | 1 | 226 -> BC7_UNORM | 9 | 4,096 | 24,576 |
-| 128 x 128 | 1 | 226 -> BC7_UNORM | 19 | 16,384 | 98,304 |
-| 256 x 256 | 1 | 226 -> BC7_UNORM | 34 | 65,536 | 393,216 |
-| 512 x 512 | 1 | 226 -> BC7_UNORM | 3 | 262,144 | 1,572,864 |
+- Each cubemap stores `non_tail + 1` self-contained full-mip cubemap snapshots back-to-back in
+  the RDS5 chunk stream. Earlier chunks hold lower-resolution streaming snapshots.
+- The **final chunk** holds the full-resolution 6-face cubemap in **slice-major `SW_4KB_S`**
+  order: face `f` (`0..5`) starts at `data_offset + f * face_size`.
+- When `non_tail > 0` and `6 * face_size >= 36 * 4096`, the final chunk is zero-padded to a
+  64 KiB boundary; otherwise its size is exact `6 * face_size`.
+- All 567 cubemap spans are byte-exact (567 / 567, 0 mismatches), and **567 / 567 are 100%
+  zlib/raw (0 BCPack)**.
 
-The slice offsets are `slice * slice_bytes` for slices 0..5. Within a slice, the mip offsets
-are the ordinary compact 4 KiB layout:
+| `mode` | `non_tail` | Tile mode | Snapshots | Records |
+|---:|---:|---:|---:|---:|
+| 18 | 0 | 9 | 1 | 90 |
+| 20 | 1 | 10 | 2 | 75 |
+| 22 | 2 | 11 | 3 | 122 |
+| 24 | 3 | 12 | 4 | 280 |
+| **Total** | | | | **567** |
 
-- Mips = 1: one top mip at offset 0, `slice_bytes` = top-mip bytes.
-- Mips = 5 or 6, 16x16/32x32: all mips fit in the one 4 KiB tail tile; the offsets are the
-  AMD tail entries, not separate mip allocations.
-- The multi-mip tile-mode-9 records (16x16 with 5 mips, 32x32 with 6 mips) have all mips in
-  the one 4 KiB tail tile. The mips = 1 records are a single top mip and have no tail. No
-  tile-mode-9 record needs a standalone mip larger than the slice itself.
+An earlier note mistakenly argued that 512×512 mode-24 cubemaps could not fit six full faces
+because it overcounted BC7 and BC1 top-mip sizes by 4×. A 512×512 BC7 top mip is
+`128 * 128 * 16 = 262,144` bytes (not `1,048,576`), and a 512×512 BC1 top mip is
+`128 * 128 * 8 = 131,072` bytes (not `524,288`). Six full 512×512 BC7 mip chains take
+`6 * 352,256 = 2,113,536` bytes (padded to `2,162,688` bytes = 528 4 KiB pages) plus `835,584`
+bytes of earlier snapshots, totaling `2,998,272` bytes exact.
 
-Evidence:
+### Pixel validation
 
-- The six-slice size is byte-exact on 90/90 allocation spans.
-- All 90 records have six populated 4 KiB/16 KiB/64 KiB/256 KiB slice blocks; none of the six
-  is blank.
-- In `graphics` #184 (16x16 BC7, 5 mips), each 4 KiB slice contains non-zero islands starting
-  at **768, 1,024, 1,280, 1,536 and 2,048 bytes**. Those are exactly the `entry` offsets the
-  compact rule produces for mips 4, 3, 2, 1 and 0 (the tail is at offset 0). The rest of the
-  slice is zero padding. The same island pattern repeats in all six slices.
+Verified with `tools/ttpf_mips.py check` (BC1_SRGB 6-face downsample MAE vs. a tail-origin
+negative control):
 
-Limits of this validation:
+| Pool / index | Dimensions | Format / mode / mips | Snapshots / `data_offset` | Per-face max error | Overall max | Tail control |
+|---|---|---|---|---:|---:|---:|
+| `ttdb_maps_7_7.ttpf` #7150 | 128×128×6 | BC1_SRGB, mode 20, 8 mips | 2 / 24,576 | 1.82 / 2.50 / 2.05 / 1.81 / 0.68 / 1.58 | 2.50 | 83.61 |
+| `ttdb_maps_0_7.ttpf` #4965 | 512×512×6 | BC1_SRGB, mode 24, 10 mips | 4 / 425,984 | 3.20 / 1.83 / 4.55 / 2.16 / 1.71 / 4.26 | 4.55 | 109.37 |
 
-- It validates allocation size, slice count, slice stride and the mip-tail offsets. It does
-  **not** decode BC6H or BC7 pixels, so the face order and content are not checked.
-- It does not add an exporter; the 90 records remain skipped by `TtpfReader` until a code
-  change adopts the rule.
-- Some of the 90 are BCPack-backed; those cannot export without a BCPack decoder regardless.
+Prefiltered reflection cubemaps can show slightly higher single-face MAE (~9 levels) on tiny
+mips because cubemap prefiltering convolves across adjacent faces, while still beating the
+tail-origin control (~130–140) by more than 13×.
 
-## What blocks the other 588
+## 3D volumes (`dimension = 3`, `depth > 1`, `mode = 2`, `mips = 1`) — 3 records
 
-### Tile mode 10: 75 cube-shaped records
+### Layout
 
-The allocation is always an integer number of compact 4 KiB chains, but the count is 8 or 9
-and no descriptor field selects it:
+Implemented in `volume_surface_layout` (`tools/tex_headers.py`) and `detile_volume`
+(`tools/ttpf_mips.py`):
 
-| Width x height | Mips | Raw -> DXGI | Records | Chains | Populated | Span |
-|---|---:|---|---:|---:|---:|---:|
-| 64 x 64 | 5 or 7 | 226 -> BC7_UNORM | 50 | 9 | 9 | 73,728 |
-| 128 x 128 | 8 | 200 -> BC1_UNORM | 25 | 8 | 8 | 98,304 |
+- Standard AMD Gfx10 3D `SW_4KB_S` micro-tiling with a single mip level (`mips = 1`).
+- **3 / 3 are 100% zlib/raw (0 BCPack)** and **3 / 3 match their allocation spans byte-exact**.
 
-Every chain is populated. A six-face model would need six chains, so three extra chains
-(64x64) or two extra chains (128x128) are not accounted for by a face rule; `depth = 3` does
-not select 8 or 9. No slice order is proven.
+### Validation
 
-### Tile mode 11: 122 cube-shaped records
+Each volume was detiled in 3D and compared against a 2D stacked-slice control using mean
+adjacent-Z voxel difference:
 
-All 122 have the same span, 270,336 bytes = 11 compact 4 KiB chains of 24,576 bytes:
+| Pool / index | Dimensions | DXGI format | B/voxel | 3D tile | `padded_d` | Span (B) | 3D Z-diff | 2D stacked control | Ratio |
+|---|---|---|---:|---|---:|---:|---:|---:|---:|
+| `ttdb_graphics.ttpf` #901 | 256×32×8 | 54 `R16_FLOAT` | 2 | 16×8×16 | 16 | 262,144 | 0.023623 | 0.124305 | 5.3× smoother |
+| `ttdb_graphics.ttpf` #575 | 32×32×32 | 10 `R16G16B16A16_FLOAT` | 8 | 8×8×8 | 32 | 262,144 | 0.036721 | 0.565428 | 15.4× smoother |
+| `ttdb_graphics.ttpf` #200 | 32×64×32 | 10 `R16G16B16A16_FLOAT` | 8 | 8×8×8 | 32 | 524,288 | 0.016793 | 0.110316 | 6.6× smoother |
 
-| Width x height | Mips | Raw -> DXGI | Records | Chains | Populated | Zero | Span |
-|---|---:|---|---:|---:|---:|---:|---:|
-| 128 x 128 | 6 or 8 | 223 -> BC6H_UF16 | 27 | 11 | 9 | 2 | 270,336 |
-| 128 x 128 | 4, 6 or 8 | 226 -> BC7_UNORM | 95 | 11 | 9 | 2 | 270,336 |
+## 43-bit `(meta, extra)` streaming chunk-page metadata
 
-The last two chains are entirely zero in every record. Nine populated chains is still not a
-cube-face count, and neither `mips` (4/6/8), `depth` (3) nor `non_tail` (2) selects 9. No slice
-order is proven.
+Decoded by `decode_etpf_chunk_pages` and `etpf_streaming_padding` in `tools/tex_headers.py`, and
+verified across all **357,115 / 357,115** descriptors (`chunk_metadata_ok = 357,115`,
+`chunk_metadata_fail = 0`):
 
-### Tile mode 12: 280 cube-shaped records
+- Combine `val43 = (extra << 11) | meta`.
+- The low 20 bits pack up to four zero-terminated 5-bit chunk page-count codes (in 4 KiB pages):
 
-The span is never an integer multiple of the compact 4 KiB chain, and the 512x512 group has a
-hard size blocker:
+| Code | Pages | Code | Pages | Code | Pages |
+|---:|---:|---:|---:|---:|---:|
+| 1..8 | 1..8 | 14 | 48 | 23 | 96 |
+| 10 | 12 | 15 | 64 | 24 | 144 |
+| 11 | 16 | 16 | 128 | 26 | 272 |
+| 12 | 24 | 21 | 18 | 27 | 384 |
+| 13 | 32 | 22 | 80 | 28 | 528 |
 
-| Width x height | Mips | Raw -> DXGI | Records | Compact 4K chain | Span | Span / chain |
-|---|---:|---|---:|---:|---:|---:|
-| 256 x 256 | 5, 6, 7 or 9 | 223/226 -> BC6H/BC7 | 142 | 90,112 | 860,160 | 9.545 |
-| 512 x 512 | 10 | 200 -> BC1_UNORM_SRGB | 77 | 176,128 | 1,540,096 | 8.744 |
-| 512 x 512 | 10 | 223/226 -> BC6H/BC7 | 61 | 352,256 | 2,998,272 | 8.512 |
+- Bits `9..18` of `extra` are always `0`.
+- The upper bits `extra >> 19` encode `(align_group, pad_pages) = ((extra >> 19) & 3, extra >> 21)`
+  for `non_tail == 3` compact 2D textures:
+  - `align_group == 1`: `pages[0] + pad_pages == 16`
+  - `align_group == 2`: `pages[0] + pages[1] + pad_pages == 16`
+  - `align_group == 3`: `pages[0] + pages[1] + pad_pages == 8`
+  - `0` for cubemaps and `non_tail == 1`.
 
-For the 61 BC6H/BC7 512x512 records, six top mips alone would need
-`6 * 1,048,576 = 6,291,456` bytes, which is more than twice the measured span. A single
-512x512 BC1 top mip is 524,288 bytes, so six BC1 faces would need 3,145,728 bytes, also more
-than the 1,540,096-byte span. These records therefore cannot be six complete cube faces of the
-effective format at the descriptor's width and height. The 256x256 group fits six top mips
-(393,216 of 860,160 bytes) but does not fit an integer number of compact chains; the remaining
-466,944 bytes are not explained by the compact rule.
+## Updated 57-pool corpus totals
 
-The same size bound rules out three or more faces for the 512x512 BC6H/BC7 group: three top
-mips would already be 3,145,728 bytes, above the 2,998,272-byte span. Only one or two full
-faces could fit, which is not a cube. The field that would make these records consistent is
-not in the 16-byte descriptor as decoded today.
+With 2D compact layouts plus 2D arrays, cubemaps, and 3D volumes enabled in
+`tools/ttpf_mips.py`:
 
-### 2D arrays: 108 records
+| Configuration | Complete | Partial | Skipped | Remaining skip breakdown |
+|---|---:|---:|---:|---|
+| Zlib/raw only (2D compact) | 305,264 | 16,419 | 35,432 | 33,507 2D BCPack + 1,223 compact BCPack + 697 multi-slice + 5 DXGI 11 |
+| Zlib/raw only (+ multi-slice) | **305,954** (+690) | **16,423** (+4) | **34,738** (−694) | 33,507 2D BCPack + 1,223 compact BCPack + 3 array BCPack + 5 DXGI 11 (**0** layout skips) |
+| With BCPack BC1/BC3/BC4/BC5 (2D only) | 353,146 | 2,515 | 1,454 | 752 BC6H/BC7 BCPack + 697 multi-slice + 5 DXGI 11 |
+| With BCPack BC1/BC3/BC4/BC5 (+ multi-slice) | **353,840** (**99.08%**, +694) | **2,518** (+3) | **757** (−697) | 752 BC6H/BC7 BCPack + 5 DXGI 11 (**0** layout skips, **0** multi-slice skips) |
 
-All 108 spans are integer multiples of a compact 64 KiB chain:
-
-| `depth` | Records | Chains | Span examples |
-|---:|---:|---:|---|
-| 2 | 99 | 3 | 1,179,648 (98 records), 589,824 (1) |
-| 4 | 2 | 8 | 1,048,576 |
-| 8 | 1 | 16 | 2,097,152 |
-| 16 | 2 | 32 | 4,194,304; 12,582,912 |
-| 24 | 2 | 48 | 6,291,456 |
-| 32 | 2 | 64 | 4,194,304; 8,388,608 |
-
-The size rule is complete on these 108 records (3 chains for `depth = 2`, `2 * depth` for
-`depth >= 4`), but it is not a slice layout. In `peds_0_3` #299 (512x512 BC5, depth 2, 3 chains), the first 393,216-byte
-chain contains the compact-like tail pattern (zero runs of 1,536, 1,984, 3,840, 7,168, 12,288
-and 17,920 bytes) while the second and third chains have no zero run of 1 KiB or more and
-376,079 / 369,866 non-zero bytes.
-The three compact-sized units are therefore not three independent slices; the first unit looks
-like a shared tail and the later units look dense. The 8-chain 256x256 sample #300 shows the
-same split: the first four chains carry the compact-like pattern and the last four are dense.
-Without a field that identifies the shared-tail group, the slice order is unresolved.
-
-### 3D volumes: 3 records
-
-All three have one mip, so only the top level is allocated:
-
-| Width x height | Depth | Raw -> DXGI | Span | Top-volume bytes | Ratio |
-|---|---:|---|---:|---:|---:|
-| 256 x 32 | 4 | 182 -> R16_FLOAT | 262,144 | 65,536 | 4.0 |
-| 32 x 32 | 16 | 138 -> R16G16B16A16_FLOAT | 262,144 | 131,072 | 2.0 |
-| 32 x 64 | 16 | 138 -> R16G16B16A16_FLOAT | 524,288 | 262,144 | 2.0 |
-
-The two R16G16B16A16 volumes are two top-volume bytes; the R16 volume is four. This is a size
-relation only. No 3D tile block, mip-depth or slice order is validated, so the volume record
-stays skipped.
-
-## Limits
-
-- No code is added. The measurement used a copy of the merged #183 parser/helpers for analysis
-  only; `tools/tex_headers.py` and `tools/ttpf_mips.py` are unchanged.
-- No texture, DDS, carved or decompressed payload is committed. The zero-run evidence above is
-  reported as offsets and lengths only.
-- The 90-record tile-mode-9 layout is allocation- and padding-validated, not pixel-decoded.
-  BC6H and BC7 remain undecoded; BCPack still blocks any record whose mips use it.
-- The other 588 records remain skipped by `TtpfReader`. The exact blocker by group is: 75
-  tile-mode-10 (8/9-chain count not selected), 122 tile-mode-11 (9 populated chains / 2 zero,
-  not selected), 280 tile-mode-12 (non-integral chain count; 512x512 is smaller than six top
-  mips), 108 2D arrays (shared-tail group not identified) and 3 volumes (no 3D tile rule).
-- The 19 2D high-bit records outside the 678 are not fixed by this note either: their element
-  size is now known and their two-layer size is measured, but no second-layer exporter exists.
+`tools/ttpf_mips.py` exports DX10 DDS for 2D arrays (`Texture2DArray`), cubemaps
+(`TextureCube`), and validated float16 3D volumes (`Texture3D`). Upstream C# `TtpfReader` parity
+has landed upstream in `breadbbbb/rpf9-explorer` PRs #5 and #6 (pending a submodule pin update).
 
 ## Reproduce
 
-The pool list and the 357,115 / 678 split come from the same scan as `docs/textures.md`:
-`python -I tools/ttpf_mips.py scan <game root>` prints `entries` and `arrays`. The per-record
-checks used a local copy of the merged #183 parser and `compact_surface_layout`; the formulas
-are in the tables above. No analysis script, pool, header dump or texture payload is committed.
+```powershell
+python -I tools/ttpf_mips.py scan <game root> --json scan.json
+python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
+python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional]
+python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--allow-provisional]
+python -I tests/test_tex_headers.py
+python -I tests/test_ttpf_mips.py
+```
 
-## Next checks
-
-1. Decode BC7 with an external decoder and test the six tile-mode-9 faces for mip-downsample
-   agreement; that would upgrade the 90-record subset from padding validation to pixel
-   validation.
-2. Find the field that selects the 8/9 chain count in tile mode 10 and the 9 populated chains
-   in tile mode 11. `meta`, `extra` and the low three `b` bits are the only unassigned
-   descriptor fields. `meta` differs between the two tile-mode-10 groups (0x146 vs 0x2A6) but
-   also appears on other sizes, so it is a profile tag rather than a proven count selector.
-3. For tile mode 12, look for a native dump or a shader-side resource view that gives the true
-   slice count. The 512x512 span rules out six full faces, so a face-based decoder cannot be
-   correct for that group.
-4. For the 108 2D arrays, test the hypothesis that the first compact-sized group is a shared
-   mip tail and the later dense groups are per-slice top mips. A decoded zlib/raw sample can
-   confirm or reject the split without BCPack.
+`scan` verifies all 357,115 descriptors (including all 697 multi-slice layouts and 43-bit chunk
+page metadata) and emits both the zlib/raw (`after_full` / `after_partial` / `after_skip`) and
+BCPack BC1/BC3/BC4/BC5 (`after_bcpack_full` / `after_bcpack_partial` / `after_bcpack_skip`)
+totals. `tests/test_tex_headers.py` and `tests/test_ttpf_mips.py` exercise the 2D array,
+cubemap, 3D volume, and chunk-metadata rules on synthetic inputs without game files.
