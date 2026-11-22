@@ -866,6 +866,50 @@ class ShortLastMusicBlockTest(unittest.TestCase):
         self.assertEqual(self.channels(bytes(d)), [])
 
 
+class AwcIndexTableTest(unittest.TestCase):
+    """The optional index table stores the tag count before each stream, as AwcRecovery.cs checks."""
+
+    @staticmethod
+    def bank(indices, tag_counts=(2,)):
+        n = len(indices)
+        header_size = 16 + n * 2 + n * 4 + sum(tag_counts) * 8
+        body = bytearray()
+        entries = []
+        for count in tag_counts:
+            fmt_at = header_size + len(body)
+            body += format_block(2, 48000, 0, 1)
+            data_at = header_size + len(body)
+            body += b"\x01\x00\x02\x00"
+            entries.append((fmt_at, data_at, count))
+        out = bytearray(b"ADAT" + struct.pack("<III", 0x10000, n, header_size))
+        for index in indices:
+            out += struct.pack("<H", index)
+        for i, (_fmt, _data, count) in enumerate(entries):
+            out += struct.pack("<I", (i + 1) | (count << 29))
+        for fmt_at, data_at, _count in entries:
+            out += struct.pack("<Q", tag(0x76, fmt_at, 32))
+            out += struct.pack("<Q", tag(0x55, data_at, 4))
+        if len(out) != header_size:
+            raise AssertionError("index-table fixture layout does not match header_size")
+        return bytes(out + body)
+
+    def test_valid_index_table_is_accepted(self):
+        streams, music = awc.parse_awc(self.bank([0]))
+        self.assertEqual([s["id"] for s in streams], [1])
+        self.assertEqual((streams[0]["samples"], streams[0]["rate"]), (2, 48000))
+        self.assertEqual(music, [])
+
+    def test_bogus_index_entry_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "index"):
+            awc.parse_awc(self.bank([0x1234]))
+
+    def test_index_tracks_cumulative_tag_count(self):
+        with self.assertRaisesRegex(ValueError, "index"):
+            awc.parse_awc(self.bank([0, 1], (2, 2)))
+        streams, _music = awc.parse_awc(self.bank([0, 2], (2, 2)))
+        self.assertEqual([s["id"] for s in streams], [1, 2])
+
+
 class MalformedBankTest(unittest.TestCase):
     def test_truncated_pcm_bank_creates_no_outputs(self):
         pcm = b"\x01\x00" * 4
