@@ -3,12 +3,13 @@
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue and a fence. Results are read back through D3D12 itself
 // (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo and
-// GetResourceTiling are compared with the host PC runtime's. WriteToSubresource/ReadFromSubresource run on
-// devices of their own, once per copy path. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run
-// under VK_LAYER_KHRONOS_validation; any validation error fails the test.
+// GetResourceTiling are compared with the host PC runtime's, and so are copies (d3d12_copy_compare.h).
+// WriteToSubresource/ReadFromSubresource run on devices of their own, once per copy path. No shaders or game data.
+// Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
 
 #include <algorithm>
 #include <array>
@@ -305,13 +306,15 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
     return 0;
 }
 
-// The host PC runtime's D3D12 device on the default adapter, to compare answers with; false if there is none.
+// The host PC runtime's D3D12 device to compare answers with: the default adapter, or the one LEONIDA_HOST_ADAPTER
+// names ("warp", or part of an adapter's name); false if there is none.
 bool create_host_device(Ref<ID3D12Device>& host) {
-    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
-                                    reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
-                              : nullptr;
-    return create && SUCCEEDED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)));
+    copycmp::Ptr<ID3D12Device> device;
+    std::string name;
+    if (!copycmp::create_host(device, name)) return false;
+    host.p = device.p;
+    device.p = nullptr;
+    return true;
 }
 
 // GetCopyableFootprints must match the PC runtime's exactly, since applications size and fill upload buffers from
@@ -538,12 +541,8 @@ D3D12_RESOURCE_DESC reserved_desc(D3D12_RESOURCE_DIMENSION dimension, UINT64 wid
 // Returns the number of mismatches, or -1 without a host D3D12 device with tiled resources or with every layout
 // skipped.
 int compare_tiling(ID3D12Device* ours) {
-    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
-                                    reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
-                              : nullptr;
     Ref<ID3D12Device> host;
-    if (!create || FAILED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return -1;
+    if (!create_host_device(host)) return -1;
     D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
     if (FAILED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
         options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED)
@@ -1063,6 +1062,11 @@ int main() {
         if (allocation_mismatches < 0)
             std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
         EXPECT(allocation_mismatches <= 0);
+
+        // D3D-46: copies against the host runtime (d3d12_copy_compare.h).
+        const int copy_mismatches = copycmp::compare_copies(device.p, d.bc, d.depth_format_usable(VK_FORMAT_D24_UNORM_S8_UINT));
+        if (copy_mismatches < 0) std::printf("Copies: no host D3D12 device to compare with, skipped\n");
+        EXPECT(copy_mismatches <= 0);
         const int tiling_mismatches = compare_tiling(device.p);
         if (tiling_mismatches < 0)
             std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "

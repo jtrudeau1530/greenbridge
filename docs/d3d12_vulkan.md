@@ -161,7 +161,10 @@ What is implemented (all of it testable without the game):
   transfer clears inside a layout round trip; rectangle clears are `vkCmdClearAttachments` in a dynamic-rendering
   scope, with rectangles clipped to the mip. Copies become `vkCmdCopyBuffer`, `vkCmdCopyBufferToImage`,
   `vkCmdCopyImageToBuffer` and `vkCmdCopyImage`. A placed footprint's row pitch becomes `bufferRowLength`, and
-  block-compressed extents stop at the mip edge (D3D12 pads footprints to whole blocks, Vulkan does not). Each
+  block-compressed extents stop at the mip edge (D3D12 pads footprints to whole blocks, Vulkan does not; a
+  texture-to-texture box of a block-compressed format is rounded up to whole blocks, as on the PC runtime, must fit
+  the destination's padded mip, and the Vulkan extent is cut where it reaches an image's edge; Vulkan wants that per
+  image, so a copy whose cut extent is neither a block multiple nor at the edge of both images is refused). Each
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
@@ -417,8 +420,48 @@ and any validation error fails them.
   resolved into a texture that is read back; the multisampled shapes D3D12 refuses are refused, and so is a
   resolve from a single-sampled texture. `GetCopyableFootprints` is compared with the PC runtime's, and a short
   run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
-  round trip and a buffer region. `GetCopyableFootprints` is compared with the PC runtime's, and a short run
-  repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
+  The comparison tests run against a PC D3D12 device: the default adapter, or the one named by
+  `LEONIDA_HOST_ADAPTER` (`warp`, or part of an adapter's name; the adapter used is printed). Some answers are the
+  driver's choice, so pick the host side when two adapters disagree: `GetResourceTiling` differs between an NVIDIA
+  host and an AMD or WARP host on a machine that has both.
+  - Copies against the host (D3D-46, `d3d12_copy_compare.h`): the same scenario runs on the layer and on the host and
+    the bytes read back are compared; a failing case prints its name, the region (subresource, mip, slice, plane)
+    and the first differing byte. Every case uploads deterministic bytes into a texture and then runs
+    `CopyResource`, `CopyTextureRegion` texture to texture (an inner box to the origin, and the origin box into
+    another array slice at an offset), footprint to texture (an inner box at an offset) and texture to footprint
+    (an inner box at an offset into a readback buffer prefilled with `0xcd`), and reads every subresource back.
+    Formats: R8, R8G8 SNORM, RGBA8 (UNORM, SRGB, typeless), BGRA8, R16 UNORM, RG16 and RGBA16 float, R32 UINT,
+    RG32 UINT, RGBA32 float, R10G10B10A2, R11G11B10, R9G9B9E5, B5G6R5, B5G5R5A1, D16, D32, D24S8, D32S8 and BC1-BC7
+    (SRGB and signed variants included), as a 36x20 texture with three slices and six mips (odd mip sizes), 3D
+    textures with boxes in depth, a single-mip single-slice texture and a one-block BC7. Buffers: `CopyBufferRegion`
+    at odd offsets and sizes, a `CopyResource` of a 4093-byte buffer, and an upload buffer straight to a readback
+    buffer. Only the bytes inside a footprint row are compared (row padding is the driver's; a difference there is
+    printed, not failed); every byte a partial copy must leave alone is compared. It found:
+    - `R8G8_SNORM`, `R16_UNORM`, `R32G32_UINT`, `R9G9B9E5_SHAREDEXP`, `B5G6R5_UNORM` and `B5G5R5A1_UNORM` textures were
+      refused (no Vulkan mapping); they map to `R8G8_SNORM`, `R16_UNORM`, `R32G32_UINT`, `E5B9G9R9_UFLOAT_PACK32`,
+      `R5G6B5_UNORM_PACK16` and `A1R5G5B5_UNORM_PACK16`.
+    - A texture-to-texture box on a block-compressed texture that reaches the padded edge of a mip (for example a
+      box of whole blocks over a 9x5 mip) was refused as `invalid_copy`; the PC runtime accepts it.
+
+    Copies between different mips of one texture are compared too (mips 24, 12, 6, 3, 1; RGBA8, BC1, BC7): sizes that
+    are no block multiple, boxes to a padded edge, and boxes that do not fit the destination, which both sides must
+    refuse (the host at `Close` with `E_INVALIDARG`, the layer at execution with `invalid_copy`). Known gaps shown
+    by it and by the formats, not fixed:
+    - **Block-compressed copies into a mip whose size is no block multiple**, for example a 0..8 box into a 6-wide
+      mip, a 6x6 mip into a larger one, or a 4x4 box into a 3x3 mip: the host copies whole blocks, `vkCmdCopyImage`
+      cannot (its extent must be a block multiple or reach each image's edge), so the layer refuses them with
+      `invalid_copy`. A fix needs a staging copy through a buffer. The test prints these as known differences.
+    - **`TEXTURE1D`** resources are not supported by the layer (creation, footprints and allocation info refuse
+      them), so 1D copies are not compared.
+    - **`D24_UNORM_S8_UINT` on a GPU without it (the Radeon 880M)**: the layer stores `D32_SFLOAT_S8_UINT`, and an
+      upload or readback copies the bits without converting 24-bit unorm to float, so the values a D24 texture
+      holds are not the ones the game wrote. Only the bit-preserving copies (`CopyResource`, box and slice copies
+      between two D24 textures) are checked there, against the layer's own readback of the source; the upload
+      and readback paths are not compared. A fix needs a conversion pass (compute) around such copies.
+    - On a GPU with D24, a readback leaves the unspecified `X8` byte of the depth plane untouched where the PC
+      runtime writes 0; the comparison ignores it.
+    A PC driver's copy flushes denormal float depth to zero, so the test keeps its values normal. A
+    `LEONIDA_HOST_ADAPTER` that matches no adapter fails the run instead of skipping the comparisons.
 - `d3d12_method_variants_test`: each variant against the method it wraps, on the device directly (the proxy's
   slot 76 is the Xbox texture method, not `CreateCommittedResource3`). It runs 12 creation cases (buffers on the
   three heap types, textures, a volume, a multisampled target, and three shapes the base refuses) through every
