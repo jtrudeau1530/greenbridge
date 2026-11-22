@@ -888,6 +888,17 @@ and any validation error fails them.
   - the index has an entry with set-0 bindings for the same program ahead of the binding-free one, and the PSO
     must take the binding-free one;
   - a device that reports 128 bytes of push constants refuses the PSO.
+- `d3d12_set0_compute_test`: set 0 from the compute bind point, through the proxy and D3D12 alone. The index entry
+  of its shader lists set-0 bindings, so the PSO's layout holds the device's bindless set and replay binds it at
+  each dispatch; nothing in the test binds it. Four dispatches of `test/glsl/cs_set0_sample.comp` (GLSL written to
+  the translator's contract) load a T# and an S# from two descriptor tables and sample one tile to the right in U:
+  - two SRVs give their textures texel for texel, so the T# decides the image;
+  - 32 bytes no view was made for give the fallback image, one colour everywhere;
+  - a clamping sampler gives the texture's right edge, so the S# decides the sampler;
+  - a device without the bindless set refuses the PSO.
+
+  Removing the set-0 bind from the dispatch path makes this test fail (`VUID-vkCmdDispatch-None-08600`, measured on
+  llvmpipe); `d3d12_m2_textured_test` covers the bind at draws in the same way.
 - `d3d12_draw_test`: milestone M1, through the proxy.
   - **Pipeline:** a VS+PS PSO found by FSSM hash. The input layout is POSITION then COLOR, while the VS has them in
     the opposite register order, so a match by position would fail.

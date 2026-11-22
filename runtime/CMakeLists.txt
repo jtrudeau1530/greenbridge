@@ -1234,8 +1234,26 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_draw COMMAND d3d12_draw_test)
       set_tests_properties(d3d12_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # Set 0 from the compute bind point: a compute PSO whose shader declares set-0 bindings samples through the
+      # device's bindless set, which nothing but the layer binds.
+      set(LEONIDA_TEST_CS_SET0_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_set0_sample.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_SET0_SAMPLE}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_SET0_SAMPLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_set0_sample.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_set0_sample.comp
+        COMMENT "Compiling the set-0 compute test shader"
+        VERBATIM)
+      add_executable(d3d12_set0_compute_test test/d3d12_set0_compute_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_CS_SET0_SAMPLE})
+      target_link_libraries(d3d12_set0_compute_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_set0_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SET0_SAMPLE_SPV="${LEONIDA_TEST_CS_SET0_SAMPLE}")
+      target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
+      set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test and d3d12_draw_test are not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
     endif()
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)

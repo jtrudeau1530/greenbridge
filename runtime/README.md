@@ -204,6 +204,9 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
   translator-style index, root arguments through the GPU address arena, and two dispatches.
+- `d3d12_set0_compute_test` — set 0 from the compute bind point: a compute PSO whose index entry lists set-0
+  bindings, and four dispatches that sample two SRVs, bytes no view was made for and a clamping sampler through
+  the bindless set the layer binds.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
   Vulkan, resizes it and presents 10 more, and checks the colour on screen. A driver double then injects an
   out-of-date and a suboptimal present, a failed semaphore during a swapchain recreation and a failed blit
