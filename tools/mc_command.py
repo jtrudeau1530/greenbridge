@@ -18,9 +18,15 @@ def split_command(raw: str) -> list:
         return []
     if os.path.isfile(raw):
         return [raw]                    # a plain path, spaces and all
-    if os.name != "nt":
-        return shlex.split(raw)
-    parts = shlex.split(raw, posix=False)
+    try:
+        if os.name != "nt":
+            parts = shlex.split(raw)
+        else:
+            parts = shlex.split(raw, posix=False)
+    except ValueError as e:
+        # shader_disasm.py calls mc_command() at import time: a bad LLVM_MC must give one clear line,
+        # not a ValueError traceback before any tool's own argument parsing runs.
+        raise SystemExit(f"LLVM_MC: invalid command line {raw!r}: {e}") from None
     return [p[1:-1] if len(p) > 1 and p[0] == p[-1] == '"' else p for p in parts]
 
 
