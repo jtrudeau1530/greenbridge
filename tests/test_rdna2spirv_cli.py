@@ -249,10 +249,6 @@ class ValidatedOutput(unittest.TestCase):
         self.assertIn("ps_fixture", json.loads(self.index.read_text(encoding="utf-8")))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class EmptyShader(unittest.TestCase):
     """A .s with no tab-indented instruction parses to an empty shader.
 
@@ -274,3 +270,36 @@ class EmptyShader(unittest.TestCase):
             self.assertIn("0 translated", p.stdout, p.stdout)
             self.assertIn("no instructions (nothing tab-indented?)", p.stdout, p.stdout)
             self.assertFalse(os.path.exists(os.path.join(out, "ps_empty.spv")))
+
+
+class PopsInvocationInterlock(unittest.TestCase):
+    """SHADER-350: POPS pixel interlock shaders must emit OpBeginInvocationInterlockEXT and OpEndInvocationInterlockEXT."""
+
+    def test_straight_line_pops_pixel_shader_emits_begin_and_end_interlock(self):
+        gen = rdna2spirv.Gen("ps")
+        gen.uses_pops = True
+        gen.body = ["OpNoOp"]
+        spv = rdna2spirv.assemble(gen)
+        self.assertIn("OpBeginInvocationInterlockEXT", spv)
+        self.assertIn("OpEndInvocationInterlockEXT", spv)
+
+    def test_branching_pops_pixel_shader_emits_begin_and_end_interlock(self):
+        gen = rdna2spirv.Gen("ps")
+        gen.uses_pops = True
+        gen.blocks = [["OpNoOp"]]
+        gen.succ = [[]]
+        spv = rdna2spirv.assemble(gen)
+        self.assertIn("OpBeginInvocationInterlockEXT", spv)
+        self.assertIn("OpEndInvocationInterlockEXT", spv)
+
+    def test_non_pops_pixel_shader_omits_interlock_ops(self):
+        gen = rdna2spirv.Gen("ps")
+        gen.uses_pops = False
+        gen.body = ["OpNoOp"]
+        spv = rdna2spirv.assemble(gen)
+        self.assertNotIn("OpBeginInvocationInterlockEXT", spv)
+        self.assertNotIn("OpEndInvocationInterlockEXT", spv)
+
+
+if __name__ == "__main__":
+    unittest.main()

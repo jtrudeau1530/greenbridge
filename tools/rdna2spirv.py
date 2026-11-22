@@ -10228,7 +10228,6 @@ def assemble(gen):
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or [])
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
-    out = hdr + dec + types + gvars + helpers + fn
     tree = (cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate and not gen.bar_rounds
             else None)
     if tree is not None:
@@ -10326,10 +10325,10 @@ def assemble(gen):
         flow = lines[2:]
         last_var = max(i for i, l in enumerate(fn) if " = OpVariable " in l)
         fn = fn[:last_var + 1] + fn_vars + fn[last_var + 1:]
-        if pops:
-            fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
-        out = hdr + dec + types + gvars + helpers + fn
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
+    if pops:
+        fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
+    out = hdr + dec + types + gvars + helpers + fn
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if msc:
         end_lock = gen.msc_epilogue + end_lock
