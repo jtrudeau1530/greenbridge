@@ -101,11 +101,12 @@ int main() {
         r = decide_subgroup_size(entry("ms", true, {128, 1, 1}), caps);
         CHECK(r.outcome == SubgroupOutcome::required && r.size == 64 && r.flags == 0 &&
               r.stage == VK_SHADER_STAGE_MESH_BIT_EXT);
-        // Vertex and geometry stages are not in the list: a wave64 VS cannot get 64; there is no emulation for it.
+        // Vertex and geometry stages are not in the list: a wave64 VS cannot be given 64, but the default is 64, so it
+        // works as it is (device_default); there is no emulation for it.
         r = decide_subgroup_size(entry("vs", true), caps);
-        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.wanted == 64);
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.wanted == 64);
         r = decide_subgroup_size(entry("gs", true), caps);
-        CHECK(r.outcome == SubgroupOutcome::unavailable);
+        CHECK(r.outcome == SubgroupOutcome::device_default);
         // A wave32 VS on a 64-wide default is wrong too.
         r = decide_subgroup_size(entry("vs", false), caps);
         CHECK(r.outcome == SubgroupOutcome::unavailable && r.wanted == 32);
@@ -139,14 +140,14 @@ int main() {
         auto r = decide_subgroup_size(entry("cs", true), caps);
         CHECK(r.outcome == SubgroupOutcome::required && r.size == 64 &&
               r.flags == VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT);
-        // Pixel shaders cannot be required, and the default is 64: a wave32 PS is wrong, a wave64 PS is not
-        // exact either, because the size is not guaranteed (min != max).
+        // Pixel shaders cannot be required, and the default is 64: a wave32 PS is wrong, a wave64 PS works as it is
+        // (device_default: nothing guarantees the default, min != max).
         r = decide_subgroup_size(entry("ps", false), caps);
         CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0);
         r = decide_subgroup_size(entry("ps", true), caps);
-        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0);
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0);
         r = decide_subgroup_size(entry("ms", true, {128, 1, 1}), caps);
-        CHECK(r.outcome == SubgroupOutcome::unavailable);
+        CHECK(r.outcome == SubgroupOutcome::device_default);
     }
 
     // --- Feature, limit and index edge cases -------------------------------------------------------------------------
@@ -160,16 +161,16 @@ int main() {
         caps = amd();
         caps.subgroup_size_control = false;
         r = decide_subgroup_size(entry("cs", true), caps);
-        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0);
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
         // The workgroup must fit size * maxComputeWorkgroupSubgroups (-pNext-02756): 1024 > 64 * 8.
         caps = amd();
         caps.max_compute_workgroup_subgroups = 8;
         r = decide_subgroup_size(entry("cs", true, {1024, 1, 1}), caps);
-        CHECK(r.outcome == SubgroupOutcome::unavailable);
+        CHECK(r.outcome == SubgroupOutcome::device_default);
         r = decide_subgroup_size(entry("cs", true, {512, 1, 1}), caps);
         CHECK(r.outcome == SubgroupOutcome::required && r.size == 64);
         r = decide_subgroup_size(entry("cs", true, {16, 8, 8}), caps);  // 1024 invocations too
-        CHECK(r.outcome == SubgroupOutcome::unavailable);
+        CHECK(r.outcome == SubgroupOutcome::device_default);
         // The limit is for compute and mesh; a pixel shader is not subject to it.
         r = decide_subgroup_size(entry("ps", true), caps);
         CHECK(r.outcome == SubgroupOutcome::required);
