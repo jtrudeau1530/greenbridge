@@ -6777,8 +6777,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.custom_border_color = has_custom_border && custom_border.customBorderColors;
     info.custom_border_color_without_format = has_custom_border && custom_border.customBorderColorWithoutFormat;
     if (info.custom_border_color) {
-        custom_border.pNext = enable13.pNext;
-        enable13.pNext = &custom_border;
+        custom_border.pNext = *v13.next();   // where later feature structs go since #1706
+        *v13.next() = &custom_border;
     } else {
         std::fprintf(stderr,
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");

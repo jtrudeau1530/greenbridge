@@ -466,8 +466,8 @@ public:
         }
         const char* custom_border_color_name = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
         if (custom_border_color) {
-            custom_border.pNext = enable13.pNext;
-            enable13.pNext = &custom_border;
+            custom_border.pNext = *v13_.next();   // where later feature structs go since #1706
+            *v13_.next() = &custom_border;
         }
 
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
