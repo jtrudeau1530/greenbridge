@@ -260,6 +260,297 @@ def ref_frexp_reconstruct_f64(src0_bits: int) -> float:
     return math.ldexp(m, exp_i32)
 
 
+class DataType(Enum):
+    """Data types supported by RDNA2 VALU instructions."""
+    F64 = auto()
+    I32 = auto()
+    U32 = auto()
+    U64 = auto()
+
+
+class OperandKind(Enum):
+    """Classification of instruction operands."""
+    VGPR_PAIR = auto()
+    VGPR_SINGLE = auto()
+    SGPR_PAIR = auto()
+    SGPR_SINGLE = auto()
+    LITERAL_I32 = auto()
+    LITERAL_F64 = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass
+class Operand:
+    """Typed operand representation in symbolic AST."""
+    kind: OperandKind
+    data_type: DataType
+    reg_index: int = 0
+    literal_val: int = 0
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def validate(self) -> None:
+        if self.kind in (OperandKind.VGPR_PAIR, OperandKind.VGPR_SINGLE):
+            limit = 255 if self.kind == OperandKind.VGPR_PAIR else 256
+            if not (0 <= self.reg_index < limit):
+                raise ValueError(f"VGPR index {self.reg_index} out of valid range [0, {limit})")
+        elif self.kind in (OperandKind.SGPR_PAIR, OperandKind.SGPR_SINGLE):
+            limit = 105 if self.kind == OperandKind.SGPR_PAIR else 106
+            if not (0 <= self.reg_index < limit):
+                raise ValueError(f"SGPR index {self.reg_index} out of valid range [0, {limit})")
+
+    def to_asm(self) -> str:
+        s = ""
+        if self.kind == OperandKind.VGPR_PAIR:
+            s = f"v[{self.reg_index}:{self.reg_index + 1}]"
+        elif self.kind == OperandKind.VGPR_SINGLE:
+            s = f"v{self.reg_index}"
+        elif self.kind == OperandKind.SGPR_PAIR:
+            s = f"s[{self.reg_index}:{self.reg_index + 1}]"
+        elif self.kind == OperandKind.SGPR_SINGLE:
+            s = f"s{self.reg_index}"
+        elif self.kind == OperandKind.LITERAL_I32:
+            s = str(s32(self.literal_val))
+        elif self.kind == OperandKind.LITERAL_F64:
+            s = f"{bits_to_f64(self.literal_val)}"
+        elif self.kind == OperandKind.INLINE_CONST:
+            s = str(self.literal_val)
+
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+@dataclass
+class InstructionAST:
+    """Symbolic AST node for v_frexp_mant_f64 and v_frexp_exp_i32_f64."""
+    opcode: str
+    dst: Operand
+    src0: Operand
+    clamp: bool = False
+    omod: str = "none"
+
+    def validate(self) -> None:
+        if self.opcode not in ("v_frexp_mant_f64", "v_frexp_exp_i32_f64"):
+            raise ValueError(f"Unsupported opcode {self.opcode}")
+
+        if self.opcode == "v_frexp_mant_f64":
+            if self.dst.kind != OperandKind.VGPR_PAIR or self.dst.data_type != DataType.F64:
+                raise TypeError("v_frexp_mant_f64 destination must be a 64-bit VGPR pair (DataType.F64)")
+        elif self.opcode == "v_frexp_exp_i32_f64":
+            if self.dst.kind != OperandKind.VGPR_SINGLE or self.dst.data_type != DataType.I32:
+                raise TypeError("v_frexp_exp_i32_f64 destination must be a 32-bit single VGPR (DataType.I32)")
+            if self.clamp:
+                raise ValueError("v_frexp_exp_i32_f64 does not support clamp modifier")
+            if self.omod != "none":
+                raise ValueError("v_frexp_exp_i32_f64 does not support omod modifier")
+
+        if self.dst.abs_mod or self.dst.neg_mod:
+            raise ValueError("Destination does not support input modifiers")
+        if self.src0.data_type != DataType.F64:
+            raise TypeError("src0 must be DataType.F64")
+        if self.omod not in ("none", "mul:2", "mul:4", "div:2"):
+            raise ValueError(f"Invalid omod modifier '{self.omod}'")
+        self.dst.validate()
+        self.src0.validate()
+
+    def to_asm(self) -> str:
+        tokens = [f"{self.opcode} {self.dst.to_asm()}, {self.src0.to_asm()}"]
+        if self.clamp:
+            tokens.append("clamp")
+        if self.omod != "none":
+            tokens.append(self.omod)
+        return " ".join(tokens)
+
+
+def parse_valu_frexp_f64(asm_line: str) -> InstructionAST:
+    """Parse assembly string for v_frexp_mant_f64 or v_frexp_exp_i32_f64 into InstructionAST."""
+    line = asm_line.strip()
+    # Normalize opcodes like v_frexp_mant_f64_e32 / e64
+    m_op = re.match(r"^(v_frexp_mant_f64|v_frexp_exp_i32_f64)(?:_e32|_e64)?\b", line)
+    if not m_op:
+        raise ValueError(f"Expected instruction starting with v_frexp_mant_f64 or v_frexp_exp_i32_f64, got: {line}")
+
+    opcode = m_op.group(1)
+    remainder = line[m_op.end():].strip()
+
+    # Split trailing modifiers
+    tokens = remainder.split()
+    operands_tokens = []
+    clamp = False
+    omod = "none"
+
+    for tok in tokens:
+        if tok == "clamp":
+            clamp = True
+        elif tok in ("mul:2", "mul:4", "div:2"):
+            omod = tok
+        else:
+            operands_tokens.append(tok)
+
+    op_str = " ".join(operands_tokens)
+    parts = [p.strip() for p in op_str.split(",") if p.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"Expected 2 operands (dst, src0), got {len(parts)} in '{line}'")
+
+    dst_str, src0_str = parts[0], parts[1]
+
+    # Parse DST
+    m_vpair = re.match(r"^v\[(\d+):(\d+)\]$", dst_str)
+    m_vsingle = re.match(r"^v(\d+)$", dst_str)
+
+    if opcode == "v_frexp_mant_f64":
+        if not m_vpair:
+            raise ValueError(f"v_frexp_mant_f64 destination must be VGPR pair v[lo:hi], got: {dst_str}")
+        lo, hi = int(m_vpair.group(1)), int(m_vpair.group(2))
+        if hi != lo + 1:
+            raise ValueError(f"Destination register pair must be contiguous: {dst_str}")
+        dst_op = Operand(kind=OperandKind.VGPR_PAIR, data_type=DataType.F64, reg_index=lo)
+    else:  # v_frexp_exp_i32_f64
+        if m_vpair:
+            raise ValueError(f"v_frexp_exp_i32_f64 destination must be single VGPR, got pair: {dst_str}")
+        if not m_vsingle:
+            raise ValueError(f"v_frexp_exp_i32_f64 destination must be VGPR vN, got: {dst_str}")
+        dst_op = Operand(kind=OperandKind.VGPR_SINGLE, data_type=DataType.I32, reg_index=int(m_vsingle.group(1)))
+
+    # Parse SRC0
+    neg_s0 = False
+    abs_s0 = False
+    s0_clean = src0_str
+    if s0_clean.startswith("-"):
+        neg_s0 = True
+        s0_clean = s0_clean[1:].strip()
+    if s0_clean.startswith("|") and s0_clean.endswith("|"):
+        abs_s0 = True
+        s0_clean = s0_clean[1:-1].strip()
+    if s0_clean.startswith("-"):
+        neg_s0 = not neg_s0
+        s0_clean = s0_clean[1:].strip()
+
+    m_v0 = re.match(r"^v\[(\d+):(\d+)\]$", s0_clean)
+    m_s0 = re.match(r"^s\[(\d+):(\d+)\]$", s0_clean)
+    if m_v0:
+        lo, hi = int(m_v0.group(1)), int(m_v0.group(2))
+        if hi != lo + 1:
+            raise ValueError(f"Source register pair must be contiguous: {s0_str}")
+        src0_op = Operand(
+            kind=OperandKind.VGPR_PAIR,
+            data_type=DataType.F64,
+            reg_index=lo,
+            abs_mod=abs_s0,
+            neg_mod=neg_s0,
+        )
+    elif m_s0:
+        lo, hi = int(m_s0.group(1)), int(m_s0.group(2))
+        if hi != lo + 1:
+            raise ValueError(f"Source register pair must be contiguous: {s0_str}")
+        src0_op = Operand(
+            kind=OperandKind.SGPR_PAIR,
+            data_type=DataType.F64,
+            reg_index=lo,
+            abs_mod=abs_s0,
+            neg_mod=neg_s0,
+        )
+    else:
+        # Literal float or hex constant
+        try:
+            if s0_clean.startswith("0x") or s0_clean.startswith("0X"):
+                val64 = int(s0_clean, 16)
+            else:
+                val64 = f64_to_bits(float(s0_clean))
+            src0_op = Operand(
+                kind=OperandKind.LITERAL_F64,
+                data_type=DataType.F64,
+                literal_val=val64,
+                abs_mod=abs_s0,
+                neg_mod=neg_s0,
+            )
+        except ValueError:
+            raise ValueError(f"Unrecognized src0 operand format: {src0_str}")
+
+    ast = InstructionAST(
+        opcode=opcode,
+        dst=dst_op,
+        src0=src0_op,
+        clamp=clamp,
+        omod=omod,
+    )
+    ast.validate()
+    return ast
+
+
+class TestValuFrexpF64SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_validation(self):
+        dst_mant = Operand(OperandKind.VGPR_PAIR, DataType.F64, reg_index=0)
+        src0_mant = Operand(OperandKind.VGPR_PAIR, DataType.F64, reg_index=2)
+        ast_mant = InstructionAST("v_frexp_mant_f64", dst_mant, src0_mant, clamp=True, omod="mul:2")
+        ast_mant.validate()
+        self.assertEqual(ast_mant.to_asm(), "v_frexp_mant_f64 v[0:1], v[2:3] clamp mul:2")
+
+        dst_exp = Operand(OperandKind.VGPR_SINGLE, DataType.I32, reg_index=5)
+        src0_exp = Operand(OperandKind.SGPR_PAIR, DataType.F64, reg_index=4)
+        ast_exp = InstructionAST("v_frexp_exp_i32_f64", dst_exp, src0_exp)
+        ast_exp.validate()
+        self.assertEqual(ast_exp.to_asm(), "v_frexp_exp_i32_f64 v5, s[4:5]")
+
+    def test_parser_mant_f64_vgpr_sgpr_operands(self):
+        ast = parse_valu_frexp_f64("v_frexp_mant_f64 v[4:5], v[6:7]")
+        self.assertEqual(ast.dst.reg_index, 4)
+        self.assertEqual(ast.src0.kind, OperandKind.VGPR_PAIR)
+        self.assertEqual(ast.src0.reg_index, 6)
+        self.assertFalse(ast.clamp)
+        self.assertEqual(ast.omod, "none")
+
+        ast_sgpr = parse_valu_frexp_f64("v_frexp_mant_f64_e32 v[0:1], s[2:3]")
+        self.assertEqual(ast_sgpr.src0.kind, OperandKind.SGPR_PAIR)
+        self.assertEqual(ast_sgpr.src0.reg_index, 2)
+
+    def test_parser_exp_i32_f64_operands(self):
+        ast = parse_valu_frexp_f64("v_frexp_exp_i32_f64 v3, v[8:9]")
+        self.assertEqual(ast.dst.kind, OperandKind.VGPR_SINGLE)
+        self.assertEqual(ast.dst.reg_index, 3)
+        self.assertEqual(ast.src0.kind, OperandKind.VGPR_PAIR)
+        self.assertEqual(ast.src0.reg_index, 8)
+
+    def test_parser_literal_and_constant_operands(self):
+        ast = parse_valu_frexp_f64("v_frexp_mant_f64 v[0:1], 1.5")
+        self.assertEqual(ast.src0.kind, OperandKind.LITERAL_F64)
+        self.assertEqual(bits_to_f64(ast.src0.literal_val), 1.5)
+
+        ast_exp = parse_valu_frexp_f64("v_frexp_exp_i32_f64 v2, 2.0")
+        self.assertEqual(ast_exp.src0.kind, OperandKind.LITERAL_F64)
+        self.assertEqual(bits_to_f64(ast_exp.src0.literal_val), 2.0)
+
+    def test_parser_modifiers_abs_neg_clamp_omod(self):
+        ast = parse_valu_frexp_f64("v_frexp_mant_f64_e64 v[0:1], -|v[2:3]| clamp mul:4")
+        self.assertTrue(ast.src0.abs_mod)
+        self.assertTrue(ast.src0.neg_mod)
+        self.assertTrue(ast.clamp)
+        self.assertEqual(ast.omod, "mul:4")
+        self.assertEqual(ast.to_asm(), "v_frexp_mant_f64 v[0:1], -|v[2:3]| clamp mul:4")
+
+    def test_ast_type_checking_and_invariants(self):
+        # Invalid dst type for mantissa (must be VGPR_PAIR F64)
+        bad_dst_mant = Operand(OperandKind.VGPR_SINGLE, DataType.F64, reg_index=0)
+        src0 = Operand(OperandKind.VGPR_PAIR, DataType.F64, reg_index=2)
+        with self.assertRaises(TypeError):
+            InstructionAST("v_frexp_mant_f64", bad_dst_mant, src0).validate()
+
+        # Invalid dst type for exponent (must be VGPR_SINGLE I32)
+        bad_dst_exp = Operand(OperandKind.VGPR_PAIR, DataType.I32, reg_index=0)
+        with self.assertRaises(TypeError):
+            InstructionAST("v_frexp_exp_i32_f64", bad_dst_exp, src0).validate()
+
+        # Clamp not supported on v_frexp_exp_i32_f64
+        good_dst_exp = Operand(OperandKind.VGPR_SINGLE, DataType.I32, reg_index=0)
+        with self.assertRaises(ValueError):
+            InstructionAST("v_frexp_exp_i32_f64", good_dst_exp, src0, clamp=True).validate()
+
+
 class TestValuFrexpF64Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
