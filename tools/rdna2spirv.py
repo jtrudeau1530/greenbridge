@@ -4796,7 +4796,8 @@ class Gen:
         elif op in ("s_movrels_b32", "s_movrels_b64"):
             # Relative SGPR read through M0 (RDNA2 ISA SOP1): D = SGPR[S0 + M0] (the b64 form reads the pair at
             # S0 + M0 and S0 + M0 + 1). The SGPR file is an array, so this is a dynamic load, as v_movrels is for
-            # VGPRs. The index wraps to the 128 array slots, so it can't reach the lane-mask parking slots past them;
+            # VGPRs. The index wraps to the 128 array slots, so it can't reach the lane-mask parking slots past them
+            # (an SGPR that holds a lane mask is handled below);
             # the hardware's own range check (and reads past s105 landing on VCC and the other specials) is not
             # modelled. SCC is not written. s_movreld (a dynamic SGPR write) stays Unsupported: the translator keeps
             # translate-time knowledge of SGPR values (literal S# words, descriptor caches) a dynamic write would
@@ -4805,6 +4806,17 @@ class Gen:
             d, src = a[0], a[1]
             if d["k"] != "sgpr" or src["k"] != "sgpr" or d.get("n", 1) != n or src.get("n", 1) != n:
                 raise Unsupported(op + " operands")
+            # An SGPR that lane_masks.py marks as a lane mask holds only this lane's bit, so a plain load would copy
+            # that bit as data (a saved EXEC of 5 read back as 0xffffffff in lanes 0 and 2, 0 elsewhere). For each
+            # such SGPR the whole wave's mask word is collected first (wave_mask, as for s_bcnt1) and replaces the
+            # load when the index lands on it. D then holds the mask as data, which is what lane_masks.py assumes
+            # for an s_movrels destination. The index is dynamic, so every mask SGPR here is a candidate (#1548,
+            # SHADER-284).
+            mask_words = []
+            for r in sorted(k for k in self.cur_masks if isinstance(k, int) and k < self.SGPRS):
+                reg = {"k": "sgpr", "r": r, "n": 1}
+                lo, hi = self.wave_mask(reg)
+                mask_words.append((r, hi if self.mask_half(reg) == "hi" else lo))
             m0 = self.tmp()
             self.emit(f"{m0} = OpLoad %uint %m0")
             vals = []
@@ -4814,6 +4826,11 @@ class Gen:
                 self.emit(f"{j} = OpBitwiseAnd %uint {i} {self.cu(self.SGPRS - 1)}")
                 self.emit(f"{ptr} = OpAccessChain %_ptr_Function_uint %sgpr {j}")
                 self.emit(f"{v} = OpLoad %uint {ptr}")
+                for r, word in mask_words:
+                    hit, sel = self.tmp(), self.tmp()
+                    self.emit(f"{hit} = OpIEqual %bool {j} {self.cu(r)}")
+                    self.emit(f"{sel} = OpSelect %uint {hit} {word} {v}")
+                    v = sel
                 vals.append(v)
             for w, v in enumerate(vals):        # every read before the first write (D may overlap the source)
                 self.store_reg("sgpr", d["r"] + w, v)
