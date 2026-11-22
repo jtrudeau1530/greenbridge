@@ -1099,5 +1099,120 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(c1, 1)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Test suite for IEEE-754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_nan_snan_quieting(self) -> None:
+        # Positive signaling NaN
+        snan_pos = 0x7C01
+        self.assertTrue(is_f16_snan(snan_pos))
+        res_pos = ref_mul_f16(snan_pos, F16_ONE)
+        self.assertTrue(is_f16_qnan(res_pos))
+        self.assertEqual(res_pos, 0x7E01)
+
+        # Negative signaling NaN
+        snan_neg = 0xFC05
+        self.assertTrue(is_f16_snan(snan_neg))
+        res_neg = ref_mul_f16(F16_TWO, snan_neg)
+        self.assertTrue(is_f16_qnan(res_neg))
+        self.assertEqual(res_neg, 0xFE05)
+
+    def test_nan_payload_propagation_and_precedence(self) -> None:
+        # Quiet NaN payload from src0
+        qnan_a = 0x7E55
+        res_a = ref_mul_f16(qnan_a, f16_to_u16(5.0))
+        self.assertEqual(res_a, qnan_a)
+
+        # Quiet NaN payload from src1
+        qnan_b = 0xFEAA
+        res_b = ref_mul_f16(f16_to_u16(-3.0), qnan_b)
+        self.assertEqual(res_b, qnan_b)
+
+        # Dual NaN: src0 takes precedence
+        qnan0 = 0x7E12
+        qnan1 = 0x7E34
+        res_dual = ref_mul_f16(qnan0, qnan1)
+        self.assertEqual(res_dual, qnan0)
+
+    def test_nan_clamping_produces_zero(self) -> None:
+        qnan = 0x7E55
+        res_clamped = ref_mul_f16(qnan, F16_ONE, clamp=True)
+        self.assertEqual(res_clamped, F16_POS_ZERO)
+
+        # Packed NaN clamp
+        s0 = pack_f16x2(qnan, F16_ONE)
+        s1 = pack_f16x2(F16_ONE, qnan)
+        res_pk_clamped = ref_v_pk_mul_f16(s0, s1, clamp=True)
+        self.assertEqual(res_pk_clamped, pack_f16x2(F16_POS_ZERO, F16_POS_ZERO))
+
+    def test_signed_zero_combinations(self) -> None:
+        self.assertEqual(ref_mul_f16(F16_POS_ZERO, F16_POS_ZERO), F16_POS_ZERO)
+        self.assertEqual(ref_mul_f16(F16_POS_ZERO, F16_NEG_ZERO), F16_NEG_ZERO)
+        self.assertEqual(ref_mul_f16(F16_NEG_ZERO, F16_POS_ZERO), F16_NEG_ZERO)
+        self.assertEqual(ref_mul_f16(F16_NEG_ZERO, F16_NEG_ZERO), F16_POS_ZERO)
+
+        # Finite and zero
+        self.assertEqual(ref_mul_f16(F16_POS_ZERO, f16_to_u16(10.0)), F16_POS_ZERO)
+        self.assertEqual(ref_mul_f16(F16_POS_ZERO, f16_to_u16(-10.0)), F16_NEG_ZERO)
+        self.assertEqual(ref_mul_f16(F16_NEG_ZERO, f16_to_u16(10.0)), F16_NEG_ZERO)
+        self.assertEqual(ref_mul_f16(F16_NEG_ZERO, f16_to_u16(-10.0)), F16_POS_ZERO)
+
+        # Clamped negative zero becomes +0.0
+        self.assertEqual(ref_mul_f16(F16_NEG_ZERO, f16_to_u16(10.0), clamp=True), F16_POS_ZERO)
+
+    def test_signed_infinity_combinations(self) -> None:
+        self.assertEqual(ref_mul_f16(F16_POS_INF, F16_POS_INF), F16_POS_INF)
+        self.assertEqual(ref_mul_f16(F16_POS_INF, F16_NEG_INF), F16_NEG_INF)
+        self.assertEqual(ref_mul_f16(F16_NEG_INF, F16_POS_INF), F16_NEG_INF)
+        self.assertEqual(ref_mul_f16(F16_NEG_INF, F16_NEG_INF), F16_POS_INF)
+
+        # Inf * 0.0 -> Canonical Quiet NaN
+        self.assertEqual(ref_mul_f16(F16_POS_INF, F16_POS_ZERO), F16_CANONICAL_QNAN)
+        self.assertEqual(ref_mul_f16(F16_NEG_INF, F16_POS_ZERO), F16_CANONICAL_QNAN)
+        self.assertEqual(ref_mul_f16(F16_POS_ZERO, F16_POS_INF), F16_CANONICAL_QNAN)
+        self.assertEqual(ref_mul_f16(F16_NEG_ZERO, F16_NEG_INF), F16_CANONICAL_QNAN)
+
+        # Clamped inf: positive inf becomes 1.0, negative inf becomes +0.0
+        self.assertEqual(ref_mul_f16(F16_POS_INF, F16_ONE, clamp=True), F16_ONE)
+        self.assertEqual(ref_mul_f16(F16_NEG_INF, F16_ONE, clamp=True), F16_POS_ZERO)
+
+        # Clamped inf * 0.0 becomes +0.0
+        self.assertEqual(ref_mul_f16(F16_POS_INF, F16_POS_ZERO, clamp=True), F16_POS_ZERO)
+
+    def test_max_normal_overflow_boundaries(self) -> None:
+        # MAX_NORMAL * 1.0 = MAX_NORMAL
+        self.assertEqual(ref_mul_f16(F16_MAX_NORMAL, F16_ONE), F16_MAX_NORMAL)
+        # MAX_NORMAL * -1.0 = -MAX_NORMAL
+        self.assertEqual(ref_mul_f16(F16_MAX_NORMAL, F16_NEG_ONE), F16_MAX_NORMAL | F16_SIGN_MASK)
+        # MAX_NORMAL * 2.0 -> overflow to +inf
+        self.assertEqual(ref_mul_f16(F16_MAX_NORMAL, F16_TWO), F16_POS_INF)
+        # MAX_NORMAL * -2.0 -> overflow to -inf
+        self.assertEqual(ref_mul_f16(F16_MAX_NORMAL, f16_to_u16(-2.0)), F16_NEG_INF)
+
+    def test_subnormal_boundaries(self) -> None:
+        # MIN_NORMAL * 1.0 = MIN_NORMAL
+        self.assertEqual(ref_mul_f16(F16_MIN_NORMAL, F16_ONE), F16_MIN_NORMAL)
+        # MIN_NORMAL * 0.5 = subnormal 2^-15
+        res_sub = ref_mul_f16(F16_MIN_NORMAL, F16_HALF)
+        self.assertTrue(is_f16_subnormal(res_sub))
+        self.assertEqual(res_sub, 0x0200)
+
+        # MIN_SUBNORMAL (2^-24) * 1.0 = MIN_SUBNORMAL
+        self.assertEqual(ref_mul_f16(F16_MIN_SUBNORMAL, F16_ONE), F16_MIN_SUBNORMAL)
+        # MIN_SUBNORMAL * 2.0 = 0x0002
+        self.assertEqual(ref_mul_f16(F16_MIN_SUBNORMAL, F16_TWO), 0x0002)
+        # MIN_SUBNORMAL * 0.5 = underflow to +0.0
+        self.assertEqual(ref_mul_f16(F16_MIN_SUBNORMAL, F16_HALF), F16_POS_ZERO)
+        # -MIN_SUBNORMAL * 0.5 = underflow to -0.0
+        self.assertEqual(ref_mul_f16(F16_MIN_SUBNORMAL | F16_SIGN_MASK, F16_HALF), F16_NEG_ZERO)
+
+    def test_round_to_nearest_even(self) -> None:
+        # Check round-to-nearest-even tie breaking
+        val = 1.0 + 2.0**(-10)
+        bits = f16_to_u16(val)
+        res = ref_mul_f16(bits, F16_ONE)
+        self.assertEqual(res, bits)
+
+
 if __name__ == "__main__":
     unittest.main()
