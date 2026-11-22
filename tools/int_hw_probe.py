@@ -10,6 +10,7 @@ Groups covered (each references its contract row in docs/design.md):
     salu_sext_flbit     s_sext_i32_i8, s_sext_i32_i16, s_flbit_i32 (SCC kept)
     salu_cmov_pack      s_cmov_b32, s_cmovk_i32, s_pack_ll/lh/hh_b32_b16 (SCC kept)
     salu_bfe_past31     s_bfe_u32, s_bfe_i32 with offset + width > 32 and width 0
+    salu_cmov_b64       s_cmov_b64 on plain data pairs (SGPR pair, inline constants, literal, null, D itself)
     salu_64_data        s_brev_b64, s_bfe_u64/i64, s_bitset0/1_b64, s_flbit_i32_b64/i64
     salu_quad_bitrep    s_quadmask_b32/b64, s_bitreplicate_b64_b32
     salu_64_bitwise     s_and/or/xor/andn2/orn2/nand/nor/xnor/not_b64 on scalar data
@@ -213,6 +214,23 @@ def build_cases():
                      ["s_mov_b32 s4, 0xffffffff", "s_mov_b32 s5, 0x00000005"],
                      "s_bfe_i32 s6, s4, s5", "width=0 -> 0, SCC=0"),
     ]
+
+    # 5b. s_cmov_b64 on plain 64-bit data pairs: D = SCC ? S0 : D, SCC kept
+    for src_name, src_setup, src_op in (
+        ("sgpr_pair", ["s_mov_b32 s4, 0x11223344", "s_mov_b32 s5, 0x55667788"], "s[4:5]"),
+        ("inline_m1", [], "-1"),
+        ("inline_m16", [], "-16"),
+        ("inline_64", [], "64"),
+        ("literal", [], "0x89abcdef"),
+        ("null", [], "null"),
+        ("self", [], "s[6:7]"),
+    ):
+        for scc_in in (0, 1):
+            cases.append(_salu64_case(
+                "salu_cmov_b64", f"s_cmov_b64_{src_name}_scc{scc_in}",
+                [*src_setup, "s_mov_b32 s6, 0xaabbccdd", "s_mov_b32 s7, 0x99887766"],
+                f"s_cmov_b64 s[6:7], {src_op}", scc_in,
+                "SCC=1 takes S0 (literal zero-extended, null = 0), SCC=0 keeps D, SCC kept"))
 
     # 6. 64-bit scalar data ops (s_brev_b64, s_bfe_u64/i64, s_bitset0/1_b64, s_flbit_i32_b64/i64)
     cases += [

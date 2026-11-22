@@ -122,7 +122,7 @@ def bfe(src, ctl, signed):
     off, width = ctl & 31, (ctl >> 16) & 0x7F
     # A field that runs past bit 31 stops there: s_bfe_i32 sign-extends from the top bit that exists (LLVM
     # constantFoldBFE does for v_bfe; 5-bit width there). The s_bfe rule itself rests on the gfx1150 measurement
-    # (4000 random control words, --oracle hw), and RDNA2 agrees: gfx1036, 20,000 programs with --bfe-any.
+    # (4000 random control words, --oracle hw), and RDNA2 agrees: gfx1036 (counts in the s_bfe row of docs/design.md).
     width = min(width, 32 - off)
     if width == 0:
         return 0
