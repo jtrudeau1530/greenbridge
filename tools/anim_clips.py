@@ -190,8 +190,10 @@ def parameter_node(s, at, parameters):
 def parse_clip(s, at):
     kind = s.u32(at + 0x20)
     if kind >= 16:  # +0x20 is a pointer: a parametric clip that refers to packs outside the dictionary
-        name_at = s.u64(at + 0x30)
-        if SYSTEM <= name_at < SYSTEM + len(s.d):      # `.motion`: name at +0x30
+        name_at, tag = s.u64(at + 0x30), s.d[at + 0x3F]
+        # `.motion`: name at +0x30, a pointer or inline (+0x3F 0x80 | length). For a `.motionmatcher` +0x3F is
+        # byte 7 of its name at +0x38: a pointer's zero high byte or an inline character.
+        if SYSTEM <= name_at < SYSTEM + len(s.d) or tag & 0x80 and tag & 0x7F <= 15:
             motion = {"kind": "motion", "name": s.string(at + 0x30), "animations": [], "children": None,
                       "parameters": None}
             try:
