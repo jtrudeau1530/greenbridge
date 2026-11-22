@@ -788,6 +788,7 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
+        if (desc->SampleDesc.Count != 1 || desc->SampleDesc.Quality != 0) return DXGI_ERROR_INVALID_CALL;
         if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
         auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
         if (!sc->init(hwnd, *desc)) {

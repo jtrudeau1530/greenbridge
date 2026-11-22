@@ -288,6 +288,19 @@ int main() {
         if (hr != DXGI_ERROR_INVALID_CALL) return fail("CreateSwapChainForHwnd invalid buffer count HRESULT");
     }
 
+    constexpr DXGI_SAMPLE_DESC invalid_samples[] = {{0, 0}, {2, 0}, {4, 0}, {1, 1}};
+    for (const auto& samples : invalid_samples) {
+        DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+        invalid.SampleDesc = samples;
+        IDXGISwapChain1* rejected = nullptr;
+        const HRESULT hr = factory->CreateSwapChainForHwnd(queue, hwnd, &invalid, nullptr, nullptr, &rejected);
+        if (rejected) {
+            rejected->Release();
+            return fail("CreateSwapChainForHwnd returned a swapchain for an invalid sample description");
+        }
+        if (hr != DXGI_ERROR_INVALID_CALL) return fail("CreateSwapChainForHwnd invalid sample description HRESULT");
+    }
+
     IDXGISwapChain1* sc1 = nullptr;
     if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &scd, nullptr, nullptr, &sc1)) || !sc1)
         return fail("CreateSwapChainForHwnd");
@@ -965,6 +978,18 @@ int main() {
             return fail("CreateWindowExW (fourth)");
         }
         mock_cw->window_handle = hwnd4;
+        for (const auto& samples : invalid_samples) {
+            DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+            invalid.SampleDesc = samples;
+            IDXGISwapChain1* rejected = nullptr;
+            const HRESULT hr = factory->CreateSwapChainForCoreWindow(queue, mock_cw, &invalid, nullptr, &rejected);
+            if (rejected || hr != DXGI_ERROR_INVALID_CALL) {
+                if (rejected) rejected->Release();
+                mock_cw->Release();
+                DestroyWindow(hwnd4);
+                return fail("CreateSwapChainForCoreWindow should reject invalid sample descriptions");
+            }
+        }
         IDXGISwapChain1* cw_sc1 = nullptr;
         if (FAILED(factory->CreateSwapChainForCoreWindow(queue, mock_cw, &scd, nullptr, &cw_sc1)) || !cw_sc1) {
             mock_cw->Release();
@@ -980,7 +1005,8 @@ int main() {
         }
         cw_sc1->Release();
         DXGI_SWAP_CHAIN_DESC1 cw_desc{};
-        if (FAILED(cw_sc->GetDesc1(&cw_desc)) || cw_desc.Width != scd.Width || cw_desc.Height != scd.Height) {
+        if (FAILED(cw_sc->GetDesc1(&cw_desc)) || cw_desc.Width != scd.Width || cw_desc.Height != scd.Height ||
+            cw_desc.SampleDesc.Count != 1 || cw_desc.SampleDesc.Quality != 0) {
             cw_sc->Release();
             mock_cw->Release();
             DestroyWindow(hwnd4);
