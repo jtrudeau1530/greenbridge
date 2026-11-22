@@ -254,23 +254,6 @@ def join_resource(rows, index, read, check_gap=True):
     return blob, chunks, parsed
 
 
-def _categorise(strings):
-    """Aggregate counts only: no string is returned from here."""
-    distinct = set(strings)
-    out = {
-        "distinct": len(distinct),
-        "path_like": sum(1 for s in distinct if "/" in s),
-        "identifier_like": sum(1 for s in strings if IDENT.fullmatch(s) is not None),
-        "empty": sum(1 for s in strings if not s),
-        "keywords": {},
-    }
-    lowered = [s.lower() for s in strings]
-    for word in KEYWORDS:
-        out["keywords"][word] = {"occurrences": sum(1 for s in lowered if word in s),
-                                 "distinct": sum(1 for s in distinct if word in s.lower())}
-    return out
-
-
 def resources_from_rows(rows, read, check_gap=True, string_limit=16):
     """Parse every RBF0 start row, join its continuations, and build the reported records."""
     out = []
