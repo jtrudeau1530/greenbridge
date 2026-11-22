@@ -1782,11 +1782,19 @@ int main() {
         // More than 4096 SRVs and more than a full shader-visible sampler heap (2048): 5000 distinct views of the
         // texture (mip ranges by swizzles), then one more that samples as the texture, and 2100 distinct wrapping
         // samplers (MaxLOD apart). The last view through the last sampler must give the texture, one tile to the
-        // right; a fallback view or the fallback (clamping) sampler would not.
+        // right; a fallback view or the fallback (clamping) sampler would not. A set with less room than that
+        // (MoltenVK's keeps the default 4096 2D images and 1024 samplers, docs/d3d12_vulkan.md section 5) gets as
+        // many as fill each short array exactly: its last view and sampler must still give the texture, and one
+        // more of each must be refused and read as the fallbacks.
         {
-            constexpr UINT many_views = 5000, many_samplers = 2100, heap_samplers = 2048;
+            constexpr UINT wanted_views = 5000, wanted_samplers = 2100, heap_samplers = 2048;
+            const auto room = rt::d3d12::bindless_room(device.p);
+            EXPECT(room.images_2d >= 2 && room.samplers >= 1);
+            const bool views_capped = room.images_2d < wanted_views + 1, samplers_capped = room.samplers < wanted_samplers;
+            const UINT many_views = views_capped ? room.images_2d - 1 : wanted_views;
+            const UINT many_samplers = samplers_capped ? room.samplers : wanted_samplers;
             Ref<ID3D12DescriptorHeap> many_view_heap, many_sampler_heaps[2];
-            D3D12_DESCRIPTOR_HEAP_DESC many_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, many_views + 1,
+            D3D12_DESCRIPTOR_HEAP_DESC many_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, many_views + 2,
                                                  D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
             EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&many_desc, IID_PPV_ARGS(&many_view_heap.p))));
             many_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, heap_samplers, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
@@ -1813,28 +1821,41 @@ int main() {
                 std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(many_view_cpu + i * step), 32);
             }
             // Every mip with alpha forced to one: the texture's texels (alpha 255), under a T# no other view has.
+            // The one past it, a short array's extra, forces alpha to zero.
             D3D12_SHADER_RESOURCE_VIEW_DESC last_srv{};
             last_srv.Format = sampled_desc.Format;
             last_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             last_srv.Shader4ComponentMapping =
                 D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
             last_srv.Texture2D = {0, UINT(-1), 0, 0};
-            const std::uint64_t last_view = many_view_cpu + many_views * step;
+            const std::uint64_t last_view = many_view_cpu + many_views * step, extra_view = last_view + step;
             device->CreateShaderResourceView(texture.p, &last_srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(last_view)});
             std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(last_view), 32);
+            if (views_capped) {
+                EXPECT(rt::d3d12::bindless_room(device.p).images_2d == 0);
+                last_srv.Shader4ComponentMapping =
+                    D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+                device->CreateShaderResourceView(texture.p, &last_srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(extra_view)});
+                std::memcpy(tsharps.emplace_back().data(), reinterpret_cast<const void*>(extra_view), 32);
+            }
             std::memcpy(tsharps.emplace_back().data(), view_bytes(own), 32);
             std::sort(tsharps.begin(), tsharps.end());
             EXPECT(std::unique(tsharps.begin(), tsharps.end()) == tsharps.end());  // distinct set entries
 
             std::vector<std::array<std::uint32_t, 4>> ssharps;
             std::uint64_t last_sampler = 0;
-            for (UINT i = 0; i < many_samplers; ++i) {
+            const UINT created_samplers = many_samplers + (samplers_capped ? 1 : 0);
+            for (UINT i = 0; i < created_samplers; ++i) {
+                if (i == many_samplers) EXPECT(rt::d3d12::bindless_room(device.p).samplers == 0);
                 D3D12_SAMPLER_DESC many_sampler = sampler_desc;
                 many_sampler.MaxLOD = float(i + 1) / 256.0f;  // the S# keeps 8 fraction bits; LOD 0 is sampled
-                last_sampler = cpu_start(many_sampler_heaps[i / heap_samplers].p) + (i % heap_samplers) * sampler_step;
-                device->CreateSampler(&many_sampler, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(last_sampler)});
-                std::memcpy(ssharps.emplace_back().data(), reinterpret_cast<const void*>(last_sampler), 16);
+                const std::uint64_t at =
+                    cpu_start(many_sampler_heaps[i / heap_samplers].p) + (i % heap_samplers) * sampler_step;
+                device->CreateSampler(&many_sampler, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(at)});
+                std::memcpy(ssharps.emplace_back().data(), reinterpret_cast<const void*>(at), 16);
+                if (i < many_samplers) last_sampler = at;
             }
+            const std::uint64_t extra_sampler = last_sampler + sampler_step;  // many_samplers < heap_samplers then
             std::memcpy(ssharps.emplace_back().data(), sampler_bytes, 16);
             std::sort(ssharps.begin(), ssharps.end());
             EXPECT(std::unique(ssharps.begin(), ssharps.end()) == ssharps.end());
@@ -1845,20 +1866,63 @@ int main() {
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             d.fn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(d.device);
-            SampleKeys last_keys{};
-            std::memcpy(last_keys.tsharp, reinterpret_cast<const void*>(last_view), sizeof(last_keys.tsharp));
-            std::memcpy(last_keys.ssharp, reinterpret_cast<const void*>(last_sampler), sizeof(last_keys.ssharp));
-            std::array<std::uint8_t, bytes> last_texels{};
-            EXPECT(sample_through_set(d, set0, set0_layout, {&last_keys, 1}, last_texels.data()));
+            const auto in_table = [&](std::uint64_t descriptor, bool sampler) {
+                std::uint32_t key[8]{~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+                std::memcpy(key, reinterpret_cast<const void*>(descriptor), sampler ? 16 : 32);
+                return rt::d3d12::bindless_hash_lookup(device.p, key) != 0;
+            };
+            EXPECT(in_table(last_view, false) && in_table(last_sampler, true));
+            if (views_capped) EXPECT(!in_table(extra_view, false));
+            if (samplers_capped) EXPECT(!in_table(extra_sampler, true));
+
+            // The last view through the last sampler; then a short array's extra in its place, which reads as the
+            // fallback: zeros for the view, and the clamping sampler's edge column for the sampler.
+            SampleKeys last_keys[3]{};
+            std::memcpy(last_keys[0].tsharp, reinterpret_cast<const void*>(last_view), sizeof(last_keys[0].tsharp));
+            std::memcpy(last_keys[0].ssharp, reinterpret_cast<const void*>(last_sampler), sizeof(last_keys[0].ssharp));
+            UINT key_count = 1;
+            if (views_capped) {
+                last_keys[key_count] = last_keys[0];
+                std::memcpy(last_keys[key_count].tsharp, reinterpret_cast<const void*>(extra_view),
+                            sizeof(last_keys[key_count].tsharp));
+                last_keys[key_count].first = key_count * texels;
+                ++key_count;
+            }
+            if (samplers_capped) {
+                last_keys[key_count] = last_keys[0];
+                std::memcpy(last_keys[key_count].ssharp, reinterpret_cast<const void*>(extra_sampler),
+                            sizeof(last_keys[key_count].ssharp));
+                last_keys[key_count].first = key_count * texels;
+                ++key_count;
+            }
+            std::array<std::uint8_t, 3 * bytes> last_texels{};
+            EXPECT(sample_through_set(d, set0, set0_layout, {last_keys, key_count}, last_texels.data()));
+            const char* const names[] = {"the last view through the last sampler", "the refused view",
+                                         "the refused sampler"};
             UINT differ = 0;
-            for (UINT i = 0; i < texels; ++i)
-                if (std::memcmp(last_texels.data() + 4 * i, texel(i % size, i / size).data(), 4) != 0 && differ++ < 4)
-                    std::fprintf(stderr, "view %u through sampler %u, texel %u: got %u,%u,%u,%u\n", many_views + 1,
-                                 many_samplers, i, last_texels[4 * i], last_texels[4 * i + 1], last_texels[4 * i + 2],
-                                 last_texels[4 * i + 3]);
+            for (UINT k = 0; k < key_count; ++k) {
+                const UINT kind = k == 0 ? 0 : views_capped && k == 1 ? 1 : 2;
+                for (UINT i = 0; i < texels; ++i) {
+                    const auto want = kind == 0 ? texel(i % size, i / size)
+                                      : kind == 1 ? std::array<std::uint8_t, 4>{}
+                                                  : texel(size - 1, i / size);
+                    const auto* got = last_texels.data() + k * bytes + 4 * i;
+                    if (std::memcmp(got, want.data(), 4) != 0 && differ++ < 4)
+                        std::fprintf(stderr, "%s, texel %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n", names[kind], i,
+                                     got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                }
+            }
             EXPECT(differ == 0);
-            std::printf("bindless capacity: the %uth SRV through the %uth sampler gave the texture\n", many_views + 1,
-                        many_samplers);
+            if (!views_capped && !samplers_capped)
+                std::printf("bindless capacity: the %uth SRV through the %uth sampler gave the texture\n",
+                            many_views + 1, many_samplers);
+            else
+                std::printf("bindless capacity: the set had room for %u more 2D views and %u more samplers, fewer than "
+                            "%u and %u: the last of each gave the texture, and one more %s refused and read as the "
+                            "fallback\n", room.images_2d, room.samplers, wanted_views + 1, wanted_samplers,
+                            views_capped && samplers_capped ? "of each was"
+                            : views_capped                  ? "view was"
+                                                            : "sampler was");
         }
 
         // 96-bit textures (D3D-62): R32G32B32_FLOAT holding the texture's red, green and blue as n/255,

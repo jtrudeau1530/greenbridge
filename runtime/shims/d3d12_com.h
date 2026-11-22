@@ -198,6 +198,14 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
 // 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
+// The free indices of that set's 2D image and sampler arrays: how many more distinct 2D T#s and S#s
+// CreateShaderResourceView and CreateSampler can register before they log that the array is full. Zeros when
+// `device` has no such set. For tests.
+struct BindlessRoom {
+    std::uint32_t images_2d = 0;
+    std::uint32_t samplers = 0;
+};
+BindlessRoom bindless_room(ID3D12Device* device);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be

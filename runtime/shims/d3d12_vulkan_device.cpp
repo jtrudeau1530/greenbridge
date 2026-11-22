@@ -3220,6 +3220,15 @@ public:
                      features.counts[b::sampled_binding(leonida::ImageDimension::dim_3d)],
                      features.counts[b::sampled_binding(leonida::ImageDimension::dim_1d)],
                      features.counts[b::storage_binding(leonida::ImageDimension::dim_2d, 0)]);
+        // D3D12 promises a shader holds a full shader-visible sampler heap. Past this many distinct S#s, CreateSampler
+        // logs that the array is full and a shader reads the fallback (clamping) sampler. On MoltenVK, whose
+        // vkGetDescriptorSetLayoutSupport rejects any layout of maxPerSetDescriptors (1212) or more, the set
+        // keeps the default 1024 (docs/d3d12_vulkan.md section 5).
+        if (features.counts[b::sampler_binding] < D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE + 1)
+            std::fprintf(stderr, "[rt] d3d12: the bindless set holds fewer samplers than a full shader-visible "
+                                 "sampler heap (%u of %u besides the fallback): its limits or "
+                                 "vkGetDescriptorSetLayoutSupport allow no more\n",
+                         features.counts[b::sampler_binding] - 1, unsigned(D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE));
         state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
         if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
             state_.bindless.reset();
@@ -5882,6 +5891,12 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]) {
     const leonida::BindlessSet* set = bindless_of(device);
     return set ? set->table().lookup(key) : 0;
+}
+
+BindlessRoom bindless_room(ID3D12Device* device) {
+    const leonida::BindlessSet* set = bindless_of(device);
+    if (!set) return {};
+    return {set->free_images(leonida::ImageDimension::dim_2d), set->free_samplers()};
 }
 
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
