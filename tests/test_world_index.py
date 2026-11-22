@@ -353,9 +353,20 @@ class WorldIndexTest(unittest.TestCase):
             self.assert_report_collision([source, "--out", upper, "--csv", lower],
                                          "--out and --csv must use different paths")
             self.assertEqual(os.listdir(folder), [])
-            accent = os.path.join(folder, "café.json")             # composed é
-            self.assert_report_collision([source, "--out", accent, "--csv", os.path.join(folder, "CAFÉ.json")],
-                                         "--out and --csv must use different paths")
+            # Case folding and Unicode normalization are separate filesystem behaviors.
+            composed = os.path.join(folder, "caf\u00e9.json")
+            decomposed = os.path.join(folder, "cafe\u0301.json")
+            with open(composed, "wb"):
+                pass
+            aliases = os.path.exists(decomposed)
+            os.unlink(composed)
+            reports = [source, "--out", composed, "--csv", decomposed]
+            if aliases:
+                self.assert_report_collision(reports, "--out and --csv must use different paths")
+                self.assertEqual(os.listdir(folder), [])
+            else:
+                self.assertEqual(WI.main(reports), 0)
+                self.assertFalse(os.path.samefile(composed, decomposed))
         else:
             self.assertEqual(WI.main([source, "--out", upper, "--csv", lower]), 0)
             with open(upper, encoding="utf-8") as f:
