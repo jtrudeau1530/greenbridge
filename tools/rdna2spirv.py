@@ -43,8 +43,10 @@ GFX10_FORMATS = {int(k): v for k, v in _json.load(open(os.path.join(os.path.dirn
 # User SGPRs s0..s(USER_SGPRS-1) are initialised from push constants (128 bytes = Vulkan's guaranteed minimum).
 USER_SGPRS = 32
 
-NOOPS = {"s_sleep", "v_nop", "s_nop", "s_inst_prefetch", "s_endpgm", "s_setprio", "s_clause", "s_delay_alu", "s_waitcnt",
-         "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_depctr"}
+# v_pipeflush (GFX10 VOP1) only flushes the VALU pipeline: no register, memory or EXEC effect to translate.
+NOOPS = {"s_sleep", "v_nop", "v_pipeflush", "s_nop", "s_inst_prefetch", "s_endpgm", "s_setprio", "s_clause",
+         "s_delay_alu", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt",
+         "s_waitcnt_depctr"}
 
 F2 = {"v_add_f32": "OpFAdd", "v_sub_f32": "OpFSub", "v_mul_f32": "OpFMul",
       "v_max_f32": "max", "v_min_f32": "min"}
