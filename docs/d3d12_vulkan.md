@@ -335,11 +335,13 @@ What is implemented (all of it testable without the game):
     back-buffer-cast or video-processor bits;
   - `CheckFeatureSupport` for feature levels (up to 12_1), architecture, D3D12 options (`OPTIONS`, `OPTIONS1`–`5`,
     `7`–`9`, `11`–`21`), GPU virtual-address support, format support, format plane counts, multisample quality
-    levels, shader model and root signature version. `D3D12_OPTIONS8` reports unaligned block textures when the
-    Vulkan logical device enables BC texture compression, and `D3D12_OPTIONS12` reports
-    `RelaxedFormatCastingSupported = TRUE`, so a committed or placed texture accepts a castable-format list. Other
-    queries (including `OPTIONS6` and `OPTIONS10`) are logged and refused until the trace shows what the game asks
-    (question 11);
+    levels, shader model, root signature version, predication (`VK_EXT_conditional_rendering`), command-queue
+    priority support, protected-resource session queries, shader cache, existing heaps, serialization, cross-node
+    sharing, displayable resources, meta-command queries (`E_INVALIDARG`), application-specific driver state, and
+    bytecode bypass hash support. `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device
+    enables BC texture compression, and `D3D12_OPTIONS12` reports `RelaxedFormatCastingSupported = TRUE`, so a
+    committed or placed texture accepts a castable-format list. Other queries (including `OPTIONS6` and `OPTIONS10`)
+    are logged and refused until the trace shows what the game asks (question 11);
   - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
     image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.

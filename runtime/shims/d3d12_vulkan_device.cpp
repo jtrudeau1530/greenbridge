@@ -4520,6 +4520,13 @@ public:
         }, each);
     }
 
+    template <typename FeatureData>
+    static HRESULT write_supported_feature(const char* method, void* data, UINT size, BOOL supported) {
+        if (size != sizeof(FeatureData)) return d3d12_trace::result(method, E_INVALIDARG);
+        static_cast<FeatureData*>(data)->Supported = supported;
+        return d3d12_trace::result(method, S_OK);
+    }
+
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void* data, UINT size) override {
         constexpr auto method = "ID3D12Device::CheckFeatureSupport";
         log_once("CheckFeatureSupport feature", feature);
@@ -5069,6 +5076,90 @@ public:
                 root->HighestVersion = kHighestRootSignatureVersion;
             return S_OK;
         }
+        case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT: {
+            if (size != sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT))
+                return d3d12_trace::result(method, E_INVALIDARG);
+            auto* prot = static_cast<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT*>(data);
+            prot->Support = D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_NONE;
+            if (prot->NodeIndex != 0) return d3d12_trace::result(method, E_INVALIDARG);
+            return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPE_COUNT: {
+            if (size != sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT))
+                return d3d12_trace::result(method, E_INVALIDARG);
+            auto* prot_count = static_cast<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT*>(data);
+            if (prot_count->NodeIndex != 0) return d3d12_trace::result(method, E_INVALIDARG);
+            prot_count->Count = 0;
+            return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPES: {
+            if (size != sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES))
+                return d3d12_trace::result(method, E_INVALIDARG);
+            const auto* prot_types = static_cast<const D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES*>(data);
+            // Zero protected resource session types exist, so only Count == 0 on node 0 matches TYPE_COUNT.
+            if (prot_types->NodeIndex != 0 || prot_types->Count != 0)
+                return d3d12_trace::result(method, E_INVALIDARG);
+            return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_SHADER_CACHE: {
+            if (size != sizeof(D3D12_FEATURE_DATA_SHADER_CACHE)) return d3d12_trace::result(method, E_INVALIDARG);
+            static_cast<D3D12_FEATURE_DATA_SHADER_CACHE*>(data)->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_NONE;
+            return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY: {
+            if (size != sizeof(D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY))
+                return d3d12_trace::result(method, E_INVALIDARG);
+            auto* prio = static_cast<D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY*>(data);
+            prio->PriorityForTypeIsSupported = FALSE;
+            if (UINT(prio->CommandListType) > D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE ||
+                (prio->Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
+                 prio->Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
+                 prio->Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME))
+                return d3d12_trace::result(method, E_INVALIDARG);
+            // Matches CreateCommandQueue: DIRECT/COMPUTE/COPY work at NORMAL or HIGH; GLOBAL_REALTIME is refused.
+            const bool supported_type = prio->CommandListType == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+                                        prio->CommandListType == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
+                                        prio->CommandListType == D3D12_COMMAND_LIST_TYPE_COPY;
+            const bool supported_priority = prio->Priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ||
+                                            prio->Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+            prio->PriorityForTypeIsSupported = (supported_type && supported_priority) ? TRUE : FALSE;
+            return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_EXISTING_HEAPS:
+            return write_supported_feature<D3D12_FEATURE_DATA_EXISTING_HEAPS>(method, data, size, FALSE);
+        case D3D12_FEATURE_SERIALIZATION: {
+            if (size != sizeof(D3D12_FEATURE_DATA_SERIALIZATION)) return d3d12_trace::result(method, E_INVALIDARG);
+            auto* ser = static_cast<D3D12_FEATURE_DATA_SERIALIZATION*>(data);
+            ser->HeapSerializationTier = D3D12_HEAP_SERIALIZATION_TIER_0;
+            if (ser->NodeIndex != 0) return d3d12_trace::result(method, E_INVALIDARG);
+            return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_CROSS_NODE: {
+            if (size != sizeof(D3D12_FEATURE_DATA_CROSS_NODE)) return d3d12_trace::result(method, E_INVALIDARG);
+            auto* cross = static_cast<D3D12_FEATURE_DATA_CROSS_NODE*>(data);
+            cross->SharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
+            cross->AtomicShaderInstructions = FALSE;
+            return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_DISPLAYABLE: {
+            if (size != sizeof(D3D12_FEATURE_DATA_DISPLAYABLE)) return d3d12_trace::result(method, E_INVALIDARG);
+            auto* disp = static_cast<D3D12_FEATURE_DATA_DISPLAYABLE*>(data);
+            disp->DisplayableTexture = FALSE;
+            disp->SharedResourceCompatibilityTier = D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0;
+            return d3d12_trace::result(method, S_OK);
+        }
+        case D3D12_FEATURE_QUERY_META_COMMAND:
+            // EnumerateMetaCommands reports 0 meta-commands, so any query is rejected (as on host D3D12).
+            return d3d12_trace::result(method, E_INVALIDARG);
+        case D3D12_FEATURE_PREDICATION:
+            return write_supported_feature<D3D12_FEATURE_DATA_PREDICATION>(
+                method, data, size, state_.info.conditional_rendering ? TRUE : FALSE);
+        case D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE:
+            return write_supported_feature<D3D12_FEATURE_DATA_APPLICATION_SPECIFIC_DRIVER_STATE>(
+                method, data, size, FALSE);
+        case D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED:
+            return write_supported_feature<D3D12_FEATURE_DATA_BYTECODE_BYPASS_HASH_SUPPORTED>(
+                method, data, size, FALSE);
         default:
             // Not answered yet. The log above lists every query; answers are added as the trace asks for them.
             return d3d12_trace::result(method, E_INVALIDARG);
