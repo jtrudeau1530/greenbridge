@@ -101,6 +101,22 @@ Leonida's rule is `u32[0xC0] + 0x28` to the last `s_endpgm` (also `docs/design.m
 "Disassembling shaders"). The 17 `code_end = DEAD` blobs are handled because the last
 `s_endpgm` is used instead of `code_end`.
 
+### Initial float mode (SHADER-190)
+
+The 1.0.2.1 scan tested 88 aligned little-endian words in each of the 26,503 indexed FSSM blobs as possible
+packed `PGM_RSRC1` registers carrying `FLOAT_MODE`, `DX10_CLAMP` and `IEEE`. It covered 78 word starts at
+FSSM offsets `0x00` through `0x134` and 10 at `code_off + 0x00` through `code_off + 0x24`, inclusive.
+
+The VGPR allocation field provides an independent check on that interpretation. Of 2,689 compute shaders, 1,675
+had zero reported invalid words and at least one explicit VGPR in the instruction listing. For each of these,
+the minimum allocation must cover the highest numbered VGPR, including range endpoints. The tested capacity was
+the low six bits of the candidate word plus one, multiplied by 8 for wave32 or 4 for wave64 (FSSM flag at
+`0xD4`, bit 5). Graphics stages can share register allocations across merged stages and were excluded from this check.
+
+Of the 88 positions, 63 gave too little capacity for at least one qualifying compute shader. Each of the other 25
+exceeded the minimum whole-granule allocation in all 1,675. Over-allocation is possible, and the mode fields could
+be stored separately or supplied by pipeline state. The initial float mode remains unresolved.
+
 ## 3. ISA, RDNA2 classification and the "XBSC" notes
 
 | Claim | SCARAB source | Leonida behaviour / measurement | Verdict |
