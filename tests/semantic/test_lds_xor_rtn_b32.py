@@ -898,6 +898,173 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(target_addr), 0x130)
 
 
+# ============================================================================
+# Section 5: Register Aliasing and In-Place Operand Preservation
+# ============================================================================
+
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for operand aliasing: vdst == vaddr, vdst == vdata, vdst == vaddr == vdata."""
+
+    def test_dst_aliases_addr_scalar(self) -> None:
+        """vdst == vaddr: Destination overwrites address register after address is latched."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x300
+        initial_mem = 0xABCD_1234
+        xor_mask = 0x0000_FFFF
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(5, addr)       # v5 = address
+        state.set_vgpr(6, xor_mask)   # v6 = data
+
+        # ds_xor_rtn_b32 v5, v5, v6
+        instr = DSXorRtnB32Instruction(dst=VGPR(5), addr=VGPR(5), data0=VGPR(6))
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_val, initial_mem ^ xor_mask)
+        # v5 now contains the returned old memory value, NOT the address
+        self.assertEqual(state.get_vgpr(5), initial_mem)
+        # Memory at 0x300 was updated correctly
+        self.assertEqual(state.lds.read_dword(addr), initial_mem ^ xor_mask)
+        # v6 was preserved
+        self.assertEqual(state.get_vgpr(6), xor_mask)
+
+    def test_dst_aliases_data_scalar(self) -> None:
+        """vdst == vdata0: Destination overwrites data register after data is latched."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x400
+        initial_mem = 0x1111_2222
+        xor_mask = 0x3333_4444
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(6, addr)       # v6 = address
+        state.set_vgpr(5, xor_mask)   # v5 = data
+
+        # ds_xor_rtn_b32 v5, v6, v5
+        instr = DSXorRtnB32Instruction(dst=VGPR(5), addr=VGPR(6), data0=VGPR(5))
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_val, initial_mem ^ xor_mask)
+        # v5 now contains returned old memory value
+        self.assertEqual(state.get_vgpr(5), initial_mem)
+        # Address register v6 is preserved
+        self.assertEqual(state.get_vgpr(6), addr)
+        # Memory updated correctly
+        self.assertEqual(state.lds.read_dword(addr), initial_mem ^ xor_mask)
+
+    def test_all_three_operands_aliased_scalar(self) -> None:
+        """vdst == vaddr == vdata0: Single register acts as address, data, and destination."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr_and_mask = 0x500  # Also acts as xor_mask
+        initial_mem = 0x1234_5678
+
+        state.lds.write_dword(addr_and_mask, initial_mem)
+        state.set_vgpr(7, addr_and_mask)
+
+        # ds_xor_rtn_b32 v7, v7, v7
+        instr = DSXorRtnB32Instruction(dst=VGPR(7), addr=VGPR(7), data0=VGPR(7))
+        old_val, new_val = interp.step(instr, state)
+
+        expected_new_mem = initial_mem ^ addr_and_mask
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_val, expected_new_mem)
+        # v7 now holds the original memory value
+        self.assertEqual(state.get_vgpr(7), initial_mem)
+        # Memory holds the XORed result
+        self.assertEqual(state.lds.read_dword(addr_and_mask), expected_new_mem)
+
+    def test_addr_aliases_data_dst_independent_scalar(self) -> None:
+        """vaddr == vdata0 != vdst: Address and data share register; register is preserved."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr_and_mask = 0x240
+        initial_mem = 0xAAAA_BBBB
+
+        state.lds.write_dword(addr_and_mask, initial_mem)
+        state.set_vgpr(1, addr_and_mask)
+        state.set_vgpr(0, 0xCAFE_CAFE)  # dst initial
+
+        # ds_xor_rtn_b32 v0, v1, v1
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(1))
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_val, initial_mem ^ addr_and_mask)
+        self.assertEqual(state.get_vgpr(0), initial_mem)
+        # v1 is unmodified
+        self.assertEqual(state.get_vgpr(1), addr_and_mask)
+        self.assertEqual(state.lds.read_dword(addr_and_mask), initial_mem ^ addr_and_mask)
+
+    def test_dst_aliases_addr_simd(self) -> None:
+        """SIMD wavefront where each lane has vdst == vaddr."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            addr = 0x600 + lane * 4
+            state.lds.write_dword(addr, 0xA000 + lane)
+            state.set_vgpr(lane, 0, addr)       # v0 = addr (also dst)
+            state.set_vgpr(lane, 1, 0x00FF)     # v1 = data
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(0), addr=VGPR(0), data0=VGPR(1))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            addr = 0x600 + lane * 4
+            expected_old = 0xA000 + lane
+            expected_new = expected_old ^ 0x00FF
+            self.assertEqual(results[lane], (expected_old, expected_new))
+            self.assertEqual(state.get_vgpr(lane, 0), expected_old)
+            self.assertEqual(state.lds.read_dword(addr), expected_new)
+
+    def test_all_three_operands_aliased_simd(self) -> None:
+        """SIMD wavefront where each lane has vdst == vaddr == vdata0."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            addr_mask = 0x800 + lane * 4
+            state.lds.write_dword(addr_mask, 0x5000 + lane)
+            state.set_vgpr(lane, 3, addr_mask)  # v3 is dst, addr, and data0
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(3), addr=VGPR(3), data0=VGPR(3))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            addr_mask = 0x800 + lane * 4
+            expected_old = 0x5000 + lane
+            expected_new = expected_old ^ addr_mask
+            self.assertEqual(results[lane], (expected_old, expected_new))
+            self.assertEqual(state.get_vgpr(lane, 3), expected_old)
+            self.assertEqual(state.lds.read_dword(addr_mask), expected_new)
+
+    def test_inplace_operand_preservation_when_not_dst(self) -> None:
+        """All source registers not aliased with vdst remain completely unchanged."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(10, 0x400)
+        state.set_vgpr(11, 0xDEAD_BEEF)
+        state.set_vgpr(12, 0)
+        state.lds.write_dword(0x400, 0x1234_5678)
+
+        instr = DSXorRtnB32Instruction(dst=VGPR(12), addr=VGPR(10), data0=VGPR(11))
+        interp.step(instr, state)
+
+        self.assertEqual(state.get_vgpr(10), 0x400)
+        self.assertEqual(state.get_vgpr(11), 0xDEAD_BEEF)
+        self.assertEqual(state.get_vgpr(12), 0x1234_5678)
+
+
+
 
 
 
