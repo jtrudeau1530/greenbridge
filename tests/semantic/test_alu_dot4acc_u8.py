@@ -775,5 +775,256 @@ class WavefrontSimdExecutionTests(unittest.TestCase):
                 self.assertEqual(interp.get_vgpr(0, lane), 170)
 
 
+class EdgeCaseBytePatternsTests(unittest.TestCase):
+    """Verifies edge-case byte patterns, walking bits, alternating patterns, and sensitivity."""
+
+    def test_walking_ones_patterns(self) -> None:
+        """Walking 1-bit across all 8 bit positions in each of the 4 bytes."""
+        for byte_idx in range(4):
+            for bit in range(8):
+                val = (1 << bit) << (8 * byte_idx)
+                multiplier = 1 << (8 * byte_idx)
+                expected = 1 << bit
+                self.assertEqual(ref_dot4acc_u32_u8(val, multiplier, 0), expected)
+
+    def test_alternating_chessboards(self) -> None:
+        """Alternating bit patterns across bytes (0xAA55AA55, 0x55AA55AA, 0x00FF00FF, 0xFF00FF00)."""
+        pat_a = 0xAA55AA55
+        pat_b = 0x55AA55AA
+        # 0x55 = 85, 0xAA = 170. 85 * 170 = 14450. 4 * 14450 = 57800.
+        self.assertEqual(ref_dot4acc_u32_u8(pat_a, pat_b, 0), 57800)
+        self.assertEqual(ref_dot4acc_u32_u8(pat_a, pat_b, 1000), 58800)
+
+        # 0x00FF00FF dot 0xFF00FF00: byte products are 0*255 + 255*0 + 0*255 + 255*0 = 0
+        self.assertEqual(ref_dot4acc_u32_u8(0x00FF00FF, 0xFF00FF00, 0x12345678), 0x12345678)
+
+        # 0x0F0F0F0F dot 0xF0F0F0F0: 15 * 240 = 3600. 4 * 3600 = 14400.
+        self.assertEqual(ref_dot4acc_u32_u8(0x0F0F0F0F, 0xF0F0F0F0, 0), 14400)
+
+    def test_symmetrical_byte_permutations(self) -> None:
+        """Reversing byte order and cross-multiplying."""
+        s0 = pack_u8(10, 20, 30, 40)
+        s1 = pack_u8(40, 30, 20, 10)
+        # 10*40 + 20*30 + 30*20 + 40*10 = 400 + 600 + 600 + 400 = 2000
+        self.assertEqual(ref_dot4acc_u32_u8(s0, s1, 0), 2000)
+
+    def test_single_bit_flip_sensitivity(self) -> None:
+        """Flipping any bit in S0 or S1 alters the dot product when multiplier is non-zero."""
+        s0 = 0x01020304
+        s1 = 0x05060708
+        acc = 1000
+        golden = ref_dot4acc_u32_u8(s0, s1, acc)
+
+        for bit in range(32):
+            corrupted_s0 = s0 ^ (1 << bit)
+            corrupted_s1 = s1 ^ (1 << bit)
+            self.assertNotEqual(
+                ref_dot4acc_u32_u8(corrupted_s0, s1, acc),
+                golden,
+                f"Flipping bit {bit} in S0 produced no change",
+            )
+            self.assertNotEqual(
+                ref_dot4acc_u32_u8(s0, corrupted_s1, acc),
+                golden,
+                f"Flipping bit {bit} in S1 produced no change",
+            )
+
+    def test_all_byte_lane_powers_of_two(self) -> None:
+        """Powers of two in each byte position produce exact power-of-two products."""
+        for p0 in range(8):
+            for p1 in range(8):
+                v0 = (1 << p0) | ((1 << p0) << 8) | ((1 << p0) << 16) | ((1 << p0) << 24)
+                v1 = (1 << p1) | ((1 << p1) << 8) | ((1 << p1) << 16) | ((1 << p1) << 24)
+                expected = 4 * ((1 << p0) * (1 << p1))
+                self.assertEqual(ref_dot4acc_u32_u8(v0, v1, 0), expected)
+
+
+class OverflowMatrixTests(unittest.TestCase):
+    """Verifies full combinatorial matrix of near-boundary accumulator values and products."""
+
+    def test_comprehensive_overflow_matrix(self) -> None:
+        """Cartesian product of representative accumulators and dot sums testing wrapping and clamping."""
+        acc_values = [
+            0,
+            1,
+            0x7FFFFFFF,
+            0x80000000,
+            (MASK32 - MAX_DOT4_SUM - 1) & MASK32,
+            (MASK32 - MAX_DOT4_SUM) & MASK32,
+            (MASK32 - MAX_DOT4_SUM + 1) & MASK32,
+            MASK32 - 1,
+            MASK32,
+        ]
+
+        sum_operands = [
+            (0x00000000, 0x00000000, 0),
+            (0x00000001, 0x00000001, 1),
+            (0x01020304, 0x05060708, 70),
+            (0x000000FF, 0x000000FF, 65025),
+            (0x0000FFFF, 0x0000FFFF, 2 * 65025),
+            (0x00FFFFFF, 0x00FFFFFF, 3 * 65025),
+            (0xFFFFFFFF, 0xFFFFFFFF, 4 * 65025),  # 260100
+        ]
+
+        for s0, s1, expected_sum in sum_operands:
+            self.assertEqual(ref_dot4_u32_u8_sum(s0, s1), expected_sum)
+            for acc in acc_values:
+                with self.subTest(sum=expected_sum, acc=hex(acc)):
+                    unclamped = ref_dot4acc_u32_u8(s0, s1, acc)
+                    clamped = ref_dot4acc_clamped_u32_u8(s0, s1, acc)
+                    raw_total = acc + expected_sum
+
+                    self.assertEqual(unclamped, raw_total & MASK32)
+
+                    if raw_total > MASK32:
+                        self.assertEqual(clamped, MASK32)
+                        self.assertNotEqual(clamped, unclamped)
+                    else:
+                        self.assertEqual(clamped, raw_total)
+                        self.assertEqual(clamped, unclamped)
+
+    def test_clamp_vs_wrap_divergence_boundary(self) -> None:
+        """Prove clamping matches wrapping iff total <= 0xFFFFFFFF, and diverges iff total > 0xFFFFFFFF."""
+        s0 = 0x00000001
+        s1 = 0x00000001
+        acc_below = MASK32 - 2  # total = MASK32 - 1
+        acc_exact = MASK32 - 1  # total = MASK32
+        acc_above = MASK32      # total = MASK32 + 1 (overflow)
+
+        self.assertEqual(ref_dot4acc_u32_u8(s0, s1, acc_below), ref_dot4acc_clamped_u32_u8(s0, s1, acc_below))
+        self.assertEqual(ref_dot4acc_u32_u8(s0, s1, acc_exact), ref_dot4acc_clamped_u32_u8(s0, s1, acc_exact))
+
+        self.assertEqual(ref_dot4acc_u32_u8(s0, s1, acc_above), 0)
+        self.assertEqual(ref_dot4acc_clamped_u32_u8(s0, s1, acc_above), MASK32)
+
+    def test_boundary_triplets_exact(self) -> None:
+        """Exact triplets at 2^32 boundary for max dot4 sum (260100)."""
+        s0 = 0xFFFFFFFF
+        s1 = 0xFFFFFFFF
+        k = MAX_DOT4_SUM
+
+        # 1. Below boundary: sum is 2^32 - 1 (0xFFFFFFFF)
+        acc_below = (MASK32 - k) & MASK32
+        self.assertEqual(ref_dot4acc_u32_u8(s0, s1, acc_below), 0xFFFFFFFF)
+        self.assertEqual(ref_dot4acc_clamped_u32_u8(s0, s1, acc_below), 0xFFFFFFFF)
+
+        # 2. At boundary: sum is 2^32 -> wraps to 0; clamped to 0xFFFFFFFF
+        acc_at = (MASK32 - k + 1) & MASK32
+        self.assertEqual(ref_dot4acc_u32_u8(s0, s1, acc_at), 0)
+        self.assertEqual(ref_dot4acc_clamped_u32_u8(s0, s1, acc_at), 0xFFFFFFFF)
+
+        # 3. Above boundary: sum is 2^32 + 1 -> wraps to 1; clamped to 0xFFFFFFFF
+        acc_above = (MASK32 - k + 2) & MASK32
+        self.assertEqual(ref_dot4acc_u32_u8(s0, s1, acc_above), 1)
+        self.assertEqual(ref_dot4acc_clamped_u32_u8(s0, s1, acc_above), 0xFFFFFFFF)
+
+
+class NegativeControlAndFaultTests(unittest.TestCase):
+    """Negative controls, translator modifier rejection, and fault injection verification."""
+
+    def test_unpatched_rdna2spirv_raises_unsupported(self) -> None:
+        """Without patch, standard rdna2spirv refuses v_dot4acc_u32_u8 cleanly."""
+        lines = [
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 1",
+            "v_mov_b32_e32 v3, 0",
+            "v_dot4acc_u32_u8 v8, v1, v2, v3",
+            "exp mrt0 v8, v8, v8, v8 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_dot4acc_unpatched", lines)
+        self.assertIn("v_dot4acc_u32_u8", str(cm.exception))
+
+    def test_translator_clamp_refused(self) -> None:
+        """The translator refuses clamp modifier on v_dot4acc_u32_u8 rather than guessing."""
+        with patch_rdna2spirv_dot4acc_u8():
+            lines = [
+                "v_mov_b32_e32 v1, 1",
+                "v_mov_b32_e32 v2, 1",
+                "v_mov_b32_e32 v3, 0",
+                "v_dot4acc_u32_u8 v8, v1, v2, v3 clamp",
+                "exp mrt0 v8, v8, v8, v8 done vm",
+                "s_endpgm",
+            ]
+            with self.assertRaises(rdna2spirv.Unsupported) as refused:
+                support.translate_lines("ps_dot4acc_clamp", lines)
+            self.assertEqual(str(refused.exception), "v_dot4acc_u32_u8 clamp")
+
+    def test_translator_op_sel_refused(self) -> None:
+        """The translator refuses op_sel modifier on v_dot4acc_u32_u8."""
+        with patch_rdna2spirv_dot4acc_u8():
+            lines = [
+                "v_mov_b32_e32 v1, 1",
+                "v_mov_b32_e32 v2, 1",
+                "v_mov_b32_e32 v3, 0",
+                "v_dot4acc_u32_u8 v8, v1, v2, v3 op_sel:[0,1,0] op_sel_hi:[1,0,1]",
+                "exp mrt0 v8, v8, v8, v8 done vm",
+                "s_endpgm",
+            ]
+            with self.assertRaises(rdna2spirv.Unsupported) as refused:
+                support.translate_lines("ps_dot4acc_op_sel", lines)
+            self.assertEqual(str(refused.exception), "v_dot4acc_u32_u8 op_sel")
+
+    def test_interpreter_rejects_sgpr_as_destination(self) -> None:
+        """VALU instructions cannot write to SGPRs as destinations."""
+        interp = WavefrontDot4accInterpreter(wave_size=32)
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_dot4acc_u32_u8 s0, v1, v2, v3")
+
+    def test_interpreter_rejects_out_of_bounds_vgpr(self) -> None:
+        """VGPR index >= 256 raises IndexError."""
+        interp = WavefrontDot4accInterpreter(wave_size=32)
+        with self.assertRaises(IndexError):
+            interp.execute_line("v_dot4acc_u32_u8 v0, v256, v1, v2")
+
+    def test_interpreter_rejects_out_of_bounds_sgpr(self) -> None:
+        """SGPR index >= 106 raises IndexError."""
+        interp = WavefrontDot4accInterpreter(wave_size=32)
+        with self.assertRaises(IndexError):
+            interp.execute_line("v_dot4acc_u32_u8 v0, v1, s120, v2")
+
+    def test_interpreter_rejects_invalid_wave_size(self) -> None:
+        """Wave sizes other than 32 or 64 are rejected."""
+        with self.assertRaises(ValueError):
+            WavefrontDot4accInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            WavefrontDot4accInterpreter(wave_size=128)
+
+    def test_interpreter_rejects_unsupported_opcode(self) -> None:
+        """Unknown opcodes raise NotImplementedError."""
+        interp = WavefrontDot4accInterpreter(wave_size=32)
+        with self.assertRaises(NotImplementedError):
+            interp.execute_line("v_bogus_opcode v0, v1, v2")
+
+    def test_negative_control_signed_oracle_mismatch(self) -> None:
+        """Negative control: signed ref_dot4_i32_i8 fails against unsigned KNOWN_VECTORS."""
+        mismatches = 0
+        for s0, s1, s2, expected in KNOWN_VECTORS:
+            signed_res = ref_dot4_i32_i8(s0, s1, s2)
+            if signed_res != expected:
+                mismatches += 1
+        self.assertGreater(mismatches, len(KNOWN_VECTORS) // 2)
+
+    def test_negative_control_inactive_lane_write_rejected(self) -> None:
+        """Negative control: inactive lane output never equals active execution result."""
+        interp = WavefrontDot4accInterpreter(wave_size=32)
+        interp.set_exec(0x00000001)  # Only lane 0 active
+        interp.set_vgpr(0, 1, 0x55555555)  # Lane 1 inactive
+        interp.set_vgpr(1, 1, 0xFFFFFFFF)
+        interp.set_vgpr(2, 1, 0xFFFFFFFF)
+        interp.set_vgpr(3, 1, 0)
+
+        interp.execute_line("v_dot4acc_u32_u8 v0, v1, v2, v3")
+        self.assertEqual(interp.get_vgpr(0, 1), 0x55555555)
+        self.assertNotEqual(interp.get_vgpr(0, 1), 260100)
+
+    def test_operand_32bit_truncation(self) -> None:
+        """Inputs exceeding 32-bit width are masked cleanly to 32 bits."""
+        s0_wide = 0x1_000000FF  # Has bit 32 set
+        s1 = 0x00000001
+        self.assertEqual(ref_dot4acc_u32_u8(s0_wide, s1, 0), 255)
+
+
 if __name__ == "__main__":
     unittest.main()
