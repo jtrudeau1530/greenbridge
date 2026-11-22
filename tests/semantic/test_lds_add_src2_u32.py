@@ -737,5 +737,39 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(flags_neg_ovf.zero)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_addition(self) -> None:
+        res = ref_ds_add_src2_u32(MIN_SUBNORMAL_F32, MIN_SUBNORMAL_F32)
+        self.assertEqual(res, 0x00000002)
+        self.assertTrue(is_f32_subnormal(res))
+
+        # Max subnormal + 1 transitions to min normal
+        res_norm = ref_ds_add_src2_u32(MAX_SUBNORMAL_F32, 1)
+        self.assertEqual(res_norm, MIN_NORMAL_F32)
+        self.assertFalse(is_f32_subnormal(res_norm))
+
+    def test_float_zeros_addition(self) -> None:
+        self.assertEqual(ref_ds_add_src2_u32(POS_ZERO_F32, POS_ZERO_F32), POS_ZERO_F32)
+        # -0.0 (0x80000000) + -0.0 (0x80000000) wraps to 0x00000000 (+0.0)
+        self.assertEqual(ref_ds_add_src2_u32(NEG_ZERO_F32, NEG_ZERO_F32), POS_ZERO_F32)
+        self.assertEqual(ref_ds_add_src2_u32(POS_ZERO_F32, NEG_ZERO_F32), NEG_ZERO_F32)
+
+    def test_infinity_threshold_addition(self) -> None:
+        # Max normal float + 1 transitions to positive infinity bit pattern
+        self.assertEqual(ref_ds_add_src2_u32(MAX_NORMAL_F32, 1), POS_INF_F32)
+
+    def test_nan_bitwise_addition(self) -> None:
+        res = ref_ds_add_src2_u32(QNAN_F32, 1)
+        self.assertTrue(is_f32_nan(res))
+        self.assertEqual(ref_ds_add_src2_u32(SNAN_F32, 0), SNAN_F32)
+
+    def test_integer_boundary_extremes(self) -> None:
+        self.assertEqual(ref_ds_add_src2_u32(MASK32, 1), 0)
+        self.assertEqual(ref_ds_add_src2_u32(MASK32, MASK32), MASK32 - 1)
+        self.assertEqual(ref_ds_add_src2_u32(0x7FFFFFFF, 1), 0x80000000)
+
+
 if __name__ == "__main__":
     unittest.main()
