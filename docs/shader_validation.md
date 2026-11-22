@@ -1133,6 +1133,37 @@ Measured on an RX 6700 (gfx1031, AMD Windows driver 32.0.21045.29003, ROCm wheel
 each value is staged once, and that the kernels assemble for gfx1031. A fake oracle plays the GPU to check the exit
 codes. On a GFX10 GPU the test runs UNORM8 and checks the controls.
 
+### `image_get_resinfo` and `image_get_lod` (`tools/image_query_probe.py`, SHADER-388)
+
+`docs/design.md` ("Image atomics, size and LOD queries") took resinfo's depth word, the clamped LOD under a linear mip
+filter and the order of u and v in the LOD query from the T# fields and the spec. The probe runs both instructions
+natively on a GFX10 GPU through the hardware oracle. Neither reads memory, so a T# with no texture behind it is
+enough. Each case runs in wave32 and wave64.
+
+```
+python -I tools/image_query_probe.py --json query.json      # 614 results; exit 77 without the oracle or on non-GFX10
+python -I tools/image_query_probe.py --self-test             # the rules against values measured on gfx1036, no GPU
+```
+
+- **resinfo:** 2D and 2D-array T#s with WORD4 DEPTH 0, 5, the GFX10.3 pitch and 0x1FFF, BASE_LEVEL 0 to 2, levels
+  inside and past LAST_LEVEL.
+- **get_lod:** one 2x2 quad of lanes whose u steps across x and v across y. MIP_FILTER none, point and linear, with
+  MIN_LOD/MAX_LOD pairs including MIN above MAX and MIN above the last level, LOD_BIAS 0, 1 and -0.5, at LODs that
+  are exact in binary. Every lane of the quad must agree. A 64x4 image steps one axis at a time.
+
+Measured on the Radeon Graphics of a Ryzen 9 9950X3D (gfx1036, AMD Windows driver 32.0.21045.16010, ROCm wheel
+clang), every result matched the rules in the tool's docstring:
+
+- The 2D depth word is 0, never DEPTH + 1. A 2D array's layer count is minified as max(1, layers >> (BASE_LEVEL +
+  level)): 100 layers at level 3 gave 12.
+- Past the last level, width, height and depth are 0, while the level count stays.
+- Raw LOD = computed LOD + LOD_BIAS. The clamped LOD is the level that would be read: 0 with no mip filter, the
+  clamp rounded half up with point, the clamp itself with linear.
+
+`tests/test_image_query_probe.py` checks the rules against the measured values, the descriptor bits and the
+kernels. A fake oracle plays the GPU to check the comparison and the exit codes; with a 2D depth of 1 it fails. On
+a GFX10 GPU the test runs the whole probe.
+
 ### `v_fma_mix*` f16 rounding in nearest mode (`tools/fma_mix_probe.py`)
 
 `docs/design.md` leaves one f16 question open. In round-to-nearest mode, does `v_fma_mixlo_f16` / `v_fma_mixhi_f16`
