@@ -342,6 +342,29 @@ int main() {
         check(rt::d3d12_xs::device_slot_first_call_seen(62), "slot 62 first-call flag is set");
     }
 
+    // _COM_Outptr_ (d3d12.h): a failed create leaves NULL in the output. WARP accepts invalid heap descriptions,
+    // so the PC-failure case for slot 14 is in d3d12_vulkan_device_test; these are the proxy's own early returns.
+    {
+        void* proxy_out = reinterpret_cast<void*>(0x1111);
+        using Slot14Fn = HRESULT(WINAPI*)(void*, const D3D12_DESCRIPTOR_HEAP_DESC*, const IID*, void**);
+        hr = reinterpret_cast<Slot14Fn>(proxy_vtbl[14])(device.Get(), &heap_desc, nullptr, &proxy_out);
+        check(FAILED(hr) && proxy_out == nullptr, "slot 14 nulls its output for a null IID");
+        using Slot62Fn = HRESULT(WINAPI*)(void*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, std::uint64_t,
+                                          std::uint64_t, const IID*, void**);
+        proxy_out = reinterpret_cast<void*>(0x1111);
+        D3D12_COMPUTE_PIPELINE_STATE_DESC empty_pso{};
+        hr = reinterpret_cast<Slot62Fn>(proxy_vtbl[62])(device.Get(), &empty_pso, 0, 0, nullptr, &proxy_out);
+        check(FAILED(hr) && proxy_out == nullptr, "slot 62 nulls its output for a null IID");
+        using Slot76Fn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                          const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                                          const D3D12_CLEAR_VALUE*, const IID*, void**);
+        proxy_out = reinterpret_cast<void*>(0x1111);
+        hr = reinterpret_cast<Slot76Fn>(proxy_vtbl[76])(device.Get(), &heap_properties, D3D12_HEAP_FLAG_NONE,
+                                                         nullptr, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         &iid_resource, &proxy_out);
+        check(FAILED(hr) && proxy_out == nullptr, "slot 76 nulls its output for a null description");
+    }
+
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
     if (real) real->AddRef();
     // Drop every device child before the proxy so the PC device is not released first.
