@@ -486,9 +486,8 @@ From HD to SLOD2, each tier's median `lodDist` is within 5% of the next tier's m
 450/450, 1,000/1,000, 2,000/1,976), so the two fields agree on the bands. For SLOD3 they differ (4,000 and
 6,043.5), and the band follows `childLodDist`.
 
-The viewer approximates point 5 with distance bands per cell and tier. The entity export omits the
-map identity and the ordinal in the map's `entities` reference array that a loader needs to follow individual
-parent links.
+The viewer approximates point 5 with distance bands per cell and tier. To follow an individual parent link,
+a loader needs the selected map's name and the target placement's original ordinal in that map's `entities` array.
 
 Two terrain regions on Xbox 1.0.2.1 give a cross-map example. In each tested HD and LOD map, `CMapData.parent` is zero.
 The schema member `75d16adf` at +0x58 is an array with one 32-bit hash in a block of type `0x4a`. That hash
