@@ -2,7 +2,7 @@
 
     python -I tests/test_awc_manifest.py
 """
-import csv, io, json, os, struct, subprocess, sys, tempfile, unittest
+import contextlib, csv, io, json, os, struct, subprocess, sys, tempfile, unittest
 from unittest import mock
 
 TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -135,6 +135,93 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual([r["stream"] for r in doc["streams"]], ["00000010", "00000020", "00000030"])
         self.assertIs(doc["streams"][0]["streamed_music"], False)
         self.assertAlmostEqual(doc["streams"][0]["duration_s"], 0.1, places=6)
+
+    def assert_input_refused(self, src, out, bank):
+        with open(bank, "rb") as f:
+            original = f.read()
+        p = self.run_tool(src, "--out", out)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("would overwrite the input", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.stdout, "")
+        with open(bank, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_report_cannot_replace_the_input_bank(self):
+        bank = self.write_bank(with_music=False)
+        self.assert_input_refused(bank, bank, bank)
+
+    def test_report_cannot_replace_a_nested_bank(self):
+        os.mkdir(os.path.join(self.tmp.name, "nested"))
+        bank = self.write_bank(os.path.join("nested", "alpha.AWC"), with_music=False)
+        self.assert_input_refused(self.tmp.name, bank, bank)
+
+    def test_report_cannot_replace_a_normalized_input_path(self):
+        bank = self.write_bank(with_music=False)
+        os.mkdir(os.path.join(self.tmp.name, "nested"))
+        out = os.path.join(self.tmp.name, "nested", "..", "alpha.awc")
+        self.assert_input_refused(bank, out, bank)
+
+    def test_report_cannot_replace_a_hard_link_to_the_input(self):
+        bank = self.write_bank(with_music=False)
+        out = os.path.join(self.tmp.name, "manifest.json")
+        try:
+            os.link(bank, out)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        self.assert_input_refused(self.tmp.name, out, bank)
+        self.assertTrue(os.path.samefile(bank, out))
+
+    def test_report_cannot_replace_a_symlink_to_the_input(self):
+        bank = self.write_bank(with_music=False)
+        out = os.path.join(self.tmp.name, "manifest.json")
+        try:
+            os.symlink(bank, out)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"symlinks unavailable: {e}")
+        self.assert_input_refused(bank, out, bank)
+        self.assertTrue(os.path.islink(out))
+
+    def test_report_cannot_replace_the_target_of_a_scanned_symlink(self):
+        bank = self.write_bank(with_music=False)
+        src = os.path.join(self.tmp.name, "banks")
+        os.mkdir(src)
+        try:
+            os.symlink(bank, os.path.join(src, "linked.awc"))
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"symlinks unavailable: {e}")
+        self.assert_input_refused(src, bank, bank)
+
+    def test_malformed_input_is_protected_before_any_bank_is_read(self):
+        bank = os.path.join(self.tmp.name, "bad.awc")
+        with open(bank, "wb") as f:
+            f.write(b"not an AWC")
+        with mock.patch.object(awc_manifest, "_bank_rows", side_effect=AssertionError("bank read")):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                result = awc_manifest.main([self.tmp.name, "--out", bank])
+        self.assertEqual(result, 2)
+        self.assertIn("would overwrite the input", err.getvalue())
+        with open(bank, "rb") as f:
+            self.assertEqual(f.read(), b"not an AWC")
+
+    def test_existing_reports_can_be_replaced_without_changing_the_bank(self):
+        bank = self.write_bank(with_music=False)
+        with open(bank, "rb") as f:
+            original = f.read()
+        for ext in ("csv", "json"):
+            with self.subTest(format=ext):
+                out = os.path.join(self.tmp.name, "manifest." + ext)
+                with open(out, "w", encoding="utf-8") as f:
+                    f.write("previous report\n")
+                p = self.run_tool(self.tmp.name, "--out", out)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                with open(out, encoding="utf-8") as f:
+                    if ext == "json":
+                        self.assertEqual(json.load(f)["stream_count"], 3)
+                    else:
+                        self.assertEqual(len(list(csv.DictReader(f))), 3)
+                with open(bank, "rb") as f:
+                    self.assertEqual(f.read(), original)
 
     def test_invalid_banks_are_not_counted(self):
         for name in ("bad1.awc", "bad2.awc"):
