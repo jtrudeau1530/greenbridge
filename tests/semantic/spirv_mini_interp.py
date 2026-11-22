@@ -711,9 +711,15 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = not val(a[1])
         elif op in ("OpFAdd", "OpFSub", "OpFMul"):
             x, y = val(a[1]), val(a[2])
-            if not (isinstance(x, float) and isinstance(y, float)):
+            fn = (lambda p, q: f32(p + q)) if op == "OpFAdd" else (
+                (lambda p, q: f32(p - q)) if op == "OpFSub" else (lambda p, q: f32(p * q)))
+            if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == len(y) and all(
+                    isinstance(p, float) and isinstance(q, float) for p, q in zip(x, y)):
+                values[res] = tuple(fn(p, q) for p, q in zip(x, y))
+            elif isinstance(x, float) and isinstance(y, float):
+                values[res] = fn(x, y)
+            else:
                 raise UnsupportedConstruct(f"{op} on non-float")
-            values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
             values[res] = f32(-val(a[1]))
         elif op == "OpFDiv":
@@ -729,10 +735,17 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             else:
                 values[res] = f32(x / y)        # x/inf is a signed zero, as in Python
         elif op == "OpQuantizeToF16":
-            # Single-instruction f32 -> f16 -> f32 round to nearest. Emitted by
-            # the translator for 16-bit interpolant reads; a Pack/Unpack
-            # round-trip is observably folded to a no-op by at least one driver.
-            values[res] = half_to_float(float_to_half(val(a[1])))
+            # Single-instruction f32 -> f16 -> f32 round to nearest, with the
+            # SPIR-V subnormal rule: a magnitude too small for a normal f16
+            # becomes +0/-0. struct.pack('<e') keeps the subnormal, which would
+            # make the interpreter more precise than a conforming driver.
+            # Emitted by the translator for 16-bit interpolant reads; a
+            # Pack/Unpack round-trip is observably folded to a no-op by at
+            # least one driver.
+            h = float_to_half(val(a[1]))
+            if h & 0x7C00 == 0:
+                h &= 0x8000
+            values[res] = half_to_float(h)
         elif op in ("OpConvertUToF", "OpConvertSToF"):
             x = val(a[1])
             if isinstance(x, bool) or not isinstance(x, int) or x > MASK:

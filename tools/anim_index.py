@@ -488,7 +488,12 @@ def main():
             rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
     except ValueError as e:
         sys.exit(f"{a.source}: {e}")
-    write_output(a.out, rows, summary)
+    except OSError as e:        # missing, a folder that can't be listed, a file that can't be read
+        sys.exit(f"{e.filename or a.source}: {e.strerror or e}")
+    try:
+        write_output(a.out, rows, summary)
+    except OSError as e:
+        sys.exit(f"{a.out}: cannot write: {e.strerror or e}")
     if a.rigs:
         if os.path.isdir(a.source):
             blob = collect_rbf0_dir(a.source)

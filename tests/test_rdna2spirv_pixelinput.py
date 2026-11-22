@@ -12,7 +12,8 @@ Rule under test (tools/rdna2spirv.py, PS input path):
     table overcounts the code's distinct v_interp attrs in 775 of 12,101 corpus PS).
     Position in the table is the v_interp attr number, not the record's slot byte.
   * A 32-bit v_interp read (p1/p2/mov) of a position flagged 16-bit (flag bit 4) sees the
-    value rounded to f16 (round to nearest, and back to f32). Reads through the *_f16
+    value rounded to f16 (round to nearest, f16 denormals flushed to signed zero,
+    and back to f32). Reads through the *_f16
     opcodes already narrow to f16 and are unchanged.
   * Without a sidecar, or with a sidecar holding no table, the output is byte-identical
     to the old code-driven path (no new declarations, no quantization, no new metadata).
@@ -76,9 +77,15 @@ def mrt0_words(spvasm, **run_options):
 
 
 def f16_roundtrip_bits(word):
-    """Independent oracle: f32 -> f16 (round to nearest even) -> f32, as bit patterns."""
+    """Independent oracle: f32 -> f16 (round to nearest even, f16 denormals flushed) -> f32, as bits.
+
+    OpQuantizeToF16 returns +0/-0 for a magnitude below the smallest normal f16, so the oracle
+    flushes exactly like the interpreter and the hardware are supposed to.
+    """
     as_float = struct.unpack("<f", struct.pack("<I", word))[0]
     half = struct.unpack("<H", struct.pack("<e", as_float))[0]
+    if half & 0x7C00 == 0:
+        half &= 0x8000
     back = struct.unpack("<e", struct.pack("<H", half))[0]
     return struct.unpack("<I", struct.pack("<f", back))[0]
 
@@ -144,6 +151,21 @@ def test_fp16_read_rounds_to_nearest(tmp_path):
     assert want != f32_one_point_one  # the fixture value is not f16-exact, so the check is meaningful
     got = mrt0_words(spv, inputs={"%in_attr1": (1.1, 0.0, 0.0, 0.0)})
     assert got == (want,) * 4
+
+
+def test_fp16_subnormal_read_flushes_to_zero(tmp_path):
+    """A magnitude too small for a normal f16 reads as +0/-0, not as an f16 subnormal.
+
+    SPIR-V's OpQuantizeToF16 returns signed zero below the smallest normal f16 (6.1e-5);
+    keeping the subnormal (struct.pack('<e') does) would be more precise than a driver.
+    """
+    table = fssm_blob([(4, 0xF, 0, 0, 0), (4, 0xF, 1, 1, FP16_FLAG)])
+    spv = translate(write_case(tmp_path, "ps_pix_subnormal", READ_ATTR1, fssm=table))
+    zero = struct.unpack("<I", struct.pack("<f", 0.0))[0]
+    neg_zero = struct.unpack("<I", struct.pack("<f", -0.0))[0]
+    assert f16_roundtrip_bits(struct.unpack("<I", struct.pack("<f", 1e-6))[0]) == zero
+    assert mrt0_words(spv, inputs={"%in_attr1": (1e-6, 0.0, 0.0, 0.0)}) == (zero,) * 4
+    assert mrt0_words(spv, inputs={"%in_attr1": (-1e-6, 0.0, 0.0, 0.0)}) == (neg_zero,) * 4
 
 
 def test_fp16_mov_read_also_rounds(tmp_path):
