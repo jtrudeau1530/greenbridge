@@ -673,6 +673,97 @@ int main() {
         std::printf("depth24: 96-bit texels repack both ways, split into rows and into slices\n");
     }
 
+    // 7. ScratchBuffers::collect() must check VkResult from vkGetSemaphoreCounterValue() (leaving in-flight
+    //    chunks retired if the query fails even when *pValue is overwritten with UINT64_MAX) and reclaim
+    //    ticket-0 batches without querying the timeline semaphore.
+    {
+        struct MockVk {
+            std::uint64_t next_handle = 1;
+            VkResult sem_result = VK_ERROR_DEVICE_LOST;
+            std::uint64_t sem_value = UINT64_MAX;
+            unsigned sem_queries = 0;
+            unsigned destroyed_buffers = 0;
+
+            static MockVk*& state() {
+                static MockVk* s = nullptr;
+                return s;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_buf(VkDevice, const VkBufferCreateInfo*,
+                                                             const VkAllocationCallbacks*, VkBuffer* out) {
+                *out = reinterpret_cast<VkBuffer>(state()->next_handle++);
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_buf(VkDevice, VkBuffer, const VkAllocationCallbacks*) {
+                ++state()->destroyed_buffers;
+            }
+            static VKAPI_ATTR void VKAPI_CALL mem_req(VkDevice, VkBuffer, VkMemoryRequirements* req) {
+                *req = {};
+                req->size = 4096;
+                req->alignment = 256;
+                req->memoryTypeBits = 1;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL bind_buf(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) {
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL free_mem(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
+            static VKAPI_ATTR VkResult VKAPI_CALL get_sem(VkDevice, VkSemaphore, std::uint64_t* out) {
+                ++state()->sem_queries;
+                if (out) *out = state()->sem_value;
+                return state()->sem_result;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL wait_idle(VkDevice) { return VK_SUCCESS; }
+            static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL gdpa(VkDevice, const char* name) {
+                if (std::strcmp(name, "vkCreateBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(create_buf);
+                if (std::strcmp(name, "vkDestroyBuffer") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(destroy_buf);
+                if (std::strcmp(name, "vkGetBufferMemoryRequirements") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(mem_req);
+                if (std::strcmp(name, "vkBindBufferMemory") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(bind_buf);
+                if (std::strcmp(name, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(free_mem);
+                if (std::strcmp(name, "vkGetSemaphoreCounterValue") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(get_sem);
+                if (std::strcmp(name, "vkDeviceWaitIdle") == 0) return reinterpret_cast<PFN_vkVoidFunction>(wait_idle);
+                return nullptr;
+            }
+        };
+        MockVk mock{};
+        MockVk::state() = &mock;
+        const VkSemaphore fake_sem = reinterpret_cast<VkSemaphore>(std::uintptr_t(0x1234));
+        {
+            ScratchBuffers scratch(&MockVk::gdpa, reinterpret_cast<VkDevice>(std::uintptr_t(1)),
+                                   [&](const VkMemoryRequirements&) {
+                                       return reinterpret_cast<VkDeviceMemory>(mock.next_handle++);
+                                   });
+            EXPECT(scratch.loaded());
+            VkBuffer b1 = VK_NULL_HANDLE, b2 = VK_NULL_HANDLE;
+            VkDeviceSize off = 0;
+            EXPECT(scratch.get(1024, b1, off));
+            scratch.retire(fake_sem, 1);
+            // Query fails with VK_ERROR_DEVICE_LOST while writing UINT64_MAX to *pValue: chunk must NOT be recycled!
+            scratch.collect();
+            EXPECT(scratch.get(1024, b2, off));
+            EXPECT(b2 != b1);  // b1 is still in flight; must not have been reclaimed into spare_
+            // Unsubmitted batch (ticket == 0): must reclaim without calling vkGetSemaphoreCounterValue.
+            const unsigned queries_before = mock.sem_queries;
+            scratch.retire(fake_sem, 0);
+            mock.sem_result = VK_SUCCESS;
+            mock.sem_value = 0;
+            scratch.collect();
+            EXPECT(mock.sem_queries == queries_before + 1);  // only queried for b1 (ticket 1), not b2 (ticket 0)
+            VkBuffer b3 = VK_NULL_HANDLE;
+            EXPECT(scratch.get(1024, b3, off));
+            EXPECT(b3 == b2);  // b2 was reclaimed cleanly from ticket 0
+            // Now b1's ticket completes cleanly.
+            mock.sem_value = 1;
+            scratch.collect();
+            scratch.retire(fake_sem, 0);
+        }
+        EXPECT(mock.destroyed_buffers == 2);
+        MockVk::state() = nullptr;
+        std::printf("depth24: ScratchBuffers::collect() checks vkGetSemaphoreCounterValue VkResult and ticket 0 ok\n");
+    }
+
     EXPECT(gpu.validation_errors() == 0);
     std::printf("depth24_convert_test: ok\n");
     return 0;

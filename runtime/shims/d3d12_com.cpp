@@ -327,11 +327,13 @@ public:
     }
 
     void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::DrawInstanced");
         record_draw(false, vertices, instances, first_vertex, 0, first_instance);
     }
 
     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT indices, UINT instances, UINT first_index, INT base_vertex,
                                                 UINT first_instance) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::DrawIndexedInstanced");
         record_draw(true, indices, instances, first_index, base_vertex, first_instance);
     }
 

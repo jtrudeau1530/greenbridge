@@ -31,6 +31,9 @@ public:
     bool core = false;               // a Vulkan 1.3 device: the features are core
     bool dynamic_rendering = false;  // supported, as a core feature or through VK_KHR_dynamic_rendering
     bool synchronization2 = false;   // supported, as a core feature or through VK_KHR_synchronization2
+    // Optional 1.3 core features, enabled where supported; on a 1.2 device they stay off (no required subgroup size).
+    bool subgroup_size_control = false;
+    bool compute_full_subgroups = false;
 
     bool usable() const { return dynamic_rendering && synchronization2; }
 
@@ -38,7 +41,7 @@ public:
     void query(VkPhysicalDevice physical, std::uint32_t api_version, PFN_vkGetPhysicalDeviceFeatures2 features2,
                PFN_vkEnumerateDeviceExtensionProperties enumerate_extensions) {
         core = api_version >= VK_API_VERSION_1_3;
-        dynamic_rendering = synchronization2 = false;
+        dynamic_rendering = synchronization2 = subgroup_size_control = compute_full_subgroups = false;
         if (!features2) return;
         if (core) {
             VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -46,6 +49,8 @@ public:
             features2(physical, &query);
             dynamic_rendering = f13.dynamicRendering == VK_TRUE;
             synchronization2 = f13.synchronization2 == VK_TRUE;
+            subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
+            compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
             return;
         }
         if (api_version < VK_API_VERSION_1_2 || !enumerate_extensions) return;
@@ -73,6 +78,8 @@ public:
         core = from.core;
         dynamic_rendering = from.dynamic_rendering;
         synchronization2 = from.synchronization2;
+        subgroup_size_control = from.subgroup_size_control;
+        compute_full_subgroups = from.compute_full_subgroups;
     }
 
     // The structs that enable both features, ahead of `chain`; returns their head for VkPhysicalDeviceVulkan12Features'
@@ -82,6 +89,8 @@ public:
             enable13_.pNext = chain;
             enable13_.dynamicRendering = VK_TRUE;
             enable13_.synchronization2 = VK_TRUE;
+            enable13_.subgroupSizeControl = subgroup_size_control ? VK_TRUE : VK_FALSE;
+            enable13_.computeFullSubgroups = compute_full_subgroups ? VK_TRUE : VK_FALSE;
             return &enable13_;
         }
         sync2_.pNext = chain;

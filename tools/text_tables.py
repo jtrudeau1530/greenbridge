@@ -270,7 +270,7 @@ def _clean(s: str) -> str:
 
 def _write_csv(path, fields, rows):
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=fields)
+        w = csv.DictWriter(fh, fieldnames=fields, lineterminator="\n")
         w.writeheader()
         n = 0
         for row in rows:

@@ -29,6 +29,8 @@ OPS = {
     "v_min_f16": ("v_min_f16_e64 v3, {0}, {1}", 2, min),
     "v_fma_f16": ("v_fma_f16 v3, {0}, {1}, {2}", 3, lambda a, b, c: a * b + c),
     "v_med3_f16": ("v_med3_f16 v3, {0}, {1}, {2}", 3, median),
+    "v_min3_f16": ("v_min3_f16 v3, {0}, {1}, {2}", 3, min),
+    "v_max3_f16": ("v_max3_f16 v3, {0}, {1}, {2}", 3, max),
     "v_sqrt_f16": ("v_sqrt_f16_e64 v3, {0}", 1, lambda a: a ** 0.5),
     "v_rcp_f16": ("v_rcp_f16_e64 v3, {0}", 1, lambda a: 1 / a),
 }

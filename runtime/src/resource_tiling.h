@@ -43,6 +43,7 @@ struct TilingDesc {
     std::uint32_t mips = 1;
     std::uint32_t element_bytes = 0;    // bytes per texel, or per block of a block-compressed format
     std::uint32_t block = 1;            // texels per block side: 4 for BC1-7
+    std::uint32_t samples = 1;          // 1, or 4 for 2D single-mip MSAA
 };
 
 // D3D12_SUBRESOURCE_TILING: a packed mip has no tiles of its own and starts at packed_tile.
@@ -63,9 +64,22 @@ struct ResourceTiling {
     std::vector<SubresourceTiling> subresources;  // mip + layer * mips
 };
 
-// The standard tile shape in elements (D3D12 "standard swizzle" tile shapes for 64 KiB tiles), or {} for an
-// element size that cannot be tiled (3- and 12-byte formats).
-constexpr TileShape element_tile_shape(bool volume, std::uint32_t element_bytes) {
+// The standard tile shape in elements (D3D12 "standard swizzle" tile shapes for 64 KiB tiles; 2D 4x MSAA scales the
+// tile shape down by 4 samples per texel, measured on RTX 5070 Ti and WARP), or {} for an unsupported sample count or
+// an element size that cannot be tiled (3- and 12-byte formats).
+constexpr TileShape element_tile_shape(bool volume, std::uint32_t element_bytes, std::uint32_t samples = 1) {
+    if (samples == 4) {
+        if (volume) return {};
+        switch (element_bytes) {
+        case 1: return {128, 128, 1};
+        case 2: return {128, 64, 1};
+        case 4: return {64, 64, 1};
+        case 8: return {64, 32, 1};
+        case 16: return {32, 32, 1};
+        default: return {};
+        }
+    }
+    if (samples != 1) return {};
     switch (element_bytes) {
     case 1: return volume ? TileShape{64, 32, 32} : TileShape{256, 256, 1};
     case 2: return volume ? TileShape{32, 32, 32} : TileShape{256, 128, 1};
@@ -103,7 +117,8 @@ inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
         return true;
     }
     const bool volume = desc.kind == TiledKind::texture3d;
-    const TileShape elements = element_tile_shape(volume, desc.element_bytes);
+    if (desc.samples != 1 && (desc.samples != 4 || volume || desc.mips != 1 || desc.block != 1)) return false;
+    const TileShape elements = element_tile_shape(volume, desc.element_bytes, desc.samples);
     if (!elements.width || !desc.mips || !desc.block || !desc.width || !desc.height || !desc.depth_or_layers)
         return false;
     out.shape = {elements.width * desc.block, elements.height * desc.block, elements.depth};
@@ -124,7 +139,7 @@ inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
             ++out.standard_mips;
         } else {
             slice[mip] = {0, 0, 0, packed_tile};
-            packed_bytes += up(w, desc.block) * up(h, desc.block) * d * desc.element_bytes;
+            packed_bytes += up(w, desc.block) * up(h, desc.block) * d * desc.element_bytes * desc.samples;
             ++out.packed_mips;
         }
     }

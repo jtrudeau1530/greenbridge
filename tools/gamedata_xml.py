@@ -518,7 +518,7 @@ def write_csv(path: str, rows: list) -> None:
               "parent_path", "parent_file", "xi_include", "type_attrs", "type_values", "content_values",
               "error"]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         for row in rows:
             out = dict(row)

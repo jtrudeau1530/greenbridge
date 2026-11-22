@@ -250,6 +250,7 @@ public:
         const UINT next_flags = (flags ? flags : flags_) | waitable_bit;
         const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
         if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
+        statistics_disjoint_.store(true, std::memory_order_relaxed);
         flags_ = next_flags;
         register_buffers();
         std::uint32_t next = 0;
@@ -259,8 +260,11 @@ public:
     HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput**) override { return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE; }
     HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* stats) override {
-        if (!stats) return E_INVALIDARG;
+        if (!stats) return DXGI_ERROR_INVALID_CALL;
         std::memset(stats, 0, sizeof(*stats));
+        // Native DXGI reports the discontinuity once, on the first valid query after creation or resize.
+        if (statistics_disjoint_.exchange(false, std::memory_order_relaxed))
+            return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
         const UINT count = present_count_.load(std::memory_order_relaxed);
         stats->PresentCount = count;
         stats->PresentRefreshCount = count;
@@ -425,6 +429,7 @@ private:
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
     std::atomic<UINT> present_count_{0};
+    std::atomic<bool> statistics_disjoint_{true};
     std::atomic<LONGLONG> last_present_qpc_{0};
     std::atomic<UINT> max_frame_latency_{2};
     DXGI_RGBA background_color_{0, 0, 0, 0};

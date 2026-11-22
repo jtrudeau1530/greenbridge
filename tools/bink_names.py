@@ -303,7 +303,7 @@ def write(out, rows, unmatched, summary):
             json.dump({"summary": summary, "streams": rows, "unmatched_list_entries": unmatched}, fh, indent=1)
     else:
         with open(out, "w", encoding="utf-8", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=FIELDS)
+            w = csv.DictWriter(fh, fieldnames=FIELDS, lineterminator="\n")
             w.writeheader()
             w.writerows(rows)
 
