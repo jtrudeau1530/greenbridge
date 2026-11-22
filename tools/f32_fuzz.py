@@ -687,7 +687,7 @@ def run_translated(text, name="ps_f32_fuzz"):
         dis = os.path.join(tmp, "disasm")
         os.mkdir(dis)
         path = os.path.join(dis, name + ".s")
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
             f.write(STUB_DXBC)
@@ -1727,7 +1727,7 @@ def main(argv=None):
             if a.keep and rep.mismatches:
                 os.makedirs(a.keep, exist_ok=True)
                 for k, (c, _, _) in enumerate(rep.mismatches):
-                    with open(os.path.join(a.keep, f"{c.group}_{c.index}_{c.op}_{k}.asm"), "w", encoding="utf-8") as f:
+                    with open(os.path.join(a.keep, f"{c.group}_{c.index}_{c.op}_{k}.asm"), "w", encoding="utf-8", newline="\n") as f:
                         f.write("\n".join(hw_lines(c, oracle.arch, not a.no_hw_guard)) + "\n")
             if a.perturb:
                 print(f"perturbed model '{a.perturb}': {n_mis} mismatches" + ("" if n_mis else " -- NOT DETECTED"))

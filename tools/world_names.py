@@ -606,7 +606,7 @@ def _write_json(path: str, data: dict) -> None:
     os.makedirs(directory, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=directory, prefix=".world-names-") as staging:
         tmp = os.path.join(staging, "report.json")
-        with open(tmp, "w", encoding="utf-8") as handle:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(data, handle, indent=1, sort_keys=True)
             handle.write("\n")
         os.replace(tmp, path)

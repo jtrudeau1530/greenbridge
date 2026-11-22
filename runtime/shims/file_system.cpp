@@ -142,7 +142,9 @@ std::filesystem::path marker(const std::filesystem::path& overlay, const std::ve
 bool deleted(const std::filesystem::path& overlay, const std::vector<std::wstring>& parts) {
     if (overlay.empty() || parts.empty()) return false;
     std::error_code ec;
-    return std::filesystem::exists(marker(overlay, parts), ec);
+    // Only regular files are deletion markers; parent directories inside .gta6rt-deleted/ exist only to hold markers
+    // for nested deleted files and must not hide the corresponding ancestor directories in the package.
+    return std::filesystem::is_regular_file(marker(overlay, parts), ec);
 }
 
 Target read_target(const std::wstring& path) {

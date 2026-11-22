@@ -1,9 +1,11 @@
-"""SHADER-10: the hand-written ps_w64_* fixtures get the tier their header names, and the census counts tiers.
+"""SHADER-10: the hand-written ps_w64_* and vs_w64_* fixtures get the tier their header names, and the census counts
+tiers.
 
-The fixtures (runtime/test/shaders/ps_w64_{a,b,c}_*.asm) are the GPU tests of w64_graphics.py: each was drawn on an
-AMD Radeon 880M with the fragment subgroup size required to 64 and to 32. Tier A and B fixtures gave identical images
-(and the words their header derives), tier C fixtures differed, so this test pins the translator's detector to what
-the hardware showed. Needs llvm-mc with the AMDGPU target and spirv-as / spirv-val, like the other tests that build
+The fixtures (runtime/test/shaders/{ps,vs}_w64_{a,b,c}_*.asm) are the GPU tests of w64_graphics.py: each pixel fixture
+was drawn on an AMD Radeon 880M with the fragment subgroup size required to 64 and to 32, each vertex fixture (TEST-251)
+on an RX 9070 XT and a Ryzen 9800X3D iGPU (RADV) with the VS stage at wave64 and at wave32 (RADV_PERFTEST=gewave32).
+Tier A and B fixtures gave identical words (and the words their header derives), tier C fixtures differed, so this
+test pins the translator's detector to what the hardware showed. Needs llvm-mc with the AMDGPU target and spirv-as / spirv-val, like the other tests that build
 shaders; the pure-Python parts run without them.
 """
 import json
@@ -38,11 +40,18 @@ EXPECT = {
     "ps_w64_c_vote_else": ("C", ["unsafe-vote-branch"], None),
     "ps_w64_c_scc_vote": ("C", ["cross-lane"], None),
     "ps_w64_c_execz_sgpr": ("C", ["stale-scalar", "unsafe-execz-branch"], None),
+    "vs_w64_a_skip": ("A", [], []),
+    "vs_w64_b_waterfall": ("B", [], ["waterfall"]),
+    "vs_w64_b_readlane_uniform": ("B", [], ["readfirstlane-uniform", "readlane-uniform"]),
+    "vs_w64_b_ballot_atomic": ("B", [], ["aggregated-atomic", "elected-lane"]),
+    "vs_w64_c_bcnt_export": ("C", ["lane-count"], None),
+    "vs_w64_c_readlane": ("C", ["cross-lane"], None),
+    "vs_w64_c_lane_id": ("C", ["lane-id"], None),
 }
 
 
 def test_every_fixture_has_a_tier_and_a_gpu_check():
-    asm = {f[:-4] for f in os.listdir(SHADERS) if f.startswith("ps_w64_") and f.endswith(".asm")}
+    asm = {f[:-4] for f in os.listdir(SHADERS) if f.startswith(("ps_w64_", "vs_w64_")) and f.endswith(".asm")}
     assert asm == set(EXPECT) == set(w64_graphics.FIXTURES)
     for name, (tier, _, _) in EXPECT.items():
         assert w64_graphics.FIXTURES[name][0] == tier
@@ -125,3 +134,15 @@ def test_expected_words_of_the_gpu_fixtures():
     assert w64_graphics._a_skip(6 + 64 * 2) == (1006, 0, 2000 + 2 + 9, 3)
     assert w64_graphics._b_waterfall(5 + 64 * 6) == (17 * ((5 & 3) + 4 * (6 & 3)) + 5, (5 & 3) + 4 * (6 & 3), 0, 0)
     assert w64_graphics._b_readfirstlane(10) == (133, 277, 0, 0)
+    assert w64_graphics._vs_a_skip(1 + 64 * 3) == (7 * 3 + 1, 1, 2000 + 3, 2)        # no whole-quad word in r1
+    assert w64_graphics._vs_a_skip(6 + 64 * 2) == (1006, 0, 2000 + 2 + 9, 3)
+    assert w64_graphics._vs_b_readlane_uniform(70) == (6 + 123, 200, 6 + 123, 277)
+    assert w64_graphics._vs_c_lane_id(700) == (None, None, 700, 0)
+
+
+def test_vs_probe_and_radv_perftest(monkeypatch):
+    monkeypatch.setenv("RADV_PERFTEST", "gewave32,nggc")
+    assert w64_graphics._radv_perftest(64) == "nggc"                # the user's other flags stay, gewave32 goes
+    assert w64_graphics._radv_perftest(32) == "nggc,gewave32"
+    assert w64_graphics.FIXTURES[w64_graphics.VS_PROBE][0] == "C"
+    assert w64_graphics.VS_RECORDS * 4 >= 0x100 + 4 * w64_graphics.VS_VERTICES   # the atomic's slots end below the records

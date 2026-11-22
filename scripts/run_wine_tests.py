@@ -251,7 +251,7 @@ def main() -> int:
     if args.summary:
         try:
             _make_parent(args.summary)
-            with open(args.summary, "a", encoding="utf-8") as f:
+            with open(args.summary, "a", encoding="utf-8", newline="\n") as f:
                 f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
                 f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
                 f.write("| Test | Result | Required |\n|---|---|---|\n")

@@ -39,7 +39,7 @@ class AssetsPoolsTest(unittest.TestCase):
             pass
 
     def pool(self, rel, size=100):
-        path = os.path.join(self.game, rel)
+        path = os.path.join(self.game, *rel.split("/"))
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             f.write(b"x" * size)

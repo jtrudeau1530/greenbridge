@@ -363,7 +363,7 @@ def main():
     if a.per_shader:
         out["per_shader"] = sorted(shaders, key=lambda e: e["name"])
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(out, f, indent=1, allow_nan=False)
     except OSError as e:
         print(f"ERROR: cannot write {path}: {e.strerror or e}", file=sys.stderr)
