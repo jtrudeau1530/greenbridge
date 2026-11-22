@@ -286,6 +286,75 @@ class DSDecRtnU64Instruction:
         return text
 
 
+# ==============================================================================
+# Deterministic Scalar Interpreter & Machine State
+# ==============================================================================
+
+class ScalarRegisterFile:
+    """Models a 256-register 32-bit scalar VGPR file with 64-bit pair support."""
+
+    def __init__(self) -> None:
+        self.regs: List[int] = [0] * DEFAULT_NUM_VGPRS
+
+    def get_u32(self, reg_idx: int) -> int:
+        return self.regs[reg_idx] & MASK_32
+
+    def set_u32(self, reg_idx: int, val: int) -> None:
+        self.regs[reg_idx] = val & MASK_32
+
+    def get_u64(self, pair: RegPair) -> int:
+        lo = self.get_u32(pair.index)
+        hi = self.get_u32(pair.index + 1)
+        return combine_u32s_to_u64(lo, hi)
+
+    def set_u64(self, pair: RegPair, val: int) -> None:
+        lo, hi = split_u64_to_u32s(val)
+        self.set_u32(pair.index, lo)
+        self.set_u32(pair.index + 1, hi)
+
+
+class ScalarMachineState:
+    """Architectural state for scalar single-lane 64-bit emulation."""
+
+    def __init__(self, capacity_qwords: int = LDS_SIZE_QWORDS) -> None:
+        self.rf = ScalarRegisterFile()
+        self.sgprs = [0] * DEFAULT_NUM_SGPRS
+        self.lds = LDSModel64(capacity_qwords)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.rf.get_u32(index)
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.rf.set_u32(index, val)
+
+    def get_vgpr64(self, pair: RegPair) -> int:
+        return self.rf.get_u64(pair)
+
+    def set_vgpr64(self, pair: RegPair, val: int) -> None:
+        self.rf.set_u64(pair, val)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_dec_rtn_u64."""
+
+    def step(
+        self, instr: DSDecRtnU64Instruction, state: ScalarMachineState
+    ) -> Tuple[int, int]:
+        """Execute a single ds_dec_rtn_u64 instruction deterministically on scalar state.
+
+        Snapshot operands before updating destination to ensure deterministic register handling.
+        """
+        vaddr = state.get_vgpr(instr.vaddr.index)
+        vdata0 = state.get_vgpr64(instr.vdata0)
+        old_val, new_mem = state.lds.atomic_dec_rtn_u64(
+            vaddr=vaddr,
+            wrap_limit=vdata0,
+            offset=instr.offset,
+        )
+        state.set_vgpr64(instr.vdst, old_val)
+        return old_val, new_mem
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -523,6 +592,129 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
                 vdata0=RegPair(6),
                 offset=65536,
             )
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter for ds_dec_rtn_u64."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState(capacity_qwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_execute_basic_u64(self) -> None:
+        self.state.lds.write_qword(10 * 8, 50)
+        self.state.set_vgpr(1, 80)
+        self.state.set_vgpr64(RegPair(2), 100)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            offset=0,
+        )
+
+        old_val, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, 50)
+        self.assertEqual(new_val, 49)
+        self.assertEqual(self.state.get_vgpr64(RegPair(4)), 50)
+        self.assertEqual(self.state.lds.read_qword(10 * 8), 49)
+
+    def test_scalar_execute_wrap_on_zero_u64(self) -> None:
+        bound = 0xAAAA_BBBB_CCCC_DDDD
+        self.state.lds.write_qword(10 * 8, 0)
+        self.state.set_vgpr(1, 80)
+        self.state.set_vgpr64(RegPair(2), bound)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            offset=0,
+        )
+
+        old_val, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, 0)
+        self.assertEqual(new_val, bound)
+        self.assertEqual(self.state.get_vgpr64(RegPair(4)), 0)
+        self.assertEqual(self.state.lds.read_qword(10 * 8), bound)
+
+    def test_scalar_determinism_across_identical_runs_u64(self) -> None:
+        state1 = ScalarMachineState(capacity_qwords=1024)
+        state2 = ScalarMachineState(capacity_qwords=1024)
+        interp1 = ScalarInterpreter()
+        interp2 = ScalarInterpreter()
+
+        val = 0x0123_4567_89AB_CDEF
+        for s in (state1, state2):
+            s.lds.write_qword(5 * 8, val)
+            s.set_vgpr(1, 40)
+            s.set_vgpr64(RegPair(2), val)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            offset=0,
+        )
+
+        res1 = interp1.step(instr, state1)
+        res2 = interp2.step(instr, state2)
+
+        self.assertEqual(res1, res2)
+        self.assertEqual(state1.rf.regs, state2.rf.regs)
+        self.assertEqual(state1.lds.memory, state2.lds.memory)
+
+    def test_scalar_loop_countdown_u64(self) -> None:
+        bound = 3
+        idx = 8
+        self.state.lds.write_qword(idx * 8, bound)
+        self.state.set_vgpr(1, idx * 8)
+        self.state.set_vgpr64(RegPair(2), bound)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            offset=0,
+        )
+
+        expected_steps = [(3, 2), (2, 1), (1, 0), (0, 3), (3, 2)]
+        for exp_old, exp_new in expected_steps:
+            old_val, new_val = self.interp.step(instr, self.state)
+            self.assertEqual(old_val, exp_old)
+            self.assertEqual(new_val, exp_new)
+            self.assertEqual(self.state.get_vgpr64(RegPair(4)), exp_old)
+            self.assertEqual(self.state.lds.read_qword(idx * 8), exp_new)
+
+    def test_scalar_untouched_state_preserved_u64(self) -> None:
+        self.state.set_vgpr(0, 0x11111111)
+        self.state.set_vgpr(1, 80)
+        self.state.set_vgpr64(RegPair(2), 50)
+        self.state.set_vgpr(6, 0x66666666)
+        self.state.lds.write_qword(9 * 8, 0xAAAA_AAAA_AAAA_AAAA)
+        self.state.lds.write_qword(10 * 8, 10)
+        self.state.lds.write_qword(11 * 8, 0xBBBB_BBBB_BBBB_BBBB)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            offset=0,
+        )
+
+        self.interp.step(instr, self.state)
+
+        # Target register pair v[4:5] modified
+        self.assertEqual(self.state.get_vgpr64(RegPair(4)), 10)
+        # Adjacent registers preserved
+        self.assertEqual(self.state.get_vgpr(0), 0x11111111)
+        self.assertEqual(self.state.get_vgpr(1), 80)
+        self.assertEqual(self.state.get_vgpr64(RegPair(2)), 50)
+        self.assertEqual(self.state.get_vgpr(6), 0x66666666)
+        # Adjacent memory preserved
+        self.assertEqual(self.state.lds.read_qword(9 * 8), 0xAAAA_AAAA_AAAA_AAAA)
+        self.assertEqual(self.state.lds.read_qword(10 * 8), 9)
+        self.assertEqual(self.state.lds.read_qword(11 * 8), 0xBBBB_BBBB_BBBB_BBBB)
 
 
 if __name__ == "__main__":
