@@ -11,11 +11,14 @@
 #include "../shims/d3d12_xs_device.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
 
+#include <dxgi1_4.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -1122,6 +1125,404 @@ int compare_feature_support(ID3D12Device* ours) {
     return mismatches;
 }
 
+// Same-adapter host D3D12 device matched by VkPhysicalDeviceIDProperties (LUID first, then PCI IDs), falling back
+// to the default adapter. False if the host has no D3D12 device.
+bool create_host_device_for_physical(VkInstance instance, VkPhysicalDevice physical,
+                                     PFN_vkGetInstanceProcAddr instance_proc, Ref<ID3D12Device>& host,
+                                     std::string& adapter_name) {
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
+                                    reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                              : nullptr;
+    if (!create) return false;
+
+    VkPhysicalDeviceIDProperties id_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id_props};
+    if (instance && physical && instance_proc) {
+        if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                instance_proc(instance, "vkGetPhysicalDeviceProperties2"))) {
+            get_props2(physical, &props2);
+        }
+    }
+
+    const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+    const auto create_factory = dxgi ? reinterpret_cast<CreateFactoryFn>(
+                                           reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")))
+                                     : nullptr;
+    Ref<IDXGIAdapter1> luid_match, pci_match;
+    std::string luid_name, pci_name;
+    if (create_factory) {
+        Ref<IDXGIFactory4> factory;
+        if (SUCCEEDED(create_factory(IID_PPV_ARGS(&factory.p)))) {
+            Ref<IDXGIAdapter1> candidate;
+            for (UINT i = 0; factory->EnumAdapters1(i, &candidate.p) != DXGI_ERROR_NOT_FOUND; ++i) {
+                DXGI_ADAPTER_DESC1 desc{};
+                if (SUCCEEDED(candidate->GetDesc1(&desc))) {
+                    char utf8[256]{};
+                    WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, utf8, sizeof(utf8), nullptr, nullptr);
+                    if (!luid_match.p && id_props.deviceLUIDValid &&
+                        std::memcmp(&desc.AdapterLuid, id_props.deviceLUID, sizeof(desc.AdapterLuid)) == 0) {
+                        luid_match.p = candidate.p;
+                        candidate.p = nullptr;
+                        luid_name = utf8;
+                        break;
+                    }
+                    if (!pci_match.p && props2.properties.vendorID != 0 && desc.VendorId == props2.properties.vendorID &&
+                        desc.DeviceId == props2.properties.deviceID) {
+                        pci_match.p = candidate.p;
+                        candidate.p = nullptr;
+                        pci_name = utf8;
+                    }
+                }
+                candidate.reset();
+            }
+        }
+    }
+    if (luid_match.p && SUCCEEDED(create(luid_match.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+        adapter_name = luid_name;
+        return true;
+    }
+    if (pci_match.p && SUCCEEDED(create(pci_match.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+        adapter_name = pci_name;
+        return true;
+    }
+    if (SUCCEEDED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+        adapter_name = "default adapter";
+        return true;
+    }
+    return false;
+}
+
+// D3D-86: validate CheckFeatureSupport(D3D12_OPTIONS2..21 except 6/8/10/12/17), check size/null refusals and local
+// invariants, and verify conservative compatibility against the host PC D3D12 runtime on the same adapter.
+int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInfo& info) {
+    int mismatches = 0;
+    const auto fail = [&](const char* what) {
+        if (mismatches++ < 32) std::fprintf(stderr, "CheckFeatureSupport options: %s\n", what);
+    };
+    const auto query_ours = [&](auto tag_feature, auto& out) -> bool {
+        using T = std::remove_reference_t<decltype(out)>;
+        const char* name = tag_feature.first;
+        const D3D12_FEATURE feature = tag_feature.second;
+        if (ours->CheckFeatureSupport(feature, nullptr, sizeof(T)) != E_INVALIDARG) {
+            std::fprintf(stderr, "%s: expected E_INVALIDARG for nullptr\n", name);
+            ++mismatches;
+            return false;
+        }
+        std::vector<std::uint8_t> scratch(sizeof(T) + 1, 0xAA);
+        for (UINT bad_size : {0u, UINT(sizeof(T) - 1), UINT(sizeof(T) + 1)}) {
+            if (ours->CheckFeatureSupport(feature, scratch.data(), bad_size) != E_INVALIDARG) {
+                std::fprintf(stderr, "%s: expected E_INVALIDARG for size %u\n", name, bad_size);
+                ++mismatches;
+                return false;
+            }
+        }
+        std::memset(&out, 0xAA, sizeof(out));
+        if (FAILED(ours->CheckFeatureSupport(feature, &out, sizeof(out)))) {
+            std::fprintf(stderr, "%s: CheckFeatureSupport failed on Vulkan device\n", name);
+            ++mismatches;
+            return false;
+        }
+        return true;
+    };
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS11 o11{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS13 o13{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS14 o14{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS15 o15{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS18 o18{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS19 o19{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS20 o20{};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS21 o21{};
+
+    query_ours(std::pair{"OPTIONS2", D3D12_FEATURE_D3D12_OPTIONS2}, o2);
+    query_ours(std::pair{"OPTIONS3", D3D12_FEATURE_D3D12_OPTIONS3}, o3);
+    query_ours(std::pair{"OPTIONS4", D3D12_FEATURE_D3D12_OPTIONS4}, o4);
+    query_ours(std::pair{"OPTIONS5", D3D12_FEATURE_D3D12_OPTIONS5}, o5);
+    query_ours(std::pair{"OPTIONS7", D3D12_FEATURE_D3D12_OPTIONS7}, o7);
+    query_ours(std::pair{"OPTIONS9", D3D12_FEATURE_D3D12_OPTIONS9}, o9);
+    query_ours(std::pair{"OPTIONS11", D3D12_FEATURE_D3D12_OPTIONS11}, o11);
+    query_ours(std::pair{"OPTIONS13", D3D12_FEATURE_D3D12_OPTIONS13}, o13);
+    query_ours(std::pair{"OPTIONS14", D3D12_FEATURE_D3D12_OPTIONS14}, o14);
+    query_ours(std::pair{"OPTIONS15", D3D12_FEATURE_D3D12_OPTIONS15}, o15);
+    query_ours(std::pair{"OPTIONS16", D3D12_FEATURE_D3D12_OPTIONS16}, o16);
+    query_ours(std::pair{"OPTIONS18", D3D12_FEATURE_D3D12_OPTIONS18}, o18);
+    query_ours(std::pair{"OPTIONS19", D3D12_FEATURE_D3D12_OPTIONS19}, o19);
+    query_ours(std::pair{"OPTIONS20", D3D12_FEATURE_D3D12_OPTIONS20}, o20);
+    query_ours(std::pair{"OPTIONS21", D3D12_FEATURE_D3D12_OPTIONS21}, o21);
+
+    std::uint32_t unknown_feature = 0;
+    if (ours->CheckFeatureSupport(static_cast<D3D12_FEATURE>(9999), &unknown_feature, sizeof(unknown_feature)) !=
+        E_INVALIDARG)
+        fail("unknown feature unexpectedly answered");
+
+    // Local invariants for what this layer actually implements.
+    if (o2.DepthBoundsTestSupported ||
+        o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
+        fail("OPTIONS2 unexpected support");
+    if (o3.CopyQueueTimestampQueriesSupported || o3.CastingFullyTypedFormatSupported ||
+        o3.WriteBufferImmediateSupportFlags != D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE ||
+        o3.ViewInstancingTier != D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED || o3.BarycentricsSupported)
+        fail("OPTIONS3 unexpected support");
+    if (!o4.MSAA64KBAlignedTextureSupported ||
+        o4.SharedResourceCompatibilityTier != D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0 ||
+        o4.Native16BitShaderOpsSupported)
+        fail("OPTIONS4 mismatch");
+    if (o5.SRVOnlyTiledResourceTier3 || o5.RenderPassesTier != D3D12_RENDER_PASS_TIER_0 ||
+        o5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED)
+        fail("OPTIONS5 unexpected support");
+    if (o7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED ||
+        o7.SamplerFeedbackTier != D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED)
+        fail("OPTIONS7 unexpected support");
+    if (o9.MeshShaderPipelineStatsSupported || o9.MeshShaderSupportsFullRangeRenderTargetArrayIndex ||
+        o9.AtomicInt64OnTypedResourceSupported || o9.AtomicInt64OnGroupSharedSupported ||
+        o9.DerivativesInMeshAndAmplificationShadersSupported ||
+        o9.WaveMMATier != D3D12_WAVE_MMA_TIER_NOT_SUPPORTED)
+        fail("OPTIONS9 unexpected support");
+    if (o11.AtomicInt64OnDescriptorHeapResourceSupported) fail("OPTIONS11 unexpected support");
+    if (o13.UnrestrictedBufferTextureCopyPitchSupported || o13.UnrestrictedVertexElementAlignmentSupported ||
+        o13.InvertedViewportHeightFlipsYSupported || o13.InvertedViewportDepthFlipsZSupported ||
+        o13.TextureCopyBetweenDimensionsSupported || o13.AlphaBlendFactorSupported)
+        fail("OPTIONS13 unexpected support");
+    if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported ||
+        o14.IndependentFrontAndBackStencilRefMaskSupported)
+        fail("OPTIONS14 unexpected support");
+    if (o15.TriangleFanSupported || o15.DynamicIndexBufferStripCutSupported) fail("OPTIONS15 unexpected support");
+    if (o16.DynamicDepthBiasSupported || o16.GPUUploadHeapSupported) fail("OPTIONS16 unexpected support");
+    if (o18.RenderPassesValid) fail("OPTIONS18 unexpected support");
+    if (o19.MismatchingOutputDimensionsSupported || (o19.SupportedSampleCountsWithNoOutputs & ~0x3Fu) != 0 ||
+        (o19.SupportedSampleCountsWithNoOutputs & 1u) == 0 || o19.PointSamplingAddressesNeverRoundUp ||
+        o19.RasterizerDesc2Supported || o19.NarrowQuadrilateralLinesSupported ||
+        o19.AnisoFilterWithPointMipSupported != (info.sampler_anisotropy ? TRUE : FALSE) ||
+        o19.MaxSamplerDescriptorHeapSize != D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE ||
+        o19.MaxSamplerDescriptorHeapSizeWithStaticSamplers != D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE ||
+        o19.MaxViewDescriptorHeapSize != D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2 ||
+        o19.ComputeOnlyCustomHeapSupported)
+        fail("OPTIONS19 mismatch");
+    if (o20.ComputeOnlyWriteWatchSupported || o20.RecreateAtTier != D3D12_RECREATE_AT_TIER_NOT_SUPPORTED)
+        fail("OPTIONS20 unexpected support");
+    if (o21.WorkGraphsTier != D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED ||
+        o21.ExecuteIndirectTier != D3D12_EXECUTE_INDIRECT_TIER_1_0 || o21.SampleCmpGradientAndBiasSupported ||
+        o21.ExtendedCommandInfoSupported)
+        fail("OPTIONS21 unexpected support");
+
+    // Verify OPTIONS19.AnisoFilterWithPointMipSupported follows VulkanDeviceInfo::sampler_anisotropy.
+    {
+        rt::d3d12::VulkanDeviceInfo toggled_info = info;
+        toggled_info.sampler_anisotropy = !info.sampler_anisotropy;
+        Ref<ID3D12Device> toggled;
+        if (FAILED(rt::d3d12::create_vulkan_device(toggled_info, IID_PPV_ARGS(&toggled.p)))) {
+            fail("failed to create toggled sampler_anisotropy device");
+        } else {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS19 toggled19{};
+            if (FAILED(toggled->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &toggled19, sizeof(toggled19))) ||
+                toggled19.AnisoFilterWithPointMipSupported != (toggled_info.sampler_anisotropy ? TRUE : FALSE))
+                fail("OPTIONS19.AnisoFilterWithPointMipSupported did not follow sampler_anisotropy");
+        }
+    }
+
+    Ref<ID3D12Device> host;
+    std::string adapter_name;
+    if (!create_host_device_for_physical(info.instance, info.physical, info.get_instance_proc, host, adapter_name)) {
+        std::printf("CheckFeatureSupport options: no host D3D12 device to compare with, skipped\n");
+        return mismatches;
+    }
+
+    UINT host_compared = 0, host_skipped = 0;
+    const auto check_bool = [&](const char* feature, const char* field, BOOL a, BOOL b) {
+        if (!a || b) return;
+        if (mismatches++ < 32)
+            std::fprintf(stderr, "%s.%s: ours TRUE exceeds host FALSE\n", feature, field);
+    };
+    const auto check_tier = [&](const char* feature, const char* field, int a, int b) {
+        if (a <= b) return;
+        if (mismatches++ < 32)
+            std::fprintf(stderr, "%s.%s: ours tier %d exceeds host %d\n", feature, field, a, b);
+    };
+    const auto compare_host = [&](const char* name, D3D12_FEATURE feature, const auto& ours_val, auto&& verify) {
+        using T = std::remove_cv_t<std::remove_reference_t<decltype(ours_val)>>;
+        T host_val{};
+        if (FAILED(host->CheckFeatureSupport(feature, &host_val, sizeof(host_val)))) {
+            ++host_skipped;
+            return;
+        }
+        ++host_compared;
+        verify(name, ours_val, host_val);
+    };
+
+    compare_host("OPTIONS2", D3D12_FEATURE_D3D12_OPTIONS2, o2,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "DepthBoundsTestSupported", a.DepthBoundsTestSupported, b.DepthBoundsTestSupported);
+                     check_tier(n, "ProgrammableSamplePositionsTier", int(a.ProgrammableSamplePositionsTier),
+                                int(b.ProgrammableSamplePositionsTier));
+                 });
+    compare_host("OPTIONS3", D3D12_FEATURE_D3D12_OPTIONS3, o3,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "CopyQueueTimestampQueriesSupported", a.CopyQueueTimestampQueriesSupported,
+                                b.CopyQueueTimestampQueriesSupported);
+                     check_bool(n, "CastingFullyTypedFormatSupported", a.CastingFullyTypedFormatSupported,
+                                b.CastingFullyTypedFormatSupported);
+                     if ((UINT(a.WriteBufferImmediateSupportFlags) & ~UINT(b.WriteBufferImmediateSupportFlags)) != 0 &&
+                         mismatches++ < 32)
+                         std::fprintf(stderr, "%s.WriteBufferImmediateSupportFlags: ours 0x%x not subset of host 0x%x\n",
+                                      n, UINT(a.WriteBufferImmediateSupportFlags),
+                                      UINT(b.WriteBufferImmediateSupportFlags));
+                     check_tier(n, "ViewInstancingTier", int(a.ViewInstancingTier), int(b.ViewInstancingTier));
+                     check_bool(n, "BarycentricsSupported", a.BarycentricsSupported, b.BarycentricsSupported);
+                 });
+    compare_host("OPTIONS4", D3D12_FEATURE_D3D12_OPTIONS4, o4,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "MSAA64KBAlignedTextureSupported", a.MSAA64KBAlignedTextureSupported,
+                                b.MSAA64KBAlignedTextureSupported);
+                     check_tier(n, "SharedResourceCompatibilityTier", int(a.SharedResourceCompatibilityTier),
+                                int(b.SharedResourceCompatibilityTier));
+                     check_bool(n, "Native16BitShaderOpsSupported", a.Native16BitShaderOpsSupported,
+                                b.Native16BitShaderOpsSupported);
+                 });
+    compare_host("OPTIONS5", D3D12_FEATURE_D3D12_OPTIONS5, o5,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "SRVOnlyTiledResourceTier3", a.SRVOnlyTiledResourceTier3, b.SRVOnlyTiledResourceTier3);
+                     check_tier(n, "RenderPassesTier", int(a.RenderPassesTier), int(b.RenderPassesTier));
+                     check_tier(n, "RaytracingTier", int(a.RaytracingTier), int(b.RaytracingTier));
+                 });
+    compare_host("OPTIONS7", D3D12_FEATURE_D3D12_OPTIONS7, o7,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_tier(n, "MeshShaderTier", int(a.MeshShaderTier), int(b.MeshShaderTier));
+                     check_tier(n, "SamplerFeedbackTier", int(a.SamplerFeedbackTier), int(b.SamplerFeedbackTier));
+                 });
+    compare_host("OPTIONS9", D3D12_FEATURE_D3D12_OPTIONS9, o9,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "MeshShaderPipelineStatsSupported", a.MeshShaderPipelineStatsSupported,
+                                b.MeshShaderPipelineStatsSupported);
+                     check_bool(n, "MeshShaderSupportsFullRangeRenderTargetArrayIndex",
+                                a.MeshShaderSupportsFullRangeRenderTargetArrayIndex,
+                                b.MeshShaderSupportsFullRangeRenderTargetArrayIndex);
+                     check_bool(n, "AtomicInt64OnTypedResourceSupported", a.AtomicInt64OnTypedResourceSupported,
+                                b.AtomicInt64OnTypedResourceSupported);
+                     check_bool(n, "AtomicInt64OnGroupSharedSupported", a.AtomicInt64OnGroupSharedSupported,
+                                b.AtomicInt64OnGroupSharedSupported);
+                     check_bool(n, "DerivativesInMeshAndAmplificationShadersSupported",
+                                a.DerivativesInMeshAndAmplificationShadersSupported,
+                                b.DerivativesInMeshAndAmplificationShadersSupported);
+                     check_tier(n, "WaveMMATier", int(a.WaveMMATier), int(b.WaveMMATier));
+                 });
+    compare_host("OPTIONS11", D3D12_FEATURE_D3D12_OPTIONS11, o11,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "AtomicInt64OnDescriptorHeapResourceSupported",
+                                a.AtomicInt64OnDescriptorHeapResourceSupported,
+                                b.AtomicInt64OnDescriptorHeapResourceSupported);
+                 });
+    compare_host("OPTIONS13", D3D12_FEATURE_D3D12_OPTIONS13, o13,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "UnrestrictedBufferTextureCopyPitchSupported",
+                                a.UnrestrictedBufferTextureCopyPitchSupported,
+                                b.UnrestrictedBufferTextureCopyPitchSupported);
+                     check_bool(n, "UnrestrictedVertexElementAlignmentSupported",
+                                a.UnrestrictedVertexElementAlignmentSupported,
+                                b.UnrestrictedVertexElementAlignmentSupported);
+                     check_bool(n, "InvertedViewportHeightFlipsYSupported", a.InvertedViewportHeightFlipsYSupported,
+                                b.InvertedViewportHeightFlipsYSupported);
+                     check_bool(n, "InvertedViewportDepthFlipsZSupported", a.InvertedViewportDepthFlipsZSupported,
+                                b.InvertedViewportDepthFlipsZSupported);
+                     check_bool(n, "TextureCopyBetweenDimensionsSupported", a.TextureCopyBetweenDimensionsSupported,
+                                b.TextureCopyBetweenDimensionsSupported);
+                     check_bool(n, "AlphaBlendFactorSupported", a.AlphaBlendFactorSupported,
+                                b.AlphaBlendFactorSupported);
+                 });
+    compare_host("OPTIONS14", D3D12_FEATURE_D3D12_OPTIONS14, o14,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "AdvancedTextureOpsSupported", a.AdvancedTextureOpsSupported,
+                                b.AdvancedTextureOpsSupported);
+                     check_bool(n, "WriteableMSAATexturesSupported", a.WriteableMSAATexturesSupported,
+                                b.WriteableMSAATexturesSupported);
+                     check_bool(n, "IndependentFrontAndBackStencilRefMaskSupported",
+                                a.IndependentFrontAndBackStencilRefMaskSupported,
+                                b.IndependentFrontAndBackStencilRefMaskSupported);
+                 });
+    compare_host("OPTIONS15", D3D12_FEATURE_D3D12_OPTIONS15, o15,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "TriangleFanSupported", a.TriangleFanSupported, b.TriangleFanSupported);
+                     check_bool(n, "DynamicIndexBufferStripCutSupported", a.DynamicIndexBufferStripCutSupported,
+                                b.DynamicIndexBufferStripCutSupported);
+                 });
+    compare_host("OPTIONS16", D3D12_FEATURE_D3D12_OPTIONS16, o16,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "DynamicDepthBiasSupported", a.DynamicDepthBiasSupported,
+                                b.DynamicDepthBiasSupported);
+                     check_bool(n, "GPUUploadHeapSupported", a.GPUUploadHeapSupported, b.GPUUploadHeapSupported);
+                 });
+    compare_host("OPTIONS18", D3D12_FEATURE_D3D12_OPTIONS18, o18,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "RenderPassesValid", a.RenderPassesValid, b.RenderPassesValid);
+                 });
+    compare_host("OPTIONS19", D3D12_FEATURE_D3D12_OPTIONS19, o19,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "MismatchingOutputDimensionsSupported", a.MismatchingOutputDimensionsSupported,
+                                b.MismatchingOutputDimensionsSupported);
+                     if (b.SupportedSampleCountsWithNoOutputs != 0 &&
+                         (a.SupportedSampleCountsWithNoOutputs & ~b.SupportedSampleCountsWithNoOutputs) != 0 &&
+                         mismatches++ < 32)
+                         std::fprintf(stderr, "%s.SupportedSampleCountsWithNoOutputs: ours 0x%x not subset of host 0x%x\n",
+                                      n, a.SupportedSampleCountsWithNoOutputs, b.SupportedSampleCountsWithNoOutputs);
+                     check_bool(n, "PointSamplingAddressesNeverRoundUp", a.PointSamplingAddressesNeverRoundUp,
+                                b.PointSamplingAddressesNeverRoundUp);
+                     check_bool(n, "RasterizerDesc2Supported", a.RasterizerDesc2Supported, b.RasterizerDesc2Supported);
+                     check_bool(n, "NarrowQuadrilateralLinesSupported", a.NarrowQuadrilateralLinesSupported,
+                                b.NarrowQuadrilateralLinesSupported);
+                     check_bool(n, "AnisoFilterWithPointMipSupported", a.AnisoFilterWithPointMipSupported,
+                                b.AnisoFilterWithPointMipSupported);
+                     if (b.MaxSamplerDescriptorHeapSize > 0 &&
+                         a.MaxSamplerDescriptorHeapSize > b.MaxSamplerDescriptorHeapSize && mismatches++ < 32)
+                         std::fprintf(stderr, "%s.MaxSamplerDescriptorHeapSize: ours %u > host %u\n", n,
+                                      a.MaxSamplerDescriptorHeapSize, b.MaxSamplerDescriptorHeapSize);
+                     if (b.MaxSamplerDescriptorHeapSizeWithStaticSamplers > 0 &&
+                         a.MaxSamplerDescriptorHeapSizeWithStaticSamplers >
+                             b.MaxSamplerDescriptorHeapSizeWithStaticSamplers &&
+                         mismatches++ < 32)
+                         std::fprintf(stderr,
+                                      "%s.MaxSamplerDescriptorHeapSizeWithStaticSamplers: ours %u > host %u\n", n,
+                                      a.MaxSamplerDescriptorHeapSizeWithStaticSamplers,
+                                      b.MaxSamplerDescriptorHeapSizeWithStaticSamplers);
+                     if (b.MaxViewDescriptorHeapSize > 0 &&
+                         a.MaxViewDescriptorHeapSize > b.MaxViewDescriptorHeapSize && mismatches++ < 32)
+                         std::fprintf(stderr, "%s.MaxViewDescriptorHeapSize: ours %u > host %u\n", n,
+                                      a.MaxViewDescriptorHeapSize, b.MaxViewDescriptorHeapSize);
+                     check_bool(n, "ComputeOnlyCustomHeapSupported", a.ComputeOnlyCustomHeapSupported,
+                                b.ComputeOnlyCustomHeapSupported);
+                 });
+    compare_host("OPTIONS20", D3D12_FEATURE_D3D12_OPTIONS20, o20,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_bool(n, "ComputeOnlyWriteWatchSupported", a.ComputeOnlyWriteWatchSupported,
+                                b.ComputeOnlyWriteWatchSupported);
+                     check_tier(n, "RecreateAtTier", int(a.RecreateAtTier), int(b.RecreateAtTier));
+                 });
+    compare_host("OPTIONS21", D3D12_FEATURE_D3D12_OPTIONS21, o21,
+                 [&](const char* n, const auto& a, const auto& b) {
+                     check_tier(n, "WorkGraphsTier", int(a.WorkGraphsTier), int(b.WorkGraphsTier));
+                     check_tier(n, "ExecuteIndirectTier", int(a.ExecuteIndirectTier), int(b.ExecuteIndirectTier));
+                     check_bool(n, "SampleCmpGradientAndBiasSupported", a.SampleCmpGradientAndBiasSupported,
+                                b.SampleCmpGradientAndBiasSupported);
+                     check_bool(n, "ExtendedCommandInfoSupported", a.ExtendedCommandInfoSupported,
+                                b.ExtendedCommandInfoSupported);
+                 });
+
+    std::printf("CheckFeatureSupport options (%s): %u feature queries compared (%u host-unsupported skipped), "
+                "MSAA64KB=%d, NoOutputsSamples=0x%x, MaxViewHeap=%u, %d mismatches\n",
+                adapter_name.empty() ? "host D3D12" : adapter_name.c_str(), host_compared, host_skipped,
+                int(o4.MSAA64KBAlignedTextureSupported), o19.SupportedSampleCountsWithNoOutputs,
+                o19.MaxViewDescriptorHeapSize, mismatches);
+    return mismatches;
+}
+
+
 }  // namespace
 
 int main() {
@@ -1159,6 +1560,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.texture_compression_bc = d.bc;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -1266,6 +1668,9 @@ int main() {
             }
         }
 
+        const int options_mismatches = compare_feature_options(device.p, info);
+        EXPECT(options_mismatches == 0);
+
         // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
         EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);
         EXPECT(rt::d3d12::device_max_push_constants_size(inner) == rt::d3d12::device_max_push_constants_size(device.p));
@@ -1277,6 +1682,7 @@ int main() {
         // Simulated fallback path when maxPushConstantsSize < 144 bytes:
         {
             rt::d3d12::VulkanDeviceInfo fallback_info = info;
+            fallback_info.texture_compression_bc = false;
             fallback_info.max_push_constants_size = 128;
             fallback_info.push_constants_need_fallback = true;
             ID3D12Device* fallback_inner = nullptr;
@@ -1285,6 +1691,10 @@ int main() {
             EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(fallback_inner, __uuidof(ID3D12Device),
                                                                reinterpret_cast<void**>(&fallback_device.p))));
             rt::d3d12::set_device_outer(fallback_inner, fallback_device.p);
+            D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{TRUE};
+            EXPECT(fallback_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8,
+                                                        sizeof(options8)) == S_OK);
+            EXPECT(options8.UnalignedBlockTexturesSupported == FALSE);
             EXPECT(rt::d3d12::device_max_push_constants_size(fallback_device.p) == 128);
             EXPECT(rt::d3d12::device_push_constants_need_fallback(fallback_device.p));
         }
@@ -1918,6 +2328,71 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_copy);
+        }
+
+        // D3D-26 through COM: AtomicCopyBufferUINT/UINT64 from the upload buffer to the readback buffer, discards of a
+        // texture and a buffer, and a WriteBufferImmediate whose address no resource holds, which fails at execution.
+        {
+            Ref<ID3D12GraphicsCommandList1> list1;
+            Ref<ID3D12GraphicsCommandList2> list2;
+            EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+            EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list2.p))));
+            const std::uint32_t value32 = 0x600df00d;
+            const std::uint64_t value64 = 0x0123456789abcdefull;
+            std::memcpy(up + 4096, &value32, 4);
+            std::memcpy(up + 4104, &value64, 8);
+            std::memset(down, 0xcd, 65536);
+            ID3D12Resource* const dependents[] = {upload.p};
+            const D3D12_SUBRESOURCE_RANGE_UINT64 ranges[] = {{0, {4096, 4112}}};
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list1->AtomicCopyBufferUINT(readback.p, 256, upload.p, 4096, 1, dependents, ranges);
+            list1->AtomicCopyBufferUINT64(readback.p, 264, upload.p, 4104, 1, dependents, ranges);
+            list->DiscardResource(rt_resource.p, nullptr);
+            const D3D12_DISCARD_REGION first_mip{0, nullptr, 0, 1};
+            list->DiscardResource(rt_resource.p, &first_mip);
+            list->DiscardResource(upload.p, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)) && SUCCEEDED(fence->SetEventOnCompletion(7, nullptr)));
+            report("atomic copy UINT", 0, down + 256, reinterpret_cast<const std::uint8_t*>(&value32), 4);
+            report("atomic copy UINT64", 0, down + 264, reinterpret_cast<const std::uint8_t*>(&value64), 8);
+            const std::uint8_t cd[4] = {0xcd, 0xcd, 0xcd, 0xcd};
+            report("next to the atomic copies", 0, down + 252, cd, 4);
+            report("next to the atomic copies", 1, down + 272, cd, 4);
+
+            // Misaligned or empty calls are refused when they are recorded.
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list1->AtomicCopyBufferUINT64(readback.p, 260, upload.p, 4104, 1, dependents, ranges);
+            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list1->AtomicCopyBufferUINT(readback.p, 256, upload.p, 4096, 0, nullptr, nullptr);
+            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER misaligned{0x10002, 1};
+            list2->WriteBufferImmediate(1, &misaligned, nullptr);
+            EXPECT(list->Close() == E_INVALIDARG);
+            // A region with NumSubresources = UINT_MAX is an explicit range, not a null region.
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const D3D12_DISCARD_REGION all_from_one{0, nullptr, 1, UINT_MAX};
+            list->DiscardResource(rt_resource.p, &all_from_one);
+            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const D3D12_DISCARD_REGION all_from_zero{0, nullptr, 0, UINT_MAX};
+            list->DiscardResource(rt_resource.p, &all_from_zero);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_subresource);
+
+            // Nothing on main gives a buffer a GPU virtual address yet (GetGPUVirtualAddress, #157/#291), so an
+            // immediate write has no target: the list is refused and nothing is submitted.
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write{0x10000, 1};
+            const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+            list2->WriteBufferImmediate(1, &write, &mode);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::unresolved_resource);
         }
 
         // A depth-stencil view of a slice range of a 4x multisampled depth array (D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY):

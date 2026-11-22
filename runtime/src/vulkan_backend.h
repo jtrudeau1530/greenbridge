@@ -80,6 +80,17 @@ public:
         replay_.resolve_image = vk.vkCmdResolveImage;
         replay_.fill_buffer = vk.vkCmdFillBuffer;
         replay_.update_buffer = vk.vkCmdUpdateBuffer;
+        // Called with mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
+        replay_.buffer_at = [this](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
+            for (const auto& [id, b] : resources_) {
+                if (b.image || !b.buffer || !b.va || va < b.va || va - b.va >= b.size || size > b.size - (va - b.va))
+                    continue;
+                buffer = b.buffer;
+                offset = b.buffer_offset + (va - b.va);
+                return true;
+            }
+            return false;
+        };
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
             replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;

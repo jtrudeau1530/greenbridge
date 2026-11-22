@@ -243,7 +243,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
             call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
                          emulate=unittest.mock.ANY, keep_emulated=True),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
-            call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
+            call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None),
             call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
         ]
         self.assertEqual(manager.mock_calls, expected_calls)

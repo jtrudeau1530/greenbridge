@@ -90,7 +90,9 @@ private:
 };
 
 constexpr uint32_t kCanonicalMagic = 0x3153524Cu;  // "LRS1" little-endian
-constexpr uint32_t kCanonicalVersion = 1;
+// 2: ranges store all six D3D12_DESCRIPTOR_RANGE1 fields (1 stored only type and count). Nothing persists these
+// blobs across builds, so version 1 is simply refused.
+constexpr uint32_t kCanonicalVersion = 2;
 
 // D3D_ROOT_SIGNATURE_VERSION 1 (1.0), 2 (1.1), 3 (1.2): the numbering RTS0 and the canonical codec both store.
 bool known_version(uint32_t v, Version& out) {
@@ -121,6 +123,10 @@ std::vector<uint8_t> encode_canonical(const RootSignature& sig) {
         for (const DescriptorRange& r : p.ranges) {
             put_u32(out, r.range_type);
             put_u32(out, r.num_descriptors);
+            put_u32(out, r.base_shader_register);
+            put_u32(out, r.register_space);
+            put_u32(out, r.flags);
+            put_u32(out, r.offset_in_table);
         }
     }
     for (const StaticSampler& s : sig.static_samplers) {
@@ -198,7 +204,8 @@ DecodeResult decode_canonical(const uint8_t* data, size_t size) {
         p.ranges.reserve(nranges);
         for (uint32_t j = 0; j < nranges; ++j) {
             DescriptorRange range;
-            if (!r.u32(range.range_type) || !r.u32(range.num_descriptors)) {
+            if (!r.u32(range.range_type) || !r.u32(range.num_descriptors) || !r.u32(range.base_shader_register) ||
+                !r.u32(range.register_space) || !r.u32(range.flags) || !r.u32(range.offset_in_table)) {
                 out.error = "truncated canonical range";
                 return out;
             }
@@ -344,7 +351,9 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
                 out.error = "absurd RTS0 range count";
                 return out;
             }
-            // Range record: {type, num, base_reg, space, offset} (+ flags on 1.1 and 1.2).
+            // Range record, in D3D12_DESCRIPTOR_RANGE(1) order: {type, num, base_reg, space, offset} in 1.0, and
+            // {type, num, base_reg, space, flags, offset} in 1.1 and 1.2: the flags come BEFORE the table offset
+            // (measured against the PC serializer in root_signature_oracle_test).
             const size_t stride = flags_v11 ? 24 : 20;
             if (nranges > 0 && (ranges_off > size || nranges > (size - ranges_off) / stride)) {
                 out.error = "RTS0 ranges overrun their payload";
@@ -354,18 +363,13 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
             for (uint32_t j = 0; j < nranges; ++j) {
                 const size_t roff = static_cast<size_t>(ranges_off) + j * stride;
                 DescriptorRange range;
-                uint32_t base_reg = 0, space = 0, disp_off = 0, rflags = 0;
+                const size_t offset_at = roff + (flags_v11 ? 20 : 16);
                 if (!u32_at(roff, range.range_type) || !u32_at(roff + 4, range.num_descriptors) ||
-                    !u32_at(roff + 8, base_reg) || !u32_at(roff + 12, space) ||
-                    !u32_at(roff + 16, disp_off) ||
-                    (flags_v11 && !u32_at(roff + 20, rflags))) {
+                    !u32_at(roff + 8, range.base_shader_register) || !u32_at(roff + 12, range.register_space) ||
+                    (flags_v11 && !u32_at(roff + 16, range.flags)) || !u32_at(offset_at, range.offset_in_table)) {
                     out.error = "truncated RTS0 range";
                     return out;
                 }
-                (void)base_reg;
-                (void)space;
-                (void)disp_off;
-                (void)rflags;
                 p.ranges.push_back(range);
             }
         } else {
