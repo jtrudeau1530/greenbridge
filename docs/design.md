@@ -149,7 +149,7 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
   `adder` = 0xB779A091). On day one, rerun with `--extra <exe>` so PSO field and type names resolve. Without the exe
   only about 1% do.
 - Runtime shims: all of `xmem.dll` is shimmed with the measured argument shapes (`XMemAlloc`, `XMemFree`,
-  `XMemVirtualQuery(process, address, out64)`, `XMemGetWorkingSetStatistics(out)`). The `d3d12_xs` root-signature
+  `XMemVirtualQuery(process, address, out64)`, `XMemGetWorkingSetStatistics(kind, out)`, with `kind` 0x20000001 at all seven FSR call sites). The `d3d12_xs` root-signature
   serializer forwards to the PC `d3d12.dll` after clearing the Xbox flag byte; the deserializer forwards unchanged.
   `D3D12XboxCreateDevice` returns an Xbox-ABI proxy over the PC device: every PC vtable slot is forwarded with
   `this` adjusted, Xbox slot 62 is `CreateComputePipelineState`, and Xbox slot 76 maps resource creation to
