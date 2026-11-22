@@ -8,7 +8,8 @@ tests/semantic/spirv_mini_interp.py and compares the exported word with a plain-
 of the two f16 values computed in double precision and rounded once to f16 (round to nearest even).
 
 Also covers v_subrev_nc_u32: D.u32 = (S1.u32 - S0.u32) & 0xFFFFFFFF, the non-carry 32-bit reverse subtract,
-and packed 16-bit lane execution (modeling v_pk_subrev_f16 on lo and hi halves).
+packed 16-bit lane execution (modeling v_pk_subrev_f16 on lo and hi halves), SIMD divergence under EXEC mask,
+and comprehensive IEEE 754 edge cases (signed zeros, infinities, NaN quieting and propagation).
 
 Standard library only: zero game data, no GPU hardware required.
 """
@@ -42,24 +43,31 @@ MASK32 = 0xFFFFFFFF
 # Half-precision constants
 H_POS_ZERO = 0x0000
 H_NEG_ZERO = 0x8000
-H_HALF = 0x3800      # 0.5
-H_ONE = 0x3C00       # 1.0
+H_SUB_MIN = 0x0001     # Smallest positive subnormal (~5.96e-8)
+H_SUB_MAX = 0x03FF     # Largest positive subnormal (~6.097e-5)
+H_MIN_NORMAL = 0x0400  # Smallest positive normalized half (2^-14)
+H_HALF = 0x3800        # 0.5
+H_ONE = 0x3C00         # 1.0
 H_ONE_P_FIVE = 0x3E00  # 1.5
-H_TWO = 0x4000       # 2.0
-H_THREE = 0x4200     # 3.0
-H_FOUR = 0x4400      # 4.0
-H_NEG_HALF = 0xB800  # -0.5
-H_NEG_ONE = 0xBC00   # -1.0
-H_NEG_TWO = 0xC000   # -2.0
-H_POS_INF = 0x7C00   # +inf
-H_NEG_INF = 0xFC00   # -inf
-H_QNAN = 0x7E00      # quiet NaN
-H_SNAN = 0x7C01      # signaling NaN
+H_TWO = 0x4000         # 2.0
+H_THREE = 0x4200       # 3.0
+H_FOUR = 0x4400        # 4.0
+H_NEG_HALF = 0xB800    # -0.5
+H_NEG_ONE = 0xBC00     # -1.0
+H_NEG_TWO = 0xC000     # -2.0
+H_POS_INF = 0x7C00     # +inf
+H_NEG_INF = 0xFC00     # -inf
+H_QNAN = 0x7E00        # quiet NaN
+H_QNAN_PAYLOAD = 0x7E01  # quiet NaN with payload
+H_SNAN = 0x7C01        # signaling NaN
+H_SNAN_PAYLOAD = 0x7DFF  # signaling NaN with payload
+H_NEG_QNAN = 0xFE00    # negative quiet NaN
+H_NEG_SNAN = 0xFC01    # negative signaling NaN
 H_MAX_FINITE = 0x7BFF  # 65504.0
-H_NEG_MAX = 0xFBFF   # -65504.0
+H_NEG_MAX = 0xFBFF     # -65504.0
 
-A = 0x44003E00       # v1: lo 1.5, hi 4.0
-B = 0x40003800       # v2: lo 0.5, hi 2.0
+A = 0x44003E00         # v1: lo 1.5, hi 4.0
+B = 0x40003800         # v2: lo 0.5, hi 2.0
 
 
 def h2f(h: int) -> float:
@@ -491,8 +499,6 @@ class PackedSubrevF16OracleTests(unittest.TestCase):
     """Reference oracle tests for packed 16-bit lane execution modeling v_pk_subrev_f16."""
 
     def test_packed_subrev_formula(self):
-        # S0 = (hi: 1.0, lo: 0.5), S1 = (hi: 3.0, lo: 2.0)
-        # Expected: lo = 2.0 - 0.5 = 1.5, hi = 3.0 - 1.0 = 2.0
         s0 = pack16(H_HALF, H_ONE)
         s1 = pack16(H_TWO, H_THREE)
         res = ref_pk_subrev_f16(s0, s1)
@@ -505,7 +511,6 @@ class PackedSubrevF16OracleTests(unittest.TestCase):
         res_fwd = ref_pk_subrev_f16(s0, s1)
         res_swapped = ref_pk_subrev_f16(s1, s0)
         self.assertNotEqual(res_fwd, res_swapped)
-        # Check both lanes swapped individually
         self.assertNotEqual(res_fwd & 0xFFFF, res_swapped & 0xFFFF)
         self.assertNotEqual((res_fwd >> 16) & 0xFFFF, (res_swapped >> 16) & 0xFFFF)
 
@@ -514,23 +519,19 @@ class PackedSubrevF16OracleTests(unittest.TestCase):
         s1 = pack16(H_TWO, H_THREE)
         r1 = ref_pk_subrev_f16(s0, s1)
         r2 = ref_pk_subrev_f16(s1, s0)
-        # Toggled sign bits on both halves
         self.assertEqual((r1 & 0xFFFF) ^ 0x8000, r2 & 0xFFFF)
         self.assertEqual(((r1 >> 16) & 0xFFFF) ^ 0x8000, (r2 >> 16) & 0xFFFF)
 
     def test_packed_lane_isolation(self):
-        # Ensure modifying lo does not affect hi, and modifying hi does not affect lo
         base_s0 = pack16(H_ONE, H_ONE)
         base_s1 = pack16(H_TWO, H_THREE)
         res_base = ref_pk_subrev_f16(base_s0, base_s1)
 
-        # Vary only lo in s0
         mod_s0 = pack16(H_HALF, H_ONE)
         res_mod = ref_pk_subrev_f16(mod_s0, base_s1)
         self.assertNotEqual(res_base & 0xFFFF, res_mod & 0xFFFF)
         self.assertEqual((res_base >> 16) & 0xFFFF, (res_mod >> 16) & 0xFFFF)
 
-        # Vary only hi in s1
         mod_s1 = pack16(H_TWO, H_FOUR)
         res_mod2 = ref_pk_subrev_f16(base_s0, mod_s1)
         self.assertEqual(res_base & 0xFFFF, res_mod2 & 0xFFFF)
@@ -548,7 +549,6 @@ class HalfVectorALUInterpreterTests(unittest.TestCase):
     def test_simd_wave64_packed_subrev(self):
         interp = HalfVectorALUInterpreter(wave_size=64)
         for lane in range(64):
-            # Each lane has distinct packed halves
             s0 = pack16(f2h(1.0 + lane * 0.1), f2h(2.0 + lane * 0.2))
             s1 = pack16(f2h(5.0 + lane * 0.5), f2h(10.0 + lane * 1.0))
             interp.set_vgpr(1, lane, s0)
@@ -581,7 +581,6 @@ class HalfVectorALUInterpreterTests(unittest.TestCase):
             interp.set_vgpr(1, lane, pack16(H_HALF, H_ONE))
             interp.set_vgpr(2, lane, pack16(H_TWO, H_FOUR))
 
-        # Only even lanes active
         interp.set_exec(0x5555555555555555)
         interp.execute_v_pk_subrev_f16(0, "v1", "v2")
 
@@ -599,7 +598,6 @@ class HalfVectorALUInterpreterTests(unittest.TestCase):
             interp.set_vgpr(1, lane, pack16(H_ONE, H_TWO))
             interp.set_vgpr(2, lane, pack16(H_THREE, H_FOUR))
 
-        # Only lane 7 active
         interp.set_exec(1 << 7)
         interp.execute_v_pk_subrev_f16(0, "v1", "v2")
 
@@ -629,7 +627,6 @@ class HalfVectorALUInterpreterTests(unittest.TestCase):
         for lane in range(32):
             interp.set_vgpr(1, lane, pack16(H_THREE, H_FOUR))
 
-        # v_pk_subrev_f16 v0, s0, v1 -> v1 - s0
         interp.execute_v_pk_subrev_f16(0, "s0", "v1")
         expected = ref_pk_subrev_f16(pack16(H_ONE, H_TWO), pack16(H_THREE, H_FOUR))
         for lane in range(32):
@@ -642,17 +639,13 @@ class HalfVectorALUInterpreterTests(unittest.TestCase):
             interp.set_vgpr(1, lane, pack16(H_HALF, H_TWO))
             interp.set_vgpr(2, lane, pack16(H_ONE_P_FIVE, H_THREE))
 
-        # Active lanes: only even lanes
         interp.set_exec(0x55555555)
-        # v_subrev_f16 low half: v2.lo - v1.lo = 1.5 - 0.5 = 1.0 (0x3C00)
         interp.execute_v_subrev_f16(0, "v1", "v2", op_sel=(0, 0, 0))
 
         for lane in range(32):
             if lane % 2 == 0:
-                # Low half updated to 1.0, high half preserved from OLD (0xAAAA)
                 self.assertEqual(interp.get_vgpr(0, lane), merge_half(OLD, H_ONE, 0))
             else:
-                # Both halves preserved from OLD
                 self.assertEqual(interp.get_vgpr(0, lane), OLD)
 
     def test_simd_v_subrev_nc_u32_exec_divergence(self):
@@ -662,7 +655,6 @@ class HalfVectorALUInterpreterTests(unittest.TestCase):
             interp.set_vgpr(1, lane, 50)
             interp.set_vgpr(2, lane, 200 + lane)
 
-        # Upper 32 lanes active
         interp.set_exec(0xFFFFFFFF00000000)
         interp.execute_v_subrev_nc_u32(0, "v1", "v2")
 
@@ -677,12 +669,10 @@ class ShaderPackedAndExecExecutionTests(unittest.TestCase):
     """Shader execution tests for packed operations and EXEC mask gating."""
 
     def test_packed_execution_via_dual_subrev_f16(self):
-        # Run low half and high half reverse subtract into v0
         lines = [
-            "v_subrev_f16_e64 v0, v1, v2 op_sel:[0,0,0]",  # v0.lo = v2.lo - v1.lo
-            "v_subrev_f16_e64 v0, v1, v2 op_sel:[1,1,1]",  # v0.hi = v2.hi - v1.hi
+            "v_subrev_f16_e64 v0, v1, v2 op_sel:[0,0,0]",
+            "v_subrev_f16_e64 v0, v1, v2 op_sel:[1,1,1]",
         ]
-        # v1: lo=0.5, hi=1.0; v2: lo=2.0, hi=3.0
         v1 = pack16(H_HALF, H_ONE)
         v2 = pack16(H_TWO, H_THREE)
         got = run_shader(lines, v1=v1, v2=v2, old=OLD)
@@ -690,9 +680,6 @@ class ShaderPackedAndExecExecutionTests(unittest.TestCase):
         self.assertEqual(got, want)
 
     def test_packed_execution_via_v_pk_add_f16_with_negated_src0(self):
-        # RDNA2 packed reverse subtract is expressed as v_pk_add_f16 with neg_lo/neg_hi on src0:
-        # D.lo = -S0.lo + S1.lo = S1.lo - S0.lo
-        # D.hi = -S0.hi + S1.hi = S1.hi - S0.hi
         lines = [
             "v_pk_add_f16 v0, v1, v2 neg_lo:[1,0] neg_hi:[1,0]",
         ]
@@ -703,7 +690,6 @@ class ShaderPackedAndExecExecutionTests(unittest.TestCase):
         self.assertEqual(got, want)
 
     def test_exec_masking_preserves_destination(self):
-        # When exec_lo is 0 during v_subrev_f16, v0 is untouched; re-enabling EXEC runs export
         lines = [
             "s_mov_b32 exec_lo, 0",
             "v_subrev_f16_e32 v0, v1, v2",
@@ -713,19 +699,171 @@ class ShaderPackedAndExecExecutionTests(unittest.TestCase):
         self.assertEqual(got, OLD)
 
     def test_exec_masking_toggled_execution(self):
-        # First op skipped under exec_lo=0, second op executed under exec_lo=1
         lines = [
             "s_mov_b32 exec_lo, 0",
-            "v_subrev_f16_e64 v0, v1, v2 op_sel:[0,0,0]",  # skipped
+            "v_subrev_f16_e64 v0, v1, v2 op_sel:[0,0,0]",
             "s_mov_b32 exec_lo, 1",
-            "v_subrev_f16_e64 v0, v1, v2 op_sel:[1,1,1]",  # executed: writes hi half
+            "v_subrev_f16_e64 v0, v1, v2 op_sel:[1,1,1]",
         ]
         v1 = pack16(H_HALF, H_ONE)
         v2 = pack16(H_TWO, H_THREE)
         got = run_shader(lines, v1=v1, v2=v2, old=OLD)
-        # Low half should still be OLD (0x5555), high half should be 3.0 - 1.0 = 2.0 (0x4000)
         expected = merge_half(OLD, H_TWO, 1)
         self.assertEqual(got, expected)
+
+
+class Ieee754SpecialValuesOracleTests(unittest.TestCase):
+    """IEEE 754 half-precision special values: signed zeros, infinities, NaN quieting and propagation."""
+
+    def test_signed_zero_reverse_subtraction(self):
+        # S1 - S0 in half precision:
+        # (+0.0) - (+0.0) == +0.0
+        self.assertEqual(ref_subrev_f16(H_POS_ZERO, H_POS_ZERO), H_POS_ZERO)
+        # (-0.0) - (+0.0) == -0.0
+        self.assertEqual(ref_subrev_f16(H_POS_ZERO, H_NEG_ZERO), H_NEG_ZERO)
+        # (+0.0) - (-0.0) == +0.0
+        self.assertEqual(ref_subrev_f16(H_NEG_ZERO, H_POS_ZERO), H_POS_ZERO)
+        # (-0.0) - (-0.0) == +0.0 (IEEE 754 round to nearest: -0 - (-0) = -0 + 0 = +0)
+        self.assertEqual(ref_subrev_f16(H_NEG_ZERO, H_NEG_ZERO), H_POS_ZERO)
+
+    def test_infinity_arithmetic(self):
+        # (+inf) - (+inf) == NaN
+        self.assertTrue(is_nan_f16(ref_subrev_f16(H_POS_INF, H_POS_INF)))
+        # (-inf) - (-inf) == NaN
+        self.assertTrue(is_nan_f16(ref_subrev_f16(H_NEG_INF, H_NEG_INF)))
+        # (+inf) - (-inf) == +inf (S1=+inf, S0=-inf)
+        self.assertEqual(ref_subrev_f16(H_NEG_INF, H_POS_INF), H_POS_INF)
+        # (-inf) - (+inf) == -inf (S1=-inf, S0=+inf)
+        self.assertEqual(ref_subrev_f16(H_POS_INF, H_NEG_INF), H_NEG_INF)
+
+        # Finite S1 minus +/-inf S0
+        self.assertEqual(ref_subrev_f16(H_POS_INF, H_ONE), H_NEG_INF)
+        self.assertEqual(ref_subrev_f16(H_NEG_INF, H_ONE), H_POS_INF)
+        self.assertEqual(ref_subrev_f16(H_POS_INF, H_NEG_ONE), H_NEG_INF)
+        self.assertEqual(ref_subrev_f16(H_NEG_INF, H_NEG_ONE), H_POS_INF)
+
+        # +/-inf S1 minus finite S0
+        self.assertEqual(ref_subrev_f16(H_ONE, H_POS_INF), H_POS_INF)
+        self.assertEqual(ref_subrev_f16(H_ONE, H_NEG_INF), H_NEG_INF)
+        self.assertEqual(ref_subrev_f16(H_NEG_ONE, H_POS_INF), H_POS_INF)
+        self.assertEqual(ref_subrev_f16(H_NEG_ONE, H_NEG_INF), H_NEG_INF)
+
+    def test_nan_propagation_and_quieting(self):
+        # Quiet NaN in S0 or S1 propagates as quiet NaN
+        res_q0 = ref_subrev_f16(H_QNAN, H_ONE)
+        self.assertTrue(is_qnan_f16(res_q0))
+        res_q1 = ref_subrev_f16(H_ONE, H_QNAN)
+        self.assertTrue(is_qnan_f16(res_q1))
+
+        # Signaling NaN in S0 or S1 is quieted to qNaN
+        res_s0 = ref_subrev_f16(H_SNAN, H_ONE)
+        self.assertTrue(is_qnan_f16(res_s0))
+        res_s1 = ref_subrev_f16(H_ONE, H_SNAN)
+        self.assertTrue(is_qnan_f16(res_s1))
+
+        # Both operands NaN
+        self.assertTrue(is_qnan_f16(ref_subrev_f16(H_QNAN, H_QNAN)))
+        self.assertTrue(is_qnan_f16(ref_subrev_f16(H_SNAN, H_QNAN)))
+        self.assertTrue(is_qnan_f16(ref_subrev_f16(H_SNAN, H_SNAN)))
+        self.assertTrue(is_qnan_f16(ref_subrev_f16(H_SNAN_PAYLOAD, H_QNAN_PAYLOAD)))
+
+    def test_finite_overflow_to_infinity(self):
+        # 65504.0 - (-65504.0) overflows to +inf
+        self.assertEqual(ref_subrev_f16(H_NEG_MAX, H_MAX_FINITE), H_POS_INF)
+        # -65504.0 - 65504.0 overflows to -inf
+        self.assertEqual(ref_subrev_f16(H_MAX_FINITE, H_NEG_MAX), H_NEG_INF)
+
+    def test_subnormal_boundaries(self):
+        # Subnormal subtraction
+        self.assertEqual(ref_subrev_f16(H_SUB_MIN, H_SUB_MAX), H_SUB_MAX - H_SUB_MIN)
+        # Minimum normal minus smallest subnormal transitions to largest subnormal
+        diff = ref_subrev_f16(H_SUB_MIN, H_MIN_NORMAL)
+        self.assertEqual(diff, H_SUB_MAX)
+
+
+class Ieee754SpecialValuesShaderExecutionTests(unittest.TestCase):
+    """End-to-end pixel shader execution for special values through rdna2spirv and spirv_mini_interp."""
+
+    def test_signed_zero_shader_execution(self):
+        # (+0.0) - (+0.0) == +0.0
+        got_pos_pos = run("v_subrev_f16_e32 v0, v1, v2", H_POS_ZERO, H_POS_ZERO)
+        self.assertEqual(got_pos_pos & 0xFFFF, H_POS_ZERO)
+
+        # (-0.0) - (+0.0) == -0.0
+        got_neg_pos = run("v_subrev_f16_e32 v0, v1, v2", H_POS_ZERO, H_NEG_ZERO)
+        self.assertEqual(got_neg_pos & 0xFFFF, H_NEG_ZERO)
+
+        # (+0.0) - (-0.0) == +0.0
+        got_pos_neg = run("v_subrev_f16_e32 v0, v1, v2", H_NEG_ZERO, H_POS_ZERO)
+        self.assertEqual(got_pos_neg & 0xFFFF, H_POS_ZERO)
+
+        # (-0.0) - (-0.0) == +0.0
+        got_neg_neg = run("v_subrev_f16_e32 v0, v1, v2", H_NEG_ZERO, H_NEG_ZERO)
+        self.assertEqual(got_neg_neg & 0xFFFF, H_POS_ZERO)
+
+    def test_infinity_subtraction_shader_execution(self):
+        # (+inf) - (+inf) == NaN
+        got_inf_nan = run("v_subrev_f16_e32 v0, v1, v2", H_POS_INF, H_POS_INF) & 0xFFFF
+        self.assertTrue(is_nan_f16(got_inf_nan))
+
+        # (-inf) - (-inf) == NaN
+        got_ninf_nan = run("v_subrev_f16_e32 v0, v1, v2", H_NEG_INF, H_NEG_INF) & 0xFFFF
+        self.assertTrue(is_nan_f16(got_ninf_nan))
+
+        # (+inf) - (-inf) == +inf
+        got_pinf = run("v_subrev_f16_e32 v0, v1, v2", H_NEG_INF, H_POS_INF) & 0xFFFF
+        self.assertEqual(got_pinf, H_POS_INF)
+
+        # (-inf) - (+inf) == -inf
+        got_ninf = run("v_subrev_f16_e32 v0, v1, v2", H_POS_INF, H_NEG_INF) & 0xFFFF
+        self.assertEqual(got_ninf, H_NEG_INF)
+
+    def test_nan_propagation_shader_execution(self):
+        # Quiet NaN in S0 produces NaN
+        got_q0 = run("v_subrev_f16_e32 v0, v1, v2", H_QNAN, H_ONE) & 0xFFFF
+        self.assertTrue(is_nan_f16(got_q0))
+
+        # Quiet NaN in S1 produces NaN
+        got_q1 = run("v_subrev_f16_e32 v0, v1, v2", H_ONE, H_QNAN) & 0xFFFF
+        self.assertTrue(is_nan_f16(got_q1))
+
+        # Signaling NaN in S0 is quieted to qNaN
+        got_s0 = run("v_subrev_f16_e32 v0, v1, v2", H_SNAN, H_ONE) & 0xFFFF
+        self.assertTrue(is_qnan_f16(got_s0))
+
+        # Signaling NaN in S1 is quieted to qNaN
+        got_s1 = run("v_subrev_f16_e32 v0, v1, v2", H_ONE, H_SNAN) & 0xFFFF
+        self.assertTrue(is_qnan_f16(got_s1))
+
+        # Both NaNs produce NaN
+        got_both = run("v_subrev_f16_e32 v0, v1, v2", H_SNAN, H_QNAN) & 0xFFFF
+        self.assertTrue(is_nan_f16(got_both))
+
+    def test_overflow_to_infinity_shader_execution(self):
+        # 65504.0 - (-65504.0) produces +inf
+        got_overflow_pos = run("v_subrev_f16_e32 v0, v1, v2", H_NEG_MAX, H_MAX_FINITE) & 0xFFFF
+        self.assertEqual(got_overflow_pos, H_POS_INF)
+
+        # -65504.0 - 65504.0 produces -inf
+        got_overflow_neg = run("v_subrev_f16_e32 v0, v1, v2", H_MAX_FINITE, H_NEG_MAX) & 0xFFFF
+        self.assertEqual(got_overflow_neg, H_NEG_INF)
+
+    def test_vop3_clamping_with_special_values(self):
+        # Negative result clamped to +0.0: 0.5 - 2.0 = -1.5 -> 0.0
+        got_neg_clamp = run("v_subrev_f16_e64 v0, v1, v2 clamp", H_TWO, H_HALF) & 0xFFFF
+        self.assertEqual(got_neg_clamp, H_POS_ZERO)
+
+        # Positive result > 1.0 clamped to 1.0: 3.0 - 1.0 = 2.0 -> 1.0
+        got_pos_clamp = run("v_subrev_f16_e64 v0, v1, v2 clamp", H_ONE, H_THREE) & 0xFFFF
+        self.assertEqual(got_pos_clamp, H_ONE)
+
+        # Overflow to +inf clamped to 1.0
+        got_inf_clamp = run("v_subrev_f16_e64 v0, v1, v2 clamp", H_NEG_INF, H_POS_INF) & 0xFFFF
+        self.assertEqual(got_inf_clamp, H_ONE)
+
+        # Overflow to -inf clamped to 0.0
+        got_ninf_clamp = run("v_subrev_f16_e64 v0, v1, v2 clamp", H_POS_INF, H_NEG_INF) & 0xFFFF
+        self.assertEqual(got_ninf_clamp, H_POS_ZERO)
 
 
 if __name__ == "__main__":
