@@ -36,7 +36,9 @@ SHADERS = os.path.join(ROOT, "runtime", "test", "shaders")
 TRANSLATOR = os.path.join(TOOLS, "rdna2spirv.py")
 
 sys.path.insert(0, TOOLS)
+sys.path.insert(0, SHADERS)
 import mc_command  # noqa: E402
+from compute_fixture import find_test_program  # noqa: E402
 
 HARNESS = "vk_image_fuzz"
 DRAW = 64  # the harness draws a 64x64 full-screen triangle
@@ -286,7 +288,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Differential fuzzer for the translator's image_load path")
     ap.add_argument("--programs", type=int, default=8)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build", "linux"))
+    # runtime/build, as docs/shader_validation.md builds it and lds_fuzz/valu_fuzz default to; a Visual Studio build's
+    # RelWithDebInfo/Release subfolder is found below.
+    ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
     ap.add_argument("--work")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--formats", default=",".join(FORMATS))
@@ -302,6 +306,7 @@ def main() -> int:
     if a.programs < 1:
         print("--programs must be at least 1", file=sys.stderr)
         return 2
+    a.build = find_test_program(a.build, HARNESS) or a.build
     rng = random.Random(a.seed)
     work = a.work or tempfile.mkdtemp(prefix="image_fuzz_")
     os.makedirs(work, exist_ok=True)
