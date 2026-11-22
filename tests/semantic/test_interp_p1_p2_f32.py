@@ -379,5 +379,204 @@ class TestInterpMathematicalOracle(unittest.TestCase):
         self.assertEqual(vgprs.get_f32(5), 42.5)
 
 
+class InterpOpcode(Enum):
+    V_INTERP_P1_F32 = "v_interp_p1_f32"
+    V_INTERP_P2_F32 = "v_interp_p2_f32"
+    V_INTERP_MOV_F32 = "v_interp_mov_f32"
+
+
+class ParamSel(Enum):
+    P0 = 0
+    P10 = 1
+    P20 = 2
+
+    @classmethod
+    def from_str(cls, s: str) -> ParamSel:
+        s_low = s.strip().lower()
+        if s_low in ("p0", "0"):
+            return cls.P0
+        if s_low in ("p10", "1"):
+            return cls.P10
+        if s_low in ("p20", "2"):
+            return cls.P20
+        raise ValueError(f"Unknown param selector: {s}")
+
+
+class Channel(Enum):
+    X = 0
+    Y = 1
+    Z = 2
+    W = 3
+
+    @classmethod
+    def from_str(cls, s: str) -> Channel:
+        s_low = s.strip().lower()
+        mapping = {"x": cls.X, "y": cls.Y, "z": cls.Z, "w": cls.W}
+        if s_low in mapping:
+            return mapping[s_low]
+        raise ValueError(f"Unknown channel: {s}")
+
+
+class RegType(Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    LITERAL = "literal"
+    PARAM_SEL = "param_sel"
+
+
+@dataclass(frozen=True)
+class AttributeRef:
+    attr_index: int
+    channel: Channel
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.attr_index <= 31):
+            raise ValueError(f"Attribute index out of bounds [0, 31]: {self.attr_index}")
+
+    @property
+    def name(self) -> str:
+        return f"attr{self.attr_index}.{self.channel.name.lower()}"
+
+    @classmethod
+    def parse(cls, s: str) -> AttributeRef:
+        s = s.strip().lower()
+        if not s.startswith("attr"):
+            raise ValueError(f"Invalid attribute syntax: {s}")
+        parts = s[4:].split(".")
+        if len(parts) != 2:
+            raise ValueError(f"Expected attr<N>.<chan>, got: {s}")
+        idx = int(parts[0])
+        chan = Channel.from_str(parts[1])
+        return cls(attr_index=idx, channel=chan)
+
+
+@dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index_or_val: Union[int, float, ParamSel]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disasm(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            base = f"v{self.index_or_val}"
+        elif self.reg_type == RegType.SGPR:
+            base = f"s{self.index_or_val}"
+        elif self.reg_type == RegType.PARAM_SEL:
+            if isinstance(self.index_or_val, ParamSel):
+                return self.index_or_val.name.lower()
+            return f"p{self.index_or_val}"
+        else:
+            base = f"{self.index_or_val}"
+        if self.abs_mod:
+            base = f"|{base}|"
+        if self.neg_mod:
+            base = f"-{base}"
+        return base
+
+
+@dataclass(frozen=True)
+class InterpInstruction:
+    opcode: InterpOpcode
+    dst: int  # VGPR index
+    src: Operand
+    attr: AttributeRef
+    clamp: bool = False
+    omod: int = 0
+
+    def disasm(self) -> str:
+        parts = [f"{self.opcode.value} v{self.dst}, {self.src.disasm()}, {self.attr.name}"]
+        if self.clamp:
+            parts.append("clamp")
+        if self.omod == 1:
+            parts.append("mul:2")
+        elif self.omod == 2:
+            parts.append("mul:4")
+        elif self.omod == 3:
+            parts.append("div:2")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
+class SymbolicInterpExpr:
+    opcode: InterpOpcode
+    src_expr: str
+    p0_sym: str
+    p10_sym: str
+    p20_sym: str
+    accum_expr: Optional[str] = None
+
+    def to_math_string(self) -> str:
+        if self.opcode == InterpOpcode.V_INTERP_P1_F32:
+            return f"({self.p10_sym} * {self.src_expr} + {self.p0_sym})"
+        elif self.opcode == InterpOpcode.V_INTERP_P2_F32:
+            accum = self.accum_expr if self.accum_expr else "D"
+            return f"({self.p20_sym} * {self.src_expr} + {accum})"
+        elif self.opcode == InterpOpcode.V_INTERP_MOV_F32:
+            return f"mov({self.src_expr})"
+        return "unknown"
+
+
+class TestInterpSymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_attribute_ref_parsing_and_formatting(self) -> None:
+        ref = AttributeRef(3, Channel.Y)
+        self.assertEqual(ref.name, "attr3.y")
+        self.assertEqual(ref.attr_index, 3)
+        self.assertEqual(ref.channel, Channel.Y)
+
+        parsed = AttributeRef.parse("attr15.w")
+        self.assertEqual(parsed.attr_index, 15)
+        self.assertEqual(parsed.channel, Channel.W)
+
+    def test_instruction_disassembly(self) -> None:
+        inst_p1 = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_P1_F32,
+            dst=2,
+            src=Operand(RegType.VGPR, 0),
+            attr=AttributeRef(0, Channel.X),
+        )
+        self.assertEqual(inst_p1.disasm(), "v_interp_p1_f32 v2, v0, attr0.x")
+
+        inst_p2 = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_P2_F32,
+            dst=2,
+            src=Operand(RegType.VGPR, 1, abs_mod=True, neg_mod=True),
+            attr=AttributeRef(0, Channel.X),
+            clamp=True,
+            omod=1,
+        )
+        self.assertEqual(inst_p2.disasm(), "v_interp_p2_f32 v2, -|v1|, attr0.x clamp mul:2")
+
+        inst_mov = InterpInstruction(
+            opcode=InterpOpcode.V_INTERP_MOV_F32,
+            dst=4,
+            src=Operand(RegType.PARAM_SEL, ParamSel.P0),
+            attr=AttributeRef(2, Channel.Z),
+        )
+        self.assertEqual(inst_mov.disasm(), "v_interp_mov_f32 v4, p0, attr2.z")
+
+    def test_symbolic_expression_expansion(self) -> None:
+        expr_p1 = SymbolicInterpExpr(
+            opcode=InterpOpcode.V_INTERP_P1_F32,
+            src_expr="i",
+            p0_sym="P0",
+            p10_sym="P10",
+            p20_sym="P20",
+        )
+        self.assertEqual(expr_p1.to_math_string(), "(P10 * i + P0)")
+
+        expr_p2 = SymbolicInterpExpr(
+            opcode=InterpOpcode.V_INTERP_P2_F32,
+            src_expr="j",
+            p0_sym="P0",
+            p10_sym="P10",
+            p20_sym="P20",
+            accum_expr=expr_p1.to_math_string(),
+        )
+        self.assertEqual(expr_p2.to_math_string(), "(P20 * j + (P10 * i + P0))")
+
+
 if __name__ == "__main__":
     unittest.main()
