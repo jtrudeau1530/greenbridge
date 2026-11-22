@@ -19,6 +19,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.dont_write_bytecode = True
@@ -250,6 +251,34 @@ class LoadOnlyShaders(unittest.TestCase):
                     if ptr and ptr[0] == "OpAccessChain" and ptr[1][1] == "%vgpr" and m.value(ptr[1][2], 0, 0) == dest_reg:
                         hi_masks += 1
                 self.assertEqual(hi_masks, 3 if expect_preserve else 0)
+
+
+class LodQueryCoordinates(unittest.TestCase):
+    def test_a16_queries_with_status_are_unsupported(self) -> None:
+        for status, dest in (("tfe", "v[6:7]"), ("lwe", "v6")):
+            with self.subTest(status=status), self.assertRaises(rdna2spirv.Unsupported):
+                translate([f"image_get_lod {dest}, v10, s[8:15], s[16:19] "
+                           f"dmask:0x1 dim:SQ_RSRC_IMG_2D a16 {status}"])
+
+    def test_a16_queries_unpack_uv_and_keep_f32_results(self) -> None:
+        fixture = Path(ROOT) / "tests/semantic/fixtures/get_lod_a16.asm"
+        lines = [line for line in fixture.read_text(encoding="utf-8").splitlines()
+                 if line and not line.startswith(";")]
+        module = Module(translate(lines))
+        queries = [(rid, args) for rid, op, args in module.order if op == "OpImageQueryLod"]
+        self.assertEqual(len(queries), 2)
+        for (rid, (ty, image, coord)), (register, image_type, components) in zip(
+                queries, [(10, "%simg2d", [0, 1]), (12, "%simg2da", [1])]):
+            self.assertEqual(ty, "%v2float")
+            self.assertEqual(module.defs[image][1][0], image_type)
+            op, unpack = module.defs[coord]
+            self.assertEqual((op, unpack[:3]), ("OpExtInst", ["%v2float", "%glsl", "UnpackHalf2x16"]))
+            op, load = module.defs[unpack[3]]
+            self.assertEqual(op, "OpLoad")
+            op, ptr = module.defs[load[1]]
+            self.assertEqual((op, ptr[1], module.value(ptr[2], 0, 0)), ("OpAccessChain", "%vgpr", register))
+            self.assertEqual([int(args[2]) for _, op, args in module.order
+                              if op == "OpCompositeExtract" and args[:2] == ["%float", rid]], components)
 
 
 class TypedGatherShaders(unittest.TestCase):
