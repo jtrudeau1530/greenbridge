@@ -172,8 +172,10 @@ def _q28(data, q28, count):
     it are ordinary ones (3,672 such records on 3,511 of 22,823 `anim.rpf` pages). A table that ends past the
     streams read for q38 is not read, and says so instead of looking like a page without one.
     """
-    if not count or q28 is None:
+    if not count:
         return [], ""
+    if q28 is None:   # none on data.rpf, navmeshes.rpf or anim.rpf; named so declared records cannot go missing
+        return [], "q28 is not a 0x50000000 pointer"
     if q28 + 32 * count > len(data):
         return [], Q28_UNREAD
     out = []

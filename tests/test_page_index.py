@@ -142,6 +142,20 @@ class PageIndexTest(unittest.TestCase):
         self.assertEqual(parsed["q28_records"], [])
         self.assertEqual(parsed["q28_error"], "q28 entry 0 has a non-0x50000000 pointer")
 
+    def test_q28_declared_without_a_table_pointer_is_named(self):
+        # n28 = 2 but +0x28 holds no 0x50000000 pointer: the records are declared and cannot be read.
+        page = header(0x200, q28=0, q38=0x100, counts=(2, 0, 1, 0))
+        put_q38(page, 0x100, [(0x1234, 0x40, 0x60)])
+        parsed, complete = page_index.parse_page(bytes(page), [])
+        self.assertTrue(complete)
+        self.assertIsNone(parsed["tables"]["q28"])
+        self.assertEqual(parsed["q28_records"], [])
+        self.assertEqual(parsed["q28_error"], "q28 is not a 0x50000000 pointer")
+        # No records declared: nothing is missing, so nothing is reported.
+        page = header(0x200, q28=0, q38=0x100, counts=(0, 0, 1, 0))
+        put_q38(page, 0x100, [(0x1234, 0x40, 0x60)])
+        self.assertEqual(page_index.parse_page(bytes(page), [])[0]["q28_error"], "")
+
     def test_q28_table_past_the_streams_read_is_named(self):
         # q38 and its record fit in the directory stream, so no continuation is read; the q28 table is after it.
         page = header(0x100, q28=0x100, q38=0xC0, counts=(2, 0, 1, 0))
