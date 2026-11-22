@@ -171,8 +171,8 @@ def rbw_registers(insns):
             reads_imm_dst or "fmac" in op or "mac_" in op or op == "v_writelane_b32"
             or op == "v_swap_b32" or "_atomic_" in op
         )
-        # v_add_co_u32 / v_sub_co_u32 write both a[0] (VGPR) and a[1] (carry SGPR/vcc).
-        if not is_no_dest and op.startswith("v_") and "_co_" in op and "_ci_" not in op and len(args) >= 2:
+        # Carry-out forms write the VGPR and scalar mask first, even when they also take a carry-in source.
+        if not is_no_dest and op.startswith("v_") and "_co_" in op and len(args) >= 2:
             dsts = args[:2]
             srcs = args[2:]
         elif is_no_dest:
