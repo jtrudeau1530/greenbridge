@@ -81,10 +81,31 @@ def disasm(code: bytes, mcpu: str):
     return p.stdout, bad, p.stderr
 
 
+MAX_DATA_DWORDS = 1 << 16
+
+
+def data_block_start(b: bytes, start: int, end: int) -> int:
+    """Where a constant-data block begins at the end of the code range [start, end), or `end` if there is none.
+
+    Some blobs carry, after the last real s_endpgm, a block laid out as: s_endpgm, a dword count N, N dwords
+    of data, then one more s_endpgm (the one the range ends on) and s_code_end padding. The data is not code:
+    llvm-mc reports its words as invalid (and reads a 0xBF810000 inside it as a second program end). The
+    block is recognised only when the count N matches the distance to the closing s_endpgm and the dword
+    before the count is itself an s_endpgm, so ordinary code is not cut."""
+    last = end - 4
+    for n in range(min(MAX_DATA_DWORDS, (last - start) // 4 - 1) + 1):
+        count = last - 4 * (n + 1)
+        if count - 4 < start:
+            break
+        if struct.unpack_from("<I", b, count)[0] == n and b[count - 4:count] == ENDPGM:
+            return count
+    return end
+
+
 def code_range(b: bytes):
     """The code section offset is the u32 at 0xC0; instructions start 0x28 bytes into it and run to the last
-    4-byte-aligned s_endpgm in the blob (some blobs hold several programs). Found by correlating against
-    clean decodes of 154 random shaders."""
+    4-byte-aligned s_endpgm in the blob (some blobs hold several programs), minus a trailing constant-data
+    block (see data_block_start). Found by correlating against clean decodes of 154 random shaders."""
     # A blob too short to hold the offset goes to the scan like any other header miss; reading it anyway raised
     # struct.error, which stopped the whole run (and make_game.py at the same blob on every rerun).
     off = struct.unpack_from("<I", b, 0xC0)[0] if len(b) >= 0xC4 else 0
@@ -94,7 +115,7 @@ def code_range(b: bytes):
         while last >= 0 and (last - start) % 4:
             last = b.rfind(ENDPGM, start, last)
         if last >= 0:
-            return start, last + 4, "header"
+            return start, data_block_start(b, start, last + 4), "header"
     end = b.find(ENDPGM)
     return None, end + 4 if end >= 0 else None, "scan"
 

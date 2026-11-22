@@ -466,6 +466,12 @@ Code starts at the u32 at FSSM offset 0xC0 (the code-section offset) plus 0x28 b
 last `s_endpgm`. Use `--mcpu gfx1013`. On 300 random shaders it decoded 284 cleanly (134 invalid words in total),
 against 201 clean and 6,560 invalid for gfx1030 and 283 clean for gfx1010–1012.
 
+Some blobs end with a constant-data block after the real code: `s_endpgm`, a dword count N, N dwords of data, a
+closing `s_endpgm`, then `s_code_end` padding. The data is not code, so the tool ends the range at the count
+(`data_block_start`) and no longer reports those words as invalid. Over a 26,503-blob build, 1,473 blobs had such a
+block (N from 0 up to several hundred); with the block excluded all 1,473 decode with no invalid word, and none of
+the other 25,030 blobs matches the pattern.
+
 ## Pixel-shader inputs
 
 `tools/fssm_header.py` decodes the FSSM input table: 8-byte records from 0x138 while the first byte is 6.
