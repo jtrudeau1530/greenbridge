@@ -758,5 +758,185 @@ class TestFmaF16SymbolicAST(unittest.TestCase):
         self.assertEqual(u_folded.value, -5.5)
 
 
+class ScalarRegisterFile:
+    """Register file for a single scalar lane with 256 32-bit VGPRs and 106 32-bit SGPRs."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+
+    def read_vgpr_u32(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def write_vgpr_u32(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def read_sgpr_u32(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def write_sgpr_u32(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_vgpr_half_u16(self, idx: int, half: HalfSel = HalfSel.LO) -> int:
+        dword = self.vgprs[idx]
+        return (dword >> 16) & MASK16 if half == HalfSel.HI else (dword & MASK16)
+
+    def write_vgpr_half_u16(self, idx: int, half: HalfSel, val: int) -> None:
+        current = self.vgprs[idx]
+        u16 = val & MASK16
+        if half == HalfSel.HI:
+            self.vgprs[idx] = (current & 0x0000FFFF) | (u16 << 16)
+        else:
+            self.vgprs[idx] = (current & 0xFFFF0000) | u16
+
+    def read_sgpr_half_u16(self, idx: int, half: HalfSel = HalfSel.LO) -> int:
+        dword = self.sgprs[idx]
+        return (dword >> 16) & MASK16 if half == HalfSel.HI else (dword & MASK16)
+
+    def write_sgpr_half_u16(self, idx: int, half: HalfSel, val: int) -> None:
+        current = self.sgprs[idx]
+        u16 = val & MASK16
+        if half == HalfSel.HI:
+            self.sgprs[idx] = (current & 0x0000FFFF) | (u16 << 16)
+        else:
+            self.sgprs[idx] = (current & 0xFFFF0000) | u16
+
+    def read_vgpr_half_f16(self, idx: int, half: HalfSel = HalfSel.LO) -> float:
+        return u16_to_f16(self.read_vgpr_half_u16(idx, half))
+
+    def write_vgpr_half_f16(self, idx: int, half: HalfSel, val: float) -> None:
+        self.write_vgpr_half_u16(idx, half, f16_to_u16(val))
+
+    def read_sgpr_half_f16(self, idx: int, half: HalfSel = HalfSel.LO) -> float:
+        return u16_to_f16(self.read_sgpr_half_u16(idx, half))
+
+    def write_sgpr_half_f16(self, idx: int, half: HalfSel, val: float) -> None:
+        self.write_sgpr_half_u16(idx, half, f16_to_u16(val))
+
+
+class FmaF16ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_fma_f16."""
+
+    def __init__(self, reg_file: ScalarRegisterFile | None = None) -> None:
+        self.reg_file = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def resolve_source_u16(self, src: ASTOperand) -> int:
+        if src.kind == OperandKind.VGPR:
+            val_u16 = self.reg_file.read_vgpr_half_u16(src.index, src.half)
+        elif src.kind == OperandKind.SGPR:
+            val_u16 = self.reg_file.read_sgpr_half_u16(src.index, src.half)
+        elif src.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            val_u16 = f16_to_u16(float(src.value)) if src.value is not None else F16_POS_ZERO
+        else:
+            raise ValueError(f"Unsupported operand kind: {src.kind}")
+
+        return apply_src_mods_u16(val_u16, neg=src.neg, abs_=src.abs_)
+
+    def execute(self, inst: ASTInstruction) -> None:
+        inst.validate()
+        u0 = self.resolve_source_u16(inst.src0)
+        u1 = self.resolve_source_u16(inst.src1)
+        u2 = self.resolve_source_u16(inst.src2)
+
+        res_u16 = ref_fma_f16_u16(u0, u1, u2, clamp=inst.clamp, omod=inst.omod.value)
+        self.reg_file.write_vgpr_half_u16(inst.dst.index, inst.dst.half, res_u16)
+
+
+class TestFmaF16ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = FmaF16ScalarInterpreter(self.rf)
+
+    def test_scalar_interpreter_vgprs(self):
+        # v0.l = v1.l * v2.h + v3.l
+        self.rf.write_vgpr_half_f16(1, HalfSel.LO, 3.0)
+        self.rf.write_vgpr_half_f16(2, HalfSel.HI, 4.0)
+        self.rf.write_vgpr_half_f16(3, HalfSel.LO, 5.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.HI),
+            src2=ASTOperand.vgpr(3, HalfSel.LO),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 17.0)
+
+    def test_scalar_interpreter_sgpr_and_constants(self):
+        # v0.h = s0.l * v1.l + inline_const(10.0)
+        self.rf.write_sgpr_half_f16(0, HalfSel.LO, 2.5)
+        self.rf.write_vgpr_half_f16(1, HalfSel.LO, 4.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.HI),
+            src0=ASTOperand.sgpr(0, HalfSel.LO),
+            src1=ASTOperand.vgpr(1, HalfSel.LO),
+            src2=ASTOperand.inline_const(10.0),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.HI), 20.0)
+
+    def test_scalar_interpreter_modifiers(self):
+        # v0.l = -|v1.l| * v2.l + 5.0 with clamp
+        # v1.l = -2.0 -> abs -> 2.0 -> neg -> -2.0
+        # -2.0 * 3.0 + 5.0 = -1.0 -> clamp -> 0.0
+        self.rf.write_vgpr_half_f16(1, HalfSel.LO, -2.0)
+        self.rf.write_vgpr_half_f16(2, HalfSel.LO, 3.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO, neg=True, abs_=True),
+            src1=ASTOperand.vgpr(2, HalfSel.LO),
+            src2=ASTOperand.inline_const(5.0),
+            clamp=True,
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 0.0)
+
+    def test_scalar_interpreter_sibling_half_preservation(self):
+        # Packing canary in v0.h
+        self.rf.write_vgpr_half_u16(0, HalfSel.HI, 0xABCD)
+        self.rf.write_vgpr_half_f16(1, HalfSel.LO, 2.0)
+        self.rf.write_vgpr_half_f16(2, HalfSel.LO, 2.0)
+        self.rf.write_vgpr_half_f16(3, HalfSel.LO, 2.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.LO),
+            src2=ASTOperand.vgpr(3, HalfSel.LO),
+        )
+        self.interp.execute(inst)
+        # v0.l updated to 6.0
+        self.assertEqual(self.rf.read_vgpr_half_f16(0, HalfSel.LO), 6.0)
+        # v0.h strictly preserved
+        self.assertEqual(self.rf.read_vgpr_half_u16(0, HalfSel.HI), 0xABCD)
+
+    def test_scalar_interpreter_deterministic_repeatability(self):
+        self.rf.write_vgpr_half_f16(1, HalfSel.LO, 1.25)
+        self.rf.write_vgpr_half_f16(2, HalfSel.HI, 3.5)
+        self.rf.write_vgpr_half_f16(3, HalfSel.LO, -2.125)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_FMA_F16,
+            dst=ASTOperand.vgpr(0, HalfSel.LO),
+            src0=ASTOperand.vgpr(1, HalfSel.LO),
+            src1=ASTOperand.vgpr(2, HalfSel.HI),
+            src2=ASTOperand.vgpr(3, HalfSel.LO),
+        )
+        self.interp.execute(inst)
+        res1 = self.rf.read_vgpr_half_u16(0, HalfSel.LO)
+
+        self.interp.execute(inst)
+        res2 = self.rf.read_vgpr_half_u16(0, HalfSel.LO)
+        self.assertEqual(res1, res2)
+
+
 if __name__ == "__main__":
     unittest.main()
