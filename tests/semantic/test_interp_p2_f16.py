@@ -281,5 +281,247 @@ class TestInterpP2F16MathematicalOracle(unittest.TestCase):
         self.assertEqual(rf.read_vgpr_u32(10), 0xAABB3C00)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions for v_interp_p2_f16
+# ==============================================================================
+
+class Opcode(Enum):
+    V_INTERP_P2_F16 = "v_interp_p2_f16"
+
+
+class Channel(Enum):
+    X = 0
+    Y = 1
+    Z = 2
+    W = 3
+
+    @classmethod
+    def from_str(cls, s: str) -> Channel:
+        s_clean = s.lower().strip()
+        if s_clean == "x":
+            return cls.X
+        elif s_clean == "y":
+            return cls.Y
+        elif s_clean == "z":
+            return cls.Z
+        elif s_clean == "w":
+            return cls.W
+        raise ValueError(f"Invalid channel string: {s}")
+
+    def to_str(self) -> str:
+        return self.name.lower()
+
+
+class AttributeRef:
+    """Reference to an attribute index (0..31) and component channel (X, Y, Z, W)."""
+
+    def __init__(self, attr_index: int, channel: Channel) -> None:
+        if not (0 <= attr_index <= 31):
+            raise ValueError(f"Attribute index must be 0..31, got {attr_index}")
+        self.attr_index = attr_index
+        self.channel = channel
+
+    @classmethod
+    def parse(cls, text: str) -> AttributeRef:
+        t = text.strip()
+        if not t.startswith("attr"):
+            raise ValueError(f"Attribute token must start with 'attr': {text}")
+        parts = t[4:].split(".")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid attribute format: {text}")
+        idx = int(parts[0])
+        chan = Channel.from_str(parts[1])
+        return cls(idx, chan)
+
+    def disasm(self) -> str:
+        return f"attr{self.attr_index}.{self.channel.to_str()}"
+
+    def __repr__(self) -> str:
+        return f"AttributeRef({self.disasm()})"
+
+
+class ASTOperand:
+    """VGPR operand with optional high/low half selection and source modifiers."""
+
+    def __init__(
+        self,
+        vgpr_index: int,
+        *,
+        high: bool = False,
+        abs_mod: bool = False,
+        neg_mod: bool = False,
+    ) -> None:
+        if not (0 <= vgpr_index <= 255):
+            raise ValueError(f"VGPR index must be 0..255, got {vgpr_index}")
+        self.vgpr_index = vgpr_index
+        self.high = high
+        self.abs_mod = abs_mod
+        self.neg_mod = neg_mod
+
+    def disasm(self) -> str:
+        base = f"v{self.vgpr_index}"
+        if self.abs_mod:
+            base = f"|{base}|"
+        if self.neg_mod:
+            base = f"-{base}"
+        return base
+
+    def __repr__(self) -> str:
+        half_str = "high" if self.high else "low"
+        return f"ASTOperand({self.disasm()}, {half_str})"
+
+
+class ASTInstruction:
+    """Symbolic AST instruction representation for v_interp_p2_f16."""
+
+    def __init__(
+        self,
+        opcode: Opcode,
+        dst: ASTOperand,
+        src_j: ASTOperand,
+        attr: AttributeRef,
+        *,
+        high_src: bool = False,
+        high_dst: bool = False,
+        clamp: bool = False,
+    ) -> None:
+        self.opcode = opcode
+        self.dst = dst
+        self.src_j = src_j
+        self.attr = attr
+        self.high_src = high_src
+        self.high_dst = high_dst
+        self.clamp = clamp
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.V_INTERP_P2_F16:
+            raise ValueError(f"Invalid opcode: {self.opcode}")
+        if not (0 <= self.dst.vgpr_index <= 255):
+            raise ValueError(f"Destination VGPR index out of range: {self.dst.vgpr_index}")
+        if not (0 <= self.src_j.vgpr_index <= 255):
+            raise ValueError(f"Source VGPR index out of range: {self.src_j.vgpr_index}")
+        if not (0 <= self.attr.attr_index <= 31):
+            raise ValueError(f"Attribute index out of range: {self.attr.attr_index}")
+        if self.dst.abs_mod or self.dst.neg_mod:
+            raise ValueError("Destination operand cannot have abs or neg modifiers")
+
+    def disasm(self) -> str:
+        parts = [
+            self.opcode.value,
+            f"{self.dst.disasm()},",
+            f"{self.src_j.disasm()},",
+            self.attr.disasm(),
+        ]
+        if self.high_src:
+            parts.append("high")
+        if self.clamp:
+            parts.append("clamp")
+        return " ".join(parts)
+
+    def __repr__(self) -> str:
+        return f"ASTInstruction({self.disasm()})"
+
+
+class TypedExpr:
+    """Base class for typed symbolic expressions."""
+
+    def evaluate(self, env_attrs: AttributeBuffer, env_vgprs: InterpolationRegisterFile) -> int:
+        raise NotImplementedError
+
+
+class InterpP2F16Expr(TypedExpr):
+    """Symbolic expression tree for v_interp_p2_f16."""
+
+    def __init__(
+        self,
+        dst_idx: int,
+        src_j_idx: int,
+        attr: AttributeRef,
+        *,
+        high_src: bool = False,
+        high_dst: bool = False,
+        abs_j: bool = False,
+        neg_j: bool = False,
+        clamp: bool = False,
+    ) -> None:
+        self.dst_idx = dst_idx
+        self.src_j_idx = src_j_idx
+        self.attr = attr
+        self.high_src = high_src
+        self.high_dst = high_dst
+        self.abs_j = abs_j
+        self.neg_j = neg_j
+        self.clamp = clamp
+
+    def evaluate(self, env_attrs: AttributeBuffer, env_vgprs: InterpolationRegisterFile) -> int:
+        j_raw_u32 = env_vgprs.read_vgpr_u32(self.src_j_idx)
+        j_mod_u32 = apply_f32_modifiers(j_raw_u32, abs_mod=self.abs_j, neg_mod=self.neg_j)
+        j_f32 = u32_to_f32(j_mod_u32)
+
+        p1_accum_f32 = env_vgprs.read_vgpr_f32(self.dst_idx)
+        p20_word = env_attrs.read_param_channel(2, self.attr.attr_index, self.attr.channel.value)
+        old_vdst = env_vgprs.read_vgpr_u32(self.dst_idx)
+
+        return ref_interp_p2_f16(
+            j_f32,
+            p20_word,
+            p1_accum_f32,
+            high_src=self.high_src,
+            high_dst=self.high_dst,
+            old_vdst_u32=old_vdst,
+            clamp=self.clamp,
+        )
+
+
+class TestInterpP2F16SymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_disasm(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_P2_F16,
+            dst=ASTOperand(2, high=False),
+            src_j=ASTOperand(1, abs_mod=True),
+            attr=AttributeRef(4, Channel.Z),
+            high_src=True,
+            clamp=True,
+        )
+        inst.validate()
+        self.assertEqual(inst.disasm(), "v_interp_p2_f16 v2, |v1|, attr4.z high clamp")
+
+    def test_typed_expr_evaluation(self):
+        ab = AttributeBuffer()
+        rf = InterpolationRegisterFile()
+
+        # attr2.x p20 = (lo: 2.0, hi: 6.0)
+        ab.write_param_channel(2, 2, 0, pack_f16_pair(f16_to_u16(2.0), f16_to_u16(6.0)))
+        # v1 (j) = 0.5
+        rf.write_vgpr_f32(1, 0.5)
+        # v0 (p1_accum) = 1.0 (stored as f32), old v0 dword canary
+        rf.write_vgpr_f32(0, 1.0)
+
+        expr = InterpP2F16Expr(
+            dst_idx=0,
+            src_j_idx=1,
+            attr=AttributeRef(2, Channel.X),
+            high_src=True,   # uses 6.0
+            high_dst=False,  # writes low half
+            clamp=False,
+        )
+        # 1.0 + 0.5 * 6.0 = 4.0
+        res = expr.evaluate(ab, rf)
+        lo, _ = unpack_f16_pair(res)
+        self.assertEqual(u16_to_f16(lo), 4.0)
+
+    def test_ast_validation_errors(self):
+        with self.assertRaises(ValueError):
+            bad_inst = ASTInstruction(
+                opcode=Opcode.V_INTERP_P2_F16,
+                dst=ASTOperand(2, neg_mod=True),  # neg on dst is illegal
+                src_j=ASTOperand(1),
+                attr=AttributeRef(0, Channel.X),
+            )
+            bad_inst.validate()
+
+
 if __name__ == "__main__":
     unittest.main()
