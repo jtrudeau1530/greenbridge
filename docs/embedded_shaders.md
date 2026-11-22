@@ -143,12 +143,33 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   `Box32Rehydration` and `LeafRehydration` are exactly the programs that would turn the dehydrated BVH packs
   into runtime trees ([bvh.md](bvh.md) §3.1). `LeafRehydration` translates since #1871, `Box32Rehydration`
   translates since #1968 (`427c1376`), and only `Box16Rehydration` awaits #1864 (`buffer_store_short`).
-* **What is still open.** None of the 52 has been executed on a GPU; translation and `spirv-val` do not prove the
-  output. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
+* **They run on a GPU (TEST-594).** `tools/bvh_gpu_smoke.py` translates them from the package and runs each through
+  `vk_compute_test`. Each program reads its root arguments from a table at `s[0:1]`, the heap base there, which the
+  tool seeds with `VKC_HEAP_INIT`: every table word points past the table into zeros. **All 49 that aren't
+  rehydration programs pass**: exit 0, no Khronos validation error, and the same heap bytes on a second run (AMD
+  Radeon RX 9070, Windows 11, `--max-shared-memory 32768`, package 1.0.2.1). With these inputs only seven change any
+  heap word (`InitHeaders`, `InitPartitionedHeaders`, `LoadInstances`, `LoadProceduralGeometry`, `LoadTriangles`,
+  `PT_BeginPass`, `PT_WriteInstances`); the others leave early. So this shows that the translated programs run
+  cleanly, not that their output is right. Two things found on the way:
+  * the wave64 bitonic sorts (`BitonicPreSort64CS`, `BitonicInnerSort64CS`) declare 32,780 bytes of workgroup memory
+    with the translator's default cap, 12 over the 32 KiB AMD's Windows driver allows
+    (`VUID-RuntimeSpirv-Workgroup-06530`). Their highest LDS offset is 8192, and `--max-shared-memory 32768` shrinks
+    the array to what they use;
+  * with every table word 0 instead, the descriptors point at the table itself, and `RadixCount` then writes into the
+    table that other waves are reading, so its output differs between runs. That is the test input, not the
+    translator; the tool's default avoids it.
+* **What is still open.** The programs' outputs are not checked against a reference yet (only the rehydration trio has
+  one, TEST-376: `tools/bvh_rehydrate.py`); `LeafRehydration` does not finish within 60 s with either table described
+  above. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
   above comes from `ILDN`, not from a runtime trace. The `STAT` bitcode and the `0x07 NOBC` record are not
   explained.
 
 ## 6. Tool and tests
+
+`tools/bvh_gpu_smoke.py --game-dir <package> [--max-shared-memory N] [--json report.json]` reproduces the GPU run
+above: the extraction and translation of §4, then two dispatches per program. Its report holds module names, statuses
+and counts only. `tests/test_bvh_gpu_smoke.py` checks the heap image, the word count and the judging of runs with a
+fake `vk_compute_test`, without a GPU or game files.
 
 `tools/pe_shader_containers.py` is standard library only and reads the file, never runs it. It accepts a
 container only when the chunk table is sorted, 4-byte aligned, entirely inside the declared total and its last
