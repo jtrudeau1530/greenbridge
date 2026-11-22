@@ -68,6 +68,7 @@ class FakeDevice:
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
     )
     fragment_shader_barycentric: bool = True
+    max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
     device_id: int = 0
@@ -166,6 +167,7 @@ class FakeVulkan:
         ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_TYPE).value = dev.device_type
         ctypes.c_uint32.from_address(base + vk_info.PROPS_VENDOR_ID).value = dev.vendor_id
         ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_ID).value = dev.device_id
+        ctypes.c_uint32.from_address(base + vk_info.PROPS_MAX_PUSH_CONSTANTS_SIZE).value = dev.max_push_constants_size
         raw_name = dev.name.encode("utf-8") if isinstance(dev.name, str) else dev.name
         name_bytes = raw_name[:256].ljust(256, b"\x00")
         ctypes.memmove(base + vk_info.PROPS_DEVICE_NAME, name_bytes, 256)
@@ -746,11 +748,19 @@ class QueryTest(unittest.TestCase):
                     "mesh_in_supported_stages": True,
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
                     "driver_id": 1,
                     "rdna2_amd_windows": False,
                 })
+
+    def test_max_push_constants_size(self):
+        """limits.maxPushConstantsSize is read from VkPhysicalDeviceProperties (offset 328 on 64-bit)."""
+        for limit in (128, 256, 4096):
+            with self.subTest(limit=limit):
+                res, _vk = self._run_query(FakeDevice(max_push_constants_size=limit))
+                self.assertEqual(res["max_push_constants_size"], limit)
 
     def test_per_vertex_inputs(self):
         """PerVertexKHR needs fragmentShaderBarycentric, and MoltenVK can't compile it to MSL either way."""
