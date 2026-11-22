@@ -83,10 +83,11 @@ def main(argv=None) -> int:
         ap.error(f"{src} is not a file")
     if os.path.getsize(src) == 0:
         ap.error(f"{src} is empty")
+    if os.path.isfile(out):
+        ap.error(f"{out} is a file, not a folder")
     os.makedirs(out, exist_ok=True)
     index, seen, used, bad = [], {}, set(), 0
-    with open(src, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         for mt in ENTRY.finditer(m):
             name = mt.group(1).decode("latin-1")
             stored = struct.unpack("<I", mt.group(3))[0]

@@ -9,13 +9,17 @@ Validates tools/shader_carve.py without touching game files or proprietary asset
 - Candidate size filtering, raw deflate decompression error handling, and container integrity checks
 - End-to-end archive carving, duplicate variant naming, filename character sanitization, and index.json output
 """
+import contextlib
+import io
 import json
+import mmap
 import os
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -491,6 +495,37 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
             self.assertIn(message, res.stderr)
             self.assertNotIn("Traceback", res.stderr)
             self.assertFalse(os.path.exists(self.out))
+
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        out_file = os.path.join(self.dir, "out_file")
+        with open(out_file, "wb") as f:
+            f.write(b"x")
+        res = self.run_carve(self.archive, out_file)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("is a file, not a folder", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_main_closes_mmap_on_exit(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        real_mmap = mmap.mmap
+        opened = []
+
+        def record(*args, **kwargs):
+            m = real_mmap(*args, **kwargs)
+            opened.append(m)
+            return m
+
+        with mock.patch("shader_carve.mmap.mmap", side_effect=record):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(shader_carve.main([self.archive, self.out]), 0)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed)
+        os.remove(self.archive)
+        self.assertFalse(os.path.exists(self.archive))
 
     def test_no_arguments_is_a_usage_error(self):
         res = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True)
