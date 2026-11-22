@@ -199,18 +199,21 @@ using XErrorCallback = bool(CALLBACK*)(HRESULT hr, const char* message, void* co
 std::atomic<XErrorCallback> g_error_callback{nullptr};
 std::atomic<void*> g_error_context{nullptr};
 
-void STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
+// HRESULT XErrorReport(HRESULT, const char*) (xgameruntime-docs' XErrorReport.md): S_OK once reported.
+HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     static std::atomic<int> s_logged{0};
     if (s_logged.fetch_add(1) < 64)
         std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
                      message ? message : "(null)");
     if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
+    return S_OK;
 }
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
     g_error_context = context;
     g_error_callback = callback;
 }
-HRESULT STDMETHODCALLTYPE error_set_options(void*, uint32_t, uint32_t) { return S_OK; }
+// void XErrorSetOptions(XErrorOptions, XErrorOptions), as Microsoft documents it: nothing to configure offline.
+void STDMETHODCALLTYPE error_set_options(void*, uint32_t, uint32_t) {}
 
 const void* const kErrorVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
