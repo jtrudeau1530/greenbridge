@@ -42,4 +42,18 @@ foreach(bytes -1 1.5 4294967296)
   if(NOT code STREQUAL "2" OR NOT log MATCHES "at byte [0-9]+")
     message(FATAL_ERROR "lds_bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
   endif()
+
+  file(WRITE "${TEST_DIR}/index.json" "{\"example\":{\"stage\":\"cs\",\"push_constant_bytes\":${bytes}}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "at byte [0-9]+")
+    message(FATAL_ERROR "push_constant_bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
+  endif()
+
+  file(WRITE "${TEST_DIR}/index.json" "{\"example\":{\"stage\":\"cs\",\"pc_tail\":{\"set\":1,\"binding\":0,\"bytes\":${bytes}}}}\n")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "at byte [0-9]+")
+    message(FATAL_ERROR "pc_tail.bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
+  endif()
 endforeach()
