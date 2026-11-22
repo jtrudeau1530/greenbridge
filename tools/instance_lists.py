@@ -314,6 +314,15 @@ def scan(path, T, start=None, limit=None):
             pos = s + max(used, 1)
 
 
+def same_output_path(first, second):
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("inputs", nargs="+", help=".rpf archives")
@@ -324,6 +333,16 @@ def main(argv=None):
     if args.limit is not None and args.limit <= 0:
         print("error: --limit must be > 0", file=sys.stderr)
         return 2
+    # The report is written after the whole scan, so check its path first: an archive given as --json used to be
+    # replaced by the report (exit 0), and a directory ended the run in a traceback.
+    if args.json:
+        if os.path.isdir(args.json):
+            print(f"error: --json {args.json} is a directory", file=sys.stderr)
+            return 2
+        for path in args.inputs:
+            if same_output_path(args.json, path):
+                print(f"error: --json would overwrite the input {path}", file=sys.stderr)
+                return 2
     T = {}
     for path in args.inputs:
         if not os.path.isfile(path):
@@ -336,8 +355,13 @@ def main(argv=None):
             return 2
     print(json.dumps(T, indent=1, sort_keys=True))
     if args.json:
-        with open(args.json, "w", encoding="utf-8") as fh:
-            json.dump(T, fh, indent=1, sort_keys=True)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
+            with open(args.json, "w", encoding="utf-8") as fh:
+                json.dump(T, fh, indent=1, sort_keys=True)
+        except OSError as exc:
+            print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
     return 0
 
 

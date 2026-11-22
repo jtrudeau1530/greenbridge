@@ -229,6 +229,67 @@ class ArchiveTests(unittest.TestCase):
         r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
 
+    @staticmethod
+    def _archive(folder):
+        path = os.path.join(folder, "fake.rpf")
+        data = b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(block())
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path, data
+
+    def test_json_over_an_input_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, data = self._archive(tmp)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", path], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(r.stdout, "")
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_over_an_archive_found_in_an_input_folder_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "pack")
+            os.mkdir(sub)
+            path, data = self._archive(sub)
+            r = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", path], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_that_is_a_directory_is_refused_before_the_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(r.stdout, "")
+
+    def test_json_in_a_missing_folder_is_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            out = os.path.join(tmp, "reports", "vertex", "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["blocks"], 1)
+
+    def test_json_that_cannot_be_written_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "w", encoding="utf-8") as fh:
+                fh.write("a file, not a folder")
+            out = os.path.join(blocker, "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("cannot write", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn('"blocks"', r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

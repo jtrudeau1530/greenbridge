@@ -253,6 +253,25 @@ class LoadOnlyShaders(unittest.TestCase):
 
 
 class TypedGatherShaders(unittest.TestCase):
+    def test_explicit_lod_gather_fetches_four_taps_from_each_typed_view(self):
+        for suffix, coords in (("", "v[4:6]"), ("_o", "v[4:7]")):
+            with self.subTest(suffix=suffix):
+                instruction = f"image_gather4_l{suffix} v[0:3], {coords}, s[0:7], s[8:11] dmask:0x2 dim:SQ_RSRC_IMG_2D"
+                m = Module(translate([instruction, "s_waitcnt vmcnt(0)"]))
+                fetches = m.fetches()
+                footprints = []
+                for scalar in ("%float", "%uint", "%int"):
+                    group = [(rid, var) for rid, var, image in fetches if image[0] == scalar]
+                    self.assertEqual(len(group), 4)
+                    footprints.append([m.defs[rid][1][2:] for rid, _ in group])
+                    for rid, var in group:
+                        self.assertEqual(m.binding[var], 0)
+                        self.assertEqual(m.defs[rid][1][-2], "Lod")
+                        taps = [a for _, op, a in m.order if op == "OpCompositeExtract" and a[1] == rid]
+                        self.assertEqual([a[2] for a in taps], ["1"])
+                self.assertEqual(footprints[0], footprints[1])
+                self.assertEqual(footprints[0], footprints[2])
+
     def test_2d_gather_picks_the_sampled_type_and_selected_component(self):
         for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
             with self.subTest(modifier=modifier):
@@ -276,10 +295,23 @@ class TypedGatherShaders(unittest.TestCase):
                         ((raw, _),) = uses("OpBitcast", rid)
                         taps = {int(a[2]): r for r, a in uses("OpCompositeExtract", raw)}
                         self.assertEqual(set(taps), {0, 1, 2, 3})
+                        halves = []
+                        for tap in range(4):
+                            if args[0] == "%v4int_st":
+                                ((signed, _),) = uses("OpBitcast", taps[tap])
+                                ((sat, clamp),) = uses("OpExtInst", signed)
+                                self.assertEqual(clamp[2], "SClamp")
+                                ((bits, _),) = uses("OpBitcast", sat)
+                                ((half, mask),) = uses("OpBitwiseAnd", bits)
+                                self.assertEqual(m.value(mask[2], 0, 0), 0xffff)
+                            else:
+                                ((half, clamp),) = uses("OpExtInst", taps[tap])
+                                self.assertEqual(clamp[2], "UMin")
+                                self.assertEqual(m.value(clamp[4], 0, 0), 0xffff)
+                            halves.append(half)
                         for tap in (0, 2):
-                            ((lo, mask),) = uses("OpBitwiseAnd", taps[tap])
-                            ((hi, shift),) = uses("OpShiftLeftLogical", taps[tap + 1])
-                            self.assertEqual(m.value(mask[2], 0, 0), 0xffff)
+                            lo = halves[tap]
+                            ((hi, shift),) = uses("OpShiftLeftLogical", halves[tap + 1])
                             self.assertEqual(m.value(shift[2], 0, 0), 16)
                             self.assertTrue(any(hi in a for _, a in uses("OpBitwiseOr", lo)))
 

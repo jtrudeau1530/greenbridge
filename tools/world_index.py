@@ -530,6 +530,41 @@ def _file_identity(path):
     return stat.st_dev, stat.st_ino
 
 
+def _resolve_report_path(path):
+    if os.name != "nt":
+        return os.path.realpath(path)
+    if not path.startswith("\\\\?\\"):
+        # GetFullPathName normalizes ordinary Windows paths the same way opening them does.
+        return os.path.realpath(os.path.abspath(path))
+
+    # realpath can trim literal trailing dots and spaces from missing verbatim components.
+    # Resolve the existing ancestor and append the missing components as written.
+    missing = []
+    while not os.path.lexists(path):
+        parent, name = os.path.split(path)
+        if not name:
+            break
+        missing.append(name)
+        path = parent
+    return os.path.join(os.path.realpath(path), *reversed(missing))
+
+
+def _pending_path_key(path):
+    path = os.path.normcase(_resolve_report_path(path))
+    if os.name != "nt":
+        return path
+
+    # Drive and UNC paths can also be spelled using the extended-length prefix.
+    extended_prefix = "\\\\?\\"
+    unc_prefix = extended_prefix + "unc\\"
+    if path.startswith(unc_prefix):
+        return "\\\\" + path[len(unc_prefix):]
+    drive, _ = os.path.splitdrive(path)
+    if drive.startswith(extended_prefix) and len(drive) == len(extended_prefix) + 2 and drive.endswith(":"):
+        return path[len(extended_prefix):]
+    return path
+
+
 def _check_report_paths(parser, reports, source, directory_files):
     existing, pending = {}, {}
     for flag, path in reports:
@@ -537,7 +572,7 @@ def _check_report_paths(parser, reports, source, directory_files):
             continue
         key = _file_identity(path)
         if key is None:
-            key = os.path.normcase(os.path.realpath(path))
+            key = _pending_path_key(path)
             destinations = pending
         else:
             destinations = existing
@@ -547,7 +582,7 @@ def _check_report_paths(parser, reports, source, directory_files):
 
     source_id = _file_identity(source)
     if source_id is None:
-        flag = pending.get(os.path.normcase(os.path.realpath(source)))
+        flag = pending.get(_pending_path_key(source))
     else:
         flag = existing.get(source_id)
     if flag:
@@ -565,8 +600,9 @@ def _staged_entity_report(path):
         yield None
         return
 
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    destination = os.path.realpath(path)
+    destination = _resolve_report_path(path)
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, exist_ok=True)
     try:
         mode = os.stat(destination).st_mode
     except FileNotFoundError:
@@ -574,13 +610,21 @@ def _staged_entity_report(path):
     if mode is not None and not stat.S_ISREG(mode):
         raise OSError(f"placement report destination is not a regular file: {path}")
 
-    with tempfile.TemporaryDirectory(dir=os.path.dirname(destination), prefix=".world-index-") as directory:
-        staged = os.path.join(directory, "entities.jsonl")
+    # mkdtemp may normalize the returned parent on Windows. Keep the spelling used to create it.
+    directory = os.path.join(parent, os.path.basename(tempfile.mkdtemp(dir=parent, prefix=".world-index-")))
+    staged = os.path.join(directory, "entities.jsonl")
+    try:
         with open(staged, "w", encoding="utf-8", newline="\n") as handle:
             yield EntityRows(handle)
         if mode is not None:
             os.chmod(staged, mode & 0o777)
         os.replace(staged, destination)
+    finally:
+        if os.path.exists(staged):
+            if os.name == "nt":
+                os.chmod(staged, stat.S_IWRITE)
+            os.unlink(staged)
+        os.rmdir(directory)
 
 
 def main(argv=None):

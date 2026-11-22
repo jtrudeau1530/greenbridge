@@ -106,8 +106,8 @@ jobs:
               throw "The Windows runtime build did not compile $path"
             }
           }
-      # For the wine job: the test list, the checkout it was made in, and the built executables and DLLs. Only what
-      # this repository builds goes in; there is no game data on the runner.
+      # For the wine job: the test list, the checkout it was made in, and the built executables, DLLs and synthetic
+      # occlusion test shaders. There is no game data on the runner.
       - name: List tests for Wine
         shell: bash
         run: |
@@ -120,6 +120,10 @@ jobs:
           path: |
             runtime/build/**/*.exe
             runtime/build/**/*.dll
+            runtime/build/binary_occlusion.vert.spv
+            runtime/build/binary_occlusion.frag.spv
+            runtime/build/overlapping_occlusion.vert.spv
+            runtime/build/overlapping_occlusion.frag.spv
             runtime/build/ctest.json
             runtime/build/windows-root.txt
           retention-days: 7

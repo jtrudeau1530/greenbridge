@@ -35,7 +35,7 @@ method, scope and caveats. No game data is included.
 | [psin.md](psin.md) | PSIN metadata container: header, section walk, `LSCH`/`LENM` schema, and the instance data (block table, pointers, arrays, maps) read through it on 17,507 containers, 99.986% of block bytes reached. |
 | [story.md](story.md) | `story000.rpf` 18.65 GiB mixed: 264 Bink 2 streams / 3.33 GB, 225,281 `RSC8` headers, 442 nested RPF9; `story000_script` PSIN, `shared_minigame` mixed content. |
 | [restofworld.md](restofworld.md) | Six rest-of-world/script archives, 1.57 GB total: `core_restofworld` 1.21 GB (11 Bink 2, 37 models, 958 graphics pages), `story000_script` PSIN, small `appdata0`/licences. |
-| [movies.md](movies.md) | Bink 2 streams and audio tracks; decode through the real loader and `Bink2Scarlett.dll`. |
+| [movies.md](movies.md) | Bink 2 streams and audio tracks; decode through the real loader and `Bink2Scarlett.dll`; stream names from the mount lists. |
 
 ## Audio
 

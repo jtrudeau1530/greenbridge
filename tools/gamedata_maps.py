@@ -354,7 +354,7 @@ def main() -> int:
 
     try:
         payloads = read_payloads(a.carve_dir)
-    except (OSError, ValueError, KeyError, struct.error) as e:
+    except (OSError, ValueError, KeyError, TypeError, struct.error) as e:
         print("error:", e, file=sys.stderr)
         return 1
 

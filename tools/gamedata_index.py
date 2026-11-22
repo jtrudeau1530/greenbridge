@@ -329,7 +329,16 @@ def summarize(rows: list, source_summary: dict, target: str) -> dict:
     }
 
 
+def _make_parent(path: str) -> None:
+    """Create the folder an output path lives in: the scan is over by the time we write, so a missing
+    folder used to end the run in a FileNotFoundError and lose the result."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_csv(path: str, rows: list) -> None:
+    _make_parent(path)
     fields = ["offset", "offset_hex", "stored", "size", "type", "root", "detail", "chunks",
               "complete", "header"]
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -360,6 +369,16 @@ def main() -> int:
     if not os.path.exists(a.target):
         print(f"ERROR: {a.target} does not exist", file=sys.stderr)
         return 2
+    protected = [a.target] if os.path.isfile(a.target) else [os.path.join(a.target, "index.json")]
+    if a.carve_dir:
+        protected.append(os.path.join(a.carve_dir, "index.json"))
+    for flag, path in (("--json", a.json), ("--csv", a.csv)):
+        if path:
+            if os.path.isdir(path):
+                ap.error(f"{flag} is a directory: {path}")
+            for input_path in protected:
+                if same_report_path(path, input_path):
+                    ap.error(f"{flag} would overwrite the input {input_path}")
     source = None
     try:
         if os.path.isdir(a.target):
@@ -386,6 +405,7 @@ def main() -> int:
     if a.csv:
         write_csv(a.csv, rows)
     if a.json:
+        _make_parent(a.json)
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"summary": summary, "rows": rows}, f, indent=1)
 

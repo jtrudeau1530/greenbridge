@@ -1,7 +1,5 @@
-; d16 typed image_load: cs_imgload with both read-backs as d16 loads. vk_store_test fills the r32 uint image with
-; 100 + 8y + x and the r32 sint image with -2 (8y + x) before the dispatch; each d16 load returns the low 16 bits of
-; its texel (masked for the uint one, sign-extended from bit 15 for the sint one), and their sum is stored into the
-; sint image. Run: vk_store_test cs_imgload_d16.spv load -> sint = 100 - (8y + x), uint unchanged.
+; Read R32 UINT/SINT through D16, unpack their low halves and store the signed sum. In vk_store_test load-d16
+; the final row covers integer saturation at both signed limits and the unsigned upper limit.
 v_and_b32_e32 v1, 7, v0
 v_lshrrev_b32_e32 v2, 3, v0
 v_cvt_f32_u32_e32 v3, v1
