@@ -58,6 +58,7 @@ static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) 
 }
 
 #include "../src/descriptor_table.h"
+#include "../src/gfx10_descriptors.h"
 
 int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
@@ -245,6 +246,8 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
     std::memset(heapp, 0, size_t(heap_bytes));
     std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
+    if (two_mip)  // The gather test loads its S# from the four words just after the T#.
+        std::memcpy(static_cast<char*>(heapp) + tsharp_va + 32, ssharp, 16);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
     // Descriptor hash table: 16 slots.
@@ -324,6 +327,12 @@ int main(int argc, char** argv) {
     sci.maxLod = float(levels - 1);
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VkSamplerCreateInfo sci1 = sci;            // index 1: the S# the shader names
+    if (two_mip) {
+        const leonida::gfx10::SamplerWords words{ssharp[0], ssharp[1], ssharp[2], ssharp[3]};
+        const auto sampler = leonida::gfx10::decode(words);
+        sci1.minLod = sampler.min_lod;
+        sci1.maxLod = sampler.max_lod;
+    }
     if (dref) {
         sci1.compareEnable = VK_TRUE;
         sci1.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
