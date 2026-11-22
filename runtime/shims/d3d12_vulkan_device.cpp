@@ -3779,13 +3779,19 @@ HRESULT present_result(VkResult result) {
 }
 }  // namespace
 
-HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect) {
+HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect,
+                                 bool tear) {
     if (!back_buffer) return E_INVALIDARG;
     const leonida::PresentRect rect = src_rect ? leonida::PresentRect{src_rect->left, src_rect->top, src_rect->right,
                                                                        src_rect->bottom}
                                                : leonida::PresentRect{};
-    return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr));
+    return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr,
+                                              tear));
 }
+
+bool WindowPresenter::tear_supported() const { return presenter_->tear_supported(); }
+bool WindowPresenter::last_present_tore() const { return presenter_->last_present_tore(); }
+std::uint64_t WindowPresenter::tear_presents() const { return presenter_->tear_presents(); }
 
 HRESULT WindowPresenter::present_blank(UINT sync_interval) {
     return present_result(presenter_->present_blank(sync_interval > 0));
@@ -3818,9 +3824,15 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
     surface_info.hwnd = window;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     if (create_surface(info.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) return nullptr;
+    // LEONIDA_PRESENT_NO_TEAR=1 keeps the swapchain FIFO-only (ImmediateThresholdPercent then does nothing).
+    char no_tear[8] = {};
+    std::size_t no_tear_length = 0;
+    const bool tear_allowed = !(getenv_s(&no_tear_length, no_tear, "LEONIDA_PRESENT_NO_TEAR") == 0 &&
+                                no_tear_length > 1 && no_tear[0] != '0');
     auto presenter = std::make_unique<leonida::VulkanPresenter>(*d->state().context, info.get_instance_proc,
                                                                 info.instance, info.physical, info.queue,
-                                                                info.queue_family, surface);  // owns the surface
+                                                                info.queue_family, surface,  // owns the surface
+                                                                info.swapchain_maintenance1 && tear_allowed);
     if (!presenter->ok()) {
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
@@ -3868,19 +3880,33 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
         get(nullptr, "vkEnumerateInstanceExtensionProperties"));
     std::vector<const char*> inst_exts;
+    bool surface_maintenance1_khr = false, surface_maintenance1_ext = false;  // enabled on the instance
     if (enum_inst_exts) {
         std::uint32_t ext_cnt = 0;
         enum_inst_exts(nullptr, &ext_cnt, nullptr);
         std::vector<VkExtensionProperties> available(ext_cnt);
         enum_inst_exts(nullptr, &ext_cnt, available.data());
-        bool has_surface = false, has_win32 = false;
+        bool has_surface = false, has_win32 = false, has_caps2 = false;
         for (const auto& e : available) {
             if (!std::strcmp(e.extensionName, VK_KHR_SURFACE_EXTENSION_NAME)) has_surface = true;
             if (!std::strcmp(e.extensionName, VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) has_win32 = true;
+            if (!std::strcmp(e.extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) has_caps2 = true;
+            if (!std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1")) surface_maintenance1_khr = true;
+            if (!std::strcmp(e.extensionName, "VK_EXT_surface_maintenance1")) surface_maintenance1_ext = true;
         }
         if (has_surface && has_win32) {
             inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
             inst_exts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+            // The surface half of VK_*_swapchain_maintenance1 (the present modes a swapchain can switch between).
+            if (has_caps2 && (surface_maintenance1_khr || surface_maintenance1_ext)) {
+                inst_exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+                if (surface_maintenance1_khr) inst_exts.push_back("VK_KHR_surface_maintenance1");
+                if (surface_maintenance1_ext) inst_exts.push_back("VK_EXT_surface_maintenance1");
+            } else {
+                surface_maintenance1_khr = surface_maintenance1_ext = false;
+            }
+        } else {
+            surface_maintenance1_khr = surface_maintenance1_ext = false;
         }
     }
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -4157,6 +4183,34 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     }
     info.calibrated_timestamps = calibrated != nullptr;
 
+    // Switching a vsync swapchain to IMMEDIATE or FIFO_RELAXED per present (PresentX's ImmediateThresholdPercent):
+    // the KHR extension (promoted from the EXT one, same structures) with the surface extension of the same name
+    // on the instance, else the EXT one. Only enabled where the instance has the surface half and the GPU the feature.
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
+    const char* swapchain_m1_name = nullptr;
+    if (has_swapchain && instance_has_surface) {
+        const auto device_has = [&](const char* name) {
+            return std::any_of(extensions.begin(), extensions.end(),
+                               [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+        };
+        if (surface_maintenance1_khr && device_has("VK_KHR_swapchain_maintenance1"))
+            swapchain_m1_name = "VK_KHR_swapchain_maintenance1";
+        else if (surface_maintenance1_ext && device_has("VK_EXT_swapchain_maintenance1"))
+            swapchain_m1_name = "VK_EXT_swapchain_maintenance1";
+        if (swapchain_m1_name) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &swapchain_m1};
+            vkGetPhysicalDeviceFeatures2(info.physical, &query);
+            if (swapchain_m1.swapchainMaintenance1 == VK_TRUE) {
+                swapchain_m1.pNext = enable13.pNext;
+                enable13.pNext = &swapchain_m1;
+            } else {
+                swapchain_m1_name = nullptr;
+            }
+        }
+    }
+    info.swapchain_maintenance1 = swapchain_m1_name != nullptr;
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
@@ -4171,6 +4225,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);

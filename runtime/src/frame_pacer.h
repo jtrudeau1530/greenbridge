@@ -19,6 +19,9 @@
 //   * A wait that comes late (after the next origin already passed) returns at once with the newest passed origin;
 //     the missed origins are skipped, not queued.
 //   * Tokens are 1, 2, 3, ... (0 is the null token), one per successful wait, never reused, across suspend/resume.
+//   * A frame is due at the vblank after the origin that handed out its token; a PresentX after that vblank is late by
+//     the time since it (present_timing), and ImmediateThresholdPercent decides whether that lateness is shown at once
+//     (decide_present_sync).
 
 #include <algorithm>
 #include <atomic>
@@ -102,12 +105,36 @@ inline constexpr std::uint32_t stat_render = 0x04;
 inline constexpr std::uint32_t stat_present = 0x08;
 inline constexpr std::uint32_t stat_display = 0x10;
 
+// How a frame that is being presented is put on the display.
+enum class PresentSync {
+    vblank,     // at the next vblank (FIFO)
+    immediate,  // now, mid-scan (a tear)
+};
+
+// D3D12XBOX_PRESENT_PARAMETERS::ImmediateThresholdPercent (docs/d3d12_vulkan.md section 4.5): a frame that missed its
+// vblank is flipped at once, mid-scan, when the scan has not got further than `threshold_percent` of the screen,
+// instead of waiting a whole interval. `late_by_us` is how long after the vblank the frame was ready (0: on time),
+// `interval_us` the refresh period; the vblank grid is regular, so the scan is `late_by_us % interval_us` of the way
+// down. 0 (or a negative or NaN value) never tears, 100 or more tears wherever the scan is. A frame on time, or an
+// interval of 0 (unpaced), is never torn. Pure, so the tests can sweep it.
+inline PresentSync decide_present_sync(std::uint64_t late_by_us, std::uint32_t interval_us, float threshold_percent) {
+    if (!(threshold_percent > 0.0f) || late_by_us == 0 || interval_us == 0) return PresentSync::vblank;
+    const double scanned_percent = 100.0 * double(late_by_us % interval_us) / double(interval_us);
+    return scanned_percent <= double(std::min(threshold_percent, 100.0f)) ? PresentSync::immediate
+                                                                          : PresentSync::vblank;
+}
+
+// Where the scan of a frame that was shown mid-scan stood, in percent (0 for a frame shown at a vblank).
+inline float scan_percent(std::uint64_t late_by_us, std::uint32_t interval_us) {
+    return interval_us ? float(100.0 * double(late_by_us % interval_us) / double(interval_us)) : 0.0f;
+}
+
 struct FrameStatistic {
     std::uint32_t type = 0;          // one stat_* bit
     std::uint32_t plane_index = 0;
     std::uint64_t token = 0;
     std::uint64_t time_us = 0;       // pacer clock
-    float percent_scanned = 0.0f;    // display entries: where the scan was when the frame came up (always 0 here)
+    float percent_scanned = 0.0f;    // display entries: where the scan was when the frame came up (0 at a vblank)
 };
 
 class FramePacer {
@@ -198,7 +225,7 @@ public:
             if (!(type_mask & type)) return;
             ++expected;
             if (!record || !present) return;
-            found[n++] = FrameStatistic{type, 0, token, time, 0.0f};
+            found[n++] = FrameStatistic{type, 0, token, time, type == stat_display ? record->percent_scanned : 0.0f};
         };
         if (record) {
             add(stat_frame_event, true, record->origin_us);
@@ -238,7 +265,33 @@ public:
         }
         return pacer_hr::ok;
     }
-    void commit_present_token(std::uint64_t token, std::uint32_t plane_count) {
+    // How late the frame of `token` is if it is presented now (see the model above). late_us stays 0 when the frame
+    // could not be shown at once anyway: unpaced, null or unknown token, or earlier frames still waiting for their
+    // vblank (a flip cannot overtake them).
+    struct PresentTiming {
+        std::uint64_t late_us = 0;
+        std::uint32_t period_us = 0;   // 0: unpaced
+    };
+    PresentTiming present_timing(std::uint64_t token) {
+        std::lock_guard guard(mutex_);
+        PresentTiming timing;
+        if (!interval_set_ || !token) return timing;
+        const std::uint64_t now = clock_.now_us();
+        retire_locked(now);
+        timing.period_us = period_us_;
+        if (!pending_.empty()) return timing;
+        for (const Record& r : records_)
+            if (r.token == token) {
+                const std::uint64_t due = r.origin_us - std::min<std::uint64_t>(r.origin_us, offset_us_) + period_us_;
+                if (now > due) timing.late_us = now - due;
+            }
+        return timing;
+    }
+
+    // `sync` immediate: the frame is shown at once (display time = present time, percent_scanned from `late_us`)
+    // instead of at the next vblank. The caller got that from decide_present_sync and the presenter confirmed it.
+    void commit_present_token(std::uint64_t token, std::uint32_t plane_count, PresentSync sync = PresentSync::vblank,
+                              std::uint64_t late_us = 0) {
         (void)plane_count;
         std::lock_guard guard(mutex_);
         const std::uint64_t now = clock_.now_us();
@@ -253,9 +306,16 @@ public:
         const std::uint64_t since = now > epoch_us_ ? now - epoch_us_ : 0;
         std::uint64_t flip = epoch_us_ + (since / period_us_ + 1) * period_us_;
         if (!pending_.empty()) flip = std::max(flip, pending_.back().flip_us + period_us_);
-        pending_.push_back(Pending{token, flip});
+        float percent = 0.0f;
+        if (sync == PresentSync::immediate && pending_.empty()) {
+            flip = now;
+            percent = scan_percent(late_us, period_us_);
+            ++immediate_presents_;
+        }
+        pending_.push_back(Pending{token, flip, percent});
         for (Record& r : records_)
             if (r.token == token) { r.presented = true; r.present_us = now; }
+        retire_locked(now);
         cv_.notify_all();
     }
     // A blank present (no planes) carries no token: it is only counted as a frame to show.
@@ -267,7 +327,7 @@ public:
         const std::uint64_t since = now > epoch_us_ ? now - epoch_us_ : 0;
         std::uint64_t flip = epoch_us_ + (since / period_us_ + 1) * period_us_;
         if (!pending_.empty()) flip = std::max(flip, pending_.back().flip_us + period_us_);
-        pending_.push_back(Pending{0, flip});
+        pending_.push_back(Pending{0, flip, 0.0f});
         cv_.notify_all();
     }
 
@@ -294,6 +354,8 @@ public:
         retire_locked(clock_.now_us());
         return std::uint32_t(pending_.size());
     }
+    // Frames that were flipped mid-scan because of ImmediateThresholdPercent.
+    std::uint64_t immediate_presents() const { std::lock_guard guard(mutex_); return immediate_presents_; }
     std::uint32_t period_us() const { std::lock_guard guard(mutex_); return period_us_; }
     bool registered() const { std::lock_guard guard(mutex_); return interval_set_ && armed_; }
 
@@ -301,9 +363,11 @@ private:
     struct Pending {
         std::uint64_t token;
         std::uint64_t flip_us;
+        float percent_scanned;  // where the scan was for a frame shown mid-scan, else 0
     };
     struct Record {
         std::uint64_t token = 0, origin_us = 0, present_us = 0, display_us = 0;
+        float percent_scanned = 0.0f;
         bool presented = false, displayed = false;
     };
 
@@ -314,6 +378,7 @@ private:
                 if (r.token == pending_.front().token && pending_.front().token) {
                     r.displayed = true;
                     r.display_us = pending_.front().flip_us;
+                    r.percent_scanned = pending_.front().percent_scanned;
                 }
             pending_.pop_front();
         }
@@ -367,6 +432,7 @@ private:
     std::int64_t last_origin_ = 0;  // origin 0 is the epoch itself, which has passed
     std::uint64_t issued_ = 0;
     std::uint64_t last_presented_ = 0;
+    std::uint64_t immediate_presents_ = 0;
     std::deque<Pending> pending_;
     std::deque<Record> records_;
 };

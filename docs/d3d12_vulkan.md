@@ -406,7 +406,8 @@ What is implemented (all of it testable without the game):
   size differs. The blit goes on the same `VkQueue` after the application's work, so the frame contains everything
   submitted before the present. Details:
   - two frames in flight, and a present semaphore per swapchain image;
-  - FIFO when vsync is asked for, otherwise MAILBOX or IMMEDIATE;
+  - FIFO when vsync is asked for, otherwise MAILBOX or IMMEDIATE; with `VK_KHR/EXT_swapchain_maintenance1` the FIFO
+    swapchain can also present one frame in IMMEDIATE or FIFO_RELAXED (`present(..., tear)`, section 4.5);
   - the swapchain is recreated on resize or when the surface reports it out of date or suboptimal, and a minimised
     window skips presents;
   - a back buffer that was never written is zero-filled like any other texture;
@@ -1566,8 +1567,8 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   return while `latency` presented frames are still waiting for their vblank. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
   `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
-  `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render, not
-  `PercentScanned`); `S_FALSE` with count 0 for what it does not have.
+  `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render;
+  `PercentScanned` only for a frame shown at once by `ImmediateThresholdPercent`, else 0); `S_FALSE` with count 0 for what it does not have.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
   (bilinear, so the rectangle's outer texels blend with their neighbours). The blit converts between formats; an sRGB
@@ -1579,8 +1580,27 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   image is not done. 2 planes: plane 0 is shown, plane 1 is
   dropped, and the missing HDR/GameDVR composition is logged once; they must share one token. More than 2 planes,
   null planes, or an empty/outside rectangle give `E_INVALIDARG`. A missing `ALLOW_DISPLAY` heap flag is logged once
-  and presented anyway. `ImmediateThresholdPercent` is ignored (logged once when non-zero): a late frame waits for
-  its vblank.
+  and presented anyway.
+- *`ImmediateThresholdPercent`* (hypothesis from the FramePacing text, item 7 above; not measured on the console):
+  a frame is due at the vblank after the origin that handed out its token. One that is presented later than that
+  is late, and when the scan would not be further down the screen than the threshold percentage (late time modulo the
+  interval, as a fraction of the interval) it is flipped at once, mid-scan, instead of waiting a whole interval. 0,
+  negative and NaN never tear; 100 or more tears wherever the scan is; a frame on time never does. The decision is
+  the pure `leonida::decide_present_sync(late_us, interval_us, threshold)` in `frame_pacer.h`. A frame behind one
+  that still waits for its vblank is not torn (it would overtake it), and neither is an unpaced present. The tear
+  is shown in `GetFrameStatisticsX` (the display entry's `PercentScanned` is set and its time is the present time)
+  and in `XboxPresentation::immediate_presents()`. In Vulkan: with `VK_KHR_swapchain_maintenance1` (else the EXT
+  original; the structures are the same and the tests' GPUs list both; the instance gets `VK_KHR_get_surface_capabilities2`
+  and the matching `*_surface_maintenance1`) a vsync swapchain is created with `VkSwapchainPresentModesCreateInfoKHR`
+  listing FIFO plus IMMEDIATE (FIFO_RELAXED when the surface does not list IMMEDIATE as compatible with FIFO,
+  checked with `VkSurfacePresentModeCompatibilityKHR`), and a present that tears chains `VkSwapchainPresentModeInfoKHR`
+  with that mode. The extension and its feature are enabled only where the GPU has them. Without them, or without
+  either mode, the threshold is ignored and logged once, and a late frame waits for its vblank as before.
+  `LEONIDA_PRESENT_NO_TEAR=1` turns it off. Caveats: FIFO_RELAXED tears only when the queue is empty and a vblank was
+  missed (close to the semantics, but the driver decides), and the lateness is measured on the pacer's clock (a
+  timer, not the display's real scan), so on a real display the tear position is whatever the driver does at that
+  moment. What is checked is that the immediate mode is chosen and presented without validation errors; no scan-out
+  or tearing was observed.
 - *Tokens*: what the console does with a null, repeated or out-of-order token is **unmeasured**, and a title that
   presents a loading screen with `Token = 0`, presents again with one token, or presents from a render thread out of
   order must not freeze. So those are presented anyway and logged once per kind; only a token that was never handed
@@ -1591,15 +1611,17 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `SetFrameIntervalX` and `ScheduleFrameEventX` are called again, as the samples do. Tokens keep counting. Calling
   `SetFrameIntervalX` again outside suspend keeps the origin event armed and re-bases the vblank grid on that moment.
 - *Not done*: HDR/GameDVR plane composition, resolving multisampled planes, a mutable-format swapchain (an sRGB/UNORM
-  alternation recreates the swapchain; `VK_KHR_swapchain_mutable_format` is not enabled on the device), `ImmediateThresholdPercent`, a host-vblank clock (the timer drifts from the
+  alternation recreates the swapchain; `VK_KHR_swapchain_mutable_format` is not enabled on the device), a host-vblank clock (the timer drifts from the
   display; with FIFO presents the swapchain holds the queue to the real refresh anyway), render statistics,
-  `PercentScanned`, and the vtable wiring. Slots to measure (all unknown): the device's `SetFrameIntervalX`,
+  `PercentScanned` of frames shown at a vblank (a scan position is never measured), and the vtable wiring. Slots to measure (all unknown): the device's `SetFrameIntervalX`,
   `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` and the queue's `PresentX`, `SuspendX`, `ResumeX`
   (the list is in the header).
 - *Tests*: `frame_pacer_test` (fake clock: interval, offset, late waits, timeouts, latency blocking, tokens,
   statistics, suspend/resume, a real 10 ms timer; no GPU) and `xbox_present_test` (the Vulkan device, reading the
   swapchain image back: blank, solid, two colours, source rectangles, RGBA/BGRA/sRGB sources, 2 planes, token errors,
-  statistics, suspend/resume, 30 frames at 60 Hz in real time; skipped, exit 77, without a Vulkan device).
+  statistics, suspend/resume, `ImmediateThresholdPercent` with a late frame at several thresholds (immediate mode
+  chosen, or not for 0, below the lateness, on time) and with `LEONIDA_PRESENT_NO_TEAR=1`, 30 frames at 60 Hz in real
+  time; skipped, exit 77, without a Vulkan device). `frame_pacer_test` also sweeps `decide_present_sync`.
 
 ### 4.6 Queries
 
@@ -1996,7 +2018,7 @@ M0–M2 do not need the executable.
 | **M4** | Compute PSOs, UAVs, storage images, indirect dispatch, copy queues, async streaming | Asset loading and GPU compute | The world's streaming path runs without device loss; compute results match a CPU/reference check |
 | **M5** | Mesh shaders, `ExecuteIndirect`, bindless-table pressure, multi-threaded command lists, pipeline cache | World rendering | A stable open-world frame at any frame rate; then profile and optimise |
 | **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; Xbox DXIL path for the builder's 53 shaders (22 lowered so far) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the DXIL path or a substitute; no unknown XDXR call remains |
-| **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run |
+| **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, validation clean on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; HDR, VRS, plane compose, alt-tab are open |
 
 ### 6.1 Minimum API set for the first frame
 

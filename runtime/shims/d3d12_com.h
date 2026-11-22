@@ -104,6 +104,11 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
+    // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are
+    // enabled on the device, with VK_KHR_get_surface_capabilities2 and the matching *_surface_maintenance1 on the
+    // instance (only meaningful with `presentation`): a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per
+    // present, which PresentX's ImmediateThresholdPercent uses.
+    bool swapchain_maintenance1 = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
@@ -194,9 +199,15 @@ public:
     // `back_buffer` is a colour texture in D3D12's PRESENT state. sync_interval 0 presents without vsync.
     // S_OK also covers a skipped present while the window is minimised.
     // `src_rect` (when not null) limits the blit to that part of the texture, which is stretched to the window.
-    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect = nullptr);
+    // `tear` (with sync_interval > 0): present in the tearing mode when the swapchain has one (tear_supported()), so a
+    // frame that missed its vblank is shown at once; last_present_tore() tells whether that happened.
+    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect = nullptr,
+                    bool tear = false);
     // A black frame, nothing read (PresentX with no planes).
     HRESULT present_blank(UINT sync_interval);
+    bool tear_supported() const;
+    bool last_present_tore() const;
+    std::uint64_t tear_presents() const;
     // Screenshot support for tests: every presented frame is also copied to host memory (call before presenting).
     bool enable_capture();
     // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <future>
+#include <limits>
 #include <thread>
 
 using namespace leonida;
@@ -364,6 +365,99 @@ int main() {
             EXPECT(blocked(waiter));
         }
         EXPECT(waiter.get().hr == pacer_hr::invalid_state);
+    }
+
+    // ImmediateThresholdPercent: the pure decision (late_by, interval, threshold -> mode).
+    {
+        const auto sync = [](std::uint64_t late, std::uint32_t interval, float threshold) {
+            return decide_present_sync(late, interval, threshold);
+        };
+        constexpr PresentSync v = PresentSync::vblank, i = PresentSync::immediate;
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        EXPECT(sync(0, period, 100.0f) == v);                  // on time: nothing to tear
+        EXPECT(sync(100, period, 0.0f) == v);                  // threshold 0 disables tearing
+        EXPECT(sync(100, period, -5.0f) == v);
+        EXPECT(sync(100, period, nan) == v);
+        EXPECT(sync(100, 0, 100.0f) == v);                     // unpaced
+        EXPECT(sync(1, period, 1.0f) == i);                    // 0.00625% scanned, within 1%
+        EXPECT(sync(159, period, 1.0f) == i);                  // 0.99375%
+        EXPECT(sync(160, period, 1.0f) == i);                  // exactly 1%: the threshold itself still tears
+        EXPECT(sync(161, period, 1.0f) == v);                  // just past it
+        EXPECT(sync(8000, period, 49.0f) == v);                // 50% scanned
+        EXPECT(sync(8000, period, 50.0f) == i);
+        EXPECT(sync(8000, period, 51.0f) == i);
+        EXPECT(sync(15999, period, 100.0f) == i);              // 100: anywhere in the scan
+        EXPECT(sync(15999, period, 250.0f) == i);              // above 100 is clamped
+        EXPECT(sync(15999, period, 99.0f) == v);
+        EXPECT(sync(period + 4000, period, 25.0f) == i);       // a whole interval and a quarter late: the scan is at 25%
+        EXPECT(sync(period + 4000, period, 24.0f) == v);
+        EXPECT(sync(3 * period, period, 10.0f) == i);          // late by whole intervals: the scan is at the top
+        EXPECT(scan_percent(8000, period) == 50.0f);
+        EXPECT(scan_percent(0, period) == 0.0f && scan_percent(5, 0) == 0.0f);
+    }
+
+    // The same through the pacer: lateness against the vblank the token was due at, and what a tear does to the frame.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 2));
+        clock.advance_us(period);  // origin 1; its frame is due at vblank 2 (t = 2 * period)
+        std::uint64_t token1 = 0, token2 = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token1) == pacer_hr::ok);
+        FramePacer::PresentTiming timing = pacer.present_timing(token1);
+        EXPECT(timing.period_us == period && timing.late_us == 0);  // before the vblank it is due at
+        EXPECT(pacer.present_timing(0).late_us == 0 && pacer.present_timing(99).late_us == 0);  // null, unknown
+        clock.advance_us(period);  // exactly at its vblank: not late
+        EXPECT(pacer.present_timing(token1).late_us == 0);
+        clock.advance_us(8000);    // half an interval late
+        timing = pacer.present_timing(token1);
+        EXPECT(timing.late_us == 8000);
+        const PresentSync mode = decide_present_sync(timing.late_us, timing.period_us, 60.0f);
+        EXPECT(mode == PresentSync::immediate);
+        pacer.commit_present_token(token1, 1, mode, timing.late_us);
+        EXPECT(pacer.immediate_presents() == 1);
+        EXPECT(pacer.frames_in_flight() == 0);  // shown at once, not queued for the next vblank
+        std::uint32_t count = 4;
+        FrameStatistic stats[4];
+        EXPECT(pacer.get_frame_statistics(token1, stat_present | stat_display, &count, stats) == pacer_hr::ok && count == 2);
+        EXPECT(stats[0].type == stat_present && stats[1].type == stat_display);
+        EXPECT(stats[1].time_us == stats[0].time_us && stats[1].time_us == 2 * period + 8000);
+        EXPECT(stats[1].percent_scanned == 50.0f && stats[0].percent_scanned == 0.0f);
+
+        // The next frame, late by the same amount but with a threshold that is too small: waits for its vblank.
+        clock.advance_us(period - 8000);  // t = 3 * period: origin 3
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token2) == pacer_hr::ok);
+        clock.advance_us(period + 8000);  // due at 4 * period, now 4.5
+        timing = pacer.present_timing(token2);
+        EXPECT(timing.late_us == 8000);
+        EXPECT(decide_present_sync(timing.late_us, timing.period_us, 40.0f) == PresentSync::vblank);
+        pacer.commit_present_token(token2, 1, PresentSync::vblank, timing.late_us);
+        EXPECT(pacer.immediate_presents() == 1 && pacer.frames_in_flight() == 1);
+        EXPECT(pacer.get_frame_statistics(token2, stat_display, &count, stats) == pacer_hr::false_);  // not shown yet
+        clock.advance_us(period);  // vblank at 5 * period
+        count = 4;
+        EXPECT(pacer.get_frame_statistics(token2, stat_display, &count, stats) == pacer_hr::ok && count == 1);
+        EXPECT(stats[0].time_us == 5 * period && stats[0].percent_scanned == 0.0f);
+    }
+
+    // A frame behind one that still waits for its vblank cannot be shown at once (it would overtake it): not late.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 2));
+        std::uint64_t token1 = 0, token2 = 0;
+        clock.advance_us(period);      // origin 1
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token1) == pacer_hr::ok);
+        clock.advance_us(period);      // origin 2 (nothing is in flight yet, so the second token is handed out)
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token2) == pacer_hr::ok);
+        clock.advance_us(period + 1600);  // 3.1 periods: token1 is presented, a whole interval late, queued for vblank 4
+        pacer.commit_present_token(token1, 1);
+        EXPECT(pacer.frames_in_flight() == 1);
+        clock.advance_us(1600);        // 3.2: token2 was due at vblank 3 and is late, but token1 is still queued
+        EXPECT(pacer.present_timing(token2).late_us == 0 && pacer.present_timing(token2).period_us == period);
+        clock.advance_us(period);      // 4.2: token1 was shown at vblank 4; token2 is late and nothing is queued
+        EXPECT(pacer.present_timing(token2).late_us == 19200);  // 4.2 periods now, due at 3
+        EXPECT(pacer.immediate_presents() == 0);
     }
 
     // Real clock: five 10 ms vblanks take about 50 ms.
