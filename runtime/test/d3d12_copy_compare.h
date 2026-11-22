@@ -161,11 +161,18 @@ struct Run {
         ours = is_ours;
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        return SUCCEEDED(d->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue.p))) &&
-               SUCCEEDED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) &&
-               SUCCEEDED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
-                                              IID_PPV_ARGS(&list.p))) &&
-               SUCCEEDED(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)));
+        const auto check_setup = [is_ours](const char* call, HRESULT hr) {
+            if (SUCCEEDED(hr)) return true;
+            std::fprintf(stderr, "copy setup: %s %s failed (HRESULT 0x%08x)\n",
+                         is_ours ? "Vulkan" : "host", call, static_cast<unsigned>(hr));
+            return false;
+        };
+        return check_setup("CreateCommandQueue", d->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue.p))) &&
+               check_setup("CreateCommandAllocator",
+                           d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) &&
+               check_setup("CreateCommandList", d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p,
+                                                                     nullptr, IID_PPV_ARGS(&list.p))) &&
+               check_setup("CreateFence", d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)));
     }
     // Starts another scenario on the same queue: the list and allocator are reset (a list that failed at Close can be).
     bool used = false;
