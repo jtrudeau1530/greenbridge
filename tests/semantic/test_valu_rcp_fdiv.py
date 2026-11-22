@@ -1072,6 +1072,135 @@ class NewtonRaphsonMultiStepEmulationTests(unittest.TestCase):
         )
 
 
+class NewtonRaphsonAccuracyAndEdgeCaseTests(unittest.TestCase):
+    def test_quotient_accuracy_within_one_ulp_wide_dynamic_range(self):
+        cases = (
+            (1.0e-30, 2.0),
+            (3.14159265e-25, 1.41421356e-20),
+            (1.0e-15, 3.0),
+            (1.0e-5, 7.0),
+            (1.0, 3.0),
+            (7.0, 3.0),
+            (22.0, 7.0),
+            (355.0, 113.0),
+            (1.234567e5, 9.87654e-5),
+            (1.0e15, 3.0e5),
+            (1.0e25, 2.5e10),
+            (1.0e30, 4.0e15),
+            (-1.0e20, 3.0),
+            (1.0e20, -7.0),
+            (-5.5e15, -1.1e5),
+        )
+        for a_f, b_f in cases:
+            with self.subTest(a=a_f, b=b_f):
+                ab = f32_bits(a_f)
+                bb = f32_bits(b_f)
+                got = run_nr_fdiv_ps(ab, bb)
+                exact = ref_exact_fdiv_f32(ab, bb)
+                ulp = f32_ulp_diff(got, exact)
+                self.assertLessEqual(
+                    ulp, 1,
+                    f"Accuracy exceeds 1 ULP for {a_f}/{b_f}: got {got:#010x}, exact {exact:#010x}, diff {ulp}"
+                )
+
+    def test_subnormal_quotients_and_inputs(self):
+        cases = (
+            ("subnormal_div_2", 0x00000004, f32_bits(2.0), 0x00000002),
+            ("neg_subnormal_div_2", 0x80000004, f32_bits(2.0), 0x80000002),
+            ("subnormal_div_half", 0x00000002, f32_bits(0.5), 0x00000004),
+            ("normal_underflow_to_subnormal", 0x00400000, f32_bits(2.0), 0x00200000),
+            ("subnormal_divisor_to_normal", f32_bits(1.0), 0x00400000, 0x7F000000),
+        )
+        for name, ab, bb, want in cases:
+            with self.subTest(case=name):
+                got = run_nr_fdiv_ps(ab, bb)
+                self.assertEqual(got, want)
+
+    def test_sign_rule_preservation(self):
+        cases = (
+            (f32_bits(6.0), f32_bits(2.0), f32_bits(3.0)),
+            (f32_bits(6.0), f32_bits(-2.0), f32_bits(-3.0)),
+            (f32_bits(-6.0), f32_bits(2.0), f32_bits(-3.0)),
+            (f32_bits(-6.0), f32_bits(-2.0), f32_bits(3.0)),
+            (0x00000000, f32_bits(2.0), 0x00000000),
+            (0x80000000, f32_bits(2.0), 0x80000000),
+            (0x00000000, f32_bits(-2.0), 0x80000000),
+            (0x80000000, f32_bits(-2.0), 0x00000000),
+        )
+        for ab, bb, want in cases:
+            with self.subTest(a=hex(ab), b=hex(bb)):
+                self.assertEqual(run_nr_fdiv_ps(ab, bb), want)
+
+    def test_zero_and_infinite_divisor_behavior(self):
+        # Division by +-0.0 is undefined in SPIR-V and raises UnsupportedConstruct
+        for z in (0x00000000, 0x80000000):
+            with self.subTest(zero=hex(z)):
+                with self.assertRaises(si.UnsupportedConstruct):
+                    run_nr_fdiv_ps(f32_bits(1.0), z)
+
+        # Infinite divisor: 1 / +-inf -> +-0.0, step 2 FMA calculates 1 - inf * 0 -> NaN
+        for inf_bits in (0x7F800000, 0xFF800000):
+            with self.subTest(inf=hex(inf_bits)):
+                got = run_nr_fdiv_ps(f32_bits(1.0), inf_bits)
+                self.assertTrue(is_f32_nan_bits(got), f"expected NaN from inf divisor, got {got:#010x}")
+
+    def test_negative_controls_for_pipeline_sabotage(self):
+        a = f32_bits(7.0)
+        b = f32_bits(3.0)
+        lines = [
+            f"v_mov_b32 v0, {a:#x}",
+            f"v_mov_b32 v1, {b:#x}",
+            "v_rcp_f32_e32 v2, v1",
+            "v_fma_f32 v3, -v1, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        spv = translate_ps(lines)
+        correct_res = si.run_fragment(spv)["%out_mrt0"][0]
+        want = ref_newton_raphson_fdiv_f32(a, b)
+        self.assertEqual(correct_res, want)
+
+        # Sabotage 1: Corrupt error-term FMA to FMul
+        bad_fma, n1 = re.subn(r"OpExtInst %float %glsl Fma\b", "OpFMul %float", spv, count=1)
+        self.assertEqual(n1, 1)
+        bad_res1 = si.run_fragment(bad_fma)["%out_mrt0"][0]
+        self.assertNotEqual(bad_res1, want)
+        self.assertGreater(f32_ulp_diff(bad_res1, want), 1000)
+
+        # Sabotage 2: Corrupt final FMul to FAdd
+        bad_mul, n2 = re.subn(r"OpFMul %float\b", "OpFAdd %float", spv, count=1)
+        self.assertEqual(n2, 1)
+        bad_res2 = si.run_fragment(bad_mul)["%out_mrt0"][0]
+        self.assertNotEqual(bad_res2, want)
+        self.assertGreater(f32_ulp_diff(bad_res2, want), 1000)
+
+        # Sabotage 3: Inverting FMA sign (+b instead of -b in error term)
+        lines_bad_sign = [
+            f"v_mov_b32 v0, {a:#x}",
+            f"v_mov_b32 v1, {b:#x}",
+            "v_rcp_f32_e32 v2, v1",
+            "v_fma_f32 v3, v1, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, v2",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        bad_sign_res = run_ps_v0(lines_bad_sign)
+        self.assertNotEqual(bad_sign_res, want)
+        self.assertGreater(f32_ulp_diff(bad_sign_res, want), 1000)
+
+        # Sabotage 4: Dropping base term in refinement (y0*e instead of y0 + y0*e)
+        lines_bad_refine = [
+            f"v_mov_b32 v0, {a:#x}",
+            f"v_mov_b32 v1, {b:#x}",
+            "v_rcp_f32_e32 v2, v1",
+            "v_fma_f32 v3, -v1, v2, 1.0",
+            "v_fma_f32 v4, v2, v3, 0.0",
+            "v_mul_f32_e32 v0, v0, v4",
+        ]
+        bad_refine_res = run_ps_v0(lines_bad_refine)
+        self.assertNotEqual(bad_refine_res, want)
+        self.assertGreater(f32_ulp_diff(bad_refine_res, want), 1000)
+
+
 class NegativeControlTests(unittest.TestCase):
     def test_sabotaged_spirv_is_detected(self):
         cases = (
