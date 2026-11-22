@@ -125,7 +125,7 @@ def find_cc():
 
 
 def build_command(kind, cc, src, out, workdir):
-    """argv that compiles src into out; MSVC's objects and the vcvars script go to workdir."""
+    """argv that compiles src into out; MSVC's objects and the vcvars script go to workdir, the cwd to run it in."""
     if kind == "gcc":
         return [cc, "-O1", src, "-o", out]
     cl = [cc if kind == "msvc" else "cl", "/nologo", "/O1", src, f"/Fe{out}", f"/Fo{os.path.join(workdir, '')}"]
@@ -135,13 +135,16 @@ def build_command(kind, cc, src, out, workdir):
     # vcvars64.bat runs vswhere itself, so its folder goes on PATH first (as scripts/build_llvm_mc.ps1 does).
     installer = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                              "Microsoft Visual Studio", "Installer")
-    script = os.path.join(workdir, "build_hw_oracle.cmd")
+    name = "build_hw_oracle.cmd"
+    script = os.path.join(workdir, name)
     # Written as UTF-8, with chcp 65001 so cmd.exe reads it as UTF-8 on any console code page: the checkout, %TEMP%
     # and Visual Studio paths in here reach cl intact when one has a character outside ASCII (a user name, say).
     with open(script, "w", encoding="utf-8", newline="\n") as f:
         f.write(f'@echo off\r\nchcp 65001 >nul\r\nset "PATH={installer};%PATH%"\r\ncall "{cc}" >nul || exit /b 1\r\n'
                 + subprocess.list2cmdline(cl) + "\r\n")
-    return ["cmd.exe", "/d", "/c", script]
+    # Relative to workdir, not the full path: cmd.exe /c loses a full path's quotes when it holds & or ^ (and
+    # list2cmdline adds none without a space), and `.\` is still found with NoDefaultCurrentDirectoryInExePath set.
+    return ["cmd.exe", "/d", "/c", "." + os.sep + name]
 
 
 def detect_arch(clang):
