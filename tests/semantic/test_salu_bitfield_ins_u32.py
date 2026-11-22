@@ -450,5 +450,41 @@ class MaskCompositionAndRoutingTests(unittest.TestCase):
             self.assertEqual(self.interp.get_sgpr(r), (r * 0x11111111) & MASK32)
 
 
+class ClampBoundaryAndNegativeTests(unittest.TestCase):
+    """Tests for width/offset clamp boundaries, register aliasing, and negative controls."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarAluInterpreter()
+
+    def test_width_offset_modulo_32_clamping(self) -> None:
+        # Width and offset are masked to 5 bits ([4:0]) in s_bfm_b32 / shifts
+        # width = 32 (32 & 31 = 0) -> mask = 0
+        self.assertEqual(ref_s_bfm_b32(32, 0), 0x00000000)
+        # width = 64 (64 & 31 = 0) -> mask = 0
+        self.assertEqual(ref_s_bfm_b32(64, 4), 0x00000000)
+        # offset = 32 (32 & 31 = 0)
+        self.assertEqual(ref_s_bfm_b32(8, 32), 0x000000FF)
+        # offset = 33 (33 & 31 = 1)
+        self.assertEqual(ref_s_bfm_b32(8, 33), 0x000001FE)
+
+    def test_in_place_register_aliasing(self) -> None:
+        # Destination same as base (s1 = s_bfi_b32(mask, insert, s1))
+        self.interp.set_sgpr(1, 0x12345678)
+        self.interp.set_sgpr(2, 0x00FF0000)
+        self.interp.set_sgpr(3, 0xA0B0C0D0)
+        self.interp.step("s_bfi_b32", "s1", "s2", "s3", "s1")
+        self.assertEqual(self.interp.get_sgpr(1), 0x12b05678)
+
+    def test_negative_controls_invalid_operand_counts(self) -> None:
+        with self.assertRaises(ValueError):
+            self.interp.step("s_bfi_b32", "s0", "s1", "s2")  # Missing 3rd source
+        with self.assertRaises(ValueError):
+            self.interp.step("s_bfm_b32", "s0", "s1")  # Needs 2 sources, test passing 1
+
+    def test_negative_controls_unsupported_instruction(self) -> None:
+        with self.assertRaises(NotImplementedError):
+            self.interp.step("s_bogus_op_b32", "s0", "s1")
+
+
 if __name__ == "__main__":
     unittest.main()
