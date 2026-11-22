@@ -490,27 +490,40 @@ file names), so the effect is recoverable from them. Measured on a 1.0.2.1 copy,
 So a material leads to its effect and that effect's ray-tracing resolve programs. The draw (VS/PS/MS) programs
 are not reachable through the carved programs' names, order or suffixes:
 
-- None of the 23,619 graphics programs (VS/PS/MS) carries an effect name; they are named `<stage>_<technique or entry>_<8 hex>`.
+- None of the 23,619 graphics programs (2,236 VS, 12,101 PS, 9,282 MS; the 195 GS are left out here) carries an
+  effect name; they are named `<stage>_<technique or entry>_<8 hex>`.
 - `shaders.rpf` stores programs grouped by kind, not by effect (the 1,004 `RaytracingResolve` programs sit next
   to each other), so position doesn't group an effect's programs either.
-- The graphics programs' 8-hex suffix groups them (1,226 suffixes over 23,016 programs, the largest shared by
-  1,775) but is not the joaat of the program name, and only 1 of the 896 suffixes on the effect-named CS programs
-  appears on any graphics program.
+- Every one of the 23,619 has an 8-hex suffix. The suffixes group them: there are 1,228 distinct ones, the largest
+  shared by 1,806 programs and 53 used once. The suffix is not the joaat of the program name, and only 1 of the
+  896 suffixes on the effect-named CS programs appears on any graphics program.
 
 They are reachable through the **effect records** in `shaders.rpf` (found by @jeremygold02, #2519). All fields
 are little-endian:
 
 1. **The effect record.** It starts with a one-byte name length and the name, including its terminator, then a
-   u32. Six stage lists follow, each a u32 count and that many u32 ordinals into a stage's programs.
+   u32 whose meaning is not known. Six stage lists follow, each a u32 count and that many u32 ordinals.
+
+   An ordinal is a program's position, in `shaders.rpf` offset order, within its group of the carve index
+   (`<work>/shaders/dxbc/index.json`, sorted by `offset`). The groups are:
+
+   - **List 0:** the VS and MS together, 11,518 programs. The three records' lists hold both kinds: the rim's 41
+     entries are 37 MS and 4 VS.
+   - **List 1:** the PS, 12,101 programs.
+   - **List 5:** the CS. On the rim and the tire its three entries are exactly the effect's own
+     `<effect>:RaytracingResolve` programs, the ones the material hash leads to in the table above.
+   - **Lists 2–4:** empty in all three records, so their stages are not identified.
 2. **The technique table.** A u32 count, then one 4-byte entry per technique: the low 15 bits of its first u16 are
-   the name's offset in the string block, and byte 3 is the pass count. A u32 pass total follows, then 24-byte pass
-   records.
+   the name's offset in a string block, and byte 3 is the pass count. A u32 pass total follows, then 24-byte pass
+   records. Where the table and its string block sit relative to the record is not derived yet: the three
+   tables were located by offset.
 3. **The pass records.** The first six bytes of each pass select an entry of each stage list: 0 is unused,
    otherwise `stage_list[selector - 1]`.
 
-Checked on three records of a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256 `0bc16345…`):
+This is checked on **three records** of a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256 `0bc16345…`). It has not
+been counted over all effects, so for the rest it is a **hypothesis** (AGENTS.md: count over the whole corpus):
 
-| Record | Stage list sizes | Techniques | Passes (total = sum of counts) | First pass mesh / pixel ordinal |
+| Record | Stage list sizes | Techniques | Passes (total = sum of counts) | First pass list 0 / list 1 ordinal |
 |---|---|---:|---:|---|
 | windshield wiper mask | 1, 1, 0, 0, 0, 0 | 1 | 1 | 11017 / 10943 |
 | stock rim | 41, 53, 0, 0, 0, 3 | 106 | 108 | 9143 / 8925 |
@@ -519,7 +532,7 @@ Checked on three records of a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256 `0bc
 Two things are still open:
 
 - **Finding effect records in general.** The three were found by their offsets; there is no general locator for
-  all effects yet.
+  all effects yet, and the format becomes a rule only once it holds for every one of them.
 - **Which technique and pass the game draws with.** That is a run-time choice; it is presumably made in the
   executable (RT-5).
 
