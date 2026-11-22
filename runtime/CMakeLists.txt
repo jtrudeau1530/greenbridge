@@ -426,6 +426,18 @@ if(BUILD_TESTING)
     set_target_properties(tiny_bundled_load PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    add_library(tiny_startup_cmdline_dll SHARED test/fixtures/tiny_startup_cmdline.cpp)
+    target_compile_definitions(tiny_startup_cmdline_dll PRIVATE STARTUP_CMDLINE_DLL)
+    add_executable(tiny_startup_cmdline test/fixtures/tiny_startup_cmdline.cpp)
+    target_link_libraries(tiny_startup_cmdline PRIVATE tiny_startup_cmdline_dll)
+    foreach(target tiny_startup_cmdline_dll tiny_startup_cmdline)
+      target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+      set_target_properties(${target} PROPERTIES
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+      )
+    endforeach()
     add_executable(tiny_game test/fixtures/tiny_game.cpp)
     target_link_libraries(tiny_game PRIVATE xgameruntime_stub)
     target_compile_definitions(tiny_game PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)  # plain fopen, as games use
@@ -705,6 +717,9 @@ if(BUILD_TESTING)
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+    add_test(NAME run_startup_cmdline COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
     add_test(NAME run_tiny_async COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_async>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_async.cmake")
