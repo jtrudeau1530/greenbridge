@@ -257,6 +257,36 @@ class ScanTest(unittest.TestCase):
         rows, summaries = bvh_index.scan_dir(self.dir)
         self.assertEqual([r["kind"] for r in rows], ["bvh4"])
         self.assertEqual(len(summaries), 1)
+        self.assertIsInstance(summaries[0], dict)
+        self.assertEqual(summaries[0]["streams"], 1)
+
+    def test_directory_of_rpfs_writes_flat_summaries(self):
+        one = os.path.join(self.dir, "one")
+        two = os.path.join(self.dir, "two")
+        os.makedirs(one)
+        os.makedirs(two)
+        with open(os.path.join(one, "a.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        for name, n in (("a.rpf", 2), ("b.rpf", 3)):
+            with open(os.path.join(two, name), "wb") as f:
+                f.write(make_rpf([bvh_payload(n)]))
+
+        out1 = os.path.join(self.dir, "one.json")
+        out2 = os.path.join(self.dir, "two.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main([one, "--out", out1]), 0)
+            self.assertEqual(bvh_index.main([two, "--out", out2]), 0)
+        with open(out1, encoding="utf-8") as f:
+            doc1 = json.load(f)
+        self.assertIsInstance(doc1["summary"], dict)
+        self.assertEqual(doc1["summary"]["streams"], 1)
+        self.assertEqual(doc1["summary"]["bvh4_nodes"], 2)
+        with open(out2, encoding="utf-8") as f:
+            doc2 = json.load(f)
+        self.assertIsInstance(doc2["summary"], list)
+        self.assertEqual(len(doc2["summary"]), 2)
+        self.assertTrue(all(isinstance(item, dict) for item in doc2["summary"]))
+        self.assertEqual([item["bvh4_nodes"] for item in doc2["summary"]], [2, 3])
 
     def test_cli_rejects_a_limit_below_one(self):
         path = os.path.join(self.dir, "one.rpf")

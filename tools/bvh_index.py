@@ -314,7 +314,7 @@ def scan_dir(path, max_inflate=1 << 28):
                 print(f"{p}: skipped ({e})", file=sys.stderr)
                 continue
             rows += r
-            summaries.append(s)
+            summaries.extend(s)
         return rows, summaries
     for p in sorted(glob.glob(os.path.join(path, "**", "*.bin"), recursive=True)):
         size = os.path.getsize(p)
