@@ -2588,20 +2588,31 @@ public:
             return E_NOTIMPL;
         }
         if (!push_constants_fit()) return E_NOTIMPL;
-        const std::vector<std::uint8_t> fssm = leonida::fssm_program(
+        // The game's FSSM program, or the FidelityFX DLL's FSPX kind-6 program: in a DXBC container's ACCC part at
+        // slot 62, bare from a slot-67 description (docs/fspx.md, "Run-time lookup").
+        const leonida::ComputeProgram program = leonida::compute_program(
             {static_cast<const std::uint8_t*>(desc.CS.pShaderBytecode), desc.CS.BytecodeLength});
-        if (fssm.empty()) {
-            log_once("compute shader bytecode holds no FSSM program; bytes", int(desc.CS.BytecodeLength));
+        if (program.kind == leonida::ComputeProgram::Kind::none) {
+            log_once("compute shader bytecode holds no FSSM or FSPX program; bytes", int(desc.CS.BytecodeLength));
             return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) return E_FAIL;
-        const std::string hash = leonida::sha256_hex(fssm);
         // A binding-free entry wins over one with bindings for the same program (pick_entry).
-        const leonida::ShaderEntry* entry =
-            pick_entry(library->candidates("cs", hash), [](const leonida::ShaderEntry&) { return true; });
+        // An FSPX program from a container is matched on its kind-0 state too; a bare kind-6 program whose
+        // translations differ is ambiguous without that state and is refused (program_candidates).
+        bool ambiguous = false;
+        const leonida::ShaderEntry* entry = pick_entry(library->program_candidates("cs", program, &ambiguous),
+                                                       [](const leonida::ShaderEntry&) { return true; });
         if (!entry) {
-            std::fprintf(stderr, "[rt] d3d12: no translated compute shader for FSSM sha256 %s\n", hash.c_str());
+            const bool fspx = program.kind == leonida::ComputeProgram::Kind::fspx;
+            if (ambiguous)
+                std::fprintf(stderr, "[rt] d3d12: FSPX kind-6 program sha256 %s is ambiguous without its kind-0 "
+                                     "state: its translations differ\n", leonida::sha256_hex(program.bytes).c_str());
+            else
+                std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
+                             fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
+                             leonida::sha256_hex(program.bytes).c_str());
             return E_INVALIDARG;
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
@@ -2664,11 +2675,13 @@ public:
             VK_SUCCESS)
             return E_FAIL;
 
-        // The code base: shaders read constant tables embedded in their own program through s_getpc_b64.
+        // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
+        // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
+        const std::vector<std::uint8_t>& code = program.bytes;
         VkDeviceSize offset = 0;
-        if (!device_.arena_allocate(fssm.size(), 256, offset)) return E_OUTOFMEMORY;
-        std::memcpy(device_.arena.mapped + offset, fssm.data(), fssm.size());
-        code_bytes_ = fssm.size();
+        if (!device_.arena_allocate(code.size(), 256, offset)) return E_OUTOFMEMORY;
+        std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
+        code_bytes_ = code.size();
         code_base_ = offset;
         pipeline_.code_base = offset;
         device_.context->add_pipeline(id(), pipeline_);
