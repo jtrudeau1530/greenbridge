@@ -905,6 +905,28 @@ denormals kept (461 each; like the other transcendental ops), and ignored with I
 under omod (35 each, none with IEEE on); a signalling NaN passes unchanged with IEEE off and is quieted with IEEE on
 (59); denormal operands read as zero and denormal results flush in every mode.
 
+A discrete RDNA2 part (SHADER-353): an RX 6700 XT (gfx1031; AMD Windows driver 26.11.2, Vulkan 1.4.315, Windows 11
+10.0.26200, `amdhip64_6.dll`, AMD clang 24.0.0git from rocm-sdk-core 10.2.0, MinGW gcc as the host compiler, main at
+4eb6155d with this change), `--oracle hw --programs 5000`, seeds 1 to 6: 39,101 programs, **28,856 match, 0 mismatch, 66 known
+deviation** (all `omod_neg_zero`), 4,056 skipped (the four GFX10.1-only mad opcodes), 3,201 denormal, 2,922 other. More
+programs than on gfx1036, probably because `v_rcp_iflag_f32` and its probes are in the table now. MODE read back as `0x1c0`, `0x1f0`, `0xc0` and
+`0x3c0`; `--negative-control` catches all six wrong models (5 to 23 mismatches). The omod table, summed over the six
+seeds (flush / keep / no_dx10 / ieee), answers what the gfx1150 row of `docs/design.md` left open for RDNA2:
+
+| omod, where it changes the result | flush | keep | no_dx10 | ieee |
+|---|---|---|---|---|
+| applied | 2,680 | 869 | 2,680 | 0 |
+| applied, but a -0 result becomes +0 | 66 | 22 | 66 | 0 |
+| ignored | 0 | 1,811 | 0 | 2,650 |
+| -0 result kept (applied or ignored, same word) | 0 | 44 | 0 | 65 |
+| other | 0 | 0 | 0 | 31 |
+
+With denormals kept, the 869 + 22 applied are all `v_rcp/rcp_iflag/rsq/sqrt/exp/log_f32` and the four cube ops
+(`OMOD_IGNORES_DENORM_MODE`), and the 1,811 ignored are all ALU ops. The 31 "other" with IEEE on are `v_min/max/min3/
+max3/med3_f32` programs with a signalling NaN source, where the IEEE-off min/max rules of #634 do not apply; the omod
+is not what differs there. Before SHADER-353, `omod_label` counted a -0 result that the omod cannot change as "applied",
+which put 65 "applied" in the ieee column although no unambiguous program applied it there.
+
 What the hardware answered where the model does not judge (gfx1150; the RDNA2 run above agrees where it is cited):
 
 - **No model error found.** The model was right wherever it had an answer, in 30,577 programs; the min/max/med3
