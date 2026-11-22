@@ -133,6 +133,9 @@ wchar_t* __cdecl game_get_wide_winmain_command_line() { return after_program_nam
 // none until then), and _putenv/_wputenv reallocate both, so a pointer taken in set_command_line would be null or
 // dangling by the time a wide-character startup calls __wgetmainargs. A lookup of a name no one sets makes the CRT
 // create the table if it does not exist yet (from the other table or the OS block) without changing it.
+// Like the msvcrt.dll original, the returned table is the CRT's own and is only valid until the next _putenv: a CRT
+// startup reads it once, before the game has other threads, and a host that edits its environment concurrently with
+// a game's startup is not covered.
 char** current_environment() {
     if (!_environ) {
         size_t size = 0;

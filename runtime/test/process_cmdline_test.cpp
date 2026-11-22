@@ -145,9 +145,12 @@ void check_getmainargs_environment() {
         return;
     }
     // First use of the wide environment in this process: set_command_line runs before anything made _wenviron.
+    // main() hosts start with only the narrow table; if a toolchain change made _wenviron exist, the first-call
+    // checks below no longer prove the creation path, so say so rather than pass silently.
+    if (_wenviron) std::printf("note: _wenviron already exists at startup; its lazy creation is not exercised\n");
     rt::process::set_command_line(L"game.exe", {L"-x"});
-    _putenv_s("LEONIDA_RT136_A", "before");  // narrow only; the wide table is built from the OS block on first use
-    if (!env_has<wchar_t>(wide_fn, L"LEONIDA_RT136_A=before")) {
+    if (_putenv_s("LEONIDA_RT136_A", "before") != 0 ||  // narrow only; the wide table is built on first use
+        !env_has<wchar_t>(wide_fn, L"LEONIDA_RT136_A=before")) {
         std::fprintf(stderr, "FAIL __wgetmainargs: no environment (or one without LEONIDA_RT136_A) at the first call\n");
         ++failures;
     }
@@ -156,8 +159,10 @@ void check_getmainargs_environment() {
         ++failures;
     }
     // A variable set after set_command_line reallocates the CRT's table; a pointer kept from before would dangle.
-    _putenv_s("LEONIDA_RT136_B", "after");
-    _wputenv_s(L"LEONIDA_RT136_C", L"after");
+    if (_putenv_s("LEONIDA_RT136_B", "after") != 0 || _wputenv_s(L"LEONIDA_RT136_C", L"after") != 0) {
+        std::fprintf(stderr, "FAIL _putenv_s/_wputenv_s did not set the test variables\n");
+        ++failures;
+    }
     if (!env_has<wchar_t>(wide_fn, L"LEONIDA_RT136_B=after") || !env_has<wchar_t>(wide_fn, L"LEONIDA_RT136_C=after")) {
         std::fprintf(stderr, "FAIL __wgetmainargs: an environment variable set after set_command_line is missing\n");
         ++failures;
