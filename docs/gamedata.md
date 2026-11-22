@@ -450,6 +450,49 @@ Not fully readable: the 8.6% unread span, the two opaque binary blobs, and the m
 tail-only documents (their retained tails are readable but incomplete). The encrypted table of contents is
 outside this work by rule; names and exact file boundaries stay unknown until a documented table reader exists.
 
+## Dirt and canned colours (`CGraphicsDefinitionsData`)
+
+One `CGraphicsDefinitionsData` document holds the dirt/grime presets for peds, vehicles and props and the
+colour table they draw from. Seven sections, each a list of `Item key="..."` records (counts; no values or
+names):
+
+| Section | Items | Fields per item | `key` |
+|---|---:|---:|---|
+| `CannedColors` | 44 | none: `x`, `y`, `z`, `w` attributes | text |
+| `AlphaChannels` | 7 | `Name`, `Channels` (1 or 2 `Probability`/`Channel` pairs; 10 in total) | equals `Name` in 6 of 7 |
+| `DirtDefinitions` | 24 | 25 (alpha curves and thresholds, vertex multipliers, normal/roughness/material contribution, spawn range, 6 `ClothHideDirtModifiers`) | equals `Name` in 22 of 24 |
+| `VehDirtDefinitions` | 1 | 12, including a `DirtTunings` block of tile, detail-map, mud and modulate start/end values | equals `Name` |
+| `VehDirtControls` | 5 | 13 | equals `Name` |
+| `VehSpawnIntensities` | 31 | 5 | equals `Name` |
+| `PropDirtDefinitions` | 9 | 4 | equals `Name` |
+
+The keys are plain text, not joaat hashes, and a loader can index each section by `key`.
+
+**Canned colours are 8-bit RGB.** In all 44, `x`, `y` and `z` are integers from 0 to 255 and `w` is -1, so
+`w` is not alpha; read it as an unused component or "no alpha".
+
+**References** (case-insensitive equality with another section's `key` or `Name`):
+
+| Field | Resolves to | Count |
+|---|---|---:|
+| `DirtDefinitions/Item/ColorLookup` | `CannedColors` | 24 of 24 |
+| `DirtDefinitions/Item/AlphaMasksLookup` | `AlphaChannels` | 18 of 24 (the other 6 are empty) |
+| `VehDirtDefinitions/Item/ColorLookup` | `CannedColors` | 1 of 1 |
+| `PropDirtDefinitions/Item/Color0Lookup`, `Color1Lookup`, `Color2Lookup` | `CannedColors` | 9 of 9 each |
+| weather data `PedDirtDefinition` (see the weather document) | `DirtDefinitions` | 1 of 1 |
+| weather data `DirtCannedColor` | none | 0 of 1 |
+
+So every dirt preset gets its colour from the canned table, and one weather selects a ped dirt preset. The
+weather's `DirtCannedColor` is a single non-numeric token that matches no canned-colour key, even as a
+substring; where it resolves is unknown. Other `common.rpf` documents share only a few short generic words
+with the `VehSpawnIntensities` keys, which is not evidence of a reference.
+
+`AlphaChannels` probabilities do not sum to 1 in any of the 7 entries, so they are not a probability
+distribution over the listed channels (independent chances or weights would fit). The `Channel` values are 0, 1 or 2.
+
+Not measured here (hypothesis): which texture channel numbering `Channel` uses, and how `VehSpawnIntensities`
+are chosen at spawn.
+
 ## No-sharing rule
 
 The archive, every carved `.bin`, `index.json` (its `head`/`pre` fields contain payload bytes), XML
