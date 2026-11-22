@@ -1877,10 +1877,10 @@ The trace will enumerate them.
     the texel block size and its row length in texels (VUID-vkCmdCopyBufferToImage-dstImage-07975), while the
     capability lifts D3D12's two alignments and is not documented as keeping offsets and pitches texel multiples
     (not tested here), so a footprint that is not texel-aligned would have to be repacked through scratch memory
-    the way a 96-bit one is (section 4.2). The replay already accepts any offset and pitch that are texel
-    multiples (`prepare_texture_copy` in `runtime/src/vulkan_replay.h`; anything else is `unsupported` there),
-    so lifting the record-time check for those alone is small; reporting the capability needs the repack as well.
-    What the console's runtime reports is not measured, and no title code that depends on it has been seen.
+    the way a 96-bit one is (section 4.2). The replay already accepts any offset and pitch that are texel multiples
+    (`prepare_texture_copy` in `runtime/src/vulkan_replay.h`; anything else is `unsupported` there), so accepting
+    those needs only the record-time check changed; reporting the capability needs the repack as well. What the
+    console's runtime reports is not measured, and no title code that depends on it has been seen.
 - `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is
   executed, through `ReplayFunctions::buffer_at`: the buffer whose `ResourceBinding::va` range holds it, at
   `buffer_offset + (address - va)`. These are the same fields and lookup as #291's arena, and the device fills
