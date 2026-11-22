@@ -13,6 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime" / "test" 
 import check
 
 
+GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
+FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
+             (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
+
 # The other wave64-only dump tests (#73's cs_wm_*, the cs_w64x_* cross-half tests): name -> expected out[] words.
 WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS + check.W64X_DUMPS + check.W64X_PARTIAL
                 if n not in (*check.WAVE32_DUMPS, "cs_wave64_ballot")}
@@ -21,10 +25,10 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# every test check.py runs: compute, cs_wavemask, the dumps (#73, #152 cross-half, partial), the two store
+# every test check.py runs: compute, cs_wavemask, cs_fmt_1010102, the dumps (#73, #152 cross-half, partial), the two store
 # tests, pixel tests, the two-mip draw, the gradient samples and three mesh fixtures (skipped here: build.py
 # does not build mesh shaders)
-TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
+TOTAL = (len(check.COMPUTE) + 2 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 2
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + 9 + len(check.GRADIENT_TESTS))  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, the two-mip draw,
                                            # cs_user_sgprs, cs_cvt_f32_sat and ps_gather_wrap
@@ -39,9 +43,16 @@ def cvt_answer(env, wrong_for=None):
 
 
 class Wave64Checks(unittest.TestCase):
-    def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False):
+    def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False, fmt=(0, GOOD_FMT)):
         def harness(_tool, shader, *args, env=None):
             name = Path(shader).stem
+            if name == "cs_fmt_1010102":
+                self.assertEqual(args, ("1", "dump"))
+                self.fmt_env, dump = env, Path(env["VKC_DUMP"])
+                self.assertFalse(dump.exists())
+                if fmt[1] is not None:
+                    dump.write_bytes(fmt[1])
+                return fmt[0], "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]
@@ -126,10 +137,7 @@ class Wave64Checks(unittest.TestCase):
         self.assertIn(f"{TOTAL - 5 - len(WAVE64_DUMPS)} of {TOTAL} pass, {5 + len(WAVE64_DUMPS)} skipped", out)
 
     def test_full_wave_checks_pass_with_expected_results(self):
-        status, out = self.run_checks(
-            (0, "compute subgroup size: 64\n0 mismatches\n"),
-            (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"),
-        )
+        status, out = self.run_checks(*FULL_WAVE)
         self.assertEqual(status, 0, out)
         self.assertRegex(out, r"cs_wave64_ballot +ok")
         self.assertIn(f"{TOTAL - 3} of {TOTAL} pass, 3 skipped", out)
@@ -156,6 +164,34 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual(status, 1, out)
                 self.assertRegex(out, rf"cs_wave64_ballot +{detail}")
                 self.assertIn(f"{TOTAL - 4} of {TOTAL} pass, 3 skipped", out)
+
+    def test_fmt_1010102_compares_the_whole_dump(self):
+        words = list(struct.unpack("<64I", GOOD_FMT))
+        for fmt, detail in (
+            ((0, struct.pack("<64I", *words[:15], 0xE00003FF, *words[16:])), "word 15: expected 0xffe00003, got 0xe00003ff"),
+            ((0, struct.pack("<64I", *words[:63], 0)), "word 63: expected 0xeeeeeeee, got 0x00000000"),
+            ((0, GOOD_FMT[:-4]), "expected 256 dump bytes, got 252"),
+            ((0, GOOD_FMT + bytes(4)), "expected 256 dump bytes, got 260"),
+            ((0, None), "no VKC_DUMP file written"),
+            ((1, GOOD_FMT), "exit 1"),
+        ):
+            with self.subTest(detail=detail):
+                status, out = self.run_checks(*FULL_WAVE, fmt=fmt)
+                self.assertEqual(status, 1, out)
+                self.assertRegex(out, rf"cs_fmt_1010102 +{detail}")
+                self.assertIn(f"{TOTAL - 4} of {TOTAL} pass, 3 skipped", out)
+
+    def test_fmt_1010102_child_env_is_private(self):
+        parent = {"VK_DRIVER_FILES": "driver.json", "VKC_OUT_WORDS": "128", "VKC_DUMP": "caller.bin"}
+        with patch.dict(check.os.environ, parent):
+            status, out = self.run_checks(*FULL_WAVE)
+            for key, value in parent.items():
+                self.assertEqual(check.os.environ[key], value)
+        self.assertEqual(status, 0, out)
+        self.assertRegex(out, r"cs_fmt_1010102 +ok")
+        self.assertEqual((self.fmt_env["VK_DRIVER_FILES"], self.fmt_env["VKC_OUT_WORDS"]), ("driver.json", "64"))
+        self.assertNotEqual(self.fmt_env["VKC_DUMP"], parent["VKC_DUMP"])
+        self.assertFalse(Path(self.fmt_env["VKC_DUMP"]).exists())
 
     def test_missing_wave64_fixture_fails_even_on_wave32(self):
         unsupported = 77, "full 64-wide compute subgroups unavailable\n"

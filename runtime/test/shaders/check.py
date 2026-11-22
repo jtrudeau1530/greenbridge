@@ -101,6 +101,9 @@ CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
+# cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
+FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
+                     0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
@@ -210,6 +213,28 @@ def run(*cmd, env=None):
 def failure(code, output, lines):
     details = "\n".join(output.strip().splitlines()[-lines:])
     return f"exit {code}: {details or 'no test output'}"
+
+
+def fmt_1010102_test(tools, spirv, env=None):
+    """Check both packed stores and the untouched tail. The console dump stops at word 7."""
+    want = FMT_1010102_WORDS + [0xEEEEEEEE] * 48
+    with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
+        dump = Path(tmp) / "out.bin"
+        # VKC_OUT_WORDS sets a minimum. Pin this dispatch to a single group's 64 words.
+        child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS="64")
+        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, "cs_fmt_1010102.spv"),
+                        "1", "dump", env=child)
+        if code:
+            return failure(code, out, 3)
+        if not dump.is_file():
+            return "no VKC_DUMP file written"
+        data = dump.read_bytes()
+    if len(data) != 4 * len(want):
+        return f"expected {4 * len(want)} dump bytes, got {len(data)}"
+    for i, (expected, got) in enumerate(zip(want, struct.unpack("<64I", data))):
+        if got != expected:
+            return f"word {i}: expected {expected:#010x}, got {got:#010x}"
+    return ""
 
 
 class Skip(str):
@@ -645,6 +670,7 @@ def main():
         results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
+    results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",

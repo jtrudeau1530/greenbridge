@@ -1,7 +1,12 @@
 """scripts/run_gpu_tests.py: how it judges the output of a compute "dump" test (no device needed)."""
+import contextlib
+import io
 from pathlib import Path
 import sys
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import run_gpu_tests as rgt
@@ -31,6 +36,28 @@ class DumpWords(unittest.TestCase):
                      "out[0..7] = 55 48 0 0 0 0 0 0 x\n", "out[0..7] = \n", "no dump here\n"):
             with self.subTest(line=line):
                 self.assertIsNone(rgt.dump_words(line))
+
+
+class PackedFormatFixture(unittest.TestCase):
+    def test_filtered_suite_counts_a_packed_store_mismatch(self):
+        name = "cs_fmt_1010102"
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def translate(_cmd):
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            problem = "word 15: expected 0xffe00003, got 0xe00003ff"
+            with (patch.object(rgt, "assemble_to_s"), patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "fmt_1010102_test", return_value=problem) as check_fmt,
+                  contextlib.redirect_stdout(output)):
+                self.assertEqual(rgt.run_suite(args, tmp), 1)
+            check_fmt.assert_called_once()
+            self.assertIn(problem, output.getvalue())
+            self.assertIn("0/1 passed", output.getvalue())
 
 
 class WholeWaveDump(unittest.TestCase):

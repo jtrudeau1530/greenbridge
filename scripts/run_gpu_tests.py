@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import Skip, clip_test
+from check import Skip, clip_test, fmt_1010102_test
 from compute_fixture import compute_header
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
@@ -627,6 +627,9 @@ def run_suite(a, work: str) -> int:
             vals = words[:len(want)] if words else []
             results.append((name, rc == 0 and vals == want,
                             " ".join(hex(x) for x in vals) if vals else msg))
+        elif name == "cs_fmt_1010102":
+            problem = fmt_1010102_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "64/64 dumped words exact"))
         elif name == "cs_global_neg_offset":
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
