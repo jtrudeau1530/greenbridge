@@ -300,6 +300,10 @@ def main() -> int:
             print(f"ERROR: {e}", file=sys.stderr)
             status = 1
             continue
+        except OSError as e:
+            print(f"ERROR: cannot read {path}: {e.strerror or e}", file=sys.stderr)
+            status = max(status, 1)
+            continue
         all_stats.append(stats)
         
         print(f"  Streams: {stats['streams']}")
