@@ -309,8 +309,55 @@ class ScalarThreadState64:
         self.vgprs[idx + 1] = (v >> 32) & MASK32
 
 
+@dataclass(frozen=True)
+class DSAtomicConditionCodes64:
+    """Condition codes evaluating 64-bit unsigned maximum return value and transition."""
+    zero: bool
+    high_bit_set: bool
+    updated: bool
+    is_uint64_max: bool
+
+
+@dataclass(frozen=True)
+class DSMemoryStatusFlags64:
+    """Status flags for 64-bit LDS address calculation, bank span, and alignment."""
+    address_wrapped: bool
+    bank_lo: int
+    bank_hi: int
+    unaligned_qword: bool
+
+
+def evaluate_atomic_max_condition_codes64(old_val: int, data_val: int, new_val: int) -> DSAtomicConditionCodes64:
+    """Evaluate architectural condition codes for 64-bit unsigned maximum."""
+    old_u = u64(old_val)
+    new_u = u64(new_val)
+    return DSAtomicConditionCodes64(
+        zero=(old_u == 0),
+        high_bit_set=bool(old_u & (1 << 63)),
+        updated=(new_u != old_u),
+        is_uint64_max=(new_u == UINT64_MAX),
+    )
+
+
+def evaluate_lds_status_flags64(vaddr: int, offset: int, capacity_bytes: int = LDS_SIZE_BYTES) -> DSMemoryStatusFlags64:
+    """Evaluate memory subsystem status flags for 64-bit LDS address computation."""
+    raw_addr = vaddr + (offset & OFFSET16_MASK)
+    eff_addr = raw_addr & MASK32
+    b_lo, b_hi = calc_lds_qword_banks(eff_addr)
+    return DSMemoryStatusFlags64(
+        address_wrapped=(raw_addr >= capacity_bytes),
+        bank_lo=b_lo,
+        bank_hi=b_hi,
+        unaligned_qword=bool(eff_addr & 0x7),
+    )
+
+
 class ScalarDSInterpreter64:
     """Deterministic scalar execution interpreter for 64-bit Data Share (DS) instructions."""
+
+    def __init__(self) -> None:
+        self.last_condition_codes: Optional[DSAtomicConditionCodes64] = None
+        self.last_status_flags: Optional[DSMemoryStatusFlags64] = None
 
     def execute(self, state: ScalarThreadState64, inst: DSMaxRtnU64Instruction) -> int:
         """Execute ds_max_rtn_u64 on scalar thread state.
@@ -319,12 +366,16 @@ class ScalarDSInterpreter64:
         2. Read data from inst.vdata0 (64-bit VGPR pair).
         3. Perform atomic unsigned maximum on LDS at eff_addr = vaddr + offset.
         4. Write original 64-bit value into inst.vdst (64-bit VGPR pair).
-        5. Returns the returned old 64-bit memory value.
+        5. Evaluate condition codes and status flags.
+        6. Returns the returned old 64-bit memory value.
         """
         vaddr = state.get_vgpr_u32(inst.vaddr.index)
         vdata = state.get_vgpr_u64(inst.vdata0.index)
-        old_val, _ = state.lds.atomic_max_rtn_u64(vaddr, vdata, inst.offset)
+        old_val, new_val = state.lds.atomic_max_rtn_u64(vaddr, vdata, inst.offset)
         state.set_vgpr_u64(inst.vdst.index, old_val)
+
+        self.last_condition_codes = evaluate_atomic_max_condition_codes64(old_val, vdata, new_val)
+        self.last_status_flags = evaluate_lds_status_flags64(vaddr, inst.offset, state.lds.size_bytes)
         return old_val
 
 
@@ -954,6 +1005,115 @@ class TestDSMaxRtnU64RegisterAliasing(unittest.TestCase):
                 self.assertEqual(self.state.get_vgpr_u32(r), 0x70000000 + r)
         for s in range(DEFAULT_NUM_SGPRS):
             self.assertEqual(self.state.sgprs[s], 0x80000000 + s)
+
+
+class TestDSMaxRtnU64ConditionCodesAndFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory64(size_bytes=4096)
+        self.state = ScalarThreadState64(lds=self.lds)
+        self.interp = ScalarDSInterpreter64()
+
+    def test_condition_codes_zero_and_high_bit(self) -> None:
+        # Zero condition
+        self.lds.write_qword(0, 0)
+        self.state.set_vgpr_u32(2, 0)
+        self.state.set_vgpr_u64(4, 100)
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+        self.interp.execute(self.state, inst)
+        cc0 = self.interp.last_condition_codes
+        self.assertIsNotNone(cc0)
+        assert cc0 is not None
+        self.assertTrue(cc0.zero)
+        self.assertFalse(cc0.high_bit_set)
+        self.assertTrue(cc0.updated)
+        self.assertFalse(cc0.is_uint64_max)
+
+        # High bit set condition (>= 2^63)
+        self.lds.write_qword(8, 0x8000000000000000)
+        self.state.set_vgpr_u32(2, 8)
+        self.state.set_vgpr_u64(4, 0x7FFFFFFFFFFFFFFF)
+        self.interp.execute(self.state, inst)
+        cc_hb = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_hb)
+        assert cc_hb is not None
+        self.assertFalse(cc_hb.zero)
+        self.assertTrue(cc_hb.high_bit_set)
+        self.assertFalse(cc_hb.updated)  # 0x8000... > 0x7FFF... in unsigned
+
+    def test_condition_codes_is_uint64_max(self) -> None:
+        self.lds.write_qword(0x10, 500)
+        self.state.set_vgpr_u32(2, 0x10)
+        self.state.set_vgpr_u64(4, UINT64_MAX)
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+        self.interp.execute(self.state, inst)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.is_uint64_max)
+        self.assertTrue(cc.updated)
+
+    def test_status_flags_wrapping_and_alignment(self) -> None:
+        # Aligned in-bounds access: addr 0x20
+        self.state.set_vgpr_u32(2, 0x20)
+        self.state.set_vgpr_u64(4, 50)
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+            offset=0,
+        )
+        self.interp.execute(self.state, inst)
+        flags = self.interp.last_status_flags
+        self.assertIsNotNone(flags)
+        assert flags is not None
+        self.assertFalse(flags.address_wrapped)
+        self.assertFalse(flags.unaligned_qword)
+        self.assertEqual(flags.bank_lo, (0x20 >> 2) % 32)
+        self.assertEqual(flags.bank_hi, ((0x20 >> 2) + 1) % 32)
+
+        # Unaligned access: addr 0x24 (aligned to 4 bytes but not 8 bytes)
+        self.state.set_vgpr_u32(2, 0x24)
+        self.interp.execute(self.state, inst)
+        flags_unaligned = self.interp.last_status_flags
+        self.assertIsNotNone(flags_unaligned)
+        assert flags_unaligned is not None
+        self.assertTrue(flags_unaligned.unaligned_qword)
+
+        # Address wrapped: addr 4096 (exceeds 4096-byte LDS)
+        self.state.set_vgpr_u32(2, 4096)
+        self.interp.execute(self.state, inst)
+        flags_wrapped = self.interp.last_status_flags
+        self.assertIsNotNone(flags_wrapped)
+        assert flags_wrapped is not None
+        self.assertTrue(flags_wrapped.address_wrapped)
+
+    def test_vcc_and_scc_carry_borrow_isolation(self) -> None:
+        canary_vcc = 0x8877665544332211
+        canary_scc = 1
+        self.state.vcc = canary_vcc
+        self.state.scc = canary_scc
+
+        self.state.set_vgpr_u32(2, 0x80)
+        self.state.set_vgpr_u64(4, UINT64_MAX)
+        inst = DSMaxRtnU64Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR, count=2),
+            vaddr=RegisterOperand(2, RegType.VGPR, count=1),
+            vdata0=RegisterOperand(4, RegType.VGPR, count=2),
+        )
+        self.interp.execute(self.state, inst)
+
+        self.assertEqual(self.state.vcc, canary_vcc)
+        self.assertEqual(self.state.scc, canary_scc)
 
 
 if __name__ == "__main__":
