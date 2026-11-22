@@ -367,19 +367,20 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
-                 mock.patch("make_game.ensure_submodule", return_value=None), \
+                 mock.patch("make_game.ensure_submodule", return_value=None) as ensure_submodule, \
                  mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
                 # off Windows runtime checks the cross-build instead (tests/test_make_game_platform.py)
                 stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
                 make_game.preflight(stages, tmp_work, wav=True)
+                ensure_submodule.assert_called_once_with()
 
     def test_preflight_aggregates_multiple_missing_tools_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value=None), \
                  mock.patch("make_game.tool_available", return_value=False), \
-                 mock.patch("make_game.ensure_submodule", return_value=None), \
+                 mock.patch.object(make_game, "ROOT", tmp_work), \
                  mock.patch("os.path.isfile", return_value=False), \
                  mock.patch("os.name", "nt"):
                 err = self.assert_fails(make_game.preflight, ["shaders", "assets", "runtime"], tmp_work, wav=True,
@@ -535,13 +536,13 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch("sys.version_info", (3, 12, 0)), \
                  mock.patch("shutil.which", return_value="/usr/bin/tool"), \
                  mock.patch("make_game.tool_available", return_value=True), \
-                 mock.patch("make_game.ensure_submodule", return_value=None), \
-                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("make_game.ensure_submodule", return_value=None) as ensure_submodule, \
                  mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
                 # shaders (30) + assets (300) = 330 GB needed, only 250 GB free
                 err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
                                         match="about 330 GB is needed")
                 self.assertIn("250 GB free", err)
+                ensure_submodule.assert_not_called()
 
     def test_preflight_low_space_points_at_run_only_stages(self):
         with tempfile.TemporaryDirectory() as tmp_work:

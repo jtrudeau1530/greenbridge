@@ -594,7 +594,6 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         if not dotnet_sdk_ok():
             missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
                            "https://dotnet.microsoft.com/download/dotnet/8.0")
-        ensure_submodule()
     if os.name == "nt" and "runtime" in stages and not runtime_build and not visual_cpp_tools_ok():
         missing.append("Visual Studio 2022 with 'Desktop development with C++'")
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
@@ -643,6 +642,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
                     "(about 30 GB; add pipelines if you need it).")
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work." + hint)
+    if "assets" in stages:
+        ensure_submodule()
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
     if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
