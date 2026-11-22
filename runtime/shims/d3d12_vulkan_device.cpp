@@ -326,6 +326,17 @@ leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC
     return {id, slices.MipSlice, slices.FirstWSlice, count};
 }
 
+leonida::TargetView line_target_view(leonida::ResourceId id, const D3D12_RESOURCE_DESC& resource,
+                                     UINT mip, UINT first_layer, UINT layer_count) {
+    if (resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || mip >= resource.MipLevels ||
+        first_layer >= resource.DepthOrArraySize)
+        return {};
+    const UINT remaining = UINT(resource.DepthOrArraySize) - first_layer;
+    const UINT count = layer_count == UINT_MAX ? remaining : layer_count;
+    if (!count || count > remaining) return {};
+    return {id, mip, first_layer, count};
+}
+
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
 // texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
 // Keeps the optional VkImageFormatListCreateInfo alongside VkImageCreateInfo so info.pNext stays valid.
@@ -4258,6 +4269,11 @@ public:
             view = {rid, 0, 0, rd.DepthOrArraySize};
             if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
                 view = volume_rtv(rid, rd, desc);
+            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D) {
+                view = line_target_view(rid, rd, desc->Texture1D.MipSlice, 0, 1);
+            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY) {
+                view = line_target_view(rid, rd, desc->Texture1DArray.MipSlice,
+                                        desc->Texture1DArray.FirstArraySlice, desc->Texture1DArray.ArraySize);
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
                 view = {rid, desc->Texture2D.MipSlice, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) {
@@ -4294,15 +4310,19 @@ public:
                 if (typeless_rgba8 || (requested != rd.Format && listed &&
                                        rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
                     const bool msaa = rd.SampleDesc.Count > 1;
-                    const bool plain = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
-                    const bool array = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                    const bool plain_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D;
+                    const bool array_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
+                    const bool plain_2d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
+                    const bool array_2d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
                     const bool ms = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS;
                     const bool ms_array = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
-                    const UINT plane = plain ? desc->Texture2D.PlaneSlice :
-                        array ? desc->Texture2DArray.PlaneSlice : 0;
+                    const UINT plane = plain_2d ? desc->Texture2D.PlaneSlice :
+                        array_2d ? desc->Texture2DArray.PlaneSlice : 0;
+                    const bool dim_ok = ((plain_1d || array_1d) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) ||
+                                        ((plain_2d || array_2d || ms || ms_array) &&
+                                         rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
                     // Subtraction keeps malformed layer ranges from overflowing during validation.
-                    if ((!plain && !array && !ms && !ms_array) || rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-                        plane || !view.resource || view.mip >= rd.MipLevels ||
+                    if (!dim_ok || plane || !view.resource || view.mip >= rd.MipLevels ||
                         !view.layer_count || view.first_layer >= rd.DepthOrArraySize ||
                         view.layer_count > rd.DepthOrArraySize - view.first_layer ||
                         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
@@ -4342,7 +4362,12 @@ public:
         if (const Resource* r = Resource::from<Resource>(resource)) {
             const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
             view = {r->id(), 0, 0, rd.DepthOrArraySize};
-            if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) {
+            if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1D) {
+                view = line_target_view(r->id(), rd, desc->Texture1D.MipSlice, 0, 1);
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY) {
+                view = line_target_view(r->id(), rd, desc->Texture1DArray.MipSlice,
+                                        desc->Texture1DArray.FirstArraySlice, desc->Texture1DArray.ArraySize);
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) {
                 view = {r->id(), desc->Texture2D.MipSlice, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS) {
                 view = {r->id(), 0, 0, 1};
@@ -4624,10 +4649,20 @@ public:
         TextureView view{};
         view.mip_count = 1;
         if (!desc) {
-            if (r->desc().DepthOrArraySize > 1) view.type = leonida::gfx10::ImageType::image_2d_array;
+            const bool array = r->desc().DepthOrArraySize > 1;
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
+                view.type = leonida::gfx10::ImageType::image_1d;
+                view.layer_count = 1;
+            } else if (array)
+                view.type = leonida::gfx10::ImageType::image_2d_array;
         } else {
             view.format = desc->Format;
             switch (desc->ViewDimension) {
+            case D3D12_UAV_DIMENSION_TEXTURE1D:
+                view.type = leonida::gfx10::ImageType::image_1d;
+                view.first_mip = desc->Texture1D.MipSlice;
+                view.layer_count = 1;
+                break;
             case D3D12_UAV_DIMENSION_TEXTURE2D:
                 view.first_mip = desc->Texture2D.MipSlice;
                 view.layer_count = 1;
