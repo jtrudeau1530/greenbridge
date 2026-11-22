@@ -499,6 +499,11 @@ if(BUILD_TESTING)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
   add_executable(shader_library_test test/shader_library_test.cpp)
   add_test(NAME shader_library COMMAND shader_library_test)
+  # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
+  add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
+  add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)
+  # Reads all 26,503 containers and modules: about 9 minutes from a hard disk.
+  set_tests_properties(shader_library_corpus PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
   if(WIN32)
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
     add_executable(bink_decode_test
