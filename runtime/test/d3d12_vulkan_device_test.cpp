@@ -4773,6 +4773,44 @@ int main() {
         EXPECT(SUCCEEDED(zeroes->Map(0, nullptr, &zero_bytes)));
         report("placed buffer", 0, static_cast<std::uint8_t*>(zero_bytes), std::array<std::uint8_t, 64>{}.data(), 64);
         zeroes->Unmap(0, nullptr);
+
+        // Placed buffers carry their console VA in VulkanContext (so VA-resolved commands like WriteBufferImmediate
+        // find them) and placed readback buffers mark host_readable (so the submission flushes GPU writes to host).
+        {
+            D3D12_HEAP_DESC rb_heap_desc{};
+            rb_heap_desc.Properties.Type = D3D12_HEAP_TYPE_READBACK;
+            rb_heap_desc.SizeInBytes = 65536;
+            rb_heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            Ref<ID3D12Heap> rb_heap;
+            Ref<ID3D12Resource> placed_rb;
+            EXPECT(SUCCEEDED(standalone->CreateHeap(&rb_heap_desc, IID_PPV_ARGS(&rb_heap.p))));
+            EXPECT(SUCCEEDED(standalone->CreatePlacedResource(rb_heap.p, 0, &placed_buffer,
+                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                              IID_PPV_ARGS(&placed_rb.p))));
+            Ref<ID3D12GraphicsCommandList2> placed_list2;
+            EXPECT(SUCCEEDED(placed_list->QueryInterface(IID_PPV_ARGS(&placed_list2.p))));
+            EXPECT(SUCCEEDED(placed_allocator->Reset()) && SUCCEEDED(placed_list->Reset(placed_allocator.p, nullptr)));
+            const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER wp{placed_va + 16, 0xCAFEBABEu};
+            const D3D12_WRITEBUFFERIMMEDIATE_MODE wm = D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT;
+            placed_list2->WriteBufferImmediate(1, &wp, &wm);
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition = {placed_a.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE};
+            placed_list->ResourceBarrier(1, &b);
+            placed_list->CopyBufferRegion(placed_rb.p, 0, placed_a.p, 0, 64);
+            EXPECT(SUCCEEDED(placed_list->Close()));
+            queue->ExecuteCommandLists(1, placed_lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)) && SUCCEEDED(fence->SetEventOnCompletion(7, nullptr)));
+            void* rb_bytes = nullptr;
+            EXPECT(SUCCEEDED(placed_rb->Map(0, nullptr, &rb_bytes)));
+            std::uint32_t word = 0;
+            std::memcpy(&word, static_cast<const std::uint8_t*>(rb_bytes) + 16, sizeof(word));
+            EXPECT(word == 0xCAFEBABEu);
+            placed_rb->Unmap(0, nullptr);
+        }
+
         // The heap owns the range: releasing it puts the next heap of that size back at the same place.
         placed_image.reset();
         placed_b.reset();
