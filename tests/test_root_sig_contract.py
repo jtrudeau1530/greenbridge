@@ -65,6 +65,22 @@ def test_pack_layout_unknown_type():
     assert dwords == [] and "unknown type" in error
 
 
+def test_cli_refuses_boolean_root_constant_count(tmp_path):
+    index_path = tmp_path / "index.json"
+    index_path.write_text(json.dumps({"synthetic": {
+        "user_sgpr_reads": [{"sgpr": 0, "kind": "const32"}],
+    }}), encoding="utf-8")
+    sig_path = tmp_path / "sig.json"
+    sig_path.write_text(json.dumps({
+        "params": [{"type": "constants", "count": True}],
+    }), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
+        capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "root signature refused: param 0: constants need an integer count >= 1" in result.stdout
+
+
 def test_reconcile_compatible():
     dwords, _ = rsc.pack_layout(ROOT_SIG)
     reads = [{"sgpr": 0, "kind": "const32"},
