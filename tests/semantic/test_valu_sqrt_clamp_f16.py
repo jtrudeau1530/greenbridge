@@ -1009,5 +1009,147 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
             self.assertEqual(res, expected)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            RegHalf(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegHalf(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegHalf(300, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = RegHalf(0, RegType.SGPR)
+        src = VOP3Operand(RegHalf(2, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VSqrtClampF16Instruction(dst=dst_sgpr, src0=src)
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        s0 = QUARTER_F16
+        correct = ref_sqrt_clamp_f16(s0)
+        self.assertEqual(correct, HALF_F16)
+
+        # Perturb single mantissa bit
+        corrupted_mantissa = correct ^ 0x1
+        self.assertNotEqual(correct, corrupted_mantissa)
+
+        # Perturb single exponent bit
+        corrupted_exp = correct ^ (1 << 10)
+        self.assertNotEqual(correct, corrupted_exp)
+
+        # Perturb sign bit
+        corrupted_sign = correct ^ SIGN_MASK
+        self.assertNotEqual(correct, corrupted_sign)
+
+    def test_mutation_fail_to_clamp_upper_bound(self) -> None:
+        """Mutant: Values > 1.0 are not clamped."""
+        def mutant_sqrt(s0_bits: int) -> int:
+            f0 = bits_to_f16(s0_bits)
+            return f16_to_bits(math.sqrt(f0))
+
+        s0 = FOUR_F16
+        expected = ref_sqrt_clamp_f16(s0)
+        self.assertEqual(expected, ONE_F16)
+
+        mutant = mutant_sqrt(s0)
+        self.assertNotEqual(expected, mutant)
+        self.assertEqual(mutant, TWO_F16)
+
+    def test_mutation_fail_to_clamp_negative_nan(self) -> None:
+        """Mutant: Negative input returns NaN instead of being clamped to +0.0."""
+        def mutant_sqrt(s0_bits: int) -> int:
+            return CANONICAL_QNAN
+
+        s0 = FOUR_F16 | SIGN_MASK
+        expected = ref_sqrt_clamp_f16(s0)
+        self.assertEqual(expected, POS_ZERO)
+
+        mutant = mutant_sqrt(s0)
+        self.assertNotEqual(expected, mutant)
+
+    def test_mutation_ignore_abs_modifier(self) -> None:
+        """Mutant: Ignore abs modifier on negative operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if neg_mod:
+                res ^= SIGN_MASK
+            return res
+
+        val = FOUR_F16 | SIGN_MASK  # -4.0
+        # Correct with abs0=True yields 1.0 (sqrt(|-4|) = 2 -> clamped to 1)
+        expected = ref_sqrt_clamp_f16(val, abs0=True)
+        self.assertEqual(expected, ONE_F16)
+
+        # If abs is ignored, -4.0 produces +0.0 (clamped NaN)
+        mutant_input = mutant_apply_mod(val, abs_mod=True, neg_mod=False)
+        mutant_res = ref_sqrt_clamp_f16(mutant_input)
+        self.assertNotEqual(expected, mutant_res)
+        self.assertEqual(mutant_res, POS_ZERO)
+
+    def test_mutation_ignore_neg_modifier(self) -> None:
+        """Mutant: Ignore neg modifier on positive operand."""
+        def mutant_apply_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & 0xFFFF
+            if abs_mod:
+                res &= ~SIGN_MASK
+            return res
+
+        val = QUARTER_F16  # 0.25
+        # Correct with neg0=True negates to -0.25 -> clamped to +0.0
+        expected = ref_sqrt_clamp_f16(val, neg0=True)
+        self.assertEqual(expected, POS_ZERO)
+
+        # If neg is ignored, 0.25 produces 0.5
+        mutant_input = mutant_apply_mod(val, abs_mod=False, neg_mod=True)
+        mutant_res = ref_sqrt_clamp_f16(mutant_input)
+        self.assertNotEqual(expected, mutant_res)
+        self.assertEqual(mutant_res, HALF_F16)
+
+    def test_mutation_ignore_exec_mask(self) -> None:
+        """Mutant: Inactive SIMD lanes are overwritten despite EXEC mask."""
+        sentinel = 0xCAFE
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.set_vgpr16(lane, 4, HalfSelect.LO, sentinel)
+
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VSqrtClampF16Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    res = ref_sqrt_clamp_f16(QUARTER_F16)
+                    state.set_vgpr16(lane, instr.dst.index, instr.dst.half, res)
+                    results.append(res)
+                return results
+
+        mutant_interp = MutantSIMDInterpreter()
+        instr = VSqrtClampF16Instruction(
+            dst=RegHalf(4, RegType.VGPR, HalfSelect.LO),
+            src0=VOP3Operand(Literal16.from_float(0.25)),
+        )
+        mutant_interp.step(instr, state)
+        corrupted_lanes = [
+            lane for lane in range(32)
+            if state.get_vgpr16(lane, 4, HalfSelect.LO) != sentinel
+        ]
+        self.assertEqual(len(corrupted_lanes), 32)
+
+    def test_mutation_subnormal_flush_to_zero(self) -> None:
+        """Mutant: Subnormal input is flushed to zero instead of producing normalized root."""
+        sub = 0x0001
+        correct = ref_sqrt_clamp_f16(sub)
+        self.assertEqual(correct, 0x0C00)
+
+        ftz_mutant = POS_ZERO
+        self.assertNotEqual(correct, ftz_mutant)
+
+
 if __name__ == "__main__":
     unittest.main()
