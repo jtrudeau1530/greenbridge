@@ -53,6 +53,10 @@ class DefaultStagesTest(unittest.TestCase):
         self.assertEqual(stages, make_game.STAGES)
         self.assertTrue(ran["runtime"])
 
+    def test_explicit_full_stage_list_reaches_preflight_off_windows(self):
+        stages, _ = self.run_main("posix", "--stages", ",".join(make_game.STAGES), "--wave64-emulate", "off")
+        self.assertEqual(stages, make_game.STAGES)
+
     def test_explicit_stages_are_kept_as_given(self):
         stages, _ = self.run_main("posix", "--stages", "shaders,runtime")
         self.assertEqual(stages, ["shaders", "runtime"])

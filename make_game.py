@@ -666,7 +666,7 @@ def main() -> int:
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
     ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida)")
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
-    ap.add_argument("--stages", default=",".join(STAGES), help="comma list from: " + ",".join(STAGES))
+    ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--wav", action="store_true",
@@ -702,11 +702,13 @@ def main() -> int:
             inside = False
         if inside:
             fail("--out and --work must be outside the game folder.")
-    stages = [s.strip() for s in a.stages.split(",") if s.strip()]
-    for s in stages:
-        if s not in STAGES:
-            fail(f"unknown stage '{s}'")
-    if os.name != "nt" and a.stages == ap.get_default("stages"):
+    stages = STAGES
+    if a.stages is not None:
+        stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+        for s in stages:
+            if s not in STAGES:
+                fail(f"unknown stage '{s}'")
+    elif os.name != "nt":
         stages = [s for s in stages if s not in WINDOWS_ONLY]
         log(f"{', '.join(WINDOWS_ONLY)}: left out, it builds on Windows only for now")
     preflight(stages, work, a.wav)
