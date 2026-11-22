@@ -149,13 +149,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "unsupported: no Vulkan physical device\n");
         return 77;  // a missing device is a skip in every texture-test mode
     }
-    // The GPU the other harnesses take: native driver first, and LEONIDA_VK_DEVICE picks one by name.
+    // LEONIDA_VK_DEVICE picks one GPU on a machine with several, as in the other test programs.
     std::vector<VkPhysicalDeviceProperties> candidates(n);
     for (uint32_t i = 0; i < n; ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
-    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
-    if (chosen == candidates.size()) {
+    const size_t chosen = leonida::vk_test::pick_device(candidates);
+    if (chosen >= n) {
         leonida::vk_test::report_no_device();
-        return 1;     // a filter that names no GPU is a wrong command line, not a skip (as vk_compute_test)
+        return 1;
     }
     VkPhysicalDevice pd = pds[chosen];
     VkPhysicalDeviceProperties properties = candidates[chosen];
