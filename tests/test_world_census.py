@@ -547,9 +547,20 @@ class MainTest(unittest.TestCase):
                 self.assertIn("not an RPF9 archive", err)
         self.assertFalse(os.path.exists(self.out))
 
+    def test_missing_or_folder_archive_is_one_line(self):
+        for archive in (os.path.join(self.dir, "no_such.rpf"), self.dir):
+            with self.subTest(archive=os.path.basename(archive)):
+                code, out, err = self.run_main(archive, "--out", self.out)
+                self.assertEqual(code, 2)
+                self.assertTrue(err.startswith(archive + ": "), err)
+                self.assertEqual(len(err.strip().splitlines()), 1)
+                self.assertEqual(out, "")
+        self.assertFalse(os.path.exists(self.out))
+
     def test_bad_scan_range(self):
         size = os.path.getsize(self.arc)
-        for args in (("--start", "16"), ("--start", str(size)), ("--start", str(size + 100)), ("--limit", "-1")):
+        for args in (("--start", "16"), ("--start", str(size)), ("--start", str(size + 100)), ("--limit", "-1"),
+                     ("--limit", "0")):     # 0 bytes is an empty range, not "no limit" (it scanned everything)
             with self.subTest(args=args):
                 code, _, err = self.run_main(self.arc, "--out", self.out, "--jobs", "1", *args)
                 self.assertEqual(code, 2)
