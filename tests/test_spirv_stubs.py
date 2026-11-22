@@ -149,6 +149,16 @@ class MalformedIndexTest(unittest.TestCase):
         self.assertIn("index.json", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_help_prints_usage_and_exits_zero(self):
+        tool = os.path.join(ROOT, "tools", "spirv_stubs.py")
+        for flag in ("-h", "--help"):
+            with self.subTest(flag=flag):
+                p = subprocess.run([sys.executable, "-I", tool, flag], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0)
+                self.assertIn("spirv_stubs.py <spirv dir>", p.stdout)
+                self.assertEqual(p.stderr, "")
+                self.assertEqual(spirv_stubs.main([flag]), 0)
+
     def test_valid_json_of_the_wrong_shape_is_one_error(self):
         for contents in ("5", "[]"):
             with self.subTest(contents=contents):

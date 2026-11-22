@@ -240,6 +240,9 @@ def generate_for_index(spirv_dir, index):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
     if len(argv) != 1:
         sys.exit(__doc__)
     spirv_dir = argv[0]

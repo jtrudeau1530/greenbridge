@@ -266,6 +266,17 @@ class MainTests(unittest.TestCase):
                 self.assertEqual(proc.stdout, "")
         self.assertEqual(sorted(os.listdir(self.root)), ["index.json"])      # no types.json was written
 
+    def test_help_prints_usage_and_writes_nothing(self):
+        tool = os.path.join(ROOT, "tools", "classify_carve.py")
+        for flag in ("-h", "--help"):
+            with self.subTest(flag=flag):
+                proc = subprocess.run([sys.executable, "-I", tool, flag], capture_output=True, text=True,
+                                      cwd=self.root)
+                self.assertEqual(proc.returncode, 0)
+                self.assertIn("usage", proc.stdout)
+                self.assertEqual(proc.stderr, "")
+        self.assertEqual(os.listdir(self.root), [])                            # nothing read or written
+
     def test_failed_write_preserves_previous_report(self):
         self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
         self.run_main()
