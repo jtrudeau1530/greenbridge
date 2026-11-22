@@ -274,6 +274,10 @@ class CrossBuildTest(unittest.TestCase):
         os.makedirs(self.game)
 
     def runtime(self, xwin="/sdk", ninja=True, suffix="", configured=None):
+        def which(t):
+            if t == "ninja":
+                return "/usr/bin/ninja" if ninja else None
+            return f"/usr/bin/{t}" if suffix else None
         def fake_run(args, hint="", **kw):
             if args[1] == "--build":
                 os.makedirs(self.build, exist_ok=True)
@@ -283,7 +287,7 @@ class CrossBuildTest(unittest.TestCase):
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch.object(make_game, "ROOT", self.root), \
                 mock.patch.object(make_game, "xwin_dir", return_value=xwin), \
-                mock.patch.object(make_game.shutil, "which", side_effect=lambda t: "/usr/bin/ninja" if ninja else None), \
+                mock.patch.object(make_game.shutil, "which", side_effect=which), \
                 mock.patch.object(make_game, "cross_tool_suffix", return_value=suffix), \
                 mock.patch.object(make_game, "configured_cross_tools", return_value=configured or {}), \
                 mock.patch.object(make_game, "run", side_effect=fake_run) as self.run_mock, \
@@ -310,7 +314,7 @@ class CrossBuildTest(unittest.TestCase):
                 open(os.path.join(self.build, "CMakeCache.txt"), "w").close()
             configure, _ = self.runtime(suffix="-21")
             for var, name in make_game.CROSS_VARS.items():
-                self.assertIn(f"-DCMAKE_{var}={name}-21", configure)
+                self.assertIn(f"-DCMAKE_{var}=/usr/bin/{name}-21", configure)
         configure, _ = self.runtime(suffix="-21", configured={"CMAKE_CXX_COMPILER": "/usr/bin/clang-cl-21"})
         self.assertFalse(any(a.startswith("-DCMAKE_CXX_COMPILER") for a in configure))
 

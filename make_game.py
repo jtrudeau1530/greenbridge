@@ -967,7 +967,8 @@ def cross_configure() -> str:
              "\"The Windows runtime on Linux\"), and no --runtime-build.")
     build = cross_build_dir()
     suffix = "" if configured_cross_tools() else cross_tool_suffix() or ""
-    tools = [f"-DCMAKE_{var}={name}{suffix}" for var, name in CROSS_VARS.items()] if suffix else []
+    tools = [f"-DCMAKE_{var}={shutil.which(name + suffix) or name + suffix}" for var, name in CROSS_VARS.items()
+             ] if suffix else []
     cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
                     f"-DXWIN_DIR={xwin}", *tools, hint="CMake's error above says what the cross-build lacks "
                     "(docs/testing.md, \"The Windows runtime on Linux\"). Or pass --runtime-build, or drop "
