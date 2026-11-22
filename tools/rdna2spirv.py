@@ -6848,8 +6848,13 @@ class Gen:
             # Measured on RDNA2 hardware (docs/design.md, "Signed-byte dot products"), where clamp saturates
             # v_dot4_i32_i8 to a signed 32-bit value and op_sel picks the 16-bit half of a source each half of the
             # product reads. llvm-mc prints neither for the programs measured, so both forms are refused, not guessed.
+            # neg_lo/neg_hi are not ignored either: measured on v_dot4_i32_i8, they flip bit 15 and bit 31 of a
+            # source dword (and take the addend's absolute value, then negate it), as if the operands were floats.
+            # A set bit is refused; an all-zero field is the plain instruction.
             if "clamp" in mods or any(m.startswith("op_sel") for m in mods):
                 raise Unsupported(op + (" clamp" if "clamp" in mods else " op_sel"))
+            if any(m.startswith(("neg_lo", "neg_hi")) and "1" in m.split(":", 1)[-1] for m in mods):
+                raise Unsupported(op + " neg")
             x, y = self.src_u(a[1]), self.src_u(a[2])
             acc = self.src_u(a[3]) if op == "v_dot4_i32_i8" else self.src_u(a[0])
             for i in range(4):
