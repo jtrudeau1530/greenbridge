@@ -752,7 +752,11 @@ def fallback_flags(a) -> tuple[str, ...]:
 def smallest_max_subgroup(vulkaninfo_text: str):
     """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
-    starts = [m.start() for m in re.finditer(r'deviceName"?\s*[=:]', vulkaninfo_text)]
+    # A device's own name is the least indented one; deeper ones (VK_KHR_maintenance7's layered APIs, e.g.
+    # MoltenVK's Metal device, in both the text and the --json output) belong to the device above them.
+    names = list(re.finditer(r'(?m)^([ \t]*)"?deviceName"?\s*[=:]', vulkaninfo_text))
+    depth = min((len(m.group(1)) for m in names), default=0)
+    starts = [m.start() for m in names if len(m.group(1)) == depth]
     if not starts:
         sizes = [int(n) for n in re.findall(size, vulkaninfo_text)]
         return min(sizes) if sizes else None

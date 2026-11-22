@@ -118,6 +118,20 @@ class DetectionGapsTest(unittest.TestCase):
         text = real_format(("Big GPU", 64, ALL)) + "VkPhysicalDeviceProperties:\n\tdeviceName        = Old GPU\n"
         self.assertIsNone(make_game.smallest_max_subgroup(text))      # one device says nothing: unknown, so on
 
+    def test_a_layered_api_name_is_not_another_device(self):
+        # VK_KHR_maintenance7 lists a layered driver's underlying API (MoltenVK on Metal) with its own deviceName,
+        # indented deeper and printed before the subgroup block: it is the same device, not one without a size.
+        layered = ("GPU0:\nVkPhysicalDeviceProperties:\n\tdeviceName        = Apple M2 Max\n"
+                   "VkPhysicalDeviceLayeredApiPropertiesListKHR:\n\tpLayeredApis: count = 1\n\t\t0:\n"
+                   "\t\t\tlayeredAPI = PHYSICAL_DEVICE_LAYERED_API_METAL_KHR\n\t\t\tdeviceName = Apple M2 Max\n"
+                   "VkPhysicalDeviceSubgroupSizeControlProperties:\n\tmaxSubgroupSize = 32\n")
+        self.assertEqual(make_game.smallest_max_subgroup(layered), 32)
+        layered_json = ('{"VkPhysicalDeviceProperties": {\n\t\t"deviceName": "Apple M2 Max"},\n'
+                        '\t"VkPhysicalDeviceLayeredApiPropertiesListKHR": {"pLayeredApis": [\n'
+                        '\t\t\t{"layeredAPI": 3,\n\t\t\t "deviceName": "Apple M2 Max"}]},\n'
+                        '\t"VkPhysicalDeviceSubgroupSizeControlProperties": {\n\t\t"maxSubgroupSize": 32}}')
+        self.assertEqual(make_game.smallest_max_subgroup(layered_json), 32)
+
     def test_a_device_printing_the_size_twice_does_not_hide_one_that_prints_none(self):
         twice = ("VkPhysicalDeviceProperties:\n\tdeviceName        = A\n"
                  "VkPhysicalDeviceSubgroupSizeControlProperties:\n\tmaxSubgroupSize = 64\n"
