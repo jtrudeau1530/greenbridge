@@ -30,7 +30,7 @@ slices/faces for arrays and cubemaps; BC1, BC3, BC4_UNORM and BC5_UNORM) or 3D
 Z-continuity vs 2D control for float16 volumes. `export` writes a DX10 DDS when
 every source mip uses a supported codec.
 
-    python -I tools/ttpf_mips.py scan <game root or pool paths...> [--json out] [--tuples]
+    python -I tools/ttpf_mips.py scan <game root, pool folders or pool paths...> [--json out] [--tuples]
     python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
     python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional] [--history path]
     python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--mips N] [--force] [--allow-provisional] [--history path]
@@ -898,11 +898,15 @@ def same_output_path(first, second):
 
 
 def find_pools(arg):
+    """Pools under a game root (data/ttdb and pack/*/data/ttdb), or, for any other folder such as data/ttdb
+    itself or one pack, every .ttpf below it. A file is taken as a pool."""
     if os.path.isfile(arg):
         return [arg]
     pools = sorted(glob.glob(os.path.join(arg, "data", "ttdb", "**", "*.ttpf"), recursive=True))
     pools += sorted(glob.glob(os.path.join(arg, "pack", "*", "data", "ttdb", "**", "*.ttpf"),
                                 recursive=True))
+    if not pools:
+        pools = sorted(glob.glob(os.path.join(arg, "**", "*.ttpf"), recursive=True))
     return pools
 
 
@@ -1550,7 +1554,12 @@ def main(argv=None):
     if a.cmd == "scan":
         pools = []
         for p in a.paths:
-            pools += find_pools(p)
+            found = find_pools(p)
+            if not found:   # a mistyped path would otherwise report an all-zero scan and exit 0
+                why = "no such file or folder" if not os.path.exists(p) else "no .ttpf pool in it"
+                print(f"ERROR: {p}: {why}", file=sys.stderr)
+                return 2
+            pools += found
         # The report is written after every pool is read: a pool given as --json used to be replaced by it.
         if a.json:
             if os.path.isdir(a.json):

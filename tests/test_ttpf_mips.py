@@ -749,6 +749,30 @@ class SyntheticPoolTest(unittest.TestCase):
         self.assertEqual((result["after_full"], result["after_partial"],
                           result["after_skip"]), (1, 0, 0))
 
+    def test_scan_finds_pools_below_any_folder_and_rejects_paths_without_one(self):
+        """A pool folder other than the game root (data/ttdb itself, one pack) is searched recursively; a
+        path with no pool is an error, not an all-zero scan with exit code 0."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        ttdb = os.path.join(self.tmp.name, "game", "data", "ttdb", "props")
+        os.makedirs(ttdb)
+        build_pool(os.path.join(ttdb, "a.ttpf"))
+        out = os.path.join(self.tmp.name, "scan.json")
+        for folder in (os.path.join(self.tmp.name, "game"), os.path.dirname(ttdb), ttdb):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(ttpf.main(["scan", folder, "--json", out]), 0, folder)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["total"]["pools"], 1, folder)
+        empty = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty)
+        for bad, why in ((os.path.join(self.tmp.name, "missing"), "no such file or folder"),
+                         (empty, "no .ttpf pool in it")):
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                self.assertEqual(ttpf.main(["scan", self.path, bad]), 2, bad)
+            self.assertIn(why, err.getvalue())
+            self.assertIn(bad, err.getvalue())
+
     def test_scan_counts_an_unlisted_tuple_as_gated(self):
         path = os.path.join(self.tmp.name, "unlisted.ttpf")
         build_pool(path, meta=0x599)
