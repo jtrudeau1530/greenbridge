@@ -1661,6 +1661,10 @@ def main(argv=None):
     ap.add_argument("--fma", choices=("glsl", "khr"), default="glsl",
                     help="with the translator oracle: emit the fused multiply-adds as GLSL Fma (default) or OpFmaKHR")
     ap.add_argument("--keep", help="write the kernel body of every hardware mismatch to this folder")
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        ap.error("no arguments given; pass --help for the available options")
     a = ap.parse_args(argv)
     rdna2spirv.FMA_KHR = a.fma == "khr"
     if a.programs < 1:
