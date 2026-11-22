@@ -947,53 +947,170 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
     """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
 
     def test_nan_as_wrap_threshold_inc(self) -> None:
-        # With threshold = QNAN_F32 (0x7FC00000)
-        # val_a = 0 < 0x7FC00000 -> increments to 1
         self.assertEqual(ref_ds_inc_src2_u32(0, QNAN_F32), 1)
-
-        # val_a = QNAN_F32 >= QNAN_F32 -> wraps to 0
         self.assertEqual(ref_ds_inc_src2_u32(QNAN_F32, QNAN_F32), 0)
-
-        # val_a = NEG_ZERO_F32 (0x80000000) > QNAN_F32 (0x7FC00000) -> wraps to 0
         self.assertEqual(ref_ds_inc_src2_u32(NEG_ZERO_F32, QNAN_F32), 0)
 
     def test_subnormal_increment_and_transitions(self) -> None:
-        # Incrementing minimum subnormal yields next subnormal
         val = MIN_SUBNORMAL_F32
         res = ref_ds_inc_src2_u32(val, POS_INF_F32)
         self.assertEqual(res, 0x00000002)
         self.assertTrue(is_f32_subnormal(res))
 
-        # Boundary transition from MAX_SUBNORMAL to MIN_NORMAL
         res_norm = ref_ds_inc_src2_u32(MAX_SUBNORMAL_F32, POS_INF_F32)
         self.assertEqual(res_norm, MIN_NORMAL_F32)
         self.assertFalse(is_f32_subnormal(res_norm))
 
     def test_float_zeros_unsigned_asymmetry(self) -> None:
-        # In float +0.0 == -0.0, but in u32: POS_ZERO (0) < NEG_ZERO (0x80000000)
         self.assertEqual(ref_ds_inc_src2_u32(POS_ZERO_F32, NEG_ZERO_F32), 1)
         self.assertEqual(ref_ds_inc_src2_u32(NEG_ZERO_F32, POS_ZERO_F32), 0)
-
-        # In dec: 0 wraps to limit
         self.assertEqual(ref_ds_dec_src2_u32(POS_ZERO_F32, NEG_ZERO_F32), NEG_ZERO_F32)
-        # In dec: NEG_ZERO > POS_ZERO (0x80000000 > 0) wraps to 0
         self.assertEqual(ref_ds_dec_src2_u32(NEG_ZERO_F32, POS_ZERO_F32), POS_ZERO_F32)
-
-        # Adding NEG_ZERO to NEG_ZERO wraps modulo 2^32 to POS_ZERO
         self.assertEqual(ref_ds_add_src2_u32(NEG_ZERO_F32, NEG_ZERO_F32), POS_ZERO_F32)
 
     def test_infinity_threshold_arithmetic(self) -> None:
-        # Adding 1 to MAX_NORMAL_F32 (0x7F7FFFFF) produces POS_INF_F32 (0x7F800000)
         self.assertEqual(ref_ds_add_src2_u32(MAX_NORMAL_F32, 1), POS_INF_F32)
-        # Subtracting 1 from POS_INF_F32 produces MAX_NORMAL_F32
         self.assertEqual(ref_ds_sub_src2_u32(POS_INF_F32, 1), MAX_NORMAL_F32)
 
     def test_integer_boundary_extremes(self) -> None:
-        # Wrapping at 0xFFFFFFFF
         self.assertEqual(ref_ds_inc_src2_u32(MASK32, MASK32), 0)
         self.assertEqual(ref_ds_dec_src2_u32(0, MASK32), MASK32)
         self.assertEqual(ref_ds_add_src2_u32(MASK32, MASK32), MASK32 - 1)
         self.assertEqual(ref_ds_sub_src2_u32(0, MASK32), 1)
+
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(500, RegType.SGPR)
+
+    def test_syntax_rejection_offsets(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset0=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset0=256)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset1=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(v0, offset1=256)
+
+    def test_syntax_rejection_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=-100)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=1000)  # Not a power of 2
+
+    def test_syntax_rejection_simd_lanes(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_mutation_detection_inc_strict_greater(self) -> None:
+        # Mutant: wraps only on `val_a > val_b` instead of `>=`
+        def mutant_inc(a: int, b: int) -> int:
+            return 0 if u32(a) > u32(b) else u32(a + 1)
+
+        # Equality case must fail on mutant!
+        val_a, val_b = 5, 5
+        correct_res = ref_ds_inc_src2_u32(val_a, val_b)
+        mutant_res = mutant_inc(val_a, val_b)
+        self.assertEqual(correct_res, 0)
+        self.assertEqual(mutant_res, 6)
+        self.assertNotEqual(correct_res, mutant_res)
+
+    def test_mutation_detection_dec_missing_zero(self) -> None:
+        # Mutant: forgets the `val_a == 0` wrap check
+        def mutant_dec(a: int, b: int) -> int:
+            return u32(b) if u32(a) > u32(b) else u32(a - 1)
+
+        val_a, val_b = 0, 8
+        correct_res = ref_ds_dec_src2_u32(val_a, val_b)
+        mutant_res = mutant_dec(val_a, val_b)
+        self.assertEqual(correct_res, 8)
+        self.assertEqual(mutant_res, MASK32)
+        self.assertNotEqual(correct_res, mutant_res)
+
+    def test_mutation_detection_sub_reversed(self) -> None:
+        # Mutant: subtracts minuend from subtrahend
+        def mutant_sub(a: int, b: int) -> int:
+            return u32(u32(b) - u32(a))
+
+        val_a, val_b = 20, 5
+        correct_res = ref_ds_sub_src2_u32(val_a, val_b)
+        mutant_res = mutant_sub(val_a, val_b)
+        self.assertEqual(correct_res, 15)
+        self.assertEqual(mutant_res, u32(-15))
+        self.assertNotEqual(correct_res, mutant_res)
+
+    def test_mutation_detection_simd_exec_leak(self) -> None:
+        # Mutant interpreter that executes regardless of EXEC mask
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def execute(self, instr: DSSrc2Instruction, state: SIMDState) -> None:
+                for lane in range(state.num_lanes):
+                    # Bug: missing `if not state.is_lane_active(lane): continue`
+                    base_addr = state.get_lane_vgpr(lane, instr.addr.base_reg.index)
+                    _, _, idx_a, _ = calc_lds_src2_addresses(
+                        vaddr=base_addr,
+                        offset0=instr.addr.offset0,
+                        offset1=instr.addr.offset1,
+                        lds_dwords=state.lds.size_dwords,
+                    )
+                    state.lds.write_dword(idx_a, 999)
+
+        state = SIMDState(num_lanes=32, exec_mask=0, lds_dwords=1024)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_ADD_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+        state.lds.write_dword(0, 42)
+
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(instr, state)
+        # Mutant erroneously modified LDS dword 0 from 42 to 999 despite EXEC=0
+        self.assertEqual(state.lds.read_dword(0), 999)
+
+        # Standard interpreter correctly preserves 42
+        state.lds.write_dword(0, 42)
+        standard = SIMDInterpreter()
+        standard.execute(instr, state)
+        self.assertEqual(state.lds.read_dword(0), 42)
+
+    def test_mutation_detection_vaddr_clobber(self) -> None:
+        # Mutant interpreter that corrupts base_reg VGPR
+        class MutantScalarInterpreter(ScalarInterpreter):
+            def execute(self, instr: DSSrc2Instruction, state: ScalarMachineState) -> None:
+                super().execute(instr, state)
+                # Bug: clobbers base_reg
+                state.set_vgpr(instr.addr.base_reg.index, 0xDEADBEEF)
+
+        state = ScalarMachineState(lds_dwords=1024)
+        state.set_vgpr(0, 0x100)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSSrc2Instruction(
+            DSOpcode.DS_INC_SRC2_U32,
+            LDSAddressExpression(v0, offset0=0, offset1=1),
+        )
+
+        mutant = MutantScalarInterpreter()
+        mutant.execute(instr, state)
+        self.assertEqual(state.get_vgpr(0), 0xDEADBEEF)
+
+        # Reset and verify correct interpreter never clobbers vaddr
+        state.set_vgpr(0, 0x100)
+        standard = ScalarInterpreter()
+        standard.execute(instr, state)
+        self.assertEqual(state.get_vgpr(0), 0x100)
 
 
 if __name__ == "__main__":
