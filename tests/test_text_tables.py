@@ -308,6 +308,31 @@ class TestCli(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("cannot read input", err.getvalue())
 
+    def test_wrong_shape_labels_json_is_clean_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "en.bin"), make_resource(EN))
+            for text in ("[1, 2]", '"x"', "null"):
+                with self.subTest(text):
+                    labels = os.path.join(tmp, "labels.json")
+                    with open(labels, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(text)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = T.main([src, "--labels", labels])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("cannot read input", err.getvalue())
+
+    def test_carve_folder_with_wrong_shape_index_is_clean_error(self):
+        for name, text in (("list", "[]"), ("nofiles", "{}"), ("badrow", '{"files": [1]}')):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = T.main([tmp])
+                self.assertEqual(rc, 2)
+                self.assertIn("cannot read input", err.getvalue())
+
 
 UNDECIDED = {"ZZ_CODE_1": "qqq zzz", "ZZ_CODE_2": "xkcd 42"}        # no script, letter or word decides: xx
 
