@@ -3200,10 +3200,9 @@ public:
                 }
             }
             if (fs->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
-                // D3D12 never renders to the shared-exponent format, but a Vulkan driver may: AMD's RDNA4 driver
-                // (26.11.2) gives E5B9G9R9_UFLOAT_PACK32 COLOR_ATTACHMENT and COLOR_ATTACHMENT_BLEND, which the
-                // checks above turned into render-target, blend and multisample support the PC runtime doesn't report.
-                s1 &= ~(D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
+                // The native packed format supports single-sample RTVs on some adapters.
+                // Only that usage has been verified through the shim's render-target path.
+                s1 &= ~(D3D12_FORMAT_SUPPORT1_BLENDABLE |
                         D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
                         D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD);
             }
