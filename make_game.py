@@ -649,21 +649,49 @@ def unpacked_shader_stems(dxbc: str) -> set[str] | None:
     return unpacked if unpacked and unpacked <= carved else None
 
 
-def disassembly_files_match(dxbc: str) -> bool:
-    names = unpacked_shader_stems(dxbc)
-    if names is None:
-        return False
+def disassembly_listings(dxbc: str) -> set[str] | None:
     try:
         with os.scandir(os.path.join(dxbc, "disasm")) as entries:
-            return all(entry.name[:-2] in names and not entry.is_symlink() for entry in entries
-                       if entry.name.endswith(".s") and (entry.is_file() or entry.is_symlink()))
+            listings = set()
+            for entry in entries:
+                if not entry.name.endswith(".s"):
+                    continue
+                if entry.is_symlink():
+                    return None
+                if entry.is_file():
+                    listings.add(entry.name[:-2])
+            return listings
     except OSError:
-        return False
+        return None
 
 
-def disassembly_matches(dxbc: str, signature: str) -> bool:
-    return (read_shader_setting(os.path.join(dxbc, "disasm.done")) == signature
-            and disassembly_files_match(dxbc))
+def disassembly_status(dxbc: str, signature: str) -> tuple[bool, bool, set[str]]:
+    """Report readiness, whether existing listings can be reused, and any repair inventory."""
+    done = read_shader_setting(os.path.join(dxbc, "disasm.done"))
+    marker = done or read_shader_setting(os.path.join(dxbc, "disasm.started"))
+    inactive = (False, False, set())
+    if not marker:
+        return inactive
+    active = unpacked_shader_stems(dxbc)
+    listings = disassembly_listings(dxbc)
+    if active is None or listings is None or not listings <= active:
+        return inactive
+    if marker == signature:
+        # Older completion markers recorded only LLVM. Require a listing for every input.
+        return (listings == active, False, set()) if done else (False, True, set())
+    try:
+        metadata = json.loads(marker)
+    except ValueError:
+        return inactive
+    if not isinstance(metadata, dict) or metadata.get("llvm") != signature:
+        return inactive
+    recorded = metadata.get("listings")
+    if not isinstance(recorded, list) or not recorded or not all(isinstance(name, str) for name in recorded):
+        return inactive
+    expected = set(recorded)
+    if not listings <= expected <= active:
+        return inactive
+    return bool(done) and listings == expected, True, expected
 
 
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
@@ -681,7 +709,7 @@ def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
             and read_shader_setting(os.path.join(spirv, "translator_flags.txt")) == translator_flags_setting(fallbacks)
             and read_shader_setting(os.path.join(spirv, "translation_sources.sha256")) == translation_sources_digest()
             and os.path.isfile(os.path.join(dxbc, "disasm.done"))
-            and disassembly_matches(dxbc, llvm_mc_signature()))
+            and disassembly_status(dxbc, llvm_mc_signature())[0])
 
 
 def prepare_shader_disassembly(work: str, disasm: str, resume: bool) -> None:
@@ -707,7 +735,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     carved = os.path.join(dxbc, "index.json")             # shader_carve.py, renamed into place at the end
     unpacked = os.path.join(dxbc, "fssm_index.json")      # fssm_unpack.py, the same
     disassembly_started = os.path.join(dxbc, "disasm.started")
-    disassembled = os.path.join(dxbc, "disasm.done")      # records the LLVM command and version after a successful run
+    disassembled = os.path.join(dxbc, "disasm.done")      # records LLVM and the listings produced
     translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
     shard_plan = os.path.join(spirv, SHARD_PLAN)          # lets translate() keep finished shards; see there
     signature = llvm_mc_signature()
@@ -722,22 +750,34 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
     disasm = os.path.join(dxbc, "disasm")
-    if not disassembly_matches(dxbc, signature):
+    complete, resume, expected = disassembly_status(dxbc, signature)
+    if not complete:
         if os.path.isfile(disassembled) or os.path.isfile(translated):
             log("shaders: llvm-mc changed or the saved disassembly could not be verified")
-        resume = (not os.path.isfile(disassembled)
-                  and read_shader_setting(disassembly_started) == signature and disassembly_files_match(dxbc))
         log("shaders: resuming disassembly (gfx1013)" if resume else "shaders: disassembling (gfx1013)")
-        drop(translated, shard_plan, disassembled)
+        drop(translated, shard_plan)
         if not resume:
-            drop(disassembly_started)
+            drop(disassembly_started, disassembled)
         prepare_shader_disassembly(work, disasm, resume)
-        if not resume:
-            with open(disassembly_started, "w", encoding="utf-8", newline="\n") as f:
-                f.write(signature + "\n")
+        if not os.path.isfile(disassembly_started) or os.path.isfile(disassembled):
+            marker = disassembly_started + ".tmp"
+            with open(marker, "w", encoding="utf-8", newline="\n") as f:
+                start = json.dumps({"llvm": signature, "listings": sorted(expected)}) if expected else signature
+                f.write(start + "\n")
+            os.replace(marker, disassembly_started)
+        drop(disassembled)
+        resume_args = ("--skip-existing",) if resume else ()
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--unpack-index", unpacked,
-           "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs, *(("--skip-existing",) if resume else ()))
-        os.replace(disassembly_started, disassembled)
+           "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs, *resume_args)
+        listings = disassembly_listings(dxbc)
+        if not listings or not expected <= listings:
+            fail("Shader disassembly did not restore all expected listings")
+        marker = disassembled + ".tmp"
+        with open(marker, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"llvm": signature, "listings": sorted(listings)}, f)
+            f.write("\n")
+        os.replace(marker, disassembled)
+        drop(disassembly_started)
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
     # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
     # disassembly stay current.
