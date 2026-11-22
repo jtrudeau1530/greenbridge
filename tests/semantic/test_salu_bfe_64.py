@@ -614,6 +614,241 @@ class MultiWordBitfieldTests(unittest.TestCase):
         self.assertEqual(scc, 1)
 
 
+class ClampBoundaryTests(unittest.TestCase):
+    """Validation of width / offset clamp boundaries and edge cases."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarAlu64Interpreter()
+
+    def test_width_zero_all_offsets(self) -> None:
+        # Zero width must return 0 and SCC=0 regardless of offset or input
+        for off in (0, 1, 15, 31, 32, 60, 63):
+            for op in ("s_bfe_u64", "s_bfe_i64"):
+                with self.subTest(op=op, off=off):
+                    ctl_val = pack_bfe64_ctl(off, 0)
+                    res, scc = self.interp.step(op, "s[0:1]", MASK64, ctl_val)
+                    self.assertEqual(res, 0)
+                    self.assertEqual(scc, 0)
+
+                    lines = [
+                        "s_mov_b32 s2, 0xFFFFFFFF",
+                        "s_mov_b32 s3, 0xFFFFFFFF",
+                        f"s_mov_b32 s4, {ctl_val:#x}",
+                        f"{op} s[0:1], s[2:3], s4",
+                    ]
+                    got, sh_scc = run_lines(lines)
+                    self.assertEqual(got, 0)
+                    self.assertEqual(sh_scc, 0)
+
+    def test_dirty_control_word_upper_bits_ignored(self) -> None:
+        # Bits [15:6] and [31:23] are ignored by RDNA2 hardware
+        clean_ctl = pack_bfe64_ctl(20, 16)
+        dirty_ctl = clean_ctl | 0xFF80FFC0
+        val = 0x12345678_9ABCDEF0
+
+        res_clean_u, scc_clean_u = self.interp.step("s_bfe_u64", "s[0:1]", val, clean_ctl)
+        res_dirty_u, scc_dirty_u = self.interp.step("s_bfe_u64", "s[2:3]", val, dirty_ctl)
+        self.assertEqual(res_clean_u, res_dirty_u)
+        self.assertEqual(scc_clean_u, scc_dirty_u)
+
+        res_clean_i, scc_clean_i = self.interp.step("s_bfe_i64", "s[0:1]", val, clean_ctl)
+        res_dirty_i, scc_dirty_i = self.interp.step("s_bfe_i64", "s[2:3]", val, dirty_ctl)
+        self.assertEqual(res_clean_i, res_dirty_i)
+        self.assertEqual(scc_clean_i, scc_dirty_i)
+
+        # Cross-check in shader
+        lines = [
+            f"s_mov_b32 s2, {val & MASK32:#x}",
+            f"s_mov_b32 s3, {(val >> 32) & MASK32:#x}",
+            f"s_mov_b32 s4, {dirty_ctl:#x}",
+            "s_bfe_u64 s[0:1], s[2:3], s4",
+        ]
+        got, sh_scc = run_lines(lines)
+        self.assertEqual(got, res_clean_u)
+        self.assertEqual(sh_scc, scc_clean_u)
+
+    def test_width_clamping_past_bit_63_matrix(self) -> None:
+        # When off + wid > 64, effective width is min(wid, 64 - off)
+        cases = [
+            # (off, wid, eff_wid)
+            (60, 8, 4),
+            (63, 64, 1),
+            (63, 127, 1),
+            (32, 64, 32),
+            (0, 127, 64),
+            (50, 20, 14),
+        ]
+        for off, wid, eff_wid in cases:
+            with self.subTest(off=off, wid=wid, eff_wid=eff_wid):
+                ctl_val = pack_bfe64_ctl(off, wid)
+                # Test with source having high bit of effective field set
+                # Bit (off + eff_wid - 1) is the top bit of the field
+                top_bit = 1 << (off + eff_wid - 1)
+                src = top_bit
+
+                # For s_bfe_u64: extracts eff_wid bits -> 1 << (eff_wid - 1)
+                expected_u = 1 << (eff_wid - 1)
+                res_u, scc_u = self.interp.step("s_bfe_u64", "s[0:1]", src, ctl_val)
+                self.assertEqual(res_u, expected_u)
+                self.assertEqual(scc_u, 1)
+
+                # For s_bfe_i64: top bit is set, so it sign-extends from eff_wid
+                expected_i = (expected_u - (1 << eff_wid)) & MASK64
+                res_i, scc_i = self.interp.step("s_bfe_i64", "s[0:1]", src, ctl_val)
+                self.assertEqual(res_i, expected_i)
+                self.assertEqual(scc_i, 1)
+
+
+class NegativeControlTests(unittest.TestCase):
+    """Sensitivity tests ensuring mutants in 64-bit BFE math are detected."""
+
+    def test_signed_vs_unsigned_mutation_caught(self) -> None:
+        # 16-bit field with top bit set (0x8000)
+        ctl_val = pack_bfe64_ctl(16, 16)
+        src = 0x80000000  # bits [31:16] = 0x8000
+        res_u, _ = ref_s_bfe_u64(src, ctl_val)
+        res_i, _ = ref_s_bfe_i64(src, ctl_val)
+        self.assertEqual(res_u, 0x8000)
+        self.assertEqual(res_i, 0xFFFFFFFFFFFF8000)
+        self.assertNotEqual(res_u, res_i)
+
+    def test_scc_hi_dword_mutation_caught(self) -> None:
+        # Result has lo=0, hi!=0 (0x12340000_00000000)
+        ctl_val = pack_bfe64_ctl(0, 64)
+        src = 0x12340000_00000000
+        res, scc = ref_s_bfe_u64(src, ctl_val)
+        self.assertEqual(res & MASK32, 0)
+        self.assertEqual((res >> 32) & MASK32, 0x12340000)
+        # An implementation checking only (lo != 0) would fail here
+        self.assertEqual(scc, 1)
+
+    def test_clamp_past_bit_63_mutation_caught(self) -> None:
+        # off=60, wid=8: field has 4 bits. Val at top 4 bits: 0xF
+        ctl_val = pack_bfe64_ctl(60, 8)
+        src = 0xF0000000_00000000
+        res_u, _ = ref_s_bfe_u64(src, ctl_val)
+        # Without clamping, an implementation might take 8 bits
+        self.assertEqual(res_u, 0xF)
+
+    def test_zero_width_mutation_caught(self) -> None:
+        ctl_val = pack_bfe64_ctl(0, 0)
+        res_u, scc_u = ref_s_bfe_u64(MASK64, ctl_val)
+        self.assertEqual(res_u, 0)
+        self.assertEqual(scc_u, 0)
+
+    def test_offset_mask_32_vs_64_mutation_caught(self) -> None:
+        # Offset 32 should extract from the high dword
+        ctl_val = pack_bfe64_ctl(32, 32)
+        src = 0xDEADBEEF_00000000
+        res, _ = ref_s_bfe_u64(src, ctl_val)
+        # If masked with 31 (copy-paste of 32-bit BFE), offset would become 0 -> extracting 0
+        self.assertEqual(res, 0xDEADBEEF)
+
+
+class PipelineAndEmissionTests(unittest.TestCase):
+    """Validation of compiler emission, multi-instruction pipelines, and operand rejections."""
+
+    def test_rdna2spirv_emission_u64(self) -> None:
+        g = rdna2spirv.Gen("ps")
+        ins = {
+            "op": "s_bfe_u64",
+            "args": [
+                {"k": "sgpr", "r": 0, "n": 2},
+                {"k": "sgpr", "r": 2, "n": 2},
+                {"k": "sgpr", "r": 4},
+            ],
+            "mods": [],
+        }
+        g.insn(ins)
+        emitted = "\n".join(g.body)
+
+        self.assertIn("OpBitwiseAnd %uint", emitted)
+        self.assertIn("OpBitFieldUExtract %uint", emitted)
+        self.assertIn("OpISub %uint", emitted)
+        self.assertIn("OpULessThan %bool", emitted)
+        self.assertIn("OpSelect %uint", emitted)
+        self.assertIn("OpShiftRightLogical %ulong", emitted)
+        self.assertIn("OpBitwiseOr %uint", emitted)
+        self.assertIn("OpStore %scc", emitted)
+        self.assertTrue(g.uses_psb)
+
+    def test_rdna2spirv_emission_i64(self) -> None:
+        g = rdna2spirv.Gen("ps")
+        ins = {
+            "op": "s_bfe_i64",
+            "args": [
+                {"k": "sgpr", "r": 0, "n": 2},
+                {"k": "sgpr", "r": 2, "n": 2},
+                {"k": "sgpr", "r": 4},
+            ],
+            "mods": [],
+        }
+        g.insn(ins)
+        emitted = "\n".join(g.body)
+
+        self.assertIn("OpBitcast %long", emitted)
+        self.assertIn("OpShiftRightArithmetic %long", emitted)
+        self.assertIn("OpBitcast %ulong", emitted)
+        self.assertIn("OpStore %scc", emitted)
+
+    def test_rdna2spirv_rejects_invalid_operands(self) -> None:
+        # Non-sgpr destination
+        g = rdna2spirv.Gen("ps")
+        with self.assertRaises(rdna2spirv.Unsupported):
+            g.insn({
+                "op": "s_bfe_u64",
+                "args": [
+                    {"k": "vgpr", "r": 0, "n": 2},
+                    {"k": "sgpr", "r": 2, "n": 2},
+                    {"k": "sgpr", "r": 4},
+                ],
+                "mods": [],
+            })
+
+        # Single SGPR destination (must have n=2)
+        with self.assertRaises(rdna2spirv.Unsupported):
+            g.insn({
+                "op": "s_bfe_u64",
+                "args": [
+                    {"k": "sgpr", "r": 0, "n": 1},
+                    {"k": "sgpr", "r": 2, "n": 2},
+                    {"k": "sgpr", "r": 4},
+                ],
+                "mods": [],
+            })
+
+    def test_chained_pipeline_execution(self) -> None:
+        ctl_val = pack_bfe64_ctl(16, 16)
+        src = 0x00000000_12340000
+        # s_bfe_u64 extracts 0x1234, sets SCC=1
+        # s_cselect_b32 writes 0x55 into s20 if SCC=1, else 0xAA
+        lines = [
+            f"s_mov_b32 s2, {src & MASK32:#x}",
+            f"s_mov_b32 s3, {(src >> 32) & MASK32:#x}",
+            f"s_mov_b32 s4, {ctl_val:#x}",
+            "s_bfe_u64 s[0:1], s[2:3], s4",
+        ]
+        got, scc = run_lines(lines)
+        self.assertEqual(got, 0x1234)
+        self.assertEqual(scc, 1)
+
+    def test_bitfield_roundtrip_insert_and_extract(self) -> None:
+        # Simulate inserting a 16-bit pattern at bit 24 of a 64-bit word,
+        # then extracting it back with s_bfe_u64
+        base = 0xAAAAAAAA_55555555
+        insert = 0xCAFE
+        offset = 24
+        width = 16
+
+        mask = ((1 << width) - 1) << offset
+        combined = (base & ~mask) | ((insert << offset) & mask)
+
+        ctl_val = pack_bfe64_ctl(offset, width)
+        extracted, scc = ref_s_bfe_u64(combined, ctl_val)
+        self.assertEqual(extracted, insert)
+        self.assertEqual(scc, 1)
+
+
 VALUES = [0, M64, 1 << 63, 0x0123456789ABCDEF, 0xFEDCBA9876543210, 0x8000000080000000, 0x00000000FFFFFFFF]
 CONTROLS = [ctl(0, 0), ctl(0, 1), ctl(0, 64), ctl(0, 127), ctl(1, 63), ctl(31, 2), ctl(32, 32), ctl(33, 31),
             ctl(60, 8), ctl(63, 1), ctl(63, 64), ctl(4, 40), 0xFFC0FFFF, 0x00100020]
