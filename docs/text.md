@@ -17,22 +17,45 @@ into the logical resource.
 
 ```
 descriptor   ptr index | u32 | u32 0x10 | ptr | 01 01 00 00 | u32 hash_bytes | ptr hash
-             | u32 0x10 | u32 blob_bytes | ptr blob
+             | u32 0x10 | u32 blob_bytes | ptr blob | ... more entries (u32 tag, u32 bytes, ptr)
 ptr          u32 0x5xxxxxxx, u32 0
 hash entry   16 bytes: u32 joaat(lowercase label), u32 0, u8 1, u8[2], u24 index (at +11), u8
-index entry  16 bytes: u64, u64 (blob offset << 20 | flags)
-blob         NUL-terminated UTF-8 strings
+index entry  16 bytes: u64, u64 (offset in its blob chunk << 20 | flags); the chunk is flags & 3
+blob         NUL-terminated UTF-8 strings, in one or more chunks
 ```
 
 A hash entry whose first word is 0, whose second word is not 0, or whose byte at +8 is not 1 is an empty slot. Text
 keeps the game's inline markup (`~o~`, `~s~`, `~n~`, `~sl:0.05:0.9~`, `~COLOR_SUBTITLE_FOREIGN_DIALOGUE~`, ...).
 
+### Blob chunks
+
+From the blob on, the descriptor is a run of 16-byte entries: u32 tag, u32 bytes, pointer. The run ends at the first
+16 bytes whose pointer word is not a `0x5xxxxxxx` pointer. A table with more than 1 MiB of text has several tag
+`0x10` entries instead of one. Each is a blob chunk of at most 1 MiB, and the chunks need not be contiguous. An
+index entry's second word names its chunk: its low 20 bits are always `0b1cc`, where `cc` is the chunk, and the bits
+above them are the offset inside that chunk.
+
+Measured on `data.rpf` (counts only):
+
+| | |
+|---|---:|
+| Tables with more than one chunk | 23 (3 of them contiguous) |
+| Chunks per such table | 2-4 |
+| Index entries in them | 649,246 |
+| Low 20 bits `0b100` / `0b101` / `0b110` / `0b111`, all tables | 3,914,583 / 220,161 / 66,416 / 6,721 |
+| Index entries pointing at the start of a string, chunk = `flags & 3` | 4,207,881 of 4,207,881 |
+
+Before this rule, `text_tables.py` read every offset from the first chunk, which is a full 1 MiB. The offset then
+landed inside some other string, so 293,292 strings in those 23 tables came out with the wrong text and no error.
+The other 14,459 `data.rpf` tables read the same as before. So do all 15,951 tables of `story000.rpf` and all 78
+of `shared_minigame000.rpf`.
+
 | Archive | Tables |
 |---|---:|
 | `data.rpf` | 14,482 |
-| `story000.rpf` | 15,831 |
+| `story000.rpf` | 15,951 |
 | `shared_minigame000.rpf` | 78 |
-| **Total** | **30,391** tables, 7,252,163 strings |
+| **Total** | **30,511** tables, 7,530,381 strings |
 
 The same 14,482 `data.rpf` tables come out of a directory carved by `rpf9_carve.py`, the archive read directly, and
 an older carve that wrote each resource as one file.
@@ -179,3 +202,11 @@ Standard library only. The four archives above take about 2 minutes on one core 
   language to name.
 - **Which text the game picks.** When a label has two texts in one language, which table wins at run time
   (load order, mission scope, the foreign-dialogue subtitle option) is not established.
+- **Hash entries whose byte at +8 is 5, 7 or 8.** `data.rpf` has 3,026 of them, in 62 tables, and none of those tables
+  is guessed as English. They are not strings: their u24 at +11 runs 0, 2, 4, ... in every table. That is, in units
+  of 16 bytes, an index into a 32-byte record array, the descriptor entry tagged `0x956a9df5`, whose size is exactly
+  32 bytes times the number of such entries. Another entry, tagged `0x10075946`, holds 32-byte records whose first
+  word is a blob reference like an index entry's second word. All 7,345 of them point at the start of a string.
+  A group record holds a u32 count equal to the u32 after it (1-7). Read as (first record, count), its first word
+  and that count cover the `0x10075946` array exactly in only 34 of the 62 tables, so the layout is not decoded.
+  `text_tables.py` skips these entries.
