@@ -704,6 +704,14 @@ int main() {
         EXPECT(rt::d3d12::register_samplers(device.p, {&literal_words, 1}) == S_OK);
         EXPECT(rt::d3d12::register_samplers(nullptr, {&literal_words, 1}) == E_INVALIDARG);
 
+        // GFX10 literal S#s can encode a larger LOD bias than vkCreateSampler accepts on this device.
+        literal.lod_bias = -32.0f;
+        const auto negative_bias = g::encode(literal);
+        literal.lod_bias = 31.0f;
+        const auto positive_bias = g::encode(literal);
+        const g::SamplerWords biased_samplers[] = {negative_bias, positive_bias};
+        EXPECT(rt::d3d12::register_samplers(device.p, biased_samplers) == S_OK);
+
         // The UINT texture's view in slot 0, and three border samplers after the first: UINT (0,0,0,0) and
         // (1,1,1,1) from CreateSampler2, which the proxy does not have (the inner device does), and float white.
         constexpr UINT uint_slot = 0, uint_black = 1, uint_white = 2, float_white = 3;
@@ -1256,6 +1264,22 @@ int main() {
             std::printf("literal S#s: registered %u/%u texels wrapped, unregistered %u/%u clamped\n", wrapped, texels,
                         clamped, texels);
             EXPECT(wrapped == texels && clamped == texels);
+
+            // With LOD zero requested, opposite bias extremes select the first and last mips.
+            for (const auto& words : biased_samplers) {
+                SampleKeys key = keys[0];
+                std::memcpy(key.ssharp, words.data(), sizeof(key.ssharp));
+                std::array<std::uint8_t, bytes> pixels{};
+                EXPECT(sample_through_set(d, set0, set0_layout, {&key, 1}, pixels.data()));
+                UINT matches = 0;
+                for (UINT i = 0; i < texels; ++i) {
+                    const auto expected = words == negative_bias ? texel(i % size, i / size) : mip_colors[1];
+                    matches += std::memcmp(pixels.data() + 4 * i, expected.data(), 4) == 0;
+                }
+                std::printf("literal sampler bias %.0f: %u/%u samples match, first RGBA %u,%u,%u,%u\n",
+                            g::decode(words).lod_bias, matches, texels, pixels[0], pixels[1], pixels[2], pixels[3]);
+                EXPECT(matches == texels);
+            }
         }
         if (bc.p) {
             SampleKeys bc_key = keys[0];
