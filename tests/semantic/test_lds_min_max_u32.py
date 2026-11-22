@@ -868,5 +868,54 @@ class TestStatusFlagsAndBankConflicts(unittest.TestCase):
         self.assertEqual(flags.bank_conflicts, 0)
 
 
+class TestUnsignedBoundaryExtremes(unittest.TestCase):
+    """Exhaustive tests for unsigned 32-bit boundary extremes and bit patterns."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_unsigned_extremes_permutations(self) -> None:
+        cases = [
+            (0, 0xFFFFFFFF, 0, 0xFFFFFFFF),
+            (0xFFFFFFFF, 0, 0, 0xFFFFFFFF),
+            (0x7FFFFFFF, 0x80000000, 0x7FFFFFFF, 0x80000000),  # In unsigned, 0x7FFFFFFF < 0x80000000
+            (0x80000000, 0xFFFFFFFF, 0x80000000, 0xFFFFFFFF),
+            (0, 0, 0, 0),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+        ]
+        for a, b, exp_min, exp_max in cases:
+            with self.subTest(a=hex(a), b=hex(b)):
+                self.assertEqual(oracle_min_u32(a, b), exp_min)
+                self.assertEqual(oracle_max_u32(a, b), exp_max)
+
+                # In-LDS scalar execution test
+                self.lds.write_dword(0, a)
+                self.state.set_vgpr(VGPR(1), 0)
+                self.state.set_vgpr(VGPR(2), b)
+                self.interp.execute(self.state, DSMinMaxU32Instruction(DSOpcode.DS_MIN_U32, VGPR(1), VGPR(2)))
+                self.assertEqual(self.lds.read_dword(0), exp_min)
+
+                self.lds.write_dword(0, a)
+                self.interp.execute(self.state, DSMinMaxU32Instruction(DSOpcode.DS_MAX_U32, VGPR(1), VGPR(2)))
+                self.assertEqual(self.lds.read_dword(0), exp_max)
+
+    def test_single_bit_walks(self) -> None:
+        # Powers of 2: 1 << 0 through 1 << 31
+        bits = [1 << k for k in range(32)]
+        for i in range(len(bits) - 1):
+            smaller = bits[i]
+            larger = bits[i + 1]
+            self.assertEqual(oracle_min_u32(smaller, larger), smaller)
+            self.assertEqual(oracle_max_u32(smaller, larger), larger)
+
+    def test_alternating_bit_patterns(self) -> None:
+        pat_a = 0x55555555  # 01010101...
+        pat_b = 0xAAAAAAAA  # 10101010... (larger in unsigned)
+        self.assertEqual(oracle_min_u32(pat_a, pat_b), pat_a)
+        self.assertEqual(oracle_max_u32(pat_a, pat_b), pat_b)
+
+
 if __name__ == "__main__":
     unittest.main()
