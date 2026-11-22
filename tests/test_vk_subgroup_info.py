@@ -418,7 +418,18 @@ class PhysicalDevicesTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+def without_device_filter(test):
+    """The tester's own LEONIDA_VK_DEVICE would narrow the fake devices; the filter tests set it themselves."""
+    env = mock.patch.dict(os.environ)
+    env.start()
+    test.addCleanup(env.stop)
+    os.environ.pop("LEONIDA_VK_DEVICE", None)
+
+
 class QueryTest(unittest.TestCase):
+    def setUp(self):
+        without_device_filter(self)
+
     def _run_query(self, *devices):
         vk = FakeVulkan(devices=devices)
         with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
@@ -604,6 +615,25 @@ class QueryTest(unittest.TestCase):
                 self.assertTrue(res["rdna2_amd_windows"])
                 self.assertTrue(res["native64"])
 
+    def test_leonida_vk_device_picks_like_the_runtime(self):
+        """LEONIDA_VK_DEVICE keeps only the devices whose name contains it (runtime/src/vulkan_device_filter.h), so an
+        iGPU asked for by name next to a discrete card is the answer (#1697 review: 9800X3D iGPU + RTX 5070)."""
+        igpu = FakeDevice(name="AMD Radeon(TM) Graphics", device_type=1, vendor_id=0x1002, device_id=0x13C0)
+        nv = FakeDevice(name="NVIDIA GeForce RTX 5070", vendor_id=0x10DE, device_id=0x2F04, driver_id=4,
+                        min_subgroup_size=32, max_subgroup_size=32)
+        for value, want in (("radeon", "AMD Radeon(TM) Graphics"), ("RADEON", "AMD Radeon(TM) Graphics"),
+                            ("5070", "NVIDIA GeForce RTX 5070"), ("", "NVIDIA GeForce RTX 5070")):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"LEONIDA_VK_DEVICE": value}):
+                res, _vk = self._run_query(igpu, nv)
+                self.assertEqual(res["device"], want)
+                self.assertIs(res["rdna2_amd_windows"], want.startswith("AMD"))
+
+    def test_leonida_vk_device_matching_nothing_is_an_error(self):
+        dev = FakeDevice(name="AMD Radeon RX 6700", vendor_id=0x1002, device_id=0x73DF)
+        with mock.patch.dict(os.environ, {"LEONIDA_VK_DEVICE": "rtx"}):
+            with self.assertRaisesRegex(RuntimeError, "LEONIDA_VK_DEVICE='rtx'"):
+                self._run_query(dev)
+
     def test_native64_uses_default_size_without_required_mesh_stage(self):
         dev = FakeDevice(
             subgroup_size=64,
@@ -655,6 +685,9 @@ class QueryTest(unittest.TestCase):
 
 
 class MainCliTest(unittest.TestCase):
+    def setUp(self):
+        without_device_filter(self)
+
     def test_main_exits_0_and_prints_single_line_json_on_stdout(self):
         vk = FakeVulkan(devices=(FakeDevice(name="CLI GPU"),))
         out, err = io.StringIO(), io.StringIO()

@@ -11,7 +11,9 @@ synchronization2, timelineSemaphore and separateDepthStencilLayouts and a graphi
 (the last one), otherwise the first. The runtime also needs the rest of its device setup (surface, extensions);
 that is not checked here. vk_pipeline_check picks by device type only, so on a PC where the two differ the pipelines
 stage can run on another GPU than the one asked here. VK_LOADER_DRIVERS_SELECT (e.g. '*amd*') narrows which
-drivers the loader offers.
+drivers the loader offers. LEONIDA_VK_DEVICE narrows the devices as it does for the runtime
+(runtime/src/vulkan_device_filter.h): only those whose name contains it, without case, and none matching is an
+error (exit 1), not a fallback to another GPU.
 
 native64 matches the current translated SPIR-V 1.5 modules, which do not allow varying subgroup sizes: either 64 can
 be required for both compute and mesh, or the default subgroupSize is 64 and subgroup operations are supported in
@@ -180,6 +182,9 @@ def query() -> dict:
         devs = physical_devices(vk, inst)
         if not devs:
             raise RuntimeError("no Vulkan device")
+        # LEONIDA_VK_DEVICE (runtime/src/vulkan_device_filter.h): only devices whose name contains it, without case;
+        # the runtime then picks among them as below, and a value that matches none is an error, not a fallback
+        wanted = os.environ.get("LEONIDA_VK_DEVICE", "").lower()
         chosen = None
         for d in devs:
             d = ctypes.c_void_p(d)
@@ -193,6 +198,9 @@ def query() -> dict:
             set_next(props, subgroup)
             vk.vkGetPhysicalDeviceProperties2(d, props)
             raw = bytes(props)[16:]
+            name = raw[PROPS_DEVICE_NAME:PROPS_DEVICE_NAME + 256].split(b"\0")[0].decode("utf-8", "replace")
+            if wanted and wanted not in name.lower():
+                continue
             if int.from_bytes(raw[PROPS_API_VERSION:PROPS_API_VERSION + 4], "little") < VK_API_VERSION_1_3:
                 continue
             f13 = block(F13_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
@@ -215,14 +223,14 @@ def query() -> dict:
             dtype = int.from_bytes(raw[PROPS_DEVICE_TYPE:PROPS_DEVICE_TYPE + 4], "little")
             # the runtime's rule: the first usable device, replaced by every later discrete GPU
             if chosen is None or dtype == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
-                chosen = (raw[PROPS_DEVICE_NAME:PROPS_DEVICE_NAME + 256].split(b"\0")[0].decode("utf-8", "replace"),
-                          subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
+                chosen = (name, subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
                           int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
         if chosen is None:
-            raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
+            raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs" +
+                               (f" whose name contains LEONIDA_VK_DEVICE={wanted!r}" if wanted else ""))
         name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex, vendor, device, driver = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
