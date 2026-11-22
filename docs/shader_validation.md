@@ -1293,6 +1293,36 @@ are not NaN, and for the f16 denormals. It differs in five ways, none fixed here
    the canonical quiet NaN (`0x7fc00000`, `0x7e00`). For example, `v_fmac_f16` keeps `0x7c01`. This is the "not
    modelled yet" note of the f16 transcendentals row in `docs/design.md`, here for these ops too.
 
+### Integer operations and scalar ALU verification (`tools/salu_diff.py`, gfx1036 follow-up to #1746)
+
+As a follow-up to #1746 (SHADER-137), `tools/salu_diff.py` and `tests/test_salu_diff.py` were expanded to include 12 integer SALU operations (`s_absdiff_i32`, `s_mul_hi_i32`, `s_lshl1..4_add_u32`, `s_sext_i32_i8`, `s_sext_i32_i16`, `s_flbit_i32`, and `s_pack_ll/lh/hh_b32_b16`) and tested on native desktop RDNA2 silicon (`gfx1036`), complementing #1746's laptop `gfx1035` probe.
+
+Hardware validation was executed via `tools/hw_oracle` and `tools/salu_diff.py` on native AMD RDNA2 silicon:
+
+- **GPU**: AMD Radeon(TM) Graphics (`gfx1036`), AMD Windows driver `32.0.21045.29003`, Windows 11, `amdhip64_6.dll`, AMD clang 23.0.0git (`rocm-sdk-core 10.0.0`).
+- **Second-silicon verification of #1746 (`tools/int_hw_probe.py`)**:
+  - `python -I tools/int_hw_probe.py --oracle both --wave both`: **87 cases: 87 match, 0 known divergence, 0 unexpected mismatch, 0 wave32/64 diff** on native `gfx1036` (corroborating that the 5 divergences originally reported by #1746 are now fully resolved on `main`).
+- **SALU operations (`s_absdiff_i32`, `s_mul_hi_i32`, `s_lshl1..4_add_u32`)**:
+  - `python -I tools/salu_diff.py --ops s_absdiff_i32,s_mul_hi_i32,s_lshl1_add_u32,s_lshl2_add_u32,s_lshl3_add_u32,s_lshl4_add_u32 --programs 500 --oracle translator,hw`: **500 passed, 0 mismatches**.
+  - Confirmed SCC preserved across operations with prior SCC=0 and SCC=1.
+- **Sign-extension and pack (`s_sext_i32_i8`, `s_sext_i32_i16`, `s_flbit_i32`, `s_pack_ll/lh/hh_b32_b16`)**:
+  - `python -I tools/salu_diff.py --ops s_sext_i32_i8,s_sext_i32_i16,s_flbit_i32,s_pack_ll_b32_b16,s_pack_lh_b32_b16,s_pack_hh_b32_b16 --programs 500 --oracle translator,hw`: **500 passed, 0 mismatches**.
+  - `s_cmov_b32` verified on hardware under SCC=0 (destination preserved) and SCC=1 (destination loaded).
+- **VALU product-sum (`v_mad_u64_u32`, `v_mad_i64_i32`)**:
+  - 292 programs in wave32 across special and random 32/64-bit inputs: **292 passed, 0 mismatches**.
+  - 192 programs in wave64 across special inputs: **192 passed, 0 mismatches**.
+  - Carry-out and sign bits in sdst matched the 65-bit ISA reference bit-for-bit.
+- **Integer saturation (`clamp`)**:
+  - 567 programs tested across `v_add_nc_u32_e64`, `v_sub_nc_u32_e64`, `v_subrev_nc_u32_e64`, `v_add_nc_i32_e64`, `v_sub_nc_i32_e64`, `v_add_nc_u16_e64`, and `v_sub_nc_u16_e64`: **567 passed, 0 mismatches**.
+  - 16-bit clamp confirmed preserving the high 16 bits of the destination VGPR.
+- **EXEC lane masking**:
+  - Multi-threaded kernel under alternating lane masks (`0xAAAAAAAA`, `0x55555555`) confirmed that inactive lanes write 0 in sdst mask words for `v_add_co_u32` and `v_mad_u64_u32`.
+- **SAD family and lerp (`v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16`, `v_sad_u32`, `v_msad_u8`, `v_mqsad_u32_u8`, `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_lerp_u8`)**:
+  - Verified across edge byte patterns, 64-bit sliding windows, and zero masks: **0 mismatches** against ISA reference.
+- **24-bit products and 64-bit shifts (`v_mul_hi_*24`, `v_lshrrev_b64`, `v_ashrrev_i64`)**:
+  - Verified across signed/unsigned products, edge signs, and 0..63 shift counts: **0 mismatches**.
+
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
