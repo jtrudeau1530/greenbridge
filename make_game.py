@@ -391,7 +391,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         elif had != want:
             log(f"shaders: wave64 emulation is now {want} (the shaders were translated with it {had}): "
                 "translating again")
-            drop(translated, shard_plan)
+            drop(translated)
     if not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
