@@ -14,7 +14,7 @@
 // resource_tiling_test. A standard mip may be smaller than a tile and then takes one tile on that axis. An NVIDIA
 // GPU packs from the first mip smaller than a tile on any axis and WARP packs nothing; the test accepts all of
 // them. The packed tail takes one tile per tile-depth slice it spans: ceil(depth of the first packed mip / tile
-// depth), so 1 for 2D, as AMD's PC runtime reports on RDNA2 and RDNA4 (83 measured layouts, see
+// depth), so 1 for 2D, as AMD's PC runtime reports on RDNA2 and RDNA4 (79 measured layouts, see
 // resource_tiling_test), and never fewer than the tail's tight linear size in whole tiles. NVIDIA sometimes reports
 // one more. Applications read the numbers rather than assume them, and this layer backs reserved textures fully, so
 // any split is consistent.
