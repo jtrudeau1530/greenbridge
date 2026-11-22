@@ -117,15 +117,18 @@ constexpr GUID kIUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00,
 // The runtime's objects are process-wide singletons: AddRef/Release count but never free.
 struct RuntimeObject {
     const void* const* vtable;
-    const GUID* class_id;    // also the id of the class's first interface (xgameruntime-docs lists them as one)
-    const GUID* newer_iid;   // a later interface the same vtable serves (IXNetworkingImpl2), or null
+    const GUID* class_id;               // the coclass id
+    const GUID* const* interface_ids;   // every interface the vtable serves, base first, null-terminated: a derived
+                                        // interface answers for each one it inherits (IXSystemImpl5 : ... : IXSystemImpl)
     std::atomic<long> refs{1};
 };
 
 HRESULT STDMETHODCALLTYPE object_query_interface(void* self, REFIID iid, void** out) {
     if (!out) return E_POINTER;
     auto* o = static_cast<RuntimeObject*>(self);
-    if (iid == kIUnknown || iid == *o->class_id || (o->newer_iid && iid == *o->newer_iid)) {
+    bool known = iid == kIUnknown || iid == *o->class_id;
+    for (const GUID* const* i = o->interface_ids; !known && i && *i; ++i) known = iid == **i;
+    if (known) {
         o->refs.fetch_add(1);
         *out = self;
         return S_OK;
@@ -323,9 +326,12 @@ const void* const kNetworkingVtable[] = {
 #undef NM
 static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl's 15 + IXNetworkingImpl2's 3");
 
+// The ids xgameruntime-docs and the xgameruntime IDL give: XThreadingImpl's and XErrorImpl's class id is also their
+// one interface's; IXNetworkingImpl's id is the class id, and IXNetworkingImpl2 derives from it.
+const GUID* const kNetworkingIids[] = {&kNetworking2, nullptr};
 RuntimeObject g_threading{kThreadingVtable, &kThreadingClass, nullptr};
 RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
-RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, &kNetworking2};
+RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids};
 
 RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem functions it serves
 
@@ -413,20 +419,29 @@ uint64_t __stdcall XSystemGetAppMemoryUsage() {
 // docs/runtime_imports.md has the measurement.
 
 constexpr GUID kSystemClass = {0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};
+// IXSystemImpl's id is the class id; IXSystemImpl5 : IXSystemImpl4 : IXSystemImpl3 : IXSystemImpl2 : IXSystemImpl
+// (xgameruntime's include/xsystem.idl). One vtable serves all five.
+constexpr GUID kSystem2 = {0x6fd71f09, 0x7513, 0x49f0, {0x89, 0xbc, 0xbf, 0xaf, 0x5d, 0xf6, 0xf8, 0x52}};
+constexpr GUID kSystem3 = {0x67ce4bfc, 0xb1d1, 0x4ac7, {0xbc, 0x3a, 0xcb, 0x92, 0x19, 0xa9, 0x7a, 0x85}};
+constexpr GUID kSystem4 = {0xdadc2895, 0x34b0, 0x4ef5, {0xa8, 0x3e, 0x45, 0x11, 0x4d, 0x62, 0x9b, 0x80}};
 constexpr GUID kSystem5 = {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
+const GUID* const kSystemIids[] = {&kSystem2, &kSystem3, &kSystem4, &kSystem5, nullptr};
 
-// A fixed string into a (size, buffer, used) out parameter, as the XSystem id queries take one.
-HRESULT copy_id(const char* id, size_t bytes, size_t size, char* out, size_t* used) {
+// A fixed string into a (size, buffer, used) out parameter, as the XSystem id queries take one. `minimum` is the
+// buffer size the API requires (its *Bytes constant), which can be larger than the string.
+HRESULT copy_id(const char* id, size_t bytes, size_t minimum, size_t size, char* out, size_t* used) {
     if (!out) return E_INVALIDARG;
-    if (size < bytes) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    if (size < minimum || size < bytes) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     std::memcpy(out, id, bytes);
     if (used) *used = bytes;
     return S_OK;
 }
 
-// XSystemXboxLiveSandboxIdMaxBytes is 16; an offline title runs in the retail sandbox.
+// XSystemXboxLiveSandboxIdMaxBytes is 16, and Microsoft's contract asks for a buffer at least that large (smaller
+// ones get ERROR_INSUFFICIENT_BUFFER, whatever the id's length); an offline title runs in the retail sandbox.
+constexpr size_t kSandboxIdMaxBytes = 16;
 constexpr char kSandboxId[] = "RETAIL";
-static_assert(sizeof(kSandboxId) <= 16, "fits XSystemXboxLiveSandboxIdMaxBytes");
+static_assert(sizeof(kSandboxId) <= kSandboxIdMaxBytes, "fits XSystemXboxLiveSandboxIdMaxBytes");
 // XSystemAppSpecificDeviceIdBytes is 45 (including the terminator): a fixed placeholder of that length, like the
 // console id.
 constexpr char kAppDeviceId[] = "00000000000000000000000000000000000000000000";
@@ -436,10 +451,10 @@ HRESULT STDMETHODCALLTYPE sys_console_id(void*, size_t size, char* out, size_t* 
     return XSystemGetConsoleId(size, out, used);
 }
 HRESULT STDMETHODCALLTYPE sys_sandbox_id(void*, size_t size, char* out, size_t* used) {
-    return copy_id(kSandboxId, sizeof(kSandboxId), size, out, used);
+    return copy_id(kSandboxId, sizeof(kSandboxId), kSandboxIdMaxBytes, size, out, used);
 }
 HRESULT STDMETHODCALLTYPE sys_app_device_id(void*, size_t size, char* out, size_t* used) {
-    return copy_id(kAppDeviceId, sizeof(kAppDeviceId), size, out, used);
+    return copy_id(kAppDeviceId, sizeof(kAppDeviceId), sizeof(kAppDeviceId), size, out, used);
 }
 // XSystemHandleTrack(callback, context): the GDK reports handle creation and destruction to it. Offline nothing is
 // tracked, so the callback is accepted and never called.
@@ -462,7 +477,7 @@ const void* const kSystemVtable[] = {
 static_assert(std::size(kSystemVtable) == 9, "IUnknown + the six methods IXSystemImpl5 is known to have");
 
 RuntimeObject& system_object() {
-    static RuntimeObject object{kSystemVtable, &kSystemClass, &kSystem5};
+    static RuntimeObject object{kSystemVtable, &kSystemClass, kSystemIids};
     return object;
 }
 
