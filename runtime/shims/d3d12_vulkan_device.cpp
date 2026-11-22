@@ -1,7 +1,7 @@
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
-// committed buffers and textures (2D, multisampled 2D, 3D) and their 1/2/3 variants, allocation info, CPU
-// texture copies (WriteToSubresource/ReadFromSubresource), query heaps, a few feature queries. Everything else is a
+// committed buffers and textures (1D, 1D arrays, 2D, multisampled 2D, 3D) and their 1/2/3 variants, allocation
+// info, CPU texture copies (WriteToSubresource/ReadFromSubresource), query heaps, a few feature queries. Everything else is a
 // generated stub that reports itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and
 // what is still open.
 #include "d3d12_com.h"
@@ -181,13 +181,15 @@ leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC
 // ClearUnorderedAccessView* with rectangles clears through an attachment (vkCmdClearAttachments).
 VkImageCreateInfo texture_create_info(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
     if (volume && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
         info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
-    info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    info.imageType = volume ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     info.format = format.format;
-    info.extent = {std::uint32_t(desc.Width), desc.Height, volume ? UINT(desc.DepthOrArraySize) : 1u};
+    info.extent = {std::uint32_t(desc.Width), one_d ? 1u : desc.Height,
+                   volume ? UINT(desc.DepthOrArraySize) : 1u};
     info.mipLevels = desc.MipLevels;
     info.arrayLayers = volume ? 1 : desc.DepthOrArraySize;
     info.samples = VkSampleCountFlagBits(std::max(1u, desc.SampleDesc.Count));
@@ -605,6 +607,7 @@ public:
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
+        const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
         VkImageCreateInfo info =
             texture_create_info(desc_, format, device_.color_attachment_usable(format.format));
@@ -632,7 +635,7 @@ public:
         binding.format = format.format;
         binding.aspects = format.aspects;
         binding.width = std::uint32_t(desc_.Width);
-        binding.height = desc_.Height;
+        binding.height = one_d ? 1u : desc_.Height;
         binding.mip_levels = desc_.MipLevels;
         binding.array_layers = info.arrayLayers;
         binding.depth = depth;
@@ -1782,9 +1785,18 @@ public:
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0 ? resource->create_buffer() : E_INVALIDARG;
-        } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+                   desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
             log_once("committed resource dimension not supported:", desc->Dimension);
+        } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc->Height != 1) {
+            log_once("1D texture height must be 1:", int(desc->Height));
+            hr = E_INVALIDARG;
+        } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+                   (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
+            log_once("1D texture cannot be an attachment, flags:", int(desc->Flags));
+            hr = E_INVALIDARG;
         } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
                    (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
             log_once("volume depth-stencil resources not supported, flags:", int(desc->Flags));
@@ -1969,10 +1981,12 @@ public:
             return;
         }
         const bool volume = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if (!volume && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        const bool one_d = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+        if (!volume && !one_d && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
             log_once("GetCopyableFootprints dimension not supported:", desc->Dimension);
             return fail();
         }
+        if (one_d && desc->Height != 1) return fail();
         const Format format = texture_storage_format(desc->Format, true);  // typeless depth families are planar either way
         UINT mips = desc->MipLevels;
         const UINT depth = volume ? desc->DepthOrArraySize : 1;
@@ -1989,7 +2003,8 @@ public:
                 planes == 2 ? (plane ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : format.aspects;
             const leonida::BlockFormat block = leonida::block_format(format.format, aspect);
             if (!block.bytes) return fail();
-            const UINT width = std::max<UINT>(1, UINT(desc->Width >> mip)), height = std::max<UINT>(1, desc->Height >> mip);
+            const UINT width = std::max<UINT>(1, UINT(desc->Width >> mip));
+            const UINT height = one_d ? 1 : std::max<UINT>(1, desc->Height >> mip);
             const UINT blocks_wide = (width + block.block - 1) / block.block;
             const UINT blocks_high = (height + block.block - 1) / block.block;
             const UINT64 row_size = UINT64(blocks_wide) * block.bytes;
@@ -2493,11 +2508,13 @@ private:
             return {align_up(desc.Width, align_64k), align_64k};
         }
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if (!volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+        if (!volume && !one_d && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
             if (desc.Dimension != D3D12_RESOURCE_DIMENSION_UNKNOWN)
                 log_once("GetResourceAllocationInfo dimension not supported:", desc.Dimension);
             return kInvalidAllocation;
         }
+        if (one_d && desc.Height != 1) return kInvalidAllocation;
         const UINT samples = desc.SampleDesc.Count, depth = volume ? desc.DepthOrArraySize : 1;
         const UINT64 max_extent =
             volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
@@ -2512,8 +2529,8 @@ private:
         D3D12_RESOURCE_DESC resolved = desc;
         if (!resolved.MipLevels) resolved.MipLevels = full;
         if (resolved.MipLevels > full) return kInvalidAllocation;
-        if (samples > 1 &&
-            (volume || resolved.MipLevels != 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+        if (samples > 1 && (volume || one_d || resolved.MipLevels != 1 ||
+                            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return kInvalidAllocation;
         if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN)
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);

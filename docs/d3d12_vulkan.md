@@ -240,10 +240,10 @@ What is implemented (all of it testable without the game):
   - `CopyDescriptors` / `CopyDescriptorsSimple`. A descriptor is the bytes of its slot, so a copy is a byte copy:
     the destination and source range lists are walked together, one descriptor at a time, and null size arrays
     mean one descriptor per range;
-  - committed buffers (upload and readback heaps mapped persistently and zeroed) and 2D textures in the common
-    render-target, depth and texture formats (typeless families become mutable-format images), plus non-attachment
-    3D textures with mipmapped upload, image copy and readback, and multisampled 2D textures (single-mip render
-    targets or depth-stencils, in the sample counts the GPU has for the format);
+  - committed buffers (upload and readback heaps mapped persistently and zeroed), 1D textures and 1D arrays, and
+    2D textures in the common render-target, depth and texture formats (typeless families become mutable-format
+    images), plus non-attachment 3D textures with mipmapped upload, image copy and readback, and multisampled 2D
+    textures (single-mip render targets or depth-stencils, in the sample counts the GPU has for the format);
   - packed `R9G9B9E5_SHAREDEXP` textures map to `VK_FORMAT_E5B9G9R9_UFLOAT_PACK32` for uploads and sampled views;
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
@@ -264,7 +264,8 @@ What is implemented (all of it testable without the game):
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
-  - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
+  - `GetCopyableFootprints` for buffers, 1D and 1D-array textures, 2D textures and volumes, including BC1–7 and the
+    two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
   - the `1`/`2`/`3` variants as wrappers over the methods above (D3D-28): `CreateCommittedResource1/2/3`,
@@ -403,7 +404,7 @@ rectangular clears of overlapping slice ranges against both Windows WARP and exp
 Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
 creation), root signatures, PSOs, draws, typeless volume RTVs,
 placed resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
-1D textures and the swapchain;
+the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); the GCL8
 front/back stencil references are recorded but not applied, because there is no pipeline or draw path for them to
@@ -456,7 +457,7 @@ and any validation error fails them.
   Results come back through D3D12 itself (`CopyTextureRegion` into a readback heap, then `Map`): the render
   target, the depth and stencil planes, and a never-written texture (which must be zero). A second list uploads a
   pattern and copies it on: whole into a texture created in `COMMON`, a boxed part into a smaller texture, a BC1
-  round trip and a buffer region. A 4x multisampled render target is cleared through a `TEXTURE2DMS` view and
+  round trip, a 1D texture and a 1D-array layer, and a buffer region. A 4x multisampled render target is cleared through a `TEXTURE2DMS` view and
   resolved into a texture that is read back; the multisampled shapes D3D12 refuses are refused, and so is a
   resolve from a single-sampled texture. `GetCopyableFootprints` is compared with the PC runtime's, and a short
   run repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
