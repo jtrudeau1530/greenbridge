@@ -1217,6 +1217,22 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_buffer_tiles COMMAND d3d12_buffer_tiles_test)
     set_tests_properties(d3d12_buffer_tiles PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    # D3D12 permits UpdateTileMappings on DIRECT/COPY/COMPUTE and a sparse buffer must remain
+    # accessible across their selected Vulkan families. The optional API-dump check catches an
+    # EXCLUSIVE VkBuffer even on drivers that happen to return correct bytes without ownership barriers.
+    add_executable(d3d12_sparse_queue_family_test test/d3d12_sparse_queue_family_test.cpp)
+    target_link_libraries(d3d12_sparse_queue_family_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_sparse_queue_family_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_sparse_queue_family_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_sparse_queue_family COMMAND d3d12_sparse_queue_family_test)
+    set_tests_properties(d3d12_sparse_queue_family PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    if(Python3_FOUND AND NOT CMAKE_CROSSCOMPILING)
+      add_test(NAME d3d12_sparse_queue_family_contract COMMAND "${Python3_EXECUTABLE}" -I
+               "${CMAKE_CURRENT_SOURCE_DIR}/test/check_sparse_queue_family.py"
+               "$<TARGET_FILE:d3d12_sparse_queue_family_test>")
+      set_tests_properties(d3d12_sparse_queue_family_contract PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 65)
+    endif()
     set_tests_properties(d3d12_vulkan_device PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(d3d12_texture1d_test test/d3d12_texture1d_test.cpp)
