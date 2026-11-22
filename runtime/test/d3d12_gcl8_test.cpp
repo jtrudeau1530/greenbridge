@@ -82,6 +82,11 @@ int main(int argc, char** argv) {
     EXPECT(list7.p->AddRef() == held);  // QueryInterface released its reference
     list7.p->Release();
 
+    // Calls made before pipeline setup still belong in the trace. They invalidate this list without needing a GPU.
+    list7.p->DrawInstanced(3, 1, 0, 0);
+    list7.p->DrawIndexedInstanced(3, 1, 0, 0, 0);
+    EXPECT(list7.p->Close() == E_INVALIDARG);
+
     UINT ignored_front = 0, ignored_back = 0;
     EXPECT(!front_back_stencil_ref(nullptr, ignored_front, ignored_back));
 
