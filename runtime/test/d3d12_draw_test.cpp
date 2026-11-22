@@ -630,8 +630,8 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            // Above the strip passes' 20: a lower value is already reached, so the wait would return at once.
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 21)) && SUCCEEDED(fence->SetEventOnCompletion(21, nullptr)));
+            // Above line 580's 30: a lower value is already reached, so the wait would return at once.
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 31)) && SUCCEEDED(fence->SetEventOnCompletion(31, nullptr)));
             const auto* result = static_cast<const std::uint8_t*>(mapped);
             for (UINT row = 0; row < size; ++row) {
                 for (UINT col = 0; col < size; ++col) {
