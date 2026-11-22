@@ -787,24 +787,30 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true", help="print the result as JSON")
     args = ap.parse_args(argv)
 
+    inputs = {"lanes": args.lanes, "vcc": args.vcc}
+    if args.lanes == 1:
+        inputs["lane"] = args.lane
+    if args.exec is not None:
+        inputs["exec"] = args.exec
+    for kind, assignments, syntax in (
+        ("sgpr", args.sgpr, "N=VALUE"),
+        ("vgpr", args.vgpr, "N=VALUE[,VALUE...]"),
+    ):
+        for item in assignments:
+            try:
+                register, text = item.split("=", 1)
+                index = _value(register)
+                value = _value(text) if kind == "sgpr" else _vgpr_value(text, args.lanes)
+            except (ValueError, argparse.ArgumentTypeError):
+                ap.exit(2, f"error: --{kind} expects {syntax}, got {item!r}\n")
+            inputs.setdefault(kind, {})[index] = value
+
     if args.parse_only:
         try:
             return _print_parse_report(args.listing)
         except (CpuRefError, OSError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
-
-    inputs = {"lanes": args.lanes, "vcc": args.vcc}
-    if args.lanes == 1:
-        inputs["lane"] = args.lane
-    if args.exec is not None:
-        inputs["exec"] = args.exec
-    for item in args.sgpr:
-        n, value = item.split("=", 1)
-        inputs.setdefault("sgpr", {})[int(n, 0)] = int(value, 0)
-    for item in args.vgpr:
-        n, value = item.split("=", 1)
-        inputs.setdefault("vgpr", {})[int(n, 0)] = _vgpr_value(value, args.lanes)
 
     try:
         result = run(args.listing, inputs)
