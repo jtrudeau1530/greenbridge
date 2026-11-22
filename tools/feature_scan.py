@@ -343,10 +343,11 @@ TYPED_MTBUF = re.compile(r"^tbuffer_(load|store)_format_(d16_)?(x|xy|xyz|xyzw)$"
 
 
 def translator_formats():
-    """(codes in the translator's typed-buffer table, GFX10 code -> format name), read from rdna2spirv itself so the
-    scan follows the table as it changes."""
+    """(codes the translator models, GFX10 code -> format name), read from rdna2spirv itself so the scan follows the
+    table as it changes. Modelled: the typed-buffer table and INVALID (0), an unbound descriptor, which reads 0 on the
+    hardware and in the translator."""
     import rdna2spirv
-    return frozenset(rdna2spirv.Gen.FORMATS), {c: n.replace("GFX10_FORMAT_", "") for c, n in
+    return frozenset(rdna2spirv.Gen.FORMATS) | {0}, {c: n.replace("GFX10_FORMAT_", "") for c, n in
                                                 rdna2spirv.GFX10_FORMATS.items()}
 
 

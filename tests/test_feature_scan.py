@@ -358,7 +358,9 @@ def test_typed_buffers_and_psv0():
             ("tbuffer_load_format_x v2, v4, s[8:11], 0 idxen", 8),             # no format: GFX10 default 8_UNORM
             ("tbuffer_store_format_x v2, v4, s[8:11], 0 format:[BUF_FMT_10_11_11_FLOAT] idxen", 8),
             ("s_endpgm", 4)])
-        ps = listing([("buffer_load_format_x v0, v1, s[0:3], 0 idxen", 8), ("s_endpgm", 4)])
+        ps = listing([("s_mov_b32 s11, 0", 4),                                    # word 3 0: FORMAT INVALID
+                      ("buffer_load_format_x v0, v1, s[0:3], 0 idxen", 8),
+                      ("buffer_load_format_x v2, v1, s[8:11], 0 idxen", 8), ("s_endpgm", 4)])
         vs = listing([("v_mov_b32_e32 v0, v1", 4), ("s_endpgm", 4)])
         synthetic = [
             ("tb_cs", "cs", cs, psv0([(9, 12), (3, 10), (6, 2)])),     # counter UAV, typed buffer SRV, typed 2D UAV
@@ -389,14 +391,14 @@ def test_typed_buffers_and_psv0():
         check(tb["mtbuf"] == {"load 16_16_SNORM": 1, "load 8_UNORM": 1, "store 10_11_11_FLOAT": 1},
               f"MTBUF formats from the instruction, 8_UNORM without format: ({tb['mtbuf']})")
         check(tb["mubuf_word3"] == {"load computed": 1, "load earlier_literal": 1, "load earlier_memory": 1,
-                                    "load literal": 1, "load memory": 1, "load shader_input": 2,
+                                    "load literal": 2, "load memory": 1, "load shader_input": 2,
                                     "store literal": 1},
               f"MUBUF word 3 by source, s_cmp is no write, a branch target starts a block ({tb['mubuf_word3']})")
-        check(tb["mubuf_literal_formats"] == {"load 8_8_8_8_UNORM": 2, "store 10_11_11_FLOAT": 1},
-              f"literal word 3 formats ({tb['mubuf_literal_formats']})")
+        check(tb["mubuf_literal_formats"] == {"load 8_8_8_8_UNORM": 2, "load INVALID": 1,
+                                              "store 10_11_11_FLOAT": 1}, f"literal word 3 formats ({tb['mubuf_literal_formats']})")
         check(tb["not_in_translator"] == {"mtbuf store 10_11_11_FLOAT": 1, "mubuf_literal store 10_11_11_FLOAT": 1},
-              f"formats outside rdna2spirv.Gen.FORMATS are listed ({tb['not_in_translator']})")
-        check(tb["shaders"] == {"mtbuf": {"cs": 1}, "mubuf": {"cs": 1, "ps": 1}, "mubuf_literal": {"cs": 1},
+              f"formats outside rdna2spirv.Gen.FORMATS are listed, INVALID (reads 0) is not ({tb['not_in_translator']})")
+        check(tb["shaders"] == {"mtbuf": {"cs": 1}, "mubuf": {"cs": 1, "ps": 1}, "mubuf_literal": {"cs": 1, "ps": 1},
                                 "mubuf_runtime_format": {"cs": 1, "ps": 1}}, f"shaders per stage ({tb['shaders']})")
 
         out_json = os.path.join(tmp, "out.json")
