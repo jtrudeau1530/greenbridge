@@ -79,6 +79,8 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+# ps_sdwa_f16_const, measured on gfx1036 (the .asm header): f16 inline constant, then src_sel
+EXPECTED_SDWA_F16_CONST = [0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0]
 
 
 def _f32_bits(x):
@@ -314,6 +316,19 @@ def reference_valu16_subrev():
             0x42000000 | _half(a - d)]
 
 
+def reference_sdwa_f16_const():
+    # An f16 float inline constant is its f16 bits over a zero high half; an integer op reads 1.0 as its f32 bits.
+    # src_sel then picks a zero-extended field of those 32 bits, like a register's.
+    def sel(word, off, width):
+        return (word >> off) & ((1 << width) - 1)
+    v1, s8 = 0x64003800, 0x3C000000
+    x = _unhalf(sel(_half(1.0), 16, 16)) + _unhalf(sel(v1, 0, 16))          # +0.0 + 0.5
+    y = _unhalf(sel(_half(2.0), 8, 8)) * _unhalf(sel(v1, 16, 16))           # 2^-18 * 1024.0
+    z = _unhalf(sel(s8, 16, 16)) + _unhalf(sel(v1, 0, 16))                  # 1.0 + 0.5
+    w = float(sel(struct.unpack("<I", struct.pack("<f", 1.0))[0], 16, 16))  # u16 0x3f80 -> f16
+    return [0xAAAA0000 | _half(v) for v in (x, y, z, w)]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -364,6 +379,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_sdwa_f16_const(), EXPECTED_SDWA_F16_CONST)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -429,6 +445,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # S1 - S0 in the _e32 and _e64 forms (neg, clamp), low half out, the destination's high half kept, also
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
+
+    def test_sdwa_src_sel_narrows_an_f16_inline_constant(self):
+        # 1.0 in v_add_f16_sdwa is 0x00003c00, so src0_sel:WORD_1 reads +0.0 and BYTE_1 of 2.0 is the denormal
+        # 0x0040; an SGPR source and v_cvt_f16_u16 reading the f32 bits of 1.0 are narrowed the same way.
+        self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.

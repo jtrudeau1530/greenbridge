@@ -425,12 +425,14 @@ class Gen:
         -2.0, ...) is the f16 value in the low half over a zero high half, not f32 bits. Measured on an RX 6800
         (gfx1030, raw kernel, wave32 and wave64): v_add_f16 d, 1.0, v with v.lo = 0.25 gives 1.25,
         v_cvt_f32_f16 d, 0.5 gives 0x3f000000, v_pack_b32_f16 d, 1.0, v puts 0x3c00 in the low half, and op_sel's
-        high half of the constant reads +0.0."""
+        high half of the constant reads +0.0. Under SDWA, src<i>_sel then narrows those 32 bits like a register's
+        (gfx1036: v_add_f16_sdwa d, 1.0, v src0_sel:WORD_1 reads +0.0)."""
         if s["k"] == "fimm":
             try:
-                return self.cu(struct.unpack("<H", struct.pack("<e", s["v"]))[0])
+                v = self.cu(struct.unpack("<H", struct.pack("<e", s["v"]))[0])
             except OverflowError:
                 raise Unsupported("f16 inline constant out of range") from None
+            return self.sdwa_src(v, s) if "sdwa_sel" in s else v
         return self.src_u({**s, "neg": False, "abs": False})
 
     def pack_f16_pair_int(self, f0, f1):
