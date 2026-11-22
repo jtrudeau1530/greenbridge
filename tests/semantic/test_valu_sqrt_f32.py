@@ -62,6 +62,26 @@ def ref_sqrt(x: float) -> float:
     return f32(math.sqrt(fx))
 
 
+def run_sqrt(val_bits: int) -> int:
+    lines = [
+        f"v_mov_b32 v1, {val_bits:#x}",
+        "v_sqrt_f32 v3, v1",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        os.mkdir(os.path.join(tmp, "disasm"))
+        with open(os.path.join(tmp, "disasm", "test.s"), "w", encoding="utf-8") as f:
+            f.write("; test\n" + "".join(f"\t{ln}\n" for ln in lines))
+        with open(os.path.join(tmp, "test.dxbc"), "wb") as f:
+            f.write(STUB_DXBC)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            spv = rdna2spirv.translate(os.path.join(tmp, "disasm", "test.s"))
+        res = si.run_fragment(spv)
+        return list(res["%out_mrt0"])[3]
+
+
 class TestValuSqrtF32Oracle(unittest.TestCase):
     def test_oracle_finite_positive(self):
         for v in (0.0, 1.0, 4.0, 9.0, 16.0, 2.0, 0.25, 1e-10, 1e10):
@@ -73,3 +93,22 @@ class TestValuSqrtF32Oracle(unittest.TestCase):
         self.assertEqual(f32_bits(ref_sqrt(-0.0)), 0x80000000)
         self.assertEqual(f32_bits(ref_sqrt(float("inf"))), 0x7F800000)
         self.assertTrue(is_f32_nan_bits(f32_bits(ref_sqrt(-1.0))))
+
+
+class TestValuSqrtF32SIMDAndPrecision(unittest.TestCase):
+    def test_simd_multilane_execution(self):
+        inputs = [0.0, 1.0, 4.0, 9.0, 16.0, 25.0, 36.0, 49.0]
+        for val in inputs:
+            vbits = f32_bits(f32(val))
+            got_bits = run_sqrt(vbits)
+            expected = f32(math.sqrt(val))
+            self.assertEqual(bits_f32(got_bits), expected)
+
+    def test_precision_tolerance(self):
+        for val in (2.0, 3.0, 5.0, 10.0, 0.1, 1000.0):
+            vbits = f32_bits(f32(val))
+            got_bits = run_sqrt(vbits)
+            got = bits_f32(got_bits)
+            expected = math.sqrt(val)
+            diff = abs(got - expected)
+            self.assertLessEqual(diff, 1e-6 * expected)
