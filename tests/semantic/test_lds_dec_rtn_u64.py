@@ -430,6 +430,66 @@ class SIMDInterpreter:
         return results
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Evaluation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class DecRtnU64StatusFlags:
+    """Condition codes and status flags for 64-bit atomic decrement."""
+    zero: bool
+    sign: bool
+    wrapped: bool
+    borrow: bool
+    unaligned: bool
+    address_wrapped: bool
+    old_is_zero: bool
+
+
+def evaluate_dec_rtn_u64_status_flags(
+    vaddr: int,
+    offset: int,
+    old_val: int,
+    vdata0: int,
+    new_val: int,
+    lds_size_bytes: int = LDS_SIZE_BYTES,
+) -> DecRtnU64StatusFlags:
+    """Evaluate condition codes, arithmetic flags, and carry/borrow generation for 64-bit atomic dec.
+
+    - zero: new memory value == 0
+    - sign: bit 63 of new memory value is set
+    - wrapped: operation wrapped to vdata0 (i.e. old_val == 0 or old_val > vdata0)
+    - borrow: decrement generated a borrow in unsigned 64-bit arithmetic (old_val == 0)
+    - unaligned: effective address has non-zero low 3 bits (not 8-byte aligned)
+    - address_wrapped: effective byte address wrapped around LDS memory boundary
+    - old_is_zero: old memory value prior to decrement was 0
+    """
+    raw_addr = vaddr + (offset & OFFSET16_MASK)
+    address_wrapped = raw_addr >= lds_size_bytes
+    eff_addr = raw_addr & (lds_size_bytes - 1)
+    unaligned = (eff_addr & 7) != 0
+
+    old_u = u64(old_val)
+    bound_u = u64(vdata0)
+    new_u = u64(new_val)
+
+    zero = (new_u == 0)
+    sign = bool((new_u >> 63) & 1)
+    wrapped = (old_u == 0 or old_u > bound_u)
+    borrow = (old_u == 0)
+    old_is_zero = (old_u == 0)
+
+    return DecRtnU64StatusFlags(
+        zero=zero,
+        sign=sign,
+        wrapped=wrapped,
+        borrow=borrow,
+        unaligned=unaligned,
+        address_wrapped=address_wrapped,
+        old_is_zero=old_is_zero,
+    )
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -1071,6 +1131,79 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
             self.assertEqual(new_mem, expected_new)
             self.assertEqual(state.get_vgpr64(RegPair(4)), expected_old)
             self.assertEqual(state.lds.read_qword(target_byte), expected_new)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation for ds_dec_rtn_u64."""
+
+    def test_zero_and_sign_flags_u64(self) -> None:
+        flags_zero = evaluate_dec_rtn_u64_status_flags(0x100, 0, old_val=1, vdata0=10, new_val=0)
+        self.assertTrue(flags_zero.zero)
+        self.assertFalse(flags_zero.sign)
+
+        flags_sign = evaluate_dec_rtn_u64_status_flags(
+            0x100, 0, old_val=0x8000_0000_0000_0001, vdata0=MASK_64, new_val=0x8000_0000_0000_0000
+        )
+        self.assertFalse(flags_sign.zero)
+        self.assertTrue(flags_sign.sign)
+
+        flags_pos = evaluate_dec_rtn_u64_status_flags(0x100, 0, old_val=10, vdata0=20, new_val=9)
+        self.assertFalse(flags_pos.zero)
+        self.assertFalse(flags_pos.sign)
+
+    def test_wrapped_and_borrow_flags_u64(self) -> None:
+        # Wrap from 0 generates borrow
+        flags_borrow = evaluate_dec_rtn_u64_status_flags(
+            0x100, 0, old_val=0, vdata0=10, new_val=10
+        )
+        self.assertTrue(flags_borrow.wrapped)
+        self.assertTrue(flags_borrow.borrow)
+        self.assertTrue(flags_borrow.old_is_zero)
+
+        # Wrap from > bound does NOT generate borrow
+        flags_wrap_gt = evaluate_dec_rtn_u64_status_flags(
+            0x100, 0, old_val=25, vdata0=10, new_val=10
+        )
+        self.assertTrue(flags_wrap_gt.wrapped)
+        self.assertFalse(flags_wrap_gt.borrow)
+        self.assertFalse(flags_wrap_gt.old_is_zero)
+
+        # Normal decrement does not wrap or borrow
+        flags_norm = evaluate_dec_rtn_u64_status_flags(
+            0x100, 0, old_val=5, vdata0=10, new_val=4
+        )
+        self.assertFalse(flags_norm.wrapped)
+        self.assertFalse(flags_norm.borrow)
+        self.assertFalse(flags_norm.old_is_zero)
+
+    def test_unaligned_qword_address_detection(self) -> None:
+        aligned_flag = evaluate_dec_rtn_u64_status_flags(
+            vaddr=0x200, offset=0, old_val=5, vdata0=10, new_val=4
+        )
+        self.assertFalse(aligned_flag.unaligned)
+
+        # 4-byte offset is dword aligned but NOT 8-byte qword aligned
+        unaligned_dword = evaluate_dec_rtn_u64_status_flags(
+            vaddr=0x200, offset=4, old_val=5, vdata0=10, new_val=4
+        )
+        self.assertTrue(unaligned_dword.unaligned)
+
+        # 8-byte offset is aligned
+        aligned_offset8 = evaluate_dec_rtn_u64_status_flags(
+            vaddr=0x200, offset=8, old_val=5, vdata0=10, new_val=4
+        )
+        self.assertFalse(aligned_offset8.unaligned)
+
+    def test_address_wraparound_detection_u64(self) -> None:
+        nowrap = evaluate_dec_rtn_u64_status_flags(
+            vaddr=0x100, offset=0, old_val=5, vdata0=10, new_val=4
+        )
+        self.assertFalse(nowrap.address_wrapped)
+
+        wrap_boundary = evaluate_dec_rtn_u64_status_flags(
+            vaddr=65536 - 8, offset=8, old_val=5, vdata0=10, new_val=4
+        )
+        self.assertTrue(wrap_boundary.address_wrapped)
 
 
 if __name__ == "__main__":
