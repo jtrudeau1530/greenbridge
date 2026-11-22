@@ -879,8 +879,8 @@ described as 128 x 128 with format code `0x5f` (95, `DXGI_FORMAT_BC6H_UF16` if t
 for the BC1/BC7 codes elsewhere in this document), one name per texture. Two 128 x 128 BC6H textures are
 2 x 16,384 = 32,768 bytes, exactly the graphics-page size. The graphics pages differ: 1,117 distinct contents
 among the 1,313 (the most repeated one 60 times). So the archive stores 1,313 instances of one HDR texture pair
-with per-instance data, the shape of a per-tile or per-cell map. The other header variants describe 172 x 172
-textures with code `0x62` (98, BC7) or other sizes.
+with per-instance data, the shape of a per-tile or per-cell map. One of the other three header variants describes
+172 x 172 textures with code `0x62` (98, BC7).
 
 **The 121 other streams** start with no known magic (`RDS5`, `0DRP`, `TTPF`, `RSC8`, `PSIN`, `RBF0`, DDS) in
 their first 4 KiB, and the large ones are high-entropy (7.3 to 7.7 bits per byte over the first 64 KiB, except
