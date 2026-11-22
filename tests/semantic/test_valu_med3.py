@@ -930,5 +930,106 @@ class TestValuMed3SIMDMultiLane(unittest.TestCase):
             self.assertEqual(results[lane], ref_med3_i32(lane, 50, 100))
 
 
+class TestValuMed3RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_inplace_dst_equals_src0(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(0, 10)
+        interp.set_vgpr_u32(1, 30)
+        interp.set_vgpr_u32(2, 20)
+
+        res = interp.execute_asm("v_med3_i32 v0, v0, v1, v2")
+        self.assertEqual(res, 20)
+        self.assertEqual(interp.get_vgpr_u32(0), 20)
+        self.assertEqual(interp.get_vgpr_u32(1), 30)
+        self.assertEqual(interp.get_vgpr_u32(2), 20)
+
+    def test_inplace_dst_equals_src1(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(0, 100)
+        interp.set_vgpr_u32(1, 50)
+        interp.set_vgpr_u32(2, 75)
+
+        res = interp.execute_asm("v_med3_u32 v1, v0, v1, v2")
+        self.assertEqual(res, 75)
+        self.assertEqual(interp.get_vgpr_u32(0), 100)
+        self.assertEqual(interp.get_vgpr_u32(1), 75)
+        self.assertEqual(interp.get_vgpr_u32(2), 75)
+
+    def test_inplace_dst_equals_src2(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(0, f32_to_bits(1.0))
+        interp.set_vgpr_u32(1, f32_to_bits(3.0))
+        interp.set_vgpr_u32(2, f32_to_bits(2.0))
+
+        res = interp.execute_asm("v_med3_f32 v2, v0, v1, v2")
+        self.assertEqual(bits_to_f32(res), 2.0)
+        self.assertEqual(bits_to_f32(interp.get_vgpr_u32(0)), 1.0)
+        self.assertEqual(bits_to_f32(interp.get_vgpr_u32(1)), 3.0)
+        self.assertEqual(bits_to_f32(interp.get_vgpr_u32(2)), 2.0)
+
+    def test_inplace_dst_equals_all_sources(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(0, 42)
+        res = interp.execute_asm("v_med3_i32 v0, v0, v0, v0")
+        self.assertEqual(res, 42)
+        self.assertEqual(interp.get_vgpr_u32(0), 42)
+
+    def test_inplace_dst_equals_two_sources(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(0, 5)
+        interp.set_vgpr_u32(1, 10)
+        res = interp.execute_asm("v_med3_i32 v0, v0, v0, v1")
+        self.assertEqual(res, 5)
+        self.assertEqual(interp.get_vgpr_u32(0), 5)
+        self.assertEqual(interp.get_vgpr_u32(1), 10)
+
+    def test_simd_inplace_divergent_mask(self):
+        sim = SIMDVALUInterpreter(wave_size=32)
+        init_vals = [i + 1 for i in range(32)]
+        for lane in range(32):
+            sim.set_vgpr_u32(0, lane, init_vals[lane])
+            sim.set_vgpr_u32(1, lane, 10)
+            sim.set_vgpr_u32(2, lane, 20)
+
+        # Active on odd lanes only: 0xAAAAAAAA
+        sim.exec = 0xAAAAAAAA
+        res = sim.execute_asm("v_med3_i32 v0, v0, v1, v2")
+
+        for lane in range(32):
+            if lane % 2 == 1:
+                expected = ref_med3_i32(init_vals[lane], 10, 20)
+                self.assertEqual(res[lane], expected)
+                self.assertEqual(sim.get_vgpr_u32(0, lane), expected)
+            else:
+                self.assertEqual(res[lane], init_vals[lane])
+                self.assertEqual(sim.get_vgpr_u32(0, lane), init_vals[lane])
+
+    def test_successive_inplace_chain(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(0, 100)
+        interp.set_vgpr_u32(1, 0)
+        interp.set_vgpr_u32(2, 50)
+
+        # Step 1: med3(100, 0, 50) -> 50
+        interp.execute_asm("v_med3_i32 v0, v0, v1, v2")
+        self.assertEqual(interp.get_vgpr_u32(0), 50)
+
+        # Step 2: change thresholds v1=20, v2=30; med3(50, 20, 30) -> 30
+        interp.set_vgpr_u32(1, 20)
+        interp.set_vgpr_u32(2, 30)
+        interp.execute_asm("v_med3_i32 v0, v0, v1, v2")
+        self.assertEqual(interp.get_vgpr_u32(0), 30)
+
+    def test_aliased_sgpr_source_immutability(self):
+        interp = ScalarVALUInterpreter()
+        interp.set_vgpr_u32(0, 999)
+        interp.set_sgpr_u32(5, 42)
+        interp.execute_asm("v_med3_i32 v0, s5, s5, s5")
+        self.assertEqual(interp.get_vgpr_u32(0), 42)
+        self.assertEqual(interp.get_sgpr_u32(5), 42)
+
+
 if __name__ == "__main__":
     unittest.main()
