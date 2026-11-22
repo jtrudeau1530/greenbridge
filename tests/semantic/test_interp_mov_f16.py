@@ -702,5 +702,122 @@ class TestInterpMovF16SIMDMultiLane(unittest.TestCase):
             self.assertEqual(wave.vgprs[lane][0], self.CANARY_OLD)
 
 
+class TestInterpMovF16RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_pack_two_halves_into_same_vgpr(self):
+        # Move attr0.x low into v0 low, then attr0.y low into v0 high
+        rf = InterpolationRegisterFile()
+        buf = AttributeBuffer()
+        interp = InterpMovF16ScalarInterpreter(rf, buf)
+
+        # attr0.x = 1.0 (0x3C00), attr0.y = 2.0 (0x4000)
+        buf.write_param_channel(0, 0, Channel.X.value, pack_f16_pair(H_ONE, 0))
+        buf.write_param_channel(0, 0, Channel.Y.value, pack_f16_pair(H_TWO, 0))
+
+        # 1. Write low half
+        inst1 = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(0, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(0, Channel.X),
+            high_src=False,
+        )
+        interp.execute(inst1)
+        self.assertEqual(rf.read_vgpr_u32(0), 0x00003C00)
+
+        # 2. Write high half (must preserve previously written low half 0x3C00!)
+        inst2 = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(0, high=True),
+            param=ParamType.P0,
+            attr=AttributeRef(0, Channel.Y),
+            high_src=False,
+        )
+        interp.execute(inst2)
+        # Both halves should be present: hi = 0x4000, lo = 0x3C00
+        self.assertEqual(rf.read_vgpr_u32(0), 0x40003C00)
+
+    def test_overwrite_only_low_half(self):
+        rf = InterpolationRegisterFile()
+        buf = AttributeBuffer()
+        interp = InterpMovF16ScalarInterpreter(rf, buf)
+
+        # Initial v3 has 0xBEEF in high half, 0x1111 in low half
+        rf.write_vgpr_u32(3, 0xBEEF1111)
+
+        buf.write_param_channel(0, 5, Channel.Z.value, pack_f16_pair(H_HALF, 0))
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(3, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(5, Channel.Z),
+            high_src=False,
+        )
+        interp.execute(inst)
+        # High half must stay 0xBEEF, low half becomes H_HALF (0x3800)
+        self.assertEqual(rf.read_vgpr_u32(3), 0xBEEF3800)
+
+    def test_overwrite_only_high_half(self):
+        rf = InterpolationRegisterFile()
+        buf = AttributeBuffer()
+        interp = InterpMovF16ScalarInterpreter(rf, buf)
+
+        # Initial v7 has 0x1234 in high half, 0xCAFE in low half
+        rf.write_vgpr_u32(7, 0x1234CAFE)
+
+        buf.write_param_channel(0, 6, Channel.W.value, pack_f16_pair(H_ONE, 0))
+        inst = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(7, high=True),
+            param=ParamType.P0,
+            attr=AttributeRef(6, Channel.W),
+            high_src=False,
+        )
+        interp.execute(inst)
+        # Low half must stay 0xCAFE, high half becomes H_ONE (0x3C00)
+        self.assertEqual(rf.read_vgpr_u32(7), 0x3C00CAFE)
+
+    def test_simd_multi_lane_pack_aliasing(self):
+        buf = AttributeBuffer()
+        buf.write_param_channel(0, 0, Channel.X.value, pack_f16_pair(0x1111, 0))
+        buf.write_param_channel(0, 0, Channel.Y.value, pack_f16_pair(0x2222, 0))
+        wave = SIMDWavefront(wave_size=64, attr_buf=buf)
+
+        wave.exec_lo = 0x00FF00FF
+        wave.exec_hi = 0xFF00FF00
+
+        initial_val = 0xDEADBEEF
+        for lane in range(64):
+            wave.vgprs[lane][2] = initial_val
+
+        # Step 1: Write low half
+        inst1 = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(2, high=False),
+            param=ParamType.P0,
+            attr=AttributeRef(0, Channel.X),
+            high_src=False,
+        )
+        wave.execute(inst1)
+
+        # Step 2: Write high half
+        inst2 = ASTInstruction(
+            opcode=Opcode.V_INTERP_MOV_F16,
+            dst=ASTOperand(2, high=True),
+            param=ParamType.P0,
+            attr=AttributeRef(0, Channel.Y),
+            high_src=False,
+        )
+        wave.execute(inst2)
+
+        for lane in range(64):
+            is_active = bool((wave.exec_mask >> lane) & 1)
+            if is_active:
+                self.assertEqual(wave.vgprs[lane][2], 0x22221111)
+            else:
+                self.assertEqual(wave.vgprs[lane][2], initial_val)
+
+
 if __name__ == "__main__":
     unittest.main()
