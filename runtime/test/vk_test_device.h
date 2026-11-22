@@ -60,6 +60,7 @@ public:
     std::uint32_t family = 0;
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
+    VkPhysicalDeviceFeatures enabled{};  // the core features enabled on `device`
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
@@ -279,6 +280,7 @@ public:
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -310,6 +312,7 @@ public:
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
+        enabled = enable;
         std::vector<const char*> device_extensions;
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);

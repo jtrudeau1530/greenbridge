@@ -1685,7 +1685,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (conditional_rendering) {
                 VkConditionalRenderingBeginInfoEXT begin{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
                 begin.buffer = p.binding.buffer;
-                begin.offset = predication->offset;
+                // A default-heap buffer is a range of the GPU address arena's VkBuffer, starting at buffer_offset.
+                begin.offset = p.binding.buffer_offset + predication->offset;
                 // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
                 begin.flags = predication->op == d3d12_predication::not_equal_zero
                                   ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT

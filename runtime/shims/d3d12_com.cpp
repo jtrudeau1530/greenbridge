@@ -5,6 +5,7 @@
 #include "d3d12_trace.h"
 #include "../src/gfx10_descriptors.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -80,6 +81,7 @@ public:
     // {2f8a7c33-91d4-4b6e-8e05-6d3f1a9b2c47}
     static constexpr GUID kTag{0x2f8a7c33, 0x91d4, 0x4b6e, {0x8e, 0x05, 0x6d, 0x3f, 0x1a, 0x9b, 0x2c, 0x47}};
     explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
+    ~GraphicsCommandList() override { release_held(); }
 
     const leonida::CommandList& commands() const { return list_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
@@ -107,6 +109,7 @@ public:
             return d3d12_trace::result(method, E_INVALIDARG);
         if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
         invalid_ = false;
+        release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         stencil_ref_set_ = false;
         return d3d12_trace::result(method, S_OK);
@@ -569,6 +572,7 @@ private:
     void bind_root(RootState& state, ID3D12RootSignature* signature) {
         const RootArgumentLayout* layout = root_signature_layout(signature);
         if (layout && layout == state.layout) return;
+        hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
         if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
@@ -626,7 +630,25 @@ private:
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
 
+    // The root signatures and pipeline states this recording uses. D3D12 lets an application release them right
+    // after Set*RootSignature / SetPipelineState; the list keeps them until Reset or its own release, so the root
+    // layout it reads and the pipeline ExecuteCommandLists looks up still exist. (Keeping them alive while the GPU
+    // runs the submission stays the application's job, as in D3D12.)
+    std::vector<IUnknown*> held_;
+
+    void hold(IUnknown* object) {
+        if (!object || std::find(held_.begin(), held_.end(), object) != held_.end()) return;
+        object->AddRef();
+        held_.push_back(object);
+    }
+
+    void release_held() {
+        for (IUnknown* object : held_) object->Release();
+        held_.clear();
+    }
+
     void set_pipeline(ID3D12PipelineState* state) {
+        hold(state);
         compute_pipeline_ = compute_pipeline_id(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
         if (state && !compute_pipeline_ && !graphics_pipeline_)

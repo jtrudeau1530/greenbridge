@@ -1184,6 +1184,29 @@ VkBlendOp blend_op(D3D12_BLEND_OP op) {
     }
 }
 
+// D3D12 and Vulkan list the logic ops in different orders, so each is named.
+VkLogicOp logic_op(D3D12_LOGIC_OP op) {
+    switch (op) {
+    case D3D12_LOGIC_OP_CLEAR: return VK_LOGIC_OP_CLEAR;
+    case D3D12_LOGIC_OP_SET: return VK_LOGIC_OP_SET;
+    case D3D12_LOGIC_OP_COPY: return VK_LOGIC_OP_COPY;
+    case D3D12_LOGIC_OP_COPY_INVERTED: return VK_LOGIC_OP_COPY_INVERTED;
+    case D3D12_LOGIC_OP_NOOP: return VK_LOGIC_OP_NO_OP;
+    case D3D12_LOGIC_OP_INVERT: return VK_LOGIC_OP_INVERT;
+    case D3D12_LOGIC_OP_AND: return VK_LOGIC_OP_AND;
+    case D3D12_LOGIC_OP_NAND: return VK_LOGIC_OP_NAND;
+    case D3D12_LOGIC_OP_OR: return VK_LOGIC_OP_OR;
+    case D3D12_LOGIC_OP_NOR: return VK_LOGIC_OP_NOR;
+    case D3D12_LOGIC_OP_XOR: return VK_LOGIC_OP_XOR;
+    case D3D12_LOGIC_OP_EQUIV: return VK_LOGIC_OP_EQUIVALENT;
+    case D3D12_LOGIC_OP_AND_REVERSE: return VK_LOGIC_OP_AND_REVERSE;
+    case D3D12_LOGIC_OP_AND_INVERTED: return VK_LOGIC_OP_AND_INVERTED;
+    case D3D12_LOGIC_OP_OR_REVERSE: return VK_LOGIC_OP_OR_REVERSE;
+    case D3D12_LOGIC_OP_OR_INVERTED: return VK_LOGIC_OP_OR_INVERTED;
+    default: return VK_LOGIC_OP_COPY;
+    }
+}
+
 // D3D12_COMPARISON_FUNC (NEVER = 1 .. ALWAYS = 8) and D3D12_STENCIL_OP (KEEP = 1 .. DECR = 8) list their values
 // in Vulkan's order, starting at 1 instead of 0.
 VkCompareOp compare_op(D3D12_COMPARISON_FUNC func) {
@@ -1211,6 +1234,24 @@ bool equal_semantic(const std::string& a, const char* b) {
     for (std::size_t i = 0; i < a.size(); ++i)
         if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
     return true;
+}
+
+// Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
+// corpus), the one to build: the first that `fits` and declares no set-0 bindings, which pipelines do not bind yet;
+// else the first that fits; else the first without bindings; else the first. Null when there is none.
+template<typename Fits>
+const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEntry*>& candidates, Fits&& fits) {
+    const leonida::ShaderEntry* fitting = nullptr;
+    const leonida::ShaderEntry* unbound = nullptr;
+    for (const leonida::ShaderEntry* e : candidates) {
+        const bool fit = fits(*e);
+        if (fit && !e->binding_count) return e;
+        if (fit && !fitting) fitting = e;
+        if (!e->binding_count && !unbound) unbound = e;
+    }
+    if (fitting) return fitting;
+    if (unbound) return unbound;
+    return candidates.empty() ? nullptr : candidates.front();
 }
 
 // Whether the input layout has an element for every ordinary (non-system-value) input of the vertex shader.
@@ -1328,22 +1369,18 @@ public:
                 return E_INVALIDARG;
             }
             const std::string hash = leonida::sha256_hex(stage.fssm);
-            // Containers with the same program can differ in their input signature; for the VS, take the first
-            // whose inputs this input layout feeds (else the first, which the layout check below reports).
-            const auto candidates = library->candidates(stage.name, hash);
-            stage.entry = candidates.empty() ? nullptr : candidates.front();
-            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT)
-                for (const leonida::ShaderEntry* candidate : candidates)
-                    if (layout_feeds(*candidate, desc.InputLayout)) {
-                        stage.entry = candidate;
-                        break;
-                    }
+            // Containers with the same program can differ in their input signature or bindings: a VS must have its
+            // inputs fed by this input layout (else the layout check below reports it).
+            const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
+            stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
+                return !vertex || layout_feeds(e, desc.InputLayout);
+            });
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
-                std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the bindless set is not implemented yet\n",
+                std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; pipelines do not bind set 0 yet\n",
                              stage.entry->name.c_str());
                 return E_NOTIMPL;
             }
@@ -1439,7 +1476,9 @@ public:
         raster.depthBiasClamp = r.DepthBiasClamp;
         raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
         raster.lineWidth = 1.0f;
-        if (!r.DepthClipEnable) log_once("DepthClipEnable = FALSE is not modelled (depth clamp); flag", 0);
+        // No depth clipping: fragments outside the viewport's depth range are kept and their depth clamped to it, as
+        // D3D12 clamps output depth to MinDepth..MaxDepth anyway (needs depthClamp, checked below).
+        raster.depthClampEnable = r.DepthClipEnable ? VK_FALSE : VK_TRUE;
 
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -1460,7 +1499,6 @@ public:
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             const D3D12_RENDER_TARGET_BLEND_DESC& b =
                 desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
-            if (b.LogicOpEnable) log_once("logic ops are not modelled; render target", int(i));
             blends[i].blendEnable = b.BlendEnable;
             blends[i].srcColorBlendFactor = blend_factor(b.SrcBlend);
             blends[i].dstColorBlendFactor = blend_factor(b.DestBlend);
@@ -1473,6 +1511,14 @@ public:
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         blend.attachmentCount = std::uint32_t(blends.size());
         blend.pAttachments = blends.data();
+        // A logic op replaces blending for every target in Vulkan (one per pipeline), and D3D12 takes it from
+        // RenderTarget[0]. Vulkan applies it to integer and normalized formats and skips float ones.
+        const D3D12_RENDER_TARGET_BLEND_DESC& first = desc.BlendState.RenderTarget[0];
+        if (desc.NumRenderTargets && first.LogicOpEnable) {
+            if (unsigned(first.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED) return E_INVALIDARG;
+            blend.logicOpEnable = VK_TRUE;
+            blend.logicOp = logic_op(first.LogicOp);
+        }
 
         // State that needs a Vulkan feature the device did not enable (VulkanDeviceInfo::features) is refused, rather
         // than handed to the driver against the spec.
@@ -1500,6 +1546,10 @@ public:
                  src1(b.dstAlphaBlendFactor)))
                 return refuse("SRC1 blend factors need dualSrcBlend, which the device lacks; factor",
                               int(b.srcColorBlendFactor));
+        if (blend.logicOpEnable && !features.logicOp)
+            return refuse("logic ops need logicOp, which the device lacks; op", int(first.LogicOp));
+        if (raster.depthClampEnable && !features.depthClamp)
+            return refuse("DepthClipEnable = FALSE needs depthClamp, which the device lacks; flag", 0);
 
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
@@ -1573,14 +1623,17 @@ public:
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) return E_FAIL;
         const std::string hash = leonida::sha256_hex(fssm);
-        const leonida::ShaderEntry* entry = library->find("cs", hash);
+        // A binding-free entry wins over one with bindings for the same program (pick_entry).
+        const leonida::ShaderEntry* entry =
+            pick_entry(library->candidates("cs", hash), [](const leonida::ShaderEntry&) { return true; });
         if (!entry) {
             std::fprintf(stderr, "[rt] d3d12: no translated compute shader for FSSM sha256 %s\n", hash.c_str());
             return E_INVALIDARG;
         }
         if (entry->binding_count) {
-            // Set 0 (bindless images, samplers, the descriptor hash table) is milestone M2.
-            std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the bindless set is not implemented yet\n",
+            // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, pipelines do not
+            // declare or bind it yet (M2).
+            std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; pipelines do not bind set 0 yet\n",
                          entry->name.c_str());
             return E_NOTIMPL;
         }
@@ -1639,10 +1692,12 @@ private:
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
     VkPipeline build(std::uint32_t unbound) const {
+        // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
+        // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
+        // (VUID-vkCmdDraw-pStrides-04913).
         static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,          VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
@@ -1670,7 +1725,7 @@ private:
         blend.attachmentCount = std::uint32_t(r.blends.size());
         blend.pAttachments = r.blends.data();
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states));
+        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
         dynamic.pDynamicStates = dynamic_states;
 
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
@@ -2094,6 +2149,8 @@ public:
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        // Default-heap buffers live here, and any of them can be a SetPredication buffer.
+        if (state_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
         if (vk.vkCreateBuffer(state_.info.device, &info, nullptr, &arena.buffer) != VK_SUCCESS) {
             arena.buffer = VK_NULL_HANDLE;
             return false;
@@ -3950,6 +4007,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.fillModeNonSolid = chosen_features.fillModeNonSolid;
     enable.depthBiasClamp = chosen_features.depthBiasClamp;
     enable.dualSrcBlend = chosen_features.dualSrcBlend;
+    enable.logicOp = chosen_features.logicOp;
+    enable.depthClamp = chosen_features.depthClamp;
+    // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
+    // 26,503 entries), doubles, 16-bit integers, and clip and cull distances in a few vertex shaders. Enabled where
+    // the GPU has them; without one, vkCreateShaderModule reports the capability (VUID-...-pCode-08740).
+    enable.shaderInt64 = chosen_features.shaderInt64;
+    enable.shaderFloat64 = chosen_features.shaderFloat64;
+    enable.shaderInt16 = chosen_features.shaderInt16;
+    enable.shaderClipDistance = chosen_features.shaderClipDistance;
+    enable.shaderCullDistance = chosen_features.shaderCullDistance;
     info.features = enable;
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;

@@ -431,8 +431,9 @@ The compute path, end to end:
   dependencies (`shader_library_test`).
   - A container with two different 0x0D payloads (195 of 26,503) is read at the last one, as
     `tools/fssm_unpack.py` does by default and so as `fssm_sha256` was computed.
-  - Index entries that share a program are all kept: the VS whose input signature the PSO's input layout feeds
-    is chosen.
+  - Index entries that share a program are all kept (789 groups of 1,182 entries in the corpus). A PSO takes the
+    first entry that fits (for a VS: whose input signature the input layout feeds) and declares no set-0
+    bindings, since pipelines do not bind set 0 yet.
   - A malformed index (bad numbers or `\u` escapes) is refused with an error instead of throwing into the shim,
     and an integer field outside 0..2^32−1 reads as 0.
 - Root signatures use the model already on `main` (`runtime/src/root_signature.h`, `rt::rootsig`): `parse_rts0`
@@ -450,10 +451,15 @@ The compute path, end to end:
   signature `pack()` refuses (more than 32 user dwords: the spill layout is open) is refused with its reason.
   **`CreateComputePipelineState`** (PC slot 11, Xbox slot 62 through the proxy) finds the shader by its FSSM
   hash, builds a pipeline with the 144-byte push-constant range and registers it for replay. Shaders that declare
-  set-0 bindings are refused with a log until the bindless set exists (M2).
+  set-0 bindings are refused with a log while pipelines do not declare or bind set 0 (M2).
 - **Command list**: `Set{Compute,Graphics}RootSignature` (a different signature clears the arguments, as D3D12
-  leaves them undefined; setting the bound one again keeps them, as D3D12 does), `SetPipelineState`, the 32-bit constant, root view and descriptor-table setters, `SetDescriptorHeaps`
-  and `ClearState`. A wrong parameter type or out-of-range constants makes `Close` return `E_INVALIDARG`.
+  leaves them undefined; setting the bound one again keeps them, as D3D12 does), `SetPipelineState`, the 32-bit
+  constant, root view and descriptor-table setters, `SetDescriptorHeaps` and `ClearState`. A wrong parameter type
+  or out-of-range constants makes `Close` return `E_INVALIDARG`.
+  - The list holds a reference to every root signature and pipeline state it is given, until `Reset` or its own
+    release. D3D12 lets an application release them right after setting them, so the root layout the setters read
+    and the pipeline `ExecuteCommandLists` looks up must outlive that. Keeping them alive while the GPU runs the
+    submission stays the application's job, as in D3D12.
   `Dispatch` records the block as it is at that moment. Replay binds the pipeline, pushes s0..s31, the heap base
   and the code base, and dispatches.
 - **Graphics pipelines and draws (M1).** `CreateGraphicsPipelineState` (PC slot 10) finds the VS and PS by FSSM hash.
@@ -461,16 +467,25 @@ The compute path, end to end:
     and its location is the element's register (the translator's vertex-fetch rule). An input the layout leaves
     unfed is refused, as D3D12 refuses it.
   - **Fixed-function state:** rasterizer, blend and depth-stencil state map one to one. Viewport, scissor,
-    topology, vertex strides, stencil references and the blend factor are dynamic.
+    topology, stencil references and the blend factor are dynamic, and so are vertex strides when the pipeline has
+    vertex bindings. A pipeline without them (a full-screen pass from `SV_VertexID`) does not declare the stride
+    state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`).
+  - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
+    pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
+    to the viewport's range anyway.
   - **Formats:** dynamic rendering takes the RTV and DSV formats. A draw that leaves a slot unbound for which the
     PSO names a format (D3D12 allows it and discards those writes) uses a variant of the pipeline with that format
     undefined, built on first use and kept with the PSO. Bit i of the variant key is colour slot i, and bit 8 is
     depth/stencil.
   - **Instance step rate 0:** every instance reads element 0, done with a stride of 0 for that slot at draw time.
-  - **Features:** independent blend state, wireframe fill, a depth-bias clamp and SRC1 blend factors need
-    `independentBlend`, `fillModeNonSolid`, `depthBiasClamp` and `dualSrcBlend`. The standalone device enables
-    those the GPU has and reports them in `VulkanDeviceInfo::features`. A PSO that needs a missing one is refused
-    with a log.
+  - **Features:** independent blend state, wireframe fill, a depth-bias clamp, SRC1 blend factors, logic ops and
+    disabled depth clipping need `independentBlend`, `fillModeNonSolid`, `depthBiasClamp`, `dualSrcBlend`, `logicOp`
+    and `depthClamp`. The standalone device enables those the GPU has and reports them in
+    `VulkanDeviceInfo::features`. A PSO that needs a missing one is refused with a log.
+  - **Shader features:** the standalone device also enables `shaderInt64` (declared by 25,803 of 26,503 index
+    entries), `shaderFloat64`, `shaderInt16`, `shaderClipDistance` and `shaderCullDistance` where the GPU has them.
+    Without one, `vkCreateShaderModule` reports the capability (`VUID-VkShaderModuleCreateInfo-pCode-08740`). The
+    index's `features` list is not read yet, so a shader that needs a feature the GPU lacks is not refused up front.
   - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA, set-0 bindings, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
@@ -499,6 +514,8 @@ The compute path, end to end:
     `E_OUTOFMEMORY`, and so is a shader-visible descriptor heap the arena cannot hold (in host memory its GPU
     handle would be 0).
   - If the arena cannot be created, its buffer is released, so other buffers keep their own memory and get no VA.
+  - With `VK_EXT_conditional_rendering`, the arena is created with the conditional-rendering usage, and
+    `SetPredication` on a default-heap buffer reads at the buffer's offset in the arena plus the call's offset.
 
 Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and
 therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
@@ -512,6 +529,18 @@ increase; such a signal is reported and dropped); instance step rates above 1 (t
 divisors); read-only DSVs (the depth image always moves to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, which matters once
 depth SRVs are sampled next to a read-only DSV, M2); the index buffer is bound without its view's size
 (`vkCmdBindIndexBuffer2`, Vulkan 1.4, takes one).
+
+Known gaps found in review, not fixed here:
+- **Wave64:** a wave64 compute shader runs at whatever subgroup size the driver picks, because no
+  `requiredSubgroupSize` is requested (claimed as a follow-up in #313).
+- **Queues:** every D3D12 queue submits to one `VkQueue`, which runs batches in order. So a queue that waits on a
+  fence another queue signals later (`B->Wait(f, n)` recorded before `A->Signal(f, n)`) holds back that signal,
+  and the GPU never progresses (woreksami's probe). Queues on separate Vulkan queues (#306 for copy and compute)
+  or holding back a batch until its wait value is submitted would fix it.
+- **Fences:** a CPU `ID3D12Fence::Signal` checks only the semaphore's current value, so it can signal below a GPU
+  signal that is still pending (`VUID-VkSemaphoreSignalInfo-value-03258`).
+- **Lookups:** `buffer_at` searches every resource for each vertex and index view; an ordered map by VA would do
+  when it shows.
 
 Build `runtime/` (Vulkan SDK and Python 3 on `PATH`) and run `ctest --test-dir <build> --output-on-failure` for the
 CPU tests:
@@ -646,7 +675,13 @@ and any validation error fails them.
   FSSM hash (an unknown program is refused). It sets root constants, a root UAV and a descriptor table whose
   application-written entry points at an upload buffer, then runs two dispatches that change s0 and the UAV in
   between. The results come back through a readback buffer. The shader, `test/glsl/cs_user_data.comp`, is GLSL
-  written to the translator's push-constant and address contract, compiled with `glslangValidator`.
+  written to the translator's push-constant and address contract, compiled with `glslangValidator`. It also checks:
+  - the dispatches' root signature and PSO are released right after being set, and the same signature is set
+    again after the arguments, so the list must hold both and keep the arguments (without the hold the test
+    crashes);
+  - the index has an entry with set-0 bindings for the same program ahead of the binding-free one, and the PSO
+    must take the binding-free one;
+  - a device that reports 128 bytes of push constants refuses the PSO.
 - `d3d12_draw_test`: milestone M1, through the proxy.
   - **Pipeline:** a VS+PS PSO found by FSSM hash. The input layout is POSITION then COLOR, while the VS has them in
     the opposite register order, so a match by position would fail.
@@ -657,18 +692,24 @@ and any validation error fails them.
     - before the second draw, the same root signature is set again after the arguments, which must keep them;
     - two more draws, through a viewport on the top-right quadrant, read COLOR per instance with step rate 0 (two
       instances that must both read element 0) and from an unbound slot (zeros).
+  - **Second pass** on the same target, cleared again: a full-screen triangle from a VS with no inputs
+    (`test/glsl/vs_fullscreen.vert`), first in its submission so no vertex buffer was bound before it, through a
+    viewport on the bottom-right quadrant; then, where the GPU has `logicOp`, the red quad XORed over the blue
+    top-left quadrant, which must read `(255,0,255,0)`.
   - **Refusals:**
-    - PSOs that need wireframe fill, independent blend or a depth-bias clamp are refused on this device, which
-      enables none of them;
+    - PSOs that need wireframe fill, independent blend, a depth-bias clamp or depth clamping are refused on this
+      device, which enables none of them;
     - nine render targets is refused, at PSO creation and at `OMSetRenderTargets`;
     - 0-byte and wrapping buffer sizes are refused, and a buffer or shader-visible heap larger than the arena runs
       out of memory;
     - a draw with no viewport executes cleanly and draws nothing.
   - **Check:** all 4096 pixels of the read-back target are compared. Where the red and green quadrants land also
-    checks the viewport flip and the winding. With each of the rebind, step-rate and variant fixes undone, the test
-    fails (wrong pixels, or `dynamicRenderingUnusedAttachments-08912`).
+    checks the viewport flip and the winding. The test fails with any of these fixes undone: the rebind, step
+    rate and logic op show wrong pixels, the variant breaks `dynamicRenderingUnusedAttachments-08912`, and the
+    stride state breaks `pStrides-04913`.
 
-  The shaders are GLSL written to the translator's contract (`test/glsl/vs_draw.vert`, `ps_draw.frag`).
+  The shaders are GLSL written to the translator's contract (`test/glsl/vs_draw.vert`, `vs_fullscreen.vert`,
+  `ps_draw.frag`).
 - `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
   the back buffer `PRESENT` → `RENDER_TARGET`, clear, move it back, execute, present, signal a fence. It then
   resizes the window and presents 10 more (70 in all), which recreates the swapchain, scales the blit and switches

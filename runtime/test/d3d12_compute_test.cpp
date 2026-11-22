@@ -152,7 +152,11 @@ int main() {
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
-        index << "{\"cs_user_data\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fssm)
+        // An entry for the same program with set-0 bindings comes first, as in one group of the corpus: the PSO
+        // must take the binding-free entry, since pipelines do not bind set 0 yet (it has no module either).
+        index << "{\"cs_user_data_bound\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fssm)
+              << "\", \"bindings\": [{\"binding\": 0}], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1]},\n"
+                 " \"cs_user_data\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fssm)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
                  "\"uses_code_base\": true, \"wave64\": false}}";
     }
@@ -291,12 +295,27 @@ int main() {
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         ID3D12DescriptorHeap* heaps[] = {heap.p};
         list->SetDescriptorHeaps(1, heaps);
-        list->SetComputeRootSignature(root.p);
-        list->SetPipelineState(pso.p);
+        // This root signature and PSO are released right after being set, as D3D12 allows: the list keeps them,
+        // so the arguments below still have a layout and ExecuteCommandLists still finds the pipeline.
+        ID3D12RootSignature* held_root = nullptr;
+        {
+            Ref<ID3D12RootSignature> own_root;
+            EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(),
+                                                         IID_PPV_ARGS(&own_root.p))));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC own_desc = pso_desc;
+            own_desc.pRootSignature = own_root.p;
+            Ref<ID3D12PipelineState> own_pso;
+            EXPECT(SUCCEEDED(device->CreateComputePipelineState(&own_desc, IID_PPV_ARGS(&own_pso.p))));
+            list->SetComputeRootSignature(own_root.p);
+            list->SetPipelineState(own_pso.p);
+            held_root = own_root.p;  // still alive: the list holds it
+        }
         const std::uint32_t base_and_step[2] = {7, 3};
         list->SetComputeRoot32BitConstants(0, 2, base_and_step, 0);
         list->SetComputeRootUnorderedAccessView(1, va_a);
         list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
+        // Setting the bound root signature again keeps the arguments, as D3D12 does.
+        list->SetComputeRootSignature(held_root);
         list->Dispatch(1, 1, 1);
         list->SetComputeRoot32BitConstant(0, 100, 0);
         list->SetComputeRootUnorderedAccessView(1, va_b);

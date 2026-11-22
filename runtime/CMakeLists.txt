@@ -692,7 +692,9 @@ if(TARGET Vulkan::Headers)
       # Milestone M1: a VS+PS pipeline and indexed draws, shaders written to the same contract.
       set(LEONIDA_TEST_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw.spv)
       set(LEONIDA_TEST_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_draw.spv)
-      foreach(pair "vs_draw.vert;${LEONIDA_TEST_VS}" "ps_draw.frag;${LEONIDA_TEST_PS}")
+      set(LEONIDA_TEST_VS_FULLSCREEN ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_fullscreen.spv)
+      foreach(pair "vs_draw.vert;${LEONIDA_TEST_VS}" "ps_draw.frag;${LEONIDA_TEST_PS}"
+                   "vs_fullscreen.vert;${LEONIDA_TEST_VS_FULLSCREEN}")
         list(GET pair 0 source)
         list(GET pair 1 output)
         add_custom_command(
@@ -704,10 +706,11 @@ if(TARGET Vulkan::Headers)
           VERBATIM)
       endforeach()
       add_executable(d3d12_draw_test test/d3d12_draw_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_VS}
-                     ${LEONIDA_TEST_PS})
+                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_VS_FULLSCREEN})
       target_link_libraries(d3d12_draw_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test and d3d12_draw_test are not built")

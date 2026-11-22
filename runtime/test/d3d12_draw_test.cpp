@@ -46,11 +46,15 @@ int main() {
     // Shader programs and the index that maps their hashes to the compiled test modules.
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
+    const auto fullscreen_program = fssm_program({0x56530002, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
+    const auto fullscreen_container = shader_container(fullscreen_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_draw_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
+                               std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
@@ -59,12 +63,15 @@ int main() {
                  "\"system_value\": 0, \"component_type\": \"float\"}, "
                  "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
                  "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
+                 " \"vs_fullscreen\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fullscreen_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []},\n"
                  " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
     }
 
     constexpr UINT size = 64;
-    std::vector<std::uint8_t> pixels(size * 256);
+    std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256);
+    const bool logic_op = d.enabled.logicOp == VK_TRUE;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -75,6 +82,8 @@ int main() {
         info.queue_family = d.family;
         info.buffer_device_address = true;
         info.shader_dir = library.string();
+        // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
+        info.features.logicOp = d.enabled.logicOp;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -115,7 +124,7 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
-        Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused;
+        Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused, xor_pso, fullscreen;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.InputLayout = {elements, 1};  // COLOR missing: D3D12 rejects a layout that leaves an input unfed
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unfed.p)) == E_INVALIDARG && !unfed.p);
@@ -153,6 +162,21 @@ int main() {
         needs_feature = pso_desc;
         needs_feature.NumRenderTargets = 9;
         EXPECT(device->CreateGraphicsPipelineState(&needs_feature, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG && !refused.p);
+        needs_feature = pso_desc;
+        needs_feature.RasterizerState.DepthClipEnable = FALSE;  // depthClamp
+        EXPECT(device->CreateGraphicsPipelineState(&needs_feature, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+
+        // XOR on render target 0: applied where the GPU has logicOp (the device passes it on), refused elsewhere.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC xor_desc = pso_desc;
+        xor_desc.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
+        xor_desc.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+        EXPECT(device->CreateGraphicsPipelineState(&xor_desc, IID_PPV_ARGS(&xor_pso.p)) ==
+               (logic_op ? S_OK : E_NOTIMPL));
+        // A full-screen pass: a VS with no inputs and an empty input layout, so the pipeline has no vertex bindings.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC fullscreen_desc = pso_desc;
+        fullscreen_desc.VS = {fullscreen_container.data(), fullscreen_container.size()};
+        fullscreen_desc.InputLayout = {nullptr, 0};
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&fullscreen_desc, IID_PPV_ARGS(&fullscreen.p))));
 
         // Geometry: a quad in the top-left quadrant (front-facing, clockwise in D3D screen space) and a triangle in
         // the bottom-left one wound the other way (back-facing).
@@ -316,6 +340,42 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
 
+        // Second pass on the same target, cleared blue again: the red quad XORed into the top-left quadrant, which
+        // gives (255,0,255,0) where logicOp exists, and the full-screen triangle (yellow, red tint: red) through a
+        // viewport on the bottom-right quadrant, with no vertex buffer in its pipeline.
+        EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
+        D3D12_RESOURCE_BARRIER to_target = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &to_target);
+        list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+        list->SetGraphicsRootSignature(root.p);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+        // The full-screen draw comes first, so no vertex buffer has been bound in this submission before it: a
+        // pipeline that declared the stride state would break VUID-vkCmdDraw-pStrides-04913 here.
+        const D3D12_VIEWPORT bottom_right{float(size / 2), float(size / 2), float(size / 2), float(size / 2), 0, 1};
+        list->RSSetViewports(1, &bottom_right);
+        list->SetPipelineState(fullscreen.p);
+        list->DrawInstanced(3, 1, 0, 0);
+        if (logic_op) {
+            list->RSSetViewports(1, &viewport);
+            list->SetPipelineState(xor_pso.p);
+            list->IASetVertexBuffers(0, 1, &vbv);
+            list->IASetIndexBuffer(&ibv);
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+        }
+        list->ResourceBarrier(1, &to_copy);
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        EXPECT(list->Close() == S_OK);
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+        std::memcpy(second_pixels.data(), mapped, second_pixels.size());
+
         // A draw with no viewport (never set, or unbound with a count of 0) rasterizes nothing in D3D12. It is not
         // recorded, so the list closes and executes cleanly (Vulkan forbids a 0x0 viewport).
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -328,7 +388,7 @@ int main() {
         EXPECT(list->Close() == S_OK);
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
 
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -341,7 +401,7 @@ int main() {
         EXPECT(list->Close() == E_INVALIDARG);
 
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
-        for (auto* p : {&mrt, &instanced, &refused, &unfed}) p->reset();
+        for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();
         pso.reset();
         root.reset();
         rtv_heap.reset();
@@ -373,13 +433,30 @@ int main() {
         }
     }
     EXPECT(!mismatches);
+    // Second pass: XOR quad top-left (where logicOp exists), full-screen triangle bottom-right, blue elsewhere.
+    for (UINT row = 0; row < size; ++row) {
+        for (UINT col = 0; col < size; ++col) {
+            const bool top = row < size / 2, left = col < size / 2;
+            using Pixel = std::array<std::uint8_t, 4>;
+            const Pixel want = top && left && logic_op ? Pixel{255, 0, 255, 0}
+                               : !top && !left         ? Pixel{255, 0, 0, 255}
+                                                       : Pixel{0, 0, 255, 255};
+            const std::uint8_t* got = second_pixels.data() + row * 256 + col * 4;
+            if (std::equal(want.begin(), want.end(), got)) continue;
+            if (mismatches++ < 6)
+                std::fprintf(stderr, "second pass pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
+                             got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+        }
+    }
+    EXPECT(!mismatches);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
     std::printf("M1: five draws and a culled triangle matched all %u pixels: input layout by semantic, root "
                 "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap, an "
-                "unbound target and DSV, a rebound root signature, step rate 0 and an unbound vertex slot\n",
-                size * size);
+                "unbound target and DSV, a rebound root signature, step rate 0 and an unbound vertex slot; then %s "
+                "and a full-screen pass without vertex input\n",
+                size * size, logic_op ? "an XOR logic op" : "(no logicOp on this GPU)");
     return 0;
 }
