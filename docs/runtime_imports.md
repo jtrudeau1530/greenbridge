@@ -89,11 +89,13 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   absolute at startup, so a bare image name (`gta6rt --run game.exe` from the game folder) and a relative folder
   both keep naming the same place after the title changes its current directory (CTest `run_tiny_game_dir`).
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
-  write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes; a delete of a
+  write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes. The copy is
+  written under `<overlay>\.gta6rt-copy` and renamed into place, one copy-up at a time, so a process killed mid-copy
+  or two threads opening the same file never leave a truncated copy under its name; a delete of a
   package file leaves an empty marker under `<overlay>\.gta6rt-deleted`, which reads and listings treat as gone. The
   package is never written.
 - Reads prefer the overlay copy and then the package. `FindFirstFile` merges the two folders, the overlay winning on a
-  name, and hides deleted names and the marker folder.
+  name, and hides deleted names, the marker folder and the copy folder.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
   cannot reach outside the package and the overlay.
 
