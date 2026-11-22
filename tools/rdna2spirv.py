@@ -5850,27 +5850,34 @@ class Gen:
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
         elif op in ("v_dot2_i32_i16", "v_dot2_u32_u16", "v_dot4_u32_u8", "v_dot8_i32_i4", "v_dot8_u32_u4",
-                    "v_dot2c_i32_i16", "v_dot8c_i32_i4"):
-            # Packed integer dot products (RDNA2 ISA VOP3P, plus VOP2/VOP3 accumulating v_dot2c_i32_i16 / v_dot8c_i32_i4):
-            #   D = sum_{k=0..N-1} (S0.elem[k] * S1.elem[k]) + (D for *c*, S2 otherwise)
-            # Wrapping at 32 bits by default; VOP3/VOP3P clamp saturates to [INT32_MIN, INT32_MAX] (signed) or
-            # [0, UINT32_MAX] (unsigned). Hardware default for VOP3P is op_sel:[0,0,0] and op_sel_hi:[1,1,1];
-            # any other op_sel/op_sel_hi (or any op_sel on VOP2/VOP3 *c*), neg_lo/neg_hi, DPP/SDWA, or source
-            # neg/abs are refused.
-            is_c = op in ("v_dot2c_i32_i16", "v_dot8c_i32_i4")
-            def bits(name, default):
-                m = next((m for m in mods if m.startswith(name + ":")), None)
-                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
-            other = [m for m in mods if m != "clamp" and not (not is_c and m.startswith(("op_sel:", "op_sel_hi:")))]
-            if (other or ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a) or
-                    (not is_c and (bits("op_sel", [0, 0, 0]) != [0, 0, 0] or
-                                   bits("op_sel_hi", [1, 1, 1]) != [1, 1, 1]))):
-                raise Unsupported(op + " modifiers")
+                    "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8", "v_dot8c_i32_i4", "v_dot8c_u32_u4"):
+            # Packed integer dot products (RDNA2 ISA VOP3P and VOP2 accumulating v_dot*c_*):
+            #   D = sum_{k=0..N-1} (S0.elem[k] * S1.elem[k]) + acc  (acc = S2 for VOP3P, old D for VOP2)
+            # Wrapping at 32 bits by default; clamp saturates to [INT32_MIN, INT32_MAX] (signed) or
+            # [0, UINT32_MAX] (unsigned). For VOP3P, hardware default is op_sel:[0,0,0] and op_sel_hi:[1,1,1];
+            # any other op_sel/op_sel_hi, neg_lo/neg_hi, DPP/SDWA, or source neg/abs are refused. For VOP2
+            # v_dot*c_*, only optional clamp (VOP3 _e64) is accepted and D must be a VGPR.
+            is_c = op in ("v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8", "v_dot8c_i32_i4", "v_dot8c_u32_u4")
+            if is_c:
+                if a[0]["k"] != "vgpr":
+                    raise Unsupported(op + " destination")
+                if any(m != "clamp" for m in mods) or ins["op"].endswith(("_dpp", "_sdwa")) or any(
+                        s.get("neg") or s.get("abs") for s in a):
+                    raise Unsupported(op + " modifiers")
+                x, y, acc = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[0])
+            else:
+                def bits(name, default):
+                    m = next((m for m in mods if m.startswith(name + ":")), None)
+                    return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+                other = [m for m in mods if m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:"))]
+                if (other or ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a) or
+                        bits("op_sel", [0, 0, 0]) != [0, 0, 0] or bits("op_sel_hi", [1, 1, 1]) != [1, 1, 1]):
+                    raise Unsupported(op + " modifiers")
+                x, y, acc = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[3])
             width = 16 if ("_dot2_" in op or "_dot2c_" in op) else (8 if "_dot4" in op else 4)
             signed = op.endswith(("i16", "i4"))
             clamp = "clamp" in mods
             ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
-            x, y, acc = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[0] if is_c else a[3])
             prods = []
             for off in range(0, 32, width):
                 xe, ye, p = self.tmp(), self.tmp(), self.tmp()
@@ -5922,6 +5929,68 @@ class Gen:
                 self.emit(f"{sat} = OpSelect %uint {nz} {bound} {r}")
                 r = sat
             self.dst(a[0], r)
+        elif op in ("v_dot2_f32_f16", "v_dot2c_f32_f16"):
+            # Half-to-float dot product (RDNA2 ISA): D = S0.lo*S1.lo + S0.hi*S1.hi + acc (acc = S2 for VOP3P
+            # v_dot2_f32_f16, old D for VOP2 v_dot2c_f32_f16).
+            if a[0]["k"] != "vgpr":
+                raise Unsupported(op + " destination")
+            if ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a):
+                raise Unsupported(op + " modifiers")
+            if op == "v_dot2_f32_f16":
+                def bits(name, default):
+                    m = next((m for m in mods if m.startswith(name + ":")), None)
+                    return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+                other = [m for m in mods if m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:"))]
+                if other:
+                    raise Unsupported(op + " modifiers")
+                sel = bits("op_sel", [0, 0, 0])
+                selhi = bits("op_sel_hi", [1, 1, 1])
+                nlo = bits("neg_lo", [0, 0, 0])
+                nhi = bits("neg_hi", [0, 0, 0])
+                if any(len(v) != 3 or any(b not in (0, 1) for b in v) for v in (sel, selhi, nlo, nhi)):
+                    raise Unsupported(op + " modifiers")
+                if sel[2] != 0 or selhi[2] != 1 or nhi[2] != 0:
+                    raise Unsupported(op + " modifiers")
+                a0 = self.f16_in(a[1], sel[0])
+                a1 = self.f16_in(a[1], selhi[0])
+                b0 = self.f16_in(a[2], sel[1])
+                b1 = self.f16_in(a[2], selhi[1])
+                if nlo[0]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpFNegate %float {a0}")
+                    a0 = t
+                if nhi[0]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpFNegate %float {a1}")
+                    a1 = t
+                if nlo[1]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpFNegate %float {b0}")
+                    b0 = t
+                if nhi[1]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpFNegate %float {b1}")
+                    b1 = t
+                acc = self.flush_f32(self.src_f(a[3]))
+                if nlo[2]:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpFNegate %float {acc}")
+                    acc = t
+            else:
+                if any(m != "clamp" for m in mods):
+                    raise Unsupported(op + " modifiers")
+                a0 = self.f16_in(a[1], 0)
+                a1 = self.f16_in(a[1], 1)
+                b0 = self.f16_in(a[2], 0)
+                b1 = self.f16_in(a[2], 1)
+                acc = self.flush_f32(self.src_f(a[0]))
+            p0, p1, s, r = (self.tmp() for _ in range(4))
+            self.emit(f"{p0} = OpFMul %float {a0} {b0}")
+            self.emit(f"{p1} = OpFMul %float {a1} {b1}")
+            self.emit(f"{s} = OpFAdd %float {p0} {p1}")
+            self.emit(f"{r} = OpFAdd %float {s} {acc}")
+            r = self.clamp_mods(r, ["clamp"] if "clamp" in mods else [])
+            self.dst(a[0], self.tou(r))
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
             def bits(name, default):
@@ -13301,8 +13370,9 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8",
-                            "v_dot2c_i32_i16", "v_dot8c_i32_i4", "v_pk_fmac_f16") or
+        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
+                            "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
+                            "v_dot8c_i32_i4", "v_dot8c_u32_u4") or
                 (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
@@ -13534,8 +13604,9 @@ def reg_reads_writes(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8",
-                           "v_dot2c_i32_i16", "v_dot8c_i32_i4", "v_pk_fmac_f16") and a[0]["k"] == "vgpr":
+        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
+                           "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
+                           "v_dot8c_i32_i4", "v_dot8c_u32_u4") and a[0]["k"] == "vgpr":
             regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
