@@ -454,6 +454,44 @@ int main() {
         return 0;
     };
 
+    {
+        DXGI_SWAP_CHAIN_DESC1 before{}, after{};
+        if (FAILED(sc->GetDesc1(&before)) || before.BufferCount < 2)
+            return fail("GetDesc1 before ResizeBuffers1 argument tests");
+        std::vector<UINT> masks(before.BufferCount, 1);
+        std::vector<IUnknown*> queues(before.BufferCount, queue);
+        const auto resize = [&](UINT count) {
+            return sc->ResizeBuffers1(count, before.Width + 1, before.Height, DXGI_FORMAT_UNKNOWN, 0,
+                                      masks.data(), queues.data());
+        };
+        for (UINT invalid_mask : {2u, 3u}) {
+            masks.back() = invalid_mask;
+            if (resize(0) != DXGI_ERROR_INVALID_CALL) return fail("ResizeBuffers1 invalid node mask with count zero");
+        }
+        masks.back() = 1;
+        queues.back() = dev;
+        if (resize(before.BufferCount) != DXGI_ERROR_INVALID_CALL)
+            return fail("ResizeBuffers1 should reject a non-queue object");
+
+        D3D12_COMMAND_QUEUE_DESC copy_desc{};
+        copy_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        ID3D12CommandQueue* copy = nullptr;
+        if (FAILED(dev->CreateCommandQueue(&copy_desc, IID_PPV_ARGS(&copy))) || !copy)
+            return fail("CreateCommandQueue for ResizeBuffers1 copy queue test");
+        queues.back() = copy;
+        const HRESULT copy_hr = resize(0);
+        copy->Release();
+        if (copy_hr != DXGI_ERROR_INVALID_CALL) return fail("ResizeBuffers1 should reject a copy queue");
+
+        if (FAILED(sc->GetDesc1(&after)) || after.Width != before.Width || after.Height != before.Height ||
+            after.BufferCount != before.BufferCount)
+            return fail("Invalid ResizeBuffers1 arguments changed the swapchain");
+        queues.back() = queue;
+        masks.front() = 0;
+        if (FAILED(sc->ResizeBuffers1(0, before.Width, before.Height, DXGI_FORMAT_UNKNOWN, 0, masks.data(), queues.data())))
+            return fail("ResizeBuffers1 should accept node masks zero and one with direct queues");
+    }
+
     // Invalid counts must leave the initial back buffers usable for the first frame.
     {
         DXGI_SWAP_CHAIN_DESC1 before_resize{};
