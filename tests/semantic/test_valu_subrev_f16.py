@@ -780,6 +780,104 @@ class SIMDVALUInterpreter:
 
 
 # ============================================================================
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ============================================================================
+
+@dataclass
+class F16StatusFlags:
+    """IEEE 754 and RDNA2 floating-point exception flags and condition codes."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_v_subrev_f16_flags(s0_bits: int, s1_bits: int, res_bits: int) -> F16StatusFlags:
+    """Evaluate architectural status flags for v_subrev_f16 (D = S1 - S0)."""
+    flags = F16StatusFlags()
+
+    s0_nan = is_nan_f16(s0_bits)
+    s1_nan = is_nan_f16(s1_bits)
+    s0_snan = is_snan_f16(s0_bits)
+    s1_snan = is_snan_f16(s1_bits)
+    s0_inf = is_inf_f16(s0_bits)
+    s1_inf = is_inf_f16(s1_bits)
+
+    # 1. Invalid operation
+    if s0_snan or s1_snan:
+        flags.invalid = True
+    elif s0_inf and s1_inf:
+        # (+inf) - (+inf) or (-inf) - (-inf)
+        if (s0_bits & SIGN_MASK_F16) == (s1_bits & SIGN_MASK_F16):
+            flags.invalid = True
+
+    # 2. Denormal operand or result
+    if is_subnormal_f16(s0_bits) or is_subnormal_f16(s1_bits) or is_subnormal_f16(res_bits):
+        flags.denormal = True
+
+    # 3. Result classification
+    if is_nan_f16(res_bits):
+        flags.nan = True
+    elif is_inf_f16(res_bits):
+        flags.infinite = True
+        # If inputs were finite, overflow occurred
+        if not s0_inf and not s1_inf and not s0_nan and not s1_nan:
+            flags.overflow = True
+            flags.inexact = True
+    elif is_zero_f16(res_bits):
+        flags.zero = True
+    else:
+        # Check inexactness via rational fraction
+        if not s0_nan and not s1_nan and not s0_inf and not s1_inf:
+            frac0 = f16_bits_to_fraction(s0_bits)
+            frac1 = f16_bits_to_fraction(s1_bits)
+            exact_diff = frac1 - frac0
+            res_frac = f16_bits_to_fraction(res_bits)
+            if exact_diff != res_frac:
+                flags.inexact = True
+            if is_subnormal_f16(res_bits) and flags.inexact:
+                flags.underflow = True
+
+    flags.negative = bool(res_bits & SIGN_MASK_F16)
+    return flags
+
+
+def compute_f16_significand_borrow(s0_bits: int, s1_bits: int) -> tuple[int, int, int]:
+    """Simulate hardware significand alignment and borrow generation for S1 - S0.
+
+    Returns:
+        (aligned_mant0, aligned_mant1, borrow_out)
+    """
+    _, exp0, mant0 = split_f16_bits(s0_bits)
+    _, exp1, mant1 = split_f16_bits(s1_bits)
+
+    # Add hidden bit for normalized floats
+    sig0 = (1 << 10) | mant0 if exp0 > 0 else mant0
+    sig1 = (1 << 10) | mant1 if exp1 > 0 else mant1
+
+    eff_exp0 = exp0 if exp0 > 0 else 1
+    eff_exp1 = exp1 if exp1 > 0 else 1
+
+    if eff_exp1 >= eff_exp0:
+        shift = min(15, eff_exp1 - eff_exp0)
+        aligned0 = sig0 >> shift
+        aligned1 = sig1
+    else:
+        shift = min(15, eff_exp0 - eff_exp1)
+        aligned0 = sig0
+        aligned1 = sig1 >> shift
+
+    diff = aligned1 - aligned0
+    borrow_out = 1 if diff < 0 else 0
+    return aligned0, aligned1, borrow_out
+
+
+# ============================================================================
 # Unit Tests
 # ============================================================================
 
@@ -1284,6 +1382,98 @@ class TestValuSubrevF16RegisterAliasing(unittest.TestCase):
         for lane in range(32):
             expected = f16_to_bits(100.0 - float(lane) * 2.0)
             self.assertEqual(extract_half(state.get_lane_vgpr(lane, 0), hi_sel=False), expected)
+
+
+class TestValuSubrevF16ConditionCodesAndFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        # S0 = 1.0, S1 = 3.0 -> D = 2.0 (exact)
+        s0 = ONE_F16
+        s1 = THREE_F16
+        res = ref_subrev_f16(s0, s1)
+        flags = evaluate_v_subrev_f16_flags(s0, s1, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flag(self) -> None:
+        # 1.0 - 0.0001 in f16 is inexact
+        s0 = f16_to_bits(0.0001)
+        s1 = ONE_F16
+        res = ref_subrev_f16(s0, s1)
+        flags = evaluate_v_subrev_f16_flags(s0, s1, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.invalid)
+
+    def test_overflow_flag(self) -> None:
+        # MAX_FINITE - (-MAX_FINITE) overflows to +inf
+        s0 = NEG_MAX_FINITE_F16
+        s1 = MAX_FINITE_F16
+        res = ref_subrev_f16(s0, s1)
+        self.assertEqual(res, POS_INF_F16)
+        flags = evaluate_v_subrev_f16_flags(s0, s1, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.infinite)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_underflow_and_denorm_flags(self) -> None:
+        # Subnormal subtraction
+        s0 = MIN_SUBNORMAL_F16
+        s1 = MAX_SUBNORMAL_F16
+        res = ref_subrev_f16(s0, s1)
+        flags = evaluate_v_subrev_f16_flags(s0, s1, res)
+        self.assertTrue(flags.denormal)
+        self.assertFalse(flags.overflow)
+
+    def test_invalid_operation_flag(self) -> None:
+        # (+inf) - (+inf) is invalid
+        res = ref_subrev_f16(POS_INF_F16, POS_INF_F16)
+        flags = evaluate_v_subrev_f16_flags(POS_INF_F16, POS_INF_F16, res)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+
+        # Signaling NaN triggers invalid operation
+        res2 = ref_subrev_f16(SNAN_DEFAULT_F16, ONE_F16)
+        flags2 = evaluate_v_subrev_f16_flags(SNAN_DEFAULT_F16, ONE_F16, res2)
+        self.assertTrue(flags2.invalid)
+        self.assertTrue(flags2.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        # (-0.0) - (+0.0) = -0.0
+        res_nz = ref_subrev_f16(POS_ZERO_F16, NEG_ZERO_F16)
+        flags_nz = evaluate_v_subrev_f16_flags(POS_ZERO_F16, NEG_ZERO_F16, res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertTrue(flags_nz.negative)
+
+        # (+0.0) - (-0.0) = +0.0
+        res_pz = ref_subrev_f16(NEG_ZERO_F16, POS_ZERO_F16)
+        flags_pz = evaluate_v_subrev_f16_flags(NEG_ZERO_F16, POS_ZERO_F16, res_pz)
+        self.assertTrue(flags_pz.zero)
+        self.assertFalse(flags_pz.negative)
+
+        # 1.0 - 3.0 = -2.0
+        res_neg = ref_subrev_f16(THREE_F16, ONE_F16)
+        flags_neg = evaluate_v_subrev_f16_flags(THREE_F16, ONE_F16, res_neg)
+        self.assertFalse(flags_neg.zero)
+        self.assertTrue(flags_neg.negative)
+
+    def test_significand_borrow_generation(self) -> None:
+        # S1=1.0, S0=2.0 -> S1 < S0 so borrow_out = 1
+        _, _, borrow1 = compute_f16_significand_borrow(TWO_F16, ONE_F16)
+        self.assertEqual(borrow1, 1)
+
+        # S1=3.0, S0=1.0 -> S1 > S0 so borrow_out = 0
+        _, _, borrow0 = compute_f16_significand_borrow(ONE_F16, THREE_F16)
+        self.assertEqual(borrow0, 0)
 
 
 if __name__ == "__main__":
