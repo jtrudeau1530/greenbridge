@@ -1139,7 +1139,8 @@ def test_gather_d16_avoids_packhalf2x16(make_shader, suffix, last_addr):
     sh2.validate(asm2)
     assert "PackHalf2x16" not in asm2
     assert "OpBitwiseOr %uint" in asm2 and "OpSelect %uint" in asm2
-    assert asm2.count("OpImageFetch ") == (0 if suffix == "lz" else 4)
+    for ty in ("%v4float", "%v4uint_st", "%v4int_st"):
+        assert asm2.count(f"OpImageFetch {ty} ") == (0 if suffix == "lz" else 4)
 
 
 def _load_mini_interp():
