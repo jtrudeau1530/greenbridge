@@ -7,7 +7,7 @@ block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 BC7 covers all eight modes. DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB) emit
 the stored RGBA8 values with no sRGB transfer, and the reserved mode (no mode
 bit in the first byte) decodes as transparent black. BC6H is not supported.
-DX10 premultiplied alpha is converted to straight alpha for PNG; sRGB colors are
+DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG; sRGB colors are
 unpremultiplied in linear light and returned in their sRGB encoding.
 
 Usage:
@@ -43,7 +43,9 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 _FOURCC_MAP: dict[bytes, str] = {
     b"DXT1": "BC1",
+    b"DXT2": "BC2",
     b"DXT3": "BC2",
+    b"DXT4": "BC3",
     b"DXT5": "BC3",
     b"ATI1": "BC4",
     b"BC4U": "BC4",
@@ -175,7 +177,7 @@ def _validate_mask(mask: int) -> tuple[int, int]:
 
 def _parse_header_internal(
     data: bytes | bytearray | memoryview,
-) -> tuple[dict[str, int | str | None], tuple[int, int, int, int] | None]:
+) -> tuple[dict[str, int | str | None], tuple[int, int, int, int] | None, int]:
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise DdsError(f"Expected bytes-like object, got {type(data).__name__}")
     if len(data) < DDS_HEADER_SIZE:
@@ -195,6 +197,7 @@ def _parse_header_internal(
     )
 
     dxgi_format: int | None = None
+    alpha_mode = 0
     data_offset = DDS_HEADER_SIZE
     masks: tuple[int, int, int, int] | None = None
 
@@ -209,8 +212,11 @@ def _parse_header_internal(
             if fmt is None:
                 raise DdsError(f"Unsupported DXGI format: {dxgi_format}")
             data_offset = DDS_DX10_HEADER_SIZE
+            alpha_mode = struct.unpack_from("<I", data, 144)[0] & DDS_ALPHA_MODE_MASK
         else:
             fmt = _FOURCC_MAP.get(fourcc)
+            if fourcc in (b"DXT2", b"DXT4"):
+                alpha_mode = DDS_ALPHA_MODE_PREMULTIPLIED
             if fmt is None:
                 raise DdsError(f"Unsupported DDS FourCC: {fourcc!r}")
     elif pf_flags & DDPF_RGB:
@@ -237,12 +243,12 @@ def _parse_header_internal(
         "mip_count": mip_count,
         "data_offset": data_offset,
     }
-    return info, masks
+    return info, masks, alpha_mode
 
 
 def parse_dds_header(data: bytes) -> dict:
     """Parse a legacy or DX10 DDS header and return format metadata."""
-    info, _ = _parse_header_internal(data)
+    info, _, _ = _parse_header_internal(data)
     return info
 
 
@@ -914,8 +920,8 @@ def _unpremultiply_rgba(rgba: bytes, srgb: bool) -> bytes:
 
 
 def decode_dds(data: bytes) -> tuple[int, int, bytes]:
-    """Decode mip 0 into top-down row-major RGBA8, with straight alpha for premultiplied DX10 images."""
-    info, masks = _parse_header_internal(data)
+    """Decode mip 0 into top-down row-major RGBA8 with straight alpha."""
+    info, masks, alpha_mode = _parse_header_internal(data)
     width = int(info["width"])  # type: ignore[arg-type]
     height = int(info["height"])  # type: ignore[arg-type]
     fmt = str(info["format"])
@@ -944,15 +950,12 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     else:
         raise DdsError(f"Unsupported DDS format: {fmt}")
 
-    if offset == DDS_DX10_HEADER_SIZE:
-        misc_flags2 = struct.unpack_from("<I", data, 144)[0]
-        alpha_mode = misc_flags2 & DDS_ALPHA_MODE_MASK
-        if alpha_mode == DDS_ALPHA_MODE_PREMULTIPLIED:
-            rgba = _unpremultiply_rgba(rgba, info["dxgi_format"] in _SRGB_DXGI_FORMATS)
-        elif alpha_mode == DDS_ALPHA_MODE_OPAQUE:
-            opaque = bytearray(rgba)
-            opaque[3::4] = b"\xff" * (width * height)
-            rgba = bytes(opaque)
+    if alpha_mode == DDS_ALPHA_MODE_PREMULTIPLIED:
+        rgba = _unpremultiply_rgba(rgba, info["dxgi_format"] in _SRGB_DXGI_FORMATS)
+    elif alpha_mode == DDS_ALPHA_MODE_OPAQUE:
+        opaque = bytearray(rgba)
+        opaque[3::4] = b"\xff" * (width * height)
+        rgba = bytes(opaque)
 
     return width, height, rgba
 
