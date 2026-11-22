@@ -1657,14 +1657,27 @@ The trace will enumerate them.
 - Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
   `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
   `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.
-  - `MakeResident` and `Evict` return `S_OK`, or `E_INVALIDARG` for a nonzero count with a null array. D3D12
-    documents `Evict` as a hint the runtime may defer, so dropping it is allowed.
-  - `SetResidencyPriority` (Device1): `S_OK`, or `E_INVALIDARG` for a nonzero count with a null object or priority
-    array. Priorities only order what the OS evicts first; any `UINT` is a valid priority.
+  The residency answers are the host runtime's: `d3d12_residency_test` runs the same 110 steps on both devices
+  with a committed buffer, a heap, a placed buffer, a descriptor heap, a query heap and a fence, and compares every
+  HRESULT, the device-removed reason after each step, and the value `EnqueueMakeResident` leaves the fence at
+  (RTX 3060, driver 610.88). Steps that leave the host runtime unusable run there in a child process with a fresh
+  device.
+  - `MakeResident` and `Evict` return `S_OK` for any count of this device's pageable objects, the same one twice,
+    an evicted one or a resident one. D3D12 documents `Evict` as a hint the runtime may defer, so dropping it is
+    allowed.
+  - `SetResidencyPriority` (Device1): only objects that own their memory take a priority, committed resources and
+    heaps; any `UINT` is a valid priority for them. A placed resource (a reserved one too, by the same rule; not measured), a descriptor heap, a query heap
+    or a fence is `E_INVALIDARG`, also inside a longer list. The host runtime then removes its device as well
+    (`DXGI_ERROR_INVALID_CALL`); the layer doesn't, since a console title that sets priorities on its placed
+    resources would lose its device over a hint.
   - `EnqueueMakeResident` (Device3) signals its fence from the CPU with the given value before returning, since
-    the work is already complete. A queue `Wait` on that fence must not hang, which is why the signal stays.
-    `E_INVALIDARG` for a null fence, a nonzero count with a null array, or flags other than `NONE` and
-    `DENY_OVERBUDGET`; a refused call does not signal.
+    the work is already complete. A queue `Wait` on that fence must not hang, which is why the signal stays. A null
+    fence is accepted and nothing is signalled. `E_INVALIDARG` for flags other than `NONE` and `DENY_OVERBUDGET`;
+    a refused call does not signal. A value below the fence's current one moves the host's fence back; the layer's
+    stays where it was (see the fence note above).
+  - Not compared: a nonzero count with a null array, and a null entry in an array, which the host runtime
+    dereferences (an access violation). The layer answers `E_INVALIDARG` for the null arrays, skips a null entry in
+    `MakeResident`, `Evict` and `EnqueueMakeResident`, and refuses one in `SetResidencyPriority`.
   - `SetStablePowerState` returns `S_OK`: Vulkan has no clock control, and the result of a frame does not depend
     on the clocks.
   - `SetBackgroundProcessingMode` (Device6): no Vulkan API steers driver background work, so nothing runs. The

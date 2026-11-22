@@ -1398,7 +1398,7 @@ public:
     // here and nothing goes back to the arena when this object dies.
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), va_(placed_va) {}
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
         if (accel_) {
@@ -1711,6 +1711,8 @@ public:
         desc_.Layout = layout;
     }
     bool reserved() const { return reserved_; }
+    // A committed resource: neither placed in a heap nor reserved. It owns its memory, like a heap does.
+    bool committed() const { return !placed_ && !reserved_; }
 
     // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
     // runtime).
@@ -2010,6 +2012,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool reserved_ = false;
+    bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
@@ -4276,20 +4279,31 @@ public:
 
     // Device1: priorities only order what the OS evicts first under memory pressure. VK_EXT_pageable_device_local_memory
     // could pass them on, but it is optional and changes no result, so they are accepted and dropped. Any UINT is a
-    // valid priority (the D3D12_RESIDENCY_PRIORITY values are named points, the low 24 bits a refinement).
+    // valid priority (the D3D12_RESIDENCY_PRIORITY values are named points, the low 24 bits a refinement). As on the
+    // host runtime (d3d12_residency_test, RTX 3060 / 610.88), only objects that own their memory take one: committed
+    // resources and heaps. A placed resource (a reserved one too, by the same rule; not measured), a descriptor heap, a query heap or a fence is E_INVALIDARG.
+    // The host also removes its device then (DXGI_ERROR_INVALID_CALL); the layer doesn't, since a console title that
+    // sets priorities on its placed resources would lose its device over a hint.
     HRESULT STDMETHODCALLTYPE SetResidencyPriority(UINT count, ID3D12Pageable* const* objects,
                                                    const D3D12_RESIDENCY_PRIORITY* priorities) override {
-        return count && (!objects || !priorities) ? E_INVALIDARG : S_OK;
+        if (count && (!objects || !priorities)) return E_INVALIDARG;
+        for (UINT i = 0; i < count; ++i) {
+            if (from<Heap>(objects[i])) continue;
+            const Resource* resource = from<Resource>(objects[i]);
+            if (!resource || !resource->committed()) return E_INVALIDARG;
+        }
+        return S_OK;
     }
 
     // Device3: the asynchronous MakeResident. The objects are already resident, so the work is complete at once
     // and the fence is signalled from the CPU now. The caller's queue Wait on it must not hang, which is why the
-    // signal is kept although the residency part is a no-op. DENY_OVERBUDGET cannot fail: nothing is paged in.
+    // signal is kept although the residency part is a no-op. DENY_OVERBUDGET cannot fail: nothing is paged in. A
+    // null fence is accepted, as the host runtime does: there is nothing to signal.
     HRESULT STDMETHODCALLTYPE EnqueueMakeResident(D3D12_RESIDENCY_FLAGS flags, UINT count,
                                                   ID3D12Pageable* const* objects, ID3D12Fence* fence,
                                                   UINT64 value) override {
-        if (!fence || (count && !objects) || (flags & ~D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET)) return E_INVALIDARG;
-        return fence->Signal(value);
+        if ((count && !objects) || (flags & ~D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET)) return E_INVALIDARG;
+        return fence ? fence->Signal(value) : S_OK;
     }
 
     // Stable power state pins GPU clocks for profiling, a developer-mode feature on Windows. Vulkan has no clock

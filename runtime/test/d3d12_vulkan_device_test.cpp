@@ -5254,7 +5254,9 @@ int main() {
             EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1.p))));
             const D3D12_RESIDENCY_PRIORITY priorities[] = {D3D12_RESIDENCY_PRIORITY_MAXIMUM,
                                                            D3D12_RESIDENCY_PRIORITY(D3D12_RESIDENCY_PRIORITY_LOW + 5)};
-            EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == S_OK);
+            // Only committed resources and heaps take a priority, as on the host runtime (d3d12_residency_test): a
+            // fence and an allocator don't.
+            EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == E_INVALIDARG);
             EXPECT(device1->SetResidencyPriority(0, nullptr, nullptr) == S_OK);
             EXPECT(device1->SetResidencyPriority(1, pageables, nullptr) == E_INVALIDARG);
             EXPECT(device1->SetResidencyPriority(1, nullptr, priorities) == E_INVALIDARG);
@@ -5266,8 +5268,9 @@ int main() {
             EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 0, nullptr, residency.p, 9) ==
                    S_OK);
             EXPECT(residency->GetCompletedValue() == 9);
-            // Refused calls leave the fence alone.
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == E_INVALIDARG);
+            // A null fence is accepted (the host runtime's answer) and signals nothing; refused calls leave the fence
+            // alone.
+            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == S_OK);
             EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, residency.p, 11) ==
                    E_INVALIDARG);
             EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 1, pageables, residency.p, 11) ==
