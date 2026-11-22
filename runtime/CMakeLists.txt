@@ -393,9 +393,21 @@ if(LEONIDA_D3D12_SHIM_TESTS)
 endif()
 endif()
 
-# GPU test and pipeline tools load Vulkan at run time.
+# GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
 find_package(Vulkan QUIET)
-if(Vulkan_FOUND)
+if(NOT TARGET Vulkan::Headers)
+  find_path(Vulkan_INCLUDE_DIR
+    NAMES vulkan/vulkan.h
+    HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{VULKAN_SDK}/include"
+  )
+  if(Vulkan_INCLUDE_DIR AND EXISTS "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.h")
+    add_library(Vulkan::Headers INTERFACE IMPORTED)
+    set_target_properties(Vulkan::Headers PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${Vulkan_INCLUDE_DIR}"
+    )
+  endif()
+endif()
+if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_texture_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test)
     add_executable(${tool} test/${tool}.cpp)
@@ -519,6 +531,6 @@ if(Vulkan_FOUND)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
 else()
-  message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
+  message(STATUS "Vulkan headers not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
                  "gfx10_descriptors_test are not built")
 endif()
