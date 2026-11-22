@@ -1332,5 +1332,254 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.state.get_vgpr64(RegPair(4)), POS_INF_F64)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection for ds_dec_rtn_u64."""
+
+    def test_syntax_rejection_invalid_registers_u64(self) -> None:
+        with self.assertRaises(ValueError):
+            RegSingle(-1)
+        with self.assertRaises(ValueError):
+            RegSingle(256)
+        with self.assertRaises(ValueError):
+            RegPair(255)
+
+        # RegType SGPR in vdst, vaddr, or vdata0
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(0, RegType.SGPR),
+                vaddr=RegSingle(1),
+                vdata0=RegPair(2),
+            )
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(0),
+                vaddr=RegSingle(1, RegType.SGPR),
+                vdata0=RegPair(2),
+            )
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(0),
+                vaddr=RegSingle(1),
+                vdata0=RegPair(2, RegType.SGPR),
+            )
+
+    def test_syntax_rejection_shape_mismatches_u64(self) -> None:
+        # vdst must be pair
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegSingle(0),  # type: ignore
+                vaddr=RegSingle(1),
+                vdata0=RegPair(2),
+            )
+        # vdata0 must be pair
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(0),
+                vaddr=RegSingle(1),
+                vdata0=RegSingle(2),  # type: ignore
+            )
+        # vaddr must be single
+        with self.assertRaises(TypeError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(0),
+                vaddr=RegPair(1),  # type: ignore
+                vdata0=RegPair(4),
+            )
+
+    def test_syntax_rejection_invalid_offset_u64(self) -> None:
+        with self.assertRaises(ValueError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(0),
+                vaddr=RegSingle(1),
+                vdata0=RegPair(2),
+                offset=-1,
+            )
+        with self.assertRaises(ValueError):
+            DSDecRtnU64Instruction(
+                vdst=RegPair(0),
+                vaddr=RegSingle(1),
+                vdata0=RegPair(2),
+                offset=65536,
+            )
+
+    def test_mutation_greater_equal_wrap_condition_u64(self) -> None:
+        """Mutant: wraps when old >= vdata0 instead of old > vdata0."""
+        def mutant_dec(old: int, bound: int) -> int:
+            a, b = u64(old), u64(bound)
+            if a == 0 or a >= b:
+                return b
+            return u64(a - 1)
+
+        val = 0x1122_3344_5566_7788
+        correct = ref_ds_dec_u64(val, val)
+        mutant = mutant_dec(val, val)
+        self.assertEqual(correct, val - 1)
+        self.assertEqual(mutant, val)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_zero_underflow_no_wrap_u64(self) -> None:
+        """Mutant: fails to wrap on zero, instead underflows to 0xFFFFFFFFFFFFFFFF."""
+        def mutant_dec(old: int, bound: int) -> int:
+            a, b = u64(old), u64(bound)
+            if a > b:
+                return b
+            return u64(a - 1)
+
+        correct = ref_ds_dec_u64(0, 50)
+        mutant = mutant_dec(0, 50)
+        self.assertEqual(correct, 50)
+        self.assertEqual(mutant, MASK_64)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_return_new_val_instead_of_old_val_u64(self) -> None:
+        """Mutant: returns new decremented value to vdst instead of old value."""
+        class BuggyReturnInterpreter(ScalarInterpreter):
+            def step(
+                self, instr: DSDecRtnU64Instruction, state: ScalarMachineState
+            ) -> Tuple[int, int]:
+                vaddr = state.get_vgpr(instr.vaddr.index)
+                vdata0 = state.get_vgpr64(instr.vdata0)
+                old_val, new_mem = state.lds.atomic_dec_rtn_u64(
+                    vaddr=vaddr,
+                    wrap_limit=vdata0,
+                    offset=instr.offset,
+                )
+                state.set_vgpr64(instr.vdst, new_mem)  # Bug: new_mem instead of old_val
+                return old_val, new_mem
+
+        state_correct = ScalarMachineState(capacity_qwords=1024)
+        state_buggy = ScalarMachineState(capacity_qwords=1024)
+        for s in (state_correct, state_buggy):
+            s.lds.write_qword(5 * 8, 20)
+            s.set_vgpr(1, 40)
+            s.set_vgpr64(RegPair(2), 50)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+        )
+
+        ScalarInterpreter().step(instr, state_correct)
+        BuggyReturnInterpreter().step(instr, state_buggy)
+
+        self.assertEqual(state_correct.get_vgpr64(RegPair(4)), 20)
+        self.assertEqual(state_buggy.get_vgpr64(RegPair(4)), 19)
+        self.assertNotEqual(
+            state_correct.get_vgpr64(RegPair(4)), state_buggy.get_vgpr64(RegPair(4))
+        )
+
+    def test_mutation_premature_destination_overwrite_on_aliasing_u64(self) -> None:
+        """Mutant: overwrites vdst before reading operands, corrupting wrap bound."""
+        class BuggyAliasingInterpreter(ScalarInterpreter):
+            def step(
+                self, instr: DSDecRtnU64Instruction, state: ScalarMachineState
+            ) -> Tuple[int, int]:
+                # Bug: clobbers vdst to 0 before reading vdata0
+                state.set_vgpr64(instr.vdst, 0)
+                vaddr = state.get_vgpr(instr.vaddr.index)
+                vdata0 = state.get_vgpr64(instr.vdata0)
+                old_val, new_mem = state.lds.atomic_dec_rtn_u64(
+                    vaddr=vaddr,
+                    wrap_limit=vdata0,
+                    offset=instr.offset,
+                )
+                return old_val, new_mem
+
+        state_correct = ScalarMachineState(capacity_qwords=1024)
+        state_buggy = ScalarMachineState(capacity_qwords=1024)
+        for s in (state_correct, state_buggy):
+            s.lds.write_qword(5 * 8, 0)
+            s.set_vgpr(1, 40)
+            s.set_vgpr64(RegPair(2), 100)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(2),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+        )
+
+        ScalarInterpreter().step(instr, state_correct)
+        BuggyAliasingInterpreter().step(instr, state_buggy)
+
+        self.assertEqual(state_correct.lds.read_qword(5 * 8), 100)
+        self.assertEqual(state_buggy.lds.read_qword(5 * 8), 0)
+        self.assertNotEqual(
+            state_correct.lds.read_qword(5 * 8), state_buggy.lds.read_qword(5 * 8)
+        )
+
+    def test_mutation_ignore_simd_exec_mask_u64(self) -> None:
+        """Mutant: SIMD interpreter executes inactive lanes regardless of exec_mask."""
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(
+                self, instr: DSDecRtnU64Instruction, state: SIMDState
+            ) -> List[Optional[Tuple[int, int]]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: ignores is_lane_active
+                    vaddr = state.get_lane_vgpr(lane, instr.vaddr.index)
+                    vdata0 = state.get_lane_vgpr64(lane, instr.vdata0)
+                    res = state.lds.atomic_dec_rtn_u64(vaddr, vdata0, instr.offset)
+                    state.set_lane_vgpr64(lane, instr.vdst, res[0])
+                    results.append(res)
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0, capacity_qwords=1024)
+        for lane in range(32):
+            state.lds.write_qword(lane * 8, 10)
+            state.set_lane_vgpr(lane, 1, lane * 8)
+            state.set_lane_vgpr64(lane, RegPair(2), 50)
+
+        instr = DSDecRtnU64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+        )
+
+        mutant_results = BuggySIMDInterpreter().step(instr, state)
+        self.assertTrue(all(r is not None for r in mutant_results))
+
+    def test_mutation_subnormal_ftz_u64(self) -> None:
+        """Mutant: flushes 64-bit subnormals to 0 prior to decrement."""
+        def mutant_ftz_dec(old: int, bound: int) -> int:
+            if (old & 0x7FF0_0000_0000_0000) == 0 and (old & 0x000F_FFFF_FFFF_FFFF) != 0:
+                old = 0
+            return ref_ds_dec_u64(old, bound)
+
+        subnormal = 0x0000_0000_0000_0001
+        correct = ref_ds_dec_u64(subnormal, 100)
+        mutant = mutant_ftz_dec(subnormal, 100)
+        self.assertEqual(correct, 0)
+        self.assertEqual(mutant, 100)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_snan_quietening_u64(self) -> None:
+        """Mutant: quietens 64-bit signaling NaNs by forcing bit 51."""
+        def mutant_quiet_snan(val: int) -> int:
+            if (val & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000 and (val & 0x000F_FFFF_FFFF_FFFF) != 0:
+                return val | 0x0008_0000_0000_0000
+            return val
+
+        snan = 0x7FF0_0000_0000_0001
+        self.assertEqual(snan & 0x0008_0000_0000_0000, 0)
+        quieted = mutant_quiet_snan(snan)
+        self.assertNotEqual(snan, quieted)
+        self.assertEqual(quieted & 0x0008_0000_0000_0000, 0x0008_0000_0000_0000)
+
+    def test_negative_control_bit_flip_detection_u64(self) -> None:
+        """Negative control: flipping any single bit of returned value fails equality."""
+        mem = LDSModel64(capacity_qwords=1024)
+        mem.write_qword(10 * 8, 42)
+        old_val, new_mem = mem.atomic_dec_rtn_u64(vaddr=80, wrap_limit=100)
+        self.assertEqual(old_val, 42)
+        self.assertEqual(new_mem, 41)
+
+        for bit in range(64):
+            corrupted_old = old_val ^ (1 << bit)
+            self.assertNotEqual(old_val, corrupted_old)
+            corrupted_new = new_mem ^ (1 << bit)
+            self.assertNotEqual(new_mem, corrupted_new)
+
+
 if __name__ == "__main__":
     unittest.main()
