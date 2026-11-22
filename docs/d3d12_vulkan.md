@@ -198,9 +198,25 @@ What is implemented (all of it testable without the game):
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
   subresource into a single-sampled one of the same size and format. `ResolveSubresourceRegion` uses the same
   Vulkan operation for non-integer colour with average mode, taking a source rectangle (or the entire subresource)
-  and a destination offset. Depth-stencil resolves, other resolve modes, and resolves between two formats of
-  one typeless family remain open. A multisampled texture copies only to one with the same sample count and has
-  no footprint.
+  and a destination offset. A `ResolveSubresourceRegion` of one depth or stencil plane (the subresource's plane
+  slice, the same on both sides) runs in a rendering scope of its own with no draws: the multisampled plane is the
+  depth or stencil attachment (load `LOAD`, store `NONE`), the destination its resolve target with the mode, the
+  render area the source rectangle. Both move from their resolve layouts to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL` and
+  back around it; the destination's other plane is not attached and keeps its contents. The format is the depth
+  format or the plane's own (`R32_FLOAT`, `R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`, and the D32S8 pair, untested).
+  What the PC runtime accepts was measured on an RTX 5070 (driver 621.24) and on WARP: `MIN` and `MAX` of either
+  plane by either format, and `AVERAGE` of the depth plane by its own format only (its `Close` fails for `AVERAGE`
+  by the depth format or of stencil); the layer accepts the same. WARP is no reference for two of them: a resolve
+  with the format `D32_FLOAT` passes its `Close` but removes the device when run (`DXGI_ERROR_DRIVER_INTERNAL_ERROR`),
+  and a one-plane D24S8 resolve writes both planes; the RTX 5070 resolves only the plane named. A scope resolves each pixel in place, so a
+  destination offset other than the source rectangle's corner is refused, as is a mode missing from the device's
+  `supportedDepthResolveModes`/`supportedStencilResolveModes` (queried at device creation; one plane per scope, so
+  `independentResolve` never applies). Refused calls fail `Close` and record nothing. `d3d12_depth_resolve_test`
+  compares D32 and D24S8 resolves (typed and typeless resources, whole and rectangle) with the PC runtime; clears give
+  every sample of a pixel one value, so the modes over differing samples are not checked yet. `DECOMPRESS`,
+  `ResolveSubresource` of depth (which D3D12 does not offer) and resolves between two formats of one typeless family
+  remain open. A multisampled texture copies only to one with the same sample count
+  and has no footprint.
   Discards, immediate writes and atomic copies replay as section 4.2 describes.
 - **UAV clears** (`ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`). The CPU handle's slot is read
   while recording as the GFX10 descriptor a shader would load (section 3.4), so the clear works with any
@@ -464,7 +480,8 @@ rectangular clears of overlapping slice ranges against both Windows WARP and exp
 
 Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
 creation), root signatures, PSOs, draws, typeless volume RTVs,
-placed resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
+placed resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves to a destination offset
+other than the source rectangle's,
 the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); the GCL8
@@ -522,6 +539,9 @@ and any validation error fails them.
 - `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
   `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
   creates only an allocator and a list, so it needs no GPU or Vulkan loader.
+- `d3d12_depth_resolve_test`: depth and stencil `ResolveSubresourceRegion` of a 4x D32 or D24S8 target cleared with
+  three overlapping values, whole and by rectangle, compared with the PC runtime on the default adapter and WARP;
+  the refused calls must fail `Close` and leave the destination as cleared.
 - `d3d12_vulkan_device_test`: the Vulkan device behind the Xbox-ABI proxy, called the way the game will call it.
   It creates heaps through slot 14 and reads their start handles in RAX, creates a render target through slot 76
   with the Xbox layout word, then creates views, records clears and barriers, executes and waits on a fence.
@@ -1154,8 +1174,9 @@ The trace will enumerate them.
   images copy dimension, format, mip levels, array layers and sample count.
 - Copies: `CopyBufferRegion` → `vkCmdCopyBuffer` with arena offsets; `CopyTextureRegion` →
   `vkCmdCopyBufferToImage`/`vkCmdCopyImageToBuffer`/`vkCmdCopyImage`, using the `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`
-  row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`.
-  Partial resolve regions need a shader or a region copy.
+  row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`;
+  depth and stencil resolves → a `vkCmdBeginRendering` scope with a resolve attachment (section 3.2).
+  Partial resolve regions to another offset need a shader or a region copy.
 - `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is
   executed, through `ReplayFunctions::buffer_at`: the buffer whose `ResourceBinding::va` range holds it, at
   `buffer_offset + (address - va)`. These are the same fields and lookup as #291's arena, and the device fills

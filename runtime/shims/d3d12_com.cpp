@@ -280,10 +280,19 @@ public:
                                                      ID3D12Resource* src, UINT src_subresource, D3D12_RECT* rect,
                                                      DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
         d3d12_trace::record("ID3D12GraphicsCommandList1::ResolveSubresourceRegion");
-        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || mode != D3D12_RESOLVE_MODE_AVERAGE ||
-            !color_resolve_format_matches(format, dst, src))
-            return check(false);
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         leonida::ResolveRegion region{x, y, std::nullopt};
+        if (mode != D3D12_RESOLVE_MODE_AVERAGE || !color_resolve_format_matches(format, dst, src)) {
+            if (!depth_stencil_resolve_supported(format, dst, dst_subresource, x, y, src, src_subresource, rect,
+                                                 mode)) {
+                note_once("ResolveSubresourceRegion refused: neither an average colour resolve nor a depth or "
+                          "stencil one the device can replay");
+                return check(false);
+            }
+            region.mode = mode == D3D12_RESOLVE_MODE_MIN   ? leonida::d3d12_resolve_mode::minimum
+                        : mode == D3D12_RESOLVE_MODE_MAX   ? leonida::d3d12_resolve_mode::maximum
+                                                           : leonida::d3d12_resolve_mode::average;
+        }
         if (rect) region.src_rect = leonida::Rect{rect->left, rect->top, rect->right, rect->bottom};
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
     }

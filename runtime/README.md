@@ -263,3 +263,16 @@ Vulkan GPU and runs explicitly.
 $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_resource_desc_test.exe
 ```
+
+### Depth and stencil resolves
+
+`d3d12_depth_resolve_test` resolves one plane of a 4x D32 or D24S8 target into a 1x one with
+`ResolveSubresourceRegion` (MIN and MAX of depth or stencil, AVERAGE of depth by its own format; whole and by
+rectangle) on the Vulkan-backed device and on Windows D3D12 (the default adapter and WARP), and compares the
+destinations read back. Calls the layer refuses must fail `Close` and leave the destination as cleared. Clears give
+every sample of a pixel one value, so the modes over differing samples are not checked. It needs a Vulkan GPU.
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_depth_resolve_test.exe
+```

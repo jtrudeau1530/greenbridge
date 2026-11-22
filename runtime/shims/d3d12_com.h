@@ -122,6 +122,15 @@ VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
 // Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
 
+// Whether a resolve of one depth or stencil plane can be replayed: both resources are depth-stencil textures of
+// `format` (a depth format, or a plane's shader-resource format such as R24_UNORM_X8_TYPELESS), the source
+// multisampled and the destination not, the same plane on both sides, MIN or MAX (or AVERAGE of the depth plane by
+// its own format), the destination offset the source rectangle's corner (or 0, 0 without one), and the Vulkan device
+// has the mode.
+bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
+                                     ID3D12Resource* src, UINT src_subresource, const D3D12_RECT* rect,
+                                     D3D12_RESOLVE_MODE mode);
+
 // The maxPushConstantsSize in bytes of the Vulkan physical device behind `device`, or 0 if not a Vulkan device.
 std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 
