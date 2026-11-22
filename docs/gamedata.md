@@ -224,6 +224,37 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
   sum of the grid. They are most likely uninitialised struct padding after the
   `u8` and are reported as `pad_29`; with N = 2 this is a hypothesis.
 
+## Grid atlases
+
+Four `GridAtlasInfo` documents describe world-space texture grids streamed by position. All four have the
+same numeric fields; the rest are names (`type`, `clientSystemName`, tile prefix/suffix, fallback texture).
+
+| Field | Measured (identical in all 4) |
+|---|---|
+| `width`, `height` | 16,384 x 33,792 world units |
+| `tileSize` | 512, so **32 x 66 = 2,112 tiles** |
+| `origin` | the grid **centre** (see below) |
+| `streamRadius` | 512 (one tile) |
+| `zInflation` | 1,000 |
+| `hasOwnGlobalFallback`, `useGlobalFallback` | true, true |
+| `sectorOverrides/Item` | 1, with one sector at start (0, 0) and span (32, 66): the whole grid |
+
+The tile count is the only reading under which the sector override's span matches: 16,384 / 512 = 32 and
+33,792 / 512 = 66, so `width`/`height` are world units, not tile or texel counts.
+
+Which corner `origin` names was tested against the 2,036,542 map placements of the local catalog (x 0.1th to
+99.9th percentile -9,955 to 4,577, y -8,096 to 9,440): with `origin` as the grid centre, 99.83% fall inside
+the grid; as the minimum corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The centre
+reading also gives a minimum x of exactly -13,312, the `PAMH` heightmap's minimum x above.
+
+Tile names: none of the four `tileTextureNamePrefix` values occurs at the start of a name in the local
+texture catalog, no fallback texture name's joaat hash is a catalog id, and seven obvious `prefix + x + y + suffix` spellings hash
+to 0-2 catalog ids out of 2,112 per atlas, which is chance level. The tile textures are therefore either outside
+the scanned archives or named another way; this is unresolved.
+
+Not measured here (hypothesis): what the four grids hold (their names suggest per-tile map data for separate
+client systems), and how `zInflation` widens a tile's streaming box vertically.
+
 ## XML documents
 
 257 documents start with an XML declaration and all 257 parse as well-formed XML with a standard parser.
