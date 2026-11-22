@@ -561,14 +561,28 @@ if(TARGET Vulkan::Headers)
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
   # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
   find_package(Python3 COMPONENTS Interpreter QUIET)
-  if(WIN32 AND Python3_FOUND)
+  # The generator finds d3d12.h through INCLUDE, which a Developer Prompt sets. A cross build (for example
+  # runtime/cmake/clang-cl-xwin.cmake) has no such prompt, so it is handed the header CMake finds.
+  set(_stubs_header)
+  set(_stubs_header_ok TRUE)
+  if(WIN32 AND CMAKE_CROSSCOMPILING)
+    find_file(LEONIDA_D3D12_HEADER d3d12.h)
+    if(LEONIDA_D3D12_HEADER)
+      set(_stubs_header --header "${LEONIDA_D3D12_HEADER}")
+    else()
+      set(_stubs_header_ok FALSE)
+      message(STATUS "d3d12.h not found (set CMAKE_INCLUDE_PATH): the D3D12 COM objects are not built")
+    endif()
+  endif()
+  if(WIN32 AND Python3_FOUND AND _stubs_header_ok)
     set(LEONIDA_STUBS ${CMAKE_CURRENT_BINARY_DIR}/generated/d3d12_stubs.h)
     add_custom_command(
       OUTPUT ${LEONIDA_STUBS}
-      COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
+      COMMAND "${Python3_EXECUTABLE}" -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
+              ${_stubs_header}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
               ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12QueryHeap
-      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py ${LEONIDA_D3D12_HEADER}
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
     add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp
@@ -589,8 +603,14 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_gcl8_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_gcl8_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_gcl8 COMMAND d3d12_gcl8_test)
-    add_test(NAME d3d12_trace COMMAND Python3::Interpreter -I
-             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace.py" "$<TARGET_FILE:d3d12_gcl8_test>")
+    # Python runs on the host; a cross-compiled fixture runs through the emulator (Wine), which the script prepends.
+    # The interpreter is named by path, because ctest would put the emulator in front of an executable target.
+    set(_trace_runner)
+    foreach(_part IN LISTS CMAKE_CROSSCOMPILING_EMULATOR)
+      list(APPEND _trace_runner "--runner=${_part}")  # one word each, even one that starts with "-" (xvfb-run -a)
+    endforeach()
+    add_test(NAME d3d12_trace COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace.py" "$<TARGET_FILE:d3d12_gcl8_test>" ${_trace_runner})
 
     # The Vulkan device behind the Xbox-ABI proxy, end to end.
     add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp)
@@ -672,7 +692,7 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(bvh_builder_test PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
   else()
-    message(STATUS "Python 3 or Windows missing: the D3D12 COM objects and d3d12_com_test are not built")
+    message(STATUS "Python 3, Windows or d3d12.h missing: the D3D12 COM objects and d3d12_com_test are not built")
   endif()
 
   # Needs only the Vulkan headers, not a GPU.
