@@ -21,7 +21,6 @@ import json
 import math
 import os
 import re
-import stat
 import struct
 import sys
 import tempfile
@@ -31,6 +30,7 @@ from xml.etree import ElementTree as ET
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rbf0_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 MAGIC = rbf0_index.MAGIC
 PROLOGUE = rbf0_index.PROLOGUE
@@ -652,17 +652,6 @@ def write_csv(path, docs):
                         int(node["nul_terminated"]), int(node["utf8_valid"]), node["text"]])
 
 
-def _report_mode(path):
-    """Permission bits for the report: those of the report it replaces, or what open() gives a new file (0666 minus
-    the umask). NamedTemporaryFile creates its file 0600. Same as rtti_scan._report_mode."""
-    try:
-        return stat.S_IMODE(os.stat(path).st_mode)
-    except FileNotFoundError:
-        mask = os.umask(0)
-        os.umask(mask)
-        return 0o666 & ~mask
-
-
 def write_json(path, docs, summary):
     """Replace the report only after the full JSON has been written, keeping its permission bits."""
     directory = os.path.dirname(os.path.abspath(path))
@@ -673,7 +662,7 @@ def write_json(path, docs, summary):
             temp = f.name
             json.dump({"tool": "rbf0_tree", "format": 1, "summary": summary, "resources": docs},
                       f, indent=1, ensure_ascii=False, allow_nan=False)
-        os.chmod(temp, _report_mode(path))
+        os.chmod(temp, published_mode(path))   # NamedTemporaryFile creates 0600
         os.replace(temp, path)
     except BaseException:
         if temp is not None:
