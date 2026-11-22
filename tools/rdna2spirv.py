@@ -5820,6 +5820,49 @@ class Gen:
             self.dst(a[0], r)
         elif op == "ds_swizzle_b32":
             self.swizzle(a, mods, ins)
+        elif op in ("v_trunc_f64", "v_ceil_f64", "v_rndne_f64", "v_floor_f64"):
+            if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n") != 2:
+                raise Unsupported(op + " operands")
+            dst, src = a
+            if (ins["op"].endswith(("_dpp", "_sdwa"))
+                    or any(mod not in ("mul:2", "mul:4", "div:2", "clamp") for mod in mods)):
+                raise Unsupported(op + " modifier")
+            self.uses_f64 = True
+            if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
+                low = self.load_reg(src["k"], src["r"])
+                high = self.load_reg(src["k"], src["r"] + 1)
+            elif src["k"] == "fimm":
+                bits = struct.unpack("<Q", struct.pack("<d", src["v"]))[0]
+                low, high = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+            elif src.get("f64_literal"):
+                if not 0 <= src["v"] <= 0xFFFFFFFF:
+                    raise Unsupported(op + " literal")
+                low, high = self.cu(0), self.cu(src["v"] & 0xFFFFFFFF)
+            elif src["k"] == "imm" and -16 <= src["v"] <= 64:
+                low, high = self.cu(src["v"] & 0xFFFFFFFF), self.cu(0xFFFFFFFF if src["v"] < 0 else 0)
+            else:
+                raise Unsupported(op + " source")
+            if src.get("abs"):
+                mag = self.tmp()
+                self.emit(f"{mag} = OpBitwiseAnd %uint {high} {self.cu(0x7FFFFFFF)}")
+                high = mag
+            if src.get("neg"):
+                negated = self.tmp()
+                self.emit(f"{negated} = OpBitwiseXor %uint {high} {self.cu(0x80000000)}")
+                high = negated
+            pair, value, result = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{pair} = OpCompositeConstruct %v2uint_d {low} {high}")
+            self.emit(f"{value} = OpBitcast %double {pair}")
+            rounding = {"v_trunc_f64": "Trunc", "v_ceil_f64": "Ceil",
+                        "v_rndne_f64": "RoundEven", "v_floor_f64": "Floor"}
+            self.emit(f"{result} = OpExtInst %double %glsl {rounding[op]} {value}")
+            result = self.clamp_mods_f64(result, mods)
+            words = self.tmp()
+            self.emit(f"{words} = OpBitcast %v2uint_d {result}")
+            for index in range(2):
+                word = self.tmp()
+                self.emit(f"{word} = OpCompositeExtract %uint {words} {index}")
+                self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, word)
         elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):

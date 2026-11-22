@@ -23,7 +23,8 @@ Design rules (see tests/semantic/README.md):
 
 Values: uint/int are Python ints in [0, 2**32) or [0, 2**64) for 64-bit types (signedness is applied by the
 operation, as in SPIR-V); float is a Python float rounded to binary32 (one made by OpBitcast also keeps its exact
-32-bit pattern, so a signalling NaN comes back out unchanged); vectors are tuples; arrays are lists; bool is bool.
+32-bit pattern, so a signalling NaN comes back out unchanged). Binary64 supports the word-pair bitcasts,
+round-to-integral operations and their result modifiers. Vectors are tuples; arrays are lists; bool is bool.
 """
 import math
 import re
@@ -251,9 +252,9 @@ class _Types:
         """Byte size of a concrete type. Runtime arrays have no size of their own; the element size is used."""
         k = self.t[name]
         if k[0] in ("int", "float"):
-            return 4
+            return k[1] // 8
         if k[0] == "vec":
-            return 4 * k[2]
+            return self.size(k[1]) * k[2]
         if k[0] == "arr":
             return self.size(k[1]) * k[2]
         if k[0] == "rarr":
@@ -261,6 +262,9 @@ class _Types:
         if k[0] == "struct":
             return sum(self.size(t) for t in k[1])
         raise UnsupportedConstruct(f"size of type {name} ({k[0]})")
+
+    def is_word_pair(self, kind):
+        return kind and kind[0] == "vec" and kind[2] == 2 and self.t[kind[1]][:2] == ("int", 32)
 
     def bits(self, name):
         k = self.t[name]
@@ -444,9 +448,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 raise UnsupportedConstruct("integer type that is not 32 or 64 bits")
             types.t[res] = ("int", bits, int(a[1]))
         elif op == "OpTypeFloat":
-            if int(a[0]) != 32:
-                raise UnsupportedConstruct("non-32-bit float type")
-            types.t[res] = ("float",)
+            bits = int(a[0])
+            if bits not in (32, 64):
+                raise UnsupportedConstruct("float type that is not 32 or 64 bits")
+            types.t[res] = ("float", bits)
         elif op == "OpTypeBool":
             types.t[res] = ("bool",)
         elif op == "OpTypeVector":
@@ -462,7 +467,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         elif op == "OpConstant":
             k = types.t[a[0]]
             if k[0] == "float":
-                constants[res] = values[res] = f32(float(a[1]))
+                constants[res] = values[res] = f32(float(a[1])) if k[1] == 32 else float(a[1])
             elif k[0] == "int":
                 constants[res] = values[res] = int(a[1]) & ((1 << k[1]) - 1)
                 id_type[res] = a[0]
@@ -717,9 +722,14 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = val(a[1])
         elif op == "OpBitcast":
             k, v = types.t[a[0]], val(a[1])
-            if k[0] == "float" and isinstance(v, int):
+            source = types.t.get(id_type.get(a[1]))
+            if k == ("float", 64) and types.is_word_pair(source):
+                values[res] = struct.unpack("<d", struct.pack("<II", *v))[0]
+            elif source == ("float", 64) and types.is_word_pair(k):
+                values[res] = struct.unpack("<II", struct.pack("<d", v))
+            elif k == ("float", 32) and isinstance(v, int):
                 values[res] = bits_f32(v)
-            elif k[0] == "int" and isinstance(v, float):
+            elif k[0] == "int" and isinstance(v, float) and source != ("float", 64):
                 values[res] = f32_bits(v)
             elif k[0] == "int" and isinstance(v, int):
                 values[res] = v & wmask(a[0])
@@ -868,6 +878,11 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = not val(a[1])
         elif op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
             x, y = val(a[1]), val(a[2])
+            if types.t[a[0]] == ("float", 64):
+                if op != "OpFMul":
+                    raise UnsupportedConstruct(f"{op} on binary64")
+                values[res] = x * y
+                continue
 
             def _fdiv(p, q):
                 # SPIR-V leaves OpFDiv by zero undefined: refuse it, as the interpreter does for every undefined case
@@ -990,7 +1005,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     # Equal zeros: -0 is ordered below +0, as in NMin/NMax above (the order RDNA2 hardware uses,
                     # so a med3 built from these ops is the hardware's median for signed zeros too).
                     v = _nmin_nmax("NMax", xs[0], xs[1])
-                    return f32(v if name == "FMax" else _nmin_nmax("NMin", v, xs[2]))
+                    result = v if name == "FMax" else _nmin_nmax("NMin", v, xs[2])
+                    return result if types.t[a[0]] == ("float", 64) else f32(result)
                 # Vector operands (v_pk_* clamp) are component-wise.
                 values[res] = (tuple(fmax_clamp(*c) for c in zip(*args)) if isinstance(args[0], tuple)
                                else fmax_clamp(*args))
@@ -1001,7 +1017,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 fn = {"RoundEven": round, "Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc}[name]
 
                 def integral(v):
-                    return f32(math.copysign(float(fn(v)), v)) if math.isfinite(v) else v
+                    result = math.copysign(float(fn(v)), v) if math.isfinite(v) else v
+                    return result if types.t[a[0]] == ("float", 64) else f32(result)
                 values[res] = tuple(integral(v) for v in x) if isinstance(x, tuple) else integral(x)
             elif name in ("Exp2", "Log2", "Sqrt", "InverseSqrt"):
                 # Correctly rounded here; Vulkan allows a few ULP of error (tests compare exact results only for
