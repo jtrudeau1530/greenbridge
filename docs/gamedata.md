@@ -257,6 +257,13 @@ fallback names match an item name or its joaat hash, and ten `prefix + x + y + s
 2,112 tiles match nothing in three atlases and one hash in the fourth. The tile textures are therefore either
 outside the scanned archives or named another way; this is unresolved.
 
+A fifth grid uses the same base fields: one `TextureGridInfo` document has `origin`, `width`, `height`,
+`tileSize`, `streamRadius` and `zInflation`, plus a low- and a high-detail fallback name, but no sector
+overrides. It is 32,768 x 32,768 units with the same 512 tile, so **64 x 64 tiles**, the same 512 stream
+radius and the same 1,000 `zInflation`, around a different origin. Tested the same way, 100.00% of the
+placements fall inside with `origin` as the centre, 0.01% as the minimum corner and 11.8% as the top-left
+corner, so the centre convention holds for both document types.
+
 Not measured here (hypothesis): what the four grids hold (their names suggest per-tile map data for separate
 client systems), and how `zInflation` widens a tile's streaming box vertically.
 
