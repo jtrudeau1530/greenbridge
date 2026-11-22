@@ -193,6 +193,13 @@ def read_skeleton(sys, drawable):
         require(parent == 0xFFFF or parent < i, f"bone {i} parent {parent} is not an earlier bone")
         m = struct.unpack_from("<16f", sys, inverse + 64 * i)
         require(all(math.isfinite(v) for v in m) and m[3] == m[7] == m[11] == 0, f"inverse bind matrix {i}")
+        # RageSkeleton.cs:109 also refuses a degenerate matrix. The stored last column is (0, 0, 0, 1),
+        # so the 4x4 determinant is the determinant of the upper-left 3x3 linear part. As in the C#,
+        # abs() keeps mirrored binds; the epsilon rejects clearly non-invertible ones, not just float32 zero.
+        det = (m[0] * (m[5] * m[10] - m[6] * m[9])
+               - m[1] * (m[4] * m[10] - m[6] * m[8])
+               + m[2] * (m[4] * m[9] - m[5] * m[8]))
+        require(math.isfinite(det) and abs(det) >= 1e-12, f"inverse bind matrix {i} determinant")
         joints.append({
             "hash": u32(sys, r + 0x1C), "name": c_string(sys, r + 0x30), "parent": None if parent == 0xFFFF else parent,
             "rotation": struct.unpack_from("<4f", sys, r), "translation": struct.unpack_from("<3f", sys, r + 0x10),

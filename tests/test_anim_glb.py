@@ -91,7 +91,7 @@ def inverse_bind(q, t):
             r[2][0], r[2][1], r[2][2], 0.0, last[0], last[1], last[2], 1.0]
 
 
-def skeleton_resource(shift_bind=0.0):
+def skeleton_resource(shift_bind=0.0, singular_bind=False):
     p = Page()
     directory = drawable_header(p, "synthetic_skeleton")
     p.b[directory + 8], p.b[directory + 9] = 1, 0
@@ -100,8 +100,12 @@ def skeleton_resource(shift_bind=0.0):
     header = p.alloc(bytes(0x70))
     records = p.alloc(bytes(0x50 * n))
     world = world_transforms()
-    matrices = p.alloc(b"".join(struct.pack("<16f", *inverse_bind(q, (t[0] + shift_bind, t[1], t[2])))
-                                for q, t in world))
+    binds = [inverse_bind(q, (t[0] + shift_bind, t[1], t[2])) for q, t in world]
+    if singular_bind:
+        # Rows 0 and 1 are equal, so the determinant is zero, but the origin still resolves to (0, 0, 1),
+        # which is bone 0's composed translation. Only the determinant distinguishes this from a valid bind.
+        binds[0] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
+    matrices = p.alloc(b"".join(struct.pack("<16f", *m) for m in binds))
     parents = p.alloc(b"".join(struct.pack("<H", 0xFFFF if x is None else x) for x in PARENTS))
     for i, name in enumerate(NAMES):
         r = records + 0x50 * i
@@ -232,6 +236,12 @@ class SkeletonAndPartTest(unittest.TestCase):
         sys_page = skeleton_resource(shift_bind=0.3)
         _joints, worst = anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
         self.assertGreater(worst, 0.29)
+
+    def test_a_singular_inverse_bind_is_refused_even_when_its_origin_matches(self):
+        sys_page = skeleton_resource(singular_bind=True)
+        # Before the fix the origin check passed and the degenerate matrix was exported as a joint.
+        with self.assertRaisesRegex(anim_glb.ExportError, "inverse bind matrix 0"):
+            anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
 
     def test_part_binds_model_bones_to_joints_by_hash(self):
         joints, _ = anim_glb.read_skeleton(skeleton_resource(), 0)
