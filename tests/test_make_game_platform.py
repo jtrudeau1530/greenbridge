@@ -420,5 +420,41 @@ class PipelineCheckExeTest(unittest.TestCase):
         self.assertIn("cmake -S runtime -B runtime/build/linux", err.getvalue())
 
 
+class RuntimeStageCopyTest(unittest.TestCase):
+    """runtime() with --runtime-build: the build's files go to the output folder, which may be the build folder."""
+
+    def run_stage(self, build, out):
+        for name in make_game.RUNTIME_FILES:
+            with open(os.path.join(build, name), "wb") as f:
+                f.write(name.encode())
+        with mock.patch.object(make_game, "log"), mock.patch.object(make_game.os, "name", "posix"):
+            make_game.runtime(os.path.join(build, "game"), out, {"expected_exe": "game.exe"}, runtime_build=build)
+
+    def test_the_build_is_copied_to_another_folder(self):
+        with tempfile.TemporaryDirectory() as build, tempfile.TemporaryDirectory() as out:
+            self.run_stage(build, out)
+            for name in make_game.RUNTIME_FILES:
+                with open(os.path.join(out, name), "rb") as f:
+                    self.assertEqual(f.read(), name.encode())
+            self.assertTrue(os.path.isfile(os.path.join(out, "game_path.txt")))
+
+    def test_the_build_folder_as_the_output_folder(self):
+        # shutil.copy2 of a file onto itself raises SameFileError, and the stage stopped before game_path.txt
+        with tempfile.TemporaryDirectory() as build:
+            self.run_stage(build, build)
+            for name in make_game.RUNTIME_FILES:
+                with open(os.path.join(build, name), "rb") as f:
+                    self.assertEqual(f.read(), name.encode())
+            self.assertTrue(os.path.isfile(os.path.join(build, "game_path.txt")))
+
+    def test_an_older_copy_in_the_output_folder_is_replaced(self):
+        with tempfile.TemporaryDirectory() as build, tempfile.TemporaryDirectory() as out:
+            with open(os.path.join(out, make_game.RUNTIME_FILES[0]), "wb") as f:
+                f.write(b"old")
+            self.run_stage(build, out)
+            with open(os.path.join(out, make_game.RUNTIME_FILES[0]), "rb") as f:
+                self.assertEqual(f.read(), make_game.RUNTIME_FILES[0].encode())
+
+
 if __name__ == "__main__":
     unittest.main()
