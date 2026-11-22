@@ -607,7 +607,17 @@ class TestGlbWriterValidationAndErrors(unittest.TestCase):
 
 
 class TestReadGlbSummaryValidation(unittest.TestCase):
-    """Tests container validation in read_glb_summary on corrupt or malformed inputs."""
+    """Tests container framing and validation in read_glb_summary."""
+
+    @staticmethod
+    def _container(doc, *chunks):
+        json_bytes = json.dumps(doc).encode("utf-8")
+        json_bytes += b" " * ((-len(json_bytes)) % 4)
+        body = b"".join(
+            struct.pack("<I4s", len(payload), kind) + payload
+            for kind, payload in ((b"JSON", json_bytes), *chunks)
+        )
+        return struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body
 
     def test_non_bytes_input_rejected(self):
         with self.assertRaises(glb_writer.GlbError):
@@ -659,17 +669,36 @@ class TestReadGlbSummaryValidation(unittest.TestCase):
         with self.assertRaises(glb_writer.GlbError):
             glb_writer.read_glb_summary(raw)
 
-    def test_second_chunk_not_bin_rejected(self):
-        jb = b"{}  "
-        total = 12 + 8 + len(jb) + 8
-        raw = (
-            b"glTF"
-            + struct.pack("<II", 2, total)
-            + struct.pack("<II", len(jb), glb_writer.CHUNK_TYPE_JSON)
-            + jb
-            + struct.pack("<II", 0, 0x12345678)  # invalid chunk type
-        )
-        with self.assertRaises(glb_writer.GlbError):
+    def test_extension_chunk_is_ignored_with_or_without_bin(self):
+        for embedded in (False, True):
+            with self.subTest(embedded=embedded):
+                buffer = {"byteLength": 4}
+                chunks = [(b"BIN\0", b"\x00" * 4)] if embedded else []
+                if not embedded:
+                    buffer["uri"] = "sample.bin"
+                doc = {"asset": {"version": "2.0"}, "buffers": [buffer]}
+                raw = self._container(doc, *chunks, (b"EXT!", b"data"))
+                summary = glb_writer.read_glb_summary(raw)
+                self.assertEqual(summary["json"], doc)
+                self.assertEqual(summary["bin_bytes"], 4 if embedded else 0)
+
+    def test_known_chunk_order_and_cardinality(self):
+        doc = {"asset": {"version": "2.0"}}
+        binary, extension = (b"BIN\0", b"\x00" * 4), (b"EXT!", b"data")
+        for label, chunks, message in (
+            ("late BIN", (extension, binary), "BIN"),
+            ("duplicate BIN", (binary, binary), "BIN chunk must be second"),
+            ("duplicate JSON", (binary, (b"JSON", b"{}  ")), "duplicate GLB JSON chunk"),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(glb_writer.GlbError, message):
+                    glb_writer.read_glb_summary(self._container(doc, *chunks))
+
+    def test_extension_chunk_cannot_overrun_container(self):
+        doc = {"asset": {"version": "2.0"}}
+        raw = bytearray(self._container(doc, (b"BIN\0", b"\x00" * 4), (b"EXT!", b"data")))
+        struct.pack_into("<I", raw, len(raw) - 12, 8)
+        with self.assertRaisesRegex(glb_writer.GlbError, "exceeds.*GLB"):
             glb_writer.read_glb_summary(raw)
 
     def test_buffer_view_exceeding_bin_rejected(self):
