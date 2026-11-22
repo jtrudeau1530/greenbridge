@@ -240,8 +240,8 @@ class ArchiveTest(unittest.TestCase):
         class _FailingWriter:
             """A csv writer that fails once the header and first row have hit the staged file."""
 
-            def __init__(self, fileobj):
-                self._w = real_csv_writer(fileobj)
+            def __init__(self, fileobj, **kwargs):
+                self._w = real_csv_writer(fileobj, **kwargs)
                 self._n = 0
 
             def writerow(self, row):

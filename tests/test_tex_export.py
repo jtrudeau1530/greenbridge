@@ -469,3 +469,79 @@ def test_stale_export_entry_is_not_counted(eq, tmp_path, monkeypatch, capsys):
     out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
     assert text.splitlines()[0].startswith("1 textures: {'error:FileNotFoundError': 1}")
     assert text.splitlines()[1] == "png: {}"
+
+# ---- bad index / --out guards (#1607's class in main) ----
+
+def _argv(monkeypatch, index, carve, out, *extra):
+    monkeypatch.setattr(sys, "argv", ["tex_export.py", str(index), str(carve), str(out), *extra])
+
+
+def test_main_reports_a_non_list_index_as_one_error_line(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text('{"files": []}', encoding="utf-8")
+    out = tmp_path / "out"
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() == 2
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR: cannot read "), err
+    assert len(err.strip().splitlines()) == 1, err
+    assert not out.exists()
+
+
+def test_main_reports_an_index_row_without_keys(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text('[{"gpu": 0}]', encoding="utf-8")
+    _argv(monkeypatch, index, tmp_path, tmp_path / "out")
+    assert T.main() == 2
+    err = capsys.readouterr().err
+    assert "ERROR: cannot read " in err, err
+    assert "row has no 'archive'" in err, err
+    assert "Traceback" not in err
+
+
+def test_main_rejects_an_out_that_is_a_file(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "existing.txt"
+    out.write_text("x", encoding="utf-8")
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() == 2
+    err = capsys.readouterr().err
+    assert "is a file, not a folder" in err, err
+    assert out.read_text(encoding="utf-8") == "x"
+
+
+def test_main_reports_an_out_under_an_existing_file(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    blocker = tmp_path / "file.txt"
+    blocker.write_text("x", encoding="utf-8")
+    _argv(monkeypatch, index, tmp_path, blocker / "sub")
+    assert T.main() == 2
+    err = capsys.readouterr().err
+    assert "ERROR: cannot create " in err, err
+    assert "Traceback" not in err
+
+
+def test_main_reports_a_dangling_symlink_out(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    link = tmp_path / "dangling-out"
+    try:
+        os.symlink(str(tmp_path / "missing-target"), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available")
+    _argv(monkeypatch, index, tmp_path, link)
+    assert T.main() == 2
+    err = capsys.readouterr().err
+    assert "ERROR: cannot create " in err, err
+    assert "Traceback" not in err
+
+
+def test_main_still_accepts_an_empty_list(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() in (None, 0)   # main() has no explicit return; sys.exit(None) is exit 0
+    assert (out / "export_log.json").is_file()

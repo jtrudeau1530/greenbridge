@@ -854,7 +854,10 @@ public:
         query_pools_[id] = pool;
     }
     void remove_query_pool(QueryHeapId id) {
+        // Lock hierarchy: resource_mutex_ -> tracker_mutex_. Holding tracker_mutex_ before erasing keeps the
+        // QueryPool node alive until any in-flight execute() that unlocked resource_mutex_ finishes QueryReplay::commit().
         std::unique_lock lock(resource_mutex_);
+        std::lock_guard tlock(tracker_mutex_);
         query_pools_.erase(id);
     }
     // The heap's d3d12_query_heap type, or ~0u for a heap that is not registered.
@@ -1033,6 +1036,7 @@ public:
 
     std::uint64_t completed_retire_ticket() {
         std::lock_guard lock(submit_mutex_);
+        if (is_device_lost()) return 0;
         return retire_tickets_.completed([this](VkSemaphore semaphore, std::uint64_t value) {
             std::uint64_t done = 0;
             return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
@@ -1231,8 +1235,12 @@ public:
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
-            vk.vkQueueWaitIdle(queue_);
-            if (progress_) context_.retire_queue_idle_locked(progress_);
+            const VkResult idle_result = vk.vkQueueWaitIdle(queue_);
+            if (idle_result == VK_SUCCESS) {
+                if (progress_) context_.retire_queue_idle_locked(progress_);
+            } else {
+                context_.mark_device_lost();
+            }
         }
         if (progress_) {
             std::lock_guard lock(context_.tracker_mutex_);
@@ -1353,6 +1361,7 @@ public:
         }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         std::uint32_t segments = 0, statistics_segments = 0;
+        bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i]);
             if (result != ReplayResult::success) return result;
@@ -1361,6 +1370,7 @@ public:
                 return ReplayResult::unsupported;
             segments += prepared[i].segment_count;
             statistics_segments += prepared[i].statistics_segment_count;
+            has_queries = has_queries || !prepared[i].queries.empty();
         }
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
                                          std::shared_ptr<OcclusionSegmentPool>& out) {
@@ -1382,6 +1392,10 @@ public:
         if (statistics_segments && can_resolve_occlusion &&
             !segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
             return ReplayResult::unsupported;
+        // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after
+        // resource_lock is unlocked. Hold tracker_mutex_ across plan -> emit -> submit -> commit so concurrent queues
+        // see submission-order query state and remove_query_pool() waits until commit finishes.
+        if (has_queries && !tracker_lock.owns_lock()) tracker_lock.lock();
         QueryReplay queries;
         std::uint32_t base = 0, statistics_base = 0;
         for (auto& list : prepared) {
@@ -1623,10 +1637,12 @@ private:
             return false;
         }
         const bool ok = (res == VK_SUCCESS);
-        waits_.clear();
-        wait_values_.clear();
-        for (auto& slot : buffers_)
-            if (slot.buffer == command_buffer) slot.ticket = ticket;
+        if (ok) {
+            waits_.clear();
+            wait_values_.clear();
+            for (auto& slot : buffers_)
+                if (slot.buffer == command_buffer) slot.ticket = ticket;
+        }
         return ok;
     }
 

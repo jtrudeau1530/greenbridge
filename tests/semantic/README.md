@@ -85,6 +85,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   undefined in SPIR-V (`UndefinedResult`); a "lane mod 32" model of issue #94 gives the words a 32-wide GPU
   shows (all 24 matched on an RTX 4070 SUPER, driver 610.88, without `--wave64-emulate`). Two SPIR-V sabotages (readlane lane & 31, bpermute without its half base) must change the
   64-wide result.
+- `test_w64x_scalar_load_order.py` translates wave64 programs with `--wave64-emulate` and checks the emitted rounds:
+  no case of the round loop's switch reads or writes buffer memory after a write, or writes after a read, so a
+  `buffer_store` and a later `s_load` / `s_buffer_load` of the wave (and a scalar load and a later store) run in
+  different rounds (#1587). Loads alone share a round.
 - `test_wave64_subgroup_ops.py` runs eight more wave64 GPU tests the same way (`cs_w64x_ballot`,
   `_readfirstlane`, `_load_ballot_load`, `_partial`, `cs_wave64_ballot`, `cs_wm_bfm64`, `cs_wm_half_cmp`,
   `cs_wavemask`): on one 64-wide subgroup every word equals the GPU check; on two 32-wide subgroups the
