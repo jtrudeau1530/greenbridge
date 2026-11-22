@@ -66,15 +66,34 @@ def skip_reason(lines, arch):
 class Kernel:
     """One program to run. lines: the instructions. raw=False wraps them (output pointer load, v[8:11] store);
     raw=True means the lines already end with their own stores and s_endpgm and only get the output pointer in
-    s[2:3]. threads: workgroup size; words: dwords read back; wave: 32 or 64."""
+    s[2:3]. threads: workgroup size; words: dwords read back; wave: 32 or 64. mode: the float MODE the kernel
+    starts with (raw kernels only), a dict of MODE_FIELDS names to values; None keeps the assembler's defaults."""
 
-    def __init__(self, lines, wave=32, threads=1, words=4, raw=False):
+    def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None):
         self.lines, self.wave, self.threads, self.words, self.raw = list(lines), wave, threads, words, raw
+        self.mode = dict(mode or {})
+        unknown = set(self.mode) - set(MODE_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown MODE fields {sorted(unknown)} (known: {sorted(MODE_FIELDS)})")
 
 
-def raw_kernel_text(name, lines, arch, wave=32):
+# Float MODE the kernel descriptor starts a wave with, as .amdhsa_* directives. The assembler's defaults (checked on
+# gfx1150 by reading the register back, see docs/shader_validation.md): IEEE 1, DX10_CLAMP 1, f32 denormals
+# flushed (denorm_mode_32 = 0), f16/f64 denormals kept (3), all rounding to nearest even (0).
+MODE_FIELDS = {
+    "ieee": ".amdhsa_ieee_mode",
+    "dx10_clamp": ".amdhsa_dx10_clamp",
+    "denorm32": ".amdhsa_float_denorm_mode_32",
+    "denorm16_64": ".amdhsa_float_denorm_mode_16_64",
+    "round32": ".amdhsa_float_round_mode_32",
+    "round16_64": ".amdhsa_float_round_mode_16_64",
+}
+
+
+def raw_kernel_text(name, lines, arch, wave=32, mode=None):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
+    modes = "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
     load = "s_load_b64" if fam == "gfx11" else "s_load_dwordx2"
     body = "\n".join("  " + ln for ln in lines)
     return f""".globl {name}
@@ -91,7 +110,7 @@ def raw_kernel_text(name, lines, arch, wave=32):
   .amdhsa_next_free_vgpr 32
   .amdhsa_next_free_sgpr 40
   .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
-  .amdhsa_system_vgpr_workitem_id 0
+  .amdhsa_system_vgpr_workitem_id 0{modes}
 .end_amdhsa_kernel
 .text
 """
@@ -148,7 +167,7 @@ def module_text(programs, arch, prefix="k", wave=32):
     for i, prog in enumerate(programs):
         name = f"{prefix}{i}"
         if isinstance(prog, Kernel):
-            text = raw_kernel_text(name, prog.lines, arch, prog.wave) if prog.raw else kernel_text(name, prog.lines, arch)
+            text = raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode) if prog.raw else kernel_text(name, prog.lines, arch)
         else:
             text = kernel_text(name, prog, arch)
         names.append(name)
@@ -157,6 +176,33 @@ def module_text(programs, arch, prefix="k", wave=32):
         line_no += text.count("\n") + 0
     parts.append(metadata(names, wave).rstrip("\n"))
     return "\n".join(parts) + "\n", names, starts
+
+
+# ---- f32 vector ALU: what GFX11 does not have, or has under another name (tools/f32_fuzz.py --oracle hw) ----
+# Checked by assembling every f32_fuzz opcode with llvm-mc for gfx1013 (the console), gfx1010, gfx1030, gfx1100,
+# gfx1150 and gfx1200. The four mad opcodes exist on GFX10.1 only (gfx1010, gfx1011, gfx1013): gfx1030 (RDNA2
+# desktop) and every GFX11 part reject them. They are not "renamed": v_fma_f32, v_fmac_f32, v_fmaak_f32 and
+# v_fma_dx9_zero_f32 round once where the mad opcodes round the product first, so substituting one would compare a
+# different instruction.
+_MAD_GONE = "exists on GFX10.1 only (gfx1010/1011/1013), not on gfx1030 or GFX11; {} is fused, a different instruction"
+VALU_REMOVED = {
+    "v_mad_f32": _MAD_GONE.format("v_fma_f32"),
+    "v_mac_f32": _MAD_GONE.format("v_fmac_f32"),
+    "v_madak_f32": _MAD_GONE.format("v_fmaak_f32"),
+    "v_mad_legacy_f32": _MAD_GONE.format("v_fma_dx9_zero_f32"),
+}
+# Same instruction, new mnemonic: the assembler takes the GFX10 spelling for GFX11 and encodes the GFX11 name.
+GFX11_VALU_RENAMED = {
+    "v_mul_legacy_f32": "v_mul_dx9_zero_f32",        # DX9 rule: 0 * anything = 0 (the oracle itself checks it)
+    "v_cvt_pkrtz_f16_f32": "v_cvt_pk_rtz_f16_f32",
+}
+
+
+def valu_skip_reason(op, arch):
+    """Why an f32 VALU opcode cannot be run on this architecture, or None."""
+    if op in VALU_REMOVED and arch not in ("gfx1010", "gfx1011", "gfx1012", "gfx1013"):
+        return f"{op}: {VALU_REMOVED[op]}"
+    return None
 
 
 def failing_kernels(stderr, starts):
