@@ -956,5 +956,203 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(bits_to_f16(state.get_vgpr16(lane, 0, hi=False)), float(lane) + 9.0)
 
 
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FP16StatusFlags:
+    """Architectural floating-point condition codes and IEEE 754 status flags for binary16."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    zero: bool = False
+    negative: bool = False
+    denormal: bool = False
+    infinite: bool = False
+    nan: bool = False
+
+
+def evaluate_v_sub_f16_flags(
+    src0_bits: int,
+    src1_bits: int,
+    res_bits: int,
+    abs0: bool = False,
+    neg0: bool = False,
+    abs1: bool = False,
+    neg1: bool = False,
+    clamp: bool = False,
+) -> FP16StatusFlags:
+    """Evaluate IEEE 754 architectural flags and condition codes for v_sub_f16."""
+    s0 = apply_f16_modifiers(src0_bits, abs0, neg0)
+    s1 = apply_f16_modifiers(src1_bits, abs1, neg1)
+
+    s0_nan = is_nan_f16(s0)
+    s1_nan = is_nan_f16(s1)
+    s0_snan = is_snan_f16(s0)
+    s1_snan = is_snan_f16(s1)
+    s0_inf = is_inf_f16(s0)
+    s1_inf = is_inf_f16(s1)
+
+    invalid = False
+    if s0_snan or s1_snan:
+        invalid = True
+    elif s0_inf and s1_inf and ((s0 & SIGN_MASK_F16) == (s1 & SIGN_MASK_F16)):
+        invalid = True
+
+    nan_flag = is_nan_f16(res_bits)
+    inf_flag = is_inf_f16(res_bits)
+    zero_flag = is_zero_f16(res_bits)
+    neg_flag = bool(res_bits & SIGN_MASK_F16)
+    denorm_flag = is_subnormal_f16(res_bits)
+
+    overflow = False
+    if not (s0_nan or s1_nan or s0_inf or s1_inf) and inf_flag:
+        overflow = True
+
+    underflow = False
+    if denorm_flag:
+        underflow = True
+
+    inexact = False
+    if overflow:
+        inexact = True
+    elif not (s0_nan or s1_nan or s0_inf or s1_inf or nan_flag or inf_flag):
+        f0 = bits_to_f16(s0)
+        f1 = bits_to_f16(s1)
+        res_f = bits_to_f16(res_bits)
+        if not clamp:
+            if Fraction(f0) - Fraction(f1) != Fraction(res_f):
+                inexact = True
+        else:
+            clamped_math = min(1.0, max(0.0, float(Fraction(f0) - Fraction(f1))))
+            if Fraction(clamped_math) != Fraction(res_f):
+                inexact = True
+
+    return FP16StatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        zero=zero_flag,
+        negative=neg_flag,
+        denormal=denorm_flag,
+        infinite=inf_flag,
+        nan=nan_flag,
+    )
+
+
+def compute_f16_mantissa_borrow(s0_bits: int, s1_bits: int) -> Tuple[int, int]:
+    """Demonstrate IEEE 754 11-bit mantissa borrow generation during subtraction."""
+    _, exp0, frac0 = split_f16_bits(s0_bits)
+    _, exp1, frac1 = split_f16_bits(s1_bits)
+    m0 = (1 << 10) | frac0 if exp0 != 0 else frac0
+    m1 = (1 << 10) | frac1 if exp1 != 0 else frac1
+    if exp0 > exp1:
+        m1 >>= (exp0 - exp1)
+    elif exp1 > exp0:
+        m0 >>= (exp1 - exp0)
+    borrow_out = 1 if m0 < m1 else 0
+    diff = m0 - m1
+    return diff, borrow_out
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and borrow generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        s0 = f16_to_bits(3.0)
+        s1 = f16_to_bits(1.0)
+        res = oracle_v_sub_f16(s0, s1)
+        flags = evaluate_v_sub_f16_flags(s0, s1, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.infinite)
+        self.assertFalse(flags.nan)
+
+    def test_inexact_flag(self) -> None:
+        s0 = f16_to_bits(1.0)
+        # Small value that causes inexact round-to-nearest
+        s1 = f16_to_bits(0.00006)
+        res = oracle_v_sub_f16(s0, s1)
+        flags = evaluate_v_sub_f16_flags(s0, s1, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+
+    def test_overflow_flag(self) -> None:
+        # MAX_FINITE - (-MAX_FINITE) = 65504 - (-65504) overflows to +inf
+        s0 = MAX_FINITE_F16
+        s1 = MAX_FINITE_F16 | SIGN_MASK_F16
+        res = oracle_v_sub_f16(s0, s1)
+        self.assertEqual(res, POS_INF_F16)
+        flags = evaluate_v_sub_f16_flags(s0, s1, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.infinite)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_underflow_and_denorm_flags(self) -> None:
+        # Subnormal subtraction
+        subnorm = MIN_SUBNORMAL_F16 * 2
+        res = oracle_v_sub_f16(subnorm, MIN_SUBNORMAL_F16)
+        self.assertEqual(res, MIN_SUBNORMAL_F16)
+        flags = evaluate_v_sub_f16_flags(subnorm, MIN_SUBNORMAL_F16, res)
+        self.assertTrue(flags.denormal)
+        self.assertTrue(flags.underflow)
+        self.assertFalse(flags.overflow)
+
+    def test_invalid_operation_flag(self) -> None:
+        # (+inf) - (+inf) is invalid
+        res = oracle_v_sub_f16(POS_INF_F16, POS_INF_F16)
+        flags = evaluate_v_sub_f16_flags(POS_INF_F16, POS_INF_F16, res)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+
+        # signaling NaN operand triggers invalid operation
+        snan = 0x7C01
+        res2 = oracle_v_sub_f16(snan, f16_to_bits(1.0))
+        flags2 = evaluate_v_sub_f16_flags(snan, f16_to_bits(1.0), res2)
+        self.assertTrue(flags2.invalid)
+        self.assertTrue(flags2.nan)
+
+    def test_zero_and_negative_flags(self) -> None:
+        # (+0) - (+0)
+        res_pz = oracle_v_sub_f16(POS_ZERO_F16, POS_ZERO_F16)
+        flags_pz = evaluate_v_sub_f16_flags(POS_ZERO_F16, POS_ZERO_F16, res_pz)
+        self.assertTrue(flags_pz.zero)
+        self.assertFalse(flags_pz.negative)
+
+        # (-0) - (+0) = -0
+        res_nz = oracle_v_sub_f16(NEG_ZERO_F16, POS_ZERO_F16)
+        flags_nz = evaluate_v_sub_f16_flags(NEG_ZERO_F16, POS_ZERO_F16, res_nz)
+        self.assertTrue(flags_nz.zero)
+        self.assertTrue(flags_nz.negative)
+
+        # 5.0 - 15.0 = -10.0
+        s0 = f16_to_bits(5.0)
+        s1 = f16_to_bits(15.0)
+        res_neg = oracle_v_sub_f16(s0, s1)
+        flags_neg = evaluate_v_sub_f16_flags(s0, s1, res_neg)
+        self.assertFalse(flags_neg.zero)
+        self.assertTrue(flags_neg.negative)
+
+    def test_mantissa_borrow_generation(self) -> None:
+        # 1.0 - 1.5: m0 = 1024, m1 = 1536 -> borrow = 1
+        _, borrow1 = compute_f16_mantissa_borrow(f16_to_bits(1.0), f16_to_bits(1.5))
+        self.assertEqual(borrow1, 1)
+
+        # 1.5 - 1.0: m0 = 1536, m1 = 1024 -> borrow = 0
+        _, borrow0 = compute_f16_mantissa_borrow(f16_to_bits(1.5), f16_to_bits(1.0))
+        self.assertEqual(borrow0, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
