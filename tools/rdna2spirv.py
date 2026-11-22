@@ -4543,6 +4543,23 @@ class Gen:
                 m = self.tmp()
                 self.emit(f"{m} = OpSelect %uint {self.tmp_bool_nz(bit64)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(sd, m)
+        elif op in ("v_mad_u32_u16", "v_mad_i32_i16"):
+            # D = S0.half * S1.half + S2 (RDNA ISA pseudocode), wrapping at 32 bits: the 16-bit halves zero-extended
+            # (u16) or sign-extended (i16); op_sel bits 0 / 1 read the high half of S0 / S1. S2 and D are whole
+            # dwords, so an op_sel bit on them, and clamp, are not modelled: rejected rather than guessed.
+            sel, dhi = self.opsel_bits(mods, 3)
+            if sel[2] or dhi or "clamp" in mods:
+                raise Unsupported(op + " op_sel/clamp")
+            ext = "OpBitFieldSExtract" if op == "v_mad_i32_i16" else "OpBitFieldUExtract"
+            hs = []
+            for i, src in enumerate(a[1:3]):
+                h = self.tmp()
+                self.emit(f"{h} = {ext} %uint {self.src_u(src)} {self.cu(16 * sel[i])} {self.cu(16)}")
+                hs.append(h)
+            m, r = self.tmp(), self.tmp()
+            self.emit(f"{m} = OpIMul %uint {hs[0]} {hs[1]}")
+            self.emit(f"{r} = OpIAdd %uint {m} {self.src_u(a[3])}")
+            self.dst(a[0], r)
         elif op == "v_mad_u32_u24":
             x, y, z = (self.src_u(t) for t in a[1:4])
             xm, ym, p, r = self.tmp(), self.tmp(), self.tmp(), self.tmp()
