@@ -9,8 +9,8 @@
 // So for a module the shim registry owns (rt::shims::owns_dll: xgameruntime.dll, d3d12_xs.dll, xmem.dll, ...), these
 // return a pseudo-handle, and GetProcAddress on it resolves names (and "#ordinal") through rt::shims::find. A name the
 // registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND, as a real module would, and is logged once. Every
-// other module goes to the host unchanged. Only images mapped by the loader see these: they are bound through the
-// registry, the runtime's own code calls the host directly.
+// other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
+// loader see these: they are bound through the registry, the runtime's own code calls the host directly.
 #include <windows.h>
 
 #include <cstdio>
@@ -204,6 +204,16 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         if (fn) return reinterpret_cast<FARPROC>(fn);
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
+    }
+    if (module && !IS_INTRESOURCE(name)) {
+        const DWORD error = GetLastError();
+        wchar_t path[32768];
+        const DWORD length = GetModuleFileNameW(module, path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])));
+        void* shim = nullptr;
+        if (length && length < sizeof(path) / sizeof(path[0]))
+            shim = find(module_name(narrow(path)), what);
+        SetLastError(error);
+        if (shim) return reinterpret_cast<FARPROC>(shim);
     }
     return GetProcAddress(module, name);
 }
