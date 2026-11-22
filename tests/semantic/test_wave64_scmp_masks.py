@@ -507,5 +507,131 @@ class Wave64ReferenceOracleTests(unittest.TestCase):
                 self.assertEqual(got, want)
 
 
+
+class Wave64SccConditionUpdateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        asm = (
+            WAVE64_BUILD_VCC_AND_SGPR
+            # Step 1: Compare A (eq u64), preserve SCC across ALU movs
+            + "s_cmp_eq_u64 vcc, s[6:7]\n"
+            + "s_mov_b32 s16, 0x42\n"
+            + "v_mov_b32_e32 v6, s16\n"
+            + "s_cselect_b32 s21, 1, 0\n"
+            # Step 2: Compare B (lg u64), unconditionally updates SCC
+            + "s_cmp_lg_u64 vcc, s[6:7]\n"
+            + "s_mov_b32 s17, 0x43\n"
+            + "s_cselect_b32 s22, 1, 0\n"
+            # Step 3: Compare C (tautology scalar eq), sets SCC to 1
+            + "s_cmp_eq_u64 s[6:7], s[6:7]\n"
+            + "s_cselect_b32 s23, 1, 0\n"
+            # Step 4: Compare D (contradiction scalar lg), sets SCC to 0
+            + "s_cmp_lg_u64 s[6:7], s[6:7]\n"
+            + "s_cselect_b32 s24, 1, 0\n"
+            # Step 5: Compare E (32-bit low half eq)
+            + "s_cmp_eq_u32 vcc_lo, s6\n"
+            + "s_cselect_b32 s25, 1, 0\n"
+            # Step 6: Compare F (32-bit high half lg)
+            + "s_cmp_lg_u32 vcc_hi, s7\n"
+            + "s_cselect_b32 s26, 1, 0\n"
+            # Store s21..s26 to slots 0..5
+            + "v_mov_b32_e32 v4, s21\nv_mov_b32_e32 v5, 0\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s22\nv_mov_b32_e32 v5, 4\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s23\nv_mov_b32_e32 v5, 8\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s24\nv_mov_b32_e32 v5, 12\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s25\nv_mov_b32_e32 v5, 16\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s26\nv_mov_b32_e32 v5, 20\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "s_endpgm\n"
+        )
+        cls.spv = translate_cs("cs_w64_scc_updates", asm, threads=64)
+
+    def test_scc_sequential_updates_and_preservation(self):
+        cases = [
+            # Equal mask & scalar
+            (0x12345678, 0x9ABCDEF0, 0x12345678, 0x9ABCDEF0),
+            # Low half equal, high half different
+            (0x12345678, 0x11111111, 0x12345678, 0x22222222),
+            # High half equal, low half different
+            (0x11111111, 0x9ABCDEF0, 0x22222222, 0x9ABCDEF0),
+            # Completely different
+            (0x00000000, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF),
+        ]
+        for lo, hi, s6, s7 in cases:
+            with self.subTest(lo=hex(lo), hi=hex(hi), s6=hex(s6), s7=hex(s7)):
+                mem = run_cs(self.spv, 64, s4=lo, s5=hi, s6=s6, s7=s7)
+                u64_eq = int(lo == s6 and hi == s7)
+                u64_lg = int(lo != s6 or hi != s7)
+                lo_eq = int(lo == s6)
+                hi_lg = int(hi != s7)
+                want = [u64_eq, u64_lg, 1, 0, lo_eq, hi_lg]
+                self.assertEqual([mem[4 * k] for k in range(6)], want)
+
+
+class Wave64MaskDecompositionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        asm = (
+            WAVE64_BUILD_VCC_AND_SGPR
+            # 0: direct s_cmp_eq_u64 vcc, s[6:7]
+            + "s_cmp_eq_u64 vcc, s[6:7]\n"
+            + "s_cselect_b32 s20, 1, 0\n"
+            # 1: decomposed eq: vcc_lo == s6 AND vcc_hi == s7
+            + "s_cmp_eq_u32 vcc_lo, s6\n"
+            + "s_cselect_b32 s21, 1, 0\n"
+            + "s_cmp_eq_u32 vcc_hi, s7\n"
+            + "s_cselect_b32 s22, 1, 0\n"
+            + "s_and_b32 s23, s21, s22\n"
+            # 2: direct s_cmp_lg_u64 vcc, s[6:7]
+            + "s_cmp_lg_u64 vcc, s[6:7]\n"
+            + "s_cselect_b32 s24, 1, 0\n"
+            # 3: decomposed lg: vcc_lo != s6 OR vcc_hi != s7
+            + "s_cmp_lg_u32 vcc_lo, s6\n"
+            + "s_cselect_b32 s25, 1, 0\n"
+            + "s_cmp_lg_u32 vcc_hi, s7\n"
+            + "s_cselect_b32 s26, 1, 0\n"
+            + "s_or_b32 s27, s25, s26\n"
+            # 4: De Morgan negation of decomposed equality: s23 ^ 1
+            + "s_xor_b32 s28, s23, 1\n"
+            # 5: direct s_cmp_eq_u64 s[6:7], vcc (swapped)
+            + "s_cmp_eq_u64 s[6:7], vcc\n"
+            + "s_cselect_b32 s29, 1, 0\n"
+            # Store results to buffer: slots 0..5
+            + "v_mov_b32_e32 v4, s20\nv_mov_b32_e32 v5, 0\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s23\nv_mov_b32_e32 v5, 4\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s24\nv_mov_b32_e32 v5, 8\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s27\nv_mov_b32_e32 v5, 12\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s28\nv_mov_b32_e32 v5, 16\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s29\nv_mov_b32_e32 v5, 20\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "s_endpgm\n"
+        )
+        cls.spv = translate_cs("cs_w64_decomp", asm, threads=64)
+
+    def test_64bit_mask_decomposition_equivalence(self):
+        cases = [
+            (0x12345678, 0x9ABCDEF0, 0x12345678, 0x9ABCDEF0),
+            (0x12345678, 0x00000000, 0x12345678, 0xFFFFFFFF),
+            (0x00000000, 0x9ABCDEF0, 0xFFFFFFFF, 0x9ABCDEF0),
+            (0xAAAAAAAA, 0x55555555, 0x55555555, 0xAAAAAAAA),
+            (0x00000001, 0x00000000, 0x00000000, 0x00000000),
+            (0x00000000, 0x80000000, 0x00000000, 0x00000000),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
+            (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+        ]
+        for lo, hi, s6, s7 in cases:
+            with self.subTest(lo=hex(lo), hi=hex(hi), s6=hex(s6), s7=hex(s7)):
+                mem = run_cs(self.spv, 64, s4=lo, s5=hi, s6=s6, s7=s7)
+                direct_eq = mem[0]
+                decomp_eq = mem[4]
+                direct_lg = mem[8]
+                decomp_lg = mem[12]
+                demorgan_lg = mem[16]
+                swapped_eq = mem[20]
+
+                self.assertEqual(direct_eq, decomp_eq)
+                self.assertEqual(direct_lg, decomp_lg)
+                self.assertEqual(decomp_lg, demorgan_lg)
+                self.assertEqual(direct_eq, swapped_eq)
+
+
 if __name__ == "__main__":
     unittest.main()
