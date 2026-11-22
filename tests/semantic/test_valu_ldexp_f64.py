@@ -818,6 +818,98 @@ class SIMDVALUInterpreter:
         return self.execute(ast)
 
 
+class TestValuLdexpF64IEEE754Boundaries(unittest.TestCase):
+    """Deep verification of IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_exact_tiesto_even_rounding(self):
+        # Construct an unscaled float that underflows to a half-way tie in subnormal range
+        # Min normal is 2^-1022 (exp_field = 1, mant = 0).
+        # Scale = -53 -> target_exp = -52 -> shift_right = 53.
+        # Mantissa F has 53 bits (1 << 52).
+        # Shifted by 53: q = 0, remainder = 1 << 52, half = 1 << 52.
+        # This is an exact half-way tie with q = 0 (even)!
+        # In TiesToEven rounding, it rounds down to 0!
+        res_even = ref_ldexp_f64(MIN_NORMAL_F64, -53)
+        self.assertEqual(res_even, POS_ZERO_F64)
+
+        # Now test with F = (1 << 52) | (1 << 1), so after shift by 53,
+        # remainder > half, so it rounds up to 1 (MIN_SUBNORMAL_F64)!
+        f_odd = MIN_NORMAL_F64 | 2
+        res_odd = ref_ldexp_f64(f_odd, -53)
+        self.assertEqual(res_odd, MIN_SUBNORMAL_F64)
+
+    def test_subnormal_scaling_transitions(self):
+        # Scaling MIN_SUBNORMAL (2^-1074) up to normal range
+        res = ref_ldexp_f64(MIN_SUBNORMAL_F64, 52)
+        self.assertEqual(res, MIN_NORMAL_F64)
+        self.assertEqual(bits_to_f64(res), 2.2250738585072014e-308)
+
+        # Scaling MAX_SUBNORMAL up by 1
+        res_max_sub = ref_ldexp_f64(MAX_SUBNORMAL_F64, 1)
+        self.assertTrue(is_normal_f64(res_max_sub))
+
+        # Scaling MIN_SUBNORMAL down by 1 -> rounds to 0
+        res_sub_down = ref_ldexp_f64(MIN_SUBNORMAL_F64, -1)
+        self.assertEqual(res_sub_down, POS_ZERO_F64)
+
+    def test_extreme_scale_integers(self):
+        # Extreme large positive exponents (e.g. 0x7FFFFFFF, 1000000)
+        for s in (0x7FFFFFFF, 1000000, 2048, 1024):
+            self.assertEqual(ref_ldexp_f64(ONE_F64, s), POS_INF_F64)
+            self.assertEqual(ref_ldexp_f64(ONE_F64 | SIGN_MASK_F64, s), NEG_INF_F64)
+
+        # Extreme large negative exponents (e.g. -0x80000000, -1000000)
+        for s in (-0x80000000, -1000000, -2048, -1075):
+            self.assertEqual(ref_ldexp_f64(ONE_F64, s), POS_ZERO_F64)
+            self.assertEqual(ref_ldexp_f64(ONE_F64 | SIGN_MASK_F64, s), NEG_ZERO_F64)
+
+    def test_max_finite_overflow_boundaries(self):
+        # MAX_FINITE with scale 0 is MAX_FINITE
+        self.assertEqual(ref_ldexp_f64(MAX_FINITE_F64, 0), MAX_FINITE_F64)
+        # MAX_FINITE with scale +1 overflows to +inf
+        self.assertEqual(ref_ldexp_f64(MAX_FINITE_F64, 1), POS_INF_F64)
+        # Negative MAX_FINITE with scale +1 overflows to -inf
+        self.assertEqual(ref_ldexp_f64(MAX_FINITE_F64 | SIGN_MASK_F64, 1), NEG_INF_F64)
+
+    def test_signed_zero_preservation_under_extremes(self):
+        # +0.0 and -0.0 must be preserved for all scale values
+        for s in (-0x80000000, -1000, -1, 0, 1, 1000, 0x7FFFFFFF):
+            self.assertEqual(ref_ldexp_f64(POS_ZERO_F64, s), POS_ZERO_F64)
+            self.assertEqual(ref_ldexp_f64(NEG_ZERO_F64, s), NEG_ZERO_F64)
+
+    def test_signed_infinity_preservation(self):
+        for s in (-1000, -1, 0, 1, 1000):
+            self.assertEqual(ref_ldexp_f64(POS_INF_F64, s), POS_INF_F64)
+            self.assertEqual(ref_ldexp_f64(NEG_INF_F64, s), NEG_INF_F64)
+
+    def test_nan_payloads_and_quietening(self):
+        # Quiet NaN payload preserved
+        qnan_payload = QNAN_F64 | 0x0000000012345678
+        res_qnan = ref_ldexp_f64(qnan_payload, 5)
+        self.assertTrue(is_nan_f64(res_qnan))
+        self.assertEqual(res_qnan & 0x0000000012345678, 0x0000000012345678)
+
+        # Signaling NaN quiet bit set
+        snan_payload = SNAN_F64 | 0x0000000087654321
+        res_snan = ref_ldexp_f64(snan_payload, -3)
+        self.assertTrue(is_nan_f64(res_snan))
+        self.assertFalse(is_snan_f64(res_snan), "Signaling NaN must be quieted")
+
+    def test_clamp_behavior_on_all_special_values(self):
+        # NaNs clamp to +0.0
+        self.assertEqual(ref_ldexp_f64(QNAN_F64, 0, clamp=True), POS_ZERO_F64)
+        self.assertEqual(ref_ldexp_f64(SNAN_F64, 0, clamp=True), POS_ZERO_F64)
+        # +inf clamps to 1.0, -inf clamps to +0.0
+        self.assertEqual(ref_ldexp_f64(POS_INF_F64, 0, clamp=True), ONE_F64)
+        self.assertEqual(ref_ldexp_f64(NEG_INF_F64, 0, clamp=True), POS_ZERO_F64)
+        # -0.0 clamps to +0.0
+        self.assertEqual(ref_ldexp_f64(NEG_ZERO_F64, 0, clamp=True), POS_ZERO_F64)
+        # Values > 1.0 clamp to 1.0
+        self.assertEqual(ref_ldexp_f64(TWO_F64, 0, clamp=True), ONE_F64)
+        # Values < 0.0 clamp to +0.0
+        self.assertEqual(ref_ldexp_f64(TWO_F64 | SIGN_MASK_F64, 0, clamp=True), POS_ZERO_F64)
+
+
 class TestValuLdexpF64StatusFlags(unittest.TestCase):
     """Unit tests for condition codes, status flags, and carry/borrow behavior."""
 
