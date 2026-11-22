@@ -330,12 +330,12 @@ int main() {
         fullscreen.ScanlineOrdering != DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED)
         return fail("GetFullscreenDesc");
 
-    // Factory::GetParent: root DXGI object has no parent; returns DXGI_ERROR_NOT_FOUND
+    // Factory::GetParent: root DXGI object has no parent; native DXGI returns E_NOINTERFACE
     void* parent_out = reinterpret_cast<void*>(1);
     if (factory->GetParent(IID_IUnknown, nullptr) != E_POINTER)
         return fail("Factory::GetParent with null out should return E_POINTER");
-    if (factory->GetParent(IID_IUnknown, &parent_out) != DXGI_ERROR_NOT_FOUND || parent_out != nullptr)
-        return fail("Factory::GetParent should return DXGI_ERROR_NOT_FOUND and set null out");
+    if (factory->GetParent(IID_IUnknown, &parent_out) != E_NOINTERFACE || parent_out != nullptr)
+        return fail("Factory::GetParent should return E_NOINTERFACE and set null out");
 
     // SwapChain::GetCoreWindow: HWND swapchain is not associated with a CoreWindow
     void* cw_out = reinterpret_cast<void*>(1);
@@ -1111,11 +1111,13 @@ int main() {
 
     // Classic IDXGIFactory::CreateSwapChain delegation
     {
-        if (factory->CreateSwapChain(nullptr, nullptr, nullptr) != E_POINTER)
-            return fail("CreateSwapChain(null out) should return E_POINTER");
+        if (factory->CreateSwapChain(nullptr, nullptr, nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChain(null out) should return DXGI_ERROR_INVALID_CALL");
         IDXGISwapChain* legacy_sc = nullptr;
-        if (factory->CreateSwapChain(nullptr, nullptr, &legacy_sc) != E_INVALIDARG)
-            return fail("CreateSwapChain(null device, null desc) should return E_INVALIDARG");
+        if (factory->CreateSwapChain(nullptr, nullptr, &legacy_sc) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChain(null device, null desc) should return DXGI_ERROR_INVALID_CALL");
+        if (factory->CreateSwapChain(queue, nullptr, &legacy_sc) != DXGI_ERROR_INVALID_CALL)
+            return fail("CreateSwapChain(valid device, null desc) should return DXGI_ERROR_INVALID_CALL");
 
         HWND hwnd_legacy = create_test_window(160, 120);
         if (!hwnd_legacy) return fail("CreateWindowExW (legacy)");
