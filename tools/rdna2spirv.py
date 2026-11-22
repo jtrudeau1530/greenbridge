@@ -6412,6 +6412,54 @@ class Gen:
             r = self.tmp()
             self.emit_fma(r, vals[0], vals[1], vals[2])
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op in ("v_div_fmas_f32", "v_div_fmas_f64"):
+            # Scaled FMA for IEEE-754 division (RDNA2 ISA VOP3): D = VCC ? (2^32 * fma(S0, S1, S2)) : fma(S0, S1, S2)
+            # for f32, and 2^64 for f64. VOP3 input (abs/neg) and output (omod/clamp) modifiers apply.
+            vcc_b = self.tmp_bool_nz(self.mask_src({"k": "special", "t": "vcc"}))
+            if op == "v_div_fmas_f32":
+                x, y, z = (self.src_f(t) for t in a[1:4])
+                f, sc, r = self.tmp(), self.tmp(), self.tmp()
+                self.emit_fma(f, x, y, z)
+                self.emit(f"{sc} = OpFMul %float {f} {self.fconst(float(1 << 32))}")
+                self.emit(f"{r} = OpSelect %float {vcc_b} {sc} {f}")
+                self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+            else:
+                def f64(sv):
+                    if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                        lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+                    elif sv["k"] in ("imm", "fimm"):
+                        bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
+                                if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+                        lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+                    else:
+                        raise Unsupported(op + " operand")
+                    v2, d = self.tmp(), self.tmp()
+                    self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
+                    self.emit(f"{d} = OpBitcast %double {v2}")
+                    if sv.get("abs"):
+                        t = self.tmp()
+                        self.emit(f"{t} = OpExtInst %double %glsl FAbs {d}")
+                        d = t
+                    if sv.get("neg"):
+                        t = self.tmp()
+                        self.emit(f"{t} = OpFNegate %double {d}")
+                        d = t
+                    return d
+                d = a[0]
+                if d["k"] != "vgpr" or d.get("n") != 2:
+                    raise Unsupported(op + " destination")
+                self.uses_f64 = True
+                x, y, z = (f64(t) for t in a[1:4])
+                f, sc, r, v2, lo, hi = (self.tmp() for _ in range(6))
+                self.emit(f"{f} = OpExtInst %double %glsl Fma {x} {y} {z}")
+                self.emit(f"{sc} = OpFMul %double {f} {self.dconst(float(1 << 64))}")
+                self.emit(f"{r} = OpSelect %double {vcc_b} {sc} {f}")
+                r = self.clamp_mods_f64(r, mods)
+                self.emit(f"{v2} = OpBitcast %v2uint_d {r}")
+                self.emit(f"{lo} = OpCompositeExtract %uint {v2} 0")
+                self.emit(f"{hi} = OpCompositeExtract %uint {v2} 1")
+                self.dst({"k": "vgpr", "r": d["r"], "n": 1}, lo)
+                self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, hi)
         elif op in ("v_mad_f32", "v_mac_f32"):
             # Unfused: the product is rounded before the add. v_mac_f32 is the VOP2 form with D as the addend
             # (LLVM SIInstrInfo.cpp getNewFMAInst: V_MAC_F32 -> V_MAD_F32_e64, V_FMAC_F32 -> V_FMA_F32_e64).
