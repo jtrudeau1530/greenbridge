@@ -264,6 +264,28 @@ class CliArgumentTest(unittest.TestCase):
                     self.assertIn("--jobs must be at least 1", result.stderr)
 
 
+class OpusInputSelectionTest(unittest.TestCase):
+    def test_collect_requires_an_opus_id_packet(self) -> None:
+        opus_id = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 312, 48000, 0, 0)
+        opus_bos = awc_opus.ogg_page(10, 0, 0, [opus_id], 2)
+        vorbis_id = b"\x01vorbis" + struct.pack("<IBIIII2B", 0, 1, 48000, 0, 0, 0, 0xB8, 1)
+        vorbis_bos = awc_opus.ogg_page(11, 0, 0, [vorbis_id], 2)
+        comment = b"COMMENT=OpusHead"
+        vorbis_comment = b"\x03vorbis" + struct.pack("<III", 0, 1, len(comment)) + comment + b"\x01"
+        vorbis_tags = awc_opus.ogg_page(11, 1, 0, [vorbis_comment], 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "opus.ogg").write_bytes(opus_bos)
+            (root / "vorbis.ogg").write_bytes(vorbis_bos + vorbis_tags)
+            (root / "incomplete.opus").write_bytes(opus_bos[:-1])
+
+            found, skipped = audio_wav.collect(directory)
+
+        self.assertEqual([stem for _, stem in found], ["opus"])
+        self.assertEqual(skipped, 2)
+
+
 class GranuleTest(unittest.TestCase):
     def test_trim_requires_identifiable_matching_endpoints(self):
         # A 240-channel family-255 header occupies two laces. Every output maps to the same mono stream.
@@ -371,11 +393,13 @@ def write_fake_ffmpeg(directory, source=FAKE_FFMPEG):
 
 
 def write_fake_opus_inputs(directory, names=("x.ogg", "x.opus", "y.ogg")):
-    """Ogg Opus look-alikes: enough for the tool to accept them; the fake ffmpeg never parses them."""
+    """Write only the Opus ID page because the fake ffmpeg never parses audio."""
     os.makedirs(directory)
+    head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 312, 48000, 0, 0)
+    page = awc_opus.ogg_page(10, 0, 0, [head], 2)
     for name in names:
         with open(os.path.join(directory, name), "wb") as f:
-            f.write(b"OggS" + b"\0" * 24 + b"OpusHead" + bytes(64))
+            f.write(page)
 
 
 class SameStemTest(unittest.TestCase):
