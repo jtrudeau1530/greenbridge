@@ -324,8 +324,8 @@ int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
     return 0;
 }
 
-// The host PC runtime's D3D12 device to compare answers with: the default adapter, or the one LEONIDA_HOST_ADAPTER
-// names ("warp", or part of an adapter's name); false if there is none.
+// The host PC runtime's D3D12 device to compare answers with: the layer's own adapter (set in main), else the default
+// one, or the one LEONIDA_HOST_ADAPTER names ("warp", or part of an adapter's name); false if there is none.
 // Under Wine there is none (copycmp::create_host).
 bool create_host_device(Ref<ID3D12Device>& host, std::string* adapter_name = nullptr) {
     copycmp::Ptr<ID3D12Device> device;
@@ -3060,6 +3060,18 @@ int main() {
     const auto status = d.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
     if (status == vktest::DeviceStatus::failed) return 1;
+    {
+        // The host comparisons (create_host_device, the copies) run on the layer's own adapter, not D3D12's default
+        // one, which on a PC with two GPUs can be the other GPU (copycmp::layer_adapter).
+        VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+        d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &properties);
+        if (id.deviceLUIDValid) {
+            LUID luid{};
+            std::memcpy(&luid, id.deviceLUID, sizeof(luid));
+            copycmp::layer_adapter() = luid;
+        }
+    }
     EXPECT(d.depth_format_usable(VK_FORMAT_D32_SFLOAT_S8_UINT));
     VkSampleCountFlags depth_sample_counts = 0, color_sample_counts = 0;
     {
