@@ -1303,5 +1303,500 @@ OpFunctionEnd
             self.assertEqual(to_signed_i32(final_lds[s]), expected)
 
 
+class TestTwosComplementSignedBoundaries(unittest.TestCase):
+    """Verifies signed 32-bit extreme boundaries, identity elements, and sign-bit coverage."""
+
+    def test_signed_32bit_extreme_boundaries(self):
+        # INT32_MIN = -2147483648 (0x80000000)
+        # INT32_MAX = 2147483647 (0x7FFFFFFF)
+        # -1 = 0xFFFFFFFF
+        # 0 = 0x00000000
+        # +1 = 0x00000001
+        cases = [
+            (INT32_MIN, INT32_MAX, INT32_MAX),
+            (INT32_MAX, INT32_MIN, INT32_MAX),
+            (INT32_MIN, 0xFFFFFFFF, 0xFFFFFFFF),  # -2147483648 vs -1 -> -1
+            (0xFFFFFFFF, INT32_MIN, 0xFFFFFFFF),
+            (0xFFFFFFFF, 0, 0),                    # -1 vs 0 -> 0
+            (0, 0xFFFFFFFF, 0),
+            (0xFFFFFFFF, 1, 1),                    # -1 vs +1 -> +1
+            (1, 0xFFFFFFFF, 1),
+            (INT32_MIN, INT32_MIN + 1, INT32_MIN + 1),  # -2147483648 vs -2147483647 -> -2147483647
+            (INT32_MAX - 1, INT32_MAX, INT32_MAX),      # 2147483646 vs 2147483647 -> 2147483647
+        ]
+        for a, b, expected in cases:
+            with self.subTest(a=hex(a), b=hex(b)):
+                self.assertEqual(reference_atomic_max_i32(a, b), expected)
+
+    def test_int32_min_identity_element(self):
+        # max(INT32_MIN, x) == x for all x
+        test_values = [
+            INT32_MIN,
+            INT32_MIN + 1,
+            -1000000,
+            -65536,
+            -1,
+            0,
+            1,
+            65535,
+            1000000,
+            INT32_MAX - 1,
+            INT32_MAX,
+        ]
+        for val in test_values:
+            with self.subTest(val=val):
+                u_val = to_unsigned_u32(val)
+                self.assertEqual(reference_atomic_max_i32(INT32_MIN, u_val), u_val)
+                self.assertEqual(reference_atomic_max_i32(u_val, INT32_MIN), u_val)
+
+        # SPIR-V execution with INT32_MIN seed
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%dummy = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        for val in test_values:
+            u_val = to_unsigned_u32(val)
+            final_lds, _ = interp.run(seed_lds={0: INT32_MIN}, lane_inputs=[{"%v_data": u_val}])
+            self.assertEqual(final_lds[0], u_val)
+
+    def test_int32_max_absorbing_element(self):
+        # max(INT32_MAX, x) == INT32_MAX for all x
+        test_values = [
+            INT32_MIN,
+            INT32_MIN + 1,
+            -500,
+            -1,
+            0,
+            1,
+            10000,
+            INT32_MAX - 1,
+            INT32_MAX,
+        ]
+        for val in test_values:
+            with self.subTest(val=val):
+                u_val = to_unsigned_u32(val)
+                self.assertEqual(reference_atomic_max_i32(INT32_MAX, u_val), INT32_MAX)
+                self.assertEqual(reference_atomic_max_i32(u_val, INT32_MAX), INT32_MAX)
+
+        # SPIR-V execution with INT32_MAX seed
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%dummy = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        for val in test_values:
+            u_val = to_unsigned_u32(val)
+            final_lds, _ = interp.run(seed_lds={0: INT32_MAX}, lane_inputs=[{"%v_data": u_val}])
+            self.assertEqual(final_lds[0], INT32_MAX)
+
+    def test_sign_bit_matrix_coverage(self):
+        # Exhaustive sign combinations: (+, +), (+, -), (-, +), (-, -)
+        sign_matrix = [
+            (10, 20, 20),           # (+, +)
+            (20, 10, 20),
+            (15, -30, 15),          # (+, -)
+            (-30, 15, 15),          # (-, +)
+            (-50, -20, -20),        # (-, -)
+            (-20, -50, -20),
+            (0x7FFFFFFF, 0x80000000, 0x7FFFFFFF),  # sign bit 0 vs 1
+            (0x80000000, 0x7FFFFFFF, 0x7FFFFFFF),  # sign bit 1 vs 0
+        ]
+        for a, b, exp in sign_matrix:
+            ua = to_unsigned_u32(a)
+            ub = to_unsigned_u32(b)
+            uexp = to_unsigned_u32(exp)
+            self.assertEqual(reference_atomic_max_i32(ua, ub), uexp)
+
+
+class TestReturnValueRetention(unittest.TestCase):
+    """Verifies that returning forms preserve prior values and non-returning forms do not clobber."""
+
+    def test_returning_form_preserves_unmodified_old_value(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out = OpVariable %_ptr_Output_uint Output
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%old = OpAtomicSMax %uint %ptr %c2 %c0 %v_data
+OpStore %out %old
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        # Test 1: Memory updates from negative to positive
+        final_lds, lane_out = interp.run(seed_lds={0: to_unsigned_u32(-40)}, lane_inputs=[{"%v_data": 70}])
+        self.assertEqual(lane_out[0]["%out"], to_unsigned_u32(-40))
+        self.assertEqual(final_lds[0], 70)
+
+        # Test 2: Memory stays same because input is smaller
+        final_lds2, lane_out2 = interp.run(seed_lds={0: 70}, lane_inputs=[{"%v_data": to_unsigned_u32(-10)}])
+        self.assertEqual(lane_out2[0]["%out"], 70)
+        self.assertEqual(final_lds2[0], 70)
+
+        # Test 3: Input is INT32_MIN, memory is INT32_MAX
+        final_lds3, lane_out3 = interp.run(seed_lds={0: INT32_MAX}, lane_inputs=[{"%v_data": INT32_MIN}])
+        self.assertEqual(lane_out3[0]["%out"], INT32_MAX)
+        self.assertEqual(final_lds3[0], INT32_MAX)
+
+    def test_multi_step_return_value_chain(self):
+        # 5 sequential atomic operations chain through LDS[0]
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out1 %out2 %out3 %out4 %out5
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_Output_uint = OpTypePointer Output %uint
+%out1 = OpVariable %_ptr_Output_uint Output
+%out2 = OpVariable %_ptr_Output_uint Output
+%out3 = OpVariable %_ptr_Output_uint Output
+%out4 = OpVariable %_ptr_Output_uint Output
+%out5 = OpVariable %_ptr_Output_uint Output
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%c_minus50 = OpConstant %uint 4294967246
+%c_minus20 = OpConstant %uint 4294967276
+%c_minus30 = OpConstant %uint 4294967266
+%c_plus10 = OpConstant %uint 10
+%c_plus5 = OpConstant %uint 5
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%r1 = OpAtomicSMax %uint %ptr %c2 %c0 %c_minus50
+OpStore %out1 %r1
+%r2 = OpAtomicSMax %uint %ptr %c2 %c0 %c_minus20
+OpStore %out2 %r2
+%r3 = OpAtomicSMax %uint %ptr %c2 %c0 %c_minus30
+OpStore %out3 %r3
+%r4 = OpAtomicSMax %uint %ptr %c2 %c0 %c_plus10
+OpStore %out4 %r4
+%r5 = OpAtomicSMax %uint %ptr %c2 %c0 %c_plus5
+OpStore %out5 %r5
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        # Seed LDS[0] with -100 (0xFFFFFF9C)
+        seed_val = to_unsigned_u32(-100)
+        final_lds, lane_out = interp.run(seed_lds={0: seed_val})
+
+        # Op 1: max(-100, -50) -> returns -100, memory becomes -50
+        self.assertEqual(to_signed_i32(lane_out[0]["%out1"]), -100)
+        # Op 2: max(-50, -20) -> returns -50, memory becomes -20
+        self.assertEqual(to_signed_i32(lane_out[0]["%out2"]), -50)
+        # Op 3: max(-20, -30) -> returns -20, memory remains -20 (-20 > -30)
+        self.assertEqual(to_signed_i32(lane_out[0]["%out3"]), -20)
+        # Op 4: max(-20, +10) -> returns -20, memory becomes +10
+        self.assertEqual(to_signed_i32(lane_out[0]["%out4"]), -20)
+        # Op 5: max(+10, +5) -> returns +10, memory remains +10 (+10 > +5)
+        self.assertEqual(to_signed_i32(lane_out[0]["%out5"]), 10)
+
+        # Final memory state
+        self.assertEqual(final_lds[0], 10)
+
+
+class TestNegativeControlsAndErrors(unittest.TestCase):
+    """Verifies that invalid constructs, unmodelled opcodes, and malformed headers fail."""
+
+    def test_unsupported_storage_class_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_UC = OpTypePointer UniformConstant %uint
+%u = OpVariable %_ptr_UC UniformConstant
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicMaxI32Interp(spvasm)
+
+    def test_unsupported_opcode_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%bad = OpSDiv %uint %c16 %c16
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_invalid_workgroup_size_rejected(self):
+        for dims in [(0, 1, 1), (1025, 1, 1), (32, 33, 1)]:
+            with self.subTest(dims=dims):
+                spvasm = f"""
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize {dims[0]} {dims[1]} {dims[2]}
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+                with self.assertRaises(WorkgroupBoundsError):
+                    LdsAtomicMaxI32Interp(spvasm)
+
+    def test_atomic_on_non_lds_pointer_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_fn_uint = OpTypePointer Function %uint
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c5 = OpConstant %uint 5
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%local_v = OpVariable %_ptr_fn_uint Function
+%bad = OpAtomicSMax %uint %local_v %c2 %c0 %c5
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_lds_access_out_of_bounds_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c999 = OpConstant %uint 999
+%c5 = OpConstant %uint 5
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c999
+%bad = OpAtomicSMax %uint %ptr %c2 %c0 %c5
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        with self.assertRaises(WorkgroupBoundsError):
+            interp.run()
+
+    def test_multiple_workgroup_variables_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%lds1 = OpVariable %_ptr_WG_lds Workgroup
+%lds2 = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicMaxI32Interp(spvasm)
+
+    def test_non_array_workgroup_variable_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_uint Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicMaxI32Interp(spvasm)
+
+    def test_non_32bit_int_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%ulong = OpTypeInt 64 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicMaxI32Interp(spvasm)
+
+    def test_variable_storage_class_mismatch_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%bad_var = OpVariable %_ptr_WG_uint Function
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        with self.assertRaises(UnsupportedConstruct):
+            LdsAtomicMaxI32Interp(spvasm)
+
+    def test_undefined_identifier_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%c16 = OpConstant %uint 16
+%c2 = OpConstant %uint 2
+%c0 = OpConstant %uint 0
+%c0_slot = OpConstant %uint 0
+%lds_arr = OpTypeArray %uint %c16
+%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr
+%_ptr_WG_uint = OpTypePointer Workgroup %uint
+%lds = OpVariable %_ptr_WG_lds Workgroup
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ptr = OpAccessChain %_ptr_WG_uint %lds %c0_slot
+%old = OpAtomicSMax %uint %ptr %c2 %c0 %undefined_val
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+    def test_unknown_branch_label_rejected(self):
+        spvasm = """
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpBranch %ghost_label
+OpReturn
+OpFunctionEnd
+"""
+        interp = LdsAtomicMaxI32Interp(spvasm)
+        with self.assertRaises(UnsupportedConstruct):
+            interp.run()
+
+
 if __name__ == "__main__":
     unittest.main()
