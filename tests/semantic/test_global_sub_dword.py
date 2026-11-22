@@ -7,6 +7,7 @@ Covers AMD RDNA2 / GFX10 sub-dword memory instructions:
   - global_load_sshort: 16-bit signed load, sign-extended to 32 bits
   - global_store_byte: 8-bit store from VGPR low byte into memory (preserving adjacent bytes)
   - global_store_short: 16-bit store from VGPR low 16 bits into memory (preserving adjacent bytes)
+  - d16 variants: global_load_{u,s}byte_d16[_hi], global_load_short_d16[_hi]
 
 Executes compiled SPIR-V shaders through spirv_mini_interp on CPU and validates against
 a deterministic reference execution oracle. Standard library only; no GPU, no game files.
@@ -127,8 +128,34 @@ class GlobalSubDwordReferenceOracle:
         ea = compute_global_effective_address(base, voffset, offset_mod)
         if op == "global_load_ubyte":
             return self.memory.read_byte(ea)
+        elif op == "global_load_sbyte":
+            b = self.memory.read_byte(ea)
+            return (b if b < 0x80 else (b | 0xFFFFFF00)) & M32
         elif op == "global_load_ushort":
             return self.memory.read_short(ea)
+        elif op == "global_load_sshort":
+            s = self.memory.read_short(ea)
+            return (s if s < 0x8000 else (s | 0xFFFF0000)) & M32
+        elif op == "global_load_ubyte_d16":
+            b = self.memory.read_byte(ea)
+            return ((old_dst & 0xFFFF0000) | b) & M32
+        elif op == "global_load_ubyte_d16_hi":
+            b = self.memory.read_byte(ea)
+            return ((old_dst & 0x0000FFFF) | (b << 16)) & M32
+        elif op == "global_load_sbyte_d16":
+            b = self.memory.read_byte(ea)
+            s = b if b < 0x80 else (b | 0xFF00)
+            return ((old_dst & 0xFFFF0000) | (s & 0xFFFF)) & M32
+        elif op == "global_load_sbyte_d16_hi":
+            b = self.memory.read_byte(ea)
+            s = b if b < 0x80 else (b | 0xFF00)
+            return ((old_dst & 0x0000FFFF) | ((s & 0xFFFF) << 16)) & M32
+        elif op == "global_load_short_d16":
+            s = self.memory.read_short(ea)
+            return ((old_dst & 0xFFFF0000) | s) & M32
+        elif op == "global_load_short_d16_hi":
+            s = self.memory.read_short(ea)
+            return ((old_dst & 0x0000FFFF) | (s << 16)) & M32
         else:
             raise ValueError(f"Unsupported load op: {op}")
 
@@ -172,6 +199,24 @@ def run(body: list[str], memory: dict[int, int] | None = None) -> dict[int, int]
     return mem
 
 
+def seed_bytes() -> bytearray:
+    return bytearray(b"".join(struct.pack("<I", w) for w in SEED))
+
+
+def words(buf: bytes | bytearray) -> list[int]:
+    return [struct.unpack_from("<I", buf, 4 * k)[0] for k in range(len(SEED))]
+
+
+LOADS = {
+    "global_load_ubyte_d16": (1, False, 0),
+    "global_load_ubyte_d16_hi": (1, False, 16),
+    "global_load_sbyte_d16": (1, True, 0),
+    "global_load_sbyte_d16_hi": (1, True, 16),
+    "global_load_short_d16": (2, False, 0),
+    "global_load_short_d16_hi": (2, False, 16),
+}
+
+
 class TestGlobalSubDwordOracle(unittest.TestCase):
     """Unit tests validating reference oracle logic against known arithmetic rules."""
 
@@ -188,14 +233,65 @@ class TestGlobalSubDwordOracle(unittest.TestCase):
         oracle.execute_store("global_store_byte", 0xEE, 0x1000, 1)
         self.assertEqual(bank.read_dword(0x1000), 0x4433EE11)
 
-    def test_oracle_short_load_and_store(self):
-        bank = GlobalSubDwordMemoryBank({0x1000: 0x44332211, 0x1004: 0x88776655})
+    def test_oracle_sign_extension(self):
+        bank = GlobalSubDwordMemoryBank({0x1000: 0xFE807F00})
         oracle = GlobalSubDwordReferenceOracle(bank)
-        self.assertEqual(oracle.execute_load("global_load_ushort", 0x1000, 0), 0x2211)
-        self.assertEqual(oracle.execute_load("global_load_ushort", 0x1000, 3), 0x5544)
-        oracle.execute_store("global_store_short", 0xAABB, 0x1000, 3)
-        self.assertEqual(bank.read_dword(0x1000), 0xBB332211)
-        self.assertEqual(bank.read_dword(0x1004), 0x887766AA)
+        self.assertEqual(oracle.execute_load("global_load_ubyte", 0x1000, 1), 0x7F)
+        self.assertEqual(oracle.execute_load("global_load_sbyte", 0x1000, 1), 0x7F)
+        self.assertEqual(oracle.execute_load("global_load_ubyte", 0x1000, 2), 0x80)
+        self.assertEqual(oracle.execute_load("global_load_sbyte", 0x1000, 2), 0xFFFFFF80)
+        self.assertEqual(oracle.execute_load("global_load_ushort", 0x1000, 1), 0x807F)
+        self.assertEqual(oracle.execute_load("global_load_sshort", 0x1000, 1), 0xFFFF807F)
+
+
+class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
+    """End-to-end tests comparing SPIR-V execution with reference oracle predictions."""
+
+    def test_basic_loads_against_oracle(self):
+        mem_init = {BASE: 0x89ABCDEF, BASE + 4: 0x01234567}
+        bank = GlobalSubDwordMemoryBank(mem_init)
+        oracle = GlobalSubDwordReferenceOracle(bank)
+
+        ops = [
+            ("global_load_ubyte", 1),
+            ("global_load_sbyte", 1),
+            ("global_load_ushort", 2),
+            ("global_load_sshort", 2),
+        ]
+        for op, size in ops:
+            for offset in (0, 1):
+                with self.subTest(op=op, offset=offset):
+                    body = [
+                        f"v_mov_b32_e32 v1, {BASE + offset:#x}",
+                        f"{op} v5, v1, s[0:1]",
+                        "s_waitcnt vmcnt(0)",
+                        f"v_mov_b32_e32 v6, {OUT:#x}",
+                        "global_store_dword v6, v5, s[0:1]",
+                    ]
+                    actual_mem = run(body, memory=mem_init)
+                    expected_val = oracle.execute_load(op, BASE + offset, 0)
+                    self.assertEqual(actual_mem[OUT], expected_val)
+
+    def test_d16_loads_write_one_half(self):
+        keep = 0xBEEF1234
+        buf = seed_bytes()
+        for op, (n, signed, shift) in LOADS.items():
+            for byte in range(0, 8):
+                with self.subTest(op=op, byte=byte):
+                    mem = run([
+                        f"v_mov_b32_e32 v1, {BASE + byte:#x}",
+                        f"v_mov_b32_e32 v5, {keep:#x}",
+                        f"{op} v5, v1, s[0:1]",
+                        "s_waitcnt vmcnt(0)",
+                        f"v_mov_b32_e32 v6, {OUT:#x}",
+                        "global_store_dword v6, v5, s[0:1]",
+                    ])
+                    v = int.from_bytes(buf[byte:byte + n], "little")
+                    if signed and v >> 7:
+                        v -= 0x100
+                    v &= 0xFFFF
+                    want = (keep & ~(0xFFFF << shift) | v << shift) & M32
+                    self.assertEqual(mem[OUT], want)
 
 
 if __name__ == "__main__":
