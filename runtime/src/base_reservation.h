@@ -98,7 +98,11 @@ inline int relaunch(const Range& r) {
     wchar_t marker[64];
     std::swprintf(marker, 64, L"%llx:%llx", static_cast<unsigned long long>(r.base),
                   static_cast<unsigned long long>(r.size));
-    SetEnvironmentVariableW(kVariable, marker);  // inherited by the child; this process only waits from here on
+    // Inherited by the child: it tells it to commit inside the reservation and not to relaunch again.
+    if (!SetEnvironmentVariableW(kVariable, marker)) {
+        std::fprintf(stderr, "error: setting %ls failed (%lu)\n", kVariable, GetLastError());
+        return 1;
+    }
     std::wstring command_line = GetCommandLineW();
     STARTUPINFOW startup{sizeof startup};
     startup.dwFlags = STARTF_USESTDHANDLES;
@@ -115,19 +119,27 @@ inline int relaunch(const Range& r) {
         std::fprintf(stderr, "error: starting gta6rt again to reserve the image range failed (%lu)\n", GetLastError());
         return 1;
     }
-    if (!VirtualAllocEx(process.hProcess, reinterpret_cast<void*>(r.base), static_cast<SIZE_T>(r.size), MEM_RESERVE,
-                        PAGE_NOACCESS)) {
-        const DWORD error = GetLastError();
+    const auto abandon = [&process] {  // the child never ran: end it and release its handles
         TerminateProcess(process.hProcess, 1);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
+    };
+    if (!VirtualAllocEx(process.hProcess, reinterpret_cast<void*>(r.base), static_cast<SIZE_T>(r.size), MEM_RESERVE,
+                        PAGE_NOACCESS)) {
+        const DWORD error = GetLastError();
+        abandon();
         std::fprintf(stderr,
                      "error: the image has no relocations and its range %#llx-%#llx is taken, also in a new "
                      "process (VirtualAllocEx %lu)\n",
                      static_cast<unsigned long long>(r.base), static_cast<unsigned long long>(r.base + r.size), error);
         return 1;
     }
-    ResumeThread(process.hThread);
+    if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {  // still suspended: the wait would never end
+        const DWORD error = GetLastError();
+        abandon();
+        std::fprintf(stderr, "error: resuming the relaunched gta6rt failed (%lu)\n", error);
+        return 1;
+    }
     WaitForSingleObject(process.hProcess, INFINITE);
     DWORD code = 1;
     GetExitCodeProcess(process.hProcess, &code);

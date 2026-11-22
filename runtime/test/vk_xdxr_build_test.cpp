@@ -6,7 +6,8 @@
 //
 // Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride;
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
-// triangles; 5000 triangles (many radix-sort tiles); updates (refits) in place and into another buffer; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
+// triangles; 5000 triangles (many radix-sort tiles); updates (refits) in place and into another buffer; clones and a
+// compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS).
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
 // one submission each, after one warm-up; result and scratch in device-local memory), then in-place updates
@@ -431,6 +432,67 @@ int main(int argc, char** argv) {
     }
     json2 += "]}\n";
     EXPECT(write_file(dir + "/tlas_refit.json", json2.data(), json2.size()));
+
+    // CopyRaytracingAccelerationStructure: a clone of blas_random, its COMPACTED_SIZE (postbuild), a compaction into
+    // a buffer of exactly that size, and a clone of the refitted TLAS. The copies are position-independent.
+    {
+        XdxrLayout blas_layout;
+        EXPECT(blas_layout.compute(1000, false));
+        Buffer clone = make(gpu, blas_layout.size + 256), info = make(gpu, 16);
+        EXPECT(clone.buffer && info.buffer);
+        const std::uint64_t clone_at = (clone.address + 255) & ~std::uint64_t(255);
+        std::memset(info.map, 0xab, 16);
+        EXPECT(gpu.run([&](VkCommandBuffer cb) {
+            const bool ok = builder.record_copy(cb, random.address, clone_at, blas_layout.size) &&
+                            builder.record_postbuild(cb, random.address, info.address) &&
+                            builder.record_postbuild(cb, clone_at, info.address + 8);
+            barrier_to_host(gpu, cb);
+            return ok;
+        }));
+        std::uint64_t compacted = 0, clone_size = 0;
+        std::memcpy(&compacted, info.map, 8);
+        std::memcpy(&clone_size, static_cast<char*>(info.map) + 8, 8);
+        EXPECT(compacted == blas_layout.size);          // a build is exactly its layout's size
+        EXPECT(clone_size == compacted);
+        auto dump_blas = [&](const std::string& name, const Buffer& b, std::uint64_t at, std::size_t bytes) {
+            const std::string j = "{\"kind\": \"blas\", \"address\": " + std::to_string(at) +
+                                  ", \"triangles\": " + tris_json(random.tris) + "}\n";
+            return write_file(dir + "/" + name + ".bin", static_cast<const char*>(b.map) + (at - b.address), bytes) &&
+                   write_file(dir + "/" + name + ".json", j.data(), j.size());
+        };
+        EXPECT(dump_blas("blas_clone", clone, clone_at, blas_layout.size));
+        // COMPACT into exactly the compacted size; a guard word after it must survive
+        Buffer packed = make(gpu, std::size_t(compacted) + 256 + 4);
+        EXPECT(packed.buffer);
+        const std::uint64_t packed_at = (packed.address + 255) & ~std::uint64_t(255);
+        const std::uint32_t guard = 0x600dc0deu;
+        std::memcpy(static_cast<char*>(packed.map) + (packed_at - packed.address) + compacted, &guard, 4);
+        EXPECT(gpu.run([&](VkCommandBuffer cb) {
+            const bool ok = builder.record_copy(cb, clone_at, packed_at, compacted + 4);   // more room than needed
+            barrier_to_host(gpu, cb);
+            return ok;
+        }));
+        std::uint32_t after = 0;
+        std::memcpy(&after, static_cast<char*>(packed.map) + (packed_at - packed.address) + compacted, 4);
+        EXPECT(after == guard);                          // the copy stops at the source's own size
+        EXPECT(dump_blas("blas_compacted", packed, packed_at, std::size_t(compacted)));
+
+        Buffer tclone = make(gpu, layout.size + 256);
+        EXPECT(tclone.buffer);
+        const std::uint64_t tclone_at = (tclone.address + 255) & ~std::uint64_t(255);
+        EXPECT(gpu.run([&](VkCommandBuffer cb) {
+            const bool ok = builder.record_copy(cb, base, tclone_at, layout.size);
+            barrier_to_host(gpu, cb);
+            return ok;
+        }));
+        EXPECT(write_file(dir + "/tlas_refit_clone.bin", static_cast<const char*>(tclone.map) + (tclone_at - tclone.address),
+                          layout.size));
+        std::string json3 = json2;
+        json3.replace(json3.find(std::to_string(base)), std::to_string(base).size(), std::to_string(tclone_at));
+        EXPECT(write_file(dir + "/tlas_refit_clone.json", json3.data(), json3.size()));
+        std::printf("copies: blas_clone, blas_compacted (%llu bytes), tlas_refit_clone\n",
+                    static_cast<unsigned long long>(compacted));
+    }
     std::printf("tlas: %u instances, %u bytes\nvk_xdxr_build_test: built every case\n", count, layout.size);
     return 0;
 }

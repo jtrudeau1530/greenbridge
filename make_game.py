@@ -350,6 +350,17 @@ def default_out() -> str:
     return os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
 
 
+def icloud_default_notes() -> list:
+    """The log lines when default_out() left iCloud-synced Documents: why, and where a build made before this change
+    is, so its resumable work folder isn't silently left behind."""
+    notes = ["iCloud syncs Documents on this Mac: building into ~/Leonida instead, so the game's files stay off iCloud"]
+    earlier = os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
+    if os.path.isdir(earlier):
+        notes.append(f"an earlier build is in {earlier}: move it to {default_out()} to resume it there, "
+                     f'or pass --out "{earlier}" to keep using it')
+    return notes
+
+
 # ---------------------------------------------------------------- preflight
 MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
@@ -694,7 +705,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         drop(translated, shard_plan, disassembled)
         clear_shader_disassembly(work, disasm)
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
-        with open(disassembled, "w", encoding="utf-8") as f:
+        with open(disassembled, "w", encoding="utf-8", newline="\n") as f:
             f.write(signature + "\n")
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
     # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
@@ -738,11 +749,11 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         # a stop at any point then leaves either no index (translated again) or an index with the right mode and
         # digest, never a guessed one. rdna2spirv.py --merge writes index.json last, after the stubs.
         os.makedirs(spirv, exist_ok=True)
-        with open(mode_file, "w", encoding="utf-8") as f:
+        with open(mode_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(want + "\n")
-        with open(flags_file, "w", encoding="utf-8") as f:
+        with open(flags_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(want_flags + "\n")
-        with open(sources_file, "w", encoding="utf-8") as f:
+        with open(sources_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
@@ -919,9 +930,9 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         # Parts from another --jobs would be merged in too, and parts from another mode, flags or translator are
         # wrong. They go before the new plan is written: a stop in between must not leave old parts under a new plan.
         for f in os.listdir(spirv):
-            if f.startswith("index.part") and f.endswith(".json"):
+            if (f.startswith("index.part") and f.endswith(".json")) or re.fullmatch(r"shard\d+\.json", f):
                 os.remove(os.path.join(spirv, f))
-        with open(plan_path, "w", encoding="utf-8") as f:
+        with open(plan_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(plan, f)
     todo = [i for i in range(jobs) if not os.path.isfile(os.path.join(spirv, f"index.part{i}.json"))]
     if len(todo) < jobs:
@@ -1070,7 +1081,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
 
 def mark(path: str, what: str) -> None:
     """Write a step's completion marker; call it only after the step succeeded."""
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{what} finished\n")
 
 
@@ -1189,7 +1200,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         if not os.path.exists(os.path.join(out, os.path.basename(built))) or \
                 not os.path.samefile(built, os.path.join(out, os.path.basename(built))):
             shutil.copy2(built, out)
-    with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write(os.path.abspath(game))
     start = os.path.join(out, "gta6rt.exe")
     if os.name != "nt":
@@ -1350,7 +1361,8 @@ def main() -> int:
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)
     if not a.out and icloud_documents():
-        log("iCloud syncs Documents on this Mac: building into ~/Leonida instead, so the game's files stay off iCloud")
+        for note in icloud_default_notes():
+            log(note)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:

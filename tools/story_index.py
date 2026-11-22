@@ -299,7 +299,7 @@ def write_output(path, rows, summary):
     with tempfile.TemporaryDirectory(dir=parent) as staging:
         staged = os.path.join(staging, "story_index" + ext)
         if ext == ".json":
-            with open(staged, "w", encoding="utf-8") as f:
+            with open(staged, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"summary": summary, "files": rows}, f, indent=1)
         else:
             with open(staged, "w", encoding="utf-8", newline="") as f:
