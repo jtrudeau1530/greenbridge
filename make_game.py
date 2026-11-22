@@ -913,7 +913,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     if not os.path.isfile(ogg_done):
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
         log("assets: audio streams -> Ogg Opus")
-        py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg)
+        py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs))
         mark(ogg_done, "awc_opus.py")
     if wav:
         if not os.path.isdir(ogg):
@@ -1044,7 +1044,11 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
     os.makedirs(out, exist_ok=True)
     for built in artifacts:
-        shutil.copy2(built, out)
+        # --runtime-build may be the output folder itself (a runtime build unpacked where the port goes): the
+        # files are in place then, and copying a file onto itself raises SameFileError.
+        if not os.path.exists(os.path.join(out, os.path.basename(built))) or \
+                not os.path.samefile(built, os.path.join(out, os.path.basename(built))):
+            shutil.copy2(built, out)
     with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8") as f:
         f.write(os.path.abspath(game))
     start = os.path.join(out, "gta6rt.exe")
