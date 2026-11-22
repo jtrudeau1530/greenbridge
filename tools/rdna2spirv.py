@@ -10441,6 +10441,10 @@ def translate(path):
     if stage not in ("vs", "ps", "cs", "ms", "gs"):
         raise Unsupported(f"stage {stage}")
     insns = info["insns"]
+    if not insns:
+        # parse_file only reads tab-indented instructions, so a hand-written or re-indented .s parses to nothing
+        # and used to translate to a module that passes spirv-val and does no work at all. Refuse it instead.
+        raise Unsupported("no instructions (nothing tab-indented?)")
     if info["invalid"]:
         # Undecodable words are constant tables embedded in the code range (147/155 such VS/PS use s_getpc_b64 to
         # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then
