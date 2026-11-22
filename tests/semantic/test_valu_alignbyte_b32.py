@@ -564,5 +564,200 @@ class TestValuAlignbyteB32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(len(interp.trace), 2)
 
 
+# ---------------------------------------------------------------------------
+# SIMD Wavefront Interpreter (Multi-Lane Divergence & 32/64-Bit EXEC Masking)
+# ---------------------------------------------------------------------------
+
+class SIMDWavefrontInterpreter:
+    """Multi-lane SIMD interpreter modeling Wave32 and Wave64 execution on RDNA2."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size} (must be 32 or 64)")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        # Per-lane VGPR files: [wave_size][256] 32-bit registers
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        # Wavefront-shared SGPR file: [106] 32-bit registers
+        self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
+
+    def set_exec_mask(self, mask: int) -> None:
+        valid_mask = (1 << self.wave_size) - 1
+        self.exec_mask = mask & valid_mask
+
+    def read_lane_reg_u32(self, lane: int, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[lane][idx] & MASK32
+        return self.sgprs[idx] & MASK32
+
+    def write_lane_reg_u32(self, lane: int, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[lane][idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def read_lane_operand(self, lane: int, op: Register | Immediate) -> int:
+        if isinstance(op, Immediate):
+            return op.bits
+        if isinstance(op, Register):
+            return self.read_lane_reg_u32(lane, op.kind, op.index)
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(self, inst: Instruction) -> list[int | None]:
+        """Executes a VALU instruction across all lanes in the wavefront governed by EXEC mask."""
+        # 1. Latch inputs for all lanes (read-before-write semantics across wavefront)
+        latched_inputs: list[tuple[int, int, int]] = []
+        for lane in range(self.wave_size):
+            s0_val = self.read_lane_operand(lane, inst.src0)
+            s1_val = self.read_lane_operand(lane, inst.src1)
+            s2_val = self.read_lane_operand(lane, inst.src2)
+            latched_inputs.append((s0_val, s1_val, s2_val))
+
+        # 2. Compute and write back strictly for active lanes
+        lane_results: list[int | None] = []
+        for lane in range(self.wave_size):
+            is_active = bool((self.exec_mask >> lane) & 1)
+            if not is_active:
+                lane_results.append(None)
+                continue
+
+            s0_val, s1_val, s2_val = latched_inputs[lane]
+            if inst.opcode == Opcode.V_ALIGNBYTE_B32:
+                res = ref_alignbyte_b32(s0_val, s1_val, s2_val)
+            else:
+                raise NotImplementedError(f"Unsupported opcode in SIMD interpreter: {inst.opcode}")
+
+            self.write_lane_reg_u32(lane, inst.dst.kind, inst.dst.index, res)
+            lane_results.append(res)
+
+        return lane_results
+
+
+class TestValuAlignbyteB32SIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_uniform_inputs(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Immediate(1),
+        )
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 0x88776655)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 0x44332211)
+
+        results = simd.step(inst)
+        self.assertEqual(len(results), 32)
+        expected = ref_alignbyte_b32(0x88776655, 0x44332211, 1)
+        for lane in range(32):
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), expected)
+
+    def test_wave64_multi_lane_divergence(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Register(RegKind.VGPR, 3),
+        )
+        expected: list[int] = []
+        for lane in range(64):
+            s0 = (0x10000000 * (lane + 1)) & MASK32
+            s1 = (0x01020304 + lane) & MASK32
+            shift = lane % 4
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, s0)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, s1)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 3, shift)
+            expected.append(ref_alignbyte_b32(s0, s1, shift))
+
+        results = simd.step(inst)
+        for lane in range(64):
+            self.assertEqual(results[lane], expected[lane])
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), expected[lane])
+
+    def test_wave32_exec_masking_partial(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        exec_mask = 0x55555555  # Even lanes active
+        simd.set_exec_mask(exec_mask)
+
+        canary = 0xDEADBEEF
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, canary)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 0x88776655)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 0x44332211)
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Immediate(2),
+        )
+        results = simd.step(inst)
+        expected = ref_alignbyte_b32(0x88776655, 0x44332211, 2)
+
+        for lane in range(32):
+            if (exec_mask >> lane) & 1:
+                self.assertEqual(results[lane], expected)
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), expected)
+            else:
+                self.assertIsNone(results[lane])
+                # Inactive lanes strictly retain canary
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), canary)
+
+    def test_wave64_exec_masking_all_inactive(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.set_exec_mask(0)
+
+        canary = 0xCAFEBABE
+        for lane in range(64):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, canary)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 0x11111111)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 0x22222222)
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Immediate(1),
+        )
+        results = simd.step(inst)
+        self.assertEqual(results, [None] * 64)
+        for lane in range(64):
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), canary)
+
+    def test_simd_with_shared_sgpr_scalar_source(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        # Shift amount 3 in SGPR s4
+        simd.write_lane_reg_u32(0, RegKind.SGPR, 4, 3)
+
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 0x10203040 + lane)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 0x50607080 + lane)
+
+        inst = Instruction(
+            opcode=Opcode.V_ALIGNBYTE_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Register(RegKind.SGPR, 4),
+        )
+        results = simd.step(inst)
+        for lane in range(32):
+            s0 = 0x10203040 + lane
+            s1 = 0x50607080 + lane
+            expected = ref_alignbyte_b32(s0, s1, 3)
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
