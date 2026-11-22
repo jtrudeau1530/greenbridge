@@ -1016,8 +1016,165 @@ class TestValuRcpF16RegisterAliasing(unittest.TestCase):
             self.assertEqual(results[lane] >> 16, 0x7777)
 
 
+
+@dataclass
+class FPStatusFlags:
+    """IEEE 754 floating-point status exception flags."""
+    invalid: bool = False
+    div_by_zero: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+
+    def merge(self, other: FPStatusFlags) -> None:
+        self.invalid |= other.invalid
+        self.div_by_zero |= other.div_by_zero
+        self.overflow |= other.overflow
+        self.underflow |= other.underflow
+        self.inexact |= other.inexact
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "invalid": self.invalid,
+            "div_by_zero": self.div_by_zero,
+            "overflow": self.overflow,
+            "underflow": self.underflow,
+            "inexact": self.inexact,
+        }
+
+
+def calc_rcp_f16_status_flags(src0_bits: int, res_bits: int, *, clamp: bool = False) -> FPStatusFlags:
+    """Compute IEEE 754 exception flags for v_rcp_f16."""
+    flags = FPStatusFlags()
+    s0 = src0_bits & MASK16
+
+    # Signaling NaN generates invalid exception
+    if is_snan_f16(s0):
+        flags.invalid = True
+        return flags
+
+    # Division by zero: 1.0 / (+-0.0)
+    if is_zero_f16(s0):
+        flags.div_by_zero = True
+        return flags
+
+    # NaN or Infinity input
+    if is_nan_f16(s0) or is_inf_f16(s0):
+        return flags
+
+    # Finite non-zero input
+    if is_inf_f16(res_bits):
+        flags.overflow = True
+        flags.inexact = True
+    elif is_subnormal_f16(res_bits):
+        flags.underflow = True
+        try:
+            exact_frac = Fraction(1) / f16_bits_to_fraction(s0)
+            if round_fraction_to_f16(exact_frac) != res_bits or f16_bits_to_fraction(res_bits) != exact_frac:
+                flags.inexact = True
+        except Exception:
+            flags.inexact = True
+    elif is_zero_f16(res_bits):
+        flags.underflow = True
+        flags.inexact = True
+    else:
+        # Check exactness
+        try:
+            exact_frac = Fraction(1) / f16_bits_to_fraction(s0)
+            if f16_bits_to_fraction(res_bits) != exact_frac:
+                flags.inexact = True
+        except Exception:
+            flags.inexact = True
+
+    return flags
+
+
+def calc_f16_condition_codes(res_bits: int) -> dict[str, bool]:
+    """Calculate condition flags for binary16 result."""
+    return {
+        "zero": is_zero_f16(res_bits),
+        "negative": bool(res_bits & SIGN_MASK_F16) and not is_nan_f16(res_bits),
+        "nan": is_nan_f16(res_bits),
+        "infinity": is_inf_f16(res_bits),
+    }
+
+
+class TestValuRcpF16StatusFlags(unittest.TestCase):
+    def test_div_by_zero_flag(self):
+        # +0.0 -> +inf with div_by_zero
+        res_pos = ref_rcp_f16(POS_ZERO_F16)
+        flags_pos = calc_rcp_f16_status_flags(POS_ZERO_F16, res_pos)
+        self.assertTrue(flags_pos.div_by_zero)
+        self.assertFalse(flags_pos.invalid)
+
+        # -0.0 -> -inf with div_by_zero
+        res_neg = ref_rcp_f16(NEG_ZERO_F16)
+        flags_neg = calc_rcp_f16_status_flags(NEG_ZERO_F16, res_neg)
+        self.assertTrue(flags_neg.div_by_zero)
+
+    def test_invalid_snan_flag(self):
+        # Signaling NaN sets invalid
+        res_snan = ref_rcp_f16(SNAN_F16)
+        flags_snan = calc_rcp_f16_status_flags(SNAN_F16, res_snan)
+        self.assertTrue(flags_snan.invalid)
+
+        # Quiet NaN does NOT set invalid
+        res_qnan = ref_rcp_f16(QNAN_F16)
+        flags_qnan = calc_rcp_f16_status_flags(QNAN_F16, res_qnan)
+        self.assertFalse(flags_qnan.invalid)
+
+    def test_overflow_and_inexact(self):
+        # 1.0 / MIN_SUBNORMAL_F16 overflows to infinity
+        res = ref_rcp_f16(MIN_SUBNORMAL_F16)
+        self.assertEqual(res, POS_INF_F16)
+        flags = calc_rcp_f16_status_flags(MIN_SUBNORMAL_F16, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+
+    def test_underflow_flag(self):
+        # 1.0 / MAX_FINITE_F16 yields subnormal result
+        res = ref_rcp_f16(MAX_FINITE_F16)
+        self.assertTrue(is_subnormal_f16(res))
+        flags = calc_rcp_f16_status_flags(MAX_FINITE_F16, res)
+        self.assertTrue(flags.underflow)
+
+    def test_inexact_flag_on_non_power_of_two(self):
+        # 1.0 / 3.0 = 0.333251953125 (inexact)
+        res = ref_rcp_f16(THREE_F16)
+        flags = calc_rcp_f16_status_flags(THREE_F16, res)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+
+    def test_exact_power_of_two_no_flags(self):
+        # 1.0 / 2.0 = 0.5 (exact)
+        res = ref_rcp_f16(TWO_F16)
+        flags = calc_rcp_f16_status_flags(TWO_F16, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.div_by_zero)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+
+    def test_condition_codes(self):
+        cc_zero = calc_f16_condition_codes(POS_ZERO_F16)
+        self.assertTrue(cc_zero["zero"])
+        self.assertFalse(cc_zero["negative"])
+
+        cc_neg = calc_f16_condition_codes(NEG_HALF_F16)
+        self.assertTrue(cc_neg["negative"])
+        self.assertFalse(cc_neg["zero"])
+
+        cc_inf = calc_f16_condition_codes(POS_INF_F16)
+        self.assertTrue(cc_inf["infinity"])
+
+        cc_nan = calc_f16_condition_codes(QNAN_F16)
+        self.assertTrue(cc_nan["nan"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
