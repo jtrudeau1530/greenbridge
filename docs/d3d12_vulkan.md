@@ -670,7 +670,12 @@ The compute path, end to end:
     entries), `shaderFloat64`, `shaderInt16`, `shaderClipDistance` and `shaderCullDistance` where the GPU has them.
     Without one, `vkCreateShaderModule` reports the capability (`VUID-VkShaderModuleCreateInfo-pCode-08740`). The
     index's `features` list is not read yet, so a shader that needs a feature the GPU lacks is not refused up front.
-  - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA, set-0 bindings, and two stages
+  - **Geometry shaders:** `desc.GS` is the translator's Vulkan geometry stage (docs/design.md, "Geometry
+    shaders": triangles in, a triangle strip out) between the VS and PS. It needs `geometryShader`, which the
+    standalone device enables where the GPU has it and reports in `VulkanDeviceInfo::features`; without it such a
+    PSO is `E_NOTIMPL`. The PSO's topology type must be `TRIANGLE`, the GS's input (`E_INVALIDARG` otherwise). The
+    push-constant range names the geometry stage only on such a device (`d3d12_geometry_test`).
+  - **Refused with a log:** hull and domain stages, stream output, MSAA, set-0 bindings, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
     stage table the graphics path accepts, and the replay pushes with the same flags. A device whose

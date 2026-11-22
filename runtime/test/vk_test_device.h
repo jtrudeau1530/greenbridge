@@ -427,6 +427,7 @@ public:
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
+        enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 

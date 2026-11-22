@@ -2423,9 +2423,21 @@ public:
             return E_NOTIMPL;
         }
         if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
-        if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.GS.BytecodeLength || desc.StreamOutput.NumEntries) {
-            log_once("graphics pipeline stage not supported yet (hull/domain/geometry/stream output):", 0);
+        if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.StreamOutput.NumEntries) {
+            log_once("graphics pipeline stage not supported yet (hull/domain/stream output):", 0);
             return E_NOTIMPL;
+        }
+        // A geometry shader is the translator's Vulkan geometry stage (docs/design.md, "Geometry shaders"): it takes
+        // triangles and emits a triangle strip. It needs the geometryShader feature, and the PSO's topology type must
+        // be its input primitive, as D3D12 requires.
+        const bool geometry = desc.GS.pShaderBytecode && desc.GS.BytecodeLength;
+        if (geometry && !device_.info.features.geometryShader) {
+            log_once("geometry shaders need the Vulkan geometryShader feature; stage", 0);
+            return E_NOTIMPL;
+        }
+        if (geometry && desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
+            log_once("a translated geometry shader takes triangles; topology type", desc.PrimitiveTopologyType);
+            return E_INVALIDARG;
         }
         const UINT samples = desc.SampleDesc.Count;
         if (!samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || (samples & (samples - 1))) {
@@ -2456,7 +2468,12 @@ public:
             const leonida::ShaderEntry* entry = nullptr;
             std::vector<std::uint8_t> fssm;
         };
-        Stage stages[2] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS}, {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
+        Stage stages[3] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
+                           {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
+                           {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
+        // stage_infos.size() indexes the recipe's per-stage required-size structs: one for every table entry.
+        static_assert(std::size(stages) <= std::size(decltype(recipe_.required_sizes){}),
+                      "Recipe::required_sizes needs an entry per graphics stage");
         bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
         // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
@@ -2744,7 +2761,10 @@ public:
         }
         // Every stage this path accepts reads the user SGPRs, so the range covers the whole stage table, not only the
         // stages present. A stage added to the table (geometry, mesh) is covered without touching this.
-        for (const Stage& stage : stages) graphics_.push_stages |= stage.bit;
+        // (The geometry bit only where the device has the stage: a range may not name a stage it cannot run.)
+        for (const Stage& stage : stages)
+            if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
+                graphics_.push_stages |= stage.bit;
         const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
@@ -2902,7 +2922,8 @@ private:
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[2]{};  // what `stages` chain
+        // One per entry of create_graphics's stage table (VS, GS, PS), static_assert there; what `stages` chain.
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
@@ -7472,6 +7493,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.dualSrcBlend = chosen_features.dualSrcBlend;
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
+    enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores
     // without a format (StorageImageWriteWithoutFormat), gather offsets (ImageGatherExtended) and LOD-clamped samples
