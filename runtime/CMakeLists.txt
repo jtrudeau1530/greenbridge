@@ -680,6 +680,7 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_pipeline_check_cli COMMAND "${CMAKE_COMMAND}"
              "-DTOOL=$<TARGET_FILE:vk_pipeline_check>"
              "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"
+             "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
