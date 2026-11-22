@@ -103,9 +103,13 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
     // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
-    // region. Attribute bits are accepted but have no host mapping yet.
+    // region. Nonzero attribute flags also fail until their host mapping is known.
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (attributes != 0) {
+        SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
 
@@ -163,7 +167,6 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    (void)attributes;
     return VirtualAlloc(address, size, host_type, protect);
 }
 
