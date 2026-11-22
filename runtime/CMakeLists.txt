@@ -1090,7 +1090,14 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_texture1d_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_texture1d_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_texture1d COMMAND d3d12_texture1d_test)
+
+    add_executable(d3d12_dsv_test test/d3d12_dsv_test.cpp)
+    target_link_libraries(d3d12_dsv_test PRIVATE gta6rt_d3d12_com dxguid)
+    target_compile_definitions(d3d12_dsv_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_dsv_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_dsv COMMAND d3d12_dsv_test)
     set_tests_properties(d3d12_texture1d PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(d3d12_dsv PROPERTIES SKIP_RETURN_CODE 77)
 
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)

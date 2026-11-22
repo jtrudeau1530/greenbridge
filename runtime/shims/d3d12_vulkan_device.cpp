@@ -4946,6 +4946,38 @@ public:
                 log_once("depth-stencil view dimension not supported:", desc->ViewDimension);
                 view = {};
             }
+            if (view.resource) {
+                // The checks the PC runtime makes on a depth view, which only the 1D helpers above already do:
+                // a depth-capable resource, a view dimension matching the texture's dimension and sample count,
+                // a mip and layer range inside it, and a view format of the texture's own family (the DSV set is
+                // the depth-plane formats; the typeless view formats an SRV names do not apply).
+                const bool ms = rd.SampleDesc.Count > 1;
+                const auto dim = desc ? desc->ViewDimension : D3D12_DSV_DIMENSION_UNKNOWN;
+                const bool ms_view = dim == D3D12_DSV_DIMENSION_TEXTURE2DMS ||
+                                     dim == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+                const bool flat_view = dim == D3D12_DSV_DIMENSION_TEXTURE2D ||
+                                       dim == D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+                const DXGI_FORMAT requested =
+                    desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
+                const bool format_fits =
+                    (requested == rd.Format &&
+                     (rd.Format == DXGI_FORMAT_D16_UNORM || rd.Format == DXGI_FORMAT_D32_FLOAT ||
+                      rd.Format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                      rd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) ||
+                    (rd.Format == DXGI_FORMAT_R16_TYPELESS && requested == DXGI_FORMAT_D16_UNORM) ||
+                    (rd.Format == DXGI_FORMAT_R24G8_TYPELESS && requested == DXGI_FORMAT_D24_UNORM_S8_UINT) ||
+                    (rd.Format == DXGI_FORMAT_R32_TYPELESS && requested == DXGI_FORMAT_D32_FLOAT) ||
+                    (rd.Format == DXGI_FORMAT_R32G8X24_TYPELESS && requested == DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+                if (!format_fits || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+                    ((ms_view || flat_view) && rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) ||
+                    (ms_view && !ms) || (flat_view && ms) || view.mip >= rd.MipLevels ||
+                    !view.layer_count || view.first_layer >= rd.DepthOrArraySize ||
+                    view.layer_count > rd.DepthOrArraySize - view.first_layer) {
+                    log_once("depth-stencil view refused (format, flags, dimension, samples or range)",
+                             int(requested));
+                    view = {};
+                }
+            }
             if (r->desc().Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) view = {};
         } else if (resource) {
             stub("ID3D12Device::CreateDepthStencilView(resource from another device)");
