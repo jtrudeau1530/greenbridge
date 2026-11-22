@@ -35,8 +35,8 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
-         # ps_ssharp and vs_base_ids
+         + len(check.TEXTURE_CONSTANTS) + 13)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
+         # ps_ssharp, vs_base_ids and the standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case)
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 

@@ -279,7 +279,8 @@ bool draw(CommandList& list, std::uint32_t index, bool indexed) {
     d.render_targets = {color_view};
     d.depth = depth_view;
     const std::uint64_t base = Scene::geometry_va + (index % 256) * 65536ull;
-    d.vertex_buffers = {{base, 24576, 12}, {base + 24576, 16384, 8}};
+    d.vertex_buffers[0] = {base, 24576, 12};          // by input slot, inlined since D3D-289
+    d.vertex_buffers[1] = {base + 24576, 16384, 8};
     if (indexed) d.index = {base + 40960, 6144, 57};
     d.topology = 4;  // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
     d.viewport = {0, 0, 1920, 1080, 0, 1};
