@@ -551,6 +551,10 @@ def segment(rows, k):
     return rows[k]["offset"], rows[k]["stored"], False
 
 
+# A continuation can start with pack:/ paths or bone names inside the dictionary.
+_MAP_BOUNDARIES = anim_index.STOP_SIGNATURES - {"name-table", "skeleton-names"}
+
+
 def group(m, rows, *, first_row_only: bool = False):
     """-> ([(root index, [stream indices or gap pages])], unresolved count by reason, gap pages by kind). A
     dictionary takes the page map's system page count of back-to-back streams. When the last page is not the next
@@ -565,14 +569,34 @@ def group(m, rows, *, first_row_only: bool = False):
             continue
         pm = struct.unpack_from("<Q", data, 8)[0] - SYSTEM
         parts, k = [i], i
-        while pm + 10 > len(data) and k + 1 < len(rows) and _next_to(rows[k], rows[k + 1]) and len(parts) < 4:
+        # Only the two count bytes are needed. Locate them by inflated size,
+        # including when they straddle a listed stream boundary.
+        count_at = pm + 8
+        counts = data[count_at:count_at + 2]
+        end = len(data)
+        while len(counts) < 2 and len(parts) < 255 and k + 1 < len(rows):
+            following = rows[k + 1]
+            if not _next_to(rows[k], following) or following["signature"] in _MAP_BOUNDARIES:
+                break
+            start, end = end, end + following["size"]
+            page = None
+            if following["signature"] == "zero-prefix":
+                page = _inflate(m, following)
+                # Short continuation pages can resemble an unnamed root. Within
+                # the original four-page window, check the root name or local map.
+                if is_root(page) and (len(parts) >= 4 or any(page[0x38:0x40])
+                                      or struct.unpack_from("<Q", page, 8)[0] - SYSTEM + 10 <= len(page)):
+                    break
             k += 1
             parts.append(k)
-            data += _inflate(m, rows[k])
-        if pm + 10 > len(data):
+            if end > count_at:
+                if page is None:
+                    page = _inflate(m, following)
+                counts += page[max(0, count_at - start):count_at + 2 - start]
+        if len(counts) != 2:
             unresolved["page map not in the next stream"] += 1
             continue
-        pages, graphics = data[pm + 8], data[pm + 9]
+        pages, graphics = counts
         if graphics:
             unresolved["graphics pages"] += 1
             continue
