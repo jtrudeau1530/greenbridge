@@ -1040,8 +1040,10 @@ The trace will enumerate them.
     `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates
     committed resources instead; raising the tier is a decision for when the trace shows what the game does. The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**Assumption**:
     that the console uses it for reserved resources too).
-  - `GetResourceTiling`: the standard 64 KiB tile shapes, standard and packed mips (a mip is packed from the first
-    one smaller than a tile on any axis, as an NVIDIA GPU does; D3D11.3 functional spec 5.9.2.8.5 only requires that
+  - `GetResourceTiling`: the standard 64 KiB tile shapes, standard and packed mips (a mip stays standard while it is
+    wider than half the tile or taller than the tile, depth not counting, as AMD's PC runtime does on RDNA2 and RDNA4
+    and so, most likely, the console (D3D-65); an NVIDIA GPU packs from the first mip smaller than a tile on any axis.
+    D3D11.3 functional spec 5.9.2.8.5 only requires that
     a mip filling a tile in every dimension stays standard, a smaller one "may or may not be packed, depending on the
     IHV"), each standard mip's tile counts, and the tile order (each array slice holds
     its standard mips, then its packed tiles). The test compares the tile shape and the tile counts of the mips both
@@ -1061,7 +1063,7 @@ The trace will enumerate them.
     Tile shapes agree in all 17 texture layouts, and 11 of them match exactly; in the other 6, AMD keeps more
     mips as standard tiles before the packed tail:
 
-    | Layout | Tile | Standard mips: ours | AMD |
+    | Layout | Tile | Standard mips: NVIDIA (the layer before D3D-65) | AMD (the layer now) |
     |---|---|---|---|
     | 1000x300 RGBA8 sRGB, 3 slices | 128x128 | 2 | 4 |
     | 2048x1024 BC7, 2 slices | 256x256 | 3 | 4 |
@@ -1070,9 +1072,15 @@ The trace will enumerate them.
     | 4096x64 BGRA8 | 128x128 | 0 | 6 |
     | 256x256x64 RGBA8 volume | 32x32x16 | 3 | 4 |
 
-    All 17 AMD results fit "a mip is packed once every axis is at most half the tile's largest side"
-    (**Hypothesis**: one driver, one GPU). Which split the console's runtime uses, and so which one the layer should
-    follow, is **Open** ([#374](https://github.com/ItsNotRexed/Leonida/issues/374#issuecomment-7071680820)).
+    An RDNA2 GPU (the Ryzen 7 9800X3D's, driver 32.0.21045.5002) gives the same splits as the RDNA4 one
+    ([#374](https://github.com/ItsNotRexed/Leonida/issues/374#issuecomment-7071869388)). With 30 more layouts that
+    probe the edges (a mip exactly at or just past half a tile, thin and tall textures, non-square 2D and volume
+    tiles), the rule that fits all 47 on both GPUs is: **a mip stays standard while it is wider than half the tile or
+    taller than the tile; depth does not count**. An earlier "every axis at most half the tile's largest side" fitted
+    the first 17 but missed four tall or deep edge cases. All 47 layouts and AMD's values are in
+    `runtime/test/resource_tiling_test.cpp`; the packed tile count is AMD's in 45 of them, and AMD reserves one more
+    for the two deep volumes that pack from mip 0. The console is RDNA2, so the layer follows this rule (D3D-65;
+    **Assumption**: that the console's runtime splits like the PC's AMD driver).
   - `UpdateTileMappings` / `CopyTileMappings` log once and do nothing. What that loses: two resources mapped to the
     same heap tiles do not alias, and a tile unmapped or remapped keeps its contents. If the trace shows the game
     relies on either, the next step is sparse binding (`sparseBinding`, `sparseResidencyImage2D`) with the heaps
