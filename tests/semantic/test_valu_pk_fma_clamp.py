@@ -470,6 +470,132 @@ class SIMDInterpreter:
 
 
 # -----------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry Tracking
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FPStatusFlags:
+    """IEEE-754 architectural exception and status flags."""
+    invalid: bool = False
+    overflow: bool = False
+    underflow: bool = False
+    inexact: bool = False
+    denormal: bool = False
+    zero: bool = False
+    negative: bool = False
+    clamped: bool = False
+
+
+def evaluate_fma_clamp_f16_flags(s0: int, s1: int, s2: int, res: int) -> FPStatusFlags:
+    """Evaluate architectural status flags for clamped half-precision FMA."""
+    s0 &= MASK16
+    s1 &= MASK16
+    s2 &= MASK16
+    res &= MASK16
+
+    invalid = False
+    if is_f16_snan(s0) or is_f16_snan(s1) or is_f16_snan(s2):
+        invalid = True
+    if (is_f16_inf(s0) and is_f16_zero(s1)) or (is_f16_inf(s1) and is_f16_zero(s0)):
+        invalid = True
+    prod_inf = is_f16_inf(s0) or is_f16_inf(s1)
+    if prod_inf and is_f16_inf(s2):
+        prod_sign = f16_sign(s0) ^ f16_sign(s1)
+        if prod_sign != f16_sign(s2):
+            invalid = True
+
+    denormal = is_f16_subnormal(s0) or is_f16_subnormal(s1) or is_f16_subnormal(s2) or is_f16_subnormal(res)
+
+    overflow = False
+    underflow = False
+    inexact = False
+    clamped = False
+
+    if not is_f16_nan(s0) and not is_f16_nan(s1) and not is_f16_nan(s2) and not invalid:
+        if not is_f16_inf(s0) and not is_f16_inf(s1) and not is_f16_inf(s2):
+            f0 = Fraction(u16_to_f16(s0))
+            f1 = Fraction(u16_to_f16(s1))
+            f2 = Fraction(u16_to_f16(s2))
+            exact_val = f0 * f1 + f2
+
+            if exact_val < 0 or exact_val > 1:
+                clamped = True
+
+            approx_res = Fraction(u16_to_f16(res))
+            if exact_val != approx_res:
+                inexact = True
+
+            if exact_val > 65504:
+                overflow = True
+            elif 0 < abs(exact_val) < Fraction(1, 2**14):
+                underflow = True
+
+    zero = is_f16_zero(res)
+    negative = bool(res & F16_SIGN_MASK)
+
+    return FPStatusFlags(
+        invalid=invalid,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        denormal=denormal,
+        zero=zero,
+        negative=negative,
+        clamped=clamped,
+    )
+
+
+def evaluate_pk_fma_clamp_f16_flags(
+    s0_dword: int, s1_dword: int, s2_dword: int, res_dword: int
+) -> Tuple[FPStatusFlags, FPStatusFlags]:
+    """Evaluate status flags for both packed lanes."""
+    s0_lo, s0_hi = unpack_f16x2(s0_dword)
+    s1_lo, s1_hi = unpack_f16x2(s1_dword)
+    s2_lo, s2_hi = unpack_f16x2(s2_dword)
+    res_lo, res_hi = unpack_f16x2(res_dword)
+
+    return (
+        evaluate_fma_clamp_f16_flags(s0_lo, s1_lo, s2_lo, res_lo),
+        evaluate_fma_clamp_f16_flags(s0_hi, s1_hi, s2_hi, res_hi),
+    )
+
+
+def generate_vcc_mask_pk_fma_clamp(pred: str, results: List[int], wave_size: int = 32) -> int:
+    """Generate Vector Condition Code (VCC) bitmask from packed half-precision outputs."""
+    mask = 0
+    for lane in range(min(len(results), wave_size)):
+        val = results[lane]
+        lo, hi = unpack_f16x2(val)
+        flo = u16_to_f16(lo)
+        fhi = u16_to_f16(hi)
+
+        passed = False
+        if pred == "both_saturated_one":
+            passed = (lo == F16_POS_ONE) and (hi == F16_POS_ONE)
+        elif pred == "both_zero":
+            passed = is_f16_zero(lo) and is_f16_zero(hi)
+        elif pred == "both_strictly_interior":
+            passed = (0.0 < flo < 1.0) and (0.0 < fhi < 1.0)
+
+        if passed:
+            mask |= (1 << lane)
+
+    return mask
+
+
+def compute_fma_mantissa_alignment_shift(s0: int, s1: int, s2: int) -> int:
+    """Compute exponent difference and alignment shift for addend s2 relative to product s0 * s1."""
+    exp0 = (s0 & F16_EXP_MASK) >> 10
+    exp1 = (s1 & F16_EXP_MASK) >> 10
+    exp2 = (s2 & F16_EXP_MASK) >> 10
+
+    # Unbiased exponents (-15 for binary16)
+    unbiased_prod = (exp0 - 15) + (exp1 - 15)
+    unbiased_addend = exp2 - 15
+    return unbiased_prod - unbiased_addend
+
+
+# -----------------------------------------------------------------------------
 # Unit Tests
 # -----------------------------------------------------------------------------
 
@@ -816,6 +942,82 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
             res_lo, res_hi = unpack_f16x2(res)
             self.assertAlmostEqual(u16_to_f16(res_lo), 0.14, places=2)
             self.assertAlmostEqual(u16_to_f16(res_hi), 0.24, places=2)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry generation."""
+
+    def test_exact_finite_flags(self) -> None:
+        s0 = f16_to_u16(0.5)
+        s1 = f16_to_u16(0.5)
+        s2 = f16_to_u16(0.25)
+        res = ref_fma_clamp_f16(s0, s1, s2)
+        flags = evaluate_fma_clamp_f16_flags(s0, s1, s2, res)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.underflow)
+        self.assertFalse(flags.inexact)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.clamped)
+
+    def test_clamped_saturation_flags(self) -> None:
+        # 2.0 * 2.0 + 1.0 = 5.0 -> clamped to 1.0
+        s0 = f16_to_u16(2.0)
+        s1 = f16_to_u16(2.0)
+        s2 = f16_to_u16(1.0)
+        res = ref_fma_clamp_f16(s0, s1, s2)
+        flags = evaluate_fma_clamp_f16_flags(s0, s1, s2, res)
+        self.assertTrue(flags.clamped)
+        self.assertTrue(flags.inexact)
+        self.assertEqual(res, F16_POS_ONE)
+
+        # 1.0 * -2.0 + 0.5 = -1.5 -> clamped to +0.0
+        s0_neg = f16_to_u16(1.0)
+        s1_neg = f16_to_u16(-2.0)
+        s2_neg = f16_to_u16(0.5)
+        res_neg = ref_fma_clamp_f16(s0_neg, s1_neg, s2_neg)
+        flags_neg = evaluate_fma_clamp_f16_flags(s0_neg, s1_neg, s2_neg, res_neg)
+        self.assertTrue(flags_neg.clamped)
+        self.assertTrue(flags_neg.zero)
+
+    def test_invalid_operation_flag(self) -> None:
+        # 0 * inf is invalid
+        s0 = F16_POS_ZERO
+        s1 = F16_POS_INF
+        s2 = F16_POS_ZERO
+        res = ref_fma_clamp_f16(s0, s1, s2)
+        flags = evaluate_fma_clamp_f16_flags(s0, s1, s2, res)
+        self.assertTrue(flags.invalid)
+        # Clamped invalid op yields +0.0
+        self.assertEqual(res, F16_POS_ZERO)
+
+    def test_vcc_condition_masks(self) -> None:
+        r0 = pack_f16x2(F16_POS_ONE, F16_POS_ONE)    # both saturated one
+        r1 = pack_f16x2(F16_POS_ZERO, F16_POS_ZERO)  # both zero
+        r2 = pack_f16x2(f16_to_u16(0.5), f16_to_u16(0.5))  # both interior
+        r3 = pack_f16x2(F16_POS_ONE, F16_POS_ZERO)   # mixed
+
+        results = [r0, r1, r2, r3]
+        mask_ones = generate_vcc_mask_pk_fma_clamp("both_saturated_one", results, 4)
+        self.assertEqual(mask_ones, 0b0001)
+
+        mask_zeros = generate_vcc_mask_pk_fma_clamp("both_zero", results, 4)
+        self.assertEqual(mask_zeros, 0b0010)
+
+        mask_interior = generate_vcc_mask_pk_fma_clamp("both_strictly_interior", results, 4)
+        self.assertEqual(mask_interior, 0b0100)
+
+    def test_mantissa_alignment_shift(self) -> None:
+        # s0: exp=15 (1.0), s1: exp=15 (1.0) -> prod exp = 0
+        # s2: exp=13 (0.25) -> unbiased exp = -2
+        # shift difference = 0 - (-2) = 2
+        s0 = f16_to_u16(1.0)
+        s1 = f16_to_u16(1.0)
+        s2 = f16_to_u16(0.25)
+        shift = compute_fma_mantissa_alignment_shift(s0, s1, s2)
+        self.assertEqual(shift, 2)
 
 
 if __name__ == "__main__":
