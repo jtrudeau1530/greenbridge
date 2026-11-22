@@ -229,7 +229,9 @@ HRESULT wrap(ID3D12Device* inner, Ref<ID3D12Device>& device) {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    if (device_status != vktest::DeviceStatus::ready) return 1;
     VkPhysicalDeviceProperties properties{};
     d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &properties);
     const double gpu_frequency = 1e9 / double(properties.limits.timestampPeriod);  // GetTimestampFrequency's answer

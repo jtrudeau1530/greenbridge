@@ -380,6 +380,30 @@ block as incomplete evidence: `gamedata_xml.py --check` is the reference for tha
 aggregate counts and schema/root/element/attribute names belong in git; the CSV/JSON, the element values, the
 `type`/`content` values and per-file paths stay on the local machine. The tests are synthetic.
 
+## `OceanSimPresets`
+
+`tools/gamedata_xml.py` lists `OceanSimPresets` among the time/weather/water roots. There is one such document.
+Its element tree (counts per path; no values or names):
+
+| Path | Count | Content |
+|---|---:|---|
+| `Presets/Item` | 10 | one preset per sea region |
+| `Presets/Item/Name`, `Id` | 10 each | region label and id |
+| `Presets/Item/Location` | 10 | `x`, `y` attributes in world units: x -7,995 to 3,183, y -4,572 to 8,645 |
+| `Presets/Item/Direction` | 10 | wave direction |
+| `Presets/Item/Octaves/Item` | 30 | exactly 3 per preset |
+| `Presets/Item/Octaves/Item/ControlPoints` | 30 | 4 `(x, y)` pairs each, both in 0..1 |
+| `WavefrontShapeA`, `B`, `G`, `R` `/Item/ControlPoints` | 1 each | one curve each |
+
+So the ocean is a small set of regional presets placed by world position, each with three wave octaves whose
+amplitude is a 4-point curve over a 0..1 input. The input is the sea state: the timecycle keyframe documents
+carry a `water_ocean_beaufort_scale` variable (26 documents, 676 values, 0 to 10), the Beaufort number per
+weather and time of day.
+
+Not measured here (hypothesis): which preset applies at a position (nearest `Location` is the obvious reading),
+how the Beaufort number maps onto the 0..1 curve input (Beaufort / 12 is one choice), and what the four
+`WavefrontShape` curves drive.
+
 ## Relationship to `data.rpf` and `script.rpf`
 
 | Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |

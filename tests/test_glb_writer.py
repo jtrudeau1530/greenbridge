@@ -399,6 +399,78 @@ class TestGlbMaterialsAndTextures(unittest.TestCase):
         self.assertTrue(mat.get("doubleSided"))
         self.assertEqual(mat["pbrMetallicRoughness"]["baseColorFactor"], [0.2, 0.4, 0.6, 1.0])
 
+    def _alpha_materials(self, materials: dict, *, has_uvs: bool = False) -> list[dict]:
+        prims = [
+            dict(_simple_triangle_primitive(has_uvs=has_uvs, offset=5.0 * i), material=key)
+            for i, key in enumerate(materials)
+        ]
+        return glb_writer.read_glb_summary(glb_writer.build_glb(prims, materials=materials))["json"]["materials"]
+
+    def test_alpha_mode_inferred_and_explicit(self):
+        red = (1.0, 0.0, 0.0)
+        mats = self._alpha_materials({
+            "plain": {"base_color_factor": red},
+            "half": {"base_color_factor": red + (0.5,)},
+            "opaque": {"base_color_factor": red + (0.5,), "alpha_mode": "OPAQUE"},
+            "blend": {"base_color_factor": red, "alpha_mode": "BLEND"},
+            "mask_default": {"alpha_mode": "MASK"},
+            "mask_low": {"base_color_factor": red + (0.4,), "alpha_mode": "MASK", "alpha_cutoff": 0.5},
+        })
+        modes = {m["name"]: (m.get("alphaMode"), m.get("alphaCutoff")) for m in mats}
+        self.assertEqual(modes, {
+            "plain": (None, None),
+            "half": ("BLEND", None),
+            "opaque": (None, None),
+            "blend": ("BLEND", None),
+            "mask_default": ("MASK", None),
+            "mask_low": ("MASK", 0.5),
+        })
+        alphas = [m["pbrMetallicRoughness"]["baseColorFactor"][3] for m in mats]
+        self.assertEqual(alphas, [1.0, 0.5, 0.5, 1.0, 1.0, 0.4])
+
+    def test_opaque_materials_stay_byte_identical(self):
+        prim = dict(_simple_triangle_primitive(), material="m1")
+        plain = glb_writer.build_glb([prim], {"m1": {"base_color_factor": (1.0, 0.0, 0.0)}})
+        explicit = glb_writer.build_glb(
+            [prim], {"m1": {"base_color_factor": (1.0, 0.0, 0.0, 1.0), "alpha_mode": "OPAQUE"}},
+        )
+        self.assertEqual(plain, explicit)
+        self.assertNotIn(b"alphaMode", plain)
+        self.assertNotIn(b"alphaMode", glb_writer.build_glb([prim]))
+
+    def test_alpha_mode_on_deduplicated_textured_material(self):
+        png = _make_synthetic_png(1, 1, bytes([0, 255, 0, 0]))
+        materials = {
+            "leaf": {"png_bytes": png, "alpha_mode": "MASK", "alpha_cutoff": 0.25},
+            "no_mode": {"png_bytes": png},  # transparent texel alone never selects a mode
+        }
+        prims = [
+            dict(_simple_triangle_primitive(offset=o), material=key)
+            for o, key in ((0.0, "leaf"), (5.0, "leaf"), (10.0, "no_mode"))
+        ]
+        gltf = glb_writer.read_glb_summary(glb_writer.build_glb(prims, materials=materials))["json"]
+        leaf, no_mode = gltf["materials"]
+        self.assertEqual((leaf["alphaMode"], leaf["alphaCutoff"]), ("MASK", 0.25))
+        self.assertNotIn("alphaMode", no_mode)
+        self.assertEqual([p["material"] for p in gltf["meshes"][0]["primitives"]], [0, 0, 1])
+        self.assertEqual(len(gltf["textures"]), 1)
+
+    def test_invalid_alpha_specs_raise_error(self):
+        prim = dict(_simple_triangle_primitive(has_uvs=False), material="m1")
+        for spec in (
+            {"alpha_mode": "blend"},
+            {"alpha_mode": "TRANSPARENT"},
+            {"alpha_mode": 1},
+            {"alpha_cutoff": 0.5},
+            {"alpha_mode": "BLEND", "alpha_cutoff": 0.5},
+            {"alpha_mode": "MASK", "alpha_cutoff": float("nan")},
+            {"alpha_mode": "MASK", "alpha_cutoff": -0.1},
+            {"alpha_mode": "MASK", "alpha_cutoff": True},
+            {"alpha_mode": "MASK", "alpha_cutoff": "0.5"},
+        ):
+            with self.subTest(spec=spec), self.assertRaises(glb_writer.GlbError):
+                glb_writer.build_glb([prim], {"m1": spec})
+
 
 class TestGlbWriterValidationAndErrors(unittest.TestCase):
     """Tests error cases and validation in build_glb and helper functions."""

@@ -22,7 +22,8 @@
 // - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3);
 // - unordered-access clears need fill_buffer, update_buffer and copy_buffer for buffers; texture views cleared with
 //   rectangles need color_attachment usage on the image (ResourceBinding::color_attachment);
-// - query commands need the query functions, fill_buffer and query_pool; resolve destinations have TRANSFER_DST usage.
+// - query commands need the query functions, fill_buffer and query_pool; resolve destinations have TRANSFER_DST
+//   usage and binary occlusion resolves need resolve_binary_occlusion.
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
@@ -656,6 +657,9 @@ struct ReplayFunctions {
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize)>
         sum_occlusion;
+    // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
+    std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
+                       VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
     // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
     PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
     PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
@@ -1634,6 +1638,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     !detail::within(p.binding.buffer_offset, resolve_queries->offset + bytes,
                                     std::numeric_limits<VkDeviceSize>::max()))
                     return ReplayResult::invalid_query;
+                if (range.type == d3d12_query::binary_occlusion) {
+                    // The internal dispatch would otherwise count towards the application's CSInvocations.
+                    if (!vk.resolve_binary_occlusion || statistics_active) return ReplayResult::unsupported;
+                }
             }
             out.queries.push_back({i, heap, statistics_active});
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
@@ -1694,11 +1702,13 @@ public:
                 pending_[{query.heap, end->index}] = std::move(result);
             } else {
                 const auto& resolve = std::get<ResolveQueries>(command);
+                const bool binary = resolve.type == d3d12_query::binary_occlusion;
                 const std::uint32_t size = query_result_size(resolve.type);
                 const auto offset = list.commands[query.command].binding.buffer_offset + resolve.offset;
                 for (std::uint32_t i = 0; i < resolve.count; ++i) {
                     const auto index = resolve.first + i;
                     const auto value = lookup(*query.heap, index);
+                    needs_binary |= binary && value.ended;
                     detail::QueryResolveRun run{value.ended ? query.heap->pool : VK_NULL_HANDLE,
                                                 index, 1, offset + VkDeviceSize(i) * size};
                     if (value.occlusion.segments) {
@@ -1734,6 +1744,7 @@ public:
     }
 
     bool needs_sum = false;
+    bool needs_binary = false;
     std::vector<std::shared_ptr<const OcclusionSegmentPool>> retained;
 
 private:
@@ -1782,21 +1793,27 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         }
     } else {
         const auto& resolve = std::get<ResolveQueries>(command);
+        const bool binary = resolve.type == d3d12_query::binary_occlusion;
         const auto size = query_result_size(resolve.type);
         const auto dst = list.commands[query.command].binding.buffer;
+        bool suspended = false;
         for (const auto& run : query.resolves) {
             if (!run.pool) {
                 vk.fill_buffer(cb, dst, run.offset, VkDeviceSize(run.count) * size, 0);
-            } else if (run.sum) {
+            } else if (run.sum || binary) {
                 // ResolveQueryData is unconditional even when the helper uses a dispatch.
-                if (predicate.buffer) vk.end_conditional_rendering(cb);
-                vk.sum_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
-                if (predicate.buffer) vk.begin_conditional_rendering(cb, &predicate);
+                if (predicate.buffer && !suspended) {
+                    vk.end_conditional_rendering(cb);
+                    suspended = true;
+                }
+                const auto& resolve_occlusion = run.sum ? vk.sum_occlusion : vk.resolve_binary_occlusion;
+                resolve_occlusion(cb, run.pool, run.first, run.count, dst, run.offset);
             } else {
                 vk.copy_query_pool_results(cb, run.pool, run.first, run.count, dst, run.offset, size,
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             }
         }
+        if (suspended) vk.begin_conditional_rendering(cb, &predicate);
     }
 }
 

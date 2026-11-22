@@ -63,8 +63,9 @@ class JenkinsHashTest(unittest.TestCase):
             self.assertEqual(h & 0xFFFFFFFF, h)
 
     def test_latin1_encoding_and_replacement(self):
-        # Latin-1 character in range 0-255
-        self.assertEqual(hashdict.joaat("café"), hashdict.joaat("caf\xe9"))
+        # Latin-1 character in range 0-255: é hashes as the one byte 0xE9. "café" and "caf\xe9" are the same
+        # Python string, so the value is pinned (Latin-1 joaat, computed independently) instead of compared.
+        self.assertEqual(hashdict.joaat("caf\xe9"), 0xEEFBF723)
         # Character outside Latin-1 range is replaced with '?'
         self.assertEqual(hashdict.joaat("caf\u20ac"), hashdict.joaat("caf?"))
 
@@ -126,6 +127,28 @@ class LookupCLITest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def test_lookup_rejects_a_dictionary_that_is_not_an_object(self):
+        # #1034: a JSON array is one error line naming the file, not an AttributeError traceback
+        bad = os.path.join(self.tmp.name, "list.json")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("[]")
+        p = self.run_tool("--lookup", bad, "0x1")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("list.json", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_build_rejects_a_malformed_archive_index(self):
+        # #1043: a bad <carve>/<archive>/index.json is one ERROR line and exit 2, not a JSONDecodeError traceback
+        for body in ("not json", "[]", '{"files": 3}', '{"other": []}'):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as carve:
+                os.makedirs(os.path.join(carve, "arch"))
+                with open(os.path.join(carve, "arch", "index.json"), "w", encoding="utf-8") as f:
+                    f.write(body)
+                p = self.run_tool(carve, "--out", os.path.join(carve, "out.json"))
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("ERROR: cannot read", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
 
     def test_lookup_known_hashes(self):
         p = self.run_tool("--lookup", self.hashes_file, "0xb779a091", "88f08ef3")

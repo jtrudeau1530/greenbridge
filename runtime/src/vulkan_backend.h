@@ -8,11 +8,12 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include "binary_occlusion_spirv.h"
 #include "occlusion_sum_spirv.h"
 #include "vulkan_depth24.h"
 #include "vulkan_replay.h"
 
-#include <bit>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -56,11 +57,11 @@ struct VulkanDeviceFunctions {
     X(vkCmdDrawIndexedIndirectCount) X(vkCmdDispatchIndirect) X(vkGetBufferDeviceAddress)                      \
     X(vkGetAccelerationStructureBuildSizesKHR) X(vkCreateAccelerationStructureKHR)                             \
     X(vkDestroyAccelerationStructureKHR) X(vkGetAccelerationStructureDeviceAddressKHR)                         \
-    X(vkCmdBuildAccelerationStructuresKHR)                                                                   \
-    X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)                  \
-    X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)                           \
+    X(vkCmdBuildAccelerationStructuresKHR)                                                                    \
+    X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)                   \
+    X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)                          \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateShaderModule) X(vkDestroyShaderModule)      \
-    X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)           \
+    X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)            \
     X(vkCmdPushConstants) X(vkCmdDispatch)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
@@ -68,7 +69,7 @@ struct VulkanDeviceFunctions {
 
     // The Vulkan 1.3 entry points may be null on older devices, the extension ones (conditional rendering) when the
     // extension is not enabled, and the query functions are optional (a list that uses queries without them is
-    // unsupported). The compute and descriptor functions are used only for summing virtual occlusion results.
+    // unsupported). The compute and descriptor functions are needed for normalized or summed occlusion results.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
@@ -86,16 +87,17 @@ struct VulkanDeviceFunctions {
     }
 };
 
-// Each queue reuses a small storage buffer. It holds an accumulated UINT64 and a bounded batch of raw
-// counts. Transfer the final word to the application's COPY_DEST buffer, which needs no storage usage.
-class OcclusionSum {
+// Both kinds of compute resolve use the same storage buffer, descriptor set and pipeline layout.
+// The destination needs transfer usage only. Pipelines are created on first use.
+class OcclusionResolve {
 public:
-    OcclusionSum(const VulkanDeviceFunctions& vk, VkDevice device) : vk_(vk), device_(device) {}
-    OcclusionSum(const OcclusionSum&) = delete;
-    OcclusionSum& operator=(const OcclusionSum&) = delete;
+    OcclusionResolve(const VulkanDeviceFunctions& vk, VkDevice device) : vk_(vk), device_(device) {}
+    OcclusionResolve(const OcclusionResolve&) = delete;
+    OcclusionResolve& operator=(const OcclusionResolve&) = delete;
 
-    ~OcclusionSum() {
-        if (pipeline_) vk_.vkDestroyPipeline(device_, pipeline_, nullptr);
+    ~OcclusionResolve() {
+        if (sum_pipeline_) vk_.vkDestroyPipeline(device_, sum_pipeline_, nullptr);
+        if (binary_pipeline_) vk_.vkDestroyPipeline(device_, binary_pipeline_, nullptr);
         if (layout_) vk_.vkDestroyPipelineLayout(device_, layout_, nullptr);
         if (pool_) vk_.vkDestroyDescriptorPool(device_, pool_, nullptr);
         if (set_layout_) vk_.vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
@@ -103,7 +105,7 @@ public:
         if (memory_) vk_.vkFreeMemory(device_, memory_, nullptr);
     }
 
-    bool initialize() {
+    bool initialize(const VkPhysicalDeviceMemoryProperties& memory) {
         if (!vk_.vkCreateDescriptorSetLayout || !vk_.vkDestroyDescriptorSetLayout ||
             !vk_.vkCreateDescriptorPool || !vk_.vkDestroyDescriptorPool || !vk_.vkAllocateDescriptorSets ||
             !vk_.vkUpdateDescriptorSets || !vk_.vkCreatePipelineLayout || !vk_.vkDestroyPipelineLayout ||
@@ -111,6 +113,7 @@ public:
             !vk_.vkDestroyPipeline || !vk_.vkCmdBindPipeline || !vk_.vkCmdBindDescriptorSets ||
             !vk_.vkCmdPushConstants || !vk_.vkCmdDispatch)
             return false;
+
         VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         buffer.size = scratch_size;
         buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -118,10 +121,19 @@ public:
         if (vk_.vkCreateBuffer(device_, &buffer, nullptr, &scratch_) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, scratch_, &requirements);
-        if (!requirements.memoryTypeBits) return false;
+        auto type = memory.memoryTypeCount;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            if (!(requirements.memoryTypeBits & (1u << i))) continue;
+            if (type == memory.memoryTypeCount) type = i;
+            if (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                type = i;
+                break;
+            }
+        }
+        if (type == memory.memoryTypeCount) return false;
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = std::countr_zero(requirements.memoryTypeBits);
+        allocation.memoryTypeIndex = type;
         if (vk_.vkAllocateMemory(device_, &allocation, nullptr, &memory_) != VK_SUCCESS ||
             vk_.vkBindBufferMemory(device_, scratch_, memory_, 0) != VK_SUCCESS)
             return false;
@@ -134,7 +146,8 @@ public:
         if (vk_.vkCreateDescriptorSetLayout(device_, &set_layout, nullptr, &set_layout_) != VK_SUCCESS) return false;
         const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pool.maxSets = pool.poolSizeCount = 1;
+        pool.maxSets = 1;
+        pool.poolSizeCount = 1;
         pool.pPoolSizes = &size;
         if (vk_.vkCreateDescriptorPool(device_, &pool, nullptr, &pool_) != VK_SUCCESS) return false;
         VkDescriptorSetAllocateInfo set{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -156,50 +169,93 @@ public:
         layout.pSetLayouts = &set_layout_;
         layout.pushConstantRangeCount = 1;
         layout.pPushConstantRanges = &count;
-        if (vk_.vkCreatePipelineLayout(device_, &layout, nullptr, &layout_) != VK_SUCCESS) return false;
+        return vk_.vkCreatePipelineLayout(device_, &layout, nullptr, &layout_) == VK_SUCCESS;
+    }
+
+    bool prepare(bool needs_sum, bool needs_binary) {
+        return (!needs_sum || sum_pipeline_ || create_pipeline(occlusion_sum_spirv, sum_pipeline_)) &&
+               (!needs_binary || binary_pipeline_ || create_pipeline(binary_occlusion_spirv, binary_pipeline_));
+    }
+
+    void sum(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
+             VkBuffer dst, VkDeviceSize offset) const {
+        begin_scratch_write(cb);
+        vk_.vkCmdFillBuffer(cb, scratch_, 0, word_size, 0);
+        bind(cb, sum_pipeline_);
+        while (count) {
+            const auto chunk = std::min(count, sum_capacity);
+            vk_.vkCmdCopyQueryPoolResults(cb, queries, first, chunk, scratch_, word_size, word_size,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    shader_access);
+            dispatch(cb, chunk, 1);
+            first += chunk;
+            count -= chunk;
+            if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        copy_result(cb, dst, offset, word_size);
+    }
+
+    void normalize(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
+                   VkBuffer dst, VkDeviceSize offset) const {
+        bind(cb, binary_pipeline_);
+        while (count) {
+            const auto chunk = std::min(count, binary_capacity);
+            const VkDeviceSize bytes = VkDeviceSize(chunk) * word_size;
+            begin_scratch_write(cb);
+            vk_.vkCmdCopyQueryPoolResults(cb, queries, first, chunk, scratch_, 0, word_size,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            barrier(cb, transfer, compute, VK_ACCESS_TRANSFER_WRITE_BIT, shader_access);
+            dispatch(cb, chunk, (chunk + binary_group_size - 1) / binary_group_size);
+            copy_result(cb, dst, offset, bytes);
+            first += chunk;
+            count -= chunk;
+            offset += bytes;
+        }
+    }
+
+private:
+    bool create_pipeline(std::span<const std::uint32_t> code, VkPipeline& out) const {
         VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module.codeSize = sizeof(occlusion_sum_spirv);
-        module.pCode = occlusion_sum_spirv;
+        module.codeSize = code.size_bytes();
+        module.pCode = code.data();
         VkShaderModule shader = VK_NULL_HANDLE;
         if (vk_.vkCreateShaderModule(device_, &module, nullptr, &shader) != VK_SUCCESS) return false;
         VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
                           VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", nullptr};
         pipeline.layout = layout_;
-        const VkResult result = vk_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pipeline_);
+        VkPipeline handle = VK_NULL_HANDLE;
+        const VkResult result = vk_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &handle);
         vk_.vkDestroyShaderModule(device_, shader, nullptr);
+        if (result == VK_SUCCESS) out = handle;
+        else if (handle) vk_.vkDestroyPipeline(device_, handle, nullptr);
         return result == VK_SUCCESS;
     }
 
-    void record(VkCommandBuffer cb, VkQueryPool queries, std::uint32_t first, std::uint32_t count,
-                VkBuffer dst, VkDeviceSize offset) const {
-        constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        constexpr auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        constexpr VkAccessFlags transfer_access = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        constexpr VkAccessFlags shader_access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        // The previous resolve may be in an earlier submission on the same queue.
-        barrier(cb, transfer | compute, transfer, transfer_access | shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
-        vk_.vkCmdFillBuffer(cb, scratch_, 0, word_size, 0);
-        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    void bind(VkCommandBuffer cb, VkPipeline pipeline) const {
+        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vk_.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
-        while (count) {
-            const auto chunk = std::min(count, capacity);
-            vk_.vkCmdCopyQueryPoolResults(cb, queries, first, chunk, scratch_, word_size, word_size,
-                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-            barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                    shader_access);
-            vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(chunk), &chunk);
-            vk_.vkCmdDispatch(cb, 1, 1, 1);
-            first += chunk;
-            count -= chunk;
-            if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
-        }
+    }
+
+    void dispatch(VkCommandBuffer cb, std::uint32_t chunk, std::uint32_t groups) const {
+        vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(chunk), &chunk);
+        vk_.vkCmdDispatch(cb, groups, 1, 1);
+    }
+
+    void begin_scratch_write(VkCommandBuffer cb) const {
+        // A sum or a normalization in an earlier submission may still use this buffer.
+        barrier(cb, transfer | compute, transfer,
+                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | shader_access,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+
+    void copy_result(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize offset, VkDeviceSize bytes) const {
         barrier(cb, compute, transfer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        const VkBufferCopy copy{0, offset, word_size};
+        const VkBufferCopy copy{0, offset, bytes};
         vk_.vkCmdCopyBuffer(cb, scratch_, dst, 1, &copy);
     }
 
-private:
     void barrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst,
                  VkAccessFlags before, VkAccessFlags after) const {
         VkBufferMemoryBarrier memory{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -211,9 +267,14 @@ private:
         vk_.vkCmdPipelineBarrier(cb, src, dst, 0, 0, nullptr, 1, &memory, 0, nullptr);
     }
 
-    static constexpr std::uint32_t capacity = 256;
+    static constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    static constexpr auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    static constexpr VkAccessFlags shader_access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    static constexpr std::uint32_t sum_capacity = 256;  // one more word holds the running sum
+    static constexpr std::uint32_t binary_capacity = 1024;
+    static constexpr std::uint32_t binary_group_size = 64;  // local_size_x in binary_occlusion.comp
     static constexpr VkDeviceSize word_size = sizeof(std::uint64_t);
-    static constexpr VkDeviceSize scratch_size = (capacity + 1) * word_size;
+    static constexpr VkDeviceSize scratch_size = std::max(sum_capacity + 1, binary_capacity) * word_size;
     const VulkanDeviceFunctions& vk_;
     VkDevice device_;
     VkBuffer scratch_ = VK_NULL_HANDLE;
@@ -222,7 +283,8 @@ private:
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkDescriptorSet set_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline sum_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline binary_pipeline_ = VK_NULL_HANDLE;
 };
 
 // Per device: what the queues share. Resources are registered by their stable ID (the COM resource pointer).
@@ -355,8 +417,10 @@ public:
     double timestamp_period() const { return timestamp_period_; }
     void set_timestamp_period(double period) { timestamp_period_ = period; }
 
-    // The Vulkan queue family chosen for the D3D12 device supports the internal compute resolve.
-    void enable_occlusion_sums() { occlusion_sums_ = true; }
+    // Configure before queue creation, when the selected queue family supports compute.
+    void set_occlusion_resolve_memory(const VkPhysicalDeviceMemoryProperties& memory) {
+        occlusion_resolve_memory_ = memory;
+    }
 
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
@@ -469,7 +533,7 @@ private:
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
-    bool occlusion_sums_ = false;
+    VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     ReplayFunctions replay_;
     DebugLabelFunctions labels_;
 };
@@ -566,10 +630,16 @@ public:
         if (context_.depth24_) context_.depth24_->collect();
         std::vector<PreparedList> prepared(lists.size());
         ReplayFunctions replay = context_.replay_;
-        if (context_.occlusion_sums_) {
+        const auto& occlusion_memory = context_.occlusion_resolve_memory_;
+        const bool can_resolve_occlusion = occlusion_memory.memoryTypeCount != 0;
+        if (can_resolve_occlusion) {
             replay.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                           std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                occlusion_sum_->record(cb, pool, first, count, dst, offset);
+                occlusion_resolve_->sum(cb, pool, first, count, dst, offset);
+            };
+            replay.resolve_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                      std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
             };
         }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
@@ -596,14 +666,18 @@ public:
         QueryReplay queries;
         std::uint32_t base = 0;
         for (auto& list : prepared) {
-            const auto result = queries.plan(list, physical, base, context_.occlusion_sums_);
+            const auto result = queries.plan(list, physical, base, can_resolve_occlusion);
             if (result != ReplayResult::success) return result;
             base += list.segment_count;
         }
-        if (queries.needs_sum && !occlusion_sum_) {
-            auto sum = std::make_unique<OcclusionSum>(context_.vk, context_.device());
-            if (!sum->initialize()) return ReplayResult::unsupported;
-            occlusion_sum_ = std::move(sum);
+        if (queries.needs_sum || queries.needs_binary) {
+            if (!occlusion_resolve_) {
+                auto helper = std::make_unique<OcclusionResolve>(context_.vk, context_.device());
+                if (!helper->initialize(occlusion_memory)) return ReplayResult::unsupported;
+                occlusion_resolve_ = std::move(helper);
+            }
+            if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary))
+                return ReplayResult::unsupported;
         }
 
         CommandSlot* slot = acquire();
@@ -756,7 +830,7 @@ private:
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
     std::uint64_t submitted_ = 0;
     std::vector<CommandSlot> buffers_;
-    std::unique_ptr<OcclusionSum> occlusion_sum_;
+    std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended

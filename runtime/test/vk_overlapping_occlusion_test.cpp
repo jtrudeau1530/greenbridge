@@ -159,19 +159,23 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     Fixture fixture{d};
     EXPECT(fixture.create(vertex, fragment));
     constexpr std::uint32_t bursts = 130;
-    Draws schedule{fixture, {8, 4, 2, 8, 4, 2}};
+    Draws schedule{fixture, {8, 4, 2, 8, 4, 2, 3}};
     schedule.extents.insert(schedule.extents.end(), 2 * bursts + 1, 1);
     schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0});
     draws = &schedule;
     VulkanContext context(get_device_proc, d.device, true, d.conditional_rendering);
     EXPECT(context.loaded());
-    context.enable_occlusion_sums();
+    VkPhysicalDeviceMemoryProperties memory{};
+    const auto get_memory = d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties");
+    get_memory(d.physical, &memory);
+    context.set_occlusion_resolve_memory(memory);
     VulkanFence gate(context, 0);
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok() && gate.semaphore());
     struct OpenGate { VulkanFence& fence; ~OpenGate() { fence.signal(1); } } open_gate{gate};
     constexpr QueryHeapId a = 1, b = 2, stats = 3;
     constexpr auto occ = d3d12_query::occlusion;
+    constexpr auto binary = d3d12_query::binary_occlusion;
     for (const auto& [id, pool] : {std::pair{a, fixture.occlusion}, std::pair{b, fixture.second}})
         context.add_query_pool(id, {pool, d3d12_query_heap::occlusion, query_count, true,
                                     std::vector<bool>(query_count, false)});
@@ -217,8 +221,13 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     EXPECT(later.resolve_queries({a, occ, 0, 3, dst_id, 24}));
     EXPECT(later.resolve_queries({b, occ, 2, 1, dst_id, 48}));
     EXPECT(later.resolve_queries({b, occ, 0, 1, dst_id, 56}));    // never begun
+    EXPECT(later.begin_query({a, binary, 3}));
+    EXPECT(later.end_query({a, binary, 3}));
     if (d.conditional_rendering) EXPECT(later.set_predication({predicate_id, 0, d3d12_predication::equal_zero}));
-    EXPECT(later.resolve_queries({a, occ, 0, 1, dst_id, 72}));    // repeated, unconditional
+    // Alternate the two compute pipelines on the shared scratch buffer, all under the false predicate.
+    EXPECT(later.resolve_queries({a, binary, 3, 1, dst_id, 64}));
+    EXPECT(later.resolve_queries({a, occ, 0, 1, dst_id, 72}));
+    EXPECT(later.resolve_queries({a, binary, 3, 1, dst_id, 80}));
     EXPECT(later.close());
     const CommandList* second[] = {&later};
     EXPECT(queue.execute(second) == ReplayResult::success);
@@ -275,7 +284,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
     EXPECT(queue.idle());
 
     const std::map<VkDeviceSize, std::uint64_t> expected = {
-        {8, 80}, {24, 80}, {32, 20}, {40, 84}, {48, 16}, {56, 0}, {72, 80},
+        {8, 80}, {24, 80}, {32, 20}, {40, 84}, {48, 16}, {56, 0}, {64, 1}, {72, 80}, {80, 1},
         {88, 2 * bursts + 1}, {96, 1}, {112, 4}, {120, 0},
     };
     for (VkDeviceSize offset = 0; offset < size; offset += 8) {
@@ -289,7 +298,8 @@ int run(vktest::Device& d, const char* vertex, const char* fragment) {
             return 1;
         }
     }
-    std::printf("crossing 80/20; nested 84/16; %u segments summed; offsets, reuse and gated overwrites exact\n",
+    std::printf("crossing 80/20; nested 84/16; %u segments summed; alternating binary results 1/1; "
+                "offsets and gated overwrites exact\n",
                 2 * bursts + 1);
     return 0;
 }

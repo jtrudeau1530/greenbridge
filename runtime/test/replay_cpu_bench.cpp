@@ -2,6 +2,8 @@
 // (CommandList), check it (prepare) and write it (emit). Every Vulkan entry point is a no-op that only counts its
 // calls, and resources are fake bindings, so no GPU, driver or game files are involved and the numbers are the
 // layer's own cost. The real ExecuteCommandLists adds the driver's vkCmd* cost on top.
+// A binary occlusion resolve counts as one mock call at the emit boundary. The benchmark excludes recording
+// the Vulkan commands inside the queue's binary resolve helper.
 //
 // Two measurements:
 //   - per command type: a list of N commands of one kind (transitions come in pairs, queries as Begin+End),
@@ -162,6 +164,8 @@ struct Scene {
         vk.end_query = nop<PFN_vkCmdEndQuery>();
         vk.write_timestamp = nop<PFN_vkCmdWriteTimestamp>();
         vk.copy_query_pool_results = nop<PFN_vkCmdCopyQueryPoolResults>();
+        vk.resolve_binary_occlusion = [](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
+                                          VkDeviceSize) { ++g_vk_calls; };
         vk.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             const auto key = std::make_tuple(r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer,
                                              range.layerCount, r.format);

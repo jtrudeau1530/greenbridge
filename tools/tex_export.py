@@ -5,11 +5,13 @@ This carve exporter cannot apply it: the carved descriptor has no tile-mode fiel
 allocation span, so the first/last heuristic below stays the only verified placement here.
 
 For each texture:
-  - element size from the DXGI format (BC: 8/16 bytes per 4x4 block; uncompressed: bytes per pixel)
+  - element size from tex_headers.FMT_INFO (BC: 8/16 bytes per 4x4 block; uncompressed: bytes per pixel); only
+    1/2/4/8/16-byte elements have a SW_4K_S equation, so 12-byte R32G32B32 stays unsupported
   - the top mip is either at the data offset or at the end of the mip chain (GFX10 stores mips smallest first);
     both are detiled and the smoother one wins (scored on the decoded image where Pillow can decode the format,
     otherwise on raw element bytes)
-  - writes <out>/<archive>/<cpu blob>_<q index>_<WxH>_<format>.dds and records the choice in export_log.json
+  - writes <out>/<archive>/<cpu blob>_<q index>_<WxH>_<format>.dds and records the choice in export_log.json,
+    with "heuristic": true whenever two distinct placements fitted (the pick is a score, not a verified layout)
 
 Usage:
     python -I tex_export.py <textures_index.json> <carve dir> <out dir> [--limit N] [--png]
@@ -26,15 +28,14 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 from amd_swizzle import _parity, equation, load  # noqa: E402
+from tex_headers import FMT_INFO  # noqa: E402
 
-# DXGI format -> (bytes per element, block dimension)
-FMT = {71: (8, 4), 72: (8, 4), 80: (8, 4), 81: (8, 4), 74: (16, 4), 77: (16, 4), 78: (16, 4), 83: (16, 4),
-       84: (16, 4), 95: (16, 4), 96: (16, 4), 98: (16, 4), 99: (16, 4), 28: (4, 1), 29: (4, 1), 87: (4, 1),
-       91: (4, 1), 24: (4, 1), 26: (4, 1), 41: (4, 1), 34: (4, 1), 10: (8, 1), 2: (16, 1), 56: (2, 1), 54: (2, 1),
-       49: (2, 1), 61: (1, 1)}
-PILLOW_OK = {71, 72, 74, 77, 78, 80, 81, 83, 84, 98, 99, 28, 29, 87, 91}
+# DXGI format -> (bytes per element, block dimension), from the indexer's table; eq4k has SW_4K_S equations
+# for 1/2/4/8/16-byte elements only, so 12-byte R32G32B32 (6, 7, 8) is left out and reported unsupported.
+FMT = {fmt: info for fmt, info in FMT_INFO.items() if info[0] in (1, 2, 4, 8, 16)}
+PILLOW_OK = {71, 72, 74, 75, 77, 78, 80, 81, 83, 84, 98, 99, 28, 29, 87, 91}
 # Pillow can't open sRGB DXGI codes; the bytes are identical to the UNORM twin, so decode with that for scoring.
-DECODE_AS = {72: 71, 78: 77, 99: 98, 29: 28, 91: 87}
+DECODE_AS = {72: 71, 75: 74, 78: 77, 99: 98, 29: 28, 91: 87}
 
 _EQ = {}
 _PATTERNS = []  # (nibbles, tables) from addrlib, read on first use so the module imports without the header
@@ -72,7 +73,12 @@ def level_bytes(we, he, bpe, bw, bh):
 def dds_bytes(w, h, fmt, payload):
     hdr = bytearray(128)
     hdr[0:4] = b"DDS "
-    struct.pack_into("<IIIIIII", hdr, 4, 124, 0x1007 | 0x80000, h, w, len(payload), 0, 1)
+    bpe, blk = FMT[fmt]
+    if blk == 1:  # DDSD_PITCH: bytes in one row of the top mip
+        flags, pitch = 0x1007 | 0x8, w * bpe
+    else:  # DDSD_LINEARSIZE: bytes in the whole top mip
+        flags, pitch = 0x1007 | 0x80000, len(payload)
+    struct.pack_into("<IIIIIII", hdr, 4, 124, flags, h, w, pitch, 0, 1)
     struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
     struct.pack_into("<I", hdr, 108, 0x1000)
     return bytes(hdr) + struct.pack("<IIIII", fmt, 3, 0, 1, 0) + payload
@@ -132,7 +138,8 @@ def export_one(t, carve, out, blob_cache):
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, name), "wb") as f:
         f.write(dds_bytes(w, h, fmt, payload))
-    t["export"] = {"file": name, "place": place, "score": round(s, 4)}
+    # two placements that fit at different offsets leave the pick to the score, not to a known layout
+    t["export"] = {"file": name, "place": place, "score": round(s, 4), "heuristic": len(cands) > 1 and chain > top}
     return "ok:" + place
 
 

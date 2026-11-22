@@ -11,6 +11,8 @@ Compute shaders can override the default header with leading "; group: X,Y,Z" an
 The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
 their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
+With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
+each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 """
 import json
 import os
@@ -91,6 +93,8 @@ def translate_tests(work, names):
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
     if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
+    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
+        cmd.append("--bary-fallback")
     return subprocess.run(cmd).returncode
 
 
@@ -135,6 +139,10 @@ def main():
         sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
         import spirv_stubs
         spirv_stubs.generate_for_index(str(spirv), combined)
+        if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":
+            # The pass-through geometry shader each --bary-fallback PS is drawn with (<name>.bary_gs.spv).
+            import bary_fallback_gs
+            bary_fallback_gs.build_for_index(str(spirv))
     return 0
 
 

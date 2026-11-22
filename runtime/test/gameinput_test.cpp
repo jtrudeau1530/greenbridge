@@ -5,8 +5,8 @@
 // (Sony vendor/product id, so SDL treats it as one and the shim takes the trigger-effect path) and a plain pad
 // without trigger motors. The test covers enumeration and device callbacks, readings and their button/axis mapping,
 // UI navigation, the guide button, rumble and trigger rumble as SDL receives them, the DualSense effect bytes for
-// each LEONIDA_DS_TRIGGERS mode, the lightbar, a dispatcher, unplugging and replugging, and the reading history behind
-// GetNextReading/GetPreviousReading. No game data.
+// each LEONIDA_DS_TRIGGERS mode, the lightbar, a dispatcher, unplug/replug, reading history,
+// and identification of two or three otherwise indistinguishable pads. No game data.
 #include <windows.h>
 
 #include <SDL3/SDL.h>
@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "gameinput.h"
@@ -302,6 +303,114 @@ void test_keyboard_pad(IGameInput* input) {
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "keyboard pad: removed at the end");
     rt::gameinput::set_keyboard_source(nullptr, nullptr);
+}
+
+bool same_id(const AppLocalDeviceId& a, const AppLocalDeviceId& b) { return std::memcmp(&a, &b, sizeof a) == 0; }
+
+// The id the shim derives from SDL: the GUID, then two FNV-1a hashes of "s:" serial, "p:" path or nothing, with
+// "t:<n>:" before it for twin n. Twin 0 is the id every pad had before twins were told apart.
+AppLocalDeviceId expected_id(const Pad& pad, int twin) {
+    const char* serial = SDL_GetJoystickSerial(pad.js);
+    const char* path = SDL_GetJoystickPath(pad.js);
+    std::string identity = (serial && *serial) ? std::string("s:") + serial : (path && *path) ? std::string("p:") + path : "";
+    if (twin) identity = "t:" + std::to_string(twin) + ":" + identity;
+    AppLocalDeviceId id{};
+    const SDL_GUID guid = SDL_GetJoystickGUIDForID(pad.id);
+    std::memcpy(id.value, guid.data, 16);
+    for (int half = 0; half < 2; ++half) {
+        uint64_t h = half ? 0x84222325cbf29ce4ull : 0xcbf29ce484222325ull;
+        for (unsigned char c : identity) h = (h ^ c) * 0x100000001b3ull;
+        std::memcpy(id.value + 16 + half * 8, &h, 8);
+    }
+    return id;
+}
+
+// Attaches one more identical twin and returns the device the shim reported for it.
+IGameInputDevice* plug(Pad& pad) {
+    const size_t before = g_device_events.size();
+    attach(pad, "Leonida virtual twin pad", 0x0F0D, 0x00C1, false);
+    rt::gameinput::poll();
+    return g_device_events.size() > before ? g_device_events.back().device : nullptr;
+}
+
+bool found_is(IGameInput* input, IGameInputDevice* dev) {
+    if (!dev) return false;
+    IGameInputDevice* found = nullptr;
+    const bool ok = input->FindDeviceFromId(&dev->GetDeviceInfo()->deviceId, &found) == S_OK && found == dev;
+    if (found) found->Release();
+    return ok;
+}
+
+// Pads SDL cannot tell apart: the same name, vendor and product, no serial, no path. Runs with no other pad connected.
+void test_twins(IGameInput* input) {
+    Pad pads[3];
+    IGameInputDevice* dev[3] = {};
+    AppLocalDeviceId id[3] = {};
+    for (int i = 0; i < 2; ++i) dev[i] = plug(pads[i]);
+    check(dev[0] && dev[1] && dev[0] != dev[1], "twins: two identical pads are two device objects");
+    if (!dev[0] || !dev[1]) {
+        for (Pad& p : pads) detach(p);
+        rt::gameinput::poll();
+        return;
+    }
+    const AppLocalDeviceId legacy = expected_id(pads[0], 0);
+    check(same_id(legacy, expected_id(pads[1], 0)), "twins: SDL gives them nothing to tell them apart");
+    for (int i = 0; i < 2; ++i) id[i] = dev[i]->GetDeviceInfo()->deviceId;
+    check(same_id(id[0], legacy), "twins: the first keeps the id a single pad has always had");
+    check(!same_id(id[0], id[1]) && same_id(id[1], expected_id(pads[1], 1)),
+          "twins: the second gets twin id 1, same GUID bytes, different from the first");
+    check(found_is(input, dev[0]) && found_is(input, dev[1]), "twins: FindDeviceFromId returns each twin for its own id");
+
+    SDL_SetJoystickVirtualButton(pads[0].js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    SDL_SetJoystickVirtualButton(pads[1].js, SDL_GAMEPAD_BUTTON_EAST, true);
+    rt::gameinput::poll();
+    check(pad_state(input, dev[0]).buttons == GameInputGamepadA && pad_state(input, dev[1]).buttons == GameInputGamepadB,
+          "twins: a reading filtered to each twin has only its own button");
+    IGameInputDevice* found = nullptr;
+    input->FindDeviceFromId(&id[1], &found);
+    check(found && pad_state(input, found).buttons == GameInputGamepadB,
+          "twins: the device found from the second id reads the second pad");
+    if (found) found->Release();
+
+    dev[2] = plug(pads[2]);
+    if (dev[2]) id[2] = dev[2]->GetDeviceInfo()->deviceId;
+    check(dev[2] && dev[2] != dev[0] && dev[2] != dev[1] && same_id(id[2], expected_id(pads[2], 2)) &&
+              !same_id(id[2], id[0]) && !same_id(id[2], id[1]) && found_is(input, dev[2]),
+          "twins: a third gets a third object and twin id 2");
+
+    // One twin unplugged: it gets its object and id back.
+    detach(pads[1]);
+    rt::gameinput::poll();
+    check(dev[1]->GetDeviceStatus() == GameInputDeviceNoStatus && found_is(input, dev[1]),
+          "twins: an unplugged twin is still found from its id");
+    check(plug(pads[1]) == dev[1] && same_id(dev[1]->GetDeviceInfo()->deviceId, id[1]),
+          "twins: the middle twin plugged back in gets its object and id back");
+    detach(pads[0]);
+    rt::gameinput::poll();
+    check(plug(pads[0]) == dev[0] && same_id(dev[0]->GetDeviceInfo()->deviceId, legacy),
+          "twins: so does the first, with the legacy id");
+
+    // Two unplugged: nothing tells them apart, so the first back takes the lower twin whichever pad it is.
+    detach(pads[1]);
+    detach(pads[2]);
+    rt::gameinput::poll();
+    IGameInputDevice* first_back = plug(pads[2]);
+    IGameInputDevice* second_back = plug(pads[1]);
+    check(first_back == dev[1] && second_back == dev[2], "twins: with two unplugged, objects follow arrival order");
+
+    // All unplugged and plugged in again: the same objects and ids in creation order, no new object.
+    for (Pad& p : pads) detach(p);
+    rt::gameinput::poll();
+    bool same = true;
+    for (int i = 0; i < 3; ++i) {
+        IGameInputDevice* d = plug(pads[i]);
+        same &= d && d == dev[i] && same_id(d->GetDeviceInfo()->deviceId, id[i]);
+    }
+    check(same && rt::gameinput::connected_count() == 3, "twins: all three replugged get the same objects and ids in order");
+
+    for (Pad& p : pads) detach(p);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "twins: removed at the end");
 }
 
 }  // namespace
@@ -752,6 +861,7 @@ int main() {
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "all pads closed after detaching");
 
+    test_twins(input);
     test_keyboard_pad(input);
     input->Release();
 
