@@ -206,6 +206,7 @@ int run_entry(void* entry, size_t stack_bytes) {
     g_exited = false;
     g_exit_code = 0;
     g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_done) return -1;
     g_running = true;
     EntryCall call{entry};
     HANDLE thread = CreateThread(nullptr, stack_bytes, game_thread, &call, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
@@ -218,7 +219,17 @@ int run_entry(void* entry, size_t stack_bytes) {
     // The run ends when any game thread exits the process (exit/ExitProcess/abort) or the entry point returns.
     HANDLE waits[] = {g_done, thread};
     WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-    if (g_exited) WaitForSingleObject(g_done, 5000);
+    bool expected = false;
+    if (g_exited.compare_exchange_strong(expected, true)) {
+        // The entry thread exited without calling end_run (e.g. ExitThread); claim g_exited so no worker thread can
+        // touch g_done while we close it, and preserve the thread's exit code.
+        DWORD thread_code = 0;
+        if (GetExitCodeThread(thread, &thread_code)) g_exit_code = static_cast<int>(thread_code);
+    } else {
+        // Another thread already won g_exited and is publishing g_exit_code + SetEvent(g_done); wait until it finishes
+        // so we never close g_done or return before g_exit_code is published.
+        WaitForSingleObject(g_done, INFINITE);
+    }
     CloseHandle(thread);
     CloseHandle(g_done);
     g_done = nullptr;

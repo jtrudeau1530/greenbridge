@@ -9,15 +9,17 @@
 // So for a module the shim registry owns (rt::shims::owns_dll: xgameruntime.dll, d3d12_xs.dll, xmem.dll, ...), these
 // return a pseudo-handle, and GetProcAddress on it resolves names (and "#ordinal") through rt::shims::find. A name the
 // registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND, as a real module would, and is logged once. Every
-// other module goes to the host unchanged. Only images mapped by the loader see these: they are bound through the
-// registry, the runtime's own code calls the host directly.
+// other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
+// loader see these: they are bound through the registry, the runtime's own code calls the host directly.
 #include <windows.h>
 
 #include <cstdio>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "shims.h"
 
@@ -65,6 +67,25 @@ std::string module_name(std::string path) {
     if (!path.empty() && path.back() == '.') path.pop_back();
     else if (path.find('.') == std::string::npos) path += ".dll";
     return path;
+}
+
+std::string host_module_name(HMODULE module) {
+    std::lock_guard lock(loader_mutex());
+    static auto* names = new std::map<HMODULE, std::string>;
+    if (auto it = names->find(module); it != names->end()) return it->second;
+
+    std::vector<wchar_t> path(MAX_PATH);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+        if (!length) return {};
+        if (length < path.size()) {
+            const std::string name = module_name(narrow(path.data()));
+            names->emplace(module, name);
+            return name;
+        }
+        if (path.size() == 32768) return {};
+        path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
+    }
 }
 
 }  // namespace
@@ -204,6 +225,13 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         if (fn) return reinterpret_cast<FARPROC>(fn);
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
+    }
+    if (module && !IS_INTRESOURCE(name)) {
+        const DWORD error = GetLastError();
+        const std::string dll = host_module_name(module);
+        void* shim = dll.empty() ? nullptr : find(dll, what);
+        SetLastError(error);
+        if (shim) return reinterpret_cast<FARPROC>(shim);
     }
     return GetProcAddress(module, name);
 }

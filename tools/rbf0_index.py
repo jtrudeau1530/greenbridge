@@ -30,6 +30,11 @@ import struct
 import sys
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
+
 MAGIC = b"RBF0"
 PROLOGUE = b"\xfb\xff\x01\x00"
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
@@ -249,23 +254,6 @@ def join_resource(rows, index, read, check_gap=True):
     return blob, chunks, parsed
 
 
-def _categorise(strings):
-    """Aggregate counts only: no string is returned from here."""
-    distinct = set(strings)
-    out = {
-        "distinct": len(distinct),
-        "path_like": sum(1 for s in distinct if "/" in s),
-        "identifier_like": sum(1 for s in strings if IDENT.fullmatch(s) is not None),
-        "empty": sum(1 for s in strings if not s),
-        "keywords": {},
-    }
-    lowered = [s.lower() for s in strings]
-    for word in KEYWORDS:
-        out["keywords"][word] = {"occurrences": sum(1 for s in lowered if word in s),
-                                 "distinct": sum(1 for s in distinct if word in s.lower())}
-    return out
-
-
 def resources_from_rows(rows, read, check_gap=True, string_limit=16):
     """Parse every RBF0 start row, join its continuations, and build the reported records."""
     out = []
@@ -386,10 +374,9 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
                 if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
                     pos = s + 1
                     continue
-                gap = mm[last:s]
-                z = gap.count(0) == len(gap)
-                zero += len(gap) if z else 0
-                unread += 0 if z else len(gap)
+                gap_zero, gap_unread = gap_split(mm, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 rows.append({"offset": s, "stored": blen, "size": blen, "head": mm[s:s + 8]})
                 last = pos = s + blen
                 continue
@@ -410,18 +397,16 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
                 pos = s + 1
                 continue
             used = p - s - len(d.unused_data)
-            gap = mm[last:s]
-            z = gap.count(0) == len(gap)
-            zero += len(gap) if z else 0
-            unread += 0 if z else len(gap)
+            gap_zero, gap_unread = gap_split(mm, last, s)
+            zero += gap_zero
+            unread += gap_unread
             rows.append(_row(out, s, used))
             last = pos = s + used
             if progress and len(rows) % 2000 == 0:
                 progress(len(rows), pos, end)
-        gap = mm[last:end]
-        z = gap.count(0) == len(gap)
-        zero += len(gap) if z else 0
-        unread += 0 if z else len(gap)
+        gap_zero, gap_unread = gap_split(mm, last, end)
+        zero += gap_zero
+        unread += gap_unread
         mspan = end - span_start
     with ArchiveReader(path) as reader:
         records = resources_from_rows(rows, reader.read, check_gap=True, string_limit=string_limit)

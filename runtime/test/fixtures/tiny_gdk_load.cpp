@@ -8,6 +8,9 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstring>
+#include <cwchar>
+#include <initializer_list>
 
 namespace {
 
@@ -29,6 +32,33 @@ int fail(const char* stage, unsigned long value) {
 }  // namespace
 
 int main() {
+    for (const wchar_t* dll : {L"kernel32.dll", L"kernelbase.dll"}) {
+        HMODULE host = GetModuleHandleW(dll);
+        if (!host) return fail("host module handle", GetLastError());
+        auto command_a = reinterpret_cast<decltype(&GetCommandLineA)>(GetProcAddress(host, "GetCommandLineA"));
+        auto command_w = reinterpret_cast<decltype(&GetCommandLineW)>(GetProcAddress(host, "GetCommandLineW"));
+        if (!command_a || !command_w || std::strcmp(command_a(), GetCommandLineA()) != 0 ||
+            std::wcscmp(command_w(), GetCommandLineW()) != 0 ||
+            !std::strstr(command_a(), "host-shim-probe") || !std::wcsstr(command_w(), L"host-shim-probe"))
+            return fail("dynamic command line matches direct imports", 0);
+        auto process_id = reinterpret_cast<decltype(&GetCurrentProcessId)>(GetProcAddress(host, "GetCurrentProcessId"));
+        if (!process_id || process_id() != GetCurrentProcessId())
+            return fail("unshimmed host export", GetLastError());
+        SetLastError(0);
+        if (GetProcAddress(host, "LeonidaNoSuchHostExport") || GetLastError() != ERROR_PROC_NOT_FOUND)
+            return fail("missing host export", GetLastError());
+        auto create_file = reinterpret_cast<decltype(&CreateFileW)>(GetProcAddress(host, "CreateFileW"));
+        if (!create_file) return fail("dynamic CreateFileW", GetLastError());
+        HANDLE file = create_file(L"GAME:\\host_shim_probe.txt", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return fail("dynamic GAME: open", GetLastError());
+        char data[4]{};
+        DWORD count = 0;
+        const BOOL read = ReadFile(file, data, sizeof(data), &count, nullptr);
+        CloseHandle(file);
+        if (!read || count != sizeof(data) || std::memcmp(data, "shim", sizeof(data)) != 0)
+            return fail("dynamic GAME: contents", 0);
+    }
     HMODULE runtime = LoadLibraryW(L"xgameruntime.dll");
     if (!runtime) return fail("LoadLibraryW(xgameruntime.dll)", GetLastError());
     // The loader shim hands out a pseudo-handle for a module it owns: not an image the host loaded.

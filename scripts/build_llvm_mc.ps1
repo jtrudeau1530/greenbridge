@@ -60,6 +60,15 @@ if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
 }
 
+# -Keep (or an interrupted build) can leave sources from another -Version.
+# Refuse that checkout rather than silently rebuilding the wrong release or resetting user files.
+$versionError = "Cannot reuse '$src' for LLVM $Version. Choose a fresh -Temp directory for this version; existing files were kept."
+if (-not (Test-Path -LiteralPath (Join-Path $src '.git'))) { throw $versionError }
+$wantedCommit = & git -C $src rev-parse --verify --quiet "refs/tags/llvmorg-$Version^{commit}"
+if ($LASTEXITCODE -ne 0 -or -not $wantedCommit) { throw $versionError }
+$sourceCommit = & git -C $src rev-parse --verify --quiet HEAD
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne $wantedCommit) { throw $versionError }
+
 # DIA SDK off: its headers need ATL, which the C++ build tools don't always include, and llvm-mc doesn't use it.
 $body = @"
 "$cmake" -S "$src\llvm" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=Release ^
@@ -70,9 +79,24 @@ $body = @"
 "@
 New-Item -ItemType Directory -Force $out | Out-Null
 # A .cmd file avoids cmd.exe's quote stripping on paths with spaces.
-# Switch cmd.exe to UTF-8 before it reads the paths in the batch file.
+# Switch cmd.exe to UTF-8 before reading paths, then restore the shared console even if the build fails.
 $bat = Join-Path $Temp "_build.cmd"
-$batchText = "@echo off`r`nchcp 65001 >nul`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body`r`n"
+$batchText = @(
+    '@echo off'
+    'setlocal'
+    'set "_leonida_cp="'
+    'for /f "tokens=2 delims=:." %%c in (''chcp'') do set "_leonida_cp=%%c"'
+    'chcp 65001 >nul'
+    'call :build'
+    'set "_leonida_exit=%errorlevel%"'
+    'if defined _leonida_cp chcp %_leonida_cp% >nul'
+    'exit /b %_leonida_exit%'
+    ':build'
+    "set `"PATH=$installer;%PATH%`""
+    "call `"$vcvars`" >nul || exit /b 1"
+    $body
+    ''
+) -join "`r`n"
 [System.IO.File]::WriteAllText($bat, $batchText, [System.Text.UTF8Encoding]::new($false))
 
 $p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
@@ -90,7 +114,8 @@ $probe = & $exe --disassemble -triple=amdgcn -mcpu=gfx1013 $probeFile
 if ($LASTEXITCODE -ne 0 -or -not ($probe -match "s_endpgm")) { throw "the built llvm-mc didn't disassemble an s_endpgm" }
 
 New-Item -ItemType Directory -Force $Dest | Out-Null
-$final = Join-Path $Dest "llvm-mc.exe"
+# LLVM_MC is saved for future terminals, whose working directory can differ from this one.
+$final = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $Dest "llvm-mc.exe"))
 Copy-Item -Force $exe $final
 if (-not $Keep) {
     try {

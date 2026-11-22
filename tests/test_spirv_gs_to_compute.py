@@ -228,3 +228,40 @@ def test_help_is_a_clean_exit_zero(capsys):
         out = capsys.readouterr().out
         assert "spirv_gs_to_compute.py in.spv out.spv" in out
         assert "SPIRV-Tools" in out
+
+
+def test_builtin_load_and_output_store_with_memory_operands():
+    gs = PHI_GS.replace(
+        'OpEntryPoint Geometry %main "main" %in_pos %out_pos',
+        'OpEntryPoint Geometry %main "main" %in_pos %out_pos %prim_id %inv_id',
+    ).replace(
+        "OpDecorate %out_pos BuiltIn Position",
+        "OpDecorate %out_pos BuiltIn Position\n"
+        "OpDecorate %prim_id BuiltIn PrimitiveId\n"
+        "OpDecorate %inv_id BuiltIn InvocationId",
+    ).replace(
+        "%out_pos = OpVariable %ptr_out_v4 Output",
+        "%ptr_in_u = OpTypePointer Input %uint\n"
+        "%out_pos = OpVariable %ptr_out_v4 Output\n"
+        "%prim_id = OpVariable %ptr_in_u Input\n"
+        "%inv_id = OpVariable %ptr_in_u Input",
+    ).replace(
+        "%v = OpLoad %v4float %p\nOpStore %out_pos %v",
+        "%pid = OpLoad %uint %prim_id Aligned 4\n"
+        "%iid = OpLoad %uint %inv_id Volatile\n"
+        "%v = OpLoad %v4float %p\n"
+        "OpStore %out_pos %v Aligned 16",
+    )
+    out, _ = gsc.rewrite(gs)
+    assert "%prim_id" not in out and "%inv_id" not in out
+    assert "%pid = OpCopyObject %uint %gsc_prim" in out
+    assert "%iid = OpCopyObject %uint " in out
+    assert "OpStore %gsc_out0 %v" in out
+    if HAVE_SPIRV:
+        res = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", os.devnull],
+                             input=out, text=True, capture_output=True)
+        assert res.returncode == 0, res.stderr
+
+    bad_gs = gs.replace("%pid = OpLoad %uint %prim_id Aligned 4", "OpCopyMemory %prim_id %inv_id")
+    with pytest.raises(gsc.Unsupported, match="%prim_id"):
+        gsc.rewrite(bad_gs)

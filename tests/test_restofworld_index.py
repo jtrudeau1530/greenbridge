@@ -539,6 +539,24 @@ class RageTextureDetectionTest(unittest.TestCase):
         self.assertIn("BC1_UNORM:1", row["detail"])
         self.assertIn("BC7_UNORM:1", row["detail"])
 
+    def test_dictionary_keeps_small_textures_and_counts_all_descriptors(self) -> None:
+        blob = _synth_pg_tex_dict([
+            _synth_tex_descriptor(0, 256, 256, 71, mips=7),
+            _synth_tex_descriptor(0x10000, 1, 2, 28, mips=2),
+        ])
+        row = restofworld_index.classify(blob, 0x2000, 128)
+        self.assertEqual(row["count"], 2)
+        self.assertIn("tex980=2;dict=1", row["detail"])
+        self.assertIn("R8G8B8A8_UNORM:1", row["detail"])
+        summary = restofworld_index.summarise([row], span=128, zero=0, unread=0)
+        self.assertEqual((summary["texture_dictionaries"], summary["texture_headers"]), (1, 2))
+
+    def test_small_texture_with_invalid_mip_count_is_excluded(self) -> None:
+        for mips in (0, 3):
+            with self.subTest(mips=mips):
+                descriptor = _synth_tex_descriptor(0, 1, 2, 28, mips=mips)
+                self.assertEqual(restofworld_index.find_rage_textures(descriptor), [])
+
     def test_non_dict_resource_page_with_linear_f16_texture(self):
         header = bytearray(0x60)
         struct.pack_into("<QQ", header, 8, 0x50000040, 0x50000080)  # u10 != 0 -> not standalone pgDictionary

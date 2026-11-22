@@ -90,11 +90,7 @@ class FirstLightTests(unittest.TestCase):
             os.unlink(
                 raw
             )  # a fresh run: a harness that writes nothing cannot pass on a stale file
-        env = dict(
-            os.environ,
-            VKH_DRAW_MESH=os.path.join(self.out, "mesh.bin"),
-            VKH_VERTEX_LAYOUT="0:3f,1:2f",
-        )
+        env = fl.harness_env(self.manifest, self.out)
         subprocess.run(
             [
                 self.harness,
@@ -145,6 +141,19 @@ class FirstLightTests(unittest.TestCase):
             self.assertTrue(
                 os.path.isfile(os.path.join(self.out, self.manifest["files"][key]))
             )
+
+
+class PpmTests(unittest.TestCase):
+    def test_nonfinite_readback_channels_write_complete_ppm(self) -> None:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        pixels = (float("nan"), float("inf"), float("-inf"), 1.0,
+                  -0.25, 0.5, 1.25, 1.0)
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "preview.ppm"
+            write_ppm(str(path), pixels, 2, 1)
+            self.assertEqual(path.read_bytes(), b"P6\n2 1\n255\n" + bytes((0, 255, 0, 0, 128, 255)))
 
 
 class ShaderPreparationTests(unittest.TestCase):
@@ -271,6 +280,132 @@ class ReadObjTests(unittest.TestCase):
         ):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 fl.read_obj(self._write_obj(bad))
+
+
+class TexturedOracleTests(unittest.TestCase):
+    """Synthetic tests for the textured first-light path (TEST-524): no GPU or game files."""
+
+    def setUp(self):
+        self.manifest = {
+            "width": 4,
+            "height": 4,
+            "min_coverage": 0.2,
+            "max_coverage": 0.5,
+            "centre_pixel": [2, 2],
+            "centre_rgba": [0.2, 0.4, 0.6, 1.0],
+            "rgba_probes": [{"pixel": [1, 1], "uv": [0.25, 0.75], "rgba": [0.8, 0.2, 0.1, 1.0]}],
+            "rgba_tolerance": 0.02,
+            "clear_pixel": [0, 0],
+            "clear": CLEAR,
+            "files": {"mesh": "mesh.bin", "texture": "texture.rgba"},
+            "ps": {"subgroup_size": 32},
+            "texture": {
+                "width": 2,
+                "height": 2,
+                "ptr_sgpr": 9,
+                "tsharp_va": 0x100,
+                "ssharp": [0x92, 0xC00000, 0x14500000, 0],
+            },
+        }
+
+    def image(self, centre=(0.2, 0.4, 0.6, 1.0), probe=(0.8, 0.2, 0.1, 1.0)) -> bytes:
+        pixels = [[CLEAR] * 4 for _ in range(16)]
+        for x, y in ((1, 1), (2, 1), (1, 2), (2, 2)):
+            pixels[y * 4 + x] = list(centre)
+        pixels[1 * 4 + 1] = list(probe)
+        return struct.pack("<64f", *(v for pixel in pixels for v in pixel))
+
+    def test_accepts_expected_textured_image(self):
+        check_image(self.image(), self.manifest)
+
+    def test_rejects_magenta_fallback_texture(self):
+        with self.assertRaises(AssertionError):
+            check_image(self.image(centre=(1.0, 0.0, 1.0, 1.0)), self.manifest)
+
+    def test_rejects_wrong_textured_probe(self):
+        with self.assertRaises(AssertionError):
+            check_image(self.image(probe=(0.1, 0.2, 0.8, 1.0)), self.manifest)
+
+    def test_sample_rgba_bilinear(self):
+        rgba = bytes(
+            [
+                255, 0, 0, 255,    0, 255, 0, 255,
+                0, 0, 255, 255,    255, 255, 0, 255,
+            ]
+        )
+        # Centre (0.5, 0.5) averages all 4 texels equally -> (0.5, 0.5, 0.25, 1.0).
+        mid = fl.sample_rgba_bilinear(2, 2, rgba, 0.5, 0.5)
+        for got, want in zip(mid, (0.5, 0.5, 0.25, 1.0)):
+            self.assertAlmostEqual(got, want, places=4)
+        # Clamped corner (0.0, 0.0) hits texel (0, 0) -> red.
+        tl = fl.sample_rgba_bilinear(2, 2, rgba, -0.5, -0.5)
+        for got, want in zip(tl, (1.0, 0.0, 0.0, 1.0)):
+            self.assertAlmostEqual(got, want, places=4)
+
+    def test_harness_env_sets_texture_vars(self):
+        env = fl.harness_env(self.manifest, "/tmp/fl_out", base_env={})
+        self.assertEqual(env["VKH_TSHARP_VA"], "0x100")
+        self.assertEqual(env["VKH_SSHARP"], "0x92,0xc00000,0x14500000,0x0")
+        sgprs = env["VKH_SGPRS"].split(",")
+        self.assertEqual(len(sgprs), 10)
+        self.assertEqual(sgprs[9], "0x100")
+        self.assertEqual(env["VKH_SUBGROUP_SIZE"], "32")
+        self.assertTrue(env["VKH_TEX_RGBA"].endswith("texture.rgba"))
+
+    def test_harness_rejects_wrapped_tsharp_va_overflow(self):
+        h = harness()
+        if not h:
+            self.skipTest("vk_harness is not built")
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            rgba_path = os.path.join(td, "tex.rgba")
+            fl.write_texture_rgba(rgba_path, 1, 1, bytes([255, 0, 0, 255]))
+            env = dict(
+                os.environ,
+                VKH_TEX_RGBA=rgba_path,
+                VKH_TSHARP_VA="0xFFFFFFE0",
+            )
+            proc = subprocess.run(
+                [h, "unused_vs.spv", "unused_ps.spv", os.path.join(td, "out.raw"), "4", "4"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("VKH_TSHARP_VA", proc.stderr)
+
+    def test_decode_synthetic_dds_and_write_rgba(self):
+        import tempfile
+
+        # Minimal valid 2x2 uncompressed R8G8B8A8 DDS (128-byte header + 16 bytes pixels).
+        dds = bytearray(128)
+        dds[0:4] = b"DDS "
+        struct.pack_into("<I", dds, 4, 124)       # dwSize
+        struct.pack_into("<I", dds, 8, 0x1007)    # DDSD_CAPS|HEIGHT|WIDTH|PIXELFORMAT
+        struct.pack_into("<I", dds, 12, 2)        # height
+        struct.pack_into("<I", dds, 16, 2)        # width
+        struct.pack_into("<I", dds, 76, 32)       # ddspf.dwSize
+        struct.pack_into("<I", dds, 80, 0x41)     # DDPF_RGB | DDPF_ALPHAPIXELS
+        struct.pack_into("<I", dds, 88, 32)       # RGBBitCount
+        struct.pack_into("<IIII", dds, 92, 0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000)
+        struct.pack_into("<I", dds, 108, 0x1000)  # DDSCAPS_TEXTURE
+        pixels = bytes([10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255])
+        dds.extend(pixels)
+        with tempfile.TemporaryDirectory() as td:
+            dds_path = os.path.join(td, "tex.dds")
+            rgba_path = os.path.join(td, "tex.rgba")
+            with open(dds_path, "wb") as f:
+                f.write(dds)
+            w, h, rgba, sha = fl.decode_dds_to_rgba(dds_path)
+            self.assertEqual((w, h), (2, 2))
+            self.assertEqual(rgba, pixels)
+            self.assertEqual(len(sha), 64)
+            fl.write_texture_rgba(rgba_path, w, h, rgba)
+            with open(rgba_path, "rb") as f:
+                blob = f.read()
+            self.assertEqual(blob[:8], struct.pack("<II", 2, 2))
+            self.assertEqual(blob[8:], pixels)
 
 
 if __name__ == "__main__":

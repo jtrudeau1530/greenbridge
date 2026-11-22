@@ -25,8 +25,8 @@ from shader_meta import SGPR_RMW  # noqa: E402
 
 NO_DEST_OPS = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe", "s_branch", "s_cbranch",
                "s_waitcnt", "s_barrier", "s_nop", "s_endpgm", "s_sendmsg", "s_sleep",
-               "exp", "buffer_store", "global_store", "flat_store", "scratch_store",
-               "image_store", "ds_write")
+               "exp", "buffer_store", "tbuffer_store", "global_store", "flat_store", "scratch_store",
+               "s_store", "s_buffer_store", "image_store", "ds_write")
 WAVE64_RE = re.compile(r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64")
 
 
@@ -142,7 +142,9 @@ def _fmt_s3_arg(a, is_dst=False):
         if a["r"] == 3 and a.get("n", 1) == 1:
             return "s3"
         return "sN"
-    if k == "vgpr":
+    if k == "slist":
+        return "s3" if 3 in a["r"] else "sN"
+    if k in ("vgpr", "vlist"):
         return "vN"
     if k == "imm":
         v = a["v"]
@@ -157,6 +159,8 @@ def rbw_registers(insns):
     s3_patterns = []
 
     def expand_reg(a):
+        if a["k"] in ("vlist", "slist"):
+            return [r for r in a["r"] if isinstance(r, int)]
         return range(a["r"], a["r"] + a.get("n", 1))
 
     for ins in insns:
@@ -164,15 +168,26 @@ def rbw_registers(insns):
         args = ins["args"]
         if not args:
             continue
-        is_no_dest = op.startswith(NO_DEST_OPS)
+        mods = ins.get("mods", ())
+        is_gf_atomic = op.startswith(("global_atomic_", "flat_atomic_"))
+        is_bi_atomic = op.startswith(("buffer_atomic_", "image_atomic_"))
+        is_no_dest = (
+            op.startswith(NO_DEST_OPS)
+            or (is_gf_atomic and "glc" not in mods)
+            or (is_bi_atomic and "glc" not in mods)
+        )
         reads_imm_dst = op in SGPR_RMW
-        # Instructions that read their destination too.
+        # Instructions that read their destination too (buffer/image atomics with glc read and write vdata at args[0];
+        # global/flat atomics with glc write vdst at args[0] and read vaddr/vdata/saddr from args[1:]).
         dst_also_read = (
             reads_imm_dst or "fmac" in op or "mac_" in op or op == "v_writelane_b32"
-            or op == "v_swap_b32" or "_atomic_" in op
+            or op == "v_swap_b32" or (not is_gf_atomic and "_atomic_" in op)
         )
-        # Carry-out forms write the VGPR and scalar mask first, even when they also take a carry-in source.
-        if not is_no_dest and op.startswith("v_") and "_co_" in op and len(args) >= 2:
+        is_dual_dst = op.startswith("v_") and (
+            "_co_" in op or op.startswith(("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64"))
+        )
+        # Carry-out / scale-out forms write the VGPR and scalar mask first, even when they also take a carry-in source.
+        if not is_no_dest and is_dual_dst and len(args) >= 2:
             dsts = args[:2]
             srcs = args[2:]
         elif is_no_dest:
@@ -184,13 +199,13 @@ def rbw_registers(insns):
 
         reads_s3_rbw = False
         for a in srcs:
-            if a["k"] == "sgpr":
+            if a["k"] in ("sgpr", "slist"):
                 for r in expand_reg(a):
                     if r not in written_s:
                         rbw_s.add(r)
                         if r == 3:
                             reads_s3_rbw = True
-            elif a["k"] == "vgpr":
+            elif a["k"] in ("vgpr", "vlist"):
                 for r in expand_reg(a):
                     if r not in written_v:
                         rbw_v.add(r)
@@ -200,9 +215,9 @@ def rbw_registers(insns):
             s3_patterns.append(f"{op} {fmt_args}".strip())
 
         for a in dsts:
-            if a["k"] == "sgpr":
+            if a["k"] in ("sgpr", "slist"):
                 written_s.update(expand_reg(a))
-            elif a["k"] == "vgpr":
+            elif a["k"] in ("vgpr", "vlist"):
                 written_v.update(expand_reg(a))
 
     return sorted(rbw_s), sorted(rbw_v), s3_patterns

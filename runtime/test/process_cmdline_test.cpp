@@ -193,6 +193,17 @@ int main() {
     // A byte above 0x7f in the narrow program name is part of the name, not the end of it.
     check_winmain(L"caf\u00e9.exe", {L"-x"}, L"-x", "a non-ASCII program name");
 
+    // If the entry thread exits via ExitThread() without going through end_run(), run_entry() must preserve its exit
+    // code (and claim g_exited before closing g_done).
+    {
+        auto exit_thread_entry = +[](void*) -> DWORD { ExitThread(42); };
+        const int code = rt::process::run_entry(reinterpret_cast<void*>(exit_thread_entry), 0);
+        if (code != 42) {
+            std::fprintf(stderr, "FAIL run_entry with ExitThread(42) returned %d, want 42\n", code);
+            ++failures;
+        }
+    }
+
     if (failures) return 1;
     std::printf("process_cmdline: GetCommandLineW parses back to __wargv, non-ASCII arguments intact (code page %u); "
                 "the WinMain line and the kernelbase/API-set names are the game's\n",

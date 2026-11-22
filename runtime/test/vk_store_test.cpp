@@ -462,6 +462,12 @@ int main(int argc, char** argv) {
         bic.imageSubresource = vol_layers; bic.imageExtent = {VOL, VOL, VOL};
         vkCmdCopyImageToBuffer(cmd, vol, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vol_rb, 1, &bic);
     }
+    // Make every copy's readback writes visible to the host before it reads the mapped buffers.
+    VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 1, &host, 0, nullptr, 0, nullptr);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));

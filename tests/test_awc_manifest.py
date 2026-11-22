@@ -293,6 +293,32 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((doc["bank_count"], doc["stream_count"]), (0, 0))
         self.assertEqual(doc["streams"], [])
 
+    def test_unreadable_bank_preserves_the_previous_manifest(self):
+        good = os.path.join(self.tmp.name, "good.awc")
+        blocked = os.path.join(self.tmp.name, "unreadable.awc")
+        self.write_bank(good, with_music=False)
+        self.write_bank(blocked, with_music=False)
+        out = os.path.join(self.tmp.name, "manifest.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+        read_bank = awc_manifest._bank_rows
+
+        def read_with_error(path, bank):
+            if path == blocked:
+                raise PermissionError(13, "permission denied", path)
+            return read_bank(path, bank)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(awc_manifest, "_bank_rows", side_effect=read_with_error), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(awc_manifest.main([self.tmp.name, "--out", out]), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("cannot read", stderr.getvalue())
+        self.assertIn(blocked, stderr.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+
     def test_failed_write_keeps_the_previous_manifest(self):
         out = os.path.join(self.tmp.name, "manifest.json")
         with open(out, "w", encoding="utf-8") as f:

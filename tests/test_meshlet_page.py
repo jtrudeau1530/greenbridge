@@ -5,6 +5,7 @@
 Every byte here is built by the test. No game file, value or name is used.
 """
 import json
+import math
 import os
 import struct
 import subprocess
@@ -348,6 +349,24 @@ class RejectTests(unittest.TestCase):
         summary = mp.summarise_page(data, "x")
         self.assertIn("unknown chunk", summary["error"])
 
+    def test_other_data_after_padding_stops(self):
+        # mesh chunks, zero padding to a 256-byte boundary, then other data (story000's 256 KiB mixed pages)
+        mesh = page(other_block(10), group([(10, 8)]))
+        tail = bytes(range(1, 65)) * 4
+        # unknown magic, and a group header whose meshlet offsets are not running sums
+        bad_group = struct.pack("<3I", 0x80000001, 1, 1) + struct.pack("<4I", 0, 5, 0, 0) + bytes(64)
+        for junk in (tail, bad_group):
+            data = mesh + b"\0" * (-len(mesh) % 256 or 256) + junk
+            summary = mp.summarise_page(data, "x")
+            self.assertNotIn("error", summary)
+            self.assertEqual((summary["sequence"], summary["stop"]), ("QG.", "non-mesh data after the chunks"))
+            self.assertEqual((summary["blocks_4240"], summary["groups"]), (1, 1))
+            self.assertEqual(mp.totals([summary])["stopped_at_other_data"], 1)
+        # with no zero padding in front, or off a 256-byte boundary, it stays an error
+        self.assertIn("error", mp.summarise_page(page(other_block(10)) + tail, "x"))
+        off = mesh + b"\0" * ((-len(mesh) % 256) + 16)
+        self.assertIn("error", mp.summarise_page(off + tail, "x"))
+
 
 def grid_group(cols, rows):
     """One meshlet over a cols x rows vertex grid (row-major), two consistently wound triangles per cell."""
@@ -383,6 +402,19 @@ class Positions4240Tests(unittest.TestCase):
         xyz = self.decode(2)
         self.assertEqual(self.decode(0), [(c, b, a) for a, b, c in xyz])
         self.assertEqual(self.decode(1), [(b, c, a) for a, b, c in xyz])
+
+    def test_checks_match_decoding(self):
+        # the header shortcut (box inside 300 m) and the vertex-by-vertex path give the decoded counts
+        for bias, scale in ((self.BIAS, self.SCALE), ((-250.0, 0.0, 0.0), (2.0 ** -14, 2.0 ** -20, 2.0 ** -10)),
+                            ((float("inf"), 0.0, 0.0), self.SCALE)):
+            data = page(other_block(4, packed=self.PACKED, bias=bias, scale=scale))
+            blk = mp.parse_page(data)[0]
+            pos = mp.positions_4240(data, blk)
+            finite = [p for p in pos if all(math.isfinite(c) for c in p)]
+            want = {"positions_4240": 4, "positions_4240_finite": len(finite),
+                    "positions_4240_within_300m": sum(1 for p in finite if all(abs(c) <= 300 for c in p))}
+            self.assertEqual(mp.block4240_checks(data, blk), want, bias)
+        self.assertEqual(want["positions_4240_finite"], 0)
 
     def test_bad_axis_and_tag_are_errors(self):
         data = page(other_block(4, axis=3))
@@ -446,7 +478,11 @@ class MeshletCentreTests(unittest.TestCase):
     def test_meshlet_centre(self):
         self.assertEqual(mp.meshlet_centre(0x007FF7FF, 0x7FF), (0.0, 0.0, 0.0))
         self.assertEqual(mp.meshlet_centre(0x0080F7EF, 0xFFFFF000), (-1.0, 1.0, -127.9375))
-        self.assertEqual(mp.meshlet_centre(0xFF000FFF, 0x00000FFF), (128.0, -127.9375, 128.0))
+        self.assertEqual(mp.meshlet_centre(0x00000FFF, 0x00000FFF), (128.0, -127.9375, 128.0))
+        # w2 bit 28 doubles the step: 1/8 m, out to +-256 m
+        self.assertEqual(mp.meshlet_centre(0x10000FFF, 0x00000FFF), (256.0, -255.875, 256.0))
+        self.assertEqual(mp.meshlet_centre(0x1080F7EF, 0x7FF), (-2.0, 2.0, 0.0))
+        self.assertEqual((mp.centre_step(0x007FF7FF), mp.centre_step(0x107FF7FF)), (0.0625, 0.125))
 
     def grid_page(self, steps):
         """A 4x4 grid in one meshlet whose stored centre is the vertex-box centre moved by `steps` (x, y, z)."""
@@ -469,6 +505,67 @@ class MeshletCentreTests(unittest.TestCase):
         checks = mp.summarise_page(data, "p", centres=True)["checks"]
         self.assertEqual((checks["centres_4240_axes_exact"], checks["centres_4240_axes_within_step"]), (1, 2))
         self.assertNotIn("centres_4240_meshlets", mp.summarise_page(data, "p")["checks"])
+
+    def test_coarse_centre_agreement(self):
+        # the grid page with its stored centre written at 1/8 m steps and bit 28 set
+        data = bytearray(self.grid_page((0, 0, 0)))
+        blk, grp = mp.parse_page(bytes(data))
+        pos = mp.positions_4240(bytes(data), blk)
+        box = [(min(p[i] for p in pos) + max(p[i] for p in pos)) / 2 for i in range(3)]
+        f = [round(c * 8) + 2047 for c in box]
+        rec = grp["offset"] + 12
+        w3 = struct.unpack_from("<I", data, rec + 12)[0] & ~0xFFF
+        struct.pack_into("<2I", data, rec + 8, 1 << 28 | f[0] | f[1] << 12, w3 | f[2])
+        c = mp.summarise_page(bytes(data), "p", centres=True)["checks"]
+        self.assertEqual((c["centres_4240_coarse_steps"], c["centres_4240_axes_exact"]), (1, 3))
+
+    def test_meshlet_radius(self):
+        self.assertEqual(mp.meshlet_radius(0x3C00 << 16 | 0x1FFF), 1.0)
+        self.assertEqual(mp.meshlet_radius(0x4D00 << 16), 20.0)
+        self.assertEqual(mp.meshlet_radius(0x7F), 0.0)
+
+    def test_radius_agreement(self):
+        data = bytearray(self.grid_page((0, 0, 0)))
+        blk, grp = mp.parse_page(bytes(data))
+        pos = mp.positions_4240(bytes(data), blk)
+        centre = mp.meshlet_centre(*struct.unpack_from("<2I", data, grp["offset"] + 12 + 8))
+        far = max(math.dist(p, centre) for p in pos)
+        rec = grp["offset"] + 12
+        w0 = struct.unpack_from("<I", data, rec)[0] & 0xFFFF
+        for radius, want in ((far * 1.01, (1, 1, 1)), (far * 0.99, (0, 1, 1)), (far * 2 + 1, (1, 1, 0))):
+            struct.pack_into("<I", data, rec, w0 | struct.unpack("<H", struct.pack("<e", radius))[0] << 16)
+            c = mp.summarise_page(bytes(data), "p", centres=True)["checks"]
+            self.assertEqual((c["centres_4240_radius_covers"], c["centres_4240_radius_covers_within_rounding"],
+                              c["centres_4240_radius_tight"]), want, radius)
+
+    def test_meshlet_cone(self):
+        self.assertIsNone(mp.meshlet_cone(0x7FF))
+        up = 32 << 14 | 32 << 20                        # octahedral u = v = 0.5 / 31.5: nearly +z
+        axis, cos_half = mp.meshlet_cone(up | 31 << 26)
+        self.assertAlmostEqual(axis[2], 1.0, places=3)
+        self.assertEqual(cos_half, 1.0)                  # f = 31: sin(half-angle) 0
+        self.assertEqual(mp.meshlet_cone(up)[1], 0.0)    # f = 0: half-angle 90 degrees
+        self.assertAlmostEqual(mp.meshlet_cone(up | 16 << 26)[1], math.sqrt(1 - (15 / 31) ** 2))
+        self.assertAlmostEqual(mp.meshlet_cone(63 << 14 | 32 << 20 | 1 << 26)[0][0], 1.0, places=3)   # +x
+
+    def test_cone_agreement(self):
+        # grid_page's grid is a plane of constant z; take the facing from its first triangle
+        data = bytearray(self.grid_page((0, 0, 0)))
+        blk, grp = mp.parse_page(bytes(data))
+        pos = mp.positions_4240(bytes(data), blk)
+        p, q, r = (pos[i] for i in next(mp.group_triangles(bytes(data), grp)))
+        nz = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+        up, down = 32 << 14 | 32 << 20, 0             # octahedral: nearly +z, and u = v = -1 folded onto -z
+        facing, away = (up, down) if nz > 0 else (down, up)
+        rec = grp["offset"] + 12
+        w2, w3 = struct.unpack_from("<2I", data, rec + 8)
+        # f = 31 is a zero half-angle: the 6-bit axis is not exactly the face normal, so only the 0.05 allowance holds
+        for cone, want in ((facing | 31 << 26, (1, 1, 0, 1)), (away | 31 << 26, (1, 0, 0, 0)),
+                           (facing | 16 << 26, (1, 1, 1, 1)), (0, (0, 0, 0, 0))):
+            struct.pack_into("<I", data, rec + 12, (w3 & 0xFFF) | cone)
+            c = mp.summarise_page(bytes(data), "p", cones=True)["checks"]
+            self.assertEqual((c["cones_4240_cones"], c["cones_4240_axis_within_25_degrees"], c["cones_4240_faces_inside"],
+                              c["cones_4240_faces_inside_within_0_05"]), want, hex(cone))
 
     def test_cli_centres(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -503,6 +600,100 @@ class SlotTagTests(unittest.TestCase):
         bad = page(other_block(10, tags=((0, 0x42, 8), (2, 0x25, 4))), group([(10, 6)]))
         self.assertFalse(mp.is_mesh_page(bad))
         self.assertIn("error", mp.summarise_page(bad, "x"))
+
+
+class Normals4240Tests(unittest.TestCase):
+    UP = 512 | 512 << 10   # octahedral u = v = 0.5 / 511.5: nearly +z
+
+    def block_with_normals(self, words, tag=0x21, packed=None, n=None):
+        n = n or len(words)
+        tags = ((0, 0x42, 8), (2, tag, 4), (1, 0x26, 4))
+        data = bytearray(page(other_block(n, tags=tags, packed=packed or [(0, 0, 0)] * n, scale=(2.0 ** -20,) * 3)))
+        blk = mp.parse_page(bytes(data))[0]
+        off = dict((i, o) for i, _, o in blk["slots"])[2]
+        for k, w in enumerate(words):
+            struct.pack_into("<I", data, blk["offset"] + off + 4 * k, w)
+        return bytes(data), blk
+
+    def assertVector(self, got, want, places=2):
+        for g, w in zip(got, want):
+            self.assertAlmostEqual(g, w, places=places)
+
+    def test_octahedral_normals(self):
+        data, blk = self.block_with_normals([1023, self.UP, 1023 | 511 << 10, 0 | 1023 << 10, 0xC0000000 | self.UP])
+        n = mp.normals_4240(data, blk)
+        self.assertVector(n[0], (0, 0, -1))   # u = 1, v = -1 folds onto -z
+        self.assertVector(n[1], (0, 0, 1))
+        self.assertVector(n[2], (1, 0, 0))
+        self.assertVector(n[3], (0, 0, -1))
+        self.assertEqual(n[4], n[1])          # bits 20-31 don't change the normal
+        for v in n:
+            self.assertAlmostEqual(sum(c * c for c in v), 1.0)
+
+    def test_type7_normals_and_other_types(self):
+        data, blk = self.block_with_normals([1023 | 512 << 10 | 512 << 20, 512 | 512 << 10 | 0 << 20], tag=0x27)
+        n = mp.normals_4240(data, blk)
+        self.assertVector(n[0], (1, 0, 0))
+        self.assertVector(n[1], (0, 0, -1))
+        data, blk = self.block_with_normals([0, 0], tag=0x26)
+        self.assertIsNone(mp.normals_4240(data, blk))
+
+    def test_normal_agreement(self):
+        flat = [(x, y, 0.0) for y in range(3) for x in range(3)]
+        tris = [(0, 1, 3), (1, 4, 3), (1, 2, 4), (2, 5, 4)]
+        up = [(0.0, 0.0, 1.0)] * 9
+        self.assertEqual(mp.normal_agreement(flat, up, tris),
+                         {"vertices": 6, "within_8_degrees": 6, "within_25_degrees": 6, "opposed": 0})
+        tilt = math.radians(20)
+        mixed = list(up)
+        mixed[0] = (0.0, 0.0, -1.0)
+        mixed[4] = (math.sin(tilt), 0.0, math.cos(tilt))
+        self.assertEqual(mp.normal_agreement(flat, mixed, tris),
+                         {"vertices": 6, "within_8_degrees": 4, "within_25_degrees": 5, "opposed": 1})
+        with self.assertRaises(mp.PageError):
+            mp.normal_agreement(flat, up[:4], tris)
+
+    def test_tangents(self):
+        tags = ((0, 0x42, 8), (2, 0x21, 4), (11, 0x27, 4), (18, 0x27, 4))
+        data = bytearray(page(other_block(3, tags=tags, packed=[(0, 0, 0)] * 3)))
+        blk = mp.parse_page(bytes(data))[0]
+        offs = dict((i, o) for i, _, o in blk["slots"])
+        x_axis = 1023 | 512 << 10 | 512 << 20          # tangent +x, normal +z: perpendicular
+        z_axis = 512 | 512 << 10 | 1023 << 20
+        for k, (nw, t11, t18) in enumerate([(self.UP, 3 << 30 | x_axis, x_axis), (self.UP, x_axis, 1 << 30 | x_axis),
+                                             (self.UP, 3 << 30 | z_axis, 3 << 30 | x_axis)]):
+            struct.pack_into("<I", data, blk["offset"] + offs[2] + 4 * k, nw)
+            struct.pack_into("<I", data, blk["offset"] + offs[11] + 4 * k, t11)
+            struct.pack_into("<I", data, blk["offset"] + offs[18] + 4 * k, t18)
+        tan = mp.tangents_4240(bytes(data), blk)
+        self.assertEqual(sorted(tan), [11, 18])
+        self.assertVector(tan[11][0][:3], (1, 0, 0))
+        self.assertEqual([r[3] for r in tan[11]], [1, -1, 1])
+        self.assertEqual([r[3] for r in tan[18]], [-1, 0, 1])
+        got = mp.tangent_agreement(mp.normals_4240(bytes(data), blk), tan)
+        self.assertEqual(got, {"vertices": 6, "perpendicular": 5, "sign_plus": 3, "sign_minus": 2})
+        checks = mp.summarise_page(bytes(data), "p", normals=True)["checks"]
+        self.assertEqual(checks["tangents_4240_perpendicular"], 5)
+
+    def test_page_normals_and_cli(self):
+        cols, rows = 4, 4
+        packed = [(c * 4096, r * 4096, 5) for r in range(rows) for c in range(cols)]   # axis 2: a plane facing +z
+        data, _ = self.block_with_normals([self.UP] * (cols * rows), packed=packed)
+        data = page(data[:mp.parse_page(data)[0]["offset"] + 0x80 + (8 + 4 + 4) * cols * rows], grid_group(cols, rows))
+        checks = mp.summarise_page(data, "p", normals=True)["checks"]
+        self.assertEqual((checks["normals_4240_vertices"], checks["normals_4240_within_8_degrees"],
+                          checks["normals_4240_opposed"]), (16, 16, 0))
+        self.assertNotIn("normals_4240_vertices", mp.summarise_page(data, "p")["checks"])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "p.bin")
+            with open(src, "wb") as fh:
+                fh.write(data)
+            out = os.path.join(tmp, "r.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, src, "--normals", "--json", out, "--quiet"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["totals"]["checks"]["normals_4240_within_25_degrees"], 16)
 
 
 class CliTests(unittest.TestCase):

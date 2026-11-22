@@ -10,7 +10,7 @@
 // whose required features or partner stubs are unavailable are reported as skipped rather than failed.
 //   [cache.bin]   loaded first if it exists (a stopped run resumes: cached pipelines are instant), saved every
 //                 10 minutes and at the end
-//   --jobs N      compile on N threads (default: half the hardware threads)
+//   --jobs N      compile on up to N worker threads (default: half the hardware threads)
 //   --large-module-bytes N  compile modules larger than N bytes alone (default: 4194304; 0 disables isolation)
 //   --start I --count N   check only index entries [I, I+N) (sorted by name)
 //   --slow SEC    print pipelines slower than SEC (default 30); compiles past 60 s are named while running
@@ -51,10 +51,12 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -610,9 +612,21 @@ int main(int argc, char** argv) {
         auto number = [&](auto& dest) {
             const auto text = value();
             if (text.empty()) return false;
-            const auto end = text.data() + text.size();
-            const auto [ptr, ec] = std::from_chars(text.data(), end, dest);
-            return ec == std::errc{} && ptr == end;
+            if constexpr (std::is_floating_point_v<std::decay_t<decltype(dest)>>) {
+                // Apple's libc++ has no floating-point from_chars overload. Parse the whole token with strtod,
+                // as shader_library.h does for JSON numbers; --slow also checks isfinite and >= 0 below.
+                const std::string token(text);
+                char* end = nullptr;
+                errno = 0;
+                const double parsed = std::strtod(token.c_str(), &end);
+                if (errno == ERANGE || end != token.c_str() + token.size()) return false;
+                dest = static_cast<std::decay_t<decltype(dest)>>(parsed);
+                return true;
+            } else {
+                const auto end = text.data() + text.size();
+                const auto [ptr, ec] = std::from_chars(text.data(), end, dest);
+                return ec == std::errc{} && ptr == end;
+            }
         };
         bool valid = true;
         if (a == "--jobs") {
@@ -813,7 +827,7 @@ int main(int argc, char** argv) {
 #endif
 
     // Scan selected shaders to request only the optional extensions they actually use.
-    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false;
+    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false, want_clock = false;
     for (auto& [_, meta] : work) {
         if (meta->stage == "ms") want_mesh = true;
         if (meta->needs_maintenance8) want_m8 = true;
@@ -822,6 +836,7 @@ int main(int argc, char** argv) {
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
             else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
+            else if (feat == "shaderSubgroupClock" || feat == "shaderDeviceClock") want_clock = true;
         }
     }
 
@@ -905,6 +920,8 @@ int main(int argc, char** argv) {
     const bool ext_fma = false;
     (void)want_fma;
 #endif
+    VkPhysicalDeviceShaderClockFeaturesKHR clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+    const bool ext_clock = link(&clock, reinterpret_cast<VkBaseOutStructure*>(&clock), VK_KHR_SHADER_CLOCK_EXTENSION_NAME, want_clock);
     const bool ext_exe = link(&exe, reinterpret_cast<VkBaseOutStructure*>(&exe),
                               VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, !stats_path.empty());
     if (!stats_path.empty() && !ext_exe) {
@@ -991,10 +1008,13 @@ int main(int argc, char** argv) {
             return "no VK_KHR_maintenance8";
 #endif
         }
-        // Execution modes the translator declares (SignedZeroInfNanPreserve 32) need a device property, not a feature.
+        // Execution modes the translator declares (SignedZeroInfNanPreserve 32, DenormPreserve 16) need a device
+        // property, not a feature.
         for (const auto& fc : meta.float_controls) {
             if (fc == "shaderSignedZeroInfNanPreserveFloat32") {
                 if (!fcProps.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
+            } else if (fc == "shaderDenormPreserveFloat16") {
+                if (!fcProps.shaderDenormPreserveFloat16) return "no " + fc;
             } else {
                 return "unknown float control " + fc;
             }
@@ -1011,6 +1031,8 @@ int main(int argc, char** argv) {
                 return "no VK_KHR_shader_fma (shaderFmaFloat32)";
 #endif
             }
+            if (feat == "shaderSubgroupClock" && !(ext_clock && clock.shaderSubgroupClock)) return "no shaderSubgroupClock";
+            if (feat == "shaderDeviceClock" && !(ext_clock && clock.shaderDeviceClock)) return "no shaderDeviceClock";
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
             if (feat == "shaderDrawParameters" && !f11.shaderDrawParameters) return "no shaderDrawParameters";
@@ -1109,8 +1131,9 @@ int main(int argc, char** argv) {
         }
     };
 
+    const auto worker_count = static_cast<unsigned>(std::min<size_t>(jobs, work.size()));
     std::fprintf(stderr, "checking %zu shaders [%zu, %zu) (stage=%s) on %u threads\n",
-                 work.size(), lo, hi, stage_filter.c_str(), jobs);
+                 work.size(), lo, hi, stage_filter.c_str(), worker_count);
 
     std::mutex mu;  // guards counters, stdout, stub cache and in-flight table
     std::shared_mutex compile_gate;  // large modules exclude other shader and pipeline work
@@ -1127,14 +1150,20 @@ int main(int argc, char** argv) {
         const char* phase;   // "module" or "pipeline"
     };
     std::map<std::thread::id, InFlight> inflight;
-    // --inflight-file: rewrite the file from `inflight`, one "name<TAB>phase" line per module. Called with mu held, at
-    // the moments named in the header.
+    // Publish a complete snapshot at the moments named in the header. This keeps the last full report if the
+    // process dies while staging the next one. Called with mu held.
     auto write_inflight = [&] {
         if (inflight_path.empty()) return;
-        if (std::FILE* f = std::fopen(inflight_path.c_str(), "w")) {
-            for (const auto& [tid, job] : inflight) std::fprintf(f, "%s\t%s\n", job.name.c_str(), job.phase);
-            std::fclose(f);
+        std::string snapshot;
+        for (const auto& [tid, job] : inflight) {
+            snapshot += job.name;
+            snapshot += '\t';
+            snapshot += job.phase;
+            snapshot += '\n';
         }
+        if (const auto error = write_pipeline_cache_file(inflight_path, snapshot.data(), snapshot.size()))
+            std::fprintf(stderr, "in-flight snapshot save to %s failed: %s\n",
+                         inflight_path.c_str(), error.message().c_str());
     };
     const auto t_start = std::chrono::steady_clock::now();
     auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(); };
@@ -1530,7 +1559,7 @@ int main(int argc, char** argv) {
     if (iso_child) std::printf("ISO-READY\n");
     std::fflush(stdout);
     std::vector<std::thread> pool;
-    for (uint32_t t = 0; t < jobs; t++) pool.emplace_back(worker);
+    for (unsigned t = 0; t < worker_count; t++) pool.emplace_back(worker);
     // Watchdog: names every compile running past 60 s (about once a minute) and saves the cache every 10 minutes.
     std::condition_variable watch_cv;
     bool all_done = false;
@@ -1631,7 +1660,7 @@ int main(int argc, char** argv) {
     if (isolated_modules)
         std::printf("large modules checked exclusively: %zu (over %zu bytes)\n", isolated_modules,
                     large_module_bytes);
-    std::printf("wall time: %.1fs on %u threads\n", elapsed(), jobs);
+    std::printf("wall time: %.1fs on %u threads\n", elapsed(), worker_count);
     const bool cache_saved = save_cache(true);  // keep successful pipelines even if another entry failed
     if (stats_out) std::fclose(stats_out);
     return (check_failed || !cache_saved) ? 1 : 0;

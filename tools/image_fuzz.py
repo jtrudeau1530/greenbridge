@@ -108,6 +108,10 @@ def translate(work: str, pc_tail: bool = False) -> str:
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         raise SystemExit(f"translator failed:\n{r.stdout}\n{r.stderr}")
+    # The batch translator can exit successfully even when an individual shader is rejected.
+    missing = [name for name in ("vs_ids.spv", "ps_image_load.spv") if not os.path.isfile(os.path.join(spirv, name))]
+    if missing:
+        raise SystemExit(f"translator did not emit {', '.join(missing)}:\n{r.stdout}\n{r.stderr}")
     return spirv
 
 
@@ -229,8 +233,30 @@ def same_component(a: float, b: float) -> bool:
     return bool(nan_a and nan_b)
 
 
+# The translated image_load fetches a UNORM texel through a float view, so the 8-bit -> float conversion is the
+# driver's, not the translated code's. RDNA2 returns the correctly rounded c / 255 (--oracle hw checks that bit for
+# bit); llvmpipe multiplies by an f32 1/255 instead, one ulp above it for 126 of the 256 values (27: 0x3dd8d8da, not
+# 0x3dd8d8d9), and a run stops at its first mismatch, so on llvmpipe no case after the first R8G8B8A8_UNORM one ran.
+# A wrong format, swizzle, binding or dmask is never that close (c / 256 is ~0.4% off), so the translator oracle
+# accepts one ulp on a UNORM8 texel component and counts how often it needed to.
+UNORM8_ULPS = 1
+unorm8_near = 0   # UNORM8 components accepted one ulp from the exact quotient, for the summary
+
+
+def near_component(a: float, b: float, ulps: int) -> bool:
+    """Finite f32 values of the same sign at most `ulps` units in the last place apart."""
+    bits_a = struct.unpack("<I", struct.pack("<f", a))[0]
+    bits_b = struct.unpack("<I", struct.pack("<f", b))[0]
+    if (bits_a ^ bits_b) & 0x80000000 or 0x7F800000 in (bits_a & 0x7F800000, bits_b & 0x7F800000):
+        return False
+    return abs(bits_a - bits_b) <= ulps
+
+
 def compare(fmt_name, texels, width, height, got, dmask=0xf) -> list:
+    global unorm8_near
     expected = oracle(fmt_name, texels, width, height)
+    # Only the components the texel supplies; the registers dmask leaves unwritten must keep their sentinels exactly.
+    near_ok = dmask.bit_count() if FORMATS[fmt_name][3] == "unorm8" else 0
     problems = []
     for y in range(DRAW):
         for x in range(DRAW):
@@ -238,7 +264,11 @@ def compare(fmt_name, texels, width, height, got, dmask=0xf) -> list:
             want = masked_components(expected[ty * width + tx], dmask)
             base = (y * DRAW + x) * 4
             have = got[base:base + 4]
-            if all(same_component(have[c], want[c]) for c in range(4)):
+            exact = [same_component(have[c], want[c]) for c in range(4)]
+            if all(exact):
+                continue
+            if all(exact[c] or (c < near_ok and near_component(have[c], want[c], UNORM8_ULPS)) for c in range(4)):
+                unorm8_near += exact.count(False)
                 continue
             problems.append((x, y, want, have))
             if len(problems) >= 6:
@@ -576,6 +606,8 @@ def main() -> int:
     if a.negative_control and "hw" not in backends:
         ap.error("--negative-control needs --oracle hw")
     formats = [f.strip() for f in a.formats.split(",") if f.strip()]
+    if not formats:
+        ap.error("--formats must select at least one format")
     unknown = [f for f in formats if f not in FORMATS]
     if unknown:
         print(f"unknown format(s): {', '.join(unknown)}; known: {', '.join(FORMATS)}", file=sys.stderr)
@@ -617,6 +649,9 @@ def main() -> int:
                 summary += f"; {failed} mismatched"
             if skipped:
                 summary += f"; {skipped} skipped"
+            if unorm8_near:
+                summary += (f"; {unorm8_near} R8G8B8A8_UNORM components one ulp from the exact c / 255 "
+                            "(the driver's conversion)")
             print("translator: " + summary)
             code = 1 if failed else 0
         if hw_oracle:

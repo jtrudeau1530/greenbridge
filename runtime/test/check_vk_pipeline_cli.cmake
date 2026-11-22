@@ -21,6 +21,7 @@ check_invalid(--large-module-bytes -1)
 check_invalid(--slow nonsense)
 check_invalid(--slow nan)
 check_invalid(--slow -0.5)
+check_invalid(--slow 1.2.3)  # strtod must consume the whole token, not just its numeric prefix
 check_invalid(--stage --graphics-only)
 check_invalid(--stats)
 

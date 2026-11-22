@@ -27,6 +27,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from file_mode import published_mode  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -114,11 +115,9 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                     if not (64 <= blen <= end - s and 16 <= w <= 8192 and 16 <= h <= 8192):
                         pos = s + 1
                         continue
-                    gap = m[last:s]
-                    if gap.count(0) == len(gap):
-                        zero += len(gap)
-                    else:
-                        unread += len(gap)
+                    gap_zero, gap_unread = gap_split(m, last, s)
+                    zero += gap_zero
+                    unread += gap_unread
                     bink2_files += 1
                     bink2_bytes += blen
                     last = pos = s + blen
@@ -153,11 +152,9 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                 if used <= 0:
                     pos = s + 1
                     continue
-                gap = m[last:s]
-                if gap.count(0) == len(gap):
-                    zero += len(gap)
-                else:
-                    unread += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 streams += 1
                 names = extract_names(prefix, types) if b".#" in prefix else []
                 if names:
@@ -172,11 +169,9 @@ def scan_archive(archive, start=None, limit=None, max_inflate=1 << 20, types=("d
                     progress(f"{streams} streams, {len(rows)} with names, "
                              f"{(pos - (data_start if start is None else start)) / span:.1%}, "
                              f"{time.time() - t0:.0f}s")
-            tail = m[last:end]
-            if tail.count(0) == len(tail):
-                zero += len(tail)
-            else:
-                unread += len(tail)
+            gap_zero, gap_unread = gap_split(m, last, end)
+            zero += gap_zero
+            unread += gap_unread
             span = end - (data_start if start is None else start)
             by_type = {}
             for suffix in unique.values():

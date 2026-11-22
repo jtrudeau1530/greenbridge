@@ -118,9 +118,10 @@ process lifetime and answers as Windows does when no `Loader` is alive.
 different index space from the `TlsAlloc` slots, and only the OS loader can allocate a module index.
 The runtime therefore ships a minimal `gta6rt_tls_host.dll`; the loader reuses the index the OS assigns
 it, writes that index into the image's `AddressOfIndex`, and copies the image's TLS template into the
-slot. This reserves one index, so **one manually mapped TLS module can be live at a time**; a second
-one is rejected with an error instead of sharing the slot. Images without a TLS directory (or with an
-all-zero one) load normally.
+slot. This reserves one index; every additional simultaneous TLS module gets its own by mapping a fresh
+clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16 modules can be live at
+once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
+directory (or with an all-zero one) load normally.
 
 Current limits, by design:
 
@@ -309,6 +310,17 @@ lines from synthetic fixtures only.
 Get-Content startup.jsonl | ConvertFrom-Json | Group-Object kind | Select-Object Count, Name
 ```
 
+[tools/boot_trace.py](../tools/boot_trace.py) prints the first-boot summary of this file and of the
+`--trace-d3d12` log (modules, unimplemented calls with their callers, DllMain/TLS results, exceptions with their
+stack, the exit, and the D3D12 calls by outcome and first call per method):
+
+```powershell
+python -I tools\boot_trace.py startup.jsonl --d3d12 d3d12.log
+```
+
+[docs/boot.md](../docs/boot.md) is the runbook around it: the commands, the triage order and the open questions'
+trace signals.
+
 ### Typed clear regression
 
 `clear_color_test` checks numeric UINT conversion and unchanged float clears without a GPU.
@@ -342,7 +354,8 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 
 `d3d12_rgb96_test` compares footprints, uploads, readbacks, boxes, texture-to-texture copies and CPU copies of
 `R32G32B32_FLOAT/UINT/SINT/TYPELESS` textures (2D arrays with mips, and volumes) with Windows WARP, bit for bit,
-and prints how long an upload and a readback take. `d3d12_descriptor_test` samples them (alpha reads as one). It
+checks that WARP and the hardware adapter report no resource tiling for all four formats, and prints how long an
+upload and a readback take. `d3d12_descriptor_test` samples them (alpha reads as one). It
 is registered in CTest (`d3d12_rgb96`).
 
 ```powershell

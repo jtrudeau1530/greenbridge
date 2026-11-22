@@ -315,12 +315,23 @@ def main(argv=None) -> int:
         if not os.path.exists(path):
             print(f"awc_names: error: {path}: no such file or directory", file=sys.stderr)
             return 2
-    if a.out and os.path.exists(a.out) and any(os.path.samefile(p, a.out) for p in inputs):
-        ap.error("--out must not overwrite an input")
+    if a.out and os.path.exists(a.out):
+        protected = inputs.copy()
+        for sources, suffix in ((a.banks, ".awc"), (a.conversations, "")):
+            for source in sources:
+                if os.path.isdir(source):
+                    protected.extend(full for full in _files(source)
+                                     if full.lower().endswith(suffix) and os.path.isfile(full))
+        if any(os.path.samefile(p, a.out) for p in protected):
+            ap.error("--out must not overwrite an input")
 
     words = []
     for path in a.words:
-        words += read_words(path)
+        try:
+            words += read_words(path)
+        except (OSError, ValueError) as error:
+            print(f"awc_names: error: cannot read {path}: {error}", file=sys.stderr)
+            return 2
     waves = conversation_waves(a.conversations)
     dictionary = Dictionary(words + waves)
     bases = dictionary.bases(a.min_token)

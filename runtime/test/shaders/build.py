@@ -100,6 +100,8 @@ def cs_fssm_extra(path):
 
 
 def shader_source(name):
+    if name == "ps_mullit":
+        return "../../../tests/semantic/fixtures/ps_mullit"
     return "vs_clip" if name in CLIP_CASES else name
 
 
@@ -184,7 +186,8 @@ def main():
     out = Path(sys.argv[1])
     available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
     names = sys.argv[2:] or available
-    unknown = sorted(set(names) - set(available))
+    # mullit_readback.py uses the CPU semantic fixture as an explicit build target.
+    unknown = sorted(set(names) - set(available) - {"ps_mullit"})
     if unknown:
         sys.exit("Unknown test shaders: " + ", ".join(unknown))
     skipped = [n for n in names if n.startswith("ms_")]

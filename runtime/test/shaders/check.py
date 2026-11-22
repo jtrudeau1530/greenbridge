@@ -82,8 +82,9 @@ CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed001
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
 WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
+                "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst",
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
@@ -91,7 +92,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
-                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_mask_vgpr_exec")
+                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_w32_andn2_exec", "cs_mask_vgpr_exec")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -119,6 +120,10 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
+            # 8/16-bit LDS writes (incl. _d16_hi) and sign/zero-extending reads
+            ("cs_w32_lds_subdword", [0x11B2D444, 0xA1B2C3D4, 0xFFFFFFB2, 0x000000B2, 0x00000011, 0xFFFFA1B2, 0x0000A1B2, 0xFFFFC3D4]),
+            # 64/96/128-bit LDS accesses and ds_read2st64_b32
+            ("cs_w32_lds_wide", [0xCAFEF00D, 0xFEEDFACE, 0x600DD00D, 0x00000000, 0x8BADF00D, 0xDEADC0DE, 0x12345678, 0x9ABCDEF0]),
             # ds_cmpst_b32 and the b64 2-address forms (cs_lds_b64_cmpst.asm header)
             ("cs_lds_b64_cmpst", [0x11110001, 0x22220002, 0x33330003, 0x44440004,
                                   0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC]),
@@ -130,6 +135,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
             # SHADER-99: -0 and NaN survive translation (SignedZeroInfNanPreserve); words 0, 2, 3 on Apple: see below
             ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
+            # s_andn2_saveexec_b32 / s_andn2_wrexec_b32: EXEC = S0 & ~EXEC, D old / new EXEC, SCC (cs_w32_andn2_exec.asm)
+            ("cs_w32_andn2_exec", [1, 8, 16, 2064, 2068, 3, 20, 1544]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
@@ -230,19 +237,46 @@ TBUFFER_STORE_WORDS = [
     0xFF0080FF, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0xA5A50290, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
     0xA5A502FF, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0x3F800000, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
     0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
+# cs_fmt_d16_xyz.asm: d16_xyz / d16_xy typed-buffer loads (out[0..10]), the two d16_xyz stores (out[16..18] and
+# out[20..22]) and the inputs at 0x100 (out[64..72]); everything else is the untouched fill. Derivation in the header.
+FMT_D16_XYZ_WORDS = [
+    0xABCD1234, 0xA5A57FFF, 0xFFFF0005, 0x1234FFFF, 0xC0003C00, 0xC0003C00, 0xBEEF3555, 0x00003C00,
+    0xCAFE3C00, 0xFFFF0005, 0x0BADFFFF, *[0xEEEEEEEE] * 5,
+    0x00000007, 0x00008001, 0x0000FFFE, 0xEEEEEEEE, 0x3F800000, 0xC0000000, 0x3F000000, 0xEEEEEEEE,
+    *[0xEEEEEEEE] * 40,
+    0xABCD1234, 0x55557FFF, 0xC0003C00, 0x7BFF3555, 5, 0x10000, 0xFFFFFFFF, 0, 0x80FF00FF, *[0xEEEEEEEE] * 7]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
                                                  0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE])]
+# cs_heap_init.asm: vk_compute_test's VKC_HEAP_INIT copies this file (zeros, then four words at 0x100) to the start
+# of the heap; the shader copies the four words to 0, and out[4..7] are the file's zeros, not the 0xEE fill.
+HEAP_INIT_WORDS = [0x1BADB002, 0xCAFEF00D, 0x80000001, 0x0000FFFF]
+HEAP_INIT_FILE = bytes(0x100) + struct.pack("<4I", *HEAP_INIT_WORDS)
+HEAP_INIT_EXPECTED = HEAP_INIT_WORDS + [0] * 4
+
+
+def heap_init_env():
+    """vk_compute_test's environment for cs_heap_init: the init file (written to the temp folder) and a buffer big
+    enough to hold it (68 words for its 0x110 bytes; one group's default is 64)."""
+    path = os.path.join(tempfile.gettempdir(), "leonida_cs_heap_init.bin")
+    with open(path, "wb") as f:
+        f.write(HEAP_INIT_FILE)
+    return {"VKC_HEAP_INIT": path, "VKC_OUT_WORDS": str(len(HEAP_INIT_FILE) // 4)}
+
+
 # cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
 # cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
-# them; the words are the exact fused results (derivations in the .asm header). The same with --fma glsl and --fma khr
-# (LEONIDA_FMA=khr for build.py): GLSL Fma may be split into two roundings by a driver, OpFmaKHR may not.
+# them; FMA_FUSED are the exact single-rounded words and FMA_SPLIT are the exact split-rounded words (derivations in
+# the .asm header; out[7] is f16 round-to-odd, never GLSL Fma, so it is always 0x7351). Under --fma khr
+# (LEONIDA_FMA=khr, shaderFmaFloat32 in index.json) every word must match FMA_FUSED; under default --fma glsl a
+# spec-compliant driver (e.g. Mesa RADV 26.2.6) may legally split GLSL.std.450 Fma.
 FMA_FUSED_ENV = {"VKC_SGPRS": "0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002"}
 FMA_FUSED = [0x33800000, 0xa8800000, 0x3a000400, 0x33800000, 0x33800000, 0x33800000, 0x28800000, 0x00007351]
+FMA_SPLIT = [0x00000000, 0x00000000, 0x3a000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00007351]
 # cs_cvt_f32_sat.asm (#300): s4 is a binary32 input, out[0] = v_cvt_u32_f32, out[1] = v_cvt_i32_f32 (truncate,
 # saturate, NaN -> 0). One dispatch per input through VKC_SGPRS; the inputs of tests/semantic/test_float_to_int.py.
 CVT_F32_SAT_CASES = (
@@ -288,6 +322,8 @@ W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
 PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_legacy_mul": (0, 0, 0, 0x40c00000),
+              "ps_mul_legacy_denorm": (0, 0, 0, 0x80000000),
+              "ps_mul_legacy_denorm_mods": (0, 0, 0, 0x40400000),
               "ps_ops": (0x48804300, 5, 7, 0xbffffffc), "ps_ops2": (0xabcd4400, 0x46001234, 0xbffffffa, 7),
               "ps_ops3": (0xbffffffa, 0x44660066, 0x44aabbcc, 16), "ps_ops4": (0x34000010, 0x00120800, 0xbeef0000, 0x12343c00),
               "ps_ops5": (0x12340010, 0xbeef0800, 0xaaaaffff, 0xdeadbc00),
@@ -307,6 +343,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
               "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
+              "ps_f64_round": (0xc12af665, 0x3fe7ffff, 0xbfffffff, 0xc12af666),
               "ps_outmods_f16": (0xaaaa3c00, 0xaaaa3e00, 0x7c000000, 0x3c000000),
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
               "ps_f16_med3_opsel": (0xaaaa4100, 0xaaaa4200, 0xaaaa3e00, 0x40005555),
@@ -341,6 +378,9 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (derivations in the .asm headers)
               "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
               "ps_valu16_subrev": (0xaaaabc00, 0xaaaac000, 0xaaaa3c00, 0x42003800),
+              # f32 VOPC ordered/unordered with a NaN, 64-bit integer VOPC (derivations in the .asm headers)
+              "ps_vcmp_f32_nan": (0x0000376c, 0x0000fd5b, 0x0000d36c, 0x00000fe7),
+              "ps_vcmp_64": (0x0000b3c4, 0x000091e6, 0x00006787, 0x00007c93),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
               "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
@@ -363,7 +403,14 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
                               "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x40e00000,0x1008=0x40a00000,"
                                           "0x100c=0x7fc10001,0x1010=0x40600000,0x1014=0xc0200000"},
              "ps_fnan_fract": {"VKH_SGPRS": "0x1000,0,16,0",
-                               "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"}}
+                               "VKH_HEAP": "0x1000=0xaedbe6ff,0x1004=0x00008800,0x1008=0x7fc10001,0x100c=0xc0200000"},
+             # f32 VOPC with a NaN, 64-bit integer VOPC: inputs from memory (derivations in the .asm headers)
+             "ps_vcmp_f32_nan": {"VKH_SGPRS": "0x1000,0,16,0",
+                                 "VKH_HEAP": "0x1000=0x7fc10001,0x1004=0x3f800000,0x1008=0x40000000"},
+             "ps_vcmp_64": {"VKH_SGPRS": "0x1000,0,64,0",
+                            "VKH_HEAP": "0x1000=0x80000000,0x1004=0,0x1008=1,0x100c=0,0x1010=0xffffffff,"
+                                        "0x1014=0xffffffff,0x1018=1,0x101c=0,0x1020=1,0x1024=0,0x1028=0x80000000,"
+                                        "0x102c=0,0x1030=7,0x1034=5,0x1038=7,0x103c=5"}}
 # ps_gather_wrap.asm (SHADER-36): image_gather4_l_o under each S# address mode, run by vk_texture_test (the 8x8 gradient
 # texture); the expected channels are derived in the .asm header.
 TEXTURE_CONSTANTS = {
@@ -538,6 +585,11 @@ def tbuffer_store_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_tbuffer_store", TBUFFER_STORE_WORDS + [0xEEEEEEEE] * 76, 192, env)
 
 
+def fmt_d16_xyz_test(tools, spirv, env=None):
+    """The d16_xyz/d16_xy loads and d16_xyz stores of cs_fmt_d16_xyz.asm: the whole 80-word heap."""
+    return dump_test(tools, spirv, "cs_fmt_d16_xyz", FMT_D16_XYZ_WORDS, len(FMT_D16_XYZ_WORDS), env)
+
+
 class Skip(str):
     """A result that is neither a pass nor a failure: the device can't run the test."""
 
@@ -659,6 +711,10 @@ def bitmask_perm_narrow_skip(out, px):
         return None
     lanes = {p[0] for p in px}
     width = max(lanes) + 1
+    # "pippi" reads lane ^ 9. Where that lane runs (every lane at 16 wide, none at 8) the word is defined and has
+    # to be right: a narrow run excuses only the sources that aren't there.
+    if any(a != lane ^ 9 for lane, a, _, _ in px if lane ^ 9 < width):
+        return None
     if lo <= width < 32 and width & (width - 1) == 0 and lanes == set(range(width)):
         return Skip(f"SKIP (fragment subgroup ran at {width} lanes on {lo}..{hi} device; needs 32)")
     return None
@@ -747,6 +803,63 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         if m and m.group(1) == "0":
             return ""
     return failure(code, out, 2)
+
+
+def shader_features(spirv, name):
+    """The Vulkan feature names recorded for a shader in index.json, or an empty set."""
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            feats = json.load(f).get(name, {}).get("features") or ()
+            return set(feats)
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def judge_fma_fused(words, khr):
+    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr every word must be exact fused; under --fma glsl
+    each of the 7 f32 words may be either fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the
+    f16 round-to-odd word out[7] must always be exact 0x00007351."""
+    if not words or len(words) < 8:
+        return False, "missing out[0..7] dump"
+    if khr:
+        for i, (got, want) in enumerate(zip(words, FMA_FUSED)):
+            if got != want:
+                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} (OpFmaKHR)"
+        return True, "8/8 fused exact (OpFmaKHR)"
+    if words[7] != FMA_FUSED[7]:
+        return False, f"word 7 (f16): got {words[7]:#010x}, want {FMA_FUSED[7]:#010x}"
+    n_split = 0
+    for i in range(7):
+        got, fused, split = words[i], FMA_FUSED[i], FMA_SPLIT[i]
+        if got == fused:
+            continue
+        if got == split:
+            n_split += 1
+            continue
+        return False, f"word {i}: got {got:#010x}, want fused {fused:#010x} or split {split:#010x}"
+    if n_split == 0:
+        return True, "8/8 fused exact (GLSL Fma)"
+    return True, f"{7 - n_split}/7 f32 fused, {n_split}/7 split (GLSL Fma; LEONIDA_FMA=khr for OpFmaKHR), f16 exact"
+
+
+def fma_fused_test(tools, spirv):
+    """Run cs_fma_fused and judge against FMA_FUSED (strict under --fma khr, fused-or-split f32 under --fma glsl)."""
+    shader = os.path.join(spirv, "cs_fma_fused.spv")
+    khr = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
+           or os.environ.get("LEONIDA_FMA") == "khr")
+    code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
+                    env=dict(os.environ, **FMA_FUSED_ENV))
+    if code == UNSUPPORTED:
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    if code != 0:
+        return failure(code, out, 2)
+    m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
+    if not m:
+        return failure(code, out, 2)
+    words = [int(x) for x in m.group(1).split()]
+    ok, detail = judge_fma_fused(words, khr=khr)
+    return "" if ok else detail
 
 
 def cvt_f32_sat_test(tools, spirv):
@@ -1269,6 +1382,24 @@ def mandelbrot_problem(px):
     return f"{len(wrong)} of {len(px)} iteration counts differ, e.g. pixel ({i % w}, {i // w}) {got} instead of {e}"
 
 
+def barycentric_problem(px: list[tuple[float, float, float, float]], abs_tol: float) -> str:
+    """Check ps_bary over the 64-by-64 frame covered by the vs_ids triangle."""
+    if len(px) != 64 * 64:
+        return f"expected 4096 pixels, got {len(px)}"
+    for index, pixel in enumerate(px):
+        a, b, _, _ = pixel
+        if not all(math.isfinite(v) for v in pixel):
+            return "barycentrics contain non-finite values"
+        y, x = divmod(index, 64)
+        # vs_ids exports (0,0), (2,0), (0,2) at the vertices. Check that gradient
+        # independently so a failure that zeros both interpolation paths is visible.
+        u, v = (x + 0.5) / 64, (y + 0.5) / 64
+        expected = (u, v, a / 2, b / 2)
+        if any(abs(got - want) > abs_tol for got, want in zip(pixel, expected)):
+            return f"at ({x},{y}): got {pixel}, expected {expected}"
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
@@ -1304,11 +1435,8 @@ def pixel_test(tools, spirv, name):
     if name in PIXEL_BITS:
         wrong = sum(p != PIXEL_BITS[name] for p in px)
         return "" if not wrong else f"{wrong} of {n} pixels differ, e.g. {[hex(x) for x in next(p for p in px if p != PIXEL_BITS[name])]}"
-    if name == "ps_bary":                              # raw i, j against the interpolated attr0.xy / 2
-        if any(not math.isfinite(v) for p in px for v in p):
-            return "barycentrics contain non-finite values"
-        err = max(max(abs(a / 2 - i), abs(b / 2 - j)) for a, b, i, j in px)
-        return "" if err < 1e-6 else f"barycentrics off by {err:.3g}"
+    if name == "ps_bary":
+        return barycentric_problem(px, 1e-6)
     if name == "ps_flat":
         if any(not math.isfinite(v) for p in px for v in p[2:]):
             return "UVs contain non-finite values"
@@ -1392,13 +1520,15 @@ def main():
     results.append(("cs_fmt_int_narrow", fmt_int_narrow_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
+    results.append(("cs_fmt_d16_xyz", fmt_d16_xyz_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
+    results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
+                                                 expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
-    results.append(("cs_fma_fused", compute_test(tools, spirv, "cs_fma_fused", "1", "dump", expected_words=FMA_FUSED,
-                                                 env=FMA_FUSED_ENV)))
+    results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1

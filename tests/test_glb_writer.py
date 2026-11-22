@@ -813,6 +813,22 @@ class TestObjParserAndBounds(unittest.TestCase):
         self.assertAlmostEqual(uvs[2][0], 0.0)
         self.assertAlmostEqual(uvs[2][1], 0.0)   # 1.0 - 1.0
 
+    def test_glb_generated_normals_split_at_explicit_obj_smoothing_boundaries(self) -> None:
+        vertices = ["v 0 0 0", "v 1 0 0", "v 0 1 0", "v 0 0 1"]
+        for directives in (("s off", "s off"), ("s 0", "s 0"), ("s 1", "s 2")):
+            with self.subTest(directives=directives):
+                obj = "\n".join([*vertices, directives[0], "f 1 2 3", directives[1], "f 2 1 4"])
+                prims = glb_writer.parse_obj(obj, is_path=False, up_axis="y")
+                data = glb_writer.build_glb(prims)
+                gltf = glb_writer.read_glb_summary(data)["json"]
+                mesh = gltf["meshes"][0]["primitives"][0]
+                accessor = gltf["accessors"][mesh["attributes"]["NORMAL"]]
+                view = gltf["bufferViews"][accessor["bufferView"]]
+                json_length = struct.unpack_from("<I", data, 12)[0]
+                start = 28 + json_length + view["byteOffset"]
+                normals = list(struct.iter_unpack("<3f", data[start:start + view["byteLength"]]))
+                self.assertEqual(normals, [(0.0, 0.0, 1.0)] * 3 + [(0.0, 1.0, 0.0)] * 3)
+
     def test_glb_preserves_finite_obj_normal_directions(self) -> None:
         obj = """\
 v 0 0 0
@@ -935,6 +951,25 @@ f 1//1 2//2 3//3
 
 
 class TestConcaveObjFaces(unittest.TestCase):
+    def test_collinear_corner_keeps_uv_in_exported_surface(self) -> None:
+        text = (
+            "v 0 0 0\nv 1 0 0\nv 2 0 0\nv 2 1 0\nv 0 1 0\n"
+            "vt 0 0.25\nvt 0.75 0.25\nf 1/1 2/2 3/1 4/1 5/1\n"
+        )
+        primitive, = glb_writer.parse_obj(text, is_path=False, up_axis="y")
+        packed = glb_writer.pack_primitive(primitive)
+        positions = list(struct.iter_unpack("<3f", packed["positions"]))
+        uvs = list(struct.iter_unpack("<2f", packed["uvs"]))
+        self.assertEqual(uvs[positions.index((1, 0, 0))], (0.75, 0.75))
+
+        areas = []
+        for triangle in struct.iter_unpack("<3H", packed["indices"]):
+            a, b, c = (positions[i] for i in triangle)
+            areas.append((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+        self.assertEqual(len(areas), 3)
+        self.assertTrue(all(area > 0 for area in areas), areas)
+        self.assertEqual(sum(areas), 4.0)
+
     def test_notched_face_preserves_its_surface_and_corner_attributes(self):
         # A square with a 2 x 3 notch, including a collinear point on its base.
         # Embed the outline in YZ so the down-axis projection matters.
@@ -1000,6 +1035,29 @@ class TestGlbWriterMainCli(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 ret = glb_writer.main([bad_obj, glb_path])
             self.assertEqual(ret, 1)
+
+    def test_main_cli_refuses_to_overwrite_the_input(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            obj_path = os.path.join(tmp_dir, "input.obj")
+            text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
+            with open(obj_path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            links = [obj_path]
+            try:
+                link = os.path.join(tmp_dir, "alias.obj")
+                os.link(obj_path, link)
+                links.append(link)
+            except (OSError, NotImplementedError):
+                pass
+            for out in links:
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    ret = glb_writer.main([obj_path, out])
+                self.assertEqual(ret, 1)
+                self.assertIn("overwrite the input", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+                with open(obj_path, encoding="utf-8", newline="") as f:
+                    self.assertEqual(f.read(), text)
 
 
 if __name__ == "__main__":

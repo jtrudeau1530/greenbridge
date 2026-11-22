@@ -1,6 +1,8 @@
 // Copies between two formats of one D3D12 copy family (depth <-> colour of the same size, BC <-> its uncompressed
-// equivalent), on the Vulkan-backed device and on host D3D12 (default adapter and WARP). Bytes read back compared.
+// equivalent), on the Vulkan-backed device and on host D3D12 (the layer's own adapter and WARP). Bytes read back
+// compared.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <d3d12sdklayers.h>
@@ -222,12 +224,13 @@ int main() {
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return 1;
     unsigned differ = 0, differ_depth = 0, compared = 0;
     for (const bool warp : {false, true}) {
-        const char* hn = warp ? "WARP" : "default adapter";
         for (const Case& c : cases) {
             // A fresh device per case: an invalid copy removes the host device.
             Ref<IDXGIAdapter> adapter;
             Ref<ID3D12Device> host;
-            if (warp && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
+            std::string adapter_name;
+            if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
+            const char* hn = adapter_name.c_str();
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
             // Only WARP validates; a hardware driver may run an invalid copy.
             if (!warp && std::strncmp(c.name, "negative", 8) == 0) continue;

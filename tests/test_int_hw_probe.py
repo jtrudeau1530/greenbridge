@@ -156,5 +156,27 @@ class IntHwProbeTests(unittest.TestCase):
             self.assertIn("disk full", err.getvalue())
 
 
+# v_bfe_u32 / v_bfe_i32 words measured natively on an AMD Radeon 610M (gfx1036, RDNA2), wave32 and wave64 identical:
+# `python -I tools/int_hw_probe.py --oracle both --group valu_bfe_past31`. A field that would run past bit 31 stops
+# there and v_bfe_i32 sign-extends from bit 31 (0xd2f90159, offset 28, width 16 gives 0xfffffffd, not 0xd); offset
+# and width are read from bits [4:0] only (offset 36 is 4, width 32 is 0).
+VALU_BFE_GFX1036 = {
+    "v_bfe_past31_vgpr": [0xFFFFFFFD, 0x0000000D, 0xFFFFFFFD, 0x0000000D],
+    "v_bfe_past31_sign": [0x00000001, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF],
+    "v_bfe_high_bits": [0x00000015, 0x00000000, 0xFFFFFFFD, 0x00000000],
+    "v_bfe_past31_const": [0xFFFFFFFD, 0x0000000D, 0xFFFFFFFD, 0x00000000],
+}
+
+
+class ValuBfeMeasuredOnRdna2(unittest.TestCase):
+    def test_translator_gives_the_gfx1036_words(self):
+        cases = [c for c in probe.build_cases() if c.group == "valu_bfe_past31"]
+        self.assertEqual(sorted(c.name for c in cases), sorted(VALU_BFE_GFX1036))
+        got = probe.run_translator(cases)
+        for name, want in VALU_BFE_GFX1036.items():
+            with self.subTest(case=name):
+                self.assertEqual(got[name], want)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -244,7 +244,7 @@ class NavmeshIndexTest(unittest.TestCase):
         carved = os.path.join(folder, "page.bin")
         with open(carved, "wb") as f:
             f.write(page(pages=4))
-        linked = os.path.join(folder, "report.json")
+        linked = os.path.join(self.root, "report.json")
         try:
             os.link(carved, linked)
         except (OSError, NotImplementedError) as e:

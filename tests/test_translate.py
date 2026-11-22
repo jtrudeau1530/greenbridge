@@ -8,15 +8,18 @@ import math
 import os
 import re
 import struct
+from pathlib import Path
 
 import pytest
 
 import rdna2spirv
-from conftest import EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, make_dxbc, mesh_psv0_chunk, requires_tools, signature_chunk
+from conftest import (EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, Shader, make_dxbc, mesh_psv0_chunk,
+                      requires_tools, signature_chunk)
 
 pytestmark = requires_tools
 
 SAMPLES = sorted(glob.glob(os.path.join(ROOT, "runtime", "test", "shaders", "*.asm")))
+SAMPLES += sorted(glob.glob(os.path.join(ROOT, "tests", "semantic", "fixtures", "ps_*.asm")))
 
 # One minimal pixel shader per instruction family listed in the "Supported" section of rdna2spirv.py's docstring.
 # Each body is wrapped in a program that exports its result so nothing is optimised away.
@@ -51,7 +54,7 @@ def program(body):
 
 @pytest.mark.parametrize("path", SAMPLES, ids=[os.path.basename(p) for p in SAMPLES])
 def test_gpu_samples_translate_and_validate(path, make_shader):
-    """The hand-written GPU-harness samples must translate to SPIR-V that passes spirv-val."""
+    """The hand-written GPU-harness and semantic shader samples must translate to valid SPIR-V."""
     stem = os.path.splitext(os.path.basename(path))[0]
     name = stem if stem.startswith(("vs_", "ps_", "cs_", "gs_", "ms_")) else "ps_" + stem   # the prefix selects the stage
     if name.startswith(("gs_", "ms_")) and stem not in SAMPLE_DXBC:
@@ -293,6 +296,27 @@ def test_compute_bad_group_size_is_rejected(make_shader, group):
     shader = make_shader("s_endpgm\n", name="cs_test", cs_header=(0x8088, group))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
+
+
+def test_geometry_emit_cut_starts_a_new_triangle_strip(tmp_path: Path) -> None:
+    asm = (Path(__file__).parent / "semantic" / "fixtures" / "gs_emit_cut.asm").read_text(encoding="utf-8")
+    position = [(0, 1, 0xf)]
+    dxbc = make_dxbc([signature_chunk(b"ISG1", position), signature_chunk(b"OSG1", position)])
+    shader = Shader(tmp_path, "gs_emit_cut", asm, dxbc=dxbc)
+    module = shader.translate()
+    shader.validate(module)
+    assert "OpExecutionMode %main OutputTriangleStrip" in module
+    # EXEC stays on throughout the fixture. Each end terminates the current strip after its last vertex.
+    strips: list[list[int]] = [[]]
+    vertex = 0
+    for event in re.findall(r"^\s*(OpEmitVertex|OpEndPrimitive)$", module, re.MULTILINE):
+        if event == "OpEndPrimitive":
+            strips.append([])
+        else:
+            strips[-1].append(vertex)
+            vertex += 1
+    assert strips == [[0, 1, 2], [3, 4, 5], []]
+    assert len(re.findall(r"OpEmitVertex\s+OpEndPrimitive", module)) == 2  # both run under the same EXEC guard
 
 
 def test_geometry_without_signatures_is_rejected(make_shader):
@@ -764,25 +788,30 @@ s_endpgm
 def test_float_controls_declared(stage, make_shader):
     """Every module declares SignedZeroInfNanPreserve for 32-bit floats, so the driver keeps NaN, inf and -0 as
     RDNA2 computes them (AMD folded x != x to false and turned -0 products into +0 without it; see
-    runtime/test/shaders/cs_signed_zero_nan.asm), and its index entry names the property the runtime checks."""
+    runtime/test/shaders/cs_signed_zero_nan.asm), and DenormPreserve for 16-bit floats, so it keeps an f16 denormal
+    instead of flushing it (NVIDIA read the 0x0040 of ps_sdwa_f16_const's `src0_sel:BYTE_1` as +0 without it,
+    SHADER-526). Its index entry names the device properties the runtime checks."""
     body = FLOAT_CONTROLS_CS if stage == "cs" else program("v_mul_f32 v1, v0, v0")
     shader = make_shader(body, name=f"{stage}_float_controls")
     spv = shader.translate()
     shader.validate(spv)
     assert "OpCapability SignedZeroInfNanPreserve" in spv
     assert "OpExecutionMode %main SignedZeroInfNanPreserve 32" in spv
+    assert "OpCapability DenormPreserve" in spv
+    assert "OpExecutionMode %main DenormPreserve 16" in spv
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
-    assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32"]
+    assert meta["float_controls"] == ["shaderSignedZeroInfNanPreserveFloat32", "shaderDenormPreserveFloat16"]
 
 
 def test_no_float_controls_leaves_them_out(make_shader, monkeypatch):
-    """--no-float-controls (FLOAT_CONTROLS = False), for a driver without the property: no capability, no
+    """--no-float-controls (FLOAT_CONTROLS = False), for a driver without the properties: no capability, no
     execution mode, no index entry, and the module still validates."""
     monkeypatch.setattr(rdna2spirv, "FLOAT_CONTROLS", False)
     shader = make_shader(FLOAT_CONTROLS_CS, name="cs_no_float_controls")
     spv = shader.translate()
     shader.validate(spv)
     assert "SignedZeroInfNanPreserve" not in spv
+    assert "DenormPreserve" not in spv
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
     assert "float_controls" not in meta
 
@@ -856,7 +885,9 @@ def test_barrier_rounds_are_wave32_compute_only(make_shader, monkeypatch):
     monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
     shader.translate()
     gen = rdna2spirv.translate.last_gen
-    assert gen.emulate and not gen.bar_rounds and gen.control_flow == "emulated wave64 rounds"
+    # #2089: --wave64-emulate keeps structured control flow where it can (was a round loop per barrier)
+    assert gen.emulate and not gen.bar_rounds and gen.control_flow in ("emulated wave64 structured",
+                                                                       "emulated wave64 rounds")
 
 
 # SHADER-36: image_gather4_l(_o) runs every texel of its 2x2 footprint through the S#'s CLAMP_X/CLAMP_Y.

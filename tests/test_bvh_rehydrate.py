@@ -237,6 +237,34 @@ class TestErrorsAndCli(unittest.TestCase):
                 self.assertEqual(R.main([paths["in.bin"], "--geom", paths["vb.bin"], "--out", paths["out.bin"],
                                          "--transform", "1,2,3"]), 2)
 
+    def test_out_must_not_overwrite_an_input(self):
+        src, _, _ = build([(0, 0x01, 0, None, 0x09), (0, 0x81, 0, 1, 0x09)])
+        with tempfile.TemporaryDirectory() as d:
+            paths = {k: os.path.join(d, k) for k in ("in.bin", "vb.bin", "ib.bin", "out.bin", "ref.bin")}
+            for k, data in (("in.bin", src), ("vb.bin", QUADS.vertices), ("ib.bin", QUADS.indices),
+                            ("ref.bin", R.rehydrate(src, [QUADS]))):
+                with open(paths[k], "wb") as f:
+                    f.write(data)
+            originals = {k: open(paths[k], "rb").read() for k in ("in.bin", "vb.bin", "ib.bin", "ref.bin")}
+            geo = paths["vb.bin"] + "," + paths["ib.bin"]
+            for argv, victim in (
+                    ([paths["in.bin"], "--geom", geo, "--out", paths["in.bin"]], "in.bin"),
+                    ([paths["in.bin"], "--geom", geo, "--out", paths["vb.bin"]], "vb.bin"),
+                    ([paths["in.bin"], "--geom", geo, "--out", paths["ref.bin"], "--compare", paths["ref.bin"]],
+                     "ref.bin")):
+                with self.subTest(victim=victim), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(R.main(argv), 2)
+                with open(paths[victim], "rb") as f:
+                    self.assertEqual(f.read(), originals[victim], victim)
+            alt = os.path.join(d, "IN.BIN")
+            if os.path.exists(alt):     # case-insensitive volume: IN.BIN is in.bin, so it must refuse
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(R.main([paths["in.bin"], "--geom", geo, "--out", alt]), 2)
+            text = io.StringIO()
+            with contextlib.redirect_stdout(text):
+                self.assertEqual(R.main([paths["in.bin"], "--geom", geo, "--out", paths["out.bin"]]), 0)
+            self.assertIn("rehydrated", text.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

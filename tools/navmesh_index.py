@@ -41,6 +41,7 @@ from file_mode import published_mode  # noqa: E402
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from report_paths import same_report_path  # noqa: E402
+from zero_span import gap_split  # noqa: E402
 
 CHUNK = 1 << 20
 HEAD = 0x80
@@ -60,7 +61,14 @@ ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 def below_normal():
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         k = ctypes.windll.kernel32
+        # The current-process pseudo-handle is pointer-sized on 64-bit Windows.
+        k.GetCurrentProcess.argtypes = ()
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k.SetPriorityClass.restype = wintypes.BOOL
         k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)
 
 
@@ -129,11 +137,9 @@ def scan_archive(path, start=None, limit=None):
                     pos = s + 1
                     continue
                 used = p - s - len(d.unused_data)
-                gap = m[last:s]
-                if gap.count(0) == len(gap):
-                    zero += len(gap)
-                else:
-                    unread += len(gap)
+                gap_zero, gap_unread = gap_split(m, last, s)
+                zero += gap_zero
+                unread += gap_unread
                 fields = page_fields(head)
                 total += 1
                 total_stored += used
@@ -141,11 +147,9 @@ def scan_archive(path, start=None, limit=None):
                 if fields:
                     rows.append({"source": path, "offset": s, "stored": used, "size": total_out, **fields})
                 last = pos = s + used
-            tail = m[last:end]
-            if tail.count(0) == len(tail):
-                zero += len(tail)
-            else:
-                unread += len(tail)
+            gap_zero, gap_unread = gap_split(m, last, end)
+            zero += gap_zero
+            unread += gap_unread
     span = end - start
     summary = {
         "input": path, "mode": "rpf", "start": start, "span": span, "streams": total,
@@ -271,6 +275,7 @@ def is_scanned_input(path, input_path, pattern):
         return True
     if not os.path.isdir(input_path) or not os.path.isfile(path):
         return False
+    pattern = pattern or "*.bin"
     # Walk up from the report path and compare each folder like same_report_path does (normcase, realpath,
     # samefile), so a spelling that differs only in case, or goes through a link, is still inside the input.
     target = os.path.abspath(path)
@@ -278,15 +283,13 @@ def is_scanned_input(path, input_path, pattern):
     while not same_report_path(root, input_path):
         parent = os.path.dirname(root)
         if parent == root:
-            return False
+            break
         root = parent
-    pattern = pattern or "*.bin"
-    if (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
-            or fnmatch.fnmatch(os.path.basename(target), pattern)):
-        return True
-    # The spelling may not match while the file is still one the scan reads: fnmatch folds case only on Windows,
-    # so CARVE/PAGE.BIN on a case-insensitive macOS or Linux volume, or a hard link, slips past the pattern. Ask
-    # the scan's own glob whether any file it reads is this one.
+    else:
+        if (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
+                or fnmatch.fnmatch(os.path.basename(target), pattern)):
+            return True
+    # A different spelling or a hard link anywhere can still refer to a scanned file.
     return any(same_report_path(target, scanned)
                for scanned in glob.iglob(
                    os.path.join(glob.escape(os.fspath(input_path)), "**", pattern), recursive=True))

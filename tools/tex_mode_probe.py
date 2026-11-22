@@ -83,10 +83,16 @@ def main():
     a = ap.parse_args()
     if bc_bpe(a.fmt) is None:
         ap.error(f"no color scorer for {a.fmt!r}; expected BC1, BC2, or BC3")
+    try:
+        with open(a.index, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as error:
+        ap.error(f"cannot read texture index {a.index}: {error}")
+    if not isinstance(index, list):
+        ap.error(f"{a.index}: texture index must contain a list")
     nib, tab = load()
-    with open(a.index, encoding="utf-8") as f:
-        texs = [t for t in json.load(f) if t["fmt_name"].startswith(a.fmt)
-                and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
+    texs = [t for t in index if t["fmt_name"].startswith(a.fmt)
+            and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
     texs = texs[: a.n]
     cands = {}
     for tname, ents in tab.items():
@@ -108,7 +114,10 @@ def main():
             align = 1 << bb
             top = mip_bytes(t["w"], t["h"], bpe, align)
             chain = sum(mip_bytes(max(1, t["w"] >> i), max(1, t["h"] >> i), bpe, align) for i in range(max(1, mips)))
-            for place, start in (("first", t["data_off"]), ("last", t["data_off"] + chain - top)):
+            placements = [("first", t["data_off"])]
+            if chain != top:
+                placements.append(("last", t["data_off"] + chain - top))
+            for place, start in placements:
                 o = offsets_for(list(eq), bb, bpe, wb, hb)
                 seg = G[start:start + (int(o.max()) + 1) * bpe]
                 if len(seg) < (int(o.max()) + 1) * bpe:

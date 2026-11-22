@@ -25,6 +25,7 @@ Groups covered (each references its contract row in docs/design.md):
     valu_cvt_16         v_cvt_f16_u16/i16, v_cvt_u16/i16_f16 (kept half, op_sel, NaN, inf)
     valu_cvt_flr_rpi    v_cvt_flr_i32_f32, v_cvt_rpi_i32_f32 (exact floor(x+0.5), signed NaN)
     valu_cvt_pknorm     v_cvt_pknorm_i16_f32, v_cvt_pknorm_u16_f32 (ties, saturation, NaN)
+    valu_bfe_past31     v_bfe_u32, v_bfe_i32 with offset + width > 32, width 0, offset/width bits above [4:0]
 
 Usage:
     python -I tools/int_hw_probe.py                         # translator side only (CPU)
@@ -656,6 +657,41 @@ def build_cases():
             "v_med3_i16 v10, v1, v2, v3",
             "v_med3_u16 v11, v1, v2, v3",
         ], "v_med3_i16 / v_med3_u16 signed vs unsigned median with op_sel"),
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_i16_u16_clamp", [
+            "v_mov_b32 v8, 0xbeef5a5a",
+            "v_mov_b32 v9, 0xbeef5a5a",
+            "v_mov_b32 v10, 0xbeef5a5a",
+            "v_mov_b32 v11, 0xbeef5a5a",
+            "v_mov_b32 v1, 0xfff00005", "v_mov_b32 v2, 0x00010002", "v_mov_b32 v3, 0x0003fff8",
+            "v_min3_i16 v8, v1, v2, v3 op_sel:[1,0,0,1] clamp",   # writes hi (fff0), keeps lo (5a5a)
+            "v_max3_u16 v9, v1, v2, v3 op_sel:[1,0,0,0] clamp",   # writes lo (fff8), keeps hi (beef)
+            "v_min3_u16 v10, v1, v2, v3 op_sel:[1,0,0,0] clamp",  # writes lo (0002), keeps hi (beef)
+            "v_max3_i16 v11, v1, v2, v3 op_sel:[1,0,0,1] clamp",  # writes hi (0002), keeps lo (5a5a)
+        ], "v_min3/max3_i16/u16 clamp range-invariance and untouched destination half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_med3_i16_u16_clamp", [
+            "v_mov_b32 v8, 0xbeef5a5a",
+            "v_mov_b32 v9, 0xbeef5a5a",
+            "v_mov_b32 v10, 0xbeef5a5a",
+            "v_mov_b32 v11, 0xbeef5a5a",
+            "v_mov_b32 v1, 0xfff00010", "v_mov_b32 v2, 0x00050020", "v_mov_b32 v3, 0x0001fff5",
+            "v_med3_i16 v8, v1, v2, v3 op_sel:[1,1,0,1] clamp",   # writes hi (fff5), keeps lo (5a5a)
+            "v_med3_u16 v9, v1, v2, v3 op_sel:[1,1,0,0] clamp",   # writes lo (fff0), keeps hi (beef)
+            "v_med3_i16 v10, v1, v2, v3 clamp",                   # writes lo (0010), keeps hi (beef)
+            "v_med3_u16 v11, v1, v2, v3 clamp",                   # writes lo (0020), keeps hi (beef)
+        ], "v_med3_i16 / v_med3_u16 clamp range-invariance and untouched destination half"),
+        _valu4_case("valu_min3_max3_med3_16", "v_min3_max3_med3_f16_clamp_nan", [
+            "v_mov_b32 v8, 0xbeef5a5a",
+            "v_mov_b32 v9, 0xbeef5a5a",
+            "v_mov_b32 v10, 0xbeef5a5a",
+            "v_mov_b32 v11, 0xbeef5a5a",
+            "v_mov_b32 v1, 0x38007e00",
+            "v_mov_b32 v2, 0xc0004000",
+            "v_mov_b32 v3, 0x3800bc00",
+            "v_min3_f16 v8, v1, v2, v3 clamp",
+            "v_max3_f16 v9, v1, v2, v3 clamp",
+            "v_med3_f16 v10, v1, v2, v3 clamp",
+            "v_med3_f16 v11, v1, v2, v3 op_sel:[1,1,1,1] clamp",
+        ], "v_min3/max3/med3_f16 NaN, DX10 clamp, dirty high-half sentinels and op_sel"),
     ]
 
     # 22. v_swaprel_b32 (M0[25:16] dst offset, M0[9:0] src offset, ignored upper M0 bits, self-swap, inactive EXEC)
@@ -688,6 +724,42 @@ def build_cases():
             "v_pack_b32_f16 v10, -|v1|, -|v2| op_sel:[1,0]",
             "v_pack_b32_f16 v11, -v1, |v2| op_sel:[0,1]",
         ], "v_pack_b32_f16 abs and -|src| with op_sel on -1.0, -0.0 and -qNaN payloads"),
+    ]
+
+    # 24. v_bfe_u32 / v_bfe_i32 past bit 31 (offset + width > 32), width 0, and the bits above [4:0]. The first
+    # three cases take offset and width from VGPRs (the translator's bfe_width path), the last one from constants
+    # (folded at translation time).
+    cases += [
+        _valu4_case("valu_bfe_past31", "v_bfe_past31_vgpr", [
+            "v_mov_b32 v1, 0xd2f90159", "v_mov_b32 v2, 28", "v_mov_b32 v3, 16", "v_mov_b32 v4, 31",
+            "v_bfe_i32 v8, v1, v2, v3",      # off 28 + width 16: a field that would end at bit 43
+            "v_bfe_u32 v9, v1, v2, v3",
+            "v_bfe_i32 v10, v1, v2, v4",     # off 28 + width 31
+            "v_bfe_u32 v11, v1, v2, v4",
+        ], "v_bfe_i32/u32 with offset + width > 32 from VGPRs"),
+        _valu4_case("valu_bfe_past31", "v_bfe_past31_sign", [
+            "v_mov_b32 v1, 0x5f000000", "v_mov_b32 v2, 30", "v_mov_b32 v3, 4", "v_mov_b32 v4, 3",
+            "v_bfe_i32 v8, v1, v2, v3",      # field bits 30-31 = 01, bit 33 (width 4's top) does not exist
+            "v_bfe_i32 v9, v1, 24, v3",      # off 24 + width 4 inside: control, 0xf -> -1
+            "v_mov_b32 v5, 0x80000000", "v_mov_b32 v6, 1",
+            "v_bfe_i32 v10, v5, v4, v6",     # off 3 width 1 on bit 3 = 0: control
+            "v_bfe_i32 v11, v5, 31, v3",     # off 31 + width 4: only bit 31 exists, so -1 (not 1)
+        ], "v_bfe_i32 sign of a field cut at bit 31"),
+        _valu4_case("valu_bfe_past31", "v_bfe_high_bits", [
+            "v_mov_b32 v1, 0xd2f90159", "v_mov_b32 v2, 36", "v_mov_b32 v3, 32", "v_mov_b32 v4, 0xfffffffc",
+            "v_mov_b32 v5, 0xfffffff0",
+            "v_bfe_u32 v8, v1, v2, 8",       # offset 36: 4 if only [4:0] is read
+            "v_bfe_u32 v9, v1, 0, v3",       # width 32: 0 if only [4:0] is read
+            "v_bfe_i32 v10, v1, v4, v5",     # offset 0xfffffffc (28), width 0xfffffff0 (16)
+            "v_bfe_i32 v11, v1, v2, 0",      # width 0
+        ], "v_bfe offset and width bits above [4:0], and width 0"),
+        _valu4_case("valu_bfe_past31", "v_bfe_past31_const", [
+            "v_mov_b32 v1, 0xd2f90159",
+            "v_bfe_i32 v8, v1, 28, 16",      # constant offset and width: folded by the translator
+            "v_bfe_u32 v9, 0xd2f90159, 28, 31",
+            "v_bfe_i32 v10, v1, 60, 48",     # 60 & 31 = 28, 48 & 31 = 16
+            "v_bfe_i32 v11, v1, 31, 64",     # width 64 & 31 = 0
+        ], "v_bfe with constant offset and width past bit 31"),
     ]
 
     return cases

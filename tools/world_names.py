@@ -223,6 +223,10 @@ class NameDictionary:
             return False
         if any(ord(ch) < 0x20 for ch in name):
             return False
+        try:
+            name.encode("utf-8")
+        except UnicodeEncodeError:   # a lone surrogate (JSON \ud800 escape, XML &#xD800;) has no UTF-8 form to hash
+            return False
         table = self.derived if derived else self.names
         h = joaat(name)
         table.setdefault(h, set()).add(name)
@@ -483,12 +487,12 @@ def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = Fa
 
 def resolve_archetypes(data, dictionary: NameDictionary, *, include_derived: bool = False) -> dict:
     if not isinstance(data, dict):
-        return {}
+        raise ValueError("expected an archetype report object")
     raw = data.get("archetypes")
     if not isinstance(raw, dict):
         raw = data.get("hashes")
     if not isinstance(raw, dict):
-        return {}
+        raise ValueError("expected an archetypes or hashes table")
     keys = data.get("keys") if isinstance(data.get("keys"), dict) else data.get("key64")
     if not isinstance(keys, dict):
         keys = {}
@@ -588,8 +592,11 @@ def _resolve(args) -> int:
         report["maps"] = dict(maps)
     archetypes = collections.Counter()
     for path in args.archetypes:
-        data = _load_json(path)
-        stats = resolve_archetypes(data, dictionary, include_derived=args.include_derived)
+        try:
+            data = _load_json(path)
+            stats = resolve_archetypes(data, dictionary, include_derived=args.include_derived)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from None
         for key, value in stats.items():
             archetypes[key] += value
     if args.archetypes:

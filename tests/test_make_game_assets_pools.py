@@ -29,6 +29,8 @@ class AssetsPoolsTest(unittest.TestCase):
             stem = os.path.splitext(os.path.basename(rel))[0]
             for mode in ("models", "textures"):
                 self.stub(os.path.join(self.out, stem, mode, "manifest.json"))
+                with open(os.path.join(self.out, stem, mode, make_game.DECODER_RECORD), "w") as f:
+                    f.write(make_game.decoder_digest())
         self.stub(os.path.join(self.out, "audio", "audio_manifest.json"))
         self.stub(os.path.join(self.out, "audio", "ogg.done"))
         self.stub(os.path.join(self.out, "audio", "xma.done"))

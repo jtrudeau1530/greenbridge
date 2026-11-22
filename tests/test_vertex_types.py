@@ -176,6 +176,19 @@ class BlockTests(unittest.TestCase):
             nrm = out["tags"]["slot2:21"]
             self.assertEqual(nrm["facenormal_oct_bit31_10_or_8_median"], 1.0)
 
+    def test_0x21_tangent_follows_u_and_bit30_is_the_bitangent_sign(self):
+        # flat grid: dP/du = +x, dP/dv = +y, normal +z. 10-bit: angle field 0 (-pi) turns b1 = -x into +x;
+        # 8-bit: octahedral tangent (127, 64) = +x. cross(+z, +x) = +y runs along +v, so bit 30 set agrees.
+        for form, word in (("10", 0x80000000 | 512 | 512 << 10), ("8", 128 | 128 << 8 | 127 << 16 | 64 << 23)):
+            for bit30, agree in ((1 << 30, True), (0, False)):
+                _, out = measure(block(normal=struct.pack("<I", word | bit30)))
+                nrm = out["tags"]["slot2:21"]
+                checked = nrm[f"tangent{form}_checked"]
+                self.assertGreater(checked, 0)
+                self.assertEqual(nrm[f"tangent{form}_along_u"], checked)
+                self.assertEqual(nrm[f"tangent{form}_sign_agree"], checked if agree else 0)
+                self.assertLess(nrm[f"tangent{form}_rotated_along_u"], checked)
+
     def test_positions_follow_the_surface(self):
         _, out = measure(block())
         self.assertLess(out["pos_edge_vs_random_median"], 0.5)
@@ -217,6 +230,43 @@ class Normal0x21Tests(unittest.TestCase):
         self.assertGreater(hi[0], 0.999)
         self.assertLess(lo[0], 0.1)
         self.assertLess(lo[2], -0.9)
+
+
+class Tangent0x21Tests(unittest.TestCase):
+    def test_10bit_tangent_is_unit_and_perpendicular_to_the_normal(self):
+        rng = random.Random(3)
+        for _ in range(2000):
+            w = 0x80000000 | rng.getrandbits(31)
+            n = vt.normal_0x21(w)
+            t, sign = vt.tangent_0x21(w)
+            self.assertAlmostEqual(sum(a * a for a in t), 1.0, places=9)
+            self.assertLess(abs(sum(a * b for a, b in zip(n, t))), 1e-9)
+            self.assertEqual(sign, 1 if (w >> 30) & 1 else -1)
+
+    def test_10bit_angle_turns_the_tangent_about_the_normal(self):
+        # normal +z: b1 = -x, b2 = -y, tangent = (-cos, sin, 0) for angle = v * 2pi / 1023 - pi
+        base = 0x80000000 | 512 | 512 << 10
+        for v in (0, 256, 511, 767, 1023):
+            ang = v * 2 * math.pi / 1023 - math.pi
+            t, _ = vt.tangent_0x21(base | v << 20)
+            self.assertAlmostEqual(t[0], -math.cos(ang), delta=2e-3)
+            self.assertAlmostEqual(t[1], math.sin(ang), delta=2e-3)
+
+    def test_negative_z_normal_uses_the_other_basis_sign(self):
+        # x = y = 0 folds to -z with the octahedral corner (1023, 1023); the basis stays perpendicular there
+        w = 0x80000000 | 1023 | 1023 << 10 | 300 << 20
+        n = vt.normal_0x21(w)
+        t, _ = vt.tangent_0x21(w)
+        self.assertLess(n[2], -0.99)
+        self.assertLess(abs(sum(a * b for a, b in zip(n, t))), 1e-9)
+
+    def test_8bit_tangent_is_octahedral_in_bits_16_to_29(self):
+        t, sign = vt.tangent_0x21(127 << 16 | 64 << 23)
+        self.assertGreater(t[0], 0.999)
+        self.assertEqual(sign, -1)
+        t, sign = vt.tangent_0x21(64 << 16 | 127 << 23 | 1 << 30)
+        self.assertGreater(t[1], 0.999)
+        self.assertEqual(sign, 1)
 
 
 class BlockRunTests(unittest.TestCase):

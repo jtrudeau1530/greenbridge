@@ -96,8 +96,10 @@ bool region_is(const Frame& frame, UINT x0, UINT y0, UINT x1, UINT y1, Px want, 
 // A CPU model of runtime/src/present_compose.comp, in double precision, written from the documented behaviour
 // (docs/d3d12_vulkan.md section 4.5), not from the shader's code: planes scaled from a source rectangle to a
 // destination rectangle (point: the texel containing the sample; bilinear: four texels clamped inside the source
-// rectangle), SDR = G2.2 Rec.709, HDR10 = PQ Rec.2020, conversions through linear light and `white` nits, plane 1 blended
-// over plane 0 in the output's encoded space, premultiplied or straight.
+// rectangle). SDR = piecewise sRGB (or G2.2, `gamma22`) Rec.709, HDR10 = PQ Rec.2020. Every texel is decoded to linear light,
+// premultiplied, before it is weighted; the filtered plane is converted to the output's linear working space (HDR10 output:
+// Rec.2020 nits with SDR white = `white` nits; SDR output: Rec.709 with SDR white = 1, HDR10 content tone mapped by
+// extended Reinhard with its white point at `hdr_peak` nits), plane 1 is blended over plane 0 there and the sum is encoded once.
 namespace xbox_present_ref {
 
 struct Tex {
@@ -110,6 +112,8 @@ struct Ref_plane {
     bool point = false, hdr = false, straight = false;
 };
 using V3 = std::array<double, 3>;
+bool gamma22 = false;       // SDR EOTF: false piecewise sRGB, true pure 2.2
+double hdr_peak = 1000.0;   // nits, the tone map's white point
 
 double pq_encode(double nits) {
     const double m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
@@ -121,43 +125,74 @@ double pq_decode(double e) {
     const double ep = std::pow(std::clamp(e, 0.0, 1.0), 1.0 / m2);
     return 10000.0 * std::pow(std::max(ep - c1, 0.0) / (c2 - c3 * ep), 1.0 / m1);
 }
-V3 convert(V3 c, bool plane_hdr, bool out_hdr, double white) {
-    if (plane_hdr == out_hdr) return c;
-    if (!plane_hdr) {  // SDR -> PQ
-        const double r = std::pow(std::clamp(c[0], 0.0, 1.0), 2.2), g = std::pow(std::clamp(c[1], 0.0, 1.0), 2.2),
-                     b = std::pow(std::clamp(c[2], 0.0, 1.0), 2.2);
-        return {pq_encode((0.627404 * r + 0.329283 * g + 0.043313 * b) * white),
-                pq_encode((0.069097 * r + 0.919540 * g + 0.011362 * b) * white),
-                pq_encode((0.016391 * r + 0.088013 * g + 0.895595 * b) * white)};
-    }
-    const double r = pq_decode(c[0]), g = pq_decode(c[1]), b = pq_decode(c[2]);
-    const auto sdr = [&](double v) { return std::pow(std::clamp(v / white, 0.0, 1.0), 1.0 / 2.2); };
-    return {sdr(1.660491 * r - 0.587641 * g - 0.072850 * b), sdr(-0.124550 * r + 1.132900 * g - 0.008349 * b),
-            sdr(-0.018151 * r - 0.100579 * g + 1.118730 * b)};
+double sdr_decode(double e) {
+    e = std::max(e, 0.0);
+    if (gamma22) return std::pow(e, 2.2);
+    return e <= 0.04045 ? e / 12.92 : std::pow((e + 0.055) / 1.055, 2.4);
 }
-std::array<double, 4> sample(const Ref_plane& p, int x, int y) {
+double sdr_encode(double l) {
+    l = std::clamp(l, 0.0, 1.0);
+    if (gamma22) return std::pow(l, 1.0 / 2.2);
+    return l <= 0.0031308 ? l * 12.92 : 1.055 * std::pow(l, 1.0 / 2.4) - 0.055;
+}
+// The tone map's luminance curve, in units of SDR white: identity up to the knee (0.8), above it extended Reinhard on the
+// excess (Reinhard et al. 2002, eq. 4) with value and slope continuous at the knee and the content peak mapped to 1.0.
+double tone_y(double y, double white) {
+    const double knee = 0.8, t = 1.0 - knee;
+    if (y <= knee) return y;
+    const double lw = std::max(hdr_peak / white, 1.0), w = (lw - knee) / t, u = (y - knee) / t;
+    return knee + t * u * (1.0 + u / (w * w)) / (1.0 + u);
+}
+// v in linear Rec.709 with SDR white = 1: colour scaled by Yd / Y.
+V3 tone_map(V3 v, double white) {
+    const double y = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+    const double s = y > 0.0 ? tone_y(y, white) / y : 1.0;
+    return {v[0] * s, v[1] * s, v[2] * s};
+}
+// A premultiplied linear colour of alpha `a` from the plane's space to the output's working space.
+V3 to_working(V3 lin, double a, bool plane_hdr, bool out_hdr, double white) {
+    if (plane_hdr == out_hdr) return lin;
+    if (!plane_hdr)  // Rec.709 -> Rec.2020, SDR white at `white` nits
+        return {(0.627404 * lin[0] + 0.329283 * lin[1] + 0.043313 * lin[2]) * white,
+                (0.069097 * lin[0] + 0.919540 * lin[1] + 0.011362 * lin[2]) * white,
+                (0.016391 * lin[0] + 0.088013 * lin[1] + 0.895595 * lin[2]) * white};
+    if (a <= 0.0) return {0, 0, 0};
+    const double r = lin[0] / a, g = lin[1] / a, b = lin[2] / a;
+    V3 v{std::max((1.660491 * r - 0.587641 * g - 0.072850 * b) / white, 0.0),
+         std::max((-0.124550 * r + 1.132900 * g - 0.008349 * b) / white, 0.0),
+         std::max((-0.018151 * r - 0.100579 * g + 1.118730 * b) / white, 0.0)};
+    v = tone_map(v, white);
+    return {v[0] * a, v[1] * a, v[2] * a};
+}
+// The texel as linear premultiplied colour and alpha, in the plane's space. `opaque`: plane 0, whose alpha is ignored.
+std::array<double, 4> decode_texel(const std::array<double, 4>& t, const Ref_plane& p, bool opaque) {
+    const double a = opaque ? 1.0 : std::clamp(t[3], 0.0, 1.0);
+    std::array<double, 4> out{0, 0, 0, a};
+    for (int c = 0; c < 3; ++c) {
+        double e = t[c];
+        if (!opaque && !p.straight) e = a > 0.0 ? e / a : 0.0;  // premultiplied data is divided by alpha for the decode
+        out[c] = (p.hdr ? pq_decode(e) : sdr_decode(e)) * a;
+    }
+    return out;
+}
+std::array<double, 4> sample(const Ref_plane& p, bool opaque, int x, int y) {
     const Tex& t = *p.tex;
     const double u = (x + 0.5 - p.dest[0]) / (p.dest[2] - p.dest[0]), v = (y + 0.5 - p.dest[1]) / (p.dest[3] - p.dest[1]);
     const double sx = p.src[0] + u * (p.src[2] - p.src[0]), sy = p.src[1] + v * (p.src[3] - p.src[1]);
-    const auto at = [&](int ix, int iy) { return t.px[std::size_t(iy) * t.w + ix]; };
+    const auto at = [&](int ix, int iy) { return decode_texel(t.px[std::size_t(iy) * t.w + ix], p, opaque); };
     if (p.point)
         return at(int(std::clamp(std::floor(sx), p.src[0], p.src[2] - 1)), int(std::clamp(std::floor(sy), p.src[1], p.src[3] - 1)));
     const double fx = std::clamp(sx - 0.5, p.src[0], p.src[2] - 1), fy = std::clamp(sy - 0.5, p.src[1], p.src[3] - 1);
     const int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
     const int x1 = int(std::min(double(x0) + 1, p.src[2] - 1)), y1 = int(std::min(double(y0) + 1, p.src[3] - 1));
     const double wx = fx - x0, wy = fy - y0;
-    // Four texels with their bilinear weights. Straight-alpha colour is weighted by its alpha (filtering associated colour),
-    // then divided by the filtered alpha: a transparent texel contributes no colour of its own.
+    // Four decoded texels with their bilinear weights: linear light, premultiplied, so a transparent texel contributes no
+    // colour of its own.
     const double weight[4] = {(1 - wx) * (1 - wy), wx * (1 - wy), (1 - wx) * wy, wx * wy};
     const std::array<double, 4> texel[4] = {at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1)};
     std::array<double, 4> out{};
-    for (int i = 0; i < 4; ++i) {
-        const double colour_weight = p.straight ? weight[i] * texel[i][3] : weight[i];
-        for (int c = 0; c < 3; ++c) out[c] += texel[i][c] * colour_weight;
-        out[3] += texel[i][3] * weight[i];
-    }
-    if (p.straight)
-        for (int c = 0; c < 3; ++c) out[c] = out[3] > 0.0 ? out[c] / out[3] : 0.0;
+    for (int i = 0; i < 4; ++i)
+        for (int c = 0; c < 4; ++c) out[c] += texel[i][c] * weight[i];
     return out;
 }
 V3 compose(const Ref_plane* planes, int count, bool out_hdr, double white, int x, int y) {
@@ -166,21 +201,15 @@ V3 compose(const Ref_plane* planes, int count, bool out_hdr, double white, int x
     };
     V3 base{0, 0, 0};
     if (inside(planes[0])) {
-        const auto c = sample(planes[0], x, y);
-        base = convert({c[0], c[1], c[2]}, planes[0].hdr, out_hdr, white);
+        const auto c = sample(planes[0], true, x, y);
+        base = to_working({c[0], c[1], c[2]}, 1.0, planes[0].hdr, out_hdr, white);
     }
     if (count > 1 && inside(planes[1])) {
-        const Ref_plane& p = planes[1];
-        const auto c = sample(p, x, y);
-        const double a = std::clamp(c[3], 0.0, 1.0);
-        V3 over{c[0], c[1], c[2]};
-        if (p.hdr != out_hdr) {  // converted as unassociated colour, premultiplied again afterwards
-            if (!p.straight && a > 0.0) over = {c[0] / a, c[1] / a, c[2] / a};
-            over = convert(over, p.hdr, out_hdr, white);
-            if (!p.straight) over = {over[0] * a, over[1] * a, over[2] * a};
-        }
-        for (int i = 0; i < 3; ++i) base[i] = p.straight ? base[i] * (1 - a) + over[i] * a : over[i] + (1 - a) * base[i];
+        const auto c = sample(planes[1], false, x, y);
+        const V3 over = to_working({c[0], c[1], c[2]}, c[3], planes[1].hdr, out_hdr, white);
+        for (int i = 0; i < 3; ++i) base[i] = over[i] + (1 - c[3]) * base[i];
     }
+    for (double& v : base) v = out_hdr ? pq_encode(std::max(v, 0.0)) : sdr_encode(v);
     return base;
 }
 
@@ -246,7 +275,7 @@ int main() {
                                   100, 100, frame_rect.right - frame_rect.left, frame_rect.bottom - frame_rect.top,
                                   nullptr, nullptr, window_class.hInstance, nullptr);
     EXPECT(window);
-    ShowWindow(window, SW_SHOWNORMAL);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
     UpdateWindow(window);
     pump();
 
@@ -632,6 +661,15 @@ int main() {
                         p.tex.px[std::size_t(y) * p.tex.w + x] = {R / 1023.0, G / 1023.0, B / 1023.0, 1.0};
                 return true;
             };
+            // R10G10B10A2 with a 2-bit alpha (0..3): stored colour is premultiplied by the caller.
+            const auto paint10a = [&](Painted& p, D3D12_RECT r, int R, int G, int B, int A) {
+                const FLOAT c[4] = {R / 1023.0f, G / 1023.0f, B / 1023.0f, A / 3.0f};
+                if (!fill(p.source, c, 1, &r)) return false;
+                for (LONG y = r.top; y < r.bottom; ++y)
+                    for (LONG x = r.left; x < r.right; ++x)
+                        p.tex.px[std::size_t(y) * p.tex.w + x] = {R / 1023.0, G / 1023.0, B / 1023.0, A / 3.0};
+                return true;
+            };
             // One PresentX of `count` planes, a fresh token for all; the swapchain frame is read back into `frame`.
             const auto present_planes = [&](rt::d3d12::XboxPresentPlaneParameters* planes_, UINT count_, HRESULT want = S_OK) {
                 clock.advance_us(4 * period);
@@ -673,6 +711,32 @@ int main() {
             const std::uint64_t composed_start = xbox.presenter().composed_presents();
             std::uint64_t composed_expected = composed_start;
             const auto composed_ok = [&] { return xbox.presenter().composed_presents() == ++composed_expected; };
+            // Fixed inputs whatever the machine says: SDR white 203 nits (not the Windows slider), piecewise sRGB (not
+            // LEONIDA_SDR_EOTF), peak 1000 nits. The query itself is checked on its own below.
+            xbox.set_sdr_white_nits(203.0f);
+            xbox.set_sdr_eotf(leonida::PresentPlanes::SdrEotf::srgb);
+            xbox.set_hdr_peak_nits(1000.0f);
+            xbox_present_ref::gamma22 = false;
+            xbox_present_ref::hdr_peak = 1000.0;
+            {
+                EXPECT(rt::d3d12::sdr_white_nits_from_level(1000) == 80.0f && rt::d3d12::sdr_white_nits_from_level(2500) == 200.0f &&
+                       rt::d3d12::sdr_white_nits_from_level(6000) == 480.0f);
+                // The query's cost: why PresentX does not run it (the layer caches it from a background thread).
+                float windows_white = 0.0f;
+                double total_us = 0, worst_us = 0;
+                const int queries = 50;
+                for (int q = 0; q < queries; ++q) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    windows_white = xbox.presenter().display_sdr_white_nits();  // 0 when Windows has no answer
+                    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                    total_us += us;
+                    worst_us = std::max(worst_us, us);
+                }
+                std::printf("SDR white level query: %.0f us mean, %.0f us worst over %d calls\n", total_us / queries, worst_us, queries);
+                EXPECT(windows_white == 0.0f || (windows_white >= 80.0f && windows_white <= 480.0f));
+                std::printf("SDR white level of this window's output from Windows: %s%.1f nits (hdr_active %d)\n",
+                            windows_white > 0 ? "" : "unavailable, ", windows_white, int(xbox.presenter().hdr_active()));
+            }
 
             // A: one plane, scaled 2x to the middle of the output, point and linear; the rest of the output is black.
             Painted quad;
@@ -754,8 +818,7 @@ int main() {
             // Straight alpha with bilinear filtering across a transparent edge: opaque white on the left, transparent black on the
             // right. Colour is filtered premultiplied, so the edge is white at partial alpha, not grey (filtering the
             // unassociated colour would also quarter the colour and quarter it again by the alpha). At output x=160 the sample
-            // is 0.75 of the way from the white texel to the transparent one: alpha 0.25, colour white:
-            // base 51 + 0.25 * (255 - 51) = 102.
+            // is 0.75 of the way from the white texel to the transparent one: alpha 0.25, colour white, blended in linear light.
             Painted edge;
             EXPECT(make_painted(edge, 80, 60));
             EXPECT(paint(edge, {0, 0, 40, 60}, 255, 255, 255, 255) && paint(edge, {40, 0, 80, 60}, 0, 0, 0, 0));
@@ -766,8 +829,13 @@ int main() {
             EXPECT(frame_matches(frame, refs, 2, false, 203.0, 1));
             {
                 const Px edge_px = frame.at(160, 120);
-                // red: 51 + 0.25 * 204 = 102 (blue: 230 + 0.25 * 25 = 236); the unfiltered-colour result would be near 54
-                EXPECT(std::abs(edge_px.r - 102) <= 1 && std::abs(edge_px.b - 236) <= 1);
+                // Linear light: red 0.25 + 0.75 * lin(51/255), blue 0.25 + 0.75 * lin(230/255), then encoded (piecewise sRGB:
+                // about 143 and 237); the unfiltered-colour result would be near 54 and blending the encoded values would give 102.
+                const auto expect_level = [](double base255) {
+                    return int(std::lround(255 * xbox_present_ref::sdr_encode(0.25 + 0.75 * xbox_present_ref::sdr_decode(base255 / 255))));
+                };
+                EXPECT(std::abs(edge_px.r - expect_level(51)) <= 1 && std::abs(edge_px.b - expect_level(230)) <= 1);
+                std::printf("compose: edge pixel %d,%d,%d (linear-light model %d,%d)\n", edge_px.r, edge_px.g, edge_px.b, expect_level(51), expect_level(230));
             }
             std::printf("compose: straight alpha, bilinear across a transparent edge (premultiplied filtering): ok\n");
 
@@ -785,7 +853,7 @@ int main() {
             const bool surface_hdr = xbox.presenter().hdr_active();
             if (!surface_hdr) {
                 EXPECT(frame_matches(frame, &href, 1, false, 203.0, 2));
-                std::printf("compose: HDR10 plane to an SDR swapchain (clipped to SDR, white = 203 nits): within 2 levels of the model\n");
+                std::printf("compose: HDR10 plane to an SDR swapchain (tone mapped to SDR, white = 203 nits, peak 1000): within 2 levels of the model\n");
             } else {
                 // A real HDR10 swapchain: the 10-bit codes come out as they went in (plane 0, point, 1:1 PQ).
                 EXPECT(frame.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || frame.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
@@ -834,8 +902,128 @@ int main() {
                 std::printf("compose: the surface has HDR10: the forced-encoding checks are skipped on it\n");
             }
             if (!surface_hdr)
-                std::printf("compose: HDR10 swapchain: this surface/display lists no ST.2084 format, so only the SDR clip and "
+                std::printf("compose: HDR10 swapchain: this surface/display lists no ST.2084 format, so only the SDR tone map and "
                             "the PQ encoder were run (HDR10 swapchain case skipped)\n");
+
+            // C2: linear-light blending and the SDR EOTF option. A 50% white overlay (premultiplied 128,128,128 alpha 128) over
+            // black is half the light: byte 188 with piecewise sRGB, 186 with gamma 2.2 (blending the encoded values would give
+            // 128), checked against the model and against these numbers.
+            {
+                Painted black, half_white;
+                EXPECT(make_painted(black, width, height));
+                EXPECT(paint(black, {0, 0, LONG(width), LONG(height)}, 0, 0, 0, 255));
+                EXPECT(make_painted(half_white, 8, 8));
+                EXPECT(paint(half_white, {0, 0, 8, 8}, 128, 128, 128, 128));
+                pair[0] = parameters(black.source, nullptr, xbox_scale_filter_point);
+                pair[1] = parameters(half_white.source, nullptr, xbox_scale_filter_point, 0, rt::d3d12::xbox_plane_flag_overlay);
+                Ref_plane lrefs[2] = {model(black, nullptr, true), model(half_white, nullptr, true)};
+                const double alpha = 128.0 / 255.0;
+                for (const bool g22 : {false, true}) {
+                    xbox.set_sdr_eotf(g22 ? leonida::PresentPlanes::SdrEotf::gamma22 : leonida::PresentPlanes::SdrEotf::srgb);
+                    xbox_present_ref::gamma22 = g22;
+                    EXPECT(present_planes(pair, 2) && composed_ok());
+                    EXPECT(frame_matches(frame, lrefs, 2, false, 203.0, 1));
+                    // the overlay's white, as light (premultiplied 128/255 over alpha 0.502 is white): 0.502 of full white
+                    const int want = int(std::lround(255 * xbox_present_ref::sdr_encode(alpha)));
+                    EXPECT(region_is(frame, 0, 0, width, height, {want, want, want}, 1));
+                    // independent of the model's formulas (hand calculation: 0.50196 as light is 187.8 and 186.4 in bytes)
+                    EXPECT(region_is(frame, 0, 0, width, height, g22 ? Px{186, 186, 186} : Px{188, 188, 188}, 1));
+                    std::printf("compose: 50%% white over black, %s: byte %d (model %d, encoded-space blend would be 128)\n",
+                                g22 ? "gamma 2.2" : "piecewise sRGB", frame.at(10, 10).r, want);
+                    // an SDR plane 0 alone through the same EOTF: bytes come out as they went in
+                    one = parameters(quad.source, nullptr, xbox_scale_filter_point);
+                    EXPECT(present_planes(&one, 1) && composed_ok());
+                    Ref_plane q = model(quad, nullptr, true);
+                    EXPECT(frame_matches(frame, &q, 1, false, 203.0, 0));
+                }
+                xbox.set_sdr_eotf(leonida::PresentPlanes::SdrEotf::srgb);
+                xbox_present_ref::gamma22 = false;
+                std::printf("compose: SDR EOTF sRGB and gamma 2.2: linear blend matches the model, single planes unchanged: ok\n");
+            }
+
+            // C3: HDR10 -> SDR output is tone mapped, not clipped: identity on luminance up to 0.8 of SDR white (162 nits), then
+            // a Reinhard shoulder that maps the content peak to 1.0. Eight columns of grey (50, 100, 150, 203, 300, 500, 750, 1000
+            // nits). The expected bytes are hand calculations (sRGB encode of the knee curve), not the model's code; 10-bit PQ
+            // codes make them good to 2.
+            {
+                // the curve itself: monotonic, identity below the knee, continuous in slope, peak -> 1
+                for (const double white : {203.0, 100.0}) {
+                    double previous = -1;
+                    for (double y = 0; y <= 20; y += 0.01) {
+                        const double d_y = xbox_present_ref::tone_y(y, white);
+                        EXPECT(d_y >= previous);
+                        EXPECT(y > 0.8 || d_y == y);
+                        previous = d_y;
+                    }
+                    const double lw = xbox_present_ref::hdr_peak / white;
+                    EXPECT(std::abs(xbox_present_ref::tone_y(std::max(lw, 1.0), white) - 1.0) < 1e-12);
+                    const double e = 1e-6;
+                    EXPECT(std::abs((xbox_present_ref::tone_y(0.8 + e, white) - 0.8) / e - 1.0) < 1e-3);
+                }
+            }
+            if (!surface_hdr) {
+                Painted ramp;
+                EXPECT(make_painted(ramp, 80, 60, DXGI_FORMAT_R10G10B10A2_UNORM));
+                const double ramp_nits[8] = {50, 100, 150, 203, 300, 500, 750, 1000};
+                const int want_1000[8] = {136, 186, 223, 243, 250, 253, 254, 255};
+                const int want_600[8] = {136, 186, 223, 244, 250, 254, 255, 255};
+                for (int i = 0; i < 8; ++i)
+                    EXPECT(paint10(ramp, {10 * i, 0, 10 * i + 10, 60}, code(ramp_nits[i]), code(ramp_nits[i]), code(ramp_nits[i])));
+                for (const float peak_nits : {1000.0f, 600.0f}) {
+                    xbox.set_hdr_peak_nits(peak_nits);
+                    xbox_present_ref::hdr_peak = peak_nits;
+                    one = parameters(ramp.source, nullptr, xbox_scale_filter_point, rt::d3d12::xbox_color_space_g2084_p2020);
+                    EXPECT(present_planes(&one, 1) && composed_ok());
+                    Ref_plane rref = model(ramp, nullptr, true, nullptr, true);
+                    EXPECT(frame_matches(frame, &rref, 1, false, 203.0, 2));
+                    const int* want = peak_nits == 1000.0f ? want_1000 : want_600;
+                    int previous = -1;
+                    bool ok = true;
+                    for (int i = 0; i < 8; ++i) {
+                        const Px got = frame.at(UINT(i * 40 + 20), 10);
+                        ok = ok && std::abs(got.r - want[i]) <= 2 && got.r >= previous;
+                        previous = got.r;
+                    }
+                    EXPECT(ok);
+                    // SDR-range content (100 and 150 nits are below the knee) is not touched by the tone map
+                    EXPECT(std::abs(frame.at(60, 10).r - 186) <= 2 && std::abs(frame.at(100, 10).r - 223) <= 2);
+                    std::printf("compose: HDR10 ramp tone mapped onto SDR, peak %.0f nits: bytes", peak_nits);
+                    for (int i = 0; i < 8; ++i) std::printf(" %d", frame.at(UINT(i * 40 + 20), 10).r);
+                    std::printf(" (hand calculation:");
+                    for (int i = 0; i < 8; ++i) std::printf(" %d", want[i]);
+                    std::printf(")\n");
+                }
+                xbox.set_hdr_peak_nits(1000.0f);
+                xbox_present_ref::hdr_peak = 1000.0;
+            }
+
+            // C4: an HDR10 plane 1 over an SDR plane 0 (the reverse of the case above), on a forced HDR10 encoding and on the SDR
+            // output. Plane 1 is premultiplied grey of 400 nits at alpha 2/3 (stored code = PQ(400) * 2/3), plane 0 black. As
+            // light the result is 266.7 nits (PQ byte 155, hand calculation) on the HDR10 output; on the SDR output 400 nits is
+            // 1.97 of SDR white, shoulder-mapped to 0.973, times 2/3, sRGB encoded: byte 211.
+            if (!surface_hdr) {
+                Painted black4, hdr_ui;
+                EXPECT(make_painted(black4, width, height));
+                EXPECT(paint(black4, {0, 0, LONG(width), LONG(height)}, 0, 0, 0, 255));
+                EXPECT(make_painted(hdr_ui, 16, 16, DXGI_FORMAT_R10G10B10A2_UNORM));
+                const int stored = int(std::lround(code(400) * 2.0 / 3.0));
+                EXPECT(paint10a(hdr_ui, {0, 0, 16, 16}, stored, stored, stored, 2));
+                pair[0] = parameters(black4.source, nullptr, xbox_scale_filter_point);
+                pair[1] = parameters(hdr_ui.source, nullptr, xbox_scale_filter_point, rt::d3d12::xbox_color_space_g2084_p2020,
+                                     rt::d3d12::xbox_plane_flag_overlay);
+                Ref_plane urefs[2] = {model(black4, nullptr, true), model(hdr_ui, nullptr, true, nullptr, true)};
+                xbox.presenter().force_hdr_encoding(true);
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                EXPECT(frame_matches(frame, urefs, 2, true, 203.0, 2));
+                const int hdr_byte = int(frame.at(5, 5).r);
+                EXPECT(region_is(frame, 0, 0, width, height, {155, 155, 155}, 3));
+                xbox.presenter().force_hdr_encoding(false);
+                EXPECT(present_planes(pair, 2) && composed_ok());
+                EXPECT(frame_matches(frame, urefs, 2, false, 203.0, 2));
+                EXPECT(region_is(frame, 0, 0, width, height, {211, 211, 211}, 3));
+                std::printf("compose: HDR10 plane 1 (premultiplied, alpha 2/3) over SDR plane 0: HDR10 output byte %d (hand 155), SDR output byte %d (hand 211): ok\n",
+                            hdr_byte, int(frame.at(5, 5).r));
+            }
 
             // D: an SDR plane 1 next to an HDR10 plane 0 that is not flagged an overlay is the GameDVR copy: not shown.
             pair[0] = parameters(hdr.source, nullptr, xbox_scale_filter_point, rt::d3d12::xbox_color_space_g2084_p2020);

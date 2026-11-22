@@ -883,6 +883,24 @@ class PngTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dds.encode_png(2, 1, b"\x00" * 7)
 
+    def test_packed_r11g11b10_preview_respects_row_pitch_and_channel_bits(self) -> None:
+        def packed(red: int, green: int, blue: int) -> int:
+            return red | (green << 11) | (blue << 22)
+
+        bright = packed(15 << 6, 14 << 6, 13 << 5)  # 1.0, 0.5, 0.25
+        fractions = packed((14 << 6) | 32, (13 << 6) | 32, (14 << 5) | 8)  # 0.75, 0.375, 0.625
+        edge = packed(0, 1, 31 << 5)  # zero, subnormal, infinity
+        nan_hdr = packed((31 << 6) | 1, 16 << 6, 31)  # NaN, 2.0, subnormal
+        payload = struct.pack("<II", bright, fractions) + b"\xee" * 4 + struct.pack("<II", edge, nan_hdr)
+        data = dds_buffer(2, 2, payload, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=26, pitch=12)
+
+        chunks = png_chunks(dds.dds_to_png_bytes(data))
+        self.assertEqual(struct.unpack(">II", chunks[0][1][:8]), (2, 2))
+        self.assertEqual(zlib.decompress(chunks[1][1]), bytes((
+            0, 255, 128, 64, 255, 191, 96, 159, 255,
+            0, 0, 0, 255, 255, 0, 255, 0, 255,
+        )))
+
     def test_dds_to_png_roundtrip(self):
         payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
         png = dds.dds_to_png_bytes(dds_buffer(

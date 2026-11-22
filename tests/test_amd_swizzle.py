@@ -5,6 +5,7 @@
 import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
 
 import os
+import pathlib
 import sys
 import tempfile
 from pathlib import Path
@@ -105,6 +106,40 @@ def test_uncompressed_feature_uses_raw_rgb_bytes():
     got = A.feature(raw, 4)
     assert got.shape == (2, 3)
     assert got.tolist() == [[0, 1, 2], [4, 5, 6]]
+
+
+@pytest.mark.parametrize(("bpe", "texels", "pixels"), [
+    (1, bytes((17, 63, 129, 245)), [(17, 17, 17), (63, 63, 63), (129, 129, 129), (245, 245, 245)]),
+    (2, bytes((17, 33, 63, 94, 129, 159, 245, 200)), [(17, 33, 0), (63, 94, 0), (129, 159, 0), (245, 200, 0)]),
+], ids=["r8", "rg8"])
+def test_cli_previews_uncompressed_r8_and_rg8(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, bpe: int, texels: bytes, pixels: list[tuple[int, int, int]],
+) -> None:
+    image = pytest.importorskip("PIL.Image")
+    # A synthetic 4 KiB row-major tile, 64 elements per row in both formats.
+    bits = ["0"] * (bpe - 1) + [f"X{i}" for i in range(6)] + [f"Y{i}" for i in range(7 - bpe)]
+    rows = {"NIBBLE01": bits[:8], "NIBBLE2": bits[8:], "NIBBLE3": ["0"] * 4, "NIBBLE4": ["0"] * 4}
+    header_path = tmp_path / "swizzle.h"
+    header_path.write_text(
+        "".join(table(name, [row]) for name, row in rows.items())
+        + "const ADDR_SW_PATINFO GFX10_SW_4K_S_PATINFO[] =\n{\n"
+        + f"    {{   0,    0,    0,    0,    0, }} , // synthetic {bpe} bpe\n}};\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    monkeypatch.setenv("AMD_SWIZZLE_HEADER", str(header_path))
+    tile = bytearray(4096)
+    tile[:2 * bpe] = texels[:2 * bpe]
+    tile[64 * bpe:66 * bpe] = texels[2 * bpe:]
+    (tmp_path / "blob.bin").write_bytes(tile)
+    output = tmp_path / "preview.png"
+
+    result = cli(tmp_path, "--bpe", str(bpe), "--width", "2", "--height", "2", "--modes", "4K", "--out", str(output))
+
+    assert result.returncode == 0, result.stderr
+    with image.open(output) as png:
+        assert png.size == (2, 2)
+        assert png.tobytes() == bytes(channel for pixel in pixels for channel in pixel)
 
 
 def test_cli_detiles_4k_tables_with_4k_blocks():

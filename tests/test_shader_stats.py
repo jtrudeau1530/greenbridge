@@ -3,10 +3,12 @@
     python -I tests/test_shader_stats.py
 """
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "shader_stats.py")
@@ -70,6 +72,27 @@ class ShaderStats(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.detail(result, "ps_nsa")[5:7], ["32", "24"])
         self.assertIn("VGPRs median 24 vs original 32", result.stdout)
+
+    def test_unreadable_listing_has_a_path_specific_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = os.path.join(tmp, "stats.csv")
+            listing = os.path.join(tmp, "ps_flat.s")
+            with open(stats, "w", encoding="utf-8", newline="\n") as f:
+                f.write("name,stage,statistic,value\n" + COMPLETE[0] + "\n")
+            with open(listing, "w", encoding="utf-8", newline="\n") as f:
+                f.write(PS_FLAT)
+            open_file = open
+
+            def locked(path, *args, **kwargs):
+                if path == listing:
+                    raise PermissionError(13, "Permission denied", path)
+                return open_file(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", side_effect=locked), \
+                    mock.patch.object(sys, "argv", [SCRIPT, stats, tmp]), self.assertRaises(SystemExit) as caught:
+                runpy.run_path(SCRIPT, run_name="__main__")
+            self.assertIn(listing, str(caught.exception))
+            self.assertIn("Permission denied", str(caught.exception))
 
     def test_shaders_without_a_listing_are_left_out(self):
         r = self.run_stats(["ps_other,ps,Instructions,10"], details=False)

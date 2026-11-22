@@ -10,6 +10,7 @@ path has to exist: two report paths that don't exist yet still collide when they
 ignores case. Standard library only; no game data.
 """
 import os
+import posixpath
 import sys
 import unicodedata
 
@@ -34,7 +35,11 @@ def case_insensitive_volume(path):
 
 def path_key(path):
     """A name two spellings of one path share: realpath, normcase, and on a case-insensitive volume case-folded NFD."""
-    path = os.path.normcase(os.path.realpath(path))
+    path = os.path.realpath(path)
+    # Use the path rules of the platform we are resolving for. On macOS os.path is
+    # posixpath and keeps case; on Windows ntpath lowercases. Resolving a simulated
+    # macOS path through ntpath would hide the case-sensitive branch under test.
+    path = posixpath.normcase(path) if sys.platform == "darwin" else os.path.normcase(path)
     if case_insensitive_volume(path):
         # APFS and HFS+ also treat composed and decomposed accents as one name.
         path = unicodedata.normalize("NFD", path.casefold())

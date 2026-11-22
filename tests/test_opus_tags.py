@@ -141,16 +141,17 @@ class TestFolder(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(original)
 
-        stats = T.tag_folder(self.opus, T.load_names(self.names, "story"))
+        names, ambiguous = T.load_names(self.names, "story")
+        stats = T.tag_folder(self.opus, names, ambiguous=ambiguous)
 
         with open(path, "rb") as f:
             self.assertTrue(f.read() == original, "tagging changed a file whose tags page includes audio")
         self.assertEqual(stats["skipped: the OpusTags page contains another packet"], 1)
 
     def test_names_and_dialogue(self):
-        names = T.load_names(self.names, "story")
+        names, ambiguous = T.load_names(self.names, "story")
         dialogue, langs = T.load_dialogue(self.dialogue)
-        stats = T.tag_folder(self.opus, names, dialogue, langs)
+        stats = T.tag_folder(self.opus, names, dialogue, langs, ambiguous=ambiguous)
         self.assertEqual((stats["ogg files"], stats["tagged"], stats["without a name"]), (3, 2, 1))
         self.assertEqual((stats["with a dialogue line"], stats["with a subtitle"]), (1, 1))
         self.assertEqual(self.tags("story", "bank_01", "0ABCDEF1.ogg"),
@@ -186,18 +187,19 @@ class TestFolder(unittest.TestCase):
         stem = awc_opus.export_stems([0x0ABCDEF1, 0x0ABCDEF1])[1]
         make_ogg(os.path.join(self.opus, "story", "bank_01", stem + ".ogg"))
         dialogue, langs = T.load_dialogue(self.dialogue)
-        stats = T.tag_folder(self.opus, T.load_names(self.names, "story"), dialogue, langs)
+        names, ambiguous = T.load_names(self.names, "story")
+        stats = T.tag_folder(self.opus, names, dialogue, langs, ambiguous=ambiguous)
         self.assertEqual((stats["ogg files"], stats["tagged"], stats["without a name"]), (4, 3, 1))
         self.assertEqual(self.tags("story", "bank_01", stem + ".ogg"), self.tags("story", "bank_01", "0ABCDEF1.ogg"))
         self.assertIn("TITLE=heistau_abcd_01", self.tags("story", "bank_01", stem + ".ogg"))
 
     def test_second_run_replaces_its_own_tags(self):
-        names = T.load_names(self.names, "story")
-        T.tag_folder(self.opus, names)
+        names, ambiguous = T.load_names(self.names, "story")
+        T.tag_folder(self.opus, names, ambiguous=ambiguous)
         path = os.path.join(self.opus, "story", "bank_02", "1FFFFFFF.ogg")
         with open(path, "rb") as f:
             once = f.read()
-        T.tag_folder(self.opus, names)
+        T.tag_folder(self.opus, names, ambiguous=ambiguous)
         with open(path, "rb") as f:
             self.assertEqual(f.read(), once)
         self.assertTrue(crc_ok(once))
@@ -206,7 +208,8 @@ class TestFolder(unittest.TestCase):
         path = os.path.join(self.opus, "story", "bank_02", "1FFFFFFF.ogg")
         with open(path, "rb") as f:
             before = f.read()
-        stats = T.tag_folder(self.opus, T.load_names(self.names, "story"), dry_run=True)
+        names, ambiguous = T.load_names(self.names, "story")
+        stats = T.tag_folder(self.opus, names, dry_run=True, ambiguous=ambiguous)
         self.assertEqual(stats["tagged"], 2)
         with open(path, "rb") as f:
             self.assertEqual(f.read(), before)
@@ -217,7 +220,8 @@ class TestFolder(unittest.TestCase):
         names = os.path.join(self.tmp.name, "manifest_names.csv")
         write_csv(names, NAMES, [{"source": "audio_manifest.json", "bank": "story/bank_02.awc",
                                   "stream_id": "1fffffff", "name": "door_slam_03", "rule": "family"}])
-        stats = T.tag_folder(self.opus, T.load_names(names))
+        loaded, ambiguous = T.load_names(names)
+        stats = T.tag_folder(self.opus, loaded, ambiguous=ambiguous)
         # 3 files; this CSV names only bank_02's, so bank_01's two stay without a name
         self.assertEqual((stats["ogg files"], stats.get("tagged", 0), stats.get("without a name", 0)), (3, 1, 2))
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
@@ -234,9 +238,47 @@ class TestFolder(unittest.TestCase):
         names = os.path.join(self.tmp.name, "both.csv")
         for order in (rows, rows[::-1]):
             write_csv(names, NAMES, order)
-            T.tag_folder(self.opus, T.load_names(names))
+            loaded, ambiguous = T.load_names(names)
+            self.assertEqual(ambiguous, {})
+            T.tag_folder(self.opus, loaded, ambiguous=ambiguous)
             self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=plain_label"])
             self.assertEqual(self.tags("story", "bank_02.awc", "1FFFFFFF.ogg"), ["TITLE=awc_label"])
+
+    def test_an_id_a_bank_names_twice_is_reported_and_left_untagged(self):
+        # Only the low 29 bits of a name hash are stored, so two names can claim one id: two sources over one archive
+        # (--source is optional) or a genuine collision. The last CSV row used to win silently, which also put that
+        # name's dialogue subtitle in the file.
+        clash = os.path.join(self.tmp.name, "clash.csv")
+        write_csv(clash, NAMES, [
+            {"source": "story", "bank": "bank_02", "stream_id": "1fffffff", "name": "door_slam_03", "rule": "family"},
+            {"source": "other", "bank": "bank_02", "stream_id": "1fffffff", "name": "wrong_name", "rule": "family"},
+        ])
+        names, ambiguous = T.load_names(clash)
+        self.assertEqual(ambiguous, {"bank_02": {0x1FFFFFFF}})
+        self.assertEqual(names["bank_02"], {})
+        path = os.path.join(self.opus, "story", "bank_02", "1FFFFFFF.ogg")
+        with open(path, "rb") as f:
+            before = f.read()
+        stats = T.tag_folder(self.opus, names, ambiguous=ambiguous)
+        self.assertEqual((stats["ogg files"], stats["ambiguous name"], stats.get("tagged", 0)), (3, 1, 0))
+        self.assertEqual(stats["without a name"], 2)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_one_name_from_two_sources_is_not_ambiguous(self):
+        # awc_names.py can list the same name twice (a manifest and a name list); that is one name, not a clash.
+        twice = os.path.join(self.tmp.name, "twice.csv")
+        write_csv(twice, NAMES, [
+            {"source": "story", "bank": "bank_02", "stream_id": "1fffffff", "name": "door_slam_03", "rule": "family"},
+            {"source": "other", "bank": "bank_02", "stream_id": "1fffffff", "name": "door_slam_03", "rule": "family"},
+        ])
+        names, ambiguous = T.load_names(twice)
+        self.assertEqual(ambiguous, {})
+        self.assertEqual(names["bank_02"], {0x1FFFFFFF: "door_slam_03"})
+        stats = T.tag_folder(self.opus, names, ambiguous=ambiguous)
+        self.assertEqual(stats["tagged"], 1)
+        self.assertNotIn("ambiguous name", stats)
+        self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
 
     def test_cli(self):
         r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names, "--source", "story",
@@ -256,6 +298,18 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
         self.assertIn("SUBTITLE=Move. Now.", self.tags("story", "bank_01", "0ABCDEF1.ogg"))
+
+    def test_cli_reports_a_clashing_id(self):
+        clash = os.path.join(self.tmp.name, "clash_cli.csv")
+        write_csv(clash, NAMES, [
+            {"source": "story", "bank": "bank_02", "stream_id": "1fffffff", "name": "door_slam_03", "rule": "family"},
+            {"source": "other", "bank": "bank_02", "stream_id": "1fffffff", "name": "wrong_name", "rule": "family"},
+        ])
+        r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", clash, "--dry-run"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ambiguous name", r.stdout)
+        self.assertIn("1", r.stdout.split("ambiguous name")[1].split()[0])
 
 
 if __name__ == "__main__":

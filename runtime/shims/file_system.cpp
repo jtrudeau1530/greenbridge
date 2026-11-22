@@ -5,7 +5,8 @@
 // DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes* are answered
 // here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
-//   - "GAME:" (any case, "\\" or "/") maps under --game-dir; any other path is a host path and goes to the host;
+//   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
+//     the overlay (RT-218); any other path is a host path and goes to the host;
 //   - an open that can write, and DeleteFile, go to the overlay (--overlay, default <game-dir>\\overlay), so the
 //     package stays exactly as installed. A write-open of a package file copies it into the overlay first, so
 //     OPEN_EXISTING keeps its bytes; a delete of a package file leaves an empty marker under
@@ -42,9 +43,17 @@ namespace {
 constexpr wchar_t kGamePrefix[] = L"game:";
 constexpr size_t kGamePrefixLength = 5;
 constexpr wchar_t kDeletedDir[] = L".gta6rt-deleted";
+constexpr wchar_t kScratchDir[] = L".gta6rt-temp";  // what "T:\" names, inside the overlay
 // A removed package folder is marked by this file inside its marker folder: the marker folder itself can already
 // exist because files below it were deleted, and that alone does not hide the folder.
 constexpr wchar_t kRemovedDirMarker[] = L".gta6rt-dir";
+// Copy-up writes here first and then renames into place, so a half-copied file never sits under the title's name.
+constexpr wchar_t kCopyDir[] = L".gta6rt-copy";
+
+// The overlay root's own folders, which a title never sees in a listing.
+bool internal_dir(const wchar_t* name) {
+    return _wcsicmp(name, kDeletedDir) == 0 || _wcsicmp(name, kCopyDir) == 0 || _wcsicmp(name, kScratchDir) == 0;
+}
 
 std::mutex g_mutex;
 std::filesystem::path g_game_dir;
@@ -91,9 +100,48 @@ enum class Parsed { Host, Console, Refused };
 
 // Splits a console path into the components below the root. A component that names a drive or a stream ("C:", "x:y")
 // and a ".." that would leave the root are refused: the package and the overlay are the only folders a title may name.
+bool is_separator(wchar_t c) { return c == L'\\' || c == L'/'; }
+
+// True when `path` is `root` or lies below it, compared by name (case-insensitive, either separator).
+bool lies_under(const std::wstring& path, const std::filesystem::path& root) {
+    std::wstring base = lower(root.native());
+    for (auto& c : base) if (c == L'/') c = L'\\';
+    while (!base.empty() && base.back() == L'\\') base.pop_back();
+    if (base.empty()) return false;
+    std::wstring p = lower(path);
+    for (auto& c : p) if (c == L'/') c = L'\\';
+    return p.compare(0, base.size(), base) == 0 && (p.size() == base.size() || p[base.size()] == L'\\');
+}
+
+// "G:\x" is the installed package, like "GAME:\x", and "T:\x" a scratch folder the title may write to, the way the
+// other console layers map those two drives (RT-218). Only the executable can say which spelling the title uses, so
+// a host drive of the same letter must keep working: a path under --game-dir or the overlay (a package on drive G:,
+// or a path GetModuleFileName handed back) stays a host path, and so does every G:/T: path while no roots are
+// configured. The scratch folder lives in the overlay, as `.gta6rt-temp`.
+enum class Drive { None, Game, Scratch };
+
+Drive console_drive(const std::wstring& path, size_t& prefix_length) {
+    if (path.size() >= kGamePrefixLength && lower(path.substr(0, kGamePrefixLength)) == kGamePrefix) {
+        prefix_length = kGamePrefixLength;
+        return Drive::Game;
+    }
+    if (path.size() < 2 || path[1] != L':' || (path.size() > 2 && !is_separator(path[2]))) return Drive::None;
+    const wchar_t letter = static_cast<wchar_t>(std::towlower(path[0]));
+    if (letter != L'g' && letter != L't') return Drive::None;
+    const Roots r = roots();
+    if (r.game.empty() && r.overlay.empty()) return Drive::None;
+    if (lies_under(path, r.game) || lies_under(path, r.overlay)) return Drive::None;
+    prefix_length = 2;
+    return letter == L'g' ? Drive::Game : Drive::Scratch;
+}
+
 Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
-    if (path.size() < kGamePrefixLength || lower(path.substr(0, kGamePrefixLength)) != kGamePrefix) return Parsed::Host;
+    size_t prefix_length = 0;
+    const Drive drive = console_drive(path, prefix_length);
+    if (drive == Drive::None) return Parsed::Host;
     parts.clear();
+    if (drive == Drive::Scratch) parts.push_back(kScratchDir);
+    const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
     auto flush = [&]() -> bool {
         if (part.empty() || part == L".") {
@@ -101,7 +149,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
             return true;
         }
         if (part == L"..") {
-            if (parts.empty()) return false;
+            if (parts.size() <= floor) return false;
             parts.pop_back();
         } else if (part.find(L':') != std::wstring::npos) {
             return false;
@@ -111,9 +159,9 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
         part.clear();
         return true;
     };
-    for (size_t i = kGamePrefixLength; i < path.size(); ++i) {
+    for (size_t i = prefix_length; i < path.size(); ++i) {
         const wchar_t c = path[i];
-        if (c == L'\\' || c == L'/') {
+        if (is_separator(c)) {
             if (!flush()) return Parsed::Refused;
         } else {
             part.push_back(c);
@@ -234,7 +282,7 @@ bool empty_in_view(const Roots& r, const std::vector<std::wstring>& parts) {
         const std::filesystem::path p = join(r.overlay, parts);
         for (auto it = std::filesystem::directory_iterator(p, ec); !ec && it != std::filesystem::directory_iterator();
              it.increment(ec)) {
-            if (parts.empty() && same_name(it->path().filename().c_str(), kDeletedDir)) continue;
+            if (parts.empty() && internal_dir(it->path().filename().c_str())) continue;
             return false;
         }
     }
@@ -314,12 +362,32 @@ Target write_target(const std::wstring& path, bool copy_up) {
     // the contents (OPEN_EXISTING, TRUNCATE_EXISTING) has to fail on it instead. CREATE_ALWAYS and CREATE_NEW still
     // make a new overlay file, which reads prefer over the package and so over the marker.
     const std::filesystem::path package_path = join(r.game, parts);
+    // One copy-up at a time: a second thread writing the same file waits here and then finds the first one's copy, so
+    // it neither fails on the taken name nor collides with that file's open through a rename of its own.
+    static std::mutex s_copy_mutex;
+    std::unique_lock copy_lock(s_copy_mutex, std::defer_lock);
+    if (copy_up) copy_lock.lock();
     if (copy_up && !deleted(r.overlay, parts) && !std::filesystem::exists(t.path, ec) &&
         std::filesystem::is_regular_file(package_path, ec)) {
-        std::filesystem::copy_file(package_path, t.path, std::filesystem::copy_options::none, ec);
+        // Copied to a private name, then renamed into place: a process killed mid-copy leaves only a hidden leftover,
+        // not a truncated file that reads would prefer over the package.
+        static unsigned s_copies = 0;  // under s_copy_mutex
+        const std::filesystem::path staging = r.overlay / kCopyDir;
+        std::filesystem::create_directories(staging, ec);
+        const std::filesystem::path tmp =
+            staging / (std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(++s_copies));
+        if (!ec) std::filesystem::copy_file(package_path, tmp, std::filesystem::copy_options::overwrite_existing, ec);
         if (ec) {
             t.error = static_cast<DWORD>(ec.value());
+            std::filesystem::remove(tmp, ec);
             return t;
+        }
+        if (!::MoveFileExW(tmp.c_str(), t.path.c_str(), 0)) {
+            // The name taken means the title created the file itself meanwhile (CREATE_NEW and CREATE_ALWAYS don't
+            // copy up, so they don't take the lock); that file is what it wrote, so keep it.
+            const DWORD error = ::GetLastError();
+            std::filesystem::remove(tmp, ec);
+            if (!std::filesystem::exists(t.path, ec)) t.error = error;
         }
     }
     return t;
@@ -395,7 +463,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         const HANDLE h = ::FindFirstFileW(search.c_str(), &found);
         if (h == INVALID_HANDLE_VALUE) return;
         do {
-            if (overlay_root && same_name(found.cFileName, kDeletedDir)) continue;
+            if (overlay_root && internal_dir(found.cFileName)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
             if (!overlay_root && !dot) {
                 std::vector<std::wstring> entry_parts = dirs;

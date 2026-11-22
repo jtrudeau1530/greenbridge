@@ -13,6 +13,7 @@ namespace {
 struct Write {
     char kind;  // 'f' fill, 'u' update, 'c' copy (dst; src in from)
     VkDeviceSize offset, size, from;
+    VkBuffer buffer = VK_NULL_HANDLE, source = VK_NULL_HANDLE;
 };
 std::vector<Write> writes;
 
@@ -37,14 +38,14 @@ void reset_texture_capture() {
 VKAPI_ATTR void VKAPI_CALL barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
                                    std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
                                    std::uint32_t, const VkImageMemoryBarrier*) {}
-VKAPI_ATTR void VKAPI_CALL fill(VkCommandBuffer, VkBuffer, VkDeviceSize offset, VkDeviceSize size, std::uint32_t) {
-    writes.push_back({'f', offset, size, 0});
+VKAPI_ATTR void VKAPI_CALL fill(VkCommandBuffer, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, std::uint32_t) {
+    writes.push_back({'f', offset, size, 0, buffer});
 }
 VKAPI_ATTR void VKAPI_CALL update(VkCommandBuffer, VkBuffer, VkDeviceSize offset, VkDeviceSize size, const void*) {
     writes.push_back({'u', offset, size, 0});
 }
-VKAPI_ATTR void VKAPI_CALL copy(VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t count, const VkBufferCopy* r) {
-    for (std::uint32_t i = 0; i < count; ++i) writes.push_back({'c', r[i].dstOffset, r[i].size, r[i].srcOffset});
+VKAPI_ATTR void VKAPI_CALL copy(VkCommandBuffer, VkBuffer source, VkBuffer buffer, std::uint32_t count, const VkBufferCopy* r) {
+    for (std::uint32_t i = 0; i < count; ++i) writes.push_back({'c', r[i].dstOffset, r[i].size, r[i].srcOffset, buffer, source});
 }
 VKAPI_ATTR void VKAPI_CALL clear_image(VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue* value,
                                        std::uint32_t, const VkImageSubresourceRange*) {
@@ -125,6 +126,55 @@ int main() {
     expect(run({1, true, 0, 8, 64, 4, 0, 0, 1}, std::span<const Rect>(&rect, 1)) == ReplayResult::success,
            "rectangle clear replays");
     expect(inside(at + 16, at + 28), "elements 2..5 of a view at 8 are [at + 16, at + 28)");
+
+    const auto scratch = reinterpret_cast<VkBuffer>(std::uintptr_t{0x3000});
+    constexpr VkDeviceSize scratch_at = 512;
+    unsigned allocations = 0;
+    expect(run({1, true, VK_FORMAT_R8_UINT, 1, 1, 1, 0, 0, 1}) == ReplayResult::unsupported && writes.empty(),
+           "short clear without scratch is rejected before any command is emitted");
+    vk.copy_scratch = [&](VkDeviceSize size, VkBuffer& buffer, VkDeviceSize& offset) {
+        expect(size == 8, "short clear requests eight scratch bytes");
+        ++allocations;
+        buffer = scratch;
+        offset = scratch_at;
+        return true;
+    };
+    for (VkDeviceSize offset = 0; offset < 8; ++offset) {
+        for (VkDeviceSize size = 1; size <= 8; ++size) {
+            allocations = 0;
+            expect(run({1, true, VK_FORMAT_R8_UINT, offset, size, 1, 0, 0, 1}) == ReplayResult::success,
+                   "small R8 range replays at every word phase");
+            const bool short_range = size < (4 - offset % 4) % 4 + 4;
+            expect(allocations == unsigned(short_range), "only ranges lacking an aligned word allocate scratch");
+            if (short_range) {
+                expect(writes.size() == 2 && writes[0].kind == 'f' && writes[0].buffer == scratch &&
+                       writes[0].offset == scratch_at && writes[0].size == 8 &&
+                       writes[1].kind == 'c' && writes[1].source == scratch && writes[1].buffer == range.buffer &&
+                       writes[1].from == scratch_at && writes[1].offset == at + offset && writes[1].size == size,
+                       "short clear writes exactly the requested bytes from scratch, not neighbouring resource bytes");
+            } else expect(inside(at + offset, at + offset + size), "fast path stays within the range");
+        }
+    }
+    allocations = 0;
+    const std::array<Rect, 3> small_rects{{{0, 0, 1, 1}, {0, 0, 2, 1}, {3, 0, 4, 1}}};
+    expect(run({1, true, VK_FORMAT_R16_UINT, 2, 8, 2, 0, 0, 1}, small_rects) == ReplayResult::success && allocations == 1,
+           "overlapping short R16 rectangles share one scratch allocation per clear");
+    vk.copy_scratch = [](VkDeviceSize, VkBuffer&, VkDeviceSize&) { return false; };
+    expect(run({1, true, VK_FORMAT_R8_UINT, 255, 1, 1, 0, 0, 1}) == ReplayResult::unsupported && writes.empty(),
+           "scratch allocation failure rejects the list without emitting commands");
+    vk.copy_scratch = [&](VkDeviceSize, VkBuffer& buffer, VkDeviceSize& offset) {
+        buffer = scratch; offset = 1; return true;
+    };
+    expect(run({1, true, VK_FORMAT_R8_UINT, 255, 1, 1, 0, 0, 1}) == ReplayResult::unsupported && writes.empty(),
+           "misaligned scratch is rejected before vkCmdFillBuffer");
+    const std::array<Rect, 2> empty_rects{{{-3, 0, 0, 1}, {0, 1, 1, 2}}};
+    expect(run({1, true, VK_FORMAT_R8_UINT, 255, 1, 1, 0, 0, 1}, empty_rects) == ReplayResult::success && writes.empty(),
+           "empty clipped rectangles need no scratch");
+    range.buffer_offset = UINT64_MAX - 2;
+    expect(run({1, true, VK_FORMAT_R8_UINT, 1, 2, 1, 0, 0, 1}) == ReplayResult::invalid_clear && writes.empty(),
+           "backing range overflow is rejected before scratch allocation or emission");
+    range.buffer_offset = at;
+    vk.copy_scratch = {};
 
     // Typeless / mutable texture UAV clears where view_format != binding.format must clear through an attachment view
     // of view_format with clear_color decoded in view_format, avoiding SFLOAT NaN round-trips (issue #1902).

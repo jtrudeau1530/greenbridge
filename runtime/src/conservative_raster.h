@@ -12,7 +12,6 @@ inline bool tier1(bool extension_enabled, std::uint32_t subpixel_bits, float ove
     return extension_enabled && subpixel_bits >= 8 && std::isfinite(overestimate) &&
            overestimate >= 0.0f && overestimate <= maximum;
 }
-
 inline std::uint32_t tier(bool extension_enabled, std::uint32_t subpixel_bits, float overestimate,
                           bool degenerate_triangles) {
     if (!tier1(extension_enabled, subpixel_bits, overestimate)) return 0;

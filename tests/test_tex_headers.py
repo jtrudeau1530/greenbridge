@@ -962,6 +962,21 @@ class CliInputTest(unittest.TestCase):
             with open(manifest, "r", encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {"files": []})
 
+    def test_output_parent_creation_failure_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            archive = os.path.join(carve, "a")
+            os.makedirs(archive)
+            with open(os.path.join(archive, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": []}, f)
+            blocker = os.path.join(tmp, "not-a-directory")
+            with open(blocker, "w", encoding="utf-8", newline="\n") as f:
+                f.write("existing file")
+            result = self.run_tool(carve, "--out", os.path.join(blocker, "out.json"))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("ERROR: cannot write", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
     def test_out_that_is_a_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "carve", "a"))

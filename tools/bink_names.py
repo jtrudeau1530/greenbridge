@@ -50,7 +50,7 @@ import gamedata_index  # noqa: E402
 import gamedata_xml  # noqa: E402
 
 LIST_ENTRY = re.compile(r"<filename>\s*\$\(common\)/movies/([^<]+?\.bk2)\s*</filename>", re.I)
-FAMILY_TAIL = re.compile(r"(_?\d+|_?(left|right|top|topleft|topright|side|high|low|medium|light|dark|close|far))+$",
+FAMILY_TAIL = re.compile(r"(_?\d+|_?(4k|left|right|top|topleft|topright|side|high|low|medium|light|dark|close|far))+$",
                          re.I)
 LIST_MARKER = b"$(common)/movies/"
 MAX_LIST_BYTES = 16 << 20
@@ -128,7 +128,9 @@ def read_mount_lists(paths):
 
 
 def _int(value):
-    return int(value, 0) if isinstance(value, str) else int(value)
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise TypeError(f"expected an integer, got {type(value).__name__}")
+    return int(value, 0) if isinstance(value, str) else value
 
 
 def load_streams(source, skip_report=None):
@@ -158,8 +160,15 @@ def load_streams(source, skip_report=None):
         try:
             if not isinstance(row, dict):
                 raise TypeError("row is not an object")
-            out.append({"source": row["source"], "offset": _int(row["offset"]), "size": _int(row["size"]),
-                        "width": _int(row["width"]), "height": _int(row["height"]), "frames": _int(row["frames"])})
+            offset = _int(row["offset"])
+            size = _int(row["size"])
+            width = _int(row["width"])
+            height = _int(row["height"])
+            frames = _int(row["frames"])
+            if offset < 0 or size <= 0 or width <= 0 or height <= 0 or frames <= 0:
+                raise ValueError("negative offset or non-positive stream field")
+            out.append({"source": row["source"], "offset": offset, "size": size,
+                        "width": width, "height": height, "frames": frames})
         except (KeyError, ValueError, TypeError, OverflowError) as error:
             raise ValueError(f"{label.format(i=start + j)} is missing or unusable: {error}") from None
         if not isinstance(out[-1]["source"], str):
@@ -167,6 +176,13 @@ def load_streams(source, skip_report=None):
     # A directory of carved files sorts by file name; carves name files by archive offset.
     out.sort(key=lambda r: (r["source"], r["offset"]))
     return out
+
+
+def _normalize_pin_path(raw):
+    path = raw.strip().replace("\\", "/").lower()
+    if path.startswith("$(common)/movies/"):
+        path = path[len("$(common)/movies/"):]
+    return path
 
 
 def load_pins(path):
@@ -182,13 +198,19 @@ def load_pins(path):
             raise ValueError(f"CSV header is missing required fields: {', '.join(missing)}")
         for j, row in enumerate(reader, start=2):
             try:
-                key = ((row.get("source") or "").strip(), _int(row["offset"]))
+                offset = _int(row["offset"])
+                if offset < 0:
+                    raise ValueError("offset must be non-negative")
+                key = ((row.get("source") or "").strip(), offset)
                 raw_path = row["path"]
                 if not isinstance(raw_path, str):
                     raise TypeError("path is missing")
+                parsed = [item for item in (_normalize_pin_path(p) for p in raw_path.split("|")) if item]
+                if not parsed:
+                    raise ValueError("empty path")
             except (KeyError, ValueError, TypeError, OverflowError) as error:
                 raise ValueError(f"row {j} is missing or unusable: {error}") from None
-            pins.setdefault(key, set()).update(p.strip().lower() for p in raw_path.split("|") if p.strip())
+            pins.setdefault(key, set()).update(parsed)
     return pins
 
 
@@ -259,7 +281,7 @@ def align(names, streams, scorer, skip_cost=SKIP_COST, max_skip=MAX_SKIP):
             if arg is not None:
                 score[j][i] = best + scorer.unary(names[i], streams[j])
                 back[j][i] = arg
-    last = score[n_streams - 1]
+    last = {i: value for i, value in score[-1].items() if n_names - 1 - i <= max_skip}
     if not last:
         raise ValueError("no alignment within --max-skip; the lists do not match this source")
     i = max(last, key=lambda k: last[k] - skip_cost * (n_names - 1 - k))
@@ -272,12 +294,13 @@ def align(names, streams, scorer, skip_cost=SKIP_COST, max_skip=MAX_SKIP):
 
 def classify(names, streams, path, scorer):
     """Confidence per aligned pair, in path order."""
+    unaries = [scorer.unary(names[i], streams[j]) for i, j in path]
     anchored = []
     for k, (i, j) in enumerate(path):
-        neighbours = [path[k + d] for d in (-1, 1) if 0 <= k + d < len(path)]
-        fam = any(family(names[i2]) == family(names[i]) and _shape(streams[j2]) == _shape(streams[j])
-                  for i2, j2 in neighbours)
-        anchored.append(fam or scorer.unary(names[i], streams[j]) > 0)
+        neighbours = [(k + d, *path[k + d]) for d in (-1, 1) if 0 <= k + d < len(path)]
+        fam = any(unaries[k2] >= 0 and family(names[i2]) == family(names[i]) and _shape(streams[j2]) == _shape(streams[j])
+                  for k2, i2, j2 in neighbours)
+        anchored.append(unaries[k] > 0 or (fam and unaries[k] >= 0))
     out = []
     for k, (i, j) in enumerate(path):
         pin = scorer.pin(streams[j]) or set()
@@ -286,6 +309,8 @@ def classify(names, streams, path, scorer):
             out.append("verified")
         elif name in pin or anchored[k]:
             out.append("anchored")
+        elif unaries[k] < 0:
+            out.append("positional")
         else:
             a = max((x for x in range(k) if anchored[x]), default=None)
             b = min((x for x in range(k + 1, len(path)) if anchored[x]), default=None)
@@ -328,7 +353,9 @@ def main(argv=None):
                     help="a mount-list XML, an archive or carve directory holding the lists, or a directory to "
                          "search (repeatable)")
     ap.add_argument("--pins", help="CSV with offset,path[,source] of streams identified by viewing them")
-    ap.add_argument("--max-skip", type=int, default=MAX_SKIP, help="most list entries skipped in a row")
+    ap.add_argument("--max-skip", type=int, default=MAX_SKIP,
+                    help="most list entries skipped before, between or after stream matches "
+                         "(an empty source leaves all entries unmatched)")
     ap.add_argument("--out", help="names.csv or names.json; default is a summary only")
     a = ap.parse_args(argv)
     if a.max_skip < 0:

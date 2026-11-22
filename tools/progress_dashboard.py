@@ -70,7 +70,7 @@ def parse_iso(s):
     return d if d.tzinfo else d.astimezone()
 
 
-def read_text(path):
+def read_utf8(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         return f.read()
 
@@ -100,14 +100,29 @@ HOME = os.path.expanduser("~")
 
 
 def scrub(text, limit=240):
-    """One line of tool output, with the user's home folder and drive paths reduced to their last component."""
+    """One line of tool output with every absolute path replaced: a path inside the repository becomes its relative
+    path, any other path (the work folder, the home folder, a temp folder) becomes <path>, file name included, since
+    a file name outside the repository can be a carved shader's name."""
     if not text:
         return ""
     line = text.strip().splitlines()[-1] if text.strip() else ""
+
+    def shown(m):
+        path = m.group(0)
+        if os.name != "nt" and re.match(r"(?i)[a-z]:[\\/]", path):
+            # A drive-letter path is relative to the current folder elsewhere, so realpath would put it inside the
+            # repository and print it whole (user name and file name included): it is never one of ours here.
+            return "<path>"
+        if inside(path, ROOT):
+            rel = os.path.relpath(os.path.realpath(path), os.path.realpath(ROOT)).replace(os.sep, "/")
+            return "." if rel == "." else rel
+        return "<path>"
+
+    line = re.sub(r"(?i)\b[a-z]:[\\/][^\s'\"]*", shown, line)
+    line = re.sub(r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*", shown, line)
     if HOME and len(HOME) > 3:
         line = line.replace(HOME, "~")
-    line = re.sub(r"(?i)\b[a-z]:[\\/](?:[^\s\\/:'\"]+[\\/])+([^\s\\/'\"]+)", r"<path>/\1", line)
-    line = re.sub(r"(?<![\w.])/(?:[^\s/'\"]+/)+([^\s/'\"]+)", r"<path>/\1", line)
+    line = re.sub(r"~[\\/][^\s'\"]*", "<path>", line)
     return line[:limit]
 
 
@@ -208,7 +223,7 @@ def ci_test_files():
             if not (name.startswith("test_") and name.endswith(".py")):
                 continue
             path = os.path.join(base, name)
-            text = read_text(path)
+            text = read_utf8(path)
             if PYTEST_MARKERS.search(text) or "__main__" not in text:
                 continue
             found.append(os.path.relpath(path, ROOT).replace("\\", "/"))
@@ -277,7 +292,7 @@ def collect_unit(col, out_dir, args):
         data = run_unit_tests(args.tests, args.jobs, args.test_timeout)
         save_text(path, dump_json(data))
     elif os.path.isfile(path):
-        data = json.loads(read_text(path))
+        data = json.loads(read_utf8(path))
     else:
         col.source("unit_results", None, "missing", note="no unit-test outcome yet: run with --run-tests")
         return
@@ -377,7 +392,7 @@ def collect_ctest(col, args):
     log = os.path.join(ROOT, "runtime", "build", "Testing", "Temporary", "LastTest.log")
     sets = []
     if os.path.isfile(log):
-        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_text(log))]))
+        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_utf8(log))]))
         col.source("ctest_lasttest", log, "ok", len(sets[-1][2]))
     else:
         col.source("ctest_lasttest", log, "missing", note="no runtime/build CTest run on this machine")
@@ -386,7 +401,7 @@ def collect_ctest(col, args):
             col.source("junit", path, "missing")
             continue
         try:
-            rows = parse_junit(read_text(path))
+            rows = parse_junit(read_utf8(path))
         except ET.ParseError as e:
             col.source("junit", path, "invalid", note=str(e))
             continue
@@ -452,7 +467,7 @@ def collect_gpu(col, logs):
         if not os.path.isfile(path):
             col.source("gpu_log", path, "missing")
             continue
-        rows, summary = parse_gpu_log(read_text(path))
+        rows, summary = parse_gpu_log(read_utf8(path))
         label = label or os.path.splitext(os.path.basename(path))[0]
         note = None
         if summary and summary[1] != len(rows):
@@ -543,7 +558,7 @@ def collect_contract(col):
     if not os.path.isfile(path):
         col.source("contract", path, "missing")
         return
-    tables = [t for t in md_tables(read_text(path)) if t[0] and "contract" in t[0].lower()]
+    tables = [t for t in md_tables(read_utf8(path)) if t[0] and "contract" in t[0].lower()]
     if not tables:
         col.source("contract", path, "invalid", note="no table under a 'contract' heading")
         return
@@ -583,7 +598,7 @@ def collect_imports(col):
         col.source("imports", path, "missing")
         return
     n = unimpl = 0
-    for heading, header, rows, _ in md_tables(read_text(path)):
+    for heading, header, rows, _ in md_tables(read_utf8(path)):
         h = [plain(x).lower() for x in header]
         if "binding" in h and "import" in h:
             bi, ii, ci = h.index("binding"), h.index("import"), h.index("consumer") if "consumer" in h else 0
@@ -621,7 +636,7 @@ def collect_corpus(col, work):
     if not os.path.isfile(carved_p):
         col.source("corpus", None, "missing", note="no <work>/shaders/dxbc/index.json (run make_game.py's shaders stage)")
         return
-    carved = json.loads(read_text(carved_p))
+    carved = json.loads(read_utf8(carved_p))
     entries = carved if isinstance(carved, list) else list(carved.values())
     per_stage = {}
     for e in entries:
@@ -629,7 +644,7 @@ def collect_corpus(col, work):
         per_stage.setdefault(st, [0, 0])[0] += 1
     validated_total = 0
     if os.path.isfile(spirv_p):
-        spirv = json.loads(read_text(spirv_p))
+        spirv = json.loads(read_utf8(spirv_p))
         for meta in spirv.values():
             if isinstance(meta, dict) and "error" not in meta:
                 st = meta.get("stage") or "unknown"
@@ -879,7 +894,7 @@ def logo_src():
 
 
 def render_page(snap, history):
-    template = read_text(TEMPLATE)
+    template = read_utf8(TEMPLATE)
     payload = json.dumps({"snapshot": snap, "history": history}, ensure_ascii=False, sort_keys=True)
     payload = payload.replace("</", "<\\/")       # a document string can never close the script element
     return template.replace("/*__PROGRESS_LOGO__*/", logo_src()).replace("/*__PROGRESS_DATA__*/null", payload)
@@ -888,7 +903,7 @@ def render_page(snap, history):
 def write_outputs(snap, out_dir):
     os.makedirs(os.path.join(out_dir, "snapshots"), exist_ok=True)
     hist_path = os.path.join(out_dir, "history.json")
-    history = json.loads(read_text(hist_path)) if os.path.isfile(hist_path) else []
+    history = json.loads(read_utf8(hist_path)) if os.path.isfile(hist_path) else []
     new = not history or history[-1]["content_hash"] != snap["content_hash"][:16]
     if new:
         stamp = snap["generated_at"].replace("-", "").replace(":", "")

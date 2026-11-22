@@ -34,6 +34,12 @@ jacket 6      WEIGHTS_0                       196,488   0x26        39,272
 jacket 7      WEIGHTS_1                       235,760   0x26        39,272
 =====  =====  ==============================  ========  ==========  =====
 
+Slots 8/9 may also use the packed layout, format ``0x8C``: 16 bytes per vertex,
+four little-endian u32 words whose low 12 bits are the joint index. The reader
+converts each vertex to the same 4 x u8 row as ``0x25`` and rejects an index
+above 255. Only ``0x8C`` is accepted: no ``0x8B`` joint layout has been measured,
+so ``0x8B`` is rejected rather than guessed.
+
 The joint index is local to the drawable model's own palette: a sorted ``u32``
 joaat32 array at ``grmModel + 0x20`` with its length at ``grmModel + 0x0C``. The
 ped skeleton bind pose is ``drawable.skeleton[].bind_matrix`` from a decoded
@@ -85,6 +91,7 @@ COMPONENT_FLOAT = 5126
 JOINT_SLOTS = (8, 9)
 WEIGHT_SLOTS = (6, 7)
 INDEX_FORMAT = 0x25   # R8G8B8A8_UINT, one 4-byte element per vertex
+PACKED_INDEX_FORMAT = 0x8C  # R32G32B32A32_UINT, 16-byte element, index in bits 0..11
 WEIGHT_FORMAT = 0x26  # R8G8B8A8_UNORM
 COMPONENT_SIZES = {5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4}
 TYPE_COMPONENTS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
@@ -208,11 +215,34 @@ def model_json_path(path: str) -> tuple[str, str]:
     raise SkinError(f"{path}: expected a decoded model directory or its model.json")
 
 
+def _stream_bytes(blob: bytes, base: int, offset: int, size: int, slot: int) -> bytes:
+    """Slice a section at ``base + offset``, rejecting a short graphics buffer."""
+    start = base + offset
+    end = start + size
+    if start < base or end > len(blob):
+        raise SkinError(f"skin stream slot {slot} is outside its graphics buffer")
+    return blob[start:end]
+
+
+def _unpack_packed_joints(data: bytes, slot: int) -> bytes:
+    """Convert four packed u32 joint words per vertex to four u8 indices."""
+    out = bytearray()
+    for at in range(0, len(data), 16):
+        for word in struct.unpack_from("<4I", data, at):
+            index = word & 0xFFF
+            if index > 0xFF:
+                raise SkinError(f"skin stream slot {slot} joint index {index} does not fit u8")
+            out.append(index)
+    return bytes(out)
+
+
 def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
     """Read one mesh's JOINTS_0/1 and WEIGHTS_0/1 streams.
 
-    Returns the four raw byte rows plus the vertex count, local palette length and
-    measured section table. The caller still maps local indices to GLB joints.
+    Joint slots accept the 4 x u8 layout (``0x25``) and the packed 4 x u32 layout
+    (``0x8C``); both become 4 x u8 per vertex. Returns the four raw byte rows plus the
+    vertex count, local palette length and measured section table. The caller still
+    maps local indices to GLB joints.
     """
     drawable = model.get("drawable")
     if not isinstance(drawable, dict):
@@ -277,16 +307,23 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
         if slot not in sections:
             continue
         offset, fmt = sections[slot]
-        expected = WEIGHT_FORMAT if slot in WEIGHT_SLOTS else INDEX_FORMAT
-        if fmt != expected:
+        if slot in WEIGHT_SLOTS:
+            if fmt != WEIGHT_FORMAT:
+                raise SkinError(
+                    f"skin stream slot {slot} has format 0x{fmt:02x}; "
+                    f"expected 0x{WEIGHT_FORMAT:02x}"
+                )
+            rows[slot] = _stream_bytes(blob, base, offset, 4 * vertex_count, slot)
+        elif fmt == INDEX_FORMAT:
+            rows[slot] = _stream_bytes(blob, base, offset, 4 * vertex_count, slot)
+        elif fmt == PACKED_INDEX_FORMAT:
+            packed = _stream_bytes(blob, base, offset, 16 * vertex_count, slot)
+            rows[slot] = _unpack_packed_joints(packed, slot)
+        else:
             raise SkinError(
-                f"skin stream slot {slot} has format 0x{fmt:02x}; expected 0x{expected:02x}"
+                f"skin stream slot {slot} has format 0x{fmt:02x}; "
+                f"expected 0x{INDEX_FORMAT:02x} or 0x{PACKED_INDEX_FORMAT:02x}"
             )
-        start = base + offset
-        end = start + 4 * vertex_count
-        if start < base or end > len(blob):
-            raise SkinError(f"skin stream slot {slot} is outside its graphics buffer")
-        rows[slot] = blob[start:end]
 
     return {
         "j0": rows[8],
@@ -445,7 +482,7 @@ def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
         for alias in aliases:
             if alias in ped_set:
                 score += 10
-            elif any(token.startswith(alias.lower()) for token in ped_set):
+            elif any(token.startswith(alias) for token in ped_set):
                 score += 5
         if score:
             candidate = (score, -len(ped_name), -index, index)
@@ -533,9 +570,14 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
             if int(weighted.max()) >= local_bones:
                 raise SkinError("a weighted joint index is outside the local palette")
         weights /= totals[:, None]
+        # A zero-weight component may carry any index; clear it before the palette lookup
+        # so an out-of-palette value cannot raise where the stdlib path returns zeros.
+        zero = weights == 0
+        indices[zero] = 0
         mapping = _np.asarray(local_to_joint, dtype=_np.uint16)
-        indices = mapping[indices]
         indices[weights == 0] = 0
+        indices = mapping[indices]
+        indices[zero] = 0
         if joint_count is not None and bool((indices >= joint_count).any()):
             raise SkinError("remapped joint index is invalid")
         return {
@@ -613,7 +655,7 @@ def accessor_bytes(gltf: dict, bin_data: bytes, index: int) -> tuple[bytes, dict
     if not isinstance(stride, int) or stride < element:
         raise SkinError(f"accessor {index} has an invalid byteStride")
     start = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
-    end = start + stride * count
+    end = start + ((count - 1) * stride + element if count else 0)
     if start < 0 or end > len(bin_data):
         raise SkinError(f"accessor {index} is outside the BIN chunk")
     if stride == element:
@@ -631,21 +673,32 @@ class _GlbBuilder:
         self.views: list[dict] = []
         self.accessors: list[dict] = []
 
-    def view(self, payload: bytes, target: int | None = None) -> int:
+    def view(self, payload: bytes, target: int | None = None, *, stride: int | None = None) -> int:
         self.bin.extend(b"\x00" * ((-len(self.bin)) % 4))
         offset = len(self.bin)
         self.bin.extend(payload)
         entry = {"buffer": 0, "byteOffset": offset, "byteLength": len(payload)}
         if target is not None:
             entry["target"] = target
+        if stride is not None:
+            entry["byteStride"] = stride
         self.views.append(entry)
         return len(self.views) - 1
 
     def accessor(self, payload: bytes, component_type: int, kind: str, count: int,
                  target: int | None, *, normalized: bool = False,
                  minimum: list[float] | None = None, maximum: list[float] | None = None) -> int:
+        stride = None
+        if target == ARRAY_BUFFER:
+            element_size = COMPONENT_SIZES[component_type] * TYPE_COMPONENTS[kind]
+            padding = bytes((-element_size) % 4)
+            if padding:
+                # Accessors are read as tightly packed bytes, but glTF vertex rows must align to four bytes.
+                payload = b"".join(payload[i:i + element_size] + padding
+                                   for i in range(0, len(payload), element_size))
+                stride = element_size + len(padding)
         entry = {
-            "bufferView": self.view(payload, target),
+            "bufferView": self.view(payload, target, stride=stride),
             "componentType": component_type,
             "count": count,
             "type": kind,

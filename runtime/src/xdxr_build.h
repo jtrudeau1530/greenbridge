@@ -74,8 +74,9 @@ struct XdxrLayout {
         size = std::uint32_t(end);
         parent_entries = std::uint32_t(body_units);
         sort_size = count;
-        // centroid bounds, keys and element indices twice, digit counts per tile, a box per element and per node
-        scratch = 64 + 16ull * sort_size + 4ull * radix_bins * tiles() + 24ull * (std::uint64_t(count) + nodes);
+        // centroid bounds, keys and element indices twice, digit counts per tile and their prefix sums, a box per
+        // element and per node
+        scratch = 64 + 16ull * sort_size + 8ull * radix_bins * tiles() + 24ull * (std::uint64_t(count) + nodes);
         return true;
     }
     std::uint32_t root() const { return nodes - 1; }
