@@ -3258,7 +3258,18 @@ class Gen:
 
     def x_buf_bytes(self):
         """Workgroup bytes of %x_buf: the wave64 exchange (emulate) or the barrier-round counts (bar_rounds)."""
-        return 4 * (self.x_sizes()[3] + 1) if self.emulate else 12 if self.bar_rounds else 0
+        if self.emulate:
+            return 4 * (self.x_sizes()[3] + 1)
+        return 12 if self.bar_rounds and not self.bar_counts_in_lds() else 0
+
+    def bar_counts_in_lds(self, lds_used=None):
+        """SHADER-579: whether the barrier rounds keep their count in a borrowed LDS word instead of %x_buf. Only
+        when the 12 bytes of %x_buf would take the total past 16384 B, the Vulkan minimum maxComputeSharedMemorySize:
+        a full 32 KiB LDS plus %x_buf is 32,780 B, over the 32,768 B of the AMD Windows and Intel drivers. Under
+        that, %x_buf fits on every device and costs no extra barriers (bar_scheduler). lds_used: before any code is
+        generated (fit_shared_memory), whether the shader will use its LDS is not known yet; assume it does."""
+        used = self.uses_lds if lds_used is None else lds_used
+        return self.bar_rounds and used and 4 * self.lds_dwords + 12 > 16384
 
     def fit_shared_memory(self):
         """SHADER-309: a compute shader's Workgroup memory, the LDS array plus %x_buf, must fit in MAX_SHARED_BYTES
@@ -3268,7 +3279,7 @@ class Gen:
         %x_buf is already sized to the workgroup, so when even the need does not fit, assemble refuses the shader."""
         if not self.cs:
             return
-        room = (MAX_SHARED_BYTES - self.x_buf_bytes()) // 4
+        room = (MAX_SHARED_BYTES - (0 if self.bar_counts_in_lds(lds_used=True) else self.x_buf_bytes())) // 4
         if self.lds_dwords > room >= max(self.lds_need, 1):
             self.lds_dwords = room
             self.cu(room)
@@ -10074,7 +10085,7 @@ def assemble(gen):
          [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)] +
          [f"%ms_out_f16h{n}_{h}" for n in ms_halves for h in (0, 1)])) if ms else []) + (
-        ["%x_buf"] if gen.emulate or gen.bar_rounds else []) + (
+        ["%x_buf"] if gen.emulate or gen.bar_rounds and not gen.bar_counts_in_lds() else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
@@ -10474,8 +10485,9 @@ def assemble(gen):
         types += [f"%x_arr = OpTypeArray %uint {gen.cu(x_sink + 1)}",
                   "%_ptr_WG_x_arr = OpTypePointer Workgroup %x_arr", "%_ptr_WG_uint_x = OpTypePointer Workgroup %uint"]
         gvars += ["%x_buf = OpVariable %_ptr_WG_x_arr Workgroup"]
-    elif gen.bar_rounds:
+    elif gen.bar_rounds and not gen.bar_counts_in_lds():
         # Barrier rounds: one count of the invocations not done per round, 3 slots by round mod 3 (bar_scheduler).
+        # With a large LDS the count borrows an LDS word instead (SHADER-579, bar_counts_in_lds).
         types += [f"%x_arr = OpTypeArray %uint {gen.cu(3)}",
                   "%_ptr_WG_x_arr = OpTypePointer Workgroup %x_arr", "%_ptr_WG_uint_x = OpTypePointer Workgroup %uint"]
         gvars += ["%x_buf = OpVariable %_ptr_WG_x_arr Workgroup"]
@@ -10584,6 +10596,8 @@ def assemble(gen):
     elif gen.bar_rounds:
         fn += ["%x_it = OpVariable %_ptr_Function_uint Function %c0",
                "%x_bar = OpVariable %_ptr_Function_bool Function %false"]
+        if gen.bar_counts_in_lds():
+            fn.append("%xb_save = OpVariable %_ptr_Function_uint Function %c0")
         fn += [f"{var} = OpVariable {ptr} Function" for var, ptr in gen.x_spills]
     # User data: s0..s31 are loaded at entry from a push-constant block (the driver's user-SGPR setup).
     if gen.uses_heap:
@@ -12212,28 +12226,31 @@ def bar_scheduler(gen):
 
     %x_buf holds 3 counts, by round mod 3: round r adds to its own slot before the barrier and reads it after,
     and invocation 0 clears the slot of round r + 1, last read in round r - 2 (before the barrier of r - 1).
+    With a large LDS (bar_counts_in_lds, SHADER-579) there is no %x_buf: the count borrows LDS word 0 between
+    rounds, when no invocation runs shader code (see bar_scheduler_tail), and starts cleared in every round.
     The first two lines are the Function variables %pc and %done, as for the dispatch loop."""
     c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
     sx, sy, _ = gen.cs["size"]
+    in_lds = gen.bar_counts_in_lds()
     return ["%pc = OpVariable %_ptr_Function_uint Function %c0",
             "%done = OpVariable %_ptr_Function_bool Function %false",
             "%xb_lid = OpLoad %v3uint %local_id", "%xb_lx = OpCompositeExtract %uint %xb_lid 0",
             "%xb_ly = OpCompositeExtract %uint %xb_lid 1", "%xb_lz = OpCompositeExtract %uint %xb_lid 2",
             f"%xb_ly2 = OpIMul %uint %xb_ly {c(sx)}", f"%xb_lz2 = OpIMul %uint %xb_lz {c(sx * sy)}",
             "%xb_lxy = OpIAdd %uint %xb_lx %xb_ly2", "%xb_li = OpIAdd %uint %xb_lxy %xb_lz2",
-            f"%xb_first = OpIEqual %bool %xb_li {c(0)}",
+            f"%xb_first = OpIEqual %bool %xb_li {c(0)}"] + ([] if in_lds else [
             # Workgroup memory starts undefined: invocation 0 clears round 0's count before the first round.
             "OpSelectionMerge %xb_z_end None", "OpBranchConditional %xb_first %xb_z %xb_z_end", "%xb_z = OpLabel",
             f"%xb_zp = OpAccessChain %_ptr_WG_uint_x %x_buf {c(0)}", f"OpStore %xb_zp {c(0)}",
             "OpBranch %xb_z_end", "%xb_z_end = OpLabel",
-            f"OpControlBarrier {c(2)} {c(2)} {c(0x108)}",
+            f"OpControlBarrier {c(2)} {c(2)} {c(0x108)}"]) + [
             "OpBranch %loop_head", "%loop_head = OpLabel", "OpLoopMerge %loop_exit %loop_cont None",
-            "OpBranch %xb_round", "%xb_round = OpLabel",
-            "%xb_itv = OpLoad %uint %x_it", f"%xb_s = OpUMod %uint %xb_itv {c(3)}",
+            "OpBranch %xb_round", "%xb_round = OpLabel", "%xb_itv = OpLoad %uint %x_it"] + ([] if in_lds else [
+            f"%xb_s = OpUMod %uint %xb_itv {c(3)}",
             f"%xb_n1 = OpIAdd %uint %xb_itv {c(1)}", f"%xb_sn = OpUMod %uint %xb_n1 {c(3)}",
             "OpSelectionMerge %xb_r_end None", "OpBranchConditional %xb_first %xb_r %xb_r_end", "%xb_r = OpLabel",
             "%xb_rp = OpAccessChain %_ptr_WG_uint_x %x_buf %xb_sn", f"OpStore %xb_rp {c(0)}",
-            "OpBranch %xb_r_end", "%xb_r_end = OpLabel",
+            "OpBranch %xb_r_end", "%xb_r_end = OpLabel"]) + [
             "%xb_d = OpLoad %bool %done",
             "OpSelectionMerge %xb_ran None", "OpBranchConditional %xb_d %xb_ran %xb_run", "%xb_run = OpLabel",
             # The invocation's blocks, until an s_barrier (%x_bar) or the end (%done).
@@ -12245,13 +12262,46 @@ def bar_scheduler(gen):
 
 
 def bar_scheduler_tail(gen):
-    """Barrier rounds: the end of a round, after the switch (see bar_scheduler)."""
+    """Barrier rounds: the end of a round, after the switch (see bar_scheduler).
+
+    SHADER-579, the count in LDS (bar_counts_in_lds): after s_barrier's own barrier (A) every invocation is done or
+    waits, so no shader code touches LDS until the next round. Invocation 0 saves LDS word 0 in a Function variable
+    and clears it; barrier B; every invocation not done adds 1; barrier C; all read the count; barrier D;
+    invocation 0 puts the saved word back; barrier E, before the next round's code. The shader sees its LDS
+    unchanged, and B to E only add workgroup barriers at a point where the whole workgroup already waits."""
     c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
-    return ["%sw_default = OpLabel", "OpStore %done %true", "OpBranch %sw_merge",
+    bar = f"OpControlBarrier {c(2)} {c(2)} {c(0x108)}"
+    head = ["%sw_default = OpLabel", "OpStore %done %true", "OpBranch %sw_merge",
             "%sw_merge = OpLabel", "OpBranch %xb_in_cont", "%xb_in_cont = OpLabel",
             "%xb_d1 = OpLoad %bool %done", "%xb_b1 = OpLoad %bool %x_bar",
             "%xb_stop = OpLogicalOr %bool %xb_d1 %xb_b1",
-            "OpBranchConditional %xb_stop %xb_in_merge %xb_in_head", "%xb_in_merge = OpLabel",
+            "OpBranchConditional %xb_stop %xb_in_merge %xb_in_head", "%xb_in_merge = OpLabel"]
+    if gen.bar_counts_in_lds():
+        return head + [
+            "OpBranch %xb_ran", "%xb_ran = OpLabel",
+            bar,                                                    # A: s_barrier's own barrier
+            f"%xb_wp = OpAccessChain %_ptr_WG_uint %lds {c(0)}",
+            "OpSelectionMerge %xb_sv_end None", "OpBranchConditional %xb_first %xb_sv %xb_sv_end",
+            "%xb_sv = OpLabel", "%xb_old = OpLoad %uint %xb_wp", "OpStore %xb_save %xb_old",
+            f"OpStore %xb_wp {c(0)}", "OpBranch %xb_sv_end", "%xb_sv_end = OpLabel",
+            bar,                                                    # B: the word is cleared
+            "%xb_d2 = OpLoad %bool %done",
+            "OpSelectionMerge %xb_c_end None", "OpBranchConditional %xb_d2 %xb_c_end %xb_c", "%xb_c = OpLabel",
+            f"%xb_ca = OpAtomicIAdd %uint %xb_wp {c(2)} {c(0)} {c(1)}",
+            "OpBranch %xb_c_end", "%xb_c_end = OpLabel",
+            bar,                                                    # C: every count is in
+            "%xb_left = OpLoad %uint %xb_wp",
+            bar,                                                    # D: every invocation has read it
+            "OpSelectionMerge %xb_rs_end None", "OpBranchConditional %xb_first %xb_rs %xb_rs_end",
+            "%xb_rs = OpLabel", "%xb_old2 = OpLoad %uint %xb_save", "OpStore %xb_wp %xb_old2",
+            "OpBranch %xb_rs_end", "%xb_rs_end = OpLabel",
+            "OpBranch %loop_cont", "%loop_cont = OpLabel",
+            bar,                                                    # E: the shader's word is back
+            "OpStore %x_bar %false",
+            f"%xb_it1 = OpIAdd %uint %xb_itv {c(1)}", "OpStore %x_it %xb_it1",
+            f"%xb_fin = OpIEqual %bool %xb_left {c(0)}", "OpBranchConditional %xb_fin %loop_exit %loop_head",
+            "%loop_exit = OpLabel"]
+    return head + [
             # Not done: count this invocation in the round's slot.
             "%xb_d2 = OpLoad %bool %done",
             "OpSelectionMerge %xb_c_end None", "OpBranchConditional %xb_d2 %xb_c_end %xb_c", "%xb_c = OpLabel",
