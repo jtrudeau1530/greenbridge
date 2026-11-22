@@ -788,6 +788,10 @@ struct ReplayFunctions {
     // cannot read while the list is prepared, `xdxr_record` records the build.
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
     std::function<void(VkCommandBuffer, const BuildAccelerationStructure&)> xdxr_record;
+    // CopyRaytracingAccelerationStructure (CLONE, COMPACT) of XDXR structures: `bytes` is the room the destination
+    // resource has; and one postbuild value (COMPACTED_SIZE, CURRENT_SIZE) of the structure at `src` to `dest`.
+    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes)> xdxr_copy;
+    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dest_va)> xdxr_postbuild;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
     // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
     std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
@@ -903,6 +907,7 @@ struct Prepared {
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
+    std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
 
@@ -2412,6 +2417,29 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     if (!p.accel_src) return ReplayResult::unresolved_resource;
                 }
             }
+        } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
+            // XDXR only (a KHR copy needs VkAccelerationStructureKHR handles and vkCmdCopyAccelerationStructureKHR);
+            // the destination's room bounds the copy, as the size is only known to the GPU.
+            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1) return ReplayResult::unsupported;
+            std::uint64_t room = ~std::uint64_t(0);
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            if (!vk.buffer_at(copy->dst_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
+            std::uint64_t source = ~std::uint64_t(0);
+            if (!vk.buffer_at(copy->src_va, source, buffer, offset)) return ReplayResult::unresolved_resource;
+            p.xdxr_bytes = std::min(room, source);
+        } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command)) {
+            // The KHR path never wrote postbuild values; it keeps skipping them rather than failing the list.
+            if (!vk.xdxr_postbuild) {
+                p.skip = true;
+            } else {
+                if (!vk.buffer_at || (info->type != 0 && info->type != 3)) return ReplayResult::unsupported;
+                std::uint64_t room = 8 * info->sources.size();
+                VkBuffer buffer = VK_NULL_HANDLE;
+                VkDeviceSize offset = 0;
+                if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
+                if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
+            }
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
                 return ReplayResult::unsupported;
@@ -3141,6 +3169,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build);
+        } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
+            vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
+        } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command); info && !p.skip) {
+            for (std::size_t i = 0; i < info->sources.size(); ++i)
+                vk.xdxr_postbuild(command_buffer, info->sources[i], info->dest_va + 8 * i);
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.

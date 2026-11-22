@@ -610,8 +610,8 @@ public:
     }
 
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
-        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT,
-        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*) override {
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT postbuild_count,
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* postbuild) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return check(false);
         const auto& in = desc->Inputs;
         leonida::BuildAccelerationStructure cmd{};
@@ -665,7 +665,38 @@ public:
                 cmd.triangles.push_back(t);
             }
         }
-        check(list_.build_acceleration_structure(cmd));
+        const std::uint64_t built = cmd.dst_va;
+        const bool recorded = list_.build_acceleration_structure(std::move(cmd));
+        check(recorded);
+        if (!recorded) return;
+        // The postbuild values of the structure just built, after it (D3D12 orders them after the build).
+        for (UINT i = 0; postbuild && i < postbuild_count; ++i) {
+            leonida::AccelerationStructurePostbuild info{};
+            info.dest_va = postbuild[i].DestBuffer;
+            info.type = static_cast<std::uint32_t>(postbuild[i].InfoType);
+            info.sources = {built};
+            const bool ok = list_.acceleration_structure_postbuild(std::move(info));
+            check(ok);
+            if (!ok) return;
+        }
+    }
+
+    void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* desc, UINT count,
+        const D3D12_GPU_VIRTUAL_ADDRESS* sources) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc || !count || !sources) return check(false);
+        leonida::AccelerationStructurePostbuild info{};
+        info.dest_va = desc->DestBuffer;
+        info.type = static_cast<std::uint32_t>(desc->InfoType);
+        info.sources.assign(sources, sources + count);
+        check(list_.acceleration_structure_postbuild(std::move(info)));
+    }
+
+    void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS dest,
+                                                               D3D12_GPU_VIRTUAL_ADDRESS source,
+                                                               D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }

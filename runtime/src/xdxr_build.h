@@ -15,6 +15,7 @@
 // device addresses are wider (llvmpipe's are host pointers), the layer must present a narrower window and a bias.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -161,10 +162,44 @@ public:
         return true;
     }
 
+    // CopyRaytracingAccelerationStructure CLONE or COMPACT: the structure at `src` to `dst`, as many bytes as its
+    // header says, at most `max_bytes` (the room the destination has). The structures are position-independent.
+    bool record_copy(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t max_bytes) {
+        if (!loaded_ || !src || !dst || max_bytes < XdxrLayout::header_size) return false;
+        if (src == dst) return true;
+        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        Push p{};
+        p.mode = mode_copy_as;
+        p.src0 = split(src);
+        p.dst = split(dst);
+        p.count = std::uint32_t(std::min<std::uint64_t>(max_bytes, 0xffffffffull) / 4);
+        dispatch(cb, p, p.count, false);
+        return true;
+    }
+
+    // One postbuild value (COMPACTED_SIZE or CURRENT_SIZE, the same for these builds): 8 bytes at `dst` for the
+    // structure at `src`. A barrier first: a build or copy recorded just before writes the header it reads.
+    bool record_postbuild(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst) {
+        if (!loaded_ || !src || !dst) return false;
+        VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+        vk_.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                 &b, 0, nullptr, 0, nullptr);
+        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        Push p{};
+        p.mode = mode_postbuild;
+        p.src0 = split(src);
+        p.dst = split(dst);
+        p.count = 1;
+        dispatch(cb, p, 1, false);
+        return true;
+    }
+
 private:
     enum : std::uint32_t {
         mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_level = 5, mode_header = 6,
-        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10, mode_copy = 11
+        mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10, mode_copy = 11,
+        mode_copy_as = 12, mode_postbuild = 13
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout
