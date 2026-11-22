@@ -2379,7 +2379,10 @@ class Gen:
             self.uses_tex_array = True
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x3")
         dmask = int(dm.split(":")[1], 0)
-        vdata, addr = a[0], self.addr_regs(a[1])
+        vdata = a[0]
+        if vdata["k"] != "vgpr":          # `off`, an SGPR or a constant where the VGPR range of the result goes
+            raise Unsupported("image_get_lod destination")
+        addr = self.addr_regs(a[1])
         img_idx = self.desc_lookup_sgpr(a[2], 8)
         smp_idx = self.desc_lookup_sgpr(a[3], 4)
         ip, img, sp, smp, si = (self.tmp() for _ in range(5))
@@ -10346,7 +10349,10 @@ class Gen:
             raise Unsupported(op + " glc " + dim.split("SQ_RSRC_IMG_")[-1])
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
-        vdata, addr = a[0], self.addr_regs(a[1])
+        vdata = a[0]
+        if vdata["k"] != "vgpr":          # `off`, an SGPR or a constant where the VGPR range of the result goes
+            raise Unsupported(op + " destination")
+        addr = self.addr_regs(a[1])
         if op == "image_sample_c_l":
             # Vulkan Dref returns one scalar. Other component masks require the depth view's swizzle.
             if (dim != "dim:SQ_RSRC_IMG_2D" or dmask != 1 or len(addr) != (3 if a16 else 4)
@@ -11168,6 +11174,8 @@ class Gen:
 
     def image_misc(self, op, a, mods):
         """Query sampled image dimensions, load mip texels and handle storage image operations."""
+        if a and a[0]["k"] != "vgpr":      # `off`, an SGPR or a constant where the VGPR range of the data goes
+            raise Unsupported(op + " data")
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
         array_query = op == "image_get_resinfo" and dim == "dim:SQ_RSRC_IMG_2D_ARRAY"
         is_atomic = op in self.IMG_ATOMICS or op == "image_atomic_cmpswap" or op in self.IMG_ATOMICS_EXTRA
