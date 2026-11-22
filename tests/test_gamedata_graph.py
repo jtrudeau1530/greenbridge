@@ -107,6 +107,62 @@ class GamedataGraphTest(unittest.TestCase):
         self.assertIn(f"cannot write {out}", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_json_that_is_a_directory_is_refused(self):
+        self.finish()
+        r = self.run_tool(self.carve, "--json", self.root)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("is a directory", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_json_over_input_xml_file_is_refused(self):
+        xml_path = os.path.join(self.root, "input.xml")
+        with open(xml_path, "wb") as f:
+            f.write(ALPHA)
+        alias = os.path.join(self.root, ".", "input.xml")
+        r = self.run_tool(xml_path, "--json", alias)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite the input", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(xml_path, "rb") as f:
+            self.assertEqual(f.read(), ALPHA)
+
+    def test_json_over_carve_dir_manifest_is_refused(self):
+        self.add(ALPHA)
+        self.finish()
+        manifest = os.path.join(self.carve, "index.json")
+        with open(manifest, "rb") as f:
+            content = f.read()
+        r = self.run_tool(self.carve, "--json", manifest)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite the input", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(manifest, "rb") as f:
+            self.assertEqual(f.read(), content)
+
+    def test_json_over_carve_dir_bin_payload_is_refused(self):
+        self.add(ALPHA)
+        self.finish()
+        bin_path = os.path.join(self.carve, f"{self.rows[0]['off']:012x}.bin")
+        with open(bin_path, "rb") as f:
+            content = f.read()
+        r = self.run_tool(self.carve, "--json", bin_path)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite an input file", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(bin_path, "rb") as f:
+            self.assertEqual(f.read(), content)
+
+    def test_fresh_json_inside_carve_dir_is_allowed(self):
+        self.add(ALPHA)
+        self.finish()
+        out = os.path.join(self.carve, "graph.json")
+        r = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isfile(out))
+        with open(out, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["summary"]["mode"], "carve")
+
     def test_cycle_at_end_of_a_deep_include_chain(self):
         size = sys.getrecursionlimit() + 50
         adjacency = {node: [node + 1] for node in range(size - 1)}
