@@ -7,7 +7,7 @@ the original names are unavailable; PSIN is identified by its own magic.
 
 ## Where it appears
 
-- `script.rpf` carve: **671 streams** start with `PSIN`, all version 22. **670 are complete**; one is
+- `script.rpf` carve: **671 streams** start with `PSIN`. **670 are complete**; one is
   the first 64 KiB of a larger record (its first-section offset points past the carved block).
 - `data.rpf` carve: **2,281 streams** start with `PSIN` (the same project's carve also reports 1,263
   `RBF0` and 3,132 resource pages). The project's existing `ArchiveReader`/`PsinMetadata` path
@@ -24,11 +24,12 @@ Every measured file begins with the same 16-byte header:
 |---:|---:|---|
 | +0 | 4 | `50 53 49 4e` (`PSIN`) |
 | +4 | 4 | big-endian absolute offset of the first section (`LSCH`) |
-| +8 | 4 | little-endian version; **22** on every measured file |
-| +12 | 4 | little-endian byte count of the hash table that follows the header |
+| +8 | 4 | type of the first block-table row (see *Instance data*) |
+| +12 | 4 | size of the first block |
 
-The hash table sits between the header and the first section. This tool does not interpret it; it is
-counted and its length is reported.
+`psin_index.py` reports +8 as `version` and +12 as `table_bytes`. They are the first row of the block table that
+starts at +8. The value 22 (`0x16`, a block of 64-bit integers) appears on 1,010 of the 18,640 PSIN streams, nearly
+all of them in `script.rpf`. On the other 17,630 the field holds a struct name hash or another type code.
 
 ## Sections
 
@@ -141,24 +142,27 @@ hypothesis until a struct is matched against its instance data.
 | Type | Members | Reference | Gap | Reading |
 |---:|---:|---|---|---|
 | 0x05 | 192,944 | a struct name: 155,495 in the same file, 36,277 in another file, 1,172 not found | varies | embedded struct (high) |
-| 0x40 | 2,311 | a struct name in another file (1,558) or not found (753) | 256, 128 | fixed block of structs (low) |
-| 0x5c | 49,375 | none; element index instead | 16 | array; 16 bytes fits a pointer, count and capacity (medium) |
+| 0x40 | 2,311 | the length in bytes (256, 128 or 16; equal to the gap on every member measured) | 256, 128 | `char[ref]` (high) |
+| 0x5c | 49,375 | none; element index instead | 16 | array `{u32 count, u32 capacity, pointer}` (high) |
 | 0x60 | 3,887 | an enum (3,866 same file, 21 other file) | 1 | 8-bit enum (medium) |
 | 0x62 | 40,024 | an enum (39,758 / 253; 13 not found) | 4 | 32-bit enum (medium) |
 | 0x63, 0x64 | 47, 85 | an enum | 1, 2 | 8/16-bit enum variants (low) |
 | 0x65 | 16,217 | an enum (16,099 / 115; 1 not found) | 8, 4 | enum-indexed bit set (low) |
-| 0x68 | 98 | an enum | 8 | unknown enum use (low) |
-| 0x50, 0x53, 0x71, 0x73, 0x75-0x77, 0x54, 0x5a | 20,777, 367, 114,700, 111, 12,888, 4, 2, 1, 3 | a hash that is no struct or enum anywhere in the corpus | 0x71: 24; 0x75: 16 | unknown |
+| 0x68 | 98 | an enum | 8 | 64-bit enum (medium) |
+| 0x50, 0x53 | 20,777, 367 | the element count in the low 16 bits | varies | fixed array in place (high) |
+| 0x71, 0x73, 0x75 | 114,700, 111, 12,888 | the key and value element indices (`ref & 0xffff`, `ref >> 16`) | 24, 16, 16 | maps (high), see *Instance data* |
+| 0x76, 0x77, 0x54, 0x5a | 4, 2, 1, 3 | varies | varies | 0x54: inline array; the others are not decoded |
 | 0x01, 0x11 | 93,811, 14,761 | - | 1 | 1-byte scalars (medium) |
 | 0x13, 0x20 | 7,372, 7,356 | - | 2 | 2-byte scalars (medium) |
 | 0x14, 0x15, 0x21, 0x4a | 35,088, 41,144, 110,948, 194,191 | - | 4 | 4-byte scalars (medium) |
-| 0x07, 0x08, 0x30, 0x42 | 52,656, 2,232, 1,112, 1,084 | - | 8 | 8-byte values (medium) |
-| 0x4d, 0x4f | 152,193, 15,076 | - (sub-code set) | 8, 4, 16 | unknown |
-| 0x0d, 0x31, 0x33, 0x34, 0x52 | 582, 7,750, 50,665, 6,072, 50,156 | - | 16 | 16-byte values (medium) |
+| 0x07, 0x08, 0x30, 0x42 | 52,656, 2,232, 1,112, 1,084 | - | 8 | struct pointer, 64-bit int, 2×f32, string pointer (high) |
+| 0x4d, 0x4f | 152,193, 15,076 | - (sub-code set) | 8, 4, 16 | 4- and 8-byte values, read as u32/u64 hashes (medium: size measured, meaning not) |
+| 0x0d, 0x31, 0x33, 0x34, 0x52 | 582, 7,750, 50,665, 6,072, 50,156 | - | 16 | 16-byte vectors; 0x52 is the list `{pointer, u16 count, u16 capacity}` (high) |
 | 0x36 | 402 | - | 64 | 64-byte value (medium) |
 
 The rest (0x0c, 0x10, 0x12, 0x16, 0x17, 0x32, 0x44, 0x4b) occur 3-1,551 times each. `psin_index.py --schema`
-lists every member.
+lists every member. The "(high)" readings were checked against the instance data in the next section. The gap
+alone is only an upper bound.
 
 ### `LENM` enum header (24 bytes) and value (16 bytes)
 
@@ -198,11 +202,116 @@ signatures are not joaat of a name. No name or hash from the game is committed h
 - Struct references (type 0x05) resolve in the same `LSCH` for 155,495 of 192,944 members and in another
   file's `LSCH` for 36,277 more. Enum references (types 0x60, 0x62-0x65, 0x68) resolve in the same file's
   `LENM` for 59,945 of 60,354 and in another file for 395 more.
-- The region between the 16-byte header and `LSCH` is most likely the instance data these structs describe.
-  This is a hypothesis: in the records looked at, it begins with struct name hashes from `LSCH`. The header's
-  +12 field is no larger than that region on 18,578 of the 18,640 PSIN streams. Mapping the region onto the schema
-  is not done here.
+- The region between the 8-byte header and `LSCH` is the instance data these structs describe: a block table
+  and its data blocks, read from the root block that `LRSC` names. See *Instance data*.
 - `LSNS` (high-entropy) is not touched.
+
+## Instance data
+
+The region between the 8-byte header and `LSCH` is a block table followed by its data blocks. The schema in
+`LSCH`/`LENM` describes the blocks, and `LRSC` names the root. `tools/psin_data.py` reads it.
+
+### Block table and blocks
+
+| Offset | Size | Field |
+|---:|---:|---|
+| +0 | 4 | block type: a struct name hash from `LSCH`, a member type code below 0x100 (for example `0x10` for string bytes, `0x16` for 64-bit integers) or `0x100 + n` for an anonymous block |
+| +4 | 4 | data size in bytes |
+| +8 | 8 | fill, `aa` × 8 |
+
+The rows start at +8. The table therefore ends 8 bytes short of a 16-byte boundary, and those 8 bytes are `70` × 8
+(`pppppppp`) on 17,507 of 17,507 files. The blocks follow in table order, each padded to 16 bytes, and the last one
+ends exactly at the first section (17,507 of 17,507). Blocks are numbered from 1.
+
+The root is the u32 at +0x10 of the `0DRP` header in `LRSC`. It is a struct block on 17,507 of 17,507 files.
+
+A **pointer** is a u64. Its low 20 bits are the block number, with 0 meaning null, and the bits above are the byte
+offset into that block.
+
+### Layouts
+
+The tables below give the layouts the instance data confirms. Arrays name their element with the member's element
+index, as in `LSCH`. Maps name a key element at `ref & 0xffff` and a value element at `ref >> 16`.
+
+| Type | Bytes | Layout |
+|---:|---:|---|
+| 0x07 | 8 | pointer to a struct block; the block's type is the struct |
+| 0x42 | 8 | pointer to a NUL-terminated string in a type-`0x10` block |
+| 0x44 | 16 | string with an in-place form: when bit 7 of byte 15 is set, its low 7 bits are the length of the string in bytes 0..14; otherwise bytes 0..7 are a string pointer as for 0x42 |
+| 0x40 | ref | `char[ref]`, NUL-padded |
+| 0x50, 0x53 | ref × element | `ref & 0xffff` elements in place |
+| 0x54 | 8 + capacity × element | `{u32 capacity, u32 count}`, then the elements in place |
+| 0x5c | 16 | `{u32 count, u32 capacity, u64 pointer}` |
+| 0x52 | 16 | `{u64 pointer, u16 count, u16 capacity, u32 0}` |
+| 0x71 | 24 | `{u64 1, u64 pointer, u16 count, u16 capacity, u32 0}`: `count` (key, value) pairs sorted by key |
+| 0x75 | 16 | `{u32 groups, u32 count, u64 pointer}`: `groups` groups of 16 control bytes followed by 16 (key, value) slots. A control byte with bit 7 set marks an empty slot. |
+| 0x73 | 16 | `{u32 capacity, u32 count, u64 pointer}`: `capacity` (key, value) slots, where key 0 marks an empty slot |
+| 0x60, 0x63 / 0x64 / 0x62, 0x65 / 0x68 | 1 / 2 / 4 / 8 | enum value or enum bit set |
+
+**Alignment.** In a (key, value) slot the value starts at the key size rounded up to the value's alignment, and the
+slot size is rounded up to the larger of the two alignments. A struct aligns to 2^(+9 of its header). The 16-byte
+vectors (0x0c, 0x0d, 0x31, 0x33, 0x34, 0x35) and 0x36 align to 16, and 0x32 aligns to 4. Every other type aligns to
+its size, capped at 8. With these rules the 24-byte 0x71 value sits at +8 after a u32 key, in a 32-byte pair.
+
+### Measured coverage
+
+The measurement walks every value reachable from the root, through embedded structs, pointers, arrays and maps,
+and marks each byte it reads.
+
+| Archive | PSIN | with `LSCH`+`LRSC` | tables fill the region | fully reached | block bytes | reached |
+|---|---:|---:|---:|---:|---:|---:|
+| `levels` | 6,982 | 6,650 | 6,650 | 6,650 | 43,591,021 | 43,591,021 |
+| `story000` | 5,348 | 5,075 | 5,075 | 5,075 | 36,404,701 | 36,404,701 |
+| `data` | 2,281 | 2,081 | 2,081 | 2,079 | 14,773,021 | 14,772,189 |
+| `story000_script` | 2,309 | 2,118 | 2,118 | 2,118 | 30,677,748 | 30,677,748 |
+| `script` | 1,012 | 1,009 | 1,009 | 1,009 | 1,323,348 | 1,323,348 |
+| `packs` | 586 | 487 | 487 | 486 | 1,924,622 | 1,923,342 |
+| `shared_minigame000` | 73 | 70 | 70 | 70 | 227,855 | 227,855 |
+| `navmeshes` | 22 | 1 | 1 | 1 | 28,688 | 28,688 |
+| `anim` | 18 | 9 | 9 | 6 | 102,040 | 86,344 |
+| `core_restofworld` | 6 | 5 | 5 | 5 | 59,136 | 59,136 |
+| `story000_restofworld` | 3 | 2 | 2 | 2 | 5,632 | 5,632 |
+| **all** | **18,640** | **17,507** | **17,507** | **17,501** | **129,117,812** | **129,100,004** (99.986%) |
+
+The other 1,133 streams are not counted. 1,076 are cut off (see *Corpus*), and 57 use the `PMAP`/`PSCH` form, which
+has no `LSCH`.
+
+Checks over the 17,507 containers:
+
+- **Pointers.** 238,681 struct pointers (0x07) and 81,680 string pointers resolve; none points outside its block
+  table or past the end of its block. 4,305 more 0x44 strings are stored in place, and every one has a NUL at its
+  stated length.
+- **Arrays.** 0x5c and 0x52 arrays resolve 177,675 and 628,888 times. Count ≤ capacity holds on all 1,352,211 arrays
+  and maps that store both. The target block's type is the element type (or struct) on 806,520 of them. The other
+  43 are arrays of enums stored in anonymous `0x100+n` blocks. 24,949 more arrays name an element struct that is
+  not in their own file's `LSCH`, and all 24,949 are empty.
+- **Maps.** 0x71: the first word is 1 on 159,409 of 159,409. The 69,954 non-empty maps hold 267,161 pairs, and
+  69,951 of those maps have ascending keys. 0x75: on all 16,035 non-empty tables the group count is a power of two
+  and the used control bytes equal `count` (92,903 slots). In `data`, `levels` and `story000_script`, the control byte of every
+  used slot with a u32/u64 hash key (0x4a, 0x4d, 0x4f) is the key's low 7 bits. It is not for other key types. When the target block is larger than `groups` groups, the rest holds further tables. 0x73: on 167 of 167
+  the non-zero keys equal `count`, and the capacity is a power of two.
+- **Enums.** 502,303 enum values are listed in their `LENM` enum and 31,624 are not. Of the unlisted ones, 30,577
+  come from three members in `story000_script`, whose values look like 32-bit hashes rather than enum values. 235,486 of 235,489 bit sets (0x65) use only bits their enum defines. 1,431
+  values name an enum that is not in their file's `LENM`.
+- **Not decoded.** 0x5a (81 members), 0x76 (12) and 0x77 (1) are counted and skipped. They are the only reason the
+  6 partly reached containers are partial: the 0x5a and 0x76 members point at `f32` and u32-hash blocks that
+  nothing else reaches.
+
+These numbers cover layout only. What each struct means, and the names behind its hashes, are not decoded here
+(see *Hashes*).
+
+### Tool
+
+```text
+python -I tools/psin_data.py <PSIN file or carve directory> [--json] [--limit N]
+python -I tools/psin_data.py <PSIN file> --dump
+```
+
+The default output is the counts above, for one file or every `.bin` in a carve directory. `--dump` prints one
+container's decoded tree (hashes as hex) on stdout, for local inspection only. It writes no file and must not be
+pasted into an issue or a pull request. `tests/test_psin_data.py` builds containers from invented names and covers
+every layout above, the end padding, a bad fill, pointers out of range, an unlisted enum value, a skipped type and
+the CLI.
 
 ## What it does not give
 
@@ -249,6 +358,7 @@ only.
 
 - The 64 KiB split is not joined automatically. A caller that has the archive order can join adjacent
   blocks first; the tool then parses the complete container.
-- `LSNS` and `CHKS` payloads are opaque to this tool; `LSCH` and `LENM` are decoded as above. The measured container layout
-  is enough to index the files and measure coverage, not to run the metadata.
+- `LSNS` and `CHKS` payloads are opaque to this tool. `LSCH` and `LENM` are decoded as above, and the instance
+  data by `tools/psin_data.py`. Struct, member and enum names stay 32-bit hashes, and most of them have no known
+  name.
 - No game data, names, hashes or payloads are committed. The carve directories are local.
