@@ -902,5 +902,158 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_sgpr64(0), saved)
 
 
+# ==============================================================================
+# Phase 6 Unit Tests: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class SCCStatusFlags:
+    """Architectural condition codes, EXEC reduction metrics, and flag states."""
+    scc: int
+    exec_zero: bool
+    exec_all_ones: bool
+    saved_exec_zero: bool
+    saved_exec_all_ones: bool
+    popcount_saved: int
+    popcount_new: int
+    lowest_active_lane: int
+    highest_active_lane: int
+
+
+def evaluate_saveexec_status(saved: int, new_exec: int, scc: int) -> SCCStatusFlags:
+    """Extract comprehensive condition codes and active-lane status metrics."""
+    n_exec = new_exec & MASK64
+    s_dst = saved & MASK64
+    pop_saved = popcount64(s_dst)
+    pop_new = popcount64(n_exec)
+    lowest = find_first_one_64(n_exec)
+    highest = (n_exec.bit_length() - 1) if n_exec > 0 else -1
+
+    return SCCStatusFlags(
+        scc=scc,
+        exec_zero=(n_exec == 0),
+        exec_all_ones=(n_exec == ALL64),
+        saved_exec_zero=(s_dst == 0),
+        saved_exec_all_ones=(s_dst == ALL64),
+        popcount_saved=pop_saved,
+        popcount_new=pop_new,
+        lowest_active_lane=lowest,
+        highest_active_lane=highest,
+    )
+
+
+def simulate_add_with_carry(a: int, b: int, cin: int) -> Tuple[int, int]:
+    """Model 32-bit SALU s_addc_u32 carry-chain: (sum & 0xFFFFFFFF, cout)."""
+    total = (a & MASK32) + (b & MASK32) + (cin & 1)
+    res = total & MASK32
+    cout = 1 if total > MASK32 else 0
+    return res, cout
+
+
+class TestConditionCodesAndStatus(unittest.TestCase):
+    """Verify SCC generation, 4-corner zero/nonzero matrix, status flags, and carry interactions."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_nand_scc_four_corner_matrix(self) -> None:
+        """Verify SCC generation across zero/nonzero matrix for s_nand_saveexec_b64."""
+        # 1. old_exec != 0, new_exec == 0 -> SCC must be 0
+        state = ScalarMachineState(exec_mask=ALL64)
+        instr = SaveExecInstruction(Opcode.S_NAND_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Literal64(ALL64))
+        saved, new_exec, scc = self.interp.step(instr, state)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+        flags = evaluate_saveexec_status(saved, new_exec, scc)
+        self.assertTrue(flags.exec_zero)
+        self.assertFalse(flags.exec_all_ones)
+        self.assertEqual(flags.lowest_active_lane, -1)
+
+        # 2. old_exec != 0, new_exec != 0 -> SCC must be 1
+        state = ScalarMachineState(exec_mask=0x8000_0000_0000_0000)
+        instr2 = SaveExecInstruction(Opcode.S_NAND_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Literal64(0))
+        saved2, new_exec2, scc2 = self.interp.step(instr2, state)
+        self.assertEqual(new_exec2, ALL64)
+        self.assertEqual(scc2, 1)
+        flags2 = evaluate_saveexec_status(saved2, new_exec2, scc2)
+        self.assertFalse(flags2.exec_zero)
+        self.assertTrue(flags2.exec_all_ones)
+        self.assertEqual(flags2.lowest_active_lane, 0)
+        self.assertEqual(flags2.highest_active_lane, 63)
+
+        # 3. old_exec == 0, new_exec != 0 -> SCC must be 1 (NAND with 0 always yields ALL64)
+        state = ScalarMachineState(exec_mask=0)
+        instr3 = SaveExecInstruction(Opcode.S_NAND_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Literal64(0x1234))
+        saved3, new_exec3, scc3 = self.interp.step(instr3, state)
+        self.assertEqual(saved3, 0)
+        self.assertEqual(new_exec3, ALL64)
+        self.assertEqual(scc3, 1)
+
+    def test_nor_scc_four_corner_matrix(self) -> None:
+        """Verify SCC generation across zero/nonzero matrix for s_nor_saveexec_b64."""
+        # 1. old_exec == 0, ssrc0 == ALL64 -> new_exec = ~(ALL64 | 0) = 0 -> SCC must be 0
+        state = ScalarMachineState(exec_mask=0)
+        instr1 = SaveExecInstruction(Opcode.S_NOR_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Literal64(ALL64))
+        saved1, new_exec1, scc1 = self.interp.step(instr1, state)
+        self.assertEqual(saved1, 0)
+        self.assertEqual(new_exec1, 0)
+        self.assertEqual(scc1, 0)
+
+        # 2. old_exec == 0, ssrc0 == 0 -> new_exec = ~(0 | 0) = ALL64 -> SCC must be 1
+        state.exec_mask = 0
+        instr2 = SaveExecInstruction(Opcode.S_NOR_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Literal64(0))
+        saved2, new_exec2, scc2 = self.interp.step(instr2, state)
+        self.assertEqual(saved2, 0)
+        self.assertEqual(new_exec2, ALL64)
+        self.assertEqual(scc2, 1)
+
+        # 3. old_exec != 0, ssrc0 covers remaining bits -> new_exec = 0 -> SCC must be 0
+        state.exec_mask = 0x0000_0000_FFFF_FFFF
+        instr3 = SaveExecInstruction(Opcode.S_NOR_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Literal64(0xFFFF_FFFF_0000_0000))
+        saved3, new_exec3, scc3 = self.interp.step(instr3, state)
+        self.assertEqual(saved3, 0x0000_0000_FFFF_FFFF)
+        self.assertEqual(new_exec3, 0)
+        self.assertEqual(scc3, 0)
+
+        # 4. old_exec != 0, new_exec != 0 -> SCC must be 1
+        state.exec_mask = 0x0000_0000_FFFF_FFFF
+        instr4 = SaveExecInstruction(Opcode.S_NOR_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Literal64(0))
+        saved4, new_exec4, scc4 = self.interp.step(instr4, state)
+        self.assertEqual(new_exec4, 0xFFFF_FFFF_0000_0000)
+        self.assertEqual(scc4, 1)
+
+    def test_scc_overwrites_prior_arithmetic_carry(self) -> None:
+        """Confirm that saveexec clobbers prior arithmetic carry in SCC."""
+        # 1. Simulate s_add_u32 producing a carry: 0xFFFFFFFF + 1 -> sum 0, cout 1
+        sum_val, cout = simulate_add_with_carry(0xFFFF_FFFF, 1, 0)
+        self.assertEqual(cout, 1)
+
+        # Set machine SCC to the carry bit
+        state = ScalarMachineState(exec_mask=ALL64, scc=cout)
+        self.assertEqual(state.scc, 1)
+
+        # 2. Execute s_nor_saveexec_b64 which produces new_exec == 0
+        instr = SaveExecInstruction(Opcode.S_NOR_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Literal64(ALL64))
+        _, new_exec, scc = self.interp.step(instr, state)
+
+        # SCC must now reflect new_exec != 0 (which is 0), clobbering the previous carry of 1!
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_branch_condition_code_decisions(self) -> None:
+        """Simulate s_cbranch_scc0 and s_cbranch_scc1 conditional flow."""
+        # Active wave: SCC=1 -> branch on scc1 taken, scc0 not taken
+        state = ScalarMachineState(exec_mask=0x1)
+        instr = SaveExecInstruction(Opcode.S_NAND_SAVEEXEC_B64, Reg64(RegType.SGPR, 0), Literal64(0))
+        _, _, scc = self.interp.step(instr, state)
+        self.assertEqual(scc, 1)
+
+        branch_scc1_taken = (state.scc == 1)
+        branch_scc0_taken = (state.scc == 0)
+        self.assertTrue(branch_scc1_taken)
+        self.assertFalse(branch_scc0_taken)
+
+
 if __name__ == "__main__":
     unittest.main()
