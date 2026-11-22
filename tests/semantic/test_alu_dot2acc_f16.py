@@ -117,6 +117,20 @@ def is_f16_nan(bits: int) -> bool:
     return exp == 0x1F and frac != 0
 
 
+def is_f16_qnan(bits: int) -> bool:
+    """Check if 16-bit word represents a quiet NaN (exp == 31, bit 9 == 1)."""
+    exp = (bits >> 10) & 0x1F
+    frac = bits & 0x3FF
+    return exp == 0x1F and bool(frac & 0x200)
+
+
+def is_f16_snan(bits: int) -> bool:
+    """Check if 16-bit word represents a signaling NaN (exp == 31, frac != 0, bit 9 == 0)."""
+    exp = (bits >> 10) & 0x1F
+    frac = bits & 0x3FF
+    return exp == 0x1F and (frac != 0) and not bool(frac & 0x200)
+
+
 def is_f16_inf(bits: int) -> bool:
     """Check if 16-bit word represents +/- infinity (exp == 31, frac == 0)."""
     exp = (bits >> 10) & 0x1F
@@ -922,6 +936,209 @@ class TestAccumulatorChainingAndClamping(unittest.TestCase):
             interp.wave.set_vgpr(0, 2, H_HALF)
             interp.execute_line("v_dot2acc_f16_f16 v3, v0, v1, v2")
             self.assertEqual(f16_bits_to_float(interp.wave.get_vgpr(0, 3) & MASK16), 1.5)
+
+
+class TestNanPropagationSubnormalsAndNegativeControls(unittest.TestCase):
+    """Validation of NaN propagation, subnormal gradual underflow and FTZ, signed zeros, and negative controls."""
+
+    def test_qnan_propagation_from_each_operand_position(self):
+        """Quiet NaN in any source component propagates to NaN result."""
+        # NaN in S0.x
+        s0_x = pack_f16x2(H_QNAN, H_ONE)
+        s1 = pack_f16x2(H_ONE, H_ONE)
+        res = ref_dot2acc_f16(s0_x, s1, H_ONE)
+        self.assertTrue(is_f16_nan(res))
+        self.assertTrue(is_f16_qnan(res))
+
+        # NaN in S0.y
+        s0_y = pack_f16x2(H_ONE, H_QNAN)
+        res = ref_dot2acc_f16(s0_y, s1, H_ONE)
+        self.assertTrue(is_f16_nan(res))
+        self.assertTrue(is_f16_qnan(res))
+
+        # NaN in S1.x
+        s1_x = pack_f16x2(H_QNAN, H_ONE)
+        res = ref_dot2acc_f16(pack_f16x2(H_ONE, H_ONE), s1_x, H_ONE)
+        self.assertTrue(is_f16_nan(res))
+        self.assertTrue(is_f16_qnan(res))
+
+        # NaN in S1.y
+        s1_y = pack_f16x2(H_ONE, H_QNAN)
+        res = ref_dot2acc_f16(pack_f16x2(H_ONE, H_ONE), s1_y, H_ONE)
+        self.assertTrue(is_f16_nan(res))
+        self.assertTrue(is_f16_qnan(res))
+
+        # NaN in S2 accumulator
+        res = ref_dot2acc_f16(pack_f16x2(H_ONE, H_ONE), pack_f16x2(H_ONE, H_ONE), H_QNAN)
+        self.assertTrue(is_f16_nan(res))
+        self.assertTrue(is_f16_qnan(res))
+
+    def test_snan_quieting_and_propagation(self):
+        """Signaling NaN in any operand produces a quieted NaN."""
+        for snan in (H_SNAN, 0x7C01, 0x7CFF):
+            s0 = pack_f16x2(snan, H_ONE)
+            s1 = pack_f16x2(H_ONE, H_ONE)
+            res = ref_dot2acc_f16(s0, s1, H_POS_ZERO)
+            self.assertTrue(is_f16_nan(res))
+            self.assertTrue(is_f16_qnan(res))
+
+            # In accumulator S2
+            res_acc = ref_dot2acc_f16(s1, s1, snan)
+            self.assertTrue(is_f16_nan(res_acc))
+            self.assertTrue(is_f16_qnan(res_acc))
+
+    def test_indeterminate_forms(self):
+        """Indeterminate arithmetic produces NaN."""
+        # 0.0 * inf = NaN
+        s0 = pack_f16x2(H_POS_ZERO, H_ONE)
+        s1 = pack_f16x2(H_POS_INF, H_ONE)
+        res = ref_dot2acc_f16(s0, s1, H_POS_ZERO)
+        self.assertTrue(is_f16_nan(res))
+
+        # (-0.0) * inf = NaN
+        s0_n = pack_f16x2(H_NEG_ZERO, H_ONE)
+        res_n = ref_dot2acc_f16(s0_n, s1, H_POS_ZERO)
+        self.assertTrue(is_f16_nan(res_n))
+
+        # (+inf) + (-inf) = NaN
+        s0_inf = pack_f16x2(H_POS_INF, H_NEG_INF)
+        s1_ones = pack_f16x2(H_ONE, H_ONE)
+        res_inf = ref_dot2acc_f16(s0_inf, s1_ones, H_POS_ZERO)
+        self.assertTrue(is_f16_nan(res_inf))
+
+    def test_nan_with_clamp_modifier(self):
+        """Under graphics saturation clamp, NaN clamps to +0.0."""
+        s0 = pack_f16x2(H_QNAN, H_POS_ZERO)
+        s1 = pack_f16x2(H_ONE, H_POS_ZERO)
+        res = ref_dot2acc_f16(s0, s1, H_POS_ZERO, clamp=True)
+        self.assertEqual(res, H_POS_ZERO)
+
+        # NaN in accumulator with clamp
+        res_acc = ref_dot2acc_f16(pack_f16x2(H_ONE, H_ONE), pack_f16x2(H_ONE, H_ONE), H_QNAN, clamp=True)
+        self.assertEqual(res_acc, H_POS_ZERO)
+
+    def test_subnormal_gradual_underflow_precision(self):
+        """In gradual underflow mode, subnormal precision is maintained."""
+        # 2^-24 + 2^-24 + 2^-24 = 3 * 2^-24
+        s0 = pack_f16x2(H_SUB_MIN, H_SUB_MIN)
+        s1 = pack_f16x2(H_ONE, H_ONE)
+        res = ref_dot2acc_f16(s0, s1, H_SUB_MIN, flush_subnormals=False)
+        self.assertEqual(res, 0x0003)
+
+        # Accumulation loop of 10 subnormal steps
+        interp = Dot2AccInterpreter(flush_subnormals=False)
+        interp.wave.set_vgpr(0, 0, pack_f16x2(H_SUB_MIN, H_POS_ZERO))
+        interp.wave.set_vgpr(0, 1, pack_f16x2(H_ONE, H_POS_ZERO))
+        interp.wave.set_vgpr(0, 2, 0x0000)
+        for _ in range(10):
+            interp.execute_line("v_dot2acc_f16_f16 v2, v0, v1, v2")
+        self.assertEqual(interp.wave.get_vgpr(0, 2) & MASK16, 10)
+
+    def test_subnormal_boundary_transition_to_normal(self):
+        """Subnormal accumulation crossing into the normal float range."""
+        # Largest subnormal (1023 * 2^-24) + Smallest subnormal (1 * 2^-24) = 1024 * 2^-24 = 2^-14 (0x0400, smallest normal)
+        s0 = pack_f16x2(H_SUB_MAX, H_POS_ZERO)
+        s1 = pack_f16x2(H_ONE, H_POS_ZERO)
+        s2 = H_SUB_MIN
+        res = ref_dot2acc_f16(s0, s1, s2, flush_subnormals=False)
+        self.assertEqual(res, H_NORM_MIN)
+        self.assertFalse(is_f16_subnormal(res))
+
+    def test_flush_to_zero_subnormal_inputs(self):
+        """FTZ mode flushes subnormal inputs to signed zero before arithmetic."""
+        s0 = pack_f16x2(H_SUB_MIN, H_POS_ZERO)
+        s1 = pack_f16x2(H_ONE, H_POS_ZERO)
+        # In FTZ, H_SUB_MIN becomes +0.0 -> result is +0.0
+        res = ref_dot2acc_f16(s0, s1, H_POS_ZERO, flush_subnormals=True)
+        self.assertEqual(res, H_POS_ZERO)
+
+        # Negative subnormal input flushes to -0.0
+        s0_neg = pack_f16x2(H_NEG_SUB_MIN, H_NEG_ZERO)
+        s1_ones = pack_f16x2(H_ONE, H_ONE)
+        res_neg = ref_dot2acc_f16(s0_neg, s1_ones, H_NEG_ZERO, flush_subnormals=True)
+        self.assertEqual(res_neg, H_NEG_ZERO)
+
+        # Subnormal accumulator flushes to zero
+        s2_sub = H_SUB_MAX
+        res_acc = ref_dot2acc_f16(pack_f16x2(H_POS_ZERO, H_POS_ZERO), pack_f16x2(H_ONE, H_ONE), s2_sub, flush_subnormals=True)
+        self.assertEqual(res_acc, H_POS_ZERO)
+
+    def test_flush_to_zero_subnormal_results(self):
+        """FTZ mode flushes subnormal products/sums to zero."""
+        # Product that results in subnormal: 2^-14 * 0.5 = 2^-15 (0x0200)
+        s0 = pack_f16x2(H_NORM_MIN, H_POS_ZERO)
+        s1 = pack_f16x2(H_HALF, H_POS_ZERO)
+        res_ftz = ref_dot2acc_f16(s0, s1, H_POS_ZERO, flush_subnormals=True)
+        self.assertEqual(res_ftz, H_POS_ZERO)
+
+        res_no_ftz = ref_dot2acc_f16(s0, s1, H_POS_ZERO, flush_subnormals=False)
+        self.assertEqual(res_no_ftz, 0x0200)
+        self.assertTrue(is_f16_subnormal(res_no_ftz))
+
+    def test_comprehensive_signed_zero_matrix(self):
+        """Test exhaustive combinations of signed zeros in dot2acc."""
+        for z0 in (H_POS_ZERO, H_NEG_ZERO):
+            for z1 in (H_POS_ZERO, H_NEG_ZERO):
+                for z2 in (H_POS_ZERO, H_NEG_ZERO):
+                    s0 = pack_f16x2(z0, z1)
+                    s1 = pack_f16x2(H_ONE, H_ONE)
+                    res = ref_dot2acc_f16(s0, s1, z2)
+                    self.assertTrue(is_f16_zero(res))
+                    # Result is negative zero if and only if all summed terms are negative zero
+                    all_neg = (z0 == H_NEG_ZERO) and (z1 == H_NEG_ZERO) and (z2 == H_NEG_ZERO)
+                    expected = H_NEG_ZERO if all_neg else H_POS_ZERO
+                    self.assertEqual(res, expected, f"Failed for z0={hex(z0)}, z1={hex(z1)}, z2={hex(z2)}")
+
+    def test_negative_out_of_bounds_registers(self):
+        """Accessing out of bounds VGPR or SGPR indices raises IndexError."""
+        interp = Dot2AccInterpreter()
+        with self.assertRaises(IndexError):
+            interp.wave.get_vgpr(0, 256)
+        with self.assertRaises(IndexError):
+            interp.wave.set_vgpr(0, -1, 0)
+        with self.assertRaises(IndexError):
+            interp.wave.get_sgpr(106)
+        with self.assertRaises(IndexError):
+            interp.wave.set_sgpr(200, 0)
+        with self.assertRaises(IndexError):
+            interp.parse_reg("v256")
+        with self.assertRaises(IndexError):
+            interp.parse_reg("s106")
+
+    def test_negative_invalid_destinations_and_opcodes(self):
+        """Invalid destination types and opcodes raise appropriate exceptions."""
+        interp = Dot2AccInterpreter()
+        # VALU destination cannot be SGPR
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_dot2acc_f16_f16 s0, v1, v2, v3")
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_mov_b32 s0, v1")
+        with self.assertRaises(ValueError):
+            interp.execute_line("s_mov_b32 v0, s1")
+        # Unsupported opcode
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_unknown_opcode v0, v1, v2")
+        # Insufficient operands
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_dot2acc_f16_f16 v0, v1, v2")
+
+    def test_negative_malformed_tokens(self):
+        """Malformed or empty operand tokens raise ValueError."""
+        interp = Dot2AccInterpreter()
+        with self.assertRaises(ValueError):
+            interp.parse_operand("", 0)
+        with self.assertRaises(ValueError):
+            interp.parse_operand("invalid_token_xyz", 0)
+        with self.assertRaises(ValueError):
+            interp.parse_reg("not_a_register")
+
+    def test_negative_invalid_wave_size(self):
+        """Unsupported wavefront sizes raise ValueError."""
+        with self.assertRaises(ValueError):
+            SimdWavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            SimdWavefront(wave_size=128)
+
 
 
 
