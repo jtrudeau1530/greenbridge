@@ -207,8 +207,29 @@ class FrexpTests(unittest.TestCase):
         self.assertEqual(run("v_frexp_mant_f16_e32 v0, 8.0", 0), f2h(0.5))
         self.assertEqual(run("v_frexp_exp_i16_f16_e32 v0, 8.0", 0), 4)
 
+    def test_clamp(self):
+        cases = [
+            (f2h(1.0), f2h(0.5)),      # +1.0 -> mant 0.5 (in range, kept)
+            (f2h(-1.0), 0),            # -1.0 -> mant -0.5 -> clamped to +0.0
+            (0x8000, 0),               # -0.0 -> clamped to +0.0
+            (f2h(1.5), f2h(0.75)),     # +1.5 -> mant 0.75 (in range, kept)
+            (0x0001, f2h(0.5)),        # +min_sub -> normalized mant 0.5 (kept)
+            (0x8001, 0),               # -min_sub -> clamped to +0.0
+            (0x7C00, f2h(1.0)),        # +Inf -> clamped to 1.0 (0x3c00)
+            (0xFC00, 0),               # -Inf -> clamped to +0.0
+            (0x7E00, 0),               # +qNaN -> clamped to +0.0
+            (0x7C01, 0),               # +sNaN -> clamped to +0.0
+        ]
+        for val, want in cases:
+            with self.subTest(val=hex(val)):
+                self.assertEqual(run("v_frexp_mant_f16_e64 v0, v1 clamp", val), want)
+        # Dirty upper-16-bit source VGPR values must not leak into clamp or destination high half
+        self.assertEqual(run("v_frexp_mant_f16_e64 v0, v1 clamp", 0xDEAD0000, v0=0xBEEF1234), 0xBEEF0000)
+        self.assertEqual(run("v_frexp_mant_f16_e64 v0, v1 clamp", 0xDEAD0000 | f2h(0.5), v0=0xBEEF1234), 0xBEEF0000 | f2h(0.5))
+
     def test_output_modifiers_are_rejected(self):
-        for line in ("v_frexp_mant_f16_e64 v0, v1 clamp", "v_frexp_mant_f16_e64 v0, v1 mul:2"):
+        for line in ("v_frexp_mant_f16_e64 v0, v1 mul:2", "v_frexp_mant_f16_e64 v0, v1 div:2",
+                     "v_frexp_exp_i16_f16_e64 v0, v1 clamp", "v_frexp_exp_i16_f16_e64 v0, v1 mul:2"):
             with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
                 run(line, f2h(1.0))
 
@@ -295,8 +316,27 @@ class LdexpTests(unittest.TestCase):
         self.assertEqual(run("v_ldexp_f16_e32 v0, 1.0, v2", 0, 3), f2h(8.0))
         self.assertEqual(run("v_ldexp_f16_e64 v0, v1, 5", f2h(1.0)), f2h(32.0))
 
+    def test_clamp(self):
+        cases = [
+            (f2h(1.0), 1, f2h(1.0)),     # 1.0 * 2 = 2.0 -> clamped to 1.0
+            (f2h(1.0), -1, f2h(0.5)),    # 1.0 * 0.5 = 0.5 -> in range, kept
+            (f2h(-1.0), 0, 0),           # -1.0 -> clamped to +0.0
+            (0x8000, 0, 0),              # -0.0 -> clamped to +0.0
+            (0x7C00, 0, f2h(1.0)),       # +Inf -> clamped to 1.0 (0x3c00)
+            (0xFC00, 0, 0),              # -Inf -> clamped to +0.0
+            (0x7E00, 0, 0),              # +qNaN -> clamped to +0.0
+            (f2h(1.0), 16, f2h(1.0)),    # overflow -> clamped to 1.0
+            (0x0001, 0, 0x0001),         # +min_sub -> in range, kept
+        ]
+        for s0, s1, want in cases:
+            with self.subTest(s0=hex(s0), s1=s1):
+                self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2 clamp", s0, s1), want)
+        # Dirty upper-16-bit source VGPR values must not leak into clamp or destination high half
+        self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2 clamp", 0xDEAD0000, 0, v0=0xBEEF1234), 0xBEEF0000)
+        self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2 clamp", 0xDEAD0000 | f2h(0.5), 0, v0=0xBEEF1234), 0xBEEF0000 | f2h(0.5))
+
     def test_output_modifiers_are_rejected(self):
-        for line in ("v_ldexp_f16_e64 v0, v1, v2 clamp", "v_ldexp_f16_e64 v0, v1, v2 mul:2"):
+        for line in ("v_ldexp_f16_e64 v0, v1, v2 mul:2", "v_ldexp_f16_e64 v0, v1, v2 div:2"):
             with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
                 run(line, f2h(1.0), 1)
 

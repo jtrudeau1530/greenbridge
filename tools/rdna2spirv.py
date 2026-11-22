@@ -7917,9 +7917,13 @@ class Gen:
             # gives a signed zero (exponent 0) and exponent 31 (infinity, NaN) passes through. f16 denormals are kept,
             # as in the MODE inferred for the game (denorm_mode_16_64 = 3): a denormal operand is normalized, and
             # v_ldexp_f16 rounds a result below the normal range to nearest even. Measured natively on gfx1036 over
-            # every f16 input (docs/design.md). clamp and output multipliers are rejected rather than guessed.
-            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
-                raise Unsupported(op + " output modifier")
+            # every f16 input (docs/design.md). VOP3 clamp clamps to [0.0, 1.0]; output multipliers are rejected.
+            if op == "v_frexp_exp_i16_f16":
+                if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+                    raise Unsupported(op + " output modifier")
+            else:
+                if any(m.startswith(("mul:", "div:")) for m in mods):
+                    raise Unsupported(op + " output modifier")
             nsrc = 2 if op == "v_ldexp_f16" else 1
             sel, dhi = self.opsel_bits(mods, nsrc)
             u = self.src_h(a[1])
@@ -8019,6 +8023,21 @@ class Gen:
                 self.emit(f"{r} = OpSelect %uint {fin} {scaled} {other}")
             lo = self.tmp()
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
+            if "clamp" in mods and op in ("v_frexp_mant_f16", "v_ldexp_f16"):
+                s15, e16, frac16, is_exp31, is_nan, is_zero_out, gt_one, c1, clamped_lo = \
+                    (self.tmp() for _ in range(9))
+                self.emit(f"{s15} = OpBitFieldUExtract %uint {lo} {self.cu(15)} {self.cu(1)}")
+                is_neg = self.tmp_bool_nz(s15)
+                self.emit(f"{e16} = OpBitFieldUExtract %uint {lo} {self.cu(10)} {self.cu(5)}")
+                self.emit(f"{is_exp31} = OpIEqual %bool {e16} {self.cu(31)}")
+                self.emit(f"{frac16} = OpBitwiseAnd %uint {lo} {self.cu(0x3FF)}")
+                has_frac = self.tmp_bool_nz(frac16)
+                self.emit(f"{is_nan} = OpLogicalAnd %bool {is_exp31} {has_frac}")
+                self.emit(f"{is_zero_out} = OpLogicalOr %bool {is_neg} {is_nan}")
+                self.emit(f"{gt_one} = OpUGreaterThan %bool {lo} {self.cu(0x3C00)}")
+                self.emit(f"{c1} = OpSelect %uint {gt_one} {self.cu(0x3C00)} {lo}")
+                self.emit(f"{clamped_lo} = OpSelect %uint {is_zero_out} {self.cu(0)} {c1}")
+                lo = clamped_lo
             self.write_half16(a[0], lo, dhi)
         elif op == "v_cvt_f32_f16":
             u = self.src_h(a[1])
