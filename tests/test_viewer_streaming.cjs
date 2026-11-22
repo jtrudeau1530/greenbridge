@@ -276,10 +276,17 @@ const source = html.slice(begin, end);
 const settle = () => new Promise(setImmediate);
 function fixture(count = 1) {
     const requests = [], added = [], disposed = [];
-    let now = 0;
+    const timers = new Map();
+    let now = 0, nextTimer = 0;
     class Group { add() {} }
     const context = vm.createContext({
         performance: { now: () => now },
+        setTimeout(callback, delay) {
+            const id = ++nextTimer;
+            timers.set(id, { at: now + delay, callback });
+            return id;
+        },
+        clearTimeout: id => timers.delete(id),
         THREE: { MeshStandardMaterial: class {}, Group, DoubleSide: 2,
             LoaderUtils: { extractUrlBase: url => url.slice(0, url.lastIndexOf('/') + 1) || './' } },
         AbortController,
@@ -311,6 +318,15 @@ function fixture(count = 1) {
     const object = () => ({ traverse(fn) { fn({ geometry: { dispose() { disposed.push(this); } } }); } });
     return { context, requests, added, disposed, state: context.state, object,
         frame(time = now) { now = time; context.state.stream(); },
+        async advanceTimers(time) {
+            now = time;
+            for (const [id, { at, callback }] of timers) {
+                if (at > now) continue;
+                timers.delete(id);
+                callback();
+            }
+            await settle();
+        },
         async fail(index, time = now) {
             now = time; requests[index].reject(new Error('synthetic load failure')); await settle();
         },
@@ -358,6 +374,60 @@ test('a transient failure retries only after backoff, then loads the chunk', asy
     assert.deepEqual(f.added, [obj]);
     f.frame(100000);
     assert.equal(f.requests.length, 2);
+});
+
+test('stalled chunk headers and bodies release their slots at the download deadline', async () => {
+    const f = fixture(5);
+    f.frame();
+    await f.advanceTimers(20000);
+    f.requests[0].headers(); // Receiving headers does not restart the deadline.
+    await settle();
+    assert(f.requests[0].completeBody);
+    await f.advanceTimers(29999);
+    assert.equal(f.state.inflight, 4);
+    assert.equal(f.state.failed, 0);
+
+    await f.advanceTimers(30000);
+    assert(f.requests.every(request => request.signal.aborted));
+    assert.equal(f.requests[0].parse, undefined);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.state.failed, 4);
+    f.frame();
+    assert.deepEqual(f.requests.slice(4).map(request => request.url), ['4.glb']);
+    f.frame(30999);
+    assert.equal(f.requests.length, 5);
+    f.frame(31000);
+    assert.deepEqual(f.requests.slice(5).map(request => request.url), ['0.glb', '1.glb', '2.glb']);
+});
+
+test('repeated download timeouts use the existing attempt budget', async () => {
+    const f = fixture();
+    f.frame();
+    await f.advanceTimers(30000);
+    f.frame(31000);
+    await f.advanceTimers(61000);
+    f.frame(62999);
+    assert.equal(f.requests.length, 2);
+    f.frame(63000);
+    await f.advanceTimers(93000);
+    f.frame(100000);
+    assert.equal(f.state.failed, 3);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.requests.length, 3);
+});
+
+test('a completed download clears its deadline before GLB parsing finishes', async () => {
+    const f = fixture();
+    f.frame();
+    await f.receive(0);
+    await f.advanceTimers(30000);
+    assert.equal(f.requests[0].signal.aborted, false);
+    assert.equal(f.state.inflight, 1);
+    const obj = f.object();
+    await f.finish(0, obj);
+    assert.deepEqual(f.added, [obj]);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(f.state.failed, 0);
 });
 
 test('permanent failure stops after three attempts with increasing delays', async () => {
