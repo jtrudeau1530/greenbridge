@@ -8,8 +8,8 @@
 // Two measurements:
 //   - per command type: a list of N commands of one kind (transitions come in pairs, queries as Begin+End),
 //     timed on its own, so one slow kind stands out;
-//   - a frame: L lists of P passes, each pass a mix of what a frame without draws records today (barriers,
-//     whole-view and rectangle clears, buffer and texture copies, a UAV clear, queries and predication).
+//   - a frame: L lists of P passes, each pass a mix of what a frame records (barriers, whole-view and rectangle
+//     clears, buffer and texture copies, a UAV clear, queries, predication and indexed and non-indexed draws).
 // prepare includes refilling the PreparedList storage kept from the last execution (as VulkanQueue::execute keeps
 // prepared_) and planning the query batch. emit includes committing query state, as execute does.
 // Each figure is the median over --reps runs after --warmup runs. Heap allocations (global operator new) and
@@ -17,8 +17,6 @@
 //
 // Usage:
 //   replay_cpu_bench [--lists L] [--passes P] [--count N] [--reps R] [--warmup W] [--csv] [--self-test]
-//
-// Draws join the frame once the draw path (#291) is on main.
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
@@ -104,6 +102,11 @@ struct Scene {
              VkImageView>
         views;
     QueryPool occlusion, timestamps;
+    // One graphics pipeline: an RGBA8 target, D32 depth and two vertex input slots, as VulkanContext keeps them.
+    GraphicsPipeline pipeline;
+    static constexpr std::uintptr_t pipeline_id = 0x7000;
+    static constexpr std::uint64_t geometry_va = 0x100000000ull;  // a 16 MiB vertex and index arena
+    static constexpr std::uint64_t geometry_size = 16ull << 20;
     LayoutTracker tracker;
     ReplayFunctions vk;
 
@@ -184,6 +187,40 @@ struct Scene {
             if (id == timestamp_heap) return &timestamps;
             return nullptr;
         };
+
+        pipeline.pipeline = fake_handle<VkPipeline>(0x6000);
+        pipeline.layout = fake_handle<VkPipelineLayout>(0x6001);
+        pipeline.push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pipeline.color_formats = {rgba8};
+        pipeline.depth_format = VK_FORMAT_D32_SFLOAT;
+        pipeline.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+        pipeline.vertex_slots = 0b11;
+        pipeline.variant = [](std::uint32_t) { return fake_handle<VkPipeline>(0x6002); };
+        vk.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
+            return id == pipeline_id ? &pipeline : nullptr;
+        };
+        vk.buffer_at = [](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+            if (va < geometry_va || va >= geometry_va + geometry_size) return false;
+            buffer = fake_handle<VkBuffer>(0x2100);
+            offset = va - geometry_va;
+            size = std::min<std::uint64_t>(size, geometry_va + geometry_size - va);
+            return true;
+        };
+        vk.zero_buffer = fake_handle<VkBuffer>(0x2101);
+        vk.zero_size = 65536;
+        vk.bind_pipeline = nop<PFN_vkCmdBindPipeline>();
+        vk.push_constants = nop<PFN_vkCmdPushConstants>();
+        vk.bind_descriptor_sets = nop<PFN_vkCmdBindDescriptorSets>();
+        vk.bind_vertex_buffers2 = nop<PFN_vkCmdBindVertexBuffers2>();
+        vk.bind_index_buffer = nop<PFN_vkCmdBindIndexBuffer>();
+        vk.set_viewport = nop<PFN_vkCmdSetViewport>();
+        vk.set_scissor = nop<PFN_vkCmdSetScissor>();
+        vk.set_primitive_topology = nop<PFN_vkCmdSetPrimitiveTopology>();
+        vk.set_primitive_restart_enable = nop<PFN_vkCmdSetPrimitiveRestartEnable>();
+        vk.set_stencil_reference = nop<PFN_vkCmdSetStencilReference>();
+        vk.set_blend_constants = nop<PFN_vkCmdSetBlendConstants>();
+        vk.draw = nop<PFN_vkCmdDraw>();
+        vk.draw_indexed = nop<PFN_vkCmdDrawIndexed>();
     }
 
     const ResourceBinding* resolve(ResourceId id) const {
@@ -222,6 +259,26 @@ bool texture_copy(CommandList& list, std::uint32_t index) {
 bool uav_clear(CommandList& list, std::uint32_t index) {
     const UavView view{Scene::uav, true, VK_FORMAT_R32_UINT, (index % 256) * 4096ull, 4096, 4, 0, 0, 1};
     return list.clear_unordered_access(view, false, {index, 0, 0, 0});
+}
+
+// A draw into the colour and depth targets, as a scene's mesh draws are: two vertex streams, and for `indexed`
+// a 16-bit index buffer; each draw reads its own part of the geometry arena.
+bool draw(CommandList& list, std::uint32_t index, bool indexed) {
+    Draw d{};
+    d.pipeline = Scene::pipeline_id;
+    d.render_targets = {color_view};
+    d.depth = depth_view;
+    const std::uint64_t base = Scene::geometry_va + (index % 256) * 65536ull;
+    d.vertex_buffers = {{base, 24576, 12}, {base + 24576, 16384, 8}};
+    if (indexed) d.index = {base + 40960, 6144, 57};
+    d.topology = 4;  // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+    d.viewport = {0, 0, 1920, 1080, 0, 1};
+    d.scissor = {0, 0, 1920, 1080};
+    d.blend_factor = {1, 1, 1, 1};
+    d.indexed = indexed;
+    d.count = indexed ? 3072 : 2048;
+    d.instances = 1;
+    return list.draw(d);
 }
 
 const Kind kinds[] = {
@@ -267,6 +324,8 @@ const Kind kinds[] = {
          return l.resolve_queries({Scene::occlusion_heap, q::binary_occlusion, first, 16, Scene::results, first * 8ull});
      },
      1},
+    {"draw", [](CommandList& l, std::uint32_t i) { return draw(l, i, false); }, 1},
+    {"draw indexed", [](CommandList& l, std::uint32_t i) { return draw(l, i, true); }, 1},
     {"predication on+off",
      [](CommandList& l, std::uint32_t) {
          return l.set_predication({Scene::predicate, 0, d3d12_predication::equal_zero}) &&
@@ -275,14 +334,20 @@ const Kind kinds[] = {
      2},
 };
 
-// One pass of the frame: what a render pass without draws records today.
+// Draws per pass; a frame's draws outnumber its other commands.
+constexpr std::uint32_t draws_per_pass = 16;
+
+// One pass of the frame.
 bool frame_pass(CommandList& l, std::uint32_t pass) {
     const std::uint32_t query = (pass * 2) % Scene::queries;
-    return l.end_query({Scene::timestamp_heap, q::timestamp, query}) &&
-           l.transition({Scene::color, all_subresources, s::pixel_shader_resource, s::render_target}) &&
-           l.clear_render_target(color_view, black) && l.clear_depth_stencil(depth_view, clear_depth, 1, 0) &&
-           l.begin_query({Scene::occlusion_heap, q::binary_occlusion, query}) &&
-           l.clear_render_target(color_view, black, two_rects) &&
+    bool ok = l.end_query({Scene::timestamp_heap, q::timestamp, query}) &&
+              l.transition({Scene::color, all_subresources, s::pixel_shader_resource, s::render_target}) &&
+              l.clear_render_target(color_view, black) && l.clear_depth_stencil(depth_view, clear_depth, 1, 0) &&
+              l.begin_query({Scene::occlusion_heap, q::binary_occlusion, query}) &&
+              l.clear_render_target(color_view, black, two_rects);
+    for (std::uint32_t i = 0; ok && i < draws_per_pass; ++i)
+        ok = draw(l, pass * draws_per_pass + i, i % 4 != 3);  // three of four indexed
+    return ok &&
            l.end_query({Scene::occlusion_heap, q::binary_occlusion, query}) &&
            l.transition({Scene::color, all_subresources, s::render_target, s::pixel_shader_resource}) &&
            l.copy_buffer({Scene::constants, (pass % 256) * 256ull, Scene::upload, (pass % 4096) * 256ull, 256}) &&
