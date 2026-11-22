@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import struct
 import unittest
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple, Union
 
 # LDS Architectural Constants for RDNA2 (GFX10/GFX10.3)
@@ -15,6 +17,132 @@ UNIT_B64_ST64_BYTES: int = 8 * ST64_MULTIPLIER  # 512 bytes
 
 MASK32: int = 0xFFFF_FFFF
 MASK64: int = 0xFFFF_FFFF_FFFF_FFFF
+
+
+class RegType(Enum):
+    """Register file domain."""
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class RegSingle:
+    """Represents a single 32-bit register."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index out of bounds [0, 255]: {self.index}")
+
+    def __str__(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class RegPair:
+    """Represents an aligned 64-bit pair of registers (e.g. v[0:1])."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 254):
+            raise ValueError(f"Register pair base index out of bounds [0, 254]: {self.index}")
+
+    @property
+    def indices(self) -> Tuple[int, int]:
+        return self.index, self.index + 1
+
+    def __str__(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}[{self.index}:{self.index + 1}]"
+
+
+@dataclass(frozen=True)
+class RegQuad:
+    """Represents an aligned 128-bit quad of registers (e.g. v[0:3])."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 252):
+            raise ValueError(f"Register quad base index out of bounds [0, 252]: {self.index}")
+
+    @property
+    def indices(self) -> Tuple[int, int, int, int]:
+        return self.index, self.index + 1, self.index + 2, self.index + 3
+
+    def __str__(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}[{self.index}:{self.index + 3}]"
+
+
+@dataclass(frozen=True)
+class LDSAddressExpression:
+    """Symbolic representation of LDS address computation."""
+    base: RegSingle
+    offset: int
+    is_st64: bool = False
+    lds_size_bytes: int = LDS_DEFAULT_SIZE_BYTES
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= 255):
+            raise ValueError(f"LDS offset out of 8-bit immediate range [0, 255]: {self.offset}")
+
+    @property
+    def stride(self) -> int:
+        return UNIT_B64_ST64_BYTES if self.is_st64 else UNIT_B64_BYTES
+
+    def evaluate(self, base_val: int) -> int:
+        return (base_val + self.offset * self.stride) & (self.lds_size_bytes - 1)
+
+
+@dataclass(frozen=True)
+class DSWrxchg2B64Instruction:
+    """AST representation of RDNA2 ds_wrxchg2_b64 instruction family."""
+    vaddr: RegSingle
+    data0: RegPair
+    data1: RegPair
+    vdst: Optional[RegQuad] = None
+    offset0: int = 0
+    offset1: int = 0
+    is_st64: bool = False
+    is_rtn: bool = True
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset0 <= 255):
+            raise ValueError(f"offset0 out of 8-bit range [0, 255]: {self.offset0}")
+        if not (0 <= self.offset1 <= 255):
+            raise ValueError(f"offset1 out of 8-bit range [0, 255]: {self.offset1}")
+        if self.is_rtn and self.vdst is None:
+            raise ValueError("Returning form (_rtn_) requires vdst destination quad")
+        if self.vdst is not None and self.vdst.reg_type != RegType.VGPR:
+            raise TypeError("LDS DS instruction vdst must be VGPRs")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise TypeError("LDS DS instruction vaddr must be VGPR")
+        if self.data0.reg_type != RegType.VGPR or self.data1.reg_type != RegType.VGPR:
+            raise TypeError("LDS DS instruction data operands must be VGPR pairs")
+
+    @property
+    def mnemonic(self) -> str:
+        st64_str = "st64" if self.is_st64 else ""
+        rtn_str = "_rtn" if self.is_rtn else ""
+        return f"ds_wrxchg2{st64_str}{rtn_str}_b64"
+
+    def disasm(self) -> str:
+        parts = [self.mnemonic]
+        if self.is_rtn and self.vdst is not None:
+            parts.append(f"{self.vdst},")
+        parts.append(f"{self.vaddr},")
+        parts.append(f"{self.data0},")
+        parts.append(f"{self.data1}")
+        line = f"{parts[0]} {' '.join(parts[1:])}"
+        if self.offset0 != 0:
+            line += f" offset0:{self.offset0}"
+        if self.offset1 != 0:
+            line += f" offset1:{self.offset1}"
+        return line
 
 
 def split_u64_to_u32s(val: int) -> Tuple[int, int]:
@@ -240,6 +368,105 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
                 )
                 self.assertEqual(struct.unpack_from("<Q", self.lds, 0x10)[0], val0)
                 self.assertEqual(struct.unpack_from("<Q", self.lds, 0x18)[0], val1)
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg_single_pair_quad_construction(self) -> None:
+        v1 = RegSingle(1)
+        self.assertEqual(str(v1), "v1")
+        self.assertEqual(v1.index, 1)
+        self.assertEqual(v1.reg_type, RegType.VGPR)
+
+        v_pair = RegPair(12)
+        self.assertEqual(str(v_pair), "v[12:13]")
+        self.assertEqual(v_pair.indices, (12, 13))
+
+        v_quad = RegQuad(16)
+        self.assertEqual(str(v_quad), "v[16:19]")
+        self.assertEqual(v_quad.indices, (16, 17, 18, 19))
+
+    def test_address_expression_evaluation(self) -> None:
+        vaddr = RegSingle(2)
+        addr_expr = LDSAddressExpression(base=vaddr, offset=5, is_st64=False)
+        self.assertEqual(addr_expr.stride, 8)
+        self.assertEqual(addr_expr.evaluate(0x100), 0x100 + 40)
+
+        st64_expr = LDSAddressExpression(base=vaddr, offset=2, is_st64=True)
+        self.assertEqual(st64_expr.stride, 512)
+        self.assertEqual(st64_expr.evaluate(0x100), 0x100 + 1024)
+
+    def test_instruction_disasm_canonical_formatting(self) -> None:
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(16),
+            vaddr=RegSingle(1),
+            data0=RegPair(12),
+            data1=RegPair(14),
+            offset0=2,
+            offset1=4,
+            is_st64=False,
+            is_rtn=True,
+        )
+        self.assertEqual(instr.mnemonic, "ds_wrxchg2_rtn_b64")
+        self.assertEqual(
+            instr.disasm(),
+            "ds_wrxchg2_rtn_b64 v[16:19], v1, v[12:13], v[14:15] offset0:2 offset1:4",
+        )
+
+    def test_instruction_st64_mnemonic_and_disasm(self) -> None:
+        instr = DSWrxchg2B64Instruction(
+            vdst=RegQuad(0),
+            vaddr=RegSingle(2),
+            data0=RegPair(4),
+            data1=RegPair(6),
+            offset0=0,
+            offset1=1,
+            is_st64=True,
+            is_rtn=True,
+        )
+        self.assertEqual(instr.mnemonic, "ds_wrxchg2st64_rtn_b64")
+        self.assertEqual(
+            instr.disasm(),
+            "ds_wrxchg2st64_rtn_b64 v[0:3], v2, v[4:5], v[6:7] offset1:1",
+        )
+
+    def test_instruction_non_return_disasm(self) -> None:
+        instr = DSWrxchg2B64Instruction(
+            vdst=None,
+            vaddr=RegSingle(5),
+            data0=RegPair(8),
+            data1=RegPair(10),
+            offset0=3,
+            offset1=6,
+            is_st64=False,
+            is_rtn=False,
+        )
+        self.assertEqual(instr.mnemonic, "ds_wrxchg2_b64")
+        self.assertEqual(
+            instr.disasm(),
+            "ds_wrxchg2_b64 v5, v[8:9], v[10:11] offset0:3 offset1:6",
+        )
+
+    def test_ast_immutability_and_equality(self) -> None:
+        instr1 = DSWrxchg2B64Instruction(
+            vdst=RegQuad(0),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=1,
+            offset1=2,
+        )
+        instr2 = DSWrxchg2B64Instruction(
+            vdst=RegQuad(0),
+            vaddr=RegSingle(1),
+            data0=RegPair(2),
+            data1=RegPair(4),
+            offset0=1,
+            offset1=2,
+        )
+        self.assertEqual(instr1, instr2)
+        self.assertEqual(hash(instr1), hash(instr2))
 
 
 if __name__ == "__main__":
