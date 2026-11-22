@@ -1338,6 +1338,32 @@ Measured on the corpus (`python -I tools/user_sgpr_census.py <spirv/index.json> 
 
 Taken together this disagrees with the packing above (from s0, two dwords per table) and is consistent with a per-stage base (s8 VS/PS, s4 CS, s16 MS) and one dword per table pointer. It is a census of shader reads, not a confirmed mapping: it does not show which root parameter feeds which SGPR, and the GS behave differently. `--expect ps=8 vs=8 cs=4 ms=16` turns it into a check; `tests/test_user_sgpr_census.py` shows that the two packing models give different results.
 
+**Measured: a real signature beside the count it produced.** `tools/fspx_unpack.py` decodes `COMPUTE_PGM_RSRC2` of
+each of the 29 compute programs in `amd_fidelityfx_upscaler_xbox.dll`, and its `USER_SGPR` field is the count the
+console launched the dispatch with. Every one of those 29 containers also carries an `RTS0`, which makes this the
+only place in the package where a serialized root signature sits beside the dword count it produced
+(`tools/rootsig_census.py`). The game's own 26,503 containers carry no `RTS0`, so their read sets cannot be joined
+with a signature and cannot settle it either.
+
+All 29 are version 1.1 with `Flags = 0`, 168 parameters in total (58 tables and 110 root CBVs, no 32-bit constants,
+SRVs or UAVs), every parameter at `D3D12_SHADER_VISIBILITY_ALL`, and 27 of them carry one static sampler. They come
+in two shapes:
+
+| Parameters | Signatures | `USER_SGPR` | Layer model (2 dwords per table) | One dword per table |
+|---|---|---|---|---|
+| 4 CBV + 2 tables | 27 | 14 | 12 | 10 |
+| 1 CBV + 2 tables | 2 | 8 | 6 | 4 |
+
+The surplus is 2 dwords under the layer's model and 4 under one-per-table, and it is the same for both shapes: the
+driver put a fixed block below the parameters. Arithmetic alone therefore does not separate the two models, because
+each fits with a reserved block of its own size. What it does settle is that the block sits below the parameters.
+The corpus census above places the lowest CS pointer at s4, with `const32` reads at s1, s3, s5 and s7. A 4-dword
+reserved block with one dword per table starts the CS parameters at s4 and reproduces both totals exactly (10 + 4
+and 4 + 4). The layer's two-dwords-per-table model needs a 2-dword block to reach the same totals, and that puts the
+first pointer at s2, which the CS reads contradict. This is consistent with one dword per table behind a 4-dword
+reserved prefix, not proof of it: nothing in the package shows which parameter each SGPR holds, and these 29 are all
+compute with every parameter visible, so they say nothing about the visibility question below.
+
 Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
 refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
 `__XB_GetRootSignatureSpillPointer`; until that layout is measured, refusing is the only correct behaviour.
