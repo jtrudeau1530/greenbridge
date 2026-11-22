@@ -79,9 +79,9 @@ that expands to `FSSM` ([fssm_crosscheck.md](fssm_crosscheck.md)). On all 52 con
 |---|---|
 | `tools/fssm_unpack.py` | **52/52** decompress to a valid `FSSM` blob (716 B to 101,320 B, median 2,200 B) |
 | `tools/shader_disasm.py --mcpu gfx1013` | **52/52** disassemble; 42 with no invalid word, 10 with invalid words in the code |
-| `tools/rdna2spirv.py` | **42** translate to SPIR-V assembly; **41** assemble and pass `spirv-val` |
+| `tools/rdna2spirv.py` | **42** translate and pass `spirv-val` |
 
-The 10 untranslated programs stop at four rules, and the one SPIR-V assembly failure is a separate emission bug:
+The 10 untranslated programs stop at four rules:
 
 | module(s) | blocker |
 |---|---|
@@ -89,7 +89,6 @@ The 10 untranslated programs stop at four rules, and the one SPIR-V assembly fai
 | `PT_LoadInstances` | `global_atomic_fmin` |
 | `Box16Rehydration`, `Box32Rehydration`, `ReloadTriangles` | `buffer_load_ushort` |
 | `LeafRehydration` | `tbuffer_load_format_x GFX10_FORMAT_8_UINT` |
-| `FindTreelets` | translates, but its assembly fails with `OpSelectionMerge must immediately precede either an OpBranchConditional...` |
 
 Reproduction, after `--extract` above:
 
