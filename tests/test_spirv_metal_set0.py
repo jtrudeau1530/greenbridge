@@ -56,3 +56,9 @@ def test_rewrite_sizes_arrays_and_spaces_bindings():
     assert "msl_arr_b2" not in out
     # each new type comes after the pointer type it replaces, so its operands are already declared
     assert out.index("%ptr_img = OpTypePointer") < out.index("%msl_cap_b0")
+
+
+def test_help_is_a_clean_exit_zero(capsys):
+    for flag in ("-h", "--help"):
+        assert m.main(["spirv_metal_set0.py", flag]) == 0
+        assert "Usage: spirv_metal_set0.py" in capsys.readouterr().out

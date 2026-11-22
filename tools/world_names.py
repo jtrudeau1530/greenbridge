@@ -573,7 +573,7 @@ def _resolve(args) -> int:
         for path in (args.dict, *args.maps, *args.archetypes):
             if _same_report_path(args.out, path):
                 raise ValueError(
-                    f"resolve: --out {args.out!r} would overwrite input {path!r}")
+                    f"resolve: --out {args.out} would overwrite input {path}")
     try:
         dictionary = NameDictionary.from_json(_load_json(args.dict))
     except ValueError as exc:

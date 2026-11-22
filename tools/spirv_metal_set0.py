@@ -107,6 +107,11 @@ def rewrite(text, counts):
 
 
 def main(argv):
+    rest = argv[1:]
+    if rest and rest[0] in ("-h", "--help"):
+        for line in __doc__.strip().splitlines()[-2:]:
+            print(line)
+        return 0
     counts = capacities()
     if argv[1:] == ["--print-layout"]:
         for b, (c, i) in enumerate(zip(counts, metal_ids(counts))):

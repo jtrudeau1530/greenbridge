@@ -532,6 +532,13 @@ struct ShaderEntry {
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
     bool uses_code_base = false;
     bool wave64 = false;
+    // The subgroup size the translator assumed (64 for a wave64 shader, 32 otherwise); 0 when the entry says null,
+    // as one translated with --wave64-emulate does, or has none.
+    std::uint32_t subgroup_size = 0;
+    // "workgroup" for a shader translated with --wave64-emulate: it uses no subgroup operation and is exact on any
+    // subgroup size. Empty for a native translation.
+    std::string wave64_exchange;
+    bool emulated() const { return !wave64_exchange.empty(); }
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> outputs;             // pixel shaders: the render-target locations written
 };
@@ -613,6 +620,10 @@ private:
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
             if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
             if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
+            if (const Json* g = meta.find("subgroup_size"); g && g->kind == Json::Kind::number)
+                e.subgroup_size = u32(g);
+            if (const Json* x = meta.find("wave64_exchange"); x && x->kind == Json::Kind::string)
+                e.wave64_exchange = x->string;
             if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
                 for (const Json& item : s->array) {
                     SignatureElement element;

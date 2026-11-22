@@ -10,6 +10,49 @@ The checker exits nonzero if a module fails to load, a pipeline fails to compile
 cache save fails. It still finishes checking the other entries and attempts the final save so the next run
 can reuse successful pipelines. Entries reported as skipped do not count as failures.
 
+## Check user-defined interfaces between stages
+
+`tools/shader_link_check.py` compares the binary SPIR-V declarations of the shaders you plan to put in the
+same pipeline. Use it before driver compilation to locate missing varyings, overlapping components, type
+mismatches and per-primitive mesh declarations. It reads local modules and needs only Python.
+
+```powershell
+python -I tools/shader_link_check.py check --vs <vertex.spv> --ps <pixel.spv>
+python -I tools/shader_link_check.py check --vs <vertex.spv> --gs <geometry.spv> --ps <pixel.spv>
+python -I tools/shader_link_check.py check --ms <mesh.spv> --ps <pixel.spv>
+python -I tools/shader_link_check.py inspect <shader.spv>
+```
+
+To audit a batch, give it the shader names from your local translation directory in a JSON file. A stage can
+use a string or a `shader` and `entry` object. Names refer to `<name>.spv` in `--shader-dir`.
+
+```json
+{
+  "version": 1,
+  "pipelines": [
+    {"name": "two-stage", "vs": "vs_example", "ps": "ps_example"},
+    {"name": "with-geometry", "vs": "vs_example", "gs": "gs_example",
+     "ps": {"shader": "ps_other", "entry": "main"}}
+  ]
+}
+```
+
+```powershell
+python -I tools/shader_link_check.py batch pairs.json --shader-dir <spirv> --quiet --report link-report.json
+```
+
+The report records per-pipeline results. It uses the Vulkan Location and Component model, including one
+outer array level for geometry inputs, mesh outputs and fragment `PerVertexKHR` inputs. Add `--maintenance4`
+when the actual device enables that feature and the pipeline relies on matching a wider output vector to a
+narrower input vector. See [Vulkan interface matching][interfaces].
+
+Exit codes are `0` for compatible interfaces, `1` for a mismatch and `2` for a bad input or an interface
+the reader cannot interpret. Continue with the driver checker for shader instruction validation, resource
+bindings, device limits and pipeline state. Shader pairs must come from the caller. Share aggregate counts
+and error classes, keeping the local shader files and reports that identify them on your PC.
+
+[interfaces]: https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-iointerfaces-matching
+
 ## Corpus
 
 The translated corpus is 26,503 entries: 2,236 vertex, 12,101 pixel, 2,689 compute, 9,282 mesh and

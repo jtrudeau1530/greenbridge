@@ -75,9 +75,10 @@ class VulkanPresenter {
 public:
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
                     VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
-                    bool swapchain_maintenance1 = false)
+                    bool swapchain_maintenance1 = false,
+                    std::function<VkExtent2D()> extent_fn = nullptr)
         : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
-          maintenance1_(swapchain_maintenance1) {
+          maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
@@ -595,7 +596,21 @@ private:
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
-        if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
+        VkExtent2D extent = caps.currentExtent;
+        // When the platform leaves the swapchain extent to the application (0xFFFFFFFF, as on Intel UHD / Win32 WSI),
+        // query the window client area or fall back to the last known extent, and clamp to the surface bounds (D3D-165).
+        if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF) {
+            if (extent_fn_) extent = extent_fn_();
+            // ponytail: if no window extent function was supplied, fall back to last extent_ or minImageExtent
+            if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF || (extent.width == 0 && extent.height == 0)) {
+                extent = extent_.width && extent_.height ? extent_ : caps.minImageExtent;
+            }
+            if (extent.width && extent.height) {
+                extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+                extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+            }
+        }
+        if (extent.width == 0 || extent.height == 0) {
             release(swapchain_);
             swapchain_ = VK_NULL_HANDLE;
             vsync_ = vsync;
@@ -659,7 +674,7 @@ private:
         if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
         info.imageFormat = chosen.format;
         info.imageColorSpace = chosen.colorSpace;
-        info.imageExtent = caps.currentExtent;
+        info.imageExtent = extent;
         info.imageArrayLayers = 1;
         info.imageUsage = usage;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -713,7 +728,7 @@ private:
         images_ = std::move(images);
         ready_ = std::move(ready);
         format_ = chosen.format;
-        extent_ = caps.currentExtent;
+        extent_ = extent;
         if (capture_) {
             // A capture that cannot be made fails the recreation with the swapchain in place and stale_ still set.
             const bool four_bytes = format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_R8G8B8A8_UNORM ||
@@ -812,6 +827,7 @@ private:
     bool ok_ = false;
     bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
     std::function<bool()> abort_;
+    std::function<VkExtent2D()> extent_fn_;
     std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
     bool capture_ = false;

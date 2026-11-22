@@ -217,6 +217,41 @@ class NavmeshIndexTest(unittest.TestCase):
             with open(carved, "rb") as f:
                 self.assertEqual(f.read(), page(pages=4), f"{flag} touched the input")
 
+    def test_report_path_linked_to_a_scanned_file_is_scanned_input(self):
+        # Before: a report path the pattern doesn't match was let through even when it is the same file as one the
+        # scan reads. A hard link does that on any filesystem, and so does PAGE.BIN for page.bin on a
+        # case-insensitive macOS or Linux volume, where fnmatch doesn't fold case: the report truncated the input.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page(pages=4))
+        linked = os.path.join(folder, "report.json")
+        try:
+            os.link(carved, linked)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"no hard links here: {e}")
+        module = load_tool_module()
+        self.assertTrue(module.is_scanned_input(linked, folder, None))
+        for flag in ("--out", "--csv"):
+            r = subprocess.run([sys.executable, "-I", TOOL, folder, flag, linked],
+                               cwd=ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(carved, "rb") as f:
+                self.assertEqual(f.read(), page(pages=4), f"{flag} touched the input")
+
+    def test_unscanned_file_in_input_folder_is_not_scanned_input(self):
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=4))
+        report = os.path.join(folder, "report.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        module = load_tool_module()
+        self.assertFalse(module.is_scanned_input(report, folder, None))
+
     def test_sibling_folder_with_shared_prefix_is_not_scanned_input(self):
         folder = os.path.join(self.root, "carve")
         sibling = os.path.join(self.root, "carve2")

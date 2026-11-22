@@ -6,6 +6,7 @@
 #include "../src/resource_tiling.h"
 
 #include <cstdio>
+#include <tuple>
 
 #define CHECK(condition) do {                                        \
     if (!(condition)) {                                              \
@@ -175,6 +176,20 @@ int main() {
             return 1;
         }
     }
+
+    // 2D 4x MSAA: tile shape divides by 4 in texels, 1 mip only, unsupported sample counts fail.
+    for (const auto& ms : {std::tuple{1u, 128u, 128u, 4u}, std::tuple{2u, 128u, 64u, 8u},
+                           std::tuple{4u, 64u, 64u, 16u}, std::tuple{8u, 64u, 32u, 32u},
+                           std::tuple{16u, 32u, 32u, 64u}}) {
+        const auto [bytes, sw, sh, want_tiles] = ms;
+        CHECK(resource_tiling({TiledKind::texture2d, 256, 256, 1, 1, bytes, 1, 4}, t));
+        CHECK(t.shape.width == sw && t.shape.height == sh && t.shape.depth == 1 && t.total_tiles == want_tiles);
+    }
+    CHECK(resource_tiling({TiledKind::texture2d, 64, 64, 1, 1, 1, 1, 4}, t) && t.total_tiles == 1);
+    CHECK(!resource_tiling({TiledKind::texture2d, 256, 256, 1, 1, 4, 1, 2}, t));
+    CHECK(!resource_tiling({TiledKind::texture2d, 256, 256, 1, 1, 4, 1, 8}, t));
+    CHECK(!resource_tiling({TiledKind::texture2d, 256, 256, 1, 2, 4, 1, 4}, t));
+    CHECK(!resource_tiling({TiledKind::texture3d, 64, 64, 16, 1, 4, 1, 4}, t));
 
     // Element sizes that have no tile shape, and empty descriptions.
     CHECK(!resource_tiling({TiledKind::texture2d, 64, 64, 1, 1, 12, 1}, t));
