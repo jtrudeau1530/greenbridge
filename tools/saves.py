@@ -226,7 +226,7 @@ def info(paths):
                 print(f'{p}: save folder, dir {meta.get("save_directory")}')
             for name in sorted(os.listdir(p)):
                 fp = os.path.join(p, name)
-                if os.path.isfile(fp) and kind_of(read(fp)[:8]):
+                if os.path.isfile(fp) and kind_of(read(fp, 8)):
                     info_file(fp, '  ')
         else:
             info_file(p)

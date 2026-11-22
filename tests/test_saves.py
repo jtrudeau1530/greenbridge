@@ -413,6 +413,23 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(reader.call_args_list,
                          [mock.call(payload, 8), mock.call(other, 8), mock.call(payload)])
 
+    def test_info_directory_reads_only_eight_bytes_per_candidate(self):
+        # The info directory loop probes each candidate with eight bytes and only reads the chosen save in full,
+        # so an unrelated large text file next to it is never read in full (mirrors save_slot's probe, #1556).
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "story")
+            jsav, _, _ = make_jsav()
+            write(os.path.join(folder, "SLOT0"), jsav)
+            write(os.path.join(folder, "notes.txt"), b"just text" * 1000)
+            with mock.patch.object(saves, "read", wraps=saves.read) as reader:
+                quiet(saves.info, [folder])
+        payload = os.path.join(folder, "SLOT0")
+        other = os.path.join(folder, "notes.txt")
+        # read(cj) opens the chives.json path only when it exists (it does not here); each candidate is an
+        # eight-byte probe and the selected save is then read in full by info_file.
+        self.assertEqual(reader.call_args_list,
+                         [mock.call(payload, 8), mock.call(payload), mock.call(other, 8)])
+
 
 class MalformedJsavTest(unittest.TestCase):
     """A truncated or lying JSAV is one error line, not a struct.error traceback."""
