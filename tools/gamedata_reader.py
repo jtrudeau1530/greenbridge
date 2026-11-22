@@ -227,6 +227,7 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
     """Read every document; returns a summary of counts (no names of entries, no values)."""
     reader = reader or Reader()
     roots, failed, read = Counter(), Counter(), 0
+    written_names = set()
     for n, doc in enumerate(documents(targets)):
         hint = doc.get("root_hint")
         if root_filter and hint != root_filter:
@@ -241,7 +242,15 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
             name = doc.get("offset_hex") or doc.get("name") or str(n)
-            with open(os.path.join(out_dir, f"{tag}_{name}.json"), "w", encoding="utf-8", newline="\n") as f:
+            stem = f"{tag}_{name}"
+            filename = f"{stem}.json"
+            suffix = 2
+            # Another input can have the same basename or carve offset. Keep existing names on ordinary reruns.
+            while filename.casefold() in written_names:
+                filename = f"{stem}_{suffix}.json"
+                suffix += 1
+            written_names.add(filename.casefold())
+            with open(os.path.join(out_dir, filename), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(value, f, indent=1, default=str)
     return {"documents": read, "roots": len(roots), "per_root_documents": dict(roots),
             "not_well_formed": sum(failed.values()), "parse_errors": dict(failed),
