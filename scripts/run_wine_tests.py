@@ -14,6 +14,7 @@ others show what does and doesn't work under Wine yet without failing the job.
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -90,8 +91,19 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     skip_code = props.get("SKIP_RETURN_CODE")
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
-    passed = (code != 0) if truthy(props.get("WILL_FAIL")) else (code == 0)
-    return ("pass" if passed else "fail"), f"exit {code} in {elapsed:.1f} s\n{out}"
+    detail = f"exit {code} in {elapsed:.1f} s\n{out}"
+    required = props.get("PASS_REGULAR_EXPRESSION", [])
+    forbidden = props.get("FAIL_REGULAR_EXPRESSION", [])
+    # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
+    try:
+        passed = any(re.search(pattern, out, re.DOTALL) for pattern in required) if required else code == 0
+        if any(re.search(pattern, out, re.DOTALL) for pattern in forbidden):
+            passed = False
+    except re.error as e:
+        return "fail", f"invalid output regular expression: {e}\n{detail}"
+    if truthy(props.get("WILL_FAIL")):
+        passed = not passed
+    return ("pass" if passed else "fail"), detail
 
 
 def positive_seconds(text: str) -> float:
