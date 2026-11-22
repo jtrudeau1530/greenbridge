@@ -358,6 +358,48 @@ class Gen:
         self.emit(f"{r} = OpINotEqual %bool {v} {self.cu(0)}")
         return r
 
+    def fma_f16_odd(self, x, y, z):
+        """fma(x, y, z) for f16 inputs (widened to f32), rounded to f32 with round-to-odd (SHADER-55).
+
+        RDNA2's v_fma_f16 / v_fmac_f16 / v_pk_fma_f16 round once, to f16 (measured: 0 of 12,612 mismatches against a
+        correctly rounded f16 FMA on an RX 6700, #374). GLSL Fma rounds to f32 first, so narrowing it to f16 is a
+        double rounding that can be 1 ulp off. Here: x*y is exact in f32 (11-bit significands give 22 bits, and the
+        f16 range squared stays inside the f32 normal range), TwoSum splits p + z into the rounded sum s and its
+        exact error, and when the error is non-zero and s is even, s moves one f32 ulp towards the error. That makes
+        s the round-to-odd f32 value of the exact result, and round-to-odd at 24 bits then rounds correctly to any
+        format with at most 22 bits, so f16_bits gives the single-rounded f16. The FAdd/FMul carry NoContraction
+        (no_contraction), so the driver can't fuse or reorder TwoSum."""
+        t = self.tmp
+        pr, s_, bb, sb, da, db, err = (t() for _ in range(7))
+        self.emit(f"{pr} = OpFMul %float {x} {y}")
+        self.emit(f"{s_} = OpFAdd %float {pr} {z}")
+        self.emit(f"{bb} = OpFSub %float {s_} {pr}")
+        self.emit(f"{sb} = OpFSub %float {s_} {bb}")
+        self.emit(f"{da} = OpFSub %float {pr} {sb}")
+        self.emit(f"{db} = OpFSub %float {z} {bb}")
+        self.emit(f"{err} = OpFAdd %float {da} {db}")
+        sbits, ebits, lsb, even, nz, fin, need, same, xs, up, dn, adj, res, r = (t() for _ in range(14))
+        self.emit(f"{sbits} = OpBitcast %uint {s_}")
+        self.emit(f"{ebits} = OpBitcast %uint {err}")
+        self.emit(f"{lsb} = OpBitwiseAnd %uint {sbits} {self.cu(1)}")
+        self.emit(f"{even} = OpIEqual %bool {lsb} {self.cu(0)}")
+        self.emit(f"{nz} = OpFUnordNotEqual %bool {err} %f0")          # true for a NaN error too...
+        self.emit(f"{fin} = OpFOrdEqual %bool {err} {err}")            # ...so require a non-NaN error
+        self.emit(f"{need} = OpLogicalAnd %bool {even} {self.emit_land(nz, fin)}")
+        self.emit(f"{xs} = OpBitwiseXor %uint {sbits} {ebits}")
+        self.emit(f"{same} = OpULessThan %bool {xs} {self.cu(0x80000000)}")   # same sign: away from zero
+        self.emit(f"{up} = OpIAdd %uint {sbits} {self.cu(1)}")
+        self.emit(f"{dn} = OpISub %uint {sbits} {self.cu(1)}")
+        self.emit(f"{adj} = OpSelect %uint {same} {up} {dn}")
+        self.emit(f"{res} = OpSelect %uint {need} {adj} {sbits}")
+        self.emit(f"{r} = OpBitcast %float {res}")
+        return r
+
+    def emit_land(self, a, b):
+        r = self.tmp()
+        self.emit(f"{r} = OpLogicalAnd %bool {a} {b}")
+        return r
+
     def f16_pack2(self, lo, hi):
         """Two f32 values -> one %uint of two RTE f16 halves (lo | hi << 16), without PackHalf2x16."""
         a, b, sh, r = self.f16_bits(lo), self.f16_bits(hi), self.tmp(), self.tmp()
@@ -2866,8 +2908,7 @@ class Gen:
             # dst = fma(src0, src1, dst). The accumulator is dst itself: low half, or high half under op_sel's dst bit.
             sel, dhi = self.opsel_bits(mods, 3)
             vals = [self.f16_in(a[1], sel[0]), self.f16_in(a[2], sel[1]), self.f16_in(a[0], sel[2])]
-            r = self.tmp()
-            self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
+            r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op in ("v_add_nc_u16", "v_sub_nc_u16"):
             # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept.
@@ -2967,8 +3008,7 @@ class Gen:
         elif op == "v_fma_f16":
             sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
             vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
-            r = self.tmp()
-            self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
+            r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op in ("v_pk_add_f16", "v_pk_mul_f16", "v_pk_max_f16", "v_pk_min_f16", "v_pk_fma_f16"):
@@ -3001,7 +3041,14 @@ class Gen:
             vx, vy = srcs[:2]
             r, p = self.tmp(), self.tmp()
             if op == "v_pk_fma_f16":
-                self.emit(f"{r} = OpExtInst %v2float %glsl Fma {vx} {vy} {srcs[2]}")
+                # one rounding per half, to f16 (SHADER-55)
+                comps = []
+                for k in (0, 1):
+                    ex = [self.tmp() for _ in range(3)]
+                    for e_, v_ in zip(ex, (vx, vy, srcs[2])):
+                        self.emit(f"{e_} = OpCompositeExtract %float {v_} {k}")
+                    comps.append(self.fma_f16_odd(*ex))
+                self.emit(f"{r} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
             elif op in ("v_pk_add_f16", "v_pk_mul_f16"):
                 self.emit(f"{r} = {'OpFAdd' if 'add' in op else 'OpFMul'} %v2float {vx} {vy}")
             else:
