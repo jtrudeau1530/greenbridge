@@ -5636,6 +5636,21 @@ class Gen:
                 self.emit(f"{sel} = OpSelect %float {act} {fval} {old}")
                 self.emit(f"OpStore {ptr} {sel}")
             return
+        if tgt == "mrtz" and self.stage == "ps":
+            # Depth export: x is the fragment depth when it's on in an uncompressed export (RGBA = Z, stencil,
+            # sample mask, alpha; Mesa ac_shader_util.c ac_get_spi_shader_z_format). A compressed mrtz is the 16-bit
+            # stencil and sample mask format, which never holds Z (ac_nir_lower_ps_late.c emit_ps_mrtz_export), and
+            # with x off no depth is exported. Until 2026-11-22 both wrote one anyway: 0.0, or an f16 half of the
+            # stencil word under compr. Stencil, sample mask and alpha aren't modelled.
+            x = a[1] if len(a) > 1 else None
+            if "compr" in ins["mods"] or x is None or (x["k"] == "special" and x["t"] == "off"):
+                return
+            self.writes_depth = True
+            old, sel = self.tmp(), self.tmp()
+            self.emit(f"{old} = OpLoad %float %out_depth")
+            self.emit(f"{sel} = OpSelect %float {self.active_b()} {self.src_f(x)} {old}")
+            self.emit(f"OpStore %out_depth {sel}")
+            return
         comps = []
         if "compr" in ins["mods"]:
             # Compressed export: two registers, each holding two f16 values (x,y) and (z,w). LLVM lists each register
@@ -5666,14 +5681,6 @@ class Gen:
         v = self.tmp()
         self.emit(f"{v} = OpCompositeConstruct %v4float {' '.join(comps)}")
         name = {"pos0": "%out_pos"}.get(tgt)
-        if tgt == "mrtz" and self.stage == "ps":
-            # Depth export: component x is the fragment depth (stencil/mask exports aren't modelled).
-            self.writes_depth = True
-            old, sel = self.tmp(), self.tmp()
-            self.emit(f"{old} = OpLoad %float %out_depth")
-            self.emit(f"{sel} = OpSelect %float {self.active_b()} {comps[0]} {old}")
-            self.emit(f"OpStore %out_depth {sel}")
-            return
         if name is None:
             if tgt.startswith("param") and self.stage == "vs":
                 name = f"%out_param{int(tgt[5:])}"
