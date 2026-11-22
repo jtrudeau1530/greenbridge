@@ -398,14 +398,55 @@ static HRESULT resolve_mount_path(char* out, size_t out_cap) {
     return S_OK;
 }
 
+// Resolves the installation path for a specific content package identifier.
+// Returns HRESULT_FROM_WIN32(ERROR_NOT_FOUND) if the package identifier is not installed.
+static HRESULT resolve_package_path(const char* packageIdentifier, char* out, size_t out_cap) {
+    if (!packageIdentifier || !out || out_cap == 0) return E_INVALIDARG;
+
+    // Check against configured process/content package identifier
+    char installed_id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGE_ID", installed_id, sizeof(installed_id));
+    const char* target_id = (n > 0 && n < sizeof(installed_id)) ? installed_id : kDefaultPackageIdentifier;
+
+    if (std::strcmp(packageIdentifier, target_id) == 0) {
+        return resolve_mount_path(out, out_cap);
+    }
+
+    // Check optional installed content packages mapping: "id1=path1;id2=path2"
+    char mapping[1024] = {};
+    const DWORD map_len = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping, sizeof(mapping));
+    if (map_len > 0 && map_len < sizeof(mapping)) {
+        char* token = mapping;
+        while (token && *token) {
+            char* sep = std::strchr(token, ';');
+            if (sep) *sep = '\0';
+            char* eq = std::strchr(token, '=');
+            if (eq) {
+                *eq = '\0';
+                if (std::strcmp(token, packageIdentifier) == 0) {
+                    const char* val = eq + 1;
+                    const size_t vlen = std::strlen(val);
+                    if (vlen + 1 > out_cap) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+                    std::memcpy(out, val, vlen + 1);
+                    return S_OK;
+                }
+            }
+            token = sep ? sep + 1 : nullptr;
+        }
+    }
+
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
 // HRESULT XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount)
-// Mounts a package installation given its identifier and yields a valid mount handle.
+// Mounts an installed content package given its identifier and yields a valid mount handle.
+// Returns ERROR_NOT_FOUND if the package identifier is not recognized/installed.
 HRESULT __stdcall XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount) {
     if (!packageIdentifier || !mount) return E_INVALIDARG;
     mount->handle = 0;
 
     char buf[MAX_PATH] = {};
-    const HRESULT hr = resolve_mount_path(buf, sizeof(buf));
+    const HRESULT hr = resolve_package_path(packageIdentifier, buf, sizeof(buf));
     if (FAILED(hr)) return hr;
 
     const uint64_t id = s_next_mount_id.fetch_add(1);

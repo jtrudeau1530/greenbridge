@@ -387,6 +387,8 @@ int main() {
     check(mount_pkg(nullptr, nullptr) == E_INVALIDARG, "XPackageMount rejects null identifier and null out pointer");
     check(mount_pkg(pkg_id, nullptr) == E_INVALIDARG, "XPackageMount rejects null out pointer with identifier");
     check(mount_pkg(nullptr, &test_out) == E_INVALIDARG, "XPackageMount rejects null identifier with out pointer");
+    check(mount_pkg("UninstalledPackage_0000000000000", &test_out) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+          "XPackageMount rejects uninstalled package identifier");
 
     size_t req_size = 0;
     check(mount_path_size(kInvalidMount, &req_size) == E_INVALIDARG,
@@ -424,6 +426,16 @@ int main() {
     check(mount_path(active_mount, sizeof(mnt_path), mnt_path) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
           "XPackageGetMountPath rejects closed/stale mount handle");
     SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+
+    SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", "DLC1_123456789012345678901234567=C:\\LeonidaDLC1");
+    XPackageMountHandle dlc_mount{0};
+    check(mount_pkg("DLC1_123456789012345678901234567", &dlc_mount) == S_OK && dlc_mount.handle != 0,
+          "XPackageMount mounts content package from LEONIDA_CONTENT_PACKAGES");
+    char dlc_path[MAX_PATH] = {};
+    check(mount_path(dlc_mount, sizeof(dlc_path), dlc_path) == S_OK && std::strcmp(dlc_path, "C:\\LeonidaDLC1") == 0,
+          "XPackageGetMountPath returns correct path for mounted content package");
+    close_mount(dlc_mount);
+    SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
 
     auto is_packaged = get<PackagedProcessFn>("XPackageIsPackagedProcess");
     check(is_packaged() == true, "XPackageIsPackagedProcess returns true by default");
