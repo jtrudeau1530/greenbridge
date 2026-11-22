@@ -551,7 +551,7 @@ def main() -> int:
     # runtime/build, as docs/shader_validation.md builds it and lds_fuzz/valu_fuzz default to; a Visual Studio build's
     # RelWithDebInfo/Release subfolder is found below.
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
-    ap.add_argument("--work")
+    ap.add_argument("--work", help="keep each run's generated files in a new subfolder here")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--formats", default=",".join(FORMATS))
     ap.add_argument("--oracle", default="translator",
@@ -605,8 +605,11 @@ def main() -> int:
             print("note: GFX11 is RDNA3 or newer, not RDNA2: a match supports the model and does not prove RDNA2")
     a.build = find_test_program(a.build, HARNESS) or a.build
     cases = make_cases(a.programs, a.seed, formats)
-    work = a.work or tempfile.mkdtemp(prefix="image_fuzz_")
-    os.makedirs(work, exist_ok=True)
+    parent = os.path.abspath(a.work) if a.work else None
+    if parent is not None:
+        os.makedirs(parent, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="image_fuzz_", dir=parent)
+    print(f"work dir {work}")
     code = 0
     verdicts = {}
     try:

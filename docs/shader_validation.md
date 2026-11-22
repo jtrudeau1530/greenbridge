@@ -624,6 +624,9 @@ T# in `s[8:15]`), runs it through `runtime/test/vk_image_fuzz.cpp` against a syn
 format, and compares every RGBA32F pixel with an oracle that models the RDNA2 texel fetch for that format: a
 fetch is a memory read, so there is no filter, border or LOD to model.
 
+Each run keeps its generated files in a unique output folder. With `--work DIR`, it is a new child of `DIR` and its
+path is printed; existing contents and other runs are left alone. Without `--work`, it is in the system temporary folder.
+
 ```sh
 cmake --build runtime/build --target vk_image_fuzz
 python -I tools/image_fuzz.py --programs 8 --seed 1 [--show]
