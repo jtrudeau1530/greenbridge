@@ -580,13 +580,23 @@ int main() {
         // D3D-75: plane 1 of a depth-stencil texture is its stencil. The T# is 8_UINT at the texture's own address,
         // with the eight bits read as G and R, B, A as 0, 0, 1 (D3D12's X24_TYPELESS_G8_UINT / X32_..._G8X24_UINT).
         // A stencil view of a colour texture, or one in another format, is a null descriptor.
-        // Plane 0, as R24_UNORM_X8_TYPELESS or R32_FLOAT_X8X24_TYPELESS, is a depth T# of the console's depth format
-        // at the same address, the depth read as R.
-        for (const auto& [resource_format, stencil_view_format, depth_view_format, depth_vk] :
+        // Plane 0, as R24_UNORM_X8_TYPELESS or R32_FLOAT_X8X24_TYPELESS, is a depth T# of the format backing the
+        // texture at the same address, the depth read as R. A GPU without a usable D24 backs R24G8 with
+        // D32_SFLOAT_S8_UINT (the layer's depth_usable rule), so the expected code follows the backing. Each depth
+        // view format belongs to its own family only: the other one's is a null descriptor, as D3D12 refuses it.
+        VkFormatProperties d24_properties{};
+        d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+            d.physical, VK_FORMAT_D24_UNORM_S8_UINT, &d24_properties);
+        const VkFormat d24_backing =
+            (d24_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+                ? VK_FORMAT_D24_UNORM_S8_UINT
+                : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        for (const auto& [resource_format, stencil_view_format, depth_view_format, other_depth_view_format, depth_vk] :
              {std::tuple{DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT,
-                         DXGI_FORMAT_R24_UNORM_X8_TYPELESS, VK_FORMAT_D24_UNORM_S8_UINT},
+                         DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, d24_backing},
               std::tuple{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
-                         DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, VK_FORMAT_D32_SFLOAT_S8_UINT}}) {
+                         DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                         VK_FORMAT_D32_SFLOAT_S8_UINT}}) {
             D3D12_RESOURCE_DESC depth_desc = texture_desc;
             depth_desc.Format = resource_format;
             depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -616,6 +626,11 @@ int main() {
             EXPECT(image_at(null_slot, depth_image));
             EXPECT(depth_image.format == g::format_from_vulkan(depth_vk) && depth_image.format != 0);
             EXPECT(depth_image.address == stencil_image.address && depth_image.swizzle[0] == g::select_x);
+
+            plane_view.Format = other_depth_view_format;  // the other depth family's view format
+            std::memset(view_bytes(null_slot), 0x77, step);
+            device->CreateShaderResourceView(depth_stencil.p, &plane_view, view_slot(null_slot));
+            EXPECT(null_at(null_slot));
 
             plane_view.Format = DXGI_FORMAT_R8_UINT;  // not a stencil view format
             plane_view.Texture2D.PlaneSlice = 1;

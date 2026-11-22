@@ -952,9 +952,14 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     // The depth plane of a depth-stencil texture, as R24_UNORM_X8_TYPELESS (D24S8) or R32_FLOAT_X8X24_TYPELESS
     // (D32S8): the texture's own depth format, whose T# code is the console's depth format (8_24_UNORM or
-    // X24_8_32_FLOAT) with the depth in R; bind_image views the depth aspect for it.
-    const bool depth_plane = (view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
-                              view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) &&
+    // X24_8_32_FLOAT) with the depth in R; bind_image views the depth aspect for it. As in D3D12, each view format
+    // belongs to its own family only: the other family's depth view leaves the slot null, whatever format backs the
+    // texture (a D24 texture may be D32_SFLOAT_S8_UINT underneath).
+    const DXGI_FORMAT family = desc.Format;
+    const bool d24_family = family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_D24_UNORM_S8_UINT;
+    const bool d32s8_family = family == DXGI_FORMAT_R32G8X24_TYPELESS || family == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    const bool depth_plane = ((view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS && d24_family) ||
+                              (view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS && d32s8_family)) &&
                              (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT);
     if (view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane)
         named = vulkan_format(view.format, false).format;
