@@ -318,11 +318,61 @@ bool create_host_device(Ref<ID3D12Device>& host) {
     return true;
 }
 
+bool block_compressed(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_UNORM:
+    case DXGI_FORMAT_BC4_SNORM:
+    case DXGI_FORMAT_BC5_UNORM:
+    case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC6H_UF16:
+    case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_UNORM:
+    case DXGI_FORMAT_BC7_UNORM_SRGB: return true;
+    default: return false;
+    }
+}
+
+// A block-compressed texture whose top mip is not a whole number of 4x4 blocks. The PC runtime only answers
+// GetCopyableFootprints for these when D3D12_OPTIONS8.UnalignedBlockTexturesSupported is TRUE (Windows 10 does
+// not); it returns -1 for every field otherwise.
+bool uses_unaligned_blocks(const D3D12_RESOURCE_DESC& desc) {
+    return block_compressed(desc.Format) && (desc.Width % 4 != 0 || desc.Height % 4 != 0);
+}
+
+bool host_supports_unaligned_block_textures(ID3D12Device* host) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS8 options{};
+    return SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options, sizeof(options))) &&
+           options.UnalignedBlockTexturesSupported;
+}
+
+// ResolveSubresourceRegion is on ID3D12GraphicsCommandList7, which the Windows 10 runtime does not have.
+bool host_has_graphics_command_list7(ID3D12Device* host) {
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12GraphicsCommandList7> list7;
+    if (FAILED(host->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))))
+        return false;
+    if (FAILED(host->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                       IID_PPV_ARGS(&list.p))))
+        return false;
+    if (FAILED(list->Close())) return false;
+    return SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list7.p)));
+}
+
 // GetCopyableFootprints must match the PC runtime's exactly, since applications size and fill upload buffers from
-// it. Returns the number of mismatches, or -1 when the host has no D3D12 device to compare with.
+// it. Unaligned block-compressed cases are skipped when the host runtime cannot answer them, so the rest still
+// run. Returns the number of mismatches, or -1 when the host has no D3D12 device to compare with.
 int compare_footprints(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
+    const bool unaligned_blocks = host_supports_unaligned_block_textures(host.p);
+    unsigned skipped = 0;
     struct Case {
         D3D12_RESOURCE_DESC desc;
         UINT subresources;
@@ -358,6 +408,10 @@ int compare_footprints(ID3D12Device* ours) {
     };
     int mismatches = 0;
     for (const Case& c : cases) {
+        if (!unaligned_blocks && uses_unaligned_blocks(c.desc)) {
+            ++skipped;
+            continue;
+        }
         for (const UINT64 base : {UINT64(0), UINT64(1024)}) {
             std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> a(c.subresources), b(c.subresources);
             std::vector<UINT> rows_a(c.subresources), rows_b(c.subresources);
@@ -390,6 +444,9 @@ int compare_footprints(ID3D12Device* ours) {
                              (unsigned long long)base, (unsigned long long)total_a, (unsigned long long)total_b);
         }
     }
+    if (skipped)
+        std::printf("GetCopyableFootprints: %u unaligned block-compressed cases skipped (the host runtime has no "
+                    "D3D12_OPTIONS8.UnalignedBlockTexturesSupported)\n", skipped);
     return mismatches;
 }
 
@@ -768,7 +825,10 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
     RESOLVE_CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     RESOLVE_CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                        IID_PPV_ARGS(&list.p))));
-    RESOLVE_CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list7.p))));
+    // ResolveSubresourceRegion is on ID3D12GraphicsCommandList7; the full ResolveSubresource path does not need
+    // it, so a host without list7 (Windows 10) can still be compared on the full form.
+    if (scenario != ResolveScenario::full)
+        RESOLVE_CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list7.p))));
     RESOLVE_CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
     UINT64 cursor = 0;
@@ -875,10 +935,15 @@ int compare_depth_multisample_quality_levels(ID3D12Device* ours, VkSampleCountFl
 
 // Compare the Vulkan-backed resolve output byte-for-byte with the host runtime for every common supported format,
 // sample count and region form. A host-unsupported combination is a deliberate skip; a mismatch in advertised
-// support or in the resulting pixels is a failure.
+// support or in the resulting pixels is a failure. The region forms need ID3D12GraphicsCommandList7 on the host;
+// without it (Windows 10) only the full ResolveSubresource form is compared, so the later device checks still run.
 int compare_resolves(ID3D12Device* ours, VkSampleCountFlags color_sample_counts) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
+    const bool host_regions = host_has_graphics_command_list7(host.p);
+    if (!host_regions)
+        std::printf("Resolve comparison: the host runtime has no ID3D12GraphicsCommandList7; "
+                    "ResolveSubresourceRegion cases are skipped\n");
 
     constexpr DXGI_FORMAT formats[] = {
         DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -937,6 +1002,10 @@ int compare_resolves(ID3D12Device* ours, VkSampleCountFlags color_sample_counts)
             }
 
             for (ResolveScenario scenario : scenarios) {
+                if (!host_regions && scenario != ResolveScenario::full) {
+                    ++skipped;
+                    continue;
+                }
                 std::vector<std::uint8_t> host_pixels, our_pixels;
                 if (!capture_resolve(host.p, format, samples, scenario, host_pixels) ||
                     !capture_resolve(ours, format, samples, scenario, our_pixels)) {
@@ -971,7 +1040,7 @@ int compare_resolves(ID3D12Device* ours, VkSampleCountFlags color_sample_counts)
             }
         }
     }
-    std::printf("Resolve comparison: %u compared, %u matched, %u unsupported format/sample combinations skipped, "
+    std::printf("Resolve comparison: %u compared, %u matched, %u unsupported or host-unavailable cases skipped, "
                 "%d mismatches\n", compared, matched, skipped, mismatches);
     if (compared == 0) {
         std::fprintf(stderr, "Resolve comparison: no common supported format/sample combination was exercised\n");
@@ -1190,6 +1259,11 @@ int main() {
             EXPECT(rt::d3d12::device_max_push_constants_size(fallback_device.p) == 128);
             EXPECT(rt::d3d12::device_push_constants_need_fallback(fallback_device.p));
         }
+
+        // The Windows 10 footprint skip depends on this classification; check it on every host.
+        EXPECT(uses_unaligned_blocks(texture_desc(10, 6, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE)));
+        EXPECT(!uses_unaligned_blocks(texture_desc(8, 8, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE)));
+        EXPECT(!uses_unaligned_blocks(texture_desc(10, 6, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE)));
 
         const int footprint_mismatches = compare_footprints(device.p);
         if (footprint_mismatches < 0)
