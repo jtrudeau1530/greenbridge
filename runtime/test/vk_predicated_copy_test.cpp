@@ -19,7 +19,12 @@ VKAPI_ATTR void VKAPI_CALL observe_host(VkCommandBuffer cb, const VkDependencyIn
 }
 int main() {
     vktest::Device d;
-    if(!d.create())return 1;
+    const auto status = d.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
+        std::printf("vk_predicated_copy_test: no Vulkan device, skipped\n");
+        return 77;
+    }
+    if (status != vktest::DeviceStatus::ready) return 1;
     if(!d.conditional_rendering || !d.storage_buffer_8bit) {
         std::puts("predicated copy: skipped (requires conditional rendering and storageBuffer8BitAccess)"); return 0;
     }
