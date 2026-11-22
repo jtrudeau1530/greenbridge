@@ -340,10 +340,21 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not a.isa:
         ap.error(f"--isa is required (or set {ENV_XML})")
-    isa = read_isa(a.isa)
+    try:
+        isa = read_isa(a.isa)
+    except OSError as e:
+        ap.error(f"--isa {a.isa}: {e.strerror or e}")
+    except ET.ParseError as e:
+        ap.error(f"--isa {a.isa}: invalid XML ({e})")
     if "RDNA 2" not in isa["architecture"]:
         print(f"warning: {a.isa} describes {isa['architecture']!r}, not AMD RDNA 2", file=sys.stderr)
-    rep = build_report(isa, scan_translator(a.translator), accepted_names(a.translator))
+    try:
+        scan, accepted = scan_translator(a.translator), accepted_names(a.translator)
+    except OSError as e:
+        ap.error(f"--translator {a.translator}: {e.strerror or e}")
+    except UnicodeDecodeError as e:
+        ap.error(f"--translator {a.translator}: not valid UTF-8 ({e.reason} at byte {e.start})")
+    rep = build_report(isa, scan, accepted)
     if a.llvm_mc:
         probe = probe_llvm_mc(a.llvm_mc, [e["name"] for e in rep["not_in_rdna2"]])
         for e in rep["not_in_rdna2"]:
