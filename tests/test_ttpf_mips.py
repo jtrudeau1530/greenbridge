@@ -1131,6 +1131,18 @@ class SyntheticPoolTest(unittest.TestCase):
         self.assertIn("not every requested mip uses a supported codec", err.getvalue())
         self.assertFalse(os.path.exists(full))
 
+    def test_export_write_error_names_the_output_without_a_traceback(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        out = os.path.join(self.tmp.name, "destination")
+        os.mkdir(out)
+        error = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(error):
+            self.assertEqual(ttpf.export(self.pool, 0, out, force=True), 1)
+        self.assertIn(out, error.getvalue())
+        self.assertIn("cannot write", error.getvalue())
+
     def test_scan_reports_the_whitelist_gate(self):
         # The synthetic tuple is validated, so it is not gated: the partial export is
         # the descriptor non_tail limit, not the 319-byte profile table.
