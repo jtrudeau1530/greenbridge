@@ -962,6 +962,17 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
 
+    if a.filter and not results:   # the filter matched only inputs/partners: say so rather than "0/0 passed"
+        names = [os.path.splitext(f)[0] for f in asm_files]
+        partners = {os.path.splitext(f)[0] for f in DRAWN_WITH.values()} | set(TEXTURE_MIP_DEPENDENCIES)
+        shown = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
+        role = "partners built for other tests" if partners.issuperset(names) else "inputs without a GPU test row"
+        hint = ("; cs_bench_* shaders are benchmark inputs, run them with the benchmark tool"
+                if all(n.startswith("cs_bench_") for n in names) else "")
+        print(f"error: --filter {a.filter!r} selected {shown} but no runnable GPU test cases ({role}){hint}",
+              file=sys.stderr)
+        return 2
+
     print("\n=== GPU TEST RESULTS ===")
     passed = skipped = 0
     for name, ok, detail in results:
