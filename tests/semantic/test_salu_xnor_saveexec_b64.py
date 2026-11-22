@@ -315,6 +315,85 @@ class ScalarInterpreter:
         return saved_exec, new_exec, scc
 
 
+# ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: int = MASK64
+    scc: int = 0
+    vcc: int = 0
+    sgprs: List[int] = field(default_factory=lambda: [0] * 128)
+    vgprs: List[List[int]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.num_lanes == 32:
+            self.exec_mask &= MASK32
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        """Check if a specific SIMD lane is active according to the EXEC mask."""
+        if 0 <= lane_id < self.num_lanes:
+            return bool(self.exec_mask & (1 << lane_id))
+        return False
+
+    def active_lane_count(self) -> int:
+        """Return the number of currently active SIMD lanes."""
+        mask = (1 << self.num_lanes) - 1
+        return popcount64(self.exec_mask & mask)
+
+    def get_sgpr64(self, index: int) -> int:
+        return join_dwords(self.sgprs[index], self.sgprs[index + 1])
+
+    def set_sgpr64(self, index: int, val: int) -> None:
+        lo, hi = split_dwords(val)
+        self.sgprs[index] = lo
+        self.sgprs[index + 1] = hi
+
+
+class SIMDInterpreter:
+    """SIMD wavefront execution engine modeling multi-lane divergence and masking."""
+
+    def __init__(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+
+    def step_salu(self, instr: SXnorSaveexecB64Instruction, state: SIMDState) -> Tuple[int, int, int]:
+        """Execute a SALU instruction on the wavefront, updating shared EXEC/SCC/SGPRs."""
+        scalar_state = ScalarMachineState(
+            sgprs=list(state.sgprs),
+            exec_mask=state.exec_mask,
+            scc=state.scc,
+            vcc=state.vcc,
+        )
+        saved_exec, new_exec, scc = self.scalar_interp.step(instr, scalar_state)
+
+        # Sync back to SIMD state
+        state.sgprs = list(scalar_state.sgprs)
+        if state.num_lanes == 32:
+            state.exec_mask = new_exec & MASK32
+        else:
+            state.exec_mask = new_exec & MASK64
+        state.scc = scc
+        state.vcc = scalar_state.vcc
+
+        return saved_exec, state.exec_mask, scc
+
+    def execute_valu_add(self, dst_vgpr: int, src0_vgpr: int, src1_vgpr: int, state: SIMDState) -> None:
+        """Execute a VALU vector add (v_add_u32) across all lanes under the current EXEC mask."""
+        for lane in range(state.num_lanes):
+            if state.is_lane_active(lane):
+                a = state.vgprs[lane][src0_vgpr]
+                b = state.vgprs[lane][src1_vgpr]
+                state.vgprs[lane][dst_vgpr] = u32(a + b)
+            # Inactive lanes strictly preserve their previous destination VGPR content
+
+
 class TestSXnorSaveexecB64ModelAndOracle(unittest.TestCase):
     """Reference mathematical oracle and architectural model tests."""
 
@@ -608,6 +687,115 @@ class TestScalarInterpreter(unittest.TestCase):
             self.assertEqual(saved, 0x1122334455667788)
             self.assertEqual(new_exec, (~(0x8877665544332211 ^ 0x1122334455667788)) & MASK64)
             self.assertEqual(scc, 1)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking tests."""
+
+    def setUp(self) -> None:
+        self.simd = SIMDInterpreter()
+
+    def test_divergent_mask_generation(self) -> None:
+        """Verify generating divergent active/inactive lane patterns."""
+        state = SIMDState(num_lanes=64, exec_mask=MASK64)
+        # S0 = alternating pattern: 0x5555555555555555 (even lanes 1, odd lanes 0)
+        # Initial EXEC = MASK64
+        # NEW_EXEC = ~(0x5555... ^ MASK64) = 0x5555555555555555
+        state.set_sgpr64(0, 0x5555555555555555)
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        saved, new_exec, scc = self.simd.step_salu(instr, state)
+
+        self.assertEqual(saved, MASK64)
+        self.assertEqual(new_exec, 0x5555555555555555)
+        self.assertEqual(state.active_lane_count(), 32)
+        for lane in range(64):
+            expected_active = (lane % 2 == 0)
+            self.assertEqual(state.is_lane_active(lane), expected_active)
+
+    def test_valu_preservation_under_divergent_mask(self) -> None:
+        """Verify that inactive lanes strictly preserve their VGPR state during VALU ops."""
+        state = SIMDState(num_lanes=64, exec_mask=MASK64)
+
+        # Pre-populate VGPRs for all lanes:
+        # v0 = lane index
+        # v1 = 100
+        # v2 = 0xDEADBEEF (destination sentinel)
+        for lane in range(64):
+            state.vgprs[lane][0] = lane
+            state.vgprs[lane][1] = 100
+            state.vgprs[lane][2] = 0xDEADBEEF
+
+        # EXEC: activate only lanes 0..15 (lower 16 lanes)
+        # Using S0 = 0x000000000000FFFF with EXEC = MASK64 -> NEW_EXEC = 0x000000000000FFFF
+        state.set_sgpr64(4, 0x000000000000FFFF)
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[6:7], s[4:5]")
+        self.simd.step_salu(instr, state)
+
+        self.assertEqual(state.active_lane_count(), 16)
+
+        # Run vector add: v2 = v0 + v1
+        self.simd.execute_valu_add(dst_vgpr=2, src0_vgpr=0, src1_vgpr=1, state=state)
+
+        # Check lane outcomes: lanes 0..15 must have lane + 100, lanes 16..63 must still be 0xDEADBEEF
+        for lane in range(64):
+            if lane < 16:
+                self.assertEqual(state.vgprs[lane][2], lane + 100, f"Active lane {lane} failed")
+            else:
+                self.assertEqual(state.vgprs[lane][2], 0xDEADBEEF, f"Inactive lane {lane} overwritten")
+
+    def test_reactivation_of_disabled_lanes(self) -> None:
+        """Verify re-activation of previously disabled lanes through XNOR logic.
+
+        In RDNA2 control flow, XNOR with 0 turns inactive (0) lanes ON because 0 XNOR 0 == 1.
+        """
+        # Start with all lanes disabled except lane 0
+        state = SIMDState(num_lanes=64, exec_mask=0x0000000000000001)
+        self.assertEqual(state.active_lane_count(), 1)
+
+        # S0 = 0 -> NEW_EXEC = ~(0 ^ EXEC) = ~EXEC
+        # Lane 0 (was 1) becomes 0; lanes 1..63 (were 0) become 1!
+        state.set_sgpr64(0, 0)
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        saved, new_exec, scc = self.simd.step_salu(instr, state)
+
+        self.assertEqual(saved, 0x0000000000000001)
+        self.assertEqual(new_exec, MASK64 ^ 1)
+        self.assertEqual(state.active_lane_count(), 63)
+        self.assertFalse(state.is_lane_active(0))
+        for lane in range(1, 64):
+            self.assertTrue(state.is_lane_active(lane))
+
+    def test_wave32_mode_masking(self) -> None:
+        """Verify Wave32 execution mode restricts active mask to 32 lanes."""
+        state = SIMDState(num_lanes=32, exec_mask=MASK32)
+        self.assertEqual(state.active_lane_count(), 32)
+
+        # XNOR with half mask in Wave32
+        state.set_sgpr64(0, 0x0000FFFF)
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        saved, new_exec, scc = self.simd.step_salu(instr, state)
+
+        self.assertEqual(saved, MASK32)
+        self.assertEqual(new_exec, 0x0000FFFF)
+        self.assertEqual(state.active_lane_count(), 16)
+        self.assertFalse(state.is_lane_active(32))
+
+    def test_total_divergence_all_lanes_disabled(self) -> None:
+        """Verify total divergence where all lanes are disabled produces 0 active count."""
+        state = SIMDState(num_lanes=64, exec_mask=0xAAAAAAAAAAAAAAAA)
+        # S0 is bitwise NOT of EXEC -> NEW_EXEC == 0
+        state.set_sgpr64(0, 0x5555555555555555)
+
+        instr = parse_salu_instruction("s_xnor_saveexec_b64 s[2:3], s[0:1]")
+        saved, new_exec, scc = self.simd.step_salu(instr, state)
+
+        self.assertEqual(saved, 0xAAAAAAAAAAAAAAAA)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.active_lane_count(), 0)
+        for lane in range(64):
+            self.assertFalse(state.is_lane_active(lane))
 
 
 if __name__ == "__main__":
