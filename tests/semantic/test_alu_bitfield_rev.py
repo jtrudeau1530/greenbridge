@@ -216,6 +216,71 @@ def run_rdna_ps(lines: list[str], name: str = "ps_alu_bitfield") -> list[int]:
     return mrt0_words(spv)
 
 
+def run_rdna_cs_wave(
+    lines: list[str],
+    num_lanes: int = 16,
+    initial_mem: dict[int, int] | None = None,
+    name: str = "cs_simd_wave",
+) -> dict[int, int]:
+    """Assemble and run a compute shader workgroup with linear local IDs."""
+    fssm = bytearray(0x148)
+    struct.pack_into("<4I", fssm, 0x138, 0x8088, num_lanes, 1, 1)
+    all_lines = list(lines) + ["s_endpgm"]
+    spv = translate_lines(name, all_lines, fssm=bytes(fssm))
+    mem = dict(initial_mem or {})
+    return si.run_workgroup(
+        spv,
+        num_lanes,
+        32,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+        push_constants=[0, 0, 0x1000, 0x31016FAC] + [0] * 28,
+        memory=mem,
+    )
+
+
+class SimdWaveBitfieldModel:
+    """Deterministic SIMD Wave model executing vector bitfield operations with EXEC masks."""
+
+    def __init__(self, wave_size: int = 32, num_vgprs: int = 64) -> None:
+        self.wave_size = wave_size
+        self.num_vgprs = num_vgprs
+        self.vgprs = [[0] * num_vgprs for _ in range(wave_size)]
+        self.exec_mask = (1 << wave_size) - 1
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & ((1 << self.wave_size) - 1)
+
+    def set_lane_vgpr(self, lane: int, reg: int, val: int) -> None:
+        self.vgprs[lane][reg] = val & MASK32
+
+    def get_lane_vgpr(self, lane: int, reg: int) -> int:
+        return self.vgprs[lane][reg]
+
+    def v_bfe_u32(self, dst: int, src_base: int, src_off: int, src_wid: int) -> None:
+        for lane in range(self.wave_size):
+            if self.exec_mask & (1 << lane):
+                base = self.vgprs[lane][src_base]
+                off = self.vgprs[lane][src_off]
+                wid = self.vgprs[lane][src_wid]
+                self.vgprs[lane][dst] = ref_v_bfe_u32(base, off, wid)
+
+    def v_bfe_i32(self, dst: int, src_base: int, src_off: int, src_wid: int) -> None:
+        for lane in range(self.wave_size):
+            if self.exec_mask & (1 << lane):
+                base = self.vgprs[lane][src_base]
+                off = self.vgprs[lane][src_off]
+                wid = self.vgprs[lane][src_wid]
+                self.vgprs[lane][dst] = ref_v_bfe_i32(base, off, wid)
+
+    def v_bfi_b32(self, dst: int, src_mask: int, src_fld: int, src_base: int) -> None:
+        for lane in range(self.wave_size):
+            if self.exec_mask & (1 << lane):
+                mask = self.vgprs[lane][src_mask]
+                fld = self.vgprs[lane][src_fld]
+                base = self.vgprs[lane][src_base]
+                self.vgprs[lane][dst] = ref_v_bfi_b32(mask, fld, base)
+
+
 class TestBitfieldReferenceOracle(unittest.TestCase):
     """Unit tests for pure Python reference oracles."""
 
@@ -559,6 +624,210 @@ class TestBitfieldRoundtripAndComposition(unittest.TestCase):
         ]
         words = run_rdna_ps(lines, name="ps_bfe_bfi_roundtrip")
         self.assertEqual(words[0], 0x12345778)
+
+
+class TestBitfieldClampBoundaries(unittest.TestCase):
+    """Verifies edge cases for width/offset clamp boundaries, zero width, and modulo 32."""
+
+    def test_offset_plus_width_exceeds_32_clamped(self):
+        """When offset + width > 32, width clamps to min(width, 32 - offset)."""
+        cases = [
+            (0xFFFFFFFF, 24, 16, 8, 0x000000FF),
+            (0xDEADBEEF, 28, 8, 4, 0x0000000D),
+            (0x80000000, 31, 31, 1, 0x00000001),
+            (0x12345678, 16, 20, 16, 0x00001234),
+        ]
+        for base, off, wid, eff_wid, expected in cases:
+            with self.subTest(base=hex(base), off=off, wid=wid):
+                self.assertEqual(ref_v_bfe_u32(base, off, wid), expected)
+                words = run_rdna_ps([
+                    f"v_mov_b32 v1, {base:#x}",
+                    f"v_mov_b32 v2, {off}",
+                    f"v_mov_b32 v3, {wid}",
+                    "v_bfe_u32 v0, v1, v2, v3",
+                    "v_mov_b32 v1, v0",
+                    "v_mov_b32 v2, v0",
+                    "v_mov_b32 v3, v0",
+                ], name=f"ps_clamp_u_{off}_{wid}")
+                self.assertEqual(words[0], expected)
+
+    def test_signed_clamp_boundary_sign_extension(self):
+        """When clamped, sign extension for v_bfe_i32 extends from (eff_width - 1)."""
+        cases = [
+            (0xC0000000, 30, 8, 0xFFFFFFFF),
+            (0x80000000, 30, 8, 0xFFFFFFFE),
+            (0x40000000, 30, 8, 0x00000001),
+            (0x80000000, 31, 16, 0xFFFFFFFF),
+        ]
+        for base, off, wid, expected in cases:
+            with self.subTest(base=hex(base), off=off, wid=wid):
+                self.assertEqual(ref_v_bfe_i32(base, off, wid), expected)
+                words = run_rdna_ps([
+                    f"v_mov_b32 v1, {base:#x}",
+                    f"v_mov_b32 v2, {off}",
+                    f"v_mov_b32 v3, {wid}",
+                    "v_bfe_i32 v0, v1, v2, v3",
+                    "v_mov_b32 v1, v0",
+                    "v_mov_b32 v2, v0",
+                    "v_mov_b32 v3, v0",
+                ], name=f"ps_clamp_i_{off}_{wid}")
+                self.assertEqual(words[0], expected)
+
+    def test_offset_modulo_32_wrapping(self):
+        """Offset operand is taken modulo 32."""
+        base = 0x12345678
+        for extra in (32, 64, 96):
+            self.assertEqual(ref_v_bfe_u32(base, 4 + extra, 8), 0x67)
+            self.assertEqual(ref_v_bfe_u32(base, 0 + extra, 4), 0x8)
+
+    def test_width_modulo_32_wrapping_and_zero(self):
+        """Width is taken modulo 32; width=0 or width=32 (32 & 31 = 0) returns 0."""
+        for base in (0xFFFFFFFF, 0x12345678, 0xDEADBEEF):
+            for off in (0, 7, 16, 31):
+                self.assertEqual(ref_v_bfe_u32(base, off, 0), 0)
+                self.assertEqual(ref_v_bfe_u32(base, off, 32), 0)
+                self.assertEqual(ref_v_bfe_i32(base, off, 0), 0)
+                self.assertEqual(ref_v_bfe_i32(base, off, 32), 0)
+
+
+class TestSimdDivergence(unittest.TestCase):
+    """Verifies SIMD lane divergence and EXEC mask write inhibition."""
+
+    def test_simd_divergent_per_lane_extraction(self):
+        """16 SIMD compute lanes evaluate lane-dependent bitfield offsets."""
+        lanes = 16
+        base = 0x76543210
+        lines = [
+            f"v_mov_b32_e32 v1, {base:#x}",
+            "v_bfe_u32 v2, v1, v0, 4",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+        ]
+        mem = run_rdna_cs_wave(lines, num_lanes=lanes, name="cs_simd_divergent")
+        for i in range(lanes):
+            expected = ref_v_bfe_u32(base, i, 4)
+            self.assertEqual(mem[4 * i], expected, f"Mismatch at lane {i}")
+
+    def test_simd_exec_mask_write_inhibition(self):
+        """Lanes deactivated by v_cmpx do not write to destination memory."""
+        lanes = 16
+        initial_mem = {4 * i: 0xDEADBEEF for i in range(lanes)}
+        lines = [
+            "v_mov_b32_e32 v1, 0x12345678",
+            "v_cmpx_lt_u32_e32 v0, 8",
+            "v_bfe_u32 v2, v1, 4, 8",
+            "v_lshlrev_b32_e32 v3, 2, v0",
+            "buffer_store_dword v2, v3, s[0:3], 0 offen",
+        ]
+        mem = run_rdna_cs_wave(lines, num_lanes=lanes, initial_mem=initial_mem, name="cs_simd_exec_mask")
+        for i in range(lanes):
+            if i < 8:
+                self.assertEqual(mem[4 * i], 0x67, f"Active lane {i} should be updated")
+            else:
+                self.assertEqual(mem[4 * i], 0xDEADBEEF, f"Inactive lane {i} should remain unchanged")
+
+    def test_simd_wave_model_wave32_and_wave64(self):
+        """Test pure-Python SimdWaveBitfieldModel across wave32 and wave64 configurations."""
+        for wave_size in (32, 64):
+            model = SimdWaveBitfieldModel(wave_size=wave_size)
+            for lane in range(wave_size):
+                model.set_lane_vgpr(lane, 1, 0x12345678)
+                model.set_lane_vgpr(lane, 2, lane & 15)
+                model.set_lane_vgpr(lane, 3, 4)
+                model.set_lane_vgpr(lane, 0, 0xAAAAAAAA)
+
+            even_mask = sum(1 << l for l in range(wave_size) if l % 2 == 0)
+            model.set_exec(even_mask)
+            model.v_bfe_u32(0, 1, 2, 3)
+
+            for lane in range(wave_size):
+                if lane % 2 == 0:
+                    expected = ref_v_bfe_u32(0x12345678, lane & 15, 4)
+                    self.assertEqual(model.get_lane_vgpr(lane, 0), expected)
+                else:
+                    self.assertEqual(model.get_lane_vgpr(lane, 0), 0xAAAAAAAA)
+
+
+class TestNegativeControls(unittest.TestCase):
+    """Negative controls ensuring sensitivity to subtle bitfield errors."""
+
+    def test_negative_unsigned_bfe_sign_extend_detected(self):
+        """Mutated v_bfe_u32 that incorrectly sign-extends must fail assertion."""
+        def buggy_bfe_u32(base: int, offset: int, width: int) -> int:
+            return ref_v_bfe_i32(base, offset, width)
+
+        correct = ref_v_bfe_u32(0x80000000, 31, 1)
+        buggy = buggy_bfe_u32(0x80000000, 31, 1)
+        self.assertEqual(correct, 1)
+        self.assertNotEqual(buggy, correct)
+
+    def test_negative_signed_bfe_zero_extend_detected(self):
+        """Mutated v_bfe_i32 that incorrectly zero-extends must fail assertion."""
+        def buggy_bfe_i32(base: int, offset: int, width: int) -> int:
+            return ref_v_bfe_u32(base, offset, width)
+
+        correct = ref_v_bfe_i32(0x80000000, 31, 1)
+        buggy = buggy_bfe_i32(0x80000000, 31, 1)
+        self.assertEqual(correct, MASK32)
+        self.assertNotEqual(buggy, correct)
+
+    def test_negative_bfi_inverted_operands_detected(self):
+        """Mutated v_bfi_b32 that inverts wrong operand must fail assertion."""
+        def buggy_bfi_b32(mask: int, field: int, base: int) -> int:
+            return ((mask & base) | ((~mask & MASK32) & field)) & MASK32
+
+        mask, field, base = 0x00FF0000, 0x12345678, 0xA0B0C0D0
+        correct = ref_v_bfi_b32(mask, field, base)
+        buggy = buggy_bfi_b32(mask, field, base)
+        self.assertEqual(correct, 0xA034C0D0)
+        self.assertNotEqual(buggy, correct)
+
+    def test_negative_width_zero_nonzero_result_detected(self):
+        """Mutated zero-width returning base must fail assertion."""
+        def buggy_bfe_zero_width(base: int, offset: int, width: int) -> int:
+            if width == 0:
+                return base & MASK32
+            return ref_v_bfe_u32(base, offset, width)
+
+        correct = ref_v_bfe_u32(0xDEADBEEF, 4, 0)
+        buggy = buggy_bfe_zero_width(0xDEADBEEF, 4, 0)
+        self.assertEqual(correct, 0)
+        self.assertNotEqual(buggy, correct)
+
+    def test_negative_clamp_out_of_bounds_detected(self):
+        """Mutated BFE that shifts without clamping width beyond 32 must diverge."""
+        def unclamped_bfe_i32(base: int, offset: int, width: int) -> int:
+            val = ((base & MASK32) >> offset) & ((1 << width) - 1)
+            if val & (1 << (width - 1)):
+                val -= 1 << width
+            return val & MASK32
+
+        # At off=30, wid=8: clamped effective width is 2 (bits 30..31 of 0xFFFFFFFF are 11 -> sign-extends to 0xFFFFFFFF).
+        # Unclamped width=8 checks bit 7 (which is 0!), incorrectly treating it as positive 3 (0x00000003).
+        clamped = ref_v_bfe_i32(0xFFFFFFFF, 30, 8)
+        unclamped = unclamped_bfe_i32(0xFFFFFFFF, 30, 8)
+        self.assertEqual(clamped, MASK32)
+        self.assertEqual(unclamped, 0x3)
+        self.assertNotEqual(clamped, unclamped)
+
+    def test_negative_simd_inactive_lane_leak_detected(self):
+        """Mutated SIMD execution that updates inactive lanes must fail assertion."""
+        model = SimdWaveBitfieldModel(wave_size=32)
+        for l in range(32):
+            model.set_lane_vgpr(l, 0, 0x11111111)
+            model.set_lane_vgpr(l, 1, 0x22222222)
+            model.set_lane_vgpr(l, 2, 0)
+            model.set_lane_vgpr(l, 3, 4)
+
+        model.set_exec(0x1)
+        model.v_bfe_u32(0, 1, 2, 3)
+
+        leaked_model = SimdWaveBitfieldModel(wave_size=32)
+        for l in range(32):
+            leaked_model.set_lane_vgpr(l, 0, 0x2)
+
+        self.assertEqual(model.get_lane_vgpr(5, 0), 0x11111111)
+        self.assertNotEqual(leaked_model.get_lane_vgpr(5, 0), model.get_lane_vgpr(5, 0))
 
 
 if __name__ == "__main__":
