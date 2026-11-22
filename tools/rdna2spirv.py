@@ -1581,7 +1581,7 @@ class Gen:
         Returns `(old_val, exit_label)` where `old_val` is the pre-op word in memory."""
         lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
         init = self.tmp()
-        self.emit(f"{init} = OpLoad %uint {p} Aligned 4")
+        self.emit(f"{init} = OpAtomicLoad %uint {p} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpBranch {lbl_hdr}")
         self.emit(f"{lbl_hdr} = OpLabel")
         cur, got = self.tmp(), self.tmp()

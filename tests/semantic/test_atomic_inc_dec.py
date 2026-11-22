@@ -95,6 +95,19 @@ def run_buffer(kind, m, d, glc=True, offset=ELEM, records=RECORDS):
     return mem.get(BOUT), mem.get(offset)
 
 
+class CasLoop(unittest.TestCase):
+    def test_initial_read_is_atomic_at_the_exchange_scope(self):
+        for kind in ("inc", "dec"):
+            for instruction in (f"global_atomic_{kind} v5, v1, v2, s[0:1] glc",
+                                f"buffer_atomic_{kind} v2, v1, s[8:11], 0 offen glc"):
+                with self.subTest(instruction=instruction):
+                    lines = translate([instruction]).splitlines()
+                    exchange, = (line.split("OpAtomicCompareExchange ")[1].split()
+                                 for line in lines if "OpAtomicCompareExchange " in line)
+                    loads = [line.split("OpAtomicLoad ")[1].split() for line in lines if "OpAtomicLoad " in line]
+                    self.assertEqual(loads, [exchange[:4]])  # type, pointer, scope, memory semantics
+
+
 class GlobalAtomicIncDec(unittest.TestCase):
     def test_edge_grid_returning_and_non_returning(self):
         for kind, fn in MODELS.items():
