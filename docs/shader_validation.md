@@ -355,6 +355,18 @@ unnoticed. gfx1150 is RDNA3.5,
 not RDNA2: the match supports the model, and RDNA2 itself rests on the ISA text and the translator results on RDNA2
 cards.
 
+With `--oracle translator,hw` on the same Radeon 880M (Vulkan, subgroup 64), seed 1, 100 programs per run: the
+default mix matches the model on the translator, native and emulated (200/200 each). With `--extended` the
+translator differs from the hardware in 22 of 177 programs (native and emulated alike), all in a `ds_swizzle_b32`
+under an EXEC mask whose source lane is off: the translator hands the active lane the source lane's register, the
+hardware gives 0 (the swizzle hypothesis above). This is a translator finding for FUZZ-10/SHADER follow-up, not
+fixed here. Partial-wave programs (`--threads` 32 in wave64) are skipped for the translator, which cannot launch
+them. NVIDIA was not run.
+
+The oracle only needs the generic `Oracle.run` of `tools/hw_oracle/runner.py` plus `Kernel(lds=..., vgprs=...)`;
+a second launcher backend (the Linux libdrm one of #1265) that honours the kernel's group segment size would run
+the same programs on an RDNA2 card. This is untested: the numbers above are gfx1150 only.
+
 **SHADER-105** (Intel `lds_fuzz` mismatches in DS atomics `max_i32`/`max_u32`, `ds_cmpst`, small reads, and
 registers that kept their initial value): AMD gfx1150 agrees with the model for every one of those families, under
 EXEC masks, in wave32 and wave64, and in multi-wave groups. The model is not wrong there; the difference was on the
