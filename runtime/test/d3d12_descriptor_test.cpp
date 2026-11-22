@@ -547,14 +547,19 @@ int main() {
             {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBE, 0, 6, 2},
             {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 1}, {D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, 6, 12, 2},
         };
+        constexpr LodView volume_lod_views[] = {
+            {0, 2, 1.0f}, {1, 1, 0.5f}, {0, 2, 2.0f}, {0, 2, 2.0f, true},
+        };
         constexpr UINT lod_view_count = std::size(lod_views);
         constexpr UINT array_clamp_count = std::size(array_clamps);
         constexpr UINT cube_lod_count = std::size(cube_lods);
+        constexpr UINT volume_lod_count = std::size(volume_lod_views);
         // Keep multisample views after the preceding volume and minimum-LOD views.
         enum : UINT {
             array_lod_slot = first_lod_slot + lod_view_count,
             cube_lod_slot = array_lod_slot + array_clamp_count,
-            ms_slot = cube_lod_slot + cube_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
+            volume_lod_slot = cube_lod_slot + cube_lod_count,
+            ms_slot = volume_lod_slot + volume_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
@@ -903,10 +908,19 @@ int main() {
         volume_view.Texture3D.MostDetailedMip = 0;
         device->CreateShaderResourceView(texture.p, &volume_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
-        volume_view.Texture3D.ResourceMinLODClamp = 0.5f;
-        device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
-        EXPECT(null_at(null_slot));
-        volume_view.Texture3D.ResourceMinLODClamp = 0;
+        for (UINT i = 0; i < volume_lod_count; ++i) {
+            const auto& v = volume_lod_views[i];
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = volume_desc.Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            srv.Shader4ComponentMapping = v.force_alpha_one
+                ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1)
+                : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture3D = {v.first, v.count, v.clamp};
+            device->CreateShaderResourceView(volume.p, &srv, view_slot(volume_lod_slot + i));
+            EXPECT(image_at(volume_lod_slot + i, vol) && vol.type == g::ImageType::image_3d);
+            EXPECT(vol.first_mip == v.first && vol.mip_count == v.count && vol.min_lod == v.clamp);
+        }
         volume_view.Format = DXGI_FORMAT_R8G8B8A8_UINT;
         device->CreateShaderResourceView(volume.p, &volume_view, view_slot(null_slot));
         EXPECT(null_at(null_slot));
@@ -1454,6 +1468,41 @@ int main() {
             }
         std::printf("volume SRVs: %u of %zu sampled RGBA texels differ\n", volume_errors, std::size(volume_slots) * texels);
         EXPECT(volume_errors == 0);
+
+        SampleKeys volume_lod_keys[volume_lod_count]{};
+        std::array<std::uint8_t, volume_lod_count * bytes> volume_lod_pixels{};
+        for (UINT i = 0; i < volume_lod_count; ++i) {
+            std::memcpy(volume_lod_keys[i].tsharp, view_bytes(volume_lod_slot + i), sizeof(volume_lod_keys[i].tsharp));
+            std::memcpy(volume_lod_keys[i].ssharp, sampler_bytes, sizeof(volume_lod_keys[i].ssharp));
+            volume_lod_keys[i].first = i * texels;
+        }
+        EXPECT(sample_through_set(d, set0, set0_layout, volume_lod_keys, volume_lod_pixels.data()));
+        UINT volume_lod_errors = 0;
+        UINT volume_clamp_diffs = 0;
+        for (UINT i = 0; i < texels; ++i) {
+            using Pixel = std::array<std::uint8_t, 4>;
+            const UINT x = i % 4, y = (i / 4) % 4, z = i / 16;
+            const Pixel mip1{std::uint8_t(x * 19), std::uint8_t(y * 23), std::uint8_t((z / 2) * 53), 101};
+            const Pixel expected[volume_lod_count] = {
+                d.image_view_min_lod ? mip1 : Pixel{}, mip1, {}, {0, 0, 0, 255},
+            };
+            for (UINT view = 0; view < volume_lod_count; ++view) {
+                const auto* sample = &volume_lod_pixels[view * bytes + 4 * i];
+                if (std::memcmp(sample, expected[view].data(), 4) && volume_lod_errors++ == 0) {
+                    std::fprintf(stderr, "volume LOD view %u texel %u: got %u,%u,%u,%u; expected %u,%u,%u,%u\n",
+                                 view, i, sample[0], sample[1], sample[2], sample[3],
+                                 expected[view][0], expected[view][1], expected[view][2], expected[view][3]);
+                }
+            }
+            // Negative control: clamp 1.0 vs unclamped volume_all (clamp 0.0) must differ at every texel.
+            if (std::memcmp(&volume_lod_pixels[4 * i], &volume_pixels[4 * i], 4) != 0) ++volume_clamp_diffs;
+        }
+        lod_mismatches += volume_lod_errors;
+        std::printf("volume minimum LOD: %u/%u samples matched across %u views (clamp 1.0 vs 0.0: %u/%u texels differed)\n",
+                    UINT(volume_lod_pixels.size() / 4) - volume_lod_errors, UINT(volume_lod_pixels.size() / 4),
+                    volume_lod_count, volume_clamp_diffs, texels);
+        EXPECT(volume_lod_errors == 0);
+        if (d.image_view_min_lod) EXPECT(volume_clamp_diffs == texels);
 
         SampleKeys byte_keys[byte_view_count]{};
         for (UINT k = 0; k < byte_view_count; ++k) {
