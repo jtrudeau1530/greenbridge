@@ -16,6 +16,19 @@ Features covered:
   - Multi-instruction ALU folding sequences: v_and_b32, v_or_b32, v_xor_b32, v_not_b32.
   - Symbolic simplification and concrete register state execution.
   - Validation against SPIR-V translation and mini-interpreter execution.
+- Multi-lane SIMD divergence under EXEC mask:
+  - Wavefront (Wave32) vector register execution modeling.
+  - Inactive lane preservation (lanes with EXEC bit == 0 are strictly preserved).
+  - Divergent execution masks (all-active, all-inactive, checkerboard, halves, single-lane).
+  - Multi-instruction ALU execution across divergent lanes.
+- Exhaustive truth tables and composite Boolean functions:
+  - 1-bit full truth tables (AND, OR, XOR, NOT, NAND, NOR, XNOR, ANDN2, ORN2).
+  - 32-bit sliced independent bit position validation.
+  - 3-input Boolean functions (majority, multiplexer, parity/xor3).
+- Negative controls and fault rejection:
+  - Non-identities, non-cancellation, non-annihilation.
+  - Inactive lane isolation negative control.
+  - Parser and interpreter syntax fault rejection.
 - Translator constant folding for shift/bfe/align operands:
   - Constant shift count modulo 32 mask elimination.
   - Constant v_bfe_u32/i32 offset and width extraction directly to OpBitField[US]Extract.
@@ -460,6 +473,8 @@ class BitopFoldingInterpreter:
         operands = [p.strip() for p in parts[1].split(",")] if len(parts) > 1 else []
 
         if op in ("v_mov_b32", "s_mov_b32"):
+            if len(operands) < 2:
+                raise ValueError(f"Missing operands in {line}")
             dst = operands[0].lower()
             val, expr = self._parse_operand(operands[1])
             self.regs[dst] = val
@@ -468,6 +483,8 @@ class BitopFoldingInterpreter:
             return (dst, val, folded)
 
         elif op in ("v_not_b32", "s_not_b32"):
+            if len(operands) < 2:
+                raise ValueError(f"Missing operands in {line}")
             dst = operands[0].lower()
             val, expr = self._parse_operand(operands[1])
             res = ref_not(val)
@@ -477,6 +494,8 @@ class BitopFoldingInterpreter:
             return (dst, res, folded)
 
         elif op in ("v_and_b32", "s_and_b32", "v_or_b32", "s_or_b32", "v_xor_b32", "s_xor_b32"):
+            if len(operands) < 3:
+                raise ValueError(f"Missing operands in {line}")
             dst = operands[0].lower()
             v0, e0 = self._parse_operand(operands[1])
             v1, e1 = self._parse_operand(operands[2])
@@ -501,6 +520,105 @@ class BitopFoldingInterpreter:
             line = line.strip()
             if line:
                 self.execute_instruction(line)
+
+
+class SimdWaveInterpreter:
+    """Wave32 SIMD vector interpreter modeling 32 lanes under an EXEC mask."""
+
+    def __init__(self, num_lanes: int = 32, num_vgprs: int = 64) -> None:
+        self.num_lanes = num_lanes
+        self.num_vgprs = num_vgprs
+        self.vgprs: list[list[int]] = [[0] * num_lanes for _ in range(num_vgprs)]
+        self.exec_mask: int = (1 << num_lanes) - 1
+
+    def set_exec(self, mask: int) -> None:
+        self.exec_mask = mask & ((1 << self.num_lanes) - 1)
+
+    def get_exec(self) -> int:
+        return self.exec_mask
+
+    def set_vgpr_lane(self, v_idx: int, lane: int, val: int) -> None:
+        self.vgprs[v_idx][lane] = ref_u32(val)
+
+    def set_vgpr_all_lanes(self, v_idx: int, values: list[int]) -> None:
+        assert len(values) == self.num_lanes
+        self.vgprs[v_idx] = [ref_u32(v) for v in values]
+
+    def set_vgpr_broadcast(self, v_idx: int, val: int) -> None:
+        u = ref_u32(val)
+        self.vgprs[v_idx] = [u] * self.num_lanes
+
+    def get_vgpr_lane(self, v_idx: int, lane: int) -> int:
+        return self.vgprs[v_idx][lane]
+
+    def get_vgpr_all_lanes(self, v_idx: int) -> list[int]:
+        return list(self.vgprs[v_idx])
+
+    def _resolve_lane_val(self, operand: str, lane: int) -> int:
+        tok = operand.strip()
+        try:
+            return ref_u32(int(tok, 0))
+        except ValueError:
+            pass
+        if tok.lower().startswith("v"):
+            v_idx = int(tok[1:])
+            return self.vgprs[v_idx][lane]
+        raise ValueError(f"Invalid operand token: {tok}")
+
+    def execute_vector_instruction(self, line: str) -> None:
+        line = line.strip()
+        if not line or line.startswith(";") or line.startswith("//"):
+            return
+        parts = line.split(None, 1)
+        raw_op = parts[0].lower()
+        op = raw_op.replace("_e32", "").replace("_e64", "")
+        operands = [p.strip() for p in parts[1].split(",")] if len(parts) > 1 else []
+
+        if not operands:
+            raise ValueError(f"No operands in instruction: {line}")
+
+        dst_tok = operands[0].lower()
+        if not dst_tok.startswith("v"):
+            raise ValueError(f"Vector destination must be VGPR (e.g. v0): {dst_tok}")
+        dst_idx = int(dst_tok[1:])
+
+        if op in ("v_mov_b32", "s_mov_b32"):
+            if len(operands) < 2:
+                raise ValueError(f"Missing source operand in {line}")
+            for lane in range(self.num_lanes):
+                if self.exec_mask & (1 << lane):
+                    val = self._resolve_lane_val(operands[1], lane)
+                    self.vgprs[dst_idx][lane] = val
+
+        elif op in ("v_not_b32", "s_not_b32"):
+            if len(operands) < 2:
+                raise ValueError(f"Missing source operand in {line}")
+            for lane in range(self.num_lanes):
+                if self.exec_mask & (1 << lane):
+                    val = self._resolve_lane_val(operands[1], lane)
+                    self.vgprs[dst_idx][lane] = ref_not(val)
+
+        elif op in ("v_and_b32", "s_and_b32", "v_or_b32", "s_or_b32", "v_xor_b32", "s_xor_b32"):
+            if len(operands) < 3:
+                raise ValueError(f"Missing binary operands in {line}")
+            for lane in range(self.num_lanes):
+                if self.exec_mask & (1 << lane):
+                    v0 = self._resolve_lane_val(operands[1], lane)
+                    v1 = self._resolve_lane_val(operands[2], lane)
+                    if op in ("v_and_b32", "s_and_b32"):
+                        res = ref_and(v0, v1)
+                    elif op in ("v_or_b32", "s_or_b32"):
+                        res = ref_or(v0, v1)
+                    elif op in ("v_xor_b32", "s_xor_b32"):
+                        res = ref_xor(v0, v1)
+                    self.vgprs[dst_idx][lane] = res
+
+        else:
+            raise ValueError(f"Unsupported SIMD instruction: {line}")
+
+    def execute_sequence(self, lines: list[str]) -> None:
+        for line in lines:
+            self.execute_vector_instruction(line)
 
 
 class BitwiseAlgebraOracleTests(unittest.TestCase):
@@ -743,11 +861,239 @@ class BitopFoldingInterpreterTests(unittest.TestCase):
                 warnings.simplefilter("ignore", ResourceWarning)
                 spv = rdna2spirv.translate(s_path)
         out = si.run_fragment(spv)["%out_mrt0"]
-        # out: (v0, v3, v4, v1)
         self.assertEqual(out[0], 0)
         self.assertEqual(out[1], ref_and(0x12345678, 0x9ABCDEF0))
         self.assertEqual(out[2], 0x12345678)
         self.assertEqual(out[3], 0x12345678)
+
+
+class SimdWaveDivergenceTests(unittest.TestCase):
+    """Test suite verifying multi-lane SIMD divergence under various EXEC masks."""
+
+    def test_simd_all_active_exec(self):
+        simd = SimdWaveInterpreter()
+        simd.set_exec(0xFFFFFFFF)
+        for lane in range(32):
+            simd.set_vgpr_lane(1, lane, 0x1000 + lane)
+            simd.set_vgpr_lane(2, lane, 0x00FF)
+        simd.execute_vector_instruction("v_and_b32 v0, v1, v2")
+        for lane in range(32):
+            self.assertEqual(simd.get_vgpr_lane(0, lane), (0x1000 + lane) & 0x00FF)
+
+    def test_simd_all_inactive_exec(self):
+        simd = SimdWaveInterpreter()
+        simd.set_exec(0x00000000)
+        simd.set_vgpr_broadcast(0, 0xCAFEBABE)
+        simd.set_vgpr_broadcast(1, 0x12345678)
+        simd.execute_vector_instruction("v_mov_b32 v0, v1")
+        for lane in range(32):
+            self.assertEqual(simd.get_vgpr_lane(0, lane), 0xCAFEBABE)
+
+    def test_simd_checkerboard_divergence(self):
+        simd = SimdWaveInterpreter()
+        simd.set_exec(0x55555555)  # Even lanes active, odd lanes inactive
+        simd.set_vgpr_broadcast(0, 0xDEADBEEF)
+        for lane in range(32):
+            simd.set_vgpr_lane(1, lane, 0xAA00 + lane)
+        simd.execute_vector_instruction("v_mov_b32 v0, v1")
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(simd.get_vgpr_lane(0, lane), 0xAA00 + lane)
+            else:
+                self.assertEqual(simd.get_vgpr_lane(0, lane), 0xDEADBEEF)
+
+    def test_simd_halves_divergence(self):
+        simd = SimdWaveInterpreter()
+        simd.set_exec(0x0000FFFF)  # Lower 16 lanes active, upper 16 inactive
+        simd.set_vgpr_broadcast(0, 0x77777777)
+        simd.set_vgpr_broadcast(1, 0x11111111)
+        simd.set_vgpr_broadcast(2, 0x22222222)
+        simd.execute_vector_instruction("v_or_b32 v0, v1, v2")
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(simd.get_vgpr_lane(0, lane), 0x33333333)
+            else:
+                self.assertEqual(simd.get_vgpr_lane(0, lane), 0x77777777)
+
+    def test_simd_single_lane_divergence(self):
+        for target_lane in (0, 7, 15, 31):
+            with self.subTest(lane=target_lane):
+                simd = SimdWaveInterpreter()
+                simd.set_exec(1 << target_lane)
+                simd.set_vgpr_broadcast(0, 0)
+                simd.set_vgpr_broadcast(1, 0xFFFFFFFF)
+                simd.execute_vector_instruction("v_mov_b32 v0, v1")
+                for lane in range(32):
+                    if lane == target_lane:
+                        self.assertEqual(simd.get_vgpr_lane(0, lane), 0xFFFFFFFF)
+                    else:
+                        self.assertEqual(simd.get_vgpr_lane(0, lane), 0)
+
+    def test_simd_divergent_folding_inactive_isolation(self):
+        # Even when constant folding simplifies an instruction (e.g. x & 0 -> 0),
+        # inactive lanes must strictly retain their previous destination value.
+        simd = SimdWaveInterpreter()
+        simd.set_exec(0x00FF00FF)
+        simd.set_vgpr_broadcast(0, 0x12345678)
+        simd.set_vgpr_broadcast(1, 0x9ABCDEF0)
+        simd.execute_vector_instruction("v_and_b32 v0, v1, 0")
+        for lane in range(32):
+            if (0x00FF00FF & (1 << lane)) != 0:
+                self.assertEqual(simd.get_vgpr_lane(0, lane), 0)
+            else:
+                self.assertEqual(simd.get_vgpr_lane(0, lane), 0x12345678)
+
+    def test_simd_multi_instruction_divergence(self):
+        simd = SimdWaveInterpreter()
+        # Step 1: execute on lower half
+        simd.set_exec(0x0000FFFF)
+        for lane in range(32):
+            simd.set_vgpr_lane(0, lane, 0x0)
+            simd.set_vgpr_lane(1, lane, lane)
+            simd.set_vgpr_lane(2, lane, 0x10)
+        simd.execute_vector_instruction("v_xor_b32 v0, v1, v2")
+
+        # Step 2: execute on upper half with complementary operation
+        simd.set_exec(0xFFFF0000)
+        simd.execute_vector_instruction("v_not_b32 v0, v1")
+
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(simd.get_vgpr_lane(0, lane), lane ^ 0x10)
+            else:
+                self.assertEqual(simd.get_vgpr_lane(0, lane), ref_not(lane))
+
+
+class BitwiseTruthTableTests(unittest.TestCase):
+    """Test suite validating full Boolean truth tables and composite logic."""
+
+    def test_1bit_truth_tables(self):
+        table = [
+            (0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1),
+            (0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0),
+            (1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1),
+            (1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 1),
+        ]
+        for a, b, exp_and, exp_or, exp_xor, exp_not_a, exp_nand, exp_nor, exp_xnor, exp_andn2, exp_orn2 in table:
+            with self.subTest(a=a, b=b):
+                self.assertEqual(ref_and(a, b), exp_and)
+                self.assertEqual(ref_or(a, b), exp_or)
+                self.assertEqual(ref_xor(a, b), exp_xor)
+                self.assertEqual(ref_not(a) & 1, exp_not_a)
+                self.assertEqual(ref_nand(a, b) & 1, exp_nand)
+                self.assertEqual(ref_nor(a, b) & 1, exp_nor)
+                self.assertEqual(ref_xnor(a, b) & 1, exp_xnor)
+                self.assertEqual(ref_andn2(a, b), exp_andn2)
+                self.assertEqual(ref_orn2(a, b) & 1, exp_orn2)
+
+    def test_32bit_sliced_truth_tables(self):
+        for bit in range(32):
+            m = 1 << bit
+            with self.subTest(bit=bit):
+                # (0, 0)
+                self.assertEqual(ref_and(0, 0) & m, 0)
+                self.assertEqual(ref_or(0, 0) & m, 0)
+                self.assertEqual(ref_xor(0, 0) & m, 0)
+                # (m, 0)
+                self.assertEqual(ref_and(m, 0) & m, 0)
+                self.assertEqual(ref_or(m, 0) & m, m)
+                self.assertEqual(ref_xor(m, 0) & m, m)
+                # (0, m)
+                self.assertEqual(ref_and(0, m) & m, 0)
+                self.assertEqual(ref_or(0, m) & m, m)
+                self.assertEqual(ref_xor(0, m) & m, m)
+                # (m, m)
+                self.assertEqual(ref_and(m, m) & m, m)
+                self.assertEqual(ref_or(m, m) & m, m)
+                self.assertEqual(ref_xor(m, m) & m, 0)
+
+    def test_3input_boolean_functions(self):
+        # Majority: maj(a, b, c) = (a & b) | (b & c) | (a & c)
+        def maj(a: int, b: int, c: int) -> int:
+            return ref_or(ref_or(ref_and(a, b), ref_and(b, c)), ref_and(a, c))
+
+        # Multiplexer: mux(sel, a, b) = (sel & a) | (~sel & b)
+        def mux(sel: int, a: int, b: int) -> int:
+            return ref_or(ref_and(sel, a), ref_and(ref_not(sel), b))
+
+        # Parity: parity(a, b, c) = a ^ b ^ c
+        def parity(a: int, b: int, c: int) -> int:
+            return ref_xor(ref_xor(a, b), c)
+
+        for a in (0, 1):
+            for b in (0, 1):
+                for c in (0, 1):
+                    # Majority is 1 if at least two inputs are 1
+                    exp_maj = 1 if (a + b + c) >= 2 else 0
+                    self.assertEqual(maj(a, b, c), exp_maj)
+
+                    # Parity is odd parity
+                    exp_parity = (a ^ b ^ c) & 1
+                    self.assertEqual(parity(a, b, c), exp_parity)
+
+        # Mux test across 32-bit words
+        for sel in (0x00000000, 0xFFFFFFFF, 0x55555555, 0x0000FFFF):
+            x = 0x12345678
+            y = 0x9ABCDEF0
+            res = mux(sel, x, y)
+            for bit in range(32):
+                expected_bit = (x if (sel & (1 << bit)) else y) & (1 << bit)
+                self.assertEqual(res & (1 << bit), expected_bit)
+
+
+class BitwiseNegativeControlTests(unittest.TestCase):
+    """Test suite validating negative controls, non-identities, and fault rejection."""
+
+    def test_non_identities(self):
+        # x & y != x in general when x has bits not in y
+        x = 0x12345678
+        y = 0x0000FFFF
+        self.assertNotEqual(ref_and(x, y), x)
+
+        # x | y != x when y has bits not in x
+        x = 0x0000FFFF
+        y = 0x12345678
+        self.assertNotEqual(ref_or(x, y), x)
+
+    def test_non_cancellation(self):
+        # x ^ y != 0 when x != y
+        for i in range(len(CANONICAL_TEST_VECTORS) - 1):
+            x = CANONICAL_TEST_VECTORS[i]
+            y = CANONICAL_TEST_VECTORS[i + 1]
+            if x != y:
+                self.assertNotEqual(ref_xor(x, y), 0)
+
+    def test_non_annihilation(self):
+        # x & c != 0 when x and c share set bits
+        x = 0x55555555
+        c = 0x11111111
+        self.assertNotEqual(ref_and(x, c), 0)
+
+    def test_inactive_lane_isolation(self):
+        simd = SimdWaveInterpreter()
+        simd.set_exec(0x00000001)  # Only lane 0 active
+        simd.set_vgpr_broadcast(0, 0xAAAAAAAAAAAAAAAA)
+        simd.set_vgpr_broadcast(1, 0x55555555)
+        simd.execute_vector_instruction("v_mov_b32 v0, v1")
+        # Lane 0 changed to 0x55555555
+        self.assertEqual(simd.get_vgpr_lane(0, 0), 0x55555555)
+        # Lanes 1..31 must NOT have changed
+        for lane in range(1, 32):
+            self.assertNotEqual(simd.get_vgpr_lane(0, lane), 0x55555555)
+            self.assertEqual(simd.get_vgpr_lane(0, lane), 0xAAAAAAAA)
+
+    def test_parser_fault_rejection(self):
+        interp = BitopFoldingInterpreter()
+        with self.assertRaises(ValueError):
+            interp.execute_instruction("v_invalid_opcode_b32 v0, v1, v2")
+        with self.assertRaises(ValueError):
+            interp.execute_instruction("v_and_b32 v0")
+
+        simd = SimdWaveInterpreter()
+        with self.assertRaises(ValueError):
+            simd.execute_vector_instruction("v_unknown_op v0, v1")
+        with self.assertRaises(ValueError):
+            simd.execute_vector_instruction("v_and_b32 s0, v1, v2")
 
 
 class BitopConstantFoldingTests(unittest.TestCase):
