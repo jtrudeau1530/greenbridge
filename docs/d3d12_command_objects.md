@@ -303,7 +303,7 @@ of an inline write of the same values.
 | `0x1a3b0` | `+0x168` | 45 → 41 `SetComputeRootUnorderedAccessView` | `(0, VA)` (inline: header + a 64-bit value) | **Measured** shape |
 | `0x20ed6` | `+0x4a0` | 148 → none | `(list, count * 40, 16)` returns a pointer; on null the DLL prints `D3D12 XDXR Error: Failed to allocate upload buffer` and throws `E_FAIL` | **Measured**: an upload allocator `(size, alignment)` |
 | `0x20f99` | `+0x158` | 43 → 39 `SetComputeRootShaderResourceView` | `(0, p)`, `p` the pointer slot 148 returned at `0x20ed6`, unchanged | **Measured**: the CPU pointer is used as the GPU address |
-| `0x149ba` | `+0x280` | 80 → none | `(x, 1, 1, 0x8020)`: `EDX=EDI`, `R8D=R9D=1`, fifth argument `0x8020` (inline: a five-dword packet) | Inferred: a `Dispatch` with one extra word |
+| `0x149ba` | `+0x280` | 80 → none | `(x, 1, 1, 0x8020)`: `EDX=EDI`, `R8D=R9D=1`, fifth argument `0x8020` (inline: the five-dword packet `0x4003cc00, x, 1, 1, W` of section 3.5a; the calls at `0x1525d` and `0x153b4` pass `0x20`) | Inferred: a `Dispatch` with one extra word |
 | `0xd6de` | `+0x238` | 71 → none | `(&label, counter, 0 or 0x1000, 0)`: the counter at `[rbx+0x9c]` is incremented first; `0x1000` on the last item of a batch | Inferred: a GPU write of a 32-bit value to memory |
 | `0xd679` | `+0x248` | 73 → none | `(&label, 3, reference, 0xffffffff, 0)` | Inferred: a GPU wait until the masked value compares (function 3) with the reference |
 | `0xd7b4` | `+0x490` | 146 → GCL7 80 `Barrier` | the same global UAV barrier as `0x1da02` | **Measured** |
@@ -371,14 +371,18 @@ vtable pointer of a public object.
 - **Slot 67** (call at `0x56d9`) is **not** the PC `CreateProtectedResourceSession1`: it takes `(desc, riid, out)`
   with `IID_ID3D12PipelineState`. The DLL's own messages name it `DeserializeComputePipelineStateX`. Its desc is the
   root signature at `+0x00`, then pointer and size pairs for the shader's `FSPX` entries: kind 0 at `+0x08`, kind 1
-  at `+0x18`, a copy of the kind-6 program at `+0x28`, and kind 7 at `+0x38` ([fspx.md](fspx.md)). The proxy maps the
-  console desc to `D3D12_COMPUTE_PIPELINE_STATE_DESC` and routes it to `CreateComputePipelineState` (PC slot 11). On a
-  PC device that call fails (`E_FAIL`) because the code is not a PC shader, so the DLL falls back to slot 62; its message
-  for that failure calls the fallback "NewBE".
+  at `+0x18`, a copy of the kind-6 program at `+0x28` with its exact size at `+0x30`, and kind 7 at `+0x38`
+  ([fspx.md](fspx.md)). The proxy maps the console desc to `D3D12_COMPUTE_PIPELINE_STATE_DESC` and routes it to
+  `CreateComputePipelineState` (PC slot 11). On a PC device that call fails (`E_FAIL`) because the code is not a PC
+  shader, so the DLL falls back to slot 62; its message for that failure calls the fallback "NewBE". The Vulkan
+  device takes the bare kind-6 program and finds its translated module by `fspx_code_sha256` ([fspx.md](fspx.md),
+  "Build and run-time lookup"), for the programs the build translated.
 - **Slot 62** (call at `0x5825`) takes the measured `(D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, out)`. The PC
   runtime refuses the DLL's code (`E_FAIL`): it is not a PC shader. The DLL's pipeline function then returns
   `0x8000000d` (`0x4b85`), but the dispatch goes on, records the null pipeline and faults (`0x65ff`), which is where a
-  PC device stops.
+  PC device stops. The Vulkan device (`LEONIDA_D3D12=vulkan`) takes the container: it hashes the kind-6 bytes of the
+  `ACCC` part and creates the pipeline from the translated module, for the programs the build translated; others,
+  and a malformed `FSPX` directory, are refused with `E_INVALIDARG`.
 - **Pipeline slot 11 sizes the compute scratch.** After either path succeeds (slot 67 jumps to `0x5833`), the DLL
   calls the new pipeline's slot 11 as `(0, 0, &obj)` (`0x586d`); the public `ID3D12PipelineState` ends at slot 8, so
   this is a console-only method. On success it reads a dword through `obj`'s slot 3 (`0x5881`), multiplies it by
@@ -392,8 +396,9 @@ vtable pointer of a public object.
 - The DLL's 29 shaders are `DXBC` containers with `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts
   and no `DXIL`. The `ACCC` payload starts with the tag `FSPX` in all 29; the game's own native shaders are `FSSM`
   inside `XBCH` ([design.md](design.md)). `FSPX` is a directory around an uncompressed RDNA2 program and its
-  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 13 of the 29 today. The 13 that
-  use `v_dot4` instructions are not translated yet ([fspx.md](fspx.md)).
+  dispatch state; `tools/fspx_unpack.py` unpacks it for the translator, which takes 17 of the 29 today, and
+  `make_game.py`'s `shaders` stage does both for the package's DLL. What stops the other 12 is listed in
+  [fspx.md](fspx.md), "Translation status".
 
 **Command list.** The console list is **not** the PC order past `ResourceBarrier`. Each row is backed by the
 argument shape at the call and, where marked "run", by the call seen in the run. Rows marked "inferred" fit the
@@ -427,6 +432,18 @@ call the DLL checks a write cursor at `+0x18` against a limit (`+0x30` for root 
 it writes the command into that buffer itself instead of calling: a root argument is a header word from the
 per-root-parameter table at `+0x344` and then the value (32 bits for a descriptor table, 64 for the slot-41 GPU VA),
 a dispatch four words (`0x4002c400`, or `(flag | 0x1000ba00) << 2`, then x, y, z).
+The BVH builder also writes a five-word dispatch, `0x4003cc00, x, 1, 1, W`.
+- **Sites:** `0x14972`, `0x15215`, `0x1536a` and `0x1d002`, each checked against the dispatch limit `+0x28`. The
+  cursor advances 20 bytes and the flag byte at `+0x140` is cleared.
+- **It is the inline form of console slot 80** (section 3.3a). When the buffer is full, each site calls slot 80
+  (`+0x280`) instead, as `(x, 1, 1, W)` with the same `W`.
+- **`W` is `0x8020`** at `0x14972` and `0x1d002`, and **`0x20`** at `0x15215` and `0x1536a`. What bit 15 selects is
+  open.
+
+The FSR DLL never writes this form.
+**Byte `+0x143` is console-runtime state:** the BVH builder reads it at 31 sites and the FSR DLL at one (all `cmp
+byte ptr [reg+143h]`), but neither DLL writes it. Every store into `+0x140`..`+0x143` in either DLL is a byte store to
+`+0x140` or `+0x141`, and no wider store reaches `+0x143`. A replacement list can leave it 0.
 It sets a flag byte at `+0x140`, stores a flag at `+0x141` from the
 pipeline, and copies 32 bytes of the pipeline object (from its `+0x10`) to `+0x544`. These are the fields
 section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x544`).

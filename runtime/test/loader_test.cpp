@@ -844,6 +844,35 @@ void test_forwarded_exports() {
         }
     }
     {
+        // Forwarder strings name the module without ".dll". The package ships Xbox builds of the CRT
+        // (vcruntime140.dll, msvcp140.dll, ...) that the loader replaces with the host's for a direct import; a
+        // forwarded one must get the host copy too, not map the bundled file.
+        const char* what = "a forwarder to a CRT module without \".dll\" binds the host copy, not the bundled one";
+        write_image_as(make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x1a0000000), "vcruntime140.dll");
+        write_image_as(make_forwarder_image("vcruntime140.memset", 0x180000000), "prov_crt.dll");
+        auto importer = write_image_as(make_import_image("prov_crt.dll", "fwd"), "importer_crt.exe");
+        HMODULE host_crt = LoadLibraryExA("vcruntime140.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        void* expected = host_crt ? reinterpret_cast<void*>(GetProcAddress(host_crt, "memset")) : nullptr;
+        if (!expected) {
+            std::printf("SKIP %s: no vcruntime140.dll in System32\n", what);
+        } else {
+            try {
+                rt::Loader loader(g_dir);
+                rt::Module& m = loader.load(importer);
+                if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Host)
+                    return failed(what, "the forwarded CRT import did not bind to the host");
+                if (*reinterpret_cast<void**>(m.base + 0x1180) != expected)
+                    return failed(what, "the address table does not hold the host's memset");
+                for (auto* mod : loader.modules())
+                    if (rt::lower(mod->name) == "vcruntime140.dll")
+                        return failed(what, "the bundled vcruntime140.dll was mapped");
+                pass(what);
+            } catch (const std::exception& e) {
+                failed(what, e.what());
+            }
+        }
+    }
+    {
         const char* what = "a forwarder to a shimmed module binds to the shim";
         write_image_as(make_forwarder_image("testshim.F", 0x180000000), "prov_shim.dll");
         auto importer = write_image_as(make_import_image("prov_shim.dll", "fwd"), "importer_shim.exe");
@@ -977,6 +1006,19 @@ void test_unwind_registration() {
     expect_rejects("unwind data past the image", make_unwind_image({{0x1000, 0x1010, 0x1FFE}}));
 }
 
+// An export whose address-table entry is past SizeOfImage (not a forwarder: outside the export directory) is
+// refused instead of being stored as base + rva, a pointer outside the mapping.
+void test_export_bounds() {
+    auto outside = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    nt_of(outside)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
+    *reinterpret_cast<uint32_t*>(outside.data() + 0x300) = 0x2000;  // funcs[0] == SizeOfImage
+    expect_rejects("an export whose address is past the image", outside);
+    auto last = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000);
+    nt_of(last)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = sizeof(IMAGE_EXPORT_DIRECTORY);
+    *reinterpret_cast<uint32_t*>(last.data() + 0x300) = 0x1FFF;  // the image's last byte: still inside
+    expect_loads("an export at the image's last byte still loads", last);
+}
+
 // The folder the images go to: leonida_loader_test\<process id> in LEONIDA_TEST_DIR when that is set, otherwise in
 // the temporary directory. A folder per run, because security software can hold the previous run's images for a
 // while after they are written (so they can be neither deleted nor overwritten); the fixed parent name is what an
@@ -1066,6 +1108,7 @@ int main() {
         test_process_detach_dependencies();
         test_delay_descriptor_fields();
         test_forwarded_exports();
+        test_export_bounds();
         test_unwind_registration();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.

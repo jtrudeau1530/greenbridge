@@ -150,6 +150,25 @@ class TestManifestVerifier(unittest.TestCase):
                 self.assertIn(bad_path, str(cm.exception))
                 self.assertIn("nested/a.bin", str(cm.exception))
 
+    def test_cli_rejects_duplicate_json_keys(self) -> None:
+        digest = hashlib.sha256(self.payloads["alpha.bin"]).hexdigest()
+        entries = f'{{"alpha.bin": "wrong", "alpha.bin": "{digest}"}}'
+        cases = (
+            ("alpha.bin", entries),
+            ("alpha.bin", f'{{"files": {entries}}}'),
+            ("files", '{"files": {"missing.bin": "wrong"}, "files": {}}'),
+            ("sha256", f'{{"files": {{"alpha.bin": {{"sha256": "wrong", "sha256": "{digest}"}}}}}}'),
+        )
+        for key, document in cases:
+            with self.subTest(document=document):
+                with open(self.manifest_path, "w", encoding="utf-8") as f:
+                    f.write(document)
+                result = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--quiet")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("duplicate JSON key", result.stderr)
+                self.assertIn(repr(key), result.stderr)
+                self.assertIn(self.manifest_path, result.stderr)
+
     def test_load_manifest_single_spelling_control(self) -> None:
         digest = hashlib.sha256(b"x").hexdigest()
         for wrapper in (True, False):
