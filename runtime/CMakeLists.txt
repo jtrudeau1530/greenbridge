@@ -1706,6 +1706,36 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_geometry_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_geometry COMMAND d3d12_geometry_test)
       set_tests_properties(d3d12_geometry PROPERTIES SKIP_RETURN_CODE 77)
+      # D3D-309: D24 depth bias and 24-bit depth in draws, with and without a pixel shader and with a geometry shader
+      # (src/depth24_fragment.h).
+      set(LEONIDA_TEST_VS_DEPTH ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_depth.spv)
+      set(LEONIDA_TEST_PS_DEPTH_EMPTY ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_depth_empty.spv)
+      set(LEONIDA_TEST_PS_DEPTH_WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_depth_write.spv)
+      set(LEONIDA_TEST_GS_DEPTH ${CMAKE_CURRENT_BINARY_DIR}/generated/gs_depth.spv)
+      foreach(pair "vs_depth.vert;${LEONIDA_TEST_VS_DEPTH}" "ps_depth_empty.frag;${LEONIDA_TEST_PS_DEPTH_EMPTY}"
+                   "ps_depth_write.frag;${LEONIDA_TEST_PS_DEPTH_WRITE}" "gs_depth.geom;${LEONIDA_TEST_GS_DEPTH}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the D24 draw test shader ${source}"
+          VERBATIM)
+      endforeach()
+      add_executable(d3d12_depth24_draw_test test/d3d12_depth24_draw_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS_DEPTH} ${LEONIDA_TEST_PS_DEPTH_EMPTY} ${LEONIDA_TEST_PS_DEPTH_WRITE}
+                     ${LEONIDA_TEST_GS_DEPTH})
+      target_link_libraries(d3d12_depth24_draw_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_depth24_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_DEPTH_SPV="${LEONIDA_TEST_VS_DEPTH}"
+                                 LEONIDA_TEST_PS_DEPTH_EMPTY_SPV="${LEONIDA_TEST_PS_DEPTH_EMPTY}"
+                                 LEONIDA_TEST_PS_DEPTH_WRITE_SPV="${LEONIDA_TEST_PS_DEPTH_WRITE}"
+                                 LEONIDA_TEST_GS_DEPTH_SPV="${LEONIDA_TEST_GS_DEPTH}")
+      target_compile_options(d3d12_depth24_draw_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_depth24_draw COMMAND d3d12_depth24_draw_test)
+      set_tests_properties(d3d12_depth24_draw PROPERTIES SKIP_RETURN_CODE 77)
       # Set 0 from the compute bind point: a compute PSO whose shader declares set-0 bindings samples through the
       # device's bindless set, which nothing but the layer binds.
       set(LEONIDA_TEST_CS_SET0_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_set0_sample.spv)

@@ -16,6 +16,7 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
@@ -2545,6 +2546,21 @@ public:
         // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
         auto& required_sizes = recipe_.required_sizes;
         const Stage* code_stage = nullptr;
+        // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU): the pixel stage writes the depth D24
+        // would hold, biased in D24 units and quantised (src/depth24_fragment.h, D3D-309), and the rasterizer's own
+        // bias is turned off. Multisampled targets keep the old path: a FragDepth write is per pixel.
+        const bool d24_as_float = desc.DSVFormat != DXGI_FORMAT_UNKNOWN &&
+                                  vulkan_format(desc.DSVFormat, true).format == VK_FORMAT_D24_UNORM_S8_UINT &&
+                                  !device_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT);
+        bool depth24_fragment = d24_as_float && desc.DepthStencilState.DepthEnable;
+        if (depth24_fragment && samples > 1) {
+            log_once("D24 depth stored as D32 keeps float depth bias and precision on multisampled targets; samples",
+                     int(samples));
+            depth24_fragment = false;
+        }
+        const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
+                                                desc.RasterizerState.SlopeScaledDepthBias,
+                                                desc.RasterizerState.DepthBiasClamp};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             stage.fssm = leonida::fssm_program(
@@ -2602,6 +2618,18 @@ public:
         }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
+            // After the f16 link above, which can also edit the pixel shader's words.
+            if (depth24_fragment && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
+                std::string why;
+                std::vector<std::uint32_t> patched = leonida::depth24_patch_fragment(stage.words, depth24_bias, why);
+                if (patched.empty()) {
+                    std::fprintf(stderr, "[rt] d3d12: %s keeps float depth on a D24 target stored as D32: %s\n",
+                                 stage.entry->name.c_str(), why.c_str());
+                    depth24_fragment = false;
+                } else {
+                    stage.words = std::move(patched);
+                }
+            }
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module_info.codeSize = stage.words.size() * 4;
             module_info.pCode = stage.words.data();
@@ -2613,6 +2641,21 @@ public:
             info.module = module;
             info.pName = "main";
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
+            stage_infos.push_back(info);
+        }
+        if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
+            const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
+            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module_info.codeSize = words.size() * 4;
+            module_info.pCode = words.data();
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (words.empty() || vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS)
+                return E_FAIL;
+            modules_.push_back(module);
+            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            info.module = module;
+            info.pName = "main";
             stage_infos.push_back(info);
         }
 
@@ -2687,10 +2730,14 @@ public:
                                                                : VK_CULL_MODE_NONE;
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
-        raster.depthBiasEnable = r.DepthBias || r.SlopeScaledDepthBias != 0.0f;
-        raster.depthBiasConstantFactor = float(r.DepthBias);
-        raster.depthBiasClamp = r.DepthBiasClamp;
-        raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
+        // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
+        // rasterizer's bias stays off and zero, so its clamp needs no depthBiasClamp feature either.
+        raster.depthBiasEnable = !depth24_fragment && (r.DepthBias || r.SlopeScaledDepthBias != 0.0f);
+        if (raster.depthBiasEnable) {
+            raster.depthBiasConstantFactor = float(r.DepthBias);
+            raster.depthBiasClamp = r.DepthBiasClamp;
+            raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
+        }
         raster.lineWidth = 1.0f;
         // No depth clipping: fragments outside the viewport's depth range are kept and their depth clamped to it, as
         // D3D12 clamps output depth to MinDepth..MaxDepth anyway (needs depthClamp, checked below).
