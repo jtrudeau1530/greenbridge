@@ -24,6 +24,9 @@ A mismatch is printed with the thread, register, the two values and the op that 
 --show line. --skip-op OP leaves an op out without changing the rest of the program, to set a known finding aside.
 Exit code: 0 when every program that ran matches, 1 on a mismatch or an untranslated program, 2 on a harness error
 or when nothing ran. Needs vk_compute_test's VKC_DUMP / VKC_OUT_WORDS (from FUZZ-6, #368).
+
+Needs llvm-mc 21 or newer for --family f16 (docs/testing.md): llvm-mc 18 rejects op_sel on the 16-bit integer VOP3
+forms, so no f16 program assembles and the run stops with exit code 2. --family mem assembles with 18.
 """
 import argparse
 import json

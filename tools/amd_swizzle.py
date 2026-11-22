@@ -103,6 +103,19 @@ def offsets(eq, bpe, wb, hb, block_bytes=65536):
     return off + block * block_bytes, (bw, bh, xb, yb)
 
 
+def feature(linear, bpe):
+    """Per-element RGB for the smoothness score: raw RGB for uncompressed bpe, colour endpoint for BC."""
+    if bpe == 4:
+        return linear.reshape(-1, 4)[:, :3].astype(np.float32)
+    if bpe == 2:
+        p = linear.reshape(-1, 2).astype(np.float32)
+        return np.stack([p[:, 0], p[:, 1], (p[:, 0] + p[:, 1]) * 0.5], axis=-1)
+    if bpe == 1:
+        return np.repeat(linear.reshape(-1, 1).astype(np.float32), 3, axis=1)
+    from tile_probe import block_feature
+    return block_feature(linear, bpe)
+
+
 def detile(data, eq, bpe, wb, hb):
     off, _ = offsets(eq, bpe, wb, hb)
     idx = off // bpe
@@ -114,7 +127,7 @@ def detile(data, eq, bpe, wb, hb):
 
 def main():
     sys.path.insert(0, os.path.dirname(__file__))
-    from tile_probe import block_feature, score
+    from tile_probe import score
     from swizzle_search import render  # noqa: F401
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
@@ -141,7 +154,7 @@ def main():
             lin = detile(data, eq, a.bpe, wb, hb)
             if lin is None:
                 continue
-            img = block_feature(lin, a.bpe).reshape(hb, wb, 3)
+            img = feature(lin, a.bpe).reshape(hb, wb, 3)
             res.append((score(img), tname, e[5], e))
     res.sort(key=lambda r: r[0])
     seen = set()

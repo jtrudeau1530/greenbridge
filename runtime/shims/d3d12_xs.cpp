@@ -18,6 +18,7 @@
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"
 #endif
+#include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "d3d12_xs_rootsig.h"
 #include "shims.h"
@@ -121,26 +122,31 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
 // least restrictive floor; higher feature levels are still exposed by the created device.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
-    if (!out) return E_POINTER;
+    constexpr auto method = "D3D12XboxCreateDevice";
+    using rt::d3d12_trace::result;
+    if (!out) return result(method, E_POINTER);
     *out = nullptr;
-    if (!riid) return E_POINTER;
+    if (!riid) return result(method, E_POINTER);
 
-    std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice adapter=%p params=%p riid=%08lx-%04x-%04x\n",
-                 adapter, params, static_cast<unsigned long>(riid->Data1), riid->Data2, riid->Data3);
-    if (params) {
-        const uint32_t* words = static_cast<const uint32_t*>(params);
-        char line[24 * 11 + 1];
-        line[0] = '\0';
-        size_t used = 0;
-        for (int i = 0; i < 24 && used < sizeof(line); ++i) {
-            int n = std::snprintf(line + used, sizeof(line) - used, "%s%08x", i ? " " : "",
-                                  static_cast<unsigned>(words[i]));
-            if (n < 0) break;
-            used += static_cast<size_t>(n);
+    const bool tracing = rt::d3d12_trace::enabled();
+    if (!tracing) {
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice adapter=%p params=%p riid=%08lx-%04x-%04x\n",
+                     adapter, params, static_cast<unsigned long>(riid->Data1), riid->Data2, riid->Data3);
+        if (params) {
+            const uint32_t* words = static_cast<const uint32_t*>(params);
+            char line[24 * 11 + 1];
+            line[0] = '\0';
+            size_t used = 0;
+            for (int i = 0; i < 24 && used < sizeof(line); ++i) {
+                int n = std::snprintf(line + used, sizeof(line) - used, "%s%08x", i ? " " : "",
+                                      static_cast<unsigned>(words[i]));
+                if (n < 0) break;
+                used += static_cast<size_t>(n);
+            }
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params[24] =%s\n", line);
+        } else {
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
         }
-        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params[24] =%s\n", line);
-    } else {
-        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
     }
 
     static std::atomic<bool> proxy_logged{false};
@@ -162,24 +168,25 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         if (FAILED(vhr)) {
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: Vulkan device failed (hr=0x%08lx)\n",
                          static_cast<unsigned long>(vhr));
-            return vhr;
+            return result(method, vhr);
         }
         vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
         if (FAILED(vhr)) {
             vulkan->Release();
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
                                  "(hr=0x%08lx)\n", static_cast<unsigned long>(vhr));
-            return vhr;
+            return result(method, vhr);
         }
         rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
-        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,
-                     static_cast<void*>(vulkan));
-        return S_OK;
+        if (!tracing)
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,
+                         static_cast<void*>(vulkan));
+        return result(method, S_OK);
     }
 #endif
 
     static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
-    if (!create) return E_NOTIMPL;
+    if (!create) return result(method, E_NOTIMPL);
 
     ID3D12Device* real = nullptr;
     HRESULT hr = create(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
@@ -188,7 +195,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         if (real) real->Release();
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: PC D3D12CreateDevice failed (hr=0x%08lx)\n",
                      static_cast<unsigned long>(hr));
-        return FAILED(hr) ? hr : E_FAIL;
+        return result(method, FAILED(hr) ? hr : E_FAIL);
     }
 
     hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
@@ -197,11 +204,12 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         real->Release();
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy creation failed (hr=0x%08lx)\n",
                      static_cast<unsigned long>(hr));
-        return hr;
+        return result(method, hr);
     }
-    std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (PC device %p)\n", *out,
-                 static_cast<void*>(real));
-    return S_OK;
+    if (!tracing)
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (PC device %p)\n", *out,
+                     static_cast<void*>(real));
+    return result(method, S_OK);
 }
 
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);

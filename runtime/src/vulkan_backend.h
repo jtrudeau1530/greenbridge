@@ -161,6 +161,13 @@ public:
         };
     }
 
+    // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
+    // set keeps its upload pending in the second case, because the copy never reached the GPU.
+    void set_bindless_commit(std::function<void(bool)> commit) {
+        std::lock_guard lock(mutex_);
+        bindless_commit_ = std::move(commit);
+    }
+
     VulkanDeviceFunctions vk;
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
@@ -204,6 +211,7 @@ private:
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
+    std::function<void(bool)> bindless_commit_;
     ReplayFunctions replay_;
 };
 
@@ -310,7 +318,8 @@ public:
         if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             // The command buffer holds at most what the set recorded for itself; submit it so the buffer is reused.
             context_.vk.vkEndCommandBuffer(command_buffer);
-            submit(command_buffer, VK_NULL_HANDLE, 0);
+            const bool submitted = submit(command_buffer, VK_NULL_HANDLE, 0);
+            if (context_.bindless_commit_) context_.bindless_commit_(submitted);
             return ReplayResult::unsupported;
         }
         for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
@@ -324,6 +333,7 @@ public:
         context_.vk.vkEndCommandBuffer(command_buffer);
         const bool submitted = submit(command_buffer, VK_NULL_HANDLE, 0);
         if (context_.depth24_) context_.depth24_->retire(progress_, submitted_);  // what this list's copies prepared
+        if (context_.bindless_commit_) context_.bindless_commit_(submitted);
         return submitted ? ReplayResult::success : ReplayResult::unsupported;
     }
 
