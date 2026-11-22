@@ -335,7 +335,7 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
                      std::vector<std::uint8_t>& pixels) {
 #define RESOLVE_CHECK(condition) do { \
     if (!(condition)) { \
-        std::fprintf(stderr, "resolve capture failed at line %d: %s (format %d, samples %u, %s)\\n", \
+        std::fprintf(stderr, "resolve capture failed at line %d: %s (format %d, samples %u, %s)\n", \
                      __LINE__, #condition, int(format), samples, resolve_scenario_name(scenario)); \
         return false; \
     } \
@@ -465,9 +465,9 @@ int compare_resolves(ID3D12Device* ours) {
         DXGI_FORMAT_R32G32B32A32_FLOAT,
     };
     constexpr UINT sample_counts[] = {2, 4, 8};
-    constexpr D3D12_FORMAT_SUPPORT1 required =
-        D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
-        D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+    constexpr UINT required =
+        UINT(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) | UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET) |
+        UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE);
     constexpr ResolveScenario scenarios[] = {
         ResolveScenario::full, ResolveScenario::rectangle, ResolveScenario::null_rectangle};
     int mismatches = 0;
@@ -479,12 +479,12 @@ int compare_resolves(ID3D12Device* ours) {
             host->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &host_format, sizeof(host_format));
         const HRESULT our_format_hr =
             ours->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &our_format, sizeof(our_format));
-        if (FAILED(host_format_hr) || (host_format.Support1 & required) != required) {
-            std::printf("resolve format %d: host does not advertise multisample colour resolve, skipped\\n", int(format));
+        if (FAILED(host_format_hr) || (UINT(host_format.Support1) & required) != required) {
+            std::printf("resolve format %d: host does not advertise multisample colour resolve, skipped\n", int(format));
             continue;
         }
-        if (FAILED(our_format_hr) || (our_format.Support1 & required) != required) {
-            std::fprintf(stderr, "resolve format %d: Vulkan device does not match host multisample format support\\n",
+        if (FAILED(our_format_hr) || (UINT(our_format.Support1) & required) != required) {
+            std::fprintf(stderr, "resolve format %d: Vulkan device does not match host multisample format support\n",
                          int(format));
             ++mismatches;
             continue;
@@ -504,7 +504,7 @@ int compare_resolves(ID3D12Device* ours) {
                 continue;
             }
             if (FAILED(our_hr) || our_levels.NumQualityLevels == 0) {
-                std::fprintf(stderr, "resolve format %d samples %u: Vulkan reports unsupported, host supports it\\n",
+                std::fprintf(stderr, "resolve format %d samples %u: Vulkan reports unsupported, host supports it\n",
                              int(format), samples);
                 ++mismatches;
                 continue;
@@ -518,7 +518,7 @@ int compare_resolves(ID3D12Device* ours) {
                     continue;
                 }
                 if (host_pixels != our_pixels) {
-                    std::fprintf(stderr, "resolve mismatch: format %d samples %u %s (host %zu bytes, Vulkan %zu)\\n",
+                    std::fprintf(stderr, "resolve mismatch: format %d samples %u %s (host %zu bytes, Vulkan %zu)\n",
                                  int(format), samples, resolve_scenario_name(scenario),
                                  host_pixels.size(), our_pixels.size());
                     ++mismatches;
@@ -528,9 +528,9 @@ int compare_resolves(ID3D12Device* ours) {
         }
     }
     std::printf("Resolve comparison: %u matched cases, %u unsupported format/sample combinations skipped, "
-                "%d mismatches\\n", comparisons, skipped, mismatches);
+                "%d mismatches\n", comparisons, skipped, mismatches);
     if (comparisons == 0) {
-        std::fprintf(stderr, "Resolve comparison: no common supported format/sample combination was exercised\\n");
+        std::fprintf(stderr, "Resolve comparison: no common supported format/sample combination was exercised\n");
         ++mismatches;
     }
     return mismatches;
