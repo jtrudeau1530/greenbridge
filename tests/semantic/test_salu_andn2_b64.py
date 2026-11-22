@@ -14,6 +14,7 @@ four-corner SCC zero/nonzero matrix, and non-commutative operand asymmetry.
 from __future__ import annotations
 
 import os
+import random
 import sys
 import unittest
 
@@ -26,6 +27,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
+
+from support import translate_lines, mrt0_words  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -376,6 +379,173 @@ class SaluInterpreterTests(unittest.TestCase):
         state.execute("s_xnor_b64", "vcc", "vcc", MASK64)
         self.assertEqual(state.vcc, 0x0F0F0F0F_0F0F0F0F)
         self.assertEqual(state.scc, 1)
+
+
+class SaluSpirvLoweringTests(unittest.TestCase):
+    """SPIR-V translation and mini-interpreter execution tests for 64-bit inverted logic."""
+
+    def test_spirv_lowering_all_five_ops(self):
+        test_pairs = [
+            (0x01234567_89ABCDEF, 0x00FF00FF_0F0F0F0F),
+            (0x00000000_00000000, 0xFFFFFFFF_FFFFFFFF),
+            (0x55555555_55555555, 0xAAAAAAAA_AAAAAAAA),
+            (0x00000001_00000000, 0x00000000_00000000),
+            (0x00000000_00000001, 0x00000000_00000000),
+        ]
+        for op, ref_fn in REF_OPS.items():
+            for idx, (v0, v1) in enumerate(test_pairs):
+                with self.subTest(op=op, idx=idx):
+                    s0_lo = v0 & MASK32
+                    s0_hi = (v0 >> 32) & MASK32
+                    s1_lo = v1 & MASK32
+                    s1_hi = (v1 >> 32) & MASK32
+                    lines = [
+                        f"s_mov_b32 s0, {s0_lo:#x}",
+                        f"s_mov_b32 s1, {s0_hi:#x}",
+                        f"s_mov_b32 s2, {s1_lo:#x}",
+                        f"s_mov_b32 s3, {s1_hi:#x}",
+                        f"{op} s[4:5], s[0:1], s[2:3]",
+                        "v_mov_b32 v0, s4",
+                        "v_mov_b32 v1, s5",
+                        "s_cselect_b32 s6, 1, 0",
+                        "v_mov_b32 v2, s6",
+                        "v_mov_b32 v3, 0",
+                        "exp mrt0 v0, v1, v2, v3 done vm",
+                        "s_endpgm",
+                    ]
+                    spv = translate_lines(f"ps_{op}_{idx}", lines)
+                    out = mrt0_words(spv)
+                    res64 = (out[1] << 32) | out[0]
+                    expected = ref_fn(v0, v1)
+                    expected_scc = ref_scc(expected)
+                    self.assertEqual(res64, expected)
+                    self.assertEqual(out[2], expected_scc)
+
+    def test_spirv_destination_aliasing(self):
+        v0 = 0x12345678_9ABCDEF0
+        v1 = 0x0F0F0F0F_F0F0F0F0
+        lines = [
+            f"s_mov_b32 s0, {v0 & MASK32:#x}",
+            f"s_mov_b32 s1, {(v0 >> 32) & MASK32:#x}",
+            f"s_mov_b32 s2, {v1 & MASK32:#x}",
+            f"s_mov_b32 s3, {(v1 >> 32) & MASK32:#x}",
+            "s_andn2_b64 s[0:1], s[0:1], s[2:3]",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v2, s6",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_andn2_alias", lines)
+        out = mrt0_words(spv)
+        res64 = (out[1] << 32) | out[0]
+        expected = ref_andn2_b64(v0, v1)
+        self.assertEqual(res64, expected)
+        self.assertEqual(out[2], ref_scc(expected))
+
+    def test_spirv_null_destination(self):
+        v0 = 0x12345678_9ABCDEF0
+        v1 = 0x12345678_9ABCDEF0
+        lines = [
+            f"s_mov_b32 s0, {v0 & MASK32:#x}",
+            f"s_mov_b32 s1, {(v0 >> 32) & MASK32:#x}",
+            f"s_mov_b32 s2, {v1 & MASK32:#x}",
+            f"s_mov_b32 s3, {(v1 >> 32) & MASK32:#x}",
+            "s_andn2_b64 null, s[0:1], s[2:3]",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_null_dst", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 0)
+
+    def test_spirv_mask_lowering_instruction_stream(self):
+        lines = [
+            "s_andn2_b64 exec, exec, vcc",
+            "s_orn2_b64 exec, exec, vcc",
+            "s_nor_b64 exec, exec, vcc",
+            "s_xnor_b64 exec, exec, vcc",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_mask_ops", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpBitwiseOr", spv)
+        self.assertIn("OpBitwiseXor", spv)
+        self.assertIn("OpNot", spv)
+
+
+class DeMorganDualityStressTests(unittest.TestCase):
+    """Stress tests verifying De Morgan dualities and algebraic identities on 64-bit logic."""
+
+    def test_de_morgan_dualities_patterns(self):
+        pattern_pairs = []
+        for i in range(64):
+            pattern_pairs.append((1 << i, ~(1 << i) & MASK64))
+            pattern_pairs.append((1 << i, 1 << ((i + 17) % 64)))
+            pattern_pairs.append((~(1 << i) & MASK64, ~(1 << ((i + 31) % 64)) & MASK64))
+
+        for a, b in pattern_pairs:
+            not_a = (~a) & MASK64
+            not_b = (~b) & MASK64
+            self.assertEqual(ref_nand_b64(a, b), ref_orn2_b64(not_a, b))
+            self.assertEqual(ref_nor_b64(a, b), ref_andn2_b64(not_a, b))
+            self.assertEqual(ref_andn2_b64(a, b), ref_nor_b64(not_a, b))
+            self.assertEqual(ref_orn2_b64(a, b), ref_nand_b64(not_a, b))
+            self.assertEqual(ref_xnor_b64(a, b), ref_xnor_b64(not_a, not_b))
+            self.assertEqual(ref_xnor_b64(a, b), ((a & b) | ref_nor_b64(a, b)) & MASK64)
+
+    def test_de_morgan_dualities_prng_stress(self):
+        rng = random.Random(0x7E01DA)
+        for _ in range(128):
+            a = rng.getrandbits(64)
+            b = rng.getrandbits(64)
+            not_a = (~a) & MASK64
+            not_b = (~b) & MASK64
+            self.assertEqual(ref_nand_b64(a, b), ref_orn2_b64(not_a, b))
+            self.assertEqual(ref_nor_b64(a, b), ref_andn2_b64(not_a, b))
+            self.assertEqual(ref_andn2_b64(a, b), ref_nor_b64(not_a, b))
+            self.assertEqual(ref_orn2_b64(a, b), ref_nand_b64(not_a, b))
+            self.assertEqual(ref_xnor_b64(a, b), ref_xnor_b64(not_a, not_b))
+            self.assertEqual(ref_xnor_b64(a, b), ((a & b) | ref_nor_b64(a, b)) & MASK64)
+            for op, fn in REF_OPS.items():
+                r = fn(a, b)
+                self.assertEqual(ref_scc(r), 1 if r != 0 else 0)
+
+
+class NegativeControlsAndDefensesTests(unittest.TestCase):
+    """Defensive tests verifying detection of invalid states and distinct operation semantics."""
+
+    def test_inverted_vs_non_inverted_discrimination(self):
+        a = 0x12345678_9ABCDEF0
+        b = 0x0F0F0F0F_F0F0F0F0
+        self.assertNotEqual(ref_andn2_b64(a, b), (a & b) & MASK64)
+        self.assertNotEqual(ref_orn2_b64(a, b), (a | b) & MASK64)
+        self.assertNotEqual(ref_nand_b64(a, b), (a & b) & MASK64)
+        self.assertNotEqual(ref_nor_b64(a, b), (a | b) & MASK64)
+        self.assertNotEqual(ref_xnor_b64(a, b), (a ^ b) & MASK64)
+
+    def test_non_commutative_asymmetry_defense(self):
+        a = 0xAAAAAAAA_55555555
+        b = 0x12345678_87654321
+        self.assertNotEqual(ref_andn2_b64(a, b), ref_andn2_b64(b, a))
+        self.assertNotEqual(ref_orn2_b64(a, b), ref_orn2_b64(b, a))
+
+    def test_interpreter_negative_validations(self):
+        state = ScalarState()
+        with self.assertRaises(ValueError):
+            state.execute("s_unknown_b64", "s[0:1]", "s[2:3]", "s[4:5]")
+        with self.assertRaises(ValueError):
+            state.resolve_src64("invalid_src")
+        with self.assertRaises(ValueError):
+            state.write_dst64("invalid_dst", 123)
 
 
 if __name__ == "__main__":
