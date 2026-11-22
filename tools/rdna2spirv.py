@@ -97,6 +97,7 @@ class Gen:
         self.uses_minlod = False
         self.uses_img_offset = False
         self.uses_pops = False
+        self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
         self.uses_bvh = False
@@ -448,6 +449,137 @@ class Gen:
         self.emit(f"{r} = OpBitwiseAnd %uint {v} {self.cu(k)}")
         return r
 
+    def f16_res(self, f):
+        """f32 ``f`` -> f16 bits (low 16) as a VALU f16 result rounds it: to nearest even (f16_bits), or, when the
+        program writes MODE.FP_ROUND[3:2], by the current mode in %mode_r16 (0 nearest even, 3 toward zero with
+        f16_bits(rtz=True); 1 and 2 are refused when the setreg is translated). Shaders that never write the field
+        get exactly f16_bits. Integer ops only either way (SHADER-56)."""
+        lo = self.f16_bits(f)
+        if not self.round_mode:
+            return lo
+        z, m, is_z, r = self.f16_bits(f, rtz=True), self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{m} = OpLoad %uint %mode_r16")
+        self.emit(f"{is_z} = OpIEqual %bool {m} {self.cu(3)}")
+        self.emit(f"{r} = OpSelect %uint {is_z} {z} {lo}")
+        return r
+
+    def sum_toward_zero(self, x, y, r):
+        """f32 ``r`` = x + y (nearest even) for an f16 add/sub that will be narrowed by f16_res. Under MODE toward zero
+        the f32 rounding must not decide the f16 result: x + y = 2 - 2^-24 rounds to 2.0 in f32, but toward zero
+        it is 0x3FFF in f16. When the exact TwoSum error shows r rounded away from zero, step r one f32 ulp toward
+        zero: the exact sum then lies strictly between r and the stepped value, with no f16 value between them,
+        so the toward-zero narrowing gives the exact result. (f16 FMAs don't need this: fma_f16_odd's round-to-odd
+        f32 value narrows exactly in any direction.) The sums here (f16 operands) never overflow or
+        reach f32 subnormals. Returns r unchanged when the program never writes MODE."""
+        if not self.round_mode:
+            return r
+        bb, t1, t2, t3, e = (self.tmp() for _ in range(5))
+        self.emit(f"{bb} = OpFSub %float {r} {x}")
+        self.emit(f"{t1} = OpFSub %float {r} {bb}")
+        self.emit(f"{t2} = OpFSub %float {x} {t1}")
+        self.emit(f"{t3} = OpFSub %float {y} {bb}")
+        self.emit(f"{e} = OpFAdd %float {t2} {t3}")
+        rp, rn, ep, en, a1, a2, away, m, isz, step = (self.tmp() for _ in range(10))
+        self.emit(f"{rp} = OpFOrdGreaterThan %bool {r} %f0")
+        self.emit(f"{rn} = OpFOrdLessThan %bool {r} %f0")
+        self.emit(f"{ep} = OpFOrdGreaterThan %bool {e} %f0")
+        self.emit(f"{en} = OpFOrdLessThan %bool {e} %f0")
+        self.emit(f"{a1} = OpLogicalAnd %bool {rp} {en}")
+        self.emit(f"{a2} = OpLogicalAnd %bool {rn} {ep}")
+        self.emit(f"{away} = OpLogicalOr %bool {a1} {a2}")
+        self.emit(f"{m} = OpLoad %uint %mode_r16")
+        self.emit(f"{isz} = OpIEqual %bool {m} {self.cu(3)}")
+        self.emit(f"{step} = OpLogicalAnd %bool {away} {isz}")
+        u, dec, su = self.tou(r), self.tmp(), self.tmp()
+        self.emit(f"{dec} = OpISub %uint {u} {self.cu(1)}")
+        self.emit(f"{su} = OpSelect %uint {step} {dec} {u}")
+        return self.tof(su)
+
+    def sum_toward_zero2(self, x, y, r):
+        """sum_toward_zero on each half of v2float operands; returns a v2float."""
+        if not self.round_mode:
+            return r
+        out = []
+        for i in (0, 1):
+            xi, yi, ri = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{xi} = OpCompositeExtract %float {x} {i}")
+            self.emit(f"{yi} = OpCompositeExtract %float {y} {i}")
+            self.emit(f"{ri} = OpCompositeExtract %float {r} {i}")
+            out.append(self.sum_toward_zero(xi, yi, ri))
+        v = self.tmp()
+        self.emit(f"{v} = OpCompositeConstruct %v2float {out[0]} {out[1]}")
+        return v
+
+    def f64_add_mode(self, x, y, r, lo, hi):
+        """v_add_f64 under MODE.FP_ROUND[3:2]: ``r`` = x + y rounded to nearest (bits lo/hi). When the mode is
+        toward zero (3) and the nearest result rounded away from zero, step one ulp back. The rounding error comes
+        from TwoSum (exact: every float op is NoContraction): e = (x - (r - (r - x))) + (y - (r - x)); r was
+        rounded away from zero when e and r have opposite signs. A finite sum that overflowed to inf becomes
+        +-DBL_MAX. Returns the new (lo, hi)."""
+        bb, t1, t2, t3, e = (self.tmp() for _ in range(5))
+        self.emit(f"{bb} = OpFSub %double {r} {x}")
+        self.emit(f"{t1} = OpFSub %double {r} {bb}")
+        self.emit(f"{t2} = OpFSub %double {x} {t1}")
+        self.emit(f"{t3} = OpFSub %double {y} {bb}")
+        self.emit(f"{e} = OpFAdd %double {t2} {t3}")
+        z2, zd = self.tmp(), self.tmp()
+        self.emit(f"{z2} = OpCompositeConstruct %v2uint_d {self.cu(0)} {self.cu(0)}")
+        self.emit(f"{zd} = OpBitcast %double {z2}")
+        en, rp, ep, rn, a1, a2, away = (self.tmp() for _ in range(7))
+        self.emit(f"{rp} = OpFOrdGreaterThan %bool {r} {zd}")
+        self.emit(f"{rn} = OpFOrdLessThan %bool {r} {zd}")
+        self.emit(f"{en} = OpFOrdLessThan %bool {e} {zd}")
+        self.emit(f"{ep} = OpFOrdGreaterThan %bool {e} {zd}")
+        self.emit(f"{a1} = OpLogicalAnd %bool {rp} {en}")
+        self.emit(f"{a2} = OpLogicalAnd %bool {rn} {ep}")
+        self.emit(f"{away} = OpLogicalOr %bool {a1} {a2}")
+        # overflow: r is inf while x and y are finite
+        ri, xi, yi, xn, yn, xs, ys, xf, of = (self.tmp() for _ in range(9))
+        self.emit(f"{ri} = OpIsInf %bool {r}")
+        self.emit(f"{xi} = OpIsInf %bool {x}")
+        self.emit(f"{yi} = OpIsInf %bool {y}")
+        self.emit(f"{xn} = OpIsNan %bool {x}")
+        self.emit(f"{yn} = OpIsNan %bool {y}")
+        self.emit(f"{xs} = OpLogicalOr %bool {xi} {xn}")
+        self.emit(f"{ys} = OpLogicalOr %bool {yi} {yn}")
+        self.emit(f"{xf} = OpLogicalOr %bool {xs} {ys}")
+        nf = self.tmp()
+        self.emit(f"{nf} = OpLogicalNot %bool {xf}")
+        self.emit(f"{of} = OpLogicalAnd %bool {ri} {nf}")
+        step, any_, m, isz = (self.tmp() for _ in range(4))
+        self.emit(f"{any_} = OpLogicalOr %bool {away} {of}")
+        self.emit(f"{m} = OpLoad %uint %mode_r16")
+        self.emit(f"{isz} = OpIEqual %bool {m} {self.cu(3)}")
+        self.emit(f"{step} = OpLogicalAnd %bool {any_} {isz}")
+        # one ulp toward zero on the magnitude bits: (hi:lo) - 1 (inf - 1 = DBL_MAX)
+        nlo, bor, bu, nhi, rlo, rhi = (self.tmp() for _ in range(6))
+        self.emit(f"{nlo} = OpISub %uint {lo} {self.cu(1)}")
+        self.emit(f"{bor} = OpIEqual %bool {lo} {self.cu(0)}")
+        self.emit(f"{bu} = OpSelect %uint {bor} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"{nhi} = OpISub %uint {hi} {bu}")
+        self.emit(f"{rlo} = OpSelect %uint {step} {nlo} {lo}")
+        self.emit(f"{rhi} = OpSelect %uint {step} {nhi} {hi}")
+        return rlo, rhi
+
+    def mode_write(self, op, a):
+        """s_setreg* on HW_REG_MODE. Only FP_ROUND[3:2] (f16/f64 rounding) is modelled, the one MODE field the
+        corpus writes (9,417 writes: value 3 = toward zero 6,694, value 0 = nearest even 2,723). A write that
+        reaches another MODE bit or only part of the field, sets directed rounding (+inf/-inf), or takes its value
+        from an SGPR is refused, so nothing changes silently. Other hardware registers (FLAT_SCR, POPS packer) are not MODE: ignored."""
+        t = a[0].get("t", "") if a and a[0]["k"] == "special" else ""
+        m = re.match(r"hwreg\((\w+)(?:,\s*(\d+),\s*(\d+))?\)", t)
+        if not m or m.group(1) != "HW_REG_MODE":
+            return
+        off, size = (int(m.group(2)), int(m.group(3))) if m.group(2) else (0, 32)
+        if (off, size) != (2, 2):
+            raise Unsupported(f"{op} on MODE bits {off}..{off + size - 1} (only FP_ROUND[3:2] as a whole is modelled)")
+        if op != "s_setreg_imm32_b32" or a[1]["k"] != "imm":
+            raise Unsupported(f"{op} with a register value on MODE.FP_ROUND")
+        new = a[1]["v"] & 3
+        if new in (1, 2):
+            raise Unsupported("MODE.FP_ROUND[3:2] directed rounding (+inf/-inf)")
+        self.emit(f"OpStore %mode_r16 {self.cu(new)}")
+
     def emit_ne0(self, v):
         r = self.tmp()
         self.emit(f"{r} = OpINotEqual %bool {v} {self.cu(0)}")
@@ -496,8 +628,8 @@ class Gen:
         return r
 
     def f16_pack2(self, lo, hi):
-        """Two f32 values -> one %uint of two RTE f16 halves (lo | hi << 16), without PackHalf2x16."""
-        a, b, sh, r = self.f16_bits(lo), self.f16_bits(hi), self.tmp(), self.tmp()
+        """Two f32 values -> one %uint of two f16 halves (lo | hi << 16), each rounded as f16_res, without PackHalf2x16."""
+        a, b, sh, r = self.f16_res(lo), self.f16_res(hi), self.tmp(), self.tmp()
         self.emit(f"{sh} = OpShiftLeftLogical %uint {b} {self.cu(16)}")
         self.emit(f"{r} = OpBitwiseOr %uint {a} {sh}")
         return r
@@ -505,7 +637,7 @@ class Gen:
     def f16_out(self, d, r, hi=0):
         """Narrow f32 ``r`` to f16 (round to nearest even, f16_bits) and write it to the low half of ``d``, or to the high half when
         ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16)."""
-        lo = self.f16_bits(r)
+        lo = self.f16_res(r)
         if not hi:
             self.write_lo16(d, lo)
             return
@@ -2350,10 +2482,11 @@ class Gen:
             # End of the POPS ordered section. The fragment-shader interlock already ends at shader exit (a longer
             # critical section, same ordering), so nothing to do here.
             return
-        if op in ("s_setreg_imm32_b32", "s_setreg_b32", "s_denorm_mode", "s_round_mode"):
-            # MODE register (rounding/denormals). SPIR-V float controls aren't modelled yet: Vulkan defaults are
-            # used, which can differ in denormal handling. Recorded here so the gap is visible.
+        if op in ("s_setreg_imm32_b32", "s_setreg_b32"):
+            self.mode_write(op, a)
             return
+        if op in ("s_denorm_mode", "s_round_mode"):
+            raise Unsupported(op + " (not in the corpus; MODE is modelled through s_setreg only)")
         if op == "s_mov_b32" and a[0]["k"] == "special" and a[0]["t"] in ("exec_lo", "exec_hi") and \
                 (a[0]["t"] == "exec_hi" or a[1]["k"] in ("imm", "fimm")):
             src = a[1]
@@ -2388,7 +2521,7 @@ class Gen:
             # Low 16 bits get the f16; on GFX10 the high half is kept (partial write: Mesa ACO instr_is_16bit lists
             # v_cvt_f16_f32 as 16-bit for gfx_level >= GFX10).
             x = self.src_f(a[1])
-            self.write_lo16(a[0], self.f16_bits(x))
+            self.write_lo16(a[0], self.f16_res(x))
         elif op == "s_mulk_i32":
             v = a[1]["v"] & 0xFFFF
             k = v - 0x10000 if v & 0x8000 else v
@@ -2445,7 +2578,7 @@ class Gen:
             self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.clamp_mods(r, mods)
-            self.write_lo16(a[0], self.f16_bits(r))
+            self.write_lo16(a[0], self.f16_res(r))
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
             def bits(name, default):
@@ -2804,6 +2937,16 @@ class Gen:
                 x, y = f64(a[1]), f64(a[2])
                 r, v2, lo, hi = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{r} = OpFAdd %double {x} {y}")
+                if self.round_mode:
+                    # MODE rounds the sum itself; clamp/omod then apply to the rounded value, as on the hardware.
+                    m2, mlo, mhi, n2, rd = (self.tmp() for _ in range(5))
+                    self.emit(f"{m2} = OpBitcast %v2uint_d {r}")
+                    self.emit(f"{mlo} = OpCompositeExtract %uint {m2} 0")
+                    self.emit(f"{mhi} = OpCompositeExtract %uint {m2} 1")
+                    mlo, mhi = self.f64_add_mode(x, y, r, mlo, mhi)
+                    self.emit(f"{n2} = OpCompositeConstruct %v2uint_d {mlo} {mhi}")
+                    self.emit(f"{rd} = OpBitcast %double {n2}")
+                    r = rd
                 # VOP3_Profile<VOP_F64_F64_F64>: HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
                 r = self.clamp_mods_f64(r, mods)
                 self.emit(f"{v2} = OpBitcast %v2uint_d {r}")
@@ -3344,6 +3487,8 @@ class Gen:
                 self.emit(f"{r} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
             elif op in ("v_pk_add_f16", "v_pk_mul_f16"):
                 self.emit(f"{r} = {'OpFAdd' if 'add' in op else 'OpFMul'} %v2float {vx} {vy}")
+                if "add" in op:
+                    r = self.sum_toward_zero2(vx, vy, r)
             else:
                 self.emit(f"{r} = OpExtInst %v2float %glsl {'FMax' if 'max' in op else 'FMin'} {vx} {vy}")
             if "clamp" in mods:
@@ -3493,6 +3638,12 @@ class Gen:
             k = {"v_add_f16": "OpFAdd", "v_sub_f16": "OpFSub", "v_subrev_f16": "OpFSub", "v_mul_f16": "OpFMul"}.get(op)
             if k:
                 self.emit(f"{r} = {k} %float {vals[0]} {vals[1]}")
+                if k == "OpFAdd":
+                    r = self.sum_toward_zero(vals[0], vals[1], r)
+                elif k == "OpFSub" and self.round_mode:
+                    ny = self.tmp()
+                    self.emit(f"{ny} = OpFNegate %float {vals[1]}")
+                    r = self.sum_toward_zero(vals[0], ny, r)
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {'FMax' if 'max' in op else 'FMin'} {vals[0]} {vals[1]}")
             r = self.clamp_mods(r, mods)
@@ -3964,7 +4115,7 @@ class Gen:
                 raise Unsupported(op + " form")
             f = self.attribute(attr["a"], attr["c"])
             if op == "v_interp_p2_f16":
-                self.dst(a[0], self.f16_bits(f))
+                self.dst(a[0], self.f16_res(f))
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
                 self.dst(a[0], self.tou(f))
         elif op.startswith("s_cmp_"):
@@ -4031,7 +4182,7 @@ class Gen:
             r, v, p, h16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl Fma {vals[0]} {vals[1]} {vals[2]}")
             r = self.clamp_mods(r, mods)
-            self.emit(f"{h16} = OpCopyObject %uint {self.f16_bits(r)}")
+            self.emit(f"{h16} = OpCopyObject %uint {self.f16_res(r)}")
             old = self.load_reg("vgpr", a[0]["r"])
             keep, newv = self.tmp(), self.tmp()
             if op == "v_fma_mixlo_f16":
@@ -6131,6 +6282,7 @@ def assemble(gen):
           "%vcc = OpVariable %_ptr_Function_uint Function %c0", "%m0 = OpVariable %_ptr_Function_uint Function %c0",
           "%vcc_hi = OpVariable %_ptr_Function_uint Function %c0",
           "%scc = OpVariable %_ptr_Function_uint Function %c0",
+          *(["%mode_r16 = OpVariable %_ptr_Function_uint Function %c0"] if gen.round_mode else []),
           "%active = OpVariable %_ptr_Function_bool Function %true"]
     if gen.emulate:
         fn += ["%x_it = OpVariable %_ptr_Function_uint Function %c0",
@@ -6747,6 +6899,7 @@ def translate(path):
         if any(i.get("normalized") for i in insns):
             raise Unsupported("reachable instruction with normalized encoding")
     g = Gen(stage)
+    g.round_mode = any(i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", "") for i in insns)
     g.wave64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
                    (base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in i["args"]))
                    for i in insns)
