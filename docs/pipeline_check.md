@@ -120,6 +120,37 @@ On Windows with an RTX 5090 (driver 621.14), a synthetic three-compute, one-vert
 sample reported zero application-cache hits on its first run and five on the seeded run. On Mesa
 llvmpipe the same five pipelines succeeded both times and neither run reported a hit.
 
+## Wave64-emulated corpus (`--wave64-emulate`)
+
+A GPU that only runs 32-wide subgroups (NVIDIA, Intel) needs the corpus translated with
+`--wave64-emulate`. Its cross-lane operations go through workgroup memory instead of subgroup operations.
+Its modules are larger, and they behave differently under the driver. All runs below are on an
+RTX 4060 Ti (NVIDIA 595 driver, 32 GB RAM).
+
+**Translation.** All 26,503 shaders translate and pass `spirv-val` at 43d4703. The run used eight
+`--shard` processes and took 80 minutes. The modules total 13.68 GB: median 3.3% larger than the
+previous emulated translation (spirv4), 90th percentile 16% larger, with exact-semantics rules added
+in between.
+
+**One process per chunk.** A single `vk_pipeline_check --jobs 4` run over the emulated corpus reached
+21,000 of 26,503 pipelines with no failures. Then the driver's compiler ran out of memory
+(`LLVM ERROR: out of memory`). With 2 jobs, one process later grew past 100 GB of committed memory.
+Driver compiler memory isn't returned between pipelines, so the build now runs as one checker
+process per 300–500 entries. Each process seeds from and saves to the same cache file, so the chunks
+resume. Since #903 the checker also compiles modules over 4 MiB alone.
+
+**The ScreenProbes shaders.** `indirect_diffuse_lighting`'s ScreenProbes_ActivateProbes,
+ActivateProbesTarget and ActivateRays compute shaders were 60, 60 and 32 MB of SPIR-V. Their 3,281
+typed-buffer loads each decoded every supported format inline. The exact UNORM/SNORM conversion added in
+#755 made that about 900 instructions per load, which pushed the two largest past SPIR-V's id bound of
+4,194,303 (#881). They were also the modules compiling when the driver ran out of memory. Since
+dcd8ecf the run-time format decode is one function per module (`%fmt_decode_fn`):
+ActivateProbes went from 6.16 M to 2.20 M instructions (41.7 MB), and all three now validate.
+
+**Results.** With the pre-dcd8ecf translation (spirv4), entries 0–24,200 compiled with 0 module and
+0 pipeline failures; two modules over 16 MiB were skipped in the chunked part. The spirv5 cache (all
+26,503 entries, nothing skipped by size) is being built.
+
 ## Device
 
 The reported runs used an NVIDIA GeForce RTX 5070 Ti (discrete, subgroup size 32 only), driver
