@@ -278,6 +278,19 @@ class Gen:
         self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
         self.emit(f"OpStore {p} {val}")
 
+    def imm_val(self, a):
+        """Integer literal value if 'a' is an immediate or known SGPR constant, else None."""
+        if a.get("abs") or a.get("neg"):
+            return None
+        k = a.get("k")
+        if k == "imm":
+            return a["v"] & 0xFFFFFFFF
+        if k == "sgpr" and a.get("n", 1) == 1 and a.get("r") in self.sgpr_imm:
+            return self.sgpr_imm[a["r"]] & 0xFFFFFFFF
+        if k == "special" and a.get("t") == "null":
+            return 0
+        return None
+
     def src_u(self, a):
         k = a["k"]
         if k in ("vgpr", "sgpr"):
@@ -4790,18 +4803,33 @@ class Gen:
         elif op == "v_alignbyte_b32":
             # (({src0, src1} as 64 bits) >> (8 * (src2 & 3))) low 32 bits
             # (32 - b) & 31 keeps the left shift below 32 when b == 0; that result is discarded by the OpSelect.
-            hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
-            m, b, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(9))
-            self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
-            self.emit(f"{b} = OpShiftLeftLogical %uint {m} {self.cu(3)}")
-            self.emit(f"{inv0} = OpISub %uint {self.cu(32)} {b}")
-            self.emit(f"{inv} = OpBitwiseAnd %uint {inv0} {self.cu(31)}")
-            self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {b}")
-            self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {inv}")
-            self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
-            self.emit(f"{nz} = OpINotEqual %bool {b} {self.cu(0)}")
-            self.emit(f"{r} = OpSelect %uint {nz} {r0} {lo_}")
-            self.dst(a[0], r)
+            sh_val = self.imm_val(a[3])
+            if sh_val is not None:
+                sel = sh_val & 3
+                if sel == 0:
+                    self.dst(a[0], self.src_u(a[2]))
+                else:
+                    hi_, lo_ = self.src_u(a[1]), self.src_u(a[2])
+                    b = sel * 8
+                    inv = 32 - b
+                    a1, b1, r = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {self.cu(b)}")
+                    self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {self.cu(inv)}")
+                    self.emit(f"{r} = OpBitwiseOr %uint {a1} {b1}")
+                    self.dst(a[0], r)
+            else:
+                hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
+                m, b, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(9))
+                self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
+                self.emit(f"{b} = OpShiftLeftLogical %uint {m} {self.cu(3)}")
+                self.emit(f"{inv0} = OpISub %uint {self.cu(32)} {b}")
+                self.emit(f"{inv} = OpBitwiseAnd %uint {inv0} {self.cu(31)}")
+                self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {b}")
+                self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {inv}")
+                self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
+                self.emit(f"{nz} = OpINotEqual %bool {b} {self.cu(0)}")
+                self.emit(f"{r} = OpSelect %uint {nz} {r0} {lo_}")
+                self.dst(a[0], r)
         elif op == "v_swap_b32":
             # exchange two VGPRs (active lanes only, through dst)
             x, y = self.src_u(a[0]), self.src_u(a[1])
@@ -4876,17 +4904,31 @@ class Gen:
         elif op == "v_alignbit_b32":
             # (({src0, src1} as 64 bits) >> (src2 & 31)) low 32 bits
             # (32 - m) & 31 keeps the left shift below 32 when m == 0; that result is discarded by the OpSelect.
-            hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
-            m, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(8))
-            self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
-            self.emit(f"{inv0} = OpISub %uint {self.cu(32)} {m}")
-            self.emit(f"{inv} = OpBitwiseAnd %uint {inv0} {self.cu(31)}")
-            self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {m}")
-            self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {inv}")
-            self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
-            self.emit(f"{nz} = OpINotEqual %bool {m} {self.cu(0)}")
-            self.emit(f"{r} = OpSelect %uint {nz} {r0} {lo_}")
-            self.dst(a[0], r)
+            sh_val = self.imm_val(a[3])
+            if sh_val is not None:
+                m_val = sh_val & 31
+                if m_val == 0:
+                    self.dst(a[0], self.src_u(a[2]))
+                else:
+                    hi_, lo_ = self.src_u(a[1]), self.src_u(a[2])
+                    inv_val = 32 - m_val
+                    a1, b1, r = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {self.cu(m_val)}")
+                    self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {self.cu(inv_val)}")
+                    self.emit(f"{r} = OpBitwiseOr %uint {a1} {b1}")
+                    self.dst(a[0], r)
+            else:
+                hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
+                m, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(8))
+                self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
+                self.emit(f"{inv0} = OpISub %uint {self.cu(32)} {m}")
+                self.emit(f"{inv} = OpBitwiseAnd %uint {inv0} {self.cu(31)}")
+                self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {m}")
+                self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {inv}")
+                self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
+                self.emit(f"{nz} = OpINotEqual %bool {m} {self.cu(0)}")
+                self.emit(f"{r} = OpSelect %uint {nz} {r0} {lo_}")
+                self.dst(a[0], r)
         elif op in ("v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64"):
             # v[d:d+1] = v[s:s+1] << / >> (src0 & 63): logical left, logical right, or arithmetic right (the sign
             # bit 63 is copied in).
@@ -6472,19 +6514,27 @@ class Gen:
             self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
             self.dst(a[0], result)
         elif op in U2 or op in S2:
-            x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
             kind = U2.get(op) or S2.get(op)
             if kind == "mul24":
+                x, y = self.src_u(a[1]), self.src_u(a[2])
                 xm, ym = self.tmp(), self.tmp()
                 self.emit(f"{xm} = OpBitwiseAnd %uint {x} {self.cu(0xFFFFFF)}")
                 self.emit(f"{ym} = OpBitwiseAnd %uint {y} {self.cu(0xFFFFFF)}")
                 self.emit(f"{r} = OpIMul %uint {xm} {ym}")
             else:
                 if op in ("s_lshl_b32", "s_lshr_b32"):
-                    m = self.tmp()
-                    self.emit(f"{m} = OpBitwiseAnd %uint {y} {self.cu(31)}")
-                    y = m
+                    y_val = self.imm_val(a[2])
+                    if y_val is not None:
+                        y = self.cu(y_val & 31)
+                    else:
+                        y_raw = self.src_u(a[2])
+                        m = self.tmp()
+                        self.emit(f"{m} = OpBitwiseAnd %uint {y_raw} {self.cu(31)}")
+                        y = m
+                else:
+                    y = self.src_u(a[2])
+                x = self.src_u(a[1])
                 self.emit(f"{r} = {kind} %uint {x} {y}")
             self.dst(a[0], r)
             if op in ("s_and_b32", "s_or_b32"):
@@ -6492,18 +6542,41 @@ class Gen:
             elif op in ("s_lshl_b32", "s_lshr_b32"):
                 self.scc_nonzero(r)
         elif op in SHIFT_REV:
-            sh, x = self.src_u(a[1]), self.src_u(a[2])
-            m, r = self.tmp(), self.tmp()
-            self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
+            sh_val = self.imm_val(a[1])
+            if sh_val is not None:
+                m = self.cu(sh_val & 31)
+            else:
+                sh = self.src_u(a[1])
+                m = self.tmp()
+                self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
+            x = self.src_u(a[2])
+            r = self.tmp()
             self.emit(f"{r} = {SHIFT_REV[op]} %uint {x} {m}")
             self.dst(a[0], r)
         elif op in ("v_bfe_u32", "v_bfe_i32"):
             # offset and width are taken mod 32 (a width of 0 gives 0)
-            x, o, w = (self.src_u(t) for t in a[1:4])
-            om, wm, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{om} = OpBitwiseAnd %uint {o} {self.cu(31)}")
-            self.emit(f"{wm} = OpBitwiseAnd %uint {w} {self.cu(31)}")
-            wc = self.bfe_width(om, wm)
+            o_val, w_val = self.imm_val(a[2]), self.imm_val(a[3])
+            if o_val is not None and w_val is not None:
+                off = o_val & 31
+                wid = min(w_val & 31, 32 - off)
+                om = self.cu(off)
+                wc = self.cu(wid)
+            else:
+                if o_val is not None:
+                    om = self.cu(o_val & 31)
+                else:
+                    o = self.src_u(a[2])
+                    om = self.tmp()
+                    self.emit(f"{om} = OpBitwiseAnd %uint {o} {self.cu(31)}")
+                if w_val is not None:
+                    wm = self.cu(w_val & 31)
+                else:
+                    w = self.src_u(a[3])
+                    wm = self.tmp()
+                    self.emit(f"{wm} = OpBitwiseAnd %uint {w} {self.cu(31)}")
+                wc = self.bfe_width(om, wm)
+            x = self.src_u(a[1])
+            r = self.tmp()
             f = "OpBitFieldSExtract" if op.endswith("i32") else "OpBitFieldUExtract"
             self.emit(f"{r} = {f} %uint {x} {om} {wc}")
             self.dst(a[0], r)
@@ -8538,7 +8611,11 @@ def dedupe_types(text):
     (%v4uint for r32ui storage, %v4uint_st for typed stores, %v4uint_in for vertex inputs): keep the first
     declaration of each OpTypeVector / OpTypePointer and rename the others everywhere."""
     alias, seen, out = {}, {}, []
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if " = OpFunction " in line:
+            out.extend(lines[i:])
+            break
         m = _TYPE_DECL.match(line)
         if m:
             name, opc, rest = m.groups()
@@ -8550,7 +8627,8 @@ def dedupe_types(text):
         out.append(line)
     if not alias:
         return text
-    return "\n".join(_ID_REF.sub(lambda t: alias.get(t.group(0), t.group(0)), l) for l in out)
+    pattern = re.compile(r"(?:" + "|".join(re.escape(k) for k in sorted(alias, key=len, reverse=True)) + r")\b")
+    return pattern.sub(lambda m: alias[m.group(0)], "\n".join(out))
 
 
 def mesh_compute_epilogue(gen):
