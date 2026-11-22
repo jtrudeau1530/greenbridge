@@ -12,6 +12,9 @@ concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  PYTEST_FILE_MARKERS: '^import pytest|^ *HAVE_NUMPY ='
+
 jobs:
   change-scope:
     if: github.event_name == 'pull_request'
@@ -67,7 +70,7 @@ jobs:
         shell: bash
         run: |
           for t in tests/test_*.py; do
-            if grep -q '^import pytest' "$t" || ! grep -q '__main__' "$t"; then
+            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               continue
             fi
             echo "== $t"
@@ -107,8 +110,10 @@ jobs:
         run: |
           pytest_files=()
           for t in tests/test_*.py; do
-            if grep -q '^import pytest' "$t" || ! grep -q '__main__' "$t"; then
+            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               pytest_files+=("$t")
+            elif [[ "$t" == tests/test_tex_headers.py ]]; then
+              pytest_files+=("$t::TestTextureDescriptorParsing::test_stdlib_qword_scanner_edge_cases_and_parity")
             fi
           done
           python -m pytest "${pytest_files[@]}" -q
