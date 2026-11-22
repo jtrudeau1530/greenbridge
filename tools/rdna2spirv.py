@@ -3970,6 +3970,64 @@ class Gen:
             self.set_exec(r)
             self.mask_dst(a[0], r)
             self.scc_from_mask(r)
+        elif op in ("s_bfe_u64", "s_bfe_i64"):
+            # 64-bit bitfield extract: offset = S1[5:0], width = S1[22:16] (0-127). A width of 0 gives 0; a field
+            # running past bit 63 stops there (LLVM constantFoldBFE: Src0 >> Offset, arithmetic for i64), so the
+            # width is cut to 64 - offset. SCC = (D != 0). The pair is 64-bit data (as for s_lshl_b64); a lane-mask
+            # source stays Unsupported (#210).
+            d, x = a[0], a[1]
+            if d["k"] != "sgpr" or d.get("n") != 2 or self.holds_lane_mask(x):
+                raise Unsupported(op + " operands")
+            if x["k"] == "sgpr" and x.get("n") == 2:
+                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
+            elif x["k"] == "imm":
+                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            else:
+                raise Unsupported(op + " source")
+            ctl = self.src_u(a[2])
+            off, wid, room, fits, w, l64, h64, t, v64 = (self.tmp() for _ in range(9))
+            self.emit(f"{off} = OpBitwiseAnd %uint {ctl} {self.cu(63)}")
+            self.emit(f"{wid} = OpBitFieldUExtract %uint {ctl} {self.cu(16)} {self.cu(7)}")
+            self.emit(f"{room} = OpISub %uint {self.cu(64)} {off}")
+            self.emit(f"{fits} = OpULessThan %bool {wid} {room}")
+            self.emit(f"{w} = OpSelect %uint {fits} {wid} {room}")              # 0..64, and off + w <= 64
+            self.emit(f"{l64} = OpUConvert %ulong {lo}")
+            self.emit(f"{h64} = OpUConvert %ulong {hi}")
+            self.emit(f"{t} = OpShiftLeftLogical %ulong {h64} %c64_32")
+            self.emit(f"{v64} = OpBitwiseOr %ulong {t} {l64}")
+            # Shift the field to the top, then back down: both amounts stay in 0..63 whenever w >= 1; w = 0 is
+            # handled by the final select, so its (clamped) shifts never decide the result.
+            wz = self.tmp()
+            self.emit(f"{wz} = OpIEqual %bool {w} {self.cu(0)}")
+            w1, up, down, up64, down64, sh, field = (self.tmp() for _ in range(7))
+            self.emit(f"{w1} = OpSelect %uint {wz} {self.cu(1)} {w}")
+            ow = self.tmp()
+            self.emit(f"{ow} = OpIAdd %uint {off} {w1}")
+            self.emit(f"{up} = OpISub %uint {self.cu(64)} {ow}")
+            self.emit(f"{down} = OpISub %uint {self.cu(64)} {w1}")
+            self.emit(f"{up64} = OpUConvert %ulong {up}")
+            self.emit(f"{down64} = OpUConvert %ulong {down}")
+            self.emit(f"{sh} = OpShiftLeftLogical %ulong {v64} {up64}")
+            if op == "s_bfe_u64":
+                self.emit(f"{field} = OpShiftRightLogical %ulong {sh} {down64}")
+            else:
+                si_, ri = self.tmp(), self.tmp()
+                self.emit(f"{si_} = OpBitcast %long {sh}")
+                self.emit(f"{ri} = OpShiftRightArithmetic %long {si_} {down64}")
+                self.emit(f"{field} = OpBitcast %ulong {ri}")
+            flo, fh, fhi, rlo, rhi = (self.tmp() for _ in range(5))
+            self.emit(f"{flo} = OpUConvert %uint {field}")
+            self.emit(f"{fh} = OpShiftRightLogical %ulong {field} %c64_32")
+            self.emit(f"{fhi} = OpUConvert %uint {fh}")
+            self.emit(f"{rlo} = OpSelect %uint {wz} {self.cu(0)} {flo}")
+            self.emit(f"{rhi} = OpSelect %uint {wz} {self.cu(0)} {fhi}")
+            self.store_reg("sgpr", d["r"], rlo)
+            self.store_reg("sgpr", d["r"] + 1, rhi)
+            orr = self.tmp()
+            self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
+            self.scc_nonzero(orr)
+            self.uses_psb = True        # Int64 capability and %ulong / %long come with the PSB declarations
         elif op in ("s_bfe_u32", "s_bfe_i32"):
             # src1 packs offset in bits [4:0] and width in bits [22:16].
             x, ctl = self.src_u(a[1]), self.src_u(a[2])
