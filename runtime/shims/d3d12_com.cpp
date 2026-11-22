@@ -613,6 +613,7 @@ public:
     Fence(leonida::VulkanContext& context, UINT64 initial, D3D12_FENCE_FLAGS flags)
         : context_(context), fence_(context, initial), flags_(flags), highest_(initial) {}
 
+    // As in D3D12, releasing the fence completes the waits still pending on it (ALL counts it as one fence).
     ~Fence() override { context_.cancel_fence_waits(fence_.semaphore()); }
 
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
@@ -981,15 +982,11 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
                                                D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) {
     if (flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL && flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY)
         return E_INVALIDARG;
-    if (count && (!fences || !values)) return E_INVALIDARG;
+    if (!count || !fences || !values) return E_INVALIDARG;  // no fences is refused, as on the host runtime
     std::vector<Fence*> objects(count);
     for (UINT i = 0; i < count; ++i)
         if (!(objects[i] = Fence::from(fences[i]))) return E_INVALIDARG;
     const bool any = flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
-    if (!count) {  // nothing to wait for
-        if (event) SetEvent(event);
-        return S_OK;
-    }
     if (!event) {
         // One vkWaitSemaphores call: VK_SEMAPHORE_WAIT_ANY_BIT is the ANY flag, no flag is ALL.
         std::vector<VkSemaphore> semaphores(count);
