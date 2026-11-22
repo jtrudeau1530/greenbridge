@@ -50,6 +50,11 @@ class PathMappingTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIsNone(rwt.map_path(path, WINDOWS_ROOT, "/repo"))
 
+    def test_parent_segments_cannot_escape_windows_root(self):
+        self.assertIsNone(rwt.map_path("D:/win/root/../outside.exe", WINDOWS_ROOT, "/repo"))
+        self.assertEqual(rwt.map_path("D:/win/root/inside/../runner.exe", WINDOWS_ROOT, "/repo"),
+                         os.path.join("/repo", "runner.exe"))
+
     def test_wine_path_uses_the_z_drive(self):
         self.assertEqual(rwt.wine_path("/tmp/x y"), "Z:" + os.path.abspath("/tmp/x y").replace("/", "\\"))
 

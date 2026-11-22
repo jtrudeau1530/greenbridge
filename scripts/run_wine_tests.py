@@ -18,6 +18,7 @@ others show what does and doesn't work under Wine yet without failing the job.
 import argparse
 import json
 import math
+import ntpath
 import os
 import re
 import shlex
@@ -38,7 +39,7 @@ def _make_parent(path: str) -> None:
 
 
 def norm(path: str) -> str:
-    return path.replace("\\", "/").rstrip("/")
+    return ntpath.normpath(path).replace("\\", "/").rstrip("/")
 
 
 def map_path(arg: str, windows_root: str, root: str) -> str | None:
