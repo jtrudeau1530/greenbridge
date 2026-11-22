@@ -911,6 +911,149 @@ HRESULT castable_view_formats(const Format& format, UINT32 count, const DXGI_FOR
     return S_OK;
 }
 
+// Argument checks the host PC runtime makes (without the debug layer) before it creates anything, so the layer
+// returns the same HRESULTs. Each rule was measured against the host runtime by d3d12_vulkan_device_test
+// (compare_invalid_arguments, D3D-49); the texture size, mip, sample-count and alignment rules are in
+// GetResourceAllocationInfo's allocation(), which CreateCommittedResource also applies.
+
+// The typeless format a DXGI format can be cast within, or the format itself when it has no such family.
+DXGI_FORMAT format_family(DXGI_FORMAT format) {
+    const int f = int(format);
+    const auto in = [f](int first, int last) { return f >= first && f <= last; };
+    if (in(1, 4)) return DXGI_FORMAT_R32G32B32A32_TYPELESS;
+    if (in(5, 8)) return DXGI_FORMAT_R32G32B32_TYPELESS;
+    if (in(9, 14)) return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    if (in(15, 18)) return DXGI_FORMAT_R32G32_TYPELESS;
+    if (in(19, 22)) return DXGI_FORMAT_R32G8X24_TYPELESS;
+    if (in(23, 25)) return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    if (in(27, 32)) return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    if (in(33, 38)) return DXGI_FORMAT_R16G16_TYPELESS;
+    if (in(39, 43)) return DXGI_FORMAT_R32_TYPELESS;
+    if (in(44, 47)) return DXGI_FORMAT_R24G8_TYPELESS;
+    if (in(48, 52)) return DXGI_FORMAT_R8G8_TYPELESS;
+    if (in(53, 59)) return DXGI_FORMAT_R16_TYPELESS;
+    if (in(60, 64)) return DXGI_FORMAT_R8_TYPELESS;
+    if (in(70, 72)) return DXGI_FORMAT_BC1_TYPELESS;
+    if (in(73, 75)) return DXGI_FORMAT_BC2_TYPELESS;
+    if (in(76, 78)) return DXGI_FORMAT_BC3_TYPELESS;
+    if (in(79, 81)) return DXGI_FORMAT_BC4_TYPELESS;
+    if (in(82, 84)) return DXGI_FORMAT_BC5_TYPELESS;
+    if (f == 87 || in(90, 91)) return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    if (f == 88 || in(92, 93)) return DXGI_FORMAT_B8G8R8X8_TYPELESS;
+    if (in(94, 96)) return DXGI_FORMAT_BC6H_TYPELESS;
+    if (in(97, 99)) return DXGI_FORMAT_BC7_TYPELESS;
+    return format;
+}
+
+// ALLOW_DEPTH_STENCIL: the host accepts every format of a family with a depth member (R32_FLOAT and R16_FLOAT
+// included) and nothing else.
+bool depth_stencil_family(DXGI_FORMAT format) {
+    const DXGI_FORMAT family = format_family(format);
+    return family == DXGI_FORMAT_R32_TYPELESS || family == DXGI_FORMAT_R16_TYPELESS ||
+           family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS;
+}
+
+// ALLOW_RENDER_TARGET: the host refuses the families below and accepts the rest, D32_FLOAT, D16_UNORM,
+// R9G9B9E5_SHAREDEXP and NV12 among them. R32G32B32 is the driver's answer (refused by both AMD drivers measured,
+// accepted by WARP); it is refused here, since Vulkan drivers rarely render to it.
+bool render_target_family(DXGI_FORMAT format) {
+    switch (format_family(format)) {
+        case DXGI_FORMAT_R32G32B32_TYPELESS:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R1_UNORM:
+        case DXGI_FORMAT_R8G8_B8G8_UNORM:
+        case DXGI_FORMAT_G8R8_G8B8_UNORM:
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC2_TYPELESS:
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC4_TYPELESS:
+        case DXGI_FORMAT_BC5_TYPELESS:
+        case DXGI_FORMAT_BC6H_TYPELESS:
+        case DXGI_FORMAT_BC7_TYPELESS:
+            return false;
+        default:
+            return true;
+    }
+}
+
+// Why the host would refuse these heap properties, or null if it accepts them.
+const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
+    if (heap.Type < D3D12_HEAP_TYPE_DEFAULT || heap.Type > D3D12_HEAP_TYPE_GPU_UPLOAD) return "heap type";
+    // CheckFeatureSupport reports OPTIONS16.GPUUploadHeapSupported FALSE, and a host runtime without GPU upload heaps
+    // (Resizable BAR off) refuses the type.
+    if (heap.Type == D3D12_HEAP_TYPE_GPU_UPLOAD) return "GPU upload heap, which OPTIONS16 reports unsupported";
+    const bool custom = heap.Type == D3D12_HEAP_TYPE_CUSTOM;
+    const bool page_given = heap.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    const bool pool_given = heap.MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN;
+    if (custom ? !(page_given && pool_given) : (page_given || pool_given))
+        return "CPU page property or memory pool (given only, and both, on custom heaps)";
+    if (heap.CreationNodeMask > 1 || heap.VisibleNodeMask > 1) return "node mask (one node)";
+    return nullptr;
+}
+
+// Why the host would refuse this committed resource, or null if these checks pass. The flag and format tables were
+// measured on an RX 9070 XT, an integrated Radeon and WARP, which agree on all of them. Cross-adapter resources
+// (valid there only as a row-major texture on a SHARED | SHARED_CROSS_ADAPTER heap) are refused: this layer has no
+// cross-adapter sharing.
+const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS heap_flags,
+                                       const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state,
+                                       const D3D12_CLEAR_VALUE* clear) {
+    if (const char* why = heap_properties_refusal(heap)) return why;
+    // The DENY flags of a committed resource's heap are the runtime's to choose; most other bits are refused too.
+    constexpr UINT committed_heap_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
+                                          D3D12_HEAP_FLAG_HARDWARE_PROTECTED | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT |
+                                          D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+    if (UINT(heap_flags) & ~committed_heap_flags) return "heap flags of a committed resource";
+
+    const bool buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    // 0x400 is not in this SDK's d3d12.h (10.0.26100), but the host accepts it on buffers and textures; 0x200 and
+    // 0x800 it refuses. RAYTRACING_ACCELERATION_STRUCTURE is accepted on a texture too.
+    constexpr UINT buffer_flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                  D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+                                  D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE | 0x400;
+    constexpr UINT texture_flags =
+        buffer_flags | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    const UINT flags = UINT(desc.Flags);
+    if (flags & ~(buffer ? buffer_flags : texture_flags)) return "resource flags";
+    const bool rt = flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const bool ds = flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    const bool uav = flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // Upload heaps start in (a part of) GENERIC_READ, readback heaps in COPY_DEST; COMMON on both; no UAVs.
+    if (heap.Type == D3D12_HEAP_TYPE_UPLOAD && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_GENERIC_READ))))
+        return "upload heap state or UAV";
+    if (heap.Type == D3D12_HEAP_TYPE_READBACK && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_COPY_DEST))))
+        return "readback heap state or UAV";
+
+    if (buffer) {
+        if (!desc.Width || desc.Height != 1 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+            desc.Format != DXGI_FORMAT_UNKNOWN || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
+            desc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+            return "buffer description";
+        if (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return "buffer alignment";
+        if (clear) return "clear value on a buffer";
+        if (heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) return "display heap for a buffer";
+        return nullptr;
+    }
+    if (desc.Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D || desc.Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        return "resource dimension";
+    if ((rt && ds) || (ds && uav) || ((flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && !ds))
+        return "resource flag combination";
+    if (ds && !depth_stencil_family(desc.Format)) return "depth-stencil format";
+    if (rt && !render_target_family(desc.Format)) return "render-target format";
+    const UINT samples = desc.SampleDesc.Count;
+    if (samples > 1 && !rt && !ds) return "multisampled texture that is not a render target or depth buffer";
+    // Every adapter measured reports one quality level; the two standard patterns are accepted too.
+    if (samples > 1 && desc.SampleDesc.Quality && desc.SampleDesc.Quality != D3D12_STANDARD_MULTISAMPLE_PATTERN &&
+        desc.SampleDesc.Quality != D3D12_CENTER_MULTISAMPLE_PATTERN)
+        return "sample quality";
+    // A clear value is only for render targets and depth buffers, in the resource's format family.
+    if (clear && (!(rt || ds) || clear->Format == DXGI_FORMAT_UNKNOWN ||
+                  format_family(clear->Format) != format_family(desc.Format)))
+        return "clear value";
+    return nullptr;
+}
+
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12DescriptorHeap> {
@@ -1298,10 +1441,11 @@ public:
         return D3D12_HEAP_FLAGS((UINT(heap_flags_) & ~creation_only) | deny);
     }
 
-    // Buffers on upload and readback heaps are mapped persistently; the ranges are hints, as on D3D12. A texture
-    // in a CPU-visible heap has no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped
-    // with a null pointer, before WriteToSubresource/ReadFromSubresource.
-    HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE*, void** data) override {
+    // Buffers on upload and readback heaps are mapped persistently; the ranges are hints, as on D3D12, except that
+    // the host runtime refuses a non-empty read range that ends past the buffer. A texture in a CPU-visible heap has
+    // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
+    // WriteToSubresource/ReadFromSubresource.
+    HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
         if (image_) {
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
@@ -1310,6 +1454,7 @@ public:
                        : E_INVALIDARG;
         }
         if (!mapped_ || subresource != 0) return E_INVALIDARG;
+        if (read && read->Begin < read->End && read->End > desc_.Width) return E_INVALIDARG;
         if (data) *data = mapped_;
         return S_OK;
     }
@@ -3027,7 +3172,22 @@ public:
                                                  void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandQueue";
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
-        if (!out) return d3d12_trace::result(method, E_POINTER);
+        // As the host runtime: no bundle queues, the three D3D12 priorities (realtime refused, below), one flag and
+        // one node. A valid description without an output is E_UNEXPECTED there, not a capability check.
+        if (desc->Type == D3D12_COMMAND_LIST_TYPE_BUNDLE || UINT(desc->Type) > D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE ||
+            (desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
+             desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
+             desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) ||
+            (desc->Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) || desc->NodeMask > 1) {
+            log_once("CreateCommandQueue refused (type, priority, flags or node mask), type", desc->Type);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        // Global realtime priority needs a privilege the host grants only on request; without it, this answer.
+        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+            log_once("CreateCommandQueue refused (global realtime priority), type", desc->Type);
+            return d3d12_trace::result(method, DXGI_ERROR_ACCESS_DENIED);
+        }
+        if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         *out = nullptr;
         if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
             desc->Type != D3D12_COMMAND_LIST_TYPE_COPY) return d3d12_trace::result(method, E_INVALIDARG);
@@ -3105,7 +3265,18 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateFence(UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateFence";
-        return d3d12_trace::result(method, create_fence(*state_.context, initial, flags, riid, out, identity()));
+        // As the host runtime: known flags only, cross-adapter only when shared, and no non-monitored fences
+        // (refused there even with both sharing flags). A null output is a capability check.
+        constexpr UINT known = D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER |
+                               D3D12_FENCE_FLAG_NON_MONITORED;
+        if ((UINT(flags) & ~known) || (flags & D3D12_FENCE_FLAG_NON_MONITORED) ||
+            ((flags & D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER) && !(flags & D3D12_FENCE_FLAG_SHARED))) {
+            log_once("CreateFence refused, flags", int(flags));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        if (!out) return d3d12_trace::result(method, S_FALSE);
+        return d3d12_trace::result(method, create_fence(*state_.context, initial, flags, riid, out,
+                                                        identity()));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature*,
@@ -3209,9 +3380,18 @@ public:
     HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,
                                                    void** out) override {
         constexpr auto method = "ID3D12Device::CreateDescriptorHeap";
-        if (!out) return d3d12_trace::result(method, E_POINTER);
-        *out = nullptr;
-        if (!desc || !desc->NumDescriptors) return d3d12_trace::result(method, E_INVALIDARG);
+        if (out) *out = nullptr;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        // As the host runtime: a null output is a capability check, answered before the rules below (S_FALSE even
+        // for a shader-visible RTV heap). Zero descriptors are allowed, RTV and DSV heaps are never shader-visible,
+        // one flag and one node.
+        if (!out) return d3d12_trace::result(method, S_FALSE);
+        if ((desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || desc->NodeMask > 1 ||
+            ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+             (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV))) {
+            log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
         auto* heap = new DescriptorHeap(state_, *desc);
         heap->attach_device(identity());
         if (!heap->ok()) {
@@ -3660,10 +3840,34 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
-                                                      const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
-                                                      const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+                                                      const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+                                                      const D3D12_CLEAR_VALUE* clear, REFIID riid,
+                                                      void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommittedResource";
-        return d3d12_trace::result(method, create_committed(heap, heap_flags, desc, initial_state, 0, nullptr, riid, out));
+        if (out) *out = nullptr;
+        if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
+        // The host runtime's argument checks (D3D-49). A refusal is logged once per reason and dimension, since a
+        // game that trips one (for example with an Xbox-only flag through slot 76) gets no resource.
+        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear)) {
+            log_once((std::string("CreateCommittedResource refused (") + why + "), dimension").c_str(),
+                     desc->Dimension);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        // The sample quality is checked above as the host does it here: CreateCommittedResource accepts a quality on a
+        // single-sampled texture and the two standard MSAA patterns, which GetResourceAllocationInfo's rules refuse.
+        // The size, mip and alignment checks below run on a copy with quality 0.
+        D3D12_RESOURCE_DESC checked = *desc;
+        if (checked.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) checked.SampleDesc.Quality = 0;
+        if ((desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+             desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) &&
+            allocation(checked).SizeInBytes == UINT64_MAX) {
+            // Extents, mips, samples and alignment, as GetResourceAllocationInfo answers.
+            log_once("CreateCommittedResource refused (texture size, mips, samples or alignment), dimension",
+                     desc->Dimension);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        return d3d12_trace::result(method, create_committed(heap, heap_flags, desc, state, 0, nullptr, riid,
+                                                            out));
     }
 
     // Reserved (tiled) resources, for the first boot (docs/d3d12_vulkan.md section 4.2): the whole resource is
@@ -4688,7 +4892,10 @@ private:
         } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
             hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
         } else if (const UINT samples = desc->SampleDesc.Count;
-                   !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT || desc->SampleDesc.Quality != 0 ||
+                   !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
+                   (samples > 1 && desc->SampleDesc.Quality &&
+                    desc->SampleDesc.Quality != D3D12_STANDARD_MULTISAMPLE_PATTERN &&
+                    desc->SampleDesc.Quality != D3D12_CENTER_MULTISAMPLE_PATTERN) ||
                    (samples > 1 && ((samples & (samples - 1)) || desc->MipLevels != 1 ||
                                     desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
                                     !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
