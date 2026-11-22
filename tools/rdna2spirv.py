@@ -3566,9 +3566,18 @@ class Gen:
                     u = s
                 m = self.tmp()
                 self.emit(f"{m} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                if src.get("neg"):
+                    # SHADER-260, measured on gfx1036: a `neg` on this instruction flips the sign bit of the half it
+                    # packs, before any quieting (0x7c01 -> 0xfc01 in IEEE mode 0, -> 0xfe01 in mode 1), in either
+                    # half and with op_sel. It used to be refused along with every other modifier.
+                    n = self.tmp()
+                    self.emit(f"{n} = OpBitwiseXor %uint {m} {self.cu(0x8000)}")
+                    m = n
                 halves.append(m)
-            if any(src.get("neg") or src.get("abs") for src in a[1:3]):
-                raise Unsupported("v_pack_b32_f16 modifiers")
+            if any(src.get("abs") for src in a[1:3]):
+                # `neg` is measured; `abs` on this instruction is not (SHADER-260), so it stays a refusal rather than
+                # a guessed sign clear.
+                raise Unsupported("v_pack_b32_f16 abs modifier")
             hi, r = self.tmp(), self.tmp()
             self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
