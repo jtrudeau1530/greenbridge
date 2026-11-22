@@ -8725,6 +8725,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     outs = sorted(int("".join(ch for ch in t if ch.isdigit()) or 0) for t in g.outputs.values() if not t.startswith("pos"))
     if outs:
         m["outputs"] = outs
+    if g.stage == "vs" and g.uses_clip:
+        m["clip_distance_count"] = g.clip_count
     if g.writes_depth:
         m["writes_depth"] = True
     if g.inputs:

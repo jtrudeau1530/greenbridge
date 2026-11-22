@@ -142,6 +142,30 @@ class BaryFallbackGeometryShader(unittest.TestCase):
         self.assertIn("%bary1 = OpConstantComposite %v3float %f0 %f1 %f0", text)
         self.assertIn("%bary2 = OpConstantComposite %v3float %f0 %f0 %f1", text)
 
+    def test_pair_forwards_the_producers_clip_array_for_each_vertex(self):
+        import json
+        from pathlib import Path
+
+        index = {"vs_clip": {"stage": "vs", "capabilities": ["ClipDistance"], "clip_distance_count": 2},
+                 "ps_bary": {"stage": "ps", "inputs": [1], "bary_fallback_input": {"location": 0}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            index_file = Path(tmp, "index.json")
+            index_file.write_text(json.dumps(index), encoding="utf-8")
+            ordinary, = bary_fallback_gs.write_for_index(tmp)
+            paired, = bary_fallback_gs.write_for_index(tmp, pair=("vs_clip", "ps_bary"))
+            self.assertNotEqual(ordinary, paired)
+            self.assertNotIn("BuiltIn ClipDistance", Path(ordinary).read_text())
+            asm = Path(paired).read_text()
+            self.assertIn("%clip_count = OpConstant %uint 2", asm)
+            self.assertEqual(asm.count("BuiltIn ClipDistance"), 2)
+            for vertex, emission in enumerate(asm.split("OpEmitVertex")[:-1]):
+                self.assertIn(f"OpAccessChain %ptr_in_clip %in_clip %int_{vertex}", emission)
+                self.assertIn(f"OpStore %out_clip %distances{vertex}", emission)
+            del index["vs_clip"]["clip_distance_count"]
+            index_file.write_text(json.dumps(index), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "regenerate"):
+                bary_fallback_gs.write_for_index(tmp, pair=("vs_clip", "ps_bary"))
+
     def test_collision_is_refused(self):
         with self.assertRaises(ValueError):
             bary_fallback_gs.gs_spvasm([0, 1], 1)
@@ -165,13 +189,14 @@ class BaryFallbackGeometryShader(unittest.TestCase):
     def test_assembles_and_validates(self):
         with tempfile.TemporaryDirectory() as tmp:
             asm = os.path.join(tmp, "gs.spvasm")
-            with open(asm, "w", encoding="utf-8", newline="\n") as f:
-                f.write(bary_fallback_gs.gs_spvasm([0, 1, 5], 6))
-            spv = os.path.join(tmp, "gs.spv")
-            for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
-                        ["spirv-val", "--target-env", "vulkan1.2", spv]):
-                r = subprocess.run(cmd, capture_output=True, text=True)
-                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            for count in (0, 1, 2, 3, 8):
+                with open(asm, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(bary_fallback_gs.gs_spvasm([0, 1, 5], 6, count))
+                spv = os.path.join(tmp, "gs.spv")
+                for cmd in (["spirv-as", "--target-env", "vulkan1.2", asm, "-o", spv],
+                            ["spirv-val", "--target-env", "vulkan1.2", spv]):
+                    r = subprocess.run(cmd, capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 if __name__ == "__main__":

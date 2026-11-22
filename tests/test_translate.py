@@ -342,6 +342,7 @@ def test_vs_clip_distance_pos1(make_shader, n_comp, exp_line, mask):
     assert [int(x) for x in chains] == list(range(n_comp))
     assert _vgpr_to_index_map(spvasm, "%out_clip", "%_ptr_Output_float") == {i: 10 + i for i in range(n_comp)}
     meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert meta["clip_distance_count"] == n_comp
     assert "shaderClipDistance" in meta["features"]
     assert "shaderCullDistance" not in meta["features"]
     assert 1 not in meta.get("outputs", [])
@@ -420,6 +421,7 @@ def test_pos1_without_osg1_is_ignored(make_shader):
     assert "OpCapability ClipDistance" not in vs_spv
     assert "BuiltIn ClipDistance" not in vs_spv
     vs_meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, vs_spv)
+    assert "clip_distance_count" not in vs_meta
     assert "shaderClipDistance" not in vs_meta["features"]
     assert 1 not in vs_meta.get("outputs", [])
 
