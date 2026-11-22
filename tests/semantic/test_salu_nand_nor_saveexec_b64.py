@@ -1175,5 +1175,156 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
             self.assertEqual(new_exec, (~bits) & MASK64)
 
 
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def mutant_nand_to_and(ssrc0: int, old_exec: int) -> Tuple[int, int, int]:
+    """Mutant 1: Forgets inversion, computing AND instead of NAND."""
+    saved_dst = old_exec & MASK64
+    new_exec = (ssrc0 & old_exec) & MASK64
+    scc = 1 if new_exec != 0 else 0
+    return saved_dst, new_exec, scc
+
+
+def mutant_nor_to_or(ssrc0: int, old_exec: int) -> Tuple[int, int, int]:
+    """Mutant 2: Forgets inversion, computing OR instead of NOR."""
+    saved_dst = old_exec & MASK64
+    new_exec = (ssrc0 | old_exec) & MASK64
+    scc = 1 if new_exec != 0 else 0
+    return saved_dst, new_exec, scc
+
+
+def mutant_nand_swap_nor(ssrc0: int, old_exec: int) -> Tuple[int, int, int]:
+    """Mutant 3: Swaps NAND for NOR."""
+    return oracle_s_nor_saveexec_b64(ssrc0, old_exec)
+
+
+def mutant_saveexec_to_wrexec(ssrc0: int, old_exec: int) -> Tuple[int, int, int]:
+    """Mutant 4: Overwrites SDST with new EXEC instead of preserving old EXEC."""
+    _, new_exec, scc = oracle_s_nand_saveexec_b64(ssrc0, old_exec)
+    return new_exec, new_exec, scc
+
+
+def mutant_scc_old_exec(ssrc0: int, old_exec: int) -> Tuple[int, int, int]:
+    """Mutant 5: Sets SCC based on old_exec instead of new_exec."""
+    saved_dst, new_exec, _ = oracle_s_nand_saveexec_b64(ssrc0, old_exec)
+    scc = 1 if old_exec != 0 else 0
+    return saved_dst, new_exec, scc
+
+
+def mutant_scc_inverted(ssrc0: int, old_exec: int) -> Tuple[int, int, int]:
+    """Mutant 6: Inverts SCC definition (1 if zero, 0 if nonzero)."""
+    saved_dst, new_exec, _ = oracle_s_nand_saveexec_b64(ssrc0, old_exec)
+    scc = 1 if new_exec == 0 else 0
+    return saved_dst, new_exec, scc
+
+
+def mutant_truncate_32(ssrc0: int, old_exec: int) -> Tuple[int, int, int]:
+    """Mutant 7: Truncates EXEC computation to 32 bits, zeroing upper half."""
+    saved_dst, new_exec, scc = oracle_s_nand_saveexec_b64(ssrc0, old_exec)
+    return saved_dst, new_exec & MASK32, scc
+
+
+def mutant_aliasing_clobber(ssrc0: int, old_exec: int) -> Tuple[int, int, int]:
+    """Mutant 8: Simulates read-after-write hazard when sdst == ssrc0."""
+    # When sdst == ssrc0, ssrc0 gets clobbered with old_exec first
+    clobbered_ssrc0 = old_exec
+    return oracle_s_nand_saveexec_b64(clobbered_ssrc0, old_exec)
+
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Verify negative control syntax rejection and detection of 8 subtle architectural mutants."""
+
+    def test_syntax_rejection_out_of_range_sgpr(self) -> None:
+        """Reject out-of-range base indices for 64-bit SGPR pairs."""
+        with self.assertRaises(ValueError):
+            Reg64(RegType.SGPR, index=255)
+        with self.assertRaises(ValueError):
+            Reg64(RegType.SGPR, index=256)
+        with self.assertRaises(ValueError):
+            Reg64(RegType.SGPR, index=-1)
+
+    def test_syntax_rejection_special_reg_with_index(self) -> None:
+        """Reject special registers (EXEC, VCC) declared with nonzero index."""
+        with self.assertRaises(ValueError):
+            Reg64(RegType.EXEC, index=1)
+        with self.assertRaises(ValueError):
+            Reg64(RegType.VCC, index=2)
+
+    def test_syntax_rejection_invalid_literal(self) -> None:
+        """Reject literal constants that exceed 64-bit bounds or are negative."""
+        with self.assertRaises(ValueError):
+            Literal64(MASK64 + 1)
+        with self.assertRaises(ValueError):
+            Literal64(-1)
+
+    def test_syntax_rejection_invalid_wave_lane_count(self) -> None:
+        """Reject non-architectural wave sizes (only Wave32 and Wave64 permitted)."""
+        with self.assertRaises(ValueError):
+            SIMDWaveState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(num_lanes=48)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(num_lanes=128)
+
+    def test_detect_mutant_1_nand_to_and(self) -> None:
+        """Mutant 1 (NAND without inversion) must be caught by oracle tests."""
+        ref = oracle_s_nand_saveexec_b64(0xAAAA_AAAA_AAAA_AAAA, 0x5555_5555_5555_5555)
+        mut = mutant_nand_to_and(0xAAAA_AAAA_AAAA_AAAA, 0x5555_5555_5555_5555)
+        self.assertNotEqual(ref[1], mut[1])
+
+    def test_detect_mutant_2_nor_to_or(self) -> None:
+        """Mutant 2 (NOR without inversion) must be caught."""
+        ref = oracle_s_nor_saveexec_b64(0x0000_FFFF_0000_FFFF, 0xFFFF_0000_FFFF_0000)
+        mut = mutant_nor_to_or(0x0000_FFFF_0000_FFFF, 0xFFFF_0000_FFFF_0000)
+        self.assertNotEqual(ref[1], mut[1])
+
+    def test_detect_mutant_3_nand_swap_nor(self) -> None:
+        """Mutant 3 (NAND swapped for NOR) must be caught."""
+        ref = oracle_s_nand_saveexec_b64(0x1234_5678_9ABC_DEF0, 0xFEDC_BA98_7654_3210)
+        mut = mutant_nand_swap_nor(0x1234_5678_9ABC_DEF0, 0xFEDC_BA98_7654_3210)
+        self.assertNotEqual(ref[1], mut[1])
+
+    def test_detect_mutant_4_saveexec_to_wrexec(self) -> None:
+        """Mutant 4 (overwriting SDST with new EXEC instead of old) must be caught."""
+        ref = oracle_s_nand_saveexec_b64(ALL64, 0x1234)
+        mut = mutant_saveexec_to_wrexec(ALL64, 0x1234)
+        self.assertNotEqual(ref[0], mut[0])
+
+    def test_detect_mutant_5_scc_old_exec(self) -> None:
+        """Mutant 5 (SCC derived from old_exec instead of new_exec) must be caught."""
+        # When old_exec != 0 but new_exec becomes 0 (e.g. ALL64 & ALL64 -> 0)
+        ref = oracle_s_nand_saveexec_b64(ALL64, ALL64)
+        mut = mutant_scc_old_exec(ALL64, ALL64)
+        self.assertEqual(ref[2], 0)
+        self.assertEqual(mut[2], 1)
+        self.assertNotEqual(ref[2], mut[2])
+
+    def test_detect_mutant_6_scc_inverted(self) -> None:
+        """Mutant 6 (inverted SCC) must be caught."""
+        ref = oracle_s_nand_saveexec_b64(0, ALL64)
+        mut = mutant_scc_inverted(0, ALL64)
+        self.assertEqual(ref[2], 1)
+        self.assertEqual(mut[2], 0)
+        self.assertNotEqual(ref[2], mut[2])
+
+    def test_detect_mutant_7_truncate_32(self) -> None:
+        """Mutant 7 (truncation to 32-bit EXEC) must be caught on Wave64 high-lane bits."""
+        ref = oracle_s_nand_saveexec_b64(0, ALL64)
+        mut = mutant_truncate_32(0, ALL64)
+        self.assertEqual(ref[1], ALL64)
+        self.assertEqual(mut[1], MASK32)
+        self.assertNotEqual(ref[1], mut[1])
+
+    def test_detect_mutant_8_aliasing_clobber(self) -> None:
+        """Mutant 8 (aliasing clobber hazard) must be caught."""
+        ssrc0 = 0x1111_1111_1111_1111
+        old_exec = 0x3333_3333_3333_3333
+        ref = oracle_s_nand_saveexec_b64(ssrc0, old_exec)
+        mut = mutant_aliasing_clobber(ssrc0, old_exec)
+        self.assertNotEqual(ref[1], mut[1])
+
+
 if __name__ == "__main__":
     unittest.main()
