@@ -4817,6 +4817,34 @@ class Gen:
                 vals.append(v)
             for w, v in enumerate(vals):        # every read before the first write (D may overlap the source)
                 self.store_reg("sgpr", d["r"] + w, v)
+        elif op == "v_swaprel_b32":
+            # GFX10 VOP1 (opcode 104): swap VGPR[D + M0[25:16]] and VGPR[S0 + M0[9:0]], the fields v_movrelsd_2_b32
+            # uses (RDNA2 ISA: tmp = VGPR[D + M0[25:16]]; VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]];
+            # VGPR[S0 + M0[9:0]] = tmp). Both registers are read before either is written; inactive lanes keep both.
+            # As for v_movrel*, the hardware's range check against the VGPR allocation is not modelled.
+            d, s0 = a[0], a[1]
+            if d["k"] != "vgpr" or s0["k"] != "vgpr":
+                raise Unsupported(op + " operands")
+            m0, lo, hi, md = (self.tmp() for _ in range(4))
+            self.emit(f"{m0} = OpLoad %uint %m0")
+            self.emit(f"{lo} = OpBitwiseAnd %uint {m0} {self.cu(0x3FF)}")
+            self.emit(f"{hi} = OpShiftRightLogical %uint {m0} {self.cu(16)}")
+            self.emit(f"{md} = OpBitwiseAnd %uint {hi} {self.cu(0x3FF)}")
+            ptrs, vals = [], []
+            for reg, off in ((d["r"], md), (s0["r"], lo)):
+                i, p_, v = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{i} = OpIAdd %uint {self.cu(reg)} {off}")
+                self.emit(f"{p_} = OpAccessChain %_ptr_Function_uint %vgpr {i}")
+                self.emit(f"{v} = OpLoad %uint {p_}")
+                ptrs.append(p_)
+                vals.append(v)
+            act = self.active_b()
+            # D's slot gets S0's value, then S0's slot gets D's old value: when both name one register the second
+            # store writes back its own value, so the register is unchanged, as a swap with itself is.
+            for p_, new, old in ((ptrs[0], vals[1], vals[0]), (ptrs[1], vals[0], vals[1])):
+                sel = self.tmp()
+                self.emit(f"{sel} = OpSelect %uint {act} {new} {old}")
+                self.emit(f"OpStore {p_} {sel}")
         elif op in ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"):
             # Relative VGPR indexing through M0: movrels reads VGPR[src + M0], movreld writes VGPR[dst + M0],
             # movrelsd does both. The register file is an array, so these become dynamic array accesses.
