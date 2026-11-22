@@ -574,5 +574,73 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(0), 320)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_vgpr_base_address_preservation(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        initial_vaddr = 0x120
+        state.set_vgpr(0, initial_vaddr)
+        state.set_lds(0x48, 10)
+        state.set_lds(0x49, 20)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_ADD_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        self.scalar_interp.execute(instr, state)
+        # LDS updated
+        self.assertEqual(state.get_lds(0x48), 30)
+        # Base register v0 is preserved and NOT overwritten
+        self.assertEqual(state.get_vgpr(0), initial_vaddr)
+
+    def test_address_a_equals_address_b_aliasing(self) -> None:
+        # When offset0 == offset1, idx_a == idx_b -> self doubling
+        state = ScalarMachineState(lds_dwords=256)
+        state.set_vgpr(0, 0x40)
+        state.set_lds(16, 250)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_ADD_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=0),
+        )
+        self.scalar_interp.execute(instr, state)
+        self.assertEqual(state.get_lds(16), 500)
+
+    def test_inplace_iterative_accumulation(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.set_vgpr(0, 0x10)
+        # dword 4 is accumulator, dword 5 is step = 3
+        state.set_lds(4, 0)
+        state.set_lds(5, 3)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_ADD_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(0), offset0=0, offset1=1),
+        )
+        for _ in range(100):
+            self.scalar_interp.execute(instr, state)
+        self.assertEqual(state.get_lds(4), 300)
+        self.assertEqual(state.get_lds(5), 3)
+
+    def test_simd_vgpr_preservation(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=MASK32, lds_dwords=512)
+        initial_addrs = [lane * 16 for lane in range(32)]
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 3, initial_addrs[lane])
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_ADD_SRC2_U32,
+            addr=LDSAddressExpression(base_reg=RegisterOperand(3), offset0=0, offset1=1),
+        )
+        self.simd_interp.execute(instr, state)
+        for lane in range(32):
+            self.assertEqual(state.get_lane_vgpr(lane, 3), initial_addrs[lane])
+
+
 if __name__ == "__main__":
     unittest.main()
