@@ -7426,9 +7426,10 @@ def main():
         merged = {}
         for part in sorted(_gl.glob(os.path.join(a.out, "index.part*.json"))):
             merged.update(_js.load(open(part, encoding="utf-8")))
-        write_index(os.path.join(a.out, "index.json"), merged)
+        # The stubs go first: index.json is what tells make_game.py the translation finished.
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, merged)
+        write_index(os.path.join(a.out, "index.json"), merged)
         print(f"merged {len(merged)} entries")
         return 0
     files = [a.src] if a.src.endswith(".s") else sorted(os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".s"))
