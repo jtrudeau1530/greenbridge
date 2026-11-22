@@ -1670,6 +1670,19 @@ public:
             }
             if (optimal & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
                 s1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+                // A D3D12 multisample resolve needs the same image usages as texture_create_info(): colour
+                // attachment plus transfer source/destination (and the ordinary sampled usage).
+                VkImageFormatProperties image_properties{};
+                const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                const VkImageCreateFlags flags = fmt.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+                if (state_.image_format_properties &&
+                    state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
+                                                   VK_IMAGE_TILING_OPTIMAL, usage, flags, &image_properties) == VK_SUCCESS &&
+                    (image_properties.sampleCounts & ~VK_SAMPLE_COUNT_1_BIT)) {
+                    s1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
+                          D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+                }
             }
             if (optimal & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) {
                 s1 |= D3D12_FORMAT_SUPPORT1_BLENDABLE;
@@ -1688,6 +1701,32 @@ public:
             }
             fs->Support1 = s1;
             fs->Support2 = s2;
+            return S_OK;
+        }
+        case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
+            if (size != sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS)) return E_INVALIDARG;
+            auto* levels = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS*>(data);
+            levels->NumQualityLevels = 0;
+            if (levels->Flags != D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE ||
+                levels->SampleCount == 0 || levels->SampleCount > 64 ||
+                (levels->SampleCount & (levels->SampleCount - 1)) != 0)
+                return E_INVALIDARG;
+            const Format format = vulkan_format(levels->Format, false);
+            if (format.format == VK_FORMAT_UNDEFINED || !state_.image_format_properties)
+                return DXGI_ERROR_UNSUPPORTED;
+
+            // Vulkan exposes one standard sample pattern per supported count, so each supported count maps to
+            // one D3D12 quality level (quality index 0). Query the exact usages used for a D3D12 RT texture.
+            const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            const VkImageCreateFlags flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+            VkImageFormatProperties image_properties{};
+            const VkResult result = state_.image_format_properties(state_.info.physical, format.format,
+                                                                   VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                                   usage, flags, &image_properties);
+            const VkSampleCountFlagBits samples = VkSampleCountFlagBits(levels->SampleCount);
+            if (result == VK_SUCCESS && (image_properties.sampleCounts & samples))
+                levels->NumQualityLevels = 1;
             return S_OK;
         }
         default:
