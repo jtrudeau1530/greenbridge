@@ -298,6 +298,23 @@ class Runner(unittest.TestCase):
         self.assertIn("2 skipped", out)
         self.assertIn("can't run it at 32 lanes", out)
 
+    def test_unpinned_wave32_warning_does_not_hide_a_later_harness_failure(self) -> None:
+        passing = iter((False, True))
+
+        def gpu(p: f.Program, _spv: Path, _build: str, _entry: dict[str, object],
+                _emulate: bool, dump: Path) -> tuple[int, str]:
+            if next(passing):
+                self.correct_dump(p, dump)
+                return 0, "compute subgroup size: 32"
+            return 1, self.UNPINNED + "\nFAILED vkQueueSubmit -> -4"
+
+        status, out = self.run_main(gpu, ("--wave", "32"))
+        self.assertEqual(status, 2, out)
+        self.assertIn("FAILED vkQueueSubmit", out)
+        self.assertIn("1/1 programs that ran match", out)
+        self.assertIn("1 harness errors", out)
+        self.assertIn("0 skipped", out)
+
     def test_pinned_wave32_is_still_compared(self):
         status, out = self.run_main(self.wrong_dump("compute subgroup size: 32"), ("--wave", "32"))
         self.assertEqual(status, 1, out)
