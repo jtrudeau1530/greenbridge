@@ -138,6 +138,198 @@ def ref_buffer_atomic_sub(
     return ret_val, True
 
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= 256:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count not in (1, 2, 4):
+            raise ValueError(f"Unsupported register count: {self.count}")
+        if self.index + self.count > 256:
+            raise ValueError(f"Register range exceeds register file boundary: {self.index}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count > 1:
+            return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferAtomicModifiers:
+    """Modifiers and options for buffer atomic instructions."""
+    offset: int = 0
+    glc: bool = False
+    slc: bool = False
+    offen: bool = True
+    idxen: bool = False
+
+    def __post_init__(self) -> None:
+        if self.offset < 0 or self.offset > 4095:
+            raise ValueError(f"Immediate inst_offset must be in range [0, 4095]: {self.offset}")
+
+
+class Opcode(enum.Enum):
+    """Buffer atomic opcodes."""
+    BUFFER_ATOMIC_SUB = "buffer_atomic_sub"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a buffer_atomic_sub instruction."""
+    opcode: Opcode
+    vdata: Register
+    vaddr: Register
+    srsrc: Register
+    soffset: Register | int
+    mods: BufferAtomicModifiers = dataclasses.field(default_factory=BufferAtomicModifiers)
+
+    def __post_init__(self) -> None:
+        if not self.vdata.is_vgpr or self.vdata.count != 1:
+            raise ValueError(f"vdata must be a single 32-bit VGPR: {self.vdata}")
+        if not self.vaddr.is_vgpr:
+            raise ValueError(f"vaddr must be a VGPR: {self.vaddr}")
+        if not self.srsrc.is_sgpr or self.srsrc.count != 4:
+            raise ValueError(f"srsrc must be a 128-bit SGPR group (count=4): {self.srsrc}")
+        if isinstance(self.soffset, Register) and not self.soffset.is_sgpr:
+            raise ValueError(f"soffset register must be an SGPR: {self.soffset}")
+
+    def to_assembly(self) -> str:
+        vd_str = self.vdata.format_asm()
+        va_str = self.vaddr.format_asm()
+        sr_str = self.srsrc.format_asm()
+        so_str = self.soffset.format_asm() if isinstance(self.soffset, Register) else str(self.soffset)
+
+        mod_parts: list[str] = []
+        if self.mods.offen:
+            mod_parts.append("offen")
+        if self.mods.idxen:
+            mod_parts.append("idxen")
+        if self.mods.offset != 0:
+            mod_parts.append(f"offset:{self.mods.offset}")
+        if self.mods.glc:
+            mod_parts.append("glc")
+        if self.mods.slc:
+            mod_parts.append("slc")
+
+        mods_str = (" " + " ".join(mod_parts)) if mod_parts else ""
+        return f"{self.opcode.value} {vd_str}, {va_str}, {sr_str}, {so_str}{mods_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of buffer instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class TestBufferAtomicSubAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_construction(self) -> None:
+        v0 = Register(RegKind.VGPR, 0, count=1)
+        v1 = Register(RegKind.VGPR, 1, count=1)
+        s_desc = Register(RegKind.SGPR, 4, count=4)
+        s_off = Register(RegKind.SGPR, 8, count=1)
+
+        self.assertEqual(v0.format_asm(), "v0")
+        self.assertEqual(v1.format_asm(), "v1")
+        self.assertEqual(s_desc.format_asm(), "s[4:7]")
+        self.assertEqual(s_off.format_asm(), "s8")
+
+    def test_instruction_formatting(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SUB,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=Register(RegKind.SGPR, 8, count=1),
+            mods=BufferAtomicModifiers(offset=16, glc=True, offen=True),
+        )
+        self.assertEqual(
+            inst.to_assembly(),
+            "buffer_atomic_sub v0, v1, s[4:7], s8 offen offset:16 glc",
+        )
+
+        inst_imm = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SUB,
+            vdata=Register(RegKind.VGPR, 2, count=1),
+            vaddr=Register(RegKind.VGPR, 3, count=1),
+            srsrc=Register(RegKind.SGPR, 12, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offen=True),
+        )
+        self.assertEqual(
+            inst_imm.to_assembly(),
+            "buffer_atomic_sub v2, v3, s[12:15], 0 offen",
+        )
+
+    def test_instruction_validation(self) -> None:
+        # Invalid vdata kind (must be VGPR)
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SUB,
+                vdata=Register(RegKind.SGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+        # Invalid srsrc count (must be 4)
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SUB,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=2),
+                soffset=0,
+            )
+
+        # Invalid offset (> 4095)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=5000)
+
+    def test_program_assembly(self) -> None:
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SUB,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        ))
+        expected = "buffer_atomic_sub v0, v1, s[4:7], 0 offen glc"
+        self.assertEqual(prog.to_assembly(), expected)
+
+
 class TestBufferAtomicSubOracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
