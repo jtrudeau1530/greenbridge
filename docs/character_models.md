@@ -144,7 +144,9 @@ reconstruction, not Lucia's body.
 The player and cutscene body is a separate shared **clothed** fragment,
 `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full` (874 v), used by `cs_lucia`, `cs_monalisa`
 and `cs_mandy` (their `FragName` is identical). It is the body the game uses; it is low-poly and
-clothed, so it is not a high-detail nude body.
+clothed, so it is not a high-detail nude body. A flat-skin render of the 874-v body with its
+normal map disconnected still shows the modelled top, shorts and ankle boots, so the clothing
+silhouette is geometry, not a painted-on atlas.
 
 ## What is not decoded
 
