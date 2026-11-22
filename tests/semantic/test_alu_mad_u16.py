@@ -28,6 +28,8 @@ Mathematical specification:
       dst_hi (op_sel bit 3) determines destination placement:
       - dst_hi = 0: writes D to dst[15:0] and preserves dst[31:16] from the prior VGPR content.
       - dst_hi = 1: writes D to dst[31:16] and preserves dst[15:0] from the prior VGPR content.
+  - Multi-lane SIMD divergence under EXEC mask:
+      Inactive lanes (EXEC[lane] == 0) preserve destination VGPR contents unmodified.
 
 Standard library only, zero game data, Python 3.9+ compatible.
 """
@@ -36,6 +38,7 @@ import gc
 import itertools
 import os
 import random
+import re
 import struct
 import sys
 import tempfile
@@ -58,6 +61,7 @@ import spirv_mini_interp as si  # noqa: E402
 MASK16 = 0xFFFF
 MASK32 = 0xFFFFFFFF
 OLD = 0xAAAA5555
+SENTINEL = 0xDEADBEEF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 _TMP_DIR: tempfile.TemporaryDirectory | None = None
@@ -172,6 +176,68 @@ def run_shader_mad(line: str, v1: int, v2: int, v3: int, old: int = OLD) -> int:
         warnings.simplefilter("ignore", ResourceWarning)
         spv = rdna2spirv.translate(_SRC_PATH)
     return si.run_fragment(spv)["%out_mrt0"][0]
+
+
+def translate_custom_lines(lines: list[str]) -> str:
+    """Translate arbitrary assembly lines to SPIR-V text with proper cleanup."""
+    with tempfile.TemporaryDirectory() as tmp:
+        disasm_dir = os.path.join(tmp, "disasm")
+        os.mkdir(disasm_dir)
+        s_path = os.path.join(disasm_dir, "ps_custom.s")
+        with open(s_path, "w", encoding="utf-8") as f:
+            f.write("; ps_custom\n" + "".join(f"\t{ln}\n" for ln in lines) + "\ts_endpgm\n")
+        with open(os.path.join(tmp, "ps_custom.dxbc"), "wb") as f:
+            f.write(STUB_DXBC)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            spv = rdna2spirv.translate(s_path)
+            gc.collect()
+        return spv
+
+
+class SimdWave:
+    """Pure-Python model of a SIMD Wave (Wave32 or Wave64) executing with lane masking."""
+
+    def __init__(self, wave_size: int = 32, exec_mask: int = 0xFFFFFFFF):
+        self.wave_size = wave_size
+        self.exec_mask = exec_mask & ((1 << wave_size) - 1)
+        self.vgprs: list[dict[int, int]] = [{0: OLD} for _ in range(wave_size)]
+        self.sgprs: dict[int, int] = {}
+
+    def is_active(self, lane: int) -> bool:
+        return bool(self.exec_mask & (1 << lane))
+
+    def exec_mad_u16(
+        self,
+        vd: int,
+        s0: int,
+        s1: int,
+        s2: int,
+        sel: tuple[int, int, int] = (0, 0, 0),
+        dst_hi: int = 0,
+        clamp: bool = False,
+    ) -> None:
+        """Execute v_mad_u16 across all lanes in the wave governed by exec_mask."""
+        for lane in range(self.wave_size):
+            if self.is_active(lane):
+                old = self.vgprs[lane].get(vd, OLD)
+                self.vgprs[lane][vd] = ref_mad_u16(s0, s1, s2, sel=sel, dst_hi=dst_hi, clamp=clamp, old_dst=old)
+
+    def exec_mad_i16(
+        self,
+        vd: int,
+        s0: int,
+        s1: int,
+        s2: int,
+        sel: tuple[int, int, int] = (0, 0, 0),
+        dst_hi: int = 0,
+        clamp: bool = False,
+    ) -> None:
+        """Execute v_mad_i16 across all lanes in the wave governed by exec_mask."""
+        for lane in range(self.wave_size):
+            if self.is_active(lane):
+                old = self.vgprs[lane].get(vd, OLD)
+                self.vgprs[lane][vd] = ref_mad_i16(s0, s1, s2, sel=sel, dst_hi=dst_hi, clamp=clamp, old_dst=old)
 
 
 class TestMadU16ReferenceOracle(unittest.TestCase):
@@ -532,6 +598,272 @@ class TestMadI16TranslationAndInterp(unittest.TestCase):
             expected = ref_mad_i16(v1, v2, v3, sel=sel, dst_hi=dst_hi, clamp=clamp, old_dst=old)
             with self.subTest(sel=sel, dst_hi=dst_hi, clamp=clamp):
                 self.assertEqual(run_shader_mad(line, v1, v2, v3, old=old), expected)
+
+
+class TestPackedHalfwordExecution(unittest.TestCase):
+    """Exhaustive op_sel permutations, register aliasing, and scalar/constant operands."""
+
+    def test_all_sixteen_op_sel_permutations(self):
+        """Test all 2^4 = 16 op_sel bit patterns on both v_mad_u16 and v_mad_i16."""
+        a = 0x0003_0007   # hi=3, lo=7
+        b = 0x0005_000B   # hi=5, lo=11
+        c = 0x0002_000D   # hi=2, lo=13
+        for op in ("v_mad_u16", "v_mad_i16"):
+            ref_fn = ref_mad_u16 if op == "v_mad_u16" else ref_mad_i16
+            for bits in itertools.product((0, 1), repeat=4):
+                line = f"{op} v0, v1, v2, v3 op_sel:[{bits[0]},{bits[1]},{bits[2]},{bits[3]}]"
+                expected = ref_fn(a, b, c, sel=bits[:3], dst_hi=bits[3])
+                with self.subTest(op=op, op_sel=bits):
+                    self.assertEqual(run_shader_mad(line, a, b, c), expected)
+
+    def test_destination_register_aliasing(self):
+        """Register aliasing: destination aliases one or more source registers."""
+        init_v0 = 0x12340003
+        init_v1 = 0x56780005
+        init_v2 = 0x9ABC0007
+
+        # v0 = v0 * v1 + v2 (dst aliases src0)
+        line1 = "v_mad_u16 v0, v0, v1, v2"
+        # s0=3, s1=5, s2=7 -> 22 (0x0016), preserved high half=0x1234
+        expected1 = (init_v0 & 0xFFFF0000) | (3 * 5 + 7)
+        got1 = run_shader_mad(line1, init_v1, init_v2, 0, old=init_v0)
+        self.assertEqual(got1, expected1)
+
+        # v0 = v1 * v0 + v2 (dst aliases src1)
+        line2 = "v_mad_u16 v0, v1, v0, v2"
+        expected2 = (init_v0 & 0xFFFF0000) | (5 * 3 + 7)
+        got2 = run_shader_mad(line2, init_v1, init_v2, 0, old=init_v0)
+        self.assertEqual(got2, expected2)
+
+        # v0 = v1 * v2 + v0 (dst aliases src2)
+        line3 = "v_mad_u16 v0, v1, v2, v0"
+        expected3 = (init_v0 & 0xFFFF0000) | (5 * 7 + 3)
+        got3 = run_shader_mad(line3, init_v1, init_v2, 0, old=init_v0)
+        self.assertEqual(got3, expected3)
+
+        # v0 = v0 * v0 + v0 (all operands alias destination)
+        line4 = "v_mad_u16 v0, v0, v0, v0"
+        expected4 = (init_v0 & 0xFFFF0000) | (3 * 3 + 3)
+        got4 = run_shader_mad(line4, 0, 0, 0, old=init_v0)
+        self.assertEqual(got4, expected4)
+
+    def test_scalar_sgpr_and_inline_constants(self):
+        """Scalar SGPR and inline constant operand support in v_mad_u16 and v_mad_i16."""
+        s4_val = 0xCAFE0005
+        v1_val = 0xBEEF0003
+        v2_val = 0x12340002
+
+        # v_mad_u16 v0, s4, v1, 10
+        # s0 = s4(lo)=5, s1 = v1(lo)=3, s2 = 10 -> 5 * 3 + 10 = 25
+        lines_sgpr = [
+            f"s_mov_b32 s4, {s4_val:#x}",
+            f"v_mov_b32 v1, {v1_val:#x}",
+            f"v_mov_b32 v2, {v2_val:#x}",
+            f"v_mov_b32 v0, {OLD:#x}",
+            "v_mad_u16 v0, s4, v1, 10",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        spv = translate_custom_lines(lines_sgpr)
+        got = si.run_fragment(spv)["%out_mrt0"][0]
+        self.assertEqual(got, (OLD & 0xFFFF0000) | 25)
+
+        # v_mad_i16 v0, -1, s4, 2
+        # s0 = -1 (0xFFFFFFFF sign-extended is -1), s1 = 5, s2 = 2 -> -1 * 5 + 2 = -3 (0xFFFD)
+        lines_const = [
+            f"s_mov_b32 s4, {s4_val:#x}",
+            f"v_mov_b32 v0, {OLD:#x}",
+            "v_mad_i16 v0, -1, s4, 2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        spv2 = translate_custom_lines(lines_const)
+        got2 = si.run_fragment(spv2)["%out_mrt0"][0]
+        self.assertEqual(got2, (OLD & 0xFFFF0000) | ((-3) & MASK16))
+
+
+class TestSimdExecDivergence(unittest.TestCase):
+    """Multi-lane SIMD divergence under EXEC mask."""
+
+    def test_simd_wave_model_divergence_patterns(self):
+        """SIMD wave model verifies lane masking, active vs inactive lanes, and join convergence."""
+        wave32 = SimdWave(wave_size=32, exec_mask=0x55555555)  # even lanes active
+        # s0=3, s1=5, s2=7 -> 22 (0x0016), preserved high half=0xAAAA
+        wave32.exec_mad_u16(vd=0, s0=3, s1=5, s2=7)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave32.vgprs[lane][0], (OLD & 0xFFFF0000) | 22)
+            else:
+                self.assertEqual(wave32.vgprs[lane][0], OLD)
+
+        wave64 = SimdWave(wave_size=64, exec_mask=0x00000000FFFFFFFF)  # low 32 lanes active
+        wave64.exec_mad_i16(vd=0, s0=0xFFFE, s1=3, s2=5)  # -2 * 3 + 5 = -1 (0xFFFF)
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(wave64.vgprs[lane][0], (OLD & 0xFFFF0000) | 0xFFFF)
+            else:
+                self.assertEqual(wave64.vgprs[lane][0], OLD)
+
+    def test_inactive_lane_preservation_under_v_cmpx(self):
+        """Shader execution turns off EXEC with v_cmpx; destination register remains untouched."""
+        for op in ("v_mad_u16", "v_mad_i16"):
+            with self.subTest(op=op):
+                lines = [
+                    f"v_mov_b32 v0, {OLD:#x}",
+                    "v_mov_b32 v1, 0x12345678",
+                    "v_mov_b32 v2, 0x9abcdef0",
+                    "v_mov_b32 v3, 0x00112233",
+                    "v_cmpx_eq_u32_e32 vcc_lo, 0, 1",  # disable all lanes in exec
+                    f"{op} v0, v1, v2, v3",
+                    "s_mov_b32 exec_lo, -1",            # restore exec for export
+                    "exp mrt0 v0, v0, v0, v0 done vm",
+                ]
+                spv = translate_custom_lines(lines)
+                got = si.run_fragment(spv)["%out_mrt0"][0]
+                self.assertEqual(got, OLD)
+
+    def test_compute_shader_simd_workgroup_divergence(self):
+        """Compute shader workgroup across 32 lanes with divergence on v0 < 16."""
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm_dir = os.path.join(tmp, "disasm")
+            fssm_dir = os.path.join(tmp, "fssm")
+            os.mkdir(disasm_dir)
+            os.mkdir(fssm_dir)
+            s_path = os.path.join(disasm_dir, "cs_mad_div.s")
+            # Lanes 0..15 execute v_mad_u16; lanes 16..31 remain inactive
+            lines = [
+                "v_mov_b32 v1, 3",
+                "v_mov_b32 v2, 5",
+                "v_mov_b32 v3, 7",
+                "v_mov_b32 v4, 0x12345678",
+                "v_cmp_lt_u32_e32 vcc_lo, v0, 16",
+                "s_and_saveexec_b32 s4, vcc_lo",
+                "v_mad_u16 v4, v1, v2, v3",
+                "s_mov_b32 exec_lo, s4",
+                "v_mul_lo_u32 v5, v0, 4",
+                "buffer_store_dword v4, v5, s[0:3], 0 offen",
+                "s_endpgm",
+            ]
+            with open(s_path, "w", encoding="utf-8") as f:
+                f.write("; cs_mad_div\n" + "".join(f"\t{ln}\n" for ln in lines))
+            with open(os.path.join(tmp, "cs_mad_div.dxbc"), "wb") as f:
+                f.write(STUB_DXBC)
+            with open(os.path.join(fssm_dir, "cs_mad_div.fssm"), "wb") as f:
+                f.write(bytes(0x138) + struct.pack("<4I", 0x8088, 32, 1, 1))
+
+            spv = rdna2spirv.translate(s_path)
+            vsharp = [0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28
+            mem = si.run_workgroup(
+                spv,
+                32,
+                32,
+                inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                push_constants=vsharp,
+                memory={},
+            )
+            # Active lanes (0..15): 3 * 5 + 7 = 22 (0x0016), preserved high half=0x1234
+            for lane in range(16):
+                self.assertEqual(mem[lane * 4], 0x12340016, f"active lane {lane}")
+            # Inactive lanes (16..31): preserved initial 0x12345678
+            for lane in range(16, 32):
+                self.assertEqual(mem[lane * 4], 0x12345678, f"inactive lane {lane}")
+
+
+class TestNegativeControls(unittest.TestCase):
+    """Negative controls / mutation detection on translated SPIR-V assembly."""
+
+    def test_detects_signed_vs_unsigned_extract(self):
+        """Mutating OpBitFieldSExtract to OpBitFieldUExtract breaks signed clamp saturation."""
+        lines = [
+            "v_mov_b32 v1, 0xFFFE",
+            "v_mov_b32 v2, 3",
+            "v_mov_b32 v3, 5",
+            "v_mov_b32 v0, 0xAAAA5555",
+            "v_mad_i16 v0, v1, v2, v3 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        good = translate_custom_lines(lines)
+        res_good = si.run_fragment(good)["%out_mrt0"][0]
+        self.assertEqual(res_good, 0xAAAAFFFF)
+
+        bad, count = re.subn(r"OpBitFieldSExtract", "OpBitFieldUExtract", good)
+        self.assertGreaterEqual(count, 1)
+        res_bad = si.run_fragment(bad)["%out_mrt0"][0]
+        self.assertNotEqual(res_good, res_bad)
+
+    def test_detects_multiplication_mutated_to_addition(self):
+        """Mutating OpIMul to OpIAdd breaks arithmetic evaluation."""
+        lines = [
+            "v_mov_b32 v1, 3",
+            "v_mov_b32 v2, 5",
+            "v_mov_b32 v3, 7",
+            "v_mov_b32 v0, 0xAAAA5555",
+            "v_mad_u16 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        good = translate_custom_lines(lines)
+        res_good = si.run_fragment(good)["%out_mrt0"][0]
+        self.assertEqual(res_good, 0xAAAA0016)
+
+        bad, count = re.subn(r"OpIMul", "OpIAdd", good)
+        self.assertEqual(count, 1)
+        res_bad = si.run_fragment(bad)["%out_mrt0"][0]
+        self.assertNotEqual(res_good, res_bad)
+
+    def test_detects_unsigned_clamp_comparison_inversion(self):
+        """Mutating OpUGreaterThan to OpULessThan breaks unsigned clamp saturation."""
+        lines = [
+            "v_mov_b32 v1, 256",
+            "v_mov_b32 v2, 256",
+            "v_mov_b32 v3, 1",
+            "v_mov_b32 v0, 0xAAAA5555",
+            "v_mad_u16 v0, v1, v2, v3 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        good = translate_custom_lines(lines)
+        res_good = si.run_fragment(good)["%out_mrt0"][0]
+        self.assertEqual(res_good, 0xAAAAFFFF)
+
+        bad, count = re.subn(r"OpUGreaterThan", "OpULessThan", good)
+        self.assertEqual(count, 1)
+        res_bad = si.run_fragment(bad)["%out_mrt0"][0]
+        self.assertNotEqual(res_good, res_bad)
+
+    def test_detects_signed_clamp_bound_inversion(self):
+        """Mutating glsl SMin to glsl SMax in signed clamp breaks upper saturation."""
+        lines = [
+            "v_mov_b32 v1, 32767",
+            "v_mov_b32 v2, 2",
+            "v_mov_b32 v3, 0",
+            "v_mov_b32 v0, 0xAAAA5555",
+            "v_mad_i16 v0, v1, v2, v3 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        good = translate_custom_lines(lines)
+        res_good = si.run_fragment(good)["%out_mrt0"][0]
+        self.assertEqual(res_good, 0xAAAA7FFF)
+
+        bad, count = re.subn(r"glsl SMin", "glsl SMax", good)
+        self.assertEqual(count, 1)
+        res_bad = si.run_fragment(bad)["%out_mrt0"][0]
+        self.assertNotEqual(res_good, res_bad)
+
+    def test_detects_destination_high_half_loss(self):
+        """Mutating high half mask preservation breaks destination register retention."""
+        lines = [
+            "v_mov_b32 v1, 3",
+            "v_mov_b32 v2, 5",
+            "v_mov_b32 v3, 7",
+            "v_mov_b32 v0, 0xAAAA5555",
+            "v_mad_u16 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+        ]
+        good = translate_custom_lines(lines)
+        res_good = si.run_fragment(good)["%out_mrt0"][0]
+        self.assertEqual(res_good, 0xAAAA0016)
+
+        bad, count = re.subn(r"OpBitwiseAnd %uint (%\w+) %cffff0000", r"OpBitwiseAnd %uint \1 %c0", good)
+        self.assertEqual(count, 1)
+        res_bad = si.run_fragment(bad)["%out_mrt0"][0]
+        self.assertNotEqual(res_good, res_bad)
 
 
 if __name__ == "__main__":
