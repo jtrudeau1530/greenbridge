@@ -677,6 +677,8 @@ c / 255. llvmpipe multiplies by an f32 1/255, which is one ulp above that for 12
 0x3dd8d8da, not 0x3dd8d8d9), and a run stops at its first mismatch, so on llvmpipe no case after the first
 `R8G8B8A8_UNORM` one ran. The translator oracle therefore accepts one ulp on a UNORM8 texel component, never on
 another format or on a sentinel, and the summary says how many components needed it. `--oracle hw` stays bit exact.
+Each run keeps its generated files in a unique output folder. With `--work DIR`, it is a new child of `DIR` and its
+path is printed; existing contents and other runs are left alone. Without `--work`, it is in the system temporary folder.
 
 ```sh
 cmake --build runtime/build --target vk_image_fuzz
