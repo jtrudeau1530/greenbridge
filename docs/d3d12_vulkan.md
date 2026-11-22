@@ -380,7 +380,9 @@ What is implemented (all of it testable without the game):
     | `CreateCommandQueue1`'s creator ID | ignored |
 
     `CreatePlacedResource1/2` wrap the placed path above; `2` carries the castable-format list. `CreateHeap1`
-    remains a stub.
+    wraps `CreateHeap` and refuses a protected session. Both refuse, as the host does (RX 5700 and WARP, D3D-238),
+    an alignment other than 0, 64 KiB and 4 MiB, a heap type outside the enum, a custom heap without a CPU page
+    property and memory pool or a non-custom heap with either, and a heap with all three `DENY_*` flags.
   - `CreateSampler2` as a wrapper over `CreateSampler` (D3D-28, part 2). Without flags it writes the same S#.
     `D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR` reads the union as integers. `(0,0,0,0)`, `(0,0,0,1)` and `(1,1,1,1)`
     take the S#'s transparent-black, opaque-black and opaque-white types. The S# has no separate integer types,
