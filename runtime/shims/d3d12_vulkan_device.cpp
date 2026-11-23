@@ -21,6 +21,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/host_stall.h"
 #include "../src/depth24_fragment.h"
+#include "../src/rect_list_geometry.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
@@ -70,7 +71,10 @@ namespace {
 constexpr UINT kDescriptorSize = descriptor_size;
 // The first 64 KiB of the GPU address arena are never handed out: VA 0 stays invalid, and the page is kept zero
 // for unbound vertex and index buffers to read (D3D12 reads zeros there).
-constexpr VkDeviceSize kArenaReserved = 64 * 1024;
+constexpr VkDeviceSize kZeroPage = 64 * 1024;  // zeroed: what unbound vertex and index buffers read
+constexpr std::uint32_t kQuadIndicesPerQuad = leonida::quad_triangle_indices.size();
+constexpr std::uint32_t kQuadIndexCount = 16 * 1024 * kQuadIndicesPerQuad;
+constexpr VkDeviceSize kArenaReserved = kZeroPage + VkDeviceSize(kQuadIndexCount) * sizeof(std::uint32_t);
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 
 // The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
@@ -3448,7 +3452,8 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
         key.text(e.SemanticName).u32(e.SemanticIndex).u32(e.Format).u32(e.InputSlot).u32(e.AlignedByteOffset);
         key.u32(e.InputSlotClass).u32(e.InstanceDataStepRate);
     }
-    key.u32(desc.IBStripCutValue).u32(desc.PrimitiveTopologyType).u32(desc.NumRenderTargets);
+    key.u32(desc.IBStripCutValue).u32(std::bit_cast<std::uint32_t>(desc.PrimitiveTopologyType))
+        .u32(desc.NumRenderTargets);
     for (const DXGI_FORMAT format : desc.RTVFormats) key.u32(format);
     key.u32(desc.DSVFormat).u32(desc.SampleDesc.Count).u32(desc.SampleDesc.Quality).u32(desc.NodeMask);
     return leonida::sha256_hex(key.data());
@@ -3812,8 +3817,18 @@ public:
             log_once("geometry shaders need the Vulkan geometryShader feature; stage", 0);
             return E_NOTIMPL;
         }
-        if (geometry && desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
-            log_once("a translated geometry shader takes triangles; topology type", desc.PrimitiveTopologyType);
+        // The console's rectangle topology type (19) draws as triangles through a generated geometry stage that adds
+        // each rectangle's fourth corner (src/rect_list_geometry.h); it needs the same device feature, and no GS of
+        // the application's own.
+        // Decode the ABI field as bits. The console's value is outside the PC enum's range.
+        const auto topology_type = std::bit_cast<std::uint32_t>(desc.PrimitiveTopologyType);
+        const bool rect_list = !mesh && topology_type == leonida::topology_type_rect_list;
+        if (rect_list && (geometry || !device_.info.features.geometryShader)) {
+            log_once("a rectangle-list pipeline needs the geometryShader feature and no geometry shader; stage", 0);
+            return geometry ? E_INVALIDARG : E_NOTIMPL;
+        }
+        if (geometry && topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
+            log_once("a translated geometry shader takes triangles; topology type", topology_type);
             return E_INVALIDARG;
         }
         const UINT samples = desc.SampleDesc.Count;
@@ -3998,6 +4013,26 @@ public:
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
+        if (rect_list) {  // the stage that adds each rectangle's fourth corner, from the vertex shader's outputs
+            std::string why;
+            const std::vector<std::uint32_t> words = leonida::rect_list_geometry(vs_stage.words, why);
+            if (words.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s cannot be drawn as a rectangle list: %s\n",
+                             vs_stage.entry->name.c_str(), why.c_str());
+                return E_NOTIMPL;
+            }
+            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module_info.codeSize = words.size() * 4;
+            module_info.pCode = words.data();
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
+            modules_.push_back(module);
+            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+            info.module = module;
+            info.pName = "main";
+            stage_infos.push_back(info);
+        }
         if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
             const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
             const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
@@ -4068,12 +4103,13 @@ public:
             }
         }
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-        switch (mesh ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : desc.PrimitiveTopologyType) {  // mesh: not used
+        // Type 19 is the console's rectangles, drawn as triangle lists through the geometry stage added above.
+        switch (mesh || rect_list ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : topology_type) {  // mesh: not used
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
         default:
-            log_once("primitive topology type not supported:", desc.PrimitiveTopologyType);
+            log_once("primitive topology type not supported:", topology_type);
             return E_INVALIDARG;
         }
         if (!mesh) {  // a mesh PSO has no index buffer: its strip cut is ignored
@@ -4095,7 +4131,7 @@ public:
                 return E_INVALIDARG;
             }
             if (r.FillMode != D3D12_FILL_MODE_SOLID ||
-                desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
+                topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
             // Target-independent rasterization is a separate pipeline path; do not silently ignore its count.
             if (r.ForcedSampleCount) return E_NOTIMPL;
         }
@@ -5825,7 +5861,13 @@ public:
             return false;
         }
         arena.mapped = static_cast<std::uint8_t*>(mapped);
-        std::memset(arena.mapped, 0, kArenaReserved);  // the zero page unbound vertex and index buffers read
+        std::memset(arena.mapped, 0, kZeroPage);  // the zero page unbound vertex and index buffers read
+        auto* indices = reinterpret_cast<std::uint32_t*>(arena.mapped + kZeroPage);
+        for (std::uint32_t i = 0; i < kQuadIndexCount; i += kQuadIndicesPerQuad) {
+            const std::uint32_t base = i / kQuadIndicesPerQuad * 4;
+            std::transform(leonida::quad_triangle_indices.begin(), leonida::quad_triangle_indices.end(), indices + i,
+                           [base](std::uint32_t index) { return base + index; });
+        }
         VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
@@ -5836,7 +5878,8 @@ public:
         length = 0;
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
-        state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
+        state_.context->set_zero_page(arena.buffer, 0, kZeroPage);
+        state_.context->set_quad_indices(arena.buffer, kZeroPage, kQuadIndexCount);
         return true;
     }
 

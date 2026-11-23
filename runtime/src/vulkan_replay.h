@@ -32,6 +32,7 @@
 
 #include "command_list.h"
 #include "depth24.h"
+#include "rect_list_geometry.h"
 #include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
@@ -43,6 +44,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
@@ -870,6 +872,10 @@ struct ReplayFunctions {
     VkBuffer zero_buffer = VK_NULL_HANDLE;
     VkDeviceSize zero_offset = 0;
     VkDeviceSize zero_size = 0;
+    // 32-bit triangle indices for non-indexed quad lists: 0, 1, 2, 0, 2, 3, then the same pattern for each quad.
+    VkBuffer quad_indices = VK_NULL_HANDLE;
+    VkDeviceSize quad_indices_offset = 0;
+    std::uint32_t quad_index_count = 0;
     std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
@@ -2183,6 +2189,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
+    // A non-indexed quad list is drawn from the shared triangle index buffer (emit).
+    if (!draw.indexed && !draw.mesh && draw.topology == topology_quad_list && !vk.quad_indices)
+        return ReplayResult::unresolved_resource;
     if (draw.indexed) {
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
@@ -2217,6 +2226,10 @@ inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
     case 11: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
     case 12: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
     case 13: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    // Rectangles draw as triangle lists through a geometry stage. Indexed quads draw as separate fans;
+    // emit() overrides non-indexed quads to a triangle list backed by the shared indices.
+    case topology_rect_list: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case topology_quad_list: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     }
 }
@@ -4146,7 +4159,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
             if (!draw->mesh) {
-                const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+                const VkPrimitiveTopology topology = draw->topology == topology_quad_list && !draw->indexed
+                    ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
                 vk.set_primitive_topology(command_buffer, topology);
                 const bool restart = draw->indexed && detail::strip_topology(topology) &&
                                      ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
@@ -4163,6 +4177,28 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+            } else if (draw->topology == topology_quad_list) {
+                if (draw->indexed) {
+                    // Indexed quads still read their vertices from the application's index buffer, one fan per quad.
+                    vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+                    for (std::uint32_t quad = 0; quad < draw->count / 4; ++quad)
+                        vk.draw_indexed(command_buffer, 4, draw->instances, draw->first + 4 * quad,
+                                        draw->base_vertex, draw->first_instance);
+                } else {
+                    // Both triangles start at the quad's first vertex for flat inputs. One draw also preserves
+                    // the original instance order, and VertexIndex - BaseVertex still gives 4q + k.
+                    constexpr std::uint32_t indices_per_quad = quad_triangle_indices.size();
+                    const std::uint32_t wanted = draw->count / 4;
+                    const std::uint32_t quads = std::min(wanted, vk.quad_index_count / indices_per_quad);
+                    if (quads < wanted)
+                        std::fprintf(stderr, "[rt] d3d12: a non-indexed quad list of %u quads draws only the first %u\n",
+                                     wanted, quads);
+                    if (quads) {
+                        vk.bind_index_buffer(command_buffer, vk.quad_indices, vk.quad_indices_offset, VK_INDEX_TYPE_UINT32);
+                        vk.draw_indexed(command_buffer, quads * indices_per_quad, draw->instances, 0,
+                                        std::int32_t(draw->first), draw->first_instance);
+                    }
+                }
             } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,

@@ -1266,6 +1266,14 @@ public:
         replay_.zero_size = size;
     }
 
+    // Pre-expanded 32-bit triangle indices for non-indexed quad lists (ReplayFunctions::quad_indices).
+    void set_quad_indices(VkBuffer buffer, VkDeviceSize offset, std::uint32_t count) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.quad_indices = buffer;
+        replay_.quad_indices_offset = offset;
+        replay_.quad_index_count = count;
+    }
+
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
     void set_color_attachment_format(std::function<bool(VkFormat)> check) {
         std::unique_lock lock(resource_mutex_);
