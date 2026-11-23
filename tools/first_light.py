@@ -145,8 +145,7 @@ def ensure_carve(game: str, work: str) -> str:
 
 
 def choose(index_path: str, vs: str, ps: str) -> list[dict]:
-    with open(index_path, encoding="utf-8") as f:
-        entries = json.load(f)
+    entries = load_json(index_path, "carve index", list, entry_keys=("stage", "name", "file"))
     by_stage_and_name = {(entry["stage"], entry["name"]): entry for entry in entries}
     requested = (("vs", vs), ("ps", ps))
     missing = [f"{stage} {name}" for stage, name in requested if (stage, name) not in by_stage_and_name]
