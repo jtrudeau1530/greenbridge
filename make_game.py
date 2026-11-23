@@ -484,9 +484,9 @@ def _linked(path: str) -> bool:
     return os.path.islink(path) or os.path.isjunction(path)
 
 
-def _tree_bytes(root: str, skip: tuple = ()) -> int:
-    """Bytes of the regular files under root, without following links or junctions (root's own names in skip are
-    left out). One os.scandir walk; on Windows the sizes come with the directory listing, so no file is opened."""
+def _tree_bytes(root: str, skip: tuple = (), ignore_suffix: str = "") -> int:
+    """Bytes of the regular files under root, without following links or junctions (root's own names in skip and
+    files ending in ignore_suffix are left out). One os.scandir walk; on Windows the sizes come with the directory listing, so no file is opened."""
     if _linked(root):
         return 0
     total, stack = 0, [(root, True)]
@@ -500,7 +500,7 @@ def _tree_bytes(root: str, skip: tuple = ()) -> int:
                             continue
                         if e.is_dir(follow_symlinks=False):
                             stack.append((e.path, False))
-                        elif e.is_file(follow_symlinks=False):
+                        elif e.is_file(follow_symlinks=False) and not (ignore_suffix and e.name.endswith(ignore_suffix)):
                             total += e.stat(follow_symlinks=False).st_size
                     except OSError:
                         continue
@@ -530,20 +530,29 @@ def _finished_pool_dirs(top: str) -> list:
 
 
 def assets_bytes_on_disk(work: str) -> int:
-    """Bytes a stopped assets stage has already written and a rerun will skip: only the output of steps whose
-    manifest or marker assets() checks before redoing them (an archive's models/textures manifest.json, a texture
-    pool's complete manifest, audio_manifest.json, ogg.done, xma.done). Other files under <work>/assets, such as a
-    step that stopped before its marker, are not counted, since the rerun writes that step again."""
+    """Bytes a stopped assets stage has already written and a rerun will keep, so they are not needed free again.
+    A model or texture folder counts, finished or not, when its decoder.sha256 matches the current decoder:
+    assets() deletes a folder with another or no fingerprint and exports it again, but for a matching one rpf9dump
+    skips every output that already exists (Util.WriteAtomic only renames complete files into place; a leftover
+    *.partial is deleted and written again, so it is not counted). Pools, audio and the other steps count only when
+    finished (a pool whose manifest ttpf_manifest() accepts, audio_manifest.json, ogg.done, xma.done); the unfinished
+    part of those is not counted, which is conservative."""
     out = os.path.join(work, "assets")
     if _linked(out):
         return 0
     total = 0
+    decoder = None
     for rel in MODEL_ARCHIVES:
         name = os.path.splitext(os.path.basename(rel))[0]
         for mode in ("models", "textures"):
             folder = os.path.join(out, name, mode)
-            if os.path.isfile(os.path.join(folder, "manifest.json")):
-                total += _tree_bytes(folder)
+            record = os.path.join(folder, DECODER_RECORD)
+            if not os.path.isfile(record):
+                continue   # no fingerprint: assets() exports this folder again, so none of it is kept
+            if decoder is None:   # read lazily: a work folder without exports never asks git for the decoder
+                decoder = decoder_digest()
+            if read_shader_setting(record) == decoder:
+                total += _tree_bytes(folder, ignore_suffix=".partial")
     for top in ("ttpf", "ttpf_pack"):
         total += sum(_tree_bytes(d) for d in _finished_pool_dirs(os.path.join(out, top)))
     audio = os.path.join(out, "audio")

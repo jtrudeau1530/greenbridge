@@ -808,6 +808,23 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
 
     OGG = "awc_opus.py finished\n"
     XMA = "rpf9dump xma finished\n"
+    DECODER = "current-decoder"
+
+    def setUp(self):
+        super().setUp()
+        # The fingerprint assets() compares each model and texture folder with, without asking git for it.
+        patcher = mock.patch("make_game.decoder_digest", return_value=self.DECODER)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def stamp(self, work, rel, fingerprint=None):
+        """The decoder.sha256 assets() writes before it exports a model or texture folder; returns its size."""
+        text = (self.DECODER if fingerprint is None else fingerprint) + "\n"
+        path = os.path.join(work, "assets", *rel.split("/"), make_game.DECODER_RECORD)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return len(text)
 
     def run_preflight(self, work, free_gb, wav=False, ffmpeg=True):
         usage = Usage(1000 * 2**30, (1000 - free_gb) * 2**30, free_gb * 2**30)
@@ -878,6 +895,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             os.makedirs(folder)
             with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8") as f:
                 f.write("{}")
+            self.stamp(work, f"{name}/models")
             real_scandir = os.scandir
 
             class Big:
@@ -1001,9 +1019,11 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.assertEqual(make_game.assets_bytes_on_disk(work), 0)  # no assets folder yet
             self.put(work, "levels/models/a.obj", 100)
             self.put(work, "levels/models/manifest.json", 7)
-            self.put(work, "levels/textures/b.dds", 50)                 # no manifest: the step reruns
+            r1 = self.stamp(work, "levels/models")
+            self.put(work, "levels/textures/b.dds", 50)                 # no fingerprint: exported again
             self.put(work, "common/models/c.obj", 30)
             self.put(work, "common/models/manifest.json", 3)
+            r2 = self.stamp(work, "common/models")
             pool = self.put_pool(work, "ttpf/pool", {"d.dds": 4096})
             hashed = self.put_pool(work, "ttpf_pack/core/pool~0123456789ab/pool", {"e.dds": 200})
             self.put_pool(work, "ttpf/half", {"f.dds": 900}, promised=["f.dds", "g.dds"])  # g.dds missing
@@ -1017,7 +1037,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.put(work, "unrelated.bin", 5000)
             with open(os.path.join(work, "outside.bin"), "wb") as f:     # not under assets
                 f.write(b"\0" * 999)
-            expected = (100 + 7) + (30 + 3) + (4096 + pool) + (200 + hashed) + (9 + 60 + 1) + 80
+            expected = (100 + 7 + r1) + (30 + 3 + r2) + (4096 + pool) + (200 + hashed) + (9 + 60 + 1) + 80
             self.assertEqual(make_game.assets_bytes_on_disk(work), expected)
 
     def test_unrelated_files_under_assets_are_not_credited(self):
@@ -1025,21 +1045,81 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         with tempfile.TemporaryDirectory() as work:
             self.write_markers(work, xma=None)
             self.put(work, "big.bin", 4096)
-            self.put(work, "levels/textures/abandoned.dds", 4096)    # a step that stopped before its manifest
+            self.put(work, "levels/textures/abandoned.dds", 4096)    # no fingerprint: exported again
             self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
             self.assert_fails(self.run_preflight, work, free_gb=10, match="about 330 GB is needed")
+
+    # A model step finished with 96 GB and a texture step stopped with 54 GB of final .dds files before its manifest.
+    # Sizes are faked where folders are listed; nothing big is written.
+    def mixed_resume(self, work, texture_fingerprint=None, model_fingerprint=None, with_partial=False):
+        models = os.path.join(work, "assets", "levels", "models")
+        textures = os.path.join(work, "assets", "levels", "textures")
+        self.put(work, "levels/models/manifest.json", 1)
+        self.stamp(work, "levels/models", model_fingerprint)
+        self.put(work, "levels/textures/a.dds", 1)                       # no manifest: the step stopped
+        self.stamp(work, "levels/textures", texture_fingerprint)
+        if with_partial:
+            self.put(work, "levels/textures/b.dds.partial", 1)           # being written when it was stopped
+        sizes = {os.path.join(models, "manifest.json"): 96 * 2**30 - 1,
+                 os.path.join(textures, "a.dds"): 54 * 2**30,
+                 os.path.join(textures, "b.dds.partial"): 40 * 2**30}
+        real_scandir = os.scandir
+
+        class Entry:
+            def __init__(self, real):
+                self.real, self.name, self.path = real, real.name, real.path
+                self.is_symlink, self.is_junction = real.is_symlink, real.is_junction
+                self.is_dir, self.is_file = real.is_dir, real.is_file
+
+            def stat(self, follow_symlinks=True):
+                st = self.real.stat(follow_symlinks=follow_symlinks)
+                return mock.Mock(st_size=sizes.get(self.path, st.st_size))
+
+        def scandir(path="."):
+            listing = real_scandir(path)
+            if os.path.normcase(os.fspath(path)) not in (os.path.normcase(models), os.path.normcase(textures)):
+                return listing
+            wrapped = mock.MagicMock()
+            wrapped.__enter__.return_value = [Entry(e) for e in listing]
+            listing.close()
+            return wrapped
+        return mock.patch("os.scandir", scandir)
+
+    def test_mixed_resume_credits_the_finished_and_the_reusable_unfinished_output_once(self):
+        # 30 + 300 - 96 - 54 = 180 GB; the record files are a few bytes. Finished-only credit asked for 234 GB and a
+        # double credit for the finished step accepted 84 GB.
+        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work, with_partial=True):
+            self.assertEqual(make_game.assets_bytes_on_disk(work) // 2**30, 150)
+            self.run_preflight(work, free_gb=180)
+            self.assert_fails(self.run_preflight, work, free_gb=179, match="about 180 GB is needed")
+
+    def test_unfinished_output_of_another_decoder_is_not_credited(self):
+        # assets() deletes a folder whose fingerprint differs and exports it again, so only the finished step counts.
+        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work, texture_fingerprint="older-decoder"):
+            self.run_preflight(work, free_gb=234)
+            self.assert_fails(self.run_preflight, work, free_gb=233, match="about 234 GB is needed")
+
+    def test_a_finished_step_of_another_decoder_is_not_credited(self):
+        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work, model_fingerprint="older-decoder"):
+            self.run_preflight(work, free_gb=276)       # 30 + 300 - 54
+            self.assert_fails(self.run_preflight, work, free_gb=275, match="about 276 GB is needed")
+
+    def test_wav_ignores_the_unfinished_output_too(self):
+        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work):
+            self.assert_fails(self.run_preflight, work, free_gb=329, wav=True, match="about 330 GB is needed")
 
     def test_assets_bytes_on_disk_does_not_follow_a_linked_folder(self):
         with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:
             with open(os.path.join(elsewhere, "big.bin"), "wb") as f:
                 f.write(b"\0" * 5000)
             self.put(work, "levels/models/manifest.json", 7)
+            record = self.stamp(work, "levels/models")
             try:
                 os.symlink(elsewhere, os.path.join(work, "assets", "levels", "models", "link"),
                            target_is_directory=True)
             except (OSError, NotImplementedError):
                 self.skipTest("symbolic links are not available here")
-            self.assertEqual(make_game.assets_bytes_on_disk(work), 7)
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 7 + record)
 
     def test_assets_bytes_on_disk_does_not_follow_a_junction(self):
         if os.name != "nt":
@@ -1049,10 +1129,11 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             with open(os.path.join(elsewhere, "big.bin"), "wb") as f:
                 f.write(b"\0" * 5000)
             self.put(work, "levels/models/manifest.json", 7)
+            record = self.stamp(work, "levels/models")
             junction = os.path.join(work, "assets", "levels", "models", "junction")
             _winapi.CreateJunction(elsewhere, junction)
             try:
-                self.assertEqual(make_game.assets_bytes_on_disk(work), 7)
+                self.assertEqual(make_game.assets_bytes_on_disk(work), 7 + record)
             finally:
                 os.rmdir(junction)          # removes the junction, not its target
 
