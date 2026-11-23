@@ -3019,18 +3019,65 @@ void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
 void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(18);
+    D3D12_SHADER_RESOURCE_VIEW_DESC typed{};
+    D3D12_RESOURCE_DESC rd{};
+    if (!desc && resource) {
+        if (const DXGI_FORMAT f = castable_view_format(resource, &rd); f != DXGI_FORMAT_UNKNOWN) {
+            typed.Format = f;
+            typed.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (rd.DepthOrArraySize > 1) {
+                typed.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                typed.Texture2DArray.MipLevels = UINT(-1);
+                typed.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+            } else {
+                typed.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                typed.Texture2D.MipLevels = UINT(-1);
+            }
+            desc = &typed;
+        }
+    }
     self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
 }
 
 void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resource* counter,
                       const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(19);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC typed{};
+    if (desc && (desc->Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || desc->Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
+        typed = *desc;
+        typed.Format = desc->Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? DXGI_FORMAT_R8G8B8A8_UNORM
+                                                                       : DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc = &typed;
+    } else if (!desc && resource) {
+        D3D12_RESOURCE_DESC rd{};
+        if (const DXGI_FORMAT f = castable_view_format(resource, &rd); f != DXGI_FORMAT_UNKNOWN && rd.DepthOrArraySize == 1) {
+            typed.Format = f;
+            typed.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            desc = &typed;
+        }
+    }
     self->real->CreateUnorderedAccessView(resource, counter, desc, translate_cpu_handle(self, dest));
 }
 
 void proxy_create_rtv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(20);
+    D3D12_RENDER_TARGET_VIEW_DESC typed{};
+    if ((!desc || desc->Format == DXGI_FORMAT_UNKNOWN) && resource) {
+        D3D12_RESOURCE_DESC rd{};
+        if (const DXGI_FORMAT f = castable_view_format(resource, &rd); f != DXGI_FORMAT_UNKNOWN) {
+            if (desc) {
+                typed = *desc;
+            } else if (rd.DepthOrArraySize > 1) {
+                typed.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                typed.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+            } else {
+                typed.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            }
+            typed.Format = f;
+            desc = &typed;
+        }
+    }
     self->real->CreateRenderTargetView(resource, desc, translate_cpu_handle(self, dest));
 }
 
@@ -3496,6 +3543,29 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
     return hr;
 }
 
+// The TYPELESS family of an RGBA8/BGRA8 render target or UAV texture, else its own format.
+DXGI_FORMAT castable_texture_format(const D3D12_RESOURCE_DESC& d) {
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+        !(d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)))
+        return d.Format;
+    if (d.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || d.Format == DXGI_FORMAT_R8G8B8A8_UNORM)
+        return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    if (d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM)
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    return d.Format;
+}
+
+// The UNORM format a view of a TYPELESS RGBA8/BGRA8 texture takes when the title names none, else UNKNOWN.
+DXGI_FORMAT castable_view_format(ID3D12Resource* resource, D3D12_RESOURCE_DESC* out_desc = nullptr) {
+    if (!resource) return DXGI_FORMAT_UNKNOWN;
+    const D3D12_RESOURCE_DESC d = resource->GetDesc();
+    if (out_desc) *out_desc = d;
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return DXGI_FORMAT_UNKNOWN;
+    if (d.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) return DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (d.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS) return DXGI_FORMAT_B8G8R8A8_UNORM;
+    return DXGI_FORMAT_UNKNOWN;
+}
+
 // A texture's initial state as the PC accepts it: a console state with buffer-only or unknown bits becomes COMMON.
 D3D12_RESOURCE_STATES pc_texture_state(D3D12_RESOURCE_DIMENSION dimension, std::uint32_t state) {
     if (dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return static_cast<D3D12_RESOURCE_STATES>(state);
@@ -3535,10 +3605,19 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                      "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
+    // A target or UAV may be viewed as UNORM and as sRGB on the console, whatever it was made as.
+    const DXGI_FORMAT asked = pc_desc.Format;
+    if (!(heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY)) pc_desc.Format = castable_texture_format(pc_desc);
     return create_committed_through_xmem(self, 76, static_cast<std::uint32_t>(heap_flags), pc_desc, *riid, out, [&] {
-        return self->real->CreateCommittedResource(
-            heap_properties, heap_flags, &pc_desc,
-            pc_texture_state(pc_desc.Dimension, static_cast<std::uint32_t>(initial_state)), clear_value, *riid, out);
+        const D3D12_RESOURCE_STATES state = pc_texture_state(pc_desc.Dimension, static_cast<std::uint32_t>(initial_state));
+        HRESULT hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, state, clear_value,
+                                                         *riid, out);
+        if (FAILED(hr) && asked != pc_desc.Format) {
+            D3D12_RESOURCE_DESC typed = pc_desc;
+            typed.Format = asked;
+            hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &typed, state, clear_value, *riid, out);
+        }
+        return hr;
     });
 }
 
