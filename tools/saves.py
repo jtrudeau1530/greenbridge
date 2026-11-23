@@ -585,7 +585,10 @@ def import_saves(args):
         if a == '--out':
             out = value(a)
         elif a == '--map':
-            k, v = value(a).split('=', 1)
+            spec = value(a)
+            if '=' not in spec:
+                raise ValueError(f'import: --map needs OLD=CONTAINER/BLOB, got {spec!r}')
+            k, v = spec.split('=', 1)
             c, _, b = v.partition('/')
             maps[k] = (c, b or None)
         elif a == '--with-packed':

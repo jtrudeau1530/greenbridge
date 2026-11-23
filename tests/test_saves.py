@@ -638,6 +638,19 @@ class ImportTest(unittest.TestCase):
             self.assertIn("--out needs a value", result.stderr)
             self.assertFalse(os.path.exists(os.path.join(tmp, "--dry-run")))
 
+    def test_import_map_needs_old_equals_new(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            tool = os.path.join(ROOT, "tools", "saves.py")
+            result = subprocess.run(
+                [sys.executable, "-I", tool, "import", story, "--map", "SLOT3", "--dry-run"],
+                cwd=tmp, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("--map needs OLD=CONTAINER/BLOB", result.stderr)
+            self.assertIn("SLOT3", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
     def test_import_layout_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             story, prof, jsav = self._folders(tmp)
