@@ -241,6 +241,16 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(stats["verified_entities"], 10)
         self.assertEqual(stats["unresolved_entities"], 2)
 
+    def test_archetype_counts_skip_overflowing_values(self):
+        name = WN.joaat_hex("synthetic_prop")
+        data = json.loads(f'{{"archetypes":{{"00000100":1e309,"00000200":-1e309,"{name}":7}}}}')
+
+        stats = WN.resolve_archetypes(data, self.dictionary)
+
+        self.assertEqual(stats["entities"], 7)
+        self.assertEqual(stats["unique_hashes"], 1)
+        self.assertEqual(stats["resolved_exact_entities"], 7)
+
     def test_archetype_32_only_is_rejected_by_key64(self):
         dictionary = WN.NameDictionary()
         dictionary.add("PLAYER")

@@ -519,7 +519,7 @@ def resolve_archetypes(data, dictionary: NameDictionary, *, include_derived: boo
         try:
             h = int(str(raw_hash), 16) & MASK32
             count = int(raw_count)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if count <= 0:
             continue
