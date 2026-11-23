@@ -31,7 +31,8 @@ class DocsEncoding(unittest.TestCase):
         self.assertGreater(len(paths), 1)
         for path in paths:
             with self.subTest(path=os.path.basename(path)):
-                text = open(path, encoding="utf-8").read()
+                with open(path, encoding="utf-8") as handle:
+                    text = handle.read()
                 for bad, good in MOJIBAKE:
                     self.assertNotIn(bad, text, f"{os.path.basename(path)}: {bad!r} should be {good!r}")
 
