@@ -9,6 +9,8 @@ otherwise.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -123,6 +125,27 @@ class LlvmProbeTests(unittest.TestCase):
                 outcome = subprocess.CompletedProcess(["llvm-mc"], code, "", diagnostic)
                 with patch.object(ic.subprocess, "run", return_value=outcome):
                     self.assertEqual(ic.probe_llvm_mc("llvm-mc", [name]), {name: expected})
+
+
+class LlvmStallTests(unittest.TestCase):
+    def test_stalled_llvm_mc_is_one_error_not_a_traceback(self) -> None:
+        stalled = subprocess.TimeoutExpired(["llvm-mc"], 30)
+        with patch.object(ic.subprocess, "run", side_effect=stalled) as run:
+            probe = ic.probe_llvm_mc("llvm-mc", ["s_endpgm", "v_add_f32"])
+        self.assertEqual(list(probe), ["error"])
+        self.assertIn("did not answer", probe["error"])
+        self.assertEqual(run.call_count, 1)      # the remaining names are not each given the full timeout again
+
+    def test_main_reports_the_stall_next_to_each_name(self) -> None:
+        xml, src = _fixture(FIXTURE_XML, ".xml"), _fixture(FIXTURE_SRC, ".py")
+        self.addCleanup(os.unlink, xml)
+        self.addCleanup(os.unlink, src)
+        stalled = subprocess.TimeoutExpired(["llvm-mc"], 30)
+        out = io.StringIO()
+        with patch.object(ic.subprocess, "run", side_effect=stalled), contextlib.redirect_stdout(out):
+            code = ic.main(["--isa", xml, "--translator", src, "--llvm-mc", "llvm-mc"])
+        self.assertEqual(code, 0)
+        self.assertIn("did not answer", out.getvalue())
 
 
 class FixtureTests(unittest.TestCase):
