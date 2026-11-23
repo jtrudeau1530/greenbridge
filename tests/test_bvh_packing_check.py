@@ -256,6 +256,11 @@ class TestArchive(unittest.TestCase):
                 self.assertEqual(C.main([good, "--json", good]), 2)          # never overwrite an input
                 self.assertEqual(C.main([good, "--limit", "5"]), 2)          # --limit is for an archive
                 self.assertEqual(C.main([os.path.join(d, "missing.bin")]), 2)
+                self.assertEqual(C.main([good, "--json", d]), 2)             # --json is a directory
+                self.assertEqual(C.main([good, "--json", os.path.join(d, "no_such_dir", "r.json")]), 2)
+                self.assertEqual(C.main([good, "--json", os.path.join(d, ".", os.path.basename(good))]), 2)
+                if sys.platform == "win32":
+                    self.assertEqual(C.main([good, "--json", good.upper()]), 2)  # case-distinct spelling on Windows
 
 
 if __name__ == "__main__":
