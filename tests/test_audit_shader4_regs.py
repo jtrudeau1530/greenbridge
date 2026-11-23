@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -232,6 +233,121 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(len(stderr.splitlines()), 1)
             self.assertIn("cannot write", stderr)
             self.assertTrue(os.path.isdir(a_folder))
+
+    def make_temp_listing(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        disasm = Path(tmp.name) / "disasm"
+        disasm.mkdir()
+        listing = disasm / "cs_sample.s"
+        listing.write_bytes(b"\ts_endpgm\n")
+        return listing
+
+    def assert_json_refuses_listing(self, listing, output):
+        original = listing.read_bytes()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = audit_mod.main([str(listing.parent), "--json", str(output)])
+        self.assertEqual((rc, listing.read_bytes() == original), (2, True))
+        self.assertIn("must not overwrite an input listing", err.getvalue())
+
+    def test_json_cannot_overwrite_a_listing(self):
+        listing = self.make_temp_listing()
+        self.assert_json_refuses_listing(listing, listing)
+
+    def test_json_cannot_overwrite_a_listing_via_equivalent_path(self):
+        listing = self.make_temp_listing()
+        disasm = listing.parent
+        self.assert_json_refuses_listing(listing, disasm / ".." / disasm.name / listing.name)
+
+    def test_json_cannot_overwrite_a_listing_via_hard_link(self):
+        listing = self.make_temp_listing()
+        output = listing.parent.parent / "alias.json"
+        try:
+            os.link(listing, output)
+        except (AttributeError, NotImplementedError, OSError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        self.assert_json_refuses_listing(listing, output)
+
+    def test_json_can_replace_a_separate_report(self):
+        listing = self.make_temp_listing()
+        original = listing.read_bytes()
+        output = listing.with_name("report.json")
+        output.write_bytes(b"{}\n")
+
+        self.assertEqual(audit_mod.main([str(listing.parent), "--json", str(output)]), 0)
+        self.assertEqual(json.loads(output.read_bytes())["cs"]["count"], 1)
+        self.assertEqual(listing.read_bytes(), original)
+
+    def make_metadata_inputs(self, custom=False):
+        disasm = self.make_temp_listing().parent
+        root = disasm.parent
+        fssm = root / ("custom-fssm" if custom else "fssm")
+        dxbc = root / "custom-dxbc" if custom else root
+        fssm.mkdir()
+        dxbc.mkdir(exist_ok=True)
+        (root / "index.json").write_bytes(b'{"shader_sample":{"stage":"ms"}}\n')
+        (disasm / "index.json").write_bytes(b'{"shader_sample":{"stage":"cs"}}\n')
+        (disasm / "shader_sample.s").write_bytes(b"\ts_endpgm\n")
+        for stem in ("cs_sample", "shader_sample"):
+            (fssm / (stem + ".fssm")).write_bytes(bytes(0x148))
+            (dxbc / (stem + ".dxbc")).write_bytes(make_dxbc([make_ms_psv0()]))
+        return disasm, fssm, dxbc
+
+    def assert_json_refuses_input(self, disasm, source, output, *options):
+        originals = {path: path.read_bytes() for path in disasm.parent.rglob("*") if path.is_file()}
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = audit_mod.main([str(disasm), *options, "--json", str(output)])
+        changed = [str(path.relative_to(disasm.parent)) for path, data in originals.items()
+                   if path.read_bytes() != data]
+        self.assertEqual((rc, changed), (2, []))
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.assertIn("--json", err.getvalue())
+        self.assertIn("must not overwrite an input", err.getvalue())
+        self.assertIn(source.name, err.getvalue())
+        self.assertIn(output.name, err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_json_refuses_both_stage_indexes(self):
+        for location in ("parent", "disasm"):
+            with self.subTest(location=location):
+                disasm, _, _ = self.make_metadata_inputs()
+                source = (disasm.parent if location == "parent" else disasm) / "index.json"
+                self.assert_json_refuses_input(disasm, source, source)
+
+    def test_json_refuses_selected_metadata_in_default_and_custom_directories(self):
+        for custom in (False, True):
+            for name in ("cs_sample.fssm", "shader_sample.fssm", "shader_sample.dxbc"):
+                with self.subTest(custom=custom, name=name):
+                    disasm, fssm, dxbc = self.make_metadata_inputs(custom)
+                    source = (fssm if name.endswith(".fssm") else dxbc) / name
+                    options = ("--fssm", str(fssm), "--dxbc", str(dxbc)) if custom else ()
+                    output = source.parent / ".." / source.parent.name / name if custom else source
+                    self.assert_json_refuses_input(disasm, source, output, *options)
+
+    def test_json_refuses_metadata_via_hard_link(self):
+        disasm, _, dxbc = self.make_metadata_inputs()
+        source = dxbc / "shader_sample.dxbc"
+        output = disasm.parent / "alias.json"
+        try:
+            os.link(source, output)
+        except (AttributeError, NotImplementedError, OSError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        self.assert_json_refuses_input(disasm, source, output)
+
+    def test_json_allows_metadata_not_selected_by_stage_or_limit(self):
+        for name in ("cs_sample.dxbc", "shader_sample.fssm", "shader_sample.dxbc"):
+            with self.subTest(name=name):
+                disasm, fssm, dxbc = self.make_metadata_inputs()
+                output = (fssm if name.endswith(".fssm") else dxbc) / name
+                options = [] if name == "cs_sample.dxbc" else ["--limit", "1"]
+                self.assertEqual(audit_mod.main([str(disasm), *options, "--json", str(output)]), 0)
+                report = json.loads(output.read_bytes())
+                self.assertEqual(report["cs"]["count"], 1)
+                self.assertEqual(report["ms"]["count"], int(not options))
+
+    def test_json_refuses_a_listing_even_when_limit_excludes_it(self):
+        listing = self.make_temp_listing()
+        self.assert_json_refuses_input(listing.parent, listing, listing, "--limit", "0")
 
     def test_synthetic_cs_ms_gs_audit_and_s3_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
