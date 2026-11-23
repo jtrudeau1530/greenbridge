@@ -41,7 +41,10 @@ class Reference(unittest.TestCase):
         self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0xB3800000}), 0x3F7FFFFF)     # -2^-24 -> below 1.0
         self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0x80000000}), 0)              # -0 -> +0
         self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0x4B7FFFFF}), 0)              # an integer
-        self.assertTrue(d.is_nan(one("v_fract_f32_e32 v1, v2", v={2: d.NINF})))
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: d.NINF}), 0xFFC00000)       # gfx1036: exactly this
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: d.PINF}), 0xFFC00000)
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0x7F800001}), 0x7F800001)     # a signalling NaN stays
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0xFFC00123}), 0xFFC00123)     # a NaN comes back as is
         self.assertEqual(one("v_fract_f32_e64 v1, -v2 mul:2", v={2: 0x3F000000}), 0x3F800000)  # 0.5 * 2
 
     def test_frexp(self):

@@ -13,8 +13,8 @@ float arithmetic (add, mul, fma, floor, the transcendentals, v_cmp_class_f32 wit
 covers the ops it does not generate.
 
 What is modelled, per instruction (OPS, --list-ops):
-  * v_fract_f32: S0 - floor(S0), at most 0x3f7fffff (a tiny negative S0 would round to 1.0); +-inf and NaN give a
-    NaN; an integer gives +0.
+  * v_fract_f32: S0 - floor(S0), at most 0x3f7fffff (a tiny negative S0 would round to 1.0); +-inf gives
+    0xffc00000, a NaN comes back unchanged (a signalling one too); an integer gives +0.
   * v_frexp_mant_f32 / v_frexp_exp_i32_f32: S0 = mant * 2^exp, mant in [0.5, 1) with S0's sign. +-0 gives +-0 and
     0; +-inf and NaN give S0 (mant) and 0 (exp).
   * v_ldexp_f32 (VOP3 only): S0 * 2^S1, S1 a signed integer; overflow is +-inf, +-inf / +-0 / NaN pass through.
@@ -177,8 +177,12 @@ def round_f32(fr, neg_zero=False):
 
 
 def fract(w):
-    if is_nan(w) or is_inf(w):
-        return QNAN
+    # Measured on gfx1036 (docs/design.md, "Float min/max/med3 with NaN, v_fract"): a NaN comes back unchanged, a
+    # signalling one too (v_cmp_class_f32 still reports class bit 0), and +-inf gives exactly 0xffc00000.
+    if is_nan(w):
+        return w
+    if is_inf(w):
+        return 0xFFC00000
     fr = to_frac(w)
     r = fr - math.floor(fr)
     if r == 0:
