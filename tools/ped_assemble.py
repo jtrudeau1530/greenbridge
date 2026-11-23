@@ -1312,7 +1312,11 @@ def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
     def read_row(offset):
         vals = unpack(bin_chunk, offset)
         if denom is not None:
-            vals = tuple(v / denom for v in vals)
+            if ctype in (COMPONENT_BYTE, COMPONENT_SHORT):
+                # Both signed minimum encodings represent -1 in glTF's normalized range.
+                vals = tuple(max(v, -denom) / denom for v in vals)
+            else:
+                vals = tuple(v / denom for v in vals)
         return vals[0] if n_comp == 1 else vals
 
     def start_of(section):
