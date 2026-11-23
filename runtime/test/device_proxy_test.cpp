@@ -200,25 +200,12 @@ int main(int argc, char** argv) {
     const LUID real_luid = real ? real->GetAdapterLuid() : LUID{};
     check(proxy_luid.LowPart == real_luid.LowPart && proxy_luid.HighPart == real_luid.HighPart,
           "slot 43 forwards GetAdapterLuid (struct return)");
-    // Slots 25 and 26 return a struct wider than 8 bytes. The console title calls them with the C ABI: the hidden
+    // Slot 25 returns a struct wider than 8 bytes. The console title calls it with the C ABI: the hidden
     // return pointer first (RCX), then the device (RDX), then the arguments, and the buffer comes back in RAX
-    // (measured for slot 26 on the retail executable). Call them that way through raw function pointers and compare
-    // with the PC device's own answers.
+    // (measured for slot 26 on the retail executable). Call slot 25 that way through a raw function pointer and compare
+    // with the PC device's own answer.
     check(rt::d3d12_xs::device_slot_overridden(25), "device slot 25 is the C-ABI GetResourceAllocationInfo override");
-    check(rt::d3d12_xs::device_slot_overridden(26), "device slot 26 is the C-ABI GetCustomHeapProperties override");
     if (real) {
-        using HeapPropsFn = D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
-        auto get_heap_props = reinterpret_cast<HeapPropsFn>(proxy_vtbl[26]);
-        for (D3D12_HEAP_TYPE type : {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK}) {
-            D3D12_HEAP_PROPERTIES got;
-            std::memset(&got, 0xcd, sizeof(got));
-            D3D12_HEAP_PROPERTIES* returned = get_heap_props(&got, device.Get(), 1, type);
-            const D3D12_HEAP_PROPERTIES want = real->GetCustomHeapProperties(1, type);
-            check(returned == &got, "slot 26 returns the caller's buffer in RAX");
-            check(std::memcmp(&got, &want, sizeof(got)) == 0,
-                  "slot 26 (C ABI) writes the PC device's GetCustomHeapProperties into the caller's buffer");
-        }
-
         using AllocInfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
                                                                      const D3D12_RESOURCE_DESC*);
         auto get_alloc_info = reinterpret_cast<AllocInfoFn>(proxy_vtbl[25]);
@@ -230,11 +217,8 @@ int main(int argc, char** argv) {
         check(got.SizeInBytes == want.SizeInBytes && got.Alignment == want.Alignment,
               "slot 25 (C ABI) writes the PC device's GetResourceAllocationInfo into the caller's buffer");
 
-        // The runtime's own code calls the proxy through d3d12.h (PC form: this, then the return buffer). Both
-        // slots still answer that form.
-        const D3D12_HEAP_PROPERTIES pc_props = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
-        const D3D12_HEAP_PROPERTIES pc_want = real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
-        check(std::memcmp(&pc_props, &pc_want, sizeof(pc_props)) == 0, "slot 26 still answers the PC (C++) form");
+        // The runtime's own code calls the proxy through d3d12.h (PC form: this, then the return buffer). Slot 25
+        // still answers that form.
         const D3D12_RESOURCE_ALLOCATION_INFO pc_info = device->GetResourceAllocationInfo(0, 1, &desc);
         check(pc_info.SizeInBytes == want.SizeInBytes && pc_info.Alignment == want.Alignment,
               "slot 25 still answers the PC (C++) form");
@@ -246,6 +230,41 @@ int main(int argc, char** argv) {
     hr = device->CreateReservedResource(&reserved_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                         IID_PPV_ARGS(reserved.GetAddressOf()));
     check(SUCCEEDED(hr) && reserved != nullptr, "slot 30 forwards CreateReservedResource (stack arguments)");
+
+    // Slot 26 the way the retail executable calls GetCustomHeapProperties: the buffer for the struct in RCX, the
+    // device in RDX, for the three heap types it asks about. The answer is the PC device's own, and nothing but
+    // the struct is written (the buffer sits in a pattern). On main this call read the PC vtable through the buffer.
+    check(rt::d3d12_xs::device_slot_overridden(26), "device slot 26 takes the console's struct-return form");
+    using XboxGetCustomHeapPropertiesFn =
+        D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
+    auto get_custom_heap = reinterpret_cast<XboxGetCustomHeapPropertiesFn>(proxy_vtbl[26]);
+    const D3D12_HEAP_TYPE heap_types[] = {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK};
+    bool console_returns_buffer = true, console_matches_pc = real != nullptr, console_writes_only_struct = true;
+    for (const D3D12_HEAP_TYPE type : heap_types) {
+        struct Padded {
+            D3D12_HEAP_PROPERTIES value;
+            std::uint8_t after[64];
+        } padded;
+        std::memset(&padded, 0xA5, sizeof(padded));
+        console_returns_buffer = get_custom_heap(&padded.value, device.Get(), 1, type) == &padded.value &&
+                                 console_returns_buffer;
+        const D3D12_HEAP_PROPERTIES want = real ? real->GetCustomHeapProperties(1, type) : D3D12_HEAP_PROPERTIES{};
+        console_matches_pc = console_matches_pc && std::memcmp(&padded.value, &want, sizeof(want)) == 0;
+        for (const std::uint8_t byte : padded.after)
+            console_writes_only_struct = console_writes_only_struct && byte == 0xA5;
+    }
+    check(console_returns_buffer, "slot 26 console form returns the buffer's address");
+    check(console_matches_pc, "slot 26 console form writes the PC device's DEFAULT, UPLOAD and READBACK properties");
+    check(console_writes_only_struct, "slot 26 console form writes nothing past the struct");
+    check(rt::d3d12_xs::device_slot_hits(26) == 3, "slot 26 hit counter is 3");
+    check(rt::d3d12_xs::is_device_proxy(device.Get()) && rt::d3d12_xs::device_proxy_real_device(device.Get()) == real,
+          "the proxy is intact after the console-form calls");
+    // A PC C++ call through the proxy (the proxy in RCX, the buffer in RDX) is still forwarded.
+    const D3D12_HEAP_PROPERTIES pc_form = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
+    const D3D12_HEAP_PROPERTIES pc_want = real ? real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD)
+                                               : D3D12_HEAP_PROPERTIES{};
+    check(real && std::memcmp(&pc_form, &pc_want, sizeof(pc_want)) == 0 && rt::d3d12_xs::device_slot_hits(26) == 4,
+          "slot 26 PC form still forwards GetCustomHeapProperties");
 
     // Slot 14: descriptor heap through the proxy. The proxy wraps the real PC heap for the handle ABI.
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};

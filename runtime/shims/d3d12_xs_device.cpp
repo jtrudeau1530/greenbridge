@@ -4,8 +4,8 @@
 // receives the proxy in RCX, replaces it with the PC device pointer from offset 8, and tail-calls the PC method at
 // the same index through a 15-argument integer prototype. Every PC D3D12 device method takes integer/pointer
 // arguments only, so the x64 registers and stack words line up exactly. The measured exceptions are IUnknown (0-2),
-// slot 14 (which wraps the heap), 62 and 76, the struct-returning slots 25 and 26 (the title calls them with the C
-// ABI, hidden return pointer first: see "Struct-returning device methods" below), plus the heap proxy's 9/10
+// slot 14 (which wraps the heap), 62 and 76, 26 (the title passes the return buffer in RCX and the device in RDX), the
+// struct-returning slot 25 (same C ABI form: see "Struct-returning device methods" below), plus the heap proxy's 9/10
 // conversion from the PC hidden-pointer form to the Xbox RAX form. Slots 8/75 (command queues), 36 (fences) and 32
 // (a shared fence) wrap what they create in queue and fence proxies built the same way, and slots 31/34/35/45/46/50
 // hand the real objects behind heap, queue and fence proxies to the real device (see the command queue and fence
@@ -1483,6 +1483,21 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// Device slot 26, GetCustomHeapProperties, as the retail executable calls it. Measured on 1.0.2.1 under
+// gta6rt --run with a register probe in this slot's thunk: three calls right after device creation, each with the
+// device proxy in RDX and not in RCX, R8 = 1 and R9 = 1, 2, 3 (node mask 1; DEFAULT, UPLOAD, READBACK). So the
+// buffer for the returned D3D12_HEAP_PROPERTIES is in RCX and the device in RDX. That is how x64 passes them to a
+// plain function that takes the device as its first argument and returns a struct; a PC C++ method has the device
+// in RCX and the buffer in RDX. The forwarder took RCX for the proxy, read the PC vtable out of the title's stack
+// buffer and faulted. The buffer's address goes back in RAX, as that convention returns it; what the title does with
+// RAX is not measured.
+D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* out, DeviceProxy* self,
+                                                        UINT node_mask, D3D12_HEAP_TYPE heap_type) {
+    note_slot(26);
+    *out = self->real->GetCustomHeapProperties(node_mask, heap_type);
+    return out;
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1533,6 +1548,14 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
     } else {
+        if constexpr (Slot == 26) {
+            // The console form has the device in RDX. A PC C++ caller has the proxy in RCX and its return buffer in
+            // RDX; that call goes to the forwarder below, as before.
+            if (is_device_proxy(reinterpret_cast<const void*>(a1)))
+                return reinterpret_cast<std::uint64_t>(proxy_get_custom_heap_properties(
+                    reinterpret_cast<D3D12_HEAP_PROPERTIES*>(self), reinterpret_cast<DeviceProxy*>(a1),
+                    static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3))));
+        }
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
@@ -1596,7 +1619,8 @@ void fill_vtable(void** vtable, std::index_sequence<I...>) {
 // returned in RAX, as both conventions require.
 //   slot 25 GetResourceAllocationInfo -> D3D12_RESOURCE_ALLOCATION_INFO (16 bytes): same rule as slot 26 (inferred,
 //           no call site measured yet)
-//   slot 26 GetCustomHeapProperties   -> D3D12_HEAP_PROPERTIES (20 bytes): measured
+//   slot 26 GetCustomHeapProperties   -> D3D12_HEAP_PROPERTIES (20 bytes): measured; it has its own thunk above
+//           (proxy_get_custom_heap_properties), not this one
 // Not changed: slot 43 GetAdapterLuid (an 8-byte LUID; by the same rule the title would expect it in RAX, but no call
 // site is measured yet, so it still forwards in the PC form).
 void** get_vtable();
@@ -1644,21 +1668,11 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     return call.ret;
 }
 
-void* WINAPI proxy_get_custom_heap_properties(std::uint64_t a0, std::uint64_t a1, std::uint64_t node_mask,
-                                              std::uint64_t heap_type) {
-    note_slot(26);
-    const StructReturnCall call = struct_return_call(a0, a1);
-    *static_cast<D3D12_HEAP_PROPERTIES*>(call.ret) = call.self->real->GetCustomHeapProperties(
-        static_cast<UINT>(node_mask), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(heap_type)));
-    return call.ret;
-}
-
 void** get_vtable() {
     static void** vtable = [] {
         static void* storage[kMaxSlots];
         fill_vtable(storage, std::make_index_sequence<kMaxSlots>{});
         storage[25] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info);
-        storage[26] = reinterpret_cast<void*>(&proxy_get_custom_heap_properties);
         return storage;
     }();
     return vtable;
@@ -1783,8 +1797,8 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 ||
+        slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 75 || slot == 76)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
