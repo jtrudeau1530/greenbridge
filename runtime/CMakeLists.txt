@@ -118,6 +118,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_gamesave.cpp
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
+    shims/xbox_bvh_builder.cpp
     shims/library_loader.cpp
     shims/process.cpp
     shims/dstorage.cpp
@@ -1748,6 +1749,24 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_xdxr_rt_check COMMAND "${Python3_EXECUTABLE}" -I
                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_D3D12_XDXR_OUT}" --rays 1000)
       set_tests_properties(d3d12_xdxr_rt_check PROPERTIES FIXTURES_REQUIRED d3d12_xdxr_cases SKIP_RETURN_CODE 77)
+    endif()
+
+    # XboxBvhBuilder.dll served by the layer's builder (RT-5, boot stop 18): the seven exports the executable imports,
+    # through the shim registry as the title binds them; the structures are checked like d3d12_xdxr_rt's.
+    set(LEONIDA_XBOX_BVH_BUILDER_OUT "${CMAKE_CURRENT_BINARY_DIR}/xbox_bvh_builder_cases")
+    add_executable(xbox_bvh_builder_test test/xbox_bvh_builder_test.cpp shims/xbox_bvh_builder.cpp shims/registry.cpp)
+    target_link_libraries(xbox_bvh_builder_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(xbox_bvh_builder_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xbox_bvh_builder_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(xbox_bvh_builder_test PRIVATE /OPT:NOREF)
+    add_test(NAME xbox_bvh_builder COMMAND xbox_bvh_builder_test "${LEONIDA_XBOX_BVH_BUILDER_OUT}")
+    set_tests_properties(xbox_bvh_builder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 FIXTURES_SETUP xbox_bvh_builder_cases)
+    add_test(NAME xbox_bvh_builder_console COMMAND xbox_bvh_builder_test --console)
+    set_tests_properties(xbox_bvh_builder_console PROPERTIES ENVIRONMENT "LEONIDA_BVH_BUILDER=console")
+    if(Python3_FOUND)
+      add_test(NAME xbox_bvh_builder_check COMMAND "${Python3_EXECUTABLE}" -I
+               "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_XBOX_BVH_BUILDER_OUT}" --rays 1000)
+      set_tests_properties(xbox_bvh_builder_check PROPERTIES FIXTURES_REQUIRED xbox_bvh_builder_cases SKIP_RETURN_CODE 77)
     endif()
 
     # GCL8's QueryInterface and its one method need an allocator and a list, not a Vulkan device.
