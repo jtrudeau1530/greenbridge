@@ -532,10 +532,11 @@ def main() -> int:
             print(f"ERROR: --out {a.out} is inside the scanned corpus {dxbc_dir}. Writing the report there would "
                   "replace index.json or a .dxbc the scan reads. Give a report path outside it.", file=sys.stderr)
             return 2
-        if same_path(a.out, spirv_index):
-            print(f"ERROR: --out {a.out} is {spirv_index}, which the scan reads. Give another report path.",
-                  file=sys.stderr)
-            return 2
+        for input_index in (index_path, spirv_index):
+            if same_path(a.out, input_index):
+                print(f"ERROR: --out {a.out} is {input_index}, which the scan reads. Give another report path.",
+                      file=sys.stderr)
+                return 2
     if not os.path.isfile(index_path):
         print(f"ERROR: {index_path} is missing. Run the shaders stage of make_game.py first.", file=sys.stderr)
         return 2
