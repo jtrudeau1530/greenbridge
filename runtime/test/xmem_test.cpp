@@ -284,6 +284,22 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(VirtualFree(gpu, 0, MEM_RELEASE), "release the 0x183 allocation");
     }
 
+    // The two 64 KiB reserve-only forms reached at startup: 64 KiB-aligned, rounded to whole pages, nothing committed.
+    constexpr ULONGLONG kReserveAttributes[] = {0x21, 0x03};
+    constexpr DWORD kReserveProtect[] = {PAGE_READWRITE, 0x801};
+    for (size_t i = 0; i < 2; ++i) {
+        void* const reservation =
+            virtual_alloc(nullptr, kPage64k + 1, MEM_RESERVE | kXmem64kPages, kReserveAttributes[i], kReserveProtect[i]);
+        check(reservation != nullptr, "an attributed 64 KiB reserve returns an address");
+        if (!reservation) continue;
+        MEMORY_BASIC_INFORMATION region{};
+        check(VirtualQuery(reservation, &region, sizeof(region)) == sizeof(region) &&
+                  region.AllocationBase == reservation && region.RegionSize == 2 * kPage64k &&
+                  reinterpret_cast<uintptr_t>(reservation) % kPage64k == 0 && region.State == MEM_RESERVE,
+              "the attributed 64 KiB reserve is aligned, rounded up to whole pages and not committed");
+        check(VirtualFree(reservation, 0, MEM_RELEASE), "release the attributed 64 KiB reserve");
+    }
+
     SetLastError(ERROR_SUCCESS);
     void* const replace_without_address =
         virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0, PAGE_READWRITE);
