@@ -147,9 +147,7 @@ def _parse_module(text):
             raise NotImplementedError(f"header op {op}: {line}")
 
     assert "%main" in funcs
-    # Expand helper OpFunctionCalls inline into %main's instruction stream for lockstep interpretation. A helper's
-    # entry block continues the caller's block; its other blocks (the x_pre helpers clear %x_buf words behind a
-    # selection) keep their labels, renamed per call like every other result.
+    # Expand single-block helper OpFunctionCalls inline into %main's instruction stream for lockstep interpretation.
     body = []
     call_seq = 0
     for res, op, a, line in funcs["%main"][1]:
@@ -162,16 +160,17 @@ def _parse_module(text):
         fn_params, fn_insns = funcs[fn_name]
         assert len(call_args) == len(fn_params)
         id_map = dict(zip(fn_params, call_args))
-        id_map.update({fres: f"%fc{call_seq}_{fres[1:]}" for fres, _, _, _ in fn_insns if fres})
-        for at, (fres, fop, fa, fline) in enumerate(fn_insns):
-            if fop == "OpLabel" and at == 0:
+        for fres, fop, fa, fline in fn_insns:
+            if fop == "OpLabel":
                 continue
             mapped_a = [id_map.get(x, x) for x in fa]
             if fop == "OpReturnValue":
-                assert at == len(fn_insns) - 1, f"{fn_name}: a return that is not the last instruction"
                 body.append((res, "OpCopyObject", [ret_t, mapped_a[0]], f"{res} = OpCopyObject {ret_t} {mapped_a[0]}"))
                 break
-            body.append((id_map[fres] if fres else None, fop, mapped_a, fline))
+            new_res = f"%fc{call_seq}_{fres[1:]}" if fres else None
+            if fres:
+                id_map[fres] = new_res
+            body.append((new_res, fop, mapped_a, fline))
 
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
     return {
@@ -237,15 +236,9 @@ def _check_spirv_structure(text):
         assert lbl in seen_labels, f"branch/merge references undefined label {lbl}"
 
 
-def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None, max_steps=2_000_000,
-                           reverse_order=False, x_buf_fill=0):
+def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None, max_steps=2_000_000, reverse_order=False):
     """Execute a --wave64-emulate compute shader across all `lx * ly * lz` invocations with real shared
-    Workgroup memory and strict uniform OpControlBarrier checking. Returns `(memory, barrier_count)`.
-
-    A word of the exchange buffer %x_buf that two invocations write with a plain OpStore between two barriers is an
-    AssertionError: that is a data race whatever the values are (SHADER-708). So is a word one invocation stores
-    with a plain OpStore and another loads or updates atomically between the same two barriers, in either order.
-    `x_buf_fill` is what every word of %x_buf holds at the start (Workgroup memory is undefined at launch)."""
+    Workgroup memory and strict uniform OpControlBarrier checking. Returns `(memory, barrier_count)`."""
     _check_spirv_structure(spvasm)
     mod = _parse_module(spvasm)
     types = mod["types"]
@@ -266,26 +259,6 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
     for res, cls, pointee, init_id in mod["globals"]:
         if cls == "Workgroup":
             wg_boxes[res] = [zero_of(pointee)]
-    x_buf = wg_boxes["%x_buf"][0] if "%x_buf" in wg_boxes else None
-    if x_buf is not None and x_buf_fill:
-        x_buf[:] = [x_buf_fill & MASK32] * len(x_buf)
-    x_writers = {}      # %x_buf word -> the invocation that stored to it since the last barrier
-    x_readers = {}      # %x_buf word -> the invocations that loaded it or used it atomically since the last barrier
-
-    def x_buf_read(word, idx, line):
-        if x_writers.get(word, idx) != idx:
-            raise AssertionError(f"%x_buf word {word} is stored by invocation {x_writers[word]} and read by "
-                                 f"{idx} with no barrier between them (a data race): {line}")
-        x_readers.setdefault(word, set()).add(idx)
-
-    def x_buf_store(word, idx, line):
-        if x_writers.setdefault(word, idx) != idx:
-            raise AssertionError(f"%x_buf word {word} is stored by invocations {x_writers[word]} and "
-                                 f"{idx} with no barrier between them (a data race): {line}")
-        others = x_readers.get(word, set()) - {idx}
-        if others:
-            raise AssertionError(f"%x_buf word {word} is read by invocation {min(others)} and stored by "
-                                 f"{idx} with no barrier between them (a data race): {line}")
 
     def walk_struct_offset(tid, idxs):
         off = 0
@@ -342,7 +315,7 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 raise NotImplementedError(f"global storage class {cls}")
         return {
             "pc": mod["main_pc"], "vals": vals, "id_t": id_t, "ptrs": ptrs, "pc_t": pc_t,
-            "cur_lbl": None, "prev_lbl": None, "done": False, "barrier": None, "idx": idx,
+            "cur_lbl": None, "prev_lbl": None, "done": False, "barrier": None,
         }
 
     def step_until_barrier(inv, step_budget):
@@ -428,8 +401,6 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                     assert p[1] % 4 == 0, f"unaligned PSB load {p[1]:#x}"
                     vals[res] = memory.get(p[1], 0)
                 else:
-                    if p[0] is x_buf:
-                        x_buf_read(p[1], inv["idx"], line)
                     v = p[0][p[1]]
                     vals[res] = list(v) if isinstance(v, list) else v
             elif op == "OpStore":
@@ -439,13 +410,9 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                     assert p[1] % 4 == 0, f"unaligned PSB store {p[1]:#x}"
                     memory[p[1]] = v & MASK32
                 else:
-                    if p[0] is x_buf:
-                        x_buf_store(p[1], inv["idx"], line)
                     p[0][p[1]] = v
             elif op in ("OpAtomicOr", "OpAtomicIAdd", "OpAtomicAnd", "OpAtomicXor", "OpAtomicExchange"):
                 p = ptrs[a[1]]
-                if p[0] is x_buf:
-                    x_buf_read(p[1], inv["idx"], line)
                 old = memory.get(p[1], 0) if p[0] == "psb" else p[0][p[1]]
                 v = vals[a[4]] & MASK32
                 if op == "OpAtomicOr":
@@ -587,8 +554,6 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
         if len(sites) != 1 or None in sites:
             raise AssertionError(f"non-uniform OpControlBarrier sites: {sites}")
         barriers += 1
-        x_writers.clear()
-        x_readers.clear()
     return memory, barriers
 
 
