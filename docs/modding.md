@@ -130,7 +130,7 @@ the engine, which shipped a first-person mode), a hit-reaction `RecoveryDirectio
 and a `firstpersonshooter_hud` UI texture. So the mod switches on a mode the engine has rather than building
 a camera. Whether the game exposes it to the player is not known.
 
-**Assumptions to confirm in the executable:** that the view mode is chosen through one getter of the form
+**ASSUMPTION:** three things to confirm in the executable: that the view mode is chosen through one getter of the form
 `mode = get(context)`, that context 0 is on foot, and that first person is enum value 4 (GTA V's
 `camViewModeSettings` order: third person near, medium, far, cinematic, first person). All three are
 settings in `mod.json`, so a different answer changes the manifest, not the runtime.
