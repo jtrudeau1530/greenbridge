@@ -149,6 +149,26 @@ class ImportCallSitesTest(unittest.TestCase):
             self.assertEqual(report["image_base"], hex(IMAGE_BASE))
             self.assertEqual(report["imports"]["xmem.dll!XMemFoo"]["call"], [hex(TEXT_RVA + 0x100), hex(TEXT_RVA + 0x110)])
 
+    def test_cli_refuses_a_selector_that_selects_nothing(self):
+        """--import is DLL!NAME and --dll is a DLL name. A bare DLL, a bare name or the two swapped select no import
+        at all, and the run then printed "0 import(s), 0 call site(s)": a typo in half the name read as proof that
+        the image never calls it (docs/xmem_exe_calls.md)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(self.data)
+            for argv in (["--import", "xmem.dll"], ["--import", "XMemFoo"], ["--import", "xmem.dll!"],
+                         ["--import", "!XMemFoo"], ["--dll", "xmem.dll!XMemFoo"], ["--dll", "!XMemFoo"]):
+                err = io.StringIO()
+                with self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(err):
+                    import_call_sites.main([path, *argv])
+                self.assertEqual(caught.exception.code, 2, argv)
+                self.assertTrue(err.getvalue().strip(), argv)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):  # the two well-formed selectors still run
+                self.assertEqual(import_call_sites.main([path, "--import", "xmem.dll!XMemFoo"]), 0)
+                self.assertEqual(import_call_sites.main([path, "--dll", "xmem.dll"]), 0)
+
     def test_cli_reports_an_unreadable_or_non_pe_file_with_exit_2(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "not_a_pe.bin")

@@ -10,8 +10,10 @@ disassembled, so this is a byte pattern: a stray `E8` or `E9` inside another ins
 thunk would be counted too, which is rare, and a call that goes through a register (`call rax` after a load of the
 slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
 
-With no `--import` and no `--dll`, every import is listed. An import named `#N` is an ordinal import. Output is counts
-and RVAs only, no instruction bytes (docs/runtime_imports.md, "The retail executable (RT-5)").
+With no `--import` and no `--dll`, every import is listed. An import named `#N` is an ordinal import. A `--import` value must
+carry both halves of `DLL!NAME` and a `--dll` value only a DLL name: a value that can match no import is refused instead of
+being answered with a count of zero. Output is counts and RVAs only, no instruction bytes (docs/runtime_imports.md, "The
+retail executable (RT-5)").
 """
 import argparse
 import json
@@ -100,12 +102,29 @@ def call_sites(data, wanted=None, dlls=None):
     return {"image_base": img.image_base, "imports": out}
 
 
+def import_selector(text: str) -> str:
+    """--import: `DLL!NAME`, the form `selected()` matches. A bare DLL, a bare name or an empty half selects no import,
+    so the run printed "0 import(s), 0 call site(s)" for a typo in either half: the answer read as "the image never
+    calls it" (docs/xmem_exe_calls.md reads those counts that way)."""
+    dll, sep, name = text.partition("!")
+    if not sep or not dll or not name:
+        raise argparse.ArgumentTypeError(f"expected DLL!NAME, got {text!r}")
+    return text
+
+
+def dll_selector(text: str) -> str:
+    """--dll: a DLL name. `DLL!NAME` is the --import form and names no DLL, so it selected nothing."""
+    if not text or "!" in text:
+        raise argparse.ArgumentTypeError(f"expected a DLL name, got {text!r}")
+    return text
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Count the direct calls to chosen imports of an x86-64 PE image.")
     ap.add_argument("image")
-    ap.add_argument("--import", dest="imports", action="append", default=[], metavar="DLL!NAME",
+    ap.add_argument("--import", dest="imports", action="append", default=[], metavar="DLL!NAME", type=import_selector,
                     help="an import to look for (repeatable); '#N' names an ordinal import")
-    ap.add_argument("--dll", dest="dlls", action="append", default=[], metavar="DLL",
+    ap.add_argument("--dll", dest="dlls", action="append", default=[], metavar="DLL", type=dll_selector,
                     help="every import of this DLL (repeatable)")
     ap.add_argument("--json", action="store_true", help="print JSON (RVAs in hex) instead of the table")
     args = ap.parse_args(argv)
