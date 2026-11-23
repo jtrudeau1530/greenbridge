@@ -153,8 +153,14 @@ int main() {
         check(rejects(add_headers(request, L"X A: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
               "a header with a space in its name is rejected");
         SetLastError(0);
-        check(rejects(add_headers(request, L"\r\n", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
-              "a blank-lines-only header block is rejected");
+        check(rejects(add_headers(request, L"X;Y: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
+              "a header with a token separator in its name is rejected");
+        SetLastError(0);
+        check(rejects(add_headers(request, L"X\u00e9: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
+              "a header with a non-ASCII character in its name is rejected");
+        check(add_headers(request, L"\r\n", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD) != FALSE &&
+                  add_headers(request, L"\r\n\r\n", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD) != FALSE,
+              "blank-lines-only header blocks are accepted (matching host winhttp.dll)");
         check(set_timeouts(session, 1000, 1000, 1000, 1000) != FALSE, "timeouts on a session handle are accepted");
         SetLastError(0);
         check(set_timeouts(connection, 1000, 1000, 1000, 1000) == FALSE &&

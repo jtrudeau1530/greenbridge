@@ -253,19 +253,34 @@ BOOL WINAPI query_headers(HINTERNET request, DWORD, LPCWSTR, LPVOID, LPDWORD, LP
     return receive_response(request, nullptr);
 }
 
-// Headers WinHTTP would reject. Measured against the host's winhttp.dll (Windows 10/11): a null or empty block,
-// embedded NULs, a line with no ':', an empty header name (": v"), or whitespace/control characters in a header
-// name ("X A: 1") fail with ERROR_INVALID_PARAMETER; a length of (DWORD)-1 means the text is NUL-terminated.
-// Nothing is stored: no request is ever sent.
+// RFC 7230 tchar grammar for HTTP header field-names (matches native WinHttpAddRequestHeaders):
+// printable ASCII 0x21..0x7E excluding HTTP token separators ()<>@,;:\"/[]?={}.
+bool is_header_name_char(wchar_t ch) {
+    if (ch <= 0x20 || ch >= 0x7F) return false;
+    switch (ch) {
+        case L'(': case L')': case L'<': case L'>': case L'@':
+        case L',': case L';': case L':': case L'\\': case L'"':
+        case L'/': case L'[': case L']': case L'?': case L'=':
+        case L'{': case L'}':
+            return false;
+        default:
+            return true;
+    }
+}
+
+// Headers WinHTTP would reject. Measured against the host's winhttp.dll (Windows 10 19045 / Windows 11 26100):
+// a null or empty block (count == 0), embedded NULs, a non-empty line with no ':', an empty header name (": v"),
+// or any non-token character (whitespace, control, separator, or non-ASCII) in a header name fail with
+// ERROR_INVALID_PARAMETER; a non-empty block containing only blank lines ("\r\n") is accepted by the host.
+// A length of (DWORD)-1 means the text is NUL-terminated. Nothing is stored: no request is ever sent.
 bool header_block_valid(LPCWSTR headers, DWORD length) {
     if (!headers) return false;
     const size_t count = length == static_cast<DWORD>(-1) ? wcslen(headers) : static_cast<size_t>(length);
     if (count == 0) return false;
-    bool saw_header = false;
     size_t i = 0;
     while (i < count) {
         if (headers[i] == L'\0') return false;
-        size_t line_start = i;
+        const size_t line_start = i;
         while (i < count && headers[i] != L'\r' && headers[i] != L'\n') {
             if (headers[i] == L'\0') return false;
             ++i;
@@ -278,11 +293,10 @@ bool header_block_valid(LPCWSTR headers, DWORD length) {
         while (colon < line_end && headers[colon] != L':') ++colon;
         if (colon == line_start || colon == line_end) return false;
         for (size_t k = line_start; k < colon; ++k) {
-            if (headers[k] <= 0x20) return false;
+            if (!is_header_name_char(headers[k])) return false;
         }
-        saw_header = true;
     }
-    return saw_header;
+    return true;
 }
 
 BOOL WINAPI add_request_headers(HINTERNET request, LPCWSTR headers, DWORD length, DWORD) {
