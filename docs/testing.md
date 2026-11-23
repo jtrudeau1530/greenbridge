@@ -100,6 +100,14 @@ Actions -> Runtime, and check out the commit it built, or start a run of the com
 python -I scripts/run_gpu_tests.py --build <unzipped runtime-windows>
 ```
 
+If you also have neither `llvm-mc` nor SPIRV-Tools (`spirv-as` / `spirv-val`) installed, `--disasm-dir` runs the
+pre-disassembled subset in `tests/semantic/fixtures/disasm` and `--assembler python` (the default under `auto` when
+`spirv-as` is absent) assembles SPIR-V with `tools/spirv_asm.py`:
+
+```sh
+python -I scripts/run_gpu_tests.py --build <unzipped runtime-windows> --disasm-dir tests/semantic/fixtures/disasm --assembler python
+```
+
 `build.py` and `check.py` take the same folder as their second argument:
 
 ```sh

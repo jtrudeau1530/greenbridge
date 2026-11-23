@@ -17528,12 +17528,13 @@ def _run_spirv_tool(cmd, **kwargs):
         raise
 
 
-def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
+def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as", validate=True):
     """Keep the assembled module out of the final path until validation succeeds.
 
     `assembler="spirv-as"` invokes the external spirv-as binary on `sa` (default);
     `assembler="python"` encodes `asm_text` (or reads `sa`) directly in memory with
     tools/spirv_asm.py, avoiding the spirv-as subprocess and temporary .spvasm I/O.
+    When `validate=False`, skip running `spirv-val` after assembly.
     """
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
         tmp = Path(f.name)
@@ -17564,7 +17565,7 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
                     result.stdout = result.stdout.decode("utf-8", "replace")
                 if isinstance(result.stderr, bytes):
                     result.stderr = result.stderr.decode("utf-8", "replace")
-        if result.returncode == 0:
+        if result.returncode == 0 and validate:
             # Offset on non-gather: VK_KHR_maintenance8
             result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
                                      tmp.name], capture_output=True, text=True, cwd=folder)
@@ -17638,6 +17639,9 @@ def main():
     ap.add_argument("--assembler", choices=("spirv-as", "python"), default="spirv-as",
                     help="SPIR-V binary assembler: spirv-as (default, external binary) or python (in-process "
                          "tools/spirv_asm.py; skips writing .spvasm to disk when combined with --no-asm)")
+    ap.add_argument("--no-validate", action="store_true",
+                    help="skip spirv-val after assembly (for running GPU tests without SPIRV-Tools when paired "
+                         "with --assembler python)")
     ap.add_argument("--merge", action="store_true", help="merge index.part*.json in --out into index.json and exit")
     ap.add_argument("--fssm-dir", default=None,
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
@@ -17828,7 +17832,7 @@ def main():
             with open(sa, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
         try:
-            r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler)
+            r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler, validate=not a.no_validate)
         except OSError as e:
             # A missing spirv-as/spirv-val fails every shader the same way; report it once as a setup
             # error (exit 2) instead of a FileNotFoundError traceback from the first one.
@@ -17881,7 +17885,8 @@ def main():
     if shard is None:
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, old)
-    print(f"{len(files)} shaders: {ok} translated, {valid} pass spirv-val")
+    status_label = "assembled (spirv-val skipped)" if a.no_validate else "pass spirv-val"
+    print(f"{len(files)} shaders: {ok} translated, {valid} {status_label}")
     if W64G_COUNTS:
         print("wave64 VS/PS/GS on 32-wide subgroups: " + ", ".join(f"tier {t}: {n}" for t, n in sorted(W64G_COUNTS.items()))
               + (" (tier C is not exact there; see wave64_graphics_reasons in the index)" if W64G_COUNTS["C"] else ""))
