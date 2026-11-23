@@ -459,9 +459,6 @@ void test_physical_pages(const PhysicalApi& api) {
     // The windows were split into one placeholder per page; the process exit releases them.
 }
 
-// The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
-// A run longer than one host view is mapped as capped views, so unmapping one page inside it only remaps the rest of
-// that view; every other page keeps its contents.
 // Splitting a view briefly unmaps the view's other pages; a thread reading one of them meanwhile must not fault.
 void test_split_under_reader(const PhysicalApi& api) {
     constexpr uint64_t kPages = 2048;  // two capped views
@@ -495,6 +492,8 @@ void test_split_under_reader(const PhysicalApi& api) {
     api.free_pages(kPages, pages.data());
 }
 
+// A run longer than one host view is mapped as capped views, so unmapping one page inside it only remaps the rest of
+// that view; every other page keeps its contents.
 void test_long_run(const PhysicalApi& api) {
     constexpr uint64_t kPages = 1100;  // more than the 1024-page view cap
     auto* const window = static_cast<uint8_t*>(
@@ -534,6 +533,7 @@ void test_long_run(const PhysicalApi& api) {
     check(api.map(window, 1, pages.data()) == nullptr && reserved_only(window), "a freed page does not map again");
 }
 
+// The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
 void test_placeholders(const PhysicalApi& api) {
     auto* const base = static_cast<uint8_t*>(
         api.virtual_alloc(nullptr, 6 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));

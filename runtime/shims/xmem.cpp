@@ -514,6 +514,8 @@ bool map_view(uintptr_t address, const View& view) {
 // With g_phys_mutex held. Unmaps every page in [start, end); the addresses become placeholders again. A view that
 // reaches outside the range is unmapped whole, and its pages outside the range are mapped again, so neighbours keep
 // their pages.
+// There is no rollback: if mapping a remainder again fails, those neighbouring pages stay unmapped and the caller only
+// sees the failure.
 bool unmap_range(uintptr_t start, uintptr_t end) {
     auto it = g_views.upper_bound(start);
     if (it != g_views.begin()) {
