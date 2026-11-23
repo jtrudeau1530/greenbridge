@@ -149,7 +149,9 @@ Current limits, by design:
   measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
-  address.
+  address. `XMemVirtualAlloc` and a title's `VirtualAlloc` serve the console's 64 KiB, 2 MiB and 4 MiB page modes
+  from ordinary host pages at the page size's alignment, without the host's large-page privilege; see
+  [docs/runtime_imports.md](../docs/runtime_imports.md#console-page-sizes).
 - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
   `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
   open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path

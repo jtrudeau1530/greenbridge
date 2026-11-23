@@ -123,6 +123,44 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
+## Console page sizes
+
+A title asks for the console's page sizes in the allocation type of `xmem.dll!XMemVirtualAlloc` and of its own
+`VirtualAlloc` (the `kernel32.dll`, `kernelbase.dll` and `api-ms-win-core-memory-l1-1-*` imports
+`runtime/shims/xmem.cpp` serves):
+
+| Allocation-type bits | Page size |
+|---|---|
+| `MEM_LARGE_PAGES \| MEM_PHYSICAL` (`0x20400000`) | 64 KiB |
+| `MEM_LARGE_PAGES` (`0x20000000`) | 2 MiB |
+| `MEM_4MB_PAGES` (`0x80000000`), with or without `MEM_LARGE_PAGES` | 4 MiB |
+
+The host reads the same bits differently: its `MEM_LARGE_PAGES` needs `SeLockMemoryPrivilege`, which a player's
+account does not hold, and it rejects `MEM_4MB_PAGES`. The values are the GDK names as other layers read them
+(OpenScarlett `include/openscarlett/kernel/kernelx_abi.h`, xbox-emulator `crates/compat/xmem/src/virt.rs`). The
+shim never forwards these bits. It serves every page size from ordinary host pages and keeps what a title can see
+of it:
+
+- a new region's base is a multiple of the page size (`VirtualAlloc2` with an alignment requirement; where that is
+  missing or refuses the parameter, a reserve-release-reserve probe that retries when another thread takes the
+  range);
+- the size is rounded up to whole pages, and an address given with the page-size bits is rounded out to the pages
+  it touches, so a commit with `MEM_LARGE_PAGES` inside a 2 MiB reservation commits that whole 2 MiB page;
+- each new region is one host allocation, so `VirtualFree(base, 0, MEM_RELEASE)` and `VirtualQuery` report the
+  base and the rounded size the title was given.
+
+`XMemVirtualAlloc` with no operation bit reserves and commits; a title's `VirtualAlloc` with a page-size bit still
+needs `MEM_RESERVE` or `MEM_COMMIT`, as on Win32. Any other combination of these bits (`0x00400000` alone with
+`XMemVirtualAlloc`, `MEM_4MB_PAGES` with `MEM_PHYSICAL`) fails with `ERROR_INVALID_PARAMETER`, and a nonzero
+`XMemVirtualAlloc` attribute word still fails with `ERROR_NOT_SUPPORTED`. A title's `VirtualAlloc` with
+`MEM_PHYSICAL` and no page-size bit goes to the host unchanged. Not covered: the page size is taken from each call's
+bits, not remembered per region, so a commit without them inside a 2 MiB reservation commits host pages only; the
+host still pages 4 KiB at a time (only TLB timing could tell); and no shim serves the physical-page calls
+(`XMemAllocatePhysicalPages` and the mapping functions), which take the same bits. `xmem_test` checks every page
+size through `XMemVirtualAlloc` (alignment, rounding, commit inside a reservation, release, the rejected
+combinations) and through a title's `VirtualAlloc` (alignment, rounding, release, the operation rule); `xmem_probe`
+runs it again with `LEONIDA_XMEM_NO_VIRTUALALLOC2` set, to cover the probe fallback.
+
 ## When an unimplemented import is called
 
 The table above has no unimplemented imports, but the game executable will. A call to one used to return 0
