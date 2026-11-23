@@ -84,6 +84,16 @@ class IndexTest(unittest.TestCase):
         self.assertNotIn("malformed JSON", r.stderr)
         self.assertIn("0 shaders in index", r.stderr)
 
+    def test_leading_utf8_bom_is_accepted(self):
+        r = self.run_tool('\ufeff{"example":{"stage":"cs"}}')
+        self.assertIn("1 shaders in index", r.stderr)
+
+    def test_utf8_bom_keeps_error_offsets_relative_to_the_file(self):
+        self.assert_index_error(self.run_tool("\ufeffnot JSON"), "expected '{' at byte 3")
+
+    def test_trailing_utf8_bom_is_still_an_error(self):
+        self.assert_index_error(self.run_tool("{}\ufeff"), "unexpected data after the top-level object")
+
     def test_valid_empty_object_is_an_empty_corpus(self):
         r = self.run_tool("{}")
         self.assertNotIn("cannot use", r.stderr)

@@ -351,7 +351,7 @@ int main() {
     const std::string hash2 = sha256_hex(bytes("another program"));
     {
         std::ofstream index(dir / "index.json", std::ios::binary);
-        index << "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
+        index << "\xef\xbb\xbf" "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
               << "\", \"bindings\": [2], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
                  "\"uses_code_base\": true, \"wave64\": false},\n"
                  " \"vs_test\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["

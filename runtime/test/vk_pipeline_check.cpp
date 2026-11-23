@@ -404,7 +404,8 @@ std::map<std::string, ShaderMeta> read_index(const std::string& path, std::strin
     if (!f || size < 0) { err = "cannot determine the file size"; unreadable = true; return out; }
     std::string s(static_cast<size_t>(size), '\0');
     if (size > 0 && (!f.read(s.data(), size) || f.gcount() != size)) { err = "read error"; unreadable = true; return out; }
-    JsonParser p{s, 0};
+    constexpr std::string_view utf8_bom = "\xef\xbb\xbf";
+    JsonParser p{s, s.starts_with(utf8_bom) ? utf8_bom.size() : 0};
     p.ws();
     if (p.i >= s.size()) { err = "the file is empty (an intentionally empty index is {})"; return out; }
     if (!p.consume('{')) { err = "expected '{' at byte " + std::to_string(p.i); return out; }
