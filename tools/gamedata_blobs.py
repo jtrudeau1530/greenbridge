@@ -9,6 +9,7 @@ Targets the 3 plain-text payloads (0x640000 VFX_SETTINGS_FILE, 0x64e000 and
 Only payload types, offsets, byte sizes, structural counts and SGD5 match counts
 are printed or written; shader/setting names and raw bytes stay local. Standard
 library only.
+Usage: `python -I tools/gamedata_blobs.py --help` lists the options.
 """
 from __future__ import annotations
 
