@@ -42,6 +42,14 @@
 //   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
 //             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
 //             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
+//   slot 86   CreatePipelineState(desc, riid, out) -> PC ID3D12Device2::CreatePipelineState (PC slot 47).
+//   slot 101  CreateStateObject(desc, riid, out) -> PC ID3D12Device5::CreateStateObject (PC slot 62, displaced on
+//             Xbox by compute-PSO slot 62).
+//   slot 108  GetResourceAllocationInfo2(ret, this, visible_mask, count, descs, info1) -> PC
+//             ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68), accepting the console C-ABI struct return
+//             (return buffer in RCX, device in RDX) as well as the PC C++ order, with each 56-byte
+//             D3D12_RESOURCE_DESC expanded to a zero-initialized D3D12_RESOURCE_DESC1 and Xbox layout words and
+//             flag bits normalized on the copy.
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
 // LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
@@ -163,7 +171,7 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 26 (the
 // console's struct-return form), 27 and 53 (committed resources, memory through the title's XMem hook),
 // 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their
-// configured indices), 62, 67, 70, 74, 76 and 127. Slot 10 is intentionally false: the
+// configured indices), 62, 67, 70, 74, 76, 86, 101, 108 and 127. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
