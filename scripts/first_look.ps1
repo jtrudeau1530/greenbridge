@@ -28,6 +28,10 @@ Write-Host "`n== GDK runtime classes and slots called through xgameruntime.lib (
 python -I (Join-Path $root "tools\gdk_runtime_calls.py") $Exe --out $out
 if ($LASTEXITCODE -ne 0) { Write-Warning "gdk_runtime_calls could not read all of $Exe; its report may be incomplete" }
 
+Write-Host "`n== Archetype lookup candidates for mods (docs/modding.md; pass the top RVA to gta6rt --archetype-lookup)"
+python -I (Join-Path $root "tools\find_hash_lookup.py") $Exe --json (Join-Path $out "hash_lookup.json")
+if ($LASTEXITCODE -ne 0) { Write-Warning "find_hash_lookup could not scan $Exe" }
+
 $rt = Join-Path $root "runtime\build\gta6rt.exe"
 # A gta6rt.exe older than the runtime sources (a pull since the last build) would report the old shim table, so it
 # is rebuilt then too, not only when missing.
