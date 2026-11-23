@@ -146,6 +146,16 @@ class DxbcMetaTests(unittest.TestCase):
         self.assertTrue(got["sfi0_resource_heap_directly_indexed"])
         self.assertFalse(got["sfi0_sampler_heap_directly_indexed"])
 
+    def test_invalid_isg1_table_does_not_publish_partial_signature(self):
+        fourcc, payload = isg1_chunk([("POSITION", 0, 0, 7, 7, 0, 3)])
+        for count, offset in ((2, 8), (1, 0)):
+            with self.subTest(count=count, offset=offset):
+                malformed = struct.pack("<II", count, offset) + payload[8:]
+                dxbc = make_dxbc([(fourcc, malformed), sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING)])
+                meta = M.read_dxbc_meta(dxbc)
+                self.assertNotIn("input_signature", meta)
+                self.assertTrue(meta["sfi0_resource_heap_directly_indexed"])
+
     def test_sfi0_both_heaps_and_empty_dxbc(self):
         dxbc = make_dxbc([sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING | M.SFI0_SAMPLER_DESCRIPTOR_HEAP_INDEXING)])
         got = M.read_dxbc_meta(dxbc)
