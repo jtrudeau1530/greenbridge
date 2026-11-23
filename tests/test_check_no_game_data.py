@@ -57,6 +57,14 @@ CAUGHT = [
     ("pe_1mib.txt", pe_header(1 << 20), "PE executable"),
     ("pe_1mib_plus.txt", pe_header((1 << 20) + 4), "PE executable"),
     ("image.bin", bytes(0x200) + b"msft-xvd" + bytes(8), "XVD image"),
+    ("container2.dat", b"PSIN" + bytes(12), "PSIN metadata container"),
+    ("heightmap.dat", b"PAMH" + bytes(12), "PAMH heightmap"),
+    ("heightmap2.dat", b"MHIU" + bytes(12), "MHIU heightmap"),
+    ("presets.dat", b"SPS1" + bytes(12), "SPS1 shader-preset table"),
+    ("effects.dat", b"SGD5" + bytes(12), "SGD5 effects database"),
+    ("texcontainer.dat", b"RDS5" + bytes(12), "RDS5 texture container"),
+    ("bank2.json", b"AWC\x00" + bytes(12), "AWC audio bank"),
+    ("script.lol", b"YSC\x00" + bytes(12), "YSC compiled script"),
 ]
 
 PASSED = [
