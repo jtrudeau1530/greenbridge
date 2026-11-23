@@ -378,8 +378,48 @@ xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; co
 
 So `XCurl.dll` needs threading, error reporting and networking from the runtime, and the interface versions in
 `libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
-`IXUserImpl6`. The executable's own set is still unmeasured. `tools/gdk_runtime_calls.py` gives it from the file
-(below), and `QueryApiImpl`'s log on the first boot.
+`IXUserImpl6`.
+
+### The retail executable's runtime classes (RT-5)
+
+`python -I tools/gdk_runtime_calls.py game_scarlett_master.exe` (from the file alone, nothing executed; `main`
+`1cc6e3c1`) finds one `QueryApiImpl` helper at RVA `0x55de048` and **161** `xgameruntime.lib` thunks that reach **17**
+runtime classes. 158 of the thunks are referenced from the image; three are present and unreferenced (one each in
+`XPackageImpl`, `XThreadingImpl` and `XAccessibilityImpl`).
+
+The executable does not import `xgameruntime.dll`. Its import table has no such module, so the thunks are linked into
+the image like `libHttpClient.GDK.dll`'s. The name occurs in the image as a UTF-16 string, which
+`tools/pe_inspect.py` lists among the run-time load candidates (a string is where to look, not proof of a
+`LoadLibrary`). The registry
+therefore needs no module name beyond the `xgameruntime.dll` it already has, which settles the assumption at the top of
+`runtime/shims/xgameruntime.cpp`.
+
+| Class | Thunks | Referenced | Served |
+|---|---:|---:|---|
+| `XAccessibilityImpl` | 10 | 9 | no |
+| `XAppCaptureImpl` | 1 | 1 | no |
+| `XLauncherImpl` | 3 | 3 | no |
+| `XDisplayImpl` | 1 | 1 | yes |
+| `XGameEventImpl` | 1 | 1 | yes |
+| `XGameImpl` | 2 | 2 | yes |
+| `XGameRuntimeFeatureImpl` | 1 | 1 | yes |
+| `XGameSaveImpl` | 20 | 20 | yes |
+| `XGameUiImpl` | 5 | 5 | yes |
+| `XNetworkingImpl` | 10 | 10 | yes |
+| `XPackageImpl` | 18 | 17 | yes |
+| `XPersistentLocalStorageImpl` | 2 | 2 | yes |
+| `XStoreImpl` | 44 | 44 | yes |
+| `XSystemAnalyticsImpl` | 1 | 1 | yes |
+| `XSystemImpl` | 3 | 3 | yes |
+| `XThreadingImpl` | 18 | 17 | yes |
+| `XUserImpl` | 21 | 21 | yes |
+
+"Served" is the tool's answer for the runtime sources at that commit. The three that are not: `XAccessibilityImpl`
+(the speech-synthesizer slots 8-13, 15, 16 and 21 are referenced; slot 14 is not), `XAppCaptureImpl` (slot 5,
+`XAppCaptureTakeScreenshot`) and `XLauncherImpl` (slots 3-5: `XLaunchUri` and the two display timeout-deferral calls).
+Open pull requests serve them: #4235, #4307 and #4248. The slots of `XUserImpl`, `XStoreImpl` and `XGameSaveImpl` the
+executable calls, and the argument counts the tool estimates from the registers, are in the report the tool writes.
+`XErrorImpl`, which `XCurl.dll` and `libHttpClient.GDK.dll` call, is not among the executable's classes.
 
 ### Measuring which runtime classes a binary calls
 
