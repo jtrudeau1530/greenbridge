@@ -1,10 +1,11 @@
 """Semantic tests for ds_swizzle_b32 with raw numeric offset:N and omitted offset (= 0).
 
-RDNA2 ISA DS_SWIZZLE_B32 encodes the swizzle in a 16-bit offset:
-  - bit 15 = 1 (QDMode): quad-permute using bits [7:0] (two bits per lane 0..3; bits [14:8] ignored);
-    llvm-mc -mcpu=gfx1013 disassembles encodings with non-zero bits [14:8] as decimal offset:N (e.g. 0x81e4 -> 33252).
-  - bit 15 = 0 (Bitmask mode): within each 32-lane half, src = ((lane & and_mask) | or_mask) ^ xor_mask with
-    and_mask = offset[4:0], or_mask = offset[9:5], xor_mask = offset[14:10].
+RDNA2 ISA DS_SWIZZLE_B32 encodes the swizzle in a 16-bit offset (verified across all 65,536 offsets on gfx1036):
+  - 0x8000..0xBFFF (bits 15:14 = 10, QDMode): quad-permute using bits [7:0] (two bits per lane 0..3; bits [13:8]
+    ignored; llvm-mc -mcpu=gfx1013 disassembles non-zero bits [13:8] as decimal offset:N, e.g. 0x81e4 -> 33252).
+  - 0x0000..0x7FFF (bit 15 = 0, Bitmask mode): within each 32-lane half, src = ((lane & and_mask) | or_mask) ^ xor_mask
+    with and_mask = offset[4:0], or_mask = offset[9:5], xor_mask = offset[14:10].
+  - 0xC000..0xFFFF (bits 15:14 = 11): separate hardware mode (rotations/interleavings, not quad permute); refused.
   - omitted offset defaults to 0 (broadcast lane 0 / lane 32 in wave64); llvm-mc omits offset:0 on disassembly.
 
     python -I tests/semantic/test_ds_swizzle_numeric.py -v
@@ -93,8 +94,8 @@ class DsSwizzleNumericTests(unittest.TestCase):
             ("qd_801f", "ds_swizzle_b32 v2, v1 offset:0x801f", 0x801F),
             # 0x81e4 = decimal 33252 (non-zero bit 8, what llvm-mc prints as numeric): QUAD_PERM(0, 1, 2, 3)
             ("qd_33252", "ds_swizzle_b32 v2, v1 offset:33252", 0x81E4),
-            # 0xff1b = QUAD_PERM(3, 2, 1, 0) with all ignored bits 14:8 set
-            ("qd_ff1b", "ds_swizzle_b32 v2, v1 offset:0xff1b", 0xFF1B),
+            # 0xbf1b = QUAD_PERM(3, 2, 1, 0) with all ignored bits 13:8 set and bit 14 clear
+            ("qd_bf1b", "ds_swizzle_b32 v2, v1 offset:0xbf1b", 0xBF1B),
         ]
         for tag, line, off in cases:
             for wave in (32, 64):
@@ -161,6 +162,9 @@ class DsSwizzleNumericTests(unittest.TestCase):
 
     def test_invalid_offsets_and_modifiers_stay_refused(self):
         for bad in (
+            "ds_swizzle_b32 v2, v1 offset:0xc000",
+            "ds_swizzle_b32 v2, v1 offset:0xff1b",
+            "ds_swizzle_b32 v2, v1 offset:0xffff",
             "ds_swizzle_b32 v2, v1 offset:65536",
             "ds_swizzle_b32 v2, v1 offset:-1",
             "ds_swizzle_b32 v2, v1 offset:notanumber",

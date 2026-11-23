@@ -1573,8 +1573,10 @@ class Gen:
             kind = m.group(1)
             args = [int(x) for x in m.group(2).split(",")[1:]] if m.group(2) else []
         else:
-            # Raw 16-bit DS_SWIZZLE_B32 offset (RDNA2 ISA): llvm-mc prints numeric offset:N when QDMode bits 14:8
-            # are non-zero (e.g. 0x81e4 -> offset:33252) and omits offset: when it is 0.
+            # Raw 16-bit DS_SWIZZLE_B32 offset (RDNA2 ISA): llvm-mc prints numeric offset:N when QDMode bits 13:8
+            # are non-zero (e.g. 0x81e4 -> offset:33252) and omits offset: when it is 0. Measured across all 65,536
+            # offsets on gfx1036: 0x0000..0x7FFF is bitmask mode, 0x8000..0xBFFF is QDMode (bits 13:8 ignored), and
+            # 0xC000..0xFFFF (bits 15:14 = 11) is a separate hardware mode (not a quad permute) and stays Unsupported.
             if ("swizzle(" in text or len(mods) > 1 or len(a) != 2 or
                     any(x["k"] in ("special", "raw") for x in a) or
                     any(not mod.startswith("offset:") for mod in mods)):
@@ -1585,7 +1587,7 @@ class Gen:
                     off = int(mods[0][7:], 0)
                 except ValueError:
                     raise Unsupported("ds_swizzle pattern") from None
-                if not 0 <= off <= 0xFFFF:
+                if not 0 <= off <= 0xBFFF:
                     raise Unsupported("ds_swizzle offset")
             if off & 0x8000:
                 kind = "QUAD_PERM"
