@@ -754,8 +754,11 @@ private:
         std::ifstream file(dir + "/index.json", std::ios::binary);
         if (!file) return fail("cannot open " + dir + "/index.json");
         const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        constexpr std::string_view utf8_bom = "\xef\xbb\xbf";
+        std::string_view json(text);
+        if (json.starts_with(utf8_bom)) json.remove_prefix(utf8_bom.size());
         Json root;
-        if (!JsonReader(text).parse(root) || root.kind != Json::Kind::object) return fail("index.json is not a JSON object");
+        if (!JsonReader(json).parse(root) || root.kind != Json::Kind::object) return fail("index.json is not a JSON object");
         if (prefix.empty()) {
             dir_ = dir;
             entries_.clear();
