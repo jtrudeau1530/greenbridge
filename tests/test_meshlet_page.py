@@ -908,6 +908,20 @@ class CliTests(unittest.TestCase):
             with open(source, "rb") as fh:
                 self.assertEqual(fh.read(), data)
 
+    def test_json_cannot_create_a_report_in_place_of_the_carve_manifest(self):
+        # <input>/index.json is the carve manifest's name even before a carve has written it.
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            with open(os.path.join(carve, "0000.bin"), "wb") as fh:
+                fh.write(page(block(4)))
+            manifest = os.path.join(carve, "index.json")
+            r = self.run_tool(carve, "--json", manifest, "--quiet")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(manifest))
+
     def test_json_over_carve_dir_manifest_or_payload_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")

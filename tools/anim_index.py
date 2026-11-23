@@ -555,7 +555,8 @@ def main():
         for flag, path in (("output", a.out), ("--rigs", a.rigs)):
             if not path:
                 continue
-            if os.path.isfile(manifest) and same_report_path(manifest, path):
+            # Reserved even before the carve writes it: other tools read <source>/index.json as the carve manifest.
+            if same_report_path(manifest, path):
                 ap.error(f"{flag} would overwrite the carve manifest: {path}")
             if os.path.isfile(path):
                 for name in os.listdir(a.source):

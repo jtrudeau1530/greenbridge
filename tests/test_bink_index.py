@@ -295,6 +295,19 @@ class TestCommandLine(unittest.TestCase):
                 self.assertIn(f"cannot write {path}", err.getvalue())
 
 
+    def test_output_cannot_create_a_report_in_place_of_the_carve_manifest(self):
+        # <target>/index.json is the carve manifest's name even before a carve has written it.
+        carve = os.path.join(self.tmp.name, "carve_no_manifest")
+        os.makedirs(carve, exist_ok=True)
+        manifest = os.path.join(carve, "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bink.main([carve, "--out", manifest])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("would overwrite the carve manifest", err.getvalue())
+        self.assertFalse(os.path.exists(manifest))
+
     def test_output_cannot_overwrite_carve_manifest(self):
         carve = os.path.join(self.tmp.name, "carve")
         os.makedirs(carve, exist_ok=True)

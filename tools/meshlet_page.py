@@ -903,11 +903,13 @@ def is_scanned_input(path, input_path):
     """True when a report path is one of the files the scan reads: writing it would destroy the input."""
     if same_output_path(path, input_path):
         return True
-    if not os.path.isdir(input_path) or not os.path.isfile(path):
+    if not os.path.isdir(input_path):
         return False
-    manifest = os.path.join(input_path, "index.json")
-    if os.path.isfile(manifest) and same_output_path(path, manifest):
+    # Reserved even before the carve writes it: other tools read <input>/index.json as the carve manifest.
+    if same_output_path(path, os.path.join(input_path, "index.json")):
         return True
+    if not os.path.isfile(path):
+        return False
     root = os.path.normcase(os.path.abspath(input_path))
     target = os.path.normcase(os.path.abspath(path))
     if os.path.dirname(target) != root and not target.startswith(root + os.sep):
