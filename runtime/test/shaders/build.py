@@ -21,6 +21,7 @@ VK_KHR_shader_fma; the test programs enable it when the device has it, else they
 (a single rounding built from plain f32 ops, for a driver that splits GLSL Fma and has no VK_KHR_shader_fma).
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
+With the variable unset, build.py/check.py follow the Mesa ANV probe automatically.
 Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
 inputs, and check.py reports it as SKIP.
 With LEONIDA_PC_TAIL_UBO=1, every shader is translated with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the
@@ -47,7 +48,29 @@ RSRC2, GROUP = 0x8088, (64, 1, 1)
 # Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
 NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
-from compute_fixture import compute_header  # noqa: E402
+from compute_fixture import compute_header, shift_user_data, user_data_shift  # noqa: E402
+
+
+def barycentric_fallback_override():
+    v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def barycentric_fallback():
+    override = barycentric_fallback_override()
+    if override is not None:
+        return override
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        answer = json.loads(r.stdout.strip().splitlines()[-1])
+        return answer.get("barycentric_fallback") is True
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return False
 
 
 def asm_mattr(path):
@@ -128,9 +151,12 @@ def translate_tests(work, names):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     disasm.mkdir()
     fssm.mkdir()
+    shift = user_data_shift()   # LEONIDA_USER_DATA_SHIFT: compute fixtures for a D3D12 PSO (compute_fixture.py)
     for n in names:
         asm_path = os.path.join(HERE, shader_source(n) + ".asm")
         raw = Path(asm_path).read_text(encoding="utf-8")
+        if shift and n.startswith("cs_"):
+            raw = shift_user_data(raw, shift)
         mattr = asm_mattr(asm_path)
         cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         if n in CLIP_CASES:
@@ -149,7 +175,7 @@ def translate_tests(work, names):
         if program:   # where the translator looks for a program to hash, as in the game's work folder
             (fssm / (n + ".fssm")).write_bytes(program)
         if n.startswith("cs_"):
-            program = bytes(compute_header(asm_path))
+            program = bytes(compute_header(asm_path, shift))
             extra = cs_fssm_extra(asm_path)
             if extra:
                 program += bytes(extra[0] - len(program)) + extra[1]
@@ -163,7 +189,7 @@ def translate_tests(work, names):
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
     if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
-    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
+    if barycentric_fallback():   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
     if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma (default), OpFmaKHR, or emulated
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
@@ -178,6 +204,9 @@ def translate_tests(work, names):
 
 
 def main():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__)
+        return 0
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     # The CMake test targets name the spirv-as/spirv-val folder here instead of passing a whole PATH, which the Visual
@@ -197,7 +226,7 @@ def main():
     names = [n for n in names if n not in skipped]
     # A computed I/J pair needs PerVertexKHR inputs, which both fallbacks take away: the translator refuses it there,
     # and check.py and run_gpu_tests.py report it as SKIP. Leave it out instead of losing the whole batch.
-    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1" or os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":
+    if barycentric_fallback() or os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":
         per_vertex = [n for n in names if n in NEEDS_PER_VERTEX_INPUTS]
         if per_vertex:
             print("not built (computed I/J pairs need PerVertexKHR inputs, off under the fallback):",
@@ -236,7 +265,7 @@ def main():
         sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
         import spirv_stubs
         spirv_stubs.generate_for_index(str(spirv), combined)
-        if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":
+        if barycentric_fallback():
             # The pass-through geometry shader each --bary-fallback PS is drawn with (<name>.bary_gs.spv).
             import bary_fallback_gs
             bary_fallback_gs.build_for_index(str(spirv))

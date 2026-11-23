@@ -81,7 +81,26 @@ The checksum at 0x160 matched none of these:
 It's left as **open**. Copy the header verbatim whenever the payload is unchanged.
 
 Payloads: settings (kind 2) are hash-keyed JSON text with tabs and CRLF **(confirmed)**. The profile record (kind 3)
-is 1,644 bytes, only the first 112 non-zero, starting `u32 10, u32 3`. It isn't decoded yet.
+is 1,644 bytes (first 112 bytes non-zero, starting `u32 10, u32 3`, followed by 1,532 bytes of zero padding) **(confirmed)**.
+
+## Profile record (kind 3, confirmed)
+
+```
+0x000 u32         version = 10                                         confirmed
+0x004 u32         kind = 3                                             confirmed
+0x008 u32         subversion / format tag                              likely
+0x00C u32         flags                                                likely
+0x010 u64         account / profile identifier                         likely
+0x018 u32[22]     profile settings & attributes (first 112 bytes non-zero)
+0x070 byte[1532]  zero padding (reserved area)                         confirmed
+```
+
+The profile record (kind 3) has a fixed 1,644-byte payload. Only the first 112 bytes (0x70) contain active profile
+fields, starting with format version 10 and kind 3; the remaining 1,532 bytes (0x5FC) are zero padding reserved for
+future profile expansion and cloud sync.
+
+`tools/saves.py info` reports the profile version, active bytes and verifies the zero-padding boundary;
+`tools/saves.py extract` writes `profile.json`.
 
 ## SLAYER1: packed copy (not decoded)
 
@@ -101,15 +120,16 @@ to it holds the same save. The wrapper's header is the only place the autosave's
 
 ## Importing into the runtime
 
-The offline XGameSave shim of the open #279 (`xgameruntime_services.cpp` there; **not on `main` yet**, where the
-`XGameSave*` imports have no implementation and get the loader's default answers, classified in
-`runtime/shims/registry.cpp`) keeps `XGameSave` data in
+The runtime's offline `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`,
+[runtime_imports.md](runtime_imports.md)) keeps `XGameSave` data in
 `LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`, with names
-%-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB]` writes payloads
-in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
+%-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--with-packed]`
+writes payloads in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
+`--with-packed` also imports `chives.dat`, the packed `SLAYER1` copy of the same save (below), as a blob of its own;
+without it only the plain payload is imported.
 
-Checked with #279's shim: four imported blobs (2 KB to 1.2 MB) read back byte-identical through its
-`XGameSaveReadBlobData`.
+Checked earlier with the shim of the open #279, which used the same layout: four imported blobs (2 KB to 1.2 MB)
+read back byte-identical through its `XGameSaveReadBlobData`.
 
 **VERIFY:** the title's real container and blob names. The default is container = slot name and blob = payload file
 name, and `--map` overrides it. Confirm or fix them from the executable's `XGameSaveCreateContainer` and
@@ -142,13 +162,16 @@ resolve most of them. The resolved names are game data and stay local; only coun
 
 ## Tool
 
+`verify` reports on every supplied file. Its exit status is 2 if any file could not be read or parsed,
+otherwise 1 if any rebuild differed, otherwise 0.
+
 ```powershell
 python -I tools/saves.py info    <file or folder>...
-python -I tools/saves.py verify  <JSAV>                 # parse every block, rebuild, compare byte for byte
+python -I tools/saves.py verify  <JSAV>...              # parse every block, rebuild, compare byte for byte
 python -I tools/saves.py extract <JSAV|ASAV> <outdir>   # blocks/*.json, index.json, save.pretty.json
 python -I tools/saves.py pack    <outdir> <JSAV>        # after editing blocks/*.json
 python -I tools/saves.py diff    <JSAV a> <JSAV b>
-python -I tools/saves.py import  <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--dry-run] [--force]
+python -I tools/saves.py import  <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--with-packed] [--dry-run] [--force]
 python -I tools/save_keys.py collect <save file or extract folder>...           # distinct $0x… keys
 python -I tools/save_keys.py resolve <saves>... --dict <files>... [--compose N] [--out FILE]
 ```

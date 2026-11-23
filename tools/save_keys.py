@@ -20,6 +20,7 @@ Commands
                                      resolved names are game data, so never commit or post it).
 
 Resolved names are game strings. Only counts belong in issues and pull requests.
+Usage: `python -I tools/save_keys.py --help` lists the options.
 """
 import argparse
 import collections
@@ -164,11 +165,17 @@ def read(p):
 INPUT_EXTENSIONS = (".jsav", ".asav", ".json", ".bin")
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a key collection must not report an
+    # incomplete directory as complete. main() turns the OSError into one error line naming the folder.
+    raise exc
+
+
 def input_files(paths):
     """Every save file (.jsav, .asav, .bin or no extension) or .json under the given paths, in reading order."""
     for p in paths:
         if os.path.isdir(p):
-            for dp, _, fs in os.walk(p):
+            for dp, _, fs in os.walk(p, onerror=_walk_error):
                 for f in sorted(fs):
                     if f.lower().endswith(INPUT_EXTENSIONS) or "." not in f:
                         yield os.path.join(dp, f)

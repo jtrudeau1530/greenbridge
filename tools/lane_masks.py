@@ -49,7 +49,8 @@ DS_HAS_DST = ("ds_read", "ds_swizzle", "ds_permute", "ds_bpermute",
               "ds_append", "ds_consume", "ds_ordered_count", "ds_nop")
 VGPR_REL_DST = ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32")
 SGPR_REL_DST = ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32")
-VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_xor_b32", "v_xor3_b32", "v_not_b32")
+VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_and_or_b32",
+                  "v_xor_b32", "v_xor3_b32", "v_xnor_b32", "v_bfi_b32", "v_not_b32")
 
 
 def base_op(op):
@@ -135,8 +136,10 @@ def lane_slot(vgpr, lane):
     return ("lane", vgpr["r"], lane["v"] & 63)
 
 
-def step(state, ins):
-    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR."""
+def step(state, ins, wave64=True):
+    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
+
+    `wave64` False: the program runs in 32-lane waves, where a 64-bit s_bfm_b64 result can't be a lane mask."""
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
         return
@@ -209,7 +212,9 @@ def step(state, ins):
     if "_saveexec_b" in op or "_wrexec_b" in op:
         put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
     elif op == "s_bfm_b64":
-        put(state, a[0], MASK)
+        # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
+        # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.
+        put(state, a[0], MASK if wave64 else None)
     elif op.startswith(COPIES) and len(a) > 1:
         k = kind(state, a[1])
         dst_t = a[0].get("t") if a[0]["k"] == "special" else None
@@ -259,7 +264,7 @@ def parked(blocks, masks):
     return sorted(found)
 
 
-def analyse(blocks, succ, *, include_either=False):
+def analyse(blocks, succ, *, include_either=False, wave64=True):
     entry = [None] * len(blocks)                        # None: not reached yet
     if blocks:
         entry[0] = {}
@@ -268,7 +273,7 @@ def analyse(blocks, succ, *, include_either=False):
         n = work.pop()
         state = dict(entry[n])
         for ins in blocks[n]:
-            step(state, ins)
+            step(state, ins, wave64)
         for s in succ[n]:
             if entry[s] is None:
                 merged = dict(state)
@@ -294,6 +299,6 @@ def analyse(blocks, succ, *, include_either=False):
             out[id(ins)] = {r: k for r, k in state.items() if k in MASK_KINDS}
             if include_either:
                 either[id(ins)] = {r for r, k in state.items() if k == EITHER}
-            if step(state, ins):
+            if step(state, ins, wave64):
                 writes.add(id(ins))
     return (out, writes, either) if include_either else (out, writes)

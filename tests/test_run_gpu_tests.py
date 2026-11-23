@@ -1,6 +1,7 @@
 """scripts/run_gpu_tests.py: how it judges the output of a compute "dump" test (no device needed)."""
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import struct
@@ -12,11 +13,54 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import run_gpu_tests as rgt
+import check   # runtime/test/shaders, on the path once run_gpu_tests is imported
 
 WANT = [55, 48]
 DEVICE_32 = "device: X (subgroup 32..32)\n"
 DEVICE_64 = "device: X (subgroup 32..64)\n"
 CONFIRMED = "compute subgroup size: 64\n"
+
+
+class BarycentricFallbackSelection(unittest.TestCase):
+    def setUp(self):
+        rgt._BARYCENTRIC_FALLBACK.clear()
+
+    def test_env_override(self):
+        with patch.dict(os.environ, {"LEONIDA_BARY_FALLBACK": "1"}, clear=False):
+            self.assertTrue(rgt.bary_fallback())
+        with patch.dict(os.environ, {"LEONIDA_BARY_FALLBACK": "0"}, clear=False):
+            proc = SimpleNamespace(stdout='{"barycentric_fallback": true}\n')
+            with patch.object(rgt.subprocess, "run", return_value=proc):
+                self.assertFalse(rgt.bary_fallback())
+
+    def test_anv_probe_is_selected_when_env_is_unset(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LEONIDA_BARY_FALLBACK", None)
+            proc = SimpleNamespace(stdout='{"barycentric_fallback": true}\n')
+            with patch.object(rgt.subprocess, "run", return_value=proc):
+                self.assertTrue(rgt.bary_fallback())
+
+    def test_env_override_beats_the_probe(self):
+        """#5933: =0 brings back native barycentrics on a device the probe flags (gfx90c on AMD's Windows driver),
+        and =1 does not need the probe at all."""
+        proc = SimpleNamespace(stdout='{"barycentric_fallback": true, "vendor_id": 4098, "device_id": 5607, '
+                                      '"driver_id": 1}\n')
+        with patch.object(rgt.subprocess, "run", return_value=proc) as run:
+            with patch.dict(os.environ, {"LEONIDA_BARY_FALLBACK": "0"}, clear=False):
+                self.assertIs(rgt.bary_fallback(), False)
+            with patch.dict(os.environ, {"LEONIDA_BARY_FALLBACK": "1"}, clear=False):
+                self.assertIs(rgt.bary_fallback(), True)
+            run.assert_not_called()
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("LEONIDA_BARY_FALLBACK", None)
+                self.assertIs(rgt.bary_fallback(), True)
+            run.assert_called_once()
+
+    def test_probe_failure_is_not_a_fallback(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LEONIDA_BARY_FALLBACK", None)
+            with patch.object(rgt.subprocess, "run", side_effect=OSError("no Vulkan")):
+                self.assertIs(rgt.bary_fallback(), False)
 
 
 def dump(words, pad=8):
@@ -169,6 +213,138 @@ class BindlessTestOnASmallPushConstantDevice(unittest.TestCase):
         self.assertNotIn("skipped", out)
 
 
+class StoreHelperUnsupported(unittest.TestCase):
+    """vk_store_test exits 77 when the device lacks a feature (TEST-469): a SKIP that quotes why, not a FAIL."""
+
+    def run_store(self, shader, rc, msg):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=f"{shader}.asm", build=tmp, llvm_mc="unused")
+
+            def run(cmd, env=None, gpu=True):
+                if Path(cmd[0]).stem == "vk_store_test":
+                    return rc, msg
+                (Path(tmp) / "spirv" / f"{shader}.spv").touch()   # rdna2spirv.py "translating" the shader
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                suite_rc = rgt.run_suite(args, tmp)
+            return suite_rc, output.getvalue()
+
+    def test_unsupported_is_a_skip_with_its_reason(self):
+        for shader in ("cs_imgstore", "cs_imgload", "cs_imgload_d16"):
+            with self.subTest(shader=shader):
+                rc, out = self.run_store(shader, 77, "unsupported: shaderStorageImageWriteWithoutFormat=0\ndevice: X")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("SKIP (unsupported: shaderStorageImageWriteWithoutFormat=0)", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+
+    def test_other_failures_still_fail(self):
+        rc, out = self.run_store("cs_imgstore", 1, "device: X\nFAILED: texel 3 is 0x0")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAILED: texel 3 is 0x0", out)
+        self.assertNotIn("skipped", out)
+
+
+INT64 = "unsupported: m.spv declares Int64 and the device has no shaderInt64\n"
+INT64_SKIP = "SKIP (unsupported: m.spv declares Int64 and the device has no shaderInt64)"
+# judge_cs_dump quotes the reason without the "unsupported:" prefix (87da93277, which wins over the wave64 skip).
+INT64_JUDGE_SKIP = "SKIP (m.spv declares Int64 and the device has no shaderInt64)"
+
+
+class ComputeFeatureUnsupported(unittest.TestCase):
+    """vk_compute_test exits 77 with an "unsupported: ..." line when the module needs a feature the device lacks
+    (Int64, Float64, OpFmaKHR): a SKIP that quotes it in every compute test, not only under --require-wave64."""
+
+    def test_judge_skips_a_named_feature_in_every_mode(self):
+        self.assertEqual(judge(77, DEVICE_32 + INT64), (None, INT64_JUDGE_SKIP))
+        self.assertEqual(judge(77, DEVICE_32 + INT64, partial=True), (None, INT64_JUDGE_SKIP))
+        # A 64-wide device without Int64: the feature is the cause, not the subgroup width.
+        self.assertEqual(judge(77, DEVICE_64 + INT64, wave64=True), (None, INT64_JUDGE_SKIP))
+
+    def test_judge_keeps_the_wave64_wording_and_fails_a_bare_77(self):
+        self.assertEqual(judge(77, DEVICE_32 + "full 64-wide compute subgroups unavailable\n", wave64=True),
+                         (None, "SKIP (no 64-wide compute subgroup on this device)"))
+        ok, _ = judge(77, DEVICE_32 + "something else went wrong\n")
+        self.assertIs(ok, False)
+
+    def run_compute(self, shader, rc, msg):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=f"{shader}.asm", build=tmp, llvm_mc="unused")
+
+            def run(cmd, env=None, gpu=True):
+                if Path(cmd[0]).stem == "vk_compute_test":
+                    calls.append(cmd)
+                    return rc, msg
+                (Path(tmp) / "spirv" / f"{shader}.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.dict(rgt.os.environ, {"LEONIDA_W64_EMULATE": ""}, clear=False),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                suite_rc = rgt.run_suite(args, tmp)
+            return suite_rc, output.getvalue(), calls
+
+    def test_every_compute_call_site_skips(self):
+        # One shader per way the runner reads vk_compute_test: judge_cs_dump (cs_bounds), its own checks (cs_lds,
+        # cs_workgroup_yz, cs_heap_init), one dispatch per input (cs_cvt_f32_sat), cs_f64_add and wavemask_check.
+        for shader in ("cs_bounds", "cs_lds", "cs_workgroup_yz", "cs_heap_init", "cs_cvt_f32_sat", "cs_f64_add",
+                       "cs_wavemask"):
+            with self.subTest(shader=shader):
+                rc, out, _ = self.run_compute(shader, 77, "device: X (subgroup 32..32)\n" + INT64)
+                self.assertEqual(rc, 0, out)
+                self.assertIn(INT64_SKIP, out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+
+    def test_one_refused_input_stops_the_per_input_loop(self):
+        _, _, calls = self.run_compute("cs_cvt_f32_sat", 77, INT64)
+        self.assertEqual(len(calls), 1)
+
+    def test_check_py_helpers_skip_a_named_feature(self):
+        # check.py's own runner and the cs_fmt_* rows go through dump_test/compute_test, not run_cmd.
+        with tempfile.TemporaryDirectory() as tmp, patch.object(check, "run", return_value=(77, INT64)):
+            for result in (check.dump_test(tmp, tmp, "cs_fmt_1010102", [1], 1),
+                           check.compute_test(tmp, tmp, "cs_bounds", "1", "dump")):
+                self.assertIsInstance(result, check.Skip)
+                self.assertEqual(result, INT64_SKIP)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(check, "run", return_value=(77, "no reason")):
+            self.assertEqual(check.dump_test(tmp, tmp, "cs_fmt_1010102", [1], 1), "exit 77: no reason")
+
+    def test_a_check_py_skip_counts_as_skipped(self):
+        # The cs_fmt_* rows record (name, not problem, problem): a Skip there is a skip, not a failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter="cs_fmt_1010102.asm", build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                (Path(tmp) / "spirv" / "cs_fmt_1010102.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "fmt_1010102_test", return_value=check.Skip(INT64_SKIP)),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+        self.assertEqual(rc, 0, output.getvalue())
+        self.assertIn("SKIP  cs_fmt_1010102", output.getvalue())
+        self.assertIn("0/1 passed, 1 skipped", output.getvalue())
+
+    def test_a_bare_77_still_fails(self):
+        for shader in ("cs_bounds", "cs_lds", "cs_heap_init"):
+            with self.subTest(shader=shader):
+                rc, out, _ = self.run_compute(shader, 77, "device: X (subgroup 32..32)\nsomething else went wrong")
+                self.assertEqual(rc, 1, out)
+                self.assertNotIn("skipped", out)
+
+
 class FilterWithoutRunnableCases(unittest.TestCase):
     """A filter selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
 
@@ -233,6 +409,15 @@ class WholeWaveDump(unittest.TestCase):
         self.assertIs(ok, None)
         self.assertTrue(detail.startswith("SKIP"))
 
+    def test_a_77_with_an_unsupported_reason_keeps_that_reason(self):
+        """A 64-wide device, a module that needs OpFmaKHR the device lacks: the skip names OpFmaKHR, not the subgroup."""
+        msg = ("unsupported: cs_x.spv needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device lacks it; "
+               "translate with --fma glsl\n")
+        ok, detail = self.judge(77, DEVICE_64 + msg)
+        self.assertIs(ok, None)
+        self.assertTrue(detail.startswith("SKIP (cs_x.spv needs OpFmaKHR"), detail)
+        self.assertNotIn("64-wide", detail)
+
     def test_right_words_without_the_confirmation_fail(self):    # a vk_compute_test that ignores the flag
         ok, detail = self.judge(0, DEVICE_64 + dump(WANT))
         self.assertIs(ok, False)
@@ -261,6 +446,17 @@ class NotWholeWave(unittest.TestCase):
     def test_plain_dump_needs_no_confirmation_and_a_77_is_a_failure(self):
         self.assertEqual(judge(0, dump(WANT)), (True, "55 48"))
         self.assertIs(judge(77, "unavailable\n")[0], False)
+
+    def test_a_77_with_an_unsupported_reason_is_a_skip(self):
+        """A module that needs OpFmaKHR on a device without VK_KHR_shader_fma: vk_compute_test exits 77 with a reason."""
+        msg = ("unsupported: cs_x.spv needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device lacks it; "
+               "translate with --fma glsl\n")
+        for kw in ({}, {"emulated": True}, {"partial": True}):
+            with self.subTest(**kw):
+                ok, detail = judge(77, DEVICE_32 + msg, **kw)
+                self.assertIs(ok, None)
+                self.assertTrue(detail.startswith("SKIP (cs_x.spv needs OpFmaKHR"), detail)
+        self.assertIs(judge(77, DEVICE_32 + "no reason given\n")[0], False)       # a bare 77 stays a failure
 
     def test_hex_words(self):
         ok, detail = rgt.judge_cs_dump(0, dump([0x400080FF, 7]), [0x400080FF, 7], wave64=False, partial=False,
@@ -324,6 +520,35 @@ class UniformBranchCheck(unittest.TestCase):
 
 class Wave32LaneDumps(unittest.TestCase):
     """run_gpu_tests.py skips cs_wqm_w32 and cs_w32_lane_wrap below 32 lanes with check.py's rule."""
+    def test_process_exit_takes_precedence_in_both_runners(self):
+        import check
+        name = "cs_w32_lane_wrap"
+        narrow = "device: synthetic (subgroup 8..16)\n"
+        for code, msg, skipped in ((1, narrow, False), (0, narrow, True),
+                                   (77, "unsupported: device feature unavailable\n", True)):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                with patch.object(check, "run", return_value=(code, msg)):
+                    verdict = check.compute_test(tmp, tmp, name, "1", "dump", needs_32_lanes=True)
+                with self.subTest(runner="check.py"):
+                    self.assertEqual(isinstance(verdict, check.Skip), skipped, verdict)
+                    if not skipped:
+                        self.assertIn("exit 1", verdict)
+
+                def launch(cmd, **kwargs):
+                    if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                        (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                        return 0, ""
+                    return code, msg
+
+                args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+                output = io.StringIO()
+                with (patch.object(rgt, "assemble_to_s", side_effect=lambda mc, src, dst, n: Path(dst).touch()),
+                      patch.object(rgt, "spirv_as"), patch.object(rgt, "run_cmd", side_effect=launch),
+                      contextlib.redirect_stdout(output)):
+                    status = rgt.run_suite(args, tmp)
+                self.assertEqual(status, 0 if skipped else 1, output.getvalue())
+                self.assertIn(f"{'SKIP' if skipped else 'FAIL'}  {name}", output.getvalue())
+
     def test_uses_check_py_rule(self):
         import check
         self.assertIs(rgt.narrow_subgroup_skip, check.narrow_subgroup_skip)
@@ -495,12 +720,71 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
                         self.assertEqual(check.pixel_test("unused", tmp, name), want)
 
 
+class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
+    """The rows whose test program judges itself show its last output line. A program that died first (a driver
+    crash while it creates a pipeline: exit -11 on Linux, 0xC0000005 on Windows) has only printed its device or
+    extension line, or nothing, so the FAIL line must carry the exit status to say what happened."""
+    DIED = {   # one row each: what its program had printed when it died
+        "cs_lds": "device: X\n", "cs_exec64": "device: X\n", "cs_bvh": "device: X\n", "cs_wavemask": "device: X\n",
+        "cs_imgstore": "device: X\n", "cs_imgload": "device: X\n", "cs_sample_lz_int_d16": "device: X\n",
+        "ps_texture_sample": "device: X\nenabled VK_KHR_maintenance8\n",
+        "ps_texture_sample_d16": "device: X\nenabled VK_KHR_maintenance8\n",
+        "ps_cube_sample": "device: X\n", "ps_gather_wrap": "device: X\n",
+        "ps_tex": "", "ps_imgatomic": "",
+    }
+
+    def run_one(self, name, code, printed):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name + ".asm", build=tmp, llvm_mc="unused", require_pass=False)   # one row
+
+            def launch(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(returncode=code, stdout="", stderr=printed)
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt.subprocess, "run", side_effect=launch),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+        rows = [ln.split(None, 2) for ln in output.getvalue().splitlines() if ln.startswith("  FAIL")]
+        return rc, rows, output.getvalue()
+
+    def test_the_fail_line_says_the_program_died(self):
+        for code in (-11, 0xC0000005):
+            for name, printed in self.DIED.items():
+                with self.subTest(name=name, code=code):
+                    rc, rows, out = self.run_one(name, code, printed)
+                    self.assertEqual(rc, 1, out)
+                    self.assertEqual(len(rows), 1, out)
+                    last = printed.splitlines()[-1] if printed else "no test output"
+                    self.assertEqual(rows[0][1:], [name, f"exit {code}: {last}"], out)
+
+    def test_no_pixel_count_for_a_frame_that_was_never_read(self):
+        _rc, rows, out = self.run_one("ps_gather_wrap", -11, "device: X\n")
+        self.assertNotIn("pixels differ", rows[0][2], out)
+
+    def test_a_verdict_keeps_its_line(self):
+        self.assertEqual(rgt.verdict_line(0, "device: X\ncs_lds: 64 lanes mirrored"), "cs_lds: 64 lanes mirrored")
+        self.assertEqual(rgt.verdict_line(0, ""), "")
+        self.assertEqual(rgt.verdict_line(1, "device: X\ncs_lds: lane 3 differs"), "exit 1: cs_lds: lane 3 differs")
+        rc, rows, out = self.run_one("cs_imgstore", 0, "device: X\ncs_imgstore: 64 texels match\n")
+        self.assertEqual((rc, rows), (0, []), out)
+        self.assertIn("PASS  cs_imgstore           cs_imgstore: 64 texels match", out)
+
+
 class FmaFusedSuite(unittest.TestCase):
     """run_gpu_tests.py runs cs_fma_fused under --filter, honoring LEONIDA_FMA=khr vs default glsl."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
 
-    def run_fma(self, rc, msg, fma_env=None):
+    def run_fma(self, rc, msg, fma_env=None, fma_mode=None):
         with tempfile.TemporaryDirectory() as tmp:
+            if fma_mode:
+                (Path(tmp) / "spirv").mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / "spirv" / "index.json").write_text(
+                    json.dumps({"cs_fma_fused": {"fma": fma_mode}}), encoding="utf-8")
             args = SimpleNamespace(filter="cs_fma_fused", build=tmp, llvm_mc="unused")
 
             def fake_run(cmd, env=None, gpu=True):
@@ -531,11 +815,26 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL  cs_fma_fused", out)
 
+    def test_recorded_exact_mode_makes_the_gpu_suite_strict(self):
+        # TEST-1147: run_gpu_tests must read the same index field as check.py, or an exact build judged
+        # in a fresh shell accepts split words that the GPU driver really produced.
+        import check
+        rc, out = self.run_fma(0, dump(check.FMA_FUSED), fma_mode="exact")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_mode="exact")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL  cs_fma_fused", out)
+
+    def test_recorded_glsl_mode_ignores_stale_exact_env(self):
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_mode="glsl", fma_env="exact")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("5/7 split", out)
+
     def test_khr_fused_passes_and_exit_77_skips(self):
         import check
         rc, out = self.run_fma(0, dump(check.FMA_FUSED), fma_env="khr")
         self.assertEqual(rc, 0, out)
-        self.assertIn("8/8 fused exact (OpFmaKHR)", out)
+        self.assertIn("8/8 fused exact (single-rounded FMA: OpFmaKHR or --fma exact)", out)
         rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
         self.assertEqual(rc, 0, out)
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)

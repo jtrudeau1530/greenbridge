@@ -16,9 +16,11 @@ Design rules (see tests/semantic/README.md):
     boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores (and 32-bit
     atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary, so they
     must be 32-bit integers at 4-byte-aligned addresses (anything else raises). Workgroup variables (LDS) are
-    zero-initialised per invocation like Function ones, so they are only meaningful with one invocation
-    (run_workgroup does not share them between invocations); 32-bit atomics on them (and on Function variables)
-    are read-combine-write like the physical-storage-buffer ones. Images are rejected.
+    zero-initialised; run_workgroup shares them between its invocations, as a workgroup does (one invocation
+    alone has its own). 32-bit atomics on them (and on Function variables) are read-combine-write like the
+    physical-storage-buffer ones. OpControlBarrier is a point every invocation of run_workgroup must reach
+    together (run_fragment refuses it). Images are rejected, except OpImageFetch on an image array that
+    run_workgroup's `resources` binds (with the StorageBuffer descriptor hash table the translator probes).
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
 
@@ -120,6 +122,18 @@ def f32(x):
         return float("inf") if x > 0 else float("-inf")
 
 
+def ieee_nan(r, *operands):
+    """`r`, except that a NaN produced from non-NaN operands (inf - inf, 0 * inf) is the x86 "real indefinite" NaN.
+
+    The measured words pinned in the tests were taken with the default NaN of x86 SSE, 0xFFC00000 (sign set).
+    Python leaves the sign of such a NaN to the host CPU, and ARM64 (Apple Silicon, Linux on ARM) gives
+    0x7FC00000, so the tests passed on x86-64 only. A NaN that comes from a NaN operand is left alone: both
+    architectures pass that operand through with its sign."""
+    if r != r and not any(o != o for o in operands):
+        return -math.nan
+    return r
+
+
 class _F32(float):
     """A binary32 value that came from a bit pattern (OpBitcast) and still carries that exact pattern.
 
@@ -142,7 +156,7 @@ def fma_f32(x, y, z):
     The product and sum are exact rationals; rounding them through a double first could land on a binary32
     midpoint and round the wrong way (for example (1 + 2**-12)**2 + 2**-70)."""
     if not all(math.isfinite(v) for v in (x, y, z)):
-        return f32(x * y + z)                 # inf/NaN rules: Python's float arithmetic follows IEEE here
+        return f32(ieee_nan(x * y + z, x, y, z))   # inf/NaN rules: Python's float arithmetic follows IEEE here
     exact = Fraction(x) * Fraction(y) + Fraction(z)
     if exact == 0:
         product_zero = x == 0.0 or y == 0.0
@@ -312,6 +326,21 @@ class _Types:
             return sum(self.size(t) for t in k[1])
         raise UnsupportedConstruct(f"size of type {name} ({k[0]})")
 
+    def copy_value(self, name, value):
+        """Copy an aggregate across the memory boundary, retaining any pointer values it contains."""
+        kind = self.t.get(name)
+        if kind is None:
+            return value
+        if kind[0] == "arr":
+            members = (self.copy_value(kind[1], item) for item in value)
+        elif kind[0] == "struct":
+            members = (self.copy_value(member, item) for member, item in zip(kind[1], value))
+        elif kind[0] == "vec" and isinstance(value, list):
+            return value.copy()
+        else:
+            return value
+        return type(value)(members)
+
     def is_word_pair(self, kind):
         return kind and kind[0] == "vec" and kind[2] == 2 and self.t[kind[1]][:2] == ("int", 32)
 
@@ -348,7 +377,7 @@ class UndefinedResult(Exception):
 
 
 def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_constants=None, memory=None,
-                  out_of_range="raise"):
+                  out_of_range="raise", return_outputs=False, lanes=None, resources=None, helpers=()):
     """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
 
     Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
@@ -356,7 +385,10 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     missing lanes are not running. `inputs_for(i)` gives invocation i's Input values (see run_fragment); push
     constants and the physical-address memory are shared. Every invocation must reach every subgroup operation,
     in the same order (the translator emits them in uniform control flow and models EXEC with a variable, so a
-    lane that is off in EXEC still executes them).
+    lane that is off in EXEC still executes them). Workgroup variables (LDS) are shared by all the invocations,
+    and OpControlBarrier, like a subgroup operation, must be reached by every invocation at the same point.
+    Invocations at the same instruction execute it in invocation order, so lanes racing on one LDS dword see a
+    defined interleaving (see the lockstep note below).
 
     Subgroup operations (Subgroup scope), over the running lanes of the caller's subgroup:
       * OpGroupNonUniformShuffle returns the value of lane Id. An Id at or past `subgroup_size` is undefined in
@@ -367,19 +399,39 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
       * OpGroupNonUniformBallot sets bit l for each running lane l whose predicate is true.
       * OpGroupNonUniformAny / All: the predicate of any / every running lane.
       * OpGroupNonUniformBitwiseOr Reduce: the OR of every running lane's value.
+      * OpGroupNonUniformBroadcastFirst: the value of the lowest running lane.
+
+    With `return_outputs=True`, also return each invocation's Output variables in invocation order.
+
+    `lanes` places the invocations: invocation i is lane lanes[i] % subgroup_size of subgroup
+    lanes[i] // subgroup_size (default: lanes[i] = i). A lane no invocation takes is not running, like a pixel
+    lane with no covered sample, so a shuffle from it is undefined. The caller's `inputs_for` gives each
+    invocation the %sg_lane that matches. `resources` binds descriptor-set variables (see _invocation).
+
+    `helpers` names invocations that run the shader but take no part in subgroup operations, as helper lanes a
+    driver leaves out: their ballot bit is never set, they count for no vote or reduction, and a shuffle from their
+    lane is undefined. They still receive each operation's result over the others.
     """
     if out_of_range not in ("raise", "wrap"):
         raise ValueError(f"out_of_range: {out_of_range!r}")
     memory = {} if memory is None else memory
-    gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True)
+    workgroup = {}                             # Workgroup variable id -> its box, one per workgroup
+    slots = list(range(invocations)) if lanes is None else list(lanes)
+    helpers = frozenset(helpers)
+    if len(slots) != invocations or len(set(slots)) != invocations or min(slots, default=0) < 0:
+        raise ValueError("lanes: one distinct non-negative slot per invocation")
+    gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True,
+                        workgroup=workgroup, resources=resources)
             for i in range(invocations)]
     pending = [None] * invocations             # what each invocation yielded last; None once it has returned
+    invocation_outputs = [None] * invocations
 
     def advance(i, value):
         try:
             pending[i] = gens[i].send(value)
-        except StopIteration:
+        except StopIteration as done:
             pending[i] = None
+            invocation_outputs[i] = done.value
 
     for i in range(invocations):
         advance(i, None)
@@ -399,43 +451,79 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
         results = []
         for i in range(invocations):
             kind, _, _value, ident = pending[i]
-            base = (i // subgroup_size) * subgroup_size
-            group = [pending[j] for j in range(base, min(base + subgroup_size, invocations))]
+            sub = slots[i] // subgroup_size
+            group = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
+                     if slots[j] // subgroup_size == sub and j not in helpers}
             if kind == "OpGroupNonUniformBallot":
                 # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
-                bits = sum(1 << l for l, req in enumerate(group) if req[2])
+                bits = sum(1 << l for l, req in group.items() if req[2])
                 results.append(tuple((bits >> (32 * w)) & MASK for w in range(4)))
             elif kind == "OpGroupNonUniformAny":
-                results.append(any(req[2] for req in group))
+                results.append(any(req[2] for req in group.values()))
             elif kind == "OpGroupNonUniformAll":
-                results.append(all(req[2] for req in group))
+                results.append(all(req[2] for req in group.values()))
             elif kind == "OpGroupNonUniformBitwiseOr":
                 acc = 0
-                for req in group:
+                for req in group.values():
                     acc |= req[2]
                 results.append(acc)
+            elif kind == "OpControlBarrier":
+                results.append(None)           # everyone is here: the "same point" check above is the barrier
+            elif kind == "OpGroupNonUniformBroadcastFirst":
+                results.append(group[min(group)][2] if group else UNDEF)   # the lowest running lane's value
             elif kind == "OpGroupNonUniformShuffle":
                 if not 0 <= ident < subgroup_size:
                     if out_of_range == "raise":
                         raise UndefinedResult(f"invocation {i}: shuffle from lane {ident} of a "
                                               f"{subgroup_size}-wide subgroup")
                     ident %= subgroup_size
-                results.append(group[ident][2] if ident < len(group) else UNDEF)
+                results.append(group[ident][2] if ident in group else UNDEF)
             else:
                 raise UnsupportedConstruct(kind)
         for i in range(invocations):
             advance(i, results[i])
-    return memory
+    return (memory, invocation_outputs) if return_outputs else memory
 
 
 _TICK = ("tick", None, None, None)
+_PARSED = {}
 
 
-def _invocation(text, inputs, push_constants, memory, step=False):
+def _parsed_lines(text):
+    """The (result, opcode, operands, line) of each non-blank line of `text`, parsed once: run_workgroup runs one
+    generator per invocation over the same module, and parsing it for every one of them dominated the run time.
+    A line that does not parse has opcode None; the caller raises where the line is reached, as before."""
+    parsed = _PARSED.get(text)
+    if parsed is None:
+        parsed = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            m = _LINE.match(line)
+            if m:
+                res, op, rest = m.groups()
+                parsed.append((res, op, rest.split(), line))
+            else:
+                parsed.append((None, None, None, line))
+        if len(_PARSED) >= 64:
+            _PARSED.clear()
+        _PARSED[text] = parsed
+    return parsed
+
+
+def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None, resources=None):
     """One invocation as a generator. It yields (opcode, instruction index, value, id) at each subgroup operation
-    and expects that operation's result back; with `step` it also yields _TICK before each instruction. It
-    returns run_fragment's result."""
+    and at each OpControlBarrier, and expects that operation's result back; with `step` it also yields _TICK before
+    each instruction. `workgroup` (run_workgroup's) maps a Workgroup variable id to the box all invocations
+    share; without it the invocation has its own. It returns run_fragment's result.
+
+    `resources` binds descriptor-set variables by name: a StorageBuffer variable whose block is one runtime array
+    of words takes a list of those words; a UniformConstant array of images takes a list with one entry per
+    descriptor index, each a function (coordinate, lod) -> the 4-tuple OpImageFetch returns. A descriptor variable
+    left out stays declared but cannot be accessed (OpAccessChain into it raises)."""
     inputs = inputs or {}
+    resources = resources or {}
     push_constants = list(push_constants or [])
     memory = {} if memory is None else memory
     types = _Types()
@@ -473,15 +561,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 raise UnsupportedConstruct(f"OpAccessChain into {k[0]}")
         return off, cur
 
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        m = _LINE.match(line)
-        if not m:
+    for res, op, a, line in _parsed_lines(text):
+        if op is None:
             raise UnsupportedConstruct(f"cannot parse line: {line!r}")
-        res, op, rest = m.groups()
-        a = rest.split()
         if in_body:
             body.append((res, op, a, line))
             continue
@@ -513,6 +595,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             types.t[res] = ("struct", a)
         elif op == "OpTypePointer":
             ptr_types[res] = (a[0], a[1])
+        elif op in ("OpTypeImage", "OpTypeSampler", "OpTypeSampledImage"):
+            types.t[res] = ("image",)                  # opaque: only OpImageFetch on a bound resource reads it
         elif op == "OpConstant":
             k = types.t[a[0]]
             if k[0] == "float":
@@ -528,8 +612,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             constants[res] = values[res] = False
         elif op == "OpConstantNull":
             constants[res] = values[res] = types.zero(a[0])
+            id_type[res] = a[0]
         elif op == "OpConstantComposite":           # a constant array or vector (e.g. %fmt_size_tab's table)
             values[res] = [values[x] for x in a[1:]]
+            id_type[res] = a[0]
         elif op == "OpVariable":
             cls, pointee = ptr_types[a[0]]
             if a[1] != cls:
@@ -541,14 +627,21 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif cls == "Input":
                 init = inputs.get(res, types.zero(pointee))
                 var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
+            elif cls == "Workgroup" and workgroup is not None and res in workgroup:
+                var_box[res] = workgroup[res]          # another invocation of the workgroup made it
             elif cls in ("Function", "Output", "Workgroup", "Private"):
-                if len(a) > 2:
-                    init = values[a[2]]
-                    var_box[res] = [list(init) if isinstance(init, list) else init]
-                else:
-                    var_box[res] = [types.zero(pointee)]
+                init = types.copy_value(pointee, values[a[2]]) if len(a) > 2 else types.zero(pointee)
+                var_box[res] = [init]
                 if cls == "Output":
                     outputs.append(res)
+                if cls == "Workgroup" and workgroup is not None:
+                    workgroup[res] = var_box[res]      # the first invocation's box is the workgroup's
+            elif cls == "StorageBuffer":
+                if res not in resources:
+                    raise UnsupportedConstruct(f"StorageBuffer {res} without a resource")
+                var_box[res] = [[[w & MASK for w in resources[res]]]]   # block { uint[] }
+            elif cls == "UniformConstant":
+                var_box[res] = [list(resources[res]) if res in resources else None]
             else:
                 raise UnsupportedConstruct(f"storage class {cls}")
             pointers[res] = ("pc", 0) if cls == "PushConstant" else (var_box[res], 0)
@@ -600,6 +693,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     pc = fn_start.get("%main", 0)
     killed = False
     cur_label = prev_label = None
+    phi_new = {}
     back_edges = 0
     while pc < len(body):
         if step:
@@ -663,14 +757,16 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         if op == "OpPhi":
             # The OpPhi of a block all read the values from before the block (a later one that names an earlier
             # one, as in a swap in a loop header, gets its old value), so the first evaluates the whole run.
-            if body[pc - 2][1] != "OpPhi":
-                phi_new, k = {}, pc - 1
+            if not phi_new:
+                k = pc - 1
                 while k < len(body) and body[k][1] == "OpPhi":
-                    b = body[k][2]
+                    phi, _, b, _ = body[k]
+                    if phi in phi_new:
+                        raise UnsupportedConstruct(f"duplicate OpPhi result {phi}")
                     incoming = [b[i] for i in range(1, len(b) - 1, 2) if b[i + 1] == prev_label]
                     if len(incoming) != 1:
-                        raise UnsupportedConstruct("OpPhi with an unknown predecessor")
-                    phi_new[body[k][0]] = val(incoming[0])
+                        raise UnsupportedConstruct(f"OpPhi {phi} needs one input from predecessor {prev_label}")
+                    phi_new[phi] = val(incoming[0])
                     k += 1
             values[res] = phi_new.pop(res)
             continue
@@ -684,8 +780,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             cls, pointee = ptr_types[a[0]]
             if cls != "Function":
                 raise UnsupportedConstruct("non-Function variable in body")
-            var_box[res] = [list(values[a[2]]) if len(a) > 2 and isinstance(values[a[2]], list)
-                            else (values[a[2]] if len(a) > 2 else types.zero(pointee))]
+            init = types.copy_value(pointee, values[a[2]]) if len(a) > 2 else types.zero(pointee)
+            var_box[res] = [init]
             pointers[res] = (var_box[res], 0)
         elif op == "OpAccessChain":
             base = a[1]
@@ -727,8 +823,18 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     raise UnsupportedConstruct("PhysicalStorageBuffer load of a type that is not a 32-bit integer")
                 values[res] = memory.get(psb_word(p[1]), 0)
             else:
-                v = deref(p)
-                values[res] = list(v) if isinstance(v, list) else v
+                values[res] = types.copy_value(a[0], deref(p))
+        elif op == "OpImageFetch":
+            image = val(a[1])
+            if not callable(image):
+                raise UnsupportedConstruct(f"OpImageFetch of an image no resource binds: {line}")
+            if len(a) != 5 or a[3] != "Lod":
+                raise UnsupportedConstruct(f"OpImageFetch other than with one Lod operand: {line}")
+            texel = tuple(image(val(a[2]), val(a[4])))
+            kind = types.t[a[0]]
+            if kind[0] != "vec" or len(texel) != kind[2]:
+                raise UnsupportedConstruct(f"OpImageFetch texel {texel!r} does not fit {a[0]}")
+            values[res] = texel
         elif op == "OpStore":
             p = pointers[a[0]]
             if p[0] == "pc":
@@ -740,7 +846,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     raise UnsupportedConstruct("PhysicalStorageBuffer store of a value that is not a 32-bit integer")
                 memory[psb_word(p[1])] = v
             else:
-                p[0][p[1]] = val(a[1])
+                p[0][p[1]] = types.copy_value(id_type.get(a[1]), val(a[1]))
         elif op in _ATOMICS:
             # One invocation, so an atomic is read, combine, write; the result is the original value (SPIR-V spec,
             # 3.42.18). Operands: result type, pointer, scope, semantics(, unequal semantics), value(, comparator).
@@ -792,6 +898,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = f32_bits(v)
             elif k[0] == "int" and isinstance(v, int):
                 values[res] = v & wmask(a[0])
+            elif k[0] == "vec" and isinstance(v, tuple) and len(v) == k[2] \
+                    and types.t[k[1]][1] == 32 and source and source[0] == "vec" and types.t[source[1]][1] == 32:
+                # Same component count, 32-bit components (an image texel as words): component by component.
+                to_float = types.t[k[1]][0] == "float"
+                values[res] = tuple((bits_f32(c) if isinstance(c, int) else c) if to_float else
+                                    (f32_bits(c) if isinstance(c, float) else c & MASK) for c in v)
             else:
                 raise UnsupportedConstruct("OpBitcast between these types")
         elif op == "OpCompositeExtract":
@@ -857,7 +969,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if isinstance(x, bool) or not isinstance(x, int) or x > MASK \
                     or (t is not None and (t[0] != "int" or t[1] != 32)):
                 raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
-            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
+            converted = float(_s32(x) if op == "OpConvertSToF" else x)
+            # Python's binary64 float holds every 32-bit integer exactly.
+            values[res] = converted if types.t[a[0]] == ("float", 64) else f32(converted)
         elif op == "OpBitCount":
             # Every bit of the operand counts: its width, not the result's (a 64-bit operand with a 32-bit result).
             t = types.t.get(id_type.get(a[1]))
@@ -891,8 +1005,16 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = val(a[1]) > val(a[2])
         elif op == "OpUGreaterThanEqual":
             values[res] = val(a[1]) >= val(a[2])
+        elif op == "OpControlBarrier":
+            # <execution scope> <memory scope> <semantics>: run_workgroup's invocations meet here (each has finished
+            # every earlier instruction, and with shared Workgroup memory sees the others' writes). run_fragment
+            # refuses it, as it does a subgroup operation: a barrier belongs to a workgroup.
+            yield (op, pc - 1, None, None)
+        elif op == "OpGroupNonUniformBroadcastFirst":
+            if types.t[a[0]][0] != "int" or val(a[1]) != 3:
+                raise UnsupportedConstruct("OpGroupNonUniformBroadcastFirst other than a Subgroup-scope integer")
+            values[res] = yield (op, pc - 1, val(a[2]), None)
         elif op == "OpGroupNonUniformShuffle":
-            # OpGroupNonUniformShuffle <result type> <scope> <value> <id>; the scope must be Subgroup (3).
             if types.t[a[0]][0] != "int" or val(a[1]) != 3:
                 raise UnsupportedConstruct("OpGroupNonUniformShuffle other than a Subgroup-scope integer")
             values[res] = yield (op, pc - 1, val(a[2]), val(a[3]))
@@ -953,8 +1075,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     return math.nan
                 return f32(p / q)       # x/inf is a signed zero, as in Python
 
-            fn = {"OpFAdd": (lambda p, q: f32(p + q)), "OpFSub": (lambda p, q: f32(p - q)),
-                  "OpFMul": (lambda p, q: f32(p * q)), "OpFDiv": _fdiv}[op]
+            fn = {"OpFAdd": (lambda p, q: f32(ieee_nan(p + q, p, q))),
+                  "OpFSub": (lambda p, q: f32(ieee_nan(p - q, p, q))),
+                  "OpFMul": (lambda p, q: f32(ieee_nan(p * q, p, q))), "OpFDiv": _fdiv}[op]
             if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == len(y) and all(
                     isinstance(p, float) and isinstance(q, float) for p, q in zip(x, y)):
                 values[res] = tuple(fn(p, q) for p, q in zip(x, y))
@@ -970,7 +1093,15 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             else:
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
-            values[res] = f32(-val(a[1]))
+            # IEEE 754 negate only flips the sign bit: it keeps a NaN's payload and does not quiet a signalling NaN.
+            # A binary32 operand is negated on its bits, because the float round trip in f32() sets the quiet bit
+            # of a signalling NaN before CPython 3.14 (issue #509), as on CI's 3.12: -v1 on 0x7F800001 must give
+            # 0xFF800001, not 0xFFC00001 (AllNaNSrc0PayloadTests).
+            x = val(a[1])
+            if types.t[a[0]] == ("float", 64):
+                values[res] = -x
+            else:
+                values[res] = bits_f32(f32_bits(x) ^ 0x80000000)
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16
@@ -983,11 +1114,6 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if h & 0x7C00 == 0:
                 h &= 0x8000
             values[res] = half_to_float(h)
-        elif op in ("OpConvertUToF", "OpConvertSToF"):
-            x = val(a[1])
-            if isinstance(x, bool) or not isinstance(x, int) or x > MASK:
-                raise UnsupportedConstruct(f"{op} on a non-32-bit-integer operand")
-            values[res] = f32(float(_s32(x) if op == "OpConvertSToF" else x))
         elif op in ("OpConvertFToU", "OpConvertFToS"):
             x, bits = val(a[1]), types.bits(a[0])
             if not isinstance(x, float) or not math.isfinite(x):
@@ -1035,6 +1161,14 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if len(a) < 3 or a[1] != "%glsl":
                 raise UnsupportedConstruct("extended instruction set")
             name, args = a[2], [val(x) for x in a[3:]]
+            if name in ("SAbs", "SMin", "SMax", "SClamp", "FindILsb", "FindSMsb", "FindUMsb"):
+                bits = types.bits(a[0])
+                for operand in a[3:]:
+                    if operand not in id_type:
+                        raise UnsupportedConstruct(f"{name}: unknown integer type for {operand}")
+                    width = types.bits(id_type[operand])
+                    if width != bits:
+                        raise UnsupportedConstruct(f"{name}: {width}-bit operand {operand} with a {bits}-bit result")
             if name == "UnpackHalf2x16":
                 values[res] = (half_to_float(args[0]), half_to_float(args[0] >> 16))
             elif name == "PackHalf2x16":
@@ -1049,7 +1183,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name in ("Sin", "Cos"):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
-                values[res] = f32(abs(args[0]))
+                magnitude = abs(args[0])
+                values[res] = magnitude if types.t[a[0]] == ("float", 64) else f32(magnitude)
             elif name == "FSign":
                 # GLSL.std.450: 1.0 if x > 0, 0.0 if x = 0 (keeping the zero's sign), -1.0 if x < 0
                 x = args[0]
@@ -1058,7 +1193,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 values[res] = 1.0 if x > 0 else -1.0 if x < 0 else x
             elif name == "SAbs":
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
-                values[res] = abs(signed(args[0], types.bits(a[0]))) & wmask(a[0])
+                values[res] = abs(signed(args[0], bits)) & wmask(a[0])
             elif name in ("FMax", "FClamp"):
                 def fmax_clamp(*xs):
                     if any(math.isnan(v) for v in xs) or (name == "FClamp" and xs[1] > xs[2]):
@@ -1122,18 +1257,18 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name == "UMax":
                 values[res] = max(args)
             elif name == "SMax":
-                values[res] = max(args, key=lambda v: signed(v, types.bits(a[0])))
+                values[res] = max(args, key=lambda v: signed(v, bits))
             elif name == "SMin":
-                values[res] = min(args, key=lambda v: signed(v, types.bits(a[0])))
+                values[res] = min(args, key=lambda v: signed(v, bits))
             elif name in ("UClamp", "SClamp"):
                 # min(max(x, minVal), maxVal) (GLSL.std.450; undefined if minVal > maxVal, which raises here).
-                key = (lambda v: signed(v, types.bits(a[0]))) if name == "SClamp" else (lambda v: v)
+                key = (lambda v: signed(v, bits)) if name == "SClamp" else (lambda v: v)
                 x, lo, hi = args
                 if key(lo) > key(hi):
                     raise UnsupportedConstruct(f"{name} with minVal > maxVal (undefined)")
                 values[res] = min(max(x, lo, key=key), hi, key=key)
-            elif name in ("FindILsb", "FindUMsb", "FindSMsb") and types.bits(a[0]) != 32:
-                raise UnsupportedConstruct(f"GLSL.std.450 {name} on a non-32-bit integer (32-bit components only)")
+            elif name in ("FindILsb", "FindUMsb", "FindSMsb") and bits != 32:
+                raise UnsupportedConstruct(f"GLSL.std.450 {name} on a {bits}-bit integer (32-bit components only)")
             elif name == "FindILsb":
                 # Bit number of the least significant 1 bit, -1 if the value is 0 (GLSL.std.450).
                 x = args[0] & MASK

@@ -13,6 +13,26 @@ import shader_diff as sd  # noqa: E402
 from spirv_mini_interp import UnsupportedConstruct  # noqa: E402
 
 
+class ReplayIndex(unittest.TestCase):
+    def test_replays_exact_case_without_running_predecessors(self):
+        # Compare actual generated instructions, their last writers and the case name.
+        args = ["--seed", "7", "--max-ops", "4"]
+        with mock.patch.object(sd, "run_one", wraps=sd.run_one) as execute, mock.patch("sys.stdout"):
+            self.assertEqual(sd.main([*args, "--programs", "4"]), 0)
+            full_run = execute.call_args_list.copy()
+            for index in (0, 3):
+                execute.reset_mock()
+                self.assertEqual(sd.main([*args, "--program-index", str(index)]), 0)
+                self.assertEqual(execute.call_args_list, [full_run[index]])
+
+    def test_rejects_invalid_or_ambiguous_selection(self):
+        for args in (["--program-index", "-1"], ["--program-index", "2", "--limit", "1"],
+                     ["--program-index", "2", "--programs", "3"]):
+            with self.subTest(args=args), mock.patch("sys.stderr"), self.assertRaises(SystemExit) as caught:
+                sd.main(args)
+            self.assertEqual(caught.exception.code, 2)
+
+
 class HarnessErrorExit(unittest.TestCase):
     def test_harness_error_alone_exits_2(self):
         def boom(*_a):
@@ -39,7 +59,8 @@ class HarnessErrorExit(unittest.TestCase):
             mock.patch.object(sd.rdna2spirv, "translate", side_effect=sd.rdna2spirv.Unsupported("test opcode")),
             contextlib.redirect_stdout(out),
         ):
-            self.assertEqual(sd.main(["--programs", "1"]), 0)
+            # exit 2: a run where every program was skipped is not a success (#4448)
+            self.assertEqual(sd.main(["--programs", "1"]), 2)
         self.assertIn("1 skipped, 0 harness errors", out.getvalue())
         self.assertIn("translator unsupported: test opcode", out.getvalue())
 
@@ -55,9 +76,24 @@ class HarnessErrorExit(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(sd, "run_fragment", side_effect=UnsupportedConstruct("test construct")):
             with contextlib.redirect_stdout(out):
-                self.assertEqual(sd.main(["--programs", "1"]), 0)
+                sd.main(["--programs", "1"])
         self.assertIn("1 skipped, 0 harness errors", out.getvalue())
         self.assertIn("test construct", out.getvalue())
+
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        out = io.StringIO()
+        with mock.patch.object(sd, "run_fragment", side_effect=UnsupportedConstruct("test construct")):
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(sd.main(["--programs", "2"]), 2)
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
+
+    def test_some_skips_next_to_passes_still_exit_0(self):
+        out = io.StringIO()
+        calls = iter([("match", ""), ("skip", "unsupported form")])
+        with mock.patch.object(sd, "run_one", lambda *_a: next(calls)):
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(sd.main(["--programs", "2"]), 0)
+        self.assertIn("1 pass, 0 mismatch, 1 skipped", out.getvalue())
 
     def test_mismatch_still_exits_1(self):
         with mock.patch.object(sd, "run_one", lambda *_a: ("mismatch", "lane word 0")), mock.patch("sys.stdout"):
@@ -101,7 +137,7 @@ class ArgumentValidation(unittest.TestCase):
 
     def test_a_valid_limit_still_runs_that_many_programs(self):
         out = io.StringIO()
-        with mock.patch.object(sd, "run_one", lambda *_a: ("pass", "")), contextlib.redirect_stdout(out):
+        with mock.patch.object(sd, "run_one", lambda *_a: ("match", "")), contextlib.redirect_stdout(out):
             self.assertEqual(sd.main(["--programs", "5", "--limit", "1"]), 0)
         self.assertIn("1 programs", out.getvalue())
 

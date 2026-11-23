@@ -1,5 +1,6 @@
 """Exit codes of a built rpf9dump. Set RPF9DUMP_DLL to its Release DLL to run it."""
 
+import json
 import os
 from pathlib import Path
 import struct
@@ -64,6 +65,20 @@ def run(*args):
 
 @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires a built rpf9dump")
 class Rpf9dumpExitCodeTest(unittest.TestCase):
+    def test_missing_or_directory_source_exits_2_before_the_output_folder_is_created(self):
+        # A mistyped source used to create <out>/<name> and then die with an unhandled FileNotFoundException
+        # from FileInfo.Length. Both mistakes are usage errors (exit 2) and must leave the output alone.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for label, src in (("missing", root / "missing.rpf"), ("directory", root)):
+                with self.subTest(source=label):
+                    out = root / f"out-{label}"
+                    done = run("ttpf", src, out)
+                    self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                    self.assertIn("source is not a file", done.stderr)
+                    self.assertNotIn("Unhandled exception", done.stderr)
+                    self.assertFalse(out.exists(), f"{label} source left {out} behind")
+
     def test_failed_xma_write_exits_nonzero_and_rerun_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -103,6 +118,70 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
             self.assertTrue((sub / "manifest.json").exists())
             self.assertEqual(dds.read_bytes()[:4], b"DDS ")
+
+    def test_unknown_mode_exits_nonzero_before_the_source_or_output_is_touched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "package.rpf"     # never created: the mode is rejected before the source is opened
+            out = root / "out"
+            bad = run("invalidmode", src, out)
+            self.assertNotEqual(bad.returncode, 0, bad.stdout + bad.stderr)
+            self.assertIn("unknown mode 'invalidmode'", bad.stdout + bad.stderr)
+            self.assertNotIn("ok=0 fail=0 skip=0", bad.stdout, "an unknown mode still reported a finished run")
+            self.assertFalse(out.exists(), "an unknown mode created the output folder")
+            self.assertEqual([p.name for p in root.iterdir()], [], "an unknown mode touched the work folder")
+
+    def test_usage_lists_every_mode(self):
+        short = run()
+        self.assertEqual(short.returncode, 2, short.stdout + short.stderr)
+        self.assertIn("usage: rpf9dump", short.stdout)
+        for mode in ("ttpf", "models", "textures", "audio", "xma"):
+            self.assertIn(mode, short.stdout, f"usage does not list {mode}")
+
+    def test_start_past_eof_exits_2_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "tiny.rpf"
+            src.write_bytes(bytes(16))
+            for mode in ("models", "textures"):
+                with self.subTest(mode=mode):
+                    out = root / f"out-{mode}"
+                    done = run(mode, src, out, "--start", "1024")
+                    self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                    self.assertIn("--start", done.stderr)
+                    self.assertNotIn("Unhandled exception", done.stderr)
+                    self.assertFalse(out.exists(), f"{mode} left {out} behind on --start past EOF")
+
+    def test_start_plus_length_overflow_is_clamped_and_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "tiny.rpf"
+            src.write_bytes(bytes(16))
+            for mode in ("models", "textures"):
+                with self.subTest(mode=mode):
+                    out = root / f"out-{mode}"
+                    done = run(mode, src, out, "--start", "8", "--length", str((1 << 63) - 1))
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertNotIn("Unhandled exception", done.stderr)
+                    manifest = json.loads((out / "tiny" / mode / "manifest.json").read_text(encoding="utf-8"))
+                    self.assertEqual(manifest["Count"], 0)
+                    self.assertEqual(manifest["Scan"]["Start"], 8)
+                    self.assertEqual(manifest["Scan"]["Length"], 8)
+
+    def test_short_source_under_64_bytes_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for size in (0, 16):
+                src = root / f"tiny_{size}.rpf"
+                src.write_bytes(bytes(size))
+                for mode in ("models", "textures"):
+                    with self.subTest(size=size, mode=mode):
+                        out = root / f"out-{mode}-{size}"
+                        done = run(mode, src, out)
+                        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                        self.assertNotIn("Unhandled exception", done.stderr)
+                        manifest = json.loads((out / f"tiny_{size}" / mode / "manifest.json").read_text(encoding="utf-8"))
+                        self.assertEqual(manifest["Count"], 0)
 
 
 if __name__ == "__main__":

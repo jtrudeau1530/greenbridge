@@ -149,7 +149,7 @@ The `SKEL_<region>_<part>` shape is the conventional RAGE bone naming. The anima
 to the bones, but a skeleton carries its own names (`joaat32` at bone record `+0x1C`, name at `+0x30`,
 [character_skeleton.md](character_skeleton.md)), so the match is measured: see
 [Bone tables and motion matchers](#bone-tables-and-motion-matchers).
-The `SKEL_<region>_<part>` shape is the conventional RAGE bone naming. Measured across all `SKEL_*` streams in
+Measured across all `SKEL_*` streams in
 `anim.rpf` (`177` streams, `118` distinct `SKEL_*` tokens) against the decoded skeleton name tables in
 `packs.rpf` (`2,866` `SKEL_`-bearing streams, `691` distinct `SKEL_*` tokens) using `tools/anim_skeleton_match.py`:
 `117` of `118` (`99.2%`) match by exact case and all `118` of `118` (`100%`) match case-insensitively (and by
@@ -484,15 +484,50 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | `+0x120` pointer (`+0x58` = 2) | a block whose `+0x18` points at the parameter node |
 | | `+0x138` pointer (`+0x58` = 1) | the parameter node: `{u64 0; u32 type; u32 0; ...}` |
 | parameter node, type 3 | `+0x10` array of u32, `+0x20` array of 8-byte items, `+0x30`/`+0x34` f32 | one sampled axis: its name hash(es), then `{u32 sample index; f32 value}` sorted by value, then min and max |
-| `.motionmatcher` (`+0x20` is a pointer) | `+0x28` 16 bytes, `+0x38` atString | an id, then `pack:/<name>.motionmatcher`; the rest is not decoded |
+| `.motionmatcher` (`+0x20` is a pointer) | `+0x20` pointer | the feature object (below) |
+| | `+0x28` 16 bytes, `+0x38` atString | an id, then `pack:/<name>.motionmatcher` |
+| | `+0x58` pointer, u32 count at `+0x54` | records `{f32; f32; f32 −1.0; u32 clip index; u64 0}`, 24 bytes. A `.motionmatcher` array keeps its u32 count just before the pointer, and a u32 capacity before that |
+| | `+0x68` pointer, count at `+0x64` | u32 offsets, one more than the records, from 0 and never decreasing |
+| | `+0x78` pointer, count at `+0x74` | u16, one per clip and then the record count: each clip's first record |
+| | `+0xB8` pointer, count at `+0xB4` | u8, 0 or 1, one per clip |
+| | `+0x98` pointer, count at `+0x94` | on 36 of 180: one `{u64 0; u32 clip hash; u32 dictionary hash}` per clip, like `.motion` children |
+| | `+0xA0` u32 groups, `+0xA4` u32 entries, `+0xA8` pointer | a hash table of the clips: per group 16 control bytes (0x80 empty, below 0x80 full), then 16 slots `{u32 clip hash; u32 dictionary key; u32 clip index; u32 0}` |
+| | `+0x170`/`+0x174`/`+0x178` | the same kind of table with 8-byte slots `{u32 hash; u32 index}` |
+| | `+0x188` u32, `+0x18C` u32 | the clip's own hash and the dictionary's `joaat32(name)`, as `.motion` has at `+0x28`/`+0x2C` |
+| | `+0x48` pointer, count at `+0x44` | one 40-byte item, zero except a u32 1 at its `+0x20` (`+0x40` holds the name's length and capacity, measured separately) |
+| | `+0x118` pointer, count at `+0x114` | one u32: the pose sample count |
+| | `+0x128` pointer, count at `+0x124` | one u16, 0 |
+| matcher feature object | `+0x18` u32, `+0x28` pointer, `+0x30` pointer or null | 1 (measured separately), then the skeleton and the `+0x30` object (both below) |
+| | `+0x40` pointer, count at `+0x3C` | pointers to the features, 0x30 bytes each: `{+0x08 u32 column; +0x0C u16 width; +0x0E u16 (1 or 5); +0x18 u32 name hash (a bone with 1); +0x1C u32 kind bits}` |
+| | `+0x48` u32 groups, `+0x4C` u32 entries, `+0x50` pointer | a hash table like the clip table, 8-byte slots `{u32 hash; u32 feature index}` |
+| | `+0xF0` pointer, count at `+0xEC` | the pose matrix, f16, in 32-byte chunks: one row of feature values per sample (layouts below) |
+| | with `+0x30`: `+0xF8` u32, `+0xFC` u32, `+0x100` u32 | samples, columns, 32-byte chunks per row (rows are padded to 16 columns) |
+| | with `+0x30`: `+0xA8` pointer, count at `+0xA4` | one 48-byte `{f32 quaternion[4]; f32 vec3; f32 0; f32 1, 1, 1; f32 0}` per sample |
+| | without `+0x30`: `+0xFC` u32, `+0x128` u32 | columns, samples (the matrix is in blocks of 8 samples) |
+| | `+0x98` pointer, count at `+0x94` | one u32 per sample: a bit mask over the matcher's key table indices, the same for every sample of a record |
+| | `+0xB8` pointer, count at `+0xB4` (32-byte chunks) | one f32 weight per pose column, 8 to a chunk, zero after the last column |
+| | `+0xC0` f32, `+0xC4` f32, `+0xC8` u32 | not decoded, then 1.0, then 1 with rows and 3 with blocks of 8 |
+| matcher `+0x30` object (112 bytes, measured separately) | `+0x08` u32 | its form: 1 or 2 |
+| | form 2: `+0x10`/`+0x14` u32, `+0x18`/`+0x1C` f32 | two bones (`joaat32` of their names) and their weights |
+| | form 2: `+0x30` 0x30 bytes, `+0x68` u32, `+0x6C` u16 | a copy of the clip's first feature (its kind at `+0x4C`), that feature's width, a flag (6 or 9) |
+| | form 1: `+0x10` f32[4], `+0x60` u32 | a unit quaternion (a reference rotation), a flag (6 or 7) |
+| | form 1: `+0x40` {u32 n; u32 n; pointer}, `+0x50` the same | n u32 bones (`joaat32` of their names), then n f32 weights |
+| matcher skeleton (feature object `+0x28`) | `+0x18` u32 slots, `+0x1C` u32 entries, `+0x20` pointer | tag table, 8-byte slots `{u32 tag; u32 bone}`, empty tag 0xFFFFFFFF |
+| | `+0x28` pointer, `+0x6C` u16 count (`+0x6E` the same, measured separately) | the bones, 80 bytes each: `{f32 rotation quaternion[4]; f32 translation[3]; 4 bytes; f32 1.0[4]; char *name at +0x30; s16 parent at +0x46; u16 index at +0x48 and +0x4C; u16 bone id at +0x4A}` (the 1.0s and the two indices on 180 of 180, measured separately) |
+| | `+0x30`, `+0x38` pointers | per bone a 4x4 f32 matrix: the inverse bind matrix, and the local matrix (row vectors, translation in row 3) |
+| | `+0x40` pointer | the parents, one s16 per bone, −1 for the root |
+| | `+0x48` pointer | a prefix tree of the bone names: `{u16 n; u16 size}`, nodes from `+4` `{u16 next sibling; u16 first child; s16 value; char text[]}` (offsets relative to the node), then n u16 bone indices at `+size` |
 | animation | `+0x24` u16 | frame count |
 | | `+0x28` f32 | duration = (frames − 1) / fps |
 | | `+0x50` array | sequence pointers |
 | | `+0x60` array, 12-byte items | tracks `{u32 bone hash; u32 track type; u32 format}` |
 
 A clip plays its animations at the same time, each over its own `[start, end]` window at its rate: animation time
-`t` is clip time `(t − start) / rate`, and `(end − start) / rate` equals the clip's `+0x78` duration (4,471 of 4,471
-entries in 300 sampled dictionaries). In the samples, the animations of one clip covered different bones and could
+`t` is clip time `(t − start) / rate`, and `(end − start) / rate` equals the clip's `+0x78` duration: over all
+61,505 dictionaries of `anim.rpf` (`tools/anim_clips.py`, `clip_windows`), 784,562 of the 785,174 animation entries of
+ordinary clips match to float32 precision (relative 1e-5) and the other 612 within 2.2e-4 relative, 581 of them in
+one-frame (0.033 s) clips where the rounding shows most; none has rate 0 (the first check, 300 sampled
+dictionaries, had 4,471 of 4,471). In the samples, the animations of one clip covered different bones and could
 have different frame rates. `tools/anim_glb.py` plays clips on a fragment skeleton and writes them as glTF
 animations; see [character_skeleton.md](character_skeleton.md#animated-gltf-export).
 
@@ -635,7 +670,13 @@ fields are in the object table above. Measured on all 17,247 `.motion` clips:
   sample count at `+0x90`, `+0x90`, `+0x50` and `+0xA0`: on all 2,281 of them that are a `.motion`'s only node, it
   equals the number of `+0x90` sample lists below. The word list resolves 1,135 of their 8,404 axis names, the same
   names as type 3 (`verticalheight`, `yawangle`, `surfaceincline` the most); `anim_clips.py` counts them as
-  `motion_node_axis_name:<type>:<name or unresolved>`.
+  `motion_node_axis_name:<type>:<name or unresolved>`. Types 4–8 have a second `{ptr, count}` array at `+0x20`
+  (found by @ismailchaka1): null on all 2,644 type-4 nodes and on 431 of the 482 type-5 nodes, present on the other
+  51 type-5 nodes and on every type-6 (295) and type-8 (98) node. On all 393 type-6 and type-8 nodes its 16-byte
+  items read `{u32, u32 0, u32, u32 0}` and none of those words is one of the node's axis names or the `.motion`'s
+  child or dictionary hashes; on type 5 only 2 of the 51 arrays have that shape. The item count is 5 on 184 type-6 nodes, 3 on 57, 2 on 44; 9 on 47 type-8 nodes and 6 on 42.
+  It equals the child count on only 5 of the 444 nodes. Not decoded; `anim_clips.py` counts the item counts as
+  `motion_node_pairs:<type>:<count or null>`.
 - **Type 3: one sampled axis.** It has one axis entry, then 1–16 `{u32 sample index, f32 value}` items and the
   axis min and max. On all 10,171 (29,123 samples), the items are sorted by value, min and max are the first and
   last values, and the sample indices are 0..n−1 in some order. They are not child indices: the sample count
@@ -663,7 +704,132 @@ fields are in the object table above. Measured on all 17,247 `.motion` clips:
 The 180 `.motionmatcher` clips sit in 142 dictionaries that hold only `.motionmatcher` clips and no local pack.
 The three motion matcher streams in [Bone tables and motion matchers](#bone-tables-and-motion-matchers)
 (`0x101c379a0`, `0x101c41d50`, `0x101ea66c0`) are the second system pages of three of those dictionaries, with 2, 1 and 2
-`.motionmatcher` clips. Their layout after the name is not decoded.
+`.motionmatcher` clips.
+
+A `.motionmatcher` object has fields up to `+0x18F`; they are in the object table above, and `anim_clips.py` decodes them
+(`parse_matcher`) and counts them as `matcher_*`. Measured by `parse_matcher` on the pages of all 142 dictionaries
+(180 clips):
+
+- **Arrays** keep a u32 count at pointer − 4 and a u32 capacity at pointer − 8, not the `{ptr; u16 count}` of the
+  rest of the dictionary.
+- **Records (`+0x58`).** 4,562 records (1–346 per clip, measured separately). The third float is −1.0 in all of
+  them, and the u32 is the record's position on 175 of 180 clips. The first float is 0 or 0.03–2.37 and the second
+  one of 2.5, 5, 6.667, 10, 15, 20, 30 or 40 (also measured separately); that they are a start time and a sample
+  rate is a hypothesis.
+- **Offsets (`+0x68`).** One more than the records on 180 of 180, starting at 0 and never decreasing, so an offset
+  table into data not decoded here.
+- **Clip table (`+0xA0`).** An open-addressing hash table: the group count is a power of two (2 on 151 clips,
+  measured separately), every control byte is 0x80 or below 0x80, the last word of every slot is 0 (measured
+  separately), and the full slots equal the entry count on 180 of 180. Its 4,381 slots hold a clip hash that is a
+  clip in anim.rpf (4,381 of 4,381) and a clip index; the indices are 0..n−1 over the entries on 180 of 180. The
+  matcher's clips are these n entries, and its records are cut from them: a record's fourth word is its clip's
+  index and the record lies in that clip's `+0x78` range on 180 of 180 (`matcher_record_clip_in_its_u16_78_range`).
+  There is one clip per record on 175; on the other 5 some clips have several records. The second word names the
+  clip's dictionary: measured separately against the 60,778 dictionary names of anim.rpf, it is `joaat32` of the
+  dictionary's name behind a fixed 8-character prefix on 4,356 of 4,381 entries (the slot's clip is in that
+  dictionary on 4,349), the plain dictionary hash on 18, and neither on 7. 177 of 180 matchers resolve all their
+  entries this way.
+- **References (`+0x98`).** 36 clips have one `{clip hash, dictionary hash}` per clip (439). All 439 resolve to a
+  clip of that dictionary in anim.rpf, and the item at each table slot's clip index names that slot's clip on all
+  36. On those 36, the dictionary the second word names is the reference's on 438 of 439 (measured separately), so
+  the table gives the dictionary for the other 144 too.
+- **Key table (`+0x170`).** The same table with 8-byte slots, 2 groups on all 180: 403 entries of `{u32 hash, u32
+  index}`, the indices 0..n−1 on 180 of 180. 38 entries are clip hashes in anim.rpf; there are 23 distinct hashes
+  (measured separately).
+- **Where an entry sits.** Every entry is where its hash h puts it: control byte h & 0x7F, in group
+  (h >> 7) & (groups − 1), or, when that group is full, in a later one with every group in between full (linear
+  probing), on 180 of 180 for each of the three tables (`table_placed_by_key`). The key table and the features'
+  `+0x48` table hash an entry by its own first u32. The clip table hashes the u64 of its first two words (clip
+  hash low, second word high) with MurmurHash3's 64-bit finaliser (`fmix64`, `clip_slot_hash`): 4,351 of its
+  4,381 entries sit in their home group and the other 30 after full groups (measured separately).
+- **Self (`+0x188`).** The clip's own hash and the dictionary's `joaat32(name)` on 180 of 180.
+- **`+0x78` and `+0xB8`.** The u16 array has one item per clip and then one more, on 180 of 180: it starts at 0,
+  never decreases and ends at the record count, so item i is clip i's first record. The u8 array has one item per
+  clip on 180 of 180 and is 0 or 1; 16 items are 1. (With one clip per record, on 175, both also fit "one per
+  record".)
+- **Features (`+0x20`).** Each matcher points to a feature object with a list of features: 1,873 in all, distinct
+  name hashes within each clip on 180 of 180 (1–21 per clip and 53 distinct names overall, measured separately). Widths are multiples of 3 on 180 of 180
+  (3, 6, 9 or 12, measured separately), and the columns chain from 0 (each feature starts where the one before
+  ends) on 180 of 180, so a clip's features fill 6–126 columns (11,616 in all; the range measured separately),
+  and the pose matrix below has one column per feature column. The `+0x48` table has one slot per feature, with the indices 0..F−1 on
+  180 of 180; its hashes are not the `+0x18` name hashes (0 of 180, measured separately). `+0x0E` is 1 on 1,842
+  features and 5 on 31, all 31 in clips with the blocks layout (measured separately). With 1, the name hash is
+  `joaat32` of a bone name of the clip's skeleton on 1,842 of 1,842, and `+0x1C` is a set of bits that gives the
+  width: 3 columns for bit 0, 3 for bit 1 and 6 for bit 3, on 1,842 of 1,842 (kinds 1, 3, 9 and 11 are seen,
+  measured separately). That bit 0 is the bone's position, bit 1 its velocity and bit 3 a rotation written as two
+  vectors is a hypothesis; the pose check below supports it for position and rotation. With 5, `+0x18` names no
+  bone (0 of 31): `+0x1C` is 0 on 20 and `+0x18` is 0 on the other 11. Measured separately, the nonzero words of
+  the 30 three-column ones are `joaat32` of names that are not bones (a word list resolves some of them).
+- **Skeleton (feature object `+0x28`).** 3,918 bones over the 180 clips. One root and every parent before its
+  child on 180 of 180, the bones' parent field is the `+0x40` array, and the tag table holds exactly two tags per
+  bone, `joaat32` of its name and its u16 id, on 180 of 180. The root's id is 0 and every other bone's is the ELF
+  hash of its upper-cased name, mod 0xFE8F, plus 0x170, on 180 of 180 (3,738 bones; `bone_id`). The local
+  matrix is the bone's rotation and translation, and the inverse bind matrix times the product of the local
+  matrices up the chain is the identity (to 2e-3), on 180 of 180. `+0x48` is a prefix tree of the bone names
+  (shared prefixes stored once): walking it, a node whose value lands in the u16 array after the tree names the
+  bone in that slot, and every bone's name leads to that bone, on 180 of 180 (`skeleton_name_tree`). The array
+  lists the bones in tree order (measured separately). `parse_matcher` returns it all as `skeleton`.
+- **Per sample (`+0x98`).** In both layouts, one u32 per sample, the same for every sample of a record, on 180 of
+  180. It is a bit mask over the key table's indices: the bits set over all samples are exactly bits 0..K−1, with
+  K the key table's entries, on 180 of 180 (`matcher_sample_u32_bits_are_key_indices`), so each record carries the
+  set of keys (tags) that apply to it.
+- **Pose matrix (feature object `+0xF0`).** One row of f16 values per sample, one column per feature column. The
+  sample count equals the last `+0x68` offset on 180 of 180 (36,436 samples), so record i owns the rows from
+  offset i to offset i+1, and the column count is the features' total on 180 of 180. Two layouts, told apart by
+  the feature object's `+0x30` object (149 with it, 31 without):
+  - **Rows** (149): row-major, each row padded with zero columns to the next multiple of 16 (`+0x100` chunks of 16).
+  - **Blocks of 8** (31): 8 samples at a time, column-major inside a block, so column c of sample r is at
+    `(r // 8) · D' · 8 + c · 8 + r mod 8`, with D' the column count rounded up to even (the spare column is zero).
+    The lanes after the last sample repeat it.
+
+  The sizes fit these layouts on 180 of 180 (`parse_matcher` refuses one that doesn't), every value is finite and
+  the padding is as described on 180 of 180. On the 149 with rows, `+0xA8` has one 48-byte item per sample: a
+  unit quaternion, a vec3 and a scale of (1, 1, 1) on 149 of 149. It is the sample's reference frame: the
+  quaternion is a rotation about z only on 30,946 of the 30,962 samples, and the frame comes from the `+0x30`
+  object's weighted bones (below). `anim_clips.matcher_pose` reads one row.
+
+  Measured separately by decoding the clips' own keyframes at each sample's time (up to two clips per matcher,
+  285 clips; record start + j / the record's rate), a feature holds its bone's pose in that frame:
+  - position columns are the bone's model-space position minus the frame's vec3, rotated by the frame's inverse,
+    on 11,469 of 12,873 samples (to 0.01 m);
+  - the two vectors of bit 3 are rows 0 and 1 of the bone's model-space rotation, in the same frame, on 2,233 of
+    2,544 (to 0.02);
+  - the frame's x and y are the weighted centroid of the object's bones on 1,148 of 1,233 samples; its z is the
+    centroid's z with flag 6, and −1.0 on every sample on 29 of the 32 form 1 matchers with flag 7 (all 149
+    matchers counted);
+  - its yaw is the heading from the first to the second bone with form 2 (682 of 752), and the z-twist of the
+    reference rotation's inverse times the bone's rotation with a one-bone form 1 (89 of 89).
+
+  Velocity columns (bit 1) fit a plain difference of the model-space position on only 1,960 of 9,366 samples, so
+  they are not decoded. A record's rows cover part of its clip, not all of it:
+  with rows 1 / (the record's second float) seconds apart, they fit inside the clip's duration on 2,108 of the
+  2,155 records whose clip duration is known without ambiguity (measured separately), which fits the sample-rate
+  hypothesis above. Which part of the clip they cover is not decoded.
+- **One-item arrays.** The matcher's `+0x48` is one 40-byte item, zero except a u32 1 at `+0x20`; `+0x118` is
+  one u32 equal to the pose sample count; `+0x128` is one u16, 0; each on 180 of 180.
+- **`+0x30` object.** On the 149 clips that have it, its `+0x08` is 2 on 93 and 1 on 56. It names the bones the
+  pose frame is built from (above). With 2: two distinct bones of the clip's skeleton by `joaat32` of their names
+  at `+0x10`/`+0x14` (93 of 93), and at `+0x30` a copy of the clip's first feature (its `+0x0E`, name hash and
+  kind, 93 of 93) whose width is at `+0x68` (by the bit rule above, 93 of 93); the u16 at `+0x6C` is 6 on 92 and
+  9 on 1. With 1: the arrays at `+0x40` and `+0x50` have the same count n (1, 3, 4 or 6, measured separately), and
+  the first holds bones of the skeleton by `joaat32` of their names (56 of 56); `+0x10` is a unit quaternion (56
+  of 56), and the u32 at `+0x60` is 6 on 24 and 7 on 32. Its weights (form 2: the f32s at `+0x18`/`+0x1C`; form
+  1: the second array) are positive and sum to 1 on 149 of 149.
+- **Column weights (`+0xB8`).** One f32 per pose column, stored 8 to a 32-byte chunk with zeros after the last
+  column (the count at `+0xB4` is the chunks), on 180 of 180. They are positive and sum to 1, and the three
+  columns of each vec3 have the same weight, on 180 of 180 (`matcher_column_weights_*`). They are not the
+  reciprocal, the deviation or the variance of their columns over the samples (measured separately), and a
+  clip's weights and `+0xC0` are the same for every clip with the same features on 20 of 23 feature sets
+  (measured separately), so they look like settings, not statistics. `+0xC4` is 1.0, and `+0xC8` is 1 with rows
+  and 3 with blocks of 8, on 180 of 180.
+- Not decoded: the hash of the features' `+0x48` table. It is a function of the feature's `+0x0E` and `+0x18`
+  only (53 distinct pairs, no conflict), and, measured separately, it is not case-sensitive or case-folded
+  joaat32 (with any constant seed or prefix, or a suffix of up to 3 characters), one-at-a-time, FNV-1/1a 32 or 64,
+  ELF, CRC-32, MurmurHash3 32, MurmurHash64A, or `fmix32`/`fmix64` of the name hash or the bone id. Also not
+  decoded: the velocity columns, the yaw rule of a form 1 object with several bones (the z-twist of their
+  weighted inverse-bind rotations fits only to 0.15 rad, 353 of 392 samples), why form 1's quaternion is not
+  the blend of its bones' bind rotations (15 of 56), the width-9 feature with `+0x0E` = 5, and the f32 at
+  `+0xC0`.
 
 ### Other archives
 
@@ -883,6 +1049,87 @@ state-machine and motion-tree hierarchy (**1,616** containers across the 324 res
   (20-byte unary node, 48), `Type 5` (44-byte blend, 42), and `Type 23` (8-byte identity pose leaf, 20), plus 13
   rarer operator types (`6, 8, 18, 25, 27, 31, 32, 34, 36, 37, 39, 40, 41`, 53 total).
 
+## `MoVE` state-machine containers
+
+`tools/anim_move.py` decodes all 324 `MoVE` (version 19) resources in `anim.rpf` (ASSET-86):
+
+```powershell
+python -I tools/anim_move.py <package>\anim.rpf <work>\anim-move.json
+```
+
+All 324 resources (325 zlib streams, 331,771 stored / 1,494,188 inflated bytes once the 64 KiB stream at
+`0x105a7d000` is joined with its 5,563-byte continuation stream at `0x105a7f9c0`) decode with 0 errors. Unlike clip
+dictionaries and `0DRP` resources, a `MoVE` resource has no virtual `0x50xxxxxx` pointers or RAGE page map: every
+internal cross-reference is a signed 32-bit self-relative byte offset (`target = field_offset + rel_i32`).
+
+### Header and variable preamble
+
+After the fixed 32-byte header (`"MoVE"`, `u32 version = 19`, three zero `u32`s, `u32 network_hash` at `+0x14`,
+`u32 body_size` at `+0x18`, `u32 0` at `+0x1C`), a variable-length preamble starts at `+0x20`:
+
+| Field | Type | Measured across 324 resources |
+|---|---|---|
+| `N_req`, `requests` | `u32`, `N_req × u32` | `0..16` request hashes (`> 0` in 149 resources, 543 entries total) |
+| `N_flag`, `flags` | `u32`, `N_flag × u32` | `0..27` flag hashes (`> 0` in 123 resources, 687 entries total) |
+| `preamble_mode` | `u32` | `0` in 225 resources, `1` in 91, `2` in 8 |
+| `N_desc`, `descriptors_5b` | `u32`, `N_desc × {u32 hash; u8 kind}` | `0` in 184 resources, `1..15` in 140 (272 entries total; `kind` = `0`: 20, `1`: 92, `2`: 74, `4`: 1, `7`: 85) |
+| `tail` | `{u16 sub_flag; u32 ref_hash_0; u32 ref_hash_1}` | 10 zero bytes whenever `preamble_mode` is `0` or `1` (316/316); `sub_flag = 1` with two non-zero reference hashes when `preamble_mode == 2` (8/8) |
+
+The root state container starts immediately after the 10-byte tail at
+`node_start = 48 + 4 * (N_req + N_flag) + 5 * N_desc` (`58..244` bytes). `body_size` at `+0x18` counts the
+request/flag arrays, three `u32` preamble words and the entire state graph (`body_size == 12 + 4 * (N_req + N_flag) +
+graph_bytes`), excluding the 46 fixed/tail bytes and the `5 * N_desc` descriptor table:
+
+$$\text{total\_bytes} = 46 + 5 \cdot N_{\text{desc}} + \text{body\_size}$$
+
+holds exactly for **324 of 324** resources.
+
+### Recursive state containers (`Type 1`, `Type 3`, `Type 22`)
+
+Every node in the graph starts with `{u16 type; u16 index; u32 name_hash}`. Three container types form the recursive
+state-machine and motion-tree hierarchy (**1,616** containers across the 324 resources). All three share a 36-byte
+(`0x24`) common prefix:
+
+```
++0x00  u16 type                (1 = StateMachine, 3 = InlinedStateMachine, 22 = MotionTree)
++0x02  u16 index               (0 on root/child states; node index inside an enclosing MotionTree)
++0x04  u32 name_hash           (joaat32; e.g. joaat32("statemachine") = 0x1997df3c, joaat32("motiontree") = 0x8d398f99)
++0x08  i32 init_or_root_rel    (target = off + 0x08 + init_or_root_rel)
++0x0c  u32 flags               (0 or 1)
++0x10  u8 b10, u8 b11, u8 n_children, u8 n_transitions
++0x14  four u32 words          (0 in all measured Type 1 and Type 3 headers)
+```
+
+| Container type | Instances | Header & body layout after `+0x24` |
+|---|---:|---|
+| `Type 1` (`StateMachine`) | 230 (63 at file root, 167 nested) | `0x58`-byte header: `+0x24` `i32 transitions_rel` (`off + 0x58 + 8 * n_children` when `n_transitions > 0`, or `0`), `+0x44` `f32 1.0`, `+0x50` `u32 n_default_transitions`, `+0x54` `i32 default_transitions_rel`. At `+0x58`: `n_children` 8-byte child directory entries `{u32 child_hash; i32 child_rel}` (`target = entry + 4 + child_rel`, 747 child states total), then `n_transitions` outgoing transitions, `n_default_transitions` default transitions, and the `n_children` child state containers (`Type 1` or `Type 22`). In 230 of 230 instances, `init_target` is in the child directory and every child's `+0x04` hash matches its directory `child_hash`. |
+| `Type 3` (`InlinedStateMachine`) | 132 (all inside a `MotionTree`, 332 child states) | Same header as `Type 1` through `+0x54`, plus `u32 n_inputs` at `+0x58` (`1..2`, 151 inputs total) and `n_inputs × i32 input_rel` at `+0x5c` (`target = (off + 0x5c + 4*i) + input_rel`, pointing to the input pose node in the enclosing `MotionTree`). The `n_children × 8`-byte child directory follows at `off + 0x5c + 4 * n_inputs`, then `n_default_transitions` (114 total) and the `n_children` child states. |
+| `Type 22` (`MotionTree`) | 1,254 (261 at file root, 993 nested) | `0x30`-byte header: `+0x24` `i32 transitions_rel` (always `0x0c`, so transitions start at `off + 0x30`), `+0x28` `i32 param_blocks_rel`, `+0x2c` `u32 n_param_blocks`. Followed by `n_transitions` outgoing transitions, `n_param_blocks` length-prefixed parameter blocks, and the motion-tree node arena (`3,875` declared children; first node has `index == 0`, root expression node is at `off + 0x08 + init_or_root_rel`). |
+
+### Transitions, parameter blocks and motion-tree nodes
+
+- **Outgoing state transitions (1,097 total: 77 on `Type 1`, 1,020 on `Type 22`):** each transition record carries its
+  own byte length as `u32 size` at `+0x10` (`size >= 0x4c`; `76`, `84`, `88`, `92`, `96`, ... bytes), a signed relative
+  offset to the target state at `+0x48`, and (when `size >= 0x50`) a `u32 condition_kind` at `+0x4c` followed by
+  `size - 0x50` bytes of condition hashes and thresholds. Summing `size` across `n_transitions` matches the exact
+  transition block span in **100%** of containers.
+- **Default / any-state transitions (491 total: 377 on `Type 1`, 114 on `Type 3`):** each record starts with
+  `{u16 size; u16 condition_count; i32 target_rel}` (`size >= 16`). Summing `size` across `n_default_transitions`
+  matches `first_child - def_tr_start` in **100%** of containers.
+- **MotionTree parameter blocks (2,104 total across the 1,254 `MotionTree`s):** each block starts with
+  `{u32 block_size; u8 index, b1, b2, b3, b4, b5, b6, b7}` (`b7 == 0` in all 2,104), followed by
+  `(b1 + b2 + b3 + b4)` 16-byte parameter/signal bindings (`3,683` total), `b5` 8-byte output/event bindings (`591`
+  total), and `b6` variable-length curve/expression sub-records (`632` total, each carrying `u16 sub_size` at `+0x04`).
+  The byte identity
+  $$\text{block\_size} = 12 + 16(b_1 + b_2 + b_3 + b_4) + 8b_5 + \sum_{k=1}^{b_6} \text{sub\_size}_k$$
+  holds in **2,104 of 2,104 (100%)** blocks.
+- **MotionTree root expression nodes (1,254 total):** the root node at `init_target` is most commonly `Type 11`
+  (clip leaf, 216), `Type 4` (2-way blend, 193), `Type 3` (`InlinedStateMachine`, 132), `Type 2` (12-byte output leaf,
+  116), `Type 28` (filter/modifier, 94), `Type 9` (directional blend, 83), `Type 1` (nested `StateMachine`, 81),
+  `Type 10` (N-way blend, 72), `Type 12` (parameterized motion, 55), `Type 19` (additive blend, 49), `Type 15`
+  (20-byte unary node, 48), `Type 5` (44-byte blend, 42), and `Type 23` (8-byte identity pose leaf, 20), plus 13
+  rarer operator types (`6, 8, 18, 25, 27, 31, 32, 34, 36, 37, 39, 40, 41`, 53 total).
+
 ## Readable, compressed and still opaque
 
 - **Readable:** all 273 name tables (2,298 paths), the `0DRP` version/page count, 1,371 type-hash headers,
@@ -901,7 +1148,7 @@ state-machine and motion-tree hierarchy (**1,616** containers across the 324 res
   sampled positions.
   No Oodle signature is known from these bytes; none is guessed.
 - **Still opaque:** high-entropy blocks inside `other` and zero-prefixed pages (4 KiB blocks up to 7.96
-  bits/byte), the `0DRP` root objects and the packed component coding of their 1,781 clip-stream pages, the
+  bits/byte), the `0DRP` root objects and the meaning of their auxiliary payloads, the
   56 empty rig sets, the RBF0 numeric fields, and
   the rig→skeleton link (0 measured matches). Of the 30 bone names, 19 have a confirmed stored hash and 11 do
   not; the four motionmatcher paths bind to embedded tables, but not to an RBF0 rig.
@@ -914,7 +1161,6 @@ state-machine and motion-tree hierarchy (**1,616** containers across the 324 res
 - None of the 1,350 model names occurs in the 8,020 animation paths collected here, and none occurs in the
   `RBF0` rig metadata either. The sampled clip hash `0x25ed0554e58ba1fc` and the recurring `0x98e1750c` are
   absent from all manifest names and integer/string values. A real cross-check needs the full model export
-  (350,251 models per `docs/design.md`) and the rig table.
   (382,781 models at `e293917` per `docs/design.md`) and the rig table.
 - `common.rpf` is the readable metadata layer. It carved to 781 streams, 710 of them XML-ish. Strict keyword
   occurrences: `clip` 734, `anim` 1,131, `motion` 237, `gesture` 2, `bone` 428 (214 `<Bones>` open/close
@@ -937,9 +1183,7 @@ The bytes support **new RAGE resource pages**, not the GTA V `YCD`/`RSC7` family
 - `MoVE` (version 19) and the 2/3 clip streams as the animation payloads; neither is zlib inside the page.
 - No `YCD`, `YDD`, `YLD`, `YFD`, `RSC7` or `RSC8` at any stream start.
 
-`MoVE` (version 19) is a flat relative-offset state-machine and motion-tree graph (`tools/anim_move.py`). The 2/3
-streams are probably packed clips inside `0DRP` resources, but only the bytes above are measured; treat that label as
-a hypothesis until a decoder reads a known `0DRP` clip.
+`MoVE` (version 19) is a flat relative-offset state-machine and motion-tree graph (`tools/anim_move.py`).
 
 ### What the bytes do not prove
 
@@ -948,9 +1192,8 @@ a hypothesis until a decoder reads a known `0DRP` clip.
 - `MoVE` v19's container layout, preamble tables, recursive state containers (`Type 1`, `Type 3`, `Type 22`),
   transitions and parameter blocks are decoded (`tools/anim_move.py`), while the unhashed source names of most
   network/request/flag hashes and the evaluation semantics of the rarest leaf operator node types remain unmapped.
-- The 2/3 streams expose header variants, track arrays and bone masks. They are the second system pages of `0DRP`
-  resources, whose root objects and packed coding are not decoded. The keyframes of the clip dictionaries are
-  decoded; see [Keyframe decoding](#keyframe-decoding).
+- The two- and three-entry auxiliary tables bound their tagged payloads. Their contents have yet to be linked
+  to a clip. The clip dictionaries' keyframes are decoded in [Keyframe decoding](#keyframe-decoding).
 - The `RBF0` rig-set/rig/group entries are parsed. The numeric fields, the schema type table and the
   rig→skeleton reference are not; the measured skeleton match is 0.
 - The three motion matcher streams embed bone tables, but whether those define a full skeleton or only the
@@ -975,15 +1218,12 @@ a hypothesis until a decoder reads a known `0DRP` clip.
    the stem (path without `pack:/` and without the final extension). The record stride varies (16 or 32 bytes in
    sampled tables), so do not assume one layout. The recurring `0x98e1750c` is `joaat32("bonerotation")`, a
    track type.
-5. **Join rigs to clips, then decode a known `0DRP` clip.** Two named clips are already followed to page-0 payloads
-   (durations and track arrays above). The missing link is the **page → packed stream**: none of the 1,781
-   packed streams contains the 30 known bone hashes or the nine tested clip hashes. Map the track records and
-   the 16-byte `(hash, 0, index, 0)` tables first, then test a component count/order/delta coding against a
-   unit-quaternion norm. (`MoVE` v19 is now decoded separately by `tools/anim_move.py`.)
+5. **Trace the auxiliary payloads to their consumers.** Use the parent's `+0x40` table to bound each payload
+   before checking its fields against the root object's schema. The table framing alone establishes no
+   association with the two named page-0 clips. (`MoVE` v19 is now decoded separately by `tools/anim_move.py`.)
 6. **Keep the compression boundary explicit.** Outer RPF9 zlib is understood. Do not add a zlib pass inside a
    page without evidence; the sampled pages had no valid nested stream.
 7. **Re-run the model cross-check with the full export.** The current 1,350-model data.rpf manifest has bone
-   bindings but no bone names or hashes. The full 350,251-model export plus the `RBF0` rig table is needed to
    bindings but no bone names or hashes. The full 382,781-model export plus the `RBF0` rig table is needed to
    match skeletons to models.
 

@@ -50,10 +50,12 @@ geometry. --compare prints how many bytes differ from a reference structure. Exi
 input error.
 """
 import argparse
+import contextlib
 import math
 import os
 import struct
 import sys
+import tempfile
 
 FLAG_DEHYDRATED = 0x01000000
 FLAG_UPDATABLE = 0x00040000
@@ -167,6 +169,14 @@ class Header:
         """Address of the parent-table entry for the node at node_offset (all arithmetic is 32-bit)."""
         unit = ((node_offset - self.offset_to_elements) & M32) >> 6
         return (self.offset_to_parents + 4 * unit) & M32
+
+    def stored_parent_entry(self, node_offset, size):
+        """The entry's address when the structure stores it, else None: only the entries from the header end to
+        offsetToElements are kept (docs/bvh.md §3.1), so a console structure's low units have none."""
+        entry = self.parent_entry(node_offset)
+        if 64 <= entry and entry + 4 <= min(self.offset_to_elements, size):
+            return entry
+        return None
 
 
 def rotation(index):
@@ -393,8 +403,8 @@ def write_box_groups(src, dst, hdr, start, count, wide):
             me = (at >> 6) << 3 | (BOX32 if wide else BOX16)
             for child in children:
                 if (child & 6) == 4 or ((child & 7) == TRI0 and hdr.flags & FLAG_UPDATABLE):
-                    entry = hdr.parent_entry(((child >> 3) << 6) & M32)
-                    if entry + 4 <= len(dst):
+                    entry = hdr.stored_parent_entry(((child >> 3) << 6) & M32, len(dst))
+                    if entry is not None:
                         struct.pack_into("<I", dst, entry, me)
 
 
@@ -412,8 +422,8 @@ def rehydrate(dehydrated, geometries, header_offset=0):
         raise ValueError("the kept header bytes (%d) run past the input" % kept)
     dst[:kept] = src[:kept]
     struct.pack_into("<I", dst, 0, hdr.flags & ~FLAG_DEHYDRATED & M32)
-    root_entry = hdr.parent_entry(((hdr.root >> 3) << 6) & M32)
-    if root_entry + 4 <= len(dst):
+    root_entry = hdr.stored_parent_entry(((hdr.root >> 3) << 6) & M32, len(dst))
+    if root_entry is not None:
         struct.pack_into("<I", dst, root_entry, INVALID)
     write_leaves(src, dst, hdr, list(geometries), LeafFrame(hdr))
     if hdr.root & 7 in (BOX16, BOX32):
@@ -429,8 +439,39 @@ def parse_transform(text):
     vals = [float(x) for x in text.split(",")]
     if len(vals) != 12:
         raise ValueError("--transform needs 12 comma-separated floats, got %d" % len(vals))
-    return tuple(tuple(f32(v) for v in vals[4 * r:4 * r + 4]) for r in range(3))
+    try:
+        rounded = [f32(v) for v in vals]
+    except (OverflowError, struct.error) as exc:
+        raise ValueError("--transform values must fit in finite float32") from exc
+    if not all(math.isfinite(v) for v in rounded):
+        raise ValueError("--transform values must fit in finite float32")
+    return tuple(tuple(rounded[4 * row:4 * row + 4]) for row in range(3))
 
+
+
+
+def _make_parent(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _publish(dest, data):
+    """Write output binary next to dest and atomically swap it in, so an interrupted or failing write
+    leaves the previous file intact instead of truncated."""
+    _make_parent(dest)
+    directory = os.path.dirname(os.path.abspath(dest))
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=directory, prefix=".bvh_rehydrate-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            f.write(data)
+        os.replace(temp, dest)
+    except BaseException:
+        if temp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+        raise
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Rehydrate a dehydrated XDXR BVH4 BLAS on the CPU (docs/bvh.md §4a).")
@@ -443,6 +484,9 @@ def main(argv=None):
     ap.add_argument("--transform")
     ap.add_argument("--compare")
     a = ap.parse_args(argv)
+    if os.path.isdir(a.out):
+        print("error: --out is a folder, not a file: %s" % a.out, file=sys.stderr)
+        return 2
     # The output must never replace a file the tool was asked to read. samefile also catches a
     # case-only difference on Windows and macOS's default volume (tools/hashdict.py).
     if os.path.exists(a.out):
@@ -472,13 +516,20 @@ def main(argv=None):
     except (OSError, ValueError, struct.error) as e:
         print("error: %s" % e, file=sys.stderr)
         return 2
-    with open(a.out, "wb") as f:
-        f.write(out)
+    try:
+        _publish(a.out, out)
+    except OSError as e:
+        print("error: cannot write %s: %s" % (a.out, e), file=sys.stderr)
+        return 2
     print("rehydrated %d bytes, %d leaves, %d geometries -> %s" % (len(out), Header(data, a.header_offset).num_elements,
                                                                   len(geometries), a.out))
     if a.compare:
-        with open(a.compare, "rb") as f:
-            ref = f.read()
+        try:
+            with open(a.compare, "rb") as f:
+                ref = f.read()
+        except OSError as e:
+            print("error: cannot read %s: %s" % (a.compare, e), file=sys.stderr)
+            return 2
         diff = sum(x != y for x, y in zip(out, ref)) + abs(len(out) - len(ref))
         print("differs from %s in %d bytes" % (a.compare, diff))
     return 0

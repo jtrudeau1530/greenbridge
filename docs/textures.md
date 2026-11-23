@@ -32,7 +32,12 @@ resumes from the DDS files already written.
 stdlib-only BCPack decoder (`tools/bcpack.py`, `tools/bcpack_tables.py`,
 `tools/bcpack_tables_bptc.py`) now decodes the rANS entropy layer and rebuilds BC blocks
 for all six active modes (BC1, BC3, BC4, BC5, BC6H and BC7 — 100% of BCPack codecs in the
-corpus). Strict confirmed-history mode is the default; `--allow-provisional` enables the
+corpus). To inspect or decode one raw BCPack stream from the command line, `tools/bcpack_tool.py`
+wraps the same decoder: `inspect <in.bin> --codec <1..7> --size <uncompressed_bytes> [--json]` prints
+the stream's header, entropy statistics and validation results; `decode <in.bin> <out.bin> --codec <1..7>
+--size <uncompressed_bytes> [--provisional]` writes the rebuilt BC blocks; `profile <in.bin> --codec <1..7>
+--size <uncompressed_bytes>` reports per-symbol frequency statistics. Strict confirmed-history mode is
+the default; `--allow-provisional` enables the
 provisional and last-resort history entries, and `--history <path>` supplies locally
 calibrated BC6H/BC7 initial history JSON tables at run time (no fitted BC6H/BC7 history
 data is embedded in the repository). `rpf9dump`'s C# `TtpfReader` (submodule pin `e293917`,
@@ -183,6 +188,15 @@ mode 1/32 descriptors have a known element size (4 mode 1, 11 mode 32); all fift
 64 KiB allocation span and one (`maps_4_7` #6034) decodes at 0.00–0.33 levels (see below). The
 other 19 mode 1 records formerly counted as unknown-format 2D entries are two-slice 2D arrays
 (`depth = 2`, DXGI 28/71/83/98; see `docs/textures_arrays.md`).
+
+Where one descriptor's mode is still in doubt, `tools/tex_mode_probe.py <textures index.json>
+<carve dir> [--fmt BC1] [--n 12]` scores every 4 KiB and 64 KiB addrlib colour pattern of the
+element size, crossed with both placements of the top mip (at the data offset, or at the end of
+the chain, since GFX10 stores mips smallest first), by the smoothness of the decoded BC1/BC2/BC3
+average colours. It prints the best and second-best pattern with the placement and the linear
+(untiled) score per texture, then a tally of the winners and how many textures no candidate fit.
+It needs numpy, like `tests/test_tex_mode_probe.py`, which covers it on synthetic blobs with no
+game files.
 
 ### The layout is the AMD mip tail
 
@@ -423,7 +437,7 @@ The RDS5 index is readable without game code:
 | chunk table | 0x18, 8 bytes per entry, `(count − 1) * 8` bytes |
 | ETPF index | `align(0x18 + (count − 1) * 8, 0x100)`; version 634 (`0x27A`) |
 | texture records | a 16-byte ETPF header, then `area` bytes of records (at least 16 × textures) |
-| asset keys | one u64 per record after the descriptor array; IDs are 32 bytes each |
+| asset keys | one u64 per record after the descriptor array; the array continues into the ID region when it is longer than the record area leaves room for (the area is at least 16 × textures), so a reader must load it across that boundary. IDs are 32 bytes each. In the 57 pools of this install, 15 have a straddling array and 28,666 of the 357,115 keys sit past the record area |
 
 Chunk entry `(u64 value)`:
 
@@ -555,8 +569,11 @@ semantics, not as a claim that they are globally unique across every shader.
 hash, role and texture name, resolves only the five measured character slots, and reports any
 other hash as `unknown 0x...`. A garment-shader material (`d5ed50f4`, `ea8d09d0`, `39ddb9ca`)
 with no `0xC8E8C282` binding is flagged `garment-no-albedo`, so a renderer keeps that part clay
-instead of painting `speculartex` as colour. `--json` and `--csv` write the same rows to a
-report, which may not overwrite an input:
+instead of painting `speculartex` as colour. The `texture` column retains the display value,
+including the eight-digit `Name` hash from `rpf9dump models`. The appended `asset_key` column
+holds the 16-digit `Id64` for matching against a texture pool's `AssetKey`. An absent or malformed
+ID appears as `-` in the terminal, an empty CSV cell and JSON `null`. Report paths must be
+distinct from the inputs:
 
     python -I tools/character_textures.py <model.json|dir> [--json FILE] [--csv FILE]
 
@@ -982,8 +999,33 @@ with per-instance data, the shape of a per-tile or per-cell map. One of the othe
 
 **The 121 other streams** start with no known magic (`RDS5`, `0DRP`, `TTPF`, `RSC8`, `PSIN`, `RBF0`, DDS) in
 their first 4 KiB, and the large ones are high-entropy (7.3 to 7.7 bits per byte over the first 64 KiB, except
-one at 4.1). They are left as opaque raw data here; matching them to the `data/ttdb` texture pools is the
-obvious next check.
+one at 4.1). They are left as opaque raw data here.
+
+**They are not copies of the texture pools.** Each of the 121 streams was compared with every chunk of all 57
+`.ttpf` pools in the package (1,026,833 chunks: 918,223 zlib, 102,725 BCPack BC1, 5,167 BC7, 718 other BCPack
+codecs, 5 raw), as stored and, for zlib chunks, inflated: the SHA-1 of the whole stream against the SHA-1 of each
+chunk, and the stream's first 64 bytes against each chunk's first 64 bytes (85 of the 121 streams start with more
+than four distinct byte values; the other 36 start with near-constant bytes and only take the whole-content test).
+
+| Result | Streams |
+|---|---:|
+| Identical to a pool chunk (stored zlib bytes and inflated content) | 1 (4 KiB, a shared `data/ttdb` pool) |
+| Same first 212,464 to 582,338 bytes as a 4 MiB `data/ttdb` chunk, then different | 3 (6, 12 and 32 MiB) |
+| Same first 1,010 to 2,800 bytes as hundreds of chunks (a common leading pattern, not a copy) | 3 |
+| No match | 114 |
+
+Sizes of the 121: 62 below 64 KiB, 16 of exactly 64 KiB, 32 from 64 KiB to 16 MiB, 11 of 16 MiB or more. So,
+apart from one 4 KiB stream, the opaque data of `textures.rpf` is not pool texture data, and three of the large
+streams share a long identical start with a pool chunk and then diverge.
+
+Following them past the divergence with an in-order alignment (extend identical runs; on a mismatch, resync on a
+64-byte piece of the chunk taken up to 64 KiB ahead, found within the next 256 KiB of the stream): in the 6 MiB and
+32 MiB streams, five different 4 MiB `data/ttdb` chunks each reappear in order for 65.8% to 97.5% of their bytes,
+in short runs broken by 164 to 1,007 gaps, while the stream advances about 1.4 to 1.5 times the chunk's length; in
+the 12 MiB stream only 8.6%. That five different chunks align this well with the same two streams says the chunks
+are alike among themselves, so repetitive content may account for part of it: this measures shared runs, not a
+copy, and what the streams are remains open. Method: the carve's
+inflated streams and `tools/ttpf_mips.py`'s `Pool` chunk table; counts only.
 
 **Measured keying and format codes (ASSET-274):**
 All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing descriptor pointers and a 32-bit
@@ -1018,7 +1060,7 @@ All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing de
 
 ## Reproduce
 
-The normal `make_game.py` assets stage now fills missing and partial BCPack DDS entries in the same pool manifests used for model texture lookup. It uses strict decoding by default and discovers an optional local reconstruction profile at `<work>/bcpack-calibration.json`. The single-entry exporter accepts the same profile through `--calibration`. Build instructions, the JSON schema and the game-independent test are in the [calibrated export guide](../tools/bcpack_calibration/README.md).
+The normal `make_game.py` assets stage now fills missing and partial BCPack DDS entries in the same pool manifests used for model texture lookup. It uses strict decoding by default and discovers an optional local reconstruction profile at `<work>/bcpack-calibration.json`. The pass stamp in each pool manifest hashes the decoder modules (`ttpf_assets.DECODER_SOURCES`) and the profile, so a pool is done again after either changes. The single-entry exporter accepts the same profile through `--calibration`. Build instructions, the JSON schema and the game-independent test are in the [calibrated export guide](../tools/bcpack_calibration/README.md).
 
 `tools/ttpf_mips.py` is the read-only measurement and decode tool (with `tools/bcpack.py`
 enabled in strict confirmed-history mode by default), and `tools/bcpack_history_calib.py`
@@ -1033,6 +1075,7 @@ python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional] [--
 python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--allow-provisional] [--history <path>]
 python -I tests/test_bcpack.py
 python -I tests/test_bcpack_history_calib.py
+python -I tests/test_bcpack_tool.py
 python -I tests/test_tex_headers.py
 python -I tests/test_ttpf_mips.py
 ```

@@ -25,6 +25,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -396,6 +397,168 @@ class CountArgumentTest(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
 
+class CliBadInputTest(unittest.TestCase):
+    """Bad paths end in one stderr line and exit 2, and a mistyped input leaves no output tree behind."""
+
+    def run_cli(self, *args, path=None):
+        env = dict(os.environ)
+        if path is not None:
+            env["PATH"] = path
+        return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "ab_control_flow.py"), *args],
+                              capture_output=True, text=True, env=env)
+
+    def check_one_line(self, res, needle):
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn(needle, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_bad_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "w", encoding="utf-8") as f:
+                f.write("x")
+            out = os.path.join(tmp, "out")
+            # No shaders folder at all.
+            self.check_one_line(self.run_cli(tmp, os.path.join(tmp, "nope"), out), "index.json")
+            self.assertFalse(os.path.exists(out))
+            # An index that is not JSON.
+            with open(os.path.join(shaders, "spirv", "index.json"), "wb") as f:
+                f.write(b"\xff\xfe not json")
+            self.check_one_line(self.run_cli(tmp, shaders, out), "index.json")
+            self.assertFalse(os.path.exists(out))
+            with open(os.path.join(shaders, "spirv", "index.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            # A names file that does not exist.
+            self.check_one_line(self.run_cli(tmp, shaders, out, "--names", os.path.join(tmp, "nope.txt")), "--names")
+            self.assertFalse(os.path.exists(out))
+            # Past the selection (an explicit names file selects without reading the disassembly):
+            names = os.path.join(tmp, "names.txt")
+            with open(names, "w", encoding="utf-8") as f:
+                f.write("one\n")
+            disasm = os.path.join(shaders, "dxbc", "disasm")
+            os.makedirs(disasm)
+            with open(os.path.join(disasm, "one.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("s_endpgm\n")
+            # an output path under a regular file,
+            self.check_one_line(self.run_cli(tmp, shaders, os.path.join(blocker, "out"), "--names", names),
+                                "cannot create")
+            # and no SPIR-V tools on PATH.
+            self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names,
+                                             path=os.path.join(tmp, "empty-path")), "spirv-as")
+            self.assertFalse(os.path.exists(out))     # the output folder this run made is removed again
+            # An output folder that already existed stays, with what this run put in it removed.
+            os.makedirs(out)
+            self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names,
+                                             path=os.path.join(tmp, "empty-path")), "spirv-as")
+            self.assertEqual(os.listdir(out), [])
+
+    def test_assembler_failure_preserves_concurrent_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "spirv").mkdir()
+            (root / "spirv/index.json").write_text("{}", encoding="utf-8")
+            disasm = root / "dxbc/disasm"
+            disasm.mkdir(parents=True)
+            (disasm / "one.s").write_text("s_endpgm\n", encoding="utf-8")
+            names = root / "names.txt"
+            names.write_text("one\n", encoding="utf-8")
+
+            for preexisting in (True, False):
+                with self.subTest(preexisting=preexisting):
+                    out = root / ("existing" if preexisting else "fresh")
+                    if preexisting:
+                        out.mkdir()
+                    sibling = out / "other-job.txt"
+
+                    def fail_assembler(command, **kwargs):
+                        self.assertEqual(command[0], "spirv-as")
+                        out.mkdir(exist_ok=True)
+                        sibling.write_bytes(b"other job")
+                        raise subprocess.CalledProcessError(1, command)
+
+                    with patch.object(AB.subprocess, "run", side_effect=fail_assembler), \
+                            contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()), \
+                            self.assertRaises(SystemExit) as raised:
+                        AB.main([tmp, tmp, str(out), "--names", str(names)])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertTrue(sibling.is_file(), "cleanup deleted concurrent output")
+                    self.assertEqual(sibling.read_bytes(), b"other job")
+
+    def test_bad_index_shape_and_stale_names_leave_no_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            index = os.path.join(shaders, "spirv", "index.json")
+            out = os.path.join(tmp, "out")
+            for payload in ("[]", '{"one": []}', '{"one": {"bindings": 5}}', '{"one": {"features": "x"}}',
+                            '{"one": {"bindings": [[0]]}}', '{"one": {"features": {"a": 1}}}'):
+                with open(index, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(payload)
+                self.check_one_line(self.run_cli(tmp, shaders, out), "metadata")
+                self.assertFalse(os.path.exists(out))
+            with open(index, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            names = os.path.join(tmp, "names.txt")
+            for payload in (b"missing\n", b"\xff"):
+                with open(names, "wb") as f:
+                    f.write(payload)
+                self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names), "cannot read selected")
+                self.assertFalse(os.path.exists(out))
+
+    def test_unreadable_output_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            os.makedirs(os.path.join(shaders, "dxbc", "disasm"))
+            with open(os.path.join(shaders, "spirv", "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            names = os.path.join(tmp, "names.txt")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("one\n")
+            with open(os.path.join(shaders, "dxbc", "disasm", "one.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("s_endpgm\n")
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            # Listing the folder fails (what a mode 000 folder does to a non-root user, injected so that it also
+            # runs as root and on Windows).
+            real_listdir = os.listdir
+
+            def listdir(path="."):
+                if os.fspath(path) == out:
+                    raise PermissionError(13, "Permission denied", out)
+                return real_listdir(path)
+            stderr = io.StringIO()
+            with patch("os.listdir", listdir), contextlib.redirect_stderr(stderr), \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                AB.main([tmp, shaders, out, "--names", names])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("cannot create", stderr.getvalue())
+
+    @unittest.skipIf(os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0,
+                     "mode 000 does not stop root or Windows")
+    def test_mode_000_output_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            os.makedirs(os.path.join(shaders, "dxbc", "disasm"))
+            with open(os.path.join(shaders, "spirv", "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            names = os.path.join(tmp, "names.txt")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("one\n")
+            with open(os.path.join(shaders, "dxbc", "disasm", "one.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("s_endpgm\n")
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            os.chmod(out, 0)
+            try:
+                self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names), "cannot create")
+            finally:
+                os.chmod(out, 0o700)
+
+
 class ResultClassificationTest(unittest.TestCase):
     def test_translation_failure(self):
         self.assertEqual(AB.classify_result(False, [b"same"], [b"same"]), "a translation is invalid")
@@ -520,7 +683,7 @@ class BackwardBranchAndDisasmTest(unittest.TestCase):
         self.assertEqual(AB.SUPPORTED_BINDINGS, {0, 1, 2})
         self.assertEqual(
             AB.HOSTED_FEATURES,
-            {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64"},
+            {"bufferDeviceAddress", "runtimeDescriptorArray", "shaderInt64", "shaderSampledImageArrayDynamicIndexing"},
         )
 
 
@@ -808,13 +971,49 @@ class PipelineExecutionTest(unittest.TestCase):
 
     @patch("subprocess.run")
     def test_main_cli_pipeline_success(self, mock_run) -> None:
-        self.assert_pipeline_outcome(mock_run, 64 * 64 * 16, "identical")
+        self.assert_pipeline_outcome(mock_run, 64 * 64 * 16, "identical MRT0: non-clear")
 
     @patch("subprocess.run")
     def test_main_rejects_identical_truncated_images(self, mock_run) -> None:
         self.assert_pipeline_outcome(mock_run, 16, "dispatch form failed to run")
 
-    def assert_pipeline_outcome(self, mock_run, image_size: int, expected: str) -> None:
+    @patch("subprocess.run")
+    def test_clear_mrt0_with_unobserved_export(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES, "identical MRT0: clear-only; unobserved MRT2",
+                                     targets=(0, 2), pixel=AB.CLEAR)
+
+    @patch("subprocess.run")
+    def test_only_unbound_target(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES,
+                                     "identical MRT0 clear-difference mask: empty; unobserved MRT1",
+                                     targets=(1,), pixel=AB.CLEAR)
+
+    @patch("subprocess.run")
+    def test_all_attachments_detects_mrt1_difference(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, 2 * AB.READBACK_BYTES, "identical MRT0: non-clear; MRT1: DIFFERENT",
+                                     targets=(0, 1), all_attachments=True, divergent=True)
+
+    @patch("subprocess.run")
+    def test_sparse_outputs_preserve_mask_and_ignore_gap(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, 3 * AB.READBACK_BYTES,
+                                     "identical MRT0 clear-difference mask: empty; identical MRT2: clear-only",
+                                     targets=(2,), all_attachments=True, pixel=AB.CLEAR, divergent=True)
+
+    @patch("subprocess.run")
+    def test_missing_plane(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES,
+                                     "MRT0: dispatch form failed to run; MRT1: dispatch form failed to run",
+                                     targets=(0, 1), all_attachments=True)
+
+    @patch("subprocess.run")
+    def test_duplicate_or_missing_cached_target(self, mock_run):
+        for cached in ([0, 1, 1], [0]):
+            self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES,
+                                         "cached outputs disagree with translated colour targets",
+                                         targets=(0, 1), all_attachments=True, cached=cached)
+
+    def assert_pipeline_outcome(self, mock_run, image_size: int, expected: str, targets=(0,), pixel=bytes(16),
+                                all_attachments=False, divergent=False, cached=None) -> None:
         import json
 
         # Prepare synthetic index
@@ -825,6 +1024,7 @@ class PipelineExecutionTest(unittest.TestCase):
                 "features": ["bufferDeviceAddress"],
             }
         }
+        index["ps_test"]["outputs"] = list(targets) if cached is None else cached
         with open(os.path.join(self.shaders, "spirv", "index.json"), "w", encoding="utf-8") as f:
             json.dump(index, f)
 
@@ -852,11 +1052,12 @@ class PipelineExecutionTest(unittest.TestCase):
             elif "spirv-val" in cmd:
                 return SimpleNamespace(returncode=0, stdout="pass")
             elif "rdna2spirv.py" in str(args):
-                # Write placeholder spvasm with %out_mrt0
+                # Write the synthetic output declarations.
                 out_dir = args[args.index("--out") + 1]
                 os.makedirs(out_dir, exist_ok=True)
                 with open(os.path.join(out_dir, "ps_test.spvasm"), "w", encoding="utf-8") as f:
-                    f.write("OpCapability Shader\n%out_mrt0 = OpVariable %po Output\n")
+                    for target in targets:
+                        f.write(f"%out_mrt{target} = OpVariable %po Output\n")
                 with open(os.path.join(out_dir, "ps_test.spv"), "wb") as f:
                     f.write(b"fake_spv")
                 return SimpleNamespace(returncode=0, stdout="1 pass spirv-val\n")
@@ -864,7 +1065,12 @@ class PipelineExecutionTest(unittest.TestCase):
                 # Harness call
                 raw_path = args[3]
                 with open(raw_path, "wb") as f:
-                    f.write(bytes(image_size))
+                    data = bytearray(pixel * (image_size // len(pixel)))
+                    if all_attachments:
+                        self.assertEqual(args[4:], ["64", "64", str(max(targets) + 1)])
+                    if divergent and "dispatch" in args[2]:
+                        data[AB.READBACK_BYTES] ^= 1
+                    f.write(data)
                 return SimpleNamespace(returncode=0, stdout="OK")
 
         mock_run.side_effect = side_effect
@@ -879,6 +1085,7 @@ class PipelineExecutionTest(unittest.TestCase):
                     "--count", "1",
                     "--runs", "1",
                     "--harness", "dummy_harness.exe",
+                    *(["--all-attachments"] if all_attachments else []),
                 ])
         self.assertEqual(ret, 0)
         outcomes_file = os.path.join(self.out, "outcomes.tsv")

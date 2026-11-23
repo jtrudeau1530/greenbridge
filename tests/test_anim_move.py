@@ -319,11 +319,15 @@ class AnimMoveTest(unittest.TestCase):
         with open(os.path.join(carved, "00030000.bin"), "wb") as f:
             f.write(two[MAX_CHUNK:])
 
-        out = os.path.join(self.tmp.name, "move.json")
-        r = subprocess.run([sys.executable, "-I", TOOL, carved, out], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(carved, "00025000.CSV"), "wb") as f:
+            f.write(b"offset,bytes")
+        out = os.path.join(carved, "move.json")
+        for _ in range(2):
+            r = subprocess.run([sys.executable, "-I", TOOL, carved, out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
+        self.assertEqual(doc["summary"]["streams"], 3)
         self.assertEqual(doc["summary"]["counts"]["move_resources"], 2)
         self.assertEqual(doc["summary"]["counts"]["multi_stream_resources"], 1)
         self.assertEqual([row["streams"] for row in doc["move_resources"]], [1, 2])
@@ -358,6 +362,40 @@ class AnimMoveTest(unittest.TestCase):
         ok = subprocess.run([sys.executable, "-I", TOOL, rpf, nested_out], capture_output=True, text=True)
         self.assertEqual(ok.returncode, 0, ok.stderr)
         self.assertTrue(os.path.isfile(nested_out))
+
+    def test_cli_refuses_to_overwrite_scanned_directory_stream(self):
+        carved = os.path.join(self.tmp.name, "carved")
+        os.makedirs(carved)
+        stream = os.path.join(carved, "00010000.bin")
+        payload = self._sample_state_machine_resource()
+        with open(stream, "wb") as f:
+            f.write(payload)
+        res = subprocess.run([sys.executable, "-I", TOOL, carved, stream], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("refuses to overwrite", res.stderr)
+        with open(stream, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_cli_refuses_relative_alias_to_input_archive(self):
+        one = self._sample_state_machine_resource()
+        rpf = os.path.join(self.tmp.name, "in.rpf")
+        write_rpf(rpf, [one])
+        with open(rpf, "rb") as f:
+            original = f.read()
+        alias = os.path.join(self.tmp.name, ".", "in.rpf")
+        res = subprocess.run([sys.executable, "-I", TOOL, rpf, alias], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("refuses to overwrite", res.stderr)
+        with open(rpf, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_module_docstring_has_no_double_encoded_characters(self):
+        """The preamble layout uses U+00D7; it was once stored as the pair U+00C3 U+2014."""
+        with open(TOOL, encoding="utf-8") as f:
+            source = f.read()
+        for broken in ("\u00c3\u2014", "\u00e2\u20ac", "\u00c2"):
+            self.assertNotIn(broken, source)
+        self.assertIn("N_req \u00d7 u32 request hashes", source)
 
 
 if __name__ == "__main__":

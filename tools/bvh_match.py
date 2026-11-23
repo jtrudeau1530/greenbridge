@@ -12,9 +12,13 @@ came from has exactly those counts among the geometries of one of its models:
    float32, faces are in primitive order) and check the rehydration against what the BLAS stores with
    tools/bvh_geometry_check.py (bounds, overrides, paired-leaf edges, internal area).
 
-The geometries whose shader the BVH leaves out are game data: pass their name hashes with --skip-shaders (or
-BVH_SKIP_SHADERS). When a geometry's shader index is not in the manifest's material list the rule cannot be applied
-to that drawable, and every geometry is a candidate; the checks then decide.
+Which geometries the BVH leaves out follows from their material's render bucket (docs/bvh.md §4a, ASSET-349): the
+byte at +57 of the shader record, which `rpf9dump models` writes as `RenderBucket`. A geometry is kept when the low 7
+bits of that byte are 0 or 3 and left out otherwise (KEPT_BUCKETS; bit 7 is ignored). When a geometry of a
+model has no bucket in the manifest (its shader index is not in the material list, or an older export without the
+field) the rule cannot be applied to that model and every geometry is a candidate; the checks then decide.
+--no-bucket-rule turns it off. --skip-shaders (or BVH_SKIP_SHADERS) still leaves out geometries by shader name hash
+on top of it; the hashes are game data, for local use only.
 
 The instance transform is the 3x4 at +0x50 of the BLAS's 208-byte instance descriptor (docs/bvh.md §3.2). Without
 it, every leaf of a rotated structure falls outside the header bounds and a correct geometry is rejected.
@@ -29,7 +33,7 @@ candidate is consistent, 1 when none is, and 2 on an input error.
 Usage:
     python -I tools/bvh_match.py <dehydrated.bin> <manifest.json> --descriptor <instance208.bin>
                                 [--models DIR] [--header-offset N] [--descriptor-offset N]
-                                [--transform 12 floats] [--skip-shaders HEX,HEX] [--unordered]
+                                [--transform 12 floats] [--skip-shaders HEX,HEX] [--no-bucket-rule] [--unordered]
                                 [--embeddings N] [--top N] [--names] [--write DIR] [--json FILE]
 
 --write DIR writes the matched geometries as float3/uint32 buffers plus an export.json, the shape
@@ -40,13 +44,25 @@ import json
 import os
 import struct
 import sys
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_geometry_check as C  # noqa: E402
 import bvh_rehydrate as R  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 INSTANCE_TRANSFORM_OFFSET = 0x50
 SKIP_SHADERS_ENV = "BVH_SKIP_SHADERS"
+# Render buckets (low 7 bits of the byte at shader record +57, `RenderBucket` in the manifest) whose geometries the
+# BVH keeps; every other bucket (1, 2, 4, 5, 6) is left out. Bit 7 does not change the choice (docs/bvh.md §4a,
+# ASSET-349).
+KEPT_BUCKETS = frozenset((0, 3))
+BUCKET_MASK = 0x7F
+
+
+def bucket_kept(bucket):
+    """True when the BVH keeps a geometry whose material has this render bucket, None when the bucket is unknown."""
+    return None if bucket is None else (bucket & BUCKET_MASK) in KEPT_BUCKETS
 
 
 def leaf_signature(src, header_offset=0):
@@ -80,26 +96,46 @@ def embeddings(signature, counts, cap, ordered=True):
 
     ordered: the picked indices must increase (a prefix is the common case); otherwise any order is allowed.
     """
+    if cap <= 0 or len(signature) > len(counts):
+        return []
+
+    latest = [len(counts) - 1] * len(signature)
+    if ordered:
+        # Match the signature backwards once. An index later than latest[i] leaves
+        # too few matching geometries for the rest of the signature.
+        k = len(counts) - 1
+        for i in reversed(range(len(signature))):
+            while k >= 0 and counts[k] != signature[i]:
+                k -= 1
+            if k < 0:
+                return []
+            latest[i] = k
+            k -= 1
+    elif Counter(signature) - Counter(counts):
+        # In any order, each triangle count just needs enough distinct geometries.
+        return []
+
     out = []
 
     def walk(i, j, acc):
-        if len(out) >= cap:
-            return
         if i == len(signature):
             out.append(list(acc))
             return
-        for k in (range(j, len(counts)) if ordered else range(len(counts))):
-            if counts[k] == signature[i] and k not in acc:
+        for k in range(j, latest[i] + 1):
+            if counts[k] == signature[i] and (ordered or k not in acc):
                 acc.append(k)
-                walk(i + 1, k + 1, acc)
+                walk(i + 1, k + 1 if ordered else 0, acc)
                 acc.pop()
+                if len(out) == cap:
+                    return
 
     walk(0, 0, [])
     return out
 
 
 def model_geometries(item):
-    """[(mesh index, model, geometry, triangles, shader hash or None)] for one manifest item, in mesh order.
+    """[(mesh index, model, geometry, triangles, shader hash or None, render bucket or None)] for one manifest item,
+    in mesh order.
 
     The mesh index is the geometry's `o` group in the item's OBJ: the manifest arrays and the OBJ groups are
     written in the same order.
@@ -111,29 +147,36 @@ def model_geometries(item):
     geometries = item.get("MeshGeoms") or list(range(len(tris)))
     shaders = item.get("MeshShaders") or [None] * len(tris)
     materials = item.get("Materials") or []
-    hashes = []
+    hashes, buckets = [], []
     for index in shaders:
-        if index is None or not 0 <= index < len(materials) or "Shader" not in materials[index]:
-            hashes.append(None)
-        else:
-            hashes.append(int(materials[index]["Shader"], 16))
-    return list(zip(range(len(tris)), models, geometries, tris, hashes))
+        material = materials[index] if index is not None and 0 <= index < len(materials) else {}
+        hashes.append(int(material["Shader"], 16) if "Shader" in material else None)
+        bucket = material.get("RenderBucket")
+        buckets.append(bucket if isinstance(bucket, int) and not isinstance(bucket, bool) else None)
+    return list(zip(range(len(tris)), models, geometries, tris, hashes, buckets))
 
 
-def match_candidates(items, signature, skip, cap, ordered=True):
-    """Every (item, model, used geometry indices, kept geometries) whose triangle counts contain the signature."""
+def match_candidates(items, signature, skip, cap, ordered=True, buckets=True):
+    """Every (item, model, used geometry indices, kept geometries) whose triangle counts contain the signature.
+
+    buckets: leave out the geometries whose render bucket the BVH does not keep (bucket_kept), in every model whose
+    geometries all have a bucket. skip: shader hashes left out as well, in every model whose geometries all have one.
+    """
     out = []
     for item in items:
         meshes = model_geometries(item)
         for model in sorted({mesh[1] for mesh in meshes}):
             group = [mesh for mesh in meshes if mesh[1] == model]
-            # A geometry whose shader is one of the excluded hashes is not in the BLAS, so it takes no index in the
-            # signature. Without every hash of the group the rule cannot be applied: keep all of them.
+            # A geometry the BVH leaves out is not in the BLAS, so it takes no index in the signature. Without the
+            # bucket (or, for --skip-shaders, the hash) of every geometry of the group a rule cannot be applied to
+            # it: keep all of them and let the checks decide.
+            by_bucket = buckets and all(mesh[5] is not None for mesh in group)
             rule = bool(skip) and all(mesh[4] is not None for mesh in group)
-            kept = [mesh for mesh in group if not rule or mesh[4] not in skip]
+            kept = [mesh for mesh in group
+                    if (not by_bucket or bucket_kept(mesh[5])) and (not rule or mesh[4] not in skip)]
             for used in embeddings(signature, [mesh[3] for mesh in kept], cap, ordered):
                 out.append({"item": item, "model": model, "used": used, "kept": kept,
-                            "rule": rule, "skipped": bool(skip)})
+                            "rule": rule, "skipped": bool(skip), "by_bucket": by_bucket, "buckets": buckets})
     return out
 
 
@@ -197,6 +240,11 @@ def score(src, candidate, groups, transform, header_offset=0):
     return C.check(src, geometries, header_offset)
 
 
+def export_buffer_names(count):
+    """The (vertex, index) buffer names write_export gives each of `count` matched geometries."""
+    return [("g%d_f3.bin" % i, "g%d_tri.bin" % i) for i in range(count)]
+
+
 def write_export(directory, candidate, groups, transform):
     """Write the matched geometries as float3/uint32 buffers plus the export.json tools/bvh_rehydrate.py is given.
 
@@ -205,10 +253,11 @@ def write_export(directory, candidate, groups, transform):
     """
     os.makedirs(directory, exist_ok=True)
     rows = []
+    names = export_buffer_names(len(candidate["used"]))
     for k in candidate["used"]:
         mesh = candidate["kept"][k]
         geometry = build_geometry(groups[mesh[0]])
-        vb, ib = "g%d_f3.bin" % len(rows), "g%d_tri.bin" % len(rows)
+        vb, ib = names[len(rows)]
         with open(os.path.join(directory, vb), "wb") as f:
             f.write(geometry.vertices)
         with open(os.path.join(directory, ib), "wb") as f:
@@ -228,6 +277,8 @@ def describe(candidate, names):
     used = [candidate["kept"][k][2] for k in candidate["used"]]
     label = ("%-40s " % item["Name"]) if names else ""
     note = " (shader rule not applied)" if candidate["skipped"] and not candidate["rule"] else ""
+    if candidate.get("buckets") and not candidate.get("by_bucket"):
+        note += " (bucket rule not applied: a geometry has no render bucket)"
     return "%sstream 0x%-10x model %d geometry %s%s" % (label, item["Offset"], candidate["model"], used, note)
 
 
@@ -242,6 +293,8 @@ def main(argv=None):
     ap.add_argument("--header-offset", type=int, default=0, help="the 64-byte header's offset in the file")
     ap.add_argument("--skip-shaders", default=os.environ.get(SKIP_SHADERS_ENV, ""),
                     help="shader name hashes of the geometries the BVH leaves out (game data; local use only)")
+    ap.add_argument("--no-bucket-rule", action="store_true",
+                    help="do not leave out geometries by render bucket (by default only buckets 0 and 3 are kept)")
     ap.add_argument("--unordered", action="store_true", help="also try the geometries in any order")
     ap.add_argument("--embeddings", type=int, default=64, help="at most this many index choices per model")
     ap.add_argument("--top", type=int, default=8, help="how many scored candidates to print")
@@ -250,6 +303,20 @@ def main(argv=None):
                                                   "and an export.json for tools/bvh_rehydrate.py")
     ap.add_argument("--json", help="write the report here")
     a = ap.parse_args(argv)
+    if a.json:
+        if os.path.isdir(a.json):
+            print("error: --json is a directory: %s" % a.json, file=sys.stderr)
+            return 2
+        # The report is written last, after the inputs have been read, so an aliased input would silently
+        # be replaced by it. Refuse the alias before any input is opened, as the other report tools do.
+        for what, other in (("the dehydrated input", a.dehydrated), ("the manifest", a.manifest),
+                            ("the --descriptor input", a.descriptor)):
+            if other and same_report_path(a.json, other):
+                print("error: --json would overwrite %s: %s" % (what, other), file=sys.stderr)
+                return 2
+        if a.write and same_report_path(a.json, os.path.join(a.write, "export.json")):
+            print("error: --json would overwrite --write's export.json: %s" % a.json, file=sys.stderr)
+            return 2
     try:
         with open(a.dehydrated, "rb") as f:
             src = f.read()
@@ -270,7 +337,8 @@ def main(argv=None):
         signature = leaf_signature(src, a.header_offset)
         if not signature:
             raise ValueError("the BLAS has no leaves")
-        candidates = match_candidates(items, signature, parse_shader_hashes(a.skip_shaders), a.embeddings, not a.unordered)
+        candidates = match_candidates(items, signature, parse_shader_hashes(a.skip_shaders), a.embeddings,
+                                      not a.unordered, not a.no_bucket_rule)
     except (OSError, ValueError, KeyError, IndexError, TypeError, struct.error) as e:
         print("error: %s" % e, file=sys.stderr)
         return 2
@@ -314,19 +382,31 @@ def main(argv=None):
             print("nothing written: no candidate is consistent")
         else:
             match = consistent[0][3]
+            if a.json:
+                # The report is written after the export, so it must not land on one of the buffers the
+                # export is about to write either. Their names depend on the match, hence the check here.
+                for vb, ib in export_buffer_names(len(match["used"])):
+                    for name in (vb, ib):
+                        if same_report_path(a.json, os.path.join(a.write, name)):
+                            print("error: --json would overwrite --write's %s: %s" % (name, a.json), file=sys.stderr)
+                            return 2
             rows = write_export(a.write, match, groups[os.path.join(models_dir, match["item"]["File"])], transform)
             print("wrote %d geometries to %s%s" % (len(rows), a.write,
                   "; pass the transform in export.json to bvh_rehydrate.py with --transform" if transform else ""))
     if a.json:
         match = consistent[0][3] if consistent else None
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"signature": signature, "consistent": bool(consistent), "scored": len(results),
-                       "matched": None if match is None else {
-                           "offset": match["item"]["Offset"], "model": match["model"],
-                           "geometry": [match["kept"][k][2] for k in match["used"]],
-                           "triangles": [match["kept"][k][3] for k in match["used"]],
-                           "name": match["item"]["Name"] if a.names else None}},
-                      f, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"signature": signature, "consistent": bool(consistent), "scored": len(results),
+                           "matched": None if match is None else {
+                               "offset": match["item"]["Offset"], "model": match["model"],
+                               "geometry": [match["kept"][k][2] for k in match["used"]],
+                               "triangles": [match["kept"][k][3] for k in match["used"]],
+                               "name": match["item"]["Name"] if a.names else None}},
+                          f, indent=1)
+        except OSError as e:
+            print("error: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            return 2
     return 0 if consistent else 1
 
 

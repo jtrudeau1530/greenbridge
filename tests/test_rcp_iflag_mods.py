@@ -39,10 +39,8 @@ class RcpIflagModsTest(unittest.TestCase):
 
         # Verify source modifier chain feeding OpFDiv.
         if neg or abs_:
-            self.assertRegex(defs[src], r"^OpBitcast %float %\w+$")
-            src = defs[src].split()[-1]
-            self.assertRegex(defs[src], r"^OpBitcast %uint %\w+$")
-            src = defs[src].split()[-1]
+            # The modified float, as the id itself: a bitcast to uint and back is the original id (Gen.tof/tou).
+            self.assertNotRegex(defs[src], r"^OpBitcast ")
             if neg:
                 self.assertRegex(defs[src], r"^OpFNegate %float %\w+$")
                 src = defs[src].split()[-1]
@@ -82,9 +80,10 @@ class RcpIflagModsTest(unittest.TestCase):
 
         word = match_result(rf"OpBitcast %uint {value}")
         dest = match_result(r"OpAccessChain %_ptr_Function_uint %vgpr %c0")
-        old_word = match_result(rf"OpLoad %uint {dest}")
-        masked = match_result(rf"OpSelect %uint %\w+ {word} {old_word}")
-        self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked}$")
+        if not re.search(rf"(?m)^ *OpStore {re.escape(dest)} {re.escape(word)}$", spv):
+            old_word = match_result(rf"OpLoad %uint {dest}")
+            masked = match_result(rf"OpSelect %uint %\w+ {word} {old_word}")
+            self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked}$")
 
     def test_no_output_modifiers(self):
         cases = (

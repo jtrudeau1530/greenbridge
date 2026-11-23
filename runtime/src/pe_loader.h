@@ -27,7 +27,8 @@ struct ImportRecord {
 };
 
 struct Module {
-    std::string name;
+    std::string name;        // UTF-8 basename for diagnostics and traces, not a lookup key
+    std::string narrow_key;  // legacy lower-case narrow basename; empty when it cannot round-trip
     std::filesystem::path path;
     uint8_t* base = nullptr;
     uint64_t preferred_base = 0;
@@ -41,6 +42,10 @@ struct Module {
     void* function_table = nullptr;
     uint32_t function_count = 0;
 
+    // Mapped for a run-time LoadLibrary or a GetProcAddress forwarder (a dynamic load), not by a host load() (the
+    // start-up graph, a static load). DllMain's DLL_PROCESS_ATTACH gets lpvReserved NULL only for a dynamic load.
+    bool dynamic_load = false;
+
     std::vector<ImportRecord> imports;
     std::map<std::string, void*> exports;           // by name, plus "#ordinal"
     std::map<std::string, std::string> forwarders;  // same keys, holding "module.symbol" for re-exports
@@ -50,7 +55,8 @@ struct Module {
     // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves distinct indices by loading
     // gta6rt_tls_host.dll (and cloning it on demand for additional simultaneous TLS modules, up to 16 at a time).
     // Every thread started after load() gets its own copy through the helper's DLL_THREAD_ATTACH, and gives it back
-    // at DLL_THREAD_DETACH; install_tls_for_thread() is for threads that already existed.
+    // at DLL_THREAD_DETACH. A thread that was already running gets its copy from load() itself, as it would from
+    // Windows for a DLL Windows loads: a block, no DLL_THREAD_ATTACH, and DLL_THREAD_DETACH when it ends.
     uint32_t tls_index = kNoTlsIndex;
     uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool
     uint64_t tls_generation = 0;       // unique token per TLS initialisation, distinguishing reused slots/addresses
@@ -104,24 +110,32 @@ public:
     void run_tls_callbacks(Module& m, uint32_t reason);
 
     // Installs/removes this module's template copy in the calling thread's TEB slot. load() does this for its caller
-    // and the thread events for threads started after it; both are no-ops on a thread that already has this module's
-    // copy. Call install on a thread that existed before load(), before mapped code runs there, and uninstall before
-    // that thread exits. Each module's copy sits in its own TEB slot, so one thread can hold copies of several
-    // modules. These do not run TLS callbacks (use
-    // run_tls_callbacks with DLL_THREAD_ATTACH/DETACH for that).
+    // and for every other thread running at the time, and the thread events for threads started after it, so on any
+    // of those both are no-ops. They remain for a thread load() could not reach (pe_loader.cpp, "Threads that
+    // existed before load()", lists the cases): install before mapped code runs there, uninstall before the thread
+    // exits. Each module's copy sits in its own TEB slot, so one thread can hold copies of several modules. These do
+    // not run TLS callbacks (use run_tls_callbacks with DLL_THREAD_ATTACH/DETACH for that).
     void install_tls_for_thread(Module& m);
     void uninstall_tls_for_thread(Module& m);
 
     // Run-time module lookup/loading used by the library_loader shim for bundled package DLLs.
     void* find_loaded_module(const std::string& dll_lower) const;
     void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
+    // The same by the module's native basename (any Unicode name, matched case-insensitively as Windows matches
+    // module names), for the W entries of LoadLibrary / GetModuleHandle.
+    void* find_loaded_module_w(const std::wstring& basename) const;
+    void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
 
 private:
     void initialise(Module& m);
     static void set_initialised(Module& m, bool value);
-    Module& map_image(const std::filesystem::path& path);
+    Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_
+    Module* find_wide_module(const std::wstring& basename) const;    // caller holds mutex_
+    void* load_runtime_candidate(Module* existing, const std::filesystem::path& candidate, uint32_t flags,
+                                 const std::string& display);        // caller holds mutex_
+    Module& map_image(const std::filesystem::path& path, const std::string& narrow_key);
     void initialize_tls(Module& m);
     void bind_imports(Module& m);
     void* resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal);
@@ -132,9 +146,10 @@ private:
 
     mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
-    std::map<std::string, Module*> by_name_;  // lower-case file name
+    std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
+    int runtime_loads_ = 0;  // > 0 while a run-time load or forwarder maps modules (under mutex_): they are dynamic
 
     // What find_address reads: one entry per mapped image, added once its memory exists. Under ranges_mutex_, a leaf
     // lock: mutex_ is held while image code runs and the registry holds its own lock around the lookup, so the

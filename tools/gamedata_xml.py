@@ -11,6 +11,8 @@ For every file it records the root element, element count, maximum depth, attrib
 ``platform:/`` references, and include-like structures. For every root it records the file count, category,
 element-name histogram, attribute histogram and reference targets. ``--check`` validates well-formedness and
 separates rootless fragments, tail-only documents and malformed documents.
+Well-formed documents use the parser's expanded root name (including its XML namespace), just as
+the element histogram does. A raw tag hint is only needed when recovering incomplete documents.
 
 Only schema names, element/attribute names and reference tokens are written. Element text, attribute values,
 ``type``/``content`` values and entry paths are not. For a carve directory a row is identified by offset; an
@@ -199,7 +201,7 @@ def scan_xml(data: bytes) -> dict:
         report["mismatched_tag"] = (isinstance(exc, ET.ParseError)
                                     and exc.code == errors.codes[errors.XML_ERROR_TAG_MISMATCH])
         # The parser stops at the error, so the comments after it would go uncounted (a truncated or tail-only
-        # document): count them in the bytes instead, still skipping comment-like text inside CDATA.
+        # document): count them in the bytes instead, respecting the surrounding markup.
         report["comments"] = raw_comment_count(data)
     if ended is not None:
         scan_refs(ended.tail, report)
@@ -207,13 +209,17 @@ def scan_xml(data: bytes) -> dict:
     return report
 
 
-CDATA = re.compile(rb"<!\[CDATA\[.*?(?:\]\]>|\Z)", re.S)
+COMMENT_MARKUP = re.compile(
+    rb"(?P<comment><!--).*?(?:-->|\Z)"
+    rb"|<!\[CDATA\[.*?(?:\]\]>|\Z)"
+    rb"|<\?.*?(?:\?>|\Z)",
+    re.S,
+)
 
 
 def raw_comment_count(data: bytes) -> int:
-    """Comment starts in a document the parser could not finish, outside CDATA sections (an unclosed one runs to
-    the end of the data)."""
-    return CDATA.sub(b"", data).count(b"<!--")
+    """Count comment starts in malformed XML, consuming comments, CDATA and PIs through their terminator or EOF."""
+    return sum(match.lastgroup == "comment" for match in COMMENT_MARKUP.finditer(data))
 
 
 def looks_truncated(data: bytes, root: str) -> bool:
@@ -235,6 +241,7 @@ def file_row(doc: dict, scan: dict) -> dict:
         header = gi.has_xml_decl(doc["data"])
     well_formed = scan["well_formed"]
     if well_formed:
+        root = scan["root"]  # the parsed name includes its namespace; a recovery hint need not
         tail_only = fragment = False
     elif doc.get("from_carve"):
         tail_only = not header
@@ -467,7 +474,10 @@ def carve_documents(directory: str):
 
 
 def xml_files(directory: str):
-    for base, _, names in os.walk(directory):
+    def scan_failed(exc: OSError) -> None:
+        raise exc
+
+    for base, _, names in os.walk(directory, onerror=scan_failed):
         for name in sorted(names):
             if name.lower().endswith(".xml"):
                 yield os.path.join(base, name)

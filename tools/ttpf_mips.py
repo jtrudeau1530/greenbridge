@@ -37,12 +37,14 @@ DX10 DDS when every source mip uses a supported codec.
 
 Standard library only. The tile patterns and tail formula are the public AMD
 Gfx10 4 KiB/64 KiB layouts recorded in docs/textures.md and docs/textures_arrays.md.
+Usage: `python -I tools/ttpf_mips.py --help` lists the options.
 """
 import argparse
 import glob
 import json
 import math
 import mmap
+import operator
 import os
 import struct
 import sys
@@ -92,14 +94,16 @@ PATTERNS_64K = {
     3: (0, 0, 0, 1, -1, 2, 3, -2, -3, 4, -4, 5, -5, 6, -6, 7),
     4: (0, 0, 0, 0, 1, -1, 2, -2, -3, 3, -4, 4, -5, 5, -6, 6),
 }
-# AMD Gfx10 3D SW_4KB_S intra-tile bit order (addrlib GFX10_SW_4K_S 3D):
-# >0 and <100 = X bit (s-1), <0 = Y bit (-s-1), >=101 = Z bit (s-101).
+# AMD Gfx10 3D SW_4KB_S intra-tile bit order: Mesa addrlib GFX10_SW_4K_S3_PATINFO (and the identical
+# GFX10_SW_4K_S3_RBPLUS_PATINFO), first nibble01 + nibble2 entries per element size.
+# >0 and <100 = X bit (s-1), <0 = Y bit (-s-1), >=101 = Z bit (s-101). The tile extents in
+# tex_headers._VOLUME_4K_TILE are 2**(number of X, Y and Z bits) of each row.
 VOLUME_PATTERNS_4K = {
     0: (1, 2, 101, -1, 102, -2, 3, 103, -3, 4, 104, -4),
-    1: (0, 1, 2, 101, -1, 102, 3, -2, 103, 4, -3, 104),
-    2: (0, 0, 1, 2, 101, -1, 102, -2, 3, 103, -3, 104),
+    1: (0, 1, 101, -1, 102, -2, 2, 103, -3, 3, 104, -4),
+    2: (0, 0, 1, -1, 101, -2, 2, 102, -3, 3, 103, -4),
     3: (0, 0, 0, 1, 101, -1, 2, 102, -2, 3, 103, -3),
-    4: (0, 0, 0, 0, 1, -1, 101, 2, -2, 102, 3, 103),
+    4: (0, 0, 0, 0, 101, -1, 1, 102, -2, 2, 103, -3),
 }
 VOLUME_FLOAT_FORMATS = {10: 4, 54: 1}  # DXGI format -> float16 channels per voxel
 
@@ -212,54 +216,161 @@ def surface_layout(width, height, fmt, mips, tile=4096):
         raise LayoutError(str(exc)) from exc
 
 
+def _coalesce_x_runs(x_offs, eb):
+    """Merge consecutive contiguous X offsets into (start_offset, byte_len) runs."""
+    if not x_offs:
+        return []
+    runs = []
+    start = x_offs[0]
+    run_len = eb
+    for xo in x_offs[1:]:
+        if xo == start + run_len:
+            run_len += eb
+        else:
+            runs.append((start, run_len))
+            start = xo
+            run_len = eb
+    runs.append((start, run_len))
+    return runs
+
+
 def detile(layout, mip, tiled):
     """Copy the mip's elements out of the tiled allocation into block-linear order."""
-    pat = (PATTERNS_4K if layout["tile"] == 4096 else PATTERNS_64K)[
-        {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
-    bw, bh = layout["block_w"], layout["block_h"]
+    tile = layout["tile"]
     eb = layout["element_bytes"]
-    out = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
-    for y in range(mip["blocks_h"]):
-        for x in range(mip["blocks_w"]):
-            off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
-            for bit, s in enumerate(pat):
-                if s > 0:
-                    off |= (((x + mip["tile_x"]) >> (s - 1)) & 1) << bit
-                elif s < 0:
-                    off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
-            at = (y * mip["blocks_w"] + x) * eb
+    pat = (PATTERNS_4K if tile == 4096 else PATTERNS_64K)[
+        {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
+    bw, bh = layout["block_w"], layout["block_h"]
+    w, h = mip["blocks_w"], mip["blocks_h"]
+    out = bytearray(w * h * eb)
+    if w == 0 or h == 0:
+        return bytes(out)
+    tx, ty = mip["tile_x"], mip["tile_y"]
+    tiles_x = mip["padded_w"] // bw
+    x_bits = [(1 << bit, s - 1) for bit, s in enumerate(pat) if s > 0]
+    y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
+
+    row_stride = tiles_x * tile
+
+    def y_base_of(y):
+        o = (y // bh) * row_stride
+        yy = y + ty
+        for mask, shift in y_bits:
+            if (yy >> shift) & 1:
+                o |= mask
+        return o
+
+    def x_off_of(x):
+        o = (x // bw) * tile
+        xx = x + tx
+        for mask, shift in x_bits:
+            if (xx >> shift) & 1:
+                o |= mask
+        return o
+
+    if h == 1:
+        # A single row has no X-table reuse: stream it, allocating no per-column or per-row tables.
+        y_base = y_base_of(0)
+        for x in range(w):
+            off = y_base + x_off_of(x)
+            at = x * eb
             out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    x_offs = [x_off_of(x) for x in range(w)]
+    max_x = max(x_offs)
+    max_y = max(map(y_base_of, range(h)))
+
+    if len(tiled) >= max_y + max_x + eb:
+        x_runs = _coalesce_x_runs(x_offs, eb)
+        src = memoryview(tiled)
+        dst = memoryview(out)
+        at = 0
+        for y in range(h):
+            y_base = y_base_of(y)
+            for xo, run in x_runs:
+                off = y_base + xo
+                dst[at:at + run] = src[off:off + run]
+                at += run
+    else:
+        for y in range(h):
+            y_base = y_base_of(y)
+            row_at = y * w * eb
+            for x, xo in enumerate(x_offs):
+                off = y_base + xo
+                at = row_at + x * eb
+                out[at:at + eb] = tiled[off:off + eb]
     return bytes(out)
 
 
 def detile_volume_slice(layout, tiled, z):
     """Copy one Z slice out of a 3D SW_4KB_S tiled volume into row-major linear order."""
+    tile = layout["tile"]
     eb = layout["element_bytes"]
     pat = VOLUME_PATTERNS_4K[{1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
     bw, bh, bd = layout["block_w"], layout["block_h"], layout["block_d"]
     mip = layout["mips"][0]
     w, h = mip["blocks_w"], mip["blocks_h"]
+    out = bytearray(w * h * eb)
+    if w == 0 or h == 0:
+        return bytes(out)
     tiles_x = mip["padded_w"] // bw
     z_base = (z // bd) * layout["z_tile_stride"]
     z_in_tile = 0
     for bit, s in enumerate(pat):
         if s >= 101:
             z_in_tile |= ((z >> (s - 101)) & 1) << bit
-    out = bytearray(w * h * eb)
-    for y in range(h):
-        y_tile = (y // bh) * tiles_x
-        y_in_tile = z_in_tile
-        for bit, s in enumerate(pat):
-            if s < 0:
-                y_in_tile |= ((y >> (-s - 1)) & 1) << bit
-        row_at = y * w * eb
+    x_bits = [(1 << bit, s - 1) for bit, s in enumerate(pat) if 0 < s < 100]
+    y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
+
+    row_stride = tiles_x * tile
+
+    def y_base_of(y):
+        o = z_base + (y // bh) * row_stride + z_in_tile
+        for mask, shift in y_bits:
+            if (y >> shift) & 1:
+                o |= mask
+        return o
+
+    def x_off_of(x):
+        o = (x // bw) * tile
+        for mask, shift in x_bits:
+            if (x >> shift) & 1:
+                o |= mask
+        return o
+
+    if h == 1:
+        # A single row has no X-table reuse: stream it, allocating no per-column or per-row tables.
+        y_base = y_base_of(0)
         for x in range(w):
-            off = z_base + (y_tile + x // bw) * layout["tile"] + y_in_tile
-            for bit, s in enumerate(pat):
-                if 0 < s < 100:
-                    off |= ((x >> (s - 1)) & 1) << bit
-            at = row_at + x * eb
+            off = y_base + x_off_of(x)
+            at = x * eb
             out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    x_offs = [x_off_of(x) for x in range(w)]
+    max_x = max(x_offs)
+    max_y = max(map(y_base_of, range(h)))
+
+    if len(tiled) >= max_y + max_x + eb:
+        x_runs = _coalesce_x_runs(x_offs, eb)
+        src = memoryview(tiled)
+        dst = memoryview(out)
+        at = 0
+        for y in range(h):
+            y_base = y_base_of(y)
+            for xo, run in x_runs:
+                off = y_base + xo
+                dst[at:at + run] = src[off:off + run]
+                at += run
+    else:
+        for y in range(h):
+            y_base = y_base_of(y)
+            row_at = y * w * eb
+            for x, xo in enumerate(x_offs):
+                off = y_base + xo
+                at = row_at + x * eb
+                out[at:at + eb] = tiled[off:off + eb]
     return bytes(out)
 
 
@@ -270,30 +381,70 @@ def detile_volume(layout, tiled):
 
 # --- BC decoding (color only; enough for the downsample check) -------------
 
+# The RGB565 channel levels, one float per value. Each is the same `i * 255.0 / max` the
+# per-pixel expression computed, so every decoded float is unchanged.
+_R565 = tuple(i * 255.0 / 31 for i in range(32))
+_G565 = tuple(i * 255.0 / 63 for i in range(64))
+_B565 = _R565
+_GREY = tuple((float(v),) * 3 for v in range(256))  # one shared (v, v, v) per BC4 level
+_BC1_HEAD = struct.Struct("<HHI").unpack_from
+_ROW_MAX_CACHE = 1 << 14  # palettes kept per decode_pixels call; reset when full
+
+
 def _rgb565(c):
-    return ((c >> 11) & 31) * 255.0 / 31, ((c >> 5) & 63) * 255.0 / 63, (c & 31) * 255.0 / 31
+    return _R565[(c >> 11) & 31], _G565[(c >> 5) & 63], _B565[c & 31]
+
+
+def _row_getters(index_bits):
+    """One itemgetter per packed row of four palette indices: getter[row](pal) is that
+    row's four palette entries, in pixel order (the lowest index bits are the left pixel)."""
+    mask = (1 << index_bits) - 1
+    return [operator.itemgetter(*((row >> (index_bits * x)) & mask for x in range(4)))
+            for row in range(1 << (4 * index_bits))]
+
+
+_BC1_ROWS = _row_getters(2)  # a byte of BC1 indices -> one row
+_BC4_ROWS = []  # 4096 getters (twelve BC4 index bits per row), built on first use
+
+
+def _bc4_rows():
+    if not _BC4_ROWS:
+        _BC4_ROWS.extend(_row_getters(3))
+    return _BC4_ROWS
+
+
+def _bc1_palette(c0, c1, four_color):
+    r0, g0, b0 = _R565[(c0 >> 11) & 31], _G565[(c0 >> 5) & 63], _B565[c0 & 31]
+    r1, g1, b1 = _R565[(c1 >> 11) & 31], _G565[(c1 >> 5) & 63], _B565[c1 & 31]
+    if four_color or c0 > c1:
+        return ((r0, g0, b0), (r1, g1, b1),
+                ((2 * r0 + r1) / 3, (2 * g0 + g1) / 3, (2 * b0 + b1) / 3),
+                ((r0 + 2 * r1) / 3, (g0 + 2 * g1) / 3, (b0 + 2 * b1) / 3))
+    return ((r0, g0, b0), (r1, g1, b1),
+            ((r0 + r1) / 2, (g0 + g1) / 2, (b0 + b1) / 2), (0.0, 0.0, 0.0))
+
+
+def _bc4_palette(e0, e1):
+    if e0 > e1:
+        vals = [e0, e1] + [((7 - i) * e0 + i * e1) // 7 for i in range(1, 7)]
+    else:
+        vals = [e0, e1] + [((5 - i) * e0 + i * e1) // 5 for i in range(1, 5)] + [0, 255]
+    return tuple([_GREY[v] for v in vals])
 
 
 def decode_bc1_block(data, at, four_color=False):
-    c0, c1, idx = struct.unpack_from("<HHI", data, at)
-    p0, p1 = _rgb565(c0), _rgb565(c1)
-    if four_color or c0 > c1:
-        pal = [p0, p1, tuple((2 * a + b) / 3 for a, b in zip(p0, p1)),
-               tuple((a + 2 * b) / 3 for a, b in zip(p0, p1))]
-    else:
-        pal = [p0, p1, tuple((a + b) / 2 for a, b in zip(p0, p1)), (0.0, 0.0, 0.0)]
-    return [pal[(idx >> (2 * (y * 4 + x))) & 3] for y in range(4) for x in range(4)]
+    c0, c1, idx = _BC1_HEAD(data, at)
+    pal, rows = _bc1_palette(c0, c1, four_color), _BC1_ROWS
+    return [*rows[idx & 255](pal), *rows[(idx >> 8) & 255](pal),
+            *rows[(idx >> 16) & 255](pal), *rows[idx >> 24](pal)]
 
 
 def decode_bc4_block(data, at):
     e0, e1 = data[at], data[at + 1]
     bits = int.from_bytes(data[at + 2:at + 8], "little")
-    if e0 > e1:
-        pal = [e0, e1] + [((7 - i) * e0 + i * e1) // 7 for i in range(1, 7)]
-    else:
-        pal = [e0, e1] + [((5 - i) * e0 + i * e1) // 5 for i in range(1, 5)] + [0, 255]
-    vals = [pal[(bits >> (3 * (y * 4 + x))) & 7] for y in range(4) for x in range(4)]
-    return [(float(v),) * 3 for v in vals]
+    pal, rows = _bc4_palette(e0, e1), _bc4_rows()
+    return [*rows[bits & 4095](pal), *rows[(bits >> 12) & 4095](pal),
+            *rows[(bits >> 24) & 4095](pal), *rows[bits >> 36](pal)]
 
 
 _BPTC_W2 = (0, 21, 43, 64)
@@ -607,33 +758,99 @@ def decode_pixels(fmt, data, blocks_w, blocks_h):
             return [(lut[vals[i]], lut[vals[i + 1]], lut[vals[i + 2]])
                     for i in range(0, n * 4, 4)]
         return None
+    if fmt in (71, 72, 74, 75, 77, 78):
+        # BC1 stands alone; BC2/BC3 carry the same color block after eight alpha bytes and use
+        # four RGB entries regardless of endpoint order.
+        stride, skip, four = (8, 0, False) if fmt in (71, 72) else (16, 8, True)
+        return _decode_bc1_rows(data, blocks_w, blocks_h, stride, skip, four)
+    if fmt == 80:
+        return _decode_bc4_rows(data, blocks_w, blocks_h)
+    decode = _BLOCK_DECODERS.get(fmt)
+    if decode is None and blocks_w > 0 and blocks_h > 0:
+        return None  # a BC format with no decoder here (an empty grid still gives [])
     px = []
     for by in range(blocks_h):
-        rows = [[None] * (blocks_w * 4) for _ in range(4)]
+        r0, r1, r2, r3 = [], [], [], []
         for bx in range(blocks_w):
-            at = (by * blocks_w + bx) * 16
-            if fmt in (71, 72):
-                blk = decode_bc1_block(data, (by * blocks_w + bx) * 8)
-            elif fmt in (74, 75, 77, 78):
-                # BC2/BC3 use four RGB entries regardless of endpoint order.
-                blk = decode_bc1_block(data, at + 8, four_color=True)
-            elif fmt in (80,):
-                blk = decode_bc4_block(data, (by * blocks_w + bx) * 8)
-            elif fmt in (83,):
-                a = decode_bc4_block(data, at)
-                b = decode_bc4_block(data, at + 8)
-                blk = [(p[0], q[0], 0.0) for p, q in zip(a, b)]
-            elif fmt in (95, 96):
-                blk = decode_bc6h_block(data, at, signed=(fmt == 96))
-            elif fmt in (98, 99):
-                blk = decode_bc7_block(data, at)
-            else:
-                return None
-            for y in range(4):
-                for x in range(4):
-                    rows[y][bx * 4 + x] = blk[y * 4 + x]
-        px.extend(rows)
-    return [p for row in px for p in row]
+            blk = decode(data, (by * blocks_w + bx) * 16)
+            r0 += blk[0:4]
+            r1 += blk[4:8]
+            r2 += blk[8:12]
+            r3 += blk[12:16]
+        px += r0
+        px += r1
+        px += r2
+        px += r3
+    return px
+
+
+def _decode_bc5_block(data, at):
+    a = decode_bc4_block(data, at)
+    b = decode_bc4_block(data, at + 8)
+    return [(p[0], q[0], 0.0) for p, q in zip(a, b)]
+
+
+_BLOCK_DECODERS = {
+    83: _decode_bc5_block,
+    95: lambda data, at: decode_bc6h_block(data, at, signed=False),
+    96: lambda data, at: decode_bc6h_block(data, at, signed=True),
+    98: decode_bc7_block,
+    99: decode_bc7_block,
+}
+
+
+def _decode_bc1_rows(data, blocks_w, blocks_h, stride, skip, four_color):
+    """BC1 color blocks of a whole surface in pixel order, filling the output one block row
+    at a time. Equal endpoint pairs share one palette (a reset cache bounds the memory)."""
+    px, rows, head, cache = [], _BC1_ROWS, _BC1_HEAD, {}
+    for by in range(blocks_h):
+        at = by * blocks_w * stride + skip
+        r0, r1, r2, r3 = [], [], [], []
+        for _ in range(blocks_w):
+            c0, c1, idx = head(data, at)
+            at += stride
+            key = c0 << 16 | c1
+            pal = cache.get(key)
+            if pal is None:
+                if len(cache) >= _ROW_MAX_CACHE:
+                    cache.clear()
+                pal = cache[key] = _bc1_palette(c0, c1, four_color)
+            r0 += rows[idx & 255](pal)
+            r1 += rows[(idx >> 8) & 255](pal)
+            r2 += rows[(idx >> 16) & 255](pal)
+            r3 += rows[idx >> 24](pal)
+        px += r0
+        px += r1
+        px += r2
+        px += r3
+    return px
+
+
+def _decode_bc4_rows(data, blocks_w, blocks_h):
+    """BC4 blocks of a whole surface in pixel order; same scheme as `_decode_bc1_rows`."""
+    px, rows, cache = [], _bc4_rows(), {}
+    for by in range(blocks_h):
+        at = by * blocks_w * 8
+        r0, r1, r2, r3 = [], [], [], []
+        for _ in range(blocks_w):
+            e0, e1 = data[at], data[at + 1]
+            bits = int.from_bytes(data[at + 2:at + 8], "little")
+            at += 8
+            key = e0 << 8 | e1
+            pal = cache.get(key)
+            if pal is None:
+                if len(cache) >= _ROW_MAX_CACHE:
+                    cache.clear()
+                pal = cache[key] = _bc4_palette(e0, e1)
+            r0 += rows[bits & 4095](pal)
+            r1 += rows[(bits >> 12) & 4095](pal)
+            r2 += rows[(bits >> 24) & 4095](pal)
+            r3 += rows[bits >> 36](pal)
+        px += r0
+        px += r1
+        px += r2
+        px += r3
+    return px
 
 
 def block_means(pixels, blocks_w, blocks_h, pixels_w=None, pixels_h=None, block=4):
@@ -641,22 +858,39 @@ def block_means(pixels, blocks_w, blocks_h, pixels_w=None, pixels_h=None, block=
         return list(pixels)
     pw = blocks_w * block if pixels_w is None else pixels_w
     ph = blocks_h * block if pixels_h is None else pixels_h
+    width = blocks_w * block  # row pitch of `pixels`
+    zero = (0.0, 0.0, 0.0)
+    if block < 1:
+        return [zero for _ in range(blocks_w * blocks_h)]
+    rx, ry = min(pw, width), min(ph, blocks_h * block)  # visible columns / rows of the grid
+    if rx > 0 and ry > 0 and len(pixels) < (ry - 1) * width + rx:
+        raise IndexError("list index out of range")
+    # Columns of each block that fall inside the picture; rows are clamped per block row.
+    cols = [min(block, max(0, rx - bx * block)) for bx in range(blocks_w)]
+    add, div, get0, get1, get2 = (operator.add, operator.truediv, operator.itemgetter(0),
+                                  operator.itemgetter(1), operator.itemgetter(2))
     out = []
     for by in range(blocks_h):
-        for bx in range(blocks_w):
-            acc = [0.0, 0.0, 0.0]
-            n = 0
-            for y in range(block):
-                if by * block + y >= ph:
-                    continue
-                for x in range(block):
-                    if bx * block + x >= pw:
-                        continue
-                    q = pixels[(by * block + y) * (blocks_w * block) + bx * block + x]
-                    for k in range(3):
-                        acc[k] += q[k]
-                    n += 1
-            out.append((acc[0] / n, acc[1] / n, acc[2] / n) if n else (0.0, 0.0, 0.0))
+        rows_in = min(block, max(0, ry - by * block))
+        # Add the pixels in raster order, each block's sum starting from 0.0 as the scalar
+        # loop did: one pass over a row's x-th column of every block at a time.
+        acc = [[0.0] * blocks_w, [0.0] * blocks_w, [0.0] * blocks_w]
+        for y in range(rows_in):
+            start = (by * block + y) * width
+            row = pixels[start:start + rx]
+            for k, get in enumerate((get0, get1, get2)):
+                chan = list(map(get, row))
+                sums = acc[k]
+                for x in range(min(block, rx)):
+                    seq = chan[x::block]
+                    if len(seq) == blocks_w:
+                        sums = list(map(add, sums, seq))
+                    else:
+                        sums[:len(seq)] = map(add, sums[:len(seq)], seq)
+                acc[k] = sums
+        counts = [rows_in * c or 1 for c in cols]
+        out.extend(zip(map(div, acc[0], counts), map(div, acc[1], counts),
+                       map(div, acc[2], counts)))
     return out
 
 
@@ -874,15 +1108,23 @@ class Pool:
         if self._fh is not None:
             self._fh.close()
 
+    def asset_key(self, index):
+        """The entry's 64-bit native asset key. The key array follows the 16-byte records and
+        is longer than the record area has room for in most pools, so it continues into the
+        32-byte ID region; TtpfReader reads it across that boundary, and so does this."""
+        at = self.textures * 16 + index * 8
+        if at + 8 <= len(self.records):
+            return u64(self.records, at)
+        if at >= len(self.records):
+            return u64(self.ids, at - len(self.records))
+        raise ValueError("ETPF asset key straddles the records/ids boundary")
+
     def descriptor(self, index):
         if not 0 <= index < self.textures:
             raise IndexError(index)
         d = parse_etpf_texture_record(self.records[index * 16:index * 16 + 16])
         d["index"] = index
-        d["asset_key_at"] = (
-            u64(self.records, self.textures * 16 + index * 8)
-            if (self.textures * 16 + index * 8 + 8 <= len(self.records))
-            else None)
+        d["asset_key_at"] = self.asset_key(index)
         return d
 
     def chunks_for(self, start, size):
@@ -923,11 +1165,14 @@ class Pool:
             if key not in cache:
                 raw = self.data[src:src + packed]
                 if codec == 0:
-                    cache[key] = bytes(raw)
+                    decoded = bytes(raw)
                 elif codec == 8:
-                    cache[key] = zlib.decompress(raw)
+                    inflater = zlib.decompressobj()
+                    decoded = inflater.decompress(raw, csize + 1)
+                    if len(decoded) > csize or not inflater.eof:
+                        raise ValueError("zlib chunk is truncated or exceeds its declared size")
                 elif bcpack_mode != "off" and codec in bcpack.SUPPORTED_REBUILD_CODECS:
-                    cache[key] = bcpack.decode(
+                    decoded = bcpack.decode(
                         raw, codec, csize,
                         allow_provisional=(bcpack_mode == "provisional"),
                         history=bcpack_history,
@@ -936,8 +1181,9 @@ class Pool:
                     raise BcpackRequired(
                         f"range touches a BCPack chunk (codec {codec})"
                     )
-                if len(cache[key]) != csize:
+                if len(decoded) != csize:
                     raise ValueError("decoded chunk length disagrees with its range")
+                cache[key] = decoded
             lo, hi = max(start, virt), min(start + size, virt + csize)
             out[lo - start:hi - start] = cache[key][lo - virt:hi - virt]
         return bytes(out)
@@ -1265,8 +1511,10 @@ def find_pools(arg):
     pools = sorted(glob.glob(os.path.join(root, "data", "ttdb", "**", "*.ttpf"), recursive=True))
     pools += sorted(glob.glob(os.path.join(root, "pack", "*", "data", "ttdb", "**", "*.ttpf"),
                                 recursive=True))
+    pools = [path for path in pools if os.path.isfile(path)]
     if not pools:
-        pools = sorted(glob.glob(os.path.join(root, "**", "*.ttpf"), recursive=True))
+        pools = sorted(path for path in glob.iglob(os.path.join(root, "**", "*.ttpf"), recursive=True)
+                       if os.path.isfile(path))
     return pools
 
 

@@ -35,6 +35,8 @@ IN_VERTS = {"InputPoints": 1, "InputLines": 2, "InputLinesAdjacency": 4, "Triang
             "InputTrianglesAdjacency": 6}
 OUT_TOPOLOGY = {"OutputPoints": "points", "OutputLineStrip": "line_strip", "OutputTriangleStrip": "triangle_strip"}
 KEEP_BUILTINS = ("SubgroupLocalInvocationId", "SubgroupSize", "NumSubgroups", "SubgroupId")
+FLOAT_CONTROL_MODES = {"DenormPreserve", "DenormFlushToZero", "SignedZeroInfNanPreserve",
+                       "RoundingModeRTE", "RoundingModeRTZ"}
 
 
 class Unsupported(Exception):
@@ -183,6 +185,7 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     out = []
     entry_label = None
     cur_block = None
+    emit_split = set()
     block_tail = {}
     main_start = None
     state = "header"        # header -> main_entry -> main_vars -> main -> other
@@ -196,10 +199,22 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             out += [f"OpEntryPoint GLCompute {m.group(1)} {m.group(2)} {' '.join(iface)}",
                     f"OpExecutionMode {m.group(1)} LocalSize {LOCAL_SIZE} 1 1"]
             continue
-        if re.match(rf"OpExecutionMode {re.escape(main)} ", s):
+        # Floating-point controls apply to compute too.
+        m = re.match(rf"OpExecutionMode {re.escape(main)} (\w+)\b", s)
+        if m and m.group(1) not in FLOAT_CONTROL_MODES:
             continue
         m = re.match(r"Op(?:Decorate|MemberDecorate|Name) (%\w+)\b", s)
         if m and m.group(1) in gone:
+            continue
+        if re.match(r"OpGroupDecorate\s", s):
+            instruction, sep, comment = s.partition(";")
+            opcode, group, *targets = instruction.split()
+            live_targets = [target for target in targets if target not in gone]
+            if live_targets == targets:
+                out.append(ln)
+            elif live_targets:
+                rewritten = " ".join((opcode, group, *live_targets))
+                out.append(rewritten + f" {sep}{comment}" if sep else rewritten)
             continue
         m = re.match(r"(%\w+) = (Op\w+)", s)
         if decos and m and m.group(2).startswith("OpType"):
@@ -234,7 +249,8 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             cur_block = entry_label
             out.append(ln)
             continue
-        if state == "main_vars" and not re.match(r"%\w+ = OpVariable ", s):
+        # OpLine and OpNoLine can be intermixed with the entry block's local variables.
+        if state == "main_vars" and not re.match(r"(?:%\w+ = OpVariable |OpLine |OpNoLine$)", s):
             # after the entry block's variables: p = GlobalInvocationId.x; return when p >= primitive_count
             state = "main"
             out += [f"%gsc_gidv = OpLoad {v3u} %gsc_gid", f"%gsc_prim = OpCompositeExtract {uint} %gsc_gidv 0",
@@ -311,6 +327,7 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
                     f"{lbl_end} = OpLabel"]
             if cur_block is not None:
                 block_tail[cur_block] = lbl_end
+                emit_split.add(cur_block)
             continue
         if s == "OpEndPrimitive":
             # flag the last emitted vertex: meta[base + 1 + (n - 1)]; with none emitted this writes the count slot,
@@ -323,6 +340,10 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             n, q = tmp(), tmp()
             out += [f"{n} = OpLoad {uint} %gsc_n",
                     f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} %gsc_metabase", f"OpStore {q} {n}"]
+        if s.startswith("OpLoopMerge ") and cur_block in emit_split:
+            # Splitting a loop header with OpSelectionMerge moves OpLoopMerge into the merge block while
+            # back-edges still target the original header label, violating SPIR-V structured CFG rules.
+            raise Unsupported("OpEmitVertex in a loop header before OpLoopMerge")
         if s in ("OpKill", "OpTerminateInvocation", "OpReturnValue"):
             raise Unsupported(s)
         out.append(s)

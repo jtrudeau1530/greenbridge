@@ -1,8 +1,12 @@
 # First boot: the runbook and the two traces
 
-**Status: prepared, not yet run against the retail executable.** The package in the repository's test corpus does
-not contain `game_scarlett_master.exe` (RT-5), so this page is the procedure and the trace tool for the day it
-arrives. Nothing here quotes game data; a real trace stays on the player's machine.
+**Status: `--dry-run` and `--init` have been run on the retail executable; `--run` has not.** The package in the
+repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the dry-run on an executable supplied
+separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
+`DllMain`s without an exception
+([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
+trace tool for the first boot. The executable's `ws2_32.dll` imports bind to the host's, so run `--run` with the
+network off. Nothing here quotes game data; a real trace stays on the player's machine.
 
 ## 1. What the first boot produces
 
@@ -36,14 +40,15 @@ $exe = "C:\path\to\game_scarlett_master.exe"
 $pkg = "C:\path\to\the\package"
 $trace = Join-Path $env:TEMP boot.jsonl
 $log = Join-Path $env:TEMP d3d12.log
-.\runtime\build\gta6rt.exe --run $exe --game-dir $pkg --trace $trace --trace-d3d12 2> $log
+.\runtime\build\gta6rt.exe --run $exe --game-dir $pkg --trace $trace --trace-d3d12 2>&1 |
+    ForEach-Object { $_.ToString() } |
+    Out-File -LiteralPath $log -Width 4096 -Encoding utf8
 python -I tools\boot_trace.py $trace --d3d12 $log
 ```
 
-Windows PowerShell 5.1 writes `2>` as UTF-16LE; the tool names that file instead of parsing it. Use
-`2>&1 | Out-File -Encoding utf8 $log` there, or PowerShell 7, which defaults to UTF-8. The tool strips the BOM that
-5.1 writes with `utf8`, and accepts the `program.exe : ` prefix 5.1 puts in front of the first stderr line when it
-turns it into an error record, so that call is not lost. `cmd /c` writes the lines unchanged.
+The capture pipeline writes each message as text to avoid PowerShell 5.1 wrapping the first stderr record at a
+narrow output width. The tool also reads existing UTF-16LE logs saved with `2>` in PowerShell 5.1 and recognizes
+the `program.exe : ` prefix on the first stderr line.
 
 Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifact; the backend must be Vulkan):
 
@@ -67,6 +72,10 @@ Useful switches:
   printing the caller's `module+RVA` and the argument registers (with a debugger attached it breaks instead). Start
   with `log`, then use `stop` to pin the first blocker and `fail` to see how the game's own failure path reacts.
   This switch covers imports only; it does not affect the D3D12 outcomes.
+* `LEONIDA_SKIP_INT3=1` (with `--trace`) steps over each int3 in guest code and logs it once per address as an
+  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
+  Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
+  open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
@@ -84,20 +93,28 @@ Read the startup trace first; the first event that is not the expected one is th
    deliberate failure in `runtime/shims/registry.cpp`; rerun with `LEONIDA_UNIMPLEMENTED=stop` to halt at the first
    remaining blocker.
 3. **`tls_callback` / `dllmain`** — a failed DllMain, or a TLS callback that faults, usually points at the CRT or
-   TLS index; the loader's own TLS is checked by `run_tiny_game_tls`.
+   TLS index. The summary shows the address and phase of the last observed TLS callback
+   (`last_tls_callback` in JSON). The loader records it before invoking the callback, so the record gives no
+   completion result. The loader's own TLS is checked by `run_tiny_game_tls`.
 4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
-   so the process behaviour is the same with or without the trace.
+   so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it reserves
+   the final slot for the last observed exception. The trace also includes handled exceptions, so the last
+   observation alone does not establish what caused the run to stop.
 5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
-6. **D3D12 trace** — the `failed`, `unsupported` and `refused` lines name the method. Compare its position with
-   the public SDK vtable; an unknown slot is expected until the executable names it (Q2, Q6). The `[rt]` lines in
-   the same log carry what the trace does not: the 24 device words, feature ids, warnings.
+6. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
+   submission ran the supported commands from a list. The runtime's `[rt]` diagnostic names the command it left out.
+   Compare the method's position with the public SDK vtable. An unknown slot is expected until the executable names it
+   (Q2, Q6). The `[rt]` lines in the same log carry the 24 device words, feature IDs and warnings.
 7. **First frame** — after the device and queues, the first `CreateRootSignature`, PSO, `Draw*` and `PresentX` (or
    DXGI) calls are the frame's critical path. The layer's M0–M4 tests already exercise the offscreen parts; the
    present slots are the part that cannot be measured from the package alone.
 
-The trace tool prints the first call per method and the `unsupported`/`failed`/`refused` lists; `--json` gives the
-same summary for a script. Share that summary's **counts and error classes**, not the trace file or its debug
-strings.
+The trace tool prints the first call per method and the `unsupported`/`failed`/`refused`/`partial` lists. The `--json`
+option gives the same summary for a script. Share only the summary's **counts and error classes**.
+
+If startup stops before the first D3D12 call, the combined command still prints the startup report. A missing
+or invalid requested trace is reported on stderr and sets exit code 2. In a partial JSON report that section
+is `null`; if neither input yields a report, stdout is empty.
 
 ## 4. The open questions, and the trace signal for each
 
@@ -106,7 +123,7 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 
 | # | Question | Signal in the first trace |
 |---|---|---|
-| 1 | `D3D12XboxCreateDevice` 24-word params and flags | first `D3D12XboxCreateDevice` in the D3D12 trace; the shim prints the 24 words only when `--trace-d3d12` is off, so run once without it (or grep `^\[rt\]`); accept unknown flags |
+| 1 | `D3D12XboxCreateDevice` 24-word params and flags | first `D3D12XboxCreateDevice` in the D3D12 trace; the shim prints the 24 words as an `[rt]` line in the same log, with or without `--trace-d3d12` (grep `^\[rt\]`); accept unknown flags |
 | 2 | Xbox device/heap/queue/command-list slots | queue, fence and allocator method names in the D3D12 trace; device slots past the PC vtable print an `[rt] d3d12_xs: device slot …` line instead and record nothing; compare with the SDK vtable |
 | 3 | Root signature → `s0..s31` | `CreateRootSignature`, `SetGraphicsRootSignature`, then the shader's user-SGPR reads; mask `0x03000000` on a copy |
 | 4 | Descriptor bytes and heap increments | first `CreateShaderResourceView`/`CreateSampler` and the first draw; dump the heap bytes and compare with the T#/S# parser |

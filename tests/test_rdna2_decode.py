@@ -24,6 +24,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -47,6 +48,49 @@ def words(*ws: int) -> bytes:
 
 
 class Rdna2DecodeUnitTests(unittest.TestCase):
+    def test_image_atomic_data_width(self):
+        for opcode, name, mask, data in (
+            (0x17, "umax", 1, "v16"), (0x17, "umax", 3, "v[16:17]"),
+            (0x10, "cmpswap", 3, "v[16:17]"), (0x10, "cmpswap", 15, "v[16:19]"),
+        ):
+            for glc in (0, 1):
+                with self.subTest(name=name, mask=mask, glc=glc):
+                    code = words(0xf0001008 | opcode << 18 | mask << 8 | glc << 13, 0x00021004)
+                    ins, = rdna2_decode.decode_bytes(code)["insns"]
+                    asm = (f"image_atomic_{name} {data}, v[4:5], s[8:15] "
+                           f"dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D unorm" + (" glc" if glc else ""))
+                    expected = shader_ir.parse_line(asm)
+                    for field in ("op", "args", "mods"):
+                        self.assertEqual(ins[field], expected[field])
+
+    def test_image_slc_is_independent_of_sampler(self):
+        for sampler in (0, 64):
+            for slc in (0, 1):
+                with self.subTest(sampler=sampler, slc=slc):
+                    code = words(0xF0800108 | (slc << 25), 0x0004090A | ((sampler // 4) << 21))
+                    ins, = rdna2_decode.decode_bytes(code)["insns"]
+                    self.assertEqual(ins["args"][-1]["r"], sampler)
+                    self.assertEqual("slc" in ins["mods"], bool(slc))
+
+    def test_mix_source_modifiers(self):
+        # LLVM gfx1013: v17, -v19, |v21|, -|v23| across all three mix variants.
+        for opcode, name in enumerate(("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16")):
+            with self.subTest(name=name):
+                code = words(0xCC200611 + (opcode << 16), 0xA45E2B13)
+                ins, = rdna2_decode.decode_bytes(code)["insns"]
+                expected = shader_ir.parse_line(f"{name} v17, -v19, |v21|, -|v23|")
+                self.assertEqual((ins["op"], ins["args"], ins["mods"]),
+                                 (name, expected["args"], expected["mods"]))
+
+    def test_vop3_legacy_mad_fma_target(self):
+        code = words(0xD5400001, 0x04120702)
+        self.assertEqual(rdna2_decode.decode_bytes(code)["insns"][0]["op"], "v_mad_legacy_f32")
+        for cpu, op in (("gfx1013", "v_mad_legacy_f32"), ("gfx1030", "v_fma_legacy_f32")):
+            with self.subTest(cpu=cpu):
+                asm, invalid, _ = shader_disasm.disasm(code, cpu, backend="python")
+                self.assertEqual(invalid, 0)
+                self.assertIn(op + " v1, v2, v3, v4", asm)
+
     def test_sopp_endpgm_branch_and_waitcnt(self):
         # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC;
         # s_branch -20 = 0xBF82FFEC; s_endpgm = 0xBF810000
@@ -62,6 +106,48 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(inv, 0)
         self.assertIn("s_cbranch_scc1 -4", text)
         self.assertIn("s_branch -20", text)
+
+    def test_s_ttracedata_imm_keeps_simm16(self):
+        for word, value in ((0xBFA80000, 0x0), (0xBFA80001, 0x1),
+                            (0xBFA80063, 0x63), (0xBFA80064, 0x64),
+                            (0xBFA81234, 0x1234), (0xBFA8FFFF, 0xFFFF)):
+            with self.subTest(word=hex(word)):
+                code = words(word)
+                info = rdna2_decode.decode_bytes(code)
+                self.assertEqual(info["invalid"], 0)
+                self.assertEqual(info["insns"][0]["op"], "s_ttracedata_imm")
+                self.assertEqual(info["insns"][0]["args"],
+                                 [{"k": "imm", "v": value}])
+                text, invalid = rdna2_decode.disasm_bytes(code)
+                self.assertEqual(invalid, 0)
+                self.assertIn(f"s_ttracedata_imm 0x{value:x}", text)
+
+    def test_disasm_formats_each_instruction_before_decoding_the_next(self):
+        code = words(0xBF800000, 0xBF810000)  # s_nop 0; s_endpgm
+        events = []
+        decode_one = rdna2_decode._decode_one
+        format_insn = rdna2_decode.format_insn
+
+        def record_decode(code, offset, *args, **kwargs):
+            events.append(("decode", offset))
+            return decode_one(code, offset, *args, **kwargs)
+
+        def record_format(ins):
+            events.append(("format", ins["pc"]))
+            return format_insn(ins)
+
+        with (
+            patch.object(rdna2_decode, "_decode_one", record_decode),
+            patch.object(rdna2_decode, "format_insn", record_format),
+        ):
+            text, invalid = rdna2_decode.disasm_bytes(code, code_start=0x100, name="synthetic")
+
+        expected_text = (
+            f"\t{'s_nop 0':<40}; encoding: [0x00,0x00,0x80,0xbf]\n"
+            f"\t{'s_endpgm':<40}; encoding: [0x00,0x00,0x81,0xbf]\n"
+        )
+        self.assertEqual((text, invalid), (expected_text, 0))
+        self.assertEqual(events, [("decode", 0), ("format", 0x100), ("decode", 4), ("format", 0x104)])
 
     def test_sop1_sop2_sopc_sopk_with_literals(self):
         # s_mov_b32 s4, 0x12345678 (SOP1: op=3, sdst=4, ssrc0=255 + lit)
@@ -164,6 +250,26 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(info["insns"][3]["args"][2], {"k": "attr", "a": 1, "c": 1})
         self.assertEqual(info["insns"][4]["args"][2]["t"], "off")
         self.assertEqual(info["insns"][4]["mods"], ["offset:-4"])
+
+    def test_sdwa_inline_sources(self):
+        values = list(range(65)) + list(range(-1, -17, -1))
+        floats = [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 0.15915494]
+        constants = [(128 + i, "imm", v) for i, v in enumerate(values)]
+        constants += [(240 + i, "fimm", v) for i, v in enumerate(floats)]
+        # gfx1013 v_mov_b32, v_add_f32 and v_cmp_eq_f32 SDWA encodings.
+        for opcode in (0x7E0002F9, 0x060000F9, 0x7C0400F9):
+            slots = (0,) if opcode == 0x7E0002F9 else (0, 1)
+            for slot in slots:
+                for code, kind, value in constants:
+                    with self.subTest(opcode=hex(opcode), slot=slot, code=code):
+                        first = opcode
+                        second = code | (1 << 23)
+                        if slot == 1:
+                            first |= code << 9
+                            second = 1 | (1 << 31)
+                        ins = rdna2_decode.decode_bytes(words(first, second))["insns"][0]
+                        operand = ins["args"][1 + slot]
+                        self.assertEqual((operand["k"], operand["v"]), (kind, value))
 
     def test_roundtrip_binary_to_spirv_and_interpreter(self):
         # Synthetic pixel shader binary: v_mov_b32 v0, 1.0; v_add_f32 v1, v0, 2.0; exp mrt0 v0, v1, v0, v1 done vm; s_endpgm

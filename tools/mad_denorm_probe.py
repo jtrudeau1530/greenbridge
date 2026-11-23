@@ -25,6 +25,7 @@ Sides:
 
 Exit code: 0 when every hardware word equals the translator's, 1 when one differs, 2 on a
 harness error, 77 when the hardware oracle is unavailable. Nothing here reads game files.
+Usage: `python -I tools/mad_denorm_probe.py --help` lists the options.
 """
 import argparse
 import os
@@ -278,11 +279,18 @@ def main(argv=None):
         for c, w in zip(CASES, want):
             print(f"  [{c.group:7s}] {c.op:16s} {c.what:38s} -> 0x{w:08x}")
         return 0
-    from hw_oracle import runner
+    from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
+        return 77
+    # The probe's three opcodes are GFX10.1 only: on gfx1030 and later the assembler rejects every kernel, which is
+    # "this GPU can't run it" (a skip), not a harness error.
+    why = asm.valu_skip_reason("v_mad_f32", oracle.arch)
+    if why:
+        oracle.close()
+        print(f"hardware oracle unavailable: {why}")
         return 77
     status = 0
     try:
