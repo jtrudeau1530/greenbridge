@@ -238,6 +238,28 @@ class CharacterTextureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("must use different paths", result.stderr)
 
+    def test_unlistable_subfolder_is_an_error_not_a_silent_skip(self):
+        import io
+        from unittest import mock
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ct_under_test", TOOL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as td:
+            write_model(pathlib.Path(td) / "a", model([{"Name": "m", "Materials": []}]))
+            orig_walk = mod.os.walk
+            def fail_walk(top, *args, **kwargs):
+                if "onerror" in kwargs and kwargs["onerror"]:
+                    kwargs["onerror"](PermissionError(13, "Permission denied"))
+                return orig_walk(top, *args, **kwargs)
+            with mock.patch.object(mod.os, "walk", side_effect=fail_walk):
+                with mock.patch.object(sys, "argv", ["character_textures.py", td]):
+                    with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                        code = mod.main()
+                        self.assertEqual(code, 2)
+                        self.assertIn("ERROR:", err.getvalue())
+                        self.assertIn("Permission denied", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

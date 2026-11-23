@@ -231,11 +231,14 @@ def classify_document(path: str, document: object) -> dict:
 
 def model_files(targets: list) -> list[str]:
     """Resolve explicit files and recurse into directories for model.json, de-duplicated."""
+    def scan_failed(exc: OSError) -> None:
+        raise exc
+
     found = []
     for target in targets:
         if os.path.isdir(target):
             matches = sorted(os.path.join(root, name)
-                             for root, _, names in os.walk(target) for name in names
+                             for root, _, names in os.walk(target, onerror=scan_failed) for name in names
                              if name.lower() == "model.json")
             if not matches:
                 raise ValueError(f"no model.json under {target}")
