@@ -64,6 +64,7 @@ method, scope and caveats. No game data is included.
 | [d3d12_xs_surface.md](d3d12_xs_surface.md) | The 116-slot `d3d12_xs.dll` export surface; 83/83 standard GUIDs match the PC SDK. |
 | [xdxr.md](xdxr.md) | `BATCHED_DESC2` (`0x50`) and `XDXR_STREAM_DESC` (`0x10`) from `XboxBvhBuilder.dll`'s reads; stream records' offsets and defaults; offline statistics not in the package. |
 | [d3d12_command_objects.md](d3d12_command_objects.md) | Measured command queue/list/fence/`PresentX` surface; verified vs prior art vs open. |
+| [xbox_d3d12_xs.md](xbox_d3d12_xs.md) | The `d3d12_xs` graphics ABI quoted from Microsoft's public GDK reference: root signatures, state objects, DXIL libraries, hit groups, shader cache sessions; which pages are missing or NDA-gated. |
 | [runtime_imports.md](runtime_imports.md) | The 16 shipped modules' measured imports and shim/host/unimplemented split. |
 | [gameinput.md](gameinput.md) | The GameInput shim on SDL3: `GameInputCreate` and the v0 `IGameInput`/`IGameInputDevice`/`IGameInputReading`/`IGameInputDispatcher` surface on any SDL gamepad, DualSense adaptive-trigger approximation and lightbar, force-feedback motors and trigger haptics through SDL's haptic API; 261 checks on virtual joysticks and a fake haptic backend, not yet tried on a real pad. |
 | [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder; key hashes are case-sensitive joaat (`tools/save_keys.py`). |
