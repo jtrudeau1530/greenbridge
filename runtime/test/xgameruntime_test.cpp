@@ -1034,6 +1034,54 @@ int main() {
           "XPackageGetMountPathSize rejects closed/stale mount handle");
     check(mount_path(dlc_mount, sizeof(mnt_path), mnt_path) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
           "XPackageGetMountPath rejects closed/stale mount handle");
+    // Mount paths are sized by the query API, and the mapping can exceed 1024 bytes.
+    const std::string long_path(300, 'p');
+    for (const std::string& mapping : {std::string("pkg=") + long_path,
+                                       std::string("unused=") + std::string(1024, 'x') + ";pkg=" + long_path}) {
+        SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping.c_str());
+        XPackageMountHandle long_mount{0};
+        const HRESULT long_hr = mount_pkg("pkg", &long_mount);
+        check(long_hr == S_OK, "XPackageMount accepts a 300-byte path in a long mapping");
+        size_t long_size = 0;
+        check(long_hr == S_OK && mount_path_size(long_mount, &long_size) == S_OK && long_size == 301,
+              "XPackageGetMountPathSize returns 301 for a 300-byte path");
+        std::string returned(long_size, '\0');
+        check(long_hr == S_OK && mount_path(long_mount, long_size, returned.data()) == S_OK &&
+                  returned == long_path + '\0', "XPackageGetMountPath returns the entire long path");
+        if (long_hr == S_OK) close_mount(long_mount);
+    }
+    {
+        namespace fs = std::filesystem;
+        const auto folder = fs::temp_directory_path() /
+            (L"leonida_content_\u16a0_\U0001F680_" + std::to_wstring(GetCurrentProcessId()));
+        std::error_code ec;
+        const bool created = fs::create_directory(folder, ec);
+        check(created, "create a Unicode content package folder");
+        if (created) {
+            std::ofstream(folder / L"marker.txt") << "mounted";
+            const auto mapping = L"unused=other;unicode=" + folder.native() + L";last=another";
+            check(SetEnvironmentVariableW(L"LEONIDA_CONTENT_PACKAGES", mapping.c_str()) != 0,
+                  "configure the content mapping in the native Windows environment");
+            XPackageMountHandle mount{};
+            check(mount_pkg("unicode", &mount) == S_OK, "mount the package with a Unicode directory");
+            const auto expected = folder.u8string();
+            size_t bytes = 0;
+            check(mount_path_size(mount, &bytes) == S_OK && bytes == expected.size() + 1,
+                  "the Unicode mount size includes every UTF-8 byte and the terminator");
+            std::string path(expected.size() + 1, '\0');
+            check(mount_path(mount, expected.size(), path.data()) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+                  "the Unicode mount refuses a buffer one UTF-8 byte short");
+            const bool exact = mount_path(mount, path.size(), path.data()) == S_OK &&
+                               std::memcmp(path.data(), expected.c_str(), path.size()) == 0;
+            check(exact, "the Unicode mount returns the exact UTF-8 path");
+            std::string marker;
+            if (exact) std::ifstream(fs::u8path(path.c_str()) / L"marker.txt") >> marker;
+            check(marker == "mounted", "the returned UTF-8 path opens the package marker");
+            close_mount(mount);
+            fs::remove_all(folder, ec);
+            check(!ec, "remove the Unicode content package fixture");
+        }
+    }
     SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
 
     auto is_packaged = get<PackagedProcessFn>("XPackageIsPackagedProcess");
