@@ -3876,6 +3876,15 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    static std::atomic<int> logged_invalid{0};
+    if ((info.SizeInBytes >> 32) && descs && logged_invalid.fetch_add(1, std::memory_order_relaxed) < 16)
+        for (UINT i = 0; i < desc_count; ++i)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 25: size 0x%llx; desc %u: dimension %d format %d %llux%ux%u "
+                         "mips %u samples %u layout 0x%x flags 0x%x\n",
+                         static_cast<unsigned long long>(info.SizeInBytes), i, int(descs[i].Dimension),
+                         int(descs[i].Format), static_cast<unsigned long long>(descs[i].Width), descs[i].Height,
+                         unsigned(descs[i].DepthOrArraySize), unsigned(descs[i].MipLevels),
+                         descs[i].SampleDesc.Count, unsigned(descs[i].Layout), unsigned(descs[i].Flags));
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
 }

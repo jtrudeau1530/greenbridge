@@ -567,7 +567,9 @@ struct TextureCreateInfo {
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         // No B8G8R8X8 view is ever a UAV, so its typeless family needs no storage usage (not every GPU has it for BGRA8).
-        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format)) {
+        // Console depth-stencil textures may allow unordered access; no Vulkan depth format takes storage usage.
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format) &&
+            !(format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
             info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
             if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -8265,6 +8267,12 @@ private:
         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
             (volume && depth_stencil))
             return kInvalidAllocation;
+        // The title asks for 4 KiB alignment on small console-tiled textures: size those as the standard layout.
+        if (is_xbox_tiled_layout(desc.Layout) && desc.Alignment == align_4k) {
+            D3D12_RESOURCE_DESC standard = desc;
+            standard.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            return allocation(standard);
+        }
         const bool tiled = is_tiled_layout(desc.Layout);
         if (tiled) {
             if (one_d || (samples > 1 && samples != 4)) return kInvalidAllocation;
