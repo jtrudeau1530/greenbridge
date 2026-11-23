@@ -1545,11 +1545,17 @@ class Gen:
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
-        if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
-            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
-            return
-        if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
-            self.set_exec(val)
+        if a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi", "exec"):
+            ins = self.cur_ins
+            is_mask = (a["t"] == "exec" or
+                       (ins is not None and base_op(ins["op"]) == "s_mov_b32"
+                        and len(ins["args"]) > 1 and self.holds_lane_mask(ins["args"][1])))
+            if self.wave64 and a["t"] in ("exec_lo", "exec_hi"):
+                self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val, mask=is_mask)
+            elif not is_mask:
+                self.set_exec(self.lane_bit_mask(val))
+            else:
+                self.set_exec(val)
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
             # VALU writes only land in active lanes. The exception is a lane mask on its way through a VGPR
@@ -5522,9 +5528,18 @@ class Gen:
         else:
             self.emit(f"{r} = OpLoad %uint %sg_lane")
 
-    def exec_half_write(self, half, val, const=None):
+    def lane_bit_mask(self, word):
+        """Per-lane 0xFFFFFFFF / 0 from bit (lane & 31) of a 32-bit uniform word."""
+        sh, shr, bit, r = (self.tmp() for _ in range(4))
+        self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+        self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        return r
+
+    def exec_half_write(self, half, val, const=None, mask=True):
         """Write one 32-bit half of EXEC. In the per-lane model a lane is active iff its bit is set. A constant
-        sets each lane from its own bit; a register value (mask representation: all-ones / zero per lane) sets
+        or computed non-mask word sets each lane from its own bit; a register mask (all-ones / zero per lane) sets
         the lanes of that half from their own copy. Lanes of the other half are unchanged."""
         lane = self.wave_lane()
         rel, inh, bit, on, cur, new = (self.tmp() for _ in range(6))
@@ -5534,14 +5549,15 @@ class Gen:
         else:
             self.emit(f"{inh} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
             self.emit(f"{rel} = OpISub %uint {lane} {self.cu(32)}")
-        if const is not None:
+        if const is not None or not mask:
+            word = self.cu(const & 0xFFFFFFFF) if const is not None else val
             r31 = self.tmp()
             self.emit(f"{r31} = OpBitwiseAnd %uint {rel} {self.cu(31)}")
             # Shift and mask, not OpBitFieldUExtract: Intel's Windows driver (UHD 770 / Xe-LP, 32.0.101.6129;
             # also seen on Xe-LPG) extracts from a constant that fits in 16 bits with the offset taken mod 16, so
             # exec_lo = 0xffff turned on all 32 lanes. GPU-checked with cs_exec_const.asm.
             shr = self.tmp()
-            self.emit(f"{shr} = OpShiftRightLogical %uint {self.cu(const & 0xFFFFFFFF)} {r31}")
+            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {r31}")
             self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
             self.emit(f"{on} = OpINotEqual %bool {bit} {self.cu(0)}")
         else:
