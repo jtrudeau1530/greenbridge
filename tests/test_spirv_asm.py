@@ -184,6 +184,7 @@ class SpirvAsmUnitTests(unittest.TestCase):
         for env, expected_ver in (
             ("vulkan1.0", 0x00010000),
             ("vulkan1.1", 0x00010300),
+            ("vulkan1.1spv1.4", 0x00010400),
             ("vulkan1.2", 0x00010500),
             ("vulkan1.3", 0x00010600),
         ):
