@@ -20,7 +20,8 @@ it is missing. Never share what it makes.
 
 Stages (each skips work that is already done, so a stopped build continues where it left off):
     check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
-    shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V
+    shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
+              compute programs inside amd_fidelityfx_upscaler_xbox.dll and XboxBvhBuilder.dll
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
               BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
@@ -1315,6 +1316,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
+    bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1417,6 +1419,113 @@ def fspx_key_clash(spirv: str):
         if modules[0] is None or modules[0] != modules[1]:
             return first[key], name
     return None
+
+
+BVH_DLL = "XboxBvhBuilder.dll"
+BVH_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py")   # as FSPX_TOOLS, for the builder
+# rdna2spirv.py's --max-shared-memory for the builder's programs: 32768, the maxComputeSharedMemorySize of the AMD
+# Windows and Intel drivers (docs/design.md, "Workgroup memory limit"). The constructor creates a pipeline for every
+# program and gives up at the first one that fails, so one module over the device's limit costs the whole builder.
+# Measured on 1.0.2.1 (docs/embedded_shaders.md section 7): with --wave64-emulate RadixAlloc declares 37,084 B under
+# the translator's 65536 default and 22,236 B under this cap; no other module changes, natively none does, and the
+# same 51 programs translate either way.
+BVH_MAX_SHARED_MEMORY = 32768
+
+
+def bvh_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the builder's outputs depend on, as one line: the DLL, the extracting, unpacking and translating tools,
+    llvm-mc, the wave64 mode, the fallback flags and the workgroup-memory cap."""
+    return json.dumps({"dll": file_sha256(dll), "tools": sources_digest(TOOLS, BVH_TOOLS),
+                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks),
+                       "max_shared_memory": BVH_MAX_SHARED_MEMORY}, sort_keys=True)
+
+
+def bvh_programs(unpacked: str, spirv: str) -> "tuple[list[str], list[str]] | None":
+    """The programs pe_shader_containers.py extracted, by file stem, and the ones among them the runtime cannot
+    find: no entry with an fssm_sha256 in <spirv>/index.json, or no module beside it. None when either index is
+    missing or unreadable, or names a module that is not there."""
+    try:
+        extracted = sorted(shader_stems(os.path.join(unpacked, "index.json"), "file", ".dxbc"))
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(index, dict) or not all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index):
+        return None
+    found = {name for name, meta in index.items()
+             if isinstance(meta, dict) and isinstance(meta.get("fssm_sha256"), str)}
+    return extracted, [name for name in extracted if name not in found]
+
+
+def bvh_report(programs: "tuple[list[str], list[str]]") -> None:
+    """One line with the counts, and one that names every program left without a module. It is printed on every
+    run, also when the step itself is reused: a program the translator has no rule for is never dropped quietly."""
+    extracted, missing = programs
+    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {BVH_DLL} programs translated")
+    if missing:
+        log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for "
+            f"{'it' if len(missing) == 1 else 'them'}, so that compute pipeline is refused (E_INVALIDARG) and the "
+            "builder's constructor, which creates all of them, gives up there. When the step runs, rdna2spirv.py "
+            "prints the instruction each one stops at (docs/embedded_shaders.md, section 4)")
+
+
+def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+                fallbacks: tuple[str, ...] = ()) -> None:
+    """XboxBvhBuilder.dll's compute programs (docs/embedded_shaders.md): pe_shader_containers.py extracts the DLL's
+    DXBC containers into <work>/shaders/bvh, fssm_unpack.py and shader_disasm.py unpack and disassemble their FSSM
+    programs there, as for a shader from shaders.rpf, and rdna2spirv.py translates them into
+    <work>/shaders/spirv/bvh, where the runtime's shader library finds them by fssm_sha256, the key of the game's
+    own shaders. Those neither feed nor depend on this step.
+
+    The 52 programs take seconds, so the step runs whole. Reuse requires both indexes, the translated modules and a
+    matching bvh_build.json (bvh_settings)."""
+    dll = os.path.join(game, BVH_DLL)
+    unpacked = os.path.join(work, "shaders", "bvh")
+    spirv = os.path.join(work, "shaders", "spirv", "bvh")
+    extracted = os.path.join(unpacked, "index.json")
+    unpack_index = os.path.join(unpacked, "fssm_index.json")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "bvh_build.json")
+    if not os.path.isfile(dll):
+        # A work folder used before with a package that had the DLL still holds that run's index, and the runtime
+        # loads <shaders>/bvh/index.json whenever it is there. Without the index the old modules are not found.
+        drop(translated, settings_file)
+        log(f"shaders: no {BVH_DLL} in the game folder, so no BVH builder programs to translate")
+        return
+    settings = bvh_settings(dll, mc_signature, emulate, fallbacks)
+    programs = bvh_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
+    if programs:
+        bvh_report(programs)
+        return
+    log(f"shaders: extracting and translating the compute programs of {BVH_DLL}")
+    drop(translated, settings_file, extracted, unpack_index)
+    # pe_shader_containers.py never overwrites a container (a second run would write <module>_NN.dxbc beside the
+    # first), and a program that no longer translates must not keep a module from the run before.
+    for folder, suffixes in ((unpacked, (".dxbc",)), (os.path.join(unpacked, "fssm"), (".fssm",)),
+                             (os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    py("pe_shader_containers.py", dll, "--extract", unpacked)
+    py("fssm_unpack.py", unpacked, "--carve-index", extracted)
+    # rdna2spirv.py reads each program's stage from index.json and its FSSM blob from fssm/, both in the parent of
+    # the listings' folder, so the disassembly sits inside the extraction folder as it does for shaders.rpf.
+    disasm = os.path.join(unpacked, "disasm")
+    py("shader_disasm.py", os.path.join(unpacked, "fssm"), "--unpack-index", unpack_index, "--out", disasm,
+       "--mcpu", "gfx1013", "--jobs", jobs)
+    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
+    py("rdna2spirv.py", disasm, "--out", spirv, "--no-asm", "--max-shared-memory", BVH_MAX_SHARED_MEMORY, *extra)
+    programs = bvh_programs(unpacked, spirv)
+    if not programs or len(programs[1]) == len(programs[0]):
+        drop(translated)   # an empty or unreadable index would read as a finished step
+        fail(f"shaders: none of the {BVH_DLL} programs translated, so their index is not kept. Run the shaders "
+             "stage again; if it happens again, the tool output above is why.")
+    bvh_report(programs)
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
 
 
 WAVE64_MODES = ("auto", "on", "off")

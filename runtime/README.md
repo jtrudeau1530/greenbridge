@@ -241,7 +241,8 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   and found by FSSM hash; three draws into a float target, compared bit for bit. Needs `llvm-mc` (`LLVM_MC`) and the
   Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
-  translator-style index, root arguments through the GPU address arena, and two dispatches.
+  translator-style index, root arguments through the GPU address arena, and two dispatches. A second program is
+  found the same way in `<shaders>/bvh/index.json`, where the BVH builder's programs go (`docs/embedded_shaders.md`).
 - `d3d12_fspx_compute_test` — compute PSOs from synthetic FSPX programs (`docs/fspx.md`): an `ACCC` container
   through slot 62 and a bare kind-6 program, found by `fspx_code_sha256` in `<shaders>/fspx/index.json`, one
   dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs

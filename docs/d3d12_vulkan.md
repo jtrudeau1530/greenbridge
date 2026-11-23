@@ -4034,6 +4034,15 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     `XBCH` record, which decompresses to `FSSM`; 51 of the 52 programs translate and pass `spirv-val` today
     ([embedded_shaders.md](embedded_shaders.md)). Translating that record is the path that avoids a DXIL lowering
     front end (section 7.2, M6); the bitcode is a second representation.
+- **On the Vulkan device (D3D-557).** With `LEONIDA_BVH_DEVICE=vulkan` the constructor runs on the Vulkan-backed
+  device, where slot 62 needs the translated module of each container's `FSSM` program. `make_game.py` translates
+  the DLL's programs into `<shaders>/bvh/` and the shader library reads that index
+  ([embedded_shaders.md](embedded_shaders.md) section 7). Measured on 1.0.2.1: before that step creation #1 failed
+  (`E_FAIL` with no library, `E_INVALIDARG` with the game's corpus loaded). With it, on an RTX 3070 (NVIDIA 610.74)
+  and on a Ryzen 7 9700X's integrated Radeon (AMD 32.0.21042.62), both with the `--wave64-emulate` translation, 49 of
+  the first 50 creations return `S_OK` and the constructor throws `E_INVALIDARG` at #50, `Box16Rehydration`, the one
+  program the translator has no rule for yet (#1864). With that rule applied locally all 53 are created and the
+  constructor and destructor return. Nothing has been dispatched.
 
 ### A.3 `amd_fidelityfx_upscaler_xbox.dll`
 
