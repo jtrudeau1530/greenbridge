@@ -2633,6 +2633,16 @@ if(TARGET Vulkan::Headers)
     add_test(NAME dxgi_host_parity COMMAND dxgi_host_parity_test)
     set_tests_properties(dxgi_host_parity PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Host-parity test for DXGI waitable swap chain frame-latency semaphore behavior.
+    add_executable(dxgi_waitable_latency_test test/dxgi_waitable_latency_test.cpp)
+    target_link_libraries(dxgi_waitable_latency_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(dxgi_waitable_latency_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_waitable_latency_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_waitable_latency COMMAND dxgi_waitable_latency_test)
+    set_tests_properties(dxgi_waitable_latency PROPERTIES
+      SKIP_RETURN_CODE 77
+      FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # Synthetic (no GPU): VulkanSwapchain's DXGI BufferCount contract when Vulkan returns more images than the
     # app asked for, or the surface minimum exceeds the request (D3D-389).
     add_executable(dxgi_swapchain_count_test test/dxgi_swapchain_count_test.cpp)

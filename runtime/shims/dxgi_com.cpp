@@ -542,6 +542,10 @@ public:
         *h = source_size_.height;
         return S_OK;
     }
+    // Host-measured (Windows 11, RTX 5090 and WARP): the waitable object is a semaphore initialized to 1 with max 40.
+    // Increasing latency releases (max_latency - prev) tokens (if current + delta > 40, ReleaseSemaphore fails with
+    // ERROR_TOO_MANY_POSTS leaving count unchanged and SetMaximumFrameLatency still returns S_OK). Decreasing updates
+    // max_frame_latency_ without draining existing tokens. Present releases 1 token per non-test call up to max 40.
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
         if (!waitable_ || max_latency == 0 || max_latency > max_waitable_frame_latency)
             return DXGI_ERROR_INVALID_CALL;
@@ -551,16 +555,18 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* n) override {
-        if (!n) return E_INVALIDARG;
-        if (!waitable_) return DXGI_ERROR_INVALID_CALL;
+        // Host-measured (Windows 11, RTX 5090 and WARP): null output returns DXGI_ERROR_INVALID_CALL on both
+        // waitable and non-waitable swapchains.
+        if (!n || !waitable_) return DXGI_ERROR_INVALID_CALL;
         *n = max_frame_latency_.load(std::memory_order_relaxed);
         return S_OK;
     }
     HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override {
         if (!waitable_) return nullptr;
         HANDLE dup = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), waitable_, GetCurrentProcess(), &dup, 0, FALSE,
-                             DUPLICATE_SAME_ACCESS))
+        // Host-measured (Windows 11, RTX 5090 and WARP): the returned handle grants SYNCHRONIZE only, so callers can
+        // wait on it and CloseHandle it, while ReleaseSemaphore fails with ERROR_ACCESS_DENIED.
+        if (!DuplicateHandle(GetCurrentProcess(), waitable_, GetCurrentProcess(), &dup, SYNCHRONIZE, FALSE, 0))
             return nullptr;
         return dup;
     }
