@@ -213,8 +213,10 @@ the comparisons with the host D3D12, which is vkd3d-proton here:
   `SetName(nullptr)`, unknown sampler flags, CPU-copy boxes).
 - `d3d12_r9g9b9e5_uav` compares a clear with WARP, and Proton's dxgi answers `EnumWarpAdapter` with the first
   hardware adapter ("WARP not supported"), so the compared value is the hardware's.
-- `d3d12_compute` and `d3d12_method_variants` crash with an access violation in `d3d12core.dll` (vkd3d-proton)
-  when they create the host device. `d3d12_compute` passes with only `WINEDLLOVERRIDES="dxgi=n"`, where the host is
+- `d3d12_compute` and `d3d12_method_variants` crash with an access violation inside `d3d12core.dll` on their
+  null-argument checks, not on device creation: `GetCachedBlob(nullptr)` and `CreateCommandQueue1(nullptr, ...)`
+  are not validated by vkd3d-proton (filed upstream as vkd3d-proton issues 3512 and 3513; Wine's builtin d3d12
+  crashes on the queue one too). `d3d12_compute` passes with only `WINEDLLOVERRIDES="dxgi=n"`, where the host is
   Wine's own d3d12 and the comparison skips.
 
 The tests that compare with the host's D3D12 (`root_sig_test`, `root_sig`, `device_proxy`, `d3d12_vulkan_device`)
