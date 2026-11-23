@@ -1357,12 +1357,11 @@ def run_suite(a, work: str) -> int:
             elif name == "ps_flat":
                 ok, detail = check_flat(raw)
             elif name == "ps_interp_f16_high":
-                with open(raw, "rb") as source:
-                    problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", source.read())))
+                # A missing or partial readback is an empty frame for this test, not a crash of the suite (as #3442).
+                problem = interp_f16_high_problem(read_raw_u32(raw) if os.path.isfile(raw) else [])
                 ok, detail = not problem, problem or "f16 low/high halves and f32 control within 2e-3"
             elif name == "ps_ij_computed":
-                with open(raw, "rb") as source:
-                    problem = ij_computed_problem(list(struct.iter_unpack("<4I", source.read())))
+                problem = ij_computed_problem(read_raw_u32(raw) if os.path.isfile(raw) else [])
                 ok, detail = not problem, problem or "computed I/J pair words and v/2 within 1e-6"
             elif name == "ps_mandelbrot":
                 px = read_raw_u32(raw) if os.path.isfile(raw) else []
@@ -1420,8 +1419,8 @@ def run_suite(a, work: str) -> int:
             elif rc != 0:
                 results.append((name, False, msg))
             else:
-                with open(raw, "rb") as source:
-                    problem = interp_f16_high_problem(list(struct.iter_unpack("<4I", source.read())))
+                # A missing or partial readback is an empty frame for this test, not a crash of the suite (as #3442).
+                problem = interp_f16_high_problem(read_raw_u32(raw) if os.path.isfile(raw) else [])
                 results.append((name, not problem, problem or "f16 low/high halves and f32 control within 2e-3"))
         elif name == "ms_clip":
             raw = os.path.join(raw_dir, f"{name}.raw")
