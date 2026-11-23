@@ -6568,6 +6568,63 @@ class Gen:
             else:
                 raise Unsupported(f"{op} modifier {m}")
 
+    def _validate_cvt32_valu(self, ins, op, mods, *, float_src, float_dst):
+        """Validate encoding, arity, destination/source widths and modifiers for unary 32-bit float/int conversions."""
+        raw_op = ins["op"]
+        raw_args = self.cur_ins["args"]
+        if len(raw_args) != 2:
+            raise Unsupported(op + " operands")
+        dst, src = raw_args
+        is_null_dst = dst.get("k") == "special" and dst.get("t") == "null"
+        if not is_null_dst and (dst.get("k") != "vgpr" or dst.get("n", 1) != 1):
+            raise Unsupported(op + " destination")
+        if dst.get("neg") or dst.get("abs") or dst.get("sext"):
+            raise Unsupported(op + " destination modifier")
+        if src.get("n", 1) != 1:
+            raise Unsupported(op + " operand width")
+        is_sdwa = raw_op.endswith("_sdwa")
+        is_dpp = raw_op.endswith("_dpp")
+        is_e32 = raw_op.endswith("_e32")
+        if src.get("sext") and (float_src or not is_sdwa):
+            raise Unsupported(op + " operand modifier")
+        if (src.get("neg") or src.get("abs")) and (not float_src or is_e32):
+            raise Unsupported(op + " operand modifier")
+        if is_e32:
+            if mods:
+                raise Unsupported(op + " modifier")
+            return
+        if is_dpp:
+            if self.non_dpp_mods(raw_op, mods):
+                raise Unsupported(op + " modifier")
+            return
+        seen_sdwa = set()
+        seen_clamp = False
+        seen_omod = False
+        for m in mods:
+            if m == "clamp":
+                if not float_dst or seen_clamp:
+                    raise Unsupported(op + " modifier")
+                seen_clamp = True
+            elif m in ("mul:2", "mul:4", "div:2"):
+                if not float_dst or seen_omod:
+                    raise Unsupported(op + " modifier")
+                seen_omod = True
+            elif is_sdwa and ":" in m:
+                k, v = m.split(":", 1)
+                if k in seen_sdwa:
+                    raise Unsupported(op + " duplicate SDWA modifier")
+                seen_sdwa.add(k)
+                if k in ("src0_sel", "dst_sel"):
+                    if v not in self.SDWA_SEL:
+                        raise Unsupported(op + " SDWA selector")
+                elif k == "dst_unused":
+                    if v not in ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"):
+                        raise Unsupported(op + " SDWA dst_unused")
+                else:
+                    raise Unsupported(op + " modifier")
+            else:
+                raise Unsupported(op + " modifier")
+
     def dst_f64(self, d, value, mods, op):
         if d["k"] != "vgpr" or d.get("n") != 2:
             raise Unsupported(op + " destination")
@@ -11800,6 +11857,7 @@ class Gen:
             self.dst({"k": "vgpr", "r": d["r"], "n": 1}, r_lo)
             self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r_hi)
         elif op in ("v_cvt_f32_u32", "v_cvt_f32_i32"):
+            self._validate_cvt32_valu(ins, op, mods, float_src=False, float_dst=True)
             x = self.src_u(a[1])
             r = self.tmp()
             self.emit(f"{r} = {'OpConvertUToF' if op.endswith('u32') else 'OpConvertSToF'} %float "
@@ -11814,6 +11872,7 @@ class Gen:
             self.emit(f"{r} = OpConvertUToF %float {m}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_cvt_flr_i32_f32", "v_cvt_rpi_i32_f32"):
+            self._validate_cvt32_valu(ins, op, mods, float_src=True, float_dst=False)
             # Measured natively on RDNA2 (gfx1035 & gfx1036, wave32 & wave64):
             # - v_cvt_flr_i32_f32 = sat_i32(floor(S0)).
             # - v_cvt_rpi_i32_f32 = sat_i32(floor(S0 + 0.5)) computed exactly without binary32 rounding of S0 + 0.5:
@@ -11850,6 +11909,7 @@ class Gen:
             self.emit(f"{result} = OpSelect %uint {x_in_range} {converted} {bound}")
             self.dst(a[0], result)
         elif op in ("v_cvt_u32_f32", "v_cvt_i32_f32"):
+            self._validate_cvt32_valu(ins, op, mods, float_src=True, float_dst=False)
             # Compare binary32 words before converting: the raw SPIR-V conversion
             # must only see a representable operand, even when its result is discarded.
             bits = self.src_u(a[1])
