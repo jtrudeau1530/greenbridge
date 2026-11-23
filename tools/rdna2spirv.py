@@ -4706,7 +4706,8 @@ class Gen:
     #   [0, 2L)              per-lane data, double-buffered by round parity (written in round r, read in r + 1)
     #   [2L, 2L + 6W)        two mask words per wave, ORed atomically, 3 slots by round mod 3 (W = waves)
     #   [2L + 6W, +6)        per round slot: lanes not done, lanes neither done nor waiting at s_barrier
-    #   last word            a sink for the stores of lanes that have nothing to reset
+    #   last word            not used (until SHADER-708 the lanes with nothing to reset stored 0 to it, a data
+    #                        race); kept, so %x_buf has the size the SHADER-309 numbers were measured with
     def x_sizes(self):
         w = self.x_lanes // 64
         mask = 2 * self.x_lanes
@@ -4789,7 +4790,7 @@ class Gen:
         fn_name = f"%x_pre_{kind}_fn"
         if kind in self.x_round_fns:
             return fn_name
-        w, mask, sched, sink = self.x_sizes()
+        w, mask, sched, _ = self.x_sizes()
         tail_params = {"vote": ["val"], "data": ["val"], "mask": ["b0", "b1"], "both": ["val", "b0", "b1"]}[kind]
         if w == 1:
             p_names = ["it", "li"] + tail_params
@@ -4800,47 +4801,44 @@ class Gen:
         params = {k: f"%xp_{kind}_{k}" for k in p_names}
         p_it, p_li = params["it"], params["li"]
         saved, self.body = self.body, []
+
+        def clear_if(cond, words):
+            # Free the slot of round + 1: the invocation `cond` picks stores 0 to `words`, the others store nothing
+            # (SHADER-708: they used to store 0 to one shared sink word, a data race between them). The lines go
+            # to the body directly: emit() would count the labels as blocks of the caller.
+            then, end = self.tmp(), self.tmp()
+            lines = [f"OpSelectionMerge {end} None", f"OpBranchConditional {cond} {then} {end}", f"{then} = OpLabel"]
+            for word in words:
+                ptr = self.tmp()
+                lines += [f"{ptr} = OpAccessChain %_ptr_WG_uint_x %x_buf {word}", f"OpStore {ptr} {self.cu(0)}"]
+            self.body += ["         " + line for line in lines + [f"OpBranch {end}", f"{end} = OpLabel"]]
+
         n1, sn = self.tmp(), self.tmp()
         self.emit(f"{n1} = OpIAdd %uint {p_it} {self.cu(1)}")
         self.emit(f"{sn} = OpUMod %uint {n1} {self.cu(3)}")
         if w == 1:
-            m2, m3, m4, ml, m5, m6, mp5, mp6 = (self.tmp() for _ in range(8))
+            m2, m3, m4, ml = (self.tmp() for _ in range(4))
             self.emit(f"{m2} = OpIMul %uint {sn} {self.cu(2)}")
             self.emit(f"{m3} = OpIAdd %uint {m2} {self.cu(mask)}")
             self.emit(f"{m4} = OpIAdd %uint {m3} {self.cu(1)}")
             self.emit(f"{ml} = OpIEqual %bool {p_li} {self.cu(0)}")
-            self.emit(f"{m5} = OpSelect %uint {ml} {m3} {self.cu(sink)}")
-            self.emit(f"{m6} = OpSelect %uint {ml} {m4} {self.cu(sink)}")
-            self.emit(f"{mp5} = OpAccessChain %_ptr_WG_uint_x %x_buf {m5}")
-            self.emit(f"OpStore {mp5} {self.cu(0)}")
-            self.emit(f"{mp6} = OpAccessChain %_ptr_WG_uint_x %x_buf {m6}")
-            self.emit(f"OpStore {mp6} {self.cu(0)}")
+            clear_if(ml, (m3, m4))
         else:
             p_lane, p_wave = params["lane"], params["wave"]
-            m0, m1, m2, m3, m4, ml, m5, m6, mp5, mp6 = (self.tmp() for _ in range(10))
+            m0, m1, m2, m3, m4, ml = (self.tmp() for _ in range(6))
             self.emit(f"{m0} = OpIMul %uint {sn} {self.cu(w)}")
             self.emit(f"{m1} = OpIAdd %uint {m0} {p_wave}")
             self.emit(f"{m2} = OpIMul %uint {m1} {self.cu(2)}")
             self.emit(f"{m3} = OpIAdd %uint {m2} {self.cu(mask)}")
             self.emit(f"{m4} = OpIAdd %uint {m3} {self.cu(1)}")
             self.emit(f"{ml} = OpIEqual %bool {p_lane} {self.cu(0)}")
-            self.emit(f"{m5} = OpSelect %uint {ml} {m3} {self.cu(sink)}")
-            self.emit(f"{m6} = OpSelect %uint {ml} {m4} {self.cu(sink)}")
-            self.emit(f"{mp5} = OpAccessChain %_ptr_WG_uint_x %x_buf {m5}")
-            self.emit(f"OpStore {mp5} {self.cu(0)}")
-            self.emit(f"{mp6} = OpAccessChain %_ptr_WG_uint_x %x_buf {m6}")
-            self.emit(f"OpStore {mp6} {self.cu(0)}")
-            q0, q1, q2, ql, q3, q4, qp3, qp4 = (self.tmp() for _ in range(8))
+            clear_if(ml, (m3, m4))
+            q0, q1, q2, ql = (self.tmp() for _ in range(4))
             self.emit(f"{q0} = OpIMul %uint {sn} {self.cu(2)}")
             self.emit(f"{q1} = OpIAdd %uint {q0} {self.cu(sched)}")
             self.emit(f"{q2} = OpIAdd %uint {q1} {self.cu(1)}")
             self.emit(f"{ql} = OpIEqual %bool {p_li} {self.cu(0)}")
-            self.emit(f"{q3} = OpSelect %uint {ql} {q1} {self.cu(sink)}")
-            self.emit(f"{q4} = OpSelect %uint {ql} {q2} {self.cu(sink)}")
-            self.emit(f"{qp3} = OpAccessChain %_ptr_WG_uint_x %x_buf {q3}")
-            self.emit(f"OpStore {qp3} {self.cu(0)}")
-            self.emit(f"{qp4} = OpAccessChain %_ptr_WG_uint_x %x_buf {q4}")
-            self.emit(f"OpStore {qp4} {self.cu(0)}")
+            clear_if(ql, (q1, q2))
         if kind in ("data", "both"):
             par, data_base, i, p = (self.tmp() for _ in range(4))
             self.emit(f"{par} = OpBitwiseAnd %uint {p_it} {self.cu(1)}")
@@ -13683,19 +13681,17 @@ def assemble(gen):
         gen.uses_subgroup = gen.uses_vote = gen.uses_ballot = gen.uses_wave_bits = gen.uses_quad = False
         gen.uses_bcast_first = False
         x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
-        x_zero = x_sink - x_mask           # mask and schedule words: zeroed before the first round
         x_threads = (gen.cs or gen.ms)["size"]
         x_threads = x_threads[0] * x_threads[1] * x_threads[2]
         sx, sy, _ = (gen.cs or gen.ms)["size"]
-        for v in (0, 1, 2, 3, 6, 31, 63, 0x948, x_mask, x_sched, x_sink, x_sink + 1, x_zero - 1, x_threads,
+        for v in (0, 1, 2, 3, 6, 31, 63, 0x948, x_mask, x_sched, x_sink + 1, x_threads,
                   x_waves, sx, sx * sy, 0xFFFFFFC0):
             gen.cu(v)
-        x_missing = gen.x_lanes - x_threads          # lanes of a partial last wave that don't exist
-        for k in range(-(-max(x_zero, x_missing) // x_threads)):
-            gen.cu(k * x_threads)
-        if x_missing:
-            for v in (x_missing - 1, gen.x_lanes + x_threads):
-                gen.cu(v)
+        for base, count in x_clear_ranges(gen, x_threads):       # the constants of x_prologue's first clear
+            for off, owners in x_clear_rows(count, x_threads):
+                gen.cu(base + off)
+                if owners is not None:
+                    gen.cu(owners)
     if gen.bar_rounds:
         sx, sy, _ = gen.cs["size"]
         for v in (0, 1, 2, 3, 0x108, sx, sx * sy):
@@ -16267,11 +16263,25 @@ def x_spill(g, parts):
     return out
 
 
+def x_clear_ranges(gen, threads):
+    """Emulated wave64: the (first word, count) ranges of %x_buf that x_prologue zeroes before the first round: the
+    mask and schedule words and, in both halves of the data, the slots of the lanes a partial last wave lacks."""
+    _, x_mask, _, x_sink = gen.x_sizes()
+    missing = gen.x_lanes - threads
+    return [(x_mask, x_sink - x_mask)] + ([(threads, missing), (gen.x_lanes + threads, missing)] if missing else [])
+
+
+def x_clear_rows(count, threads):
+    """A clear of `count` words by `threads` invocations with one writer per word, as rows of (offset, owners):
+    invocation i stores to word offset + i. owners is None when every invocation has a word in the row, else how
+    many do (the last row, when count is not a multiple of threads)."""
+    return [(off, None if off + threads <= count else count - off) for off in range(0, count, threads)]
+
+
 def x_prologue(gen, threads):
     """Emulated wave64 prologue: %pc/%done declarations, invocation/lane/wave indices, and %x_buf zeroing + barrier.
     Shared by x_scheduler (round loop) and structured wave64 emulation (inline_all / structured_hybrid)."""
     c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
-    _, x_mask, _, x_sink = gen.x_sizes()
     sx, sy, _ = (gen.cs or gen.ms)["size"]
     L = ["%pc = OpVariable %_ptr_Function_uint Function %c0",
          "%done = OpVariable %_ptr_Function_bool Function %false"]
@@ -16285,23 +16295,23 @@ def x_prologue(gen, threads):
               "%x_lxy = OpIAdd %uint %x_lx %x_ly2", "%x_li = OpIAdd %uint %x_lxy %x_lz2"]
     L += [f"%x_lane = OpBitwiseAnd %uint %x_li {c(63)}", f"%x_wave = OpShiftRightLogical %uint %x_li {c(6)}",
           f"%x_wbase = OpBitwiseAnd %uint %x_li {c(0xFFFFFFC0)}"]
-    # Workgroup memory starts undefined: zero the mask and schedule words, every invocation a share of them.
-    zero = x_sink - x_mask
-    for k in range(-(-zero // threads)):
-        L += [f"%x_z{k} = OpIAdd %uint %x_li {c(k * threads)}",
-              f"%x_zm{k} = OpExtInst %uint %glsl UMin %x_z{k} {c(zero - 1)}",
-              f"%x_zi{k} = OpIAdd %uint %x_zm{k} {c(x_mask)}",
-              f"%x_zp{k} = OpAccessChain %_ptr_WG_uint_x %x_buf %x_zi{k}", f"OpStore %x_zp{k} {c(0)}"]
-    # A partial last wave: its missing lanes never write their data slots. They read as 0, as a lane that is
-    # off does for ds_bpermute (and v_readlane of a lane that doesn't exist has no defined value anyway).
-    missing = gen.x_lanes - threads
-    for k in range(-(-missing // threads) if missing else 0):
-        for par, base in ((0, threads), (1, gen.x_lanes + threads)):
-            L += [f"%x_y{k}_{par} = OpIAdd %uint %x_li {c(k * threads)}",
-                  f"%x_ym{k}_{par} = OpExtInst %uint %glsl UMin %x_y{k}_{par} {c(missing - 1)}",
-                  f"%x_yi{k}_{par} = OpIAdd %uint %x_ym{k}_{par} {c(base)}",
-                  f"%x_yp{k}_{par} = OpAccessChain %_ptr_WG_uint_x %x_buf %x_yi{k}_{par}",
-                  f"OpStore %x_yp{k}_{par} {c(0)}"]
+    # Workgroup memory starts undefined: zero the mask and schedule words, and the data slots of the lanes a partial
+    # last wave doesn't have (they never write them; they read as 0, as a lane that is off does for ds_bpermute, and
+    # v_readlane of a lane that doesn't exist has no defined value anyway). One invocation per word (SHADER-708):
+    # in each row invocation i has word i of it, and in a last row shorter than the workgroup only the invocations
+    # that have a word store. Two invocations storing to one word with no order between them is a data race even
+    # when both store 0; GPU-assisted validation reports it (SharedMemoryDataRace-RaceOnStore).
+    for n, (base, count) in enumerate(x_clear_ranges(gen, threads)):
+        for k, (off, owners) in enumerate(x_clear_rows(count, threads)):
+            t = f"%x_z{n}_{k}"
+            store = [f"{t}i = OpIAdd %uint %x_li {c(base + off)}",
+                     f"{t}p = OpAccessChain %_ptr_WG_uint_x %x_buf {t}i", f"OpStore {t}p {c(0)}"]
+            if owners is None:
+                L += store
+            else:
+                L += [f"{t}o = OpULessThan %bool %x_li {c(owners)}", f"OpSelectionMerge {t}e None",
+                      f"OpBranchConditional {t}o {t}s {t}e", f"{t}s = OpLabel", *store,
+                      f"OpBranch {t}e", f"{t}e = OpLabel"]
     L.append(f"OpControlBarrier {c(2)} {c(2)} {c(0x948)}")
     return L
 
@@ -16309,25 +16319,28 @@ def x_prologue(gen, threads):
 def x_round_loop_head(gen, seg_ids):
     """Emulated wave64 round loop head switching over `seg_ids` (shared by x_scheduler and tail_scheduler)."""
     c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
-    x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
+    x_waves, x_mask, x_sched, _ = gen.x_sizes()
     return ["OpBranch %loop_head", "%loop_head = OpLabel", "OpLoopMerge %loop_exit %loop_cont None",
             "OpBranch %x_round", "%x_round = OpLabel",
             "%x_itv = OpLoad %uint %x_it", f"%x_s = OpUMod %uint %x_itv {c(3)}",
             # Free the slot of round + 1 for its writers. Its readers ran before the last barrier (round - 2 wrote
             # it, round - 1 read it); its writers come after the next one. Lane 0 of each wave clears the wave's
-            # mask words, invocation 0 the counts; the others store to the sink word.
+            # mask words, invocation 0 the counts; the others store nothing (SHADER-708: they used to store 0 to
+            # one shared sink word, a data race between them).
             f"%x_n1 = OpIAdd %uint %x_itv {c(1)}", f"%x_sn = OpUMod %uint %x_n1 {c(3)}",
             f"%x_m0 = OpIMul %uint %x_sn {c(x_waves)}", "%x_m1 = OpIAdd %uint %x_m0 %x_wave",
             f"%x_m2 = OpIMul %uint %x_m1 {c(2)}", f"%x_m3 = OpIAdd %uint %x_m2 {c(x_mask)}",
             f"%x_m4 = OpIAdd %uint %x_m3 {c(1)}", f"%x_ml = OpIEqual %bool %x_lane {c(0)}",
-            f"%x_m5 = OpSelect %uint %x_ml %x_m3 {c(x_sink)}", f"%x_m6 = OpSelect %uint %x_ml %x_m4 {c(x_sink)}",
-            "%x_mp5 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_m5", f"OpStore %x_mp5 {c(0)}",
-            "%x_mp6 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_m6", f"OpStore %x_mp6 {c(0)}",
+            "OpSelectionMerge %x_me None", "OpBranchConditional %x_ml %x_ms %x_me", "%x_ms = OpLabel",
+            "%x_mp3 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_m3", f"OpStore %x_mp3 {c(0)}",
+            "%x_mp4 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_m4", f"OpStore %x_mp4 {c(0)}",
+            "OpBranch %x_me", "%x_me = OpLabel",
             f"%x_q0 = OpIMul %uint %x_sn {c(2)}", f"%x_q1 = OpIAdd %uint %x_q0 {c(x_sched)}",
             f"%x_q2 = OpIAdd %uint %x_q1 {c(1)}", f"%x_ql = OpIEqual %bool %x_li {c(0)}",
-            f"%x_q3 = OpSelect %uint %x_ql %x_q1 {c(x_sink)}", f"%x_q4 = OpSelect %uint %x_ql %x_q2 {c(x_sink)}",
-            "%x_qp3 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_q3", f"OpStore %x_qp3 {c(0)}",
-            "%x_qp4 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_q4", f"OpStore %x_qp4 {c(0)}",
+            "OpSelectionMerge %x_qe None", "OpBranchConditional %x_ql %x_qs %x_qe", "%x_qs = OpLabel",
+            "%x_qp1 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_q1", f"OpStore %x_qp1 {c(0)}",
+            "%x_qp2 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_q2", f"OpStore %x_qp2 {c(0)}",
+            "OpBranch %x_qe", "%x_qe = OpLabel",
             "%x_d = OpLoad %bool %done", "%x_b = OpLoad %bool %x_bar", "%x_nd = OpLogicalNot %bool %x_d",
             "%x_nb = OpLogicalNot %bool %x_b", "%x_run = OpLogicalAnd %bool %x_nd %x_nb",
             "OpSelectionMerge %x_ran None", "OpBranchConditional %x_run %dispatch %x_ran",
@@ -16340,9 +16353,10 @@ def x_round_loop_head(gen, seg_ids):
 
 
 def x_mini_scheduler(gen, midx, seg_ids):
-    """Local multi-wave round loop covering only one wave-divergent region `seg_ids` (no s_barrier / s_endpgm)."""
+    """Local multi-wave round loop covering only one wave-divergent region `seg_ids` (no s_barrier / s_endpgm).
+    The slot of round + 1 is freed as in x_round_loop_head: lane 0 of a wave and invocation 0 store, no one else."""
     c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
-    x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
+    x_waves, x_mask, x_sched, _ = gen.x_sizes()
     p = f"%xm{midx}"
     return ["OpStore %x_ldone %false",
             f"OpBranch {p}_head", f"{p}_head = OpLabel", f"OpLoopMerge {p}_exit {p}_cont None",
@@ -16352,16 +16366,16 @@ def x_mini_scheduler(gen, midx, seg_ids):
             f"{p}_m0 = OpIMul %uint {p}_sn {c(x_waves)}", f"{p}_m1 = OpIAdd %uint {p}_m0 %x_wave",
             f"{p}_m2 = OpIMul %uint {p}_m1 {c(2)}", f"{p}_m3 = OpIAdd %uint {p}_m2 {c(x_mask)}",
             f"{p}_m4 = OpIAdd %uint {p}_m3 {c(1)}", f"{p}_ml = OpIEqual %bool %x_lane {c(0)}",
-            f"{p}_m5 = OpSelect %uint {p}_ml {p}_m3 {c(x_sink)}",
-            f"{p}_m6 = OpSelect %uint {p}_ml {p}_m4 {c(x_sink)}",
-            f"{p}_mp5 = OpAccessChain %_ptr_WG_uint_x %x_buf {p}_m5", f"OpStore {p}_mp5 {c(0)}",
-            f"{p}_mp6 = OpAccessChain %_ptr_WG_uint_x %x_buf {p}_m6", f"OpStore {p}_mp6 {c(0)}",
+            f"OpSelectionMerge {p}_me None", f"OpBranchConditional {p}_ml {p}_ms {p}_me", f"{p}_ms = OpLabel",
+            f"{p}_mp3 = OpAccessChain %_ptr_WG_uint_x %x_buf {p}_m3", f"OpStore {p}_mp3 {c(0)}",
+            f"{p}_mp4 = OpAccessChain %_ptr_WG_uint_x %x_buf {p}_m4", f"OpStore {p}_mp4 {c(0)}",
+            f"OpBranch {p}_me", f"{p}_me = OpLabel",
             f"{p}_q0 = OpIMul %uint {p}_sn {c(2)}", f"{p}_q1 = OpIAdd %uint {p}_q0 {c(x_sched)}",
             f"{p}_q2 = OpIAdd %uint {p}_q1 {c(1)}", f"{p}_ql = OpIEqual %bool %x_li {c(0)}",
-            f"{p}_q3 = OpSelect %uint {p}_ql {p}_q1 {c(x_sink)}",
-            f"{p}_q4 = OpSelect %uint {p}_ql {p}_q2 {c(x_sink)}",
-            f"{p}_qp3 = OpAccessChain %_ptr_WG_uint_x %x_buf {p}_q3", f"OpStore {p}_qp3 {c(0)}",
-            f"{p}_qp4 = OpAccessChain %_ptr_WG_uint_x %x_buf {p}_q4", f"OpStore {p}_qp4 {c(0)}",
+            f"OpSelectionMerge {p}_qe None", f"OpBranchConditional {p}_ql {p}_qs {p}_qe", f"{p}_qs = OpLabel",
+            f"{p}_qp1 = OpAccessChain %_ptr_WG_uint_x %x_buf {p}_q1", f"OpStore {p}_qp1 {c(0)}",
+            f"{p}_qp2 = OpAccessChain %_ptr_WG_uint_x %x_buf {p}_q2", f"OpStore {p}_qp2 {c(0)}",
+            f"OpBranch {p}_qe", f"{p}_qe = OpLabel",
             f"{p}_d = OpLoad %bool %x_ldone", f"{p}_run = OpLogicalNot %bool {p}_d",
             f"OpSelectionMerge {p}_ran None", f"OpBranchConditional {p}_run {p}_dispatch {p}_ran",
             f"{p}_dispatch = OpLabel", f"OpBranch {p}_ch_head", f"{p}_ch_head = OpLabel",
