@@ -86,7 +86,9 @@ Read the startup trace first; the first event that is not the expected one is th
 3. **`tls_callback` / `dllmain`** — a failed DllMain, or a TLS callback that faults, usually points at the CRT or
    TLS index; the loader's own TLS is checked by `run_tiny_game_tls`.
 4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
-   so the process behaviour is the same with or without the trace.
+   so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it reserves
+   the final slot for the last observed exception. The trace also includes handled exceptions, so the last
+   observation alone does not establish what caused the run to stop.
 5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
 6. **D3D12 trace** — the `failed`, `unsupported` and `refused` lines name the method. Compare its position with
    the public SDK vtable; an unknown slot is expected until the executable names it (Q2, Q6). The `[rt]` lines in
