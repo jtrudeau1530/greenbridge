@@ -321,6 +321,37 @@ class TestMatching(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("shader rule not applied", out)
 
+    def test_json_in_a_missing_directory_is_one_error_line(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        nested = os.path.join(self.dir, "nodir", "r.json")
+        status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                    ["--json", nested])
+        self.assertEqual(status, 2, err)
+        self.assertIn("cannot write", err)
+        self.assertNotIn("Traceback", err)
+        self.assertFalse(os.path.exists(nested))
+
+    def test_readonly_json_is_one_error_line(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        ro = os.path.join(self.dir, "ro.json")
+        with open(ro, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.chmod(ro, 0o444)
+        try:
+            try:
+                with open(ro, "a", encoding="utf-8"):
+                    pass
+                self.skipTest("the file is still writable (running as root, or Windows)")
+            except OSError:
+                pass
+            status, _, err = self.guide(src, [item(0x1000, "a.obj", [2])], {"a.obj": [group(2)]},
+                                        ["--json", ro])
+            self.assertEqual(status, 2, err)
+            self.assertIn("cannot write", err)
+            self.assertNotIn("Traceback", err)
+        finally:
+            os.chmod(ro, 0o644)
+
 
 class TestPieces(unittest.TestCase):
     def test_leaf_signature_counts_a_paired_leaf_twice(self):
