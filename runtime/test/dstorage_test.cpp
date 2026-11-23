@@ -629,7 +629,7 @@ void test_auto_submit_and_full_queue(Env& env) {
 
 void test_memory_queue(Env& env) {
     IDStorageQueueX2* q = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
-    IDStorageStatusArrayX* s = make_status(env, 4);
+    IDStorageStatusArrayX* s = make_status(env, 6);
     std::vector<uint8_t> buf = pattern(8192, 9);
     std::vector<uint8_t> want = buf;
     std::memmove(want.data() + 1024, want.data(), 4096);
@@ -654,8 +654,30 @@ void test_memory_queue(Env& env) {
     huge.SourceSize = huge.DestinationSize = (1u << 29) + 1;  // more than 1 GiB together
     q->EnqueueRequest(&huge);
     q->EnqueueStatus(s, 3);
+    // Buffers over 32 MiB need 64 KiB or 2 MiB pages (DSTORAGE_REQUEST). Reserved memory: a copy that is not refused
+    // faults and reports an access violation instead.
+    constexpr uint32_t k32MiB = 32u << 20;
+    void* wide = VirtualAlloc(nullptr, 2 * (k32MiB + 4096), MEM_RESERVE, PAGE_READWRITE);
+    check(wide != nullptr, "reserve 64 MiB for the over-limit copy");
+    DSTORAGE_REQUEST over = r;
+    over.Source = wide;
+    over.Destination = static_cast<uint8_t*>(wide) + k32MiB + 4096;
+    over.SourceSize = over.DestinationSize = k32MiB + 1;
+    q->EnqueueRequest(&over);
+    q->EnqueueStatus(s, 4);
+    std::vector<uint8_t> at_limit_source = pattern(k32MiB, 10), at_limit(k32MiB, 0);
+    DSTORAGE_REQUEST limit = r;
+    limit.Source = at_limit_source.data();
+    limit.Destination = at_limit.data();
+    limit.SourceSize = limit.DestinationSize = k32MiB;
+    q->EnqueueRequest(&limit);
+    q->EnqueueStatus(s, 5);
     q->Submit();
-    check(wait_complete(s, 3), "memory requests complete");
+    check(wait_complete(s, 5), "memory requests complete");
+    check_hr(s->GetHResult(4), E_DSTORAGE_REQUEST_TOO_LARGE, "an unpaged buffer over 32 MiB is refused untouched");
+    check_hr(s->GetHResult(5), S_OK, "a 32 MiB unpaged copy");
+    check(at_limit == at_limit_source, "the 32 MiB copy moved every byte");
+    VirtualFree(wide, 0, MEM_RELEASE);
     check_hr(s->GetHResult(0), S_OK, "a memory-to-memory copy");
     check(buf == want, "an overlapping memory copy moves like memmove");
     check_hr(s->GetHResult(1), E_DSTORAGE_ACCESS_VIOLATION, "a memory copy to memory the process cannot write");
@@ -861,6 +883,88 @@ void test_iid_policy_events_and_cancel(Env& env) {
     q->Release();
 }
 
+// Holds the queue's worker inside a copy: the copy's source is a guard page, and this handler waits on the first
+// touch until the test releases it. The guard is gone after that fault, so the copy then goes on.
+struct GuardHold {
+    uint8_t* page = nullptr;
+    HANDLE entered = nullptr;
+    HANDLE release = nullptr;
+};
+GuardHold* g_hold = nullptr;
+
+LONG CALLBACK hold_on_guard(EXCEPTION_POINTERS* x) {
+    const EXCEPTION_RECORD* e = x->ExceptionRecord;
+    if (!g_hold || e->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION || e->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const auto* address = reinterpret_cast<const uint8_t*>(e->ExceptionInformation[1]);
+    if (address < g_hold->page || address >= g_hold->page + 4096) return EXCEPTION_CONTINUE_SEARCH;
+    SetEvent(g_hold->entered);
+    WaitForSingleObject(g_hold->release, 10000);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// DSTORAGE_PRIORITY_STATS: TotalRequestCount and the byte totals count submitted requests; PendingRequestCount counts
+// requests whose processing has started and not completed. A memory queue (realtime, the only priority it may have):
+// the counts are compared with the ones before.
+void test_stats_timing(Env& env) {
+    auto realtime = [&] {
+        DSTORAGE_STATS st{};
+        env.factory->GetStats(&st);
+        return st.RealtimePriorityStats;
+    };
+    const DSTORAGE_PRIORITY_STATS before = realtime();
+    IDStorageQueueX2* q = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    if (!q) return;
+    IDStorageStatusArrayX* s = make_status(env, 1);
+    GuardHold hold;
+    hold.page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    hold.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    hold.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hold.page || !hold.entered || !hold.release) {
+        check(false, "allocate the guard page and its events");
+        return;
+    }
+    std::memset(hold.page, 0x5A, 4096);
+    DWORD old = 0;
+    VirtualProtect(hold.page, 4096, PAGE_READWRITE | PAGE_GUARD, &old);
+    std::vector<uint8_t> out(4096, 0);
+    DSTORAGE_REQUEST r{};
+    r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+    r.Source = hold.page;
+    r.Destination = out.data();
+    r.SourceSize = r.DestinationSize = 4096;
+    q->EnqueueRequest(&r);
+    q->EnqueueStatus(s, 0);
+    DSTORAGE_PRIORITY_STATS p = realtime();
+    check(p.TotalRequestCount == before.TotalRequestCount &&
+              p.TotalRequestSourceByteCount == before.TotalRequestSourceByteCount &&
+              p.TotalRequestDestinationByteCount == before.TotalRequestDestinationByteCount,
+          "an enqueued request is not counted before Submit");
+
+    g_hold = &hold;
+    void* handler = AddVectoredExceptionHandler(1, hold_on_guard);
+    q->Submit();
+    check(WaitForSingleObject(hold.entered, 10000) == WAIT_OBJECT_0, "the copy reached the guard page");
+    p = realtime();
+    check(p.TotalRequestCount == before.TotalRequestCount + 1 &&
+              p.TotalRequestSourceByteCount == before.TotalRequestSourceByteCount + 4096 &&
+              p.TotalRequestDestinationByteCount == before.TotalRequestDestinationByteCount + 4096,
+          "a submitted request is counted, with its sizes");
+    check(p.PendingRequestCount == before.PendingRequestCount + 1, "a running request is pending");
+    SetEvent(hold.release);
+    check(wait_complete(s, 0), "the held copy completes");
+    check_hr(s->GetHResult(0), S_OK, "the held copy succeeds");
+    check(out == std::vector<uint8_t>(4096, 0x5A), "the held copy moved every byte");
+    check(realtime().PendingRequestCount == before.PendingRequestCount, "a completed request is no longer pending");
+    RemoveVectoredExceptionHandler(handler);
+    g_hold = nullptr;
+    CloseHandle(hold.entered);
+    CloseHandle(hold.release);
+    VirtualFree(hold.page, 0, MEM_RELEASE);
+    s->Release();
+    q->Release();
+}
+
 void test_stats(Env& env) {
     DSTORAGE_STATS st{};
     env.factory->GetStats(&st);
@@ -868,7 +972,7 @@ void test_stats(Env& env) {
     check(st.NormalPriorityStats.CurrentQueueCount == 0 && st.RealtimePriorityStats.CurrentQueueCount == 0,
           "every queue was released");
     check(st.NormalPriorityStats.TotalRequestCount > 1000 && st.NormalPriorityStats.TotalFenceCount >= 2 &&
-              st.RealtimePriorityStats.TotalRequestCount == 4,
+              st.RealtimePriorityStats.TotalRequestCount == 7,
           "requests and fences are counted per priority");
     check(st.CumulativeOpenFileCount >= 10 && st.MaxOpenFileCount >= 3, "files are counted");
     check(st.ErrorCount > 10, "errors are counted");
@@ -907,6 +1011,7 @@ int main() {
     test_close_and_release(env);
     test_threads(env);
     test_iid_policy_events_and_cancel(env);
+    test_stats_timing(env);
     test_stats(env);
 
     fs::remove_all(env.root, ec);

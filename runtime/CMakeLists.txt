@@ -116,6 +116,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/process.cpp
     shims/dstorage.cpp
   )
+  # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with
+  # __try. MSVC always catches it; clang-cl only with asynchronous exceptions (as for tiny_dll below). A source file
+  # property, so gta6rt and dstorage_test both get it.
+  set_source_files_properties(shims/dstorage.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang>:/EHa>")
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)

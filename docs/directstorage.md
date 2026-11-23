@@ -59,7 +59,10 @@ The first boot with the executable settles most of this: the dry-run report show
   `SetDebugFlags` and `SetCpuAffinity` are stored only (a console core mask means nothing on the host).
   `SetStagingBufferSize` accepts 0, 16, 20, 24, 28 and 32 MiB, fails with `E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE`
   otherwise and with `E_DSTORAGE_STAGING_BUFFER_LOCKED` while a queue or file exists; there is no staging buffer.
-  `GetStats` reports the counts the shim keeps (queues per priority, requests, bytes, files, errors). A bad
+  `GetStats` reports the counts the shim keeps (queues per priority, requests, bytes, files, errors). As
+  `DSTORAGE_PRIORITY_STATS` defines them, `TotalRequestCount` and the byte totals grow when a request is submitted
+  (not when it is enqueued), and `PendingRequestCount` counts the requests the worker is processing; status and fence
+  entries are counted when they are enqueued. A bad
   argument (a null pointer, an invalid queue desc or staging size) is logged once per method and kind, so a wrong
   vtable guess shows up in the log as arguments that make no sense for the method.
 - **Files**: `OpenFile` goes through the registry's `kernel32.dll!CreateFileW`, the shim in `file_system.cpp`, so a
@@ -87,11 +90,14 @@ The first boot with the executable settles most of this: the dry-run report show
   4. BCPack mode above 7, swizzle mode above 4 (`_INVALID_BCPACK_MODE`, `_INVALID_SWIZZLE_MODE`), then zlib, BCPack
      or swizzle, then physical pages (`E_NOTIMPL`, logged once: later PRs);
   5. an `IntermediateSize` without zlib and BCPack (`_INVALID_INTERMEDIATE_SIZE`), `DestinationSize` other than
-     `SourceSize` (`_INVALID_DESTINATION_SIZE`), more than 1 GiB in total (`_REQUEST_TOO_LARGE`);
+     `SourceSize` (`_INVALID_DESTINATION_SIZE`), more than 1 GiB in total, then a buffer over 32 MiB
+     (`_REQUEST_TOO_LARGE` for both: `DSTORAGE_REQUEST` allows a buffer over 32 MiB only with 64 KiB or 2 MiB pages,
+     which are not implemented yet);
   6. a null destination, a null source (memory) or a null file (`E_INVALIDARG`), a closed file (`_FILE_NOT_OPEN`);
   7. a zero size: a success that touches no memory (an assumption: the reference does not say);
   8. a range past the end of the file (`E_DSTORAGE_END_OF_FILE`), then a destination or source the process cannot
-     access (`E_DSTORAGE_ACCESS_VIOLATION`; the worker survives it).
+     access (`E_DSTORAGE_ACCESS_VIOLATION`; the worker survives it). This needs asynchronous exceptions under
+     clang-cl, so `runtime/CMakeLists.txt` builds `dstorage.cpp` with `/EHa` there; MSVC always catches it.
 - **Cancel**: `CancelRequestsWithTag(mask, value)` marks every request enqueued before the call and not yet started
   whose `(CancellationTag & mask) == value`. A cancelled request completes as a success without reading and is not
   counted as a failure, as the overview and the reference say, even when it also had an error found at enqueue.
