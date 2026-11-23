@@ -11,7 +11,11 @@
 //   [cache.bin]   loaded first if it exists (a stopped run resumes: cached pipelines are instant), saved every
 //                 10 minutes and at the end
 //   --jobs N      compile on up to N worker threads (default: half the hardware threads)
-//   --large-module-bytes N  compile modules larger than N bytes alone (default: 4194304; 0 disables isolation)
+//   --large-module-bytes N  modules larger than N bytes are "large" (default: 4194304; 0 disables the gate)
+//   --large-parallel N  how many large modules may be in the driver at once: 0 (default) = as many as fit 3/4 of
+//                 the memory available at start, at large_module_gate.h's estimate per module, up to --jobs, with the
+//                 small ones compiling alongside; 1 = each large module alone, the other threads waiting (the
+//                 behaviour before; also what 0 falls back to when the available memory can't be read)
 //   --start I --count N   check only index entries [I, I+N) (sorted by name)
 //   --slow SEC    print pipelines slower than SEC (default 30); compiles past 60 s are named while running
 //   --max-bytes N skip modules whose .spv is larger than N bytes (0 = no limit; names every skip)
@@ -30,8 +34,10 @@
 //   --inflight-file F  keep the modules that are in the driver in F, one "name<TAB>phase" line each (phase: module
 //                 while vkCreateShaderModule runs, pipeline while its pipeline is created), so whoever ran the check
 //                 can tell which module was there when the process died. F is rewritten when a module over
-//                 --large-module-bytes enters or leaves the driver (it is alone then, so F names exactly it) and by
-//                 the 5 s watchdog for the others, and emptied at the end. make_game.py's pipelines stage reads it.
+//                 --large-module-bytes enters or leaves the driver (with --large-parallel 1 it is alone then, so F
+//                 names exactly it; otherwise F names every module in flight and make_game.py retries each alone)
+//                 and by the 5 s watchdog for the others, and emptied at the end. make_game.py's pipelines stage
+//                 reads it.
 //   --skip-file F modules named in F (one per line) are not compiled: each is reported as MODULE CRASH and counted
 //                 as a failed pipeline, as --isolate does for a module that killed the driver. make_game.py writes F
 //                 after a crash, so the next run checks everything else instead of dying on the same module.
@@ -42,6 +48,7 @@
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
+#include "large_module_gate.h"
 #include "../src/spirv_words.h"
 
 #include <algorithm>
@@ -588,7 +595,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
-            "[--max-bytes N] [--large-module-bytes N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
+            "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
             "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
             "[--skip-file F]\n");
         return 2;
@@ -599,6 +606,7 @@ int main(int argc, char** argv) {
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
     size_t large_module_bytes = 4 * 1024 * 1024;
+    unsigned large_parallel = 0;   // 0 = by the memory budget
     double slow = 30.0;
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
@@ -640,6 +648,7 @@ int main(int argc, char** argv) {
         else if (a == "--graphics-only") stage_filter = "graphics";
         else if (a == "--max-bytes") valid = number(max_bytes);
         else if (a == "--large-module-bytes") valid = number(large_module_bytes);
+        else if (a == "--large-parallel") valid = number(large_parallel);
         else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
@@ -726,7 +735,8 @@ int main(int argc, char** argv) {
         if (auto self = std::filesystem::read_symlink("/proc/self/exe", ec); !ec) exe = self.string();
         std::vector<std::string> pass = {"--jobs", std::to_string(jobs), "--slow", std::to_string(slow), "--stage", stage_filter,
                                          "--max-bytes", std::to_string(max_bytes),
-                                         "--large-module-bytes", std::to_string(large_module_bytes)};
+                                         "--large-module-bytes", std::to_string(large_module_bytes),
+                                         "--large-parallel", std::to_string(large_parallel)};
         if (cache_feedback) pass.push_back("--cache-feedback");
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
         struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}; };
@@ -1136,8 +1146,26 @@ int main(int argc, char** argv) {
                  work.size(), lo, hi, stage_filter.c_str(), worker_count);
 
     std::mutex mu;  // guards counters, stdout, stub cache and in-flight table
-    std::shared_mutex compile_gate;  // large modules exclude other shader and pipeline work
+    std::shared_mutex compile_gate;  // --large-parallel 1: large modules exclude other shader and pipeline work
     size_t isolated_modules = 0;
+    // Otherwise large modules share a memory budget and the small ones are never held back (large_module_gate.h).
+    const uint64_t available_memory = leonida::available_memory_bytes();
+    const bool large_exclusive = large_parallel == 1 || (large_parallel == 0 && available_memory == 0);
+    leonida::LargeModuleGate large_gate(
+        large_parallel == 0 ? available_memory / 4 * 3 : UINT64_MAX,
+        large_parallel == 0 ? jobs : std::min<unsigned>(large_parallel, jobs));
+    if (large_module_bytes) {
+        if (large_exclusive)
+            std::fprintf(stderr, "large modules (over %zu bytes): one at a time, the other threads waiting\n",
+                         large_module_bytes);
+        else if (large_parallel == 0)
+            std::fprintf(stderr, "large modules (over %zu bytes): up to %u at once within %.1f GB "
+                                 "(3/4 of the %.1f GB available)\n", large_module_bytes, large_gate.max_inflight(),
+                         large_gate.budget() / 1e9, available_memory / 1e9);
+        else
+            std::fprintf(stderr, "large modules (over %zu bytes): up to %u at once\n", large_module_bytes,
+                         large_gate.max_inflight());
+    }
     std::map<std::string, uint32_t> modules_ok, modules_bad, big_skipped;
     std::map<std::string, StageStats> stats;
     std::map<std::string, VkShaderModule> stub_cache;
@@ -1234,7 +1262,7 @@ int main(int argc, char** argv) {
                            VkResult r, double sec, VkPipelineCreationFeedbackFlags fb_flags) {
         std::lock_guard<std::mutex> g(mu);
         inflight.erase(std::this_thread::get_id());
-        if (inflight.empty()) write_inflight();   // a large module just finished (it compiles alone)
+        if (inflight.empty()) write_inflight();   // a large module just finished (alone with --large-parallel 1)
         auto& st = stats[stage];
         st.seconds += sec;
         if (sec > st.max_sec) { st.max_sec = sec; st.max_name = name; }
@@ -1310,12 +1338,18 @@ int main(int argc, char** argv) {
             const bool isolated = large_module_bytes && std::cmp_greater(file_size, large_module_bytes);
             std::unique_lock exclusive(compile_gate, std::defer_lock);
             std::shared_lock parallel(compile_gate, std::defer_lock);
-            if (isolated) exclusive.lock();
-            else if (large_module_bytes) parallel.lock();
+            leonida::LargeModuleGate::Ticket large_ticket;   // left after the module and its pipeline are gone
+            if (large_exclusive) {
+                if (isolated) exclusive.lock();
+                else if (large_module_bytes) parallel.lock();
+            } else if (isolated) {
+                large_ticket = leonida::LargeModuleGate::Ticket(large_gate,
+                                                                leonida::large_module_estimate(file_size));
+            }
             {   // in flight from here: vkCreateShaderModule can also take long or die in the driver
                 std::lock_guard<std::mutex> g(mu);
                 inflight[std::this_thread::get_id()] = {name, std::chrono::steady_clock::now(), "module"};
-                if (isolated) write_inflight();   // alone in flight: the file names exactly this module
+                if (isolated) write_inflight();   // a large module: name it now (alone with --large-parallel 1)
             }
 
             const auto code = leonida::read_spirv_words(f, file_size);
@@ -1357,7 +1391,7 @@ int main(int argc, char** argv) {
                     {
                         std::lock_guard<std::mutex> g(mu);
                         inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
-                        if (isolated) write_inflight();   // alone in flight: the file names exactly this module
+                        if (isolated) write_inflight();   // a large module: name it now (alone with --large-parallel 1)
                     }
                     VkPipeline p = VK_NULL_HANDLE;
                     maybe_simulate_crash(name);
@@ -1531,7 +1565,7 @@ int main(int argc, char** argv) {
                         {
                             std::lock_guard<std::mutex> g(mu);
                             inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
-                            if (isolated) write_inflight();   // alone in flight: the file names exactly this module
+                            if (isolated) write_inflight();   // a large module: name it now (alone with --large-parallel 1)
                         }
                         VkPipeline p = VK_NULL_HANDLE;
                         maybe_simulate_crash(name);
@@ -1658,7 +1692,8 @@ int main(int argc, char** argv) {
         std::printf("; checked %zu of %zu\n", work.size() - big_total, work.size());
     }
     if (isolated_modules)
-        std::printf("large modules checked exclusively: %zu (over %zu bytes)\n", isolated_modules,
+        std::printf("large modules checked %s: %zu (over %zu bytes)\n",
+                    large_exclusive ? "exclusively" : "within the memory budget", isolated_modules,
                     large_module_bytes);
     std::printf("wall time: %.1fs on %u threads\n", elapsed(), worker_count);
     const bool cache_saved = save_cache(true);  // keep successful pipelines even if another entry failed
