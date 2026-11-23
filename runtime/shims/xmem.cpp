@@ -144,14 +144,25 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
     // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
-    // region. Nonzero attribute flags also fail until their host mapping is known.
+    // region.
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
     if (attributes != 0) {
-        SetLastError(ERROR_NOT_SUPPORTED);
-        return nullptr;
+        // A reserve-only call needs address space, not physical pages or a GPU binding.
+        // These are the two 64 KiB access/protection pairs observed at startup. Preserve the
+        // CPU protection; no pages are backed at this point.
+        if (allocation_type != (MEM_RESERVE | kXmem64kPages)) {
+            SetLastError(ERROR_NOT_SUPPORTED);
+            return nullptr;
+        }
+        if (attributes == 0x03 && protect == (0x800 | PAGE_NOACCESS)) {
+            protect = PAGE_NOACCESS;
+        } else if (attributes != 0x21 || protect != PAGE_READWRITE) {
+            SetLastError(ERROR_NOT_SUPPORTED);
+            return nullptr;
+        }
     }
 
     const DWORD page_mode = allocation_type & kXmemPageModeMask;

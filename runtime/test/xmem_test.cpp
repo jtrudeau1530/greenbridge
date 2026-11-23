@@ -227,7 +227,37 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     SetLastError(ERROR_SUCCESS);
     void* const attributed = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 1, PAGE_READWRITE);
     check(attributed == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "nonzero XMem allocation attributes are rejected before host allocation");
+          "unknown XMem commit attributes are rejected before host allocation");
+
+    constexpr SIZE_T guest_page = 64 * 1024;
+    constexpr DWORD reserve64k = MEM_RESERVE | 0x20400000;
+    struct Reservation { ULONGLONG attributes; DWORD guest_protect; DWORD host_protect; };
+    constexpr Reservation reservations[] = {
+        {0x21, PAGE_READWRITE, PAGE_READWRITE},
+        {0x03, 0x800 | PAGE_NOACCESS, PAGE_NOACCESS},
+    };
+    for (const auto& request : reservations) {
+        void* reservation = virtual_alloc(nullptr, guest_page + 1, reserve64k,
+                                          request.attributes, request.guest_protect);
+        check(reservation != nullptr, "attributed 64 KiB reserve returns an address");
+        if (reservation) {
+            MEMORY_BASIC_INFORMATION region{};
+            check(VirtualQuery(reservation, &region, sizeof(region)) == sizeof(region) &&
+                      region.AllocationBase == reservation && region.RegionSize == 2 * guest_page &&
+                      reinterpret_cast<uintptr_t>(reservation) % guest_page == 0 &&
+                      region.State == MEM_RESERVE && region.AllocationProtect == request.host_protect,
+                  "range is aligned and reserved with the requested CPU protection");
+            check(VirtualFree(reservation, 0, MEM_RELEASE), "release attributed reservation");
+        }
+        SetLastError(ERROR_SUCCESS);
+        check(!virtual_alloc(nullptr, guest_page, reserve64k | MEM_COMMIT, request.attributes,
+                             request.guest_protect) && GetLastError() == ERROR_NOT_SUPPORTED,
+              "reservation support does not commit or emulate physical pages");
+    }
+    SetLastError(ERROR_SUCCESS);
+    check(!virtual_alloc(nullptr, guest_page, reserve64k, 0x03, PAGE_READWRITE) &&
+              GetLastError() == ERROR_NOT_SUPPORTED,
+          "other attribute and CPU protection pairs stay unsupported");
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
