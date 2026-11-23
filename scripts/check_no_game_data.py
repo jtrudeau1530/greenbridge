@@ -8,8 +8,9 @@ as .txt. This reads the first bytes of each file and matches the magic numbers o
 files the build extracts from it: RPF9 archives, TTPF texture pools, RAGE resources, XBCH/FSSM/DXBC shader
 containers, SPIR-V, DDS, AWC audio, PSIN/PAMH/MHIU/SPS1/SGD5/RDS5 containers, YSC/SCRP compiled scripts, the
 animation MoVE container and SKEL_ bone table, Ogg, RIFF WAVE, Bink, glTF binaries, PE executables and XVD
-images. The magics are
-the ones docs/ measures (docs/gamedata.md and the shader and audio notes). Text formats (disassembly, .obj, .spvasm)
+images, the player's saves (JSAV, ASAV and SLAYER1) and world_build.py's LPK1 staging packs of the game's
+geometry. The magics are the ones docs/ measures (docs/gamedata.md, docs/saves.md and the shader and audio
+notes). Text formats (disassembly, .obj, .spvasm)
 have no magic and stay with the extension check.
 
 A compressed file hides those magics from both checks, so the script looks inside what the standard library opens:
@@ -64,6 +65,11 @@ MAGICS = (
     ("MoVE animation container", 0, b"MoVE"),
     ("SKEL_ bone table", 0, b"SKEL_"),
     ("SCRP compiled script", 0, b"SCRP"),
+    # docs/saves.md: "Never commit or attach real saves"; and the geometry world_build.py packs from the game's models.
+    ("JSAV story save", 0, b"JSAV"),
+    ("ASAV save record", 0, b"ASAV"),
+    ("SLAYER1 packed save", 0, b"SLAYER1\0"),
+    ("LPK1 world staging pack", 0, b"LPK1"),
     ("Ogg stream", 0, b"OggS"),
     ("Bink 2 video", 0, b"KB2"),
     ("Bink video", 0, b"BIK"),
