@@ -148,6 +148,97 @@ class CliTest(unittest.TestCase):
         self.assertIn("not a translator index", result.stderr)
         self.assertIsNone(summary)
 
+    def test_json_creates_missing_parent_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = os.path.join(tmp, "index.json")
+            with open(idx, "w", encoding="utf-8") as f:
+                json.dump(NO_SPILL, f)
+            out = os.path.join(tmp, "reports", "sub", "report.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, idx, "--json", out],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.isfile(out))
+            with open(out, encoding="utf-8") as f:
+                rep = json.load(f)
+            self.assertIn("stages", rep)
+
+    def test_json_refuses_a_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = os.path.join(tmp, "index.json")
+            with open(idx, "w", encoding="utf-8") as f:
+                json.dump(NO_SPILL, f)
+            sub = os.path.join(tmp, "other_dir")
+            os.makedirs(sub)
+            for target in (tmp, sub):
+                with self.subTest(target=target):
+                    r = subprocess.run([sys.executable, "-I", TOOL, idx, "--json", target],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 2)
+                    self.assertIn("is a folder, not a file", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+
+    def test_json_refuses_to_overwrite_an_input_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = os.path.join(tmp, "index.json")
+            with open(idx, "w", encoding="utf-8") as f:
+                json.dump(NO_SPILL, f)
+            with open(idx, "rb") as f:
+                before = f.read()
+            # Direct match
+            r1 = subprocess.run([sys.executable, "-I", TOOL, idx, "--json", idx],
+                                capture_output=True, text=True)
+            self.assertEqual(r1.returncode, 2)
+            self.assertIn("must not overwrite an input index", r1.stderr)
+            self.assertNotIn("Traceback", r1.stderr)
+            with open(idx, "rb") as f:
+                self.assertEqual(f.read(), before)
+
+            # Dot-aliased spelling
+            alias = os.path.join(tmp, ".", "index.json")
+            r2 = subprocess.run([sys.executable, "-I", TOOL, idx, "--json", alias],
+                                capture_output=True, text=True)
+            self.assertEqual(r2.returncode, 2)
+            self.assertIn("must not overwrite an input index", r2.stderr)
+
+            # With --carve
+            carve = os.path.join(tmp, "carve.json")
+            with open(carve, "w", encoding="utf-8") as f:
+                json.dump([{"name": "x"}], f)
+            r3 = subprocess.run([sys.executable, "-I", TOOL, idx, "--carve", carve, "--json", carve],
+                                capture_output=True, text=True)
+            self.assertEqual(r3.returncode, 2)
+            self.assertIn("must not overwrite an input index", r3.stderr)
+
+    def test_json_in_input_folder_can_be_written_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = os.path.join(tmp, "index.json")
+            with open(idx, "w", encoding="utf-8") as f:
+                json.dump(NO_SPILL, f)
+            out = os.path.join(tmp, "report.json")
+            r1 = subprocess.run([sys.executable, "-I", TOOL, idx, "--json", out],
+                                capture_output=True, text=True)
+            self.assertEqual(r1.returncode, 0, r1.stderr)
+            self.assertTrue(os.path.isfile(out))
+            # Run again: overwriting earlier report must succeed
+            r2 = subprocess.run([sys.executable, "-I", TOOL, idx, "--json", out],
+                                capture_output=True, text=True)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+
+    def test_json_failed_write_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = os.path.join(tmp, "index.json")
+            with open(idx, "w", encoding="utf-8") as f:
+                json.dump(NO_SPILL, f)
+            blocker = os.path.join(tmp, "not_a_dir")
+            with open(blocker, "wb") as f:
+                f.write(b"file")
+            out = os.path.join(blocker, "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, idx, "--json", out],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("error: cannot write", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
