@@ -669,6 +669,113 @@ class PedCataloguesTests(unittest.TestCase):
             self.assertEqual(r6.returncode, 0, r6.stderr.decode("utf-8", "replace"))
             self.assertNotIn("UnicodeEncodeError", r6.stderr.decode("utf-8", "replace"))
 
+    def test_cli_out_path_guards_directory_inputs(self):
+        blocks, _ = build_rich_catalogue_blocks()
+        raw_0drp = build_synthetic_0drp(blocks)
+        script = os.path.join(TOOLS, "ped_catalogues.py")
+        py = [sys.executable, "-I", script]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cat_dir = os.path.join(tmp, "cats")
+            sub_dir = os.path.join(cat_dir, "sub")
+            sibling_dir = os.path.join(tmp, "cats_out")
+            os.makedirs(sub_dir)
+            os.makedirs(sibling_dir)
+
+            cat_file = os.path.join(cat_dir, "sample.0drp")
+            with open(cat_file, "wb") as fh:
+                fh.write(raw_0drp)
+
+            # census <dir> --out <dir>/<catalogue> -> exit 2, catalogue untouched
+            r1 = subprocess.run(py + ["census", cat_dir, "--out", cat_file], capture_output=True, text=True)
+            self.assertEqual(r1.returncode, 2)
+            self.assertIn("inside input folder", r1.stderr)
+            with open(cat_file, "rb") as fh:
+                self.assertEqual(fh.read(), raw_0drp)
+
+            # resolve <dir> --out <dir>/<catalogue> -> exit 2, catalogue untouched
+            r2 = subprocess.run(py + ["resolve", cat_dir, "--out", cat_file], capture_output=True, text=True)
+            self.assertEqual(r2.returncode, 2)
+            self.assertIn("inside input folder", r2.stderr)
+            with open(cat_file, "rb") as fh:
+                self.assertEqual(fh.read(), raw_0drp)
+
+            # census <dir> --out <dir>/sub/report.json (existing and non-existing nested dir) -> exit 2
+            nested_out = os.path.join(sub_dir, "report.json")
+            r3 = subprocess.run(py + ["census", cat_dir, "--out", nested_out], capture_output=True, text=True)
+            self.assertEqual(r3.returncode, 2)
+            self.assertIn("inside input folder", r3.stderr)
+            self.assertFalse(os.path.exists(nested_out))
+
+            missing_nested = os.path.join(cat_dir, "missing_sub", "report.json")
+            r3b = subprocess.run(py + ["census", cat_dir, "--out", missing_nested], capture_output=True, text=True)
+            self.assertEqual(r3b.returncode, 2)
+            self.assertIn("inside input folder", r3b.stderr)
+
+            # Relative path with '..' and trailing slash still resolves inside <dir> -> exit 2
+            trav_out = os.path.join(sibling_dir, "..", "cats", "sub", "report.json")
+            r3c = subprocess.run(
+                py + ["resolve", cat_dir + os.sep, "--out", trav_out],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(r3c.returncode, 2)
+            self.assertIn("inside input folder", r3c.stderr)
+            self.assertFalse(os.path.exists(nested_out))
+
+            # Windows case and separator differences still match <dir> -> exit 2
+            if os.name == "nt":
+                mixed_out = os.path.join(cat_dir, "SUB", "report.json").replace("\\", "/")
+                r3d = subprocess.run(py + ["census", cat_dir, "--out", mixed_out], capture_output=True, text=True)
+                self.assertEqual(r3d.returncode, 2)
+                self.assertIn("inside input folder", r3d.stderr)
+                self.assertFalse(os.path.exists(nested_out))
+                # Different drive letters must not raise ValueError
+                self.assertFalse(pc._is_under_dir(r"Z:\elsewhere\report.json", r"C:\cats"))
+
+            # Symlink outside <dir> pointing at a file inside <dir> -> exit 2, target untouched
+            link_out = os.path.join(sibling_dir, "link.0drp")
+            try:
+                os.symlink(cat_file, link_out)
+            except (OSError, NotImplementedError):
+                link_out = None
+            if link_out is not None:
+                r_sym = subprocess.run(py + ["census", cat_dir, "--out", link_out], capture_output=True, text=True)
+                self.assertEqual(r_sym.returncode, 2)
+                self.assertIn("inside input folder", r_sym.stderr)
+                with open(cat_file, "rb") as fh:
+                    self.assertEqual(fh.read(), raw_0drp)
+
+            # inspect <file> --out <file> -> exit 2, file untouched
+            r4 = subprocess.run(py + ["inspect", cat_file, "--out", cat_file], capture_output=True, text=True)
+            self.assertEqual(r4.returncode, 2)
+            self.assertIn("overwrite", r4.stderr)
+            with open(cat_file, "rb") as fh:
+                self.assertEqual(fh.read(), raw_0drp)
+
+            # resolve <dir> --names-file <names> --out <names> -> exit 2, names untouched
+            names_file = os.path.join(sibling_dir, "names.txt")
+            with open(names_file, "w", encoding="utf-8") as fh:
+                fh.write("synth_body_full_03\n")
+            r5 = subprocess.run(
+                py + ["resolve", cat_dir, "--names-file", names_file, "--out", names_file],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(r5.returncode, 2)
+            self.assertIn("overwrite", r5.stderr)
+            with open(names_file, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "synth_body_full_03\n")
+
+            # census <dir> --out <sibling_dir>/report.json (shares string prefix "<dir>_out") -> exit 0
+            sibling_out = os.path.join(sibling_dir, "report.json")
+            r6 = subprocess.run(py + ["census", cat_dir, "--out", sibling_out], capture_output=True, text=True)
+            self.assertEqual(r6.returncode, 0, r6.stderr)
+            with open(sibling_out, encoding="utf-8") as fh:
+                rep = json.load(fh)
+            self.assertEqual(rep["catalogues"], 1)
+            self.assertEqual(rep["presets"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -60,7 +60,7 @@ from typing import Iterable, Iterator
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import odrp_7a  # noqa: E402
 import psin_data  # noqa: E402
-from report_paths import same_report_path  # noqa: E402
+from report_paths import same_report_path, path_key  # noqa: E402
 import world_names  # noqa: E402
 
 # Schema & struct hashes (measured over retail packs.rpf 0DRP + PSIN catalogues).
@@ -1348,15 +1348,29 @@ def _parse_hex_hash(text: str) -> tuple[int, int]:
     raise ValueError(f"hash wider than 64 bits: {text!r}")
 
 
+def _is_under_dir(path: str, folder: str) -> bool:
+    """Return True when `path` resolves to `folder` or any path beneath it."""
+    folder_key = path_key(folder)
+    target_key = path_key(path)
+    try:
+        return os.path.commonpath([folder_key, target_key]) == folder_key
+    except ValueError:
+        return False
+
+
 def _check_out_path(out_path: str, inputs: list[str]) -> str | None:
     if os.path.isdir(out_path):
         return f"{out_path} is a folder, not a file"
+    for inp in inputs:
+        if not inp:
+            continue
+        if same_report_path(inp, out_path):
+            return f"output must not overwrite input {inp}"
+        if os.path.isdir(inp) and _is_under_dir(out_path, inp):
+            return f"output must not be inside input folder {inp}"
     parent = os.path.dirname(os.path.abspath(out_path))
     if not os.path.isdir(parent):
         return f"{parent} is not a folder"
-    for inp in inputs:
-        if inp and same_report_path(inp, out_path):
-            return f"output must not overwrite input {inp}"
     return None
 
 
