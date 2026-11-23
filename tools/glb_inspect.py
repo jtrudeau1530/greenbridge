@@ -667,7 +667,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.json_path:
-        if os.path.isdir(args.json_path):
+        # A trailing separator marks a directory-style destination; realpath would strip it and publish
+        # over a same-named file, which open(..., "w") never did.
+        separators = tuple(separator for separator in (os.sep, os.altsep) if separator)
+        if os.path.isdir(args.json_path) or args.json_path.endswith(separators):
             print(f"error: --json {args.json_path} is a directory", file=sys.stderr)
             return 2
         if same_report_path(args.json_path, args.input):

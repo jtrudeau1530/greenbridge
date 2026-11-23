@@ -507,6 +507,24 @@ class GlbInspectTests(unittest.TestCase):
             with open(out, encoding="utf-8") as handle:
                 self.assertEqual(json.load(handle)["meshes"][0]["name"], "Triangle")
 
+    def test_json_trailing_separator_is_refused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "model.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(triangle_glb())
+            for separator in sorted({os.sep, os.altsep} - {None}):
+                with self.subTest(separator=separator):
+                    with open(out, "wb") as handle:
+                        handle.write(b"previous report\n")
+                    result = self.run_tool(path, "--json", out + separator)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("is a directory", result.stderr)
+                    with open(out, "rb") as handle:
+                        self.assertEqual(handle.read(), b"previous report\n")
+                    self.assertEqual([name for name in os.listdir(folder) if name.startswith(".glb_inspect-")], [],
+                                     "a refused destination left its staging file behind")
+
     def test_json_symlink_loop_is_an_error_and_keeps_both_links(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "model.glb")
