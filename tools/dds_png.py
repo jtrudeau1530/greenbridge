@@ -30,8 +30,10 @@ from functools import cache
 import json
 import math
 import os
+import shutil
 import struct
 import sys
+import tempfile
 from typing import BinaryIO, NamedTuple, TypedDict
 import zlib
 
@@ -1517,11 +1519,17 @@ def main(argv: list[str] | None = None) -> int:
             args.input, args.max_size or 0, mip=args.mip or 0, layer=args.layer or 0,
             face=args.face, z=args.z or 0,
         )
-        parent = os.path.dirname(os.path.abspath(args.output))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(args.output, "wb") as f:
-            f.write(png)
+        # Resolve an existing symlink as the old direct write did, and stage on the same filesystem.
+        output = os.path.realpath(args.output)
+        parent = os.path.dirname(output)
+        os.makedirs(parent, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".dds-preview-", dir=parent) as staging:
+            pending = os.path.join(staging, "preview.png")
+            with open(pending, "wb") as f:
+                f.write(png)
+            if os.path.isfile(output):
+                shutil.copymode(output, pending)
+            os.replace(pending, output)
     except (DdsError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
