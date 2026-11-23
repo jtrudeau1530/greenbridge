@@ -102,13 +102,31 @@ constexpr char kEventName[] = "XGameEventImpl";
 constexpr GUID kEventClass = {0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d}};
 std::atomic<long> g_events{0};
 
+struct EnvFlagCache {
+    INIT_ONCE once;
+    bool on;
+    const char* name;
+};
+
+// Uses INIT_ONCE instead of a function-local dynamic static (_Init_thread_header) because guest threads may run
+// with title-owned TLS slot 0.
+bool env_flag_is_one(EnvFlagCache& flag) {
+    InitOnceExecuteOnce(
+        &flag.once,
+        [](PINIT_ONCE, PVOID param, PVOID*) -> BOOL {
+            auto* f = static_cast<EnvFlagCache*>(param);
+            char value[4] = {};
+            size_t length = 0;
+            f->on = getenv_s(&length, value, f->name) == 0 && length == 2 && value[0] == '1';
+            return TRUE;
+        },
+        &flag, nullptr);
+    return flag.on;
+}
+
 bool log_every_event() {
-    static const bool on = [] {
-        char value[4] = {};
-        size_t length = 0;
-        return getenv_s(&length, value, "LEONIDA_LOG_GAME_EVENTS") == 0 && length == 2 && value[0] == '1';
-    }();
-    return on;
+    static EnvFlagCache flag{INIT_ONCE_STATIC_INIT, false, "LEONIDA_LOG_GAME_EVENTS"};
+    return env_flag_is_one(flag);
 }
 
 // 3: HRESULT XGameEventWrite(XUserHandle user, const char* serviceConfigId, const char* playSessionId,
@@ -395,12 +413,8 @@ struct XDisplayHdrModeInfo {
 };
 
 bool hdr_requested() {
-    static const bool on = [] {
-        char value[4] = {};
-        size_t length = 0;
-        return getenv_s(&length, value, "LEONIDA_HDR") == 0 && length == 2 && value[0] == '1';
-    }();
-    return on;
+    static EnvFlagCache flag{INIT_ONCE_STATIC_INIT, false, "LEONIDA_HDR"};
+    return env_flag_is_one(flag);
 }
 
 // 4: XDisplayHdrModeResult XDisplayTryEnableHdrMode(XDisplayHdrModePreference preference, XDisplayHdrModeInfo* info)

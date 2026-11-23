@@ -230,12 +230,20 @@ bool first_call(std::atomic<bool>& seen) {
     return seen.compare_exchange_strong(expected, true, std::memory_order_relaxed);
 }
 
+// Uses INIT_ONCE rather than function-local dynamic statics (_Init_thread_header): guest threads running under
+// title-owned TLS slot 0 (#4313/#7524) must not observe uninitialized block-scope guard state.
 bool trace_enabled() {
-    static const bool enabled = [] {
-        char value[8] = {};
-        const DWORD length = GetEnvironmentVariableA("XS_TRACE", value, sizeof(value));
-        return length > 0 && value[0] != '\0' && value[0] != '0';
-    }();
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static bool enabled = false;
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            char value[8] = {};
+            const DWORD length = GetEnvironmentVariableA("XS_TRACE", value, sizeof(value));
+            enabled = length > 0 && value[0] != '\0' && value[0] != '0';
+            return TRUE;
+        },
+        nullptr, nullptr);
     return enabled;
 }
 
@@ -338,27 +346,33 @@ unsigned env_device_slot(const char* name, unsigned fallback) {
 }
 
 const XboxDeviceSlotRoutes& xbox_device_slot_routes() {
-    static const XboxDeviceSlotRoutes routes = [] {
-        XboxDeviceSlotRoutes r;
-        const unsigned frame_interval = env_device_slot("LEONIDA_XS_FRAME_INTERVAL_SLOT", r.frame_interval);
-        const unsigned schedule_event = env_device_slot("LEONIDA_XS_SCHEDULE_EVENT_SLOT", r.schedule_event);
-        const unsigned wait_event = env_device_slot("LEONIDA_XS_WAIT_EVENT_SLOT", r.wait_event);
-        const unsigned queue_x = env_device_slot("LEONIDA_XS_QUEUE_X_SLOT", r.queue_x);
-        const unsigned list_x = env_device_slot("LEONIDA_XS_LIST_X_SLOT", r.list_x);
-        const bool moved = frame_interval != r.frame_interval || schedule_event != r.schedule_event ||
-                           wait_event != r.wait_event || queue_x != r.queue_x || list_x != r.list_x;
-        r.frame_interval = frame_interval;
-        r.schedule_event = schedule_event;
-        r.wait_event = wait_event;
-        r.queue_x = queue_x;
-        r.list_x = list_x;
-        if (moved)
-            std::fprintf(stderr,
-                         "[rt] d3d12_xs: Xbox device slots: SetFrameIntervalX=%u ScheduleFrameEventX=%u "
-                         "WaitFrameEventX=%u CreateCommandQueueX=%u CreateCommandListX=%u\n",
-                         r.frame_interval, r.schedule_event, r.wait_event, r.queue_x, r.list_x);
-        return r;
-    }();
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static XboxDeviceSlotRoutes routes{};
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            XboxDeviceSlotRoutes r;
+            const unsigned frame_interval = env_device_slot("LEONIDA_XS_FRAME_INTERVAL_SLOT", r.frame_interval);
+            const unsigned schedule_event = env_device_slot("LEONIDA_XS_SCHEDULE_EVENT_SLOT", r.schedule_event);
+            const unsigned wait_event = env_device_slot("LEONIDA_XS_WAIT_EVENT_SLOT", r.wait_event);
+            const unsigned queue_x = env_device_slot("LEONIDA_XS_QUEUE_X_SLOT", r.queue_x);
+            const unsigned list_x = env_device_slot("LEONIDA_XS_LIST_X_SLOT", r.list_x);
+            const bool moved = frame_interval != r.frame_interval || schedule_event != r.schedule_event ||
+                               wait_event != r.wait_event || queue_x != r.queue_x || list_x != r.list_x;
+            r.frame_interval = frame_interval;
+            r.schedule_event = schedule_event;
+            r.wait_event = wait_event;
+            r.queue_x = queue_x;
+            r.list_x = list_x;
+            if (moved)
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: Xbox device slots: SetFrameIntervalX=%u ScheduleFrameEventX=%u "
+                             "WaitFrameEventX=%u CreateCommandQueueX=%u CreateCommandListX=%u\n",
+                             r.frame_interval, r.schedule_event, r.wait_event, r.queue_x, r.list_x);
+            routes = r;
+            return TRUE;
+        },
+        nullptr, nullptr);
     return routes;
 }
 
@@ -504,12 +518,18 @@ DeviceProxy* dxgi_owner(void* self) {
 
 HRESULT host_adapter(ID3D12Device* real, REFIID riid, void** out) {
     using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
-    static const CreateFactoryFn create_factory = [] {
-        const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        return dxgi ? reinterpret_cast<CreateFactoryFn>(
-                          reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")))
-                    : nullptr;
-    }();
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static CreateFactoryFn create_factory = nullptr;
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            create_factory = dxgi ? reinterpret_cast<CreateFactoryFn>(
+                                        reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")))
+                                  : nullptr;
+            return TRUE;
+        },
+        nullptr, nullptr);
     if (!create_factory) return DXGI_ERROR_NOT_FOUND;
     IDXGIFactory4* factory = nullptr;
     HRESULT hr = create_factory(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory));
@@ -601,22 +621,28 @@ HRESULT WINAPI dxgi_get_maximum_frame_latency(void* self, UINT* latency) {
 }
 
 void** get_dxgi_vtable() {
-    static void* table[kDxgiDeviceSlots] = {
-        reinterpret_cast<void*>(&dxgi_query_interface),          // 0
-        reinterpret_cast<void*>(&dxgi_add_ref),                  // 1
-        reinterpret_cast<void*>(&dxgi_release),                  // 2
-        reinterpret_cast<void*>(&dxgi_set_private_data),         // 3  IDXGIObject
-        reinterpret_cast<void*>(&dxgi_set_private_data_interface),
-        reinterpret_cast<void*>(&dxgi_get_private_data),
-        reinterpret_cast<void*>(&dxgi_get_parent),
-        reinterpret_cast<void*>(&dxgi_get_adapter),              // 7  IDXGIDevice
-        reinterpret_cast<void*>(&dxgi_create_surface),
-        reinterpret_cast<void*>(&dxgi_query_resource_residency),
-        reinterpret_cast<void*>(&dxgi_set_gpu_thread_priority),
-        reinterpret_cast<void*>(&dxgi_get_gpu_thread_priority),
-        reinterpret_cast<void*>(&dxgi_set_maximum_frame_latency),  // 12 IDXGIDevice1
-        reinterpret_cast<void*>(&dxgi_get_maximum_frame_latency),
-    };
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static void* table[kDxgiDeviceSlots]{};
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            table[0] = reinterpret_cast<void*>(&dxgi_query_interface);
+            table[1] = reinterpret_cast<void*>(&dxgi_add_ref);
+            table[2] = reinterpret_cast<void*>(&dxgi_release);
+            table[3] = reinterpret_cast<void*>(&dxgi_set_private_data);  // IDXGIObject
+            table[4] = reinterpret_cast<void*>(&dxgi_set_private_data_interface);
+            table[5] = reinterpret_cast<void*>(&dxgi_get_private_data);
+            table[6] = reinterpret_cast<void*>(&dxgi_get_parent);
+            table[7] = reinterpret_cast<void*>(&dxgi_get_adapter);  // IDXGIDevice
+            table[8] = reinterpret_cast<void*>(&dxgi_create_surface);
+            table[9] = reinterpret_cast<void*>(&dxgi_query_resource_residency);
+            table[10] = reinterpret_cast<void*>(&dxgi_set_gpu_thread_priority);
+            table[11] = reinterpret_cast<void*>(&dxgi_get_gpu_thread_priority);
+            table[12] = reinterpret_cast<void*>(&dxgi_set_maximum_frame_latency);  // IDXGIDevice1
+            table[13] = reinterpret_cast<void*>(&dxgi_get_maximum_frame_latency);
+            return TRUE;
+        },
+        nullptr, nullptr);
     return table;
 }
 
@@ -754,12 +780,16 @@ void fill_heap_vtable(void** vtable, std::index_sequence<I...>) {
 }
 
 void** get_heap_vtable() {
-    static void** vtable = [] {
-        static void* storage[kHeapSlots];
-        fill_heap_vtable(storage, std::make_index_sequence<kHeapSlots>{});
-        return storage;
-    }();
-    return vtable;
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static void* storage[kHeapSlots]{};
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            fill_heap_vtable(storage, std::make_index_sequence<kHeapSlots>{});
+            return TRUE;
+        },
+        nullptr, nullptr);
+    return storage;
 }
 
 HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
@@ -946,21 +976,25 @@ const char* child_public_name(unsigned slot) {
 // XboxID3D12CommandQueue::Signal, and XboxID3D12CommandQueue::Slot40 for a slot past the public chain.
 template <ChildKind K>
 const char* child_trace_name(unsigned slot) {
-    static const auto names = [] {
-        static char storage[ChildStats<K>::kSlots][64];
-        const char* iface = K == ChildKind::queue   ? "XboxID3D12CommandQueue"
-                            : K == ChildKind::fence ? "XboxID3D12Fence"
-                                                    : "XboxID3D12CommandAllocator";
-        for (unsigned s = 0; s < ChildStats<K>::kSlots; ++s) {
-            const char* method = child_public_name<K>(s);
-            if (method)
-                std::snprintf(storage[s], sizeof(storage[s]), "%s::%s", iface, method);
-            else
-                std::snprintf(storage[s], sizeof(storage[s]), "%s::Slot%u", iface, s);
-        }
-        return &storage;
-    }();
-    return (*names)[slot < ChildStats<K>::kSlots ? slot : 0];
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static char storage[ChildStats<K>::kSlots][64]{};
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            const char* iface = K == ChildKind::queue   ? "XboxID3D12CommandQueue"
+                                : K == ChildKind::fence ? "XboxID3D12Fence"
+                                                        : "XboxID3D12CommandAllocator";
+            for (unsigned s = 0; s < ChildStats<K>::kSlots; ++s) {
+                const char* method = child_public_name<K>(s);
+                if (method)
+                    std::snprintf(storage[s], sizeof(storage[s]), "%s::%s", iface, method);
+                else
+                    std::snprintf(storage[s], sizeof(storage[s]), "%s::Slot%u", iface, s);
+            }
+            return TRUE;
+        },
+        nullptr, nullptr);
+    return storage[slot < ChildStats<K>::kSlots ? slot : 0];
 }
 
 template <ChildKind K>
@@ -1618,47 +1652,66 @@ void fill_child_vtable(void** vtable, std::index_sequence<I...>) {
 
 // True when the fault logger is installed (once per process; a failure is logged once).
 bool install_table_overrun_handler() {
-    static const bool installed = [] {
-        if (AddVectoredExceptionHandler(0, &table_overrun_handler)) return true;
-        std::fprintf(stderr, "[rt] d3d12_xs: AddVectoredExceptionHandler failed (error %lu); a slot past a queue or "
-                     "fence proxy table faults without being named\n", GetLastError());
-        return false;
-    }();
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static bool installed = false;
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            if (AddVectoredExceptionHandler(0, &table_overrun_handler)) {
+                installed = true;
+            } else {
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: AddVectoredExceptionHandler failed (error %lu); a slot past a queue or "
+                             "fence proxy table faults without being named\n",
+                             GetLastError());
+            }
+            return TRUE;
+        },
+        nullptr, nullptr);
     return installed;
 }
 
 template <ChildKind K>
 void** get_child_vtable() {
-    static void** vtable = [] {
-        using S = ChildStats<K>;
-        constexpr std::size_t bytes = S::kSlots * sizeof(void*);
-        SYSTEM_INFO system{};
-        GetSystemInfo(&system);
-        const SIZE_T page = system.dwPageSize;
-        if (void* base = page >= bytes ? VirtualAlloc(nullptr, kTableRegion, MEM_RESERVE, PAGE_NOACCESS) : nullptr) {
-            if (VirtualAlloc(base, page, MEM_COMMIT, PAGE_READWRITE)) {
-                auto* table = reinterpret_cast<void**>(static_cast<char*>(base) + page - bytes);
-                fill_child_vtable<K>(table, std::make_index_sequence<S::kSlots>{});
-                DWORD old = 0;
-                if (!VirtualProtect(base, page, PAGE_READONLY, &old))  // the table works, but stays writable
-                    std::fprintf(stderr, "[rt] d3d12_xs: %s proxy table stays writable (VirtualProtect error %lu)\n",
-                                 child_kind_name<K>(), GetLastError());
-                S::table_begin.store(reinterpret_cast<std::uintptr_t>(table), std::memory_order_release);
-                S::region_end.store(reinterpret_cast<std::uintptr_t>(base) + kTableRegion, std::memory_order_release);
-                // table_end is what "guarded" means (command_object_tables_guarded, the fault logger): set only when
-                // a fault past the table will be named. Without the logger the region still faults, unnamed.
-                if (install_table_overrun_handler())
-                    S::table_end.store(reinterpret_cast<std::uintptr_t>(base) + page, std::memory_order_release);
-                return table;
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static void** vtable = nullptr;
+    static void* fallback[ChildStats<K>::kSlots]{};
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            using S = ChildStats<K>;
+            constexpr std::size_t bytes = S::kSlots * sizeof(void*);
+            SYSTEM_INFO system{};
+            GetSystemInfo(&system);
+            const SIZE_T page = system.dwPageSize;
+            if (void* base = page >= bytes ? VirtualAlloc(nullptr, kTableRegion, MEM_RESERVE, PAGE_NOACCESS) : nullptr) {
+                if (VirtualAlloc(base, page, MEM_COMMIT, PAGE_READWRITE)) {
+                    auto* table = reinterpret_cast<void**>(static_cast<char*>(base) + page - bytes);
+                    fill_child_vtable<K>(table, std::make_index_sequence<S::kSlots>{});
+                    DWORD old = 0;
+                    if (!VirtualProtect(base, page, PAGE_READONLY, &old))  // the table works, but stays writable
+                        std::fprintf(stderr,
+                                     "[rt] d3d12_xs: %s proxy table stays writable (VirtualProtect error %lu)\n",
+                                     child_kind_name<K>(), GetLastError());
+                    S::table_begin.store(reinterpret_cast<std::uintptr_t>(table), std::memory_order_release);
+                    S::region_end.store(reinterpret_cast<std::uintptr_t>(base) + kTableRegion,
+                                        std::memory_order_release);
+                    // table_end is what "guarded" means (command_object_tables_guarded, the fault logger): set only when
+                    // a fault past the table will be named. Without the logger the region still faults, unnamed.
+                    if (install_table_overrun_handler())
+                        S::table_end.store(reinterpret_cast<std::uintptr_t>(base) + page, std::memory_order_release);
+                    vtable = table;
+                    return TRUE;
+                }
+                VirtualFree(base, 0, MEM_RELEASE);
             }
-            VirtualFree(base, 0, MEM_RELEASE);
-        }
-        // No reservation: the table still works, but a slot past it is not caught.
-        std::fprintf(stderr, "[rt] d3d12_xs: %s proxy table without a guard region\n", child_kind_name<K>());
-        static void* storage[S::kSlots];
-        fill_child_vtable<K>(storage, std::make_index_sequence<S::kSlots>{});
-        return storage;
-    }();
+            // No reservation: the table still works, but a slot past it is not caught.
+            std::fprintf(stderr, "[rt] d3d12_xs: %s proxy table without a guard region\n", child_kind_name<K>());
+            fill_child_vtable<K>(fallback, std::make_index_sequence<S::kSlots>{});
+            vtable = fallback;
+            return TRUE;
+        },
+        nullptr, nullptr);
     return vtable;
 }
 
@@ -2144,14 +2197,18 @@ void WINAPI list_clear_depth_stencil_view(ListProxy* self, D3D12_CPU_DESCRIPTOR_
 }
 
 void** get_list_vtable() {
-    static void** vtable = [] {
-        static void* storage[kListSlots];
-        fill_list_vtable(storage, std::make_index_sequence<kListSlots>{});
-        static_assert(console_to_pc_list_slot(51) == 47, "console list slot 51 is PC ClearDepthStencilView");
-        storage[51] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
-        return storage;
-    }();
-    return vtable;
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;  // no thread-safe-static guard: lists are made on title threads
+    static void* storage[kListSlots]{};
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            fill_list_vtable(storage, std::make_index_sequence<kListSlots>{});
+            static_assert(console_to_pc_list_slot(51) == 47, "console list slot 51 is PC ClearDepthStencilView");
+            storage[51] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
+            return TRUE;
+        },
+        nullptr, nullptr);
+    return storage;
 }
 
 bool is_list_proxy_impl(const void* list) {
@@ -3829,14 +3886,18 @@ void* WINAPI proxy_get_resource_allocation_info1(std::uint64_t a0, std::uint64_t
 }
 
 void** get_vtable() {
-    static void** vtable = [] {
-        static void* storage[kMaxSlots];
-        fill_vtable(storage, std::make_index_sequence<kMaxSlots>{});
-        storage[25] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info);
-        storage[56] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info1);
-        return storage;
-    }();
-    return vtable;
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    static void* storage[kMaxSlots]{};
+    InitOnceExecuteOnce(
+        &once,
+        [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+            fill_vtable(storage, std::make_index_sequence<kMaxSlots>{});
+            storage[25] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info);
+            storage[56] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info1);
+            return TRUE;
+        },
+        nullptr, nullptr);
+    return storage;
 }
 
 bool supports(ID3D12Device* real, REFIID iid) {
