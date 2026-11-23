@@ -53,7 +53,8 @@ class Int32ToFloat64(unittest.TestCase):
                 pair, = re.findall(rf"(%\w+) = OpBitcast %v2uint_d {value}\b", text)
                 for i in range(2):
                     word, = re.findall(rf"(%\w+) = OpCompositeExtract %uint {pair} {i}\b", text)
-                    selected, = re.findall(rf"(%\w+) = OpSelect %uint %\w+ {word} %\w+", text)
+                    sel = re.findall(rf"(%\w+) = OpSelect %uint %\w+ {word} %\w+", text)
+                    selected, = sel or [word]
                     pointer, = re.findall(rf"OpStore (%\w+) {selected}\b", text)
                     self.assertIn(f"{pointer} = OpAccessChain %_ptr_Function_uint %vgpr %c{first + i}\n", text)
 
