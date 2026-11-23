@@ -341,33 +341,34 @@ int huffman_lut_checks() {
         w.write_lsb(0, 5);   // HLIT = 257 (symbols 0..256)
         w.write_lsb(0, 5);   // HDIST = 1 (distance 0, length 0)
         w.write_lsb(15, 4);  // HCLEN = 19 code-length symbols
-        // Code-length alphabet: give symbols 0..15 and 18 (repeat zero) length 5 each (17 codes of length 5 <= 32).
+        // Complete code-length tree (Kraft sum = 15/16 + 2/32 = 1, accepted by standard zlib):
+        // symbols 0..14 have length 4 (codes 0..14); symbols 15 and 18 have length 5 (codes 30 and 31).
         // Order: 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15.
         static constexpr int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
         std::int16_t cl_lens[19] = {};
-        for (int s = 0; s <= 15; ++s) cl_lens[s] = 5;
+        for (int s = 0; s <= 14; ++s) cl_lens[s] = 4;
+        cl_lens[15] = 5;
         cl_lens[18] = 5;
         for (int i = 0; i < 19; ++i) w.write_lsb(std::uint32_t(cl_lens[order[i]]), 3);
-        // Canonical codes for cl_lens: symbols 0..15 -> 0..15 (5 bits), symbol 18 -> 16 (5 bits).
         const auto emit_zeros = [&](int count) {
             while (count >= 11) {
                 const int run = std::min(count, 138);
-                w.write_msb(16u, 5);  // symbol 18
+                w.write_msb(31u, 5);  // symbol 18
                 w.write_lsb(std::uint32_t(run - 11), 7);
                 count -= run;
             }
-            while (count-- > 0) w.write_msb(0u, 5);
+            while (count-- > 0) w.write_msb(0u, 4);
         };
         // Lengths for literals 0..96 ('a' is 97): 97 zeros.
         emit_zeros(97);
         // 'a'..'n' (97..110): lengths 1..14; 'o' (111): length 15.
-        for (int len = 1; len <= 14; ++len) w.write_msb(std::uint32_t(len), 5);
-        w.write_msb(15u, 5);  // 'o'
+        for (int len = 1; len <= 14; ++len) w.write_msb(std::uint32_t(len), 4);
+        w.write_msb(30u, 5);  // 'o' (length 15)
         // 112..255: 144 zeros.
         emit_zeros(144);
         // 256 (EOB): length 15; distance 0: length 0.
-        w.write_msb(15u, 5);
-        w.write_msb(0u, 5);
+        w.write_msb(30u, 5);
+        w.write_msb(0u, 4);
 
         std::vector<std::uint8_t> expected;
         for (int rep = 0; rep < 4; ++rep) {
