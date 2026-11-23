@@ -320,6 +320,8 @@ if(BUILD_TESTING)
   add_executable(vulkan_device_filter_test test/vulkan_device_filter_test.cpp)
   target_include_directories(vulkan_device_filter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME vulkan_device_filter COMMAND vulkan_device_filter_test)
+  add_executable(vk_presenter_capture_colour_test test/vk_presenter_capture_colour_test.cpp)
+  add_test(NAME vk_presenter_capture_colour COMMAND vk_presenter_capture_colour_test)
   if(TARGET gta6rt)
     # Compile-time ABI checks (D3D12/XMem structure sizes, alignments and member offsets against the Windows SDK).
     # The file existed but no target built it, so none of its static_asserts ever ran.

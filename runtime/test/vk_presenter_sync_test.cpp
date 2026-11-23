@@ -16,12 +16,12 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
 
+#include "vk_presenter_capture_colour.h"
 #include "vk_test_device.h"
 #include "../src/vulkan_present.h"
 
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -304,14 +304,9 @@ int main() {
         EXPECT(driver::capture_waw_barriers.load() == 4);
 
         EXPECT(presenter.read_back(pixels, &ext, &fmt));
-        EXPECT(pixels.size() == std::size_t(ext.width) * ext.height * 4);
-        const std::size_t mid2 = (std::size_t(ext.height / 2) * ext.width + ext.width / 2) * 4;
         const bool bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
-        const int r = bgra ? pixels[mid2 + 2] : pixels[mid2 + 0];
-        const int g = pixels[mid2 + 1];
-        const int b = bgra ? pixels[mid2 + 0] : pixels[mid2 + 2];
-        EXPECT(std::abs(r - 51) <= 2 && std::abs(g - 153) <= 2 && std::abs(b - 230) <= 2);
-        std::printf("presenter sync: capture-buffer WAW barriers (4/4) and read_back (%d,%d,%d) ok\n", r, g, b);
+        EXPECT(presenter_capture_matches_clear(pixels, ext.width, ext.height, bgra));
+        std::printf("presenter sync: capture-buffer WAW barriers (4/4) and full-frame read_back ok\n");
 
         // 3. Concurrent present() + VulkanQueue::execute() + add/remove_resource() hammering LayoutTracker.
         std::atomic<bool> stop{false};
