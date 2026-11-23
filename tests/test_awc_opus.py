@@ -464,6 +464,15 @@ class ExportBankTest(unittest.TestCase):
         self.assertEqual(len(os.listdir(os.path.join(self.out, "many"))), 5)
         self.assertEqual(len(probes), 1)
 
+    def test_pcm_data_size_must_match_the_declared_samples(self):
+        fmt = format_block(100, 22050, 0x00, 2)
+        path = os.path.join(self.tmp.name, "odd.awc")
+        with open(path, "wb") as f:
+            f.write(build_bank([(1, fmt, bytes(401)), (2, fmt, bytes(399)), (3, fmt, bytes(400))]))
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 2, "music": 0})
+        self.assertEqual(os.listdir(os.path.join(self.out, "odd")), ["00000003.wav"])
+
     def test_stereo_plain_stream_length_is_per_channel(self):
         # A stereo format tag stores interleaved samples: 3840 counts = 1920 frames per channel.
         # Three 960-frame packets carry 2880 frames per channel, so the declared 1920 trims
