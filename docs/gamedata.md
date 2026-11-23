@@ -981,7 +981,7 @@ no values or names):
 | `DirtDefinitions` | 24 | 25 (alpha curves and thresholds, vertex multipliers, normal/roughness/material contribution, spawn range, 6 `ClothHideDirtModifiers`) | equals `Name` in 22 of 24 |
 | `VehDirtDefinitions` | 1 | 12, including a `DirtTunings` block of tile, detail-map, mud and modulate start/end values | equals `Name` |
 | `VehDirtControls` | 5 | 13 | equals `Name` |
-| `VehSpawnIntensities` | 31 | 5 | equals `Name` |
+| `VehSpawnIntensities` | 31 | Name, `IntensitySets` (7 `Item`s of `DirtMin`/`DirtMax`/`MudMin`/`MudMax`), `DirtRainChance`, `DirtRainMin`, `DirtRainMax` | equals `Name` |
 | `PropDirtDefinitions` | 9 | 4 | equals `Name` |
 
 The keys are plain text, not joaat hashes, and a loader can index each section by `key`.
@@ -1028,6 +1028,28 @@ The three mixed entries combine 0 and 2. Each tie is a name read against measure
 measured, not confirmed against the shader that samples the mask.
 
 Not measured here (hypothesis): how `VehSpawnIntensities` are chosen at spawn.
+**Spawn intensities are keyed by vehicle class.** Measured on 2026-11-23 from one retail Xbox Series
+1.0.2.1 install with `tools/veh_spawn_intensities.py` (numbers and ranges only; the tool never prints
+entry names). The 31 entries are 30 generic vehicle-class tokens plus one entry whose rain fields differ
+from every other chance-0.5 entry; each carries 7 intensity bands, so the section's own "5 fields" summary
+is top-level children only:
+
+| Measure | Value |
+|---|---|
+| `IntensitySets` bands per entry | 7 in all 31 |
+| distinct band signatures | 9, carrying 12, 8, 3, 2, 2, 1, 1, 1, 1 entries |
+| band 7 ranges over the signatures | `DirtMin` 0.353400..0.804305, `DirtMax` 0.450900..1.240000 |
+| mud (a `MudMin`/`MudMax` above zero) | in band 6 of 1 signature, band 7 of 6 signatures; everywhere it exists the range is 0.8..1.0 |
+| bands overlap | yes: each band is a draw range, not a partition (band 1's `DirtMax` exceeds band 2's `DirtMin` in the largest signature) |
+| `DirtRainChance` groups | 4: 0.5 in 24 entries (`DirtRainMin` 0.818644 except one at 0.7), 0.0 in 6, 0.3 in 1 |
+
+Band 1 to band 7 in the largest signature ladder through the same recurring endpoints
+(0.007828, 0.174168, 0.391389, 0.485323, 0.659491, 0.804305), so a run draws its dirt intensity from one
+of the seven ranges, and rain applies another random factor gated by `DirtRainChance`. Each entry has 7
+bands while `AlphaChannels` has 7 entries and `DirtDefinitions` references 5 of them; whether a spawn picks
+one band per `AlphaChannels` entry is open.
+
+Not measured here (hypothesis): whether a spawn selects one `IntensitySets` band per `AlphaChannels` entry.
 
 ## Entity component sets and component LOD
 
