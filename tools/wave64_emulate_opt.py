@@ -78,6 +78,13 @@ _SCC_UNCONDITIONAL_WRITES = _ALL_SAVEEXEC_WREXEC | frozenset({
     "s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64",
 })
 
+# Scalar ops that reconstruct a whole mask word when their source holds a lane mask.
+_MASK_WORD_READERS = frozenset({
+    "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
+    "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64",
+    "s_flbit_i32_b32", "s_flbit_i32",
+})
+
 # Mask ops that emit a cross-lane vote in --wave64-emulate when SCC is live.
 _MASK_SCC_VOTE_OPS = _ALL_SAVEEXEC_WREXEC | frozenset({
     "s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64",
@@ -502,8 +509,7 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             return False, empty_stats, 0, (), ()
 
         # 2. Cross-lane mask readers (`wave_mask`, `wave_equal`, live-SCC `scc_from_mask`).
-        if op in ("s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
-                  "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64"):
+        if op in _MASK_WORD_READERS:
             if len(a) > 1 and _holds_lane_mask(ins, a[1], lm):
                 return False, empty_stats, 0, (), ()
         elif op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
@@ -989,8 +995,7 @@ def _insn_may_barrier(ins, lane_masks, scc_live):
         return True
     a = ins["args"]
     lm = lane_masks.get(id(ins), {})
-    if op in ("s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
-              "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64"):
+    if op in _MASK_WORD_READERS:
         return len(a) > 1 and _holds_lane_mask(ins, a[1], lm)
     if op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
         return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm)

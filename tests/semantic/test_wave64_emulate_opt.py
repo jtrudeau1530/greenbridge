@@ -850,6 +850,36 @@ class LocalExecFoldTests(unittest.TestCase):
                 spv, _ = _translate_encoded(f"cs_neg_{label}", insns, (64, 1, 1), emulate=True)
                 self.assertGreaterEqual(spv.count("OpAtomicOr"), 1, f"{label} should NOT fold s_cbranch_execz")
 
+    def test_mask_flbit_keeps_wave_exchange_out_of_lane_local_execz_fold(self):
+        # Both waves have bit 3 set in VCC_LO. Only lane 32 of each wave writes its leading-zero count.
+        for lx in (64, 128):
+            for op, ext_inst in (("s_flbit_i32_b32", "FindUMsb"), ("s_flbit_i32", "FindSMsb")):
+                for source in ("vcc_lo", "s14"):
+                    with self.subTest(threads=lx, op=op, source=source):
+                        insns = [
+                            ("s_mov_b32 s14, 8", 4),
+                            ("v_and_b32_e32 v1, 63, v0", 4),
+                            ("v_cmp_eq_u32_e32 vcc, 3, v1", 4),
+                            ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+                            ("s_mov_b32 exec_lo, 0", 4),
+                            ("s_mov_b32 exec_hi, 1", 4),
+                            ("s_cbranch_execz 4", 4),
+                            (f"{op} s9, {source}", 4),
+                            ("v_mov_b32_e32 v4, s9", 4),
+                            ("buffer_store_dword v4, v6, s[0:3], 0 offen", 8),
+                            ("s_mov_b64 exec, -1", 4),
+                            ("s_endpgm", 4),
+                        ]
+                        spv, _ = _translate_encoded("cs_flbit_in_execz", insns, (lx, 1, 1), emulate=True)
+                        self.assertIn(ext_inst, spv)
+                        if source == "vcc_lo":
+                            self.assertIn("OpAtomicOr", spv)
+                        else:
+                            self.assertNotIn("OpAtomicOr", spv)
+                        if op == "s_flbit_i32_b32":
+                            mem, _ = run_emulated_workgroup(spv, (lx, 1, 1), push_constants=VSHARP + [0] * 28)
+                            self.assertEqual(mem, {lane * 4: 28 for lane in range(32, lx, 64)})
+
     def test_write_before_folded_read_orders_across_halves(self):
         # Every lane stores `100 + lane` at `lane * 4`; then ONLY lanes >= 32 enter a folded s_cbranch_execz
         # and read partner lane `(lane ^ 32) * 4`. The uniform x_split before `if (%active)` must order the write!
@@ -1252,6 +1282,29 @@ class StructuredEmulationTests(unittest.TestCase):
                         v4 = nxt
                     for l in range(threads):
                         self.assertEqual(mem[512 + l * 4], v4[l] & 0xFFFFFFFF, f"lane {l} rev={rev}")
+
+    def test_mask_flbit_is_synchronized_in_a_branch_taken_by_only_one_wave(self):
+        # One wave takes the SCC branch body. Its bit scan still needs a workgroup exchange.
+        for op, ext_inst in (("s_flbit_i32_b32", "FindUMsb"), ("s_flbit_i32", "FindSMsb")):
+            with self.subTest(op=op):
+                insns = [
+                    ("v_and_b32_e32 v1, 63, v0", 4),
+                    ("v_cmp_eq_u32_e32 vcc, 3, v1", 4),
+                    ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+                    ("v_readfirstlane_b32 s20, v0", 4),
+                    ("s_cmp_eq_u32 s20, 0", 4),
+                    ("s_cbranch_scc0 4", 4),
+                    (f"{op} s9, vcc_lo", 4),
+                    ("v_mov_b32_e32 v4, s9", 4),
+                    ("buffer_store_dword v4, v6, s[0:3], 0 offen", 8),
+                    ("s_mov_b64 exec, -1", 4),
+                    ("s_endpgm", 4),
+                ]
+                spv, _ = _translate_encoded("cs_flbit_in_scc_branch", insns, (128, 1, 1), emulate=True)
+                self.assertIn(ext_inst, spv)
+                if op == "s_flbit_i32_b32":
+                    mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28)
+                    self.assertEqual(mem, {lane * 4: 28 for lane in range(64)})
 
     def test_multiwave_structured_hybrid_zero_switch_and_local_mini_scheduler(self):
         # 128 threads (2 waves): top-level spine + sync-free guard (live-out scalar) + wave-divergent
