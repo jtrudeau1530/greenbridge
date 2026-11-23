@@ -181,6 +181,9 @@ def translate_tests(work, names):
 
 
 def main():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__)
+        return 0
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     # The CMake test targets name the spirv-as/spirv-val folder here instead of passing a whole PATH, which the Visual
