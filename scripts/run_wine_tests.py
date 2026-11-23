@@ -15,6 +15,7 @@ runtime/build/generated). For those, the drive of --windows-root is pointed at -
 Every test is reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
+Relative executable paths in --wine or WINE are read from the directory where you start this runner.
 """
 import argparse
 from graphlib import CycleError, TopologicalSorter
@@ -353,6 +354,9 @@ def main() -> int:
         print("ERROR: CTest test dependencies form a cycle", file=sys.stderr)
         return 2
     wine = args.wine
+    # Each test starts in its own CTest working directory. Keep bare commands on PATH.
+    if os.path.dirname(wine[0]) and not os.path.isabs(wine[0]):
+        wine[0] = os.path.join(os.getcwd(), wine[0])
     results = {}
     results_by_index: dict[int, str] = {}
     prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
