@@ -705,7 +705,9 @@ class Analysis:
         if op == "v_readlane_b32" and len(a) == 3:
             vr = a[1]["r"] if a[1].get("k") == "vgpr" else None
             tl = self.rd(st, ins, a[2])
-            if vr is not None and vr in st["u"] and not tl:
+            if vr is not None and vr in st["u"]:
+                # Every lane holds the same value in v[vr], so the selected lane index (even if derived from
+                # first-lane, lane-count, or lane-id) cannot change the result across 32-lane halves.
                 idiom("readlane-uniform")
                 if ev is not None:
                     ev["uniform_readlane"].add(id(ins))

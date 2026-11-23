@@ -192,6 +192,7 @@ FIXTURES = {
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
     "ps_w64_b_readfirstlane": ("B", _b_readfirstlane, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_readlane_uniform": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),
+    "ps_w64_b_readlane_uniform_lane": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_ballot_atomic": ("B", _b_ballot, {"VKH_SGPRS": "0,0,65536,0x30000000", "VKH_HEAP": "0=0"}),
     "ps_w64_c_waterfall_count": ("C", _c_waterfall_count, {}),
     "ps_w64_c_bcnt_export": ("C", _c_bcnt, {}),
