@@ -294,6 +294,8 @@ const IID kUnknownIid = __uuidof(IUnknown);
 const IID kResourceIid = __uuidof(ID3D12Resource);
 const IID kDevice1Iid = __uuidof(ID3D12Device1);
 const D3D12_COMMAND_QUEUE_DESC kQueueDesc{};
+// The retail title's slot 48 desc is 32 bytes (the route logs words 4..7); type in word 0 as in kQueueDesc.
+const std::uint32_t kXboxQueueDesc[8]{};
 
 // A device proxy over a new mock device. The proxy takes the mock's one reference.
 void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true) {
@@ -743,7 +745,7 @@ int check_xbox_slots() {
 
     // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path (filtered desc copy).
     void* queue = nullptr;
-    EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
+    EXPECT(hr_of(raw(device, 48, word(kXboxQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
@@ -818,7 +820,7 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
         EXPECT(hr_of(raw(device, 98, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
         void* queue = nullptr;
-        EXPECT(hr_of(raw(device, 99, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
+        EXPECT(hr_of(raw(device, 99, word(kXboxQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
         EXPECT(xs::is_queue_proxy(queue) && mock->calls[99] == 0);
         const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
         void* allocator = nullptr;
