@@ -137,11 +137,14 @@ zero key and w4=0, with (SS,II) mostly (14,3), (2,0) or (10,0). They are not dec
 
 ### Relation to the 32 user-data dwords
 
-A 1:1 packing into the 32-dword root-argument block is not supported by the counts. A compute PSO's chunk
-record has a median of 17 slots (max 281), and 0x41 offsets reach 0x820 (2,080 bytes); 199,074 of 402,328
-offsets (49.5%) fit inside 128 bytes, but only 5,581 of 20,318 records have all of theirs inside. The record
-therefore describes a larger layout than the 32 dwords, and at most half of the 0x41 entries can be part of
-that block (medium). No mapping from a slot to a user-SGPR index was confirmed.
+Within one record the cost is small: a graphics chunk record carries 11 constant dwords and one or two tables,
+15 dwords under two dwords per table. The 32-dword block is therefore the union of the tables and constants,
+not one dword per 0x41 entry (medium). The 0x41 offsets also exceed 128 bytes for half the entries (range
+0..0x820, 49.5% at or below 0x78), which fits a per-table descriptor index better than a dword offset. The
+records that do not fit are elsewhere: 4,519 of the 20,318 chunk records exceed 32 dwords under two dwords per
+table (4,202 under one), and none of them is on the graphics path. Of those 4,519, 1,017 are named by a compute
+PSO and the other 3,502 are not named by the graphics or compute records measured here. The extreme record has
+231 constant dwords; the largest slot count is 281. No mapping from a slot to a user-SGPR index was confirmed.
 
 ### Which PSOs reference which records
 
@@ -152,6 +155,41 @@ that block (medium). No mapping from a slot to a user-SGPR index was confirmed.
   one per PSO.
 - A compute PSO's +8 and +0xC name 20- and 28-byte hash records, +0x10 a mixed record and +0x14 a chunk record
   (2,693 references, 2,684 distinct records).
+
+## Graphics user signature
+
+`tools/psocache_usersig.py` resolves a graphics PSO to its user data and prints, per chunk, the kind, register
+space, base register, count, element size and the slot bytes. A PSO uses 3 to 5 distinct chunk records after
+duplicates are removed (four on 23,625 of 25,471 PSOs); the eight layouts are shared across the corpus.
+
+| Chunk or field | Reading | Confidence |
+|---|---|---|
+| 0x300 / 0x302 / 0x303 | descriptor entries | high that they are descriptors, medium for the SRV/CBV/UAV names |
+| 0x002 | sampler entry, no slot | medium-high; none of the eight graphics records carries one |
+| 0x401 | 32-bit constants, `a` = count | medium |
+| 0x100 | unknown, not consumed | low |
+| 0x41 offset (w2) | descriptor index inside the table, 8-byte granular | medium |
+| 0x41 `b` | register space | medium |
+| 0x41 `a` | base register for descriptors | medium |
+| 0x41 size | element size 2, 4 or 8 | high |
+| 0x41 key (w3) | unknown | low |
+| 0x41 count (w4) | descriptor count | low |
+| 0x42 SS | descriptor-table / root-parameter index | medium-high |
+| 0x42 II | range type: 0 SRV, 1 UAV, 2 CBV, 3 sampler | medium-high |
+| 0x42 RR | width, 1 normally and 2 on extra slots | low |
+
+The kind-to-range-type correspondence is exact in the positional pairing: 23,047 of 23,049 0x300 entries sit on
+II=0, 4,144 of 4,146 0x303 on II=1 and all 6,100 0x302 on II=2. One distinct SS is read as one
+`D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE`, each (SS, II) pair as one `D3D12_DESCRIPTOR_RANGE`, and each 0x401
+as one `D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS`. That mapping is one-to-one for the measured graphics
+records, but it is an inference: SS could be a register space and `b` the table index instead, and the cache
+does not say whether a table costs one or two user-data dwords.
+
+Under both table models all 25,471 graphics PSOs fit 32 dwords (15 dwords with two per table). A later
+`CreateGraphicsPipelineState` path would group the slots by SS into tables, take II as the range type and the
+0x41 entries as the range contents, take each 0x401 as a constants parameter, and pack them in root-parameter
+order. The record does not carry that order, so it would have to come from SS or from the shader's reads, which
+is not measured.
 
 ## What remains unknown
 
@@ -192,3 +230,13 @@ described above, `--entry N` lists one meta index entry and `--limit N` bounds h
 prints offsets, sizes and counts, names every field that does not fit instead of stopping, and exits 0 when the
 regions add up to the file size, 1 on a disagreement and 2 when the file is not a cache. `--json` prints the same
 report as JSON. It does not decode a chunk payload, disassemble the code or verify a hash.
+
+`tools/psocache_usersig.py` turns one or more graphics PSOs into the per-record user signature and the 32-dword
+fit described above:
+
+```
+python -I tools/psocache_usersig.py <cache> [--entry N] [--limit N] [--json]
+```
+
+It reuses the parser from `tools/psocache_inspect.py`, prints the aggregate over the first `--limit` graphics PSOs
+(all by default) or one PSO with `--entry N`, and never prints a hash.
