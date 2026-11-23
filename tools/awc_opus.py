@@ -65,6 +65,8 @@ def ogg_page(serial: int, seq: int, granule: int, packets: list, flags: int) -> 
             lacing.append(255)
             n -= 255
         lacing.append(n)
+    if len(lacing) > 255:
+        raise ValueError("packet needs more than 255 Ogg segments")
     hdr = struct.pack("<4sBBqIIIB", b"OggS", 0, flags, granule, serial, seq, 0, len(lacing)) + bytes(lacing)
     body = b"".join(packets)
     page = bytearray(hdr + body)

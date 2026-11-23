@@ -271,6 +271,13 @@ class OggCrcTest(unittest.TestCase):
     def test_payload_changes_crc(self):
         self.assertNotEqual(awc.ogg_crc(self.PAGE[:-1] + b"u"), 0xF7708715)
 
+    def test_page_segment_limit(self):
+        # 254 full segments plus a terminating partial one; a multiple of 255 needs an extra zero segment.
+        page = awc.ogg_page(1, 0, 0, [b"x" * (254 * 255 + 254)], 2)
+        self.assertEqual(len(page), 27 + 255 + 254 * 255 + 254)
+        with self.assertRaisesRegex(ValueError, "255 Ogg segments"):
+            awc.ogg_page(1, 0, 0, [b"x" * (255 * 255)], 2)
+
 
 class OpusSamplesTest(unittest.TestCase):
     def test_toc_patterns(self):
