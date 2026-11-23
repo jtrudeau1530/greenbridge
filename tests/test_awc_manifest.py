@@ -355,6 +355,30 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
 
+    def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
+        out = os.path.join(self.tmp.name, "manifest.json")
+        previous = '{"previous": true}\n'
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(previous)
+        os.chmod(out, 0o444)
+        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".awc_manifest-") and mode == 0o600:
+                made_writable.append(path)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(awc_manifest.os, "replace", side_effect=OSError("replace denied")), \
+                mock.patch.object(awc_manifest.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                awc_manifest.write_manifest([], 0, 0, "json", out)
+        self.assertEqual(len(made_writable), 1)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])
+
     def test_recursive_report_distinguishes_banks_with_the_same_basename(self):
         for folder in ("left", "right"):
             os.mkdir(os.path.join(self.tmp.name, folder))

@@ -553,6 +553,25 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(self.read(self.csv).splitlines()[1].split(",")[:2], ["a.rpf", "16"])
         self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
 
+    def test_failed_replace_of_read_only_report_removes_writable_temp(self):
+        os.chmod(self.out, 0o444)
+        self.addCleanup(lambda: os.path.exists(self.out) and os.chmod(self.out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".bvh_index-") and mode == 0o600:
+                made_writable.append(path)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(bvh_index.os, "replace", side_effect=OSError("replace denied")), \
+                mock.patch.object(bvh_index.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                bvh_index.write_outputs([], [{"streams": 0}], self.out, None)
+        self.assertEqual(len(made_writable), 1)
+        self.assertEqual(self.read(self.out), self.OLD_JSON)
+        self.assertEqual([n for n in os.listdir(self.dir) if n.startswith(".bvh_index-")], [])
+
     @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
     def test_replaced_report_keeps_its_permission_bits(self):
         os.chmod(self.out, 0o640)

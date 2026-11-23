@@ -432,6 +432,30 @@ class OutputTest(unittest.TestCase):
         finally:
             os.umask(old)
 
+    def test_failed_replace_of_read_only_report_removes_writable_temp(self):
+        out = os.path.join(self.root, "tree.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+        os.chmod(out, 0o444)
+        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".rbf0_tree-") and mode == 0o600:
+                made_writable.append(path)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with patch.object(rbf0_tree.os, "replace", side_effect=OSError("replace denied")), \
+                patch.object(rbf0_tree.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                rbf0_tree.write_json(out, [], {"resources": 0})
+        self.assertEqual(len(made_writable), 1)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual([n for n in os.listdir(self.root) if n.startswith(".rbf0_tree-")], [])
+
     def _run_cli(self, *argv):
         tool = os.path.join(ROOT, "tools", "rbf0_tree.py")
         return subprocess.run([sys.executable, "-I", tool, *argv, "--quiet"], capture_output=True, text=True)

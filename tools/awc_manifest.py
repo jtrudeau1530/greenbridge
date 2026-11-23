@@ -216,6 +216,12 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
         if f is not sys.stdout:
             f.close()
         if tmp:
+            # The staging file may have inherited a read-only destination's mode; make it deletable
+            # first, or Windows strands it beside the manifest when the replace fails.
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             try:
                 os.unlink(tmp)
             except OSError:
