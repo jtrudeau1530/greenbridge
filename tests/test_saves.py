@@ -128,6 +128,45 @@ class JsavTest(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", TOOL, "verify", p], capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
 
+    def test_verify_batch_reports_every_input_and_keeps_the_worst_status(self):
+        data, _, _ = make_jsav()
+        with tempfile.TemporaryDirectory() as tmp:
+            bad, missing, changed, good = (os.path.join(tmp, n) for n in
+                                           ("bad.jsav", "missing.jsav", "changed.jsav", "good.jsav"))
+            write(bad, b"JSAV")
+            write(changed, data + bytes(16))  # excess padding: parses but does not rebuild identically
+            write(good, data)
+            for paths, status in [([bad, missing, changed, good], 2), ([changed, good], 1)]:
+                with self.subTest(paths=paths):
+                    r = subprocess.run([sys.executable, "-I", TOOL, "verify", *paths],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, status, r.stderr)
+                    self.assertIn(f"{changed}: MISMATCH", r.stdout)
+                    self.assertIn(f"{good}: OK", r.stdout)
+                    errors = r.stderr.splitlines()
+                    self.assertEqual(len(errors), len(paths) - 2)
+                    for path, line in zip(paths[:-2], errors):
+                        self.assertIn(path, line)
+
+    def test_block_decoder_recursion_error_does_not_abort_verify_batch(self):
+        data, _, blocks = make_jsav(seed=1)
+        loads = json.loads
+
+        def decode(payload, *args, **kwargs):
+            if payload == blocks[1]:  # fail one block, not the whole-body parse or the next file
+                raise RecursionError("decoder nesting limit")
+            return loads(payload, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad, good = (os.path.join(tmp, n) for n in ("first.jsav", "next.jsav"))
+            write(bad, data)
+            write(good, make_jsav(seed=2)[0])
+            with mock.patch.object(saves.json, "loads", side_effect=decode), \
+                    contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(saves.main(["saves.py", "verify", bad, good]), 2)
+            self.assertIn(f"{good}: OK", out.getvalue())
+            self.assertEqual(err.getvalue().splitlines(), [f"ERROR: JSAV block 1 exceeds the JSON nesting limit ({bad})"])
+
     def test_extract_edit_pack(self):
         d, _, _ = make_jsav()
         with tempfile.TemporaryDirectory() as tmp:
