@@ -35,7 +35,7 @@ Since 2026-11-22 its `REUSE.toml` on `xbox-series` (commit `f1c25d72`) lists **8
 the agreement of everyone who wrote lines in it ([realdody/americas-recomp#179](https://github.com/realdody/americas-recomp/issues/179),
 still open, so the list can change): 35 files at the top of its tools/xbox directory, 30 in tools/xbox/platform (for
 example `xbox_dxil_lower.py`, `d3d12_xs.cpp`, `xmem.cpp`, `xbox_device_proxy.h`), one each under tools/xbox/msvc and
-tools/xbox/platform/xgr, its 20 tools/tests/test_xbox_*.py tests and `docs/xbox/BVH_CONTAINER.md`. Everything else,
+tools/xbox/platform/xgr, its 20 tools/tests/test_xbox_*.py tests and its docs/xbox/BVH_CONTAINER.md. Everything else,
 including the recompiler in its core directory and the `xgameruntime` stand-in sources, stays GPL-2.0-only.
 
 **Rule until the maintainer decides:** **no americas-recomp code is copied into Leonida**, MIT-listed or not. MIT is

@@ -292,8 +292,6 @@ The game does not boot yet, and none of this has been measured against the real 
 blocks the import-driven work:
 
 - The device entry point: `D3D12XboxCreateDevice` exists and wraps the PC or the Vulkan-backed device in the
-  measured-slot proxy, but its parameter and flag layout is unmeasured and so is the Xbox device vtable beyond
-  slots 62, 67 and 76.
   measured-slot proxy, but its parameter and flag layout is unmeasured, and the Xbox device vtable is only partly
   measured: the FSR DLL's calls confirm device slots 14, 15, 16, 18, 19, 27, 38, 62 and 76, slot 67 is a
   console-only pipeline call, and the rest is open (`docs/d3d12_vulkan.md`, question 2).
@@ -302,8 +300,6 @@ blocks the import-driven work:
   `PresentX` and the frame events themselves are implemented (`shims/xbox_present.*`, `xbox_present_test`) but
   nothing reaches them yet: their queue and device slots are unmeasured.
 - Most of the `xgameruntime` surface: an offline shim covers `XGameRuntimeInitialize`, device/console queries,
-  `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` and
-  `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.
   `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`,
   `XPersistentLocalStorageImpl` and `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.
 

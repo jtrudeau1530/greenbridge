@@ -413,10 +413,7 @@ chunks on a 256-byte boundary behind zero padding; the walk stops there (`stoppe
 | cones: axis within 25° / every face inside within 0.05 | 89.5% / 94.2% of 228,244 |
 
 The stored centres match the box centre less often here: 25.7% of axes in the same step, 41.5% within one,
-against 50.1% / 71.8% in the minigame archive. 625 meshlets use the 1/8 m step. Since the radius still covers the
-farthest vertex from the stored centre in 93.2%, the decoding holds; these assets seem to store a centre other
-than the box midpoint (a sphere centre would fit).
-against 50.1% / 71.8% in the minigame archive. Since the radius still covers the farthest vertex from the stored
+against 50.1% / 71.8% in the minigame archive. 625 meshlets use the 1/8 m step. Since the radius still covers the farthest vertex from the stored
 centre in 93.2%, the decoding holds. These assets seem to store a centre other than the box midpoint; a sphere
 centre would fit. The centre and radius counts in this table were taken before the step exponent was read in
 full: they read only w2 bit 28. `story000` also has e = 2 to 4 on about 456 meshlets (@zzEmmazz's count), so those

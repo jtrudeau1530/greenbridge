@@ -25,17 +25,9 @@ The short version:
   contain no numeric encodings apart from the standard VOP3 base-plus-offset convention.
 - SCARAB's family classifier is sound; its VOP1/VOP2/SOP1 **mnemonic tables and length
   model** are not. Leonida's `llvm-mc` path is the better decoder.
-<<<<<<< HEAD
-- **Leonida bug found and fixed:** `xdat_entries` keyed by tag, so a container with two `0x0D`
-  entries silently kept only the last. 195/26,503 containers have two distinct `XBCH` payloads.
-  `xdat_entries_all` now preserves every entry in directory order, `xdat_entries` keeps the
-  last-wins view for old callers, and `unpack(payload="first"|"last")` / `--payload` selects
-  which one is written. The repro tests are in `tests/test_fssm_crosscheck.py`.
-=======
 - **Leonida bug found, since fixed:** `xdat_entries` kept only the last of a container's two
   `0x0D` entries. 195/26,503 containers have two distinct `XBCH` payloads. #2479 added
   `xdat_entries_all` and a `payload=` choice; `tests/test_fssm_crosscheck.py` pins both.
->>>>>>> origin/main
 
 ## 1. Container and unwrap
 
@@ -48,11 +40,7 @@ The short version:
 | The unwrap is a full chain `.dxbc -> DXIL chunk -> XBCH -> zlib -> FSSM`. | `fssm_lib.fssm_from_dxbc()` | `fssm_unpack.unpack()` does the same, but selects the `XBCH` by XDAT tag and checks the decompressed length. SCARAB scans for `XBCH` (the extractor additionally requires version 3) and does not check the length. | **Equivalent in result, different in mechanism** |
 | A bare `FSSM` blob is accepted as input. | `fssm_to_rdna2.unwrap()` | `fssm_unpack.unpack()` accepts only `.dxbc`; the rest of Leonida (`shader_disasm.py`) accepts a bare `.fssm`. | **Minor input-form gap** |
 | `FSSM` magic is asserted after decompression. | `fssm_lib.fssm_from_dxbc()` | `fssm_unpack.unpack()` also rejects a payload that doesn't start with `FSSM` (`ValueError`, counted as a problem, nothing written). All 26,503 are `FSSM`, so there is no corpus failure. | **Verified** |
-<<<<<<< HEAD
-| **Duplicate XDAT tag `0x0D`.** | `fssm_lib` / `fssm_to_rdna2` pick the **first** version-3 `XBCH` | `xdat_entries` is a dict, so the **last** tag-`0x0D` entry wins; `xdat_entries_all` exposes both in directory order and `unpack` selects first or last (`payload=`, `--payload`). 195/26,503 containers (all `$VS_*` VoxelizeGeneric) have **two different** tag-`0x0D` payloads; the two FSSM payloads differ in code size and content. | **Corrected — was a real Leonida bug, now fixed** |
-=======
 | **Duplicate XDAT tag `0x0D`.** | `fssm_lib` / `fssm_to_rdna2` pick the **first** version-3 `XBCH` | `xdat_entries` was a dict, so the **last** tag-`0x0D` entry won. 195/26,503 containers (all `$VS_*` VoxelizeGeneric) have **two different** tag-`0x0D` payloads; the two FSSM payloads differ in code size and content. Since #2479 `xdat_entries_all` returns every entry in directory order and `unpack(payload=…)` picks one; `xdat_entries` keeps the last-wins view for old callers. | **Corrected — real Leonida bug, fixed in #2479** |
->>>>>>> origin/main
 
 ### The duplicate-XBCH exception (the important one)
 
@@ -75,16 +63,6 @@ In the measured pair the first is 3,679 bytes and starts with a GS/ES-like prolo
 instructions. The 24-byte descriptor at `code_off + 0x10` is identical in the measured
 pairs, so they belong to the same container record.
 
-<<<<<<< HEAD
-Leonida writes the second (last) payload as `<name>.fssm` by default; `unpack(payload="first")`
-and the CLI's `--payload first` select the first, matching SCARAB's scan-from-the-start choice.
-The two projects therefore extract **different payloads by default** for these containers. The
-authoritative mapping (which payload the game's pipeline uses) is not established here.
-
-Repro: `tests/test_fssm_crosscheck.py::DuplicateXbchTest` covers the fixed behaviour —
-`xdat_entries_all` returns both payloads in order, `xdat_entries` keeps the old last-wins
-view, and `unpack` selects `first` or `last`.
-=======
 Leonida writes the second payload as `<name>.fssm` by default; `fssm_unpack.py --payload first`
 writes the first instead, which is the one SCARAB takes when it scans from the start. The
 default is unchanged, so the two projects still extract **different payloads** for these
@@ -95,7 +73,6 @@ Covered by `tests/test_fssm_crosscheck.py::DuplicateXbchTest`:
 `test_xdat_entries_all_preserves_both_payloads_in_order` pins the directory order,
 `test_xdat_entries_keeps_the_last_payload_per_tag` the compatibility view, and
 `test_unpack_selects_first_or_last_payload` the `payload=` choice.
->>>>>>> origin/main
 
 ## 2. FSSM header and code range
 
@@ -198,16 +175,10 @@ Adopt:
 
 1. **Keep `+0x28`.** Leonida already does. The regression test in
    `tests/test_fssm_crosscheck.py` pins it, including the `code_end = DEAD` case.
-<<<<<<< HEAD
-2. **Preserve duplicate XBCH payloads.** Done: `xdat_entries_all` keeps every entry in
-   directory order, `xdat_entries` keeps the last-wins view for old callers, and
-   `unpack(payload="first"|"last")` / `--payload` selects which payload is written.
-=======
 2. **Preserve duplicate XBCH payloads.** This is the one real Leonida bug found, and #2479
    did it: `xdat_entries_all` keeps every entry for a tag in directory order,
    `unpack(payload="first"|"last")` and the CLI's `--payload` choose between them, and
    `xdat_entries` keeps the last-wins view for old callers.
->>>>>>> origin/main
 3. **Treat `0xDEADBEEFDEADBEEF` as an unset `code_end`** (and `meta_ptr`). If a future tool
    reads `0xE8`, it must fall back to `code_off + code_size` or the last `s_endpgm`.
    Leonida's last-`s_endpgm` rule already does this implicitly; document it.

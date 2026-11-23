@@ -280,8 +280,7 @@ What is implemented (all of it testable without the game):
   store `NONE` or `STORE`): MoltenVK writes all 48 destination texels, KosmicKrisp only the 20 inside. No device
   property reports it, so nothing is gated. The format is the depth
   format or the plane's own (`R32_FLOAT`, `R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`, and for D32S8
-  `R32_FLOAT_X8X24_TYPELESS` and `X32_TYPELESS_G8X24_UINT`; all compared with the PC runtime, TEST-847).
-  property reports it, so nothing is gated. A depth-only source above array layer 0 is resolved in a
+  `R32_FLOAT_X8X24_TYPELESS` and `X32_TYPELESS_G8X24_UINT`; all compared with the PC runtime, TEST-847). A depth-only source above array layer 0 is resolved in a
   `VkRenderPass` with a framebuffer of the same two views instead of the rendering scope, on every GPU (D3D-417, a
   driver workaround): AMD's Windows driver (32.0.21042.62, Ryzen 7 9700X iGPU) resolves a dynamic-rendering depth
   attachment from layer 0 of the image when the multisampled view starts at another layer, while it honours the
@@ -379,11 +378,9 @@ What is implemented (all of it testable without the game):
   - descriptor heaps whose slots are 32 bytes (`GetDescriptorHandleIncrementSize`; the console's increments are
     question 4). RTV/DSV slots hold a `TargetView`; shader-visible heaps return a GPU handle, but nothing reads it
     yet;
-  - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D`, `TEXTURE2DMS`,
-    `TEXTURE2DARRAY` and `TEXTURE2DMSARRAY` (a slice range; `ArraySize` -1 is every slice from the first on, as
-    on the host, `d3d12_view_slices_test`; 1D and 1D-array DSVs wait for 1D textures, D3D-63);
-  - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE1D`, `TEXTURE1DARRAY`,
-    `TEXTURE2D`, `TEXTURE2DMS`, `TEXTURE2DARRAY` and `TEXTURE2DMSARRAY` (a slice range);
+  - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE1D`, `TEXTURE1DARRAY` (D3D-63),
+    `TEXTURE2D`, `TEXTURE2DMS`, `TEXTURE2DARRAY` and `TEXTURE2DMSARRAY` (a slice range; `ArraySize` -1 is every
+    slice from the first on, as on the host, `d3d12_view_slices_test`);
   - `CopyDescriptors` / `CopyDescriptorsSimple`. A descriptor is the bytes of its slot, so a copy is a byte copy:
     the destination and source range lists are walked together, one descriptor at a time, and null size arrays
     mean one descriptor per range;
@@ -774,13 +771,10 @@ The compute path, end to end:
     so descriptor bytes the application writes itself are what shaders load.
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
   - Shader programs (FSSM blobs) are copied in as the code base.
-- **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place from `pack()`; a
-  signature `pack()` refuses (more than 32 user dwords: the spill layout is open; the translated shaders have no
-  below-base spill-pointer candidates, section 3.5) is refused with its reason. Before
 - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts:
   `pack()` for the graphics bind point and `pack_stage(Stage::Compute)` for the compute one (from s4, one dword per
-  table; section 3.5, D3D-448). A signature neither can place (the spill layout is open) is refused with both
-  reasons; one only a single layout places is created with a log line, and binding it at the other bind point
+  table; section 3.5, D3D-448). A signature neither can place (more than 32 user dwords: the spill layout is open; the
+  translated shaders have no below-base spill-pointer candidates) is refused with both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
   invalidates the list. Before
   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
   `S_FALSE` for a null output whatever the blob, then `E_INVALIDARG` for a node other than node 0 or a DXBC
@@ -3455,14 +3449,11 @@ struct entry {               // 10 uints = 40 bytes
 | Entries (cap / load / bytes / mean probes) | Placement | `uniform_tsharp_hit` (us/1M, Glk/s) | `uniform_pair_ts` (us/1M, Glk/s) | `divergent_tsharp_hit` (us/1M, Glk/s) | `divergent_pair_ts` (us/1M, Glk/s) | `divergent_miss` (us/1M, Glk/s) |
 |---|---|---|---|---|---|---|
 | 1k (4,096 / 24.4% / 160 KiB / 1.316; 900 T#, 1k pair, 1,024 miss) | `device_local` | 3.322 (301.06) | 2.917 (342.84) | 24.008 (41.65) | 23.759 (42.09) | 96.175 (10.40) |
-| 1k | `host_visible` | 4.890 (204.48) | 3.583 (279.10) | 27.582 (36.26) | 26.426 (37.84) | 395.433 (2.53) |
-| 1k | `host_device_local` | 3.317 (301.49) | 2.918 (342.73) | 23.973 (41.71) | 23.732 (42.14) | 96.148 (10.40) |
+| 1k | `host_device_local` `host_visible` | 3.317 (301.49) 4.890 (204.48) | 2.918 (342.73) 3.583 (279.10) | 23.973 (41.71) 27.582 (36.26) | 23.732 (42.14) 26.426 (37.84) | 96.148 (10.40) 395.433 (2.53) |
 | 10k (65,536 / 15.3% / 2.50 MiB / 1.310; 9k T#, 10k pair, 16,384 miss) | `device_local` | 12.842 (77.87) | 5.142 (194.49) | 38.202 (26.18) | 39.618 (25.24) | 206.654 (4.84) |
-| 10k | `host_visible` | 211.889 (4.72) | 16.257 (61.51) | 10261.465 (0.10) | 3334.286 (0.30) | 181717.455 (0.01) |
-| 10k | `host_device_local` | 12.838 (77.89) | 5.166 (193.59) | 38.223 (26.16) | 39.468 (25.34) | 209.528 (4.77) |
+| 10k | `host_device_local` `host_visible` | 12.838 (77.89) 211.889 (4.72) | 5.166 (193.59) 16.257 (61.51) | 38.223 (26.16) 10261.465 (0.10) | 39.468 (25.34) 3334.286 (0.30) | 209.528 (4.77) 181717.455 (0.01) |
 | 100k (524,288 / 19.1% / 20.00 MiB / 1.416; 90k T#, 100k pair, 131,072 miss) | `device_local` | 6.007 (166.47) | 7.159 (139.69) | 71.939 (13.90) | 47.306 (21.14) | 483.346 (2.07) |
-| 100k | `host_visible` | 213.404 (4.69) | 183.383 (5.45) | 15149.069 (0.07) | 16289.665 (0.06) | 205561.481 (0.00) |
-| 100k | `host_device_local` | 6.025 (165.97) | 7.161 (139.64) | 71.895 (13.91) | 47.277 (21.15) | 482.358 (2.07) |
+| 100k | `host_device_local` `host_visible` | 6.025 (165.97) 213.404 (4.69) | 7.161 (139.64) 183.383 (5.45) | 71.895 (13.91) 15149.069 (0.07) | 47.277 (21.15) 16289.665 (0.06) | 482.358 (2.07) 205561.481 (0.00) |
 
 Three consequences for the runtime and table layout (additional GPU measurements follow, including AMD RDNA3):
 
@@ -3477,14 +3468,11 @@ Raw CSV rows (297, 9 processes): [D3D-56 RTX 5080 report](https://github.com/Its
 | Entries (cap / load / bytes / mean probes) | Placement | `uniform_tsharp_hit` (us/1M, Glk/s) | `uniform_pair_ts` (us/1M, Glk/s) | `divergent_tsharp_hit` (us/1M, Glk/s) | `divergent_pair_ts` (us/1M, Glk/s) | `divergent_miss` (us/1M, Glk/s) |
 |---|---|---|---|---|---|---|
 | 1k (4,096 / 24.4% / 160 KiB / 1.316) | `device_local` | 6.220 (160.76) | 5.705 (175.27) | 15.285 (65.42) | 14.051 (71.17) | 50.461 (19.82) |
-| 1k | `host_visible` | 9.508 (105.17) | 5.783 (172.93) | 15.869 (63.02) | 13.465 (74.27) | 51.978 (19.24) |
-| 1k | `host_device_local` | 8.783 (113.85) | 5.360 (186.58) | 15.380 (65.02) | 13.974 (71.56) | 49.765 (20.09) |
+| 1k | `host_device_local` `host_visible` | 8.783 (113.85) 9.508 (105.17) | 5.360 (186.58) 5.783 (172.93) | 15.380 (65.02) 15.869 (63.02) | 13.974 (71.56) 13.465 (74.27) | 49.765 (20.09) 51.978 (19.24) |
 | 10k (65,536 / 15.3% / 2.50 MiB / 1.310) | `device_local` | 5.152 (194.09) | 4.880 (204.90) | 27.998 (35.72) | 20.506 (48.77) | 146.217 (6.84) |
-| 10k | `host_visible` | 7.536 (132.69) | 6.236 (160.36) | 72.932 (13.71) | 54.183 (18.46) | 334.096 (2.99) |
-| 10k | `host_device_local` | 5.066 (197.38) | 4.841 (206.57) | 28.322 (35.31) | 20.641 (48.45) | 144.532 (6.92) |
+| 10k | `host_device_local` `host_visible` | 5.066 (197.38) 7.536 (132.69) | 4.841 (206.57) 6.236 (160.36) | 28.322 (35.31) 72.932 (13.71) | 20.641 (48.45) 54.183 (18.46) | 144.532 (6.92) 334.096 (2.99) |
 | 100k (524,288 / 19.1% / 20.00 MiB / 1.416) | `device_local` | 7.618 (131.28) | 6.005 (166.54) | 53.558 (18.67) | 54.927 (18.21) | 290.279 (3.45) |
-| 100k | `host_visible` | 47.905 (20.87) | 29.887 (33.46) | 3492.770 (0.29) | 2240.356 (0.45) | 32108.853 (0.03) |
-| 100k | `host_device_local` | 7.660 (130.54) | 6.040 (165.55) | 53.983 (18.52) | 54.804 (18.25) | 292.561 (3.42) |
+| 100k | `host_device_local` `host_visible` | 7.660 (130.54) 47.905 (20.87) | 6.040 (165.55) 29.887 (33.46) | 53.983 (18.52) 3492.770 (0.29) | 54.804 (18.25) 2240.356 (0.45) | 292.561 (3.42) 32108.853 (0.03) |
 
 On this GPU:
 
@@ -3660,9 +3648,7 @@ folded into the table below with the measurement basis noted per row; nothing is
 | Xbox root-signature descriptors carry flags `0x03000000`. The PC serializer rejects them with `E_INVALIDARG`; the proxy clears the high byte on a copy. The v1.0 `D3D12SerializeRootSignature` path keeps flags at +32, and `0x3000001` also fails on the PC runtime. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Narrows the root-signature reflection risk. Mask the high byte on a private copy; the meaning of the bits remains **Open**. See section 3.5. |
 | The BVH builder's constructor creates 53 compute pipelines through device slot 62, called with a compute-PSO shape (a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`, two zero words, iid, out). On the PC interface the prior art forwards to, slot 62 is `CreateStateObject` (wrong arity), so the proxy overrides it. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Corrects the assumption that the whole device vtable is public order. Slot 62 must be compute-PSO creation for the builder, not a state object. Slots 1/15/18/19/27/38 did match the desktop order. |
 | A reusable `xbox_device_proxy.h` forwards every slot to a PC object, counts hits per slot and logs first calls with `XS_TRACE=1`; the observed device slots include 1, 14, 15, 16, 18, 19, 27, 38, 62 and 76. Their `xgr` stand-in covers 48 of 398 methods; Xodus (LGPL-2.1) covers 152 of 396 via IDL-generated stubs. | *Run* — [platform README](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md), [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Confirms the trace-first approach and shows the long tail. We adopt the *method* (per-slot counters, first-call logging), not the code. |
-| The BVH builder's 53 compute shaders are Xbox DXIL with `@xbox.*` intrinsics; 44 of 53 fail the PC D3D12 shader compiler, 22 have been lowered to standard DXIL and accepted as pipelines, and 31 use raw 64-bit GPU addresses. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | A separate translation path from the FSSM RDNA2 corpus when measured on the **bitcode**. Measured later on the console `XBCH` record of the same containers: 52 programs, 42 pass `spirv-val` through the FSSM translator ([embedded_shaders.md](embedded_shaders.md)). |
-| The BVH builder's 53 compute shaders are Xbox DXIL with `@xbox.*` intrinsics; 44 of 53 fail the PC D3D12 shader compiler, 22 have been lowered to standard DXIL and accepted as pipelines, and 31 use raw 64-bit GPU addresses. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | A separate translation path from the FSSM RDNA2 corpus when measured on the **bitcode**. Measured later on the console `XBCH` record of the same containers: 52 programs, 51 pass `spirv-val` through the FSSM translator ([embedded_shaders.md](embedded_shaders.md)). |
-| The BVH builder's 53 compute shaders are Xbox DXIL with `@xbox.*` intrinsics; 44 of 53 fail the PC D3D12 shader compiler, 22 have been lowered to standard DXIL and accepted as pipelines, and 31 use raw 64-bit GPU addresses. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | A separate translation path from the FSSM RDNA2 corpus. See section 4.8 and the paragraph below. |
+| The BVH builder's 53 compute shaders are Xbox DXIL with `@xbox.*` intrinsics; 44 of 53 fail the PC D3D12 shader compiler, 22 have been lowered to standard DXIL and accepted as pipelines, and 31 use raw 64-bit GPU addresses. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | A separate translation path from the FSSM RDNA2 corpus when measured on the **bitcode**. See section 4.8 and the paragraph below. Measured later on the console `XBCH` record of the same containers: 52 programs, 51 pass `spirv-val` through the FSSM translator ([embedded_shaders.md](embedded_shaders.md)). 52 programs, 42 pass `spirv-val` through the FSSM translator ([embedded_shaders.md](embedded_shaders.md)). |
 | On the console's own shader compiler, compute user parameters go into user SGPRs `s4`… in root-signature order while each fits whole (root constant = 1 dword, root descriptor = 2, descriptor table = 1 dword holding the 32-bit address of its first descriptor); `s0`..`s3` are the driver's. From the first parameter that does not fit, it and all after it go into a packed array addressed by a 40-bit pointer in `s[0:1]` (constant 4 B, descriptor 8 B, no alignment). Thread-group ids follow the user SGPRs. | *Console-compiler output, sibling layer* | Narrows question 3 for the compute stage: the inline-from-`s4` model matches this repo's census (lowest CS pointer SGPR `s4`), and the spill target is named (the array at `s[0:1]`), not guessed. VS/PS/MS bases were not measured there; verify against the game's own signatures. |
 | The command list's inline records: a `Dispatch` is `0x4002C400` followed by x, y, z (16 B); a 20-byte record `0x4003CC00` stands in for console slot 80; the pipeline record is a 28-byte copy of the PSO object's +0x10..+0x2B; a root parameter starts from the header word at list +0x344+4·i (the high half carries n−1 for a multi-constant write), then a descriptor is 12 B, one constant 8 B and n constants 4+4n B. | *Console-DLL run, sibling layer* | Supplies the record opcode for the "five-dword packet" this repo inferred at slot 80 and the header encoding for parameter groups; consistent with our own measurements of +0x18/+0x28/+0x30/+0x140/+0x344/+0x544. |
 | Mesh (NGG) inputs measured across the corpus: `s3[27:24]` = wave index in the group, `v5` = group·128 + thread, `s16`–`s24` = user data. | *Corpus measurement, sibling layer* | Confirms the `s16` mesh base of §3.5's census and the `v5` group numbering already used for the mesh stage. |
@@ -3782,8 +3768,7 @@ nothing is copied from their trees.
 | 17 | Do upload/readback resources ever reach shaders (as vertex/index buffers or descriptors), and does the `-heap_base` bias work for them? | Trace `CreateCommittedResource` heap types and every VB/IB/descriptor that points at an upload resource; test the bias with a synthetic draw. |
 | 18 | Does the game alias buffers/images in a heap, or use reserved/tiled resources? | Trace `CreatePlacedResource` ranges, aliasing barriers, `CreateReservedResource` and tile mappings. If yes, implement shared memory per heap range or fall back to linear allocations with a clear log. Shaders: 30 declare `TILED_RESOURCES` in SFI0 (`tools/feature_scan.py`), so reserved/tiled resources are likely used. Placed resources are D3D-16 and reserved resources D3D-20 (#313). |
 | 19 | What do the `0x03000000` root-signature flag bits mean? | Masking them on a copy works around the PC serializer; the semantics remain unknown. **Origin measured** (section "Root-signature flag quirk"): in the package only `XboxBvhBuilder.dll` sets them, in its 52 compiled `RTS0` parts and unconditionally at `0xc30e` before serialising; the FSR DLL's 29 `RTS0` parts carry 0. Compare against the public flag enum and observe the game's behaviour with and without the mask; check whether the executable's root signatures carry them. |
-| 20 | Which of the BVH builder's 52 `FSSM` programs does the game actually use, and do the translated programs match a reference? | Dump the slot-62 compute PSOs on the first RT frame and map each to its container by the `ILDN` name; 42/52 pass `spirv-val` today and the four missing rules are named in [embedded_shaders.md](embedded_shaders.md); compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
-| 20 | Which of the BVH builder's 52 `FSSM` programs does the game actually use, and do the translated programs match a reference? | Dump the slot-62 compute PSOs on the first RT frame and map each to its container by the `ILDN` name; 51/52 pass `spirv-val` today and the one missing rule is named in [embedded_shaders.md](embedded_shaders.md); compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
+| 20 | Which of the BVH builder's 52 `FSSM` programs does the game actually use, and do the translated programs match a reference? | Dump the slot-62 compute PSOs on the first RT frame and map each to its container by the `ILDN` name; 51/52 pass `spirv-val` today and the one missing rule is named in [embedded_shaders.md](embedded_shaders.md); compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. 42/52 pass `spirv-val` today and the four missing rules are named in [embedded_shaders.md](embedded_shaders.md); compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
 | 21 | Which `Metadata` values and blob format does the console's PIX use for `SetMarker`/`BeginEvent`? The layer reads 0 and 1 as strings and labels 2 (the PC PIX3 blob) `PIX event` (section 4.10). | Log the `Metadata` values the game passes; if it is 2, decode the console blob from the executable's PIX calls rather than assuming the PC WinPixEventRuntime layout. |
 | 22 | Does the game ask `CheckFeatureSupport(D3D12_OPTIONS5)` for `RaytracingTier` and switch ray tracing off when it reads `NOT_SUPPORTED`? The layer answers `NOT_SUPPORTED` because full DXR (`CreateStateObject`, `DispatchRays`) is not implemented, even though the XDXR acceleration-structure path the game's own traversal shaders use is ([bvh.md](bvh.md) §7a). On the console, ray tracing is always present, so the game may never ask. | The first-boot trace (`--trace-d3d12`) logs every `CheckFeatureSupport` call and its answer. If the game asks and gates its RT on the tier, decide with the maintainer whether to report `TIER_1_0`/`1_1` for this game while `DispatchRays` stays unimplemented; until then, keep the conservative answer. |
 

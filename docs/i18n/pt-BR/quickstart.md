@@ -3,7 +3,6 @@
 > [!NOTE]
 > A documentação em inglês ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
 > [`docs/README.md`](../../README.md)) é a **referência oficial**. Este guia reúne apenas instruções estáveis de
-> configuração e compilação (sincronizado com o commit `16282101`). Para o status diário do projeto, consulte o
 > configuração e compilação (sincronizado com o commit `f847748c`). Para o status diário do projeto, consulte o
 > [`README.md`](../../../README.md).
 
@@ -54,9 +53,6 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 **Pouco espaço em disco:** o valor de ~400 GB refere-se ao build completo. Para *executar* o port,
 `--stages check,shaders,runtime` precisa de cerca de **30 GB**; o estágio `assets` (~370 GB) serve apenas para as
 ferramentas de extração de assets, e `--wav` adiciona várias vezes o tamanho dos arquivos Ogg Opus. `--work` e `--out`
-podem apontar para outro disco; se o pacote do jogo estiver em uma unidade somente leitura, use `--overlay` em um disco
-gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm`: apagá-los mantendo a pasta faz o estágio parecer
-concluído com zero shaders, e um link simbólico em `disasm` é recusado.
 podem apontar para outro disco; se o pacote do jogo estiver em uma unidade somente leitura, use `--overlay` (no
 `gta6rt`) em um disco gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm`: apagá-los mantendo a pasta faz
 o estágio parecer concluído com zero shaders, e um link simbólico em `disasm` é recusado.

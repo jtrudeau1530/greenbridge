@@ -25,10 +25,6 @@ Projekt jest na wczesnym etapie: **gra jeszcze się nie uruchamia**.
 
 ## Wymagania
 
-- **Twoja własna kopia** paczki Xbox Series w wersji `1.0.2.1` (folder z plikiem `MicrosoftGame.Config` i archiwami
-  `.rpf` czytelnymi na dysku jako zwykłe pliki).
-- **Windows 10/11 x64** z około **350 GB wolnego miejsca** na pliki robocze (mogą trafić na inny dysk dzięki
-  `--work`).
 - **Twoja własna kopia** paczki Xbox Series w wersji `1.0.2.1` (folder z plikiem `MicrosoftGame.Config` i archiwami `.rpf` czytelnymi na dysku jako zwykłe pliki).
 - **Windows 10/11 x64** z około **400 GB wolnego miejsca** na pliki robocze (mogą trafić na inny dysk dzięki `--work`).
 - [Python 3.12+](https://www.python.org/downloads/) (zaznacz *„Add python.exe to PATH”*).

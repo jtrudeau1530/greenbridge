@@ -1,4 +1,4 @@
-﻿"""Decode the MoVE (version 19) state-machine and motion-tree containers in anim.rpf (ASSET-86).
+"""Decode the MoVE (version 19) state-machine and motion-tree containers in anim.rpf (ASSET-86).
 
     python -I tools/anim_move.py <package>\\anim.rpf <work>\\anim-move.json
 

@@ -416,17 +416,14 @@ counts.
 3. **`0DRP` unnamed structs and fields.** Several `0x7a` struct/member hashes (including `0x4712787b`, `0x57ad0b12`,
    `0xdd53676a`, `0xf2dd6348`, `0xde5f1345`, and 3 of the 4 singletons) are not yet matched to engine names.
 4. **Per-record bitfields inside `0x00010015` tiles.** `u32@0x10` bit 3's secondary trigger on `289` tiles and bit 6's
-   name, `u32@0xE8` build-stamp encoding, polygon/adjacent-edge/special-link flag bitfields, and the exact C++ class name
-   and `+0x56/+0x58` vertical unit of the paired 96-byte `+0xB8` footprint records remain open.
+   name, `u32@0xE8` build-stamp encoding, the polygon flag bits (`+0x18` bits 8 and 13 lie under nine in ten lane
+   nodes; which of them is road surface is open; see above), the adjacent-edge and special-link flag bitfields, and
+   the exact C++ class name and `+0x56/+0x58` vertical unit of the paired 96-byte `+0xB8` footprint records remain
+   open.
 5. **Band-3 `grid` subsystem and EOF `PSIN` v79.** The Band-3 subsystem identity, the x/y order of the octree key's
    octant bits 0/1, the cube's placement against its sector and the meaning of the `u32[N]` leaf fields are open
    (the key encoding and the inner-node word are decoded above), as is why the final `PSIN` (version `79`)
    terminates before `LSNS` ends.
-   name, `u32@0xE8` build-stamp encoding, the polygon flag bits (`+0x18` bits 8 and 13 lie under nine in ten lane
-   nodes; which of them is road surface is open; see above), the adjacent-edge and special-link flag bitfields, and the C++ type of the
-   96-byte `+0xB8` records remain open.
-5. **Band-3 `grid` subsystem and EOF `PSIN` v79.** The Band-3 subsystem identity, `u64` key encoding and `u32[N]`
-   payload bits are open, as is why the final `PSIN` (version `79`) terminates before `LSNS` ends.
 
 ## Vehicle navmesh settings (`CVehiclePoints`, `common.rpf`)
 

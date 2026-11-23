@@ -1880,6 +1880,7 @@ driver returns two blobs) and the tool exits 77.
 stored. Measured on gfx1036 with the `const` template (EGEN-TOOL-PS-ORACLE-FORMATS):
 
 | Target | `col_0_export_format` | What reaches the target |
+|---|---|---|
 | RGBA32F, RGBA32_UINT | 9 (32_ABGR) | the four exported dwords as they are; a channel exported as `off` is 0 |
 | RG32F | 2 (32_GR) | R = the last enabled of x, z; G = the last enabled of y, w (all four enabled: z, w) |
 | R32F | 1 (32_R) | the last enabled channel (all four enabled: w) |

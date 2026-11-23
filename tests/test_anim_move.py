@@ -1,4 +1,4 @@
-﻿"""Synthetic tests for tools/anim_move.py (ASSET-86).
+"""Synthetic tests for tools/anim_move.py (ASSET-86).
 
     python -I -m unittest tests/test_anim_move.py -v
 

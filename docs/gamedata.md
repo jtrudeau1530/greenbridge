@@ -1026,9 +1026,6 @@ and 4 (twice); `interpolation_type` is `EASE_LINEAR_IN` on 9 samples and `EASE_Q
 region names. So unlike GTA V, where the 13 sample times are compiled in, this build reads them (and the easing
 between them) from `time_data`; their count matches the 13 values of every keyframe variable.
 
-Not measured here (hypothesis): how the two regions are chosen at runtime, what the two plain-modifier
-numbers mean and how the runtime blends them (see "The two plain-modifier numbers" above), and how
-`controlValue` maps onto game state.
 Not measured here (hypothesis): how the two regions are chosen at runtime, the exact runtime rule distinguishing
 `b == 0` from `b == 1` on the 343 plain-modifier variables where both occur (see *Plain-modifier number pairs*
 above), and how `controlValue` maps onto game state.
@@ -1327,8 +1324,6 @@ Four representative roots in the world/navigation/map category (826,397 B across
   `o` in `Loopkup`.) Contains four keyed lookup tables (`key=`):
   - `LocationNames/Item` × 2,318 (`Name` on all 2,318; `TextureDictionary` and `Texture` on 46).
   - `InteriorNames/Item` × 1,358, holding `2,280` nested `<Item>` records with `{Name, Pos}`. Their 2,280 3D positions
-    span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — 100% inside the world bounds of the
-    `PAMH` heightmap and `GridAtlasInfo` grids above.
     span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — their 2D `x`/`y` coordinates fall 100%
     inside the `x`/`y` extent of the `PAMH` heightmap (`-13,312..5,120`, `-9,728..11,264`) and `GridAtlasInfo` grids
     above, while `z` reaches `820.9` (above the `PAMH` `404` m ceiling).
