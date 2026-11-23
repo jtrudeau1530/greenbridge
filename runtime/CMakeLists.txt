@@ -996,7 +996,7 @@ if(TARGET Vulkan::Headers)
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
     # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).
-    foreach(test vk_command_replay vk_predicated_copy vk_predicate_capture)
+    foreach(test vk_command_replay vk_predicated_copy vk_predicate_capture vk_queue)
       add_test(NAME ${test} COMMAND ${test}_test)
       set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
