@@ -554,14 +554,16 @@ int main() {
             std::ofstream spv(dir / "fspx" / (name + ".spv"), std::ios::binary);
             spv.write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * 4));
         };
-        const auto index = [&](const std::vector<std::pair<std::string, const std::vector<std::uint8_t>*>>& entries) {
+        const auto index = [&](const std::vector<std::pair<std::string, const std::vector<std::uint8_t>*>>& entries,
+                               bool different_layout = false) {
             std::ofstream main(dir / "index.json", std::ios::binary | std::ios::trunc);
             main << "{}";
             std::ofstream sub(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
             sub << "{";
             for (std::size_t i = 0; i < entries.size(); ++i)
                 sub << (i ? ",\n" : "") << "\"" << entries[i].first << "\": {\"stage\": \"cs\", \"fspx_code_sha256\": \""
-                    << sha256_hex(code) << "\", \"fspx_state_sha256\": \"" << sha256_hex(*entries[i].second) << "\"}";
+                    << sha256_hex(code) << "\", \"fspx_state_sha256\": \"" << sha256_hex(*entries[i].second) << "\""
+                    << (i == 1 && different_layout ? ", \"push_constant_bytes\": 16" : "") << "}";
             sub << "}";
         };
         std::filesystem::create_directories(dir / "fspx");
@@ -596,6 +598,12 @@ int main() {
         // The same two keys with one module (a duplicate container) is not ambiguous for the bare program.
         write("pair_64", module(1));
         CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).size() == 2 && !ambiguous);
+        // Equal words with conflicting layout metadata are ambiguous until kind 0 selects one entry.
+        index({{"pair_32", &state32}, {"pair_64", &state64}}, true);
+        CHECK(pair.load(dir.string(), &error));
+        CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).empty() && ambiguous);
+        const auto by_layout = pair.program_candidates("cs", compute_program(wrapped(state64)), &ambiguous);
+        CHECK(by_layout.size() == 1 && by_layout[0]->push_constant_bytes == 16 && !ambiguous);
         // One translation for the code key: the bare program takes it.
         index({{"pair_32", &state32}});
         CHECK(pair.load(dir.string(), &error) && pair.size() == 1);
