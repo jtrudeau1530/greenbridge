@@ -14077,6 +14077,19 @@ def assemble(gen):
             gen.cu(ms_clip_member)
         if ms_cull_member is not None:
             gen.cu(ms_cull_member)
+    # The buffer-format tables below (uses_fmt_size, uses_store_views/uses_int_fetch) build their
+    # array types from gen.cu ids. Register those constants here, before the dump: a cu() call
+    # after it returns an id that is never defined, and spirv-as then rejects the module.
+    if gen.uses_fmt_size:
+        gen.cu(128)
+        for c in range(128):
+            if c in Gen.FORMATS:
+                gen.cu(Gen.FORMATS[c][0])
+    if gen.uses_store_views or gen.uses_int_fetch:
+        gen.cu(16)
+        for words in Gen.int_format_masks():
+            for w in words:
+                gen.cu(w)
     gen.consts.setdefault(0, "%c0")
     for v, name in sorted(gen.consts.items()):
         types.append(f"{name} = OpConstant %uint {v}")
