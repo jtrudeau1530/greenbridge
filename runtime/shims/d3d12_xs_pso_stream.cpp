@@ -1,7 +1,11 @@
 #include "d3d12_xs_pso_stream.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <type_traits>
+#include <unordered_map>
 
 namespace rt::d3d12_xs {
 namespace {
@@ -90,11 +94,130 @@ bool walk(const unsigned char* stream, std::size_t size, std::vector<Subobject>&
     return off == size;
 }
 
-// Copies `count` bytes into a new owned blob and returns its address (stable: the blob's buffer does not move).
-const unsigned char* own_blob(std::vector<std::vector<unsigned char>>& blobs, const void* bytes, std::size_t count) {
+// 64-bit FNV-1a over raw blob bytes, computed outside the interner lock.
+std::uint64_t hash_bytes(const unsigned char* bytes, std::size_t count) {
+    std::uint64_t h = 14695981039346656037ull;
+    for (std::size_t i = 0; i < count; ++i) {
+        h ^= bytes[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+using Blob = std::vector<unsigned char>;
+using SharedBlob = std::shared_ptr<const Blob>;
+
+// Shares immutable blobs across live records.
+class BlobInterner {
+public:
+    static BlobInterner& instance() {
+        static auto* singleton = new BlobInterner();  // immortal: blobs can be freed during static destruction
+        return *singleton;
+    }
+
+    SharedBlob intern(const unsigned char* src, std::size_t count) {
+        const std::uint64_t hash = hash_bytes(src, count);
+        SharedBlob created;
+        // Pin checked candidates across retries so only newly published entries need comparison.
+        std::vector<SharedBlob> candidates;
+        for (;;) {
+            const std::size_t checked = candidates.size();
+            {
+                std::lock_guard lock(mutex_);
+                collect_candidates_locked(hash, count, candidates);
+                if (created && candidates.size() == checked) {
+                    entries_.emplace(hash, Entry{created.get(), created});
+                    return created;
+                }
+            }
+
+            for (std::size_t i = checked; i < candidates.size(); ++i) {
+                const SharedBlob& candidate = candidates[i];
+                if (count == 0 || std::memcmp(candidate->data(), src, count) == 0) return candidate;
+            }
+
+            if (!created) {
+                created = SharedBlob(new Blob(src, src + count), [hash](const Blob* blob) {
+                    instance().forget(hash, blob);
+                    delete blob;
+                });
+            }
+        }
+    }
+
+    std::size_t size() {
+        std::lock_guard lock(mutex_);
+        return entries_.size();
+    }
+
+private:
+    struct Entry {
+        const Blob* blob;
+        std::weak_ptr<const Blob> owner;
+    };
+
+    void collect_candidates_locked(std::uint64_t hash, std::size_t count, std::vector<SharedBlob>& candidates) {
+        auto [it, end] = entries_.equal_range(hash);
+        for (; it != end; ++it) {
+            const Entry& entry = it->second;
+            // The deleter removes the entry before freeing the blob.
+            if (entry.blob->size() != count) continue;
+            if (std::any_of(candidates.begin(), candidates.end(),
+                            [&entry](const SharedBlob& candidate) { return candidate.get() == entry.blob; }))
+                continue;
+            // Grow before promotion so allocation failure cannot release a blob under the lock.
+            candidates.emplace_back();
+            candidates.back() = entry.owner.lock();
+            if (!candidates.back()) candidates.pop_back();
+        }
+    }
+
+    void forget(std::uint64_t hash, const Blob* blob) {
+        std::lock_guard lock(mutex_);
+        auto [it, end] = entries_.equal_range(hash);
+        for (; it != end; ++it) {
+            if (it->second.blob == blob) {
+                entries_.erase(it);
+                return;
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::unordered_multimap<std::uint64_t, Entry> entries_;
+};
+
+// Interns `count` bytes into an immutable shared blob and returns its stable address.
+const unsigned char* own_blob(std::vector<SharedBlob>& blobs, const void* bytes, std::size_t count) {
     const auto* src = static_cast<const unsigned char*>(bytes);
-    blobs.emplace_back(src, src + count);
-    return blobs.back().data();
+    blobs.push_back(BlobInterner::instance().intern(src, count));
+    return blobs.back()->data();
+}
+
+// Interns semantic names before interning the array that points to them.
+template <class T>
+const T* own_named_array(std::vector<SharedBlob>& blobs, const T* src, std::size_t count) {
+    std::vector<T> items(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        T& item = items[i];
+        const T& source = src[i];
+        if constexpr (std::is_same_v<T, D3D12_SO_DECLARATION_ENTRY>) {
+            // The interner hashes every byte, including the stream-output entry's padding.
+            std::memset(&item, 0, sizeof(item));
+            item.Stream = source.Stream;
+            item.SemanticName = source.SemanticName;
+            item.SemanticIndex = source.SemanticIndex;
+            item.StartComponent = source.StartComponent;
+            item.ComponentCount = source.ComponentCount;
+            item.OutputSlot = source.OutputSlot;
+        } else {
+            item = source;
+        }
+        if (!item.SemanticName) continue;
+        const std::size_t len = std::strlen(item.SemanticName) + 1;
+        item.SemanticName = reinterpret_cast<const char*>(own_blob(blobs, item.SemanticName, len));
+    }
+    return reinterpret_cast<const T*>(own_blob(blobs, items.data(), items.size() * sizeof(T)));
 }
 
 // Holds a PsoStreamRecord as an IUnknown: the object keeps one reference, the creation code drops its own.
@@ -231,8 +354,7 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             D3D12_STREAM_OUTPUT_DESC so{};
             std::memcpy(&so, payload, sizeof(so));
             if (so.pSODeclaration && so.NumEntries)
-                so.pSODeclaration = reinterpret_cast<const D3D12_SO_DECLARATION_ENTRY*>(
-                    own_blob(blobs_, so.pSODeclaration, so.NumEntries * sizeof(D3D12_SO_DECLARATION_ENTRY)));
+                so.pSODeclaration = own_named_array(blobs_, so.pSODeclaration, so.NumEntries);
             if (so.pBufferStrides && so.NumStrides)
                 so.pBufferStrides = reinterpret_cast<const UINT*>(
                     own_blob(blobs_, so.pBufferStrides, so.NumStrides * sizeof(UINT)));
@@ -243,16 +365,7 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             D3D12_INPUT_LAYOUT_DESC layout{};
             std::memcpy(&layout, payload, sizeof(layout));
             if (!layout.pInputElementDescs || !layout.NumElements) return true;
-            const std::size_t bytes = layout.NumElements * sizeof(D3D12_INPUT_ELEMENT_DESC);
-            auto* elements = reinterpret_cast<D3D12_INPUT_ELEMENT_DESC*>(
-                const_cast<unsigned char*>(own_blob(blobs_, layout.pInputElementDescs, bytes)));
-            for (UINT i = 0; i < layout.NumElements; ++i) {
-                if (!elements[i].SemanticName) continue;
-                const std::size_t len = std::strlen(elements[i].SemanticName) + 1;
-                elements[i].SemanticName =
-                    reinterpret_cast<const char*>(own_blob(blobs_, elements[i].SemanticName, len));
-            }
-            layout.pInputElementDescs = elements;
+            layout.pInputElementDescs = own_named_array(blobs_, layout.pInputElementDescs, layout.NumElements);
             std::memcpy(payload, &layout, sizeof(layout));
             return true;
         }
@@ -268,6 +381,8 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
         default: return true;  // no pointers in this payload
     }
 }
+
+std::size_t interned_blob_count() { return BlobInterner::instance().size(); }
 
 DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* records, unsigned count,
                            std::vector<unsigned char>& out) {

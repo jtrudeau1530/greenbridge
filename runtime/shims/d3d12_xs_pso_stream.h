@@ -29,9 +29,7 @@ inline constexpr std::size_t kDerivedRecordPayload = 4;
 // present, so the count reaches 4 (measured from the title's record writes, see the notes in docs/d3d12_vulkan.md).
 inline constexpr unsigned kDerivedMaxRecords = 4;
 
-// An owned deep copy of one pipeline state stream. The root signature references are held until destruction; shader
-// bytecode, stream-output and input-layout arrays and strings, and cached blobs are copied, and their pointers in the
-// copy point at the copies.
+// Owns a pipeline state stream, its root signatures, and shared copies of its blobs.
 class PsoStreamRecord {
 public:
     // Null when the stream is malformed, holds a subobject type this module does not walk, or is too large.
@@ -55,9 +53,13 @@ private:
     bool copy_pointed_data(std::size_t type, std::size_t payload_offset);
 
     std::vector<unsigned char> bytes_;
-    std::vector<std::vector<unsigned char>> blobs_;  // owned copies; their buffers do not move when this grows
-    std::vector<ID3D12RootSignature*> roots_;        // AddRef'd
+    // Interned immutable copies with stable addresses.
+    std::vector<std::shared_ptr<const std::vector<unsigned char>>> blobs_;
+    std::vector<ID3D12RootSignature*> roots_;  // AddRef'd
 };
+
+// Distinct pointed-to blobs currently shared by live records (for tests: 0 once every record is destroyed).
+std::size_t interned_blob_count();
 
 enum class DeriveStatus { ok, unknown_tag, missing_state, malformed };
 
