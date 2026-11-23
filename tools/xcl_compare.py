@@ -26,6 +26,7 @@ No game files are used or needed.
 
 import argparse
 import json
+import math
 import os
 import queue
 import shutil
@@ -477,6 +478,10 @@ def main():
     ap.add_argument("--out", help="report path (default: <work>/report.json)")
     ap.add_argument("--gui", action="store_true", help="show the checks live in a window")
     args = ap.parse_args()
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout must be finite and greater than zero")
+    if args.max_restarts < 0:
+        ap.error("--max-restarts must be non-negative")
     if sys.platform != "win32":
         raise SystemExit("Windows only: both runtimes run Windows executables")
     if args.gui:
