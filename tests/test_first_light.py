@@ -500,6 +500,91 @@ class OracleTests(unittest.TestCase):
             check_image(b"", self.manifest)
 
 
+class ProbeCoordinateTests(unittest.TestCase):
+    rgba = (0.25, 0.75, 0.0, 1.0)
+    image = struct.pack("<16f", *([CLEAR] * 8 + list(rgba) * 2))
+
+    def setUp(self):
+        self.manifest = {"width": 2, "height": 2, "min_coverage": 0.5, "max_coverage": 0.5}
+
+    def test_rejects_invalid_coordinates_in_every_probe_path(self):
+        for point in ([-1, 1], [-1, 0], [2, 0], [0, 2], [0, -1], {}, [0], [True, 1], [0, 1.0]):
+            probes = (
+                ("clear_pixel", {"clear_pixel": point}),
+                ("centre_pixel", {"centre_pixel": point, "centre_uv": self.rgba[:2]}),
+                ("centre_pixel", {"centre_pixel": point, "centre_rgba": self.rgba}),
+                ("uv_probes", {"uv_probes": [{"pixel": point, "uv": self.rgba[:2]}]}),
+                ("rgba_probes", {"rgba_probes": [{"pixel": point, "rgba": self.rgba}]}),
+            )
+            for field, probe in probes:
+                with self.subTest(point=point, probe=probe):
+                    with self.assertRaisesRegex(AssertionError, f"invalid {field}.*coordinates"):
+                        check_image(self.image, self.manifest | probe)
+
+    def test_accepts_edges_and_optional_probes(self):
+        for probe in (
+            {},
+            {"clear_pixel": None, "centre_pixel": None, "centre_uv": self.rgba[:2]},
+            {"centre_uv": self.rgba[:2]},
+            {
+                "clear_pixel": [1, 0],
+                "centre_pixel": [0, 1],
+                "centre_uv": self.rgba[:2],
+                "uv_probes": [{"pixel": [1, 1], "uv": self.rgba[:2]}],
+            },
+            {
+                "centre_pixel": [1, 1],
+                "centre_rgba": self.rgba,
+                "centre_uv": [0.0, 0.0],
+                "rgba_probes": [{"pixel": [0, 1], "rgba": self.rgba}],
+                "uv_probes": [{"pixel": [1, 1], "uv": [0.0, 0.0]}],
+            },
+        ):
+            with self.subTest(probe=probe):
+                self.assertEqual(check_image(self.image, self.manifest | probe)["covered"], 2)
+
+    def test_empty_centre_pixel_uses_the_image_centre(self):
+        for key, expected in (("centre_uv", self.rgba[:2]), ("centre_rgba", self.rgba)):
+            with self.subTest(key=key):
+                manifest = self.manifest | {"centre_pixel": [], key: expected}
+                self.assertEqual(check_image(self.image, manifest)["covered"], 2)
+
+    def test_rgba_probes_still_reject_invalid_uv_coordinates(self):
+        manifest = self.manifest | {
+            "rgba_probes": [{"pixel": [0, 1], "rgba": self.rgba}],
+            "uv_probes": [{"pixel": [99, -5]}],
+        }
+        with self.assertRaisesRegex(AssertionError, r"invalid uv_probes pixel coordinates \[99, -5\]"):
+            check_image(self.image, manifest)
+
+    def test_null_uv_probes_are_optional_with_rgba(self):
+        manifest = self.manifest | {
+            "rgba_probes": [{"pixel": [0, 1], "rgba": self.rgba}],
+            "uv_probes": None,
+        }
+        self.assertEqual(check_image(self.image, manifest)["covered"], 2)
+        with self.assertRaises(TypeError):
+            check_image(self.image, manifest | {"uv_probes": False})
+
+    def test_check_reports_invalid_coordinates(self):
+        def draw(command, **kwargs):
+            Path(command[3]).write_bytes(self.image)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            manifest = self.manifest | {
+                "files": {"mesh": "mesh.bin"},
+                "centre_uv": self.rgba[:2],
+                "centre_pixel": [2, 0],
+            }
+            (out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+            with (patch.object(fl, "find_harness", return_value="vk_harness"),
+                  patch.object(fl.subprocess, "run", side_effect=draw),
+                  self.assertRaisesRegex(SystemExit, r"invalid centre_pixel coordinates \[2, 0\] for 2x2 image")):
+                fl.main(["--check", "--out", tmp])
+            self.assertFalse((out / "image.ppm").exists())
+
+
 class ReadObjTests(unittest.TestCase):
     """Wavefront OBJ parsing in tools/first_light.py without a GPU or game package."""
 
