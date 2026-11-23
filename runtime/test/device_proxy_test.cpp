@@ -21,6 +21,7 @@
 
 #include <wrl/client.h>
 
+#include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "shims.h"
 
@@ -107,7 +108,9 @@ bool load_compute_shader(ComPtr<ID3DBlob>& bytecode) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // --trace-d3d12, as gta6rt takes it: device_proxy_trace checks that the parameter words still print then.
+    if (argc == 2 && std::strcmp(argv[1], "--trace-d3d12") == 0) rt::d3d12_trace::set_enabled(true);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("device_proxy_test: Xbox-ABI device proxy over WARP\n");
 
@@ -132,7 +135,7 @@ int main() {
     check(create_device != nullptr, "shim registry exposes d3d12_xs!D3D12XboxCreateDevice");
     if (!create_device) return 1;
 
-    std::uint32_t params[24] = {};  // logged only; the measured layout is not decoded
+    std::uint32_t params[24] = {0x1234abcd};  // logged only, not decoded; word 0 is device_proxy_trace's marker
     const IID iid_device = __uuidof(ID3D12Device);
     void* created = nullptr;
     hr = create_device(warp.Get(), params, &iid_device, &created);
