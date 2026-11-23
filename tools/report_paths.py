@@ -38,7 +38,11 @@ def case_insensitive_volume(path):
 
 def path_key(path):
     """A name two spellings of one path share: realpath, normcase, and on a case-insensitive volume case-folded NFD."""
-    path = os.path.realpath(path)
+    return _resolved_key(os.path.realpath(path))
+
+
+def _resolved_key(path):
+    """`path_key` for a path `os.path.realpath` has already resolved."""
     # Use the path rules of the platform we are resolving for. On macOS os.path is
     # posixpath and keeps case; on Windows ntpath lowercases. Resolving a simulated
     # macOS path through ntpath would hide the case-sensitive branch under test.
@@ -57,7 +61,11 @@ def same_name_on_folding_volume(first, second):
     one overwrite the first. Ask the volume itself: create one spelling in a scratch folder beside the reports and
     look for the other. Names that differ by more than case are never one file, so that costs nothing.
     """
-    first, second = os.path.realpath(first), os.path.realpath(second)
+    return _same_resolved_name(os.path.realpath(first), os.path.realpath(second))
+
+
+def _same_resolved_name(first, second):
+    """`same_name_on_folding_volume` for paths `os.path.realpath` has already resolved."""
     first_dir, first_name = os.path.split(first)
     second_dir, second_name = os.path.split(second)
     if first_name.casefold() != second_name.casefold():
@@ -73,10 +81,13 @@ def same_name_on_folding_volume(first, second):
 
 
 def same_report_path(first, second):
-    if path_key(first) == path_key(second):
+    # Resolve each path once: the key and the volume probe both want the resolved name, and a guard runs once
+    # per input file, so a second realpath per path is the whole cost of the check (see #6220's review).
+    first, second = os.path.realpath(first), os.path.realpath(second)
+    if _resolved_key(first) == _resolved_key(second):
         return True
     try:
         return os.path.samefile(first, second)
     except OSError:
         pass
-    return same_name_on_folding_volume(first, second)
+    return _same_resolved_name(first, second)
