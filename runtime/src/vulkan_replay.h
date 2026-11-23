@@ -3370,9 +3370,15 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
             const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
-            std::vector<VkImageMemoryBarrier2> barriers;
+            // One barrier for each piece: nearly always one or two (LayoutPieces), which stay on the stack.
+            std::array<VkImageMemoryBarrier2, 2> few;
+            std::vector<VkImageMemoryBarrier2> many;
+            if (pieces.size() > few.size()) many.resize(pieces.size());
+            VkImageMemoryBarrier2* const barriers = many.empty() ? few.data() : many.data();
+            std::uint32_t barrier_count = 0;
             for (const auto& piece : pieces) {
-                VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+                VkImageMemoryBarrier2& b = barriers[barrier_count++];
+                b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
                 b.srcStageMask = src.stages;
                 b.dstStageMask = dst.stages;
                 b.srcAccessMask = src.access;
@@ -3385,11 +3391,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.subresourceRange = detail::layout_range(p.binding, piece.range);
                 if (b.srcStageMask) detail::restrict_to_queue(vk, b.srcStageMask, b.srcAccessMask);
                 if (b.dstStageMask) detail::restrict_to_queue(vk, b.dstStageMask, b.dstAccessMask);
-                barriers.push_back(b);
             }
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-            dependency.imageMemoryBarrierCount = std::uint32_t(barriers.size());
-            dependency.pImageMemoryBarriers = barriers.data();
+            dependency.imageMemoryBarrierCount = barrier_count;
+            dependency.pImageMemoryBarriers = barriers;
             vk.pipeline_barrier2(command_buffer, &dependency);
             if (tracker) tracker->set(id, range, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
