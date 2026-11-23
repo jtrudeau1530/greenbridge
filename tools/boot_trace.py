@@ -64,6 +64,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "dllmain": {"ok": 0, "failed": 0, "failed_modules": []},
         "unimplemented": [],
         "unimplemented_by_dll": {},
+        "unimplemented_call_counts": {},
         "debug_strings": 0,
         "file_open_failed": [],
         "file_open_failed_count": 0,
@@ -73,7 +74,6 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "exit": None,
         "error": None,
     }
-    seen_imports = set()
     with _open_text(path) as fh:
         for number, line in enumerate(fh, 1):
             line = line.strip()
@@ -123,8 +123,9 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                         trace["dllmain"]["failed_modules"].append(event.get("module"))
             elif kind == "unimplemented_call":
                 name = str(event.get("import", "?"))
-                if name not in seen_imports:
-                    seen_imports.add(name)
+                calls = trace["unimplemented_call_counts"]
+                calls[name] = calls.get(name, 0) + 1
+                if calls[name] == 1:
                     trace["unimplemented"].append(
                         {"import": name, "caller": event.get("caller")}
                     )
@@ -289,9 +290,11 @@ def format_text(summary: dict, limit: int) -> str:
             line += f" ({_tail(dm['failed_modules'], limit)})"
         out.append(line)
         if startup["unimplemented"]:
-            out.append(f"  unimplemented: {len(startup['unimplemented'])} unique")
-            for item in startup["unimplemented"][:limit]:
-                out.append(f"    {item['import']} from {item['caller']}")
+            calls = startup["unimplemented_call_counts"]
+            out.append(f"  unimplemented: {len(calls)} unique, {sum(calls.values())} calls")
+            for item in sorted(startup["unimplemented"], key=lambda item: -calls[item["import"]])[:limit]:
+                count = calls[item["import"]]
+                out.append(f"    {item['import']} from {item['caller']} ({count} {'call' if count == 1 else 'calls'})")
             if len(startup["unimplemented"]) > limit:
                 out.append(f"    ... {len(startup['unimplemented']) - limit} more")
             by_dll = ", ".join(

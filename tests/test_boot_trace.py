@@ -137,6 +137,20 @@ class BootTraceTests(unittest.TestCase):
         self.assertIs(trace["exceptions"][1]["cpp"], True)
         self.assertEqual(trace["exit"], 0)
 
+    def test_unimplemented_calls_rank_by_frequency_and_preserve_first_caller(self):
+        names = ("x.dll!Foo", "y.dll!Bar", "y.dll!Bar", "y.dll!Bar")
+        self.write(self.startup, [
+            {"kind": "unimplemented_call", "import": name, "caller": f"synthetic+{i}"}
+            for i, name in enumerate(names)
+        ])
+        trace = bt.parse_startup(self.startup, limit=1)
+        self.assertEqual(trace["unimplemented_call_counts"], {"x.dll!Foo": 1, "y.dll!Bar": 3})
+        self.assertEqual(trace["unimplemented_by_dll"], {"x.dll": 1, "y.dll": 1})
+        report = bt.format_text(bt.summarize(trace, None), 1)
+        self.assertIn("unimplemented: 2 unique, 4 calls", report)
+        self.assertIn("y.dll!Bar from synthetic+1 (3 calls)", report)
+        self.assertNotIn("x.dll!Foo from", report)
+
     def test_exception_limit_keeps_final_observation(self):
         early = [
             {"kind": "exception", "code": "0xe06d7363", "at": f"synthetic.exe+0x{0x1100 + i:x}", "cpp": True}
