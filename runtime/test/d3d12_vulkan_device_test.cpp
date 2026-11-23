@@ -6564,7 +6564,12 @@ int main() {
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
                 EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                // On the Xbox device proxy, slot 78 is the title's SetFrameIntervalX (#6935), not the PC
+                // CreateReservedResource2, by design: the proxy is the title's device and answers ID3D12Device11 with
+                // itself. The PC method is checked on the Vulkan device behind it.
+                ID3D12Device* pc = rt::d3d12_xs::is_device_proxy(device.p) ? rt::d3d12_xs::device_proxy_real_device(device.p)
+                                                                            : device.p;
+                EXPECT(SUCCEEDED(pc->QueryInterface(IID_PPV_ARGS(&device10.p))));
                 EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                                   nullptr, IID_PPV_ARGS(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
