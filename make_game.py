@@ -461,25 +461,6 @@ def icloud_default_notes() -> list:
 MIN_FREE_GB = {"shaders": 30, "assets": 370}
 
 
-def tree_bytes(path: str) -> int:
-    """Bytes in the files under path (0 when it is missing); links are not followed."""
-    total, stack = 0, [path]
-    while stack:
-        try:
-            with os.scandir(stack.pop()) as it:
-                for e in it:
-                    try:
-                        if e.is_dir(follow_symlinks=False):
-                            stack.append(e.path)
-                        elif e.is_file(follow_symlinks=False):
-                            total += e.stat(follow_symlinks=False).st_size
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-    return total
-
-
 def assets_exported(work: str) -> bool:
     """Whether an earlier run finished the assets stage's exports, so its space is already in use. xma.done is the
     last marker assets() writes, after every model, texture and audio export before it succeeded; ogg.done is read
@@ -504,9 +485,9 @@ def _linked(path: str) -> bool:
     return os.path.islink(path) or os.path.isjunction(path)
 
 
-def _tree_bytes(root: str, skip: tuple = ()) -> int:
-    """Bytes of the regular files under root, without following links or junctions (root's own names in skip are
-    left out). One os.scandir walk; on Windows the sizes come with the directory listing, so no file is opened."""
+def _tree_bytes(root: str, skip: tuple = (), ignore_suffix: str = "") -> int:
+    """Bytes of the regular files under root, without following links or junctions (root's own names in skip and
+    files ending in ignore_suffix are left out). One os.scandir walk; on Windows the sizes come with the directory listing, so no file is opened."""
     if _linked(root):
         return 0
     total, stack = 0, [(root, True)]
@@ -520,7 +501,7 @@ def _tree_bytes(root: str, skip: tuple = ()) -> int:
                             continue
                         if e.is_dir(follow_symlinks=False):
                             stack.append((e.path, False))
-                        elif e.is_file(follow_symlinks=False):
+                        elif e.is_file(follow_symlinks=False) and not (ignore_suffix and e.name.endswith(ignore_suffix)):
                             total += e.stat(follow_symlinks=False).st_size
                     except OSError:
                         continue
@@ -550,20 +531,34 @@ def _finished_pool_dirs(top: str) -> list:
 
 
 def assets_bytes_on_disk(work: str) -> int:
-    """Bytes a stopped assets stage has already written and a rerun will skip: only the output of steps whose
-    manifest or marker assets() checks before redoing them (an archive's models/textures manifest.json, a texture
-    pool's complete manifest, audio_manifest.json, ogg.done, xma.done). Other files under <work>/assets, such as a
-    step that stopped before its marker, are not counted, since the rerun writes that step again."""
+    """Bytes a stopped assets stage has already written and a rerun will keep, so they are not needed free again.
+    A model or texture folder counts, finished or not, when its decoder.sha256 matches the current decoder:
+    assets() deletes a folder with another or no fingerprint and exports it again, but for a matching one rpf9dump
+    skips every output that already exists (Util.WriteAtomic only renames complete files into place; a leftover
+    *.partial is deleted and written again, so it is not counted). Pools, audio and the other steps count only when
+    finished (a pool whose manifest ttpf_manifest() accepts, audio_manifest.json, ogg.done, xma.done); the unfinished
+    part of those is not counted, which is conservative."""
     out = os.path.join(work, "assets")
     if _linked(out):
         return 0
     total = 0
+    # Before ensure_submodule() has fetched the submodule, the digest has no git pin and differs from the one assets()
+    # will compute (a source zip with a non-empty Core has no pin either, and is ready). Credit none until then.
+    decoder = None if submodule_ready() else ""
     for rel in MODEL_ARCHIVES:
         name = os.path.splitext(os.path.basename(rel))[0]
         for mode in ("models", "textures"):
             folder = os.path.join(out, name, mode)
-            if os.path.isfile(os.path.join(folder, "manifest.json")):
-                total += _tree_bytes(folder)
+            record = os.path.join(folder, DECODER_RECORD)
+            if not os.path.isfile(record):
+                continue   # no fingerprint: assets() exports this folder again, so none of it is kept
+            if decoder is None:   # read lazily: a work folder without exports never hashes the decoder
+                try:   # not the cached decoder_digest(): the submodule may not be fetched yet (ensure_submodule)
+                    decoder = compute_decoder_digest()
+                except OSError:
+                    decoder = ""   # can't tell what the exports came from: credit none of them
+            if decoder and read_shader_setting(record) == decoder:
+                total += _tree_bytes(folder, ignore_suffix=".partial")
     for top in ("ttpf", "ttpf_pack"):
         total += sum(_tree_bytes(d) for d in _finished_pool_dirs(os.path.join(out, top)))
     audio = os.path.join(out, "audio")
@@ -639,12 +634,6 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if need.get("assets") and not wav and assets_exported(work):
         log(f"preflight: the assets are already exported in {work}; not counting their {need['assets']} GB")
         need["assets"] = 0
-    elif need.get("assets") and not wav:
-        # A stopped export resumes: what it already wrote is on the disk, so it isn't needed free a second time.
-        done_gb = int(tree_bytes(os.path.join(work, "assets")) / 2**30)
-        if done_gb:
-            log(f"preflight: {done_gb} GB of assets are already exported in {work}; not counting them")
-            need["assets"] = max(0, need["assets"] - done_gb)
     os.makedirs(work, exist_ok=True)
     free_gb = shutil.disk_usage(work).free / 2**30
     need_gb = sum(need.values())
@@ -797,9 +786,16 @@ def dotnet_sdk_ok() -> bool:
     return any(int(m) >= 8 for m in re.findall(r"^(\d+)\.", r.stdout, re.M))
 
 
+def submodule_ready() -> bool:
+    """Whether third_party/rpf9-explorer is checked out (a non-empty Core): what ensure_submodule() requires and
+    what decoder_digest() is only meaningful after."""
+    core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
+    return os.path.isdir(core) and bool(os.listdir(core))
+
+
 def ensure_submodule() -> None:
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
-    if os.path.isdir(core) and os.listdir(core):
+    if submodule_ready():
         return
     clone = "git clone --recursive https://github.com/ItsNotRexed/Leonida"
     git = shutil.which("git")
@@ -1474,8 +1470,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
 DECODER_RECORD = "decoder.sha256"
 
 
-@functools.cache
-def decoder_digest() -> str:
+def compute_decoder_digest() -> str:
     """SHA-256 over the checked-out third_party/rpf9-explorer commit and the name and exact bytes of each
     tools/rpf9dump source file: what the model and texture exports come from."""
     sub = os.path.join(ROOT, "third_party", "rpf9-explorer")
@@ -1495,6 +1490,11 @@ def decoder_digest() -> str:
     folder = os.path.join(TOOLS, "rpf9dump")
     names = sorted(n for n in os.listdir(folder) if n.endswith((".cs", ".csproj", ".json")))
     return sources_digest(folder, names, pin)
+
+
+# assets() asks for it once, after preflight's ensure_submodule() has fetched the submodule. Anything earlier (the
+# preflight credit) calls compute_decoder_digest() instead, so a digest made from a missing checkout is never cached.
+decoder_digest = functools.cache(compute_decoder_digest)
 
 
 def rpf9dump(work: str) -> str:
