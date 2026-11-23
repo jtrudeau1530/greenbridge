@@ -1214,14 +1214,19 @@ public:
         const VkSemaphore semaphore = fence_.semaphore();
         context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
             std::uint64_t now = 0;
-            context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now);
-            if (now >= queued && now < value) {
+            bool signaled = false;
+            if (context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now) == VK_SUCCESS &&
+                now >= queued && now < value) {
                 VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 info.semaphore = semaphore;
                 info.value = value;
-                context->vk.vkSignalSemaphore(context->device(), &info);
+                signaled = context->vk.vkSignalSemaphore(context->device(), &info) == VK_SUCCESS;
             }
             held->fetch_sub(1);
+            if (signaled) {
+                context->holds().signaled(semaphore, value);
+                context->holds().pump_ready();
+            }
         });
         return S_OK;
     }
