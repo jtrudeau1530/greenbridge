@@ -532,7 +532,13 @@ int main(int argc, char** argv) {
     si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(queue));
-    std::ofstream(argv[3], std::ios::binary).write(static_cast<const char*>(readback_map), std::streamsize(W) * H * 16);
+    std::ofstream output(argv[3], std::ios::binary);
+    output.write(static_cast<const char*>(readback_map), std::streamsize(W) * H * 16);
+    output.close();
+    if (!output) {
+        std::fprintf(stderr, "failed to write %s\n", argv[3]);
+        return 1;
+    }
     std::printf("ok -> %s\n", argv[3]);
     return 0;
 }
