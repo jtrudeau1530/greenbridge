@@ -318,6 +318,64 @@ def test_v_and_or_xnor_bfi_track_vector_masks():
         assert id(bad) not in writes, bad["op"]
         assert 7 not in out[id(bad_use)] and ("v", 6) not in out[id(bad_use)], bad["op"]
 
+def test_wave32_vcc_hi_isolation():
+    use = ins("s_nop", imm(0))
+    vcmp_lo = ins("v_cmp_eq_u32_e64", sp("vcc_lo"), v(0), imm(1))
+    vcmp_hi = ins("v_cmp_lt_f32_e64", sp("vcc_hi"), v(0), v(1))
+
+    # In wave32, writing plain data to vcc_hi does not clear vcc (vcc_lo), and vice versa.
+    m_data_hi = L.analyse(
+        [[vcmp_lo, vcmp_hi, ins("s_mov_b32", sp("vcc_hi"), imm(0x5)), use]],
+        [[]],
+        wave64=False,
+    )[0][id(use)]
+    assert m_data_hi == {"vcc": L.MASK}
+
+    m_data_lo = L.analyse(
+        [[vcmp_lo, vcmp_hi, ins("s_mov_b32", sp("vcc_lo"), imm(0x5)), use]],
+        [[]],
+        wave64=False,
+    )[0][id(use)]
+    assert m_data_lo == {"vcc_hi": L.MASK}
+
+    # v_add_co_u32 / v_mad_u64_u32 / s_and_saveexec_b32 / s_wqm_b32 writing vcc_hi in wave32 produce a vcc_hi mask
+    # without clobbering vcc, and s_mov_b32 vcc_hi, s_mask vs s_mov_b32 s_dst, vcc_hi propagate it.
+    for hi_prod in (
+        ins("v_add_co_u32", v(2), sp("vcc_hi"), v(0), v(1)),
+        ins("v_mad_u64_u32", {"k": "vgpr", "r": 2, "n": 2}, sp("vcc_hi"), v(0), v(1), {"k": "vgpr", "r": 4, "n": 2}),
+        ins("s_and_saveexec_b32", sp("vcc_hi"), sp("vcc")),
+        ins("s_wqm_b32", sp("vcc_hi"), sp("vcc_lo")),
+    ):
+        got = L.analyse([[vcmp_lo, hi_prod, ins("s_mov_b32", s(4), sp("vcc_hi")), use]], [[]], wave64=False)[0][id(use)]
+        assert got == {"vcc": L.MASK, "vcc_hi": L.MASK, 4: L.MASK}, hi_prod["op"]
+
+    # CFG join: mask on one branch, EITHER (0/-1) on the other preserves vcc_hi as MASK in wave32;
+    # mask vs plain data drops vcc_hi while keeping vcc.
+    out_join = L.analyse(
+        [[vcmp_lo], [vcmp_hi], [ins("s_mov_b32", sp("vcc_hi"), imm(-1))], [use]],
+        [[1, 2], [3], [3], []],
+        wave64=False,
+    )[0][id(use)]
+    assert out_join == {"vcc": L.MASK, "vcc_hi": L.MASK}
+
+    out_drop = L.analyse(
+        [[vcmp_lo], [vcmp_hi], [ins("s_mov_b32", sp("vcc_hi"), imm(0x5))], [use]],
+        [[1, 2], [3], [3], []],
+        wave64=False,
+    )[0][id(use)]
+    assert out_drop == {"vcc": L.MASK}
+
+    # In wave64, plain-data writes to vcc_hi still clear vcc as a single 64-bit mask.
+    out_w64 = L.analyse(
+        [[ins("v_cmp_lt_u32_e64", sp("vcc"), v(0), imm(32)),
+          ins("s_mov_b32", sp("vcc_hi"), imm(0x5)),
+          use]],
+        [[]],
+        wave64=True,
+    )[0][id(use)]
+    assert out_w64 == {}
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
@@ -328,4 +386,5 @@ if __name__ == "__main__":
     test_b64_mask_imm_and_include_either()
     test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
     test_v_and_or_xnor_bfi_track_vector_masks()
+    test_wave32_vcc_hi_isolation()
     print("ok")
