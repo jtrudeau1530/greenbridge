@@ -1,7 +1,7 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/logo.png" alt="Leonida" width="200">
+  <img src="assets/logo.svg" alt="Leonida" width="200">
 </a>
 
   <br>
