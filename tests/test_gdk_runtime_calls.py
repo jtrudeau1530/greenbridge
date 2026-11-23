@@ -459,6 +459,10 @@ class DecoderTest(unittest.TestCase):
             "48B80000000000000000": 10,   # mov rax,imm64
             "F6C101": 3,                  # test cl,1
             "F7C100000000": 6,            # test ecx,imm32
+            "66F7C10000": 5,              # test cx,imm16
+            "6648F7C100000000": 8,        # test rcx,imm32 (REX.W overrides 66h)
+            "66C7C10000": 5,              # mov cx,imm16
+            "6648C7C100000000": 8,        # mov rcx,imm32 (REX.W overrides 66h)
             "4C8B11": 3,                  # mov r10,[rcx]
             "0F8400000000": 6,            # je rel32
         }
