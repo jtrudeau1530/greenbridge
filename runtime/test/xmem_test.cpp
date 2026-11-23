@@ -234,7 +234,7 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     struct Reservation { ULONGLONG attributes; DWORD guest_protect; DWORD host_protect; };
     constexpr Reservation reservations[] = {
         {0x21, PAGE_READWRITE, PAGE_READWRITE},
-        {0x03, 0x800 | PAGE_NOACCESS, PAGE_NOACCESS},
+        {0x03, PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS, PAGE_NOACCESS},
     };
     for (const auto& request : reservations) {
         void* reservation = virtual_alloc(nullptr, guest_page + 1, reserve64k,

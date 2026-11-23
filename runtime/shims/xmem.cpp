@@ -157,7 +157,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
             SetLastError(ERROR_NOT_SUPPORTED);
             return nullptr;
         }
-        if (attributes == 0x03 && protect == (0x800 | PAGE_NOACCESS)) {
+        if (attributes == 0x03 && protect == (PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS)) {
             protect = PAGE_NOACCESS;
         } else if (attributes != 0x21 || protect != PAGE_READWRITE) {
             SetLastError(ERROR_NOT_SUPPORTED);

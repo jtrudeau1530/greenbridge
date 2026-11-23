@@ -91,7 +91,7 @@ and size as an `xmem_transfer` event, because the enum values are not public. `x
 
 During startup the title uses `XMemVirtualAlloc` to reserve address space in units of 64 KiB.
 For `MEM_RESERVE | 0x20400000`, the observed (attribute, protection) pairs are
-`(0x21, PAGE_READWRITE)` and `(0x03, 0x800 | PAGE_NOACCESS)`. The shim reserves ordinary host address
+`(0x21, PAGE_READWRITE)` and `(0x03, PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS)`. The shim reserves ordinary host address
 space with the corresponding CPU protection. Both ranges remain uncommitted. The public GDK sample also
 uses separate access attributes and CPU/GPU protection flags for a reserve-only range.
 [Microsoft AdvancedESRAM sample](https://github.com/microsoft/Xbox-GDK-Samples/blob/main/Samples/Graphics/AdvancedESRAM/TransientAllocator.cpp).
