@@ -112,16 +112,28 @@ struct Mock {
     std::uint64_t armed_value;  // fence: the value SetEventOnCompletion (slot 9) waits for
     HANDLE armed_event;      // fence: the event it sets then, or null
     unsigned calls[kMockSlots];
-    std::uint64_t args[kMockSlots][5];
+    std::uint64_t args[kMockSlots][6];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the description of its last CreateCommandQueue (slot 8)
     D3D12_SHADER_RESOURCE_VIEW_DESC srv;  // device: the description CreateShaderResourceView (slot 18) last received
+    UINT om_rtv_count;                   // list slot 46 (OMSetRenderTargets): captured RTV/DSV handles
+    BOOL om_single_range;
+    SIZE_T om_rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    bool om_has_dsv;
+    SIZE_T om_dsv;
+    SIZE_T clear_dsv_handle;             // list slot 47 (ClearDepthStencilView): typed float-ABI capture
+    D3D12_CLEAR_FLAGS clear_dsv_flags;
+    FLOAT clear_dsv_depth;
+    UINT8 clear_dsv_stencil;
+    UINT clear_dsv_num_rects;
+    const D3D12_RECT* clear_dsv_rects;
 };
 
 Mock g_pool[256];
 unsigned g_pool_used = 0;
 
 void** mock_vtable();
+void** mock_list_vtable();
 
 Mock* new_mock(Kind kind) {
     if (g_pool_used == std::size(g_pool)) {
@@ -130,7 +142,7 @@ Mock* new_mock(Kind kind) {
     }
     Mock* m = &g_pool[g_pool_used++];
     std::memset(m, 0, sizeof(*m));
-    m->vtable = mock_vtable();
+    m->vtable = (kind == Kind::list || kind == Kind::command_list) ? mock_list_vtable() : mock_vtable();
     m->kind = kind;
     if (kind == Kind::fence) m->completed = kCompletedValue;
     return m;
@@ -430,6 +442,23 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         if (out) *out = kMockQueueDesc;
         return a1;
     }
+    if ((m->kind == Kind::list || m->kind == Kind::command_list) && slot == 46) {  // OMSetRenderTargets
+        m->om_rtv_count = static_cast<UINT>(a1);
+        m->om_single_range = static_cast<BOOL>(a3);
+        std::memset(m->om_rtvs, 0, sizeof(m->om_rtvs));
+        const auto* rtvs = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a2);
+        if (rtvs && m->om_rtv_count > 0) {
+            const UINT n = m->om_single_range
+                               ? 1u
+                               : (m->om_rtv_count < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
+                                      ? m->om_rtv_count
+                                      : D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
+            for (UINT i = 0; i < n; ++i) m->om_rtvs[i] = rtvs[i].ptr;
+        }
+        const auto* dsv = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a4);
+        m->om_has_dsv = dsv != nullptr;
+        m->om_dsv = dsv ? dsv->ptr : 0;
+    }
     return S_OK;
 }
 
@@ -456,9 +485,20 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
         // registers (an optimized build corrupted the test's own locals that way).
         ++self->calls[Slot];
         const std::uint64_t words[] = {a1, a2, a3, a4, a5, a6};
-        std::memcpy(self->args[Slot], words, 5 * sizeof(words[0]));
+        std::memcpy(self->args[Slot], words, sizeof(words));
         return mock_call(self, Slot, words);
     }
+}
+
+void WINAPI mock_clear_depth_stencil_view(Mock* self, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags,
+                                          FLOAT depth, UINT8 stencil, UINT num_rects, const D3D12_RECT* rects) {
+    ++self->calls[47];
+    self->clear_dsv_handle = dsv.ptr;
+    self->clear_dsv_flags = flags;
+    self->clear_dsv_depth = depth;
+    self->clear_dsv_stencil = stencil;
+    self->clear_dsv_num_rects = num_rects;
+    self->clear_dsv_rects = rects;
 }
 
 // PC ID3D12Device::CreateCommandList takes six words after `this`, one more than the generic mock thunk declares, so
@@ -554,6 +594,17 @@ void** mock_vtable() {
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
         table[76] = reinterpret_cast<void*>(&mock_create_committed_resource3);
 #endif
+        return true;
+    }();
+    (void)filled;
+    return table;
+}
+
+void** mock_list_vtable() {
+    static void* table[kMockSlots];
+    static const bool filled = [] {
+        fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
+        table[47] = reinterpret_cast<void*>(&mock_clear_depth_stencil_view);
         return true;
     }();
     (void)filled;
@@ -2540,6 +2591,144 @@ int check_get_desc_c_abi() {
     return 0;
 }
 
+int check_list_cpu_handles() {
+    g_heap_hook = {};
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+
+    Mock* real = nullptr;
+    void* device = make_device(real, 9, true, true, true);
+    EXPECT(device != nullptr);
+
+    constexpr SIZE_T kCustomBase = 0x77880000ull;
+    g_heap_hook.next_ptr = reinterpret_cast<void*>(kCustomBase);
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    desc.NumDescriptors = 8;
+    const IID iid_heap = __uuidof(ID3D12DescriptorHeap);
+    void* heap = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&heap)))));
+    EXPECT(heap != nullptr && raw(heap, 9) == kCustomBase);
+
+    const IID iid_alloc = __uuidof(ID3D12CommandAllocator);
+    const IID iid_gcl = __uuidof(ID3D12GraphicsCommandList);
+    void* allocator = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&iid_alloc), word(&allocator)))));
+    void* list = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0,
+                               word(&iid_gcl), word(&list)))));
+    EXPECT(list != nullptr && xs::is_list_proxy(list));
+    Mock* const real_list = reinterpret_cast<Mock*>(xs::list_proxy_real_list(list));
+    EXPECT(real_list != nullptr);
+
+    const SIZE_T off1 = 1 * kMockDescriptorInc;
+    const SIZE_T off4 = 4 * kMockDescriptorInc;
+    const SIZE_T off6 = 6 * kMockDescriptorInc;
+    const SIZE_T outside = kCustomBase + desc.NumDescriptors * kMockDescriptorInc;
+
+    // Console slot 50 -> PC slot 46 (OMSetRenderTargets): multiple RTV handles + DSV handle, caller arrays untouched.
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {{kCustomBase + off1}, {outside}};
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv{kCustomBase + off6};
+        raw(list, 50, 2, word(rtvs), FALSE, word(&dsv));
+        EXPECT(real_list->calls[46] == 1);
+        EXPECT(real_list->om_rtv_count == 2 && real_list->om_single_range == FALSE);
+        EXPECT(real_list->om_rtvs[0] == kMockHeapCpuStart + off1 && real_list->om_rtvs[1] == outside);
+        EXPECT(real_list->om_has_dsv && real_list->om_dsv == kMockHeapCpuStart + off6);
+        EXPECT(rtvs[0].ptr == kCustomBase + off1 && rtvs[1].ptr == outside && dsv.ptr == kCustomBase + off6);
+    }
+    // Single descriptor range: only rtvs[0] is read and translated even when NumRenderTargetDescriptors > 1; null DSV.
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE single_rtv{kCustomBase + off4};
+        raw(list, 50, 3, word(&single_rtv), TRUE, 0);
+        EXPECT(real_list->calls[46] == 2);
+        EXPECT(real_list->om_rtv_count == 3 && real_list->om_single_range == TRUE);
+        EXPECT(real_list->om_rtvs[0] == kMockHeapCpuStart + off4 && !real_list->om_has_dsv);
+        EXPECT(single_rtv.ptr == kCustomBase + off4);
+    }
+    // Zero RTVs with a non-null DSV.
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv{kCustomBase + off1};
+        raw(list, 50, 0, 0, FALSE, word(&dsv));
+        EXPECT(real_list->calls[46] == 3);
+        EXPECT(real_list->om_rtv_count == 0 && real_list->om_has_dsv && real_list->om_dsv == kMockHeapCpuStart + off1);
+    }
+    // Count beyond D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT (8): forwards safely without overrunning stack scratch.
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE nine[9]{};
+        for (UINT i = 0; i < 9; ++i) nine[i].ptr = outside + i * kMockDescriptorInc;
+        raw(list, 50, 9, word(nine), FALSE, 0);
+        EXPECT(real_list->calls[46] == 4 && real_list->om_rtv_count == 9);
+    }
+
+    // Console slot 51 -> PC slot 47 (ClearDepthStencilView): CPU handle translated AND FLOAT Depth in XMM3 preserved.
+    {
+        using ClearDsvFn = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT,
+                                         const D3D12_RECT*);
+        void* const* list_vtbl = *reinterpret_cast<void* const* const*>(list);
+        auto clear_dsv = reinterpret_cast<ClearDsvFn>(list_vtbl[51]);
+        const D3D12_RECT rect{1, 2, 3, 4};
+        clear_dsv(list, D3D12_CPU_DESCRIPTOR_HANDLE{kCustomBase + off6},
+                  D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.375f, 0x5Au, 1, &rect);
+        EXPECT(real_list->calls[47] == 1);
+        EXPECT(real_list->clear_dsv_handle == kMockHeapCpuStart + off6);
+        EXPECT(real_list->clear_dsv_flags == (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL));
+        EXPECT(real_list->clear_dsv_depth == 0.375f);
+        EXPECT(real_list->clear_dsv_stencil == 0x5Au);
+        EXPECT(real_list->clear_dsv_num_rects == 1 && real_list->clear_dsv_rects == &rect);
+
+        // Second call (past first-call log): outside-range handle passes through and a different depth float holds.
+        clear_dsv(list, D3D12_CPU_DESCRIPTOR_HANDLE{outside}, D3D12_CLEAR_FLAG_DEPTH, 0.625f, 0u, 0, nullptr);
+        EXPECT(real_list->calls[47] == 2);
+        EXPECT(real_list->clear_dsv_handle == outside);
+        EXPECT(real_list->clear_dsv_depth == 0.625f);
+        EXPECT(real_list->clear_dsv_num_rects == 0 && real_list->clear_dsv_rects == nullptr);
+    }
+
+    // Console slot 52 -> PC slot 48 (ClearRenderTargetView): CPU handle translated, color and rects forwarded.
+    {
+        const FLOAT color[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+        const D3D12_RECT rect{0, 0, 8, 8};
+        raw(list, 52, kCustomBase + off1, word(color), 1, word(&rect));
+        EXPECT(real_list->calls[48] == 1);
+        EXPECT(real_list->args[48][0] == kMockHeapCpuStart + off1);
+        EXPECT(real_list->args[48][1] == word(color) && real_list->args[48][2] == 1 &&
+               real_list->args[48][3] == word(&rect));
+
+        raw(list, 52, outside, word(color), 0, 0);
+        EXPECT(real_list->calls[48] == 2 && real_list->args[48][0] == outside);
+    }
+
+    // Console slots 53/54 -> PC slots 49/50 (ClearUnorderedAccessViewUint/Float): GPU handle kept, CPU handle remapped.
+    {
+        const UINT uvals[4] = {1, 2, 3, 4};
+        const FLOAT fvals[4] = {1.0f, 0.5f, 0.25f, 0.0f};
+        const D3D12_RECT rect{2, 2, 6, 6};
+        raw(list, 53, kMockHeapGpuStart + off1, kCustomBase + off4, 0x3333ull, word(uvals), 1, word(&rect));
+        EXPECT(real_list->calls[49] == 1);
+        EXPECT(real_list->args[49][0] == kMockHeapGpuStart + off1);
+        EXPECT(real_list->args[49][1] == kMockHeapCpuStart + off4);
+        EXPECT(real_list->args[49][2] == 0x3333ull && real_list->args[49][3] == word(uvals) &&
+               real_list->args[49][4] == 1 && real_list->args[49][5] == word(&rect));
+
+        raw(list, 54, kMockHeapGpuStart + off6, kCustomBase + off6, 0x4444ull, word(fvals), 0, 0);
+        EXPECT(real_list->calls[50] == 1);
+        EXPECT(real_list->args[50][0] == kMockHeapGpuStart + off6);
+        EXPECT(real_list->args[50][1] == kMockHeapCpuStart + off6);
+        EXPECT(real_list->args[50][2] == 0x4444ull && real_list->args[50][3] == word(fvals) &&
+               real_list->args[50][4] == 0 && real_list->args[50][5] == 0);
+
+        raw(list, 54, kMockHeapGpuStart, outside, 0x4444ull, word(fvals), 0, 0);
+        EXPECT(real_list->calls[50] == 2 && real_list->args[50][1] == outside);
+    }
+
+    EXPECT(raw(list, 2) == 0);
+    EXPECT(raw(allocator, 2) == 0);
+    EXPECT(raw(heap, 2) == 0);
+    EXPECT(raw(device, 2) == 0 && real->refs == 0);
+    xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    return 0;
+}
+
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
 
 std::atomic<int> g_injected{0};
@@ -3135,7 +3324,7 @@ int main(int argc, char** argv) {
         check_slot70() || check_slot70_raw_buffer() || check_descriptor_heap_hooks() || check_committed_resource3_x() ||
         check_committed_resource3_xmem_hook() || check_committed_buffers_on_xmem() || check_slot74() ||
         check_view_heap_cap() || check_lists() || check_signalx_detection() || check_list_tail_names() ||
-        check_get_desc_c_abi())
+        check_get_desc_c_abi() || check_list_cpu_handles())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
