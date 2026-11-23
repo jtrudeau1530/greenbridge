@@ -220,6 +220,8 @@ def step(state, ins, wave64=True):
         # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
         # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.
         put(state, a[0], MASK if wave64 else None, wave64)
+    elif wave64 and op == "s_bitreplicate_b64_b32" and a[0].get("t") == "vcc":
+        put(state, a[0], MASK, wave64)
     elif op.startswith(COPIES) and len(a) > 1:
         k = kind(state, a[1], wave64)
         dst_t = a[0].get("t") if a[0]["k"] == "special" else None

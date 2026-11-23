@@ -197,6 +197,29 @@ class Wave32B32LaneMaskTests(unittest.TestCase):
 
 
 class Wave64HalfMaskBitwiseTests(unittest.TestCase):
+    def test_bitreplicate_writes_wave64_vcc_and_preserves_exec_and_scc(self):
+        asm = [
+            "s_mov_b64 exec, -1",
+            "s_cmp_eq_u32 s5, 0",
+            "s_bitreplicate_b64_b32 vcc, s4",
+            "s_cselect_b32 s6, 1, 0",
+            "s_mov_b64 s[12:13], vcc",
+            "v_cndmask_b32_e64 v4, 0, 1, s[12:13]",
+            "v_mov_b32 v5, s6",
+            "v_lshlrev_b32 v6, 2, v0",
+            "buffer_store_dword v4, v6, s[0:3], 0 offen",
+            "buffer_store_dword v5, v6, s[0:3], 0 offen offset:256",
+            "s_endpgm",
+        ]
+        spv = translate_cs("w64_bitreplicate_vcc", asm, 64)
+        for word in (0, 0x80000001, 0x0F0F0F0F, M32):
+            for compare in (0, 1):
+                with self.subTest(word=word, compare=compare):
+                    mem = run_cs(spv, 64, s4=word, s5=compare)
+                    self.assertEqual([mem[4 * i] for i in range(64)],
+                                     [word >> (i // 2) & 1 for i in range(64)])
+                    self.assertEqual([mem[256 + 4 * i] for i in range(64)], [int(compare == 0)] * 64)
+
     def test_exec_lo_and_exec_hi_preserve_other_half_and_vote_own_half_scc(self):
         # Test s_not_b32 and all 8 binary ops writing exec_lo or exec_hi.
         ops = ["s_not_b32"] + list(BIN_REFS.keys())
