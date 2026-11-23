@@ -377,6 +377,25 @@ class BootTraceTests(unittest.TestCase):
         text = bt.format_text(bt.summarize(None, trace), 1)
         self.assertIn("  last recorded call: #3 CreateCommandAllocator ok", text.splitlines())
 
+    def test_unterminated_d3d12_outcome_must_be_complete(self):
+        first = b"[d3d12-trace] #1 CreateCommandAllocator ok\n"
+        second = b"[d3d12-trace] #2 CreateCommittedResource "
+        for ending, seq, ignored, outcomes in (
+            (b"fai", 1, 1, {"ok": 1}),
+            (b"failed", 2, 0, {"ok": 1, "failed": 1}),
+            (b"future-result\n", 2, 0, {"ok": 1, "future-result": 1}),
+        ):
+            with self.subTest(ending=ending):
+                with open(self.d3d12, "wb") as fh:
+                    fh.write(first + second + ending)
+                trace = bt.parse_d3d12(self.d3d12)
+                self.assertEqual(trace["last_call"]["seq"], seq)
+                self.assertEqual(trace["last_call"]["outcome"], next(reversed(outcomes)))
+                self.assertEqual(trace["last_seq"], seq)
+                self.assertEqual(trace["calls"], seq)
+                self.assertEqual(trace["outcomes"], outcomes)
+                self.assertEqual(trace["ignored_lines"], ignored)
+
     def test_d3d12_log_without_trace_lines_is_an_error(self):
         self.write_lines(self.d3d12, ["[rt] one", "[rt] two"])
         err = io.StringIO()

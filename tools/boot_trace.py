@@ -31,6 +31,7 @@ import re
 import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+D3D12_OUTCOMES = frozenset(("called", "ok", "failed", "unsupported", "refused", "partial"))
 
 
 class TraceError(ValueError):
@@ -188,7 +189,9 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
     with _open_text(path) as fh:
         for line in fh:
             match = D3D12_LINE.match(line.rstrip("\n"))
-            if not match:
+            # The writer ends every record with a newline. A complete known outcome is also
+            # recoverable if the trace was cut just before that newline.
+            if not match or (not line.endswith("\n") and match.group(3) not in D3D12_OUTCOMES):
                 if line.strip():
                     trace["ignored_lines"] += 1
                 continue
