@@ -16,6 +16,7 @@ using NTSTATUS = LONG;
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
@@ -27,6 +28,7 @@ namespace rt::bcrypt_rng {
 namespace {
 
 constexpr NTSTATUS kStatusSuccess = 0x00000000L;
+constexpr NTSTATUS kStatusUnsuccessful = static_cast<NTSTATUS>(0xC0000001L);
 constexpr NTSTATUS kStatusInvalidHandle = static_cast<NTSTATUS>(0xC0000008L);
 constexpr NTSTATUS kStatusInvalidParameter = static_cast<NTSTATUS>(0xC000000DL);
 constexpr NTSTATUS kStatusNoMemory = static_cast<NTSTATUS>(0xC0000017L);
@@ -79,6 +81,8 @@ BOOL CALLBACK init_bcrypt_once(PINIT_ONCE, PVOID, PVOID*) {
     if (len > 0 && len < sizeof(seed_buf) && parse_u64(seed_buf, seed)) {
         g_seeded_mode = true;
         g_prng_state = seed ? seed : 0x9E3779B97F4A7C15ULL;
+        std::fprintf(stderr, "[rt] bcrypt: deterministic LEONIDA_RNG_SEED enabled (0x%llx)\n",
+                     static_cast<unsigned long long>(seed));
     }
     return TRUE;
 }
@@ -203,8 +207,7 @@ NTSTATUS WINAPI gen_random(BCRYPT_ALG_HANDLE hAlgorithm, PUCHAR pbBuffer, ULONG 
         if (st >= 0) return st;
     }
     if (g_rtl_gen_random && g_rtl_gen_random(pbBuffer, cbBuffer)) return kStatusSuccess;
-    fill_seeded(pbBuffer, cbBuffer);
-    return kStatusSuccess;
+    return kStatusUnsuccessful;
 }
 
 }  // namespace
