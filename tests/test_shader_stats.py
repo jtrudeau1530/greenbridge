@@ -200,6 +200,13 @@ class ShaderStats(unittest.TestCase):
         d = self.detail(r)
         self.assertEqual((d[3], d[6]), ("-", "8"))
 
+    def test_row_wider_than_the_header_is_rejected_with_its_line(self):
+        r = self.run_stats(["ps_flat,ps,Instructions,16", "ps_flat,ps,VGPRs,8,unheaded"])
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("stats.csv: line 3: row has more fields than the header", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
     def run_args(self, *args):
         return subprocess.run([sys.executable, "-I", SCRIPT, *args], capture_output=True, text=True)
 
