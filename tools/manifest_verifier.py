@@ -378,9 +378,14 @@ def print_report(
     verbose: bool = False,
     strict: Optional[bool] = None,
 ) -> None:
+    unreadable_reasons = dict(report.unreadable)
     for rel in sorted(report.problems.keys()):
         kind = report.problems[rel]
-        out.write(f"{kind:<10}{rel}\n")
+        if kind == "UNREADABLE":
+            reason = unreadable_reasons.get(rel, "unreadable file")
+            out.write(f"{kind} {rel}: {reason}\n")
+        else:
+            out.write(f"{kind:<10}{rel}\n")
     for rel in report.untracked:
         out.write(f"{'NEW':<10}{rel}\n")
 

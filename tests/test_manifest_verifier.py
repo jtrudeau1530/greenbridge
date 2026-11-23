@@ -529,6 +529,30 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertEqual(data["problem_count"], 0)
         self.assertEqual(data["matched_count"], len(SYNTHETIC_SIZES))
 
+    def test_text_report_includes_unreadable_reason(self) -> None:
+        hash_file = mv.sha256_file
+
+        def read_file(path: str, *, expected_size: int | None = None) -> str:
+            if os.path.basename(path) == "alpha.bin":
+                raise OSError("Simulated permission denied")
+            return hash_file(path, expected_size=expected_size)
+
+        with open(os.path.join(self.game_dir, "delta.bin"), "r+b") as f:
+            f.write(bytes([self.payloads["delta.bin"][0] ^ 1]))
+
+        with patch.object(mv, "sha256_file", side_effect=read_file):
+            report = mv.verify_manifest(self.game_dir, self.manifest_path)
+        self.assertFalse(report.passed)
+        self.assertEqual(report.to_dict()["unreadable"], [("alpha.bin", "Simulated permission denied")])
+
+        output = io.StringIO()
+        mv.print_report(report, out=output)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "UNREADABLE alpha.bin: Simulated permission denied",
+            "CHANGED   delta.bin",
+            "2 problem(s)",
+        ])
+
     def test_cli_tampered_returns_exit_code_1(self) -> None:
         delta_p = os.path.join(self.game_dir, "delta.bin")
         with open(delta_p, "r+b") as f:
