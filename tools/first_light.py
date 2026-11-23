@@ -961,6 +961,8 @@ def main(argv=None) -> int:
     )
     a = ap.parse_args(argv)
     if a.camera:
+        if not math.isfinite(a.yaw):
+            ap.error("--yaw must be finite")
         if a.vs not in (None, CAMERA_VS):
             ap.error(f"--camera writes the constant layout of {CAMERA_VS} only")
         if a.no_fit or a.keep_z:
