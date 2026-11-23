@@ -109,6 +109,22 @@ python -I runtime/test/shaders/check.py <out dir> <unzipped runtime-windows>
 
 The artifact belongs to the commit that built it, so run the scripts from that commit as well (see the note above).
 
+#### Run one test from the Windows artifact
+
+For a focused GPU check without building locally, extract the artifact and open
+PowerShell in the directory containing the test executable. Keep the extracted
+files together so the test can find any fixtures relative to that directory.
+For example, to run the synthetic depth/stencil resolve test without game files:
+
+```powershell
+.\d3d12_depth_resolve_test.exe
+Write-Output "Test exit code: $LASTEXITCODE"
+```
+
+Report the executable name, the workflow run and its commit, your GPU and driver,
+the exit code, and the test summary in [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
+Label it as a single-test run so the result is easy to distinguish from a full suite run.
+
 ## Run them
 
 The whole suite, assembled, translated and run in one go:
