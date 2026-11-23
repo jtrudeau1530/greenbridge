@@ -205,6 +205,16 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
         m = re.match(r"Op(?:Decorate|MemberDecorate|Name) (%\w+)\b", s)
         if m and m.group(1) in gone:
             continue
+        if re.match(r"OpGroupDecorate\s", s):
+            instruction, sep, comment = s.partition(";")
+            opcode, group, *targets = instruction.split()
+            live_targets = [target for target in targets if target not in gone]
+            if live_targets == targets:
+                out.append(ln)
+            elif live_targets:
+                rewritten = " ".join((opcode, group, *live_targets))
+                out.append(rewritten + f" {sep}{comment}" if sep else rewritten)
+            continue
         m = re.match(r"(%\w+) = (Op\w+)", s)
         if decos and m and m.group(2).startswith("OpType"):
             out += decos            # decorations end where the first type begins

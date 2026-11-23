@@ -274,6 +274,38 @@ def test_help_is_a_clean_exit_zero(capsys):
         assert "SPIRV-Tools" in out
 
 
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize("targets,expected_targets", [
+    ("%in_pos", ""),
+    ("%out_pos", ""),
+    ("%in_pos %v %out_pos %x", "%v %x"),
+    ("%v %x", "%v %x"),
+], ids=["removed-input", "removed-output", "mixed", "live-only"])
+def test_group_decorate_keeps_only_live_capture_targets(tmp_path: Path, targets: str,
+                                                        expected_targets: str) -> None:
+    geometry = PHI_GS.replace(
+        "OpDecorate %in_pos BuiltIn Position", "OpDecorate %in_pos Location 0",
+    ).replace(
+        "%void = OpTypeVoid",
+        "OpDecorate %relaxed RelaxedPrecision\n"
+        "%relaxed = OpDecorationGroup\n"
+        f"OpGroupDecorate %relaxed {targets} ; keep only module IDs\n"
+        "%void = OpTypeVoid",
+    )
+
+    lowered, _ = gsc.rewrite(geometry)
+    for name, assembly in (("geometry", geometry), ("compute", lowered)):
+        module = tmp_path / f"{name}.spv"
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                       input=assembly, text=True, check=True)
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)], check=True)
+
+    group_uses = [line.partition(";")[0].strip() for line in lowered.splitlines()
+                  if line.strip().startswith("OpGroupDecorate ")]
+    expected = [f"OpGroupDecorate %relaxed {expected_targets}"] if expected_targets else []
+    assert group_uses == expected
+
+
 def test_builtin_load_and_output_store_with_memory_operands():
     gs = PHI_GS.replace(
         'OpEntryPoint Geometry %main "main" %in_pos %out_pos',
