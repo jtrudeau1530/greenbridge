@@ -7,6 +7,7 @@ are sentinels). No game files, no GPU, no network: the GitHub path is fed synthe
 """
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -189,6 +190,20 @@ class Freshness(unittest.TestCase):
     def test_changed_tools_need_revalidation(self):
         got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), "0" * 16))
         self.assertEqual(got["test_progress_dashboard.py"], ("partial", "revalidation_required"))
+
+    def test_changed_shader_helper_needs_revalidation(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(pd, "ROOT", root):
+            for directory in ("tools", "scripts", "runtime/test/shaders", "tests"):
+                Path(root, directory).mkdir(parents=True)
+            test = "tests/test_progress_dashboard.py"
+            Path(root, test).touch()
+            helper = Path(root, "runtime/test/shaders/compute_fixture.py")
+            helper.write_bytes(b"shift = 0\n")
+            cached = self.base(pd.file_digest(test), pd.code_digest())
+            self.assertEqual(self.collect(cached)["test_progress_dashboard.py"], ("verified", "current"))
+
+            helper.write_bytes(b"shift = 1\n")
+            self.assertEqual(self.collect(cached)["test_progress_dashboard.py"], ("partial", "revalidation_required"))
 
     def test_code_edited_during_the_run_is_never_current(self):
         got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), None))
