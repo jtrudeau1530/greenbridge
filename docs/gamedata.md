@@ -848,8 +848,7 @@ of the seven ranges, and rain applies another random factor gated by `DirtRainCh
 bands while `AlphaChannels` has 7 entries and `DirtDefinitions` references 5 of them; whether a spawn picks
 one band per `AlphaChannels` entry is open.
 
-Not measured here (hypothesis): which texture channel numbering `Channel` uses, and whether a spawn selects
-one `IntensitySets` band per `AlphaChannels` entry.
+Not measured here (hypothesis): whether a spawn selects one `IntensitySets` band per `AlphaChannels` entry.
 
 ## Entity component sets and component LOD
 

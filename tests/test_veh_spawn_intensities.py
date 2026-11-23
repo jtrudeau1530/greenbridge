@@ -138,6 +138,21 @@ class CliTest(unittest.TestCase):
             self.assertTrue(err.startswith("ERROR:"))
             self.assertNotIn("Traceback", err)
 
+    def test_a_non_finite_value_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_doc(tmp)
+            with open(path, encoding="utf-8") as f:
+                doc = f.read().replace('DirtMin value="-1"', 'DirtMin value="NaN"', 1)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(doc)
+            report = os.path.join(tmp, "report.json")
+            status, out, err = self.run_tool(path, "--json", report)
+            self.assertEqual(status, 2)
+            self.assertTrue(err.startswith("ERROR:"), err)
+            self.assertFalse(os.path.exists(report))
+            with open(path, encoding="utf-8") as f:          # the input document is untouched
+                self.assertIn('DirtMin value="NaN"', f.read())
+
     def test_carve_directory_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             blob = DOC.encode("utf-8")

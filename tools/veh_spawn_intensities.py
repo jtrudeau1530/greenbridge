@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import xml.etree.ElementTree as ET
@@ -45,9 +46,12 @@ def _number(item, tag):
     if value is None:
         raise CensusError(f"{tag} has no value= attribute")
     try:
-        return float(value)
+        number = float(value)
     except ValueError:
         raise CensusError(f"{tag} is not numeric") from None
+    if not math.isfinite(number):
+        raise CensusError("a value is not finite")
+    return number
 
 
 def records(root):
