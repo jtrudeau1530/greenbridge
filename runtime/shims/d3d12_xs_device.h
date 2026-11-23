@@ -21,6 +21,9 @@
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
 // LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
+//   slot 26   GetCustomHeapProperties, called by the retail title with the C ABI: return buffer in RCX, the device
+//             in RDX (the PC form is `this` in RCX, return buffer in RDX). Slot 25 (GetResourceAllocationInfo, also a
+//             struct wider than 8 bytes) takes the same form by the same rule. Both accept either form.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in

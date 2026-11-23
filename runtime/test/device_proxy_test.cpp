@@ -3,6 +3,7 @@
 // It creates the proxy through the registered d3d12_xs!D3D12XboxCreateDevice shim, then calls the measured Xbox
 // slots exactly as the guest would (raw function pointers, not the C++ interface):
 //   slot 14  CreateDescriptorHeap (returns a heap proxy)
+//   slot 25/26 GetResourceAllocationInfo/GetCustomHeapProperties in the title's C form (return buffer first)
 //   heap 9/10 GetCPU/GetGPUDescriptorHandleForHeapStart (Xbox: 8-byte handle in RAX; the PC heap uses the
 //             hidden return pointer in RDX, so slot 14 wraps it)
 //   slot 62  CreateComputePipelineState
@@ -199,6 +200,46 @@ int main(int argc, char** argv) {
     const LUID real_luid = real ? real->GetAdapterLuid() : LUID{};
     check(proxy_luid.LowPart == real_luid.LowPart && proxy_luid.HighPart == real_luid.HighPart,
           "slot 43 forwards GetAdapterLuid (struct return)");
+    // Slots 25 and 26 return a struct wider than 8 bytes. The console title calls them with the C ABI: the hidden
+    // return pointer first (RCX), then the device (RDX), then the arguments, and the buffer comes back in RAX
+    // (measured for slot 26 on the retail executable). Call them that way through raw function pointers and compare
+    // with the PC device's own answers.
+    check(rt::d3d12_xs::device_slot_overridden(25), "device slot 25 is the C-ABI GetResourceAllocationInfo override");
+    check(rt::d3d12_xs::device_slot_overridden(26), "device slot 26 is the C-ABI GetCustomHeapProperties override");
+    if (real) {
+        using HeapPropsFn = D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
+        auto get_heap_props = reinterpret_cast<HeapPropsFn>(proxy_vtbl[26]);
+        for (D3D12_HEAP_TYPE type : {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK}) {
+            D3D12_HEAP_PROPERTIES got;
+            std::memset(&got, 0xcd, sizeof(got));
+            D3D12_HEAP_PROPERTIES* returned = get_heap_props(&got, device.Get(), 1, type);
+            const D3D12_HEAP_PROPERTIES want = real->GetCustomHeapProperties(1, type);
+            check(returned == &got, "slot 26 returns the caller's buffer in RAX");
+            check(std::memcmp(&got, &want, sizeof(got)) == 0,
+                  "slot 26 (C ABI) writes the PC device's GetCustomHeapProperties into the caller's buffer");
+        }
+
+        using AllocInfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                                     const D3D12_RESOURCE_DESC*);
+        auto get_alloc_info = reinterpret_cast<AllocInfoFn>(proxy_vtbl[25]);
+        const D3D12_RESOURCE_DESC desc = buffer_desc();
+        D3D12_RESOURCE_ALLOCATION_INFO got{~0ull, ~0ull};
+        D3D12_RESOURCE_ALLOCATION_INFO* returned = get_alloc_info(&got, device.Get(), 0, 1, &desc);
+        const D3D12_RESOURCE_ALLOCATION_INFO want = real->GetResourceAllocationInfo(0, 1, &desc);
+        check(returned == &got, "slot 25 returns the caller's buffer in RAX");
+        check(got.SizeInBytes == want.SizeInBytes && got.Alignment == want.Alignment,
+              "slot 25 (C ABI) writes the PC device's GetResourceAllocationInfo into the caller's buffer");
+
+        // The runtime's own code calls the proxy through d3d12.h (PC form: this, then the return buffer). Both
+        // slots still answer that form.
+        const D3D12_HEAP_PROPERTIES pc_props = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
+        const D3D12_HEAP_PROPERTIES pc_want = real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
+        check(std::memcmp(&pc_props, &pc_want, sizeof(pc_props)) == 0, "slot 26 still answers the PC (C++) form");
+        const D3D12_RESOURCE_ALLOCATION_INFO pc_info = device->GetResourceAllocationInfo(0, 1, &desc);
+        check(pc_info.SizeInBytes == want.SizeInBytes && pc_info.Alignment == want.Alignment,
+              "slot 25 still answers the PC (C++) form");
+    }
+
     D3D12_RESOURCE_DESC reserved_desc = buffer_desc();
     reserved_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> reserved;
