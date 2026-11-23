@@ -385,6 +385,11 @@ void test_physical_pages(const PhysicalApi& api) {
 
     check(api.map(window, kPages, nullptr) == window, "XMemMapPhysicalPages with no page array unmaps");
     check(reserved_only(window) && reserved_only(window + 3 * kPage64k), "unmapped pages are reserved again");
+    // The split above left the range as several host placeholders; the whole run maps again over them.
+    check(api.map(window, kPages, pages) == window && page_holds(window, 0x1000u) &&
+              page_holds(window + 3 * kPage64k, 0x4000u),
+          "a run maps again over a range an earlier partial unmap split");
+    check(api.map(window, kPages, nullptr) == window && reserved_only(window), "and unmaps again");
 
     // Remap in reverse order into the other window: each page keeps its contents.
     uint64_t reversed[kPages];
