@@ -1210,6 +1210,8 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     std::memcpy(m->base, file.data(), oh.SizeOfHeaders);
     auto* sec = IMAGE_FIRST_SECTION(nt);
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (sec->VirtualAddress < oh.SizeOfHeaders)
+            throw std::runtime_error(m->name + ": section " + std::to_string(i) + " overlaps the headers");
         uint32_t n = std::min(sec->SizeOfRawData, sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData);
         if (!n) continue;
         if (sec->PointerToRawData > file.size() || n > file.size() - sec->PointerToRawData)
@@ -1235,6 +1237,9 @@ Module& Loader::map_image(const std::filesystem::path& path) {
             size_t count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
             for (size_t i = 0; i < count; ++i) {
                 uint16_t type = entries[i] >> 12, off = entries[i] & 0xFFF;
+                if (type != IMAGE_REL_BASED_ABSOLUTE &&
+                    static_cast<uint64_t>(block->VirtualAddress) + off < oh.SizeOfHeaders)
+                    throw std::runtime_error(m->name + ": a relocation lands in the headers");
                 if (type == IMAGE_REL_BASED_DIR64) {
                     require_range(m->name, static_cast<uint64_t>(block->VirtualAddress) + off, sizeof(uint64_t), m->size,
                                   "a relocation");
