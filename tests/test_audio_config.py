@@ -171,13 +171,14 @@ class TestJoin(unittest.TestCase):
         skip = b"\x00" * 4 + make_record(0x40, 150_000, tail=b"\x00" * 18 + hidden[:4]) + hidden[4:]
         self.assert_every_split(skip, [8], (1, A.JOIN_BLOCK_BYTES))
 
-    def test_marker_needs_twenty_following_bytes_and_tiny_parts(self):
+    def test_marker_with_twenty_following_bytes_and_tiny_parts(self):
         record = make_record(0x20, 150_000)
-        short = b"\x00" * 4 + record[:24]          # marker at 8, then exactly 20 bytes
-        self.assertEqual(A.scan(short), [])
-        self.assertEqual(len(A.scan(short + b"\x00")), 1)
-        cases = (((short,), []),
-                 ((short, b"", b"", b"\x00"), [("00.bin", 8)]),
+        complete = b"\x00" * 4 + record[:24]       # marker at 8, then exactly 20 bytes
+        self.assertEqual(A.scan(complete[:-1]), [])
+        self.assertEqual(len(A.scan(complete)), 1)
+        self.assertEqual(len(list(A.scan_stream([complete]))), 1)
+        cases = (((complete,), [("00.bin", 8)]),
+                 ((complete, b"", b"", b"\x00"), [("00.bin", 8)]),
                  ((record[:1], record[1:2], record[2:3], record[3:]), [("03.bin", 1)]),
                  ((record[:5], record[5:]), [("00.bin", 4)]),
                  ((b"", record[:2], record[2:]), [("02.bin", 2)]))
