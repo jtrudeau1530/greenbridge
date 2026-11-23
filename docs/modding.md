@@ -1,6 +1,6 @@
 # Mods
 
-**Status: the mod format and loader are in place; swaps are not applied yet.** `gta6rt` reads every
+**Status: the mod format, loader and hook are in place; only the lookup's address in the executable is missing.** `gta6rt` reads every
 `mods/<folder>/mod.json`, checks it and logs what it would change. A swap takes effect once the game's
 archetype lookup is hooked, and that needs the executable (RT-5): its address differs per version.
 
@@ -85,6 +85,20 @@ The swap needs one function in the executable: the archetype lookup by name hash
 3. **Cross-check.** Called with `0xD7C0CDFF` it must return a valid archetype too (`cs_mandy` is a live
    model id: a `story000.rpf` cutscene table uses it).
 
-Once its RVA is known for 1.0.2.1, the loader installs a hook there that calls
-`leonida::mods::active().remap(hash)` on the argument before the original runs. That is the only
-version-specific piece; the manifests stay as they are.
+Then pass it to the runtime:
+
+```powershell
+gta6rt.exe --dry-run game_scarlett_master.exe --archetype-lookup 1A2B3C0
+```
+
+`--archetype-lookup RVA[,ARG]` (hex RVA; `ARG` 0 when the hash is the first argument, 1 when it is the
+second, as in a member function) hooks the function right after the image is mapped, before any of its
+code runs (`runtime/src/code_hooks.h`). It does not patch the function: every direct `call` and `jmp`
+to it in the image's code is pointed at a thunk that passes the hash through
+`leonida::mods::active().remap()` and continues into the original with every other argument as it was.
+The log line reports how many call sites were redirected, so a `--dry-run` with a candidate RVA shows at
+once whether it is the lookup (hundreds of callers) or not (a handful, or none). ctest `code_hooks` runs
+the thunk on small x64 functions in memory.
+
+That RVA is the only version-specific piece; it can go in `game/xbox-1.0.2.1.json` once confirmed, and
+the manifests stay as they are.
