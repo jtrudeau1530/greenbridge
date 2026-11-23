@@ -875,17 +875,18 @@ public:
         return append(indirect);
     }
 
+    // D3D12: acceleration structures and build scratch are 256-byte aligned; postbuild destinations 8-byte aligned.
     bool build_acceleration_structure(BuildAccelerationStructure build) {
-        if (!build.dst_va || !build.scratch_va) return false;
+        if (!build.dst_va || build.dst_va % 256 || !build.scratch_va || build.scratch_va % 256) return false;
+        if (build.update && (!build.src_va || build.src_va % 256)) return false;
         return append(std::move(build));
     }
-    // D3D12: acceleration structures are 256-byte aligned, postbuild destinations 8-byte aligned.
     bool copy_acceleration_structure(CopyAccelerationStructure copy) {
-        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256) return false;
+        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256 || copy.mode > 4) return false;
         return append(copy);
     }
     bool acceleration_structure_postbuild(AccelerationStructurePostbuild info) {
-        if (!info.dest_va || info.dest_va % 8 || info.sources.empty()) return false;
+        if (!info.dest_va || info.dest_va % 8 || info.type > 3 || info.sources.empty()) return false;
         for (const auto va : info.sources)
             if (!va || va % 256) return false;
         return append(std::move(info));

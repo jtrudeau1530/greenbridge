@@ -5546,14 +5546,31 @@ public:
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* out) override {
         if (!out) return;
         *out = {};
+        if (!desc) return;
+        if (desc->Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
+            desc->Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
+            return;
+        if (desc->DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY &&
+            desc->DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+            return;
+        const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+        if (!is_tlas && desc->NumDescs > 0) {
+            if (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY) {
+                if (!desc->pGeometryDescs) return;
+            } else {
+                if (!desc->ppGeometryDescs) return;
+                for (UINT i = 0; i < desc->NumDescs; ++i)
+                    if (!desc->ppGeometryDescs[i]) return;
+            }
+        }
         auto& vk = state_.context->vk;
-        if (desc && state_.context->xdxr_acceleration_structures()) {
+        if (state_.context->xdxr_acceleration_structures()) {
             // XDXR records: the layout depends only on the triangle or instance count and on whether the nodes are
             // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h). Its size has room for the most nodes a tree of
             // that many elements can have; a build's own size, in its header, is what COMPACTED_SIZE reports. An
             // update refits (no sort); the build's scratch size covers it.
             leonida::BuildAccelerationStructure build{};
-            build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+            build.is_tlas = is_tlas;
             if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
                 build.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;
             if (build.is_tlas) {
@@ -5562,9 +5579,9 @@ public:
                 for (UINT i = 0; i < desc->NumDescs; ++i) {
                     const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
                         (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
-                            ? (desc->ppGeometryDescs ? desc->ppGeometryDescs[i] : nullptr)
-                            : (desc->pGeometryDescs ? &desc->pGeometryDescs[i] : nullptr);
-                    if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
+                            ? desc->ppGeometryDescs[i]
+                            : &desc->pGeometryDescs[i];
+                    if (gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
                     leonida::RtTriangleGeometry t{};
                     t.vertex_count = gd->Triangles.VertexCount;
                     t.index_count = gd->Triangles.IndexCount;
@@ -5581,9 +5598,8 @@ public:
             out->UpdateScratchDataSizeInBytes = layout.scratch;
             return;
         }
-        if (!desc || !state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
+        if (!state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
 
-        const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
         std::vector<VkAccelerationStructureGeometryKHR> geoms;
         std::vector<std::uint32_t> max_prims;
         if (is_tlas) {
