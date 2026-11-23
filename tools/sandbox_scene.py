@@ -176,6 +176,13 @@ def main(argv=None):
     ap.add_argument("--tex-size", type=int, default=256)
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
+    if args.center is not None:
+        try:
+            if not all(math.isfinite(v) for v in args.center):
+                raise OverflowError
+            struct.pack("<2f", *args.center)
+        except OverflowError:
+            ap.error("--center coordinates must be finite float32 values")
     if not math.isfinite(args.radius) or args.radius < 0:
         ap.error("--radius must be finite and non-negative")
     if args.max_props < 0:
