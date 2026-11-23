@@ -498,6 +498,58 @@ A section that runs past the end of a truncated stream is shown as raw bytes. `t
 synthetic container, checks it with `psin_index.py` and `psin_data.block_table`, and when ImHex is installed compares
 the pattern's output with both.
 
+## Non-PSIN object-tree table in `script.rpf`
+
+Besides its 1,012 `PSIN` containers (1,015 streams, 3,477,872 inflated bytes), `script.rpf` contains one large non-`PSIN`
+binary container carved at offset `0x53000` (`42` contiguous deflate streams: 41 x 65,536 + 15,408 = **2,702,384**
+inflated bytes / `0x293C30`, 461,333 stored bytes, 43.7% of `script.rpf`'s inflated output). It is not `PSIN`, `RBF0`
+or `0DRP`, and carries no strings: it is a dense 483-tree forest serialized in preorder with `0x71717171` (`'qqqq'`)
+relocatable pointers, measured with `tools/script_qtable.py` on package 1.0.2.1.
+
+### Layout and header (`0x000000..0x293C2F`)
+
+| Region | Offset | Size | Layout |
+|---|---:|---:|---|
+| Header | `0x000000` | 40 B | ten `u32` words: `record_count = 30,683` (`0x000077DB`) at `+0x14`; all other nine words `0` |
+| Offset table | `0x000028` | 245,464 B | `30,683` strictly ascending, 16-byte-aligned `u64` offsets (`0x03BF00` to `0x293C00`) |
+| Record pool | `0x03BF00` | 2,456,880 B | `30,683` 16-byte-aligned records (`32` to `6,704` bytes), ending at exact EOF (`0x293C30`) |
+
+Each record `i` begins with an 8-byte prefix before its body at `offsets[i] + 8`:
+
+- **`+0x00` `u32 root_key_hash`**: non-zero on **483** records (`483` distinct values) and `0` on the other **30,200**
+  records.
+- **`+0x04` `u32 root_flags`**: `0` on all 30,200 non-root records; on the 483 roots, `0xFFFF0000` (385), `0` (86) or
+  `(1..8) << 16` (12).
+
+### Relocatable pointers and tree bijection
+
+Every 8-byte-aligned `u64` word from `+0x08` onward whose high 32 bits equal `0x71717171` (`'qqqq'`) is an internal
+pointer whose low 32 bits equal `offsets[target] + 8` (the start of record `target`'s body):
+
+- **30,200 of 30,200** `0x71717171` pointers resolve to a valid record (`0` unresolved, `0` outside the pool).
+- **Exact root bijection:** the **483** records with `root_key_hash != 0` are the exact **483** records with
+  in-degree `0`; all **30,200** records with `root_key_hash == 0` have in-degree `1`.
+- **Contiguous preorder forest:** all **30,200** edges point strictly forward (`target > source`, `0` back-edges or
+  cycles), remain inside their root's contiguous index slice `[root_k, root_{k+1})` (`0` cross-tree edges), and match
+  strict depth-first preorder in stored pointer-field sibling order across all **30,683** positions. Tree sizes range
+  from `1` to `1,131` nodes (median `53`, depths `0..9`).
+
+### Array and struct records
+
+| Kind | Count | Header at `+0x08` | Notes |
+|---|---:|---|---|
+| Array records | 10,294 | `+0x08 = 0x14`, `+0x0C = 0`, `+0x10 = +0x14 = count` (`0..220`), `+0x18 = stride`, `+0x1C = flags`, `+0x20 = 0` (`u64`), `+0x28 = element_type_hash` (35 distinct, none 0), `+0x2C = 0` | Elements start at `+0x30`; `align16(48 + count * stride) == len(rec)` holds on **10,294 of 10,294**. `flags = 0` (8,211 value/struct arrays, strides `4, 8, 12, 16, 20, 24, 32, 48, 64, 128`) and `flags = 0x10000` (2,083 pointer arrays, all stride `8`, holding 7,297 `0x71717171` pointers). |
+| Typed struct records | 20,389 | `+0x08 = struct_type_hash` (66 distinct hashes), `+0x0C = 0` on all 20,389 | Sizes `32` B (17,106: 12,332 wrapper nodes pointing at `+0x10` to `i + 1` with `+0x18 = 0`, 3,540 single-pointer at `+0x18`, 3 two-pointer, 1,231 leaves), `48` B (1,642: 1,641 two-pointer, 1 leaf) and `64` B (1,641 leaves). |
+
+```text
+python -I tools/script_qtable.py <carve_dir_or_rpf_or_bin> [--root-hash HEX] [--type-hash HEX] [--json FILE]
+```
+
+Accepts an `rpf9_carve.py` carve directory (`script`), a `script.rpf` archive or a joined `.bin` payload.
+Default stdout and `--json` output emit aggregate counts, histograms and structural invariant checks only; `--root-hash`
+and `--type-hash` report local tree/type counts in hex. `tests/test_script_qtable.py` covers synthetic multi-tree parsing,
+64 KiB stream reassembly across a carve folder, pointer validation and output collision guards.
+
 ## Limits
 
 - The 64 KiB split is not joined automatically. A caller that has the archive order can join adjacent
