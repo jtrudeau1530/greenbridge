@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pool_workers  # noqa: E402
 import rdna2spirv  # noqa: E402
 import shader_meta  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 STAGES = ("vs", "ps", "cs", "gs", "hs", "ds", "ms", "as")
 TABLE_LOADS = ("s_load_dwordx4", "s_load_dwordx8", "s_load_dwordx16")
@@ -301,6 +302,8 @@ def main(argv=None):
     if not os.path.isdir(a.src):
         print(f"ERROR: {a.src} is not a folder", file=sys.stderr)
         return 2
+    if a.json and a.index_out and same_report_path(a.json, a.index_out):
+        ap.error(f"--json and --index-out name one file: {a.json}; the second report would replace the first")
     files = listings(a.src)[: a.limit] if a.limit is not None else listings(a.src)
     jobs = pool_workers.process_workers(max(1, a.jobs))
     if jobs == 1 or len(files) < 64:
