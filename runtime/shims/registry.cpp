@@ -90,8 +90,10 @@ std::vector<Lookup> g_lookups;
 //  xaudio2_9.dll             XAudio2Create: HRESULT (learn.microsoft.com/windows/win32/api/xaudio2/
 //  xaudio2_9redist.dll       nf-xaudio2-xaudio2create). xaudio2_9.dll is the console name (docs/d3d12_vulkan.md §7).
 //  dstorage.dll              DStorageGetFactory: HRESULT (learn.microsoft.com/windows/win32/api/dstorage/
-//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory). dstorage_xs.dll and xcrdapi.dll are the console names
-//  xcrdapi.dll               (xcrdapi.dll!DStorageGetFactory is imported by the retail executable, #6715).
+//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory, and the GDK's gaming/gdk/docs/reference/system/dstorage/
+//  xcrdapi.dll               functions/dstoragegetfactory). dstorage_xs.dll and xcrdapi.dll are the console names
+//                            (xcrdapi.dll!DStorageGetFactory is imported by the retail executable, #6715).
+//                            dstorage.cpp serves it; the class is kept for a build without that shim.
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
