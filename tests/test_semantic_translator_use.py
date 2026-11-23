@@ -75,7 +75,6 @@ DEBT = {
     "test_valu_frexp_exp_i32_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_frexp_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_frexp_mant_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_ldexp_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_lerp_u8.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_minmax_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_mul_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
