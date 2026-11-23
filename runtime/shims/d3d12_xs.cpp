@@ -164,8 +164,8 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     size_t backend_length = 0;
     if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0) {
         ID3D12Device* vulkan = nullptr;
-        HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device),
-                                                                 reinterpret_cast<void**>(&vulkan));
+        HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(
+            __uuidof(ID3D12Device), reinterpret_cast<void**>(&vulkan), rt::d3d12::QueueTestSettings::ignore);
         if (FAILED(vhr)) {
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: Vulkan device failed (hr=0x%08lx)\n",
                          static_cast<unsigned long>(vhr));

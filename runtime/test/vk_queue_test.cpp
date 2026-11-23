@@ -116,6 +116,48 @@ int check_picker() {
     return 0;
 }
 
+// Which VkQueue each new D3D12 queue leases (CreateCommandQueue): an unused one while there is one, its own family's
+// first, then the one with the fewest D3D12 queues. `own` and `graphics` count the D3D12 queues on each VkQueue.
+int check_queue_slots() {
+    const auto lease = [](std::vector<std::uint32_t>& own, std::vector<std::uint32_t>& graphics) {
+        const auto slot = pick_queue_slot({own, graphics});
+        if (slot.pool != SIZE_MAX) ++(slot.pool == 0 ? own : graphics)[slot.index];
+        return slot;
+    };
+    {   // Enough queues (an RTX 5080: 8 compute, 16 graphics): every COMPUTE queue gets a VkQueue of its own.
+        std::vector<std::uint32_t> compute(8, 0), graphics(16, 0);
+        for (std::size_t i = 0; i < 8; ++i) {
+            const auto slot = lease(compute, graphics);
+            EXPECT(slot.pool == 0 && slot.index == i);
+        }
+        const auto ninth = lease(compute, graphics);
+        EXPECT(ninth.pool == 1 && ninth.index == 0);  // then an unused graphics queue, not a shared compute one
+    }
+    {   // One VkQueue per family (LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1): DIRECT, COMPUTE, then they share.
+        std::vector<std::uint32_t> none, compute(1, 0), graphics(1, 0);
+        EXPECT(lease(none, graphics).pool == 1);
+        EXPECT(lease(compute, graphics).pool == 0);
+        const auto second_compute = lease(compute, graphics);
+        EXPECT(second_compute.pool == 0 && compute[0] == 2);  // a tie goes to the type's own family
+        const auto third_compute = lease(compute, graphics);
+        EXPECT(third_compute.pool == 1 && graphics[0] == 2);  // then the queue with fewer D3D12 queues
+        --compute[0];
+        --compute[0];  // two COMPUTE queues released
+        EXPECT(lease(compute, graphics).pool == 0);
+    }
+    {   // A queue released by its last D3D12 queue is unused again and preferred to sharing.
+        std::vector<std::uint32_t> none, graphics{3, 0, 2};
+        const auto slot = lease(none, graphics);
+        EXPECT(slot.pool == 1 && slot.index == 1);
+    }
+    {   // No VkQueue at all.
+        std::vector<std::uint32_t> none;
+        EXPECT(pick_queue_slot({none, none}).pool == SIZE_MAX);
+    }
+    std::printf("queue slots: distinct while free, shared by fewest users after\n");
+    return 0;
+}
+
 constexpr std::uint32_t kSize = 64 * 1024;
 constexpr std::uint32_t kTex = 64;  // 64x64 RGBA8: row pitch 256, already aligned
 
@@ -124,7 +166,7 @@ std::uint8_t pattern(std::uint32_t i, std::uint8_t seed) { return std::uint8_t(i
 }  // namespace
 
 int main() {
-    if (check_picker()) return 1;
+    if (check_picker() || check_queue_slots()) return 1;
 
     vktest::Device d;
     d.all_queue_types = true;

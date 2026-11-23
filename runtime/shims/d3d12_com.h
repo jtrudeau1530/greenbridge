@@ -191,7 +191,14 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
 
 // The same, on a Vulkan instance and device of its own (destroyed with the D3D12 device). Picks the first discrete
 // GPU with the features above. LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation.
-HRESULT create_vulkan_device_standalone(REFIID riid, void** out);
+//
+// The queue test settings (LEONIDA_VK_MAX_QUEUES_PER_FAMILY, LEONIDA_VK_GRAPHICS_FAMILY_ONLY; docs/testing.md) give
+// the device fewer Vulkan queues than the GPU has, so the tests run the path where D3D12 queues share one. Only the
+// tests apply them: the game's device (d3d12_xs, LEONIDA_D3D12=vulkan) passes `ignore`, so a variable left set does
+// not serialize the game's queues; it says once that it ignores them.
+enum class QueueTestSettings { apply, ignore };
+HRESULT create_vulkan_device_standalone(REFIID riid, void** out,
+                                        QueueTestSettings queue_test_settings = QueueTestSettings::apply);
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
 // GetDevice must return. No reference is taken: the outer object owns the device. `outer` may be the proxy's

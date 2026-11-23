@@ -84,6 +84,46 @@ void log_once(const char* what, int value) {
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
 }
 
+// Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
+// queues share a VkQueue runs on any GPU; both together give the Intel UHD 770 on Windows and lavapipe (one family,
+// one queue). LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N (1 to 16): at most N VkQueues per queue family (unset, or not a
+// number from 1 to 16: 16). LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1: COMPUTE and COPY queues use the graphics family, as on
+// a GPU without async compute or transfer families. The game's device ignores both (QueueTestSettings::ignore).
+
+// The setting's value, or false when it is unset; set but ignored, it says so.
+bool queue_test_setting(const char* name, char* text, size_t size, rt::d3d12::QueueTestSettings settings) {
+    size_t length = 0;
+    if (getenv_s(&length, text, size, name) != 0 || length <= 1) return false;
+    if (settings == rt::d3d12::QueueTestSettings::apply) return true;
+    std::fprintf(stderr, "[rt] d3d12: %s is a test setting; the game's device ignores it (all its Vulkan queues)\n",
+                 name);
+    return false;
+}
+
+bool graphics_family_only(rt::d3d12::QueueTestSettings settings) {
+    char text[8] = {};
+    const bool on = queue_test_setting("LEONIDA_VK_GRAPHICS_FAMILY_ONLY", text, sizeof(text), settings) &&
+                    text[0] != '0';
+    if (on) std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_GRAPHICS_FAMILY_ONLY: every D3D12 queue in the graphics family\n");
+    return on;
+}
+
+std::uint32_t max_queues_per_family(rt::d3d12::QueueTestSettings settings) {
+    constexpr std::uint32_t most = 16;
+    char text[16] = {};
+    if (!queue_test_setting("LEONIDA_VK_MAX_QUEUES_PER_FAMILY", text, sizeof(text), settings)) return most;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (end == text || *end || value < 1 || value > most) {
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_MAX_QUEUES_PER_FAMILY=%s is not a number from 1 to %u: ignored\n",
+                     text, most);
+        return most;
+    }
+    std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_MAX_QUEUES_PER_FAMILY: at most %lu Vulkan queue(s) per family\n",
+                 value);
+    return std::uint32_t(value);
+}
+
 // The pipelines build stage writes its cache beside gta6rt.exe, independently of the working directory.
 std::filesystem::path pipeline_cache_path() {
     std::wstring path(32768, L'\0');
@@ -4442,9 +4482,9 @@ public:
 
     explicit Device(const VulkanDeviceInfo& info) {
         state_.info = info;
-        queue_busy_.resize(info.command_queues.size(), false);
-        compute_busy_.resize(info.compute_queues.size(), false);
-        copy_busy_.resize(info.copy_queues.size(), false);
+        queue_users_.resize(info.command_queues.size(), 0);
+        compute_users_.resize(info.compute_queues.size(), 0);
+        copy_users_.resize(info.copy_queues.size(), 0);
         for (std::uint32_t f : {info.queue_family, info.compute_family, info.copy_family})
             if (f != UINT32_MAX && std::find(state_.families.begin(), state_.families.end(), f) == state_.families.end())
                 state_.families.push_back(f);
@@ -5101,55 +5141,37 @@ public:
             return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
                                                                      state_.info.queue_family, *desc, riid, out,
                                                                      identity(), state_.clock));
-        if (desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
-            const bool compute = desc->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
-            auto& busy = compute ? compute_busy_ : copy_busy_;
-            const auto& queues = compute ? state_.info.compute_queues : state_.info.copy_queues;
-            const std::uint32_t family = compute ? state_.info.compute_family : state_.info.copy_family;
-            std::size_t dedicated = busy.size();
-            {
-                std::lock_guard lock(queue_mutex_);
-                for (std::size_t i = 0; i < busy.size(); ++i) {
-                    if (!busy[i]) {
-                        busy[i] = true;
-                        dedicated = i;
-                        break;
-                    }
-                }
-            }
-            if (dedicated < busy.size()) {
-                std::shared_ptr<void> lease(nullptr, [this, compute, dedicated](void*) {
-                    std::lock_guard lock(queue_mutex_);
-                    (compute ? compute_busy_ : copy_busy_)[dedicated] = false;
-                });
-                return d3d12_trace::result(method, create_command_queue(*state_.context, queues[dedicated], family,
-                                                                         *desc, riid, out, identity(), state_.clock,
-                                                                         std::move(lease)));
-            }
-        }
-        std::size_t slot = queue_busy_.size();
+        // A VkQueue of the type's own family first, then the graphics family; shared when every one is in use.
+        const bool compute = desc->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        const bool copy = desc->Type == D3D12_COMMAND_LIST_TYPE_COPY;
+        auto& own_users = compute ? compute_users_ : copy_users_;
+        const auto& own_queues = compute ? state_.info.compute_queues : state_.info.copy_queues;
+        const std::uint32_t own_family = compute ? state_.info.compute_family : state_.info.copy_family;
+        const std::span<const std::uint32_t> own =
+            compute || copy ? std::span<const std::uint32_t>(own_users) : std::span<const std::uint32_t>();
+        std::vector<std::uint32_t>* users = nullptr;
+        std::size_t slot = 0;
+        std::uint32_t sharing = 0;  // other D3D12 queues already on the chosen VkQueue
         {
             std::lock_guard lock(queue_mutex_);
-            for (std::size_t i = 0; i < queue_busy_.size(); ++i) {
-                if (!queue_busy_[i]) {
-                    queue_busy_[i] = true;
-                    slot = i;
-                    break;
-                }
-            }
+            const auto chosen = leonida::pick_queue_slot({own, queue_users_});
+            if (chosen.pool == SIZE_MAX) return d3d12_trace::result(method, E_OUTOFMEMORY);  // no VkQueue at all
+            users = chosen.pool == 0 ? &own_users : &queue_users_;
+            slot = chosen.index;
+            sharing = (*users)[slot]++;
         }
-        if (slot == queue_busy_.size()) {
-            std::fprintf(stderr, "[rt] d3d12: no independent Vulkan queue available\n");
-            return d3d12_trace::result(method, E_OUTOFMEMORY);
-        }
+        const bool own_pool = users != &queue_users_;
+        if (sharing)
+            log_once("CreateCommandQueue: every Vulkan queue of the family is in use; this D3D12 queue shares one with "
+                     "the others on it (their batches run in submission order), type", desc->Type);
         // Child holds a device reference until after the lease has been released.
-        std::shared_ptr<void> lease(nullptr, [this, slot](void*) {
+        std::shared_ptr<void> lease(nullptr, [this, users, slot](void*) {
             std::lock_guard lock(queue_mutex_);
-            queue_busy_[slot] = false;
+            --(*users)[slot];
         });
-        const VkQueue queue = state_.info.command_queues[slot];
-        return d3d12_trace::result(method, create_command_queue(*state_.context, queue,
-                                                                 state_.info.queue_family, *desc, riid, out,
+        const VkQueue queue = own_pool ? own_queues[slot] : state_.info.command_queues[slot];
+        const std::uint32_t family = own_pool ? own_family : state_.info.queue_family;
+        return d3d12_trace::result(method, create_command_queue(*state_.context, queue, family, *desc, riid, out,
                                                                  identity(), state_.clock, std::move(lease)));
     }
 
@@ -7914,9 +7936,10 @@ private:
     }
 
     std::mutex queue_mutex_;
-    std::vector<bool> queue_busy_;
-    std::vector<bool> compute_busy_;
-    std::vector<bool> copy_busy_;
+    // Live D3D12 queues per VkQueue of info.command_queues, compute_queues and copy_queues (pick_queue_slot).
+    std::vector<std::uint32_t> queue_users_;
+    std::vector<std::uint32_t> compute_users_;
+    std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
     std::atomic<bool> removed_{false};
     OwnedRuntime owned_;
@@ -8352,7 +8375,7 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
 
 // Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and
 // VK_KHR_synchronization2 (vulkan13_features.h). LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
-HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
+HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettings queue_test_settings) {
     if (!out) return E_POINTER;
     *out = nullptr;
     static const HMODULE library = LoadLibraryA("vulkan-1.dll");
@@ -8418,9 +8441,31 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     char validation[8] = {};
     size_t length = 0;
     if (getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0') {
-        instance_info.pNext = &validation_features;
-        instance_info.enabledLayerCount = 1;
-        instance_info.ppEnabledLayerNames = &layer;
+        // Ask for the layer only when the loader lists it, and say so when it does not: an instance that cannot be
+        // made because of a missing layer left the caller with "Vulkan unavailable" and no hint that validation was
+        // the cause. Wine does not list the Linux loader's layers to the program and refuses an explicit request for
+        // one, so there only VK_INSTANCE_LAYERS (which Wine keeps out of the program's environment) loads it.
+        bool layer_listed = false;
+        if (const auto enumerate_layers = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
+                get(nullptr, "vkEnumerateInstanceLayerProperties"))) {
+            std::uint32_t layer_count = 0;
+            enumerate_layers(&layer_count, nullptr);
+            std::vector<VkLayerProperties> layers(layer_count);
+            if (layer_count && enumerate_layers(&layer_count, layers.data()) >= VK_SUCCESS)
+                for (std::uint32_t i = 0; i < layer_count; ++i)
+                    layer_listed = layer_listed || std::strcmp(layers[i].layerName, layer) == 0;
+        }
+        if (layer_listed) {
+            instance_info.pNext = &validation_features;
+            instance_info.enabledLayerCount = 1;
+            instance_info.ppEnabledLayerNames = &layer;
+        } else {
+            std::fprintf(stderr,
+                         "[rt] d3d12: LEONIDA_VK_VALIDATION is set but %s is not listed by the Vulkan loader "
+                         "(install the Vulkan SDK; under Wine set VK_INSTANCE_LAYERS=%s instead)\n",
+                         layer, layer);
+            return E_FAIL;
+        }
     }
     // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
     const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
@@ -8639,7 +8684,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, nullptr);
     std::vector<VkQueueFamilyProperties> families(family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, families.data());
-    const std::uint32_t command_queue_count = std::min(16u, families[info.queue_family].queueCount);
+    const std::uint32_t queue_cap = max_queues_per_family(queue_test_settings);
+    const std::uint32_t command_queue_count = std::min(queue_cap, families[info.queue_family].queueCount);
     std::vector<float> priorities(16, 1.0f);
     std::vector<VkDeviceQueueCreateInfo> queue_infos;
     {
@@ -8657,11 +8703,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     // enforces the D3D12 COPY/COMPUTE stage restrictions on the more capable family.
     const bool sparse_buffers = chosen_features.sparseBinding && chosen_features.sparseResidencyBuffer &&
                                 chosen_features.sparseResidencyAliased;
-    const auto picked = leonida::sparse_capable_queue_families(families, preferred, sparse_buffers);
+    auto picked = leonida::sparse_capable_queue_families(families, preferred, sparse_buffers);
+    if (graphics_family_only(queue_test_settings)) picked = {info.queue_family, info.queue_family, info.queue_family};
     std::uint32_t compute_count = 0, copy_count = 0;
     if (picked.compute != info.queue_family) {
         info.compute_family = picked.compute;
-        compute_count = std::min(16u, families[picked.compute].queueCount);
+        compute_count = std::min(queue_cap, families[picked.compute].queueCount);
         VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         q.queueFamilyIndex = picked.compute;
         q.queueCount = compute_count;
@@ -8671,7 +8718,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (picked.copy != info.queue_family) {
         info.copy_family = picked.copy;
         if (picked.copy != picked.compute) {
-            copy_count = std::min(16u, families[picked.copy].queueCount);
+            copy_count = std::min(queue_cap, families[picked.copy].queueCount);
             VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
             q.queueFamilyIndex = picked.copy;
             q.queueCount = copy_count;

@@ -503,6 +503,16 @@ another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` p
 The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
 `vk_device_pick.h`, and fail with a message naming the filter when it matches no device.
 
+Two test settings make the layer's standalone device look like a GPU with fewer Vulkan queues, so D3D12 queues share
+them (`docs/d3d12_vulkan.md` section 4.4) on any GPU: `LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N` (1 to 16) creates at most
+N Vulkan queues per queue family, and `LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1` puts COMPUTE and COPY queues in the
+graphics family, as on a GPU without async compute or transfer families. Both together give the shape of the Intel
+UHD 770 on Windows and of lavapipe, one family with one queue; the `d3d12_queue_share_one_queue` and
+`d3d12_queue_wait_one_queue` tests run that way, and any other test can be run so by hand. The device logs what it
+applied; a queue count outside 1 to 16 is ignored, with a message. Only tests apply them: the device that
+`gta6rt --run` creates for a game (`LEONIDA_D3D12=vulkan`) ignores both and prints `... is a test setting; the
+game's device ignores it`, so leaving them set cannot slow a game down (`run_tiny_frame_queue_test_settings`).
+
 ## Known problems
 
 | What you see | Cause | What to do |
