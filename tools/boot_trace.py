@@ -12,9 +12,10 @@ a native program in an error record (`program.exe : [d3d12-trace] #1 ...`), so a
 tag is accepted too. The reader accepts UTF-8 and BOM-marked UTF-16, including PowerShell 5.1 stderr redirection.
 
 Usage:
-    python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N]
+    python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--counts-only] [--limit N]
 
-The traces can quote what the game prints, so they stay on the player's machine: the text report counts debug
+Use --counts-only for an aggregate JSON report to share. The traces can quote what the game prints, so they
+stay on the player's machine. The text report counts debug
 strings instead of printing them, and only the tests' synthetic fixtures go into the repository. Share counts and
 error classes from a real run, not its trace (AGENTS.md, "No game data").
 
@@ -226,6 +227,35 @@ def summarize(startup: dict | None, d3d12: dict | None) -> dict:
     return {"startup": startup, "d3d12": d3d12}
 
 
+def counts_only(summary: dict) -> dict:
+    """Project only fixed counters into the summary intended for sharing."""
+    counters = summarize(None, None)
+    if startup := summary["startup"]:
+        counters["startup"] = {
+            name: startup[name] for name in ("events", "bad_lines", "tls_callbacks", "debug_strings",
+                                             "file_open_failed_count", "exception_count")
+        }
+        counters["startup"].update(
+            modules=len(startup["modules"]),
+            dllmain_failed=startup["dllmain"]["failed"],
+            unimplemented_imports=len(startup["unimplemented"]),
+            int3_skipped=len(startup["int3_skipped"]),
+            exit_observed=startup["exit"] is not None,
+        )
+    if d3d12 := summary["d3d12"]:
+        outcomes = {}
+        for outcome, count in d3d12["outcomes"].items():
+            key = outcome if outcome in ("failed", "unsupported", "refused", "partial", "ok", "called", "ignored") else "other"
+            outcomes[key] = outcomes.get(key, 0) + count
+        counters["d3d12"] = {
+            "calls": d3d12["calls"],
+            "ignored_lines": d3d12["ignored_lines"],
+            "sequence_break_count": d3d12["sequence_break_count"],
+            "outcomes": outcomes,
+        }
+    return counters
+
+
 def _tail(items, limit: int) -> str:
     shown = ", ".join(str(x) for x in items[:limit])
     return shown + (f", ... {len(items) - limit} more" if len(items) > limit else "")
@@ -344,6 +374,7 @@ def main(argv=None) -> int:
     ap.add_argument("startup", nargs="?", help="the JSONL written by gta6rt --trace")
     ap.add_argument("--d3d12", help="the stderr log written with --trace-d3d12")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
+    ap.add_argument("--counts-only", action="store_true", help="print aggregate JSON without paths or event details")
     ap.add_argument(
         "--limit", type=int, default=10, help="items listed per section (default 10)"
     )
@@ -361,11 +392,13 @@ def main(argv=None) -> int:
             try:
                 summary[section] = parse(path, a.limit)
             except TraceError as e:
-                print(f"error: {e}", file=sys.stderr)
+                print(f"error: {section} trace unavailable" if a.counts_only else f"error: {e}", file=sys.stderr)
                 exit_code = 2
     if not any(summary.values()):
         return 2
-    if a.json:
+    if a.counts_only:
+        print(json.dumps(counts_only(summary), indent=1))
+    elif a.json:
         print(json.dumps(summary, indent=1))
     else:
         print(format_text(summary, a.limit))

@@ -374,6 +374,38 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(data["startup"]["pid"], 123)
         self.assertEqual(data["d3d12"]["calls"], 9)
 
+    def test_counts_only_json_omits_raw_trace_fields(self):
+        self.write(self.startup, [
+            {"kind": "exception", "code": "private-code", "address": "private-address",
+             "stack": ["private-stack"]},
+            {"kind": "file_open_failed", "path": "private-file", "caller": "private-caller"},
+            {"kind": "error", "what": "private-message"},
+            {"kind": "private-kind"},
+        ])
+        self.write_lines(self.d3d12, [
+            "[d3d12-trace] #1 private-method failed",
+            "[d3d12-trace] #2 private-method private-outcome",
+        ])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main([self.startup, "--d3d12", self.d3d12, "--counts-only"]), 0)
+        text = out.getvalue()
+        self.assertNotIn("private-", text)
+        self.assertNotIn("boot.jsonl", text)
+        self.assertNotIn("d3d12.log", text)
+        data = json.loads(text)
+        self.assertEqual(data["startup"]["exception_count"], 1)
+        self.assertEqual(data["startup"]["events"], 4)
+        self.assertEqual(data["d3d12"]["outcomes"], {"failed": 1, "other": 1})
+        self.assertEqual(data["d3d12"]["calls"], 2)
+
+    def test_counts_only_redacts_missing_input_paths_from_stderr(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(bt.main([self.startup, "--counts-only"]), 2)
+        self.assertIn("startup trace unavailable", err.getvalue())
+        self.assertNotIn("boot.jsonl", err.getvalue())
+
     def test_missing_and_empty_files_are_errors(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
