@@ -150,6 +150,21 @@ class IsolateTest(unittest.TestCase):
         r = self.run_tool(["--isolate", "--stats", str(self.cache("s.csv"))])
         self.assertEqual(r.returncode, 2)
 
+    def test_isolate_updates_the_inflight_snapshot(self):
+        snapshot = self.cache("inflight.txt")
+        snapshot.write_text("stale\tmodule\n", encoding="utf-8")
+        args = ["--isolate", "--start", str(NAMES.index(CRASHER)), "--count", "1",
+                "--large-module-bytes", "1", "--large-parallel", "1", "--inflight-file", str(snapshot)]
+
+        failed = self.run_tool(args, crash=CRASHER)
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertIn(f"MODULE CRASH {CRASHER}", failed.stdout)
+        self.assertEqual(snapshot.read_text(encoding="utf-8"), f"{CRASHER}\tpipeline\n")
+
+        passed = self.run_tool(args)
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertEqual(snapshot.read_bytes(), b"")
+
 
 def main():
     """unittest.main(), except that a file whose tests all skipped succeeds: unittest exits 5 for an empty run, and

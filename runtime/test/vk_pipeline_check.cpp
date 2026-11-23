@@ -38,7 +38,7 @@
 //                 --large-module-bytes enters or leaves the driver (with --large-parallel 1 it is alone then, so F
 //                 names exactly it; otherwise F names every module in flight and make_game.py retries each alone)
 //                 and by the 5 s watchdog for the others, and emptied at the end. make_game.py's pipelines stage
-//                 reads it.
+//                 reads it. With --isolate, the active child writes the snapshot.
 //   --skip-file F modules named in F (one per line) are not compiled: each is reported as MODULE CRASH and counted
 //                 as a failed pipeline, as --isolate does for a module that killed the driver. make_game.py writes F
 //                 after a crash, so the next run checks everything else instead of dying on the same module.
@@ -948,6 +948,7 @@ int main(int argc, char** argv) {
                                          "--large-module-bytes", std::to_string(large_module_bytes),
                                          "--large-parallel", std::to_string(large_parallel)};
         if (cache_feedback) pass.push_back("--cache-feedback");
+        if (!inflight_path.empty()) pass.insert(pass.end(), {"--inflight-file", inflight_path});
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
         struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}; };
         std::map<std::string, Agg> agg;
