@@ -771,7 +771,8 @@ The compute path, end to end:
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
   - Shader programs (FSSM blobs) are copied in as the code base.
 - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place from `pack()`; a
-  signature `pack()` refuses (more than 32 user dwords: the spill layout is open) is refused with its reason. Before
+  signature `pack()` refuses (more than 32 user dwords: the spill layout is open; the translated shaders have no
+  below-base spill-pointer candidates, section 3.5) is refused with its reason. Before
   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
   `S_FALSE` for a null output whatever the blob, then `E_INVALIDARG` for a node other than node 0 or a DXBC
   container whose size (the dword at +24) is not the size passed.
@@ -1699,6 +1700,33 @@ Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-d
 refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
 `__XB_GetRootSignatureSpillPointer`; until that layout is measured, refusing is the only correct behaviour.
 
+Measured (D3D-315): zero below-base spill-pointer candidates in the translated shaders.
+`python -I tools/root_spill_census.py <spirv/index.json> --carve <dxbc/index.json> --expect-no-spill` exits 0 on
+the 26,501 translated shaders (all but the 2 compute shaders refused for workgroup memory under wave64 emulation),
+Xbox Series 1.0.2.1:
+- **No root signatures in the containers.** 0 of the 26,503 carved containers have an `RTS0` part. The game
+  builds its root signatures at run time, so the number that exceed 32 dwords is open until they are dumped from
+  the executable.
+- **No spill-pointer candidates.** No user-SGPR read used as an address (`ptr32_lo`, `ptr64_lo`, `ptr64_hi`) sits
+  below the stage base (ps/vs/gs s8, cs s4, ms s16) in any stage. For compute that block holds the measured spill
+  pointer `s[0:1]` (section 7); here `s0` and `s1` are never read as an address, only `s1` as a constant
+  (109 CS, 551 PS, 12 VS).
+- **Compute stays far below the budget.** The largest RSRC2 `USER_SGPR` count is 14 (31 of 2,687 shaders), so at
+  most 10 of the 28 root dwords above s4 are used.
+- **The highest reads are not spills.** PS reads reach s31 (8 shaders), s29 (7), s27 (1) and s25 (8); MS s29 (2)
+  and s27 (8); VS s25 (2). Each of those top reads is a 32-bit constant after a gap, not an address.
+
+What this does not settle:
+- **How many runtime-created signatures exceed the budget.** The containers carry none, so that count waits for
+  signatures dumped from the executable.
+- **Why a particular `pack()` refusal happens.** `pack()` counts two dwords per table from s0, which the census
+  above disagrees with, so its 32-dword limit and the console's budget need not agree. Whether a given refusal is
+  that model or a real spill is open until the signature and its shaders are compared.
+- **A spill behind a pointer at or above the base.** It reads the same as a table pointer, so the census can't
+  tell the two apart.
+
+The spill layout stays unimplemented: no shader in the translated set reads a candidate a spill could sit behind.
+
 Reconciliation: `tools/root_sig_contract.py` checks a candidate root signature against every shader's
 `user_sgpr_reads` from `spirv/index.json` (const32 vs constant dwords, 64-bit VAs vs view/table pairs) and fails
 the build on the first contradiction. Until the console mapping in §3.5 is confirmed by a PSO, this check — not
@@ -1770,7 +1798,9 @@ Things that can invalidate this simple model, all **Open**:
   driver must spill the rest to memory, probably behind a pointer in the user data. The current shader contract has
   no representation for that. The likely answer is that this game keeps its root signatures small (bindless
   descriptors, a few constants), but it must be measured. If a large root signature appears, the spill layout has
-  to be reverse-engineered from the shader's loads.
+  to be reverse-engineered from the shader's loads. Measured on the shader side (D3D-315, spill policy above):
+  zero below-base spill-pointer candidates in the translated shaders. The root signatures themselves, and how many
+  exceed the budget, are still to be dumped from the executable.
 - **Direct heap indexing.** The bound heap base and stride are not root parameters. Measured (D3D-329, section
   3.4): each heap's base reaches the shader as a 32-bit pointer in an entry SGPR, inside the user data for compute
   (and below `s32` for the graphics stages, whose user count is not measured yet), and the stride is compiled into
