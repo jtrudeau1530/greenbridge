@@ -319,7 +319,7 @@ class GlbInspectTests(unittest.TestCase):
     def test_nul_padding_is_accepted_and_counted(self):
         payload = b'{"asset":{"version":"2.0"}}' + b"\x00"
         with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "nul.glb")
+            path = os.path.join(folder, "nul_padding.glb")
             out = os.path.join(folder, "report.json")
             with open(path, "wb") as handle:
                 handle.write(raw_glb([(JSON_CHUNK, payload)]))
