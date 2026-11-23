@@ -1057,7 +1057,6 @@ def run_suite(a, work: str) -> int:
             # d16_xyz / d16_xy typed-buffer loads and d16_xyz stores (cs_fmt_d16_xyz.asm header)
             problem = fmt_d16_xyz_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "80/80 dumped words exact"))
-            results.append((name, not problem, problem or "128/128 dumped words exact"))
         elif name in ("cs_global_neg_offset", "cs_global_mem_ext"):
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
