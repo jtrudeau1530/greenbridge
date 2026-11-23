@@ -22,6 +22,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "host_wine.h"
 
 #ifdef _MSC_VER
 extern "C" __declspec(thread) int _Init_thread_epoch;
@@ -361,8 +362,11 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(committed == committed_pool, "a later commit of that range succeeds at its address");
         if (committed) {
             MEMORY_BASIC_INFORMATION committed_info{};
-            check(VirtualQuery(committed, &committed_info, sizeof committed_info) && committed_info.State == MEM_COMMIT &&
-                      committed_info.Protect == (PAGE_READWRITE | PAGE_WRITECOMBINE),
+            // Wine accepts PAGE_WRITECOMBINE here but reports the region as plain PAGE_READWRITE.
+            const bool committed_query =
+                VirtualQuery(committed, &committed_info, sizeof committed_info) && committed_info.State == MEM_COMMIT;
+            check(committed_query && (committed_info.Protect == (PAGE_READWRITE | PAGE_WRITECOMBINE) ||
+                                      (hostwine::host_is_wine() && committed_info.Protect == PAGE_READWRITE)),
                   "the committed range is committed PAGE_READWRITE without the graphics bits");
             static_cast<volatile uint8_t*>(committed)[0] = 0x5c;
             check(static_cast<volatile uint8_t*>(committed)[0] == 0x5c, "the committed range is writable");
