@@ -5232,13 +5232,18 @@ public:
 
     // The buffer resource holding console VA `va`, with a reference added for the caller, or null when no resource this
     // layer made holds it. `start` and `size` are the resource's first VA and byte size.
-    ID3D12Resource* add_ref_buffer_at(std::uint64_t va, std::uint64_t& start, std::uint64_t& size) {
+    // Only this layer's own buffers have a VA in the registry (the swapchain's are images, a copy's staging binding has
+    // no VA), so an ID found by VA is the ID3D12Resource pointer of a Resource (resource_id).
+    ID3D12Resource* add_ref_buffer_at(std::uint64_t va, std::uint64_t bytes, std::uint64_t& start, std::uint64_t& size) {
         leonida::ResourceId id = 0;
-        if (!state_.context->buffer_resource_at(va, id, start, size)) return nullptr;
-        auto* resource = reinterpret_cast<ID3D12Resource*>(id);  // an ID is the ID3D12Resource pointer (resource_id)
-        if (!Resource::from<Resource>(resource)) return nullptr;
-        resource->AddRef();
-        return resource;
+        ID3D12Resource* found = nullptr;
+        const bool ok = state_.context->buffer_resource_at(va, bytes, id, start, size, [&](leonida::ResourceId candidate) {
+            auto* resource = static_cast<Resource*>(reinterpret_cast<ID3D12Resource*>(candidate));
+            if (!resource->try_add_ref()) return false;
+            found = resource;
+            return true;
+        });
+        return ok ? found : nullptr;
     }
 
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
@@ -8282,9 +8287,10 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     // this finds the layer's resource for it.
     if (rt::d3d12_xs::is_device_proxy(outer))
         rt::d3d12_xs::set_device_resource_provider(
-            outer, [](ID3D12Device* real, std::uint64_t va, std::uint64_t* start, std::uint64_t* size) -> ID3D12Resource* {
+            outer, [](ID3D12Device* real, std::uint64_t va, std::uint64_t bytes, std::uint64_t* start,
+                      std::uint64_t* size) -> ID3D12Resource* {
                 Device* device = Device::from<Device>(real);
-                return device ? device->add_ref_buffer_at(va, *start, *size) : nullptr;
+                return device ? device->add_ref_buffer_at(va, bytes, *start, *size) : nullptr;
             });
     // And for the same outer: its IDXGIDevice1::GetAdapter (d3d12_xs_device.h) hands
     // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets

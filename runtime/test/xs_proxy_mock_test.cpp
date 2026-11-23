@@ -835,7 +835,11 @@ int run_env_slots(bool valid, bool on_slot70 = false) {
 Mock* g_buffer = nullptr;
 constexpr std::uint64_t kBufferStart = 0x10000, kBufferSize = 0x400;
 
-ID3D12Resource* find_buffer(ID3D12Device*, std::uint64_t va, std::uint64_t* start, std::uint64_t* size) {
+std::uint64_t g_asked_bytes = 0;  // the byte count the proxy last asked the provider to cover
+
+ID3D12Resource* find_buffer(ID3D12Device*, std::uint64_t va, std::uint64_t bytes, std::uint64_t* start,
+                            std::uint64_t* size) {
+    g_asked_bytes = bytes;
     if (!g_buffer || va < kBufferStart || va >= kBufferStart + kBufferSize) return nullptr;
     *start = kBufferStart;
     *size = kBufferSize;
@@ -920,6 +924,7 @@ int check_slot70_raw_buffer() {
            mock->srv.Buffer.NumElements == 0x40 && mock->srv.Buffer.StructureByteStride == 0 &&
            mock->srv.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     EXPECT(g_buffer->refs == 1);  // the proxy released the reference the provider added
+    EXPECT(g_asked_bytes == 0x100);  // it asks for a buffer that holds the whole width, so an alias that does wins
 
     // A width that runs past the buffer is cut at its end: (0x400 - 0x3f0) / 4 elements.
     shape = raw_shape(kBufferStart + 0x3f0, 0x1000);

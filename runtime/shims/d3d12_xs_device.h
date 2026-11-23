@@ -83,10 +83,11 @@ using DxgiAdapterProvider = HRESULT (*)(ID3D12Device* real, REFIID riid, void** 
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither: nothing is set then.
 bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
 // Finds the buffer resource that holds a console GPU virtual address, for device slot 70. `real` is the device behind
-// the proxy. Returns the resource with a reference added (the proxy releases it), or null when no resource holds
+// the proxy; `bytes` is how many bytes from `va` the caller wants, so a resource that holds all of them is preferred
+// over a shorter alias. Returns the resource with a reference added (the proxy releases it), or null when no resource holds
 // `va`; `start` and `size` are then unused, otherwise the resource's first VA and size in bytes.
-using ResourceByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64_t va, std::uint64_t* start,
-                                                std::uint64_t* size);
+using ResourceByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64_t va, std::uint64_t bytes,
+                                                std::uint64_t* start, std::uint64_t* size);
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither. Without a provider slot
 // 70 writes only the null view.
 bool set_device_resource_provider(void* device, ResourceByVaProvider provider);

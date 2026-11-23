@@ -1292,7 +1292,7 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
         return;
     }
     std::uint64_t start = 0, size = 0;
-    ID3D12Resource* resource = self->resource_provider(self->real, shape.va, &start, &size);
+    ID3D12Resource* resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
     if (!resource || shape.va < start || shape.va - start >= size) {
         if (resource) resource->Release();
         log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
