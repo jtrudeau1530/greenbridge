@@ -19,9 +19,10 @@ class FirstLookShimReportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             # Every tool first_look.ps1 runs: a missing one fails its step, and the test's stand-in loader (an alias)
-            # leaves that exit code in $LASTEXITCODE for the script's exit.
+            # leaves that exit code in $LASTEXITCODE for the script's exit. (gdk_runtime_calls since round 43,
+            # find_hash_lookup for mods, exe_checklist for the notes to confirm.)
             for name in ("scripts/first_look.ps1", "tools/pe_inspect.py", "tools/gdk_runtime_calls.py",
-                         "tools/gdk_runtime_classes.json"):
+                         "tools/gdk_runtime_classes.json", "tools/find_hash_lookup.py", "tools/exe_checklist.py"):
                 (root / name).parent.mkdir(exist_ok=True)
                 shutil.copyfile(source / name, root / name)
             loader = root / "runtime/build/gta6rt.exe"

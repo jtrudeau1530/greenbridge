@@ -28,6 +28,17 @@ Write-Host "`n== GDK runtime classes and slots called through xgameruntime.lib (
 python -I (Join-Path $root "tools\gdk_runtime_calls.py") $Exe --out $out
 if ($LASTEXITCODE -ne 0) { Write-Warning "gdk_runtime_calls could not read all of $Exe; its report may be incomplete" }
 
+Write-Host "`n== Archetype lookup candidates for mods (docs/modding.md; pass the top RVA to gta6rt --archetype-lookup)"
+python -I (Join-Path $root "tools\find_hash_lookup.py") $Exe --json (Join-Path $out "hash_lookup.json")
+if ($LASTEXITCODE -ne 0) { Write-Warning "find_hash_lookup could not scan $Exe" }
+
+Write-Host "`n== What to confirm against this executable (every ASSUMPTION / UNVERIFIED / VERIFY note; called ones first)"
+$calls = Join-Path $out ((Split-Path $Exe -Leaf) + ".gdk_calls.json")
+$checklistArgs = @("--out", (Join-Path $out "checklist.md"))
+if (Test-Path $calls) { $checklistArgs += @("--gdk-calls", $calls) }
+python -I (Join-Path $root "tools\exe_checklist.py") @checklistArgs
+if ($LASTEXITCODE -ne 0) { Write-Warning "exe_checklist could not write the checklist" }
+
 $rt = Join-Path $root "runtime\build\gta6rt.exe"
 $tlsHost = Join-Path $root "runtime\build\gta6rt_tls_host.dll"
 $runtimeFiles = @($rt, $tlsHost)

@@ -35,8 +35,9 @@ id but not an interface id is read as the class's implemented interface. The arg
 highest of rdx/r8/r9 (xmm1-3) written, or [rsp+20h+8k] stored, between the previous call and the slot call.
 
 Output: per image and class, the class and interface ids, the slots called with their method names and whether
-their thunks are referenced, the thunk count, and whether runtime/shims/xgameruntime.cpp serves the class (a
-`constexpr GUID k...Class` with its id; the class only, not each slot); then the known ids present in the image that
+their thunks are referenced, the thunk count, and whether the runtime serves the class (a `constexpr GUID
+k...Class` with its id in one of runtime/shims/xgameruntime*.cpp: xgameruntime.cpp and the classes it hands on to
+xgameruntime_user.cpp, _gamesave.cpp, _store.cpp, _offline.cpp; the class only, not each slot); then the known ids present in the image that
 no thunk reaches. Text by default, --json for JSON. --out DIR writes both, as <image file name>.gdk_calls.txt and
 .json (x.dll-2.gdk_calls.txt for a second input named x.dll), and prints one summary line per image instead.
 
@@ -60,7 +61,7 @@ from pe_inspect import DIR_EXCEPTION, MACHINES, PeFormatError, PeImage  # noqa: 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TABLE = os.path.join(HERE, "gdk_runtime_classes.json")
-DEFAULT_RUNTIME_SOURCE = os.path.join(HERE, "..", "runtime", "shims", "xgameruntime.cpp")
+DEFAULT_RUNTIME_SOURCE = os.path.join(HERE, "..", "runtime", "shims")   # every xgameruntime*.cpp in it
 
 IUNKNOWN_SLOTS = 3          # QueryInterface, AddRef, Release
 RELEASE = 2
@@ -402,6 +403,21 @@ class RuntimeTable:
 GUID_CONSTANT = re.compile(
     r"constexpr\s+GUID\s+k(\w*?)Class\s*=\s*\{\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,"
     r"\s*\{([^}]*)\}\s*\}")
+
+
+def read_runtime_source(path: str) -> str:
+    """The text of a shim source file, or of every xgameruntime*.cpp in a folder (OSError when there is none)."""
+    if os.path.isdir(path):
+        names = sorted(n for n in os.listdir(path) if n.startswith("xgameruntime") and n.endswith(".cpp"))
+        if not names:
+            raise FileNotFoundError(2, "no xgameruntime*.cpp in the folder", path)
+        texts = []
+        for n in names:
+            with open(os.path.join(path, n), encoding="utf-8", errors="replace") as f:
+                texts.append(f.read())
+        return "\n".join(texts)
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
 
 
 def served_classes(source: str) -> dict[str, str]:
@@ -864,7 +880,7 @@ def report(path: str, table: RuntimeTable, served: dict[str, str] | None) -> dic
 
 
 def served_text(flag) -> str:
-    return {True: "served by xgameruntime.cpp", False: "NOT served by xgameruntime.cpp", None: "served: unknown"}[flag]
+    return {True: "served by the runtime", False: "NOT served by the runtime", None: "served: unknown"}[flag]
 
 
 def referenced_text(count, total) -> str:
@@ -920,7 +936,7 @@ def to_text(r: dict) -> str:
     todo = [c for c in r["classes"] if c["served"] is not True]
     if todo:
         out.append("")
-        out.append("Not served by xgameruntime.cpp (class as interface: slots called; the referenced ones):"
+        out.append("Not served by the runtime (class as interface: slots called; the referenced ones):"
                    if all(c["served"] is False for c in todo) else
                    "Served status unknown (class as interface: slots called; the referenced ones):")
         for c in todo:
@@ -965,7 +981,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="write <image>.gdk_calls.txt and .json here and print a summary line per image")
     ap.add_argument("--table", default=DEFAULT_TABLE, help="the class table (default: %(default)s)")
     ap.add_argument("--runtime-source", default=DEFAULT_RUNTIME_SOURCE,
-                    help="the shim whose `constexpr GUID k...Class` ids count as served (default: %(default)s)")
+                    help="a shim source, or a folder of xgameruntime*.cpp, whose `constexpr GUID k...Class` ids count "
+                         "as served (default: %(default)s)")
     a = ap.parse_args(argv)
 
     try:
@@ -974,8 +991,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cannot read the class table {a.table}: {e}", file=sys.stderr)
         return 1
     try:
-        with open(a.runtime_source, encoding="utf-8", errors="replace") as f:
-            served = served_classes(f.read())
+        served = served_classes(read_runtime_source(a.runtime_source))
     except OSError as e:
         print(f"warning: cannot read {a.runtime_source} ({e.strerror or e}); 'served' is unknown", file=sys.stderr)
         served = None

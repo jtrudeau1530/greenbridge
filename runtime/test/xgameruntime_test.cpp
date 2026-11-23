@@ -231,8 +231,8 @@ void check_run_time_load() {
     auto query = reinterpret_cast<Query>(get_proc(rt_mod, "QueryApiImpl"));
     auto uninit_api = reinterpret_cast<Uninit>(get_proc(rt_mod, "UninitializeApiImpl"));
     check(init_ex2(0x2410, 0x0, 0x02, &options) == S_OK, "InitializeApiImplEx2 succeeds offline");
-    // XGameSaveImpl (xgameruntime include/xgamesave.idl), not served yet.
-    const GUID some_class = {0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}};
+    // An id no runtime class has (made up for this test).
+    const GUID some_class = {0x4c454f4e, 0x4944, 0x4100, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}};
     void* out = reinterpret_cast<void*>(1);
     check(query(&some_class, some_class, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr,
           "QueryApiImpl refuses a class it doesn't provide yet (HRESULT 0x80070032) and clears the out pointer");

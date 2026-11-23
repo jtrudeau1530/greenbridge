@@ -530,6 +530,10 @@ bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** o
     return true;
 }
 
+// A new handle to the offline user, for the classes that hand one out too (XUserFindForDevice, in
+// xgameruntime_offline.cpp). The title closes it with XUserCloseHandle like any other.
+void* xgameruntime_user_new_handle() { return new_handle(); }
+
 // For tests: the XUserHandles a title holds open.
 long xgameruntime_user_open_handles() {
     std::lock_guard<std::mutex> lock(g_handles_mutex);

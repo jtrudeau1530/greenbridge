@@ -112,6 +112,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
     shims/xgameruntime_user.cpp
+    shims/xgameruntime_gamesave.cpp
+    shims/xgameruntime_store.cpp
+    shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
     shims/process.cpp
   )
@@ -259,6 +262,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     test/xgameruntime_test.cpp
     shims/xgameruntime.cpp
     shims/xgameruntime_user.cpp
+    shims/xgameruntime_gamesave.cpp
+    shims/xgameruntime_store.cpp
+    shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
@@ -274,6 +280,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     test/xgameruntime_user_test.cpp
     shims/xgameruntime.cpp
     shims/xgameruntime_user.cpp
+    shims/xgameruntime_gamesave.cpp
+    shims/xgameruntime_store.cpp
+    shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
@@ -283,6 +292,60 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xgameruntime_user_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xgameruntime_user_test PRIVATE /OPT:NOREF)
   target_link_libraries(xgameruntime_user_test PRIVATE gta6rt_xtaskqueue)
+
+  # XGameSaveImpl (offline saves in LEONIDA_SAVE_DIR) through QueryApiImpl, slot by slot.
+  add_executable(xgameruntime_gamesave_test
+    test/xgameruntime_gamesave_test.cpp
+    shims/xgameruntime.cpp
+    shims/xgameruntime_user.cpp
+    shims/xgameruntime_gamesave.cpp
+    shims/xgameruntime_store.cpp
+    shims/xgameruntime_offline.cpp
+    shims/library_loader.cpp
+    shims/registry.cpp
+    shims/file_system.cpp
+  )
+  target_include_directories(xgameruntime_gamesave_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xgameruntime_gamesave_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xgameruntime_gamesave_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xgameruntime_gamesave_test PRIVATE /OPT:NOREF)
+  target_link_libraries(xgameruntime_gamesave_test PRIVATE gta6rt_xtaskqueue)
+
+  # XStoreImpl (offline: the game is owned, no add-ons, no updates) through QueryApiImpl, slot by slot.
+  add_executable(xgameruntime_store_test
+    test/xgameruntime_store_test.cpp
+    shims/xgameruntime.cpp
+    shims/xgameruntime_user.cpp
+    shims/xgameruntime_gamesave.cpp
+    shims/xgameruntime_store.cpp
+    shims/xgameruntime_offline.cpp
+    shims/library_loader.cpp
+    shims/registry.cpp
+    shims/file_system.cpp
+  )
+  target_include_directories(xgameruntime_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xgameruntime_store_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xgameruntime_store_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xgameruntime_store_test PRIVATE /OPT:NOREF)
+  target_link_libraries(xgameruntime_store_test PRIVATE gta6rt_xtaskqueue)
+
+  # XGameEventImpl, XGameUiImpl, XGameStreamingImpl (offline) through QueryApiImpl.
+  add_executable(xgameruntime_offline_test
+    test/xgameruntime_offline_test.cpp
+    shims/xgameruntime.cpp
+    shims/xgameruntime_user.cpp
+    shims/xgameruntime_gamesave.cpp
+    shims/xgameruntime_store.cpp
+    shims/xgameruntime_offline.cpp
+    shims/library_loader.cpp
+    shims/registry.cpp
+    shims/file_system.cpp
+  )
+  target_include_directories(xgameruntime_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xgameruntime_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xgameruntime_offline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xgameruntime_offline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(xgameruntime_offline_test PRIVATE gta6rt_xtaskqueue)
 
   # GameInput shim on SDL3 (zlib licence): any controller SDL supports, DualSense trigger effects and lightbar.
   # Nothing is downloaded unless asked. The shim is built when SDL3 is available:
@@ -920,6 +983,11 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
     add_test(NAME xgameruntime_user COMMAND xgameruntime_user_test)
+    add_test(NAME xgameruntime_gamesave COMMAND xgameruntime_gamesave_test)
+    add_test(NAME xgameruntime_store COMMAND xgameruntime_store_test)
+    add_test(NAME xgameruntime_offline COMMAND xgameruntime_offline_test)
+    add_test(NAME xgameruntime_offline_hdr COMMAND xgameruntime_offline_test)
+    set_tests_properties(xgameruntime_offline_hdr PROPERTIES ENVIRONMENT "LEONIDA_HDR=1")
     add_test(NAME xgameruntime_user_gamertag COMMAND xgameruntime_user_test --expect-gamertag Tester42)
     set_tests_properties(xgameruntime_user_gamertag PROPERTIES ENVIRONMENT "LEONIDA_GAMERTAG=Tester42")
     # Longer than getenv_s's old 64-byte buffer: still the "Player" fallback (and its message), not a silent one.

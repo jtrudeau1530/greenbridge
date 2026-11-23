@@ -66,9 +66,14 @@ This writes `reports/exe/` (JSON plus a readable summary). Check it in this orde
    inline write checks the cursor limit, so a layer that keeps the cursor at the limit receives every command
    through the vtable; any unchecked site is a write that layer never sees. The package's DLLs check at every site
    ([d3d12_command_objects.md](d3d12_command_objects.md), "Every inline write in the package's DLLs checks first").
-4. **GDK runtime classes.** The exe imports no GDK function by name; `<exe>.gdk_calls.txt` lists the runtime classes
-   and vtable slots it calls through `xgameruntime.lib`'s thunks, and the classes `runtime/shims/xgameruntime.cpp`
-   doesn't serve yet ([runtime_imports.md](runtime_imports.md#measuring-which-runtime-classes-a-binary-calls)).
+5. **GDK runtime classes.** The exe imports no GDK function by name; `<exe>.gdk_calls.txt` lists the runtime classes
+   and vtable slots it calls through `xgameruntime.lib`'s thunks, and the classes the runtime's
+   `runtime/shims/xgameruntime*.cpp` don't serve yet
+   ([runtime_imports.md](runtime_imports.md#measuring-which-runtime-classes-a-binary-calls)).
+6. **What to confirm.** `checklist.md` (`tools/exe_checklist.py`) gathers every `ASSUMPTION`, `UNVERIFIED` and
+   `VERIFY` note of the runtime and the docs, with file and line. Notes in a shim whose class the exe calls are
+   marked **called** and come first: those are the ones its first boot reaches, such as the `XStoreGameLicense`
+   sizes.
 
 Then `runtime\build\gta6rt.exe --dry-run <exe>` maps the image and binds every import to the shim table without
 running any game code. It reports what it couldn't bind.

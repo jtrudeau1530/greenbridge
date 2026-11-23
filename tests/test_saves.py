@@ -571,7 +571,7 @@ class MalformedSlayerTest(unittest.TestCase):
 
 class ImportTest(unittest.TestCase):
     def test_encoding_matches_the_shim(self):
-        # Same rule as encode_name() in runtime/shims/xgameruntime_services.cpp.
+        # Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp.
         self.assertEqual(saves.xgs_encode("slot 1/main"), "slot%201%2Fmain")
         self.assertEqual(saves.xgs_encode("world.dat"), "world.dat")
         self.assertEqual(saves.xgs_encode(".hidden"), "%2Ehidden")
@@ -625,6 +625,24 @@ class ImportTest(unittest.TestCase):
             with self.assertRaises(SystemExit):        # two payloads onto one blob (case-insensitive on Windows)
                 quiet(saves.import_saves, [story, prof, "--out", out, "--force",
                                            "--map", "SLOT3=Same/blob", "--map", "Player=same/BLOB"])
+
+    def test_container_names_follow_the_runtime_rule(self):
+        # The same rule as valid_container_name() in runtime/shims/xgameruntime_gamesave.cpp.
+        for good in ("SLOT3", "slots/SAVE_00.sav-1", "a/b/c"):
+            self.assertTrue(saves.valid_container_name(good), good)
+        for bad in ("slot 0", "a..b", "x.", "dir/", "a/b-c/d", "", "é", "a" * 257):
+            self.assertFalse(saves.valid_container_name(bad), bad)
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                quiet(saves.import_saves, [story, "--out", os.path.join(tmp, "o"), "--map", "SLOT3=slot 0/story",
+                                           "--dry-run"])
+            self.assertIn("'slot 0' breaks XGameSaveCreateContainer's naming rule", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                quiet(saves.import_saves, [story, "--out", os.path.join(tmp, "o"), "--dry-run"])
+            self.assertEqual(err.getvalue(), "")
 
     def test_folder_with_two_payloads_is_refused(self):
         # A folder holding a save and an older backup with the same signature must not import either silently.

@@ -76,7 +76,10 @@ What is not known yet, and decides how far the swap reaches:
 ## Day one: finding the hook
 
 The swap needs one function in the executable: the archetype lookup by name hash (RAGE's
-`fwArchetypeManager::GetArchetypeFromHashKey`). Ways to find it in `game_scarlett_master.exe`:
+`fwArchetypeManager::GetArchetypeFromHashKey`). `scripts/first_look.ps1` already ranks candidates with
+`tools/find_hash_lookup.py` (report `hash_lookup.json`): it finds where the code loads `0xE472B687` and
+`0xD7C0CDFF`, takes the functions called right after, and orders them by how many direct callers the
+whole image has. Run it alone with `python -I tools/find_hash_lookup.py <exe>`. What it automates:
 
 1. **Constant search.** The player model id `0xE472B687` should appear as an immediate in the code that
    sets up the story player. Its callers pass it to the lookup (or to a function that does).
@@ -102,3 +105,36 @@ the thunk on small x64 functions in memory.
 
 That RVA is the only version-specific piece; it can go in `game/xbox-1.0.2.1.json` once confirmed, and
 the manifests stay as they are.
+
+## First-person view (`mods/first_person`)
+
+```json
+{ "camera": { "view_mode": "first_person", "first_person_value": 4, "contexts": [0] } }
+```
+
+`camera.view_mode` is `first_person` or `default` (leave the game's choice). The game picks a view mode per
+camera context (on foot, in a vehicle, ...) with a getter that takes the context and returns an enum; the
+mod answers `first_person_value` for the listed `contexts` (every context when the list is left out) and
+the game's own answer otherwise. When several enabled mods have a `camera` section, the last folder wins.
+
+**Evidence that the engine has a first-person view.** The camera metadata classes GTA V uses
+(`camFirstPersonShooterCameraMetadata`, `camFollowPedCameraMetadata`, ...) do not appear by `joaat` in the
+carved `common`, `data` or `script` streams, but the game's own tuning data refers to a first-person view
+in several systems: a ladder/mount tunable `FirstPersonDirectionDot`, a `UseFirstPersonCameraMatrix` flag on
+every cloth-collision capsule (horse saddle and satchel capsules among them, so the code is RDR2's branch of
+the engine, which shipped a first-person mode), a hit-reaction `RecoveryDirection` of `FIRST_PERSON_VIEW`,
+and a `firstpersonshooter_hud` UI texture. So the mod switches on a mode the engine has rather than building
+a camera. Whether the game exposes it to the player is not known.
+
+**Assumptions to confirm in the executable:** that the view mode is chosen through one getter of the form
+`mode = get(context)`, that context 0 is on foot, and that first person is enum value 4 (GTA V's
+`camViewModeSettings` order: third person near, medium, far, cinematic, first person). All three are
+settings in `mod.json`, so a different answer changes the manifest, not the runtime.
+
+**Day one:** find the getter, then run `gta6rt --dry-run <exe> --view-mode-getter RVA` and check the log
+line's count of redirected calls. Leads: the code that reads the view-mode input (GTA V's
+`INPUT_NEXT_CAMERA`, an action hash), the switch over the five view-mode values that selects a camera
+metadata per mode, and the callers of the `UseFirstPersonCameraMatrix` check in the cloth code (they ask
+whether the active view is first person). The hook (`hook_image_results` in `runtime/src/code_hooks.h`) runs
+the original and overrides its result; it is for getters with at most four register arguments and an
+integer result. ctest `code_hooks` and `mods` cover the thunk and the override.

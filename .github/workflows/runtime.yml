@@ -293,10 +293,14 @@ jobs:
   # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary
   # shows the rest.
   # Two Wines: Ubuntu's own (9.0) and WineHQ's current stable, which is closer to what Proton users run.
+  # Not on pull requests: in 188 sampled pull request runs these two jobs never failed when the Windows job had passed,
+  # yet they took about a quarter of the account's 20 concurrent runner slots. They run on every push to main that
+  # touches these paths, and on demand from the Actions tab (workflow_dispatch). Pull requests still build and test the
+  # Windows runtime natively and upload runtime-windows for testers.
   wine:
     needs: windows
     # The uploaded build can still be tested under Wine if the later native tests fail.
-    if: ${{ !cancelled() && needs.windows.outputs.wine-artifact == 'success' }}
+    if: ${{ github.event_name != 'pull_request' && !cancelled() && needs.windows.outputs.wine-artifact == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
