@@ -16,6 +16,7 @@ contain element values, entry names or payload bytes, so the CSV/JSON can be rev
 game data. Non-XML payloads follow the 64 KiB block rule; a file whose inflated size is an exact multiple of
 64 KiB can merge with the next stream. XML documents close on their root element, so their grouping is exact.
 The tool is standard library only and never writes outside the requested output files.
+Usage: `python -I tools/gamedata_index.py --help` lists the options.
 """
 from __future__ import annotations
 
