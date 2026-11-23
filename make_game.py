@@ -10,8 +10,10 @@ r"""Build the PC port from your own copy of the game.
 
 The game folder is your own Xbox Series package, version 1.0.2.1, with its files already readable on disk
 (see game/xbox-1.0.2.1.json for the file list). It is found automatically in Downloads, Desktop, Documents
-(also where Windows keeps them, such as in OneDrive), Games, your home folder and the top of each drive (two
-folder levels down). This script never decrypts or works around anything: it reads plain files and writes
+(also where Windows keeps them, such as in OneDrive), Games, your home folder, the top of each drive on Windows
+and the usual mount points elsewhere (/mnt, /media, /run/media, /Volumes), two folder levels down. A share path
+(\\server\share\...) can't be listed, so give it to --game. This script never decrypts or works around anything:
+it reads plain files and writes
 everything it makes under --out. The only thing it downloads is the third_party/rpf9-explorer submodule, when
 it is missing. Never share what it makes.
 
@@ -221,6 +223,7 @@ XVD_MAGIC = b"msft-xvd"
 XVD_HEADER_SIZE = 0x1000
 XVD_ENCRYPTION_DISABLED = 0x2          # VolumeFlags bit
 CONTAINER_SUFFIXES = (".xvc", ".msixvc", ".xvd")
+VOLUME_ROOTS = ("/mnt", "/media", "/run/media", "/Volumes")   # POSIX: where drives and shares are mounted
 
 
 def xvd_header(path: str):
@@ -298,19 +301,29 @@ def known_folders() -> list:
     return found
 
 
-def find_dumps(containers: list | None = None) -> list:
-    """Folders on this PC that hold a supported version: Downloads, Desktop, Documents (under the home folder and
-    where Windows really keeps them), the home folder and the top of each drive, up to two folder levels down.
-    Only folder names and a few file sizes are read. With a containers list, also appends (path, header) for each
-    packaged container (.xvc/.msixvc/.xvd) in the folders searched, which the build can't use: only the 4 KiB header
-    of a file with that suffix is read."""
-    home = os.path.expanduser("~")
+def discovery_roots(home: str) -> list:
+    """Where find_dumps() starts looking. Windows: the known folders, the home folder and every drive letter. Else:
+    the same folders plus the usual mount points, because that is where a copy on another disk or on a network share
+    shows up (/Volumes is where macOS mounts both, /run/media is where Fedora and openSUSE mount removable media).
+    A Windows share path (\\server\share\...) can't be listed at all; --game takes it directly."""
     roots = [os.path.join(home, d) for d in ("Downloads", "Desktop", "Documents", "Games")] + known_folders() + [home]
     if os.name == "nt":
         import string
         roots += [f"{d}:\\" for d in string.ascii_uppercase if os.path.isdir(f"{d}:\\")]
     else:
-        roots += ["/mnt", "/media"]
+        roots += list(VOLUME_ROOTS)
+    return roots
+
+
+def find_dumps(containers: list | None = None) -> list:
+    """Folders on this PC that hold a supported version: the folders discovery_roots() names (Downloads, Desktop,
+    Documents under the home folder and where Windows really keeps them, the home folder, each drive on Windows, the
+    usual mount points elsewhere), up to two folder levels down.
+    Only folder names and a few file sizes are read. With a containers list, also appends (path, header) for each
+    packaged container (.xvc/.msixvc/.xvd) in the folders searched, which the build can't use: only the 4 KiB header
+    of a file with that suffix is read."""
+    home = os.path.expanduser("~")
+    roots = discovery_roots(home)
     skip = {"windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin",
             "system volume information", "node_modules", ".git"}
     visited_depths, found, seen_containers = {}, {}, set()
@@ -2051,7 +2064,8 @@ def path_is_within(path: str, directory: str) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
-    ap.add_argument("--game", help="your package folder (found automatically if left out)")
+    ap.add_argument("--game", help="your package folder (found automatically if left out; a share path "
+                                    "\\\\server\\share\\... goes here)")
     ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
     ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
                                   "whose Documents iCloud syncs)")

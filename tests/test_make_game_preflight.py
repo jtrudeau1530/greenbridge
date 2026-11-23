@@ -759,6 +759,35 @@ class GameDiscoveryTest(unittest.TestCase):
             self.assertEqual(self.discover(), [(package, self.version)])
 
 
+    def test_discovery_roots_follow_the_platform(self):
+        # Elsewhere than Windows a copy on another disk or on a share shows up under a mount point, so those are
+        # searched too: /Volumes is where macOS mounts drives and mount_smbfs shares, /run/media is Fedora's.
+        with mock.patch.object(make_game.os, "name", "posix"), \
+             mock.patch.object(make_game, "known_folders", return_value=[]):
+            roots = make_game.discovery_roots(self.home)
+        self.assertIn(os.path.join(self.home, "Downloads"), roots)
+        for root in ("/mnt", "/media", "/run/media", "/Volumes"):
+            self.assertIn(root, roots)
+        self.assertEqual([r for r in roots if r.endswith(":\\")], [])
+
+    def test_windows_roots_are_the_drives_that_exist(self):
+        with mock.patch.object(make_game.os, "name", "nt"), \
+             mock.patch.object(make_game, "known_folders", return_value=[]), \
+             mock.patch("os.path.isdir", side_effect=lambda path: path.startswith("C:")):
+            roots = make_game.discovery_roots(self.home)
+        self.assertIn("C:\\", roots)
+        self.assertNotIn("D:\\", roots)
+        self.assertNotIn("/Volumes", roots)
+
+    def test_find_searches_the_platform_roots(self):
+        package = os.path.join(self.home, "Volumes", "share", "GTA VI")
+        self.write_probes(package)
+        root = os.path.dirname(os.path.dirname(package))
+        with mock.patch.object(make_game, "discovery_roots", return_value=[root]), \
+             mock.patch.object(make_game, "versions", return_value=[self.version]):
+            self.assertEqual(make_game.find_dumps(), [(package, self.version)])
+
+
 class PathAndGameSelectionTest(PreflightTestBase):
     def test_choose_game_single_found(self):
         dummy_entry = ("D:\\TestGames\\Leonida", {"title": "Xbox Package", "version": "1.0.2.1"})
