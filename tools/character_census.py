@@ -127,9 +127,15 @@ def count(value):
 
 
 # -------------------------------------------------------------------- reading
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a census must not report an
+    # incomplete scan as complete. main() turns the OSError into one ERROR line and exit 2.
+    raise exc
+
+
 def model_json_files(directory: str):
-    """Every nested model.json, in a stable order."""
-    for base, dirs, files in os.walk(directory):
+    """Every nested model.json, in a stable order. An unlistable sub-folder raises OSError."""
+    for base, dirs, files in os.walk(directory, onerror=_walk_error):
         dirs.sort()
         for name in sorted(files):
             if name.lower() == MODEL_JSON:
@@ -876,7 +882,8 @@ def main(argv=None) -> int:
     try:
         sources = list(input_files(args.target))
     except (OSError, ValueError) as exc:
-        print(f"ERROR: cannot read {args.target}: {getattr(exc, 'strerror', None) or exc}",
+        print(f"ERROR: cannot read {getattr(exc, 'filename', None) or args.target}: "
+              f"{getattr(exc, 'strerror', None) or exc}",
               file=sys.stderr)
         return 2
     for flag, path in (("--json", args.json), ("--csv", args.csv)):
@@ -894,7 +901,8 @@ def main(argv=None) -> int:
     try:
         rows = list(load_rows(args.target))
     except OSError as exc:
-        print(f"ERROR: cannot read {args.target}: {getattr(exc, 'strerror', None) or exc}",
+        print(f"ERROR: cannot read {getattr(exc, 'filename', None) or args.target}: "
+              f"{getattr(exc, 'strerror', None) or exc}",
               file=sys.stderr)
         return 2
     rows.sort(key=lambda row: (row["name"].lower(), row["source"].lower()))

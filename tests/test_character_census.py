@@ -5,16 +5,31 @@
 All model.json files, manifests, shaders, textures and counts here are built by the test. No game
 data is read or written.
 """
+import contextlib
 import csv
+import importlib.util
+import io
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TOOL = ROOT / "tools" / "character_census.py"
+
+
+def load_tool():
+    spec = importlib.util.spec_from_file_location("character_census_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CC = load_tool()
 
 
 def write_json(path, value):
@@ -446,6 +461,48 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("not found", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_undercount(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the census used to report
+        # the remaining models and exit 0, hiding the incomplete scan.
+        sub = self.root / "static"
+        os.chmod(sub, 0o000)
+        try:
+            try:
+                os.listdir(sub)
+                self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+            except OSError:
+                pass
+            result = self.run_tool(self.root)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("ERROR", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        finally:
+            os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_is_a_clean_error_when_chmod_is_not_enough(self):
+        # The chmod case above self-skips on Windows and as root, and CI only runs this file on
+        # windows-latest, so the guard went unexercised there. Forcing os.scandir to raise for one
+        # folder gives the same PermissionError os.walk hits for real, on every platform.
+        sub = self.root / "static"
+        real_scandir = os.scandir
+        locked = os.path.normcase(os.path.abspath(str(sub)))
+
+        def scandir(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(str(path))) == locked:
+                raise PermissionError(13, "Access is denied", str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        err = io.StringIO()
+        out = io.StringIO()
+        with mock.patch.object(CC.os, "scandir", scandir):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                code = CC.main([str(self.root)])
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn("ERROR", err.getvalue())
+        self.assertIn("cannot read", err.getvalue())
+        self.assertIn(str(sub), err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":
