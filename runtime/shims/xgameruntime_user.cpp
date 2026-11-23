@@ -319,6 +319,22 @@ HRESULT STDMETHODCALLTYPE user_resolve_privilege_result(void*, XAsyncBlock* asyn
     return XAsyncGetResult(async, &kResolveIdentity, 0, nullptr, nullptr);
 }
 
+// Issue resolution requires unavailable system UI; report that failure asynchronously.
+const char kIssueIdentity = 0;
+HRESULT CALLBACK issue_provider(XAsyncOp op, const XAsyncProviderData* data) {
+    if (op == XAsyncOp::Begin) return XAsyncSchedule(data->async, 0);
+    if (op == XAsyncOp::DoWork) XAsyncComplete(data->async, E_GAMEUSER_FAILED_TO_RESOLVE, 0);
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE user_resolve_issue_async(void*, XUserHandle user, const void*, XAsyncBlock* async) {
+    if (!valid(user) || !async) return E_INVALIDARG;
+    return XAsyncBegin(async, nullptr, &kIssueIdentity, "XUserResolveIssueWithUiAsync", issue_provider);
+}
+HRESULT STDMETHODCALLTYPE user_resolve_issue_result(void*, XAsyncBlock* async) {
+    if (!async) return E_INVALIDARG;
+    return XAsyncGetResult(async, &kIssueIdentity, 0, nullptr, nullptr);
+}
+
 // 33: HRESULT XUserRegisterForChangeEvent(XTaskQueueHandle queue, void* context, XUserChangeEventCallback* callback,
 //                                         XTaskQueueRegistrationToken* token)
 // 34: bool XUserUnregisterForChangeEvent(XTaskQueueRegistrationToken token, bool wait)
@@ -483,10 +499,10 @@ const void* const kUserVtable[] = {
     FN((offline_failure<26, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 26 XUserGetTokenAndSignatureUtf16Async
     FN((offline_failure<27, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 27 ...Utf16ResultSize
     FN((offline_failure<28, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 28 ...Utf16Result
-    FN((offline_failure<29, E_GAMEUSER_FAILED_TO_RESOLVE>)),                    // 29 XUserResolveIssueWithUiAsync
-    FN((offline_failure<30, E_GAMEUSER_FAILED_TO_RESOLVE>)),                    // 30 XUserResolveIssueWithUiResult
-    FN((offline_failure<31, E_GAMEUSER_FAILED_TO_RESOLVE>)),                    // 31 XUserResolveIssueWithUiUtf16Async
-    FN((offline_failure<32, E_GAMEUSER_FAILED_TO_RESOLVE>)),                    // 32 XUserResolveIssueWithUiUtf16Result
+    FN(user_resolve_issue_async),                                               // 29 XUserResolveIssueWithUiAsync
+    FN(user_resolve_issue_result),                                              // 30 XUserResolveIssueWithUiResult
+    FN(user_resolve_issue_async),                                               // 31 XUserResolveIssueWithUiUtf16Async
+    FN(user_resolve_issue_result),                                              // 32 XUserResolveIssueWithUiUtf16Result
     FN(user_register_change),                                                   // 33 XUserRegisterForChangeEvent
     FN(user_unregister_change),                                                 // 34 XUserUnregisterForChangeEvent
     FN(user_get_signout_deferral),                                              // 35 XUserGetSignOutDeferral

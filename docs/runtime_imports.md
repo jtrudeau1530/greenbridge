@@ -425,8 +425,9 @@ trio (23-25). What the slots must answer is still **not measured**; that is the 
   printable ASCII characters at most), `Player` otherwise.
 - **Handles:** each one is its own allocation, closed once by `XUserCloseHandle`. `XUserCompare` is 0 for any two
   handles, since they all name the one user.
-- **Not available offline:** token, gamer-picture, MSA-token and resolve-issue requests fail synchronously before
-  starting (`E_GAMEUSER_FAILED_TO_GET_TOKEN`, `E_FAIL`, `E_GAMEUSER_FAILED_TO_RESOLVE`), so no `XAsyncBlock` waits.
+- **Not available offline:** token, gamer-picture and MSA-token requests fail synchronously before starting
+  (`E_GAMEUSER_FAILED_TO_GET_TOKEN`, `E_FAIL`). Both resolve-issue variants return `S_OK` when queued and report
+  `E_GAMEUSER_FAILED_TO_RESOLVE` asynchronously through the `XAsyncBlock`.
   `XUserGetSignOutDeferral` is `E_GAMEUSER_DEFERRAL_NOT_AVAILABLE`, and change callbacks are only tracked as tokens,
   because the user never changes.
 - **Logged on first use:** the docs' unknown slot 15 (answers `E_NOTIMPL`, so nothing reads outputs it didn't

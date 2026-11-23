@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -38,6 +39,7 @@ struct XUserLocalId {
 
 constexpr HRESULT E_GAMEUSER_USER_NOT_FOUND = static_cast<HRESULT>(0x89245104);
 constexpr HRESULT E_GAMEUSER_DEFERRAL_NOT_AVAILABLE = static_cast<HRESULT>(0x89245103);
+constexpr HRESULT E_GAMEUSER_FAILED_TO_RESOLVE = static_cast<HRESULT>(0x89245107);
 constexpr HRESULT E_GAMEUSER_FAILED_TO_GET_TOKEN = static_cast<HRESULT>(0x89245111);
 
 constexpr GUID kUserClass = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
@@ -144,6 +146,38 @@ int main(int argc, char** argv) {
     check(at<ResolveAsync>(user, 21)(user, h, 0, 254, &resolve) == S_OK && finished(&resolve) &&
               at<ResolveResult>(user, 22)(user, &resolve) == S_OK,
           "XUserResolvePrivilegeWithUiAsync completes with S_OK (nothing to resolve)");
+
+    // Both issue-resolution variants must complete through the manual queue, including their callback.
+    using IssueAsync = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, const void*, XAsyncBlock*);
+    XTaskQueueHandle issue_queue = nullptr;
+    check(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &issue_queue) == S_OK,
+          "issue queue created");
+    for (int slot_index : {29, 31}) {
+        check(at<ResolveResult>(user, slot_index + 1)(user, nullptr) == E_INVALIDARG,
+              "issue result rejects a null async block");
+        bool called = false;
+        XAsyncBlock issue{};
+        issue.queue = issue_queue;
+        issue.context = &called;
+        issue.callback = [](XAsyncBlock* block) { *static_cast<bool*>(block->context) = true; };
+        const HRESULT started = at<IssueAsync>(user, slot_index)(user, h, nullptr, &issue);
+        check(started == S_OK, "issue async starts");
+        if (started == S_OK) {
+            check(XAsyncGetStatus(&issue, false) == E_PENDING && !called, "issue pending before dispatch");
+            check(at<ResolveResult>(user, slot_index + 1)(user, &issue) == E_PENDING,
+                  "issue result pending before dispatch");
+            XTaskQueueDispatch(issue_queue, XTaskQueuePort::Work, 0);
+            check(!called, "issue callback waits for completion dispatch");
+            XTaskQueueDispatch(issue_queue, XTaskQueuePort::Completion, 0);
+            check(called, "issue callback runs");
+            check(at<ResolveResult>(user, slot_index + 1)(user, &issue) == E_GAMEUSER_FAILED_TO_RESOLVE,
+                  "issue result reports offline failure");
+        }
+        check(at<IssueAsync>(user, slot_index)(user, nullptr, nullptr, &issue) == E_INVALIDARG &&
+                  at<IssueAsync>(user, slot_index)(user, h, nullptr, nullptr) == E_INVALIDARG,
+              "issue rejects invalid arguments");
+    }
+    XTaskQueueCloseHandle(issue_queue);
 
     // ---- tokens: not available offline (23) ----
     using TokenAsync = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, uint32_t, const char*, const char*, size_t,
