@@ -10,6 +10,7 @@
 #include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_xs_device.h"
 #include <dxgi1_4.h>
 #include <cstring>
 #include <string>
@@ -283,6 +284,158 @@ int check_title_placed_all(ID3D12Device* device) {
     return failures;
 }
 
+// ---- Committed buffers on the title's XMem hook memory, through the Xbox device proxy ----
+//
+// With the title's allocation hook installed (here a bump allocator over a VirtualAlloc range, as a title's arena), a
+// committed buffer made through the proxy lives on the memory the hook gave: its GPU VA is that address, a GPU copy
+// reads what the CPU wrote there, and what a GPU copy writes into it the CPU reads there. The memory goes back
+// through the hook's free with the resource. A texture is made on the device's own memory and only takes its size
+// from the hook.
+struct ArenaHook {
+    std::uint8_t* base = nullptr;
+    std::size_t size = 0;
+    std::size_t used = 0;
+    int allocs = 0;
+    int frees = 0;
+    void* last_free = nullptr;
+} g_arena;
+
+void* arena_alloc(std::size_t bytes, std::uint64_t) {
+    const std::size_t rounded = (bytes + 0xffff) & ~std::size_t(0xffff);
+    if (rounded > g_arena.size - g_arena.used) return nullptr;
+    void* const p = g_arena.base + g_arena.used;
+    g_arena.used += rounded;
+    ++g_arena.allocs;
+    return p;
+}
+
+void arena_free(void* p, std::uint64_t) {
+    ++g_arena.frees;
+    g_arena.last_free = p;
+}
+
+// Copies `size` bytes from `src` to `dst` on a direct queue of `device` and waits for it.
+bool gpu_copy(ID3D12Device* device, ID3D12Resource* dst, ID3D12Resource* src, UINT64 size) {
+    D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                         IID_PPV_ARGS(&list.p))))
+        return false;
+    list->CopyBufferRegion(dst, 0, src, 0, size);
+    if (FAILED(list->Close())) return false;
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))) ||
+        FAILED(queue->Signal(fence.p, 1)))
+        return false;
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const bool ok = done && SUCCEEDED(fence->SetEventOnCompletion(1, done)) &&
+                    WaitForSingleObject(done, 10000) == WAIT_OBJECT_0;
+    if (done) CloseHandle(done);
+    return ok;
+}
+
+int check_committed_on_hook(ID3D12Device* vulkan) {
+    const char* who = "vulkan committed buffer on the XMem hook";
+    constexpr SIZE_T kArena = 16 * 0x10000;
+    constexpr UINT64 kWidth = 0x18000;  // not a whole number of 64 KiB pages: the hook takes two
+    g_arena = {};
+    g_arena.base = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kArena, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(g_arena.base);
+    g_arena.size = kArena;
+    std::memset(g_arena.base, 0xab, kArena);
+    Ref<ID3D12Device> proxy;
+    vulkan->AddRef();  // the proxy takes over the reference it is given; the caller keeps its own
+    if (FAILED(rt::d3d12_xs::create_device_proxy(vulkan, __uuidof(ID3D12Device), reinterpret_cast<void**>(&proxy.p)))) {
+        vulkan->Release();
+        VirtualFree(g_arena.base, 0, MEM_RELEASE);
+        std::fprintf(stderr, "%s: create_device_proxy failed\n", who);
+        return 1;
+    }
+    rt::d3d12_xs::set_descriptor_heap_allocator(&arena_alloc, &arena_free);
+    int failed = 0;
+    [&]() -> int {
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = kWidth;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        {
+            Ref<ID3D12Resource> buffer;
+            EXPECT(SUCCEEDED(proxy->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&buffer.p))));
+            EXPECT(g_arena.allocs == 1 && g_arena.used == 0x20000);
+            EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(g_arena.base));
+            EXPECT(g_arena.base[0] == 0 && g_arena.base[0x1ffff] == 0);  // zeroed, as a committed resource starts
+            EXPECT(g_arena.base[0x20000] == 0xab);                        // and nothing past what the hook gave
+
+            // CPU writes, GPU reads.
+            for (UINT64 i = 0; i < kWidth; ++i) g_arena.base[i] = static_cast<std::uint8_t>(i * 29u + 3u);
+            D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+            Ref<ID3D12Resource> readback;
+            EXPECT(SUCCEEDED(vulkan->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&readback.p))));
+            EXPECT(gpu_copy(vulkan, readback.p, buffer.p, kWidth));
+            void* mapped = nullptr;
+            EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+            const bool read_same = std::memcmp(mapped, g_arena.base, static_cast<size_t>(kWidth)) == 0;
+            readback->Unmap(0, nullptr);
+            EXPECT(read_same);
+
+            // GPU writes, CPU reads.
+            D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+            Ref<ID3D12Resource> upload;
+            EXPECT(SUCCEEDED(vulkan->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                             IID_PPV_ARGS(&upload.p))));
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &mapped)));
+            auto* const src = static_cast<std::uint8_t*>(mapped);
+            for (UINT64 i = 0; i < kWidth; ++i) src[i] = static_cast<std::uint8_t>(i * 7u + 101u);
+            EXPECT(gpu_copy(vulkan, buffer.p, upload.p, kWidth));
+            const bool written_same = std::memcmp(src, g_arena.base, static_cast<size_t>(kWidth)) == 0;
+            upload->Unmap(0, nullptr);
+            EXPECT(written_same);
+            EXPECT(g_arena.frees == 0);
+        }
+        EXPECT(g_arena.frees == 1 && g_arena.last_free == g_arena.base);
+
+        // A texture: the device's own memory; the hook gives its size only, and its bytes are not touched.
+        D3D12_RESOURCE_DESC texture = desc;
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Width = texture.Height = 64;
+        texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        std::memset(g_arena.base + g_arena.used, 0xab, 0x10000);
+        std::uint8_t* const texture_memory = g_arena.base + g_arena.used;
+        {
+            Ref<ID3D12Resource> image;
+            EXPECT(SUCCEEDED(proxy->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture,
+                                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&image.p))));
+            EXPECT(g_arena.allocs == 2 && texture_memory[0] == 0xab);
+        }
+        EXPECT(g_arena.frees == 2 && g_arena.last_free == texture_memory);
+        std::printf("%s: %llu bytes at the hook's address: GPU VA is that address, a GPU copy reads the CPU's "
+                    "writes and the CPU reads the GPU's; a texture only takes its size from the hook\n",
+                    who, static_cast<unsigned long long>(kWidth));
+        return 0;
+    }() ? ++failed : 0;
+    rt::d3d12_xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    proxy.p->Release();
+    proxy.p = nullptr;
+    VirtualFree(g_arena.base, 0, MEM_RELEASE);
+    return failed;
+}
+
 void print_cases(const std::vector<Case>& cases, const char* who) {
     for (const Case& c : cases)
         std::printf("%s: %-44s hr=0x%08lX size=%llu align=%llu type=%d cpu=%d pool=%d flags=0x%x\n", who, c.name,
@@ -315,6 +468,7 @@ int main() {
         print_cases(vulkan_cases, "vulkan");
         failures += check_import(ours.p, vk.host_pointer_alignment != 0);
         if (vk.host_pointer_alignment) failures += check_title_placed_all(ours.p);
+        if (vk.host_pointer_alignment) failures += check_committed_on_hook(ours.p);
         Ref<IDXGIFactory4> factory;
         if (!hostwine::host_is_wine() && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
             for (const bool warp : {false, true}) {

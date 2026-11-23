@@ -127,8 +127,11 @@ using DescriptorHeapBackingFree = void (*)(void* ptr, std::uint64_t attributes);
 // little of the arena is left unused, so a resource the hook never sees fails the check. The object type of a resource
 // allocation is not measured and is left 0; the allocator ID is the D3D one above.
 inline constexpr std::uint64_t kXmemCommittedResourceAttributes = (0x80ULL << 16) | (2ULL << 14);
-// Installs (or clears when both are null) the backing allocator consulted by CreateDescriptorHeap (slot 14) and by
-// CreateCommittedResource3 (slot 127).
+// Installs (or clears when both are null) the backing allocator consulted by CreateDescriptorHeap (slot 14) and by the
+// committed resources (slots 27, 53, 76 and 127). A committed buffer is made on the memory the allocator gives when the
+// device behind the proxy registered a placed-at-VA handler (the Vulkan layer); a texture, or a buffer that handler
+// cannot make, stays on the PC device's memory with the allocator's memory as bookkeeping only.
+// LEONIDA_XMEM_RESOURCE_BACKING=0 keeps every committed resource on the PC device's memory.
 void set_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
 // Installs the default bridge (used by D3D12XboxCreateDevice) only when no explicit allocator has been set.
 void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
@@ -152,8 +155,9 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 26 (the
-// console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and 78/79/80
-// (the Xbox slots above, at their configured indices), 62, 67, 70, 76 and 127. Slot 10 is intentionally false: the
+// console's struct-return form), 27 and 53 (committed resources, memory through the title's XMem hook),
+// 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their
+// configured indices), 62, 67, 70, 76 and 127. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);

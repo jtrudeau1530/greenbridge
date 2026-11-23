@@ -387,6 +387,35 @@ HRESULT WINAPI mock_create_committed_resource3(Mock* self, const D3D12_HEAP_PROP
 }
 #endif
 
+// PC ID3D12Device::CreateCommittedResource (slot 27, seven words) and ID3D12Device4::CreateCommittedResource1 (slot 53,
+// eight words) also take more words than the generic thunk; their entries keep the ones the checks read.
+struct CommittedCall {
+    unsigned calls;
+    D3D12_HEAP_FLAGS heap_flags;
+    D3D12_RESOURCE_DESC desc;
+    const void* session;
+    const IID* riid;
+    void** out;
+};
+CommittedCall g_committed[2];  // [0]: slot 27, [1]: slot 53
+
+HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS flags,
+                                              const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                              const D3D12_CLEAR_VALUE*, const IID* riid, void** out) {
+    ++self->calls[27];
+    g_committed[0] = {g_committed[0].calls + 1, flags, desc ? *desc : D3D12_RESOURCE_DESC{}, nullptr, riid, out};
+    return mock_create(self, Kind::resource, reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out));
+}
+
+HRESULT WINAPI mock_create_committed_resource1(Mock* self, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS flags,
+                                               const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                               const D3D12_CLEAR_VALUE*, const void* session, const IID* riid,
+                                               void** out) {
+    ++self->calls[53];
+    g_committed[1] = {g_committed[1].calls + 1, flags, desc ? *desc : D3D12_RESOURCE_DESC{}, session, riid, out};
+    return mock_create(self, Kind::resource, reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out));
+}
+
 template <std::size_t... I>
 void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&mock_slot<static_cast<unsigned>(I)>)), ...);
@@ -397,6 +426,8 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        table[27] = reinterpret_cast<void*>(&mock_create_committed_resource);
+        table[53] = reinterpret_cast<void*>(&mock_create_committed_resource1);
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
         table[76] = reinterpret_cast<void*>(&mock_create_committed_resource3);
 #endif
@@ -1899,6 +1930,210 @@ int check_committed_resource3_xmem_hook() {
     return 0;
 }
 
+// ---- Committed buffers on the title's XMem hook memory ----
+//
+// With a placed-at-VA handler registered (the Vulkan layer registers create_buffer_at_host_address), a committed buffer
+// whose memory the hook gives is made on that memory by the handler instead of on the PC device's memory, so the
+// title's CPU view of those bytes is the resource. A texture, a shared heap, a handler that fails and a hook that
+// refuses keep the PC device's resource, with the hook memory as bookkeeping where the hook gave some.
+struct PlacedHandlerState {
+    int calls = 0;
+    ID3D12Device* real = nullptr;
+    void* va = nullptr;
+    D3D12_RESOURCE_DESC desc{};
+    unsigned char first_byte = 0xcc;  // the memory's first byte when the handler ran: zeroed or the title's
+    HRESULT result = S_OK;
+} g_placed;
+
+HRESULT mock_placed_handler(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
+    ++g_placed.calls;
+    g_placed.real = real;
+    g_placed.va = va;
+    g_placed.desc = desc;
+    g_placed.first_byte = *static_cast<const unsigned char*>(va);
+    if (FAILED(g_placed.result)) return g_placed.result;
+    Mock* child = new_mock(Kind::resource);
+    return mock_query(child, &riid, out);
+}
+
+int check_committed_buffers_on_xmem() {
+    constexpr std::size_t kTaken = 0x20000;  // two 64 KiB pages: what GetResourceAllocationInfo answers
+    alignas(4096) static unsigned char arena[kTaken];  // the mock handler checks no alignment
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 0x18000;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);  // the Xbox row-major word slot 76 replaces
+    D3D12_RESOURCE_DESC texture = buffer;
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = texture.Height = 256;
+    texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device);
+    mock->allocation_size = kTaken;
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+    xs::set_placed_at_va_handler(&mock_placed_handler);
+    const auto reset = [&] {
+        g_heap_hook = {};
+        g_heap_hook.next_ptr = arena;
+        g_placed = {};
+        std::memset(arena, 0xab, sizeof(arena));
+    };
+    // Slot 76: (heap, flags, desc, state, clear, riid, out).
+    const auto slot76 = [&](const D3D12_RESOURCE_DESC& desc, std::uint32_t flags, void** out) {
+        const std::uint64_t w[10] = {word(&heap), flags, word(&desc), 0, 0, word(&kResourceIid), word(out), 0, 0, 0};
+        return hr_of(raw10(device, 76, w));
+    };
+
+    // A buffer: the handler makes it on the hook's memory, zeroed first; the PC device makes nothing; the memory goes
+    // back through the hook's free with the resource.
+    reset();
+    void* resource = nullptr;
+    EXPECT(slot76(buffer, 0, &resource) == S_OK && resource);
+    EXPECT(g_heap_hook.alloc_calls == 1 && g_heap_hook.last_alloc_size == kTaken &&
+           g_heap_hook.last_alloc_attr == xs::kXmemCommittedResourceAttributes);
+    EXPECT(g_placed.calls == 1 && g_placed.va == arena && g_placed.real == reinterpret_cast<ID3D12Device*>(mock));
+    EXPECT(g_placed.desc.Width == buffer.Width && g_placed.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    EXPECT(g_placed.first_byte == 0 && arena[kTaken - 1] == 0);  // the whole allocation, as a committed resource
+    EXPECT(mock->calls[27] == 0);
+    EXPECT(reinterpret_cast<Mock*>(resource)->private_data != nullptr && g_heap_hook.free_calls == 0);
+    EXPECT(release(resource) == 0);
+    EXPECT(g_heap_hook.free_calls == 1 && g_heap_hook.last_free_ptr == arena);
+
+    // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: the title's bytes stay.
+    reset();
+    resource = nullptr;
+    EXPECT(slot76(buffer, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &resource) == S_OK && resource);
+    EXPECT(g_placed.calls == 1 && g_placed.first_byte == 0xab);
+    EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 1);
+
+    // A texture: the PC device makes it, the hook memory is bookkeeping, the handler is not asked.
+    reset();
+    resource = nullptr;
+    const unsigned pc_before = mock->calls[27];
+    EXPECT(slot76(texture, 0, &resource) == S_OK && resource);
+    EXPECT(g_placed.calls == 0 && mock->calls[27] == pc_before + 1 && g_heap_hook.alloc_calls == 1);
+    EXPECT(arena[0] == 0xab);  // bookkeeping memory is the title's, not touched
+    EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 1);
+
+    // A shared heap: the PC device's memory, the hook memory as bookkeeping.
+    reset();
+    resource = nullptr;
+    EXPECT(slot76(buffer, D3D12_HEAP_FLAG_SHARED, &resource) == S_OK && resource);
+    EXPECT(g_placed.calls == 0 && g_heap_hook.alloc_calls == 1 && arena[0] == 0xab);
+    EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 1);
+
+    // The handler cannot use the memory: the PC device makes the buffer, and the memory the hook gave once is the
+    // bookkeeping (not a second allocation).
+    reset();
+    g_placed.result = E_INVALIDARG;
+    resource = nullptr;
+    const unsigned pc_fallback_before = mock->calls[27];
+    EXPECT(slot76(buffer, 0, &resource) == S_OK && resource);
+    EXPECT(g_placed.calls == 1 && mock->calls[27] == pc_fallback_before + 1 && g_heap_hook.alloc_calls == 1);
+    EXPECT(reinterpret_cast<Mock*>(resource)->kind == Kind::resource && reinterpret_cast<Mock*>(resource)->private_data);
+    EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 1);
+
+    // ...and the PC device refuses too: the title gets the PC answer and a null object, the memory goes back at once.
+    reset();
+    g_placed.result = E_INVALIDARG;
+    mock->create_result = E_OUTOFMEMORY;
+    resource = reinterpret_cast<void*>(1);
+    EXPECT(slot76(buffer, 0, &resource) == E_OUTOFMEMORY && !resource);
+    EXPECT(g_heap_hook.alloc_calls == 1 && g_heap_hook.free_calls == 1 && g_heap_hook.last_free_ptr == arena);
+    mock->create_result = S_OK;
+
+    // The hook refuses: the PC device makes the buffer, the handler is not asked.
+    reset();
+    g_heap_hook.next_ptr = nullptr;
+    resource = nullptr;
+    EXPECT(slot76(buffer, 0, &resource) == S_OK && resource);
+    EXPECT(g_heap_hook.alloc_calls == 1 && g_placed.calls == 0 && !reinterpret_cast<Mock*>(resource)->private_data);
+    EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 0);
+
+    // Slot 27 (CreateCommittedResource) and slot 53 (CreateCommittedResource1) take the same path; their arguments
+    // reach the PC device unchanged when it makes the resource. (Slot 76's PC calls above went through PC slot 27.)
+    g_committed[0] = g_committed[1] = {};
+    for (const unsigned slot : {27u, 53u}) {
+        const int which = slot == 27 ? 0 : 1;
+        const auto call = [&](const D3D12_RESOURCE_DESC& desc, void** out, const IID* riid = &kResourceIid) {
+            const std::uint64_t session = 0x5e55;
+            std::uint64_t w[10] = {word(&heap), 0, word(&desc), 0, 0, word(riid), word(out), 0, 0, 0};
+            if (slot == 53) {  // (heap, flags, desc, state, clear, session, riid, out)
+                w[5] = session;
+                w[6] = word(riid);
+                w[7] = word(out);
+            }
+            return hr_of(raw10(device, slot, w));
+        };
+        reset();
+        resource = nullptr;
+        D3D12_RESOURCE_DESC pc_buffer = buffer;
+        pc_buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        EXPECT(call(pc_buffer, &resource) == S_OK && resource);
+        EXPECT(g_placed.calls == 1 && g_placed.va == arena && g_committed[which].calls == 0);
+        EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 1);
+
+        reset();
+        resource = nullptr;
+        D3D12_RESOURCE_DESC pc_texture = texture;
+        pc_texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        EXPECT(call(pc_texture, &resource) == S_OK && resource);
+        EXPECT(g_placed.calls == 0 && g_committed[which].calls == 1 && g_heap_hook.alloc_calls == 1);
+        EXPECT(g_committed[which].desc.Width == 256 && g_committed[which].riid == &kResourceIid);
+        if (slot == 53) EXPECT(g_committed[which].session == reinterpret_cast<const void*>(0x5e55));
+        EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 1);
+
+        // A capability check (no output) is the PC device's, and takes no memory from the title.
+        reset();
+        EXPECT(call(pc_texture, nullptr) == S_FALSE);
+        EXPECT(g_committed[which].calls == 2 && g_heap_hook.alloc_calls == 0 && g_placed.calls == 0);
+        EXPECT(xs::device_slot_overridden(slot));
+        g_committed[which] = {};
+    }
+
+    // Slot 127's buffer goes on the hook memory the same way.
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    {
+        reset();
+        D3D12_RESOURCE_DESC1 buffer1{};
+        buffer1.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer1.Width = buffer.Width;
+        buffer1.Height = buffer1.DepthOrArraySize = buffer1.MipLevels = 1;
+        buffer1.SampleDesc.Count = 1;
+        buffer1.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);
+        g_committed3 = {};
+        resource = nullptr;
+        std::uint64_t words[10] = {word(&heap), 0, word(&buffer1), 0, 0, 0, 0, 0, word(&kResourceIid), word(&resource)};
+        EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+        EXPECT(g_placed.calls == 1 && g_placed.va == arena && g_committed3.calls == 0);
+        EXPECT(g_placed.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+        EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 1);
+    }
+#endif
+
+    // No hook installed: the handler is never asked, even for a buffer.
+    xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    reset();
+    resource = nullptr;
+    EXPECT(slot76(buffer, 0, &resource) == S_OK && resource);
+    EXPECT(g_placed.calls == 0 && g_heap_hook.alloc_calls == 0 && arena[0] == 0xab);
+    EXPECT(release(resource) == 0);
+
+    xs::set_placed_at_va_handler(nullptr);
+    EXPECT(release(device) == 0);
+    std::printf("%s: committed buffers go on the title's XMem hook memory (slots 27, 53, 76, 127); textures, shared "
+                "heaps and refusals keep the PC device's memory\n",
+                g_label);
+    return 0;
+}
+
 }  // namespace
 
 // A failure ends the process with a message on stderr, never in a dialog a test run would wait on: abort() (an
@@ -1928,7 +2163,7 @@ int main(int argc, char** argv) {
         check_open_shared() || check_alloc_failures() || check_allocators() || check_render_target_sizes() ||
         check_allocation_descriptions_cleaned() || check_render_target_layout() || check_xbox_slots() ||
         check_custom_heap_properties() || check_slot70() || check_slot70_raw_buffer() || check_descriptor_heap_hooks() ||
-        check_committed_resource3_x() || check_committed_resource3_xmem_hook())
+        check_committed_resource3_x() || check_committed_resource3_xmem_hook() || check_committed_buffers_on_xmem())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

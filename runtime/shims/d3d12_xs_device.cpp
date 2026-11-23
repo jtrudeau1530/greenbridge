@@ -226,7 +226,6 @@ const char* slot_name(unsigned slot) {
         case 24: return "CopyDescriptorsSimple (CPU handles translated)";
         case 25: return "GetResourceAllocationInfo (C or PC form)";
         case 26: return "GetCustomHeapProperties (C or PC form)";
-        case 27: return "CreateCommittedResource (PC slot 27)";
         case 31: return "CreateSharedHandle (proxies unwrapped)";
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
         case 34: return "MakeResident (proxies unwrapped)";
@@ -243,6 +242,8 @@ const char* slot_name(unsigned slot) {
         case 70: return "Xbox shader-resource view from raw words";
         case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
         case 75: return "CreateCommandQueue1 -> queue proxy";
+        case 27: return "CreateCommittedResource (memory through the title's XMem hook)";
+        case 53: return "CreateCommittedResource1 (memory through the title's XMem hook)";
         case 76: return "Xbox resource creation";
         case 127: return "Xbox CreateCommittedResource3";
         case 78: return "Xbox SetFrameIntervalX";
@@ -1818,34 +1819,6 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     return hr;
 }
 
-HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
-                              D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
-                              D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
-                              const IID* riid, void** out) {
-    note_slot(76);
-    if (!out) return E_POINTER;
-    *out = nullptr;
-    if (!xbox_desc) return E_POINTER;
-    if (!riid) return E_POINTER;
-
-    // The measured description is 56 bytes plus Xbox extension words; D3D12_RESOURCE_DESC is exactly 56 bytes.
-    // The Xbox layout word is 0x101 (tiled) or 0x1 (row-major buffer), and is not a PC layout value. Committed
-    // resources take ROW_MAJOR for buffers and UNKNOWN for everything else, so the word is ignored and replaced.
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
-    const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
-    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
-                     static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
-    }
-    return self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state, clear_value,
-                                               *riid, out);
-}
-
 // Device slot 26, GetCustomHeapProperties, as the retail executable calls it. Measured on 1.0.2.1 under
 // gta6rt --run with a register probe in this slot's thunk: three calls right after device creation, each with the
 // device proxy in RDX and not in RCX, R8 = 1 and R9 = 1, 2, 3 (node mask 1; DEFAULT, UPLOAD, READBACK). So the
@@ -1859,46 +1832,6 @@ D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* o
     note_slot(26);
     *out = self->real->GetCustomHeapProperties(node_mask, heap_type);
     return out;
-}
-
-// Device slot 133 is the console's CreatePlacedResourceX: (va, desc, state, clear, riid, out), measured on the retail
-// executable (docs/retail_boot_chain.md, section 3.4). `va` is the start of a physical-page range the title has just
-// mapped, `desc` a 56-byte description with Xbox bits above the PC resource flags and an Xbox layout word, and
-// `state` is 0xFFFFFFFF, which is no PC state. The resource is a buffer on those pages, made by the handler the
-// device behind the proxy registered (set_placed_at_va_handler), with the PC flags kept and the layout made
-// ROW_MAJOR, as slot 76 does.
-std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
-
-HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
-                                       std::uint32_t state, const IID* riid, void** out) {
-    note_slot(133);
-    if (out) *out = nullptr;
-    // Without a handler (a PC device behind the proxy, or none registered) the slot refuses like any slot past the
-    // PC vtable, whatever its arguments.
-    const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
-    if (!handler) return E_NOTIMPL;
-    if (!out || !xbox_desc || !riid) return E_POINTER;
-    // An integer mask: a D3D12_RESOURCE_FLAGS constant past the SDK's last enumerator is not a constant expression
-    // for clang-cl with SDK 10.0.26100 (found in review). The cast is applied to the masked value at run time.
-    // The PC flags up to RAYTRACING_ACCELERATION_STRUCTURE (0x100) and USE_TIGHT_ALIGNMENT (0x400); 0x200 is
-    // dropped, as committed_resource_refusal says the host refuses it (found in review).
-    constexpr std::uint32_t kPcResourceFlags = 0x5ff;
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
-    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
-    // The Xbox layout word (0x101 tiled, 0x1 row-major buffer) is no PC layout: ROW_MAJOR for a buffer and UNKNOWN
-    // for everything else, as slot 76 does.
-    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 133 CreatePlacedResourceX: va=%p dimension=%d width=%llu xbox flags=0x%x "
-                     "state=0x%x -> a buffer on the title's pages\n",
-                     va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
-                     xbox_flags, state);
-    }
-    return handler(self->real, va, pc_desc, *riid, out);
 }
 
 // The Xbox routes at their configured indices. Returns false when `slot` is none of them. Slot 70 asks too, because an
@@ -1929,26 +1862,6 @@ bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, 
     }
     return true;
 }
-
-// Xbox device slot 127 (RT-5 stop 15, measured by Pipodi in #6982): the argument list of ID3D12Device10::
-// CreateCommittedResource3, (heap properties, heap flags, desc1, initial layout, clear value, protected session,
-// castable format count, castable formats, riid, out), with the Xbox layout word in desc1.Layout and Xbox bits above
-// the PC flags in desc1.Flags. The slot is past the PC device's vtable, so the generic thunk could only refuse it. The
-// PC device creates the resource through its own CreateCommittedResource3 (PC slot 76) with the layout word replaced
-// as slot 76 does and the flags limited to the PC bits. The initial layout, clear value, session and castable list go
-// on as the title passed them; 0xFFFFFFFF is D3D12_BARRIER_LAYOUT_UNDEFINED, the value the console passes for the
-// state of slot 133 as well. The words take the positions the thunk received them in (see the top of the file).
-constexpr unsigned kCreateCommittedResource3X = 127;
-constexpr unsigned kPcCreateCommittedResource3 = 76;  // ID3D12Device10, the PC device's 77th method
-// D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT: a PC bit the Windows SDK 10.0.26100 header does not name yet; the PC runtime
-// accepts it for committed resources (D3D12 tight alignment spec), so a title's request must reach it.
-constexpr std::uint32_t kPcResourceFlagUseTightAlignment = 0x400;
-constexpr std::uint32_t kPcResourceFlagsMask =
-    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
-    D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
-    D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY |
-    D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE | kPcResourceFlagUseTightAlignment;
 
 // The XMem memory a committed resource took through the title's allocation hook (slot 127). The console D3D runtime
 // allocates a committed resource's memory with XMemAlloc, so a title's hook sees every such allocation and may count
@@ -1983,19 +1896,21 @@ struct XmemBackingOwner final : IUnknown {
     }
 };
 
-// Allocates the resource's size through the installed hook and ties the memory to `resource`. Without a hook, a size
-// or the private-data slot, the resource is left as it is: the hook is the title's bookkeeping, never the PC's memory.
-void attach_xmem_backing(DeviceProxy* self, void* resource, const D3D12_RESOURCE_DESC1& desc1) {
-    if (!resource) return;
-    DescriptorHeapBackingAlloc alloc_fn = nullptr;
-    DescriptorHeapBackingFree free_fn = nullptr;
-    {
-        std::lock_guard lock(heap_alloc_mutex());
-        alloc_fn = g_heap_alloc;
-        free_fn = g_heap_free;
-    }
-    if (!alloc_fn) return;
+// The handler slot 133 uses to make a buffer on the title's own pages (set_placed_at_va_handler). Committed buffers
+// whose memory comes from the title's XMem hook are made on that memory through the same handler.
+std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
 
+struct XmemHooks {
+    DescriptorHeapBackingAlloc alloc = nullptr;
+    DescriptorHeapBackingFree free = nullptr;
+};
+
+XmemHooks xmem_hooks() {
+    std::lock_guard lock(heap_alloc_mutex());
+    return {g_heap_alloc, g_heap_free};
+}
+
+D3D12_RESOURCE_DESC desc_of(const D3D12_RESOURCE_DESC1& desc1) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = desc1.Dimension;
     desc.Alignment = desc1.Alignment;
@@ -2007,24 +1922,29 @@ void attach_xmem_backing(DeviceProxy* self, void* resource, const D3D12_RESOURCE
     desc.SampleDesc = desc1.SampleDesc;
     desc.Layout = desc1.Layout;
     desc.Flags = desc1.Flags;
+    return desc;
+}
+
+// The PC allocation size of `desc`, or 0 when the device has none to give.
+std::size_t xmem_size(DeviceProxy* self, const D3D12_RESOURCE_DESC& desc) {
     const D3D12_RESOURCE_ALLOCATION_INFO info = self->real->GetResourceAllocationInfo(0, 1, &desc);
     if (info.SizeInBytes == 0 || info.SizeInBytes == UINT64_MAX ||
         info.SizeInBytes > (std::numeric_limits<std::size_t>::max)())
-        return;
+        return 0;
+    return static_cast<std::size_t>(info.SizeInBytes);
+}
 
-    void* const memory = alloc_fn(static_cast<std::size_t>(info.SizeInBytes), kXmemCommittedResourceAttributes);
-    static std::atomic<bool> logged{false};
-    if (first_call(logged))
-        std::fprintf(stderr, "[rt] d3d12_xs: slot 127 resource memory through the title's XMem hook: %llu bytes, %s\n",
-                     static_cast<unsigned long long>(info.SizeInBytes), memory ? "allocated" : "refused");
-    if (!memory) return;
-    auto* const owner = new (std::nothrow) XmemBackingOwner(memory, free_fn, kXmemCommittedResourceAttributes);
+// Ties hook memory to `resource` as private data, so it goes back through the hook's free when the resource dies. A
+// resource that takes no reference (no ID3D12Object, or no memory for the entry) gives the memory back at once.
+void tie_xmem(void* resource, void* memory, const XmemHooks& hooks) {
+    auto* const owner = new (std::nothrow) XmemBackingOwner(memory, hooks.free, kXmemCommittedResourceAttributes);
     if (!owner) {
-        if (free_fn) free_fn(memory, kXmemCommittedResourceAttributes);
+        if (hooks.free) hooks.free(memory, kXmemCommittedResourceAttributes);
         return;
     }
     ID3D12Object* object = nullptr;
-    if (SUCCEEDED(static_cast<IUnknown*>(resource)->QueryInterface(__uuidof(ID3D12Object),
+    if (resource &&
+        SUCCEEDED(static_cast<IUnknown*>(resource)->QueryInterface(__uuidof(ID3D12Object),
                                                                     reinterpret_cast<void**>(&object))) &&
         object) {
         object->SetPrivateDataInterface(kXmemBackingPrivateData, owner);  // the resource holds its own reference
@@ -2032,6 +1952,200 @@ void attach_xmem_backing(DeviceProxy* self, void* resource, const D3D12_RESOURCE
     }
     owner->Release();  // frees now when the resource took no reference
 }
+
+// LEONIDA_XMEM_RESOURCE_BACKING=0 keeps every committed resource on the PC device's own memory and the hook memory as
+// bookkeeping only, as before (to compare a run, or when GPU reads of host memory are too slow on a machine).
+bool xmem_buffer_backing_enabled() {
+    static const bool enabled = [] {
+        char value[8]{};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_XMEM_RESOURCE_BACKING", value, sizeof(value));
+        return !(n == 1 && value[0] == '0');
+    }();
+    return enabled;
+}
+
+// Heap flags a buffer on the title's memory cannot honour: memory shared with another device or process. Such a
+// resource stays on the PC device's memory and the hook memory is bookkeeping.
+constexpr std::uint32_t kHeapFlagsNotOnTitleMemory = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
+
+// The committed resource of device slots 27, 53, 76 and 127, with the memory the console's D3D runtime would take
+// through XMemAlloc. With no hook installed, `create_pc` alone runs, as before.
+//
+// A buffer is made on the memory the hook gives (through the slot-133 handler, which imports it with
+// VK_EXT_external_memory_host), so the title's CPU reads and writes at that address are the resource's bytes, as on the
+// console. Its GPU VA is that address. Unless the heap flags say D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, the memory is zeroed
+// first, as a PC committed resource starts. A buffer the handler cannot make (no handler: not the Vulkan layer; the
+// memory off the import alignment; no extension) falls back to the PC device's memory with the hook memory as
+// bookkeeping.
+//
+// A texture stays on the PC device's memory and the hook memory is bookkeeping only: the console lays a texture out in
+// its own tiling, which no Vulkan image on imported host memory reproduces, so the title's CPU view of those bytes
+// could not match the image anyway.
+template <class CreatePc>
+HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uint32_t heap_flags,
+                                      const D3D12_RESOURCE_DESC& desc, const IID& riid, void** out,
+                                      CreatePc&& create_pc) {
+    const XmemHooks hooks = xmem_hooks();
+    if (!hooks.alloc) return create_pc();
+    const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
+    const bool on_title_memory = handler && desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+                                 !(heap_flags & kHeapFlagsNotOnTitleMemory) && xmem_buffer_backing_enabled();
+
+    if (!on_title_memory) {
+        // The PC device first: a refused resource never takes memory from the title's hook.
+        const HRESULT hr = create_pc();
+        if (FAILED(hr) || !*out) return hr;
+        const std::size_t size = xmem_size(self, desc);
+        if (!size) return hr;
+        void* const memory = hooks.alloc(size, kXmemCommittedResourceAttributes);
+        static std::atomic<bool> logged{false};
+        if (first_call(logged))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot %u resource memory through the title's XMem hook: %zu bytes, %s "
+                         "(bookkeeping: the resource stays on the PC device's memory)\n",
+                         slot, size, memory ? "allocated" : "refused");
+        if (memory) tie_xmem(*out, memory, hooks);
+        return hr;
+    }
+
+    const std::size_t size = xmem_size(self, desc);
+    void* const memory = size ? hooks.alloc(size, kXmemCommittedResourceAttributes) : nullptr;
+    if (!memory) {
+        static std::atomic<bool> logged{false};
+        if (first_call(logged))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot %u buffer: the title's XMem hook %s; the PC device's memory\n",
+                         slot, size ? "refused it" : "was not asked (no allocation size)");
+        return create_pc();
+    }
+    if (!(heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) std::memset(memory, 0, size);
+    HRESULT hr = handler(self->real, memory, desc, riid, out);
+    if (SUCCEEDED(hr)) {
+        static std::atomic<bool> logged{false};
+        if (first_call(logged))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot %u buffer on the title's XMem hook memory: %p, %llu bytes (%zu taken)\n",
+                         slot, memory, static_cast<unsigned long long>(desc.Width), size);
+        tie_xmem(*out, memory, hooks);
+        return hr;
+    }
+    static std::atomic<bool> fallback_logged{false};
+    if (first_call(fallback_logged))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot %u buffer: the device could not use the title's memory at %p (0x%08lx); "
+                     "the PC device's memory, the hook memory kept as bookkeeping\n",
+                     slot, memory, static_cast<unsigned long>(hr));
+    if (out) *out = nullptr;
+    hr = create_pc();
+    if (FAILED(hr) || !*out) {
+        if (hooks.free) hooks.free(memory, kXmemCommittedResourceAttributes);
+        return hr;
+    }
+    tie_xmem(*out, memory, hooks);
+    return hr;
+}
+
+HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
+                              D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
+                              D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
+                              const IID* riid, void** out) {
+    note_slot(76);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!xbox_desc) return E_POINTER;
+    if (!riid) return E_POINTER;
+
+    // The measured description is 56 bytes plus Xbox extension words; D3D12_RESOURCE_DESC is exactly 56 bytes.
+    // The Xbox layout word is 0x101 (tiled) or 0x1 (row-major buffer), and is not a PC layout value. Committed
+    // resources take ROW_MAJOR for buffers and UNKNOWN for everything else, so the word is ignored and replaced.
+    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
+    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
+                     static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
+    }
+    return create_committed_through_xmem(self, 76, static_cast<std::uint32_t>(heap_flags), pc_desc, *riid, out, [&] {
+        return self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state, clear_value,
+                                                   *riid, out);
+    });
+}
+
+// PC device slots 27 (ID3D12Device::CreateCommittedResource) and 53 (ID3D12Device4::CreateCommittedResource1) were
+// forwarded verbatim. The console's D3D runtime takes a committed resource's memory through XMemAlloc whichever slot
+// creates it, so these take it through the title's hook as slots 76 and 127 do. The arguments go on unchanged.
+constexpr unsigned kPcCreateCommittedResource = 27;
+constexpr unsigned kPcCreateCommittedResource1 = 53;  // ID3D12Device4
+
+// The PC entry of `slot` on `object`, called with the words as received (a null IID or output reaches the PC runtime
+// as it did when the slot was forwarded, so its own argument answers stay the title's).
+using PcCommittedFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                       const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+                                       const IID*, void**);
+using PcCommitted1Fn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                        const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+                                        ID3D12ProtectedResourceSession*, const IID*, void**);
+template <class Fn>
+Fn pc_entry(void* object, unsigned slot) {
+    return reinterpret_cast<Fn>((*reinterpret_cast<void***>(object))[slot]);
+}
+
+HRESULT proxy_create_committed_resource_pc(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
+                                           D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc,
+                                           D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
+                                           const IID* riid, void** out) {
+    note_slot(kPcCreateCommittedResource);
+    const auto create = pc_entry<PcCommittedFn>(self->real, kPcCreateCommittedResource);
+    const auto forward = [&] {
+        return create(self->real, heap_properties, heap_flags, desc, initial_state, clear_value, riid, out);
+    };
+    if (!out || !desc || !riid) return forward();  // a capability check or an argument error: the PC runtime's answer
+    *out = nullptr;
+    return create_committed_through_xmem(self, kPcCreateCommittedResource, static_cast<std::uint32_t>(heap_flags),
+                                         *desc, *riid, out, forward);
+}
+
+HRESULT proxy_create_committed_resource1_pc(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
+                                            D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc,
+                                            D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
+                                            ID3D12ProtectedResourceSession* session, const IID* riid, void** out) {
+    note_slot(kPcCreateCommittedResource1);
+    if (self->slot_count <= kPcCreateCommittedResource1)
+        return refuse_beyond_device(kPcCreateCommittedResource1, self->slot_count);
+    // Called on the device pointer the slot was forwarded to before: the proxy's slot count says the PC device's
+    // vtable reaches slot 53, so its entry there is ID3D12Device4::CreateCommittedResource1.
+    const auto create = pc_entry<PcCommitted1Fn>(self->real, kPcCreateCommittedResource1);
+    const auto forward = [&] {
+        return create(self->real, heap_properties, heap_flags, desc, initial_state, clear_value, session, riid, out);
+    };
+    if (!out || !desc || !riid) return forward();
+    *out = nullptr;
+    return create_committed_through_xmem(self, kPcCreateCommittedResource1, static_cast<std::uint32_t>(heap_flags),
+                                         *desc, *riid, out, forward);
+}
+
+// Xbox device slot 127 (RT-5 stop 15, measured by Pipodi in #6982): the argument list of ID3D12Device10::
+// CreateCommittedResource3, (heap properties, heap flags, desc1, initial layout, clear value, protected session,
+// castable format count, castable formats, riid, out), with the Xbox layout word in desc1.Layout and Xbox bits above
+// the PC flags in desc1.Flags. The slot is past the PC device's vtable, so the generic thunk could only refuse it. The
+// PC device creates the resource through its own CreateCommittedResource3 (PC slot 76) with the layout word replaced
+// as slot 76 does and the flags limited to the PC bits. The initial layout, clear value, session and castable list go
+// on as the title passed them; 0xFFFFFFFF is D3D12_BARRIER_LAYOUT_UNDEFINED, the value the console passes for the
+// state of slot 133 as well. The words take the positions the thunk received them in (see the top of the file).
+constexpr unsigned kCreateCommittedResource3X = 127;
+constexpr unsigned kPcCreateCommittedResource3 = 76;  // ID3D12Device10, the PC device's 77th method
+// D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT: a PC bit the Windows SDK 10.0.26100 header does not name yet; the PC runtime
+// accepts it for committed resources (D3D12 tight alignment spec), so a title's request must reach it.
+constexpr std::uint32_t kPcResourceFlagUseTightAlignment = 0x400;
+constexpr std::uint32_t kPcResourceFlagsMask =
+    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+    D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+    D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY |
+    D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE | kPcResourceFlagUseTightAlignment;
 
 HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap_word, std::uint64_t heap_flags,
                                            std::uint64_t desc_word, std::uint64_t layout_word,
@@ -2081,16 +2195,56 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
 #endif
     if (!device10) return E_NOTIMPL;
     const auto create = reinterpret_cast<Fn>((*reinterpret_cast<void***>(device10))[kPcCreateCommittedResource3]);
-    const HRESULT hr =
-        create(static_cast<ID3D12Device*>(device10), reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(heap_word),
-               static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(heap_flags)), &pc_desc,
-               static_cast<std::uint32_t>(layout_word), reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word),
-               reinterpret_cast<ID3D12ProtectedResourceSession*>(session_word),
-               static_cast<std::uint32_t>(castable_count), reinterpret_cast<const DXGI_FORMAT*>(castable_formats), riid,
-               out);
+    const HRESULT hr = create_committed_through_xmem(
+        self, kCreateCommittedResource3X, static_cast<std::uint32_t>(heap_flags), desc_of(pc_desc), *riid, out, [&] {
+            return create(static_cast<ID3D12Device*>(device10),
+                          reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(heap_word),
+                          static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(heap_flags)), &pc_desc,
+                          static_cast<std::uint32_t>(layout_word), reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word),
+                          reinterpret_cast<ID3D12ProtectedResourceSession*>(session_word),
+                          static_cast<std::uint32_t>(castable_count),
+                          reinterpret_cast<const DXGI_FORMAT*>(castable_formats), riid, out);
+        });
     static_cast<IUnknown*>(device10)->Release();
-    if (SUCCEEDED(hr)) attach_xmem_backing(self, *out, pc_desc);
     return hr;
+}
+
+// Device slot 133 is the console's CreatePlacedResourceX: (va, desc, state, clear, riid, out), measured on the retail
+// executable (docs/retail_boot_chain.md, section 3.4). `va` is the start of a physical-page range the title has just
+// mapped, `desc` a 56-byte description with Xbox bits above the PC resource flags and an Xbox layout word, and
+// `state` is 0xFFFFFFFF, which is no PC state. The resource is a buffer on those pages, made by the handler the
+// device behind the proxy registered (set_placed_at_va_handler), with the PC flags kept and the layout made
+// ROW_MAJOR, as slot 76 does. g_placed_at_va is declared above, with the committed resources that use it too.
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
+                                       std::uint32_t state, const IID* riid, void** out) {
+    note_slot(133);
+    if (out) *out = nullptr;
+    // Without a handler (a PC device behind the proxy, or none registered) the slot refuses like any slot past the
+    // PC vtable, whatever its arguments.
+    const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
+    if (!handler) return E_NOTIMPL;
+    if (!out || !xbox_desc || !riid) return E_POINTER;
+    // An integer mask: a D3D12_RESOURCE_FLAGS constant past the SDK's last enumerator is not a constant expression
+    // for clang-cl with SDK 10.0.26100 (found in review). The cast is applied to the masked value at run time.
+    // The PC flags up to RAYTRACING_ACCELERATION_STRUCTURE (0x100) and USE_TIGHT_ALIGNMENT (0x400); 0x200 is
+    // dropped, as committed_resource_refusal says the host refuses it (found in review).
+    constexpr std::uint32_t kPcResourceFlags = 0x5ff;
+    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
+    // The Xbox layout word (0x101 tiled, 0x1 row-major buffer) is no PC layout: ROW_MAJOR for a buffer and UNKNOWN
+    // for everything else, as slot 76 does.
+    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 CreatePlacedResourceX: va=%p dimension=%d width=%llu xbox flags=0x%x "
+                     "state=0x%x -> a buffer on the title's pages\n",
+                     va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
+                     xbox_flags, state);
+    }
+    return handler(self->real, va, pc_desc, *riid, out);
 }
 
 template <unsigned Slot>
@@ -2195,6 +2349,22 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<void**>(a7)));
     } else if constexpr (Slot == kCreateCommittedResource3X) {
         return hr_to_u64(proxy_create_committed_resource3_x(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
+    } else if constexpr (Slot == kPcCreateCommittedResource) {
+        return hr_to_u64(proxy_create_committed_resource_pc(
+            self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
+            static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(a2)),
+            reinterpret_cast<const D3D12_RESOURCE_DESC*>(a3),
+            static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
+            reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == kPcCreateCommittedResource1) {
+        return hr_to_u64(proxy_create_committed_resource1_pc(
+            self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
+            static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(a2)),
+            reinterpret_cast<const D3D12_RESOURCE_DESC*>(a3),
+            static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<ID3D12ProtectedResourceSession*>(a6),
+            reinterpret_cast<const IID*>(a7), reinterpret_cast<void**>(a8)));
     } else {
         if constexpr (Slot == 26) {
             // The console form has the device in RDX. A PC C++ caller has the proxy in RCX and its return buffer in
@@ -2515,7 +2685,8 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 26) || slot == 31 || slot == 32 ||
         slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 62 ||
-        slot == 67 || slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == 133)
+        slot == 67 || slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X ||
+        slot == kPcCreateCommittedResource || slot == kPcCreateCommittedResource1 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

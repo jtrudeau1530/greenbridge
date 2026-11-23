@@ -96,6 +96,33 @@ mapper (#5378) or an imported host allocation.
 The proxy's slot table must also be longer than the title's highest slot. A shorter table leaves a null pointer,
 not an `E_NOTIMPL`.
 
+### 3.5 Committed resources take their memory through the title's XMem hook
+
+On the console the D3D runtime allocates a committed resource's memory with `XMemAlloc`, so a hook the title
+installs through `__XMemAllocationHooks__` sees it (stop 17 counts it against an arena). The device proxy does the
+same for device slots 27 (`CreateCommittedResource`), 53 (`CreateCommittedResource1`), 76 and 127: it asks the
+installed hook for the PC allocation size with the committed-resource attribute word
+(`kXmemCommittedResourceAttributes`) and gives the memory back through the hook's free when the resource dies.
+
+What the memory is used for depends on the resource:
+
+- **A buffer** is made on that memory when the device behind the proxy is the Vulkan layer. The handler slot 133
+  uses (`create_buffer_at_host_address`) imports it with `VK_EXT_external_memory_host`. The buffer's GPU VA is the
+  hook's address, and the title's CPU reads and writes there are the buffer's bytes, with no copy. The memory is
+  zeroed first unless the heap flags include `D3D12_HEAP_FLAG_CREATE_NOT_ZEROED`. `d3d12_existing_heap_test`
+  checks both directions on a GPU.
+- **A texture** stays on the device's own memory, and the hook memory only keeps the title's accounting. The
+  console lays a texture out in its own tiling, and no Vulkan image on imported host memory reproduces it, so the
+  title's CPU view of those bytes would not match the image anyway.
+- **A buffer the handler cannot make** (a PC D3D12 device behind the proxy, no `VK_EXT_external_memory_host`, an
+  address off the import alignment) and **a shared heap** (`D3D12_HEAP_FLAG_SHARED`, `_SHARED_CROSS_ADAPTER`) fall
+  back to the device's memory, with the hook memory as bookkeeping. The hook is asked only once per resource.
+
+GPU reads of host memory cross the bus, so a heavily read DEFAULT buffer is slower there than in device memory.
+`LEONIDA_XMEM_RESOURCE_BACKING=0` keeps every committed resource on the device's memory (bookkeeping only) to
+compare a run. The hook attribute word for a resource is the one #7235 measured at stop 17. The object type field
+is not measured and stays 0.
+
 ## 4. What this does not show
 
 These are one run's first failures, not a list of what is missing. Every stand-in above is local and untested
