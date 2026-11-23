@@ -1540,9 +1540,14 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     auto* info1 = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5);
 
     std::vector<D3D12_RESOURCE_DESC1> cleaned;
-    const D3D12_RESOURCE_DESC1* descs_to_pass = reinterpret_cast<const D3D12_RESOURCE_DESC1*>(raw_descs);
-    if (raw_descs && count > 0 && count <= 1024) {
-        cleaned.resize(count);
+    const D3D12_RESOURCE_DESC1* descs_to_pass = nullptr;
+    if (raw_descs && count > 0) {
+        try {
+            cleaned.resize(count);
+        } catch (...) {
+            *ret = {UINT64_MAX, 0};
+            return reinterpret_cast<std::uint64_t>(ret);
+        }
         for (UINT i = 0; i < count; ++i) {
             D3D12_RESOURCE_DESC1 d{};
             std::memcpy(&d, &raw_descs[i], sizeof(D3D12_RESOURCE_DESC));

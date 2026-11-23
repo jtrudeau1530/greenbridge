@@ -209,8 +209,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                                       descs[0].SamplerFeedbackMipRegion.Height |
                                       descs[0].SamplerFeedbackMipRegion.Depth;
                     if (count > 1) {
-                        m->array[68][3] = (static_cast<std::uint64_t>(descs[1].Layout) << 32) |
-                                          static_cast<std::uint32_t>(descs[1].Flags);
+                        const auto& last = descs[count - 1];
+                        m->array[68][3] = (static_cast<std::uint64_t>(last.Layout) << 32) |
+                                          static_cast<std::uint32_t>(last.Flags);
                     }
                 }
                 if (ret) *ret = {0x40000, 0x10000};
@@ -874,6 +875,15 @@ int check_xbox_slots() {
     EXPECT(buf_ret.SizeInBytes == 0x40000 && mock->calls[68] == 2 && xs::device_slot_hits(108) == 2);
     EXPECT(mock->array[68][0] == static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR));
     EXPECT(mock->array[68][1] == static_cast<std::uint64_t>(D3D12_RESOURCE_FLAG_NONE));
+
+    std::vector<D3D12_RESOURCE_DESC> batch1025(1025, xbox_descs[0]);
+    batch1025.back() = xbox_descs[1];
+    D3D12_RESOURCE_ALLOCATION_INFO batch_ret{};
+    EXPECT(call_slot108_c_abi(&batch_ret, device, 1, 1025, batch1025.data(), nullptr) == &batch_ret);
+    EXPECT(batch_ret.SizeInBytes == 0x40000 && mock->calls[68] == 3 && xs::device_slot_hits(108) == 3);
+    EXPECT(mock->array[68][0] == static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_UNKNOWN));
+    EXPECT(mock->array[68][3] == ((static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR) << 32) |
+                                  static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)));
 
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
