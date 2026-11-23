@@ -55,7 +55,8 @@ constexpr wchar_t kCopyDir[] = L".gta6rt-copy";
 
 // The overlay root's own folders, which a title never sees in a listing.
 bool internal_dir(const wchar_t* name) {
-    return _wcsicmp(name, kDeletedDir) == 0 || _wcsicmp(name, kCopyDir) == 0 || _wcsicmp(name, kScratchDir) == 0;
+    return _wcsicmp(name, kDeletedDir) == 0 || _wcsicmp(name, kCopyDir) == 0 || _wcsicmp(name, kScratchDir) == 0 ||
+           _wcsicmp(name, kPersistentStorageDir) == 0;
 }
 
 std::mutex g_mutex;

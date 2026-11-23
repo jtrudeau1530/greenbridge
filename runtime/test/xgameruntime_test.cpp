@@ -394,7 +394,7 @@ void check_run_time_load() {
     }
 
     // XPersistentLocalStorageImpl (RT-219): the class id with IXPersistentLocalStorageImpl3's interface id, over a
-    // temporary overlay. The storage folder is <overlay>\persistent.
+    // temporary overlay. The storage folder is <overlay>\.gta6rt-persistent.
     const GUID pls_class = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
     const GUID pls3 = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
     const std::filesystem::path scratch =
@@ -421,8 +421,8 @@ void check_run_time_load() {
                   path[size - 1] == '\0',
               "slot 4 (GetPath) fills the buffer and reports the bytes used");
         const std::filesystem::path folder = std::filesystem::path(path.c_str());
-        check(folder == scratch / L"overlay" / L"persistent" && std::filesystem::is_directory(folder),
-              "the path is <overlay>\\persistent and the folder exists");
+        check(folder == scratch / L"overlay" / L".gta6rt-persistent" && std::filesystem::is_directory(folder),
+              "the path is <overlay>\\.gta6rt-persistent and the folder exists");
         char tiny[2] = {'x', 'x'};
         used = 99;
         check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, 2, tiny, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
@@ -449,6 +449,49 @@ void check_run_time_load() {
                   XAsyncGetStatus(&too_big, true) == HRESULT_FROM_WIN32(ERROR_DISK_FULL) &&
                   reinterpret_cast<PromptResult>(slot(pls, 7))(pls, &too_big) == HRESULT_FROM_WIN32(ERROR_DISK_FULL),
               "slots 6/7: a prompt for more than the quota fails with ERROR_DISK_FULL");
+
+        {
+            using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+            using FindFirstFn = HANDLE(WINAPI*)(LPCWSTR, LPWIN32_FIND_DATAW);
+            using FindNextFn = BOOL(WINAPI*)(HANDLE, LPWIN32_FIND_DATAW);
+            using FindCloseFn = BOOL(WINAPI*)(HANDLE);
+            using DeleteFn = BOOL(WINAPI*)(LPCWSTR);
+            const auto create_w = reinterpret_cast<CreateFileWFn>(rt::shims::find("kernel32.dll", "CreateFileW"));
+            const auto first_w = reinterpret_cast<FindFirstFn>(rt::shims::find("kernel32.dll", "FindFirstFileW"));
+            const auto next_w = reinterpret_cast<FindNextFn>(rt::shims::find("kernel32.dll", "FindNextFileW"));
+            const auto close_w = reinterpret_cast<FindCloseFn>(rt::shims::find("kernel32.dll", "FindClose"));
+            const auto delete_w = reinterpret_cast<DeleteFn>(rt::shims::find("kernel32.dll", "DeleteFileW"));
+            auto lists = [&](const wchar_t* pattern, const wchar_t* name) {
+                bool found = false;
+                WIN32_FIND_DATAW fd{};
+                const HANDLE h = first_w(pattern, &fd);
+                if (h == INVALID_HANDLE_VALUE) return false;
+                do found = found || _wcsicmp(fd.cFileName, name) == 0;
+                while (next_w(h, &fd));
+                close_w(h);
+                return found;
+            };
+            std::filesystem::create_directories(scratch / L"game" / L"persistent");
+            std::ofstream(scratch / L"game" / L"persistent" / L"cache.bin", std::ios::binary) << "package";
+            std::ofstream(folder / L"index.bin", std::ios::binary) << "storage";
+
+            check(!lists(L"GAME:\\*", L".gta6rt-persistent") && !lists(L"GAME:\\persistent\\*", L"index.bin"),
+                  "GAME: listings show neither the storage folder nor its files");
+            char bytes[16] = {};
+            DWORD got = 0;
+            const HANDLE h = create_w(L"GAME:\\persistent\\cache.bin", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                      OPEN_EXISTING, 0, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                ::ReadFile(h, bytes, sizeof bytes - 1, &got, nullptr);
+                ::CloseHandle(h);
+            }
+            check(std::string(bytes) == "package",
+                  "GAME:\\persistent\\cache.bin is the package's file, not the storage file of that name");
+            std::error_code size_ec;
+            check(delete_w(L"GAME:\\persistent\\cache.bin") &&
+                      std::filesystem::file_size(folder / L"cache.bin", size_ec) == 1024,
+                  "deleting the GAME: name leaves the storage file alone");
+        }
 
         void* handle = reinterpret_cast<void*>(1);
         check(reinterpret_cast<Mount>(slot(pls, 8))(pls, "pkg", &handle) == E_NOTIMPL && handle == nullptr,

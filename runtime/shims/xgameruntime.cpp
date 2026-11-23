@@ -364,9 +364,9 @@ static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl's
 // can ask where it may keep its cache. Slots 3-7 follow Microsoft's XPersistentLocalStorage reference and the ids and
 // layout in the public xgameruntime-docs and Wine IDL (facts only): GetPathSize, GetPath, GetSpaceInfo,
 // PromptUserForSpaceAsync and PromptUserForSpaceResult; IXPersistentLocalStorageImpl3 adds MountForPackage at slot 8.
-// The storage is <overlay>\persistent, so the package stays read-only and --overlay moves it with everything else a
-// title writes. Offline there is nobody to ask for more room: a prompt for space the quota can hold succeeds, one it
-// cannot fails with ERROR_DISK_FULL.
+// The storage is <overlay>\.gta6rt-persistent, so the package stays read-only, --overlay moves it with everything
+// else a title writes, and GAME: does not see it. Offline there is nobody to ask for more room: a prompt for space the
+// quota can hold succeeds, one it cannot fails with ERROR_DISK_FULL.
 
 constexpr GUID kPersistentStorageClass = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
 constexpr GUID kPersistentStorage2 = {0xd29411df, 0x0794, 0x4553, {0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d}};
@@ -387,7 +387,7 @@ static_assert(sizeof(PersistentSpaceInfo) == 32, "XPersistentLocalStorageSpaceIn
 std::filesystem::path persistent_storage_dir() {
     const std::filesystem::path overlay = rt::fs::overlay_dir();
     if (overlay.empty()) return {};
-    std::filesystem::path dir = overlay / L"persistent";
+    std::filesystem::path dir = overlay / rt::fs::kPersistentStorageDir;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     return ec ? std::filesystem::path{} : dir;

@@ -20,6 +20,8 @@
 
 namespace rt::fs {
 
+inline constexpr wchar_t kPersistentStorageDir[] = L".gta6rt-persistent";
+
 // Sets the roots. main.cpp calls this once, before anything is mapped; the test calls it per case. The overlay is
 // created on the first write, not here.
 void configure(const std::filesystem::path& game_dir, const std::filesystem::path& overlay_dir);
