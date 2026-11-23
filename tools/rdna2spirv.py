@@ -4563,6 +4563,60 @@ class Gen:
             return v
         return self.lds_access(addr, byte_off, f)
 
+    def ds_append(self, op, a, mods):
+        """ds_append / ds_consume vD [offset:N]: one LDS add (append) or subtract (consume) of the number of lanes on in
+        EXEC, for the whole wave, at the byte address N; every active lane gets the value before the op, inactive lanes
+        keep vD. Measured natively on RDNA2 gfx1036 (hunt6 hw_append.py, wave32 and wave64 with EXEC across both
+        halves): the address is the offset field alone, M0 (0x4, 0x100, 0x10000, 0x40000, 0x80000) does not move it.
+        The add is done once, by the first active lane of the wave (the wave's EXEC gathered as for s_bcnt1); the old
+        value reaches the other lanes by a subgroup shuffle from that lane, or an exchange round under
+        --wave64-emulate (a wave64 on 32-wide subgroups without it: right in the half of the first active lane only,
+        the known cross-half approximation). The gds form is refused."""
+        if "gds" in mods:
+            raise Unsupported(op + " gds")
+        if not a or a[0]["k"] != "vgpr":
+            raise Unsupported(op + " operands")
+        off = self.mod_int(mods, "offset", 0)
+        lo, hi = self.wave_mask({"k": "special", "t": "exec"})
+        cl, ch, cnt, lz, hz, l, h, h32, fh, first, lane, me, act, do = (self.tmp() for _ in range(14))
+        self.emit(f"{cl} = OpBitCount %uint {lo}")
+        self.emit(f"{ch} = OpBitCount %uint {hi}")
+        self.emit(f"{cnt} = OpIAdd %uint {cl} {ch}")
+        self.emit(f"{lz} = OpINotEqual %bool {lo} {self.cu(0)}")
+        self.emit(f"{hz} = OpINotEqual %bool {hi} {self.cu(0)}")
+        self.emit(f"{l} = OpExtInst %uint %glsl FindILsb {lo}")
+        self.emit(f"{h} = OpExtInst %uint %glsl FindILsb {hi}")
+        self.emit(f"{h32} = OpIAdd %uint {h} {self.cu(32)}")
+        self.emit(f"{fh} = OpSelect %uint {hz} {h32} {self.cu(64)}")      # no lane on: 64, nobody's lane
+        self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
+        self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
+        self.emit(f"{me} = OpIEqual %bool {lane} {first}")
+        self.emit(f"{act} = OpCopyObject %bool {self.active_b()}")
+        self.emit(f"{do} = OpLogicalAnd %bool {me} {act}")
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {do} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        spv = "OpAtomicIAdd" if op == "ds_append" else "OpAtomicISub"
+        r = self.lds_atomic(self.cu(0), off, f"{spv} %uint {{p}} {self.cu(2)} {self.cu(0)} {cnt}")
+        done = self.current_label_placeholder()
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        old = self.tmp()
+        self.emit(f"{old} = OpPhi %uint {r} {done} {self.cu(0)} {pre}")
+        if self.emulate:
+            read, _ = self.x_round(data=old)
+            fi = self.tmp()
+            self.emit(f"{fi} = OpBitwiseAnd %uint {first} {self.cu(63)}")
+            val = read(fi)
+        else:
+            self.uses_subgroup = self.uses_ballot = True
+            fi, val = self.tmp(), self.tmp()
+            self.emit(f"{fi} = OpBitwiseAnd %uint {first} {self.cu(63 if self.wave64 else 31)}")
+            self.emit(f"{val} = OpGroupNonUniformShuffle %uint {self.cu(3)} {old} {fi}")
+        self.dst(a[0], val)
+
     def lds_op(self, op, a, mods):
         """LDS (GFX10 DS encoding). Addresses are bytes. offset:N is bytes; read2/write2 offset0/offset1 count
         data-size units (x64 for st64). Writes and atomics run only in active lanes; results land in VGPRs through
@@ -4570,6 +4624,8 @@ class Gen:
         if self.stage not in ("cs", "ms"):
             raise Unsupported(op + " outside compute")
         self.uses_lds = True
+        if op in ("ds_append", "ds_consume"):
+            return self.ds_append(op, a, mods)          # wave-wide: before the per-lane EXEC selection below
         rtn = "_rtn_" in op
         name = op if op == "ds_wrxchg_rtn_b32" else op.replace("_rtn_", "_")
         act = self.active_b()

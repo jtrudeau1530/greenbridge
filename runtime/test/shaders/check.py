@@ -106,7 +106,7 @@ SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00
 WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
-                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
+                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext", "cs_w32_ds_append",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
@@ -162,6 +162,9 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # not bit 0 for every lane; word = set lanes | lowest lane << 8 (derivations in each .asm header)
             ("cs_w32_mask_imm", [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
             ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
+            # ds_append / ds_consume (derivations in cs_w32/w64_ds_append.asm)
+            ("cs_w32_ds_append", [100, 0xDEAD, 200, 0xDEAD, 108, 197, 108, 140]),
+            ("cs_w64_ds_append", [100, 100, 0xDEAD, 103, 200, 199, 103, 167]),
             # SHADER-99: -0 and NaN survive translation (SignedZeroInfNanPreserve); words 0, 2, 3 on Apple: see below
             ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
             # s_andn2_saveexec_b32 / s_andn2_wrexec_b32: EXEC = S0 & ~EXEC, D old / new EXEC, SCC (cs_w32_andn2_exec.asm)
