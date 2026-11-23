@@ -1974,6 +1974,13 @@ int main(int argc, char** argv) {
                     large_module_bytes);
     std::printf("wall time: %.1fs on %u threads\n", elapsed(), worker_count);
     const bool cache_saved = save_cache(true);  // keep successful pipelines even if another entry failed
-    if (stats_out) std::fclose(stats_out);
+    if (stats_out) {
+        const bool write_failed = std::ferror(stats_out) != 0;
+        const bool close_failed = std::fclose(stats_out) != 0;
+        if (write_failed || close_failed) {
+            std::fprintf(stderr, "cannot write pipeline statistics to %s\n", stats_path.c_str());
+            check_failed = true;
+        }
+    }
     return (check_failed || !cache_saved) ? 1 : 0;
 }
