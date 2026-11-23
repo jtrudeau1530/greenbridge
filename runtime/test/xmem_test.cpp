@@ -727,6 +727,122 @@ void test_window_carve_and_reuse(const PhysicalApi& api) {
     }
 }
 
+using HostVirtualFreeFn = BOOL(WINAPI*)(void*, SIZE_T, DWORD);
+using TitleVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);
+
+bool released(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) && info.State == MEM_FREE;
+}
+
+bool all_released(const uint8_t* base, size_t pages) {
+    for (size_t i = 0; i < pages; ++i) {
+        if (!released(base + i * kPage64k)) return false;
+    }
+    return true;
+}
+
+// The title releases its physical-page reservations with kernel32!VirtualFree(base, 0, MEM_RELEASE). Once pages are
+// mapped, a reservation is one placeholder per page plus views, which the host would release only the first of.
+void test_title_virtual_free(const PhysicalApi& api) {
+    const auto title_free = reinterpret_cast<HostVirtualFreeFn>(rt::shims::find("kernel32.dll", "VirtualFree"));
+    check(title_free != nullptr, "registry exposes kernel32.dll!VirtualFree");
+    if (!title_free) return;
+    bool same = true;
+    for (const char* dll : {"kernelbase.dll", "api-ms-win-core-memory-l1-1-0.dll", "api-ms-win-core-memory-l1-1-6.dll"}) {
+        same &= rt::shims::find(dll, "VirtualFree") == reinterpret_cast<void*>(title_free);
+    }
+    check(same, "the memory api sets serve the same VirtualFree");
+
+    // A window with pages mapped at its first and third page.
+    constexpr size_t kPages = 4;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    check(window && api.allocate(0x280, &count, pages) == TRUE && count == 2, "a window and two pages");
+    if (!window || count != 2) return;
+    check(api.map(window, 1, &pages[0]) == window && api.map(window + 2 * kPage64k, 1, &pages[1]) != nullptr,
+          "map the pages at the window's first and third page");
+    check(title_free(window, 0, MEM_RELEASE) == TRUE, "VirtualFree(window, 0, MEM_RELEASE) succeeds");
+    check(all_released(window, kPages), "the whole window is free afterwards, views and split placeholders included");
+    check(api.map(window, 1, &pages[0]) == nullptr, "nothing maps into a released window");
+    check(api.free_pages(2, pages) == TRUE, "the pages that were mapped there can still be freed");
+
+    // A placeholder reservation with a carved window (one page mapped) and a committed replacement.
+    auto* const base = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 6 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
+    check(base != nullptr, "a placeholder reservation");
+    if (!base) return;
+    auto* const carved = static_cast<uint8_t*>(api.virtual_alloc(
+        base + kPage64k, 2 * kPage64k, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x27, PAGE_READWRITE));
+    auto* const committed = static_cast<uint8_t*>(
+        api.virtual_alloc(base + 4 * kPage64k, kPage64k,
+                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x27, PAGE_READWRITE));
+    count = 1;
+    check(carved && committed && api.allocate(0x280, &count, pages) == TRUE &&
+              api.map(carved + kPage64k, 1, &pages[0]) != nullptr,
+          "carve a window and a committed range out of it, and map a page in the window");
+    check(title_free(base, 0, MEM_RELEASE) == TRUE, "VirtualFree(base, 0, MEM_RELEASE) releases the reservation");
+    check(all_released(base, 6), "every page of it is free: placeholders, the window's view and the committed range");
+    check(api.map(carved, 1, &pages[0]) == nullptr, "the carved window is gone too");
+    api.free_pages(1, pages);
+
+    // A carved window released on its own leaves the rest of its reservation.
+    auto* const outer = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
+    auto* const inner = outer ? static_cast<uint8_t*>(api.virtual_alloc(
+                                    outer + kPage64k, 2 * kPage64k,
+                                    MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x27, PAGE_READWRITE))
+                              : nullptr;
+    count = 1;
+    check(inner && api.allocate(0x280, &count, pages) == TRUE && api.map(inner, 1, &pages[0]) == inner,
+          "a window carved out of a reservation, one page mapped");
+    if (!inner) return;
+    check(title_free(inner, 0, MEM_RELEASE) == TRUE && all_released(inner, 2),
+          "VirtualFree of the carved window releases its range");
+    check(reserved_only(outer) && reserved_only(outer + 3 * kPage64k), "the rest of the reservation stays reserved");
+    check(title_free(outer, 0, MEM_RELEASE) == TRUE && all_released(outer, 4), "and is released with its base");
+    api.free_pages(1, pages);
+
+    // A hole released inside a reservation and allocated again belongs to whoever allocated it: releasing the outer
+    // reservation leaves it, whether the title's VirtualAlloc or XMemVirtualAlloc made it.
+    const auto title_alloc = reinterpret_cast<TitleVirtualAllocFn>(rt::shims::find("kernel32.dll", "VirtualAlloc"));
+    for (const bool by_xmem : {false, true}) {
+        auto* const ring = static_cast<uint8_t*>(
+            api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
+        auto* const hole = ring ? static_cast<uint8_t*>(api.virtual_alloc(
+                                      ring + kPage64k, 2 * kPage64k,
+                                      MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x27, PAGE_READWRITE))
+                                : nullptr;
+        check(hole && title_free(hole, 0, MEM_RELEASE) == TRUE, "carve a window out of a reservation and release it");
+        if (!hole || !title_alloc) return;
+        void* const again =
+            by_xmem ? api.virtual_alloc(hole, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE)
+                    : title_alloc(hole, 2 * kPage64k, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        check(again == hole, by_xmem ? "XMemVirtualAlloc reserves the hole again" : "VirtualAlloc takes the hole again");
+        if (!by_xmem && again) static_cast<volatile uint8_t*>(again)[0] = 0x6b;
+        check(title_free(ring, 0, MEM_RELEASE) == TRUE && released(ring) && released(ring + 3 * kPage64k),
+              "releasing the outer reservation frees its own pages");
+        check(!released(hole) && !released(hole + kPage64k), "and leaves the allocation in the hole");
+        if (by_xmem) {
+            uint64_t page = 0;
+            count = 1;
+            check(api.allocate(0x280, &count, &page) == TRUE && api.map(hole, 1, &page) == hole,
+                  "the window in the hole still takes pages");
+            api.map(hole, 1, nullptr);
+            api.free_pages(1, &page);
+        } else {
+            check(static_cast<volatile uint8_t*>(again)[0] == 0x6b, "and its contents");
+        }
+        check(title_free(hole, 0, MEM_RELEASE) == TRUE && all_released(hole, 2), "the hole's allocation releases");
+    }
+
+    // Everything else is the host's.
+    void* const plain = VirtualAlloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    check(plain && title_free(plain, 0, MEM_RELEASE) == TRUE && released(plain), "VirtualFree of ordinary memory");
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
@@ -1069,6 +1185,7 @@ int main() {
         test_mapping_protection(physical);
         test_placeholders(physical);
         test_window_carve_and_reuse(physical);
+        test_title_virtual_free(physical);
     }
 
     print_result();
