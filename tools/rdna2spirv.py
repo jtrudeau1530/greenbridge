@@ -15617,17 +15617,6 @@ def check_printed_encodings(path, info):
             continue
         enc = bytes.fromhex(ins["enc"])
         raw = blob[ins["pc"]:ins["pc"] + len(enc)]
-        if (base_op(ins["op"]).startswith("v_fma_mix") and len(enc) == 12 and len(raw) == 12
-                and same_encoding(raw[:8], enc[:8], ins["op"], len(ins["args"])) and raw[8:10] == enc[8:10]):
-            # A VOP3P literal is a whole dword. llvm-mc prints it as an f16 (its low half) and re-encodes the
-            # high half as 0, but op_sel can select that high half of a mixed-precision operand: read the
-            # dword the blob holds. Only the high half may differ, so the printed operand is its low half.
-            lit = int.from_bytes(raw[8:], "little")
-            for x in ins["args"]:
-                if x["k"] == "imm" and x["v"] & 0xFFFF == lit & 0xFFFF:
-                    x["v"] = lit
-            ins["enc"] = raw.hex()
-            continue
         if not same_encoding(raw, enc, ins["op"], len(ins["args"])):
             literal = mix_literal(raw, enc, base_op(ins["op"]))
             if literal is not None:
