@@ -28,6 +28,7 @@ Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each b
 For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
 """
 import argparse
+import functools
 import os
 import struct
 import sys
@@ -35,7 +36,7 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode  # noqa: E402
+from file_mode import new_file_mode, published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
 from report_paths import path_key  # noqa: E402
 
@@ -140,6 +141,11 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
     return written
 
 
+@functools.cache
+def folder_file_mode(directory: str) -> int:
+    return new_file_mode(directory)
+
+
 def write_file(path: str, data: bytes) -> None:
     """Write under a private temporary name and rename into place: a stopped run or a full disk never leaves a
     short file under the final name, where a later run would keep it. The staging file is created in the
@@ -153,14 +159,18 @@ def write_file(path: str, data: bytes) -> None:
             tmp_path = f.name
             f.write(data)
         # NamedTemporaryFile creates 0600; give the staged file the mode of the file it replaces, or a new file's.
-        os.chmod(tmp_path, published_mode(out_path))
+        os.chmod(tmp_path, published_mode(out_path) if os.path.exists(out_path) else folder_file_mode(parent))
         os.replace(tmp_path, out_path)
     except BaseException:
-        try:
-            if tmp_path is not None:
+        if tmp_path is not None:
+            try:
+                os.chmod(tmp_path, 0o600)  # it may already carry a read-only mode, which Windows won't unlink
+            except OSError:
+                pass
+            try:
                 os.remove(tmp_path)
-        except OSError:
-            pass
+            except OSError:
+                pass
         raise
 
 
@@ -366,7 +376,7 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP):
             write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"], True)
             counts["pcm"] += 1
             continue
-        if s["codec"] == 0 and s["channels"] in (1, 2):
+        if s["codec"] == 0 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 2:
             write_wav(os.path.join(od, stem + ".wav"), d[at:at + size], s["rate"], s["channels"])
             counts["pcm"] += 1
             continue

@@ -460,6 +460,33 @@ class ExportBankTest(unittest.TestCase):
             self.assertGreater(last["granule"], 0)
             self.assertEqual(last["serial"], 3)
 
+    def test_new_outputs_in_one_folder_probe_the_file_mode_once(self):
+        fmt = format_block(1, 48000, 0, 1)
+        path = os.path.join(self.tmp.name, "many.awc")
+        with open(path, "wb") as f:
+            f.write(build_bank([(sid, fmt, struct.pack("<h", sid)) for sid in range(1, 6)]))
+        real_open = os.open
+        probes = []
+
+        def counting_open(file, *args, **kwargs):
+            if str(file).endswith(".probe"):
+                probes.append(file)
+            return real_open(file, *args, **kwargs)
+        with mock.patch.object(os, "open", counting_open):
+            counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts["pcm"], 5)
+        self.assertEqual(len(os.listdir(os.path.join(self.out, "many"))), 5)
+        self.assertEqual(len(probes), 1)
+
+    def test_pcm_data_size_must_match_the_declared_samples(self):
+        fmt = format_block(100, 22050, 0x00, 2)
+        path = os.path.join(self.tmp.name, "odd.awc")
+        with open(path, "wb") as f:
+            f.write(build_bank([(1, fmt, bytes(401)), (2, fmt, bytes(399)), (3, fmt, bytes(400))]))
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 1, "other": 2, "music": 0})
+        self.assertEqual(os.listdir(os.path.join(self.out, "odd")), ["00000003.wav"])
+
     def test_stereo_plain_stream_length_is_per_channel(self):
         # A stereo format tag stores interleaved samples: 3840 counts = 1920 frames per channel.
         # Three 960-frame packets carry 2880 frames per channel, so the declared 1920 trims
@@ -1021,6 +1048,32 @@ class MalformedBankTest(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
                 self.assertEqual(awc.main(), 0)
             self.assertIn("skip bad.awc", out.getvalue())
+
+
+class WriteFileReadOnlyTest(unittest.TestCase):
+    def test_failed_replace_over_a_read_only_file_leaves_no_staging_file(self):
+        real_remove = os.remove
+
+        def windows_remove(p):
+            if not os.access(p, os.W_OK):
+                raise PermissionError(13, "read-only file", p)
+            real_remove(p)
+
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "a.ogg")
+            with open(dest, "wb") as f:
+                f.write(b"old")
+            os.chmod(dest, 0o444)
+            try:
+                with mock.patch.object(awc.os, "replace", side_effect=OSError("replace failed")), \
+                        mock.patch.object(awc.os, "remove", side_effect=windows_remove):
+                    with self.assertRaises(OSError):
+                        awc.write_file(dest, b"new")
+                self.assertEqual(sorted(os.listdir(d)), ["a.ogg"])
+                with open(dest, "rb") as f:
+                    self.assertEqual(f.read(), b"old")
+            finally:
+                os.chmod(dest, 0o644)
 
 
 if __name__ == "__main__":
