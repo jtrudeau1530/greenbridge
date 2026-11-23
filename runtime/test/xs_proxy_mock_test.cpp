@@ -849,7 +849,7 @@ int check_placed_resource_x() {
     EXPECT(device && xs::device_slot_overridden(133));
     xs::reset_device_proxy_stats();
     constexpr std::uint64_t kVa = 0x7f0000000000ull;  // any address: the stand-in does not touch it
-    constexpr auto kXboxFlag = static_cast<D3D12_RESOURCE_FLAGS>(0x20000);  // a bit above every PC flag
+    constexpr std::uint32_t kXboxFlag = 0x20000;  // a bit above every PC flag
 
     // The fourth word is a D3D12_BARRIER_LAYOUT. On this device (no ID3D12Device10) it becomes the legacy state.
     // A buffer with an Xbox flag bit, a non-PC layout word and the all-ones layout (UNDEFINED): PC flags only,
@@ -862,7 +862,8 @@ int check_placed_resource_x() {
     buffer.MipLevels = 1;
     buffer.SampleDesc.Count = 1;
     buffer.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
-    buffer.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kXboxFlag);
+    const std::uint32_t buffer_flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kXboxFlag;
+    std::memcpy(&buffer.Flags, &buffer_flags, sizeof buffer.Flags);
     const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {{0, 0, 0, 1}}};
     void* resource = nullptr;
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0xFFFFFFFFu, word(&clear), word(&kResourceIid),
@@ -883,7 +884,8 @@ int check_placed_resource_x() {
     target.Width = 64;
     target.Height = 32;
     target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    target.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | kXboxFlag);
+    const std::uint32_t target_flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | kXboxFlag;
+    std::memcpy(&target.Flags, &target_flags, sizeof target.Flags);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 2, word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
     EXPECT(mock->calls[27] == 2 && g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
