@@ -23,6 +23,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "title_textures.h"
 
 namespace {
 
@@ -81,10 +82,11 @@ constexpr unsigned kSlots = 48;
 struct Computer {
     void** vtable;
     std::atomic<unsigned long> refs{1};
+    std::uint32_t desc[14]{};  // the resource description it was made for
 };
 std::atomic<bool> first[kSlots];
 template <unsigned Slot>
-std::uint64_t WINAPI method(Computer* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4) {
+std::uint64_t WINAPI method(Computer* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, std::uint64_t a6) {
     if constexpr (Slot == 0) {  // QueryInterface: itself for anything
         if (!a2) return E_POINTER;
         *reinterpret_cast<void**>(a2) = self;
@@ -95,6 +97,14 @@ std::uint64_t WINAPI method(Computer* self, std::uint64_t a1, std::uint64_t a2, 
     } else if constexpr (Slot == 2) {
         return self->refs.fetch_sub(1) - 1;  // never freed: a handful exist at most
     } else {
+        // CopyIntoSubresource(base, offset, subresource, source, row pitch, slice pitch)
+        if constexpr (Slot == 8)
+            rt::title_textures::note_linear_upload(a1, static_cast<std::uint32_t>(a3), reinterpret_cast<const void*>(a4),
+                                                   static_cast<std::uint32_t>(a5), static_cast<std::uint32_t>(a6), self->desc);
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1) < 14)
+            std::fprintf(stderr, "[xg] %p method %u (0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx)\n", (void*)self, Slot, (unsigned long long)a1,
+                         (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5, (unsigned long long)a6);
         if (!first[Slot].exchange(true))
             std::fprintf(stderr, "[rt] xg_xs: texture computer method %u first call (0x%llx 0x%llx 0x%llx 0x%llx): S_OK, no-op\n",
                          Slot, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
@@ -124,7 +134,14 @@ HRESULT __stdcall XGCreateTextureComputer(const void* desc, void** out2, const v
     if (!out) return E_POINTER;
     auto* c = new xgstub::Computer{};
     c->vtable = xgstub::vtable();
+    std::memcpy(c->desc, desc, sizeof(c->desc));
     *out = c;
+    if (logged.load() < 14) {
+        const auto* w = reinterpret_cast<const std::uint32_t*>(desc);
+        std::fprintf(stderr, "[xg] computer %p desc", (void*)c);
+        for (int i = 0; i < 18; ++i) std::fprintf(stderr, " %x", w[i]);
+        std::fprintf(stderr, "\n");
+    }
     return S_OK;
 }
 

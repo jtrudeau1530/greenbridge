@@ -30,6 +30,7 @@
 #include <vector>
 #include <intrin.h>
 #include "d3d12_trace.h"
+#include "title_textures.h"
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
 #include "d3d12_xs_pso_stream.h"
@@ -1453,6 +1454,8 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
     // Pass zero-extended UINT in 64-bit RDX so both 32-bit PC implementations and 64-bit mock thunks see clean count.
     // Each list proxy (#2490) is replaced by its real list, as the generic slot-10 path does.
+    if (self->device) rt::title_textures::refresh(self->device->real);
+    sync_title_heaps();
     UnwrappedArray unwrapped;
     if (!unwrapped.fill(lists_word, count_word)) return 0;
     if (unwrapped.data()) lists_word = unwrapped.data();
@@ -1786,7 +1789,6 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandLists) {
-            sync_title_heaps();
             return queue_execute_command_lists(self, a1, a2);
         }
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait))
@@ -2731,6 +2733,9 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
 
     RawSrvShape shape{};
     const char* why = parse_raw_srv(texture_words, view_desc, shape);
+    if ((why || !self->resource_provider) &&
+        rt::title_textures::create_view(self->real, texture_words, view_desc, destination))
+        return;
     if (why || !self->resource_provider) {
         log_slot70_null_once(why ? why : "no resource provider", texture_words, view_desc);
         write_null_srv(self, destination);
