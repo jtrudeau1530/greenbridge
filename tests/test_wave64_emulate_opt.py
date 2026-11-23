@@ -1,8 +1,10 @@
-"""Synthetic checks for tools/wave64_emulate_opt.py: the CFG analyses behind --wave64-emulate.
+"""Unit-level checks for tools/wave64_emulate_opt.py: the CFG analyses behind --wave64-emulate.
 
-Everything here is a hand-built block graph of instruction dicts shaped the way `rdna2spirv`
-passes them in (`{"op": ..., "args": [...]}`, operands as `{"k": "sgpr"/"special", ...}`). The
-invariants under test come from the module's own docstrings:
+This complements the end-to-end workgroup suite at tests/semantic/test_wave64_emulate_opt.py, which
+executes whole translated modules and caught nothing about the per-opcode read/write tables; these
+are hand-built block graphs of instruction dicts shaped the way `rdna2spirv` passes them in
+(`{"op": ..., "args": [...]}`, operands as `{"k": "sgpr"/"special", ...}`). The invariants under
+test come from the module's own docstrings:
 
 - `scc_live_outs` is conservative: an SCC write stays in the answer when a read can reach it before
   an unconditional overwrite, and drops when the value is killed first;
