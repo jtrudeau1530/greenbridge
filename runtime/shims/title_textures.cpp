@@ -28,13 +28,27 @@ struct Buffer {
     ID3D12Resource* resource = nullptr;
     std::uint8_t* mapped = nullptr;
     std::uint64_t size = 0;
+    std::uint64_t seen = 0;  // the submission its last view was made at
 };
+
+// The title may free the memory: a fault is a missed copy, not a crash.
+bool guarded_copy(void* to, const void* from, std::size_t n) {
+    __try {
+        std::memcpy(to, from, n);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
 
 std::mutex g_mutex;
 std::map<std::uint64_t, std::map<std::uint32_t, Linear>> g_linear;
 std::map<std::uint64_t, Texture> g_textures;
 std::map<std::pair<std::uint64_t, std::uint64_t>, Buffer> g_buffers;
 bool g_any_dirty = false;
+std::uint64_t g_submission = 0;
+std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>> g_fresh;
+std::pair<std::uint64_t, std::uint64_t> g_cursor{0, 0};
 std::map<std::uint64_t, ID3D12Resource*> g_shadows;
 std::map<std::uint64_t, std::map<std::uint32_t, Linear>> g_shadow_dirty;
 
@@ -216,6 +230,9 @@ bool create_view(ID3D12Device* device, std::uint64_t resource_desc, std::uint64_
             if (b.resource) b.resource->Map(0, nullptr, reinterpret_cast<void**>(&b.mapped));
             b.size = size;
         }
+        if (b.seen != g_submission || !b.seen) g_fresh.push_back({{va, size}, g_submission});
+        b.seen = g_submission;
+        if (b.mapped) guarded_copy(b.mapped, reinterpret_cast<const void*>(va), static_cast<std::size_t>(size));
         device->CreateShaderResourceView(b.resource, &srv, dest);
         return true;
     }
@@ -238,9 +255,28 @@ bool create_view(ID3D12Device* device, std::uint64_t resource_desc, std::uint64_
 
 void refresh(ID3D12Device* device) {
     const std::lock_guard lock(g_mutex);
-    for (auto& [key, b] : g_buffers)
-        if (b.mapped && readable(key.first, b.size))
-            std::memcpy(b.mapped, reinterpret_cast<const void*>(key.first), static_cast<std::size_t>(b.size));
+    ++g_submission;
+    // Views made in the last few submissions are copied again; older ones take turns, within a budget.
+    std::uint64_t budget = 4ull << 20;
+    for (auto it = g_buffers.upper_bound(g_cursor); budget && it != g_buffers.end(); ++it) {
+        g_cursor = it->first;
+        if (!it->second.mapped) continue;
+        guarded_copy(it->second.mapped, reinterpret_cast<const void*>(it->first.first), static_cast<std::size_t>(it->second.size));
+        budget -= std::min<std::uint64_t>(budget, it->second.size + 4096);
+    }
+    if (budget) g_cursor = {0, 0};
+    for (std::size_t k = 0; k < g_fresh.size();) {
+        auto& [key, at] = g_fresh[k];
+        if (at + 4 < g_submission) {
+            g_fresh[k] = g_fresh.back();
+            g_fresh.pop_back();
+            continue;
+        }
+        const auto it = g_buffers.find(key);
+        if (it != g_buffers.end() && it->second.mapped)
+            guarded_copy(it->second.mapped, reinterpret_cast<const void*>(key.first), static_cast<std::size_t>(it->second.size));
+        ++k;
+    }
     for (auto& [base, subs] : g_shadow_dirty) {
         const auto it = g_shadows.find(base);
         if (it == g_shadows.end()) continue;
