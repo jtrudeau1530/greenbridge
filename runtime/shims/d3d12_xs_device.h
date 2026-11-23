@@ -7,6 +7,8 @@
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
+//   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> PC CreateCommittedResource on a DEFAULT heap,
+//             with the Xbox flag bits dropped and an all-ones state as COMMON. Not backed by the memory at va.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in

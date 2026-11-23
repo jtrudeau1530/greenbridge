@@ -128,6 +128,7 @@ const char* slot_name(unsigned slot) {
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
         case 75: return "CreateCommandQueue1 -> queue proxy";
+        case 133: return "Xbox CreatePlacedResourceX -> committed resource";
         case 76: return "Xbox resource creation";
         default: return "forwarded";
     }
@@ -1321,6 +1322,48 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// Device slot 133 places a resource at a virtual address: (va, desc, initial_state, clear_value, riid, out), the
+// shape of the console's CreatePlacedResourceX. Measured locally at a title's call sites: riid is ID3D12Resource, va is
+// the start of a range the title has just reserved for physical pages, desc is a 56-byte D3D12_RESOURCE_DESC with
+// Xbox bits in Flags above the PC flags, and initial_state is all ones, which is no PC state. The PC has no call that
+// puts a resource at a caller's address, so this creates a committed DEFAULT-heap resource from the cleaned
+// description: the PC flags only, slot 76's layout rule, COMMON for a buffer or an all-ones state, and the clear value
+// only for a render target or depth texture. The resource is not backed by the memory at va: what the title writes
+// there does not reach it. Backing it needs the physical-page mapper; until then this gets the title past the call.
+constexpr std::uint32_t kPcResourceFlags = 0x3FF;  // D3D12_RESOURCE_FLAG_* up to USE_TIGHT_ALIGNMENT (0x200)
+
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* xbox_desc,
+                                       std::uint32_t initial_state, const D3D12_CLEAR_VALUE* clear_value,
+                                       const IID* riid, void** out) {
+    note_slot(133);
+    if (out) *out = nullptr;
+    if (!xbox_desc) return E_INVALIDARG;
+    if (!riid || !out) return E_POINTER;
+
+    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
+    const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    const auto state = (buffer || initial_state == 0xFFFFFFFFu) ? D3D12_RESOURCE_STATE_COMMON
+                                                                 : static_cast<D3D12_RESOURCE_STATES>(initial_state);
+    const bool clearable =
+        !buffer && (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 places a resource at a VA: dimension=%d flags=0x%x -> 0x%x, state=0x%x; "
+                     "created committed, not backed by the VA\n",
+                     static_cast<int>(pc_desc.Dimension), xbox_flags, static_cast<unsigned>(pc_desc.Flags),
+                     initial_state);
+    (void)va;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                     D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+    return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc, state,
+                                               clearable ? clear_value : nullptr, *riid, out);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1362,6 +1405,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 133) {
+        return hr_to_u64(proxy_create_placed_resource_x(
+            self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), static_cast<std::uint32_t>(a3),
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4), reinterpret_cast<const IID*>(a5),
+            reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -1520,7 +1568,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 bool device_slot_overridden(unsigned slot) {
     return slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
            slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-           slot == 75 || slot == 76;
+           slot == 75 || slot == 76 || slot == 133;
 }
 
 bool is_queue_proxy(const void* queue) { return is_child_proxy<ChildKind::queue>(queue); }
