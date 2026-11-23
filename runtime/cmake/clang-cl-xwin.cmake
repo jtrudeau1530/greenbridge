@@ -25,7 +25,10 @@ list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES XWIN_DIR)
 
 # The LLVM tools, by their unversioned names unless given (-DCMAKE_CXX_COMPILER=clang-cl-19 -DCMAKE_LINKER=lld-link-19
 # ...). The MSVC STL that xwin lays out needs Clang 19 or newer.
-foreach(_tool C_COMPILER:clang-cl CXX_COMPILER:clang-cl LINKER:lld-link AR:llvm-lib RC_COMPILER:llvm-rc MT:llvm-mt)
+# llvm-dlltool stands in for dumpbin: SDL3's CMake (-DLEONIDA_SDL3_FETCH=ON) reads a DLL name from an import library
+# with CMAKE_DLLTOOL --identify, and without either tool configuring stops with "Cannot find dumpbin".
+foreach(_tool C_COMPILER:clang-cl CXX_COMPILER:clang-cl LINKER:lld-link AR:llvm-lib RC_COMPILER:llvm-rc MT:llvm-mt
+               DLLTOOL:llvm-dlltool)
   string(REPLACE ":" ";" _tool "${_tool}")
   list(GET _tool 0 _var)
   list(GET _tool 1 _name)
