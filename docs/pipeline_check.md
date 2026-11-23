@@ -62,6 +62,42 @@ and error classes, keeping the local shader files and reports that identify them
 
 [interfaces]: https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-iointerfaces-matching
 
+## Test RADV pipeline compilation without a physical GPU
+
+On Linux, Mesa's AMDGPU DRM shim can expose a recorded AMD device profile to RADV so its compiler
+targets that GPU. This lets `vk_pipeline_check` measure shader compile time and reproduce compiler
+failures on a machine without AMD hardware. Readback and dispatch correctness still require a Vulkan
+device that executes commands. See the [Mesa DRM shim guide](https://docs.mesa3d.org/ci/drm-shim.html).
+
+Build Mesa with `-Dvulkan-drivers=amd -Dtools=drm-shim`. Set `mesa_build` to that build directory
+and `radv_icd` to the absolute path of the matching RADV Vulkan ICD manifest. From the Leonida root,
+build the checker and translate a synthetic fixture. The fixture build needs `spirv-as`, `spirv-val`
+and LLVM 21 or later with the AMDGPU target. Set `LLVM_MC` if the assembler has a versioned name.
+
+```sh
+cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build runtime/build --target vk_pipeline_check
+fixtures=$(mktemp -d)
+python3 -I runtime/test/shaders/build.py "$fixtures" cs_buf_fmt8
+
+AMDGPU_GPU_ID=gfx1201 \
+LD_PRELOAD="$mesa_build/src/amd/drm-shim/libamdgpu_noop_drm_shim.so" \
+VK_DRIVER_FILES="$radv_icd" MESA_SHADER_CACHE_DISABLE=true \
+  runtime/build/vk_pipeline_check "$fixtures/spirv" --jobs 1 --slow 0
+```
+
+The checker should select a device whose name includes `RADV GFX1201` and report one compute pipeline
+compiled. For comparisons, use the same Mesa version, GPU profile and translation flags each time.
+Run each comparison in a fresh process and leave the pipeline cache filename out.
+
+Mesa 25.0.7 also supports a null device directly through the installed RADV ICD. On Debian 13
+this runs the same compile check with the distro driver.
+
+```sh
+RADV_FORCE_FAMILY=GFX1201 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json \
+MESA_SHADER_CACHE_DISABLE=true runtime/build/vk_pipeline_check "$fixtures/spirv" --jobs 1 --slow 0
+```
+
 ## Corpus
 
 The translated corpus is 26,503 entries: 2,236 vertex, 12,101 pixel, 2,689 compute, 9,282 mesh and
