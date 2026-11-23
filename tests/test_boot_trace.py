@@ -359,7 +359,7 @@ class BootTraceTests(unittest.TestCase):
         self.write_lines(self.d3d12, [
             "[d3d12-trace] #1 CreateCommandAllocator ok",
             "[d3d12-trace] #2 CreateCommittedResource failed",
-            "[d3d12-trace] #3 CreateCommandAllocator failed",
+            "[d3d12-trace] #3 CreateCommandAllocator ok",
             "[rt] a runtime diagnostic after the last call",
             "[d3d12-trace] #4",
         ])
@@ -373,9 +373,9 @@ class BootTraceTests(unittest.TestCase):
             self.assertEqual(bt.main(["--d3d12", self.d3d12, "--limit", "1", "--json"]), 0)
         parsed = json.loads(output.getvalue())["d3d12"]
         self.assertEqual(parsed["last_seq"], 3)
-        self.assertEqual(parsed["last_call"], {"seq": 3, "method": "CreateCommandAllocator", "outcome": "failed"})
+        self.assertEqual(parsed["last_call"], {"seq": 3, "method": "CreateCommandAllocator", "outcome": "ok"})
         text = bt.format_text(bt.summarize(None, trace), 1)
-        self.assertIn("  last recorded call: #3 CreateCommandAllocator failed", text.splitlines())
+        self.assertIn("  last recorded call: #3 CreateCommandAllocator ok", text.splitlines())
 
     def test_d3d12_log_without_trace_lines_is_an_error(self):
         self.write_lines(self.d3d12, ["[rt] one", "[rt] two"])
