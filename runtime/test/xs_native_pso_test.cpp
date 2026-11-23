@@ -390,6 +390,32 @@ void test_vs_ps() {
     EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK && mock->stream_calls == 2);
 }
 
+// A container is read from disk once: a later pipeline naming it gets the same bytes even if the file is gone.
+void test_container_read_once() {
+    fresh();
+    MockDevice* mock = new_device();
+    void* device = proxy_over(mock);
+    Desc d;
+    d.stage(0, kVs).stage(1, kPs);
+    void* out = nullptr;
+    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK && mock->last.vs == kVsBytes);
+
+    const std::filesystem::path vs = g_root / L"dxbc" / L"vs one.dxbc", moved = g_root / L"dxbc" / L"vs one.moved";
+    std::filesystem::rename(vs, moved);
+    out = nullptr;
+    const HRESULT again = call57(device, &d.desc, &kPipelineIid, &out);
+    std::filesystem::rename(moved, vs);
+    EXPECT(again == S_OK && mock->stream_calls == 2 && mock->last.vs == kVsBytes && mock->last.ps == kPsBytes);
+
+    // A container that could not be read is not remembered as missing: once the file is there, it resolves.
+    fresh();
+    std::filesystem::rename(vs, moved);
+    out = nullptr;
+    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL);
+    std::filesystem::rename(moved, vs);
+    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK && mock->last.vs == kVsBytes);
+}
+
 void test_mesh() {
     fresh();
     MockDevice* mock = new_device();
@@ -522,6 +548,7 @@ void test_directory() {
 int main() {
     make_tree();
     test_vs_ps();
+    test_container_read_once();
     test_mesh();
     test_derive_from_slot57();
     test_unresolved();

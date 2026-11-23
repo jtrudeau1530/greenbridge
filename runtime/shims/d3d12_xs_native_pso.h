@@ -33,6 +33,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace rt::d3d12_xs {
@@ -122,6 +123,44 @@ inline bool read_container(const std::filesystem::path& dir, const std::string& 
     } catch (const std::exception&) {
         return false;
     }
+}
+
+// A container read from disk, shared by every pipeline that names it. Many pipelines reuse one stage, and the title
+// creates thousands of them, so each file is read once. Not cached: a failed read (the file may appear later), and
+// anything past the byte budget (read again on each use, as before).
+using Container = std::shared_ptr<const std::vector<std::uint8_t>>;
+inline constexpr std::size_t kContainerCacheBudget = std::size_t(256) << 20;
+inline std::unordered_map<std::string, Container>* g_containers = nullptr;  // under g_lock; null until first use
+inline std::size_t g_container_bytes = 0;                                    // under g_lock
+
+inline Container load_container(const std::filesystem::path& dir, const std::string& relative) {
+    AcquireSRWLockExclusive(&g_lock);
+    if (g_containers) {
+        const auto hit = g_containers->find(relative);
+        if (hit != g_containers->end()) {
+            Container found = hit->second;
+            ReleaseSRWLockExclusive(&g_lock);
+            return found;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+
+    auto bytes = std::make_shared<std::vector<std::uint8_t>>();
+    if (!read_container(dir, relative, *bytes)) return nullptr;
+    Container loaded = std::move(bytes);
+
+    AcquireSRWLockExclusive(&g_lock);
+    if (!g_containers) g_containers = new std::unordered_map<std::string, Container>();
+    const auto [slot, inserted] = g_containers->try_emplace(relative, loaded);
+    if (!inserted) {
+        loaded = slot->second;  // another thread read it first: share its copy
+    } else if (g_container_bytes + loaded->size() > kContainerCacheBudget) {
+        g_containers->erase(slot);
+    } else {
+        g_container_bytes += loaded->size();
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    return loaded;
 }
 
 inline bool log_this(std::uint64_t n) { return (n & (n - 1)) == 0; }
@@ -320,12 +359,15 @@ inline NativePsoStats native_pso_stats() {
     return {g_calls.load(), g_created.load(), g_stubbed.load(), g_refused.load()};
 }
 
-// Test helper: forgets the loaded map and the counters, so the next call reads the provider again.
+// Test helper: forgets the loaded map, the cached containers and the counters, so the next call reads the provider again.
 inline void reset_native_pso_state() {
     using namespace native_pso_detail;
     AcquireSRWLockExclusive(&g_lock);
     delete g_map;
     delete g_dir;
+    delete g_containers;
+    g_containers = nullptr;
+    g_container_bytes = 0;
     g_map = nullptr;
     g_dir = nullptr;
     g_loaded = false;
@@ -373,14 +415,15 @@ inline HRESULT create_native_graphics_pipeline(PipelineStreamCreator create, voi
         return unresolved(create, context, desc, &plan.state, *riid, out, call,
                           map ? status_name(plan.status) : "no native_hashes.txt", plan.failed_block);
 
-    std::vector<std::uint8_t> code[np::kStageBlocks];
+    Container code[np::kStageBlocks];  // keeps each stage's bytes alive until the device has the pipeline
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pc{};
     D3D12_SHADER_BYTECODE ms{};
     for (const np::PlannedStage& s : plan.stages) {
-        if (!read_container(*dir, s.shader->path, code[s.block]))
+        code[s.block] = load_container(*dir, s.shader->path);
+        if (!code[s.block])
             return unresolved(create, context, desc, &plan.state, *riid, out, call, "container not readable",
                               s.block);
-        const D3D12_SHADER_BYTECODE bc{code[s.block].data(), code[s.block].size()};
+        const D3D12_SHADER_BYTECODE bc{code[s.block]->data(), code[s.block]->size()};
         const std::string& stage = s.shader->stage;
         (stage == "vs" ? pc.VS : stage == "ps" ? pc.PS : stage == "gs" ? pc.GS : ms) = bc;
     }
