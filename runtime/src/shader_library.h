@@ -23,6 +23,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -783,8 +784,7 @@ public:
     //   - FSPX with its kind-0 entry (a container or a bare payload): by fspx_code_sha256, then only the entries
     //     whose fspx_state_sha256 is the SHA-256 of that kind-0 entry;
     //   - a bare kind-6 program, which comes without kind 0: by fspx_code_sha256 when all those entries have the
-    //     same module; when their modules differ the program is ambiguous, the result is empty and `ambiguous` is
-    //     set, instead of picking one of them.
+    //     same module and runtime metadata; otherwise the program is ambiguous and the result is empty.
     std::vector<const ShaderEntry*> program_candidates(std::string_view stage, const ComputeProgram& program,
                                                        bool* ambiguous = nullptr) const {
         if (ambiguous) *ambiguous = false;
@@ -799,8 +799,13 @@ public:
         }
         if (all.size() > 1) {
             const auto first = spirv(*all.front());
+            const auto runtime_metadata = [](const ShaderEntry& e) {
+                return std::tie(e.binding_count, e.push_constant_bytes, e.local_size, e.lds_bytes, e.uses_code_base,
+                                e.wave64, e.subgroup_size, e.wave64_exchange, e.literal_samplers);
+            };
             for (std::size_t i = 1; i < all.size(); ++i) {
-                if (first.empty() || spirv(*all[i]) != first) {
+                if (first.empty() || runtime_metadata(*all[i]) != runtime_metadata(*all.front()) ||
+                    spirv(*all[i]) != first) {
                     if (ambiguous) *ambiguous = true;
                     return {};
                 }
