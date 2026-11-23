@@ -769,8 +769,8 @@ int check_xbox_slots() {
 
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
-int run_env_slots(bool valid) {
-    const char* frame_interval = valid ? "96" : "2";
+int run_env_slots(bool valid, bool on_slot70 = false) {
+    const char* frame_interval = on_slot70 ? "70" : valid ? "96" : "2";
     const char* schedule_event = valid ? "97" : "2";
     const char* wait_event = valid ? "98" : "2";
     const char* queue_x = valid ? "99" : "2";
@@ -786,7 +786,12 @@ int run_env_slots(bool valid) {
     EXPECT(device);
     xs::reset_device_proxy_stats();
     std::uint64_t token = 0;
-    if (valid) {
+    if (on_slot70) {
+        // SetFrameIntervalX moved onto 70, which also has a built-in handler: the override wins, so (output, interval,
+        // latency, flags) is a frame-interval call, never a shader-resource view whose handle is the latency.
+        EXPECT(hr_of(raw(device, 70, 0, 16667, 1, 0)) == S_OK && mock->calls[70] == 0 && mock->calls[18] == 0);
+        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);  // the old default is a PC slot now
+    } else if (valid) {
         // Every route moved: the new slot is handled, the default slot is forwarded to the mock.
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
@@ -970,6 +975,7 @@ int main(int argc, char** argv) {
     if (argc == 2) {
         if (std::strcmp(argv[1], "--env-slots") == 0) return run_env_slots(true);
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
+        if (std::strcmp(argv[1], "--env-slots-70") == 0) return run_env_slots(true, true);
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;

@@ -1501,6 +1501,35 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// The Xbox routes at their configured indices. Returns false when `slot` is none of them. Slot 70 asks too, because an
+// override that moves a route onto 70 must win over the built-in 70 handler.
+bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                            std::uint64_t a4, std::uint64_t a5, std::uint64_t& result) {
+    const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
+    if (slot == routes.frame_interval) {
+        log_xbox_route_once(slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
+    } else if (slot == routes.schedule_event) {
+        log_xbox_route_once(slot, "ScheduleFrameEventX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a4));
+    } else if (slot == routes.wait_event) {
+        log_xbox_route_once(slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
+    } else if (slot == routes.queue_x) {
+        log_xbox_route_once(slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+                                                      reinterpret_cast<const IID*>(a2),
+                                                      reinterpret_cast<void**>(a3)));
+    } else if (slot == routes.list_x) {
+        log_xbox_route_once(slot, "CreateCommandListX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
+                                                       reinterpret_cast<void**>(a5)));
+    } else {
+        return false;
+    }
+    return true;
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1543,6 +1572,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 70) {
+        std::uint64_t routed = 0;
+        if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;  // an override moved a route here
         proxy_create_srv_from_raw_x(self, a1, a2, a3);
         return 0;
     } else if constexpr (Slot == 76) {
@@ -1558,30 +1589,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
-        const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
-        if (Slot == routes.frame_interval) {
-            log_xbox_route_once(Slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
-        }
-        if (Slot == routes.schedule_event) {
-            log_xbox_route_once(Slot, "ScheduleFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a4));
-        }
-        if (Slot == routes.wait_event) {
-            log_xbox_route_once(Slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
-        }
-        if (Slot == routes.queue_x) {
-            log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
-                                                        reinterpret_cast<const IID*>(a2),
-                                                        reinterpret_cast<void**>(a3)));
-        }
-        if (Slot == routes.list_x) {
-            log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
-                                                         reinterpret_cast<void**>(a5)));
-        }
+        std::uint64_t routed = 0;
+        if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
