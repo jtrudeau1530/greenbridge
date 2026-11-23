@@ -559,6 +559,39 @@ int main(int argc, char** argv) {
         check(hook_state.free_count == 1 && hook_state.freed_ptr == hook_state.backing &&
                   hook_state.freed_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
               "releasing the hooked heap frees its backing through __XMemAllocationHooks__");
+
+        // A CPU-only title-backed heap: what CreateConstantBufferView writes into WARP's heap is also copied over the
+        // title's backing, where a title that assembles its tables with CPU stores reads it. The proxy copies only
+        // from a layer whose CPU handles are addresses, so the check follows what WARP's handle is.
+        std::memset(hook_state.backing, 0, sizeof(hook_state.backing));
+        D3D12_DESCRIPTOR_HEAP_DESC cpu_only_desc = hooked_desc;
+        cpu_only_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        ComPtr<ID3D12DescriptorHeap> cpu_only_heap;
+        hr = device->CreateDescriptorHeap(&cpu_only_desc, IID_PPV_ARGS(cpu_only_heap.GetAddressOf()));
+        check(SUCCEEDED(hr) && cpu_only_heap != nullptr, "hooked slot 14 creates a CPU-only descriptor heap");
+        if (cpu_only_heap && buffer) {
+            ID3D12DescriptorHeap* real_heap = rt::d3d12_xs::heap_proxy_real_heap(cpu_only_heap.Get());
+            const SIZE_T real_start = real_heap ? real_heap->GetCPUDescriptorHandleForHeapStart().ptr : 0;
+            const auto title_base = reinterpret_cast<SIZE_T>(hook_state.backing);
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+            cbv.BufferLocation = buffer->GetGPUVirtualAddress();
+            cbv.SizeInBytes = 256;
+            device->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{title_base + inc});
+            MEMORY_BASIC_INFORMATION mbi{};
+            const bool addressable =
+                real_start != 0 && VirtualQuery(reinterpret_cast<const void*>(real_start + inc), &mbi, sizeof(mbi)) &&
+                mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+            if (addressable) {
+                bool written = false;
+                for (UINT i = 0; i < inc; ++i) written |= hook_state.backing[inc + i] != 0;
+                check(written && std::memcmp(hook_state.backing + inc, reinterpret_cast<const void*>(real_start + inc),
+                                             inc) == 0,
+                      "CreateConstantBufferView into a title-backed CPU-only heap reaches the title's backing on WARP");
+            } else {
+                std::printf("note: WARP's CPU descriptor handles are not addresses; the backing copy is not checked\n");
+            }
+        }
+        cpu_only_heap.Reset();
         rt::shims::remove_xmem_allocation_hooks(&title_hooks);
     }
 

@@ -96,6 +96,8 @@ struct DescriptorRange {
     SIZE_T real_start;
     const DeviceProxy* device;
     const HeapProxy* heap;
+    UINT stride;  // the layer's descriptor increment for the heap's type (slot 15), which sized the backing
+    bool mirror;  // the layer's handles in the range are readable memory: device writes are copied to the backing
 };
 
 // Immortal: late COM Release calls during process teardown may still unregister a heap or check the table.
@@ -120,13 +122,37 @@ DescriptorHeapBackingAlloc g_heap_alloc = nullptr;
 DescriptorHeapBackingFree g_heap_free = nullptr;
 bool g_heap_alloc_explicit = false;
 
+// True when [start, start + size) is committed memory that can be read. A PC driver's CPU descriptor handle may be
+// an opaque value rather than an address; the D3D12 layer's handles are addresses into its heap's storage.
+bool readable_memory(SIZE_T start, SIZE_T size) {
+    if (start == 0 || size == 0 || start > (std::numeric_limits<SIZE_T>::max)() - size) return false;
+    constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    for (SIZE_T at = start; at < start + size;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !(mbi.Protect & kReadable))
+            return false;
+        at = reinterpret_cast<SIZE_T>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+}
+
 bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap, SIZE_T custom_start,
-                               SIZE_T byte_size, SIZE_T real_start) {
+                               SIZE_T byte_size, SIZE_T real_start, UINT stride) {
     if (custom_start == 0 || byte_size == 0 || custom_start > (std::numeric_limits<SIZE_T>::max)() - byte_size)
         return false;
+    const bool mirror = stride != 0 && byte_size % stride == 0 && readable_memory(real_start, byte_size);
+    if (!mirror) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: a title-backed descriptor heap's layer handles are not readable "
+                                 "memory; device writes into it are not copied to the title's backing\n");
+    }
     try {
         std::lock_guard lock(descriptor_range_mutex());
-        descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap});
+        descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap, stride,
+                                       mirror});
         g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
         return true;
     } catch (const std::bad_alloc&) {
@@ -159,6 +185,29 @@ D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D1
         }
     }
     return handle;
+}
+
+// On the console a descriptor heap is plain memory, and a title may build a view in a CPU-only heap and then copy
+// it into a shader-visible table with CPU stores, reading its own backing. Device slots 17-24 write the layer's heap
+// through translate_cpu_handle, so after each one the bytes the layer wrote are copied over the title's backing:
+// `count` descriptors from the title's handle on, clamped to the heap. The backing was sized with the layer's
+// increment (slot 14) and the title steps its handles by the increment slot 15 forwards from the layer, so an offset
+// in the backing is the same offset in the layer's heap.
+void mirror_title_descriptors(const DeviceProxy* device, SIZE_T title_ptr, UINT count) {
+    if (title_ptr == 0 || count == 0 || g_custom_range_count.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard lock(descriptor_range_mutex());
+    const auto& ranges = descriptor_ranges();
+    for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
+        if (device && it->device != device) continue;
+        if (title_ptr < it->custom_start || title_ptr >= it->custom_end) continue;
+        if (!it->mirror) return;
+        const SIZE_T room = it->custom_end - title_ptr;
+        const SIZE_T wanted = static_cast<SIZE_T>(count) * it->stride;
+        std::memcpy(reinterpret_cast<void*>(title_ptr),
+                    reinterpret_cast<const void*>(it->real_start + (title_ptr - it->custom_start)),
+                    wanted < room ? wanted : room);
+        return;
+    }
 }
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -686,7 +735,7 @@ void** get_heap_vtable() {
 
 HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
                           SIZE_T custom_cpu_start = 0, SIZE_T custom_byte_size = 0, SIZE_T real_cpu_start = 0,
-                          DescriptorHeapBackingFree custom_free = nullptr) {
+                          DescriptorHeapBackingFree custom_free = nullptr, UINT custom_stride = 0) {
     if (!real || !device) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -704,8 +753,8 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy->custom_free = custom_free;
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
 
-    if (custom_cpu_start != 0 &&
-        !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start)) {
+    if (custom_cpu_start != 0 && !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size,
+                                                            real_cpu_start, custom_stride)) {
         delete proxy;
         proxy_release(device);
         return E_OUTOFMEMORY;
@@ -1460,6 +1509,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     SIZE_T custom_cpu_start = 0;
     SIZE_T custom_byte_size = 0;
     SIZE_T real_cpu_start = 0;
+    UINT stride = 0;
     DescriptorHeapBackingAlloc alloc_fn = nullptr;
     DescriptorHeapBackingFree free_fn = nullptr;
     {
@@ -1477,6 +1527,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
                 if (addr <= (std::numeric_limits<SIZE_T>::max)() - byte_size) {
                     custom_cpu_start = addr;
                     custom_byte_size = byte_size;
+                    stride = inc;
                     real_cpu_start = raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr;
                 } else if (free_fn) {
                     free_fn(backing, kXmemDescriptorHeapAttributes);
@@ -1486,7 +1537,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     }
 
     hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
-                           custom_cpu_start ? free_fn : nullptr);
+                           custom_cpu_start ? free_fn : nullptr, stride);
     if (FAILED(hr)) {
         heap->Release();
         if (custom_cpu_start && free_fn)
@@ -1497,40 +1548,47 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 
 // Device slots 17-24 write or copy descriptors using CPU handles. When a title supplies its own descriptor-heap base
 // via __XMemAllocationHooks__, those handles fall in [custom_start, custom_end) and must be translated back to the
-// underlying PC/Vulkan heap before forwarding.
+// underlying PC/Vulkan heap before forwarding, and what the layer wrote there is copied back over the title's
+// backing (mirror_title_descriptors).
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
     self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(18);
     self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resource* counter,
                       const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(19);
     self->real->CreateUnorderedAccessView(resource, counter, desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_rtv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(20);
     self->real->CreateRenderTargetView(resource, desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_dsv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(21);
     self->real->CreateDepthStencilView(resource, desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(22);
     self->real->CreateSampler(desc, translate_cpu_handle(self, dest));
+    mirror_title_descriptors(self, dest.ptr, 1);
 }
 
 void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
@@ -1571,6 +1629,10 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
         return;
     }
     self->real->CopyDescriptors(num_dest, dest_out, dest_sizes, num_src, src_out, src_sizes, type);
+    // A null size array means ranges of one descriptor each, as on the PC.
+    if (dest_starts)
+        for (UINT i = 0; i < num_dest; ++i)
+            mirror_title_descriptors(self, dest_starts[i].ptr, dest_sizes ? dest_sizes[i] : 1);
 }
 
 void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
@@ -1578,6 +1640,7 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D1
     note_slot(24);
     self->real->CopyDescriptorsSimple(num_descriptors, translate_cpu_handle(self, dest_start),
                                       translate_cpu_handle(self, src_start), type);
+    mirror_title_descriptors(self, dest_start.ptr, num_descriptors);
 }
 
 // The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured

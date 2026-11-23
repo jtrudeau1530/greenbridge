@@ -180,6 +180,26 @@ HRESULT mock_create(Mock* device, Kind kind, std::uint64_t riid, std::uint64_t o
     return mock_query(child, reinterpret_cast<const IID*>(riid), out);
 }
 
+// Descriptor storage the mock heaps return from slot 9 when set (unset: kMockHeapCpuStart, which is not memory).
+// The mock device writes into it: a view slot fills one descriptor with a pattern of its own, CopyDescriptors fills
+// its destination ranges and CopyDescriptorsSimple copies. Handles outside it are only recorded.
+std::uint8_t* g_mock_descriptors = nullptr;
+std::size_t g_mock_descriptors_size = 0;
+
+std::uint8_t* mock_descriptors_at(std::uint64_t handle, std::uint64_t count) {
+    const auto base = reinterpret_cast<std::uint64_t>(g_mock_descriptors);
+    if (!g_mock_descriptors || handle < base || count > g_mock_descriptors_size / kMockDescriptorInc ||
+        handle - base > g_mock_descriptors_size - count * kMockDescriptorInc)
+        return nullptr;
+    return g_mock_descriptors + (handle - base);
+}
+
+void mock_fill_descriptors(std::uint64_t handle, std::uint64_t count, unsigned slot) {
+    std::uint8_t* d = mock_descriptors_at(handle, count);
+    for (std::size_t i = 0; d && i < count * kMockDescriptorInc; ++i)
+        d[i] = static_cast<std::uint8_t>(slot * 8 + i % kMockDescriptorInc + 1);
+}
+
 void copy_array(Mock* m, unsigned slot, std::uint64_t objects, std::uint64_t count) {
     const auto* in = reinterpret_cast<const std::uint64_t*>(objects);
     for (std::uint32_t i = 0; in && i < static_cast<std::uint32_t>(count) && i < 4; ++i) m->array[slot][i] = in[i];
@@ -194,9 +214,22 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
             case 14: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));      // CreateDescriptorHeap
             case 15: return kMockDescriptorInc;                                                  // GetDescriptorHandleIncrementSize
-            case 23:                                                                             // CopyDescriptors
+            case 23: {                                                                           // CopyDescriptors
                 copy_array(m, 23, a2, a1);                                                       // dest starts
                 copy_array(m, 24, words[4], a4);                                                 // src starts (recorded in slot 24's array)
+                const auto* starts = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a2);
+                const auto* sizes = reinterpret_cast<const UINT*>(a3);
+                for (std::uint32_t i = 0; starts && i < static_cast<std::uint32_t>(a1); ++i)
+                    mock_fill_descriptors(starts[i].ptr, sizes ? sizes[i] : 1, 23);
+                break;
+            }
+            case 17: case 22: mock_fill_descriptors(a2, 1, slot); break;           // CBV, sampler: (desc, dest)
+            case 18: case 20: case 21: mock_fill_descriptors(a3, 1, slot); break;  // SRV, RTV, DSV: (res, desc, dest)
+            case 19: mock_fill_descriptors(a4, 1, slot); break;                    // UAV: (res, counter, desc, dest)
+            case 24:                                                               // CopyDescriptorsSimple
+                if (std::uint8_t* dst = mock_descriptors_at(a2, a1))
+                    if (const std::uint8_t* src = mock_descriptors_at(a3, a1))
+                        std::memmove(dst, src, static_cast<std::size_t>(a1) * kMockDescriptorInc);
                 break;
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
@@ -213,8 +246,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     }
     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
     if (m->kind == Kind::heap && slot == 9) {
-        if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapCpuStart;
-        return kMockHeapCpuStart;
+        const SIZE_T start = g_mock_descriptors ? reinterpret_cast<SIZE_T>(g_mock_descriptors) : kMockHeapCpuStart;
+        if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = start;
+        return start;
     }
     if (m->kind == Kind::heap && slot == 10) {
         if (a1) reinterpret_cast<D3D12_GPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapGpuStart;
@@ -980,6 +1014,94 @@ int check_descriptor_heap_hooks() {
     return 0;
 }
 
+// What device slots 17-24 write into a title-backed heap reaches the title's own backing as well as the layer's heap:
+// a title that copies a view out of a CPU-only heap with CPU stores reads its backing, not the layer's.
+int check_descriptor_mirror() {
+    g_heap_hook = {};
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+
+    Mock* real = new_mock(Kind::device);
+    real->refs = 1;
+    real->device_level = 9;
+    void* device = nullptr;
+    EXPECT(SUCCEEDED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(real), __uuidof(ID3D12Device), &device)));
+
+    constexpr UINT kCount = 8, kInc = kMockDescriptorInc;
+    constexpr std::uint8_t kGuard = 0xCD;
+    alignas(16) static std::uint8_t layer[kCount * kInc];
+    alignas(16) static std::uint8_t title[(kCount + 1) * kInc];  // one guard descriptor past the heap's end
+    std::memset(layer, 0, sizeof(layer));
+    std::memset(title, 0, kCount * kInc);
+    std::memset(title + kCount * kInc, kGuard, kInc);
+    g_mock_descriptors = layer;
+    g_mock_descriptors_size = sizeof(layer);
+    g_heap_hook.next_ptr = title;
+
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    desc.NumDescriptors = kCount;
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;  // CPU-only: the title assembles its tables from it
+    const IID iid_heap = __uuidof(ID3D12DescriptorHeap);
+    void* heap = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&heap)))));
+    const auto base = reinterpret_cast<std::uint64_t>(title);
+    EXPECT(heap != nullptr && raw(heap, 9) == base);
+
+    const auto at = [&](unsigned index) { return base + std::uint64_t(index) * kInc; };
+    const auto mirrored = [&](unsigned first, unsigned count) {
+        bool written = false;
+        for (unsigned i = first * kInc; i < (first + count) * kInc; ++i) written |= layer[i] != 0;
+        return written && std::memcmp(title + first * kInc, layer + first * kInc, count * kInc) == 0;
+    };
+
+    raw(device, 17, 0x11, at(0));                // CreateConstantBufferView
+    EXPECT(mirrored(0, 1));
+    raw(device, 18, 0x22, 0x33, at(1));          // CreateShaderResourceView
+    EXPECT(mirrored(1, 1));
+    raw(device, 19, 0x22, 0x33, 0x44, at(2));    // CreateUnorderedAccessView
+    EXPECT(mirrored(2, 1));
+    raw(device, 22, 0x55, at(3));                // CreateSampler
+    EXPECT(mirrored(3, 1));
+    raw(device, 20, 0x22, 0x33, at(4));          // CreateRenderTargetView
+    raw(device, 21, 0x22, 0x33, at(5));          // CreateDepthStencilView
+    EXPECT(mirrored(4, 2));
+    EXPECT(std::memcmp(layer, layer + kInc, kInc) != 0);  // each slot wrote its own pattern
+
+    // CopyDescriptorsSimple: two descriptors, and a count past the heap's end that the backing clamps.
+    raw(device, 24, 2, at(6), at(0), 0);
+    EXPECT(mirrored(6, 2) && std::memcmp(title + 6 * kInc, title, 2 * kInc) == 0);
+    raw(device, 24, 4, at(6), at(0), 0);
+    EXPECT(mirrored(6, 2) && title[kCount * kInc] == kGuard && title[(kCount + 1) * kInc - 1] == kGuard);
+
+    // CopyDescriptors: a two-descriptor range, then a null size array (one descriptor per range).
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsts[2] = {{static_cast<SIZE_T>(at(6))}, {static_cast<SIZE_T>(at(0))}};
+        D3D12_CPU_DESCRIPTOR_HANDLE srcs[1] = {{static_cast<SIZE_T>(at(2))}};
+        UINT sizes[1] = {2};
+        auto* d = static_cast<ID3D12Device*>(device);
+        d->CopyDescriptors(1, dsts, sizes, 1, srcs, sizes, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        EXPECT(mirrored(6, 2) && std::memcmp(title + 6 * kInc, title, 2 * kInc) != 0);
+        d->CopyDescriptors(2, dsts, nullptr, 1, srcs, nullptr, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        EXPECT(mirrored(0, 1) && mirrored(6, 1) && std::memcmp(title, title + 6 * kInc, kInc) == 0);
+    }
+    EXPECT(title[kCount * kInc] == kGuard);
+
+    // Once the heap is released its range is gone, and a write at the old address touches neither side.
+    EXPECT(raw(heap, 2) == 0);
+    std::uint8_t before[kInc];
+    std::memcpy(before, title, kInc);
+    raw(device, 17, 0x11, at(0));
+    EXPECT(real->args[17][1] == at(0) && std::memcmp(before, title, kInc) == 0);
+
+    g_mock_descriptors = nullptr;
+    g_mock_descriptors_size = 0;
+    EXPECT(raw(device, 2) == 0 && real->refs == 0);
+    xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    std::printf("%s: CBV/SRV/UAV/RTV/DSV/sampler and both descriptor copies into a title-backed CPU-only heap reach "
+                "the title's backing, clamped to the heap\n", g_label);
+    return 0;
+}
+
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
 
 std::atomic<int> g_injected{0};
@@ -1085,7 +1207,8 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_descriptor_heap_hooks())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_descriptor_heap_hooks() ||
+        check_descriptor_mirror())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
