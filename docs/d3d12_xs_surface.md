@@ -562,9 +562,12 @@ None of these has a numeric value in SCARAB, and none has a layout. The tiling/D
 therefore **described, not answered**: the names tell Leonida what to look for in the game's
 resource descriptions, and the copy/state names tell it which compression transitions the game
 may perform, but the actual swizzle and DCC metadata format still has to come from Leonida's own
-`tools/amd_swizzle.py` / `tools/tile_probe.py` work or from the console `xg_xs.dll` functions
-`XGComputeOptimalSwizzleMode`, `XGEncodeDCC`, `XGDecodeDCC` (SCARAB names them; it does not call
-them).
+`tools/amd_swizzle.py` (the mode's equation, read from the public AMD header and evaluated to
+detile with), `tools/tile_probe.py` (the block-endpoint feature and smoothness score measured on
+a blob) and `tools/swizzle_search.py` (the brute-force search over every bit ordering with the
+right x/y split inside a tile, scored with `tile_probe`), or from the console `xg_xs.dll`
+functions `XGComputeOptimalSwizzleMode`, `XGEncodeDCC`, `XGDecodeDCC` (SCARAB names them; it does
+not call them).
 
 Two names are worth adding to the trace filter because they affect correctness, not just
 performance: `D3D12CONS_RESOURCE_STATE_PRESERVE_*` (a barrier that preserves compressed data) and
