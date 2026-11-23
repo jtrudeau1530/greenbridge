@@ -206,6 +206,16 @@ could overflow to inf), and pixel interpolation (`v_interp_p1/p2/mov` become fra
 location). MODE writes (`s_setreg`) model the f16/f64 rounding field, FP_ROUND[3:2], the only MODE field the
 corpus writes; other MODE writes are refused (see Known approximations).
 
+`--opt` is off by default and runs a basic-block peephole pass, `tools/spirv_opt.py`, over the emitted
+module before it is assembled: register store-to-load forwarding, `OpAccessChain` CSE, dead-store
+elimination, `OpSelect`/`OpCopyObject` folding and DCE. Only Function-scope variables that do not escape
+are tracked, and a variable with any dynamic index is excluded from whole-function dead-slot elimination.
+
+Measured on five hand-written pixel fixtures from `tests/semantic/fixtures/disasm`, with every result still
+passing `spirv-val --target-env vulkan1.2`: `ps_ops` 76→33 instructions and 7,876→4,516 bytes, `ps_flat`
+60→22 and 4,560→1,676, `ps_sdwa` 61→19 and 5,720→2,192, `ps_vcc_x2` 63→26 and 5,260→2,552, and
+`ps_fnan_med3` 76→26 and 8,060→4,264.
+
 ### GPU tests (RTX 4060 Ti)
 
 `runtime\test\vk_harness.cpp` (CMake target `vk_harness`, built by `scripts\build_runtime.ps1` or
