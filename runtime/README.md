@@ -195,8 +195,11 @@ Current limits, by design:
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address. `XMemAllocDefault`/`XMemFreeDefault` share that heap. `XMemVirtualAlloc` accepts the attribute word,
-  drops the console's `PAGE_GRAPHICS_*` protection bits, commits 2 MiB guest pages 2 MiB-aligned,
-  and passes `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` through. Physical pages
+  drops the console's `PAGE_GRAPHICS_*` protection bits, commits 2 MiB and 4 MiB guest pages aligned to their page size,
+  and passes `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` through. A title's `VirtualAlloc` routes console
+  64 KiB, 2 MiB and 4 MiB page bits through the same path, requiring `MEM_RESERVE` or `MEM_COMMIT` and stripping
+  `MEM_GRAPHICS`/`MEM_TITLE`; `MEM_RESET`/`MEM_RESET_UNDO` drop the page bits and go to the host `VirtualAlloc`. Calls requiring the placeholder API fail with `ERROR_NOT_SUPPORTED` when it is absent.
+  Physical pages
   (`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`) are
   64 KiB pages of pagefile-backed sections, mapped one view per page into the placeholder that a reserve-only
   64 KiB-page `XMemVirtualAlloc` becomes, with that reservation's protection. `XMemIsToolsMemAvailable` is `FALSE`.

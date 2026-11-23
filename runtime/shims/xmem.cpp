@@ -210,9 +210,11 @@ const PlaceholderApi& placeholder_api() { return g_placeholder_api; }
 // XMem allocation-type page bits select the guest page granularity and must not be forwarded as Win32 flags.
 constexpr DWORD kXmemLargePages = 0x20000000;  // 2 MiB pages
 constexpr DWORD kXmem64kPages = 0x20400000;    // 64 KiB pages
-constexpr DWORD kXmemPageModeMask = kXmem64kPages;
+constexpr DWORD kXmem4MbPages = 0x80000000;    // 4 MiB pages (MEM_4MB_PAGES)
+constexpr DWORD kXmemPageModeMask = kXmem64kPages | kXmem4MbPages;
 constexpr SIZE_T kXmemPageSize64k = 0x10000;
 constexpr SIZE_T kXmemPageSize2m = 0x200000;
+constexpr SIZE_T kXmemPageSize4m = 0x400000;
 constexpr DWORD kXmemHostAllocationTypeMask = MEM_COMMIT | MEM_RESERVE | MEM_REPLACE_PLACEHOLDER |
                                               MEM_RESERVE_PLACEHOLDER | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH |
                                               MEM_RESET_UNDO;
@@ -241,8 +243,9 @@ DWORD host_protect(DWORD p) {
 // replace, and its protection is kept here: the map calls take none, so a mapped page gets its window's protection, as
 // AWE's MapUserPhysicalPages does.
 //
-// ASSUMPTION: a title does not commit memory inside such a window with kernel32!VirtualAlloc. A placeholder refuses a
-// plain commit; the measured windows are only ever passed to the map calls.
+// ASSUMPTION: a title does not commit memory inside such an XMem window with kernel32!VirtualAlloc. A placeholder
+// refuses a plain commit; the measured windows are only ever passed to the map calls. TitleVirtualAlloc reservations
+// stay ordinary reservations so they support plain host commits.
 struct Window {
     SIZE_T size;
     DWORD protect;
@@ -339,17 +342,17 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
 // recorded (xmem_attributes). Its types cover committed 2 MiB and 64 KiB pages, reserve-only 64 KiB windows for physical pages, one
 // MEM_RESERVE_PLACEHOLDER reservation and five MEM_REPLACE_PLACEHOLDER windows carved out of it, each then filled with
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
-// 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
-// VirtualAlloc2.
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+// 4 KiB (host large pages need SeLockMemoryPrivilege). The 4 MiB mode uses the same path as 2 MiB, with
+// 4 MiB granularity. Regions the host places are aligned to the guest page size through VirtualAlloc2.
+void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, DWORD protect, bool console_windows) {
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
 
-    const DWORD page_mode = allocation_type & kXmemPageModeMask;
-    if (page_mode != 0 && page_mode != kXmem64kPages && page_mode != kXmemLargePages) {
+    DWORD page_mode = allocation_type & kXmemPageModeMask;
+    if (page_mode == (kXmem4MbPages | kXmemLargePages)) page_mode = kXmem4MbPages;
+    if (page_mode != 0 && page_mode != kXmem64kPages && page_mode != kXmemLargePages && page_mode != kXmem4MbPages) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
@@ -367,8 +370,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     const bool commit = (host_type & MEM_COMMIT) != 0;
     const bool new_placeholder = (host_type & MEM_RESERVE_PLACEHOLDER) != 0;
     const bool replace = (host_type & MEM_REPLACE_PLACEHOLDER) != 0;
-    const bool window = page_mode != 0 && !commit && !new_placeholder;
-    if ((new_placeholder || replace || window || page_mode == kXmemLargePages) && !placeholder_api().available()) {
+    const bool window = console_windows && page_mode != 0 && !commit && !new_placeholder;
+    const bool large_pages = page_mode == kXmemLargePages || page_mode == kXmem4MbPages;
+    const bool aligned_reservation = !console_windows && page_mode != 0 && !address && (host_type & MEM_RESERVE);
+    if ((new_placeholder || replace || window || large_pages || aligned_reservation) && !placeholder_api().available()) {
         SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
@@ -379,6 +384,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     SIZE_T base_granularity = (host_type & MEM_RESERVE) ? system_info.dwAllocationGranularity : system_info.dwPageSize;
     if (page_mode == kXmem64kPages) page_granularity = base_granularity = kXmemPageSize64k;
     if (page_mode == kXmemLargePages) page_granularity = base_granularity = kXmemPageSize2m;
+    if (page_mode == kXmem4MbPages) page_granularity = base_granularity = kXmemPageSize4m;
     if (new_placeholder || replace) {
         // Placeholders are split and replaced on allocation-granularity boundaries only.
         if (page_granularity < system_info.dwAllocationGranularity) page_granularity = system_info.dwAllocationGranularity;
@@ -399,6 +405,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         }
         const uintptr_t requested_end = requested + size;
         const uintptr_t base = requested & ~(static_cast<uintptr_t>(base_granularity) - 1);
+        if (base == 0) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return nullptr;
+        }
         if (requested_end > max - (static_cast<uintptr_t>(page_granularity) - 1)) {
             SetLastError(ERROR_INVALID_PARAMETER);
             return nullptr;
@@ -434,16 +444,23 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         }
         return result;
     }
-    if (page_mode == kXmemLargePages && address == nullptr) {
+    if ((large_pages || aligned_reservation) && address == nullptr) {
         MEM_ADDRESS_REQUIREMENTS requirements{};
-        requirements.Alignment = kXmemPageSize2m;
+        requirements.Alignment = base_granularity;
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
+        // Title reservations retain their host flags, including MEM_TOP_DOWN and MEM_WRITE_WATCH.
+        return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size,
+                                                console_windows ? host_type | MEM_RESERVE : host_type, host_prot,
                                                 &parameter, 1);
     }
     return VirtualAlloc(address, size, host_type, host_prot);
+}
+
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+    return xmem_virtual_alloc(address, size, allocation_type, protect, true);
 }
 
 // With g_phys_mutex held. Maps `view` at the 64 KiB-aligned `address`, which holds no mapped page. MEM_REPLACE_PLACEHOLDER
@@ -772,13 +789,31 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
 // with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
 // 0x10000000, PAGE_READWRITE) returns NULL; so does 0x40000000), so an engine allocating its heaps this way gets
 // NULL at boot. Both are hints about where the memory lives; the host has no such split, so they are dropped and
-// the rest is passed through. The PAGE_GRAPHICS_* protection bits are dropped (host_protect). Not done: whether
-// graphics memory has to come from an arena the D3D12 layer can see (#313).
+// page-size bits use ordinary aligned host allocations instead of privileged host large pages or console windows.
+// An operation is still required, as on Win32. The PAGE_GRAPHICS_* protection bits are dropped (host_protect).
+// Not done: whether graphics memory has to come from an arena the D3D12 layer can see (#313).
 constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    allocation_type &= ~(kMemGraphics | kMemTitle);
+    if (allocation_type & (MEM_RESET | MEM_RESET_UNDO)) {
+        return VirtualAlloc(address, size, allocation_type & ~kXmemPageModeMask, host_protect(protect));
+    }
+    if (!address && (allocation_type & MEM_COMMIT) && !(allocation_type & MEM_RESERVE)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (allocation_type & (kXmemLargePages | kXmem4MbPages)) {
+        // VirtualAlloc refuses the VirtualAlloc2-only placeholder flags; keep that with page-size bits too.
+        if (!(allocation_type & (MEM_RESERVE | MEM_COMMIT)) ||
+            (allocation_type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER))) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        return xmem_virtual_alloc(address, size, allocation_type, protect, false);
+    }
+    return VirtualAlloc(address, size, allocation_type, host_protect(protect));
 }
 
 }  // namespace

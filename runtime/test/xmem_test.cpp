@@ -6,7 +6,7 @@
 // size at +8, and XMemVirtualQuery's MEMORY_BASIC_INFORMATION prefix inside a zeroed 64-byte output.
 // XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
 // nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
-// graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
+// graphics protection bits and commits 2 MiB and 4 MiB guest pages; the placeholder flags pass through; physical pages keep their
 // contents across unmap and remap, alias when mapped twice, and scatter-map per address.
 #include <windows.h>
 #include <psapi.h>
@@ -44,8 +44,10 @@ using XMemMapPhysicalPagesScatterFn = BOOL(WINAPI*)(void* const*, uint32_t, cons
 constexpr uint32_t kMeasuredKind = 0x20000001;
 constexpr DWORD kXmemLargePages = 0x20000000;
 constexpr DWORD kXmem64kPages = 0x20400000;
+constexpr DWORD kXmem4MbPages = 0x80000000;
 constexpr SIZE_T kPage64k = 0x10000;
 constexpr SIZE_T kPage2m = 0x200000;
+constexpr SIZE_T kPage4m = 0x400000;
 
 int g_checks = 0;
 int g_failures = 0;
@@ -242,6 +244,84 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
               "a 2 MiB-page region is rounded up to whole pages, committed read-write without the graphics bits");
         static_cast<volatile uint8_t*>(large_page)[2 * kPage2m - 1] = 0x77;
         check(VirtualFree(large_page, 0, MEM_RELEASE), "release the 2 MiB-page region");
+    }
+
+    // 4 MiB uses the existing large-page path, including reserve-only placeholder windows.
+    for (const DWORD bits : {kXmem4MbPages, kXmem4MbPages | kXmemLargePages}) {
+        void* const region = virtual_alloc(nullptr, kPage4m + 1, MEM_RESERVE | MEM_COMMIT | bits, 0, PAGE_READWRITE);
+        check(region != nullptr, "XMemVirtualAlloc commits 4 MiB guest pages");
+        if (region) {
+            MEMORY_BASIC_INFORMATION info{};
+            check((reinterpret_cast<uintptr_t>(region) & (kPage4m - 1)) == 0,
+                  "a 4 MiB-page region is 4 MiB-aligned");
+            check(VirtualQuery(region, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+                      info.RegionSize == 2 * kPage4m && info.Protect == PAGE_READWRITE,
+                  "a 4 MiB-page region is rounded up to two writable pages");
+            auto* const pages4m = static_cast<volatile uint8_t*>(region);
+            pages4m[0] = 0x41;
+            pages4m[2 * kPage4m - 1] = 0x42;
+            check(pages4m[0] == 0x41 && pages4m[2 * kPage4m - 1] == 0x42, "the 4 MiB pages are writable");
+            check(VirtualFree(region, 0, MEM_RELEASE), "release the 4 MiB-page region");
+        }
+
+        void* const window = virtual_alloc(nullptr, 1, MEM_RESERVE | bits, 0, PAGE_READWRITE);
+        check(window != nullptr, "XMemVirtualAlloc reserves a 4 MiB-page window");
+        if (window) {
+            MEMORY_BASIC_INFORMATION info{};
+            check((reinterpret_cast<uintptr_t>(window) & (kPage4m - 1)) == 0 &&
+                      VirtualQuery(window, &info, sizeof(info)) && info.State == MEM_RESERVE &&
+                      info.RegionSize == kPage4m,
+                  "a reserve-only 4 MiB window is aligned and rounded to one page");
+            void* const committed = virtual_alloc(static_cast<uint8_t*>(window) + 1, 1,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | bits, 0, PAGE_READWRITE);
+            check(committed == window, "a commit replacement rounds to the 4 MiB window boundaries");
+            if (committed) {
+                static_cast<volatile uint8_t*>(committed)[kPage4m - 1] = 0x43;
+                check(VirtualQuery(committed, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+                          info.RegionSize == kPage4m,
+                      "the whole 4 MiB placeholder is committed");
+            }
+            check(VirtualFree(window, 0, MEM_RELEASE), "release the 4 MiB window");
+        }
+
+        auto* const placeholder = static_cast<uint8_t*>(virtual_alloc(
+            nullptr, 2 * kPage4m, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER | bits, 0, PAGE_NOACCESS));
+        check(placeholder != nullptr, "reserve an explicit two-page 4 MiB placeholder");
+        if (placeholder) {
+            auto* const part = static_cast<uint8_t*>(virtual_alloc(
+                placeholder + kPage4m + 1, 1, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | bits,
+                0, PAGE_READWRITE));
+            check(part == placeholder + kPage4m, "replace a subrange of the two-page 4 MiB placeholder");
+            MEMORY_BASIC_INFORMATION info{};
+            check(VirtualQuery(placeholder, &info, sizeof(info)) && info.State == MEM_RESERVE &&
+                      info.RegionSize == kPage4m,
+                  "the first 4 MiB page remains reserved after splitting");
+            if (part) {
+                check(VirtualQuery(part, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+                          info.RegionSize == kPage4m,
+                      "the replacement commits exactly the second 4 MiB page");
+                static_cast<volatile uint8_t*>(part)[kPage4m - 1] = 0x44;
+                check(static_cast<volatile uint8_t*>(part)[kPage4m - 1] == 0x44,
+                      "the split 4 MiB replacement is writable");
+                check(VirtualFree(part, 0, MEM_RELEASE), "release the split 4 MiB replacement");
+            }
+            check(VirtualFree(placeholder, 0, MEM_RELEASE), "release the remaining 4 MiB placeholder");
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        void* const low = virtual_alloc(reinterpret_cast<void*>(kPage4m - 1), 1,
+                                        MEM_RESERVE | MEM_COMMIT | bits, 0, PAGE_READWRITE);
+        check(low == nullptr && GetLastError() == ERROR_INVALID_ADDRESS,
+              "XMem rejects an address that rounds down to zero");
+        if (low) VirtualFree(low, 0, MEM_RELEASE);
+    }
+
+    for (const DWORD bits : {kXmem4MbPages | kXmem64kPages, kXmem4MbPages | DWORD{0x00400000}}) {
+        SetLastError(ERROR_SUCCESS);
+        void* const invalid = virtual_alloc(nullptr, kPage4m, MEM_RESERVE | MEM_COMMIT | bits, 0, PAGE_READWRITE);
+        check(invalid == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+              "4 MiB bits combined with the physical-page bit remain invalid");
+        if (invalid) VirtualFree(invalid, 0, MEM_RELEASE);
     }
 
     // The attribute word is accepted (every measured call passes a nonzero one) and the protection loses its graphics
@@ -545,6 +625,12 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     void* const v = virtual_alloc ? virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x183, PAGE_READWRITE)
                                   : nullptr;
     if (v) VirtualFree(v, 0, MEM_RELEASE);
+    const auto title_alloc = reinterpret_cast<decltype(&VirtualAlloc)>(rt::shims::find("kernel32.dll", "VirtualAlloc"));
+    if (title_alloc) {
+        void* const title = title_alloc(nullptr, kPage4m, MEM_RESERVE | MEM_COMMIT | kXmem4MbPages, PAGE_READWRITE);
+        check(title != nullptr, "title page allocation succeeds with tracing enabled");
+        if (title) VirtualFree(title, 0, MEM_RELEASE);
+    }
     rt::startup_trace::close();
 
     std::ifstream in(path);
@@ -559,6 +645,8 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     check(count("\"kind\":\"xmem_attributes\"") == 6, "six events: two XMemAlloc words, three XMemFree words and one XMemVirtualAlloc word");
     check(count("\"api\":\"XMemVirtualAlloc\",\"attributes\":\"0x183\",\"size\":65536") == 1,
           "XMemVirtualAlloc 0x183 is recorded once, with its size");
+    check(count("\"api\":\"XMemVirtualAlloc\",\"attributes\":\"0x0\"") == 0,
+          "title VirtualAlloc emits no xmem_attributes event");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x5e50000\",\"size\":4096") == 1,
           "XMemAlloc 0x5e50000 is recorded once, with the size of the first call");
     check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x99\",\"size\":16") == 1, "XMemAlloc 0x99 is recorded once");
@@ -665,6 +753,93 @@ void test_title_virtual_alloc() {
         std::snprintf(what, sizeof what, "registry exposes %s!VirtualAlloc", dll);
         check(alloc != nullptr, what);
         if (!alloc) continue;
+
+        const struct { DWORD bits; SIZE_T page; } modes[] = {
+            {kXmemLargePages, kPage2m}, {kXmem4MbPages, kPage4m},
+            {kXmem4MbPages | kXmemLargePages, kPage4m}, {kXmem64kPages, kPage64k},
+        };
+        for (const auto& mode : modes) {
+            for (const DWORD placeholder : {DWORD{MEM_RESERVE_PLACEHOLDER}, DWORD{MEM_REPLACE_PLACEHOLDER}}) {
+                SetLastError(0);
+                void* const refused = alloc(nullptr, mode.page, MEM_RESERVE | placeholder | mode.bits, PAGE_NOACCESS);
+                std::snprintf(what, sizeof what, "%s!VirtualAlloc refuses placeholder flag %#lx with page bits %#lx", dll,
+                              static_cast<unsigned long>(placeholder), static_cast<unsigned long>(mode.bits));
+                check(refused == nullptr && GetLastError() == ERROR_INVALID_PARAMETER, what);
+                if (refused) VirtualFree(refused, 0, MEM_RELEASE);
+            }
+            for (const DWORD tags : {DWORD{0}, kMemGraphics | kMemTitle}) {
+                void* const p = alloc(nullptr, mode.page + 1, MEM_RESERVE | MEM_COMMIT | mode.bits | tags,
+                                      PAGE_READWRITE | PAGE_GRAPHICS_READWRITE);
+                std::snprintf(what, sizeof what, "%s!VirtualAlloc page bits %#lx tags %#lx returns aligned memory",
+                              dll, static_cast<unsigned long>(mode.bits), static_cast<unsigned long>(tags));
+                check(p && (reinterpret_cast<uintptr_t>(p) & (mode.page - 1)) == 0, what);
+                if (p) {
+                    MEMORY_BASIC_INFORMATION info{};
+                    check(VirtualQuery(p, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+                              info.RegionSize == 2 * mode.page && info.Protect == PAGE_READWRITE,
+                          "title page modes round to whole pages and strip graphics protection");
+                    auto* const bytes = static_cast<volatile uint8_t*>(p);
+                    bytes[0] = 0x51;
+                    bytes[2 * mode.page - 1] = 0x52;
+                    check(bytes[0] == 0x51 && bytes[2 * mode.page - 1] == 0x52, "title guest pages are writable");
+                    check(VirtualFree(p, 0, MEM_RELEASE), "release the title guest-page region");
+                }
+                SetLastError(ERROR_SUCCESS);
+                void* const no_operation = alloc(nullptr, mode.page, mode.bits | tags, PAGE_READWRITE);
+                check(no_operation == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+                      "title guest pages require MEM_RESERVE or MEM_COMMIT");
+                if (no_operation) VirtualFree(no_operation, 0, MEM_RELEASE);
+
+                SetLastError(ERROR_SUCCESS);
+                void* const commit_only = alloc(nullptr, mode.page, MEM_COMMIT | mode.bits | tags, PAGE_READWRITE);
+                check(commit_only == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+                      "title commit-only with a null address fails for every guest page mode");
+                if (commit_only) VirtualFree(commit_only, 0, MEM_RELEASE);
+
+                SetLastError(ERROR_SUCCESS);
+                void* const low = alloc(reinterpret_cast<void*>(mode.page - 1), 1,
+                                        MEM_RESERVE | MEM_COMMIT | mode.bits | tags, PAGE_READWRITE);
+                check(low == nullptr && GetLastError() == ERROR_INVALID_ADDRESS,
+                      "title rejects an address below the guest page granularity");
+                if (low) VirtualFree(low, 0, MEM_RELEASE);
+
+                auto* const reserved = static_cast<uint8_t*>(
+                    alloc(nullptr, mode.page + 1, MEM_RESERVE | mode.bits | tags, PAGE_READWRITE));
+                check(reserved && (reinterpret_cast<uintptr_t>(reserved) & (mode.page - 1)) == 0,
+                      "title reserve-only returns an aligned ordinary reservation");
+                if (reserved) {
+                    SYSTEM_INFO system_info{};
+                    GetSystemInfo(&system_info);
+                    const SIZE_T part_size = system_info.dwPageSize;
+                    MEMORY_BASIC_INFORMATION info{};
+                    check(VirtualQuery(reserved, &info, sizeof(info)) && info.State == MEM_RESERVE &&
+                              info.RegionSize == 2 * mode.page,
+                          "title reserve-only rounds to whole guest pages");
+                    auto* const part = static_cast<volatile uint8_t*>(
+                        VirtualAlloc(reserved + part_size, part_size, MEM_COMMIT, PAGE_READWRITE));
+                    check(part == reserved + part_size, "plain host VirtualAlloc commits a subrange of the title reservation");
+                    if (part) {
+                        part[0] = 0x61;
+                        part[part_size - 1] = 0x62;
+                        check(part[0] == 0x61 && part[part_size - 1] == 0x62,
+                              "the title reservation's committed subrange is writable");
+                        check(alloc(reserved + part_size, part_size, MEM_RESET | mode.bits | tags, PAGE_READWRITE) ==
+                                  reserved + part_size,
+                              "title MEM_RESET strips page bits and preserves the host subrange");
+                    }
+                    check(VirtualQuery(reserved, &info, sizeof(info)) && info.State == MEM_RESERVE &&
+                              info.RegionSize == part_size,
+                          "committing a subrange leaves the first host page reserved");
+                    check(VirtualFree(reserved, 0, MEM_RELEASE), "release the title reservation after subrange commit");
+                }
+            }
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        void* const commit_only = alloc(nullptr, kPage64k, MEM_COMMIT, PAGE_READWRITE);
+        check(commit_only == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+              "title commit-only with a null address fails without guest page bits");
+        if (commit_only) VirtualFree(commit_only, 0, MEM_RELEASE);
 
         void* const gfx = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x2004);  // PAGE_GRAPHICS_READWRITE
         check(gfx != nullptr, "title VirtualAlloc with protect 0x2004 succeeds");

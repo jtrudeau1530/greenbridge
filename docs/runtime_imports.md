@@ -119,8 +119,14 @@ Seven more `xmem.dll` imports follow argument shapes measured locally at a title
   `MEM_RESERVE_PLACEHOLDER` and carves windows out of it with `MEM_REPLACE_PLACEHOLDER`, and the shim passes both
   through. **ASSUMPTION:** nothing commits into a window with `kernel32!VirtualAlloc`, which a placeholder refuses.
 - `XMemVirtualAlloc` used to refuse 2 MiB pages, and five of the 23 measured calls commit them. They are now
-  committed 2 MiB-aligned through `VirtualAlloc2`. The attribute word is recorded (`xmem_attributes`) and the
-  console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.
+  committed 2 MiB-aligned through `VirtualAlloc2`. The 4 MiB mode (`MEM_4MB_PAGES`, `0x80000000`, optionally
+  combined with `MEM_LARGE_PAGES`) uses the same alignment, rounding and placeholder/window handling at 4 MiB
+  granularity. A title's `VirtualAlloc` routes console 64 KiB, 2 MiB and 4 MiB page modes through this path after
+  stripping `MEM_GRAPHICS`/`MEM_TITLE`, but still requires `MEM_RESERVE` or `MEM_COMMIT` and refuses the placeholder flags, as `VirtualAlloc` does; `MEM_RESET`/`MEM_RESET_UNDO` drop the page bits and go to the host `VirtualAlloc`. These are ordinary host
+  pages, with no large-page privilege required. Without the placeholder API, calls that need it (including 2 MiB
+  and 4 MiB modes) fail with `ERROR_NOT_SUPPORTED`; no fallback is provided.
+  The attribute word is recorded (`xmem_attributes`) and the console's `PAGE_GRAPHICS_*` bits are dropped from the
+  protection, as before.
 - `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
   on an out-of-memory path, after an allocation has already failed.
 
