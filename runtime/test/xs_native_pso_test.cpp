@@ -1,8 +1,9 @@
 // Xbox device slot 57 (d3d12_xs_native_pso.h) through the device proxy, over a mock device: no D3D12 runtime, no
 // GPU, no game data. The descriptions, digest map and "containers" are built here by hand; the mock records what the
-// proxy hands to CreateGraphicsPipelineState (PC slot 10) and ID3D12Device2::CreatePipelineState (PC slot 47).
+// proxy hands to ID3D12Device2::CreatePipelineState (PC slot 47), and slot 55 deriving from such a pipeline.
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/d3d12_xs_native_pso.h"
+#include "../shims/d3d12_xs_pso_stream.h"
 #include "../src/native_pso.h"
 
 #include <d3d12.h>
@@ -22,13 +23,19 @@ namespace np = leonida::native_pso;
 namespace xs = rt::d3d12_xs;
 
 int g_failures = 0;
-#define EXPECT(c) do { if (!(c)) { std::fprintf(stderr, "xs_native_pso_test line %d: %s\n", __LINE__, #c); ++g_failures; } } while (0)
+#define EXPECT(c) \
+    do { if (!(c)) { std::fprintf(stderr, "xs_native_pso_test line %d: %s\n", __LINE__, #c); ++g_failures; } } while (0)
 
-// ---- Mock pipeline: an object with IUnknown only; one placed at an odd address for the even-pointer check ----
+// ---- Mock pipeline: IUnknown and ID3D12Object private data (slot 55 keeps its stream record there); one placed
+// at an odd address for the even-pointer check ----
 
 struct MockPipeline {
     void** vtable;
     long refs;
+    GUID data_guid;
+    std::vector<std::uint8_t> data;
+    GUID interface_guid;
+    IUnknown* object;
 };
 
 unsigned g_odd_releases = 0;
@@ -36,19 +43,53 @@ alignas(16) unsigned char g_odd_storage[32];
 
 bool odd(const void* p) { return reinterpret_cast<std::uintptr_t>(p) & 1; }
 
-HRESULT WINAPI pipe_qi(void*, const IID*, void** out) {
-    if (out) *out = nullptr;
-    return E_NOINTERFACE;
+HRESULT WINAPI pipe_qi(MockPipeline* self, const IID* riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (odd(self) || !(IsEqualIID(*riid, __uuidof(IUnknown)) || IsEqualIID(*riid, __uuidof(ID3D12Object)) ||
+                       IsEqualIID(*riid, __uuidof(ID3D12PipelineState))))
+        return E_NOINTERFACE;
+    ++self->refs;
+    *out = self;
+    return S_OK;
 }
 ULONG WINAPI pipe_add_ref(MockPipeline* self) { return odd(self) ? 1 : ++self->refs; }
 ULONG WINAPI pipe_release(MockPipeline* self) {
     if (odd(self)) return ++g_odd_releases, 0;
     return --self->refs;
 }
-void* g_pipe_vtable[] = {reinterpret_cast<void*>(&pipe_qi), reinterpret_cast<void*>(&pipe_add_ref),
-                         reinterpret_cast<void*>(&pipe_release)};
+HRESULT WINAPI pipe_get_private_data(MockPipeline* self, const GUID* guid, UINT* size, void* data) {
+    if (!IsEqualGUID(*guid, self->data_guid) || self->data.empty()) return DXGI_ERROR_NOT_FOUND;
+    if (!data || *size < self->data.size()) return E_INVALIDARG;
+    *size = static_cast<UINT>(self->data.size());
+    std::memcpy(data, self->data.data(), self->data.size());
+    return S_OK;
+}
+HRESULT WINAPI pipe_set_private_data(MockPipeline* self, const GUID* guid, UINT size, const void* data) {
+    self->data_guid = *guid;
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    self->data.assign(bytes, bytes + size);
+    return S_OK;
+}
+HRESULT WINAPI pipe_set_private_interface(MockPipeline* self, const GUID* guid, IUnknown* object) {
+    if (object) object->AddRef();
+    self->interface_guid = *guid;
+    self->object = object;  // kept for the life of the test
+    return S_OK;
+}
+HRESULT WINAPI pipe_set_name(MockPipeline*, const wchar_t*) { return S_OK; }
+void* g_pipe_vtable[] = {reinterpret_cast<void*>(&pipe_qi),
+                         reinterpret_cast<void*>(&pipe_add_ref),
+                         reinterpret_cast<void*>(&pipe_release),
+                         reinterpret_cast<void*>(&pipe_get_private_data),
+                         reinterpret_cast<void*>(&pipe_set_private_data),
+                         reinterpret_cast<void*>(&pipe_set_private_interface),
+                         reinterpret_cast<void*>(&pipe_set_name)};
 
-// ---- Mock device ----
+// The root signature slot 57 passes on: an IUnknown, since slot 86's kept stream holds a reference to it.
+MockPipeline g_root_signature{g_pipe_vtable, 1, {}, {}, {}, nullptr};
+
+// ---- Mock device: every pipeline must come through PC slot 47 (ID3D12Device2::CreatePipelineState) ----
 
 struct Recorded {
     std::vector<std::uint8_t> vs, ps, gs, ms;
@@ -60,6 +101,7 @@ struct Recorded {
     D3D12_COMPARISON_FUNC depth_func{};
     D3D12_CULL_MODE cull{};
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology{};
+    bool has_layout = false, has_topology = false;
     UINT samples = 0, sample_mask = 0;
     BOOL blend0 = TRUE;
     std::vector<std::string> names;
@@ -74,7 +116,7 @@ struct MockDevice {
     bool odd_pointer;
     unsigned graphics_calls, stream_calls;
     Recorded last;
-    MockPipeline pipeline;
+    MockPipeline* last_pipeline;
 };
 
 std::vector<std::uint8_t> copy(const D3D12_SHADER_BYTECODE& b) {
@@ -93,8 +135,8 @@ HRESULT hand_out(MockDevice* self, const IID* riid, void** out) {
         std::memcpy(object, &vtable, sizeof(vtable));
         *out = object;
     } else {
-        self->pipeline = {g_pipe_vtable, 1};
-        *out = &self->pipeline;
+        self->last_pipeline = new MockPipeline{g_pipe_vtable, 1, {}, {}, {}, nullptr};
+        *out = self->last_pipeline;
     }
     return S_OK;
 }
@@ -114,30 +156,10 @@ ULONG WINAPI dev_add_ref(MockDevice* self) { return ++self->refs; }
 ULONG WINAPI dev_release(MockDevice* self) { return --self->refs; }
 HRESULT WINAPI dev_other(MockDevice*) { return S_OK; }
 
-HRESULT WINAPI dev_graphics(MockDevice* self, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, const IID* riid,
-                            void** out) {
-    ++self->graphics_calls;
-    Recorded r;
-    r.vs = copy(d->VS);
-    r.ps = copy(d->PS);
-    r.gs = copy(d->GS);
-    r.root = d->pRootSignature;
-    r.rt_count = d->NumRenderTargets;
-    std::memcpy(r.rtv, d->RTVFormats, sizeof(r.rtv));
-    r.dsv = d->DSVFormat;
-    r.depth_enable = d->DepthStencilState.DepthEnable;
-    r.depth_func = d->DepthStencilState.DepthFunc;
-    r.cull = d->RasterizerState.CullMode;
-    r.topology = d->PrimitiveTopologyType;
-    r.samples = d->SampleDesc.Count;
-    r.sample_mask = d->SampleMask;
-    r.blend0 = d->BlendState.RenderTarget[0].BlendEnable;
-    for (UINT i = 0; i < d->InputLayout.NumElements; ++i) {
-        r.names.emplace_back(d->InputLayout.pInputElementDescs[i].SemanticName);
-        r.elements.push_back(d->InputLayout.pInputElementDescs[i]);
-    }
-    self->last = std::move(r);
-    return hand_out(self, riid, out);
+HRESULT WINAPI dev_graphics(MockDevice* self, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, const IID*, void** out) {
+    ++self->graphics_calls;  // slot 57 must not take this path: slot 55 could not derive from its pipelines
+    if (out) *out = nullptr;
+    return E_FAIL;
 }
 
 template <typename P>
@@ -156,15 +178,35 @@ HRESULT WINAPI dev_stream(MockDevice* self, const D3D12_PIPELINE_STATE_STREAM_DE
         std::memcpy(&type, base + at, sizeof(type));
         switch (type) {
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: r.root = *payload<void*>(base, at); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: r.vs = copy(*payload<D3D12_SHADER_BYTECODE>(base, at)); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: r.gs = copy(*payload<D3D12_SHADER_BYTECODE>(base, at)); break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: r.ms = copy(*payload<D3D12_SHADER_BYTECODE>(base, at)); break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: r.ps = copy(*payload<D3D12_SHADER_BYTECODE>(base, at)); break;
-            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: payload<D3D12_BLEND_DESC>(base, at); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
+                r.blend0 = payload<D3D12_BLEND_DESC>(base, at)->RenderTarget[0].BlendEnable;
+                break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: r.sample_mask = *payload<UINT>(base, at); break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
                 r.cull = payload<D3D12_RASTERIZER_DESC>(base, at)->CullMode;
                 break;
-            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
-                r.depth_func = payload<D3D12_DEPTH_STENCIL_DESC>(base, at)->DepthFunc;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: {
+                const auto* ds = payload<D3D12_DEPTH_STENCIL_DESC>(base, at);
+                r.depth_enable = ds->DepthEnable;
+                r.depth_func = ds->DepthFunc;
+                break;
+            }
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+                const auto* layout = payload<D3D12_INPUT_LAYOUT_DESC>(base, at);
+                r.has_layout = true;
+                for (UINT i = 0; i < layout->NumElements; ++i) {
+                    r.names.emplace_back(layout->pInputElementDescs[i].SemanticName);
+                    r.elements.push_back(layout->pInputElementDescs[i]);
+                }
+                break;
+            }
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+                r.has_topology = true;
+                r.topology = *payload<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(base, at);
                 break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
                 const auto* f = payload<D3D12_RT_FORMAT_ARRAY>(base, at);
@@ -172,7 +214,9 @@ HRESULT WINAPI dev_stream(MockDevice* self, const D3D12_PIPELINE_STATE_STREAM_DE
                 std::memcpy(r.rtv, f->RTFormats, sizeof(r.rtv));
                 break;
             }
-            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: r.dsv = *payload<DXGI_FORMAT>(base, at); break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
+                r.dsv = *payload<DXGI_FORMAT>(base, at);
+                break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC:
                 r.samples = payload<DXGI_SAMPLE_DESC>(base, at)->Count;
                 break;
@@ -271,9 +315,10 @@ void make_tree() {
     const auto line = [](const np::Digest& d, const char* stage, const char* path) {
         return np::hex(d) + "\t" + stage + "\t" + path + "\n";
     };
-    write(g_spirv / L"native_hashes.txt", std::string(np::HashMap::kHeader) + "\n" +
-                                              line(kVs, "vs", "../dxbc/vs one.dxbc") + line(kPs, "ps", "../dxbc/ps.dxbc") +
-                                              line(kMs, "ms", "../dxbc/ms.dxbc") + line(kLost, "ps", "../dxbc/gone.dxbc"));
+    const std::string map = std::string(np::HashMap::kHeader) + "\n" + line(kVs, "vs", "../dxbc/vs one.dxbc") +
+                            line(kPs, "ps", "../dxbc/ps.dxbc") + line(kMs, "ms", "../dxbc/ms.dxbc") +
+                            line(kLost, "ps", "../dxbc/gone.dxbc");
+    write(g_spirv / L"native_hashes.txt", map);
 }
 
 struct Desc {
@@ -281,7 +326,7 @@ struct Desc {
     std::vector<std::uint8_t> code[np::kStageBlocks], rec[np::kStageBlocks];
     np::GraphicsDesc desc{};
     Desc() {
-        desc.root_signature = reinterpret_cast<const void*>(0x5000);
+        desc.root_signature = &g_root_signature;
         desc.state_a = {a.data(), a.size()};
         desc.state_b = {b.data(), b.size()};
     }
@@ -325,15 +370,15 @@ void test_vs_ps() {
     d.stage(2, kPs).stage(0, kVs);
     void* out = reinterpret_cast<void*>(1);
     EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK);
-    EXPECT(out == &mock->pipeline && mock->graphics_calls == 1 && mock->stream_calls == 0);
+    EXPECT(out == mock->last_pipeline && mock->stream_calls == 1 && mock->graphics_calls == 0);
     const Recorded& r = mock->last;
     EXPECT(r.vs == kVsBytes && r.ps == kPsBytes && r.gs.empty());
-    EXPECT(r.root == reinterpret_cast<const void*>(0x5000));
+    EXPECT(r.root == static_cast<const void*>(&g_root_signature));
     EXPECT(r.rt_count == 2 && r.rtv[0] == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && r.rtv[1] == DXGI_FORMAT_R16G16_FLOAT &&
            r.rtv[2] == DXGI_FORMAT_UNKNOWN);
     EXPECT(r.dsv == DXGI_FORMAT_D32_FLOAT && r.depth_enable && r.depth_func == D3D12_COMPARISON_FUNC_ALWAYS);
     EXPECT(r.cull == D3D12_CULL_MODE_NONE && !r.blend0 && r.samples == 1 && r.sample_mask == 0xffffffffu);
-    EXPECT(r.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    EXPECT(r.has_layout && r.has_topology && r.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
     EXPECT(r.names.size() == 2 && r.names[0] == "POSITION" && r.names[1] == "TEXCOORD");
     EXPECT(r.elements.size() == 2 && r.elements[1].Format == DXGI_FORMAT_R32G32_FLOAT &&
            r.elements[1].AlignedByteOffset == 12);
@@ -342,7 +387,7 @@ void test_vs_ps() {
 
     // The map is read once: a second pipeline does not need the provider again.
     xs::set_native_shader_directory_provider(nullptr);
-    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK && mock->graphics_calls == 2);
+    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK && mock->stream_calls == 2);
 }
 
 void test_mesh() {
@@ -353,14 +398,38 @@ void test_mesh() {
     d.stage(1, kPs).stage(6, kMs);
     void* out = nullptr;
     EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK);
-    EXPECT(out == &mock->pipeline && mock->stream_calls == 1 && mock->graphics_calls == 0);
-    EXPECT(mock->last.ms == kMsBytes && mock->last.ps == kPsBytes && mock->last.root == reinterpret_cast<const void*>(0x5000));
+    EXPECT(out == mock->last_pipeline && mock->stream_calls == 1 && mock->graphics_calls == 0 &&
+           !mock->last.has_layout && !mock->last.has_topology);
+    EXPECT(mock->last.ms == kMsBytes && mock->last.ps == kPsBytes &&
+           mock->last.root == static_cast<const void*>(&g_root_signature));
     EXPECT(mock->last.rt_count == 2 && mock->last.dsv == DXGI_FORMAT_D32_FLOAT && mock->last.samples == 1);
     EXPECT(mock->last.cull == D3D12_CULL_MODE_NONE && mock->last.depth_func == D3D12_COMPARISON_FUNC_ALWAYS);
 
     MockDevice* old = new_device(false);
     void* old_device = proxy_over(old);
     EXPECT(call57(old_device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL && !out && old->stream_calls == 0);
+}
+
+// Slot 55 derives from a slot-57 pipeline: the stream slot 57 made is kept on it (#7759).
+void test_derive_from_slot57() {
+    fresh();
+    MockDevice* mock = new_device();
+    void* device = proxy_over(mock);
+    Desc d;
+    d.stage(0, kVs).stage(1, kPs);
+    void* base = nullptr;
+    EXPECT(call57(device, &d.desc, &kPipelineIid, &base) == S_OK && base == mock->last_pipeline);
+    std::vector<std::uint8_t> record(xs::kDerivedRecordSize, 0);
+    put32(record, 0, 3);  // tag 3: sample mask
+    put32(record, xs::kDerivedRecordPayload, 0x0f);
+    void* derived = nullptr;
+    using Fn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, const void*, const IID*, void**);
+    const auto fn = reinterpret_cast<Fn>((*static_cast<void***>(device))[55]);
+    EXPECT(static_cast<HRESULT>(static_cast<std::uint32_t>(fn(device, base, 1, record.data(), &kPipelineIid,
+                                                              &derived))) == S_OK);
+    EXPECT(derived && derived != base && mock->stream_calls == 2 && mock->graphics_calls == 0);
+    EXPECT(mock->last.sample_mask == 0x0f && mock->last.vs == kVsBytes && mock->last.ps == kPsBytes);
+    EXPECT(mock->last.names.size() == 2 && mock->last.names[1] == "TEXCOORD" && mock->last.rt_count == 2);
 }
 
 void test_unresolved() {
@@ -370,34 +439,34 @@ void test_unresolved() {
     void* out = reinterpret_cast<void*>(1);
     Desc unknown;
     unknown.stage(0, kVs).stage(1, kUnknown);
-    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == E_NOTIMPL && !out && mock->graphics_calls == 0);
+    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == E_NOTIMPL && !out && mock->stream_calls == 0);
     Desc lost;
     lost.stage(0, kVs).stage(1, kLost);
-    EXPECT(call57(device, &lost.desc, &kPipelineIid, &out) == E_NOTIMPL && !out && mock->graphics_calls == 0);
+    EXPECT(call57(device, &lost.desc, &kPipelineIid, &out) == E_NOTIMPL && !out && mock->stream_calls == 0);
     EXPECT(xs::native_pso_stats().refused == 2);
 
     // #7417's switch: the device gets a pipeline whose only stage is an FSSM blob no index names.
     SetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", L"1");
-    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == S_OK && out == &mock->pipeline);
-    EXPECT(mock->graphics_calls == 1 && mock->last.vs.size() == 16 && std::memcmp(mock->last.vs.data(), "FSSM", 4) == 0);
+    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == S_OK && out == mock->last_pipeline);
+    EXPECT(mock->stream_calls == 1 && mock->last.vs.size() == 16 && std::memcmp(mock->last.vs.data(), "FSSM", 4) == 0);
     EXPECT(mock->last.ps.empty() && mock->last.elements.empty() && mock->last.rt_count == 2);
     EXPECT(xs::native_pso_stats().stubbed == 1);
     // A device without #7417 refuses the stub: counted as refused, not stubbed.
     mock->result = E_INVALIDARG;
-    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == E_INVALIDARG && !out && mock->graphics_calls == 2);
+    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == E_INVALIDARG && !out && mock->stream_calls == 2);
     EXPECT(xs::native_pso_stats().stubbed == 1 && xs::native_pso_stats().refused == 3);
     mock->result = S_OK;
     SetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", L"0");
-    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->graphics_calls == 2);
+    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->stream_calls == 2);
 
     Desc good;
     good.stage(0, kVs).stage(1, kPs);
     for (const wchar_t* off : {L"0", L"off", L"FALSE", L"no"}) {
         SetEnvironmentVariableW(L"LEONIDA_NATIVE_PSO", off);
-        EXPECT(call57(device, &good.desc, &kPipelineIid, &out) == E_NOTIMPL && !out && mock->graphics_calls == 2);
+        EXPECT(call57(device, &good.desc, &kPipelineIid, &out) == E_NOTIMPL && !out && mock->stream_calls == 2);
     }
     SetEnvironmentVariableW(L"LEONIDA_NATIVE_PSO", L"1");
-    EXPECT(call57(device, &good.desc, &kPipelineIid, &out) == S_OK && mock->graphics_calls == 3);
+    EXPECT(call57(device, &good.desc, &kPipelineIid, &out) == S_OK && mock->stream_calls == 3);
 }
 
 void test_arguments_and_results() {
@@ -416,10 +485,10 @@ void test_arguments_and_results() {
     EXPECT(call57(device, &no_b.desc, &kPipelineIid, &out) == E_INVALIDARG);
     Desc half = d;
     half.desc.stages[0].records = {};
-    EXPECT(call57(device, &half.desc, &kPipelineIid, &out) == E_INVALIDARG && mock->graphics_calls == 0);
+    EXPECT(call57(device, &half.desc, &kPipelineIid, &out) == E_INVALIDARG && mock->stream_calls == 0);
 
     mock->result = E_INVALIDARG;
-    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_INVALIDARG && !out && mock->graphics_calls == 1);
+    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_INVALIDARG && !out && mock->stream_calls == 1);
     mock->result = S_OK;
     mock->odd_pointer = true;
     EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_FAIL && !out && g_odd_releases == 1);
@@ -437,14 +506,14 @@ void test_directory() {
     d.stage(0, kVs).stage(1, kPs);
     void* out = nullptr;
     SetEnvironmentVariableW(L"LEONIDA_SHADERS", g_spirv.c_str());
-    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->graphics_calls == 0);
+    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->stream_calls == 0);
 
     // A folder without native_hashes.txt, and an empty path: nothing resolves.
     for (const std::filesystem::path& dir : {g_root, std::filesystem::path()}) {
         fresh(false);
         g_provided = dir;
         xs::set_native_shader_directory_provider(&provided_dir);
-        EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->graphics_calls == 0);
+        EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->stream_calls == 0);
     }
 }
 
@@ -454,6 +523,7 @@ int main() {
     make_tree();
     test_vs_ps();
     test_mesh();
+    test_derive_from_slot57();
     test_unresolved();
     test_arguments_and_results();
     test_directory();

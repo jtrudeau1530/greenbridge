@@ -3682,8 +3682,15 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 57) {
         note_slot(57);
         log_xbox_route_once(57, "native graphics pipeline (desc, riid, out)", a1, a2, a3, a4, a5);
-        return hr_to_u64(create_native_graphics_pipeline(self->real, reinterpret_cast<const void*>(a1),
-                                                         reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+        // Through slot 86's stream path, which keeps the stream so slot 55 can derive from these pipelines.
+        const PipelineStreamCreator stream = [](void* proxy, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                                const IID* riid, void** out) {
+            auto* device = static_cast<DeviceProxy*>(proxy);
+            return device->slot_count <= 47 ? E_NOTIMPL : create_pso_from_stream(device, desc, riid, out);
+        };
+        return hr_to_u64(create_native_graphics_pipeline(stream, self, reinterpret_cast<const void*>(a1),
+                                                         reinterpret_cast<const IID*>(a2),
+                                                         reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 67) {
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),

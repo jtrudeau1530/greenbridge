@@ -210,7 +210,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     target_compile_definitions(xs_proxy_mock_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(xs_proxy_mock_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     # Device slot 57 (native graphics pipelines) over a mock device, with hand-built descriptions and files.
-    add_executable(xs_native_pso_test test/xs_native_pso_test.cpp shims/d3d12_xs_device.cpp)
+    add_executable(xs_native_pso_test test/xs_native_pso_test.cpp shims/d3d12_xs_device.cpp
+                                      shims/d3d12_xs_pso_stream.cpp)
     target_compile_definitions(xs_native_pso_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(xs_native_pso_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
   else()

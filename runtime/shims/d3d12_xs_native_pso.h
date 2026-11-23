@@ -2,9 +2,10 @@
 //
 // The handler reads the 0x108-byte description, finds each stage's source container through the HASH digest in its
 // records (<shaders>/native_hashes.txt, written by tools/native_pso_hashes.py), and creates the pipeline on the
-// device behind the proxy from the game's own containers, as a PC title would: CreateGraphicsPipelineState for
-// VS/PS/GS, ID3D12Device2::CreatePipelineState for MS/PS. Blob A (blend, raster, depth) is not decoded: blending
-// and culling are off and a depth target is written with ALWAYS.
+// device behind the proxy from the game's own containers, as a PC title would, as one pipeline state stream
+// (VS/GS/PS or MS/PS) through the proxy's slot-86 path, which keeps the stream so slot 55 can derive from the
+// pipeline. Blob A (blend, raster, depth) is not decoded: blending and culling are off and a depth target is
+// written with ALWAYS.
 //
 // Header-only, so every target that compiles d3d12_xs_device.cpp gets it without a build change.
 //
@@ -21,6 +22,7 @@
 
 #include <atomic>
 #include <climits>
+#include <cstring>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -36,6 +38,10 @@ namespace rt::d3d12_xs {
 // Where the translator's output is (<work>/shaders/spirv); asked once, on the first slot-57 call. The Vulkan device
 // sets it. Without one (a host D3D12 device, which cannot take console containers) every call is refused.
 using ShaderDirectoryProvider = std::filesystem::path (*)();
+
+// Creates a pipeline from a stream on the device behind the proxy (ID3D12Device2::CreatePipelineState).
+using PipelineStreamCreator = HRESULT (*)(void* context, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                          const IID* riid, void** out);
 
 struct NativePsoStats {
     std::uint64_t calls, created, stubbed, refused;
@@ -135,46 +141,57 @@ inline void fill_fixed_state(const np::FixedState& s, D3D12_GRAPHICS_PIPELINE_ST
     pc.SampleDesc.Count = s.sample_count;
 }
 
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE T, typename P>
-struct alignas(void*) Subobject {
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = T;
-    P value{};
+// A pipeline state stream: each subobject is a type word, then its payload at its own alignment, padded to 8 bytes
+// (d3dx12's alignas(void*) subobjects).
+class Stream {
+public:
+    template <typename P>
+    void add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const P& payload) {
+        const std::size_t at = size_;
+        const std::size_t offset = (at + sizeof(type) + alignof(P) - 1) & ~(alignof(P) - 1);
+        size_ = (offset + sizeof(P) + 7) & ~std::size_t(7);
+        words_.resize(size_ / 8);
+        auto* bytes = reinterpret_cast<unsigned char*>(words_.data());
+        std::memcpy(bytes + at, &type, sizeof(type));
+        std::memcpy(bytes + offset, &payload, sizeof(P));
+    }
+    D3D12_PIPELINE_STATE_STREAM_DESC desc() { return {size_, words_.data()}; }
+
+private:
+    std::vector<std::uint64_t> words_;
+    std::size_t size_ = 0;
 };
 
-struct MeshStream {
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rtvs;
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> dsv;
-    Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample;
-};
+// The stream of a graphics description; an MS stage makes a mesh pipeline (no input layout or topology).
+inline void build_stream(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc, D3D12_SHADER_BYTECODE ms, Stream& s) {
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, pc.pRootSignature);
+    const bool mesh = ms.pShaderBytecode != nullptr;
+    if (mesh) s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+    if (pc.VS.pShaderBytecode) s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, pc.VS);
+    if (pc.GS.pShaderBytecode) s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, pc.GS);
+    if (pc.PS.pShaderBytecode) s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, pc.PS);
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, pc.BlendState);
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, pc.SampleMask);
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, pc.RasterizerState);
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, pc.DepthStencilState);
+    if (!mesh) {
+        s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, pc.InputLayout);
+        s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, pc.PrimitiveTopologyType);
+    }
+    D3D12_RT_FORMAT_ARRAY rtvs{};
+    rtvs.NumRenderTargets = pc.NumRenderTargets;
+    for (unsigned i = 0; i < 8; ++i) rtvs.RTFormats[i] = pc.RTVFormats[i];
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, rtvs);
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, pc.DSVFormat);
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, pc.SampleDesc);
+}
 
-inline HRESULT create_mesh(ID3D12Device* real, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc,
+inline HRESULT create_from(PipelineStreamCreator create, void* context, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc,
                            D3D12_SHADER_BYTECODE ms, const IID& riid, void** out) {
-    ID3D12Device2* device2 = nullptr;
-    if (FAILED(real->QueryInterface(__uuidof(ID3D12Device2), reinterpret_cast<void**>(&device2))) || !device2)
-        return E_NOTIMPL;
-    MeshStream s;
-    s.root.value = pc.pRootSignature;
-    s.ms.value = ms;
-    s.ps.value = pc.PS;
-    s.blend.value = pc.BlendState;
-    s.sample_mask.value = pc.SampleMask;
-    s.raster.value = pc.RasterizerState;
-    s.depth.value = pc.DepthStencilState;
-    s.rtvs.value.NumRenderTargets = pc.NumRenderTargets;
-    for (unsigned i = 0; i < 8; ++i) s.rtvs.value.RTFormats[i] = pc.RTVFormats[i];
-    s.dsv.value = pc.DSVFormat;
-    s.sample.value = pc.SampleDesc;
-    const D3D12_PIPELINE_STATE_STREAM_DESC stream{sizeof(s), &s};
-    const HRESULT hr = device2->CreatePipelineState(&stream, riid, out);
-    device2->Release();
-    return hr;
+    Stream s;
+    build_stream(pc, ms, s);
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc = s.desc();
+    return create(context, &desc, &riid, out);
 }
 
 inline const char* status_name(np::PlanStatus s) {
@@ -213,8 +230,9 @@ inline HRESULT finish(HRESULT hr, void** out, std::uint64_t call, const char* wh
     return hr;
 }
 
-inline HRESULT unresolved(ID3D12Device* real, const np::GraphicsDesc& desc, const np::FixedState* state,
-                          const IID& riid, void** out, std::uint64_t call, const char* why, std::size_t block) {
+inline HRESULT unresolved(PipelineStreamCreator create, void* context, const np::GraphicsDesc& desc,
+                          const np::FixedState* state, const IID& riid, void** out, std::uint64_t call,
+                          const char* why, std::size_t block) {
     const bool stub = env_flag(L"LEONIDA_STUB_PIPELINES", false);
     static_assert(sizeof(kStubProgram) == 16);
     const std::uint64_t n = stub ? g_stub_asks.fetch_add(1) + 1 : g_refused.fetch_add(1) + 1;
@@ -227,7 +245,7 @@ inline HRESULT unresolved(ID3D12Device* real, const np::GraphicsDesc& desc, cons
     pc.pRootSignature = static_cast<ID3D12RootSignature*>(const_cast<void*>(desc.root_signature));
     fill_fixed_state(state ? *state : np::FixedState{}, pc);
     pc.VS = {kStubProgram, sizeof(kStubProgram)};
-    return finish(real->CreateGraphicsPipelineState(&pc, riid, out), out, call, "stub", g_stubbed);
+    return finish(create_from(create, context, pc, {}, riid, out), out, call, "stub", g_stubbed);
 }
 
 }  // namespace native_pso_detail
@@ -255,9 +273,9 @@ inline void reset_native_pso_state() {
     g_calls = g_created = g_stubbed = g_refused = g_stub_asks = 0;
 }
 
-// slot 57 (desc, riid, out) on the device behind the proxy.
-inline HRESULT create_native_graphics_pipeline(ID3D12Device* real, const void* desc_words, const IID* riid,
-                                               void** out) {
+// slot 57 (desc, riid, out); `create` makes the pipeline from its stream on the device behind the proxy.
+inline HRESULT create_native_graphics_pipeline(PipelineStreamCreator create, void* context, const void* desc_words,
+                                               const IID* riid, void** out) {
     using namespace native_pso_detail;
     const std::uint64_t call = g_calls.fetch_add(1) + 1;
     if (desc_words && !g_first_logged.exchange(true)) {
@@ -289,7 +307,7 @@ inline HRESULT create_native_graphics_pipeline(ID3D12Device* real, const void* d
         return E_INVALIDARG;
     }
     if (plan.status != np::PlanStatus::ok || !dir)
-        return unresolved(real, desc, &plan.state, *riid, out, call,
+        return unresolved(create, context, desc, &plan.state, *riid, out, call,
                           map ? status_name(plan.status) : "no native_hashes.txt", plan.failed_block);
 
     std::vector<std::uint8_t> code[np::kStageBlocks];
@@ -297,7 +315,8 @@ inline HRESULT create_native_graphics_pipeline(ID3D12Device* real, const void* d
     D3D12_SHADER_BYTECODE ms{};
     for (const np::PlannedStage& s : plan.stages) {
         if (!read_container(*dir, s.shader->path, code[s.block]))
-            return unresolved(real, desc, &plan.state, *riid, out, call, "container not readable", s.block);
+            return unresolved(create, context, desc, &plan.state, *riid, out, call, "container not readable",
+                              s.block);
         const D3D12_SHADER_BYTECODE bc{code[s.block].data(), code[s.block].size()};
         const std::string& stage = s.shader->stage;
         (stage == "vs" ? pc.VS : stage == "ps" ? pc.PS : stage == "gs" ? pc.GS : ms) = bc;
@@ -311,8 +330,7 @@ inline HRESULT create_native_graphics_pipeline(ID3D12Device* real, const void* d
                             e.step_rate});
     pc.InputLayout = {elements.data(), static_cast<UINT>(elements.size())};
 
-    const HRESULT hr = plan.mesh ? create_mesh(real, pc, ms, *riid, out)
-                                 : real->CreateGraphicsPipelineState(&pc, *riid, out);
+    const HRESULT hr = create_from(create, context, pc, ms, *riid, out);
     return finish(hr, out, call, plan.stages.front().shader->path.c_str(), g_created);
 }
 

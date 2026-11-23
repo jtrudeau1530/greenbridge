@@ -4143,6 +4143,7 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
+        const rt::host_stall::Scope compiling;  // host-only time a guest Sleep sits out, as for compute (slot 57)
         if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
                                                           &info, nullptr, &pipeline) != VK_SUCCESS)
             return VK_NULL_HANDLE;
