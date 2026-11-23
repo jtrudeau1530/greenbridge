@@ -482,8 +482,7 @@ std::filesystem::path persistent_storage_dir() {
     return ec ? std::filesystem::path{} : dir;
 }
 
-std::string utf8_of(const std::filesystem::path& path) {
-    const std::wstring& wide = path.native();
+std::string utf8_of(const std::wstring& wide) {
     const int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
     if (n <= 0) return {};
     std::string utf8(static_cast<size_t>(n), '\0');
@@ -507,7 +506,7 @@ uint64_t folder_bytes(const std::filesystem::path& dir) {
 HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
     if (!path_size) return E_POINTER;
     *path_size = 0;
-    const std::string path = utf8_of(persistent_storage_dir());
+    const std::string path = utf8_of(persistent_storage_dir().native());
     if (path.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     *path_size = path.size() + 1;  // with the terminating NUL
     return S_OK;
@@ -516,7 +515,7 @@ HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
 HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size_t* path_used) {
     if (path_used) *path_used = 0;
     if (!path) return E_POINTER;
-    const std::string folder = utf8_of(persistent_storage_dir());
+    const std::string folder = utf8_of(persistent_storage_dir().native());
     if (folder.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     if (path_size < folder.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     std::memcpy(path, folder.c_str(), folder.size() + 1);
@@ -875,16 +874,19 @@ static std::string resolve_package_path(const char* packageIdentifier, HRESULT& 
     }
 
     // Check optional installed content packages mapping: "id1=path1;id2=path2"
-    DWORD capacity = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr, 0);
-    std::string mapping;
+    DWORD capacity = GetEnvironmentVariableW(L"LEONIDA_CONTENT_PACKAGES", nullptr, 0);
+    std::wstring wide_mapping;
     DWORD map_len = 0;
     while (capacity > 0) {
-        mapping.resize(capacity);
-        map_len = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping.data(), capacity);
+        wide_mapping.resize(capacity);
+        map_len = GetEnvironmentVariableW(L"LEONIDA_CONTENT_PACKAGES", wide_mapping.data(), capacity);
         if (map_len < capacity) break;
         capacity = map_len;
     }
     if (map_len > 0 && map_len < capacity) {
+        // The GDK returns UTF-8 bytes even when Windows uses a legacy ANSI code page.
+        wide_mapping.resize(map_len);
+        std::string mapping = utf8_of(wide_mapping);
         char* token = mapping.data();
         while (token && *token) {
             char* sep = std::strchr(token, ';');
