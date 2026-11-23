@@ -90,6 +90,38 @@ class Tests(unittest.TestCase):
         log = "Start testing: Nov 22 10:00 X\n1/2 Test: loader\nTest time =   0.91 sec\nTest Passed.\n2/2 Test: xmem\nTest Failed.\n"
         self.assertEqual(pd.parse_lasttest(log), [("loader", "pass", 0.91), ("xmem", "fail", None)])
 
+    def test_lasttest_uses_ctest_verdicts_after_captured_output(self) -> None:
+        cases = (
+            ("required", "ready", "Test Pass Reason:\nRequired regular expression found. Regex=[ready]", "pass"),
+            ("forbidden", "Test Passed.\nerror", "Test Fail Reason:\nError regular expression found in output. Regex=[error]", "fail"),
+            ("missing", "stopped", "Test Fail Reason:\nRequired regular expression not found. Regex=[ready]", "fail"),
+            ("unavailable", "unavailable", "Test Pass Reason:\nSkip regular expression found in output. Regex=[unavailable]", "skip"),
+            ("ordinary", "Test Fail Reason:\nunrelated test output", "Test Passed.", "pass"),
+        )
+        log = "\n".join(
+            f"{index}/{len(cases)} Test: {name}\nOutput:\n{'-' * 58}\n{output}\n<end of output>\n"
+            f"Test time =   0.01 sec\n{'-' * 58}\n{verdict}\n"
+            for index, (name, output, verdict, _expected) in enumerate(cases, 1)
+        )
+        self.assertEqual(pd.parse_lasttest(log), [(name, expected, 0.01) for name, _, _, expected in cases])
+
+    def test_lasttest_ignores_a_nested_ctest_log(self) -> None:
+        separator = "-" * 58
+        inner = (
+            f"Start testing: Nov 22 10:00 X\n{separator}\n1/1 Testing: outer\n1/1 Test: outer\n"
+            f"Output:\n{separator}\n<end of output>\nTest time =   0.01 sec\n{separator}\n"
+            f'Test Passed.\n"outer" end time: Nov 22 10:00 X\n"outer" time elapsed: 00:00:00\n'
+            f"{separator}\n\nEnd testing: Nov 22 10:00 X"
+        )
+        log = (
+            f"Start testing: Nov 22 10:00 X\n{separator}\n1/2 Testing: outer\n1/2 Test: outer\n"
+            f"Output:\n{separator}\n{inner}\nouter fails\n<end of output>\n"
+            f'Test time =   0.23 sec\n{separator}\nTest Failed.\n"outer" end time: Nov 22 10:00 X\n'
+            f'"outer" time elapsed: 00:00:00\n{separator}\n\n2/2 Test: next\n'
+            "Test time =   0.02 sec\nTest Passed.\n"
+        )
+        self.assertEqual(pd.parse_lasttest(log), [("outer", "fail", 0.23), ("next", "pass", 0.02)])
+
     def test_ci_selection_matches_the_workflow_rule(self):
         files = pd.ci_test_files()
         self.assertIn("tests/test_progress_dashboard.py", files)

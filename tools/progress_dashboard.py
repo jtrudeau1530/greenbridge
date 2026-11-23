@@ -375,22 +375,48 @@ def parse_junit(text):
     return out
 
 
-def parse_lasttest(text):
+def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
     """[(name, result, seconds)] from CTest's Testing/Temporary/LastTest.log."""
     out, name, secs = [], None, None
-    for line in text.splitlines():
+    captured = False
+    nested_runs = 0
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if captured:
+            # CTest writes child output verbatim, so it can contain complete nested logs.
+            if line.startswith("Start testing: ") and next_line == "-" * 58:
+                nested_runs += 1
+            elif nested_runs and line.startswith("End testing: "):
+                nested_runs -= 1
+            elif not nested_runs and line == "<end of output>" and next_line.startswith("Test time ="):
+                captured = False
+            continue
         m = re.match(r"^\d+/\d+ Test: (.+)$", line)
         if m:
             name, secs = m.group(1).strip(), None
+            continue
+        if not name:
+            continue
+        if line == "Output:":
+            captured = True
             continue
         m = re.match(r"^Test time =\s*([\d.]+) sec", line)
         if m:
             secs = float(m.group(1))
             continue
-        if name and line.startswith(("Test Passed", "Test Failed", "Test Not Run")):
-            res = "pass" if "Passed" in line else ("fail" if "Failed" in line else "skip")
-            out.append((name, res, secs))
-            name = None
+        if line.startswith("Test Passed"):
+            res = "pass"
+        elif line == "Test Pass Reason:" and next_line:
+            res = "skip" if next_line.startswith("Skip regular expression found in output.") else "pass"
+        elif line.startswith("Test Failed") or line == "Test Fail Reason:":
+            res = "fail"
+        elif line.startswith("Test Not Run"):
+            res = "skip"
+        else:
+            continue
+        out.append((name, res, secs))
+        name = None
     return out
 
 
