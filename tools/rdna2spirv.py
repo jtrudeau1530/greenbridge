@@ -218,6 +218,9 @@ class Gen:
         self.stage = stage
         self.body = []
         self.consts = {}
+        # tof/tou results -> the id they were bitcast from. A bitcast of a bitcast gives the original id back: wherever
+        # the key is valid its source is too (the key's own definition uses it), so no dominance is lost.
+        self.bitcast_from = {}
         self.n = 0
         self.outputs = {}
         self.inputs = {}
@@ -1113,15 +1116,20 @@ class Gen:
         return r
 
     def tof(self, u):
+        if u in self.bitcast_from:
+            return self.bitcast_from[u]
         f = self.tmp()
         self.emit(f"{f} = OpBitcast %float {u}")
+        self.bitcast_from[f] = u
         return f
 
     def tou(self, f):
+        if f in self.bitcast_from:
+            return self.bitcast_from[f]
         u = self.tmp()
         self.emit(f"{u} = OpBitcast %uint {f}")
+        self.bitcast_from[u] = f
         return u
-
     def src_f(self, a):
         return self.tof(self.src_u(a))
 
