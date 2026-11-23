@@ -890,6 +890,11 @@ int main(int argc, char** argv) {
                       rt::d3d12_xs::is_queue_proxy(queue.Get()) &&
                       rt::d3d12_xs::queue_proxy_real_queue(queue.Get()) == real_queue,
                   "queue slot 18 console form matches real queue GetDesc");
+            // Pin the older layout first (#2490): an undetected queue answers PC-order slot 18 as the newer
+            // layout's frequency getter; PC-order GetDesc there is the older layout's.
+            UINT64 frequency = 0;
+            check(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency != 0,
+                  "queue slot 16 PC GetTimestampFrequency pins the older layout");
             const D3D12_COMMAND_QUEUE_DESC pc_queue_desc = queue->GetDesc();
             check(real_queue && std::memcmp(&pc_queue_desc, &want, sizeof(want)) == 0 &&
                       rt::d3d12_xs::queue_slot_hits(18) == qhits_before + 2,
