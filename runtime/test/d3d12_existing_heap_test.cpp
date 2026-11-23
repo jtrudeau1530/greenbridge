@@ -85,10 +85,16 @@ std::vector<Case> open_cases(ID3D12Device* device) {
     run("64 KiB reserved only", reserved);
     void* readonly = VirtualAlloc(nullptr, k64, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY);
     run("64 KiB committed read-only", readonly);
+    // The console title's graphics regions keep PAGE_WRITECOMBINE (or PAGE_NOCACHE) once XMemVirtualAlloc drops
+    // the PAGE_GRAPHICS_* bits.
+    void* combined = VirtualAlloc(nullptr, k64, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE);
+    run("64 KiB committed read-write write-combined", combined);
+    void* uncached = VirtualAlloc(nullptr, k64, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_NOCACHE);
+    run("64 KiB committed read-write uncached", uncached);
     void* big = VirtualAlloc(nullptr, 32 * k64, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     run("2 MiB committed", big);
     // The heap keeps no hold on the memory the test frees here; every heap above is already released.
-    for (void* p : {whole, static_cast<void*>(partial), reserved, readonly, big}) VirtualFree(p, 0, MEM_RELEASE);
+    for (void* p : {whole, static_cast<void*>(partial), reserved, readonly, combined, uncached, big}) VirtualFree(p, 0, MEM_RELEASE);
     return out;
 }
 

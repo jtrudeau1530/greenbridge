@@ -6421,8 +6421,9 @@ public:
     //
     // OpenExistingHeapFromAddress answers as the host runtime does on an RTX 4090 and WARP (d3d12_existing_heap_test
     // open_cases): the address must be the base of a VirtualAlloc allocation that is committed read-write over its
-    // whole size; an address inside it, a partly committed or reserved-only allocation and a read-only one are
-    // E_INVALIDARG. The heap is the allocation's size, 64 KiB aligned, CUSTOM / WRITE_BACK / L0, flags SHARED |
+    // whole size; an address inside it, a partly committed or reserved-only allocation, a read-only one and an
+    // uncached one are E_INVALIDARG. The heap is the allocation's size, 64 KiB aligned, CUSTOM / L0 with WRITE_BACK
+    // (WRITE_COMBINE for a PAGE_WRITECOMBINE range), flags SHARED |
     // SHARED_CROSS_ADAPTER | ALLOW_SHADER_ATOMICS. Its backing is that memory itself, imported with
     // VK_EXT_external_memory_host, so the GPU sees the caller's writes. Without the extension, or when the range is
     // not aligned to minImportedHostPointerAlignment or no memory type takes it, the call stays E_NOTIMPL, and
@@ -6433,7 +6434,8 @@ public:
         if (out) *out = nullptr;
         if (!address || !out) return d3d12_trace::result(method, E_INVALIDARG);
         SIZE_T size = 0;
-        if (!existing_allocation_size(address, size)) return d3d12_trace::result(method, E_INVALIDARG);
+        DWORD protect = 0;
+        if (!existing_allocation_size(address, size, protect)) return d3d12_trace::result(method, E_INVALIDARG);
         if (!state_.get_host_pointer_properties) {
             log_once("OpenExistingHeapFromAddress (no VK_EXT_external_memory_host; existing heaps are not supported)", 0);
             return d3d12_trace::result(method, E_NOTIMPL);
@@ -6485,7 +6487,8 @@ public:
         D3D12_HEAP_DESC desc{};
         desc.SizeInBytes = size;
         desc.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
-        desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        desc.Properties.CPUPageProperty = (protect & PAGE_WRITECOMBINE) ? D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE
+                                                                        : D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
         desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
         desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         desc.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER |
@@ -6495,16 +6498,19 @@ public:
         return d3d12_trace::result(method, hand_out(heap, riid, out));
     }
 
-    // The size of the VirtualAlloc allocation `address` starts, when the whole of it is committed read-write: what
-    // the host runtime accepts. False for an address inside an allocation, a reserved or free page, or another
-    // protection anywhere in it.
-    static bool existing_allocation_size(const void* address, SIZE_T& size) {
+    // The size of the VirtualAlloc allocation `address` starts, and its protection, when the whole of it is committed
+    // PAGE_READWRITE, or PAGE_READWRITE | PAGE_WRITECOMBINE: what the host runtime accepts (a write-combined range
+    // opens as a WRITE_COMBINE heap). False for an address inside an allocation, a reserved or free page, another
+    // protection (read-only, PAGE_NOCACHE), or two protections in one allocation.
+    static bool existing_allocation_size(const void* address, SIZE_T& size, DWORD& protect) {
         MEMORY_BASIC_INFORMATION region{};
         if (!VirtualQuery(address, &region, sizeof(region)) || region.AllocationBase != address) return false;
+        protect = region.Protect;
+        if (protect != PAGE_READWRITE && protect != (PAGE_READWRITE | PAGE_WRITECOMBINE)) return false;
         size = 0;
         const char* at = static_cast<const char*>(address);
         while (VirtualQuery(at + size, &region, sizeof(region)) && region.AllocationBase == address) {
-            if (region.State != MEM_COMMIT || region.Protect != PAGE_READWRITE) return false;
+            if (region.State != MEM_COMMIT || region.Protect != protect) return false;
             size += region.RegionSize;
         }
         return size != 0;
