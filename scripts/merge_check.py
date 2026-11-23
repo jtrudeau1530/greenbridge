@@ -105,14 +105,19 @@ def duplicates(repo, main, tree, min_length, block=3):
     legitimately."""
     found = {}
     hunks, path, added = {}, None, None
+    new_file = False
+    # Gitlink updates describe submodule commits and have no file text to compare.
     patch = git(repo, "-c", "core.quotePath=true", "diff", "--unified=0", "--no-color", "--no-renames",
                 "--src-prefix=a/", "--dst-prefix=b/", "--no-relative", "--no-ext-diff", "--no-textconv",
-                main, tree).stdout
+                "--ignore-submodules=all", main, tree).stdout
     for line in patch.split("\n"):
         if line.startswith("diff --git "):
             path, added = None, None
+            new_file = False
+        elif added is None and line == "--- /dev/null":
+            new_file = True
         elif added is None and line.startswith("+++ "):
-            path = patch_destination(line)
+            path = None if new_file else patch_destination(line)
         elif line.startswith("@@ ") and path:
             added = []
             hunks.setdefault(path, []).append(added)
@@ -121,15 +126,13 @@ def duplicates(repo, main, tree, min_length, block=3):
             if text:
                 added.append(text)
     def windows(rev, path):
-        r = git(repo, "show", f"{rev}:{path}", check=False)
-        lines = [l.strip() for l in r.stdout.split("\n") if l.strip()] if r.returncode == 0 else []
-        return r.returncode == 0, Counter(tuple(lines[i:i + block]) for i in range(len(lines) - block + 1))
+        out = git(repo, "show", f"{rev}:{path}").stdout
+        lines = [l.strip() for l in out.split("\n") if l.strip()]
+        return Counter(tuple(lines[i:i + block]) for i in range(len(lines) - block + 1))
 
     for path, groups in hunks.items():
-        exists, before = windows(main, path)
-        if not exists:
-            continue  # a new file: nothing to duplicate
-        _, after = windows(tree, path)
+        before = windows(main, path)
+        after = windows(tree, path)
         same = []
         for added in groups:
             marked = [False] * len(added)
