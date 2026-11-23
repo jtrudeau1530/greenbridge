@@ -799,8 +799,12 @@ def main(argv=None):
         return 2
     text = json.dumps(summary, indent=1, sort_keys=True)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text + "\n")
+        try:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 2
     else:
         sys.stdout.write(text + "\n")
     return 0
