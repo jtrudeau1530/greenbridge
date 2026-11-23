@@ -26,8 +26,6 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 
 - **Su propia copia** del paquete de Xbox Series, versión `1.0.2.1`: la carpeta que contiene `MicrosoftGame.Config`
   y los archivos `.rpf`, como ficheros legibles en el disco.
-- **Windows 10/11 x64**, con unos **350 GB libres** para una compilación completa. Los archivos de trabajo pueden
-  ir a otra unidad con `--work`; más abajo se explica cómo omitir la exportación de recursos y usar unos 30 GB.
 - **Windows 10/11 x64**, con unos **400 GB libres** para los archivos de trabajo. Pueden ir a otra unidad con
   `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (marque «Add python.exe to PATH» durante la instalación).
@@ -56,14 +54,12 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 - [ffmpeg](https://ffmpeg.org/download.html) en el `PATH` *(opcional: decodifica los flujos XMA2 y es obligatorio
   con `--wav`)*.
 
-**Poco espacio en disco:** los ~350 GB son para la compilación completa. Para *ejecutar* el port,
-`--stages check,shaders,runtime` necesita unos 30 GB; la etapa `assets` (~300 GB) solo es para las herramientas de
+**Poco espacio en disco:** los ~400 GB son para la compilación completa. Para *ejecutar* el port,
+`--stages check,shaders,runtime` necesita unos 30 GB; la etapa `assets` (~370 GB) solo es para las herramientas de
 recursos, y `--wav` añade varias veces el tamaño del Ogg Opus (la comprobación previa muestra esta elección cuando
 la etapa `assets` es la que no cabe). `--work` y `--out` pueden estar en otra unidad. El runtime asigna el paquete
 en su lugar, por lo que una unidad de solo lectura requiere `gta6rt --overlay <carpeta escribible>`; `--overlay`
-es una opción de `gta6rt`, no de `make_game.py`. Deje los archivos `.s` en `work/shaders/dxbc/disasm` donde están:
-borrarlos, junto con `work/shaders/spirv/index.json`, puede dejar la etapa de shaders aparentemente terminada con
-cero shaders. Una carpeta `disasm` que sea un enlace simbólico se rechaza cuando la etapa tiene que vaciarla.
+El runtime asigna el paquete en su lugar, por lo que una unidad de solo lectura requiere `gta6rt --overlay <carpeta escribible>`; `--overlay` es una opción de `gta6rt`, no de `make_game.py`. Deje los archivos `.s` en `work/shaders/dxbc/disasm` donde están: la siguiente ejecución los compara con la lista de `disasm.done` y vuelve a desensamblar los que faltan (todos los de una carpeta cuyo `disasm.done` sea anterior a esa lista) y después traduce todos los shaders de nuevo. Una carpeta `disasm` que sea un enlace simbólico se rechaza cuando la etapa tiene que vaciarla.
 
 ## Compilar
 
@@ -85,8 +81,8 @@ empezar comprueba los requisitos y el espacio libre, y enumera de una vez todo l
 
 ### Si dispone de poco espacio
 
-Los 350 GB corresponden a la compilación completa. Puede omitir la exportación de recursos con
-`--stages check,shaders,runtime`, que necesita unos **30 GB**. La etapa `assets` (unos 300 GB) sirve para las
+Los 400 GB corresponden a la compilación completa. Puede omitir la exportación de recursos con
+`--stages check,shaders,runtime`, que necesita unos **30 GB**. La etapa `assets` (unos 370 GB) sirve para las
 herramientas de recursos; `--wav` añade varias veces el tamaño de los archivos Ogg Opus. La comprobación previa
 ofrece la alternativa sin `assets` cuando esa etapa no cabe. Puede situar tanto `--work` como `--out` en otra
 unidad.
