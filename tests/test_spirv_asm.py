@@ -80,6 +80,44 @@ class SpirvAsmUnitTests(unittest.TestCase):
                 words = _literal_words(f.read(), 7, 1)
             self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], literal)
 
+    def test_instruction_boundaries_follow_tokens_across_physical_lines(self):
+        canonical = (
+            "OpCapability Shader\n"
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            '%file = OpString "OpNop ; = %id"\n'
+            "%int = OpTypeInt 32 1\n"
+            "%pair = OpTypeStruct %int %int\n"
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%main = OpFunction %void None %fn\n"
+            "%entry = OpLabel\n"
+            "OpNop\nOpReturn\nOpFunctionEnd\n"
+        )
+        mixed = (
+            "OpCapability Shader OpMemoryModel\r\nLogical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main" OpExecutionMode %main LocalSize 1 1 1\n'
+            '%file = OpString "OpNop ; = %id" %int\r=\nOpTypeInt 32 ; signedness follows\n1 '
+            "%pair = OpTypeStruct %int\n%int\n"
+            "%void = OpTypeVoid %fn = OpTypeFunction %void\n"
+            "%main = OpFunction %void None\n%fn %entry = OpLabel\n"
+            "OpNop OpReturn OpFunctionEnd\n"
+        )
+        assembled = spirv_asm.assemble(mixed)
+        self.assertEqual(assembled, spirv_asm.assemble(canonical))
+        _validate(assembled)
+
+    def test_result_id_starts_instruction_on_its_physical_line(self):
+        text = '%str = OpString "first\r\nlast" %x\r=\nOpNotReal\n'
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 2: unknown opcode"):
+            spirv_asm.assemble(text)
+
+    def test_later_unterminated_literal_reports_its_physical_line(self):
+        text = '%str = OpString "first\rlast" %bad = OpString "unterminated'
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 2: unterminated string"):
+            spirv_asm.assemble(text)
+
     def test_reject_repeated_type_result_ids(self):
         declarations = (
             ("OpTypeInt 32 0", "OpTypeFloat 32"),

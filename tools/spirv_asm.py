@@ -81,6 +81,10 @@ _ASSEMBLY_TOKEN = re.compile(_QUOTED_OR_COMMENT)
 _ASSEMBLY_PART = re.compile(_QUOTED_OR_COMMENT + r'|(\r\n?|\n)')
 
 
+def _line_break_count(text: str) -> int:
+    return text.count("\r") + text.count("\n") - text.count("\r\n")
+
+
 def _instruction_lines(text):
     # Most modules have only single-line operands. Keep their bulk split on the fast path.
     if not any("\r" in part[0] or "\n" in part[0] for part in _ASSEMBLY_TOKEN.finditer(text)):
@@ -95,7 +99,7 @@ def _multiline_instructions(text):
     for part in _ASSEMBLY_PART.finditer(text):
         if part[1] is None:
             token = part[0]
-            physical_line += token.count("\r") + token.count("\n") - token.count("\r\n")
+            physical_line += _line_break_count(token)
             continue
         yield instruction_line, text[start:part.start()]
         physical_line += 1
@@ -138,7 +142,9 @@ def _tokenize_line(line: str, lineno: int) -> list[str]:
                     j += 1
             else:
                 raise SpirvAsmError(f"line {lineno}: unterminated string literal")
-            tokens.append("".join(out))
+            token = "".join(out)
+            tokens.append(token)
+            lineno += _line_break_count(token)
             i = j
             continue
         j = i + 1
@@ -147,6 +153,32 @@ def _tokenize_line(line: str, lineno: int) -> list[str]:
         tokens.append(line[i:j])
         i = j
     return tokens
+
+
+def _instruction_tokens(text: str):
+    """Yield one token list per instruction, with its physical starting line."""
+    tokens = []
+    start_line = previous_line = 1
+    for line, raw_line in _instruction_lines(text):
+        for token in _tokenize_line(raw_line, line):
+            if token == "=" and len(tokens) > 1 and tokens[-1].startswith("%"):
+                # The ID before '=' begins the next instruction, even across a newline.
+                result_id = tokens.pop()
+                yield start_line, tokens
+                start_line, tokens = previous_line, [result_id]
+            elif (tokens and tokens[-1] != "=" and token.startswith("Op")
+                  and len(token) > 2 and "A" <= token[2] <= "Z"):
+                # Opcodes are distinct from bare operand spellings, %IDs and quoted strings.
+                yield start_line, tokens
+                tokens = []
+            if not tokens:
+                start_line = line
+            tokens.append(token)
+            previous_line = line
+            if token.startswith('"'):
+                line += _line_break_count(token)
+    if tokens:
+        yield start_line, tokens
 
 
 def _unquote_string(tok: str, lineno: int) -> str:
@@ -299,13 +331,23 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
     if version is None:
         raise SpirvAsmError(f"unsupported target environment: {target_env!r}")
 
+    # A successful line-by-line parse consists of complete instructions. Try this first
+    # for generated shaders, where the more expensive token grouping is rarely needed.
+    track_switch_types = "OpSwitch" in text
+    lines = ((lineno, _tokenize_line(raw, lineno)) for lineno, raw in _instruction_lines(text))
+    try:
+        return _assemble(lines, version, track_switch_types)
+    except SpirvAsmError:
+        pass
+    return _assemble(_instruction_tokens(text), version, track_switch_types)
+
+
+def _assemble(instructions, version: int, track_switch_types: bool) -> bytes:
     sym_to_id: dict[str, int] = {}
     next_id = 1
     defined_types: set[str] = set()
     type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width)
     id_to_type: dict[int, int] = {}        # result_id -> result_type_id
-    # Only OpSwitch needs a value's result type, to choose the case literal width.
-    track_switch_types = "OpSwitch" in text
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
 
     def get_id(tok: str, lineno: int) -> int:
@@ -446,8 +488,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
         raise SpirvAsmError(f"line {lineno}: unsupported operand kind {kind!r}")
 
-    for lineno, raw_line in _instruction_lines(text):
-        toks = _tokenize_line(raw_line, lineno)
+    for lineno, toks in instructions:
         if not toks:
             continue
         res_tok = None
