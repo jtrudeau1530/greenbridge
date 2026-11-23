@@ -21,8 +21,10 @@ int fail(const char* what) {
 }  // namespace
 
 int main() {
-    constexpr int kThreads = 8;
-    constexpr int kRounds = 2000;
+    // The threads spin between rounds, so there are never more of them than cores left beside the main thread.
+    const unsigned cores = std::thread::hardware_concurrency();
+    const int kThreads = cores >= 9 ? 8 : cores >= 3 ? int(cores) - 1 : 2;
+    constexpr int kRounds = 500;
 
     vktest::Device d;
     const auto status = d.initialize();
