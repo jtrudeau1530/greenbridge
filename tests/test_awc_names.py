@@ -232,14 +232,14 @@ class TestCli(unittest.TestCase):
             banks = os.path.join(tmp, "banks")
             os.mkdir(banks)
             write(os.path.join(banks, "one.awc"), make_bank(["zz_rootau_abcd_01", "zz_rootau_abcd_02"],
-                                                            extra_ids=[12345]))
+                                                            extra_ids=[12345, 12345]))
             conv = write(os.path.join(tmp, "c.pso"),
                          b"ZZ_ROOTAU_ABCD\x00ZZ_A\x00ZZ_ROOTAU_ABCD\x00ZZ_B\x00")
             words = write(os.path.join(tmp, "words.txt"), "unrelated\nother_word\n")
             out = os.path.join(tmp, "names.csv")
             with contextlib.redirect_stdout(io.StringIO()) as log:
                 self.assertEqual(A.main([banks, "--words", words, "--conversations", conv, "--out", out]), 0)
-            self.assertIn("2 named", log.getvalue())
+            self.assertIn("3 distinct bank/ID pairs, 2 named", log.getvalue())
             with open(out, encoding="utf-8", newline="") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual([(r["bank"], r["name"], r["rule"]) for r in rows],

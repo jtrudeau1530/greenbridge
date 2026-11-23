@@ -392,7 +392,7 @@ def main(argv=None) -> int:
         for (b, i), (name, rule, _k) in sorted(found.items()):
             rows.append({"source": label, "bank": index.labels[b], "stream_id": f"{i:08x}", "name": name,
                          "rule": rule})
-        print(f"{label}: {stats['banks']} banks, {stats['streams']} streams, {stats['named']} named "
+        print(f"{label}: {stats['banks']} banks, {stats['streams']} distinct bank/ID pairs, {stats['named']} named "
               f"({stats['dialogue']} dialogue, {stats['family']} family, family size >= {stats['family_min_size']}); "
               f"control {stats['control_dialogue']} dialogue, {stats['control_family']} family", flush=True)
     if a.out:
