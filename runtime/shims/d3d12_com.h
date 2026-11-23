@@ -377,6 +377,9 @@ struct RootArgumentLayout {
         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
+        // A table: the CBV/SRV/UAV slots its ranges declare (an unbounded range counts as 1024), for the scan of
+        // title-written V#s before a submission (src/title_va_alias.h). 0: a sampler table, or not a table.
+        std::uint32_t table_descriptors = 0;
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob

@@ -37,8 +37,21 @@ Words at(uvec2 va) {
 
 void main() {
     const uint i = gl_GlobalInvocationID.x;
-    Words table = at(uvec2(pc.s[8], 0u));
     Words result = at(uvec2(pc.s[6], pc.s[7]));
+    if (pc.s[5] == 0xFFFFFFFEu) {
+        // Root view read mode (d3d12_title_va_test): read through the root UAV itself, 256 bytes past its base, and
+        // write at the base, so the root view's address is both read and written.
+        result.w[i] = result.w[64u + i] + pc.s[4];
+        return;
+    }
+    Words table = at(uvec2(pc.s[8], 0u));
+    if (pc.s[5] == 0xFFFFFFFDu) {
+        // Root view read to a table pointer (d3d12_title_va_test): read through the root view, 256 bytes past its
+        // base, and write where the table entry's raw 64-bit VA points.
+        Words target = at(uvec2(table.w[0], table.w[1]));
+        target.w[i] = result.w[64u + i] + pc.s[4];
+        return;
+    }
     if (pc.s[5] == 0u) {
         // CBV V# mode: table holds a 16-byte GFX10 raw buffer descriptor written by CreateConstantBufferView.
         const uint num_records = table.w[2];

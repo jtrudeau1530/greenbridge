@@ -6,13 +6,16 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/title_va_alias.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <cstdio>
@@ -219,6 +222,8 @@ public:
     }
 
     const leonida::CommandList& commands() const { return list_; }
+    // The descriptor tables this recording binds (console VAs), for the scan before a submission.
+    const std::vector<std::pair<std::uint64_t, std::uint32_t>>& tables() const { return tables_; }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
     const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
@@ -255,6 +260,7 @@ public:
         record_into(command_allocator);
         invalid_ = false;
         calls_.clear();
+        tables_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
@@ -1200,6 +1206,13 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
+        // A root view into the title's own memory (a slot-133 buffer, a constant ring) gets the console VA of a GPU
+        // copy of it, so the shader's heap_base + VA reaches it (src/title_va_alias.h). A descriptor table is in one
+        // of the layer's heaps: kept, and its buffer V#s are rewritten the same way before each submission.
+        if (type == rt::rootsig::ParamType::Descriptor)
+            va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view);
+        else if (va && p->table_descriptors && (tables_.empty() || tables_.back().first != va))
+            tables_.push_back({va, p->table_descriptors});
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
@@ -1224,6 +1237,10 @@ private:
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
+    // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
+    // The span a root view may read: D3D12's largest constant buffer (4096 x 16 bytes).
+    static constexpr std::uint64_t kRootViewBytes = 65536;
     leonida::Viewport viewport_{};
     leonida::Rect scissor_{};
     std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets_{};
@@ -1338,13 +1355,16 @@ private:
 
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
         if (count) draw_views_stale_ = true;
-        for (UINT i = 0; i < count; ++i)
+        for (UINT i = 0; i < count; ++i) {
+            if (views) leonida::title_va_aliases().note(views[i].BufferLocation, leonida::TitleVaAliases::vertex_view);
             vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
                                                                           views[i].StrideInBytes}
                                                : leonida::VertexBufferView{};
+        }
     }
 
     void set_index_buffer(const D3D12_INDEX_BUFFER_VIEW* view) {
+        if (view) leonida::title_va_aliases().note(view->BufferLocation, leonida::TitleVaAliases::index_view);
         index_ = view ? leonida::IndexBufferView{view->BufferLocation, view->SizeInBytes, u(view->Format)}
                       : leonida::IndexBufferView{};
     }
@@ -1594,6 +1614,21 @@ public:
             }
             recorded.push_back(&list->commands());
             graphics.push_back(list);
+        }
+        // Buffer V#s the title wrote into a bound table itself may name its own memory: rewritten to a GPU copy's
+        // console VA before the copies are refreshed for this submission (src/title_va_alias.h).
+        {
+            std::map<std::uint64_t, std::uint32_t> tables;  // each table once, with the most slots it was bound with
+            for (const GraphicsCommandList* list : graphics)
+                for (const auto& [table, descriptors] : list->tables())
+                    tables[table] = std::max(tables[table], descriptors);
+            if (!tables.empty()) {
+                const auto start = std::chrono::steady_clock::now();
+                for (const auto& [table, descriptors] : tables) leonida::title_va_aliases().scan_table(table, descriptors);
+                leonida::title_va_aliases().note_scan(std::uint64_t(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                        .count()));
+            }
         }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
