@@ -185,19 +185,27 @@ struct PlaceholderApi {
     bool available() const { return virtual_alloc2 && map_view3 && unmap_view2; }
 };
 
-const PlaceholderApi& placeholder_api() {
-    static const PlaceholderApi api = [] {
-        PlaceholderApi resolved;
-        if (const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll")) {
-            resolved.virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2"));
-            resolved.map_view3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelbase, "MapViewOfFile3"));
-            resolved.unmap_view2 =
-                reinterpret_cast<UnmapViewOfFile2Fn>(GetProcAddress(kernelbase, "UnmapViewOfFile2"));
-        }
-        return resolved;
-    }();
-    return api;
+PlaceholderApi resolve_placeholder_api() {
+    PlaceholderApi resolved;
+    // kernel32 forwards these, but a host may have kernelbase unloaded at the point the loader reaches the first
+    // shim call, so load it rather than assume.
+    HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    if (!kernelbase) kernelbase = LoadLibraryW(L"kernelbase.dll");
+    if (kernelbase) {
+        resolved.virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2"));
+        resolved.map_view3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelbase, "MapViewOfFile3"));
+        resolved.unmap_view2 = reinterpret_cast<UnmapViewOfFile2Fn>(GetProcAddress(kernelbase, "UnmapViewOfFile2"));
+    }
+    return resolved;
 }
+
+// Namespace scope: this resolves during static initialisation, on the thread that starts the process. As a
+// function-local static it was first evaluated on the title's thread, the initialiser did not run there, every
+// member stayed null and available() answered no on a host that has VirtualAlloc2 -- so every console 64 KiB window
+// and every 2 MiB/4 MiB reservation took the plain-VirtualAlloc fallback instead of the placeholder path.
+const PlaceholderApi g_placeholder_api = resolve_placeholder_api();
+
+const PlaceholderApi& placeholder_api() { return g_placeholder_api; }
 
 // XMem allocation-type page bits select the guest page granularity and must not be forwarded as Win32 flags.
 constexpr DWORD kXmemLargePages = 0x20000000;  // 2 MiB pages
