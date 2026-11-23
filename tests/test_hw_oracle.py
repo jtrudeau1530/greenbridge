@@ -173,6 +173,19 @@ class True16(unittest.TestCase):
         out = asm.true16_spelling(text)
         self.assertEqual(out, text.replace("v_cvt_f16_f32 v8,", "v_cvt_f16_f32 v8.l,"))
 
+    def test_true16_binary_keeps_explicit_halves_and_other_instruction_forms(self):
+        for old, new in (
+                ("v_mul_f16_e32 v0, v1, v2", "v_mul_f16_e32 v0.l, v1.l, v2.l"),
+                (" v_max_f16_e64 v8.h, -|v4|, s1 // v9", " v_max_f16_e64 v8.h, -|v4.l|, s1 // v9"),
+                ("v_lshlrev_b16 v0, 3, v2", "v_lshlrev_b16 v0.l, 3, v2.l")):
+            self.assertEqual(asm.true16_spelling(old), new)
+            self.assertEqual(asm.true16_spelling(new), new)
+        for text in ("v_mul_lo_u16_e64 v1, v2, v3 op_sel:[0,1,0]",
+                     "v_fma_f16_e64 v0, v1, v2, v3 op_sel:[1,0,1,1]",
+                     "v_pk_add_f16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[1,1]",
+                     ".long 0xd7050014 // v_mul_lo_u16 v20, v21, v22"):
+            self.assertEqual(asm.true16_spelling(text), text)
+
 
 class ToolchainFallbacks(unittest.TestCase):
     """The two probes, with a stand-in for the assembler and the launcher."""

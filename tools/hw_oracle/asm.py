@@ -392,12 +392,31 @@ _F16_UNARY = "|".join(f"v_{op}_f16" for op in ("exp", "log", "rcp", "rsq", "sqrt
 _F16_DST = re.compile(rf"^([ \t]*(?:v_cvt_f16_f32|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+)(?=[ \t]*,)", re.M)
 _F16_SRC = re.compile(rf"^([ \t]*(?:v_cvt_f32_f16|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+(?:\.[lh])?[ \t]*,"
                       r"[-| \ta-z(]*\bv\d+)\b(?!\.[lh])", re.M)
+# These binary instructions use 16-bit VGPRs for all three operands. Packed operations and the VOP3 instructions the
+# fuzzers emit with op_sel keep their existing operand spelling.
+_TRUE16_BINARY = re.compile(
+    r"^([ \t]*v_(?:(?:add|sub|mul|max|min)_f16|mul_lo_u16|lshlrev_b16|lshrrev_b16|ashrrev_i16|"
+    r"(?:max|min)_[ui]16)(?:_e32|_e64)?[ \t]+)([^/;\r\n]+)", re.M)
+_BARE_VGPR = re.compile(r"\bv\d+\b(?!\.[lh])")
 
 
 def true16_spelling(text):
-    """The f16 operands of those ops written as the low half, which is what a bare register means there on GFX10
+    """The 16-bit operands of those ops written as the low half, which is what a bare register means there on GFX10
     and to older assemblers. Line numbers don't change, so error lines still map to kernels."""
-    return _F16_SRC.sub(r"\1.l", _F16_DST.sub(r"\1.l", text))
+    def binary(match):
+        prefix, operands = match.groups()
+        if re.search(r"\bop_sel\s*:", operands):
+            return match[0]
+        return prefix + _BARE_VGPR.sub(r"\g<0>.l", operands)
+
+    text = _F16_SRC.sub(r"\1.l", _F16_DST.sub(r"\1.l", text))
+    return _TRUE16_BINARY.sub(binary, text)
+
+
+def needs_true16(assembles):
+    """Probe fixed input so a failed generated instruction never changes the chosen spelling."""
+    bare = "v_cvt_f16_f32 v8, v1\n"
+    return not assembles(bare) and assembles(true16_spelling(bare))
 
 
 # ---- op_sel on GFX11+: the two-source 16-bit integer VOP3 ops want it on the registers too ----

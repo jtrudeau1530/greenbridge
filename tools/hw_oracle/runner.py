@@ -261,12 +261,7 @@ class Oracle:
 
     def _needs_true16(self):
         """Whether this assembler rejects `v_cvt_f16_f32 v8, v1` and takes `v8.l` (LLVM 23 on GFX11)."""
-        if asm.family(self.arch) == "gfx10":
-            return False
-        bare = "v_cvt_f16_f32 v8, v1\n"
-        if self._assemble(bare)[0] is not None:
-            return False
-        return self._assemble(asm.true16_spelling(bare))[0] is not None
+        return asm.family(self.arch) != "gfx10" and asm.needs_true16(lambda text: self._assemble(text)[0] is not None)
 
     def _probe_waves(self):
         """Each wave size really runs as that size: a 64-thread group stores v_mbcnt lane ids. In a wave64 kernel

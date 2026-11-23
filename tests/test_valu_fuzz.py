@@ -341,10 +341,19 @@ def _amd_tool(name):
 
 @pytest.mark.skipif(_amd_tool("llvm-mc") is None, reason="AMD llvm-mc (next to LEONIDA_AMD_CLANG) not found")
 def test_gfx11_opcode_table_matches_llvm_mc():
+    from hw_oracle import asm
+
     mc = _amd_tool("llvm-mc")
+    cmd = [mc, "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1150", "-show-encoding"]
+
+    def assemble(text):
+        return subprocess.run(cmd, input=text, capture_output=True, text=True)
+
+    true16 = asm.needs_true16(lambda text: assemble(text).returncode == 0)
     for name, opcode in vf.GFX11_VOP3_OPCODE.items():
-        r = subprocess.run([mc, "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1150", "-show-encoding"],
-                           input=f"{name} v20, v21, v22\n", capture_output=True, text=True)
+        text = f"{name} v20, v21, v22\n"
+        r = assemble(asm.true16_spelling(text) if true16 else text)
+        assert r.returncode == 0 and "encoding: [" in r.stdout, (name, r.stderr, r.stdout)
         got = [int(b, 16) for b in r.stdout.split("encoding: [")[1].split("]")[0].split(",")]
         w0, w1 = vf.vop3_words(opcode, 20, [21, 22], 0)
         want = [w0 & 255, w0 >> 8 & 255, w0 >> 16 & 255, w0 >> 24, w1 & 255, w1 >> 8 & 255, w1 >> 16 & 255, w1 >> 24]
@@ -357,12 +366,18 @@ def test_gfx11_opcode_table_matches_llvm_mc():
 def test_hw_kernels_assemble(family, arch):
     from hw_oracle import asm
     fam = asm.family(arch)
+    cmd = [os.environ["LEONIDA_AMD_CLANG"], "--target=amdgcn-amd-amdhsa", f"-mcpu={arch}"]
+    assembler = ["-x", "assembler", "-c", "-", "-o", os.devnull]
+
+    def assemble(text, wave=32):
+        return subprocess.run(cmd + (["-mwavefrontsize64"] if wave == 64 else []) + assembler,
+                              input=text, capture_output=True, text=True)
+
+    true16 = fam != "gfx10" and asm.needs_true16(lambda text: assemble(text).returncode == 0)
     for p in vf.programs(family, 2, 12, (32, 64)):
         k = asm.Kernel(p.hw_lines(fam), p.wave, vf.THREADS, p.out_words(), raw=True, vgprs=vf.HW_VGPRS, sgprs=vf.HW_SGPRS)
         text = asm.module_text([k], arch, wave=p.wave)[0]
-        r = subprocess.run([os.environ["LEONIDA_AMD_CLANG"], "--target=amdgcn-amd-amdhsa", f"-mcpu={arch}",
-                            *(["-mwavefrontsize64"] if p.wave == 64 else []), "-x", "assembler", "-c", "-", "-o", os.devnull],
-                           input=text, capture_output=True, text=True)
+        r = assemble(asm.true16_spelling(text) if true16 else text, p.wave)
         assert r.returncode == 0, (arch, p.name, r.stderr[-600:])
 
 
