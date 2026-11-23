@@ -306,6 +306,9 @@ default open state and after `BinkSetSoundTrack(0, NULL)`, which behaved identic
 - **Decoded packet sizes (`BinkGetTrackData` after `BinkDoFrame`):** every track overwrote the sentinel buffer with
   decoded bytes — **145,920 bytes** on frame 0 (initial pre-roll, matching `header_max_size` in 229/229) and
   **7,680 bytes** on frame 1 (229/229; confirmed through frame 2 on 1-, 2-, and 4-track samples).
+The loader-side runs behind these numbers are recorded in [`runtime/test/bink_decode_test.md`](../runtime/test/bink_decode_test.md),
+[`runtime/test/bink_audio_test.md`](../runtime/test/bink_audio_test.md) and
+[`runtime/test/bink_play.md`](../runtime/test/bink_play.md).
 
 ## 5. What is still unknown
 
