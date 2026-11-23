@@ -490,13 +490,20 @@ def main(argv=None):
             ap.error(f"{flag} is a folder, not a report file: {path}")
     if os.path.isdir(a.target):
         manifest = os.path.join(a.target, "index.json")
+
+        def unlistable(error):
+            # os.walk skips a folder it cannot list unless onerror stops it, and then a report path that is a file
+            # in that folder would pass this check and be overwritten. Refuse rather than guess.
+            ap.error(f"{flag} cannot be checked against the inputs: cannot list {error.filename or a.target}: "
+                     f"{error.strerror or error}")
+
         for flag, path in (("--out", a.out), ("--csv", a.csv)):
             if not path:
                 continue
             if os.path.isfile(manifest) and same_output_path(path, manifest):
                 ap.error(f"{flag} would overwrite the carve manifest: {path}")
             if os.path.isfile(path):
-                for root, _dirs, names in os.walk(a.target):
+                for root, _dirs, names in os.walk(a.target, onerror=unlistable):
                     for name in names:
                         if name.lower().endswith((".json", ".csv")):
                             continue

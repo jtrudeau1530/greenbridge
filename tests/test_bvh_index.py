@@ -427,6 +427,37 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("is a folder, not a report file", err.getvalue())
 
+    def test_overwrite_check_fails_on_an_unlistable_sub_folder(self):
+        # os.walk skips a folder it cannot list unless onerror stops it, so the report check used to pass over
+        # it and a report file inside it could be overwritten. Forcing os.scandir to raise for one folder gives
+        # the PermissionError os.walk hits for real, also on Windows where chmod cannot lock a folder.
+        locked = os.path.join(self.dir, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        out = os.path.join(self.dir, "report.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("previous report")
+        real_scandir = os.scandir
+        target = os.path.normcase(os.path.abspath(locked))
+
+        def scandir(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(os.fspath(path))) == target:
+                raise PermissionError(13, "Access is denied", os.fspath(path))
+            return real_scandir(path, *args, **kwargs)
+
+        err = io.StringIO()
+        with mock.patch.object(bvh_index.os, "scandir", scandir):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    bvh_index.main([self.dir, "--out", out])
+        self.assertEqual(cm.exception.code, 2, err.getvalue())
+        self.assertIn("--out cannot be checked against the inputs", err.getvalue())
+        self.assertIn(locked, err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "previous report")
+
 
 class _Unprintable:
     """A cell whose str() fails part-way through the CSV, standing in for a write that dies mid-report."""
