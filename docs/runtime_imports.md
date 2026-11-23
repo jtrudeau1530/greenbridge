@@ -199,12 +199,13 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`,
-`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs'
-layout (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
+`XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
+(below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
+`XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs' layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
-the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
+the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` serves slot by slot.
 
 `XCurl.dll` has a second way in. One of its functions reads `HKLM\Microsoft\GamingServices` value
 `ServiceRetryTimeout`, then `LoadLibraryExW(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` and
@@ -339,6 +340,21 @@ The executable's first boot confirms them, or names the slots that differ.
 
 `xgameruntime_offline_test` drives the five classes; `xgameruntime_offline_hdr` runs it again with
 `LEONIDA_HDR=1`.
+
+Two more classes are served from `tools/gdk_runtime_calls.py`'s measurement of `libHttpClient.GDK.dll` (it finds the
+thunks in the code without running it and prints, per class, the interface id asked for, the slots called and the
+argument count each passes after `this`). Their thunks are in the DLL but nothing in it calls them; a title linked with
+the same `xgameruntime.lib` gets the same thunks. Every slot is the function at that position of xgameruntime-docs'
+layout with the documented argument count, and each behaves as Microsoft's reference page for that function says
+(`runtime/shims/xgameruntime.cpp` cites both):
+
+| Class | Interface asked for | Slots (args after `this`) | Offline behaviour |
+|---|---|---|---|
+| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through (whichever `xgameruntime*.cpp` serves it) and the feature is documented for Windows: today XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XGame, XGameSave, XGameUI, XNetworking, XPackage, XPersistentLocalStorage, XStore, XSystem, XUser, XGameEvent, XGameStreaming. False for XDisplay (served, but documented for the consoles only), for the classes not served (XAccessibility and XSpeechSynthesizer, XAppCapture, XGameInvite, XLauncher) and for values past the enum |
+| `XSystemAnalyticsImpl` | its class id | 3 `XSystemGetAnalyticsInfo` (1: the result's address, as MSVC passes a returned struct to a member function) | The named export's `XSystemAnalyticsInfo` |
+
+Not served yet, though `libHttpClient.GDK.dll` has thunks for them: `XAccessibilityImpl` (slots 3-21) and
+`XLauncherImpl` (3-5), among others.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):

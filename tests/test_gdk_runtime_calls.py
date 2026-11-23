@@ -398,6 +398,9 @@ class ImageTest(unittest.TestCase):
         for name in ("kThreadingClass", "kUserClass", "kSaveClass", "kStoreClass"):
             self.assertIn(name, names)
         self.assertEqual(served.get("704c3f58-e629-4cc2-b197-30511b996fe2"), "kSaveClass")
+        # xgameruntime.cpp serves XGameRuntimeFeatureImpl; the ids its feature table only names (k...ClassId) don't count.
+        self.assertEqual(served.get("8836fe87-edb9-4fe3-8dad-05f0d2cd5b40"), "kGameRuntimeFeatureClass")
+        self.assertNotIn("1b339674-328d-4283-a200-3171f18d3639", served)   # XLauncherImpl
         empty = os.path.join(self.tmp, "no-shims")
         os.makedirs(empty, exist_ok=True)
         with self.assertRaises(OSError):
