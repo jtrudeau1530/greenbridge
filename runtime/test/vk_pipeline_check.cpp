@@ -50,6 +50,7 @@
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
 #include "large_module_gate.h"
+#include "pipeline_summary.h"
 #include "../src/spirv_words.h"
 #include "../src/subgroup_size.h"
 
@@ -1909,10 +1910,8 @@ int main(int argc, char** argv) {
 
     for (auto& [_, mod] : stub_cache) if (mod) vkDestroyShaderModule(dev, mod, nullptr);
 
-    std::set<std::string> all_stages;
-    for (auto& [st, _] : modules_ok) all_stages.insert(st);
-    for (auto& [st, _] : modules_bad) all_stages.insert(st);
-    for (auto& [st, _] : stats) all_stages.insert(st);
+    const std::set<std::string> all_stages =
+        leonida::summary_stages(modules_ok, modules_bad, stats, big_skipped);
 
     if (iso_child) {   // --isolate child: machine-readable counts; the parent prints the summary
         for (const auto& st : all_stages) {

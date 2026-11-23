@@ -345,6 +345,9 @@ if(BUILD_TESTING)
   find_package(Threads REQUIRED)
   target_link_libraries(large_module_gate_test PRIVATE Threads::Threads)
   add_test(NAME large_module_gate COMMAND large_module_gate_test)
+  # vk_pipeline_check's isolate summary stage set: pure stdlib, no Vulkan device.
+  add_executable(pipeline_summary_test test/pipeline_summary_test.cpp)
+  add_test(NAME pipeline_summary COMMAND pipeline_summary_test)
   # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
   add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
   add_test(NAME xdxr_descs COMMAND xdxr_descs_test)
