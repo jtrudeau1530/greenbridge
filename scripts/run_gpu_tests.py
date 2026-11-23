@@ -754,8 +754,12 @@ def run_suite(a, work: str) -> int:
     disasm_dir = os.path.join(work, "disasm")
     spirv_dir = os.path.join(work, "spirv")
     raw_dir = os.path.join(work, "raw")
-    for d in (fssm_dir, disasm_dir, spirv_dir, raw_dir):
-        os.makedirs(d, exist_ok=True)
+    for directory in (work, fssm_dir, disasm_dir, spirv_dir, raw_dir):
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            print(f"error: cannot prepare GPU test directory {directory}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
     disasm_files = []
