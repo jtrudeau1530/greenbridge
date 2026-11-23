@@ -1284,12 +1284,13 @@ def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[s
 
 
 def fspx_cache_complete(spirv: str) -> bool:
-    """Check that the FSPX translation index and its named modules are present."""
+    """Check that the FSPX translation index names at least one program and that its named modules are present.
+    A translation that produced no modules writes a bare `{}`, which must not be cached as a finished step."""
     try:
         index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
     except ValueError:
         return False
-    return isinstance(index, dict) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+    return isinstance(index, dict) and bool(index) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
 
 
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
