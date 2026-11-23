@@ -259,6 +259,19 @@ class GamedataIndexTest(unittest.TestCase):
                 self.assertIn("ERROR: cannot write", p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
 
+    def test_reads_carve_index_with_utf8_bom(self):
+        self.add(b'<?xml version="1.0"?><RootA/>')
+        index_path = os.path.join(self.carve, "index.json")
+        doc = {"summary": {"archive": "synthetic", "files": len(self.rows)}, "files": self.rows}
+        with open(index_path, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps(doc).encode("utf-8"))
+        out = os.path.join(self.root, "bom_out.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["summary"]["xml_documents"], 1)
+
 
 class XmlClassificationTest(unittest.TestCase):
     """Synthetic XML classification cases; no game data, no files written."""

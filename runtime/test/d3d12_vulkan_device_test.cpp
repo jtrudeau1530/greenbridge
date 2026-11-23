@@ -6324,13 +6324,13 @@ int main() {
             report("next to the atomic copies", 0, down + 252, cd, 4);
             report("next to the atomic copies", 1, down + 272, cd, 4);
 
-            // Misaligned or empty calls are refused when they are recorded.
+            // Misaligned calls are refused when recorded; count == 0 is accepted (matches Windows 11 WARP & RTX 5090).
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list1->AtomicCopyBufferUINT64(readback.p, 260, upload.p, 4104, 1, dependents, ranges);
             EXPECT(list->Close() == E_INVALIDARG);
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list1->AtomicCopyBufferUINT(readback.p, 256, upload.p, 4096, 0, nullptr, nullptr);
-            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(list->Close() == S_OK);
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER misaligned{0x10002, 1};
             list2->WriteBufferImmediate(1, &misaligned, nullptr);
@@ -7114,6 +7114,18 @@ int main() {
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
             EXPECT(made->maintenance8 == (m8.maintenance8 == VK_TRUE));
 #endif
+            // The OPTIONS booleans answer what the layer will honour, not what the GPU offers (docs 4.1: a false
+            // "supported" is worse at boot; the PSO paths refuse these same missing features). Stencil ref: the
+            // layer enables no stencil export and the translator emits no stencil-ref write, so always FALSE.
+            D3D12_FEATURE_DATA_D3D12_OPTIONS answers{};
+            EXPECT(SUCCEEDED(standalone->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &answers,
+                                                             sizeof(answers))));
+            EXPECT(answers.DoublePrecisionFloatShaderOps == BOOL(made->features.shaderFloat64));
+            EXPECT(answers.OutputMergerLogicOp == BOOL(made->features.logicOp));
+            EXPECT(answers.PSSpecifiedStencilRefSupported == FALSE);
+            EXPECT(answers.ROVsSupported == BOOL(made->fragment_shader_interlock));
+            EXPECT(answers.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation ==
+                   BOOL(made->shader_output_layer && made->shader_output_viewport_index));
         }
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;

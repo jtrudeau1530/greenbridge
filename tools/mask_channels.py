@@ -13,6 +13,7 @@ Only counts are written. The input is the user's own export and stays local.
 
 `--json` is published from a staging file next to the destination, creating the folder when it is missing, so
 a run that fails while writing leaves an older report in place; a write error is one `ERROR:` line and exit 2.
+Usage: `python -I tools/mask_channels.py --help` lists the options.
 """
 from __future__ import annotations
 

@@ -1026,7 +1026,14 @@ def main(argv=None):
         args.test_files = [f for f in ci_test_files() if not args.tests or re.search(args.tests, f)]
         if args.tests and not args.test_files:
             ap.error("--tests did not match any test files")
-    os.makedirs(out_dir, exist_ok=True)
+    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
+        print(f"--out {args.out} is not a directory", file=sys.stderr)
+        return 2
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"--out {args.out}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
     try:
         snap = build(args, out_dir)
     except OSError as exc:
