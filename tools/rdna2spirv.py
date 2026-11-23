@@ -2526,25 +2526,27 @@ class Gen:
         once can leave one's low dword with the other's high dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two
         reads, so another lane's 64-bit op on the same element between them could be seen half done. The other _x2
         forms (add/sub/min/max carry or compare across the dwords, cmpswap_x2 compares all 64 bits) and inc/dec stay
-        Unsupported."""
+        Unsupported. fcmpswap compares as binary32 (float_cmpswap_loop)."""
         kind = op[len("global_atomic_"):]
         if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
             return self.global_atomic_x2(op, kind[:-3], a, mods)
         if kind in ("fmin", "fmax"):
             return self.global_atomic_float(op, kind, a, mods)
         is_inc_dec = kind in ("inc", "dec")
-        if (kind not in self.BUF_ATOMICS and not is_inc_dec) or any(m in mods for m in ("slc", "dlc", "lds")):
-            raise Unsupported(op if (kind not in self.BUF_ATOMICS and not is_inc_dec) else op + " form")
+        fcmp = kind == "fcmpswap"           # float compare: see float_cmpswap_loop
+        known = kind in self.BUF_ATOMICS or is_inc_dec or fcmp
+        if not known or any(m in mods for m in ("slc", "dlc", "lds")):
+            raise Unsupported(op if not known else op + " form")
         rtn = "glc" in mods
         if len(a) != (4 if rtn else 3):
             raise Unsupported(op + " operands")
         vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
-        if vdata["k"] != "vgpr" or vdata.get("n", 1) != (2 if kind == "cmpswap" else 1) or \
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != (2 if kind in ("cmpswap", "fcmpswap") else 1) or \
                 (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 1)):
             raise Unsupported(op + " operands")
         full = self.global_address(op, vaddr, saddr, mods)
         val = self.load_reg("vgpr", vdata["r"])
-        cmp = self.load_reg("vgpr", vdata["r"] + 1) if kind == "cmpswap" else None
+        cmp = self.load_reg("vgpr", vdata["r"] + 1) if kind in ("cmpswap", "fcmpswap") else None
         al = self.atomic_aligned(full, 4)
         cond = self.tmp()
         self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {al}")
@@ -2558,6 +2560,9 @@ class Gen:
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
         if is_inc_dec:
             res, done_lbl = self.atomic_inc_dec_cas(p, val, kind, lbl_do)
+        elif fcmp:
+            res = self.float_cmpswap_loop(p, val, cmp, self.cu(1))
+            done_lbl = self.current_label_placeholder()      # the loop's exit block
         else:
             res, done_lbl = self.tmp(), lbl_do
             if kind == "cmpswap":
@@ -2633,6 +2638,33 @@ class Gen:
             for w in range(2):
                 self.dst({"k": "vgpr", "r": vdst["r"] + w, "n": 1}, olds[w])
 
+    def float_cmpswap_loop(self, p, new, cmp, scope):
+        """tmp = M; M = (tmp == CMP as binary32) ? NEW : tmp; returns tmp (RDNA2 ISA, *_FCMPSWAP / DS_CMPST_F32). A
+        float compare (OpFOrdEqual: -0 == +0, a NaN never matches) is not what OpAtomicCompareExchange compares (the
+        bits), so this is a loop: read M (an atomic load at `scope`, as atomic_inc_dec_cas), pick NEW or M by the float
+        compare, swap that in if M still holds what was read, else retry. Exact under contention. p: a uint pointer
+        (PhysicalStorageBuffer with device scope, or Workgroup)."""
+        lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + t for t in ("_hdr", "_cont", "_exit"))
+        init = self.tmp()
+        self.emit(f"{init} = OpAtomicLoad %uint {p} {scope} {self.cu(0)}")
+        entry = self.current_label_placeholder()
+        self.emit(f"OpBranch {lbl_hdr}")
+        self.emit(f"{lbl_hdr} = OpLabel")
+        cur, cf, kf, eq, st, got, done = (self.tmp() for _ in range(7))
+        self.emit(f"{cur} = OpPhi %uint {init} {entry} {got} {lbl_cont}")
+        self.emit(f"{cf} = OpBitcast %float {cur}")
+        self.emit(f"{kf} = OpBitcast %float {cmp}")
+        self.emit(f"{eq} = OpFOrdEqual %bool {cf} {kf}")
+        self.emit(f"{st} = OpSelect %uint {eq} {new} {cur}")
+        self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {scope} {self.cu(0)} {self.cu(0)} {st} {cur}")
+        self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+        self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
+        self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
+        self.emit(f"{lbl_cont} = OpLabel")
+        self.emit(f"OpBranch {lbl_hdr}")
+        self.emit(f"{lbl_exit} = OpLabel")
+        return cur
+
     def buffer_atomic(self, op, a, mods):
         """buffer_atomic_<op> vdata, vaddr, s[V#], soffset ...: 32-bit atomic at the element address (buffer device
         address). With 'glc' the pre-op value is returned in vdata. Inactive lanes don't touch memory and keep vdata;
@@ -2643,7 +2675,8 @@ class Gen:
         if kind in ("fmin", "fmax"):
             return self.buffer_atomic_float(op, kind, a, mods)
         is_inc_dec = kind in ("inc", "dec")
-        if (kind not in self.BUF_ATOMICS and not is_inc_dec) or "x2" in kind:
+        fcmp = kind == "fcmpswap"           # float compare: see float_cmpswap_loop
+        if (kind not in self.BUF_ATOMICS and not is_inc_dec and not fcmp) or "x2" in kind:
             raise Unsupported(op)
         vd = a[0]
         if is_inc_dec and (vd["k"] != "vgpr" or vd.get("n", 1) != 1):
@@ -2665,6 +2698,10 @@ class Gen:
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
         if is_inc_dec:
             res_do, done_lbl = self.atomic_inc_dec_cas(p, val, kind, lbl_do)
+        elif fcmp:
+            cmp = self.load_reg("vgpr", vd["r"] + 1)
+            res_do = self.float_cmpswap_loop(p, val, cmp, self.cu(1))
+            done_lbl = self.current_label_placeholder()      # the loop's exit block
         else:
             spv, _ = self.BUF_ATOMICS[kind]
             res_do, done_lbl = self.tmp(), lbl_do
@@ -4589,6 +4626,14 @@ class Gen:
             self.emit(f"{lbl_exit} = OpLabel")
             if d is not None:
                 self.dst(d, cur)
+        elif op in ("ds_cmpst_rtn_f32", "ds_cmpst_f32"):
+            # ds_cmpst_b32's operands (DATA = the compare value, DATA2 = the new one), compared as binary32. A CAS
+            # loop, so lds_ptr as the other CAS-loop LDS atomics (lds_access's merge assumes a single-block access).
+            d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
+            p = self.lds_ptr(self.src_u(ad), off)
+            old = self.float_cmpswap_loop(p, self.src_u(src), self.src_u(cmp_), sc)
+            if d is not None:
+                self.dst(d, old)
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
             # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
