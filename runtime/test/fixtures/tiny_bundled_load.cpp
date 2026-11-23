@@ -27,6 +27,24 @@ int main() {
     if (GetModuleHandleW(L"tiny_bundled_dll.dll") != nullptr)
         return fail("GetModuleHandleW before LoadLibrary should be NULL", 0);
 
+    // Win32 reserves hFile. Test a real file handle against both the shim-owned and bundled lookup paths.
+    HANDLE file = CreateFileW(L"tiny_bundled_dll.dll", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return fail("open tiny_bundled_dll.dll", GetLastError());
+    SetLastError(0);
+    const HMODULE owned = LoadLibraryExA("xgameruntime.dll", file, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const DWORD owned_error = GetLastError();
+    SetLastError(0);
+    const HMODULE bundled = LoadLibraryExW(L"tiny_bundled_dll.dll", file, 0);
+    const DWORD bundled_error = GetLastError();
+    CloseHandle(file);
+    if (owned || owned_error != ERROR_INVALID_PARAMETER)
+        return fail("LoadLibraryExA with hFile rejects a shim-owned name", owned_error);
+    if (bundled || bundled_error != ERROR_INVALID_PARAMETER)
+        return fail("LoadLibraryExW with hFile rejects a bundled name", bundled_error);
+    if (GetModuleHandleW(L"tiny_bundled_dll.dll") != nullptr)
+        return fail("LoadLibraryExW with hFile leaves the bundled DLL unmapped", 0);
+
     // DONT_RESOLVE_DLL_REFERENCES must fail explicitly rather than silently resolving imports and running DllMain.
     SetLastError(0);
     if (LoadLibraryExW(L"tiny_bundled_dll.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES) != nullptr ||
