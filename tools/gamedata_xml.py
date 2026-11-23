@@ -467,7 +467,10 @@ def carve_documents(directory: str):
 
 
 def xml_files(directory: str):
-    for base, _, names in os.walk(directory):
+    def scan_failed(exc: OSError) -> None:
+        raise exc
+
+    for base, _, names in os.walk(directory, onerror=scan_failed):
         for name in sorted(names):
             if name.lower().endswith(".xml"):
                 yield os.path.join(base, name)
