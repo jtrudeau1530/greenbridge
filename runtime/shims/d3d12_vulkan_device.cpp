@@ -1687,6 +1687,17 @@ const char* barrier_layout_refusal(const D3D12_RESOURCE_DESC& desc, D3D12_BARRIE
     }
 }
 
+// Console Xbox D3D12 CreateDescriptorHeap (device slot 14) passes the PC description followed by the heap address
+// and size, as measured in the retail boot (issue #313 comment 7107265058): a 16-byte PC D3D12_DESCRIPTOR_HEAP_DESC,
+// then address at +0x10 and size at +0x18. The title asserts GetCPUDescriptorHandleForHeapStart() == address.
+// Backing this range with title memory / section 3.3 aliasing is tracked separately; this path only satisfies the
+// observed ABI contract and must not be inferred from normal PC 16-byte CreateDescriptorHeap calls.
+struct ConsoleDescriptorHeapDesc {
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    std::uint64_t address = 0;
+    std::uint64_t size = 0;
+};
+
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12DescriptorHeap> {
@@ -1699,9 +1710,20 @@ public:
     // heaps (RTV, DSV, non-visible staging heaps) stay in host memory.
     // A shader-visible heap that the arena cannot hold is not created (ok() is false, E_OUTOFMEMORY), as a
     // default-heap buffer is not: in host memory its GPU handle would be 0, and every table would read VA 0.
-    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
-        const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
-        if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
+    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uint64_t console_address = 0,
+                   std::uint64_t console_size = 0)
+        : device_(device), desc_(desc), console_address_(console_address), console_size_(console_size),
+          console_addressed_(console_address != 0) {
+        const VkDeviceSize bytes = VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize;
+        if (console_addressed_) {
+            // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address. Report the requested title VA
+            // now; backing this range with title memory / §3.3 aliasing is tracked separately.
+            log_once("descriptor heap uses console address/size (not backed by title memory)", int(desc_.Type));
+            cpu_ = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
+            in_arena_ = false;
+            return;
+        }
+        if ((desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
             if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
                          int(std::min<VkDeviceSize>(bytes / 1024, INT_MAX)));
@@ -1734,12 +1756,16 @@ public:
     }
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
+        if (console_addressed_) return {static_cast<UINT64>(console_address_)};
         if (!in_arena_) log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
         return {in_arena_ ? UINT64(arena_offset_) : 0};
     }
 
     const D3D12_DESCRIPTOR_HEAP_DESC& raw_desc() const { return desc_; }
-    D3D12_GPU_VIRTUAL_ADDRESS gpu_base() const { return in_arena_ ? UINT64(arena_offset_) : 0; }
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_base() const {
+        if (console_addressed_) return static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(console_address_);
+        return in_arena_ ? UINT64(arena_offset_) : 0;
+    }
 
 private:
     DeviceState& device_;
@@ -1748,6 +1774,9 @@ private:
     std::uint8_t* cpu_ = nullptr;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    std::uint64_t console_address_ = 0;
+    std::uint64_t console_size_ = 0;
+    bool console_addressed_ = false;
 };
 
 class Resource final
@@ -9577,6 +9606,31 @@ bool has_global_realtime_privilege() {
 
 void set_global_realtime_privilege_override_for_test(int state) {
     g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
+}
+
+HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                       D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
+                                       REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !desc) return E_INVALIDARG;
+    // No output: a capability check, as CreateDescriptorHeap does.
+    if (!out) return S_FALSE;
+    if ((desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || desc->NodeMask > 1 ||
+        ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+         (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV))) {
+        return E_INVALIDARG;
+    }
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_INVALIDARG;
+
+    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
+    heap->attach_device(d->identity());
+    if (!heap->ok()) {
+        heap->Release();
+        return E_OUTOFMEMORY;
+    }
+    return hand_out(heap, riid, out);
 }
 
 }  // namespace rt::d3d12
