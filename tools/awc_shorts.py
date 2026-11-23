@@ -110,7 +110,7 @@ def main(argv=None) -> int:
         print("awc_shorts: error: require 0 <= --min-seconds <= --max-seconds", file=sys.stderr)
         return 2
     if not os.path.exists(a.src):
-        print(f"awc_shorts: error: source does not exist: {a.src!r}", file=sys.stderr)
+        print(f"awc_shorts: error: source does not exist: {a.src}", file=sys.stderr)
         return 2
     try:
         banks = _banks(a.src)
