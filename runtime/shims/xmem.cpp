@@ -487,11 +487,11 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
 
 enum class PageCommit { not_ours, committed_before, committed_now, failed };
 
-PageCommit commit_mapped_page(uintptr_t address, DWORD& protect) {
+PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& protect) {
     const auto it = g_mapped.find(address);
     if (it == g_mapped.end() || !it->second.section->scratch) return PageCommit::not_ours;
     MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) || info.Type != MEM_MAPPED) {
+    if (!VirtualQuery(reinterpret_cast<void*>(accessed), &info, sizeof(info)) || info.Type != MEM_MAPPED) {
         return PageCommit::not_ours;
     }
     if (info.State == MEM_COMMIT) {
@@ -530,13 +530,13 @@ LONG CALLBACK physical_page_fault(EXCEPTION_POINTERS* info) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     busy = true;
-    const uintptr_t address =
-        static_cast<uintptr_t>(record->ExceptionInformation[1]) & ~static_cast<uintptr_t>(kPhysicalPageSize - 1);
+    const uintptr_t accessed = static_cast<uintptr_t>(record->ExceptionInformation[1]);
+    const uintptr_t address = accessed & ~static_cast<uintptr_t>(kPhysicalPageSize - 1);
     DWORD protect = 0;
     PageCommit result;
     {
         const FaultLockShared lock;
-        result = commit_mapped_page(address, protect);
+        result = commit_mapped_page(address, accessed, protect);
     }
     busy = false;
     if (result == PageCommit::committed_now) return EXCEPTION_CONTINUE_EXECUTION;
@@ -812,7 +812,8 @@ bool commit_physical_range(const void* address, size_t size) {
     const FaultLockShared lock;
     for (uintptr_t i = 0; i < pages; ++i) {
         DWORD protect = 0;
-        if (commit_mapped_page(first + i * kPhysicalPageSize, protect) == PageCommit::failed) return false;
+        const uintptr_t page = first + i * kPhysicalPageSize;
+        if (commit_mapped_page(page, page, protect) == PageCommit::failed) return false;
     }
     return true;
 }

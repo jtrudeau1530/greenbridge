@@ -530,6 +530,12 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
               access_faults(static_cast<volatile uint32_t*>(static_cast<void*>(window)), true),
           "a write to a committed read-only page still faults to the next handler");
     VirtualProtect(window, kPage64k, PAGE_READWRITE, &old);
+    check(VirtualProtect(window + 4096, 4096, PAGE_READONLY, &old) != FALSE &&
+              access_faults(static_cast<volatile uint32_t*>(static_cast<void*>(window + 4096)), true),
+          "a write to a read-only 4 KiB part of a read-write page still faults to the next handler");
+    check(!access_faults(static_cast<volatile uint32_t*>(static_cast<void*>(window + 8192)), true),
+          "the rest of that page stays writable");
+    VirtualProtect(window + 4096, 4096, PAGE_READWRITE, &old);
     void* const elsewhere = VirtualAlloc(nullptr, kPage64k, MEM_RESERVE, PAGE_READWRITE);
     check(elsewhere != nullptr && access_faults(static_cast<volatile uint32_t*>(elsewhere), false),
           "a fault outside the mapped pages still reaches the next handler");
