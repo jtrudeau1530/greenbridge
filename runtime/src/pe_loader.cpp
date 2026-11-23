@@ -1365,7 +1365,6 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
 
     std::lock_guard lock(mutex_);
-    const RuntimeLoadScope dynamic(runtime_loads_);
     Module* existing = find_narrow_module(dll_lower);
     const std::filesystem::path candidate = game_dir_ / dll_lower;
     std::error_code ec;
@@ -1418,6 +1417,7 @@ void* Loader::load_runtime_candidate(Module* existing, const std::filesystem::pa
 
     Module* mapped = nullptr;
     try {
+        const RuntimeLoadScope dynamic(runtime_loads_);
         Module& m = load(candidate);
         mapped = &m;
         initialise();

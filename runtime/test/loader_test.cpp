@@ -91,10 +91,13 @@ std::filesystem::path write_image(const std::vector<uint8_t>& bytes) {
     return p;
 }
 
-std::filesystem::path write_image_as(const std::vector<uint8_t>& bytes, const std::string& name) {
+std::filesystem::path write_image_as(const std::vector<uint8_t>& bytes, const std::filesystem::path& name) {
     auto p = g_dir / name;
     std::ofstream out(p, std::ios::binary);
-    if (!out) throw std::runtime_error("cannot write " + p.string());
+    if (!out) {
+        auto u8 = p.u8string();
+        throw std::runtime_error("cannot write " + std::string(u8.begin(), u8.end()));
+    }
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<long long>(bytes.size()));
     return p;
 }
@@ -902,6 +905,21 @@ void test_attach_reserved() {
         else pass("a run-time load's DllMain gets a NULL lpvReserved");
     } catch (const std::exception& e) {
         failed("a run-time load's DllMain gets a NULL lpvReserved", e.what());
+    }
+
+    reset_notifications();
+    try {
+        const std::wstring wide_name = L"attach_reserved_\u6f22.dll";
+        write_image_as(make_lifecycle_image(), wide_name);
+        rt::Loader loader(g_dir);
+        bool handled = false;
+        void* h = loader.load_runtime_module_w(wide_name, 0, handled);
+        if (!handled || !h) failed("a wide run-time load's DllMain gets a NULL lpvReserved", "the wide run-time load failed");
+        else if (!g_attach_seen) failed("a wide run-time load's DllMain gets a NULL lpvReserved", "DllMain was not called");
+        else if (g_attach_reserved) failed("a wide run-time load's DllMain gets a NULL lpvReserved", "lpvReserved was non-NULL");
+        else pass("a wide run-time load's DllMain gets a NULL lpvReserved");
+    } catch (const std::exception& e) {
+        failed("a wide run-time load's DllMain gets a NULL lpvReserved", e.what());
     }
 }
 
