@@ -3644,6 +3644,32 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"committed: heap flag ALLOW_SHADER_ATOMICS on a buffer", [](ID3D12Device* d) {
              return with_heap_flags(d, buffer_desc(256), D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
          }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a UAV buffer", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             return with_heap_flags(d, desc, D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a UAV texture", [](ID3D12Device* d) {
+             return with_heap_flags(d, texture_desc(16, 16, DXGI_FORMAT_R32_FLOAT,
+                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                    D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a render-target UAV", [](ID3D12Device* d) {
+             return with_heap_flags(d, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                    D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a texture without UAV", [](ID3D12Device* d) {
+             return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on a render target without UAV", [](ID3D12Device* d) {
+             return with_heap_flags(d, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                                    D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
+        {"committed: heap flag ALLOW_SHADER_ATOMICS on an upload buffer", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_GENERIC_READ,
+                              D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS);
+         }},
         {"committed: heap flag CREATE_NOT_RESIDENT on a texture", [](ID3D12Device* d) {
              return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT);
          }},
@@ -5772,6 +5798,21 @@ int main() {
         D3D12_HEAP_PROPERTIES heap_properties{};
         EXPECT(SUCCEEDED(upload->GetHeapProperties(&heap_properties, nullptr)) &&
                heap_properties.Type == D3D12_HEAP_TYPE_UPLOAD);
+        {
+            // D3D-469: the flag stays on the heap, next to the DENY flags a committed buffer gets (0x4c0 on the host).
+            const D3D12_HEAP_PROPERTIES atomics_heap{D3D12_HEAP_TYPE_DEFAULT};
+            auto atomics_desc = buffer_desc(256);
+            atomics_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            Ref<ID3D12Resource> atomics;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&atomics_heap, D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS,
+                                                             &atomics_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&atomics.p))));
+            D3D12_HEAP_PROPERTIES atomics_got{};
+            D3D12_HEAP_FLAGS atomics_flags = D3D12_HEAP_FLAG_NONE;
+            EXPECT(SUCCEEDED(atomics->GetHeapProperties(&atomics_got, &atomics_flags)));
+            EXPECT(UINT(atomics_flags) == (UINT(D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) |
+                                           UINT(D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS)));
+        }
 
         // D3D-96: upload buffers are in VRAM exactly when the GPU has Resizable BAR (and LEONIDA_UPLOAD_SYSMEM is not
         // set), host-visible either way. The copies below read this buffer on the GPU, so both placements are checked.

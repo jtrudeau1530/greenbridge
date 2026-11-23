@@ -1495,7 +1495,7 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     // The DENY flags of a committed resource's heap are the runtime's to choose; most other bits are refused too.
     constexpr UINT committed_heap_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
                                           D3D12_HEAP_FLAG_HARDWARE_PROTECTED | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT |
-                                          D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+                                          D3D12_HEAP_FLAG_CREATE_NOT_ZEROED | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
     if (UINT(heap_flags) & ~committed_heap_flags) return "heap flags of a committed resource";
 
     const bool buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1511,6 +1511,10 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     const bool rt = flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     const bool ds = flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     const bool uav = flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // ALLOW_SHADER_ATOMICS is for a resource shaders can write: RTX 4070 Laptop (621.24) and WARP refuse it without
+    // ALLOW_UNORDERED_ACCESS, on buffers and textures alike. It changes nothing on one adapter; GetHeapProperties keeps it.
+    if ((UINT(heap_flags) & D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) && !uav)
+        return "ALLOW_SHADER_ATOMICS without ALLOW_UNORDERED_ACCESS";
     // Upload heaps start in (a part of) GENERIC_READ, readback heaps in COPY_DEST; COMMON on both; no UAVs.
     if (heap.Type == D3D12_HEAP_TYPE_UPLOAD && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_GENERIC_READ))))
         return "upload heap state or UAV";

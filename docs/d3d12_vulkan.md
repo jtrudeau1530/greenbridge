@@ -2239,7 +2239,8 @@ The trace will enumerate them.
   `compare_invalid_arguments` (`d3d12_vulkan_device_test`): invalid ones, their valid neighbours, and
   `ALLOW_RENDER_TARGET`/`ALLOW_DEPTH_STENCIL` on every format both devices create. Rules the host keeps that are easy
   to get wrong: a committed resource takes no heap flag except `SHARED`, `ALLOW_DISPLAY` (textures only),
-  `HARDWARE_PROTECTED`, `CREATE_NOT_RESIDENT` and `CREATE_NOT_ZEROED`; a buffer refuses `ALLOW_SIMULTANEOUS_ACCESS`;
+  `HARDWARE_PROTECTED`, `CREATE_NOT_RESIDENT`, `CREATE_NOT_ZEROED` and `ALLOW_SHADER_ATOMICS` (only with
+  `ALLOW_UNORDERED_ACCESS`; measured on an RTX 4070 Laptop and WARP); a buffer refuses `ALLOW_SIMULTANEOUS_ACCESS`;
   MSAA takes quality 0 or one of the two standard patterns; a buffer may be `ALLOW_RENDER_TARGET` but not
   `ALLOW_DEPTH_STENCIL`, and is aligned 0 or 64 KiB only; upload heaps start in any part of `GENERIC_READ` (or
   `COMMON`), readback heaps in `COPY_DEST` or `COMMON`, neither with UAVs; a texture starts in exactly
