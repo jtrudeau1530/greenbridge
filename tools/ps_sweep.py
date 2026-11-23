@@ -40,6 +40,7 @@ timed out while another process was starting.
 
 Shaders are numbered by their place in `sample.json`; the summary lines and everything under `<dir>` except
 `sample.json` (which names the sampled shaders, so keep it out of reports) are counts and numbers only.
+Usage: `python -I tools/ps_sweep.py --help` lists the options.
 """
 from collections import Counter
 import argparse
