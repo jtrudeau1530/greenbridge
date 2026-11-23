@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
@@ -75,6 +76,13 @@ class CpuScore(unittest.TestCase):
     def test_unknown(self):
         self.assertIsNone(pc.cpu_score("Mystery CPU"))
         self.assertIsNone(pc.cpu_score(""))
+
+
+class DetectRam(unittest.TestCase):
+    def test_reported_capacity_is_not_clamped_to_the_common_range(self):
+        for gib, expected in ((2, 2), (31.8, 32), (255.8, 256)):
+            with self.subTest(gib=gib), patch.object(pc, "_total_ram_bytes", return_value=int(gib * 2**30)):
+                self.assertEqual(pc.detect_ram_gb(), expected)
 
 
 class Evaluate(unittest.TestCase):
