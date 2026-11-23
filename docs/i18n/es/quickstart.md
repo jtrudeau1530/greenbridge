@@ -57,8 +57,7 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 **Poco espacio en disco:** los ~400 GB son para la compilación completa. Para *ejecutar* el port,
 `--stages check,shaders,runtime` necesita unos 30 GB; la etapa `assets` (~370 GB) solo es para las herramientas de
 recursos, y `--wav` añade varias veces el tamaño del Ogg Opus (la comprobación previa muestra esta elección cuando
-la etapa `assets` es la que no cabe). `--work` y `--out` pueden estar en otra unidad. El runtime asigna el paquete
-en su lugar, por lo que una unidad de solo lectura requiere `gta6rt --overlay <carpeta escribible>`; `--overlay`
+la etapa `assets` es la que no cabe). `--work` y `--out` pueden estar en otra unidad.
 El runtime asigna el paquete en su lugar, por lo que una unidad de solo lectura requiere `gta6rt --overlay <carpeta escribible>`; `--overlay` es una opción de `gta6rt`, no de `make_game.py`. Deje los archivos `.s` en `work/shaders/dxbc/disasm` donde están: la siguiente ejecución los compara con la lista de `disasm.done` y vuelve a desensamblar los que faltan (todos los de una carpeta cuyo `disasm.done` sea anterior a esa lista) y después traduce todos los shaders de nuevo. Una carpeta `disasm` que sea un enlace simbólico se rechaza cuando la etapa tiene que vaciarla.
 
 ## Compilar
