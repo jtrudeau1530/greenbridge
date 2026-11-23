@@ -727,6 +727,27 @@ void run_checks(const std::filesystem::path& root) {
               "creating a never-removed directory is unchanged");
     }
 
+    // A marker held without delete sharing makes recreation fail and rolls back the overlay directory.
+    {
+        std::filesystem::create_directories(package / "held_marker_dir");
+        const auto mark = overlay / ".gta6rt-deleted" / "held_marker_dir" / ".gta6rt-dir";
+        check(rmdir_w(L"GAME:\\held_marker_dir") != FALSE, "removing the directory creates a marker to hold");
+        const HANDLE held = ::CreateFileW(mark.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                          FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(held != INVALID_HANDLE_VALUE, "opened the removal marker without delete sharing");
+        if (held != INVALID_HANDLE_VALUE) {
+            const BOOL created = mkdir_w(L"GAME:\\held_marker_dir", nullptr);
+            const DWORD error = GetLastError();
+            check(!created && (error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED),
+                  "recreating a directory reports the marker deletion error");
+            check(!std::filesystem::exists(overlay / "held_marker_dir") && std::filesystem::exists(mark),
+                  "failed recreation removes the overlay directory and keeps the marker");
+            ::CloseHandle(held);
+            check(mkdir_w(L"GAME:\\held_marker_dir", nullptr) != FALSE,
+                  "recreating the directory succeeds after releasing the marker");
+        }
+    }
+
     // MoveFile: the destination is in the overlay; a moved package file is deleted by a marker.
     {
         check(move_w(L"GAME:\\misc\\one.txt", L"GAME:\\misc\\moved.txt") != FALSE, "MoveFileW moves a package file");

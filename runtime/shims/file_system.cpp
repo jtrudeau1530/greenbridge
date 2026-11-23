@@ -991,6 +991,11 @@ BOOL create_directory(LPCWSTR template_name, LPCWSTR name, LPSECURITY_ATTRIBUTES
     if (created) {
         // Keep markers for deleted children, which must remain hidden after the folder is recreated.
         std::filesystem::remove(marker(r.overlay, parts) / kRemovedDirMarker, ec);
+        if (ec) {
+            const DWORD error = static_cast<DWORD>(ec.value());
+            ::RemoveDirectoryW(target.c_str());
+            return fail_bool(error);
+        }
     }
     return created;
 }
