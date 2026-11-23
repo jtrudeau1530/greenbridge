@@ -1,85 +1,96 @@
-"""How runtime/test/check_d3d12_trace.py runs its fixture, with synthetic stand-in programs: no Wine, GPU or game files."""
-import importlib.util
+"""Run runtime/test/check_d3d12_trace.py through a fake runner, without a Windows build."""
 import os
+from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-SPEC = importlib.util.spec_from_file_location("check_d3d12_trace", ROOT / "runtime" / "test" / "check_d3d12_trace.py")
-check = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(check)
-
-# A stand-in runner: `python -c RUNNER_CODE <fixture> [args]` prints a trace line for the fixture it was given.
-ECHO_RUNNER = "import sys; print('[d3d12-trace] #1 ' + ' '.join(sys.argv[1:]), file=sys.stderr); print('other')"
-
-# A stand-in for Wine that hangs: it starts a helper (as wineserver would), records the helper's pid, and waits.
-HANGING_RUNNER = """
-import subprocess, sys, time
-helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-with open(sys.argv[1], "w") as f:
-    f.write(str(helper.pid))
-time.sleep(60)
-"""
 
 
-def gone(pid: int) -> bool:
-    """The process has exited (a zombie waiting for its new parent counts)."""
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
-    except FileNotFoundError:
-        return True
+ROOT = Path(__file__).resolve().parents[1]
+CHECK = ROOT / "runtime" / "test" / "check_d3d12_trace.py"
+
+COMMAND_LIST_TRACE = [
+    "ID3D12GraphicsCommandList::SetPipelineState called",
+    "ID3D12GraphicsCommandList::SetGraphicsRootSignature called",
+    "ID3D12GraphicsCommandList::SetMarker called",
+    "ID3D12GraphicsCommandList3::SetProtectedResourceSession unsupported",
+    "ID3D12GraphicsCommandList3::SetProtectedResourceSession unsupported",
+    "ID3D12GraphicsCommandList::Close ok",
+    "ID3D12GraphicsCommandList::Close failed",
+    "ID3D12GraphicsCommandList::Reset ok",
+    "ID3D12GraphicsCommandList::SetDescriptorHeaps called",
+    "ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable called",
+    "ID3D12GraphicsCommandList::SetComputeRootSignature called",
+    "ID3D12GraphicsCommandList::Dispatch called",
+    "ID3D12GraphicsCommandList::DrawInstanced called",
+    "ID3D12GraphicsCommandList::DrawIndexedInstanced called",
+    "ID3D12GraphicsCommandList::Close failed",
+]
 
 
-class RunFixtureTest(unittest.TestCase):
+class CheckD3D12TraceRunnerTests(unittest.TestCase):
     def setUp(self):
-        self.saved = (list(check.RUNNER), check.TIMEOUT_S, check.RUNNER_TIMEOUT_S)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.cwd = Path(directory.name)
 
-    def tearDown(self):
-        check.RUNNER[:], check.TIMEOUT_S, check.RUNNER_TIMEOUT_S = self.saved
+    def check(self, runner_source: str, runner_timeout: int = 20) -> subprocess.CompletedProcess:
+        (self.cwd / "runner.py").write_text(runner_source, encoding="utf-8", newline="\n")
+        # Shorten the runner limit without touching the script: run its main() with RUNNER_TIMEOUT replaced.
+        launch = ("import runpy, sys; timeout = int(sys.argv.pop(1)); script = sys.argv.pop(1); sys.argv[0] = script; "
+                  "main = runpy.run_path(script)['main']; main.__globals__['RUNNER_TIMEOUT'] = timeout; main()")
+        return subprocess.run(
+            [sys.executable, "-I", "-B", "-c", launch, str(runner_timeout), str(CHECK), "fixture.exe",
+             f"--runner={sys.executable}", "--runner=-I", "--runner=runner.py"],
+            cwd=self.cwd, capture_output=True, text=True, timeout=60,
+        )
 
-    def test_the_runner_is_put_in_front_and_trace_lines_are_kept(self):
-        check.RUNNER[:] = [sys.executable, "-c", ECHO_RUNNER]
-        self.assertEqual(check.run_fixture("fixture.exe", "--trace-d3d12"),
-                         ["[d3d12-trace] #1 fixture.exe --trace-d3d12"])
+    def test_trace_through_runner(self):
+        lines = "".join(f"[d3d12-trace] #{n} {entry}\\n" for n, entry in enumerate(COMMAND_LIST_TRACE, 1))
+        result = self.check(
+            "import sys\n"
+            "assert sys.argv[1] == 'fixture.exe', sys.argv\n"
+            f"if '--trace-d3d12' in sys.argv[2:]:\n    sys.stderr.write('{lines}')\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"D3D12 trace verified with {len(COMMAND_LIST_TRACE)} ordered entries", result.stdout)
 
-    def test_a_missing_runner_is_a_one_line_failure(self):
-        check.RUNNER[:] = [os.path.join(tempfile.gettempdir(), "no-such-wine", "wine")]
-        with self.assertRaises(SystemExit) as caught:
-            check.run_fixture("fixture.exe")
-        self.assertRegex(str(caught.exception.code), r"^cannot start .*no-such-wine.*wine: ")
+    def test_failing_fixture_reports_its_output(self):
+        result = self.check("import sys\nprint('fixture output')\nsys.exit(3)\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("fixture.exe exited with 3", result.stderr)
+        self.assertIn("fixture output", result.stderr)
 
-    def test_a_missing_fixture_is_a_one_line_failure(self):
-        check.RUNNER[:] = []
-        missing = os.path.join(tempfile.gettempdir(), "no-such-dir", "d3d12_gcl8_test.exe")
-        with self.assertRaises(SystemExit) as caught:
-            check.run_fixture(missing)
-        self.assertTrue(str(caught.exception.code).startswith(f"cannot start {missing}: "))
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups and flock")
+    def test_runner_timeout_stops_the_fixture_it_started(self):
+        import fcntl
 
-    def test_a_nonzero_exit_keeps_the_output(self):
-        check.RUNNER[:] = [sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)"]
-        with self.assertRaises(SystemExit) as caught:
-            check.run_fixture("fixture.exe")
-        self.assertEqual(caught.exception.code, "fixture.exe exited with 3\nout\nerr\n")
-
-    @unittest.skipUnless(os.name == "posix" and os.path.isdir("/proc"), "process groups and /proc")
-    def test_a_timeout_stops_the_runner_and_what_it_started(self):
-        with tempfile.TemporaryDirectory() as scratch:
-            pid_file = os.path.join(scratch, "helper.pid")
-            check.RUNNER[:] = [sys.executable, "-c", HANGING_RUNNER, pid_file]
-            check.RUNNER_TIMEOUT_S = 2
-            with self.assertRaises(SystemExit) as caught:
-                check.run_fixture("fixture.exe")
-            self.assertEqual(caught.exception.code, "fixture.exe did not finish within 2 s")
-            with open(pid_file) as f:
-                helper = int(f.read())
-        deadline = time.monotonic() + 10
-        while not gone(helper) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.assertTrue(gone(helper), "the runner's helper outlived the timeout")
+        # Like a Wine launcher: the fixture runs in a child that holds the output pipes and outlives the limit.
+        result = self.check(
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import fcntl, sys, time; lock = open(\"fixture.lock\", \"w\"); fcntl.flock(lock, fcntl.LOCK_EX); "
+            "print(\"fixture ready\", flush=True); time.sleep(60)'], stdout=subprocess.PIPE)\n"
+            "child.stdout.readline()\n"
+            "time.sleep(60)\n",
+            runner_timeout=2,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("fixture.exe: no exit within 2s", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        # The lock is released once the fixture exits, even while its PID is still a zombie.
+        with (self.cwd / "fixture.lock").open("r+") as lock:
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        self.fail("the fixture outlived the runner timeout")
+                    time.sleep(0.02)
 
 
 if __name__ == "__main__":
