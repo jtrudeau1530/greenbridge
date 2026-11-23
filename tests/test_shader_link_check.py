@@ -77,12 +77,14 @@ class ModuleFixture:
             self.decorate(identifier, decoration)
         return identifier
 
-    def entry(self, name, ids, stage=None):
+    def entry(self, name, ids, stage=None, *, model=None):
         raw = name.encode("utf-8") + b"\x00"
         raw += bytes(-len(raw) % 4)
         string = struct.unpack(f"<{len(raw) // 4}I", raw)
         function = self.allocate()
-        args = (self.MODELS[stage or self.stage], function, *string, *ids)
+        if model is None:
+            model = self.MODELS[stage or self.stage]
+        args = (model, function, *string, *ids)
         self.entries.extend([((len(args) + 1) << 16) | spv.OP_ENTRY_POINT, *args])
 
     def binary(self, big_endian=False):
@@ -303,13 +305,31 @@ class LinkingTest(unittest.TestCase):
         self.assertEqual(kinds(output(), fragment), [])
         self.assertEqual(kinds(output(array_count=3), fragment), ["type-mismatch"])
 
-    def test_mesh_primitive_output_matches_fragment_domain(self):
-        mesh = simple("ms", spv.STORAGE_OUTPUT, 0, array_count=37)
-        mesh.decorate(mesh.ids[0], spv.DEC_PER_PRIMITIVE)
-        fragment = input()
-        self.assertEqual(kinds(mesh, fragment), ["per-primitive-mismatch"])
-        fragment.decorate(fragment.ids[0], spv.DEC_PER_PRIMITIVE)
-        self.assertEqual(kinds(mesh, fragment), [])
+    def test_mesh_nv_and_ext_outputs_match_fragment_domains(self):
+        for name, model in (("MeshNV", 5268), ("MeshEXT", 5365)):
+            with self.subTest(model=name):
+                mesh = ModuleFixture("ms")
+                vec4 = mesh.numeric(32, 4)
+                mesh.variable(spv.STORAGE_OUTPUT, mesh.array(vec4, 3), location=0)
+                primitive = mesh.variable(spv.STORAGE_OUTPUT, mesh.array(vec4, 1), location=1)
+                mesh.decorate(primitive, spv.DEC_PER_PRIMITIVE)
+                mesh.entry("main", mesh.ids, model=model)
+
+                reflected = mesh.reflect()
+                self.assertEqual(reflected.stage, "ms")
+                self.assertEqual(mesh.reflect(stage="ms"), reflected)
+                self.assertTrue(all(d.indexed_by_vertex_or_primitive for d in reflected.outputs))
+                shape = spv.NumericType("f", 32, 4)
+                self.assertEqual(
+                    [d.varyings for d in reflected.outputs],
+                    [(spv.Varying(spv.Address(0), shape),), (spv.Varying(spv.Address(1), shape, True),)],
+                )
+
+                fragment = input()
+                fragment_primitive = fragment.variable(spv.STORAGE_INPUT, fragment.numeric(32, 4), location=1)
+                self.assertEqual(kinds(mesh, fragment), ["per-primitive-mismatch"])
+                fragment.decorate(fragment_primitive, spv.DEC_PER_PRIMITIVE)
+                self.assertEqual(kinds(mesh, fragment), [])
 
     def test_matching_structure_members_keep_order_and_locations(self):
         def block(stage, storage, locations):
