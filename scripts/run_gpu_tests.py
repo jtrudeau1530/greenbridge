@@ -1156,7 +1156,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
-                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
+                      "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
                       "cs_mask_vgpr_exec"):
             cs_dump_wants = {
@@ -1235,6 +1235,8 @@ def run_suite(a, work: str) -> int:
                 "cs_w64x_partial": [40, 40, 528, 0, 0, 532, 539, 524820],
                 "cs_w64x_partial_scmp": [0, 1, 0, 1, 1, 1, 1, 0],     # s_cmp mask, -1 in a partial wave
                 "cs_w32_partial_scmp": [0, 1, 1, 0, 1, 1, 1, 1],      # the same in a 20-thread wave32
+                # ds_permute_b32 in a 20-thread wave32: a never-launched source lane sends nothing (.asm header)
+                "cs_w32_partial_permute": [0, 29, 127, 0, 1, 0, 134, 113],
                 "cs_w32_andn2_exec": [1, 8, 16, 2064, 2068, 3, 20, 1544],   # s_andn2_saveexec/wrexec_b32 (.asm header)
                 "cs_w32_sincos": [1, 1, 1, 1, 1, 1],                  # SHADER-88 (cs_w32_sincos.asm): angles in turns
                 # SHADER-74: v_permlane16/x16 FI / BOUND_CTRL with the source lane off in EXEC (cs_w32_permlane_fi.asm)
@@ -1270,7 +1272,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
                                   "cs_w32_lds_subdword", "cs_w32_lds_wide",
-                                  "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_permlane_fi", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap",
+                                  "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_w32_permlane_fi", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap",
                                   "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec") and not emulated and not partial
