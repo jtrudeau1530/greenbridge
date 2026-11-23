@@ -142,6 +142,26 @@ std::filesystem::path win32_io_path(const std::filesystem::path& path) {
     return std::filesystem::path(L"\\\\?\\" + full);
 }
 
+std::filesystem::path win32_find_path(const std::filesystem::path& path, const std::wstring& leaf) {
+    if (path.native().size() < MAX_PATH) return path;
+    const auto search = win32_io_path(path);
+    if (search == path || !leaf.ends_with(L'.') || leaf.find_first_of(L"*?") == std::wstring::npos) return search;
+
+    // GetFullPathNameW strips a terminal dot, but that dot changes a native Win32 search (e.g. "mesh*.").
+    // Preserve the DOS wildcard expression for the extended path and let the filesystem match it, including
+    // short names. The DOS_STAR, DOS_QM and DOS_DOT tokens are defined by MS-FSA 2.1.4.3-4.
+    std::wstring mask = search.filename().native();
+    if (mask.ends_with(L'*')) mask.back() = L'<';
+    else mask.push_back(L'"');
+    for (size_t i = 0; i + 1 < mask.size(); ++i) {
+        const wchar_t next = mask[i + 1];
+        if (mask[i] == L'?') mask[i] = L'>';
+        else if (mask[i] == L'*' && next == L'.') mask[i] = L'<';
+        else if (mask[i] == L'.' && (next == L'*' || next == L'?' || next == L'<')) mask[i] = L'"';
+    }
+    return search.parent_path() / mask;
+}
+
 // "G:\x" is the installed package, like "GAME:\x", and "T:\x" a scratch folder the title may write to, the way the
 // other console layers map those two drives (RT-218). Only the executable can say which spelling the title uses, so
 // a host drive of the same letter must keep working: a path under --game-dir or the overlay (a package on drive G:,
@@ -610,7 +630,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
     auto add_root = [&](const std::filesystem::path& root, bool overlay_root) {
         if (root.empty()) return;
         WIN32_FIND_DATAW found{};
-        const HANDLE h = ::FindFirstFileW(win32_io_path(join(root, dirs) / leaf).c_str(), &found);
+        const HANDLE h = ::FindFirstFileW(win32_find_path(join(root, dirs) / leaf, leaf).c_str(), &found);
         if (h == INVALID_HANDLE_VALUE) return;
         do {
             if (overlay_root && internal_dir(found.cFileName)) continue;

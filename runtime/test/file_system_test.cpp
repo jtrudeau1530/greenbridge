@@ -1453,6 +1453,38 @@ void run_checks(const std::filesystem::path& root) {
         check(attributes_w((guest_dir + L"legacy.bin").c_str()) == INVALID_FILE_ATTRIBUTES,
               "a read-only query respects the long file's delete marker");
 
+        // Compare the same merged listing against the short-path Win32 search, including the names
+        // hidden by package deletion markers.
+        const wchar_t* const masks[] = {L"*.", L"?.", L"mesh*.", L"mesh*..", L"mesh?.", L"mesh.*.",
+                                        L"*.?.", L"*. ", L"*.*", L"mesh?.txt"};
+        const auto list_masks = [&](const std::filesystem::path& pack, const std::filesystem::path& layer,
+                                    const std::filesystem::path& subdir) {
+            for (const wchar_t* name : {L"a", L"a.txt", L"mesh", L"mesh1", L"mesh.txt", L"mesh-old", L".dot"})
+                write_path(extended(pack / subdir / name), "package");
+            for (const wchar_t* name : {L"mesh", L"mesh-cache", L"mesh-cache.tmp"})
+                write_path(extended(layer / subdir / name), "overlay");
+            rt::fs::configure(pack, layer);
+            const auto guest = L"GAME:\\" + subdir.native() + L"\\";
+            check(delete_w((guest + L"mesh-old").c_str()), "the wildcard fixture hides an extensionless package file");
+            std::vector<std::vector<std::wstring>> results;
+            for (const wchar_t* mask : masks) {
+                auto entries = list(first_w, next_w, find_close, (guest + mask).c_str());
+                std::sort(entries.begin(), entries.end());
+                results.push_back(std::move(entries));
+            }
+            return results;
+        };
+        const auto short_matches = list_masks(fixture / "short_package", fixture / "short_overlay", L"masks");
+        const auto long_matches = list_masks(long_package, long_overlay, relative / L"masks");
+        check(count(short_matches[0], L"mesh") == 1 && contains(short_matches[0], L"mesh-cache") &&
+                  !contains(short_matches[0], L"mesh.txt") && !contains(short_matches[0], L"mesh-old"),
+              "the short *. control merges extensionless entries and hides the deleted name");
+        for (size_t i = 0; i < short_matches.size(); ++i) {
+            char detail[96];
+            std::snprintf(detail, sizeof detail, "the long listing matches short Win32 for %ls", masks[i]);
+            check(long_matches[i] == short_matches[i], detail);
+        }
+
         // The scratch drive is usable with a short guest name and a long configured overlay root.
         const auto scratch_overlay = fixture / relative / "scratch_overlay";
         rt::fs::configure(long_package, scratch_overlay);
