@@ -955,8 +955,10 @@ rejections**, so the four OOB_SELECT bounds rules of "Buffer bounds checking" ho
 and gfx1150. Negative control (`--programs 300`): unperturbed 0 of 600; caught 312, 33, 211, 39, 19, 353, 129 and 53
 (oob_ignore_mode, mode0_no_stride, idx_unchecked, soffset_unchecked, whole_access, oob_load_keeps, sbuf_no_bound,
 sbuf_stride_ignored). `--hw-sync` at seed 5 (500 programs, both wave sizes): `scalar` (the default) and `full`
-1,000 of 1,000, `sinv` 964, `min` 955, `none` 935, so on gfx1200 a scalar load after vector stores needs both the
-store wait and the scalar-cache invalidation, as on the earlier families.
+1,000 of 1,000, `sinv` 964, `min` 955, `none` 935. With the scalar loads left out (`--skip-op sload --skip-op sbuf`)
+`none` gives 1,000 of 1,000, and with `s_load` alone 979: on gfx1200, as on GFX11 above, a vector load after a store
+of the same thread needs no wait, and a scalar load after vector stores needs both the store wait and the
+scalar-cache invalidation.
 
 *Findings.* The OOB_SELECT per-mode rules, the per-dword straddle rule and the `s_buffer_load` bound of design.md hold
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the

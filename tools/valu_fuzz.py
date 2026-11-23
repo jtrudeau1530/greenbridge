@@ -19,8 +19,8 @@ Families:
 Oracles (--oracle translator|hw|translator,hw): translator (default) assembles for gfx1013, translates and runs
 vk_compute_test. hw runs the same programs natively on the AMD GPU through tools/hw_oracle/ (wave32 and native wave64,
 64 threads) and compares them with the model, so it tests the model, not the translator; it exits 77 when the tools
-are missing. On the hardware f16 also runs on GFX11.7 and GFX12, while mem is refused per family there (gfx12xx has no
-s_waitcnt_vscnt and rejects the buffer_load/store forms, hw_family_skip_reason names both). The forms are the ones
+are missing. On the hardware both families also run on GFX11.7 and GFX12; mem's gfx12 kernels are respelled by
+gfx12_lines (null soffset, the split wait counters, global_inv). The forms are the ones
 with the same meaning on GFX10 and GFX11; what differs is listed in
 docs/shader_validation.md ("16-bit and memory ops on the GPU"). --negative-control checks that wrong models are caught.
 
@@ -1184,6 +1184,11 @@ def main():
             oracle.close()
             print(f"hardware oracle unavailable: {why}")
             return 77
+        if W3_LAYOUT == "gfx10" and asm.family(oracle.arch) == "gfx12":
+            # GFX10's RESOURCE_LEVEL bit 24 is WRITE_COMPRESS_ENABLE in gfx12-rsrc.json: not an informational change there
+            oracle.close()
+            print(f"error: --gfx10-word3 sets V# word 3 bit 24, which is WRITE_COMPRESS_ENABLE on {oracle.arch}")
+            return 2
         print(f"hardware oracle: {oracle.device}")
     if a.show is not None:
         parts = a.show.split(":")

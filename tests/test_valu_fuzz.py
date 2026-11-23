@@ -411,6 +411,33 @@ def test_mem_kernels_in_gfx12_spelling():
             vf.HW_SYNC = old
 
 
+def test_gfx10_word3_is_refused_on_gfx12(monkeypatch, capsys):
+    # --gfx10-word3 sets bit 24 (GFX10 RESOURCE_LEVEL), which gfx12-rsrc.json names WRITE_COMPRESS_ENABLE
+    from hw_oracle import runner
+
+    class Fake:
+        def __init__(self, arch):
+            self.arch, self.device, self.ran = arch, "fake", False
+
+        def run(self, kernels):
+            self.ran = True
+            return ["assembler rejected: fake"] * len(kernels)
+
+        def close(self):
+            pass
+
+    for arch, want in (("gfx1201", 2), ("gfx1150", 2)):
+        fake = Fake(arch)
+        monkeypatch.setattr(runner, "open_oracle", lambda **kw: fake)
+        monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--oracle", "hw", "--programs", "2",
+                                          "--gfx10-word3"])
+        assert vf.main() == want, arch
+        out = capsys.readouterr().out
+        assert ("WRITE_COMPRESS_ENABLE" in out) == (arch == "gfx1201"), (arch, out[-300:])
+        assert fake.ran == (arch != "gfx1201"), arch    # refused before any kernel on gfx12; gfx11 still runs it
+    vf.W3_LAYOUT = None
+
+
 def test_vsharp_word3_per_family():
     # GFX12 keeps GFX11's word 3 (gfx12-rsrc.json: same DST_SEL/FORMAT/OOB_SELECT bits, 32_FLOAT = 22 in the GFX11
     # table); GFX10 adds RESOURCE_LEVEL; a family without a known layout is refused, not given GFX11's by default
