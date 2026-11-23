@@ -65,6 +65,31 @@ class Main(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cef.main([]), 2)
 
+    def test_help_prints_the_usage_and_succeeds(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cef.main(["--help"]), 0)
+        self.assertIn("FAILED_LIST EXIT_STATUS", out.getvalue())
+
+    def test_a_list_that_cannot_be_read_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "absent.txt"
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(cef.main([str(missing), "8"]), 2)
+        self.assertEqual(err.getvalue().count("\n"), 1)
+        self.assertIn(str(missing), err.getvalue())
+
+    def test_a_non_integer_status_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "failed.txt"
+            path.write_text("a\n", encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(cef.main([str(path), "x"]), 2)
+        self.assertEqual(err.getvalue().count("\n"), 1)
+        self.assertIn("'x'", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

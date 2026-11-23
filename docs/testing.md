@@ -401,7 +401,9 @@ whose Metal device is "Apple Paravirtual device" (Metal family Mac2, not Apple7)
 subgroups, so the wave64 and "32 lanes on request" tests skip there (about 75 of 190 in November 2026), and Mesa's
 KosmicKrisp finds no device. `macos-15` can't build the runtime: Xcode 16's libc++ has no floating-point
 `std::from_chars`. A test known to fail on MoltenVK is listed in the step's `EXPECTED_FAILURES` with the pull
-request or coordination-issue finding that tracks it; it still runs, and `scripts/ci_expected_failures.py` fails the step on any other failure.
+request or coordination-issue finding that tracks it; it still runs, and `scripts/ci_expected_failures.py` fails the step
+on any other failure. It takes `FAILED_LIST EXIT_STATUS [EXPECTED ...]`, answers `--help`, and reports a list it cannot
+read or a non-numeric status as one line with exit code 2.
 
 ## GPUs without fragment barycentrics (NVIDIA Volta, Pascal and older)
 
