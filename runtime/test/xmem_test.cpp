@@ -15,12 +15,17 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <string>
 
 #include "shims.h"
 #include "startup_trace.h"
+
+#ifdef _MSC_VER
+extern "C" __declspec(thread) int _Init_thread_epoch;
+#endif
 
 namespace {
 
@@ -898,6 +903,84 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     DeleteFileW(path.c_str());
 }
 
+#ifdef _MSC_VER
+struct PhysicalTraceProbe {
+    XMemAllocatePhysicalPagesFn allocate;
+    XMemFreePhysicalPagesFn free_pages;
+    bool traced;
+};
+
+DWORD WINAPI physical_trace_worker(void* argument) {
+    const auto& probe = *static_cast<const PhysicalTraceProbe*>(argument);
+    const auto request = [&](uint64_t attributes, uint64_t requested) {
+        uint64_t count = requested;
+        uint64_t pages[3]{};
+        if (!probe.allocate(attributes, &count, pages) || count > std::size(pages)) return false;
+        const bool freed = probe.free_pages(count, pages) != FALSE;
+        return count == requested && freed;
+    };
+
+    // The TLS host can enter the shim before the runtime's CRT has initialized this thread's epoch.
+    const int saved_epoch = _Init_thread_epoch;
+    _Init_thread_epoch = 0;
+    const bool ok = probe.traced ? request(0x1111, 2) && request(0x1111, 1) && request(0x2222, 3)
+                                 : request(0x1111, 1);
+    _Init_thread_epoch = saved_epoch;
+    return ok ? 0 : 1;
+}
+
+void test_physical_trace_first_call() {
+    PhysicalTraceProbe probe{
+        reinterpret_cast<XMemAllocatePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages")),
+        reinterpret_cast<XMemFreePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages")),
+        false,
+    };
+    check(probe.allocate && probe.free_pages, "physical page exports are registered");
+    if (!probe.allocate || !probe.free_pages) return;
+
+    const auto run_worker = [&] {
+        HANDLE thread = CreateThread(nullptr, 0, physical_trace_worker, &probe, 0, nullptr);
+        if (!thread) return false;
+        DWORD result = 1;
+        const bool done = WaitForSingleObject(thread, INFINITE) == WAIT_OBJECT_0 &&
+                          GetExitCodeThread(thread, &result);
+        CloseHandle(thread);
+        return done && result == 0;
+    };
+    check(run_worker(), "physical pages allocate and free without tracing on the zero-epoch thread");
+
+    wchar_t temp[MAX_PATH];
+    const DWORD length = GetTempPathW(MAX_PATH, temp);
+    check(length > 0 && length < MAX_PATH, "find a directory for the physical-page trace");
+    if (!length || length >= MAX_PATH) return;
+    const std::wstring path =
+        std::wstring(temp) + L"xmem_physical_trace_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
+    const bool opened = rt::startup_trace::open(path.c_str());
+    check(opened, "open the startup trace before entering the worker");
+    if (!opened) return;
+    probe.traced = true;
+    check(run_worker(), "physical pages allocate and free with tracing on the zero-epoch thread");
+    rt::startup_trace::close();
+
+    std::ifstream in(path);
+    std::stringstream text;
+    text << in.rdbuf();
+    in.close();
+    DeleteFileW(path.c_str());
+    const std::string log = text.str();
+    const auto count = [&](const char* needle) {
+        std::size_t hits = 0;
+        for (auto at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++hits;
+        return hits;
+    };
+    check(count("\"kind\":\"xmem_physical_pages\"") == 2, "one event per distinct physical-page attribute");
+    check(count("\"api\":\"XMemAllocatePhysicalPages\",\"attributes\":\"0x1111\",\"pages\":2,\"caller\":\"") == 1,
+          "trace keeps the page count from the first traced call for each attribute");
+    check(count("\"api\":\"XMemAllocatePhysicalPages\",\"attributes\":\"0x2222\",\"pages\":3,\"caller\":\"") == 1,
+          "another physical-page attribute gets its own event with caller");
+}
+#endif
+
 // XMemTransferMemory moves budget between the console's title and system partitions; a PC has neither, so the shim
 // succeeds for every direction and size and moves (allocates) nothing. The XMEM_TRANSFER_TYPE values are not public,
 // so the directions here are just the first few enum values and one far outside any plausible range.
@@ -1114,7 +1197,15 @@ void print_result() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+#ifdef _MSC_VER
+    if (argc == 2 && std::strcmp(argv[1], "--physical-trace-first-call") == 0) {
+        test_physical_trace_first_call();
+        print_result();
+        return g_failures ? 1 : 0;
+    }
+#endif
+    if (argc != 1) return 2;
     std::printf("xmem_test: registered xmem.dll shim ABI\n");
 
     const auto alloc = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAlloc"));

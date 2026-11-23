@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -606,15 +607,19 @@ DWORD view_protect(const Window& window) { return window.protect & ~(PAGE_WRITEC
 
 bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
 
+// The first traced allocation can come from the TLS host's thread. Keep the set lazy without a function-local
+// CRT initialization guard on that thread.
+std::mutex g_physical_trace_mutex;
+constinit std::optional<std::set<uint64_t>> g_seen_physical_attributes;
+
 // gta6rt --trace FILE: the first XMemAllocatePhysicalPages for each distinct attribute word goes to the startup trace
 // as an "xmem_physical_pages" event with the page count and the caller.
 void note_physical_attributes(uint64_t attributes, uint64_t count, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
-    static std::mutex mutex;
-    static std::set<uint64_t> seen;
     {
-        const std::lock_guard lock(mutex);
-        if (!seen.insert(attributes).second) return;
+        const std::lock_guard lock(g_physical_trace_mutex);
+        if (!g_seen_physical_attributes) g_seen_physical_attributes.emplace();
+        if (!g_seen_physical_attributes->insert(attributes).second) return;
     }
     rt::startup_trace::event("xmem_physical_pages",
                              "\"api\":\"XMemAllocatePhysicalPages\",\"attributes\":" +
