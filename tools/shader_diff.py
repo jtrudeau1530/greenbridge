@@ -163,7 +163,14 @@ def generate_program(rng, n_ops):
         name, emit = rng.choice(vec_ops)
         dst = rng.choice(SCRATCH)
         clean = [v for v in SCRATCH if v not in tainted]
-        pool = SCRATCH if name in _FLOAT_OPS or not clean else clean
+        if name not in _FLOAT_OPS and not clean:
+            # All float results may carry oracle-specific NaN payloads. Restore one
+            # known bit pattern before choosing integer operands, even when dst is read.
+            lines.append(f"v_mov_b32 v{dst}, 0")
+            writers[dst] = ("v_mov_b32/seed", len(lines))
+            tainted.discard(dst)
+            clean = [dst]
+        pool = SCRATCH if name in _FLOAT_OPS else clean
         srcs = [rng.choice(pool) for _ in range(4)]
         lines.append(emit(rng, dst, srcs))
         writers[dst] = (name, len(lines))
