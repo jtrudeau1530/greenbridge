@@ -247,7 +247,7 @@ def _analyze_from_source(source) -> list[dict]:
     return out
 
 
-def check_carve_index(directory: str) -> None:
+def check_carve_index(directory: str) -> list[dict]:
     """Name the index and the bad row of a folder that is not an rpf9_carve.py carve, before the scan.
 
     DirectorySource reads `index['files']` and each row's `off` and `stored` straight through, so a hand-edited
@@ -257,7 +257,7 @@ def check_carve_index(directory: str) -> None:
     if not os.path.isfile(index_path):
         raise ValueError(f"{directory} is not an rpf9_carve.py folder (no index.json)")
     try:
-        with open(index_path, encoding="utf-8") as f:
+        with open(index_path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except OSError as e:
         raise ValueError(f"cannot read {index_path}: {e.strerror or e}") from e
@@ -269,6 +269,7 @@ def check_carve_index(directory: str) -> None:
     for i, row in enumerate(rows):
         if not isinstance(row, dict) or "off" not in row or "stored" not in row:
             raise ValueError(f"{index_path}: row {i} needs an 'off' and a 'stored'")
+    return sorted(rows, key=lambda r: r["off"])
 
 
 def read_payloads(target: str) -> list[dict]:
@@ -368,8 +369,7 @@ def main(argv=None) -> int:
         if a.json:
             check_report_path(a.json, a.target, a.shaders)
         if os.path.isdir(a.target):
-            check_carve_index(a.target)
-            rows = gm._read_index_rows(a.target)
+            rows = check_carve_index(a.target)
             if a.json:
                 check_report_path(a.json, a.target, a.shaders, rows=rows)
         payloads = read_payloads(a.target)
