@@ -12167,10 +12167,12 @@ class Gen:
         if is3d and op in ("image_sample_d", "image_sample_d_cl") and ("tfe" in mods or "lwe" in mods):
             raise Unsupported(op + " 3D gradient status")
         grad_width = 3 if is3d else min(ncoord, 2)  # an array layer has no derivative
+        # Cube loads use the same 2D-array view (sampled or storage) and integer layer as array loads.
+        view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
         # glc makes the access coherent (see image_load_coherent). Only image_load can be: a sampled read has no
         # coherent form in SPIR-V, so it is refused rather than read stale.
         coherent = "glc" in mods
-        if coherent and (op != "image_load" or dim not in self.STORE_DIMS):
+        if coherent and (op != "image_load" or view_dim not in self.STORE_DIMS):
             raise Unsupported(op + " glc " + dim.split("SQ_RSRC_IMG_")[-1])
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
@@ -12229,10 +12231,8 @@ class Gen:
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
             if coherent:
-                self.image_load_coherent(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img_idx, dmask, vdata, d16)
+                self.image_load_coherent(view_dim, self.sgpr_word(a[2], 1), iv, img_idx, dmask, vdata, d16)
                 return
-            # Cube loads use the same sampled 2D-array view and integer layer as array loads.
-            view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
             self.image_load_typed(view_dim, self.sgpr_word(a[2], 1), iv, img, img_idx,
                                   dmask, vdata, self.cu(0), d16)
             return
@@ -12812,10 +12812,12 @@ class Gen:
         (UNORM/SNORM/FLOAT convert from the float bits the shader wrote). Missing components are 0.
         With d16, enabled components are packed two 16-bit values per consecutive VGPR (low half first): IEEE f16
         widened to f32 for float/norm views, zero-extended u16 for UINT views, and sign-extended i16 for SINT views."""
-        if dim not in self.STORE_DIMS or any(m in mods for m in ("tfe", "lwe")):
+        # Cube storage images are bound as 6-layer 2D arrays (runtime/src/vulkan_bindless.h).
+        view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
+        if view_dim not in self.STORE_DIMS or any(m in mods for m in ("tfe", "lwe")):
             raise Unsupported("image_store " + dim.split("SQ_RSRC_IMG_")[-1] + (" a16" if "a16" in mods else "")
                               + (" d16" if "d16" in mods else ""))
-        di, _, _, nc = self.STORE_DIMS[dim]
+        di, _, _, nc = self.STORE_DIMS[view_dim]
         if "glc" in mods:
             self.coherent_images = True     # a coherent store (glc, device scope): see image_load_coherent
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0xf")
