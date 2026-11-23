@@ -279,11 +279,18 @@ std::map<uintptr_t, View> g_views;  // view base -> view
 // retries the access. The last finished split stays published too, for a fault the handler sees only after the split
 // is done; any other access violation goes on to the next handler.
 // Only the last finished span is kept, so a fault delivered after two later splits is not retried.
-std::atomic<uintptr_t> g_split_begin{0};
-std::atomic<uintptr_t> g_split_end{0};
-std::atomic<uintptr_t> g_last_split_begin{0};
-std::atomic<uintptr_t> g_last_split_end{0};
+// A span is one word, so a reader never pairs one split's start with another's end: views are 64 KiB aligned and at
+// most kMaxViewPages long, so the base keeps its low 16 bits for the page count. 0 is no span.
+std::atomic<uint64_t> g_split{0};
+std::atomic<uint64_t> g_last_split{0};
 std::atomic<uint64_t> g_splits{0};  // splits started
+
+uint64_t pack_span(uintptr_t begin, uintptr_t end) { return begin | (end - begin) / kPhysicalPageSize; }
+
+bool span_holds(uint64_t span, uintptr_t address) {
+    const uintptr_t begin = span & ~uint64_t{0xffff};
+    return span && address >= begin && address < begin + (span & 0xffff) * kPhysicalPageSize;
+}
 bool g_split_handler = false;  // with g_phys_mutex held
 
 LONG CALLBACK wait_for_split(EXCEPTION_POINTERS* info) {
@@ -297,16 +304,11 @@ LONG CALLBACK wait_for_split(EXCEPTION_POINTERS* info) {
     for (;;) {
         const uint64_t splits = g_splits.load(std::memory_order_acquire);
         bool in_split = false;
-        for (;;) {
-            const uintptr_t begin = g_split_begin.load(std::memory_order_acquire);
-            if (!begin || address < begin || address >= g_split_end.load(std::memory_order_acquire)) break;
+        while (span_holds(g_split.load(std::memory_order_acquire), address)) {
             in_split = true;
             SwitchToThread();
         }
-        if (!in_split) {
-            const uintptr_t last = g_last_split_begin.load(std::memory_order_acquire);
-            in_split = last && address >= last && address < g_last_split_end.load(std::memory_order_acquire);
-        }
+        in_split = in_split || span_holds(g_last_split.load(std::memory_order_acquire), address);
         if (!in_split) return EXCEPTION_CONTINUE_SEARCH;
         // Retry only an access the page now allows: the fault may have come in during a split that has since finished.
         MEMORY_BASIC_INFORMATION mbi{};
@@ -326,15 +328,12 @@ LONG CALLBACK wait_for_split(EXCEPTION_POINTERS* info) {
 struct SplitGuard {
     SplitGuard(uintptr_t begin, uintptr_t end) {
         if (!g_split_handler) g_split_handler = AddVectoredExceptionHandler(1, &wait_for_split) != nullptr;
-        g_split_end.store(end, std::memory_order_release);
-        g_split_begin.store(begin, std::memory_order_release);
+        g_split.store(pack_span(begin, end), std::memory_order_release);
         g_splits.fetch_add(1, std::memory_order_release);
     }
     ~SplitGuard() {
-        g_last_split_begin.store(0, std::memory_order_release);
-        g_last_split_end.store(g_split_end.load(std::memory_order_relaxed), std::memory_order_release);
-        g_last_split_begin.store(g_split_begin.load(std::memory_order_relaxed), std::memory_order_release);
-        g_split_begin.store(0, std::memory_order_release);
+        g_last_split.store(g_split.load(std::memory_order_relaxed), std::memory_order_release);
+        g_split.store(0, std::memory_order_release);
     }
     SplitGuard(const SplitGuard&) = delete;
     SplitGuard& operator=(const SplitGuard&) = delete;
@@ -507,6 +506,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 // run, so the run is mapped as one view per placeholder it spans. Views are capped at kMaxViewPages so that unmapping a
 // page inside a long run only remaps the rest of one capped view, not the whole run.
 constexpr uint64_t kMaxViewPages = 1024;  // 64 MiB
+static_assert(kMaxViewPages < 0x10000, "a split span keeps its page count in 16 bits");
 
 bool map_view(uintptr_t address, const View& view) {
     for (uint64_t mapped = 0; mapped < view.count;) {
