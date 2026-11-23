@@ -3308,23 +3308,24 @@ std::size_t xmem_size(DeviceProxy* self, const D3D12_RESOURCE_DESC& desc) {
     return static_cast<std::size_t>(info.SizeInBytes);
 }
 
-// Ties hook memory to `resource` as private data, so it goes back through the hook's free when the resource dies. A
-// resource that takes no reference (no ID3D12Object, or no memory for the entry) gives the memory back at once.
-void tie_xmem(void* resource, void* memory, const XmemHooks& hooks) {
-    auto* const owner = new (std::nothrow) XmemBackingOwner(memory, hooks.free, kXmemCommittedResourceAttributes);
-    if (!owner) {
-        if (hooks.free) hooks.free(memory, kXmemCommittedResourceAttributes);
-        return;
-    }
+// The caller retains ownership of the hook memory if attachment fails.
+HRESULT tie_xmem(void* resource, void* memory, const XmemHooks& hooks) {
+    if (!resource) return E_POINTER;
     ID3D12Object* object = nullptr;
-    if (resource &&
-        SUCCEEDED(static_cast<IUnknown*>(resource)->QueryInterface(__uuidof(ID3D12Object),
-                                                                    reinterpret_cast<void**>(&object))) &&
-        object) {
-        object->SetPrivateDataInterface(kXmemBackingPrivateData, owner);  // the resource holds its own reference
-        object->Release();
+    HRESULT hr = static_cast<IUnknown*>(resource)->QueryInterface(
+        __uuidof(ID3D12Object), reinterpret_cast<void**>(&object));
+    if (FAILED(hr)) return hr;
+    if (!object) return E_NOINTERFACE;
+
+    auto* const owner = new (std::nothrow) XmemBackingOwner(memory, nullptr, kXmemCommittedResourceAttributes);
+    hr = E_OUTOFMEMORY;
+    if (owner) {
+        hr = object->SetPrivateDataInterface(kXmemBackingPrivateData, owner);
+        if (SUCCEEDED(hr)) owner->free_fn = hooks.free;
+        owner->Release();
     }
-    owner->Release();  // frees now when the resource took no reference
+    object->Release();
+    return hr;
 }
 
 // LEONIDA_XMEM_RESOURCE_BACKING=0 keeps every committed resource on the PC device's own memory and the hook memory as
@@ -3382,7 +3383,8 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
                          "[rt] d3d12_xs: slot %u resource memory through the title's XMem hook: %zu bytes, %s "
                          "(bookkeeping: the resource stays on the PC device's memory)\n",
                          slot, size, memory ? "allocated" : "refused");
-        if (memory) tie_xmem(*out, memory, hooks);
+        if (memory && FAILED(tie_xmem(*out, memory, hooks)) && hooks.free)
+            hooks.free(memory, kXmemCommittedResourceAttributes);
         return hr;
     }
 
@@ -3398,12 +3400,18 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
     if (!(heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) std::memset(memory, 0, size);
     HRESULT hr = handler(self->real, memory, desc, 0xFFFFFFFFu, riid, out);
     if (SUCCEEDED(hr)) {
+        const HRESULT attach_hr = tie_xmem(*out, memory, hooks);
+        if (FAILED(attach_hr)) {
+            if (*out) static_cast<IUnknown*>(*out)->Release();
+            *out = nullptr;
+            if (hooks.free) hooks.free(memory, kXmemCommittedResourceAttributes);
+            return attach_hr;
+        }
         static std::atomic<bool> logged{false};
         if (first_call(logged))
             std::fprintf(stderr,
                          "[rt] d3d12_xs: slot %u buffer on the title's XMem hook memory: %p, %llu bytes (%zu taken)\n",
                          slot, memory, static_cast<unsigned long long>(desc.Width), size);
-        tie_xmem(*out, memory, hooks);
         return hr;
     }
     static std::atomic<bool> fallback_logged{false};
@@ -3414,11 +3422,9 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
                      slot, memory, static_cast<unsigned long>(hr));
     if (out) *out = nullptr;
     hr = create_pc();
-    if (FAILED(hr) || !*out) {
+    if (FAILED(hr) || !*out || FAILED(tie_xmem(*out, memory, hooks))) {
         if (hooks.free) hooks.free(memory, kXmemCommittedResourceAttributes);
-        return hr;
     }
-    tie_xmem(*out, memory, hooks);
     return hr;
 }
 
