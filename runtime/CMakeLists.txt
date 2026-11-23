@@ -1626,6 +1626,12 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_fence_dispatcher_sync COMMAND vk_fence_dispatcher_sync_test)
     set_tests_properties(vk_fence_dispatcher_sync PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # CPU-only: one VkShaderModule per distinct SPIR-V, shared by the pipeline states built from it (A42).
+  add_executable(shader_module_cache_test test/shader_module_cache_test.cpp)
+  target_link_libraries(shader_module_cache_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME shader_module_cache COMMAND shader_module_cache_test)
+  endif()
   # CPU-only: the bindless set's array sizes from synthetic device limits.
   add_executable(bindless_sizing_test test/bindless_sizing_test.cpp)
   target_link_libraries(bindless_sizing_test PRIVATE Vulkan::Headers)

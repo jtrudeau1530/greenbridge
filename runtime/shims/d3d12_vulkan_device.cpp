@@ -17,6 +17,7 @@
 #include "d3d12_xs_native_pso.h"
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
+#include "../src/shader_module_cache.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/host_stall.h"
 #include "../src/depth24_fragment.h"
@@ -1095,6 +1096,25 @@ struct DeviceState {
         std::uint64_t address;
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
+    // A42: every PipelineState takes its VkShaderModules from here, one per distinct SPIR-V (src/shader_module_cache.h).
+    std::once_flag shader_modules_once;
+    std::unique_ptr<leonida::ShaderModuleCache> shader_modules_cache;
+    leonida::ShaderModuleCache& shader_modules() {
+        std::call_once(shader_modules_once, [this] {
+            shader_modules_cache = std::make_unique<leonida::ShaderModuleCache>(
+                [this](const std::vector<std::uint32_t>& words) {
+                    VkShaderModuleCreateInfo create{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                    create.codeSize = words.size() * 4;
+                    create.pCode = words.data();
+                    VkShaderModule module = VK_NULL_HANDLE;
+                    if (context->vk.vkCreateShaderModule(info.device, &create, nullptr, &module) != VK_SUCCESS)
+                        return VkShaderModule(VK_NULL_HANDLE);
+                    return module;
+                },
+                [this](VkShaderModule module) { context->vk.vkDestroyShaderModule(info.device, module, nullptr); });
+        });
+        return *shader_modules_cache;
+    }
     std::mutex descriptor_mutex;  // the set and the containers below
     // vkDeviceWaitIdle calls made for the bindless set (none, unless LEONIDA_BINDLESS_IDLE_WAIT restores the old wait).
     std::atomic<std::uint64_t> bindless_idle_waits{0};
@@ -3298,11 +3318,11 @@ public:
         if (registered_) device_.context->remove_pipeline(id());
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
-        if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
+        if (module_) device_.shader_modules().release(module_);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
-        for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
+        for (VkShaderModule module : modules_) device_.shader_modules().release(module);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
     }
 
@@ -3594,11 +3614,8 @@ public:
                     stage.words = std::move(patched);
                 }
             }
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = stage.words.size() * 4;
-            module_info.pCode = stage.words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
+            const VkShaderModule module = device_.shader_modules().acquire(stage.words);
+            if (module == VK_NULL_HANDLE) return E_FAIL;
             modules_.push_back(module);
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             info.stage = stage.bit;
@@ -3609,12 +3626,8 @@ public:
         }
         if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
             const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = words.size() * 4;
-            module_info.pCode = words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (words.empty() || vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS)
-                return E_FAIL;
+            const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
+            if (module == VK_NULL_HANDLE) return E_FAIL;
             modules_.push_back(module);
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -4006,10 +4019,8 @@ public:
             return E_FAIL;
         }
 
-        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module_info.codeSize = words.size() * 4;
-        module_info.pCode = words.data();
-        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+        module_ = device_.shader_modules().acquire(words);
+        if (module_ == VK_NULL_HANDLE) return E_FAIL;
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
