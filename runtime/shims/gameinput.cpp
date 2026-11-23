@@ -1829,6 +1829,16 @@ void update_keyboard_pad() {
     if (active) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
         for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
+        static const long long autopress = [] { const char* v = std::getenv("LEONIDA_AUTOPRESS"); return v ? std::atoll(v) * 1000 : -1LL; }();
+        static const unsigned long long t0 = GetTickCount64();
+        if (autopress >= 0) {
+            const long long ms = static_cast<long long>(GetTickCount64() - t0) - autopress;
+            if (ms >= 0 && ms % 3000 < 250) {
+                const int which = static_cast<int>(ms / 3000) % 2;
+                down[which ? SDL_GAMEPAD_BUTTON_START : SDL_GAMEPAD_BUTTON_SOUTH] = true;
+                if (ms % 3000 < 3) std::fprintf(stderr, "[rt] gameinput: autopress %s at %lld s\n", which ? "START" : "A", (ms + autopress) / 1000);
+            }
+        }
         lx = key_down('D') - key_down('A');  // opposite keys cancel
         ly = key_down('S') - key_down('W');  // SDL's +Y is down
         aim = key_down(VK_RBUTTON);

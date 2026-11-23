@@ -17,6 +17,7 @@
 // --game-dir is also where a title's GAME: paths read from; anything it writes or deletes goes to the overlay
 // (--overlay, default <game-dir>/overlay) so the package is never modified (shims/file_system.cpp).
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -269,6 +270,53 @@ int wmain(int argc, wchar_t** argv) {
                         reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()));
         }
         std::printf("running %s\n", main_module.name.c_str());
+        if (const char* v = std::getenv("LEONIDA_SAMPLE_SECS")) {
+            static uintptr_t s_base, s_end, h_base, h_end;
+            {
+                h_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+                auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(h_base);
+                h_end = h_base + reinterpret_cast<const IMAGE_NT_HEADERS64*>(h_base + dos->e_lfanew)->OptionalHeader.SizeOfImage;
+            }
+            static DWORD s_period;
+            s_base = reinterpret_cast<uintptr_t>(main_module.base);
+            s_end = s_base + main_module.size;
+            s_period = static_cast<DWORD>(std::atoi(v)) * 1000;
+            CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+                for (unsigned round = 0;; ++round) {
+                    Sleep(s_period);
+                    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                    THREADENTRY32 te{sizeof(te)};
+                    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+                        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+                        HANDLE h = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+                        if (!h) continue;
+                        CONTEXT c{};
+                        c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                        if (SuspendThread(h) != static_cast<DWORD>(-1)) {
+                            if (GetThreadContext(h, &c)) {
+                                char line[1024];
+                                int n = std::snprintf(line, sizeof line, "[rt] sample %u tid %lu rip %s%llx rcx %llx stack", round, te.th32ThreadID,
+                                                      c.Rip >= s_base && c.Rip < s_end ? "exe+0x" : "0x",
+                                                      static_cast<unsigned long long>(c.Rip >= s_base && c.Rip < s_end ? c.Rip - s_base : c.Rip),
+                                                      static_cast<unsigned long long>(c.Rcx));
+                                const uintptr_t* sp = reinterpret_cast<const uintptr_t*>(c.Rsp);
+                                MEMORY_BASIC_INFORMATION mbi{};
+                                int found = 0;
+                                if (VirtualQuery(sp, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT)
+                                    for (int i = 0; i < 2048 && found < 16 && reinterpret_cast<uintptr_t>(sp + i) + 8 <= reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize; ++i)
+                                        if (sp[i] >= s_base && sp[i] < s_end) { n += std::snprintf(line + n, sizeof line - n, " %llx", static_cast<unsigned long long>(sp[i] - s_base)); ++found; }
+                                        else if (sp[i] >= h_base && sp[i] < h_end) { n += std::snprintf(line + n, sizeof line - n, " rt+%llx", static_cast<unsigned long long>(sp[i] - h_base)); ++found; }
+                                std::fprintf(stderr, "%s\n", line);
+                            }
+                            ResumeThread(h);
+                        }
+                        CloseHandle(h);
+                    }
+                    CloseHandle(snap);
+                }
+            }, nullptr, 0, nullptr);
+        }
         std::fflush(stdout);
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
         std::fflush(stdout);

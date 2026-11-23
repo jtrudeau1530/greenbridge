@@ -4529,8 +4529,12 @@ public:
             // The console makes this pipeline from native code at once; the driver's compile of the translated module
             // is host-only time on the title's thread, which a guest Sleep sits out (src/host_stall.h).
             const rt::host_stall::Scope compiling;
+            static const bool diag = std::getenv("LEONIDA_DIAG_COMPILE") != nullptr;
+            if (diag) std::fprintf(stderr, "[rt] diag compile begin %s tid %lu\n", entry->name.c_str(), GetCurrentThreadId());
+            const unsigned long long t0 = GetTickCount64();
             created = vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
                                                   &pipeline_.pipeline);
+            if (diag) std::fprintf(stderr, "[rt] diag compile end %s %llu ms\n", entry->name.c_str(), GetTickCount64() - t0);
         }
         if (created != VK_SUCCESS) return E_FAIL;
 
