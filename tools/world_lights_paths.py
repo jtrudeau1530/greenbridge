@@ -675,6 +675,58 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
     return total
 
 
+def read_entities(path):
+    """Rows of a world_index.py ``--entities-out`` file, shape-checked: archetype hash, 3-float position,
+    4-float rotation, optional float scale (``None`` keeps a field unset, as the producer writes for
+    incomplete rows).
+
+    Raises ValueError naming file and line for any row the tool cannot use, so malformed input is refused
+    before the scan instead of crashing the summary after it. UnicodeDecodeError (binary garbage) is
+    re-raised as ValueError with the path.
+    """
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError as exc:
+                    raise ValueError("%s:%d: not valid JSON (%s)" % (path, n, exc)) from None
+                if not isinstance(e, dict):
+                    raise ValueError("%s:%d: not a JSON object" % (path, n))
+                a = e.get("archetype")
+                try:
+                    a = int(a, 16) if isinstance(a, str) else a    # world_index writes the hash as hex
+                    hash(a)
+                except ValueError:
+                    raise ValueError("%s:%d: archetype is not a hex hash: %r"
+                                     % (path, n, e.get("archetype"))) from None
+                except TypeError:
+                    raise ValueError("%s:%d: archetype is not a hash: %r"
+                                     % (path, n, e.get("archetype"))) from None
+                row = {"archetype": a}
+                for key, width in (("position", 3), ("rotation", 4)):
+                    v = e.get(key)
+                    if v is None:
+                        row[key] = None
+                    elif isinstance(v, list) and len(v) == width and all(
+                            isinstance(x, (int, float)) and not isinstance(x, bool) for x in v):
+                        row[key] = list(v)
+                    else:
+                        raise ValueError("%s:%d: %s is not %d numbers: %r" % (path, n, key, width, v))
+                for key in ("scale_xy", "scale_z"):
+                    v = e.get(key)
+                    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                        raise ValueError("%s:%d: %s is not a number: %r" % (path, n, key, v))
+                    row[key] = v
+                rows.append(row)
+    except UnicodeDecodeError:
+        raise ValueError("%s: not UTF-8 text" % path) from None
+    return rows
+
+
 def summarize(total, entities=None, lights_out=None):
     """Build the counts-only summary, and place archetype lights through the entity rows if given."""
     lights = dict(total["lights"])
@@ -700,27 +752,22 @@ def summarize(total, entities=None, lights_out=None):
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
         placed["entity_lights_in_maps"] = len(total["world_lights"]) if lights_out else lights.get("lights_entity_in_map_placed", 0)
         if entities:
-            with open(entities, encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    e = json.loads(line)
-                    a = e.get("archetype")
-                    a = int(a, 16) if isinstance(a, str) else a    # world_index writes the hash as hex
-                    sets = arch.get(a)
-                    placed["entities"] += 1
-                    if not sets:
-                        continue
-                    ls = sets[0]
-                    placed["entities_with_lights"] += 1
-                    placed["archetype_lights_placed"] += len(ls)
-                    if out is not None and e.get("position") and e.get("rotation"):
-                        for L in ls:
-                            local = _local_light_position(L, L["offset"])
-                            p, d = place(local, L.get("direction"), e["position"], e["rotation"],
-                                         e.get("scale_xy"), e.get("scale_z"))
-                            out.write(json.dumps(_light_row(p, d, L, "archetype", a),
-                                                 separators=(",", ":")) + "\n")
+            for row in read_entities(entities):
+                a = row["archetype"]
+                sets = arch.get(a)
+                placed["entities"] += 1
+                if not sets:
+                    continue
+                ls = sets[0]
+                placed["entities_with_lights"] += 1
+                placed["archetype_lights_placed"] += len(ls)
+                if out is not None and row["position"] and row["rotation"]:
+                    for L in ls:
+                        local = _local_light_position(L, L["offset"])
+                        p, d = place(local, L.get("direction"), row["position"], row["rotation"],
+                                     row["scale_xy"], row["scale_z"])
+                        out.write(json.dumps(_light_row(p, d, L, "archetype", a),
+                                             separators=(",", ":")) + "\n")
     except BaseException:
         if out is not None:
             try:
@@ -783,6 +830,12 @@ def main(argv=None):
     if a.entities and not os.path.isfile(a.entities):
         print(f"ERROR: {a.entities}: no such file", file=sys.stderr)
         return 2
+    if a.entities:
+        try:
+            read_entities(a.entities)    # refuse malformed rows before the scan, not after it
+        except (ValueError, OSError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     if a.out and a.lights_out and same_report_path(a.out, a.lights_out):
         ap.error("--out and --lights-out must use different paths")
     inputs = [("archive", a.archive)]
