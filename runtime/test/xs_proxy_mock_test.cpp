@@ -323,7 +323,8 @@ void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true
     mock->full_chain_lists = full_chain_lists;
     mock->refs = 1;
     void* device = nullptr;
-    if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device)))
+    if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device,
+                                       /*console_lists=*/true)))
         return nullptr;
     return device;
 }
@@ -930,6 +931,22 @@ int check_lists() {
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);
     EXPECT(release(device) == 0 && mock->refs == 0);
+
+    // A PC caller (console_lists=false — the default, what the GPU harnesses use) gets the real list back:
+    // slot 12 returns the mock, not a proxy, so its PC vtable indices stay valid.
+    Mock* pc_mock = new_mock(Kind::device);
+    pc_mock->device_level = 9;
+    pc_mock->refs = 1;
+    void* pc_device = nullptr;
+    EXPECT(SUCCEEDED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(pc_mock), __uuidof(ID3D12Device),
+                                           &pc_device)));
+    void* pc_list = nullptr;
+    EXPECT(hr_of(raw(pc_device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, word(&gcl_iid),
+                     word(&pc_list))) == S_OK);
+    EXPECT(pc_list && !xs::is_list_proxy(pc_list) &&
+           reinterpret_cast<Mock*>(pc_list)->kind == Kind::command_list);
+    EXPECT(release(pc_list) == 0);
+    EXPECT(release(pc_device) == 0 && pc_mock->refs == 0);
     std::printf("%s: lists come back console-shaped (cursor pinned, GetDevice, Dispatch forwarded, extras "
                 "recorded); AllocateUploadMemory hands out arena pointers a root SRV receives\n", g_label);
     return 0;

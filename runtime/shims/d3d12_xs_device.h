@@ -68,7 +68,8 @@ namespace rt::d3d12_xs {
 // `console_lists` shapes the command lists CreateCommandList returns: true (the title path) gives the
 // console-shaped object the Xbox ABI calls; false hands the real list back for callers compiled against
 // the PC headers (the GPU test harnesses), whose vtable indices past slot 26 do not exist in console order.
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool console_lists = true);
+// D3D12XboxCreateDevice opts in; the default is PC-shaped so direct callers keep the old behaviour.
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool console_lists = false);
 
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);
