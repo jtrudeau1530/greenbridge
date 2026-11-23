@@ -529,6 +529,20 @@ public:
         std::function<void()> callback;
     };
 
+    // A dispatch runs outside mutex_. Each entry in a ready batch gets its own slot: a callback may re-entrantly
+    // call cancel() for a later entry in the same batch, which marks that entry cancelled so it is skipped before
+    // it can use the semaphore. A callback running on another thread must still be waited for.
+    // A cancelled entry still in pending_ is dispatched by cancel() itself (callback and bookkeeping both run);
+    // one already in a ready batch is skipped and only its event is signalled. The held Signal op's count is
+    // therefore not decremented for a skipped batch entry. That is safe because only ~Fence cancels a wait, but
+    // keep it in mind if cancel() gains other callers.
+    struct DispatchSlot {
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        std::thread::id owner;
+        bool active = false;     // guarded by mutex_
+        bool cancelled = false;  // guarded by mutex_
+    };
+
     using SignalEventFn = void (*)(void* event_handle);
 
     // Longest single vkWaitSemaphores call in run(): bounds how long the thread can sit in an uninterruptible wait.
@@ -609,7 +623,8 @@ public:
     }
 
     // Completes the pending waits for `sem` (a released D3D12 fence counts as reached, as on the PC runtime) and
-    // blocks until any in-flight vkWaitSemaphores releases `sem` before the caller destroys the VkSemaphore.
+    // blocks until both a vkWaitSemaphores on `sem` and any callback already dispatched for it have finished, before
+    // the caller destroys the VkSemaphore.
     void cancel(VkSemaphore sem) {
         if (!sem) return;
         std::vector<Entry> cancelled;
@@ -627,10 +642,18 @@ public:
                 }
             }
             pending_.resize(write);
-            if (thread_.joinable() && waiting_) {
+            // Entries already taken out of pending_ but not yet started belong to a live ready batch. Mark them
+            // cancelled so dispatch skips them; this is how a re-entrant cancel() from another callback in the
+            // same batch is completed without waiting on the callback that is already on this thread's stack.
+            for (const auto& slot : dispatching_) {
+                if (slot->semaphore == sem && !slot->active) slot->cancelled = true;
+            }
+            if (thread_.joinable() && (waiting_ || callback_on_other_thread(sem))) {
                 const std::uint64_t target_epoch = epoch_ + 1;
                 signal_wakeup_locked();
-                epoch_cv_.wait(lock, [this, target_epoch] { return !waiting_ || epoch_ >= target_epoch; });
+                epoch_cv_.wait(lock, [this, sem, target_epoch] {
+                    return (!waiting_ || epoch_ >= target_epoch) && !callback_on_other_thread(sem);
+                });
             }
         }
         dispatch_entries(cancelled, fn);
@@ -655,6 +678,63 @@ private:
         }
     }
 
+    // True only for a callback already running on another thread. A slot that has not started yet is cancelled by
+    // cancel() and skipped, so it never uses a destroyed semaphore and must not hold up the cancelling caller.
+    bool callback_on_other_thread(VkSemaphore sem) const {
+        const std::thread::id me = std::this_thread::get_id();
+        return std::any_of(dispatching_.begin(), dispatching_.end(), [&](const auto& d) {
+            return d->semaphore == sem && d->active && d->owner != me;
+        });
+    }
+
+    // mutex_ is held on entry and again on return. Recording every entry before unlocking closes the window where
+    // run() has taken them out of pending_ but has not started the callback, yet cancel() can return and let the
+    // caller destroy the semaphore. Each entry has its own slot so a cancel() for a later entry in the same batch
+    // skips that entry instead of being mistaken for the callback already on the cancelling thread's stack.
+    void dispatch_outside_lock(std::unique_lock<std::mutex>& lock, std::vector<Entry>& entries, SignalEventFn fn) {
+        const std::thread::id me = std::this_thread::get_id();
+        std::vector<std::shared_ptr<DispatchSlot>> slots;
+        slots.reserve(entries.size());
+        for (const Entry& e : entries) {
+            auto slot = std::make_shared<DispatchSlot>();
+            slot->semaphore = e.semaphore;
+            slot->owner = me;
+            slots.push_back(slot);
+            dispatching_.push_back(slot);
+        }
+        lock.unlock();
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            Entry& e = entries[i];
+            DispatchSlot& slot = *slots[i];
+            bool skip = false;
+            {
+                std::lock_guard guard(mutex_);
+                skip = slot.cancelled;
+                if (!skip) slot.active = true;
+            }
+            if (skip) {
+                // A re-entrant cancel() removed this wait; still complete its event so no waiter is left behind.
+                if (fn && e.event_handle) fn(e.event_handle);
+                continue;
+            }
+            if (e.callback) e.callback();
+            else if (fn && e.event_handle) fn(e.event_handle);
+            {
+                std::lock_guard guard(mutex_);
+                slot.active = false;
+                const auto it = std::find(dispatching_.begin(), dispatching_.end(), slots[i]);
+                if (it != dispatching_.end()) dispatching_.erase(it);
+            }
+            epoch_cv_.notify_all();
+        }
+        lock.lock();
+        for (const auto& slot : slots) {
+            const auto it = std::find(dispatching_.begin(), dispatching_.end(), slot);
+            if (it != dispatching_.end()) dispatching_.erase(it);
+        }
+        epoch_cv_.notify_all();
+    }
+
     // Only signals wakeup_sem_ when run() is actively waiting (waiting_ == true) on wakeup_val_ + 1,
     // eliminating any lost-wakeup race between snapshot construction and vkWaitSemaphores. Keep signaling even if
     // device_lost_ is already set so a blocked vkWaitSemaphores wakes cleanly for cancel()/stop().
@@ -674,9 +754,7 @@ private:
             if (device_lost_.load(std::memory_order_acquire)) {
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(drained, fn);
+                dispatch_outside_lock(lock, drained, signal_event_);
                 return;
             }
             if (stop_) return;
@@ -714,9 +792,7 @@ private:
                 device_lost_.store(true, std::memory_order_release);
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(drained, fn);
+                dispatch_outside_lock(lock, drained, signal_event_);
                 return;
             }
             if (stop_) return;
@@ -744,17 +820,12 @@ private:
                 for (Entry& e : pending_) ready.push_back(std::move(e));
                 pending_.clear();
                 device_lost_.store(true, std::memory_order_release);
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(ready, fn);
+                dispatch_outside_lock(lock, ready, signal_event_);
                 return;
             }
             pending_.resize(write);
             if (!ready.empty()) {
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(ready, fn);
-                lock.lock();
+                dispatch_outside_lock(lock, ready, signal_event_);
                 if (stop_) return;
             }
         }
@@ -771,6 +842,7 @@ private:
     std::condition_variable cv_;
     std::condition_variable epoch_cv_;
     std::vector<Entry> pending_;
+    std::vector<std::shared_ptr<DispatchSlot>> dispatching_;  // ready-batch callbacks outside mutex_
     std::vector<VkSemaphore> semaphores_;
     std::vector<std::uint64_t> values_;
     std::uint64_t epoch_ = 0;
