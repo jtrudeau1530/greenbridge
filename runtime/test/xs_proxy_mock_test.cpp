@@ -813,11 +813,37 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 1);  // not an Xbox slot: forwarded
+        EXPECT(hr_of(raw(device, 71)) == S_OK && mock->calls[71] == 1);  // not an Xbox slot: forwarded
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,
                 valid ? "move all five routes" : "outside 3..127 are ignored");
+    return 0;
+}
+
+// ---- 8. Device slot 70: a view from raw words, never the PC CreatePlacedResource1 ----
+
+int check_slot70() {
+    // Level 9 has the PC slot 70; level 0 does not (44 PC slots). Neither may reach CreatePlacedResource1.
+    for (const int level : {9, 0}) {
+        Mock* mock = nullptr;
+        void* device = make_device(mock, level, true);
+        EXPECT(device && xs::device_slot_overridden(70));
+        xs::reset_device_proxy_stats();
+        const std::uint32_t words[8] = {0x1000, 0, 0, 0, 0, 0, 0, 0};
+        const std::uint32_t view[8] = {};
+        const std::uint64_t destination = 0x7000;
+        raw(device, 70, word(words), word(view), destination);
+        EXPECT(mock->calls[70] == 0 && xs::device_slot_hits(70) == 1);
+        // The destination gets the PC null view: CreateShaderResourceView (slot 18) with no resource, a desc, and the
+        // destination handle unchanged.
+        EXPECT(mock->calls[18] == 1 && mock->args[18][0] == 0 && mock->args[18][1] != 0 &&
+               mock->args[18][2] == destination);
+        // No destination, no write.
+        raw(device, 70, word(words), word(view), 0);
+        EXPECT(mock->calls[70] == 0 && mock->calls[18] == 1);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+    }
     return 0;
 }
 
@@ -948,7 +974,7 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_slot70())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
