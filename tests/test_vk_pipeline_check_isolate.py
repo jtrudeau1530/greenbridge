@@ -97,6 +97,13 @@ class IsolateTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("cs: 5 modules ok, 0 failed", r.stdout)
         self.assertIn("cs pipelines: 5 ok, 0 failed, 0 skipped", r.stdout)
+
+    def test_oversized_batch_keeps_the_requested_slice(self):
+        r = self.run_tool(["--isolate", "--start", "2", "--count", "2",
+                           "--isolate-batch", str(2 * sys.maxsize + 1)], cache=self.cache("iso_slice.cache"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("cs: 2 modules ok, 0 failed", r.stdout)
+        self.assertIn("cs pipelines: 2 ok, 0 failed, 0 skipped", r.stdout)
         self.assertNotIn("CRASH", r.stdout)
         self.assertNotIn("ISO-", r.stdout)
 

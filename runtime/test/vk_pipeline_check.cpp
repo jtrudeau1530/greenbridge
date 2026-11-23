@@ -1023,7 +1023,11 @@ int main(int argc, char** argv) {
             }
             return found;
         };
-        for (size_t s = lo; s < hi && !setup_failed; s += isolate_batch) bisect(bisect, s, std::min(isolate_batch, hi - s));
+        for (size_t s = lo; s < hi && !setup_failed;) {
+            const size_t batch = std::min(isolate_batch, hi - s);
+            bisect(bisect, s, batch);
+            s += batch;
+        }
         if (setup_failed) return 1;
         bool failed = !crashes.empty() || unreproduced || !cache_ok;
         for (const auto& [st, a] : agg) {
