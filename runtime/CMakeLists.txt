@@ -2157,6 +2157,24 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_conservative_tier2_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_conservative_tier2 COMMAND d3d12_conservative_tier2_test)
       set_tests_properties(d3d12_conservative_tier2 PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_HOST_ADAPTER=warp")
+      set(LEONIDA_CONSERVATIVE_TIER3_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_conservative_tier3.spv)
+      add_custom_command(OUTPUT ${LEONIDA_CONSERVATIVE_TIER3_PS}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_CONSERVATIVE_TIER3_PS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_conservative_tier3.frag
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_conservative_tier3.frag VERBATIM)
+      add_executable(d3d12_conservative_tier3_test test/d3d12_conservative_tier3_test.cpp
+        ${LEONIDA_CONSERVATIVE_VS} ${LEONIDA_CONSERVATIVE_TIER3_PS})
+      target_link_libraries(d3d12_conservative_tier3_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_conservative_tier3_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+        LEONIDA_CONSERVATIVE_VS="${LEONIDA_CONSERVATIVE_VS}"
+        LEONIDA_CONSERVATIVE_TIER3_PS="${LEONIDA_CONSERVATIVE_TIER3_PS}")
+      target_compile_options(d3d12_conservative_tier3_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME inner_coverage_oracle COMMAND d3d12_conservative_tier3_test --oracle-only)
+      add_test(NAME d3d12_inner_coverage_guards COMMAND d3d12_conservative_tier3_test --guards-only)
+      add_test(NAME d3d12_inner_coverage_native COMMAND d3d12_conservative_tier3_test --native-only)
+      add_test(NAME d3d12_conservative_tier3 COMMAND d3d12_conservative_tier3_test)
+      set_tests_properties(d3d12_inner_coverage_guards d3d12_inner_coverage_native d3d12_conservative_tier3
+        PROPERTIES SKIP_RETURN_CODE 77)
       add_executable(d3d12_msaa_draw_test test/d3d12_msaa_draw_test.cpp shims/d3d12_xs_device.cpp
                      ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_msaa_draw_test PRIVATE gta6rt_d3d12_com)

@@ -812,8 +812,9 @@ The compute path, end to end:
     including unbound-attachment variants. OFF keeps the ordinary pipeline. Missing support, unknown modes,
     wireframe and non-triangle PSOs are refused; conservative TIR (`ForcedSampleCount != 0`) remains `E_NOTIMPL`.
     Tier 2 additionally requires `degenerateTrianglesRasterized` and primitive overestimation plus half a
-    device subpixel step no greater than 1/256 pixel. Other eligible devices retain Tier 1. Tier 3 and
-    `SV_InnerCoverage` are not exposed. See [Microsoft's rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/conservative-rasterization)
+    device subpixel step no greater than 1/256 pixel. Other eligible devices retain Tier 1. The standalone
+    device does not expose Tier 3: the Xbox `SV_InnerCoverage` input mapping has not been confirmed. See
+    [Microsoft's rules](https://learn.microsoft.com/en-us/windows/win32/direct3d12/conservative-rasterization)
     and [Vulkan's properties](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceConservativeRasterizationPropertiesEXT.html).
     `d3d12_conservative_tier2_test` checks the tighter geometric uncertainty bound, post-snap and exact
     degenerates with distinct indices, provoking-vertex colour, constant depth, back-facing classification,
@@ -838,6 +839,30 @@ The compute path, end to end:
     The GPU test needs the current graphics path's 144-byte push-constant support; CPU capability checks
     do not need a GPU. No game-pass usage is claimed by these synthetic tests.
     `d3d12_conservative_tier3_reference` is a native D3D12 reference probe, not Tier 3 support in the Vulkan layer.
+    **Explicit InnerCoverage library contract (experimental):** a caller-owned device can set
+    `VulkanDeviceInfo::inner_coverage_abi` only for a shader library whose InnerCoverage input is already lowered
+    to the boolean SPIR-V `FullyCoveredEXT` built-in (false maps to uint 0, true to uint 1). Tier 3 then also
+    requires all Tier 2 properties and `fullyCoveredFragmentShaderInputVariable`. The default remains false,
+    including for the standalone device; this is not an inferred FSSM/VGPR layout or automatic game-shader support.
+    Graphics PSOs inspect the actual SPIR-V capability, even if index capability metadata is absent, and refuse
+    `FragmentFullyCoveredEXT` with `E_NOTIMPL` before shader-module creation unless the contract and device support
+    are present. A module using `PostDepthCoverage` additionally requires
+    `conservativeRasterizationPostDepthCoverage`. The tests use explicit synthetic GLSL; no new translator rule
+    or retail shader coverage is claimed.
+    `inner_coverage_oracle` checks false positives, missed interior values and missing invocations on the CPU.
+    `d3d12_inner_coverage_guards` checks that neither opt-in nor metadata omission can bypass missing support.
+    `d3d12_inner_coverage_native` checks 48 native D3D12 scenarios on the matching adapter: six triangles,
+    1x/4x MSAA, scissor and unbound-target variants. These pass on RX 5700 XT (Windows 32.0.21045.5002) with
+    Vulkan validation active. `d3d12_conservative_tier3` runs the same 48 scenario pairs on Vulkan and native D3D12
+    when Vulkan has the property and native D3D12 has Tier 3; it skips on this RX 5700 XT. The positive Vulkan
+    path still requires independent execution on a capable GPU. InnerCoverage with conservative rasterization
+    off is undefined in D3D12 and is not compared. Edge pixels within the uncertainty region are not required
+    to match byte-for-byte; both backends must independently satisfy the geometric guarantees.
+    To validate the explicit path, configure with Vulkan SDK/glslang available, build
+    `d3d12_conservative_tier3_test`, select an adapter with `LEONIDA_VK_DEVICE` if needed, and run
+    `ctest --test-dir runtime/build -C RelWithDebInfo -R "^(inner_coverage_oracle|d3d12_inner_coverage_guards|d3d12_inner_coverage_native|d3d12_conservative_tier3)$" -V`.
+    Check that the positive test prints 48 Vulkan/native paired scenarios rather than `Skipped`.
+    `d3d12_conservative_tier3_reference` remains a native D3D12 reference probe; it does not opt in to that Vulkan contract.
     It reports the selected Vulkan device's `fullyCoveredFragmentShaderInputVariable`, matches that device to its
     native D3D12 adapter by LUID, then checks the adapter's Tier 3 `SV_InnerCoverage` output on four synthetic
     triangles. On Windows with Visual Studio 2022 and Windows SDK 10.0.26100 or newer, run

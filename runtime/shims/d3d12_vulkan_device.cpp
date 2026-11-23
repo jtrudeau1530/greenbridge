@@ -548,6 +548,7 @@ struct DeviceState {
     UINT no_output_sample_counts = 0;
     float max_sampler_lod_bias = 0;
     D3D12_CONSERVATIVE_RASTERIZATION_TIER conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+    bool conservative_post_depth_coverage = false;
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
     VkResolveModeFlags depth_resolve_modes = 0;
     VkResolveModeFlags stencil_resolve_modes = 0;
@@ -2969,6 +2970,15 @@ public:
             }
             stage.words = library->spirv(*stage.entry);
             if (stage.words.empty()) return E_FAIL;
+            const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
+            if (!inner.valid) return E_INVALIDARG;
+            if (inner.fully_covered &&
+                (stage.bit != VK_SHADER_STAGE_FRAGMENT_BIT ||
+                 device_.conservative_raster_tier != D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 ||
+                 (inner.post_depth && !device_.conservative_post_depth_coverage))) {
+                log_once("FullyCoveredEXT needs an enabled Tier 3 shader ABI and device properties; stage", int(stage.bit));
+                return E_NOTIMPL;
+            }
         }
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
@@ -4464,7 +4474,9 @@ public:
                 get_props2(info.physical, &props);
                 state_.conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER(leonida::conservative_raster::tier(
                     info.conservative_rasterization, props.properties.limits.subPixelPrecisionBits,
-                    conservative.primitiveOverestimationSize, conservative.degenerateTrianglesRasterized == VK_TRUE));
+                    conservative.primitiveOverestimationSize, conservative.degenerateTrianglesRasterized == VK_TRUE,
+                    conservative.fullyCoveredFragmentShaderInputVariable == VK_TRUE, info.inner_coverage_abi));
+                state_.conservative_post_depth_coverage = conservative.conservativeRasterizationPostDepthCoverage == VK_TRUE;
                 state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
                 const leonida::ArenaLimits limits = leonida::query_arena_limits(get_props2, info.physical);
