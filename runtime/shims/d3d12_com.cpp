@@ -1161,16 +1161,20 @@ private:
     // signature that is already bound changes nothing: "existing root signature bindings do not become stale"
     // (D3D12, "Using a Root Signature"), and engines rebind routinely.
     void bind_root(RootState& state, ID3D12RootSignature* signature) {
+        if (list_.closed()) return;
+        const RootArgumentLayout* layout = root_signature_layout(signature);
+        if (signature && !layout) {
+            stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
+            return check(false);
+        }
         if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
                 l.bind_root(compute ? l.compute_ : l.graphics_, signature);
             }))
             return hold(signature);  // the bundle keeps it for as long as it can be executed
-        const RootArgumentLayout* layout = root_signature_layout(signature);
         if (layout && layout == state.layout) return;
         hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
-        if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
             stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
@@ -1205,31 +1209,30 @@ private:
     }
 
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
+        if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
             // The layout is the executing list's, so the range is checked when it runs; no signature takes more
             // than D3D12_MAX_ROOT_COST dwords, which bounds what is copied from the caller's memory.
-            if (count > D3D12_MAX_ROOT_COST) return check(false);
+            if (count > D3D12_MAX_ROOT_COST || (count && !data)) return check(false);
             const auto* words = static_cast<const std::uint32_t*>(data);
             std::vector<std::uint32_t> copy;
-            if (data) copy.assign(words, words + count);
-            // A count of 0 with a non-null pointer is a valid call; an empty vector's data() may be null.
-            static constexpr std::uint32_t none = 0;
-            defer([=, compute = &state == &compute_, copy = std::move(copy),
-                   given = data != nullptr](GraphicsCommandList& l) {
+            if (count) copy.assign(words, words + count);
+            defer([=, compute = &state == &compute_, copy = std::move(copy)](GraphicsCommandList& l) {
                 l.constants(compute ? l.compute_ : l.graphics_, index, count,
-                            !given ? nullptr : copy.empty() ? &none : copy.data(), offset);
+                            copy.empty() ? nullptr : copy.data(), offset);
             });
             return;
         }
         const RootArgumentLayout::Parameter* p = parameter(state, index, rt::rootsig::ParamType::Constants);
         if (!p) return;
-        if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
+        if ((count && !data) || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
         const std::uint32_t first = first_dword(state, *p);
         for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
+        if (list_.closed()) return;
         if (defer([=, compute = &state == &compute_](GraphicsCommandList& l) {
                 l.address(compute ? l.compute_ : l.graphics_, index, va, type);
             }))
