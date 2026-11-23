@@ -331,6 +331,11 @@ Each positional source is reported and thresholded on its own. A source is a dir
 bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
 took about 3 minutes on one core.
 
+The dictionary is also readable the other way, which needs no carve folder:
+`python -I tools/hashdict.py --lookup <temp>/hashes.json <hash>...` takes a dictionary path followed by one or more
+32-bit hashes in hexadecimal and prints each with the name the dictionary holds for it, or `?` when it holds none
+(`tools/hashdict.py:70,82-93`). That answers "which wave is this id" when another tool prints a hash and no name.
+
 You can also pass the JSON inventory written by `awc_manifest.py --out inventory.json`. The naming tool reads
 the plain stream IDs and streamed-music channel IDs directly from its rows. Bank labels keep the nested path
 and drop the `.awc` extension to match the export folders. Banks with no stream rows have no names in this inventory.
