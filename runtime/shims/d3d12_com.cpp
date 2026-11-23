@@ -26,6 +26,11 @@
 
 namespace rt::d3d12 {
 
+// A handle in a title-backed descriptor heap (#7021) maps to the layer's own slot; any other is unchanged.
+static D3D12_CPU_DESCRIPTOR_HANDLE layer_handle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    return rt::d3d12_xs::translate_cpu_descriptor_handle(nullptr, handle);
+}
+
 struct TileGrid {
     std::uint64_t columns = 0;
     std::uint64_t rows = 0;
@@ -439,10 +444,12 @@ public:
         render_target_count_ = count;
         draw_views_stale_ = true;
         for (UINT i = 0; i < count && targets; ++i) {
-            const SIZE_T handle = single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr;
+            const SIZE_T handle =
+                layer_handle({single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr}).ptr;
             if (handle) render_targets_[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
         }
-        depth_ = depth && depth->ptr ? *reinterpret_cast<const leonida::TargetView*>(depth->ptr) : leonida::TargetView{};
+        depth_ = depth && depth->ptr ? *reinterpret_cast<const leonida::TargetView*>(layer_handle(*depth).ptr)
+                                     : leonida::TargetView{};
     }
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
@@ -682,7 +689,7 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
-        check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
+        check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(layer_handle(view).ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
     }
 
@@ -692,7 +699,8 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearDepthStencilView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr) return check(false);
-        check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
+        check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(layer_handle(view).ptr), u(flags),
+                                        depth,
                                         stencil, to_rects(count, rects)));
     }
 
@@ -1025,7 +1033,7 @@ private:
                                 const std::array<std::uint32_t, 4>& values, UINT count, const D3D12_RECT* rects) {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);  // no clear is allowed in a bundle
         leonida::UavView target{};
-        if (!view.ptr || !resource || !unordered_access_view(view, resource, target)) return check(false);
+        if (!view.ptr || !resource || !unordered_access_view(layer_handle(view), resource, target)) return check(false);
         check(list_.clear_unordered_access(target, is_float, values, to_rects(count, rects)));
     }
 
