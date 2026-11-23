@@ -2944,6 +2944,12 @@ queue they came on (one `VkQueue` behind all of them).
   blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
   `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
+  `LEONIDA_PRESENT_UNCAP` (any non-empty value other than "0", read when the object is made) takes the frame-rate
+  cap off: a wait hands its token out at once (no vblank grid, no latency throttle) and `PresentX` presents
+  unsynced — MAILBOX or IMMEDIATE, not FIFO — so the frame rate is whatever the title renders; registration and
+  suspension errors are unchanged, and the statistics of an uncapped frame report its present time. This covers
+  the frame-event cap only: a cap inside the game's own code would still apply, and the DXGI swapchain fallback
+  keeps the app's sync interval.
   `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render;
   `PercentScanned` only for a frame shown at once by `ImmediateThresholdPercent`, else 0); `S_FALSE` with count 0 for what it does not have.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
