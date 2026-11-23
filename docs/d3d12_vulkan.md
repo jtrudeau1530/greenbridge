@@ -974,8 +974,10 @@ The compute path, end to end:
   - If the arena cannot be created, its buffer is released, so other buffers keep their own memory and get no VA.
   - With `VK_EXT_conditional_rendering`, the arena is created with the conditional-rendering usage, and
     `SetPredication` on a default-heap buffer reads at the buffer's offset in the arena plus the call's offset.
-  - `CreateHeap` reserves the requested size in the arena at 64 KiB, and a buffer placed in it gets the heap's
-    place plus the placed offset as its console VA. A placed texture keeps its own `VkDeviceMemory` and a null VA,
+  - `CreateHeap` reserves the requested size in the arena at 64 KiB and zeroes it (not with `CREATE_NOT_ZEROED`),
+    and a buffer placed in it gets the heap's place plus the placed offset as its console VA. Placing a buffer
+    writes nothing: it reads the bytes already there, and a buffer it overlaps keeps them (buffers inherit data,
+    `d3d12_placed_inherit_test`). A placed texture keeps its own `VkDeviceMemory` and a null VA,
     1D, 2D and 3D alike (arrays and mips included), and a dimension outside the enum is `E_INVALIDARG`, as on the
     host (RTX 2080 Ti and WARP, `d3d12_placed_dimensions_test`);
     tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures are backed the same way with

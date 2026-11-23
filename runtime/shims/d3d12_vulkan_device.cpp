@@ -2591,10 +2591,12 @@ public:
 
     // A placed buffer is a range of the heap's arena memory: it has no VkBuffer of its own and its console VA is
     // where it sits in the arena. The arena is host-visible, so an upload or readback place maps that same range.
+    // Placing writes nothing: the heap was zeroed when it was made (Heap), and a buffer placed over bytes another
+    // resource holds reads them, while that resource keeps them (buffers inherit data in any state, "Memory
+    // Aliasing and Data Inheritance"; d3d12_placed_inherit_test).
     HRESULT create_placed_buffer() {
         if (!device_.arena.mapped) return E_OUTOFMEMORY;
         if (cpu_visible()) mapped_ = device_.arena.mapped + va_;
-        std::memset(device_.arena.mapped + va_, 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
         leonida::ResourceBinding binding{};
         binding.size = desc_.Width;
         binding.buffer = device_.arena.buffer;
@@ -3211,11 +3213,15 @@ public:
     // {5d20c7a4-8e13-4b6d-9f27-3a1c94e0b7d8}
     static constexpr GUID kTag{0x5d20c7a4, 0x8e13, 0x4b6d, {0x9f, 0x27, 0x3a, 0x1c, 0x94, 0xe0, 0xb7, 0xd8}};
 
+    // A heap starts zeroed unless it was made with CREATE_NOT_ZEROED, as on D3D12; the arena range it takes may hold
+    // what an earlier resource left there. Placed buffers are ranges of it and write nothing when they are placed.
     Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
         VkDeviceSize offset = 0;
         if (device_.arena.mapped &&
             device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset,
                                    DeviceState::arena_heap)) {
+            if (!(desc_.Flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED))
+                std::memset(device_.arena.mapped + offset, 0, std::size_t(desc_.SizeInBytes));
             allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
                 new leonida::TileHeapAllocation{device_.arena.memory, offset, desc_.SizeInBytes,
                                                 device_.arena.memory_type},
