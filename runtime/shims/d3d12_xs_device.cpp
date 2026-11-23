@@ -2940,9 +2940,13 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     const auto* words = reinterpret_cast<const std::uint64_t*>(desc);
     const std::uint64_t title_address = words[2], title_size = words[3];
     MEMORY_BASIC_INFORMATION mbi{};
-    const bool title_heap = title_address && title_size && title_size < (1ull << 34) &&
+    // Only words that describe exactly this heap: a PC-size description on the stack is followed by whatever is there.
+    const std::uint64_t exact =
+        std::uint64_t(desc->NumDescriptors) * self->real->GetDescriptorHandleIncrementSize(desc->Type);
+    const bool title_heap = title_address && title_size == exact &&
                             VirtualQuery(reinterpret_cast<void*>(title_address), &mbi, sizeof(mbi)) &&
-                            mbi.State == MEM_COMMIT;
+                            mbi.State == MEM_COMMIT &&
+                            reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize >= title_address + title_size;
     SIZE_T custom_cpu_start = 0;
     SIZE_T custom_byte_size = 0;
     SIZE_T real_cpu_start = 0;
