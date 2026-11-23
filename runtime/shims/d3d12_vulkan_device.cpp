@@ -14,6 +14,7 @@
 #include "d3d12_com_object.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "d3d12_xs_native_pso.h"
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
@@ -8677,6 +8678,7 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
         device->Release();
         return E_FAIL;
     }
+    rt::d3d12_xs::set_native_shader_directory_provider(&configured_shader_directory);  // slot 57's containers
     return hand_out(device, riid, out);
 }
 

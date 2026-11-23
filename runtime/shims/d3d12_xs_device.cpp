@@ -28,6 +28,7 @@
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
 #include "d3d12_xs_pso_stream.h"
+#include "d3d12_xs_native_pso.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -280,6 +281,7 @@ const char* slot_name(unsigned slot) {
         case 48: return "Xbox CreateCommandQueueX (32-byte desc) -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
         case 56: return "GetResourceAllocationInfo1 (C or PC form)";
+        case 57: return "Xbox native graphics pipeline";
         case 61: return "Xbox CreateSamplerX -> PC CreateSampler";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
@@ -3677,6 +3679,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_command_signature(
             self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1), a2, reinterpret_cast<const IID*>(a3),
             reinterpret_cast<void**>(a4)));
+    } else if constexpr (Slot == 57) {
+        note_slot(57);
+        return hr_to_u64(create_native_graphics_pipeline(self->real, reinterpret_cast<const void*>(a1),
+                                                         reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 67) {
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
@@ -4057,8 +4063,8 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 26) || slot == 31 ||
         slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 ||
-        slot == 55 || slot == 56 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 ||
-        slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == kCreateCommittedResource3X ||
+        slot == 55 || slot == 56 || slot == 57 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 ||
+        slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == kCreateCommittedResource3X ||
         slot == kPcCreateCommittedResource || slot == kPcCreateCommittedResource1 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();

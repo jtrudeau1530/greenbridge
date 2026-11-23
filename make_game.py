@@ -1386,9 +1386,32 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     verify_translation_completeness(dxbc, spirv)
+    native_pso_hashes(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
+
+
+def native_pso_hashes(dxbc: str, spirv: str) -> None:
+    """Write <spirv>/native_hashes.txt, which device slot 57 finds the game's containers by (their HASH digest;
+    tools/native_pso_hashes.py). A few seconds over the corpus; redone when index.json is newer than the map."""
+    import native_pso_hashes as tool
+    index, out = os.path.join(spirv, "index.json"), os.path.join(spirv, tool.OUT_NAME)
+    if not os.path.isfile(index) or not os.path.isdir(dxbc):
+        return
+    if os.path.isfile(out) and os.path.getmtime(out) >= os.path.getmtime(index):
+        return
+    if os.path.exists(out):
+        os.remove(out)
+    try:
+        table = tool.build(dxbc, spirv)
+    except tool.DigestClash as e:
+        fail(f"shaders: native_pso_hashes: {e}")
+    except (OSError, ValueError) as e:
+        log(f"shaders: no native_hashes.txt ({e}): device slot 57 will refuse every pipeline")
+        return
+    tool.write(spirv, table)
+    log(f"shaders: {len(table)} native shader digests for device slot 57")
 
 
 FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
