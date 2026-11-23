@@ -46,8 +46,10 @@ import subprocess
 import sys
 import shutil
 import tempfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
+from itertools import islice
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -867,8 +869,15 @@ def translate(progs, work, emulate, pc_tail=False, *, asm_jobs=1):
             assemble(p)
     else:
         with ThreadPoolExecutor(max_workers=asm_jobs) as pool:
-            for _ in pool.map(assemble, progs):
-                pass
+            # Refill a small window in input order to bound the queue and report the first failure by program order.
+            remaining = iter(progs)
+            window = min(2 * asm_jobs, sys.maxsize)
+            pending = deque(pool.submit(assemble, p) for p in islice(remaining, window))
+            for p in remaining:
+                pending.popleft().result()
+                pending.append(pool.submit(assemble, p))
+            for job in pending:
+                job.result()
 
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
