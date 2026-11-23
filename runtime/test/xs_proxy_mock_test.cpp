@@ -92,6 +92,8 @@ struct Mock {
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
     Mock* device10_alias;    // device: when set, QueryInterface(ID3D12Device10) answers this object, not itself
+    UINT64 allocation_size;  // device: what GetResourceAllocationInfo (slot 25) answers
+    IUnknown* private_data;  // resource: the SetPrivateDataInterface object, released with the last reference
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -202,6 +204,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 copy_array(m, 23, a2, a1);                                                       // dest starts
                 copy_array(m, 24, words[4], a4);                                                 // src starts (recorded in slot 24's array)
                 break;
+            case 25:  // GetResourceAllocationInfo(visible_mask, count, descs): the struct comes back through a1
+                if (a1) *reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1) = {m->allocation_size, 65536};
+                return a1;
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
             case 32:                                                                          // OpenSharedHandle
@@ -216,6 +221,13 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         return S_OK;
     }
     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+    if (m->kind == Kind::resource && slot == 5) {                     // SetPrivateDataInterface(guid, object)
+        auto* const object = reinterpret_cast<IUnknown*>(a2);
+        if (object) object->AddRef();
+        if (m->private_data) m->private_data->Release();
+        m->private_data = object;
+        return S_OK;
+    }
     if (m->kind == Kind::heap && slot == 9) {
         if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapCpuStart;
         return kMockHeapCpuStart;
@@ -236,7 +248,13 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
     } else if constexpr (Slot == 1) {
         return static_cast<std::uint64_t>(++self->refs);
     } else if constexpr (Slot == 2) {
-        return static_cast<std::uint64_t>(--self->refs);
+        const long left = --self->refs;
+        if (left == 0 && self->private_data) {  // an object releases its private-data interfaces when it dies
+            IUnknown* const held = self->private_data;
+            self->private_data = nullptr;
+            held->Release();
+        }
+        return static_cast<std::uint64_t>(left);
     } else {
         // A caller may pass fewer words than this thunk declares (OpenSharedHandle passes three), so its frame
         // has no room past the four register homes. The words are copied into this frame and passed by pointer:
@@ -1229,6 +1247,77 @@ int check_committed_resource3_x() {
     return 0;
 }
 
+// ---- Device slot 127 takes the resource's memory through the title's XMem hook ----
+//
+// The console runtime allocates a committed resource's memory with XMemAlloc, and a title's hook may count it (a budget
+// check after its first render targets). The proxy calls the installed hook with the PC allocation size and the
+// committed-resource attributes, and gives the memory back through the hook's free when the resource dies.
+int check_committed_resource3_xmem_hook() {
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC1 texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = 3840;
+    texture.Height = 2160;
+    texture.DepthOrArraySize = 1;
+    texture.MipLevels = 1;
+    texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture.SampleDesc.Count = 1;
+    texture.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    constexpr UINT64 kSize = 33423360;  // 3840 x 2176 x 4: whole 64 KiB tiles
+    constexpr std::uintptr_t kArena = 0x7a000000;
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device);
+    mock->allocation_size = kSize;
+    g_heap_hook = {};
+    g_heap_hook.next_ptr = reinterpret_cast<void*>(kArena);
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+
+    void* resource = nullptr;
+    std::uint64_t words[10] = {word(&heap), 0, word(&texture), 0, 0, 0, 0, 0, word(&kResourceIid), word(&resource)};
+    EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+    EXPECT(g_heap_hook.alloc_calls == 1 && g_heap_hook.last_alloc_size == kSize);
+    EXPECT(g_heap_hook.last_alloc_attr == xs::kXmemCommittedResourceAttributes);
+    EXPECT(((g_heap_hook.last_alloc_attr >> 14) & 3) == 2 && ((g_heap_hook.last_alloc_attr >> 16) & 0xff) == 0x80);
+    EXPECT(mock->calls[25] == 1);
+    Mock* const res = reinterpret_cast<Mock*>(resource);
+    EXPECT(res->private_data != nullptr && g_heap_hook.free_calls == 0);  // held while the resource lives
+    EXPECT(release(resource) == 0);
+    EXPECT(g_heap_hook.free_calls == 1 && g_heap_hook.last_free_ptr == reinterpret_cast<void*>(kArena) &&
+           g_heap_hook.last_free_attr == xs::kXmemCommittedResourceAttributes);
+
+    // A hook that refuses: the resource is still created and nothing is freed.
+    g_heap_hook = {};
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+    EXPECT(g_heap_hook.alloc_calls == 1 && reinterpret_cast<Mock*>(resource)->private_data == nullptr);
+    EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 0);
+
+    // The PC device's refusal: no resource, so the hook is not asked.
+    g_heap_hook = {};
+    g_heap_hook.next_ptr = reinterpret_cast<void*>(kArena);
+    mock->create_result = E_OUTOFMEMORY;
+    EXPECT(hr_of(raw10(device, 127, words)) == E_OUTOFMEMORY && !resource);
+    EXPECT(g_heap_hook.alloc_calls == 0);
+    mock->create_result = S_OK;
+
+    // No hook installed: slot 127 behaves as before.
+    xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    g_heap_hook = {};
+    EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
+    EXPECT(g_heap_hook.alloc_calls == 0 && reinterpret_cast<Mock*>(resource)->private_data == nullptr);
+    EXPECT(release(resource) == 0);
+    EXPECT(release(device) == 0);
+    std::printf("%s: device slot 127 takes the resource's memory through the XMem hook and frees it with the resource\n",
+                g_label);
+#endif
+    return 0;
+}
+
 }  // namespace
 
 // A failure ends the process with a message on stderr, never in a dialog a test run would wait on: abort() (an
@@ -1255,7 +1344,7 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_descriptor_heap_hooks() ||
-        check_committed_resource3_x())
+        check_committed_resource3_x() || check_committed_resource3_xmem_hook())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
