@@ -261,8 +261,10 @@ class Module:
 
     def read_instruction(self, opcode, operands, at):
         if opcode in TYPE_OPS:
-            exact = TYPE_OPERANDS.get(opcode)
-            self.require_operands(operands, at, exact or 1, exact)
+            required = TYPE_OPERANDS.get(opcode)
+            # OpTypeFloat can also carry an optional FPEncoding operand.
+            maximum = 3 if opcode == OP_TYPE_FLOAT else required
+            self.require_operands(operands, at, required or 1, maximum)
             identifier, *args = operands
             self.define(identifier)
             self.types[identifier] = (opcode, tuple(args))
@@ -373,6 +375,8 @@ class Module:
         opcode, args = self.type_declaration(identifier)
         nested = (*path, identifier)
         if opcode in (OP_TYPE_INT, OP_TYPE_FLOAT):
+            if opcode == OP_TYPE_FLOAT and len(args) > 1:
+                raise InterfaceError(f"unsupported floating-point encoding {args[1]} in graphics interface")
             width = args[0]
             if width not in (16, 32, 64) or (opcode == OP_TYPE_INT and args[1] not in (0, 1)):
                 raise InterfaceError("unsupported numeric type in graphics interface")

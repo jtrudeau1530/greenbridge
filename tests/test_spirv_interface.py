@@ -411,7 +411,7 @@ class ModuleStructureAndDecorationsTest(unittest.TestCase):
             ("OpTypeInt_short", spv.OP_TYPE_INT, (1, 32)),
             ("OpTypeInt_long", spv.OP_TYPE_INT, (1, 32, 0, 9)),
             ("OpTypeFloat_short", spv.OP_TYPE_FLOAT, (1,)),
-            ("OpTypeFloat_long", spv.OP_TYPE_FLOAT, (1, 32, 0)),
+            ("OpTypeFloat_long", spv.OP_TYPE_FLOAT, (1, 16, 0, 0)),
             ("OpTypeVector_short", spv.OP_TYPE_VECTOR, (1, 2)),
             ("OpTypeMatrix_long", spv.OP_TYPE_MATRIX, (1, 2, 3, 4)),
             ("OpTypeArray_short", spv.OP_TYPE_ARRAY, (1, 2)),
@@ -444,6 +444,24 @@ class ModuleStructureAndDecorationsTest(unittest.TestCase):
         self.assertEqual(len(iface.outputs), 1)
         self.assertEqual(iface.outputs[0].symbol, var)
         self.assertEqual(iface.outputs[0].varyings[0].address, spv.Address(3))
+
+    def test_accepts_encoded_float_outside_interface(self):
+        b = SpirvBuilder("vs")
+        bf16 = b.emit_type(spv.OP_TYPE_FLOAT, 16, 0)  # BFloat16KHR
+        b.constant(bf16, 0x3F00)
+        b.variable(spv.STORAGE_OUTPUT, b.numeric("f", 32, 4), location=3)
+        output, = b.reflect().outputs
+        self.assertEqual(
+            output.varyings,
+            (spv.Varying(spv.Address(3), spv.NumericType("f", 32, 4)),),
+        )
+
+    def test_rejects_encoded_float_varying(self):
+        b = SpirvBuilder("vs")
+        bf16 = b.emit_type(spv.OP_TYPE_FLOAT, 16, 0)  # BFloat16KHR
+        b.variable(spv.STORAGE_OUTPUT, bf16, location=3)
+        with self.assertRaisesRegex(spv.InterfaceError, "unsupported floating-point encoding"):
+            b.reflect()
 
     def test_ignores_non_interface_decorations_and_validates_known_ones(self):
         b = SpirvBuilder("ps")
