@@ -424,11 +424,11 @@ class Program:
     def hw_lines(self, arch, ops=None):
         """The program as a native kernel body for tools/hw_oracle: the entry EXEC is saved and restored (a partial
         wave has fewer lanes than -1), the stores go through the output pointer in s[2:3], and the ds_* mnemonics are
-        the ones the architecture names them."""
+        the ones the architecture names them, and so are the barrier and the LDS waits (GFX12, asm.sync_lines)."""
         from hw_oracle import asm
         ops = self.ops if ops is None else ops
         lines = self.body(ops, hw=True, arch=arch)
-        return [asm.ds_line(ln, arch) for ln in lines]
+        return [out for ln in lines for out in asm.sync_lines(asm.ds_line(ln, arch), arch)]
 
     def body(self, ops, hw=False, arch="gfx1150"):
         w64 = self.wave == 64
@@ -922,13 +922,20 @@ def run_translator(progs, a, work, tally):
 
 def hw_skip_reason(p, arch):
     """Why a program cannot run natively on this GPU, or None. GFX11 renamed the ds_* loads and stores, which
-    asm.ds_line respells, and swaps ds_cmpstore's data operands (measured on gfx1150). The swap is not measured on
-    GFX12, so a program with a ds_cmpst is skipped there; everything else the generator emits is spelled the same
-    on GFX10, GFX11 and GFX12 (assembled for gfx1030, gfx1100, gfx1150 and gfx1201), so the other skips are the
-    assembler's own rejections, which the runner reports."""
+    asm.ds_line respells, and swaps ds_cmpstore's data operands (measured on gfx1150 and on gfx1201); GFX12 also
+    spells the barrier and the LDS wait differently, which asm.sync_lines respells. Everything else the generator
+    emits is spelled the same on GFX10, GFX11 and GFX12 (assembled for gfx1030, gfx1100, gfx1150 and gfx1201), so
+    the other skips are the assembler's own rejections, which the runner reports.
+
+    One behaviour differs on GFX12: a wave64 ds_bpermute_b32 reaches all 64 lanes there, while RDNA2 (the console's
+    generation, and what this model describes) keeps each 32-lane half separate. Measured with every lane asking for
+    lane (l + 32) mod 64: an RX 9070 XT (gfx1201) returns lane l ^ 32, a gfx1036 iGPU returns lane l, and on gfx1201
+    300 of 300 wave64 programs match --perturb bpermute_wave64_cross. So those programs can't check the RDNA2 model on
+    GFX12 and are skipped there; wave32 and every other wave64 program still run."""
     from hw_oracle import asm
-    if asm.family(arch) == "gfx12" and any(op["kind"] == "cmpst" for op in p.ops):
-        return "ds_cmpstore_rtn_b32 operand order is only measured on GFX11 (gfx1150)"
+    if asm.family(arch) == "gfx12" and p.wave == 64 and "bpermute_wave64_cross" not in PERTURB \
+            and any(op["kind"] == "bpermute" for op in p.ops):
+        return "a wave64 ds_bpermute_b32 reaches all 64 lanes on GFX12 (measured on gfx1201), not each 32-lane half"
     return None
 
 
