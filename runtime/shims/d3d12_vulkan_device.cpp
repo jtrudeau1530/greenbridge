@@ -2753,7 +2753,32 @@ public:
     // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors). An acceleration
     // structure reports its real device address (instance descriptors and builds hand it to the driver); other
     // buffers report their console VA into the GPU address arena.
-    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
+        if (accel_) return gpu_va_;
+        if (!va_ && desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return title_shadow();
+        return va_;
+    }
+    // Boot stand-in (LEONIDA_PLACEHOLDER_PSO=1): on the console a texture has an address the title writes through as a
+    // CPU pointer. It gets zeroed memory of its own; what it writes there does not reach the image.
+    D3D12_GPU_VIRTUAL_ADDRESS title_shadow() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_PLACEHOLDER_PSO");
+            return v && *v == '1';
+        }();
+        if (!on) return 0;
+        std::call_once(shadow_once_, [this] {
+            const std::uint64_t bytes = (std::uint64_t(desc_.Width) * desc_.Height * (desc_.DepthOrArraySize ? desc_.DepthOrArraySize : 1) * 16 * 4 / 3 + 0xFFFF) & ~0xFFFFull;
+            shadow_ = VirtualAlloc(nullptr, static_cast<std::size_t>(bytes), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            static std::atomic<int> n{0};
+            if (n.fetch_add(1) < 12)
+                std::fprintf(stderr, "[title] texture %llux%u format %d asked for its address: shadow %p (%llu bytes)\n",
+                             static_cast<unsigned long long>(desc_.Width), desc_.Height, int(desc_.Format), shadow_,
+                             static_cast<unsigned long long>(bytes));
+        });
+        return reinterpret_cast<std::uint64_t>(shadow_);
+    }
+    std::once_flag shadow_once_;
+    void* shadow_ = nullptr;
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
