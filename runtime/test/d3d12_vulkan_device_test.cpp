@@ -6324,13 +6324,13 @@ int main() {
             report("next to the atomic copies", 0, down + 252, cd, 4);
             report("next to the atomic copies", 1, down + 272, cd, 4);
 
-            // Misaligned or empty calls are refused when they are recorded.
+            // Misaligned calls are refused when recorded; count == 0 is accepted (matches Windows 11 WARP & RTX 5090).
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list1->AtomicCopyBufferUINT64(readback.p, 260, upload.p, 4104, 1, dependents, ranges);
             EXPECT(list->Close() == E_INVALIDARG);
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list1->AtomicCopyBufferUINT(readback.p, 256, upload.p, 4096, 0, nullptr, nullptr);
-            EXPECT(list->Close() == E_INVALIDARG);
+            EXPECT(list->Close() == S_OK);
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER misaligned{0x10002, 1};
             list2->WriteBufferImmediate(1, &misaligned, nullptr);

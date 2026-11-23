@@ -1896,6 +1896,17 @@ if(TARGET Vulkan::Headers)
       SKIP_RETURN_CODE 77
       FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
+    # ClearState predication reset (GPU readback) + SetPredication / AtomicCopyBuffer Close() parity against WARP & HW.
+    add_executable(d3d12_predication_atomic_copy_test test/d3d12_predication_atomic_copy_test.cpp)
+    target_link_libraries(d3d12_predication_atomic_copy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_predication_atomic_copy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_predication_atomic_copy_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_predication_atomic_copy COMMAND d3d12_predication_atomic_copy_test)
+    set_tests_properties(d3d12_predication_atomic_copy PROPERTIES
+      SKIP_RETURN_CODE 77
+      FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
+    )
+
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
     add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
     target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
