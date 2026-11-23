@@ -77,6 +77,7 @@ method, scope and caveats. No game data is included.
 | [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder; key hashes are case-sensitive joaat (`tools/save_keys.py`). |
 | [pipeline_check.md](pipeline_check.md) | Driver-level corpus check: 10/12 shards, 22,092 modules, 2,217 compute pipelines, 0 failures. |
 | [multi_gpu_validation.md](multi_gpu_validation.md) | Running disjoint shards on eight identical RDNA1/RADV GPUs: PCI-BDF pinning, base controls, per-card logs, the V540 farm's aggregate results and its known driver limitations. |
+| [pipeline_check.md](pipeline_check.md) | Driver-level corpus check: the full corpus, 26,503 of 26,503 modules and pipelines, 0 failures (RTX 4060 Ti); an earlier 10/12-shard run, 22,092 modules and 2,217 compute pipelines, also had 0 failures. |
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [isa_coverage.md](isa_coverage.md) | RDNA2 ISA coverage of the translator against AMD's machine-readable XML: which of its 1,153 instructions have a rule, and which matched names are not RDNA2. |
 | [buffer_bounds.md](buffer_bounds.md) | V# `OOB_SELECT` bounds measured natively: RDNA2 (gfx1036) follows Mesa's GFX11 column (729/732 cases), not GFX10; raw mode also counts `soffset`. |
