@@ -355,7 +355,7 @@ class Module:
                 f"varying array length %{identifier} is not a literal OpConstant or OpSpecConstant"
             ) from None
         opcode, args = self.type_declaration(type_id)
-        if opcode != OP_TYPE_INT or args[0] not in (16, 32, 64) or args[1] not in (0, 1):
+        if opcode != OP_TYPE_INT or args[0] not in (8, 16, 32, 64) or args[1] not in (0, 1):
             raise InterfaceError("varying array length must be an integer")
         width, signed = args
         if len(literal) != (width + 31) // 32:
