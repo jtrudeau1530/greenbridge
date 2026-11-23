@@ -732,6 +732,28 @@ test('stale and evicted chunks close each shared bitmap once', async t => {
     for (const tex of [...stale.textures, ...live.textures]) assert.equal(tex.dispose.mock.callCount(), 1);
 });
 
+test('eviction disposes each skeleton shared by skinned meshes once', async t => {
+    const f = fixture();
+    const shared = { dispose: t.mock.fn() };
+    const separate = { dispose: t.mock.fn() };
+    const nodes = [
+        { isSkinnedMesh: true, skeleton: shared },
+        { isSkinnedMesh: true, skeleton: shared },
+        { isSkinnedMesh: true, skeleton: separate },
+        { isSkinnedMesh: true },
+    ];
+    f.frame();
+    await f.succeed(0, { traverse(fn) { nodes.forEach(fn); } });
+    assert.equal(shared.dispose.mock.callCount(), 0);
+    assert.equal(separate.dispose.mock.callCount(), 0);
+
+    f.context.camera.position.x = 10000;
+    f.frame();
+    assert.equal(f.state.live.has('chunk_0'), false);
+    assert.equal(shared.dispose.mock.callCount(), 1);
+    assert.equal(separate.dispose.mock.callCount(), 1);
+});
+
 test('stale parses retain their slot, then dispose success or ignore failure', async () => {
     const f = fixture();
     f.frame(); await f.receive(0); f.state.drop('chunk_0'); f.frame();

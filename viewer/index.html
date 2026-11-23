@@ -277,10 +277,11 @@ function applyWire(root) {
 }
 function disposeObject(obj) {
   const disposedGeo = new Set(), disposedMat = new Set(), disposedTex = new Set();
-  const bitmaps = new Set();
+  const bitmaps = new Set(), skeletons = new Set();
   obj.traverse(n => {
     if (n.geometry && !disposedGeo.has(n.geometry)) { disposedGeo.add(n.geometry); n.geometry.dispose(); }
     if (n.isInstancedMesh && typeof n.dispose === "function") n.dispose();
+    if (n.isSkinnedMesh && n.skeleton) skeletons.add(n.skeleton);
     const allMats = [].concat(n.material || [], originalMaterials.get(n) || []);
     for (const m of allMats) {
       if (!m || m === clayMat || disposedMat.has(m)) continue;
@@ -296,6 +297,7 @@ function disposeObject(obj) {
     }
     originalMaterials.delete(n);
   });
+  for (const skeleton of skeletons) skeleton.dispose();
   for (const bitmap of bitmaps) bitmap.close();
 }
 function dist(c, p) {
