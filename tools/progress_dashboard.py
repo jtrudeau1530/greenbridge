@@ -34,9 +34,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE = os.path.join(ROOT, "tools", "progress_dashboard.html")
@@ -76,10 +80,22 @@ def read_utf8(path):
 
 
 def save_text(path, text):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    # A fixed `path + ".tmp"` blocks refreshes when that name is taken by a stale directory
+    # or a concurrent writer. Publish from a unique temp in the same directory instead.
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.chmod(tmp, published_mode(path))          # mkstemp creates 0600
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)                     # a read-only temp cannot be unlinked on Windows
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def dump_json(obj):

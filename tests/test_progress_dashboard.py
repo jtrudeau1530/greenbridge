@@ -410,6 +410,18 @@ class Outputs(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertFalse(os.path.exists(os.path.join(ROOT, "progress_out_test")))
 
+    def test_save_text_refreshes_when_fixed_temp_name_is_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.json")
+            stale = out + ".tmp"
+            os.mkdir(stale)
+            pd.save_text(out, '{"ok": 1}\n')
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"ok": 1}\n')
+            self.assertTrue(os.path.isdir(stale))
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith("report.json.")],
+                             ["report.json.tmp"])
+
     def test_page_snapshot_history_and_dedupe(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")
