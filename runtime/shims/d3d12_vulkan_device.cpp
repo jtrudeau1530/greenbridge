@@ -600,6 +600,9 @@ struct DeviceState {
     PFN_vkGetPhysicalDeviceImageFormatProperties2 image_format_properties2 = nullptr;
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
     LUID luid{};       // VkPhysicalDeviceIDProperties::deviceLUID; zero when the driver reports none
+    // An integrated GPU (VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU): D3D12_FEATURE_ARCHITECTURE answers UMA, the custom
+    // heap equivalents are in MEMORY_POOL_L0 and custom heaps in L1 are refused, as the host runtime does there.
+    bool uma = false;
     leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
     std::once_flag pipeline_cache_once;
     VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
@@ -1459,8 +1462,11 @@ bool render_target_family(DXGI_FORMAT format) {
     }
 }
 
-// Why the host would refuse these heap properties, or null if it accepts them.
-const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
+// Why the host would refuse these heap properties, or null if it accepts them. `uma` is the device's
+// D3D12_FEATURE_ARCHITECTURE answer: a UMA adapter has no MEMORY_POOL_L1, and the host refuses a custom heap in it
+// (measured on a Radeon 780M, AMD 32.0.13030.13001, and on WARP: E_INVALIDARG from CreateHeap and
+// CreateCommittedResource for every CPU page property).
+const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap, bool uma) {
     if (heap.Type < D3D12_HEAP_TYPE_DEFAULT || heap.Type > D3D12_HEAP_TYPE_GPU_UPLOAD) return "heap type";
     // CheckFeatureSupport reports OPTIONS16.GPUUploadHeapSupported FALSE, and a host runtime without GPU upload heaps
     // (Resizable BAR off) refuses the type.
@@ -1471,6 +1477,7 @@ const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
     if (custom ? !(page_given && pool_given) : (page_given || pool_given))
         return "CPU page property or memory pool (given only, and both, on custom heaps)";
     if (heap.CreationNodeMask > 1 || heap.VisibleNodeMask > 1) return "node mask (one node)";
+    if (uma && custom && heap.MemoryPoolPreference == D3D12_MEMORY_POOL_L1) return "MEMORY_POOL_L1 on a UMA adapter";
     return nullptr;
 }
 
@@ -1479,12 +1486,12 @@ const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap) {
 // custom heap without a CPU page property), and a heap that denies buffers and both kinds of texture. ALLOW_DISPLAY
 // (CreateCommittedResource on a default heap only, per the D3D12_HEAP_FLAGS documentation) is refused too, confirmed
 // on an RTX 4070 SUPER and a UHD 770 host by @CowBoYdu76. Those hosts accept HARDWARE_PROTECTED, so it is not refused.
-const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc) {
+const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc, bool uma) {
     if (!desc.SizeInBytes) return "zero size";
     if (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
         desc.Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
         return "alignment (0, 64 KiB or 4 MiB)";
-    if (const char* why = heap_properties_refusal(desc.Properties)) return why;
+    if (const char* why = heap_properties_refusal(desc.Properties, uma)) return why;
     constexpr UINT deny_all = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
                               D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
     if ((UINT(desc.Flags) & deny_all) == deny_all) return "heap flags denying every resource kind";
@@ -1548,8 +1555,8 @@ const char* initial_state_refusal(bool buffer, UINT flags, D3D12_RESOURCE_STATES
 
 const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS heap_flags,
                                        const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state,
-                                       const D3D12_CLEAR_VALUE* clear, bool acceleration_structures) {
-    if (const char* why = heap_properties_refusal(heap)) return why;
+                                       const D3D12_CLEAR_VALUE* clear, bool acceleration_structures, bool uma) {
+    if (const char* why = heap_properties_refusal(heap, uma)) return why;
     // The DENY flags of a committed resource's heap are the runtime's to choose; most other bits are refused too.
     constexpr UINT committed_heap_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
                                           D3D12_HEAP_FLAG_HARDWARE_PROTECTED | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT |
@@ -5282,9 +5289,12 @@ public:
     // none to report (deviceLUIDValid false).
     LUID STDMETHODCALLTYPE GetAdapterLuid() override { return state_.luid; }
 
-    // The CUSTOM equivalent of a standard heap type, from the D3D12 documentation's table for a NUMA adapter
-    // (D3D12_FEATURE_ARCHITECTURE answers UMA = FALSE): DEFAULT is GPU-only memory in L1, UPLOAD write-combined
-    // and READBACK write-back system memory in L0, GPU_UPLOAD write-combined L1. CUSTOM and unknown types have
+    // The CUSTOM equivalent of a standard heap type, from the D3D12 documentation's table for the architecture
+    // D3D12_FEATURE_ARCHITECTURE reports. NUMA (a discrete GPU): DEFAULT is GPU-only memory in L1, UPLOAD
+    // write-combined and READBACK write-back system memory in L0, GPU_UPLOAD write-combined L1. UMA (an integrated
+    // GPU, CacheCoherentUMA FALSE): the same pages, all in L0, as the host runtime answers on a Radeon 780M (AMD
+    // 32.0.13030.13001). The pool only names the answer; memory is chosen by the CPU page property either way. CUSTOM
+    // and unknown types have
     // no equivalent and get an all-zero answer (D3D12 reports them through the debug layer), with node 0 in both node
     // masks as the host runtime gives it (d3d12_fence_timing_test compares CUSTOM, an unknown type and node mask 2).
     D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE GetCustomHeapProperties(UINT node_mask, D3D12_HEAP_TYPE type) override {
@@ -5315,6 +5325,7 @@ public:
             log_once("GetCustomHeapProperties heap type without a custom equivalent:", int(type));
             return properties;
         }
+        if (state_.uma) properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
         properties.Type = D3D12_HEAP_TYPE_CUSTOM;
         return properties;
     }
@@ -6775,7 +6786,7 @@ public:
     HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
-        if (const char* why = heap_desc_refusal(*desc)) {
+        if (const char* why = heap_desc_refusal(*desc, state_.uma)) {
             log_once((std::string("CreateHeap refused (") + why + "), heap type").c_str(), int(desc->Properties.Type));
             return E_INVALIDARG;
         }
@@ -6863,7 +6874,7 @@ public:
         // committed buffer must start in GENERIC_READ or COPY_DEST. UAV access is refused there all the same.
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const char* why = committed_resource_refusal(default_heap, D3D12_HEAP_FLAG_NONE, *desc, state, clear,
-                                                     acceleration_structures());
+                                                     acceleration_structures(), state_.uma);
         const D3D12_HEAP_TYPE heap_type = heap->properties().Type;
         if (!why && (heap_type == D3D12_HEAP_TYPE_UPLOAD || heap_type == D3D12_HEAP_TYPE_READBACK) &&
             (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
@@ -7125,10 +7136,13 @@ public:
             auto* arch = static_cast<D3D12_FEATURE_DATA_ARCHITECTURE1*>(data);
             const UINT node = arch->NodeIndex;
             if (node != 0) return d3d12_trace::result(method, E_INVALIDARG);
-            // A discrete desktop GPU: not tile-based, no UMA. The console is UMA (question 11); the layer keeps
-            // upload heaps host-visible, so the game's upload path still works.
+            // The host GPU's architecture (question 11): not tile-based; UMA on an integrated GPU, as the host runtime
+            // answers there (Radeon 780M, AMD 32.0.13030.13001: UMA 1, CacheCoherentUMA 0), else a discrete one. The
+            // console is UMA; the layer keeps upload heaps host-visible either way, so the game's upload path works.
+            // CacheCoherentUMA stays FALSE: the AMD iGPU measured reports it so, and FALSE only steers an application
+            // to write-combined uploads, which every UMA adapter accepts.
             arch->TileBasedRenderer = FALSE;
-            arch->UMA = FALSE;
+            arch->UMA = state_.uma ? TRUE : FALSE;
             arch->CacheCoherentUMA = FALSE;
             if (v1) arch->IsolatedMMU = TRUE;
             return d3d12_trace::result(method, S_OK);
@@ -7997,7 +8011,7 @@ private:
         if (out) *out = nullptr;
         if (!heap || !desc) return finish(E_INVALIDARG);
         if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear,
-                                                         acceleration_structures())) {
+                                                         acceleration_structures(), state_.uma)) {
             log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), dimension")
                          .c_str(),
                      int(desc->Dimension));
@@ -8096,6 +8110,7 @@ private:
             properties2(info.physical, &properties);
             static_assert(sizeof(LUID) == VK_LUID_SIZE);
             if (id.deviceLUIDValid) std::memcpy(&state_.luid, id.deviceLUID, sizeof(LUID));
+            state_.uma = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
         }
         if (!state_.luid.LowPart && !state_.luid.HighPart) log_once("the Vulkan driver reports no device LUID;", 0);
 
@@ -8171,7 +8186,7 @@ private:
             backing.MipLevels = desc->MipLevels;
         }
         if (const char* why = committed_resource_refusal(heap, D3D12_HEAP_FLAG_NONE, backing, state, clear,
-                                                         acceleration_structures())) {
+                                                         acceleration_structures(), state_.uma)) {
             log_once((std::string(method) + " refused (" + why + "), dimension").c_str(), int(desc->Dimension));
             return d3d12_trace::result(method, E_INVALIDARG);
         }
