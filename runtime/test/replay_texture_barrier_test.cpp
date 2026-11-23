@@ -12,6 +12,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #include <new>
 #include <vector>
 
@@ -27,6 +30,28 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+// The aligned forms, so that an allocation of an over-aligned type is counted also.
+void* operator new(std::size_t size, std::align_val_t alignment) {
+    ++g_allocations;
+    const std::size_t align = static_cast<std::size_t>(alignment);
+#ifdef _WIN32
+    if (void* p = _aligned_malloc(size ? size : 1, align)) return p;
+#else
+    if (void* p = std::aligned_alloc(align, (size + align - 1) / align * align + (size ? 0 : align))) return p;
+#endif
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size, std::align_val_t alignment) { return operator new(size, alignment); }
+void operator delete(void* p, std::align_val_t) noexcept {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+void operator delete[](void* p, std::align_val_t alignment) noexcept { operator delete(p, alignment); }
+void operator delete(void* p, std::size_t, std::align_val_t alignment) noexcept { operator delete(p, alignment); }
+void operator delete[](void* p, std::size_t, std::align_val_t alignment) noexcept { operator delete(p, alignment); }
 
 namespace {
 

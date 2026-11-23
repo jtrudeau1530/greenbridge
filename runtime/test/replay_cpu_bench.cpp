@@ -576,7 +576,7 @@ int main(int argc, char** argv) {
             reps, warmup);
         check(kind.name, r);
         // One image barrier for each piece: emit keeps the usual one or two on the stack.
-        if (kind.name == texture_barrier_kind && r.emit.allocations != 0) {
+        if (std::strcmp(kind.name, texture_barrier_kind) == 0 && r.emit.allocations != 0) {
             std::fprintf(stderr, "FAIL %s: emit makes %.2f heap allocations per command\n", kind.name,
                          r.emit.allocations);
             ++failures;
