@@ -59,7 +59,8 @@ python -I tools/shader_link_check.py inspect <shader.spv>
 ```
 
 To audit a batch, give it the shader names from your local translation directory in a JSON file. A stage can
-use a string or a `shader` and `entry` object. Names refer to `<name>.spv` in `--shader-dir`.
+use a string or a `shader` and `entry` object. Names refer to `<name>.spv` in `--shader-dir`. The manifest is read as
+UTF-8 with or without the byte order mark, so a copy saved by Notepad or `Out-File -Encoding utf8` is taken as is.
 
 ```json
 {

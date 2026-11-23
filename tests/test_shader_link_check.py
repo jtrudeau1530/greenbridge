@@ -482,6 +482,14 @@ class CommandLineTest(unittest.TestCase):
                 self.assertIn("shader_link_check: error:", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
+    def test_manifest_saved_with_a_windows_bom_is_read(self):
+        # Notepad and PowerShell 5's Out-File -Encoding utf8 put a BOM first; that is not a manifest error.
+        self.manifest.write_bytes(b"\xef\xbb\xbf" + json.dumps(
+            {"version": 1, "pipelines": [{"name": "bom", "vs": "vertex", "ps": "pixel"}]}).encode("utf-8"))
+        result = self.run_batch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("bom: compatible", result.stdout)
+
     def test_corpus_style_names_are_accepted_and_paths_are_not(self):
         # make_game's corpus names (shader_carve stems) contain "~", "!", "&", "(", a leading "." and more: 21,043 of
         # 26,503 on a 1.0.2.1 copy failed the old [a-zA-Z0-9_.-] rule. Only names that leave --shader-dir fail.

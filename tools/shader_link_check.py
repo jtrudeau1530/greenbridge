@@ -138,7 +138,8 @@ def reject_duplicate_keys(pairs):
 
 def load_pipeline_manifest(path: Path, shader_dir: Path):
     try:
-        with path.open(encoding="utf-8") as source:
+        # utf-8-sig: a hand-written manifest from Notepad or PowerShell 5 Out-File starts with a BOM.
+        with path.open(encoding="utf-8-sig") as source:
             doc = json.load(source, object_pairs_hook=reject_duplicate_keys)
     except (OSError, ValueError) as exc:
         raise ValueError(f"{path}: {exc}") from exc
