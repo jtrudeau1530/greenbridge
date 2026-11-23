@@ -2563,10 +2563,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (depth_clear->flags & clear_depth) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
             if (depth_clear->flags & clear_stencil) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
             const VkImageAspectFlags available = p.binding.aspects & depth_stencil_aspects;
-            if (!p.binding.image || !available || (aspects & ~available) || (p.binding.aspects & ~depth_stencil_aspects))
+            if (!p.binding.image || !available || (p.binding.aspects & ~depth_stencil_aspects))
                 return ReplayResult::invalid_clear;
+            // A flag for a plane the view's format doesn't have is ignored, as the PC D3D12 runtime (WARP) and native
+            // drivers do: STENCIL on a D32_FLOAT view clears nothing, DEPTH | STENCIL clears the depth plane. Until
+            // 2026-11-23 it returned invalid_clear here and the whole list was dropped (D3D-437).
+            aspects &= available;
             if (!detail::view_range(p.binding, depth_clear->target, aspects, p.range))
                 return ReplayResult::invalid_subresource;
+            if (!aspects) p.skip = true;
             if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
                 r != ReplayResult::success)
                 return r;

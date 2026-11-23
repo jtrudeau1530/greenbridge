@@ -159,10 +159,13 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned bytes, co
 
 // Clears a depth-stencil target fully and a rectangle, then reads the depth plane (and the stencil plane, when the
 // format has one) back. depth_bytes is the depth plane's bytes per pixel (2 for D16, 4 for D32); has_stencil selects
-// the separate stencil plane (subresource 1) of a combined format.
+// the separate stencil plane (subresource 1) of a combined format. full_flags / part_flags override the clear flags
+// of the two clears (0: DEPTH, plus STENCIL when the format has a stencil plane).
 bool clear_depth_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned depth_bytes, bool has_stencil,
                           FLOAT depth_full, UINT8 stencil_full, FLOAT depth_part, UINT8 stencil_part,
-                          std::vector<unsigned char>& depth_pixels, std::vector<unsigned char>& stencil_pixels) {
+                          std::vector<unsigned char>& depth_pixels, std::vector<unsigned char>& stencil_pixels,
+                          D3D12_CLEAR_FLAGS full_flags = D3D12_CLEAR_FLAGS(0),
+                          D3D12_CLEAR_FLAGS part_flags = D3D12_CLEAR_FLAGS(0)) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -208,9 +211,9 @@ bool clear_depth_and_read(ID3D12Device* device, DXGI_FORMAT format, unsigned dep
     device->CreateDepthStencilView(image.p, nullptr, handle);
     const D3D12_CLEAR_FLAGS flags =
         static_cast<D3D12_CLEAR_FLAGS>((has_stencil ? D3D12_CLEAR_FLAG_STENCIL : 0) | D3D12_CLEAR_FLAG_DEPTH);
-    list->ClearDepthStencilView(handle, flags, depth_full, stencil_full, 0, nullptr);
+    list->ClearDepthStencilView(handle, full_flags ? full_flags : flags, depth_full, stencil_full, 0, nullptr);
     const D3D12_RECT rect{1, 1, 4, 3};
-    list->ClearDepthStencilView(handle, flags, depth_part, stencil_part, 1, &rect);
+    list->ClearDepthStencilView(handle, part_flags ? part_flags : flags, depth_part, stencil_part, 1, &rect);
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = image.p;
@@ -570,6 +573,29 @@ int main(int argc, char** argv) {
                 }
                 ++cases_checked;
             }
+        }
+        // D3D-437: STENCIL on a depth-only D32_FLOAT view. The PC runtime (WARP) ignores the absent plane: DEPTH |
+        // STENCIL clears the depth and STENCIL alone clears nothing; the layer used to drop the whole list instead.
+        struct PlaneCase { D3D12_CLEAR_FLAGS full, part; float depth_full, depth_part; };
+        const PlaneCase plane_cases[] = {
+            {D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0.875f},
+            {D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_FLAG_STENCIL, 0.25f, 0.75f},
+            {D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.375f, 1.0f},
+        };
+        for (unsigned i = 0; i < std::size(plane_cases); ++i) {
+            const auto& pc = plane_cases[i];
+            std::vector<unsigned char> actual, expected, no_stencil_a, no_stencil_e;
+            if (!clear_depth_and_read(ours.p, DXGI_FORMAT_D32_FLOAT, 4, false, pc.depth_full, 0x11, pc.depth_part, 0x22,
+                                      actual, no_stencil_a, pc.full, pc.part) ||
+                !clear_depth_and_read(host.p, DXGI_FORMAT_D32_FLOAT, 4, false, pc.depth_full, 0x11, pc.depth_part, 0x22,
+                                      expected, no_stencil_e, pc.full, pc.part))
+                return 1;
+            if (actual != expected) {
+                std::fprintf(stderr, "D32_FLOAT stencil-flag case %u: depth readback differs from WARP\n", i);
+                ++format_failures;
+                continue;
+            }
+            ++cases_checked;
         }
         if (format_failures) {
             std::fprintf(stderr, "d3d12_clear_test: %u color/depth format(s) differ from WARP\n", format_failures);
