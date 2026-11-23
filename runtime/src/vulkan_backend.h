@@ -1809,7 +1809,14 @@ public:
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
-        context_.holds().attach(this);
+        try {
+            context_.holds().attach(this);
+        } catch (...) {
+            // A failed registration leaves no queue to run the destructor for these Vulkan handles.
+            if (progress_) vk.vkDestroySemaphore(context.device(), progress_, nullptr);
+            if (pool_) vk.vkDestroyCommandPool(context.device(), pool_, nullptr);
+            throw;
+        }
     }
 
     ~VulkanQueue() {
