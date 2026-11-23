@@ -29,7 +29,7 @@ Exit status is 0 even when nothing is found; the summary says how many streams w
 """
 import argparse
 import csv
-import glob
+import fnmatch
 import json
 import mmap
 import os
@@ -316,11 +316,29 @@ def summarize(rows, source, span, zero, unread, elapsed):
             "elapsed_s": round(elapsed, 2)}
 
 
+def find_payloads(root, patterns, skipped=None):
+    """The files under root matching each glob pattern, as a sorted list per pattern. Hidden names are left out and
+    links are followed, as glob.glob("**", recursive=True) did. Unlike glob, a folder that cannot be listed is not
+    dropped silently: it is named on stderr and added to skipped, so the run reports itself incomplete."""
+    found = {p: [] for p in patterns}
+
+    def unlistable(error):
+        print(f"{error.filename or root}: skipped ({error.strerror or error})", file=sys.stderr)
+        if skipped is not None:
+            skipped.append(error.filename or root)
+
+    for folder, dirs, names in os.walk(root, onerror=unlistable, followlinks=True):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in names:
+            if not name.startswith("."):
+                for p in patterns:
+                    if fnmatch.fnmatch(name, p):
+                        found[p].append(os.path.join(folder, name))
+    return [sorted(found[p]) for p in patterns]
+
+
 def scan_dir(path, max_inflate=1 << 28, skipped=None):
-    # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
-    # class by glob and match nothing. The "**"/"*.rpf"/"*.bin" suffixes stay as glob patterns.
-    root = glob.escape(os.fspath(path))
-    rpfs = sorted(glob.glob(os.path.join(root, "**", "*.rpf"), recursive=True))
+    rpfs, bins = find_payloads(os.fspath(path), ("*.rpf", "*.bin"), skipped)
     rows, summaries = [], []
     if rpfs:
         for p in rpfs:
@@ -334,7 +352,7 @@ def scan_dir(path, max_inflate=1 << 28, skipped=None):
             rows += r
             summaries.extend(s)
         return rows, summaries
-    for p in sorted(glob.glob(os.path.join(root, "**", "*.bin"), recursive=True)):
+    for p in bins:
         size = os.path.getsize(p)
         with open(p, "rb") as f:
             head = f.read(HEAD)
@@ -523,7 +541,7 @@ def main(argv=None):
     if not rows:
         print("no zlib streams found", file=sys.stderr)
     if skipped:
-        print(f"{len(skipped)} archive(s) could not be scanned; the report is incomplete", file=sys.stderr)
+        print(f"{len(skipped)} archive(s) or folder(s) could not be scanned; the report is incomplete", file=sys.stderr)
         return 1
     return 0
 
