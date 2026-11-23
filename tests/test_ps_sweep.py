@@ -125,6 +125,17 @@ class Classification(unittest.TestCase):
         self.assertEqual(self.classify([0.5, 1.0], [-1.0, -1.0]), ("NaN or zero on one GPU only", "unwritten"))
         self.assertEqual(self.classify([nan, 1.0], [nan, 1.0]), ("OK on both", ""))   # NaN on both is not a difference
 
+    def test_non_finite_values_compare_per_component(self):
+        nan, inf = float("nan"), float("inf")
+        gross = ("differs beyond tolerance", "gross (>0.1)")
+        # NaN in different components of the two outputs
+        self.assertEqual(self.classify([nan, 1.0], [1.0, nan]), gross)
+        # an infinity against a finite value, and against the opposite infinity
+        self.assertEqual(self.classify([inf, 1.0], [1.0, 1.0]), gross)
+        self.assertEqual(self.classify([inf, 1.0], [-inf, 1.0]), gross)
+        # the same non-finite value at the same component matches
+        self.assertEqual(self.classify([inf, nan, 1.0], [inf, nan, 1.0]), ("OK on both", ""))
+
     def test_failures_and_timeouts(self):
         self.assertEqual(self.classify([0.5], [0.5], 0, 77), ("fails on one GPU", "b: missing device feature"))
         self.assertEqual(self.classify([0.5], [0.5], 4, 0), ("fails on one GPU", "a: exit 4"))

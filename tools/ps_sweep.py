@@ -192,6 +192,12 @@ def classify_pair(rec_a, rec_b, raw_a, raw_b, tol=TOLERANCE):
         for x, y in zip(fa, fb):
             if x == y or (math.isnan(x) and math.isnan(y)):
                 continue
+            if not (math.isfinite(x) and math.isfinite(y)):
+                # A NaN against a number, or an infinity against anything else, always differs; the tolerance
+                # arithmetic would pass inf against 1.0 and NaN against NaN in another component.
+                bad += 1
+                worst = math.inf
+                continue
             d = abs(x - y)
             if d > tol + tol * max(abs(x), abs(y)):
                 bad += 1
