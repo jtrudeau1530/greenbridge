@@ -438,9 +438,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     return VirtualAlloc(address, size, host_type, host_prot);
 }
 
-// With g_phys_mutex held. Maps `view` at the 64 KiB-aligned `address`, which holds no mapped page.
+// With g_phys_mutex held. Maps `view` at the 64 KiB-aligned `address`, which holds no mapped page. MEM_REPLACE_PLACEHOLDER
+// needs the view to fill one placeholder exactly, and earlier partial unmaps can leave several host placeholders in one
+// run, so the run is mapped as one view per placeholder it spans (one view for a fresh window).
 bool map_view(uintptr_t address, const View& view) {
-    // An earlier partial unmap can leave several host placeholders in one guest run: one view per placeholder.
     for (uint64_t mapped = 0; mapped < view.count;) {
         const uintptr_t base = address + mapped * kPhysicalPageSize;
         void* const target = reinterpret_cast<void*>(base);
@@ -455,10 +456,7 @@ bool map_view(uintptr_t address, const View& view) {
         const uint64_t count = available < remaining ? available : remaining;
         const SIZE_T size = static_cast<SIZE_T>(count * kPhysicalPageSize);
         const uint64_t offset = view.offset + mapped * kPhysicalPageSize;
-        if ((info.AllocationBase != target || info.RegionSize != size) &&
-            !VirtualFree(target, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
-            return false;
-        }
+        if (!isolate_placeholder(target, size)) return false;
         if (!placeholder_api().map_view3(view.section->handle, GetCurrentProcess(), target, offset, size,
                                          MEM_REPLACE_PLACEHOLDER, view.protect, nullptr, 0)) {
             return false;
