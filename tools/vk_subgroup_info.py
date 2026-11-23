@@ -45,6 +45,7 @@ the fallback (correct, one geometry-shader stage slower); LEONIDA_BARY_FALLBACK=
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
+Usage: `python -I tools/vk_subgroup_info.py --help` lists the options.
 """
 import argparse
 import ctypes
