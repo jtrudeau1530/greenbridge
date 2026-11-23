@@ -71,15 +71,18 @@
 // Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
 // in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
-// first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
-// reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
-// (PresentX, SuspendX, ResumeX) will show up; their slots are not known and are not guessed, and that the console
-// keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
-// unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
-// CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
-// (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
-// heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface answers only the
-// modelled interfaces; one the real object has but the proxy does not model is logged once and refused.
+// first four argument words and refused with E_NOTIMPL. Fence slot 12 is served instead: the retail executable reads
+// its return as the address of the fence's 64-bit completed value, so it returns a per-fence mirror that a wait on
+// the real fence keeps current (d3d12_xs_device.cpp, "Fence slot 12"). A slot past the table faults on the vtable
+// read inside a reserved, never-committed region, and the fault is logged with the slot. That is where the console's
+// queue methods (PresentX, SuspendX, ResumeX) will show up; their slots are not known and are not guessed, and that
+// the console keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence
+// proxies are unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait
+// (14/15), device CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45),
+// SetResidencyPriority (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes
+// them through and a heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface
+// answers only the modelled interfaces; one the real object has but the proxy does not model is logged once and
+// refused.
 #pragma once
 
 #include <d3d12.h>
