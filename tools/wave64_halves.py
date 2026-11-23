@@ -489,6 +489,14 @@ class Analysis:
                     continue
                 T[r] = t
                 st["g"].pop(r, None)
+                # SHADER-820: a vote's SCC names the mask register it tested (its first SGPR for a pair). A new
+                # value in that register (v_cmp into the pair or VCC, s_mov_b64, s_cselect_b64: none of them
+                # writes SCC) leaves SCC a vote on the old mask, while a run side narrows EXEC to the new one, so
+                # the tag goes. Ops that vote on their own destination set the new tag after this put().
+                vote = st["g"].get("scc")
+                if vote and vote[0] == "vote" and r != "scc" and (
+                        r == vote[1] or (isinstance(vote[1], tuple) and r == (vote[1][0], vote[1][1] + 1))):
+                    del st["g"]["scc"]
                 if tag is not None:
                     st["g"][r] = tag
                 if isinstance(r, tuple) and r[0] == "v":
