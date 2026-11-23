@@ -31,7 +31,7 @@ Usage:
     python -I tools/mem_diff.py --self-test
 
 Exit code 0 when every program matches, 1 on a mismatch (the first one is printed with its listing), 2 on a
-harness error. Skips are counted with their reasons, never silent.
+harness error or when every program was skipped (nothing was compared). Skips are counted with their reasons, never silent.
 """
 import argparse
 import gc
@@ -802,7 +802,12 @@ def main(argv=None):
         print("FIRST FAILURE:\n" + first)
     if counts["harness-error"]:
         return 2
-    return 1 if counts["mismatch"] else 0
+    if counts["mismatch"]:
+        return 1
+    if not counts["pass"]:
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

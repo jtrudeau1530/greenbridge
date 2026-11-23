@@ -59,7 +59,7 @@ Usage:
     python -I tools/fmisc_diff.py --self-test
 
 Exit 0 when every program matches, 1 on a mismatch (the shortest failing program is printed after removing
-instructions that do not matter), 2 on a harness error, 77 when the requested hardware oracle is unavailable.
+instructions that do not matter), 2 on a harness error or when every program was skipped (nothing was compared), 77 when the requested hardware oracle is unavailable.
 Skips are counted with their reasons.
 """
 import argparse
@@ -746,7 +746,12 @@ def main(argv=None):
     finally:
         if oracle:
             oracle.close()
-    return 1 if failures else 0
+    if failures:
+        return 1
+    if not counts["pass"]:
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
