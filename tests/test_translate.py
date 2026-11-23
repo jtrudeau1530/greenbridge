@@ -299,11 +299,11 @@ def test_cs_store_packed_atomic_pointers(make_shader):
         assert defs[index] == "OpConstant %uint 0"
 
 
-def test_compute_thread_group_size_sgpr_is_rejected(make_shader):
-    """TG_SIZE_EN (RSRC2 bit 10) adds an SGPR the translator doesn't model."""
+def test_compute_thread_group_size_sgpr_is_written(make_shader):
+    """TG_SIZE_EN (RSRC2 bit 10) adds the thread-group SGPR after the workgroup ids (s5 here); the prologue writes it
+    (tests/semantic/test_cs_tg_size.py runs it)."""
     shader = make_shader("s_endpgm\n", name="cs_test", cs_header=(0x8088 | 1 << 10, (64, 1, 1)))
-    with pytest.raises(rdna2spirv.Unsupported):
-        shader.translate()
+    assert "%tgv" in shader.translate()
 
 
 @pytest.mark.parametrize("group", [(0, 1, 1), (2048, 1, 1)], ids=["empty", "over-1024"])
