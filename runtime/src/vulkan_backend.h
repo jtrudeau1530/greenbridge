@@ -1150,6 +1150,16 @@ public:
 
     void add_sparse_resource(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseResource> sparse) {
         std::unique_lock lock(resource_mutex_);
+        if (!binding.image) {
+            auto [it, inserted] = sparse_resources_.try_emplace(id, std::move(sparse));
+            try {
+                set_resource_locked(id, binding);
+            } catch (...) {
+                if (inserted) sparse_resources_.erase(it);
+                throw;
+            }
+            return;
+        }
         set_resource_locked(id, binding);
         sparse_resources_.emplace(id, std::move(sparse));
         if (binding.image) {
@@ -1530,11 +1540,20 @@ private:
     // resources_[id] = binding, with the VA index kept in step (a re-registered ID drops its old range first).
     void set_resource_locked(ResourceId id, const ResourceBinding& binding) {
         auto [it, inserted] = resources_.try_emplace(id, binding);
+        if (addressable(binding)) {
+            try {
+                buffer_vas_.insert(binding.va, binding.size, id);
+            } catch (...) {
+                if (inserted) resources_.erase(it);
+                throw;
+            }
+        }
         if (!inserted) {
-            unindex_buffer(id, it->second);
+            // A same-VA insert updates its size in place; removing the old key would remove the new range.
+            if (addressable(it->second) && (!addressable(binding) || it->second.va != binding.va))
+                unindex_buffer(id, it->second);
             it->second = binding;
         }
-        if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
     }
 
     const ResourceBinding* resolve(ResourceId id) const {
