@@ -556,7 +556,7 @@ def detect_ram_gb():
     for common in (4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128):
         if abs(gb - common) / common < 0.08:
             return common
-    return max(4, min(128, round(gb)))
+    return max(1, round(gb))
 
 
 def detect_all() -> dict:
