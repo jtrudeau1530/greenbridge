@@ -477,6 +477,70 @@ class CliTest(unittest.TestCase):
                 result = json.load(handle)
             self.assertEqual(result["maps"]["name_resolved"], 1)
 
+    def test_build_out_refuses_to_overwrite_an_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "manifest.json")
+            scan = os.path.join(tmp, "scan.json")
+            names = os.path.join(tmp, "names.txt")
+            rpf9 = os.path.join(tmp, "rpf9_names.json")
+            xml = os.path.join(tmp, "common.xml")
+            models_dir = os.path.join(tmp, "assets", "archive", "models")
+            os.makedirs(models_dir)
+            dir_manifest = os.path.join(models_dir, "manifest.json")
+
+            with open(manifest, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"Items": [{"Name": "synthetic_m.#dr"}]}, handle)
+            with open(dir_manifest, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"Items": [{"Name": "synthetic_dir_m.#dr"}]}, handle)
+            with open(scan, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"entries": [{"Path": "models/synthetic_s._dr_at_0000000000000010.r9modeldata"}]}, handle)
+            with open(names, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("synthetic_n\n")
+            with open(rpf9, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"files": [{"names": ["synthetic_r.#dr"]}]}, handle)
+            with open(xml, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("<root><name>synthetic_x</name></root>\n")
+
+            cases = [
+                ("manifest", ["--manifest", manifest], manifest),
+                ("manifest_dir", ["--manifest", os.path.join(tmp, "assets")], dir_manifest),
+                ("scan", ["--scan", scan], scan),
+                ("names", ["--names", names], names),
+                ("rpf9_names", ["--rpf9-names", rpf9], rpf9),
+                ("xml", ["--xml", xml], xml),
+            ]
+            for label, prefix, source in cases:
+                with self.subTest(input=label):
+                    with open(source, "rb") as handle:
+                        original = handle.read()
+                    out_buf, err_buf = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                        self.assertEqual(WN.main(["build", *prefix, "--out", source]), 1)
+                    self.assertIn(f"would overwrite input {source}", err_buf.getvalue())
+                    self.assertEqual(out_buf.getvalue(), "")
+                    with open(source, "rb") as handle:
+                        self.assertEqual(handle.read(), original)
+
+            # A hard link to either a direct input or a discovered directory manifest is refused too.
+            for label, prefix, source, link_name in (
+                ("manifest_hardlink", ["--manifest", manifest], manifest, "manifest_link.json"),
+                ("dir_manifest_hardlink", ["--manifest", os.path.join(tmp, "assets")], dir_manifest, "dir_link.json"),
+            ):
+                hardlink = os.path.join(tmp, link_name)
+                try:
+                    os.link(source, hardlink)
+                except OSError:
+                    self.skipTest("hard links unsupported on this filesystem")
+                with self.subTest(input=label):
+                    with open(source, "rb") as handle:
+                        original = handle.read()
+                    err_buf = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_buf):
+                        self.assertEqual(WN.main(["build", *prefix, "--out", hardlink]), 1)
+                    self.assertIn(f"would overwrite input {source}", err_buf.getvalue())
+                    with open(source, "rb") as handle:
+                        self.assertEqual(handle.read(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

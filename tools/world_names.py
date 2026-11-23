@@ -558,11 +558,27 @@ def _load_json(path: str) -> dict:
         return json.load(handle)
 
 
+def _build_input_paths(args):
+    for path in (*args.manifest, *args.scan, *args.names, *args.rpf9_names, *args.xml):
+        yield path
+    if os.path.exists(args.out):
+        for path in args.manifest:
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    dirs.sort()
+                    if "manifest.json" in files and os.path.basename(root).lower() == "models":
+                        yield os.path.join(root, "manifest.json")
+
+
 def _build(args) -> int:
     if not (args.manifest or args.scan or args.names or args.xml or args.rpf9_names):
         print("build: at least one --manifest/--scan/--names/--rpf9-names/--xml source is required",
               file=sys.stderr)
         return 2
+    for path in _build_input_paths(args):
+        if same_report_path(args.out, path):
+            raise ValueError(
+                f"build: --out {args.out} would overwrite input {path}")
     dictionary = build_dictionary(args.manifest, args.scan, args.names, args.xml,
                                   derive_lod=args.derive_lod, rpf9_names=args.rpf9_names)
     counts = dictionary.counts()
