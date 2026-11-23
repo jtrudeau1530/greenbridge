@@ -71,7 +71,10 @@ std::string module_name(std::string path) {
 
 std::string host_module_name(HMODULE module) {
     std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
+    // Zero-init + lazy alloc under the mutex: the MSVC thread-safe static guard can misfire when the
+    // game's entry point runs before the guard table is in a consistent state (observed under Wine).
+    static std::map<HMODULE, std::string>* names{};
+    if (!names) names = new std::map<HMODULE, std::string>;
     if (auto it = names->find(module); it != names->end()) return it->second;
 
     std::vector<wchar_t> path(MAX_PATH);
@@ -200,9 +203,9 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
             IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
         if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
         {
-            static auto* m = new std::mutex;
-            static auto* seen = new std::set<std::string>;
-            std::lock_guard lock(*m);
+            static std::set<std::string>* seen{};
+            std::lock_guard lock(loader_mutex());
+            if (!seen) seen = new std::set<std::string>;
             if (seen->insert(p->dll + "!" + what).second)
                 std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
         }
