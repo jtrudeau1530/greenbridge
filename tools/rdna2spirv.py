@@ -7591,39 +7591,64 @@ class Gen:
             else:
                 self.emit(f"{row} = OpCopyObject %uint {half}")
             self.emit(f"{src} = OpBitwiseOr %uint {row} {nib}")
-            r = self.tmp()
-            self.g_shuffle(r, v, src)
-            # op_sel:[FI, BOUND_CTRL] (LLVM: llvm.amdgcn.permlane16 <fi> <bound_control> -> op_sel bits 0 and 1).
-            # FI=1 fetches the value of a source lane that is off in EXEC. FI=0 does not: the destination lane keeps
-            # its old value (BOUND_CTRL=0) or gets 0 (BOUND_CTRL=1). Measured on RDNA2 (issue #374).
+            # op_sel:[FI, BOUND_CTRL] (LLVM: llvm.amdgcn.permlane16 <fi> <bound_control> -> op_sel bits 0, 1).
+            # FI=1 fetches the value of a source lane that is off in EXEC. FI=0 does not: the destination keeps its
+            # old value (BOUND_CTRL=0) or gets 0 (BOUND_CTRL=1). A source lane that is on gives its value either
+            # way. Measured on RDNA2 (issue #374).
             (fi, bc), _ = self.opsel_bits(mods, 2)
-            if not fi:
-                sa, ok, old, r2 = (self.tmp() for _ in range(4))
+            if fi:
+                # FI=1 fetches the value of a source lane that is off in EXEC.
+                r = self.tmp()
+                self.g_shuffle(r, v, src)
+                self.dst(a[0], r)
+            elif self.emulate:
+                r = self.tmp()
+                self.g_shuffle(r, v, src)
+                sa, ok, r2 = (self.tmp() for _ in range(3))
                 self.emit(f"{sa} = OpSelect %uint {self.active_b()} {self.cu(1)} {self.cu(0)}")
                 act = self.tmp()
-                if self.emulate:
-                    self.g_shuffle(act, sa, src)
-                    self.emit(f"{ok} = OpINotEqual %bool {act} {self.cu(0)}")
-                else:
-                    # A source lane that is not in this subgroup (a workgroup smaller than the wave) is off too; a
-                    # shuffle from it is undefined, so redirect it first, as ds_lane_read does.
-                    ballot, present, safe_src, got = (self.tmp() for _ in range(4))
-                    self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
-                    self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {src}")
-                    self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
-                    self.emit(f"{act} = OpGroupNonUniformShuffle %uint %c3 {sa} {safe_src}")
-                    self.emit(f"{got} = OpINotEqual %bool {act} {self.cu(0)}")
-                    self.emit(f"{ok} = OpLogicalAnd %bool {present} {got}")
-                    self.uses_subgroup = self.uses_ballot = True
+                self.g_shuffle(act, sa, src)
+                self.emit(f"{ok} = OpINotEqual %bool {act} {self.cu(0)}")
                 if bc:
                     self.emit(f"{r2} = OpSelect %uint {ok} {r} {self.cu(0)}")
                 else:
-                    ptr = self.tmp()   # a plain load, as dst() does: a VGPR that nothing has written yet is not an undefined value
+                    ptr, old = (self.tmp() for _ in range(2))   # a plain load, as dst() does: a VGPR that nothing has written yet is not an undefined value
                     self.emit(f"{ptr} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a[0]['r'])}")
                     self.emit(f"{old} = OpLoad %uint {ptr}")
                     self.emit(f"{r2} = OpSelect %uint {ok} {r} {old}")
-                r = r2
-            self.dst(a[0], r)
+                self.dst(a[0], r2)
+            else:
+                # A source lane that is off in EXEC (or absent from a workgroup smaller than the wave) is off too;
+                # a shuffle from it is undefined, so redirect it first, as ds_lane_read does. The scalar select that
+                # applied FI/BOUND_CTRL can become a short-circuiting ternary in MSL, moving the ballot and both
+                # shuffles into divergent control flow: on MoltenVK 1.4.2 and on MoltenVK main at SPIRV-Cross
+                # aa217aeb the FI=0 lanes then read the source lane's value instead of keeping the old one (#5895).
+                # Combine with bitwise masks instead, as #932 does for ds_bpermute: the ballot and the shuffles run
+                # before lane predication.
+                sa, ballot, present, safe_src, r, act, got, ok, mask = (self.tmp() for _ in range(9))
+                self.emit(f"{sa} = OpSelect %uint {self.active_b()} {self.cu(1)} {self.cu(0)}")
+                physical_src = self.wave_source_lane(src)
+                self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {physical_src}")
+                self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
+                self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {self.wave_source_lane(safe_src)}")
+                self.emit(f"{act} = OpGroupNonUniformShuffle %uint %c3 {sa} {self.wave_source_lane(safe_src)}")
+                self.emit(f"{got} = OpINotEqual %bool {act} {self.cu(0)}")
+                self.emit(f"{ok} = OpLogicalAnd %bool {present} {got}")
+                self.uses_subgroup = self.uses_ballot = True
+                self.emit(f"{mask} = OpSelect %uint {ok} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                if bc:
+                    r2 = self.tmp()
+                    self.emit(f"{r2} = OpBitwiseAnd %uint {r} {mask}")
+                else:
+                    ptr, old, keep, newv, oldv, r2 = (self.tmp() for _ in range(6))
+                    self.emit(f"{ptr} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a[0]['r'])}")   # as dst() does
+                    self.emit(f"{old} = OpLoad %uint {ptr}")
+                    self.emit(f"{keep} = OpNot %uint {mask}")
+                    self.emit(f"{newv} = OpBitwiseAnd %uint {r} {mask}")
+                    self.emit(f"{oldv} = OpBitwiseAnd %uint {old} {keep}")
+                    self.emit(f"{r2} = OpBitwiseOr %uint {newv} {oldv}")
+                self.dst(a[0], r2, eager=True)
         elif op.startswith("buffer_load_dword"):
             self.buffer_load(op, a, mods)
         elif op in self.BUFFER_SUB:
