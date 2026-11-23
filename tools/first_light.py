@@ -450,7 +450,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
                 f"clear pixel {clear} is {pixels[i : i + 4]}, expected {want}"
             )
     centre = manifest.get("centre_pixel")
-    if centre is None:
+    if centre is None or centre == []:
         centre = [width // 2, height // 2]
     if (rgba := manifest.get("centre_rgba")) is not None:
         i = pixel_offset(centre, "centre_pixel")
@@ -477,15 +477,16 @@ def check_image(data: bytes, manifest: dict) -> dict:
                     raise AssertionError(
                         f"RGBA probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want_rgba} (tol {tol})"
                     )
-    else:
-        for probe in manifest.get("uv_probes", []):
-            i = pixel_offset(probe.get("pixel"), "uv_probes pixel")
-            u, v = probe["uv"]
-            for c, want in enumerate((u, v, 0.0, 1.0)):
-                if abs(pixels[i + c] - want) > 2e-3:
-                    raise AssertionError(
-                        f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
-                    )
+    for probe in manifest.get("uv_probes", []):
+        i = pixel_offset(probe.get("pixel"), "uv_probes pixel")
+        if rgba_probes is not None:
+            continue
+        u, v = probe["uv"]
+        for c, want in enumerate((u, v, 0.0, 1.0)):
+            if abs(pixels[i + c] - want) > 2e-3:
+                raise AssertionError(
+                    f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
+                )
     return {"covered": covered, "ratio": ratio, "pixels": pixels}
 
 

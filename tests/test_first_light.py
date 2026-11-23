@@ -250,7 +250,7 @@ class ProbeCoordinateTests(unittest.TestCase):
         self.manifest = {"width": 2, "height": 2, "min_coverage": 0.5, "max_coverage": 0.5}
 
     def test_rejects_invalid_coordinates_in_every_probe_path(self):
-        for point in ([-1, 1], [-1, 0], [2, 0], [0, 2], [0, -1], [], [0], [True, 1], [0, 1.0]):
+        for point in ([-1, 1], [-1, 0], [2, 0], [0, 2], [0, -1], {}, [0], [True, 1], [0, 1.0]):
             probes = (
                 ("clear_pixel", {"clear_pixel": point}),
                 ("centre_pixel", {"centre_pixel": point, "centre_uv": self.rgba[:2]}),
@@ -279,11 +279,25 @@ class ProbeCoordinateTests(unittest.TestCase):
                 "centre_rgba": self.rgba,
                 "centre_uv": [0.0, 0.0],
                 "rgba_probes": [{"pixel": [0, 1], "rgba": self.rgba}],
-                "uv_probes": [{"pixel": [2, 0], "uv": [0.0, 0.0]}],
+                "uv_probes": [{"pixel": [1, 1], "uv": [0.0, 0.0]}],
             },
         ):
             with self.subTest(probe=probe):
                 self.assertEqual(check_image(self.image, self.manifest | probe)["covered"], 2)
+
+    def test_empty_centre_pixel_uses_the_image_centre(self):
+        for key, expected in (("centre_uv", self.rgba[:2]), ("centre_rgba", self.rgba)):
+            with self.subTest(key=key):
+                manifest = self.manifest | {"centre_pixel": [], key: expected}
+                self.assertEqual(check_image(self.image, manifest)["covered"], 2)
+
+    def test_rgba_probes_still_reject_invalid_uv_coordinates(self):
+        manifest = self.manifest | {
+            "rgba_probes": [{"pixel": [0, 1], "rgba": self.rgba}],
+            "uv_probes": [{"pixel": [99, -5]}],
+        }
+        with self.assertRaisesRegex(AssertionError, r"invalid uv_probes pixel coordinates \[99, -5\]"):
+            check_image(self.image, manifest)
 
     def test_check_reports_invalid_coordinates(self):
         def draw(command, **kwargs):
