@@ -12556,11 +12556,13 @@ class Gen:
             self.dynamic_sampled_access(sp, "%_ptr_UC_smp", "%samplers", smp_idx)
             self.emit(f"{smp} = OpLoad %smp {sp}")
             typed_implicit = op == "image_sample" and self.stage == "ps" and dim == "dim:SQ_RSRC_IMG_2D"
-            typed_sample = typed_implicit or (op in ("image_sample_l", "image_sample_lz") and dim == "dim:SQ_RSRC_IMG_2D")
+            # An explicit-LOD sample has the same shape in every dimension, so it takes the typed read too:
+            # image_read_typed picks the UINT/SINT alias of the dimension's sampled binding (image_load does).
+            typed_sample = typed_implicit or op in ("image_sample_l", "image_sample_lz")
 
-            def sampled_image(image, cls):
+            def sampled_image(image, cls, di=0):
                 sampled = self.tmp()
-                sampler_type = f"itxsamp{cls}_0" if cls else stype
+                sampler_type = f"itxsamp{cls}_{di}" if cls else stype
                 self.emit(f"{sampled} = OpSampledImage %{sampler_type} {image} {smp}")
                 return sampled
 
@@ -12791,6 +12793,9 @@ class Gen:
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
             lod = f[ncoord] if kind == "_l" and len(f) > ncoord else "%f0"
             if typed_sample:
+                # The aliases image_read_typed declares are indexed by the dimension it reads: a cube samples its
+                # 6-layer 2D-array view, which is what `img` was loaded from above.
+                di = self.STORE_DIMS[view_dim][0]
                 operands = f"Lod {lod}"
                 if typed_implicit:
                     # Compute the quad gradients before the per-image format branch.
@@ -12800,13 +12805,13 @@ class Gen:
                     operands = f"Grad {dx} {dy}"
 
                 def sample(image, cls, ty):
-                    sampled = sampled_image(image, cls)
+                    sampled = sampled_image(image, cls, di)
                     result = self.tmp()
                     self.emit(f"{result} = OpImageSampleExplicitLod {ty} {sampled} {uv} {operands}")
                     return result
 
                 self.uses_int_sampler = True
-                self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
+                self.image_read_typed(view_dim, self.sgpr_word(a[2], 1), img, img_idx,
                                       dmask, vdata, d16, sample)
                 return
             res = self.tmp()
@@ -14984,7 +14989,7 @@ def assemble(gen):
                           f"%rt_itx{cls}_{di} = OpTypeRuntimeArray %itximg{cls}_{di}",
                           f"%_ptr_UC_rt_itx{cls}_{di} = OpTypePointer UniformConstant %rt_itx{cls}_{di}",
                           f"%_ptr_UC_itx{cls}_{di} = OpTypePointer UniformConstant %itximg{cls}_{di}"]
-                if gen.uses_int_sampler and di == 0:
+                if gen.uses_int_sampler:
                     types.append(f"%itxsamp{cls}_{di} = OpTypeSampledImage %itximg{cls}_{di}")
                 dec += [f"OpDecorate %itx{cls}_{di} DescriptorSet 0",
                         f"OpDecorate %itx{cls}_{di} Binding {Gen.SAMPLED_BINDINGS[di]}"]
