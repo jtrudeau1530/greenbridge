@@ -532,12 +532,18 @@ python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 
   no other program is skipped for its semantics; an assembler rejection is counted as `rejected`, never as a pass.
 - **GFX12** (`hw_oracle/asm.py` `sync_lines`): there is no `s_barrier` (a workgroup barrier is
   `s_barrier_signal -1` then `s_barrier_wait -1`), and the LDS wait is `s_wait_dscnt 0` instead of the legacy
-  `s_waitcnt lgkmcnt(0)`. **A wave64 `ds_bpermute_b32` reaches all 64 lanes on GFX12**, while RDNA2 (and gfx1150)
-  keep each 32-lane half separate: with every lane asking for lane `(l + 32) mod 64`, the RX 9070 XT returns lane
-  `l ^ 32` and a gfx1036 iGPU returns lane `l`. The model describes RDNA2, so on gfx12xx a wave64 program with a
-  `ds_bpermute` is skipped with that reason; under `--perturb bpermute_wave64_cross` all 1,000 wave64 programs of
-  seed 1 match there. RX 9070 XT, AMD 26.11.2, `--programs 1000`, seeds 1 and 2: wave32 1,000/1,000 match; wave64
-  537 and 506 match, 0 mismatch, the rest skipped for that reason. The gfx1036 iGPU gives 1,000/1,000 in both.
+  `s_waitcnt lgkmcnt(0)`. **A wave64 `ds_bpermute_b32` and `ds_permute_b32` reach all 64 lanes on GFX12**, while
+  RDNA2 (and gfx1150) keep each 32-lane half separate: with every lane asking for lane `(l + 32) mod 64`, the
+  RX 9070 XT returns lane `l ^ 32` and a gfx1036 iGPU returns lane `l`; and with every lane *sending* to lane
+  `(l + 32) mod 64`, the RX 9070 (gfx1201, same as the XT measurement) delivers the sender's value to lane
+  `l ^ 32`, all 64 lanes, with lane-`l`-to-lane-`l` sending as the control. A masked wave64 `ds_swizzle` keeps
+  its halves (0 mismatches in a 40-program `--swizzle-exec` run there). The model describes RDNA2, so on gfx12xx
+  a wave64 program with either op is skipped with that reason; under `--perturb bpermute_wave64_cross` /
+  `--perturb permute_wave64_cross` the programs that run match there (the `--extended` 40 programs of seed 1:
+  23 of 40 wave64 match, 0 mismatch, the rest skipped for the bpermute reason). RX 9070 XT, AMD 26.11.2,
+  `--programs 1000`, seeds 1 and 2: wave32 1,000/1,000 match; wave64 537 and 506 match, 0 mismatch, the rest
+  skipped for that reason; on the RX 9070, `--programs 500`, seed 1: wave32 500/500 match, wave64 250 match and
+  250 skipped, 0 mismatch, 0 rejected. The gfx1036 iGPU gives 1,000/1,000 in both.
 - **Wider op mix**, opt-in so that a seed keeps its programs: `--permute` (`ds_permute_b32`), `--swizzle-exec`
   (`ds_swizzle_b32` under EXEC masks), `--threads`, `--extended` (all three). `ds_permute_b32` and a masked
   `ds_swizzle_b32` carry a hypothesis (the model's reading of the ISA text); on the hardware a failing one is a
@@ -925,6 +931,19 @@ vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
   - IEEE mode 0: the half is moved as pure bit operations (`& 0x7FFF` for `abs`, `^ 0x8000` for `neg`, `(x & 0x7FFF) ^ 0x8000` for `-|x|`), with `sNaN` payload and quiet bit preserved untouched.
   - Wave32 and wave64 produce identical results across all 1,088 kernels (0 differences).
   - The translator implements the IEEE mode 0 bit moves, which is exact on hardware.
+
+*Results on RDNA4 (RX 9070, gfx1201, RADV/Mesa 26.2.6, the Linux DRM launcher, AMD clang 23.1.5, `main` + this
+change).* The hardware gate is per family now: `f16` also runs on gfx1170 and gfx12xx (its kernels assemble clean
+for gfx1150, gfx1170 and gfx1201 — 300 programs per wave size each, 0 rejected; the generator's op_sel lines are
+respelled by `asm.opsel16_spelling` there, as the runner always has), and `mem` still runs on gfx1150 and gfx1170
+(300 programs per wave size, every op kind, 0 rejected) but is refused on gfx12xx with the two rejects AMD clang
+gives there: GFX12 has no `s_waitcnt_vscnt` ("instruction not supported on this GPU") and takes none of the
+`buffer_load/store_b32/b64/b96/b128` forms the generator writes ("operands are not valid for this GPU or mode"), so
+`--family mem --oracle hw` exits 77 naming both (300 of 300 mem kernels per wave size rejected for gfx1201).
+`f16` numbers: `--programs 500` (1,000 kernels, wave32 and native wave64) 1,000/1,000 match, 0 mismatches,
+0 assembler rejections; the negative control caught every perturbation (100/87/85/42/31/90 of 100 programs for
+hi_zero, opsel_dst_ignored, pk_swapped, min_is_max, pack_swapped, i16_opsel_ignored). gfx1201 is not RDNA2: the
+match supports the model and settles nothing about the console.
 
 *Findings.* The OOB_SELECT per-mode rules, the per-dword straddle rule and the `s_buffer_load` bound of design.md hold
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
