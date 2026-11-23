@@ -313,7 +313,7 @@ runpy.run_path(sys.argv.pop(1), run_name="__main__")
         os.mkdir(out_dir)
         err = io.StringIO()
         argv = ["rpf_probe.py", self.game, "--out", out_dir]
-        with (mock.patch("sys.argv", argv), mock.patch.object(probe, "probe") as probe_fn,
+        with (mock.patch("sys.argv", argv), mock.patch.object(probe, "probe", wraps=probe.probe) as probe_fn,
               contextlib.redirect_stderr(err)):
             self.assertEqual(probe.main(), 2)
         probe_fn.assert_not_called()
