@@ -1022,8 +1022,6 @@ HRESULT STDMETHODCALLTYPE pkg_identifier(void*, size_t size, char* buffer) {
     return XPackageGetCurrentProcessPackageIdentifier(size, buffer);
 }
 bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess(); }
-// The locales the package declares: <Resources><Resource Language="xx-YY"/> in MicrosoftGame.Config, read from
-// the game folder (LEONIDA_GAME_DIR, else --game-dir). Empty when there is no config or it declares none.
 // The package's MicrosoftGame.Config as text, from the game folder (LEONIDA_GAME_DIR, else --game-dir); empty when
 // there is no folder or no config. Wide on purpose: a game folder named outside the ANSI code page must reach the file
 // intact.
@@ -1057,19 +1055,47 @@ std::string package_config() {
     return std::string{std::istreambuf_iterator<char>(f), {}};
 }
 
+// The locales the package declares: <Resources><Resource Language="xx-YY"/> in MicrosoftGame.Config, read from
+// the game folder (LEONIDA_GAME_DIR, else --game-dir). Empty when there is no config or it declares none.
+// A <Resource> inside an XML comment is not declared (Microsoft's config template ships commented-out entries), XML
+// allows whitespace around an attribute's '=', and only an attribute named exactly Language on an element named
+// exactly Resource counts.
 std::vector<std::string> package_locales() {
     std::vector<std::string> out;
-    const std::string xml = package_config();
-    if (xml.empty()) return out;
+    const std::string raw = package_config();
+    if (raw.empty()) return out;
+    std::string xml;   // the config without its comments; an unterminated comment runs to the end of the file
+    xml.reserve(raw.size());
+    for (size_t at = 0; at < raw.size();) {
+        const size_t open = raw.find("<!--", at);
+        xml.append(raw, at, open == std::string::npos ? std::string::npos : open - at);
+        if (open == std::string::npos) break;
+        const size_t close = raw.find("-->", open + 4);
+        if (close == std::string::npos) break;
+        at = close + 3;
+    }
+    const auto space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    const auto skip_space = [&](size_t p) {
+        while (p < xml.size() && space(xml[p])) ++p;
+        return p;
+    };
     for (size_t at = 0; (at = xml.find("<Resource", at)) != std::string::npos; ++at) {
-        if (xml.compare(at, 10, "<Resources") == 0) continue;
-        const size_t end = xml.find('>', at);
-        const size_t key = xml.find("Language=", at);
-        if (end == std::string::npos || key == std::string::npos || key + 10 > end) continue;
-        const char quote = xml[key + 9];
-        const size_t close = xml.find(quote, key + 10);
-        if ((quote == '"' || quote == '\'') && close != std::string::npos && close < end)
-            out.push_back(xml.substr(key + 10, close - key - 10));
+        size_t p = at + 9;
+        if (p < xml.size() && !space(xml[p]) && xml[p] != '/' && xml[p] != '>') continue;   // <Resources>, ...
+        // The attributes, name = "value" or name = 'value', up to the tag's end; a malformed one ends the tag.
+        for (p = skip_space(p); p < xml.size() && xml[p] != '>' && xml[p] != '/'; p = skip_space(p)) {
+            const size_t name = p;
+            while (p < xml.size() && !space(xml[p]) && xml[p] != '=' && xml[p] != '>' && xml[p] != '/') ++p;
+            const size_t name_end = p;
+            p = skip_space(p);
+            if (p >= xml.size() || xml[p] != '=') break;
+            p = skip_space(p + 1);
+            if (p >= xml.size() || (xml[p] != '"' && xml[p] != '\'')) break;
+            const size_t close = xml.find(xml[p], p + 1);
+            if (close == std::string::npos) break;
+            if (xml.compare(name, name_end - name, "Language") == 0) out.push_back(xml.substr(p + 1, close - p - 1));
+            p = close + 1;
+        }
     }
     return out;
 }
