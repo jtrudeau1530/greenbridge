@@ -764,6 +764,29 @@ public:
         UINT stride = 0;
         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
             return check(false);
+        const auto arg_desc = argument_buffer->GetDesc();
+        if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
+            return check(false);
+        if (count_buffer) {
+            const auto count_desc = count_buffer->GetDesc();
+            if (count_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || count_buffer_offset % 4 != 0 ||
+                count_desc.Width < sizeof(UINT) || count_buffer_offset > count_desc.Width - sizeof(UINT))
+                return check(false);
+        } else if (count_buffer_offset != 0) {
+            return check(false);
+        }
+        if (max_command_count) {
+            const UINT64 record_size =
+                kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
+                : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
+                : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+                : 0;
+            if (!record_size || stride < record_size || stride % 4 != 0)
+                return check(false);
+            const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
+            if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
+                return check(false);
+        }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
         cmd.stride = stride;
