@@ -57,6 +57,18 @@ class CpuScore(unittest.TestCase):
     def test_estimated(self):
         self.assertAlmostEqual(pc.cpu_score("Intel Core i7-11700K"), 103 * 1.06)
 
+    def test_ultra_x_tiers_are_recognized_as_estimates(self):
+        for name, tier in (
+            ("Intel(R) Core(TM) Ultra X7 358H", "Intel Core Ultra 7 358H"),
+            ("Intel® Core™ Ultra X9 Processor 388H", "Intel Core Ultra 9 388H"),
+        ):
+            with self.subTest(name=name):
+                score, exact = pc.cpu_lookup(name)
+                self.assertIsNotNone(score)
+                self.assertEqual(score, pc.cpu_score(tier))
+                self.assertFalse(exact)
+        self.assertIsNone(pc.cpu_score("Intel Core Ultra X5 358H"))
+
     def test_ultra(self):
         self.assertEqual(pc.cpu_score("Intel Core Ultra 7 265K"), 178)
 
