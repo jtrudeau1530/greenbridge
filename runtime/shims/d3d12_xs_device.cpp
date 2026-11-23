@@ -1510,6 +1510,7 @@ void destroy_upload_state(void* upload_state) {
 constexpr unsigned kListNotForwarded = ~0u;
 constexpr unsigned kConsoleSetDescriptorHeaps = 32;
 constexpr unsigned kConsoleExecuteBundle = 31;
+constexpr unsigned kConsoleReset = 139;
 constexpr unsigned kConsoleBarrier = 146;
 constexpr unsigned kConsoleAllocateUpload = 148;
 
@@ -1520,6 +1521,7 @@ constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot == 60) return 58;                 // EndEvent (no console SetMarker/BeginEvent)
     if (slot == 61) return 59;                 // ExecuteIndirect (Package)
     if (slot == kConsoleBarrier) return 80;    // D3D12_BARRIER_GROUP (Package; PC GCL7)
+    if (slot == kConsoleReset) return 10;      // Reset(allocator, pso): measured on the retail title (Pipodi)
     return kListNotForwarded;
 }
 
@@ -1705,9 +1707,12 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t, std::uint64_t,
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
-            if constexpr (Slot == 10) {
-                // Reset(allocator, pso): the title hands its allocator proxy; the real list takes the real one.
+            if constexpr (pc == 10) {
+                // Reset(allocator, pso) — console 10, and 139 as the retail title calls it: the title hands its
+                // allocator proxy; the real list takes the real one (and a wrapped pipeline state, if that ever
+                // exists, the same way).
                 a1 = unwrap_object(a1);
+                a2 = unwrap_object(a2);
             } else if constexpr (Slot == kConsoleExecuteBundle) {
                 a1 = unwrap_object(a1);  // the bundle is a list proxy too
             } else if constexpr (Slot >= 41 && Slot <= 46) {

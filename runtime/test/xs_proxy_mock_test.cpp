@@ -895,6 +895,10 @@ int check_lists() {
     EXPECT(release(found) >= 1);
     // A forwarded console slot: Dispatch is console 14 (PC slot 14 too — order holds through 26).
     EXPECT(hr_of(raw(list, 14, 1, 1, 1)) == S_OK && real->calls[14] == 1);
+    // Console slot 139 is the retail title's Reset(allocator, pso) (Pipodi measured it on 1.0.2.1): the allocator
+    // proxy unwraps and the call reaches the real list's PC slot 10.
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK && real->calls[10] == 1 &&
+           real->args[10][0] == word(real_allocator));
     // Console-only extras (27-30) and the unmeasured tail are recorded and return 0, never forwarded.
     EXPECT(raw(list, 27, 1, 2, 3, 4) == 0 && real->calls[27] == 0);
     EXPECT(raw(list, 148, 0, 16) == 0);  // AllocateUploadMemory(0, ...) refuses
