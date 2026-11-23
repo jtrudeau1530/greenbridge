@@ -1410,7 +1410,8 @@ and any validation error fails them.
   that the whole image holds the clear colour at the swapchain's size (after the first 60 frames, after the
   resize and at the end). Last, it reads the colour on screen with GDI when the window is in front, no other
   window lies over its centre (an always-on-top one can, even over the foreground window) and GDI can read the
-  screen. Under Wine's macOS driver it can't: `GetPixel` on the screen DC returns `CLR_INVALID` even
+  screen. On a GPU that does not drive the window's monitor (the UHD 770 with the desktop on an RTX 4080 SUPER) the
+  desktop never shows the swapchain, so the test prints the pixel, does not assert it and says why. Under Wine's macOS driver it can't: `GetPixel` on the screen DC returns `CLR_INVALID` even
   for a pixel GDI painted itself, and the window's own DC holds Wine's GDI surface (white), not the image
   presented through the Metal layer. There the capture checks are what confirms the colour.
   - The injected failures below make the runtime log `[rt] d3d12: present failed` three times (VkResult
