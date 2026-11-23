@@ -31,8 +31,9 @@ The 151 tagged types live in the nine `CLOUDSCAPE_*` families (2 to 38 types eac
 untagged ones are the 16 single-type families plus one stray variant of a `CLOUDSCAPE_*` data set. Eleven of
 the 17 have `Name == DataName` exactly; the other six differ only in case (like `MISTY` borrowing `misty`).
 
-The `Mod*` axes are not restatements of the numeric data. Seven of the nine axes change *within* a family
-(for `ModTemperature` and `ModFetch`, 8 of 9 families carry more than one value). Every one of the 151 tagged
+The `Mod*` axes are not restatements of the numeric data. All eight axes change *within* a family; seven of
+the eight do it in at least 6 of the nine `CLOUDSCAPE_*` families (`ModTemperature` and `ModFetch` in 8 of 9,
+`ModMisc` only in 3). Every one of the 151 tagged
 types references one of 19 distinct `WeatherAppDataName` entries; none of the 17 untagged types has one.
 `SkipDebugCycling` per type is `True` for 137 and `False` for 31; all 31 `False` ones are tagged (120 of the
 151), and every untagged type is `True`.
