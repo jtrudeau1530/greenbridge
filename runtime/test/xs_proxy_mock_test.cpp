@@ -442,6 +442,108 @@ int check_levels() {
     return 0;
 }
 
+// One COM identity with separate base and extended-interface pointers. The base table is padded with recording
+// slots so an incorrect call through it fails a check instead of reading beyond a short vtable.
+Mock* g_device_identity = nullptr;
+Mock* g_device_extension = nullptr;
+
+HRESULT WINAPI distinct_device_query(Mock*, const IID* riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!riid) return E_NOINTERFACE;
+    Mock* answer = nullptr;
+    if (IsEqualIID(*riid, __uuidof(IUnknown)) || IsEqualIID(*riid, __uuidof(ID3D12Object)) ||
+        IsEqualIID(*riid, __uuidof(ID3D12Device))) {
+        answer = g_device_identity;
+    } else if (mock_has(g_device_extension, *riid)) {
+        answer = g_device_extension;
+    }
+    if (!answer) return E_NOINTERFACE;
+    ++answer->refs;
+    *out = answer;
+    return S_OK;
+}
+
+template <unsigned Slot>
+HRESULT WINAPI distinct_device_create(Mock* self, const void* desc, const IID* riid, void** out) {
+    ++self->calls[Slot];
+    self->args[Slot][0] = word(desc);
+    self->args[Slot][1] = word(riid);
+    self->args[Slot][2] = word(out);
+    if (out) *out = nullptr;
+    return self->create_result;
+}
+
+int check_distinct_device_interfaces() {
+    Mock* base = new_mock(Kind::device);
+    Mock* extension = new_mock(Kind::device);
+    base->refs = 1;
+    extension->device_level = 8;
+    g_device_identity = base;
+    g_device_extension = extension;
+    void* base_table[kMockSlots];
+    void* extension_table[kMockSlots];
+    std::memcpy(base_table, mock_vtable(), sizeof(base_table));
+    std::memcpy(extension_table, mock_vtable(), sizeof(extension_table));
+    base_table[0] = extension_table[0] = reinterpret_cast<void*>(&distinct_device_query);
+    extension_table[47] = reinterpret_cast<void*>(&distinct_device_create<47>);
+    extension_table[62] = reinterpret_cast<void*>(&distinct_device_create<62>);
+    base->vtable = base_table;
+    extension->vtable = extension_table;
+
+    // Both pointers expose the same IUnknown identity, but QI(Device8) does not return the base pointer.
+    const IID device8_iid = __uuidof(ID3D12Device8);
+    void* queried = nullptr;
+    EXPECT(hr_of(raw(base, 0, word(&device8_iid), word(&queried))) == S_OK && queried == extension);
+    void* identity = nullptr;
+    EXPECT(hr_of(raw(queried, 0, word(&kUnknownIid), word(&identity))) == S_OK && identity == base);
+    EXPECT(release(identity) == 1 && release(queried) == 0);
+
+    void* device = nullptr;
+    EXPECT(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(base), __uuidof(ID3D12Device), &device) == S_OK);
+    EXPECT(xs::device_proxy_slot_count(device) == 73 && extension->refs == 0);
+    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{};
+    D3D12_STATE_OBJECT_DESC state_desc{};
+    const IID pso_iid = __uuidof(ID3D12PipelineState), state_iid = __uuidof(ID3D12StateObject);
+    void* out = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 86, word(&stream_desc), word(&pso_iid), word(&out))) == S_OK && !out);
+    EXPECT(base->calls[47] == 0 && extension->calls[47] == 1 && extension->refs == 0);
+    EXPECT(extension->args[47][0] == word(&stream_desc) && extension->args[47][1] == word(&pso_iid));
+    out = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 101, word(&state_desc), word(&state_iid), word(&out))) == S_OK && !out);
+    EXPECT(base->calls[62] == 0 && extension->calls[62] == 1 && extension->refs == 0);
+    EXPECT(extension->args[62][0] == word(&state_desc) && extension->args[62][1] == word(&state_iid));
+
+    // A failing call still releases the QI reference and propagates the backend's HRESULT.
+    extension->create_result = E_ABORT;
+    EXPECT(hr_of(raw(device, 86, word(&stream_desc), word(&pso_iid), word(&out))) == E_ABORT);
+    EXPECT(hr_of(raw(device, 101, word(&state_desc), word(&state_iid), word(&out))) == E_ABORT);
+    EXPECT(base->calls[47] == 0 && base->calls[62] == 0 && extension->refs == 0);
+    EXPECT(extension->calls[47] == 2 && extension->calls[62] == 2);
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 4096;
+    desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    D3D12_RESOURCE_ALLOCATION_INFO allocation{};
+    EXPECT(raw(device, 108, word(&allocation), 1, 1, word(&desc), 0) == word(&allocation));
+    EXPECT(allocation.SizeInBytes == 0x40000 && allocation.Alignment == 0x10000);
+    EXPECT(base->calls[68] == 0 && extension->calls[68] == 1 && extension->refs == 0);
+    EXPECT(extension->array[68][0] == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    using CAbiAllocationFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
+        D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*,
+        D3D12_RESOURCE_ALLOCATION_INFO1*);
+    const auto table = *reinterpret_cast<void* const* const*>(device);
+    allocation = {};
+    EXPECT(reinterpret_cast<CAbiAllocationFn>(table[108])(&allocation, device, 1, 1, &desc, nullptr) == &allocation);
+    EXPECT(allocation.SizeInBytes == 0x40000 && allocation.Alignment == 0x10000);
+    EXPECT(base->calls[68] == 0 && extension->calls[68] == 2 && extension->refs == 0);
+    EXPECT(release(device) == 0 && base->refs == 0);
+    g_device_identity = g_device_extension = nullptr;
+    std::printf("%s: slots 86/101/108 use distinct QI pointers, preserve results and balance references\n", g_label);
+    return 0;
+}
+
 // ---- 2. Fences with and without ID3D12Fence1 ----
 
 int check_fence1() {
@@ -1078,7 +1180,8 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
+    if (check_tail(true) || check_levels() || check_distinct_device_interfaces() || check_fence1() ||
+        check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

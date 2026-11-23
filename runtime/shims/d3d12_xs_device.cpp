@@ -1490,8 +1490,13 @@ HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STAT
     if (out) *out = nullptr;
     if (self->slot_count <= 47) return refuse_beyond_device(86, self->slot_count);  // predates ID3D12Device2
     if (!riid) return E_POINTER;
-    using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
-    return reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
+    // Supporting an interface does not make its pointer or vtable identical to the original device's.
+    ID3D12Device2* device2 = nullptr;
+    const HRESULT query = self->real->QueryInterface(__uuidof(ID3D12Device2), reinterpret_cast<void**>(&device2));
+    if (FAILED(query) || !device2) return FAILED(query) ? query : E_NOINTERFACE;
+    const HRESULT result = device2->CreatePipelineState(desc, *riid, out);
+    device2->Release();
+    return result;
 }
 
 // Xbox slot 101: CreateStateObject(desc, riid, out), forwarded to PC ID3D12Device5::CreateStateObject (PC slot 62,
@@ -1501,8 +1506,12 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
     if (out) *out = nullptr;
     if (self->slot_count <= 62) return refuse_beyond_device(101, self->slot_count);  // predates ID3D12Device5
     if (!riid) return E_POINTER;
-    using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_STATE_OBJECT_DESC*, const IID*, void**);
-    return reinterpret_cast<Fn>(self->real_vtable[62])(self->real, desc, riid, out);
+    ID3D12Device5* device5 = nullptr;
+    const HRESULT query = self->real->QueryInterface(__uuidof(ID3D12Device5), reinterpret_cast<void**>(&device5));
+    if (FAILED(query) || !device5) return FAILED(query) ? query : E_NOINTERFACE;
+    const HRESULT result = device5->CreateStateObject(desc, *riid, out);
+    device5->Release();
+    return result;
 }
 
 // Xbox slot 108: GetResourceAllocationInfo2, forwarded to PC ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68).
@@ -1564,10 +1573,14 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
         descs_to_pass = cleaned.data();
     }
 
-    using Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
-        ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
-        D3D12_RESOURCE_ALLOCATION_INFO1*);
-    reinterpret_cast<Fn>(proxy->real_vtable[68])(proxy->real, ret, visible_mask, count, descs_to_pass, info1);
+    ID3D12Device8* device8 = nullptr;
+    const HRESULT query = proxy->real->QueryInterface(__uuidof(ID3D12Device8), reinterpret_cast<void**>(&device8));
+    if (FAILED(query) || !device8) {
+        *ret = {UINT64_MAX, 0};
+        return reinterpret_cast<std::uint64_t>(ret);
+    }
+    *ret = device8->GetResourceAllocationInfo2(visible_mask, count, descs_to_pass, info1);
+    device8->Release();
     return reinterpret_cast<std::uint64_t>(ret);
 }
 
