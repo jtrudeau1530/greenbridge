@@ -166,8 +166,8 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XUserImpl` and `XGameSaveImpl` from
-xgameruntime-docs' layout (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XUserImpl`, `XGameSaveImpl` and `XStoreImpl`
+from xgameruntime-docs' layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
@@ -264,6 +264,20 @@ The executable's first boot confirms them, or names the slots that differ.
   ignored: nothing syncs offline.
 
 `xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`.
+
+`XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout, also **not measured**:
+- **Interfaces:** the class id doubles as `IXStoreImpl`'s; `IXStoreImpl2`-`6` answer with the same 84-slot vtable.
+- **Offline answers:** the game license is active and not a trial; a package's license is acquirable and valid;
+  there are no add-on licenses, no products in any query and no package updates. License-changed and license-lost
+  registrations hand out tokens; the callbacks never run.
+- **Not available offline:** purchases, consumables, license tokens, collections and purchase ids, downloads and
+  every store UI fail before starting (`E_FAIL`, logged once). The docs' three unnamed slots and
+  `XStoreIsAvailabilityPurchasable` (no documented signature) answer `E_NOTIMPL`.
+- **UNVERIFIED:** `STORE_SKU_ID_SIZE` = 18, `SKU_ID_SIZE` = 5 and `TRIAL_UNIQUE_ID_MAX_SIZE` = 64, which fix
+  `XStoreGameLicense` (104 bytes) and `XStoreCanAcquireLicenseResult` (12 bytes). The public pages give no values;
+  confirm them from the buffer the executable passes to `XStoreQueryGameLicenseResult` before a boot relies on it.
+
+`xgameruntime_store_test` drives the license check, add-ons, updates, package licenses and product queries.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
