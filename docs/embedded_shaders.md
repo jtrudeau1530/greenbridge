@@ -25,17 +25,33 @@ python -I tools/pe_shader_containers.py <dll> --json <work>/containers.json --ex
 
 ## 2. Inventory
 
-The 16 DLLs and the package's root files were scanned. All the containers are in two DLLs:
+The 16 DLLs and the package's root files were scanned first (`XboxBvhBuilder.dll` and `amd_fidelityfx_upscaler_xbox.dll`); `game_scarlett_master.exe` (RT-5) adds 10 more console containers:
 
 | image | containers | bytes | min / median / max | chunks |
 |---|---:|---:|---:|---|
 | `XboxBvhBuilder.dll` | 52 | 674,404 | 4,072 / 7,454 / 74,508 | `SFI0 ISG1 OSG1 PSV0 RTS0 STAT ILDN HASH DXIL` |
 | `amd_fidelityfx_upscaler_xbox.dll` | 29 | 289,656 | 1,764 / 5,176 / 42,616 | `SFI0 ISG1 OSG1 PSV0 RTS0 HASH ACCC` |
 | other 14 DLLs | 0 | 0 | — | — |
+| `game_scarlett_master.exe` | 10 | 9,520 | 924 / 936 / 992 | `SFI0 ISG1 OSG1 PSV0 HASH DXIL PRIV` |
 
 The 29 `ACCC` containers hold `FSPX` payloads ([fspx.md](fspx.md)); the 52 `DXIL` containers are the subject of
 this note. The FSR DLL has one rejected `DXBC` hit: the bytes are an immediate in its own magic check, and the
 validator rejects it (the scan reports both counts).
+
+### Retail executable (`game_scarlett_master.exe`, RT-5)
+
+Scanning the retail executable (120,181,760 bytes, SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`)
+with `tools/pe_shader_containers.py` finds **10** valid DXBC containers (9,520 bytes total, file offsets
+`0x688cd3c`..`0x688fdf6`, sizes 924–992 bytes) and 1 rejected `DXBC` hit:
+
+* **Stages (`PSV0`):** **1** vertex shader (`0x688cd3c`, 992 bytes) and **9** pixel shaders (924–980 bytes). Unlike the
+  DLL containers above, none carries `ILDN`, `STAT`, `RTS0`, or LLVM bitcode (`has_bitcode = false`). All 10 carry
+  console-only `XBCH` (`XDAT` tag `0x0d`, 307–368 bytes) and `NOBC` (tag `0x07`, 28 bytes), plus a 12-byte `PRIV` chunk.
+* **Translation and GPU check:** `tools/pe_shader_containers.py --extract` previously hardcoded `"stage": "cs"` in
+  `index.json`, causing `rdna2spirv.py` to reject all 10 with `CS group size`. With `stage` read from `PSV0`, all 10
+  unpack via `tools/fssm_unpack.py` (10/10 `FSSM`, 1,245–4,176 bytes), disassemble cleanly via `tools/shader_disasm.py --backend python`
+  (10/10 clean), translate via `tools/rdna2spirv.py` (10/10 translated, all wave64 tier A), and pass `vk_pipeline_check`
+  on an NVIDIA GeForce RTX 5060 Laptop GPU (driver `617.14`, Windows 11): **10/10 modules and 10/10 pipelines OK** (1 VS, 9 PS, 0 failed, 0 skipped).
 
 **Every one of the 52 containers carries two representations of its program:**
 
@@ -66,14 +82,20 @@ All spans fit inside their enclosing parts, and all 104 `STAT` and outer `DXIL` 
 The bitcode is what a PC D3D12 compiler consumes; the runtime path is the `XBCH` record. The constructor passes
 the **whole container** to the compute-PSO call: at `0x180021330` it loads `DAT_180025700` with size `0x1134`
 (4,404 bytes, the size of container 0, `CopyAndCompactBVH`) and calls `FUN_18000c470`, whose vtable call at
-`+0x1f0` (slot 62) receives that pointer, its size and two zero words. `FUN_18001d400` adds two more PSOs,
-`XDXR PostBuildInfoQuery` (0x14a4 bytes) and `XDXR GetBVHCompactedSize`. `bvh_builder_test` measures **53** PSO
+`+0x1f0` (slot 62) receives that pointer, its size and two zero words. `FUN_18001d400` creates the
+`XDXR GetBVHCompactedSize` PSO (0x14a4 bytes; measured below). `bvh_builder_test` measures **53** PSO
 creations during construction over the **52** containers ([d3d12_vulkan.md](d3d12_vulkan.md) A.2), so one
 container is created twice. It is **`GetBVHCompactedSize`** (5,284 bytes = 0x14a4): creations **#47 and #53** pass
 byte-identical containers (RT-182, `LEONIDA_BVH_RECORD62=1`, which now prints each creation's module from its `ILDN`
-part and says when a container repeats). 0x14a4 is also the size this section gives for `XDXR PostBuildInfoQuery`,
-which fits `FUN_18001d400`'s two XDXR PSOs being this one container created twice, once under each name; the test
-does not see the PSO names, so that last step is a hypothesis. The creation order, by module (it is not the table
+part and says when a container repeats). The test now also prints each creation's call site and the name the builder
+gives the returned PSO (RT-266, WARP, default constructor flag): the builder names every one of the 53 PSOs with
+`SetName`, `XDXR <module>` (for example `XDXR InitPartitionedHeaders`; some modules are shortened, as
+`XDXR CopyAndCompact`, or numbered, as `XDXR CalculateMortonCodes 0`/`1`). **#47 and #53 both get `XDXR
+GetBVHCompactedSize`**, from the same call site in `FUN_18001d400` (return address `+0x1d503`, called through
+`FUN_18000c470` at `+0xc4e4`); `FUN_18001d400` is called twice, once from `FUN_18000d850` (#47) and once from
+`FUN_180021330` directly (#53). So the repeat is one PSO created twice under one name, not one container under two
+names, and no creation is named `XDXR PostBuildInfoQuery` in this run (default flag, WARP; the flag-true
+constructor was not run). The creation order, by module (it is not the table
 order of section 3; `CopyAndCompactBVH` is #52, not the first):
 
 | creations | modules, in the order of the `CreateComputePipelineState` calls |
@@ -82,12 +104,12 @@ order of section 3; `CopyAndCompactBVH` is #52, not the first):
 | #14-#29 | `BitonicPreSortCS`, `BitonicOuterSortCS`, `BitonicInnerSortCS`, `BitonicPreSort64CS`, `BitonicOuterSort64CS`, `BitonicInnerSort64CS`, `RadixReset`, `RadixCount`, `PrefixSum64`, `PrefixSum128`, `PrefixSum256`, `PrefixSum512`, `PrefixSum1024`, `PrefixSum2048`, `PrefixSum4096`, `RadixAlloc` |
 | #30-#46 | `RearrangeTriangles`, `RearrangeBVHs`, `LoadInstances`, `SplitInstances`, `LoadTriangles`, `LoadProceduralGeometry`, `ReloadTriangles`, `ReloadProcedurals`, `PT_ConstructBVH4`, `ConstructBVH4`, `RefitBVH4`, `BuildBVHSplits`, `BuildBVHSplits64`, `FindTreelets`, `ResetKDOP`, `BuildKDOP`, `BuildApexPointMap` |
 | #47-#53 | `GetBVHCompactedSize`, `DecompressHeader`, `LeafRehydration`, `Box16Rehydration`, `Box32Rehydration`, `CopyAndCompactBVH`, `GetBVHCompactedSize` (again) |
-container is created twice: **`GetBVHCompactedSize`** (RT-182). With `LEONIDA_BVH_RECORD62=1` the test prints each
-creation's container with its `ILDN` module name and the first bytes of its digest: creations 1 to 51 are 51
-distinct containers, `GetBVHCompactedSize` (5,284 bytes, 0x14a4) among them at 47; creation 52 is
-`CopyAndCompactBVH` (4,404 bytes, 0x1134); creation 53 is `GetBVHCompactedSize` again, with the same digest and
-size. So the 0x14a4-byte container `FUN_18001d400` passes for `XDXR PostBuildInfoQuery` is the
-`GetBVHCompactedSize` module, and the PSO for it is created twice. Measured on 1.0.2.1 with an RTX 5080 (driver
+
+The test also prints each creation's container with its `ILDN` module name and the first bytes of its digest
+(RT-182): creations 1 to 51 are 51 distinct containers, `GetBVHCompactedSize` (5,284 bytes, 0x14a4) among them at 47;
+creation 52 is `CopyAndCompactBVH` (4,404 bytes, 0x1134); creation 53 is `GetBVHCompactedSize` again, with the
+same digest and size. So the 0x14a4-byte container `FUN_18001d400` passes is the `GetBVHCompactedSize` module, and
+the PSO for it is created twice (under one name, `XDXR GetBVHCompactedSize`, per the SetName record above). Measured on 1.0.2.1 with an RTX 5080 (driver
 621.01): all 53 creations return `S_OK`.
 
 ## 3. The 52 modules
@@ -146,17 +168,6 @@ The single remaining untranslated program stops at one rule:
 | module(s) | blocker |
 |---|---|
 | `Box16Rehydration` | `buffer_store_short` (#1864) |
-
-| module(s) | blocker then | now |
-|---|---|---|
-| `BuildKDOP`, `LoadInstances`, `ReloadProcedurals`, `LoadProceduralGeometry`, `LoadTriangles` | `global_atomic_fmax` | translate |
-| `PT_LoadInstances` | `global_atomic_fmin` | translates |
-| `Box32Rehydration`, `ReloadTriangles` | `buffer_load_ushort` | translate |
-| `LeafRehydration` | `tbuffer_load_format_x GFX10_FORMAT_8_UINT` | translates |
-| `Box16Rehydration` | `buffer_load_ushort` | stops at `buffer_store_short` (#1864) |
-
-The disassembly count is unchanged: the same 42 programs have no invalid word, and 10 have invalid words in the
-code. All 10 of those translate; `Box16Rehydration` is one of the 42 clean ones.
 
 Reproduction, after `--extract` above:
 

@@ -39,6 +39,7 @@ Usage:
 Offsets are the resources' zlib stream offsets in the archive (the `0x...` offsets rpf9dump and skin_streams
 report). `--part` takes a drawable, a fragment or a drawable dictionary; `:<child>` picks a dictionary child.
 `--coverage` writes counts only: how many clip-dictionary bone tracks name a joint of the skeleton.
+Usage: `python -I tools/anim_glb.py --help` lists the options.
 """
 import argparse
 import collections
@@ -57,6 +58,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_clips  # noqa: E402
 import anim_index  # noqa: E402
 import glb_writer  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 import skin_streams  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -461,11 +463,15 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
         step = anim["duration"] / (frames - 1) if frames > 1 and anim["duration"] > 0 else 1.0 / 30
         start = entry["start"] if math.isfinite(entry["start"]) else 0.0
         end = entry["end"] if math.isfinite(entry["end"]) and entry["end"] >= start else anim["duration"]
-        keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4]
-        fallback = not keep
-        if fallback:
-            target_time = 0.5 * (start + end) if end >= start else start
-            keep = [min(range(frames), key=lambda k: abs(k * step - target_time))] if frames else []
+        if end == start:
+            keep = [min(range(frames), key=lambda k: abs(k * step - start))] if frames else []
+            single_pose = True
+        else:
+            keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4]
+            single_pose = not keep
+            if single_pose:
+                target_time = 0.5 * (start + end)
+                keep = [min(range(frames), key=lambda k: abs(k * step - target_time))] if frames else []
         if not keep:
             continue
         tally["animations"] += 1
@@ -491,7 +497,7 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
             if (target, path) in channels:
                 tally["tracks_overridden"] += 1
             # a frame kept by the 1e-4 tolerance before `start` would get a slightly negative time
-            if fallback:
+            if single_pose:
                 channels[(target, path)] = [(0.0, tuple(tracks[t][k])) for k in keep]
             else:
                 channels[(target, path)] = [(max(0.0, (k * step - start) / rate), tuple(tracks[t][k])) for k in keep]
@@ -703,7 +709,7 @@ def coverage(args):
         groups, _unresolved, _gaps = anim_clips.group(m, rows)
     segments = [[anim_clips.segment(rows, k) for k in parts] for _root, parts in groups]
     hashes = sorted({j["hash"] for j in joints})
-    jobs = max(1, args.jobs)
+    jobs = process_workers(max(1, args.jobs))   # a pool takes at most 61 workers on Windows
     slices = [(args.anim, segments[i::jobs], hashes) for i in range(jobs)]
     total = collections.Counter()
     if jobs == 1:
@@ -724,16 +730,19 @@ def main(argv=None):
     ap.add_argument("--skeleton", type=parse_offset, required=True, help="resource with the skeleton, <offset>[:<child>]")
     ap.add_argument("--part", type=parse_offset, action="append", default=[], help="part drawable, <offset>[:<child>]")
     ap.add_argument("--anim", help="anim.rpf")
-    ap.add_argument("--dictionary", type=lambda t: parse_offset(t)[0], help="clip dictionary offset in --anim")
-    ap.add_argument("--clip", action="append", default=[], help="clip name (without pack:/ and .clip) or 0xhash")
+    ap.add_argument("--dictionary", type=lambda t: parse_offset(t)[0], help="export: clip dictionary offset in --anim")
+    ap.add_argument("--clip", action="append", default=[],
+                    help="export: name (without pack:/ and .clip) or 0xhash in the selected --anim dictionary")
     ap.add_argument("--lod", type=int, default=0, help="LOD level of the parts (0 = highest)")
     ap.add_argument("--max-influences", type=int, choices=(4, 8), default=8,
                     help="bone influences per vertex; 4 keeps the largest four, renormalised (three.js reads four)")
     ap.add_argument("--no-root-motion", action="store_true", help="leave out the mover (bone hash 0) tracks")
     ap.add_argument("--coverage", action="store_true", help="count clip bone tracks that name a skeleton joint")
-    ap.add_argument("--jobs", type=int, default=1, help="worker processes for --coverage")
+    ap.add_argument("--jobs", type=int, default=1, help="worker processes for --coverage (at least 1)")
     ap.add_argument("--report", help="write a JSON report (counts only)")
     args = ap.parse_args(argv)
+    if args.jobs < 1:
+        ap.error("--jobs must be at least 1")
     inputs = [args.archive] + ([args.anim] if args.anim else [])
     outputs = [p for p in (args.out, args.report) if p]
     for o in outputs:
@@ -744,6 +753,11 @@ def main(argv=None):
         ap.error(f"--report is a directory: {args.report}")
     if args.out and args.report and same_path(args.out, args.report):
         ap.error("the GLB and the report are the same path")
+    if args.clip or args.dictionary is not None:
+        if args.coverage:
+            ap.error("--clip and --dictionary select clips for export, not --coverage")
+        if not args.anim:
+            ap.error("--clip and --dictionary require --anim")
     if args.coverage:
         if not args.anim or not args.report:
             ap.error("--coverage needs --anim and --report")
@@ -756,7 +770,10 @@ def main(argv=None):
             ap.error("--anim needs --dictionary")
     try:
         report = coverage(args) if args.coverage else export(args)
-    except (ExportError, anim_clips.DecodeError, struct.error, OSError, ValueError) as e:
+    except OSError as e:
+        print(f"ERROR: {e.filename or args.archive}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    except (ExportError, anim_clips.DecodeError, struct.error, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     if args.report:

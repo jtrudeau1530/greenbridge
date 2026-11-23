@@ -162,6 +162,67 @@ class WorldIndexTest(unittest.TestCase):
         struct.pack_into("<Q", b, 0x28, 0x60000000)
         self.assertIsNone(WI.parse_resource(bytes(b)))
 
+    def test_schema_member_type_mismatch_is_rejected(self):
+        # Position declared as scalar float (0x21) instead of vector3 (0x32) (#5601).
+        b = bytearray(make_resource())
+        b[0x318] = 0x21
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+        # Archetype name declared as vector3 (0x32).
+        b = bytearray(make_resource())
+        b[0x308] = 0x32
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+        # LOD level declared as vector3 (0x32).
+        b = bytearray(make_resource())
+        b[0x378] = 0x32
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+        # Map extent declared as scalar float (0x21).
+        b = bytearray(make_resource())
+        # Map members start at 0x3A0; streamingExtentsMin is index 3 (offset 0x3A0 + 16*3 = 0x3D0)
+        b[0x3D8] = 0x21
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+        # Member offset + width overflowing struct size.
+        b = bytearray(make_resource())
+        # Position offset at 0x314 set to struct size (0x90), width 12 overflows struct.
+        struct.pack_into("<I", b, 0x314, 0x90)
+        self.assertIsNone(WI.parse_resource(bytes(b)))
+
+    def test_non_finite_placement_floats_produce_valid_json(self):
+        # Placement position containing NaN and +inf is written as null in valid JSON (#5602).
+        b = bytearray(make_resource())
+        struct.pack_into("<3f", b, 0x438, float("nan"), 2.5, float("inf"))
+        row = WI.parse_resource(bytes(b))
+        self.assertIsNotNone(row)
+        self.assertEqual(row["position_min"], [None, 2.5, None])
+        self.assertEqual(row["position_max"], [None, 2.5, None])
+
+        src = os.path.join(self.dir, "non_finite.bin")
+        out = os.path.join(self.dir, "out.json")
+        with open(src, "wb") as f:
+            f.write(bytes(b))
+        self.assertEqual(WI.main([src, "--out", out]), 0)
+
+        with open(out, "r", encoding="utf-8") as f:
+            raw = f.read()
+        self.assertNotIn("NaN", raw)
+        self.assertNotIn("Infinity", raw)
+        # Parse with strict handler that rejects NaN/Infinity tokens.
+        parsed = json.loads(raw, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(f"non-JSON {c}")))
+        self.assertEqual(parsed["resources"][0]["position_min"], [None, 2.5, None])
+        self.assertEqual(parsed["resources"][0]["position_max"], [None, 2.5, None])
+
+    def test_non_finite_lod_dist_is_ignored(self):
+        b = bytearray(make_resource())
+        # lodDist at 0x460 set to +inf
+        struct.pack_into("<f", b, 0x460, float("inf"))
+        row = WI.parse_resource(bytes(b))
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["lod_dist_min"])
+        self.assertIsNone(row["lod_dist_max"])
+
     def test_split_resource_needs_continuation(self):
         self.assertFalse(WI._needs_continuation(make_resource()))
         self.assertTrue(WI._needs_continuation(make_resource()[:0x150]))
@@ -676,7 +737,7 @@ class WorldIndexTest(unittest.TestCase):
                 f.write(part)
             files.append({"off": off, "stored": stored, "size": len(part)})
             off = ((off + stored + 15) & ~15) + gap
-        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": {}, "files": files}, f)
         return folder
 

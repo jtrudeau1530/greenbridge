@@ -10,6 +10,9 @@ model failed.
 
 Usage:
     python -I tools/batch_glb.py <in_dir> <out_dir> [--jobs N] [--up z|y] [--textures <dir>]
+Usage: `python -I tools/batch_glb.py --help` lists the options.
+
+A matched texture is also reported as unembedded when none of its primitives has UV coordinates.
 """
 from __future__ import annotations
 
@@ -25,9 +28,16 @@ import glb_writer
 import dds_png
 
 
+def _existing_texture_dir(value: str) -> str:
+    """--textures must name a directory: a typo otherwise silently embedded nothing and still exited 0."""
+    if not os.path.isdir(value):
+        raise argparse.ArgumentTypeError(f"not a directory: {value}")
+    return value
+
+
 def _build_texture_index(texture_dir: str | None) -> dict[str, str]:
     """Index available texture files (.png and .dds) by lowercase basename without extension."""
-    if not texture_dir or not os.path.isdir(texture_dir):
+    if not texture_dir:
         return {}
     index: dict[str, str] = {}
     for entry in os.scandir(texture_dir):
@@ -95,6 +105,7 @@ def convert_single(
             base_stem = os.path.splitext(os.path.basename(in_path))[0].lower()
             # Clean possible hash suffix like 'ambient_femalebb._ft_at_...' -> 'ambient_femalebb'
             clean_stem = base_stem.split(".")[0]
+            texture_has_uv: dict[str, bool] = {}
 
             for prim in primitives:
                 mat_name = prim.get("material", "")
@@ -124,10 +135,13 @@ def convert_single(
                         dropped_seen.add(found_path)        # one line per texture per model, not per primitive
                         dropped.append((found_path, why_not))
                     if png_bytes:
+                        texture_has_uv[found_path] = texture_has_uv.get(found_path, False) or bool(prim.get("uvs"))
                         materials[mat_name] = {
                             "name": mat_name or clean_stem,
                             "png_bytes": png_bytes,
                         }
+            dropped.extend((path, "matching primitives have no texture coordinates")
+                           for path, has_uv in texture_has_uv.items() if not has_uv)
 
         glb_writer.write_glb(out_path, primitives, materials=materials if materials else None)
         return True, in_path, "", dropped
@@ -192,6 +206,20 @@ def batch_convert(
     }
 
 
+def _positive_jobs(value: str) -> int:
+    jobs = int(value)
+    if jobs <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer (got {value!r})")
+    return jobs
+
+
+def _non_negative_int(value: str) -> int:
+    num = int(value)
+    if num < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0 (got {value!r})")
+    return num
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Batch convert Wavefront OBJ models to binary glTF 2.0 (.glb)."
@@ -200,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("out_dir", help="Output directory for .glb files")
     parser.add_argument(
         "--jobs",
-        type=int,
+        type=_positive_jobs,
         default=None,
         help="Number of parallel worker threads (default: CPU count)",
     )
@@ -212,13 +240,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--textures",
-        type=str,
+        type=_existing_texture_dir,
         default=None,
         help="Optional directory containing textures (.png or .dds) to link and embed",
     )
     parser.add_argument(
         "--max-tex-size",
-        type=int,
+        type=_non_negative_int,
         default=0,
         help="Max texture dimension in pixels when decoding DDS (0 = unconstrained)",
     )

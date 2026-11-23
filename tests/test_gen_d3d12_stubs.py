@@ -60,6 +60,21 @@ public:
 };
 """
 
+BRANCHED_HEADER = """\
+MIDL_INTERFACE("77777777-7777-7777-7777-777777777777")
+IBranched : public IUnknown
+{
+public:
+#if defined(_MSC_VER) || !defined(_WIN32)
+    virtual THING_DESC STDMETHODCALLTYPE GetDesc(void) = 0;
+#else
+    virtual THING_DESC *STDMETHODCALLTYPE GetDesc(
+        THING_DESC * RetVal) = 0;
+#endif
+    virtual UINT STDMETHODCALLTYPE GetCount(void) = 0;
+};
+"""
+
 ORPHAN_HEADER = """\
 MIDL_INTERFACE("33333333-3333-3333-3333-333333333333")
 IOrphan : public IMissing
@@ -240,6 +255,25 @@ class CoverageTests(unittest.TestCase):
         report = gen.coverage(IFACES, ["IChild", "IChild"], [self.source])
         self.assertEqual([row["interface"] for row in report], ["IChild"])
 
+    def test_method_declared_in_both_preprocessor_branches_counts_once(self):
+        # d3d12.h declares struct-returning methods in both branches of #if/#else; that is one method.
+        interfaces = gen.parse_interfaces(BRANCHED_HEADER)
+        self.assertEqual(gen.coverage(interfaces, ["IBranched"], []), [{
+            "interface": "IBranched",
+            "methods": 2,
+            "implemented": 0,
+            "open": ["IBranched::GetDesc", "IBranched::GetCount"],
+        }])
+        with open(self.source, "w", encoding="utf-8", newline="\n") as f:
+            f.write("THING_DESC STDMETHODCALLTYPE GetDesc() { return {}; }\n")
+        report = gen.coverage(interfaces, ["IBranched"], [self.source])
+        self.assertEqual((report[0]["methods"], report[0]["implemented"], report[0]["open"]),
+                         (2, 1, ["IBranched::GetCount"]))
+        # The stub class keeps both branches, so it compiles under either side of the condition.
+        text = gen.emit_class(interfaces, "IBranched")
+        self.assertEqual(text.count('stub("IBranched::GetDesc")'), 2)
+        self.assertIn("\n#else\n", text)
+
 
 class MainTests(unittest.TestCase):
     def setUp(self):
@@ -419,6 +453,69 @@ class MainTests(unittest.TestCase):
     def test_find_header_without_include_returns_none(self):
         with mock.patch.dict(os.environ, {"INCLUDE": ""}, clear=False):
             self.assertIsNone(gen.find_header())
+
+
+class ReportPathCollisions(unittest.TestCase):
+    """`--out` and `--report` are two artifacts; naming one file for both lost the report silently (#2716)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.header = os.path.join(self.dir, "d3d12.h")
+        with open(self.header, "w", encoding="utf-8") as f:
+            f.write(GOOD_HEADER)
+        self.source = os.path.join(self.dir, "impl.cpp")
+        with open(self.source, "w", encoding="utf-8") as f:
+            f.write("HRESULT STDMETHODCALLTYPE DoThing(UINT a);\n")
+
+    def run_main(self, *args):
+        err = io.StringIO()
+        with mock.patch("sys.argv", ["gen_d3d12_stubs.py", "--header", self.header, *args, "IChild"]), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as raised:
+                gen.main()
+        self.assertEqual(raised.exception.code, 2)
+        return err.getvalue()
+
+    def test_out_and_report_must_differ(self):
+        one = os.path.join(self.dir, "both.txt")
+        err = self.run_main("--out", one, "--report", one, "--source", self.source)
+        self.assertIn("--out and --report must use different paths", err)
+
+    def test_the_same_file_spelled_differently_is_still_the_same_file(self):
+        one = os.path.join(self.dir, "both.txt")
+        spelled = os.path.join(self.dir, ".", "sub", "..", "both.txt")
+        os.makedirs(os.path.join(self.dir, "sub"))
+        err = self.run_main("--out", one, "--report", spelled, "--source", self.source)
+        self.assertIn("must use different paths", err)
+
+    def test_out_cannot_overwrite_a_source(self):
+        err = self.run_main("--out", self.source, "--report", os.path.join(self.dir, "r.json"),
+                            "--source", self.source)
+        self.assertIn(f"--out {self.source} would overwrite the input {self.source}", err)
+
+    def test_report_cannot_overwrite_a_source(self):
+        err = self.run_main("--out", os.path.join(self.dir, "out.h"), "--report", self.source,
+                            "--source", self.source)
+        self.assertIn(f"--report {self.source} would overwrite the input {self.source}", err)
+
+    @unittest.skipUnless(os.name == "nt", "letter case only folds on Windows and case-insensitive volumes")
+    def test_a_case_different_spelling_is_one_file(self):
+        err = self.run_main("--out", os.path.join(self.dir, "Out.H"), "--report",
+                            os.path.join(self.dir, "out.h"), "--source", self.source)
+        self.assertIn("must use different paths", err)
+
+    def test_distinct_paths_still_write_both_artifacts(self):
+        out = os.path.join(self.dir, "out.h")
+        report = os.path.join(self.dir, "r.json")
+        with mock.patch("sys.argv", ["gen_d3d12_stubs.py", "--header", self.header, "--out", out,
+                                     "--report", report, "--source", self.source, "IChild"]):
+            self.assertEqual(gen.main(), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertTrue(f.read().startswith("// Generated by tools/gen_d3d12_stubs.py"))
+        with open(report, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)[0]["implemented"], 1)   # still a report, not a header
 
 
 if __name__ == "__main__":

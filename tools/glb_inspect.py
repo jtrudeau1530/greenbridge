@@ -6,6 +6,8 @@ Usage:
 Reads the GLB container (12-byte header, JSON chunk, optional BIN chunk and
 chunk padding), then reports what the JSON actually contains. Missing fields are
 reported as missing; nothing is inferred from the binary buffers.
+For base-color textures without a core source, the inspector checks the declared
+KHR_texture_basisu and EXT_texture_webp image sources without loading either format.
 
 All geometry, names and paths come from the inspected file. No game data is
 needed or bundled.
@@ -138,15 +140,15 @@ def parse_glb(data: bytes) -> dict:
             )
         if chunk_length % 4:
             raise GlbError(f"{label} chunk at offset {offset} has length {chunk_length}, not a multiple of 4")
-        payload = data[offset + CHUNK_HEADER_SIZE:offset + CHUNK_HEADER_SIZE + chunk_length]
-        chunks.append({"type": chunk_type, "length": chunk_length, "payload": payload})
+        chunks.append({"type": chunk_type, "length": chunk_length})
         offset += CHUNK_HEADER_SIZE + chunk_length
 
     if not chunks or chunks[0]["type"] != CHUNK_TYPE_JSON:
         kind = _chunk_type_name(chunks[0]["type"]) if chunks else "none"
         raise GlbError(f"missing JSON chunk: first chunk is {kind}")
 
-    json_payload = chunks[0]["payload"]
+    json_offset = GLB_HEADER_SIZE + CHUNK_HEADER_SIZE
+    json_payload = data[json_offset:json_offset + chunks[0]["length"]]
     pad_start = len(json_payload.rstrip(b" \x00"))
     padding = len(json_payload) - pad_start
     nul_padding = json_payload[pad_start:].count(b"\x00")
@@ -164,7 +166,6 @@ def parse_glb(data: bytes) -> dict:
     if not isinstance(gltf, dict):
         raise GlbError("malformed JSON chunk: root is not a JSON object")
 
-    bin_payload = None
     bin_padding = None
     seen_bin = False
     for chunk_index, chunk in enumerate(chunks[1:], 1):
@@ -177,12 +178,12 @@ def parse_glb(data: bytes) -> dict:
         if chunk_index != 1:
             raise GlbError("BIN chunk must immediately follow the JSON chunk")
         seen_bin = True
-        bin_payload = chunk["payload"]
+        bin_length = chunk["length"]
         buffers = _array(gltf.get("buffers"))
         buffer0 = _object(buffers[0]) if buffers else {}
         declared = buffer0.get("byteLength")
-        if "uri" not in buffer0 and _is_int(declared) and 0 <= declared <= len(bin_payload):
-            bin_padding = len(bin_payload) - declared
+        if "uri" not in buffer0 and _is_int(declared) and 0 <= declared <= bin_length:
+            bin_padding = bin_length - declared
 
     chunk_table = []
     for chunk_index, chunk in enumerate(chunks):
@@ -391,6 +392,13 @@ def _texture_name(gltf: dict, texture_index: object) -> str | None:
     if texture is None:
         return None
     image = _entry(gltf, "images", texture.get("source"))
+    if "source" not in texture:
+        extensions = _object(texture.get("extensions"))
+        for extension in ("KHR_texture_basisu", "EXT_texture_webp"):
+            source = _object(extensions.get(extension)).get("source")
+            image = _entry(gltf, "images", source)
+            if image is not None:
+                break
     if image is not None:
         name = _text(image.get("name"))
         if name is not None:

@@ -20,6 +20,7 @@ MISSING_INPUT_TOOLS = (
     "content_definitions",
     "cpu_ref",
     "gamedata_maps",
+    "gamedata_sps1",
     "navmesh_index",
     "pe_inspect",
     "rtti_scan",

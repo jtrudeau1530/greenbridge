@@ -55,12 +55,78 @@ class TestBatchGlb(unittest.TestCase):
                 with self.subTest(source=source, output=output):
                     result = subprocess.run(
                         [sys.executable, "-I", os.path.join(TOOLS, "batch_glb.py"), source, output],
-                        capture_output=True, text=True, check=False,
+                        capture_output=True, text=True, errors="replace", check=False,
                     )
                     self.assertEqual(result.returncode, 1)
                     self.assertTrue(result.stderr.startswith("ERROR: "), result.stderr)
                     self.assertIn(error, result.stderr)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_cli_rejects_invalid_jobs_and_max_tex_size(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            for flag, value, error in [
+                ("--jobs", "0", "argument --jobs"),
+                ("--jobs", "-1", "argument --jobs"),
+                ("--max-tex-size", "-1", "argument --max-tex-size"),
+            ]:
+                with self.subTest(flag=flag, value=value):
+                    result = subprocess.run(
+                        [
+                            sys.executable, "-I",
+                            os.path.join(TOOLS, "batch_glb.py"),
+                            root, os.path.join(root, "out"),
+                            flag, value,
+                        ],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(error, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+    def test_a_textures_path_that_is_not_a_directory_is_a_usage_error(self) -> None:
+        # before the validator a typo'd --textures path returned an empty index and the run still
+        # embedded nothing and exited 0, as if the folder had no textures.
+        with tempfile.TemporaryDirectory() as in_dir, tempfile.TemporaryDirectory() as out_dir:
+            with open(os.path.join(in_dir, "m.obj"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("o m\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            not_a_dir = os.path.join(in_dir, "textures.txt")
+            with open(not_a_dir, "wb") as f:
+                f.write(b"x")
+            result = subprocess.run(
+                [sys.executable, "-I", os.path.join(TOOLS, "batch_glb.py"),
+                 in_dir, out_dir, "--textures", not_a_dir],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("argument --textures", result.stderr)
+            self.assertIn("not a directory", result.stderr)
+            self.assertEqual(os.listdir(out_dir), [])
+
+    def test_cli_accepts_valid_jobs_and_max_tex_size(self) -> None:
+        with tempfile.TemporaryDirectory() as in_dir, tempfile.TemporaryDirectory() as out_dir:
+            obj_path = os.path.join(in_dir, "test_model.obj")
+            with open(obj_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(
+                    "o test\n"
+                    "v 0.0 0.0 0.0\n"
+                    "v 1.0 0.0 0.0\n"
+                    "v 0.0 1.0 0.0\n"
+                    "f 1 2 3\n"
+                )
+
+            # zero texture size (unconstrained) and a positive jobs limit are valid
+            result = subprocess.run(
+                [
+                    sys.executable, "-I",
+                    os.path.join(TOOLS, "batch_glb.py"),
+                    in_dir, out_dir,
+                    "--jobs", "1",
+                    "--max-tex-size", "0",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("converted 1/1 models", result.stdout)
 
     def test_batch_convert_synthetic(self) -> None:
         with tempfile.TemporaryDirectory() as in_dir, tempfile.TemporaryDirectory() as out_dir:
@@ -159,6 +225,25 @@ class TestBatchGlb(unittest.TestCase):
                 textures.append(binary[offset:offset + view["byteLength"]])
 
             self.assertEqual(textures, [red_png, blue_png])
+
+    def test_readable_texture_reported_only_if_all_matching_groups_lack_uvs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            png = dds_png.dds_to_png_bytes(_create_minimal_bc1_dds())
+            (root / "paint.png").write_bytes(png)
+            obj = root / "panel.obj"
+            for groups, embedded in ((("bare", "bare"), False), (("bare", "uv"), True), (("uv", "bare"), True)):
+                with self.subTest(groups=groups):
+                    faces = "".join(f"g part{i}\n" + ("f 1/1 2/1 3/1\n" if g == "uv" else "f 1 2 3\n")
+                                    for i, g in enumerate(groups))
+                    obj.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nusemtl paint\n" + faces,
+                                   encoding="utf-8", newline="\n")
+                    stats = batch_glb.batch_convert(temp, temp, texture_dir=temp, jobs=1)
+                    self.assertEqual(stats["succeeded"], 1)
+                    self.assertEqual(png in (root / "panel.glb").read_bytes(), embedded)
+                    expected = [] if embedded else [(str(obj), str(root / "paint.png"),
+                                                     "matching primitives have no texture coordinates")]
+                    self.assertEqual(stats["dropped_textures"], expected)
 
     def test_batch_convert_with_dds_texture(self) -> None:
         with tempfile.TemporaryDirectory() as in_dir, \

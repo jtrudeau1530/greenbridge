@@ -7,13 +7,15 @@
 //
 // Nothing here goes online.
 //
-// ASSUMPTION: the console executable is not available, so the DLL name it imports these through is unknown.
-// "xgameruntime.dll" is the name the PC GDK uses. If the executable's import table names another module, register
-// the same functions under that name too; nothing else changes.
+// Measured on the retail executable (docs/runtime_imports.md, "The retail executable's runtime classes"): it does not
+// import xgameruntime.dll. Its 161 runtime thunks are linked into the image and reach the classes through
+// QueryApiImpl, as libHttpClient.GDK.dll's do, so "xgameruntime.dll" below is the only module name needed. The name
+// occurs in the image as a UTF-16 string, which would be a run-time load.
 #include <windows.h>
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -36,6 +39,9 @@
 
 namespace rt::shims {
 bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
+bool xgameruntime_gamesave_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
+bool xgameruntime_store_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
+bool xgameruntime_offline_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
 }
 
 namespace {
@@ -51,10 +57,11 @@ std::atomic<int> g_runtime_refs{0};
 // XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
 // XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
-// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below), and XPersistentLocalStorageImpl from
-// the public docs' layout (no caller in the shipped DLLs to measure); for any other class QueryApiImpl
-// logs the class and interface id and refuses it, so the first boot with the executable lists the interfaces to
-// implement next.
+// XErrorImpl, XNetworkingImpl, XSystemImpl, XPackageImpl, XGameRuntimeFeatureImpl and XSystemAnalyticsImpl are
+// served (their layouts are measured, below), XPersistentLocalStorageImpl and XGameImpl from the public docs' layout
+// (no caller in the shipped DLLs to measure), and the classes of the other xgameruntime_*.cpp files through their
+// query functions; for any other class QueryApiImpl logs the class and interface id and refuses it, so the first boot
+// with the executable lists the interfaces to implement next.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -229,6 +236,7 @@ static_assert(std::size(kThreadingVtable) == 31, "IUnknown + IXThreadingImpl's 2
 using XErrorCallback = bool(CALLBACK*)(HRESULT hr, const char* message, void* context);
 std::atomic<XErrorCallback> g_error_callback{nullptr};
 std::atomic<void*> g_error_context{nullptr};
+std::mutex g_error_mutex{};   // guards g_error_callback + g_error_context as one consistent pair
 
 // HRESULT XErrorReport(HRESULT, const char*) (xgameruntime-docs' XErrorReport.md): S_OK once reported.
 HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
@@ -236,10 +244,12 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     if (s_logged.fetch_add(1) < 64)
         std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
                      message ? message : "(null)");
+    std::lock_guard<std::mutex> lock(g_error_mutex);
     if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
     return S_OK;
 }
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
+    std::lock_guard<std::mutex> lock(g_error_mutex);
     g_error_context = context;
     g_error_callback = callback;
 }
@@ -260,8 +270,9 @@ const void* const kErrorVtable[] = {
 // "Class layouts, measured"): the UTF-16 security-information query for a URL, the server certificate check, the
 // connectivity hint and its change registration. Signatures follow Microsoft's public XNetworking documentation.
 // Offline there is no network: the hint says so (initialized, no connectivity), every query that would need the
-// network fails with kNoNetwork (asynchronously, through XAsync, for the *Async calls), change registrations hand
-// out tokens whose callbacks never fire, and the IXNetworkingImpl2 additions are E_NOTIMPL.
+// network fails with kNoNetwork (asynchronously, through XAsync, for the *Async calls), a change registration sends
+// the initial notification Microsoft documents (on the queue's completion port) and none after, since nothing
+// changes, and the IXNetworkingImpl2 additions are E_NOTIMPL.
 
 constexpr GUID kNetworkingClass = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
 constexpr GUID kNetworking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
@@ -295,13 +306,6 @@ HRESULT STDMETHODCALLTYPE net_query_port_result(void*, XAsyncBlock* async, uint1
     *port = 0;
     return XAsyncGetStatus(async, false);
 }
-std::atomic<uint64_t> g_net_tokens{0};
-HRESULT STDMETHODCALLTYPE net_register(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken* token) {
-    if (!token) return E_POINTER;
-    token->token = g_net_tokens.fetch_add(1) + 1;  // never fires offline: nothing changes
-    return S_OK;
-}
-bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
 HRESULT STDMETHODCALLTYPE net_security_async(void*, const void* url, XAsyncBlock* async) {
     if (!url) return E_INVALIDARG;
     return start_failed_async(async);
@@ -328,6 +332,94 @@ HRESULT STDMETHODCALLTYPE net_connectivity_hint(void*, ConnectivityHint* hint) {
     hint->network_initialized = true;
     return S_OK;
 }
+
+using PortChangedCallback = void(CALLBACK*)(void* context, uint16_t port);
+using HintChangedCallback = void(CALLBACK*)(void* context, const ConnectivityHint* hint);
+
+struct NetRegistration {
+    bool running = false;
+    bool unregistered = false;
+};
+std::mutex g_net_mu;
+std::condition_variable g_net_cv;
+std::unordered_map<uint64_t, NetRegistration> g_net_registrations;
+std::atomic<uint64_t> g_net_tokens{0};
+
+void notify(PortChangedCallback callback, void* context) {
+    uint16_t port = 0;
+    net_query_port(nullptr, &port);
+    callback(context, port);
+}
+void notify(HintChangedCallback callback, void* context) {
+    ConnectivityHint hint{};
+    net_connectivity_hint(nullptr, &hint);
+    callback(context, &hint);
+}
+
+template <class Callback> struct InitialNotification {
+    uint64_t token;
+    void* context;
+    Callback callback;
+
+    static void CALLBACK run(void* self, bool canceled) {
+        std::unique_ptr<InitialNotification> n(static_cast<InitialNotification*>(self));
+        {
+            std::lock_guard lock(g_net_mu);
+            const auto it = g_net_registrations.find(n->token);
+            if (canceled || it == g_net_registrations.end()) return;
+            it->second.running = true;
+        }
+        notify(n->callback, n->context);
+        {
+            std::lock_guard lock(g_net_mu);
+            const auto it = g_net_registrations.find(n->token);
+            if (it->second.unregistered) g_net_registrations.erase(it);
+            else it->second.running = false;
+        }
+        g_net_cv.notify_all();
+    }
+};
+
+template <class Callback>
+HRESULT STDMETHODCALLTYPE net_register(void*, XTaskQueueHandle queue, void* context, Callback callback,
+                                       XTaskQueueRegistrationToken* token) {
+    if (!callback) return E_INVALIDARG;
+    if (!token) return E_POINTER;
+    XTaskQueueHandle process_queue = nullptr;
+    if (!queue) {
+        if (!XTaskQueueGetCurrentProcessTaskQueue(&process_queue)) return HRESULT_FROM_WIN32(ERROR_NO_TASK_QUEUE);
+        queue = process_queue;
+    }
+    const uint64_t id = g_net_tokens.fetch_add(1) + 1;
+    {
+        std::lock_guard lock(g_net_mu);
+        g_net_registrations.emplace(id, NetRegistration{});
+    }
+    token->token = id;
+    auto* initial = new InitialNotification<Callback>{id, context, callback};
+    const HRESULT hr = XTaskQueueSubmitCallback(queue, XTaskQueuePort::Completion, initial,
+                                                &InitialNotification<Callback>::run);
+    if (process_queue) XTaskQueueCloseHandle(process_queue);
+    if (FAILED(hr)) {
+        delete initial;
+        token->token = 0;
+        std::lock_guard lock(g_net_mu);
+        g_net_registrations.erase(id);
+    }
+    return hr;
+}
+bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken token, bool wait) {
+    std::unique_lock lock(g_net_mu);
+    const auto it = g_net_registrations.find(token.token);
+    if (it == g_net_registrations.end()) return true;
+    if (!it->second.running) {
+        g_net_registrations.erase(it);
+        return true;
+    }
+    it->second.unregistered = true;
+    if (wait) g_net_cv.wait(lock, [&] { return !g_net_registrations.contains(token.token); });
+    return wait;
+}
 HRESULT STDMETHODCALLTYPE net_not_implemented(void*) { return E_NOTIMPL; }
 
 #define NM(fn) reinterpret_cast<const void*>(&fn)
@@ -336,7 +428,7 @@ const void* const kNetworkingVtable[] = {
     NM(net_query_port),            // 3  XNetworkingQueryPreferredLocalUdpMultiplayerPort
     NM(net_query_port_async),      // 4  ...Async
     NM(net_query_port_result),     // 5  ...AsyncResult
-    NM(net_register),              // 6  XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged
+    NM(net_register<PortChangedCallback>),  // 6  XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged
     NM(net_unregister),            // 7  XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged
     NM(net_security_async),        // 8  XNetworkingQuerySecurityInformationForUrlAsync
     NM(net_security_result_size),  // 9  ...AsyncResultSize
@@ -346,7 +438,7 @@ const void* const kNetworkingVtable[] = {
     NM(net_security_result),       // 13 ...Utf16AsyncResult (XCurl)
     NM(net_verify_certificate),    // 14 XNetworkingVerifyServerCertificate (XCurl)
     NM(net_connectivity_hint),     // 15 XNetworkingGetConnectivityHint (XCurl)
-    NM(net_register),              // 16 XNetworkingRegisterConnectivityHintChanged (XCurl)
+    NM(net_register<HintChangedCallback>),  // 16 XNetworkingRegisterConnectivityHintChanged (XCurl)
     NM(net_unregister),            // 17 XNetworkingUnregisterConnectivityHintChanged (XCurl)
     NM(net_not_implemented),       // 18 XNetworkingQueryConfigurationSetting (IXNetworkingImpl2)
     NM(net_not_implemented),       // 19 XNetworkingSetConfigurationSetting
@@ -361,9 +453,9 @@ static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl's
 // can ask where it may keep its cache. Slots 3-7 follow Microsoft's XPersistentLocalStorage reference and the ids and
 // layout in the public xgameruntime-docs and Wine IDL (facts only): GetPathSize, GetPath, GetSpaceInfo,
 // PromptUserForSpaceAsync and PromptUserForSpaceResult; IXPersistentLocalStorageImpl3 adds MountForPackage at slot 8.
-// The storage is <overlay>\persistent, so the package stays read-only and --overlay moves it with everything else a
-// title writes. Offline there is nobody to ask for more room: a prompt for space the quota can hold succeeds, one it
-// cannot fails with ERROR_DISK_FULL.
+// The storage is <overlay>\.gta6rt-persistent, so the package stays read-only, --overlay moves it with everything
+// else a title writes, and GAME: does not see it. Offline there is nobody to ask for more room: a prompt for space the
+// quota can hold succeeds, one it cannot fails with ERROR_DISK_FULL.
 
 constexpr GUID kPersistentStorageClass = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
 constexpr GUID kPersistentStorage2 = {0xd29411df, 0x0794, 0x4553, {0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d}};
@@ -384,7 +476,7 @@ static_assert(sizeof(PersistentSpaceInfo) == 32, "XPersistentLocalStorageSpaceIn
 std::filesystem::path persistent_storage_dir() {
     const std::filesystem::path overlay = rt::fs::overlay_dir();
     if (overlay.empty()) return {};
-    std::filesystem::path dir = overlay / L"persistent";
+    std::filesystem::path dir = overlay / rt::fs::kPersistentStorageDir;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     return ec ? std::filesystem::path{} : dir;
@@ -493,15 +585,45 @@ RuntimeObject g_persistent_storage{kPersistentStorageVtable, &kPersistentStorage
 RuntimeObject& system_object();   // XSystemImpl, defined after the XSystem functions it serves
 RuntimeObject& package_object();  // XPackageImpl, after the XPackage functions
 RuntimeObject& game_object();     // XGameImpl, after XPackageImpl
+RuntimeObject* const* measured_objects();  // XGameRuntimeFeatureImpl and XSystemAnalyticsImpl, after XGameImpl
+
+// The object this file hands out for a class id, or null when the class isn't one of this file's.
+RuntimeObject* find_object(const GUID& class_id) {
+    for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &system_object(),
+                             &package_object(), &game_object()})
+        if (class_id == *o->class_id) return o;
+    for (RuntimeObject* const* o = measured_objects(); *o; ++o)
+        if (class_id == *(*o)->class_id) return *o;
+    return nullptr;
+}
+
+// QueryApiImpl's answer for a served class: true with *hr set (and *out on success) when this file or one of the
+// other xgameruntime_*.cpp files serves the class, false when none does.
+bool query_served(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr) {
+    if (RuntimeObject* o = find_object(class_id)) {
+        *hr = object_query_interface(o, interface_id, out);
+        return true;
+    }
+    return rt::shims::xgameruntime_user_query(class_id, interface_id, out, hr) ||       // xgameruntime_user.cpp
+           rt::shims::xgameruntime_gamesave_query(class_id, interface_id, out, hr) ||   // xgameruntime_gamesave.cpp
+           rt::shims::xgameruntime_store_query(class_id, interface_id, out, hr) ||      // xgameruntime_store.cpp
+           rt::shims::xgameruntime_offline_query(class_id, interface_id, out, hr);      // xgameruntime_offline.cpp
+}
+
+// Whether QueryApiImpl serves the class, whichever file serves it (the reference taken to find out is released).
+bool class_served(const GUID& class_id) {
+    void* obj = nullptr;
+    HRESULT hr = S_OK;
+    if (!query_served(class_id, kIUnknown, &obj, &hr)) return false;
+    if (obj) (*static_cast<ULONG(STDMETHODCALLTYPE* const* const*)(void*)>(obj))[2](obj);   // Release
+    return true;
+}
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &g_persistent_storage, &system_object(),
-                                 &package_object(), &game_object()})
-            if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
         HRESULT hr = S_OK;
-        if (rt::shims::xgameruntime_user_query(*class_id, interface_id, out, &hr)) return hr;   // xgameruntime_user.cpp
+        if (query_served(*class_id, interface_id, out, &hr)) return hr;
     }
     char cls[40], iid[40];
     print_guid(cls, class_id);
@@ -1082,6 +1204,113 @@ static_assert(std::size(kGameVtable) == 6, "IUnknown + IXGameImpl3's 3 methods")
 RuntimeObject& game_object() {
     static RuntimeObject object{kGameVtable, &kGameClass, kGameIids};
     return object;
+}
+
+// ---- XGameRuntimeFeatureImpl, XSystemAnalyticsImpl ----
+//
+// Measured with tools/gdk_runtime_calls.py, which finds xgameruntime.lib's thunks in an image's code without running
+// it: for each class, the interface id the thunks ask QueryApiImpl for, the slots they call and the number of
+// arguments each passes after `this`. On the package's libHttpClient.GDK.dll every slot below is the function at that
+// position of the interface's "Layout" list in xodus-gaming/xgameruntime-docs (GPL-3.0; facts only), and the measured
+// argument count is the documented one. Signatures and semantics are Microsoft's public GDK reference pages,
+// learn.microsoft.com/gaming/gdk/docs/reference/system/<family>/functions/<name>, cited per function as
+// <family>/<name>.
+// The thunks are in libHttpClient.GDK.dll but nothing there calls them; a title linked with the same xgameruntime.lib
+// reaches these classes through the same thunks. docs/runtime_imports.md has the table.
+
+#define VT(fn) reinterpret_cast<const void*>(&fn)
+
+// XSystemAnalyticsImpl (IXSystemAnalyticsImpl, whose id is the class id): slot 3 is
+//   XSystemAnalyticsInfo XSystemGetAnalyticsInfo()   (xsystem/xsystemgetanalyticsinfo)
+// The one argument measured after `this` is where the result goes: a member function returning a struct takes its
+// address after `this` and returns it (MSVC x64), and the thunk copies the struct out of the returned pointer. The
+// answer is the named export's.
+constexpr GUID kSystemAnalyticsClass = {0xb884675d, 0xb738, 0x4a9c, {0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b}};
+
+XSystemAnalyticsInfo* STDMETHODCALLTYPE system_analytics_info(void*, XSystemAnalyticsInfo* result) {
+    if (result) *result = XSystemGetAnalyticsInfo();
+    return result;
+}
+
+const void* const kSystemAnalyticsVtable[] = {
+    VT(object_query_interface), VT(object_add_ref), VT(object_release),
+    VT(system_analytics_info),  // 3
+};
+
+// XGameRuntimeFeatureImpl (IXGameRuntimeFeatureImpl, whose id is the class id): slot 3 is
+//   bool XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature feature)
+// (xgameruntimefeature/xgameruntimeisfeatureavailable), measured with one 32-bit argument and a byte result.
+// XGameRuntimeFeature : uint32_t has the values of Microsoft's enum page, XAccessibility = 0 to XGameStreaming = 21.
+// Offline a feature is available when both hold:
+//   - QueryApiImpl serves the class its functions go through (xgameruntime-docs' layouts), from this file or another
+//     xgameruntime_*.cpp, so a call can reach it; the answer follows each class as it is served;
+//   - Microsoft documents it for Windows: an offline PC lacks what is documented only for the consoles (XDisplay:
+//     xdisplay/xdisplaytryenablehdrmode lists only the Xbox consoles as supported platforms).
+// Values past the enum are false.
+constexpr GUID kGameRuntimeFeatureClass = {0x8836fe87, 0xedb9, 0x4fe3, {0x8d, 0xad, 0x05, 0xf0, 0xd2, 0xcd, 0x5b, 0x40}};
+
+// The classes no object in this file stands for; the other files serve some of them. Named ...ClassId, not ...Class,
+// because tools/gdk_runtime_calls.py counts every `constexpr GUID k...Class` in these files as a served class.
+constexpr GUID kAccessibilityClassId = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
+constexpr GUID kAppCaptureClassId = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+constexpr GUID kDisplayClassId = {0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
+constexpr GUID kGameEventClassId = {0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d}};
+constexpr GUID kGameInviteClassId = {0x0651aae2, 0x4012, 0x4077, {0xbf, 0x84, 0x8b, 0x90, 0x97, 0x09, 0x0e, 0x2c}};
+constexpr GUID kGameSaveClassId = {0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}};
+constexpr GUID kGameStreamingClassId = {0x0a2192aa, 0xb2d5, 0x4d58, {0x83, 0xbe, 0x38, 0x3b, 0x6d, 0x80, 0x79, 0x9e}};
+constexpr GUID kGameUiClassId = {0xdfcd4649, 0x4ff8, 0x4043, {0xba, 0x07, 0x35, 0xd6, 0x07, 0xdf, 0x98, 0xb0}};
+constexpr GUID kLauncherClassId = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
+constexpr GUID kStoreClassId = {0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
+constexpr GUID kUserClassId = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+
+struct RuntimeFeature {
+    const GUID* class_id;  // the class the feature's functions go through
+    bool console_only;     // documented for the Xbox consoles only
+};
+const RuntimeFeature kRuntimeFeatures[] = {
+    {&kAccessibilityClassId, false},    // 0  XAccessibility
+    {&kAppCaptureClassId, false},       // 1  XAppCapture
+    {&kThreadingClass, false},          // 2  XAsync
+    {&kThreadingClass, false},          // 3  XAsyncProvider
+    {&kDisplayClassId, true},           // 4  XDisplay
+    {&kGameClass, false},               // 5  XGame
+    {&kGameInviteClassId, false},       // 6  XGameInvite
+    {&kGameSaveClassId, false},         // 7  XGameSave
+    {&kGameUiClassId, false},           // 8  XGameUI
+    {&kLauncherClassId, false},         // 9  XLauncher
+    {&kNetworkingClass, false},         // 10 XNetworking
+    {&kPackageClass, false},            // 11 XPackage
+    {&kPersistentStorageClass, false},  // 12 XPersistentLocalStorage
+    {&kAccessibilityClassId, false},    // 13 XSpeechSynthesizer (IXAccessibilityImpl holds its functions)
+    {&kStoreClassId, false},            // 14 XStore
+    {&kSystemClass, false},             // 15 XSystem
+    {&kThreadingClass, false},          // 16 XTaskQueue
+    {&kThreadingClass, false},          // 17 XThread
+    {&kUserClassId, false},             // 18 XUser
+    {&kErrorClass, false},              // 19 XError
+    {&kGameEventClassId, false},        // 20 XGameEvent
+    {&kGameStreamingClassId, false},    // 21 XGameStreaming
+};
+static_assert(std::size(kRuntimeFeatures) == 22, "XGameRuntimeFeature has 22 values");
+
+bool STDMETHODCALLTYPE runtime_is_feature_available(void*, uint32_t feature) {
+    if (feature >= std::size(kRuntimeFeatures)) return false;
+    const RuntimeFeature& f = kRuntimeFeatures[feature];
+    return !f.console_only && class_served(*f.class_id);
+}
+
+const void* const kGameRuntimeFeatureVtable[] = {
+    VT(object_query_interface), VT(object_add_ref), VT(object_release),
+    VT(runtime_is_feature_available),  // 3
+};
+#undef VT
+
+RuntimeObject g_game_runtime_feature{kGameRuntimeFeatureVtable, &kGameRuntimeFeatureClass, nullptr};
+RuntimeObject g_system_analytics{kSystemAnalyticsVtable, &kSystemAnalyticsClass, nullptr};
+
+RuntimeObject* const* measured_objects() {
+    static RuntimeObject* const objects[] = {&g_game_runtime_feature, &g_system_analytics, nullptr};
+    return objects;
 }
 
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}

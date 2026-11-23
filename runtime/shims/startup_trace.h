@@ -14,13 +14,15 @@
 //   {"seq":9,"t":0.030,"kind":"exit","code":0}
 //
 // The exception handler is vectored, logs and returns EXCEPTION_CONTINUE_SEARCH: it never changes what the process
-// does. OutputDebugStringA/W raise DBG_PRINTEXCEPTION_C / DBG_PRINTEXCEPTION_WIDE_C when no debugger is attached, so
-// the same handler records their text without a shim.
+// does (except LEONIDA_SKIP_INT3, below).
+// OutputDebugStringA/W raise DBG_PRINTEXCEPTION_C / DBG_PRINTEXCEPTION_WIDE_C when no debugger is attached, so the
+// same handler records their text without a shim.
 //
 // The file can quote whatever the game prints: it stays on the player's machine (AGENTS.md, "No game data").
 #pragma once
 
 #include <windows.h>
+#include <set>
 
 #include <atomic>
 #include <cerrno>
@@ -48,6 +50,10 @@ inline unsigned long long seq = 0;
 inline std::chrono::steady_clock::time_point start;
 inline void* veh = nullptr;
 inline thread_local bool in_handler = false;
+// With nothing to handle it, OutputDebugStringW's DBG_PRINTEXCEPTION_WIDE_C falls back to OutputDebugStringA on its
+// own ANSI copy (ExceptionInformation[3]), a second, lossy exception for the same text. Every debug string on the
+// thread resets this, so only the exception right after the wide one, with that same pointer, is skipped.
+inline thread_local ULONG_PTR wide_fallback = 0;
 
 inline void append_escaped(std::string& out, const char* s, size_t n) {
     static const char hex[] = "0123456789abcdef";
@@ -162,6 +168,10 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
         if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
+            const ULONG_PTR fallback = wide_fallback;
+            const bool wide = r.ExceptionCode == kDbgPrintWide;
+            wide_fallback = wide && r.NumberParameters >= 4 ? r.ExceptionInformation[3] : 0;
+            if (!wide && fallback && r.NumberParameters >= 2 && r.ExceptionInformation[1] == fallback) return;
             std::string text = debug_text(r);
             while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
             event("debug_string", "\"text\":" + quote(text));
@@ -182,8 +192,29 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
     }
 }
 
+// LEONIDA_SKIP_INT3 (diagnostic, with --trace): an int3 in guest code is logged once per address and stepped over,
+// so a boot can be followed past the title's soft asserts (an int3 followed by code that carries on). Off by default:
+// a console title never reaches one in a correct run, so each skipped address is a finding, not a fix.
+inline bool skip_int3(EXCEPTION_POINTERS* info) {
+    static const bool skip = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0;
+    if (!skip || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT || !info->ContextRecord) return false;
+    const auto* at = static_cast<const unsigned char*>(info->ExceptionRecord->ExceptionAddress);
+    if (!at || *at != 0xCC || info->ContextRecord->Rip != reinterpret_cast<DWORD64>(at)) return false;
+    static std::mutex m;
+    static std::set<const void*> seen;
+    bool first = false;
+    {
+        const std::lock_guard lock(m);
+        first = seen.insert(at).second;
+    }
+    if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
+    info->ContextRecord->Rip += 1;
+    return true;
+}
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
     in_handler = true;
 #ifdef _MSC_VER
     // Under /EHsc, catch(...) does not catch SEH faults (e.g. a bad DBG_PRINTEXCEPTION_C pointer or corrupt unwind).

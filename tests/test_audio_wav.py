@@ -23,8 +23,46 @@ TOOL = os.path.join(ROOT, "tools", "audio_wav.py")
 FFMPEG = shutil.which("ffmpeg")
 
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
 import audio_wav  # noqa: E402
 import awc_opus  # noqa: E402
+import winbatch  # noqa: E402
+
+
+class DecodeQueueTest(unittest.TestCase):
+    def test_failure_summary_counts_all_but_prints_only_ten_first_lines(self):
+        items = [(str(i), str(i)) for i in range(13)]
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(audio_wav, "collect", return_value=(items, 0)), \
+                mock.patch.object(audio_wav, "plan_outputs", return_value=(items, 0, 0)), \
+                mock.patch.object(audio_wav, "find_ffmpeg", return_value="unused"), \
+                mock.patch.object(audio_wav, "decode", return_value=(False, "\n  first line\nextra detail")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            status = audio_wav.main([root, "--jobs", "2"])
+        self.assertEqual(status, 1)
+        self.assertIn("13 failed", out.getvalue())
+        self.assertEqual(out.getvalue().count(": first line"), 10)
+        self.assertNotIn("extra detail", out.getvalue())
+        self.assertIn("and 3 more failures", out.getvalue())
+
+    def test_submission_stays_within_worker_window(self):
+        workers, consumed = 2, 0
+        expected = {str(i) for i in range(1000)}
+        received = set()
+
+        def jobs():
+            for submitted, name in enumerate(sorted(expected), 1):
+                self.assertLessEqual(submitted - consumed, workers)
+                yield name, name, name + ".wav"
+
+        with audio_wav.concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool, \
+                mock.patch.object(audio_wav, "decode", new=lambda _, src, dst: (src, dst)):
+            for rel, future in audio_wav._decode_jobs(pool, "unused", jobs(), workers):
+                self.assertEqual(future.result(), (rel, rel + ".wav"))
+                consumed += 1
+                received.add(rel)
+        self.assertEqual(received, expected)
+        self.assertEqual(consumed, len(expected))
 
 
 @unittest.skipUnless(FFMPEG, "ffmpeg is not on PATH")
@@ -416,9 +454,7 @@ def write_fake_ffmpeg(directory, source=FAKE_FFMPEG):
     with open(script, "w", encoding="utf-8") as f:
         f.write(source)
     if os.name == "nt":
-        ffmpeg = os.path.join(directory, "ffmpeg.cmd")
-        with open(ffmpeg, "w", encoding="utf-8") as f:
-            f.write(f'@"{sys.executable}" "{script}" %*\n')
+        ffmpeg = winbatch.write_python_cmd(os.path.join(directory, "ffmpeg.cmd"), sys.executable, script)
     else:
         ffmpeg = os.path.join(directory, "ffmpeg")
         with open(ffmpeg, "w", encoding="utf-8") as f:

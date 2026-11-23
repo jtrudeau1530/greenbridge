@@ -8,13 +8,20 @@
 // so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
+#include "window_station.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
+#include <vulkan/vulkan_win32.h>
 
 #include <dxgi1_6.h>
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <string_view>
 #include <vector>
@@ -69,6 +76,50 @@ bool is_hdr_monitor(HWND window) {
     return false;
 }
 
+// The LUID of the DXGI adapter whose output shows the window's monitor, or false when it cannot be told. A Vulkan
+// swapchain made on another adapter (a render-only GPU, such as an Intel iGPU with no monitor attached while the
+// desktop runs on a discrete GPU) is not shown by the desktop compositor at all: a bare vkCreateSwapchainKHR + clear +
+// vkQueuePresentKHR program on the UHD 770 leaves the window's own white background on screen, and GDI, BitBlt with
+// CAPTUREBLT and PrintWindow all read that white, while the same program on the display GPU reads the clear colour.
+bool display_adapter_luid(HWND window, LUID* luid) {
+    const HMONITOR target = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    if (!target) return false;
+    Ref<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return false;
+    for (UINT i = 0;; ++i) {
+        Ref<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(i, &adapter.p) == DXGI_ERROR_NOT_FOUND) break;
+        if (!adapter.p) continue;
+        for (UINT j = 0;; ++j) {
+            Ref<IDXGIOutput> output;
+            if (adapter->EnumOutputs(j, &output.p) == DXGI_ERROR_NOT_FOUND) break;
+            if (!output.p) continue;
+            DXGI_OUTPUT_DESC desc{};
+            DXGI_ADAPTER_DESC1 adapter_desc{};
+            if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == target &&
+                SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+                *luid = adapter_desc.AdapterLuid;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// True when the Vulkan device is known to be a different adapter from the one driving the window's monitor.
+bool device_is_not_display_adapter(const vktest::Device& d, HWND window) {
+    LUID display{};
+    if (!display_adapter_luid(window, &display)) return false;
+    const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2"));
+    if (!properties2) return false;
+    VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    properties2(d.physical, &properties);
+    if (!id.deviceLUIDValid) return false;
+    return std::memcmp(id.deviceLUID, &display, sizeof(LUID)) != 0;
+}
+
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
     return DefWindowProcW(window, message, w, l);
 }
@@ -79,15 +130,6 @@ void pump() {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-}
-
-bool has_interactive_window_station() {
-    HWINSTA station = GetProcessWindowStation();
-    if (!station) return true;  // Unknown environment: let window creation report the real failure.
-    USEROBJECTFLAGS flags{};
-    DWORD bytes = 0;
-    if (!GetUserObjectInformationW(station, UOI_FLAGS, &flags, sizeof(flags), &bytes)) return true;
-    return (flags.dwFlags & WSF_VISIBLE) != 0;
 }
 
 // True when the window manager reports this window as the top-level window at a screen point. Being the foreground
@@ -122,10 +164,13 @@ PFN_vkDestroySemaphore real_destroy_semaphore = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceFormatsKHR real_surface_formats = nullptr;
 PFN_vkCreateSwapchainKHR real_create_swapchain = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR real_get_caps = nullptr;
+PFN_vkCreateWin32SurfaceKHR real_create_surface = nullptr;
 VkResult fail_next_submit = VK_SUCCESS;  // armed: the next vkQueueSubmit returns this and submits nothing
 VkResult next_present = VK_SUCCESS;      // armed: the next present that succeeds reports this instead
 int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore from now fails
 bool fail_surface_formats = false;       // armed: the next surface-format query fails before creation
+bool fail_surface_create = false;        // armed: the next vkCreateWin32SurfaceKHR fails (recreation after a loss)
+unsigned surface_creations = 0;          // vkCreateWin32SurfaceKHR successes through the double
 bool observe_next_swapchain = false;
 bool report_undefined_extent = false;    // armed: surface capabilities reports undefined extent (0xFFFFFFFF)
 bool undefined_extent_queried = false;
@@ -216,6 +261,17 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
     return real_get_device(device, name);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL create_surface(VkInstance instance, const VkWin32SurfaceCreateInfoKHR* info,
+                                              const VkAllocationCallbacks* allocator, VkSurfaceKHR* out) {
+    if (fail_surface_create) {
+        fail_surface_create = false;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    const VkResult result = real_create_surface(instance, info, allocator, out);
+    if (result == VK_SUCCESS) ++surface_creations;
+    return result;
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
     const std::string_view n = name;
     if (n == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
@@ -223,6 +279,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const
         return reinterpret_cast<PFN_vkVoidFunction>(surface_formats);
     if (n == "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
         return reinterpret_cast<PFN_vkVoidFunction>(get_surface_capabilities);
+    if (n == "vkCreateWin32SurfaceKHR") return reinterpret_cast<PFN_vkVoidFunction>(create_surface);
     return real_get_instance(instance, name);
 }
 
@@ -238,6 +295,8 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
     real_create_swapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(real_get_device(device, "vkCreateSwapchainKHR"));
     real_get_caps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
         instance_proc(instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+    real_create_surface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+        instance_proc(instance, "vkCreateWin32SurfaceKHR"));
 }
 }  // namespace driver
 
@@ -467,6 +526,29 @@ int main() {
         driver::report_undefined_extent = false;
         EXPECT(presented_image_is_clear_colour());
 
+        // 5. A surface lost under a presented swapchain (the window's display went away): the frame is not shown,
+        //    the sticky E_FAIL of before #5689's present handling is avoided by remaking the surface for the same
+        //    window at the next present and rebuilding the swapchain on it. Until the surface can be remade, the
+        //    vkd3d precedent keeps rendering to nothing instead of failing every present.
+        unsigned surfaces_before = driver::surface_creations;
+        before = presenter->presented();
+        EXPECT(frame(0, [] { driver::next_present = VK_ERROR_SURFACE_LOST_KHR; }));
+        EXPECT(presenter->presented() == before);                      // nothing was shown
+        EXPECT(!presented_image_is_clear_colour());                    // and read_back does not hand out the frame
+        EXPECT(driver::surface_creations == surfaces_before);          // the loss is noted, not yet recreated
+        EXPECT(frame(0));                                              // the next present remakes the surface...
+        EXPECT(driver::surface_creations == surfaces_before + 1);      // ...through the factory callback...
+        EXPECT(presenter->presented() == before + 1);                  // ...and shows again
+        EXPECT(presented_image_is_clear_colour());
+        before = presenter->presented();
+        EXPECT(frame(0, [] { driver::next_present = VK_ERROR_SURFACE_LOST_KHR; }));  // lost again, and the remake
+        EXPECT(frame(0, [] { driver::fail_surface_create = true; }));  // also fails: keep rendering to nothing
+        EXPECT(presenter->presented() == before);                      // the two frames were not shown
+        EXPECT(!presented_image_is_clear_colour());
+        driver::fail_surface_create = false;
+        EXPECT(frame(0));                                              // surfaceable again: recover
+        EXPECT(presenter->presented() == before + 1);
+
         std::printf("injected: out-of-date and suboptimal presents counted apart, a failed swapchain recreation "
                     "released and retried, a failed blit submission recovered, undefined surface extent resolved "
                     "(%u real out-of-date presents)\n",
@@ -526,8 +608,15 @@ int main() {
                     if (reads > 1)
                         std::printf("read %d times, 50 ms apart; the first read was %d,%d,%d\n", reads,
                                     GetRValue(first_pixel), GetGValue(first_pixel), GetBValue(first_pixel));
-                    EXPECT(is_clear_colour(pixel));
-                    screen_checked = true;
+                    if (device_is_not_display_adapter(d, window)) {
+                        // The pixel is what the desktop shows, and the desktop does not show this GPU's swapchain.
+                        std::printf("the Vulkan device is not the adapter that drives this monitor: the desktop does "
+                                    "not show its swapchain, on-screen colour check skipped, the colour was checked "
+                                    "in the presented images\n");
+                    } else {
+                        EXPECT(is_clear_colour(pixel));
+                        screen_checked = true;
+                    }
                 }
             }
         } else {

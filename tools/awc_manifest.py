@@ -7,8 +7,9 @@ exporter agree on stream ids, codecs, sample rates and streamed-music descriptor
 scanned recursively for *.awc. CSV is the default on stdout; --out writes a file and a .json
 extension selects JSON unless --format says otherwise. A report cannot replace an input bank, including one
 found during a directory scan. Unreadable banks are reported on stderr, skipped,
-and excluded from bank_count. The bank column gives the path relative to the scanned directory or the basename
-for a single file.
+and excluded from bank_count, but a single named file that holds no bank is an error (exit 2) instead of an
+empty manifest, since then the path or the format is wrong. The bank column gives the path relative to the
+scanned directory or the basename for a single file.
 
 CSV columns: bank, stream, codec, codec_name, channels, sample_rate, declared_samples, duration_s,
 streamed_music, data_offset, data_size, bank_size, notes. JSON is an object with bank_count,
@@ -20,6 +21,7 @@ look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
 A streamed-music descriptor contributes one row per channel group; `channels` is the packet channel count read
 from the Opus TOC stereo bit, and `declared_samples`/`duration_s` are per channel (the descriptor stores the
 interleaved count). `data_offset`/`size` is the shared data tag.
+Usage: `python -I tools/awc_manifest.py --help` lists the options.
 """
 import argparse
 import csv
@@ -155,8 +157,11 @@ def collect(src: str, *, out: str | None = None):
     """
     recursive = os.path.isdir(src)
     if recursive:
+        def scan_failed(error):
+            raise error
+
         banks = []
-        for root, dirs, files in os.walk(src):
+        for root, dirs, files in os.walk(src, onerror=scan_failed):
             dirs.sort()
             banks += [os.path.join(root, f) for f in files if f.lower().endswith(".awc")]
         banks.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))
@@ -213,6 +218,12 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
         if f is not sys.stdout:
             f.close()
         if tmp:
+            # The staging file may have inherited a read-only destination's mode; make it deletable
+            # first, or Windows strands it beside the manifest when the replace fails.
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             try:
                 os.unlink(tmp)
             except OSError:
@@ -239,6 +250,11 @@ def main(argv=None) -> int:
     except OSError as e:
         print(f"awc_manifest: error: cannot read {e.filename or a.src}: {e.strerror or e}", file=sys.stderr)
         return 1
+    if not banks and not os.path.isdir(a.src):
+        # A named file that parsed as no bank is a wrong path or format, not an empty result; a directory scan
+        # keeps reporting 0 banks because scanning a folder with no bank in it is a valid answer.
+        print(f"awc_manifest: error: {a.src}: holds no AWC bank", file=sys.stderr)
+        return 2
     try:
         write_manifest(rows, banks, streamed, fmt, a.out)
     except OSError as e:

@@ -87,7 +87,6 @@ class TestManifestVerifier(unittest.TestCase):
             cwd=self.root,
             capture_output=True,
             text=True,
-            encoding="utf-8",
             errors="replace",
         )
 
@@ -95,6 +94,54 @@ class TestManifestVerifier(unittest.TestCase):
         sample_path = os.path.join(self.game_dir, "alpha.bin")
         expected = hashlib.sha256(self.payloads["alpha.bin"]).hexdigest()
         self.assertEqual(mv.sha256_file(sample_path), expected)
+
+    def test_sha256_file_reuses_buffer_across_short_reads(self) -> None:
+        payload = bytes(range(25))
+        sample_path = os.path.join(self.root, "short-reads.bin")
+        with open(sample_path, "wb") as f:
+            f.write(payload)
+
+        buffers = []
+        with open(sample_path, "rb", buffering=0) as f:
+            real_readinto = f.readinto
+
+            def read_some(buffer):
+                view = memoryview(buffer)
+                buffers.append(view.obj)
+                return real_readinto(view[:3])
+
+            with patch.object(f, "readinto", read_some), patch.object(mv, "open", return_value=f, create=True):
+                self.assertEqual(
+                    mv.sha256_file(sample_path, chunk_size=8),
+                    hashlib.sha256(payload).hexdigest(),
+                )
+
+        self.assertGreater(len(buffers), 1)
+        self.assertEqual(len(buffers[0]), 8)
+        self.assertTrue(all(buf is buffers[0] for buf in buffers))
+
+        # Small files cap the reusable buffer to the file size rather than allocating CHUNK.
+        small_buffers = []
+        with open(sample_path, "rb", buffering=0) as f:
+            real_readinto = f.readinto
+
+            def record_buffer(buffer):
+                view = memoryview(buffer)
+                small_buffers.append(view.obj)
+                return real_readinto(view)
+
+            with patch.object(f, "readinto", record_buffer), patch.object(mv, "open", return_value=f, create=True):
+                self.assertEqual(mv.sha256_file(sample_path), hashlib.sha256(payload).hexdigest())
+
+        self.assertEqual(len(small_buffers), 1)
+        self.assertEqual(len(small_buffers[0]), len(payload))
+
+    def test_sha256_file_rejects_nonpositive_chunk_size(self) -> None:
+        sample_path = os.path.join(self.game_dir, "alpha.bin")
+        for bad in (0, -1):
+            with self.subTest(chunk_size=bad):
+                with self.assertRaises(ValueError):
+                    mv.sha256_file(sample_path, chunk_size=bad)
 
     def test_walk_normalization(self) -> None:
         items = dict(mv.walk(self.game_dir))
@@ -112,9 +159,10 @@ class TestManifestVerifier(unittest.TestCase):
         target = "/target"
         posix_os = Mock(sep="/", path=Mock(wraps=posixpath))
         posix_os.path.isdir.return_value = True
-        posix_os.path.isfile.side_effect = os.path.isfile
+        posix_os.stat.side_effect = os.stat
         posix_os.path.getsize.return_value = len(payload)
         posix_os.walk.return_value = [(target, [], [literal_name])]
+        posix_os.stat.side_effect = lambda path: os.stat(self.game_dir if path == target else path)
         with (patch.object(mv, "os", posix_os),
               patch.object(mv, "sha256_file", return_value=hashlib.sha256(payload).hexdigest()) as hash_file):
             report = mv.verify_manifest(target, self.manifest_path)
@@ -154,6 +202,19 @@ class TestManifestVerifier(unittest.TestCase):
             json.dump(doc, f)
         entries = mv.load_manifest(flat_path)
         self.assertEqual(list(entries.keys()), ["alpha.bin"])
+
+    def test_flat_manifest_checks_files_named_like_metadata(self) -> None:
+        files = {"alpha.bin": b"keep", "version": b"old"}
+        directory = os.path.join(self.root, "flat-game")
+        os.mkdir(directory)
+        for name, data in files.items():
+            with open(os.path.join(directory, name), "wb") as f:
+                f.write(b"new" if name == "version" else data)
+        path = self.write_manifest(os.path.join(self.root, "flat.json"), files, wrapper=False)
+        report = mv.verify_manifest(directory, path, jobs=1)
+        self.assertFalse(report.passed)
+        self.assertEqual(report.problems, {"version": "CHANGED"})
+        self.assertEqual(report.untracked, [])
 
     def test_load_manifest_duplicate_normalized_paths_raise(self) -> None:
         digest = hashlib.sha256(b"x").hexdigest()
@@ -298,6 +359,35 @@ class TestManifestVerifier(unittest.TestCase):
         with self.assertRaises(mv.ManifestError):
             mv.load_manifest(missing_path)
 
+    def test_cli_distinguishes_manifest_path_errors(self) -> None:
+        stat_path = os.stat
+
+        def stat_with_denied_manifest(path, *args, **kwargs):
+            if path == self.manifest_path:
+                raise PermissionError("Simulated permission denied")
+            return stat_path(path, *args, **kwargs)
+
+        for flags in ([], ["--json"]):
+            with self.subTest(flags=flags):
+                with (
+                    patch.object(mv.os, "stat", side_effect=stat_with_denied_manifest),
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    rc = mv.main([self.game_dir, "--manifest", self.manifest_path, "--quiet", *flags])
+                self.assertEqual(rc, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("cannot read manifest", stderr.getvalue())
+                self.assertIn("Simulated permission denied", stderr.getvalue())
+
+    def test_cli_reports_non_regular_manifest_path(self) -> None:
+        for flags in ([], ["--json"]):
+            with self.subTest(flags=flags):
+                res = self.run_cli(self.game_dir, "--manifest", self.root, "--quiet", *flags)
+                self.assertEqual(res.returncode, 2)
+                self.assertEqual(res.stdout, "")
+                self.assertIn("manifest path is not a regular file", res.stderr)
+
     def test_load_manifest_malformed_entries(self) -> None:
         invalid_entries = os.path.join(self.root, "invalid_entries.json")
         with open(invalid_entries, "w", encoding="utf-8") as f:
@@ -321,6 +411,37 @@ class TestManifestVerifier(unittest.TestCase):
     def test_verify_target_dir_missing(self) -> None:
         with self.assertRaises(mv.ManifestError):
             mv.verify_manifest(os.path.join(self.root, "missing_dir"), self.manifest_path)
+
+    def test_cli_distinguishes_target_path_errors(self) -> None:
+        stat_path = os.stat
+
+        def stat_with_denied_target(path, *args, **kwargs):
+            if path == self.game_dir:
+                raise PermissionError("Simulated permission denied")
+            return stat_path(path, *args, **kwargs)
+
+        for flags in ([], ["--json"]):
+            with self.subTest(flags=flags, case="denied"):
+                with (
+                    patch.object(mv.os, "stat", side_effect=stat_with_denied_target),
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    rc = mv.main([self.game_dir, "--manifest", self.manifest_path, "--quiet", *flags])
+                self.assertEqual(rc, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("cannot access target directory", stderr.getvalue())
+                self.assertIn("Simulated permission denied", stderr.getvalue())
+
+            for target, message in (
+                (self.manifest_path, "target path is not a directory"),
+                (os.path.join(self.root, "absent"), "target directory does not exist"),
+            ):
+                with self.subTest(flags=flags, target=target):
+                    res = self.run_cli(target, "--manifest", self.manifest_path, "--quiet", *flags)
+                    self.assertEqual(res.returncode, 2)
+                    self.assertEqual(res.stdout, "")
+                    self.assertIn(message, res.stderr)
 
     def test_clean_verification_serial_and_parallel(self) -> None:
         serial_report = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=1)
@@ -437,19 +558,36 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertTrue(any("[" in line for line in stream_output.splitlines()))
 
     def test_unreadable_file_graceful_handling(self) -> None:
-        # Simulate unreadable file by patching sha256_file to raise OSError
-        def mock_sha(path: str, chunk_size: int = mv.CHUNK, *, expected_size: int | None = None) -> str:
-            if "alpha.bin" in path:
-                raise OSError("Simulated permission denied")
-            with open(path, "rb") as f:
-                return hashlib.sha256(f.read()).hexdigest()
+        hash_file = mv.sha256_file
 
-        with patch("tools.manifest_verifier.sha256_file", side_effect=mock_sha):
-            report = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=1)
-            self.assertFalse(report.passed)
-            self.assertEqual(report.problems.get("alpha.bin"), "UNREADABLE")
-            self.assertEqual(len(report.unreadable), 1)
-            self.assertEqual(report.unreadable[0][0], "alpha.bin")
+        def mock_sha(path: str, *, expected_size: int | None = None) -> str:
+            if os.path.basename(path) == "alpha.bin":
+                raise OSError("Simulated permission denied")
+            return hash_file(path, expected_size=expected_size)
+
+        # Change exactly one byte so bravo reaches hashing and reports CHANGED.
+        with open(os.path.join(self.game_dir, "bravo.bin"), "r+b") as f:
+            f.write(bytes([self.payloads["bravo.bin"][0] ^ 1]))
+
+        scheduled_bytes = sum(SYNTHETIC_SIZES.values())
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                events = []
+                with patch.object(mv, "sha256_file", side_effect=mock_sha):
+                    report = mv.verify_manifest(
+                        self.game_dir, self.manifest_path, jobs=jobs, progress_callback=events.append
+                    )
+                self.assertFalse(report.passed)
+                self.assertEqual(report.unreadable, [("alpha.bin", "Simulated permission denied")])
+                self.assertEqual(report.hash_mismatch, ["bravo.bin"])
+                self.assertEqual(set(report.matched), set(SYNTHETIC_SIZES) - {"alpha.bin", "bravo.bin"})
+                self.assertEqual(report.problem_count, 2)
+                self.assertEqual(events[-1].completed_files, len(SYNTHETIC_SIZES))
+                self.assertEqual(events[-1].completed_bytes, scheduled_bytes)
+                self.assertEqual(events[-1].pct, 1.0)
+                verified_bytes = scheduled_bytes - SYNTHETIC_SIZES["alpha.bin"]
+                self.assertEqual(report.bytes_verified, verified_bytes)
+                self.assertEqual(report.to_dict()["bytes_verified"], verified_bytes)
 
     def test_empty_manifest_and_zero_byte_file(self) -> None:
         zero_p = os.path.join(self.game_dir, "empty.bin")
@@ -471,6 +609,18 @@ class TestManifestVerifier(unittest.TestCase):
         report = mv.verify_manifest(self.game_dir, empty_manifest, jobs=1)
         self.assertTrue(report.passed)
         self.assertIn("empty.bin", report.matched)
+
+    def test_cli_manifest_without_entries_is_an_error_not_ok(self) -> None:
+        # Every file would otherwise be NEW, and the run would print OK and exit 0 having verified nothing.
+        empty = os.path.join(self.root, "no_entries.json")
+        for doc in ({"files": {}}, {}, {"created": "2026-11-22 00:00:00"}):
+            with self.subTest(doc=doc):
+                with open(empty, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(doc, f)
+                res = self.run_cli(self.game_dir, "--manifest", empty, "--quiet")
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn(f"lists no files, but {self.game_dir} holds {len(SYNTHETIC_SIZES)}", res.stderr)
+                self.assertNotIn("OK", res.stdout)
 
     def test_cli_clean_verification(self) -> None:
         res = self.run_cli(self.game_dir, "--manifest", self.manifest_path, "--jobs", "2")
@@ -500,6 +650,30 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertTrue(data["passed"])
         self.assertEqual(data["problem_count"], 0)
         self.assertEqual(data["matched_count"], len(SYNTHETIC_SIZES))
+
+    def test_text_report_includes_unreadable_reason(self) -> None:
+        hash_file = mv.sha256_file
+
+        def read_file(path: str, *, expected_size: int | None = None) -> str:
+            if os.path.basename(path) == "alpha.bin":
+                raise OSError("Simulated permission denied")
+            return hash_file(path, expected_size=expected_size)
+
+        with open(os.path.join(self.game_dir, "delta.bin"), "r+b") as f:
+            f.write(bytes([self.payloads["delta.bin"][0] ^ 1]))
+
+        with patch.object(mv, "sha256_file", side_effect=read_file):
+            report = mv.verify_manifest(self.game_dir, self.manifest_path)
+        self.assertFalse(report.passed)
+        self.assertEqual(report.to_dict()["unreadable"], [("alpha.bin", "Simulated permission denied")])
+
+        output = io.StringIO()
+        mv.print_report(report, out=output)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "UNREADABLE alpha.bin: Simulated permission denied",
+            "CHANGED   delta.bin",
+            "2 problem(s)",
+        ])
 
     def test_cli_tampered_returns_exit_code_1(self) -> None:
         delta_p = os.path.join(self.game_dir, "delta.bin")
@@ -594,15 +768,15 @@ class TestStableHashing(unittest.TestCase):
                     return
                 reader = Mock(wraps=f)
 
-                def read(*read_args):
+                def readinto(buf):
                     nonlocal changed
-                    data = f.read(*read_args)
-                    if data and not changed:
+                    count = f.readinto(buf)
+                    if count and not changed:
                         changed = True
                         mutate()
-                    return data
+                    return count
 
-                reader.read.side_effect = read
+                reader.readinto.side_effect = readinto
                 yield reader
 
         with patch.object(mv, "open", hooked_open, create=True):

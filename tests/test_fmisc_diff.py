@@ -41,7 +41,10 @@ class Reference(unittest.TestCase):
         self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0xB3800000}), 0x3F7FFFFF)     # -2^-24 -> below 1.0
         self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0x80000000}), 0)              # -0 -> +0
         self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0x4B7FFFFF}), 0)              # an integer
-        self.assertTrue(d.is_nan(one("v_fract_f32_e32 v1, v2", v={2: d.NINF})))
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: d.NINF}), 0xFFC00000)       # gfx1036: exactly this
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: d.PINF}), 0xFFC00000)
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0x7F800001}), 0x7F800001)     # a signalling NaN stays
+        self.assertEqual(one("v_fract_f32_e32 v1, v2", v={2: 0xFFC00123}), 0xFFC00123)     # a NaN comes back as is
         self.assertEqual(one("v_fract_f32_e64 v1, -v2 mul:2", v={2: 0x3F000000}), 0x3F800000)  # 0.5 * 2
 
     def test_frexp(self):
@@ -253,12 +256,79 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("MISMATCH", out)
 
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        def refuse(lines, *args):
+            raise d.Skip("unsupported form")
+        real = d.translated
+        try:
+            d.translated = refuse
+            rc, out = self.main("--programs", "3", "--seed", "1", "--ops", "v_cvt_u32_f32")
+        finally:
+            d.translated = real
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no program ran: every one was skipped", out)
+
     def test_hardware_oracle_without_the_tools_exits_77(self):
         env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOL.parent / "no-such-clang.exe"))
         r = subprocess.run([sys.executable, "-I", str(TOOL), "--oracle", "hw", "--programs", "3"],
                            capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
         self.assertIn("unavailable", r.stdout)
+
+
+class VulkanOracle(unittest.TestCase):
+    """--oracle hw,vk: the compute program the GPU runs, its wave64 spelling, and the verdict against the hardware."""
+
+    def setUp(self):
+        import vk_fuzz_run
+        self.vk = vk_fuzz_run
+
+    def test_program_text_wave32(self):
+        lines = ["v_mov_b32_e32 v1, 0x3f800000", "v_cmp_lt_f32_e64 s20, v1, v2", "v_cndmask_b32_e64 v8, 0, 1, s20"]
+        text = self.vk.program_text("cs_x", lines, 4, 32).splitlines()
+        self.assertIn("; group: 32,1,1", text)
+        self.assertEqual(text[3:5], ["s_mov_b32 exec_lo, -1", "v_mov_b32 v20, v0"])
+        self.assertIn("v_lshlrev_b32 v21, 4, v20", text)
+        self.assertIn("buffer_store_dword v8, v21, s[0:3], 0 offen", text)
+        self.assertIn("buffer_store_dword v11, v21, s[0:3], 0 offen offset:12", text)
+        self.assertEqual(text[-1], "s_endpgm")
+        self.assertIn("v_cmp_lt_f32_e64 s20, v1, v2", text)
+
+    def test_wave64_spells_lane_masks_as_pairs(self):
+        w = self.vk.wave64_text
+        self.assertEqual(w("v_cmp_lt_f32_e64 s20, v1, v2"), "v_cmp_lt_f32_e64 s[20:21], v1, v2")
+        self.assertEqual(w("v_cndmask_b32_e64 v8, 0, 1, s21"), "v_cndmask_b32_e64 v8, 0, 1, s[22:23]")
+        self.assertEqual(w("v_cmp_lt_f32_e32 vcc_lo, v1, v2"), "v_cmp_lt_f32_e32 vcc, v1, v2")
+        self.assertEqual(w("s_mov_b32 s4, 0x20"), "s_mov_b32 s4, 0x20")           # data SGPRs stay
+        self.assertEqual(w("s_mov_b32 s2, 0x20"), "s_mov_b32 s2, 0x20")
+        text = self.vk.program_text("cs_x", ["v_cmp_lt_f32_e64 s21, v1, v2"], 4, 64).splitlines()
+        self.assertIn("; mattr: +wavefrontsize64,-wavefrontsize32", text)
+        self.assertIn("s_mov_b64 exec, -1", text)
+        self.assertIn("v_cmp_lt_f32_e64 s[22:23], v1, v2", text)
+
+    def test_kernel_for_wave64(self):
+        k = d.hw_kernel(["v_cmp_lt_f32_e64 s20, v1, v2"], 64)
+        self.assertEqual(k.wave, 64)
+        self.assertIn("v_cmp_lt_f32_e64 s[20:21], v1, v2", k.lines)
+
+    def test_verdict_classes(self):
+        lines = prefix() + ["v_fract_f32 v1, v2"] + d.observe([1, 2, 3, 4])
+        same = [0x3F800000, 0, 0, 0]
+        self.assertEqual(d.vk_verdict(lines, same, list(same))[0], "match")
+        nan = [QNAN, 0, 0, 0]
+        self.assertEqual(d.vk_verdict(lines, nan, [0xFFC00001, 0, 0, 0])[0], "match")     # any NaN
+        klass, why = d.vk_verdict(lines, same, [0x3F800001, 0, 0, 0])
+        self.assertEqual(klass, "mismatch")
+        self.assertIn("word 0", why)
+        # a denormal seed makes the reference decline: a difference there is the denormal gap, not a mismatch
+        den = prefix(v={2: 0x00000001}) + ["v_fract_f32 v1, v2"] + d.observe([1, 2, 3, 4])
+        self.assertEqual(d.vk_verdict(den, [0, 1, 0, 0], [0x3F800000, 1, 0, 0])[0], "denormal")
+
+    def test_vk_needs_the_hardware(self):
+        r = subprocess.run([sys.executable, "-I", str(TOOL), "--oracle", "vk", "--programs", "1"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--oracle hw,vk", r.stderr)
 
 
 if __name__ == "__main__":

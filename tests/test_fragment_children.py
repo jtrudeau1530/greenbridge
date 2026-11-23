@@ -115,6 +115,13 @@ class TestFragmentChildren(unittest.TestCase):
         self.assertEqual(stats["stray_drawables"], 1)
         self.assertEqual(stats["fragments_with_stray"], 1)
 
+    def test_stray_at_the_last_aligned_offset_is_found(self):
+        # 0x1f50 + 176 == 0x2000: the body ends exactly at the end of the page, with or without trailing padding
+        for padding in (0, 16):
+            with self.subTest(padding=padding):
+                stats = self.scan(archive(fragment(strays=(0x1f50,)) + bytes(padding)))
+                self.assertEqual(stats["stray_drawables"], 1)
+
     def test_null_shader_group_is_still_a_body(self):
         b = bytearray(fragment(drawables=2))
         struct.pack_into("<Q", b, MAIN + RECORD + 16, 0)
@@ -223,6 +230,21 @@ class TestCommandLine(unittest.TestCase):
             self.assertEqual(self.run_tool(path, "--json", path).returncode, 2)
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), archive(fragment()))
+
+    def test_output_in_a_missing_folder_is_refused_before_the_scan(self):
+        # a typo in the folder used to raise at write time, after a scan that can run for hours
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive(fragment(drawables=3)))
+            for flag in ("--json", "--records"):
+                with self.subTest(flag=flag):
+                    out = os.path.join(tmp, "no-such-folder", "out")
+                    result = self.run_tool(path, flag, out)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("no-such-folder", result.stderr)
+                    self.assertNotIn("a.rpf:", result.stdout)   # the scan did not start
+                    self.assertFalse(os.path.exists(os.path.dirname(out)))
 
 
 if __name__ == "__main__":

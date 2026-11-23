@@ -13,6 +13,19 @@ Usage:
 With ``--probe`` each stream is written to a temporary file and passed to
 ``ffprobe``; the extra columns say only whether that ffprobe build can decode
 the stream. A missing ffprobe leaves the base columns unchanged.
+A single named file that is neither a Bink 2 stream nor an RPF archive is an
+error (exit 2), not an empty index; a directory scan still reports 0 streams
+when nothing matches.
+
+A single named file has to start with ``KB2`` or an RPF header; anything else
+(an empty file, a text file, a carved chunk) cannot hold a stream and is one
+error line with exit 2, which is how a wrong path shows up.
+
+In an RPF9 archive the last ``u32 +12`` bytes of the file are a block of their own
+(``docs/rpf.md``), so when the gap after the last stream reaches EOF and is at least
+that long, those bytes are counted as ``rpf_trailer`` and only the rest of the gap is
+split into zero padding and unread bytes.
+Usage: `python -I tools/bink_index.py --help` lists the options.
 """
 import argparse
 import csv
@@ -137,14 +150,18 @@ def scan_file(path, source):
     size = os.path.getsize(path)
     if size == 0:
         return rows, {"files_scanned": 1, "streams": 0, "bytes": 0, "zero_padding": 0,
-                      "unread_bytes": 0, "span": 0}
+                      "rpf_trailer": 0, "unread_bytes": 0, "span": 0}
     with open(path, "rb") as fh:
         with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            start = 0
-            if size >= 8 and bytes(data[1:4]) == b"FPR":
-                hint = struct.unpack_from("<I", data, 4)[0]
+            start = trailer_size = 0
+            if size >= 16 and bytes(data[1:4]) == b"FPR":
+                hint, trailer_size = struct.unpack_from("<I4xI", data, 4)
                 if HDR <= hint < size:
                     start = hint
+                # +12 as the trailer size is measured on RPF9 only, where it is always a multiple of 16
+                # (docs/rpf.md, "The trailer at EOF"); any other value leaves the tail to the zero/unread split.
+                if bytes(data[0:1]) != b"9" or trailer_size % 16:
+                    trailer_size = 0
             pos = start
             last = start
             zero = unread = 0
@@ -164,13 +181,14 @@ def scan_file(path, source):
                 rows.append(row)
                 last = match.start() + row["size"]
                 pos = last
-            z, u = _gap(data, last, len(data))
+            trailer = trailer_size if 0 < trailer_size <= len(data) - last else 0
+            z, u = _gap(data, last, len(data) - trailer)
             zero += z
             unread += u
             span = len(data) - start
     stats = {"files_scanned": 1, "streams": len(rows),
              "bytes": sum(r["size"] for r in rows), "zero_padding": zero,
-             "unread_bytes": unread, "span": span}
+             "rpf_trailer": trailer, "unread_bytes": unread, "span": span}
     return rows, stats
 
 
@@ -182,18 +200,23 @@ def scan_target(target, skip_report=None):
     repeat invocation does not count the previous report's bytes.
     """
     rows, total = [], {"files_scanned": 0, "streams": 0, "bytes": 0,
-                       "zero_padding": 0, "unread_bytes": 0, "span": 0}
+                       "zero_padding": 0, "rpf_trailer": 0, "unread_bytes": 0, "span": 0}
     if os.path.isdir(target):
         base = target
         paths = []
-        for root, _dirs, files in os.walk(target):
+
+        def scan_failed(error):
+            raise error
+
+        for root, _dirs, files in os.walk(target, onerror=scan_failed):
             for name in files:
                 path = os.path.join(root, name)
                 if skip_report is not None and same_output_path(path, skip_report):
                     continue
-                paths.append(path)
-        for path in sorted(paths):
-            got, stats = scan_file(path, os.path.relpath(path, base))
+                # "/" in the source and the sort key, so the report is the same on every platform
+                paths.append((os.path.relpath(path, base).replace(os.sep, "/"), path))
+        for source, path in sorted(paths):
+            got, stats = scan_file(path, source)
             rows.extend(got)
             for key in total:
                 total[key] += stats[key]
@@ -290,6 +313,16 @@ def write_json(path, target, rows, summary, probe):
                   fh, indent=1)
 
 
+def is_rpf_archive(path):
+    """True when *path* starts with an RPF header (``?FPR``)."""
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(16)
+    except OSError:
+        return False
+    return len(header) >= 16 and header[1:4] == b"FPR"
+
+
 def same_output_path(first, second):
     """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
     if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
@@ -298,6 +331,21 @@ def same_output_path(first, second):
         return os.path.samefile(first, second)
     except OSError:
         return False
+
+
+def target_problem(path):
+    """None when a single named file is something this tool indexes, else a one-line reason.
+
+    The scan only searches the bytes for `KB2` headers, so a wrong path or a mislabelled file came back as a
+    successful scan of 0 streams. An RPF archive may hold no stream and is a real answer.
+    """
+    with open(path, "rb") as fh:
+        head = fh.read(4)
+    if not head:
+        return "empty file"
+    if head[1:4] != b"FPR" and not SIG.match(head):
+        return "not a Bink 2 stream (KB2) or an RPF archive"
+    return None
 
 
 def main(argv=None):
@@ -313,7 +361,8 @@ def main(argv=None):
         ap.error(f"--out is a folder, not a report file: {a.out}")
     if a.out and os.path.isdir(a.target):
         manifest = os.path.join(a.target, "index.json")
-        if os.path.isfile(manifest) and same_output_path(a.out, manifest):
+        # Reserved even before the carve writes it: other tools read <target>/index.json as the carve manifest.
+        if same_output_path(a.out, manifest):
             ap.error(f"--out would overwrite the carve manifest: {a.out}")
         if os.path.isfile(a.out):
             for root, _dirs, names in os.walk(a.target):
@@ -325,6 +374,15 @@ def main(argv=None):
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2
+    if not os.path.isdir(a.target):
+        try:
+            problem = target_problem(a.target)
+        except OSError as error:
+            print(f"bink_index: error: cannot read {a.target}: {error.strerror or error}", file=sys.stderr)
+            return 2
+        if problem:
+            print(f"bink_index: error: {a.target}: {problem}", file=sys.stderr)
+            return 2
 
     skip_report = None
     if a.out and os.path.isfile(a.out):
@@ -334,6 +392,11 @@ def main(argv=None):
     except OSError as error:
         path = error.filename or a.target
         print(f"bink_index: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+        return 2
+    if not rows and not os.path.isdir(a.target) and not is_rpf_archive(a.target):
+        # A named file with no Bink 2 stream and no RPF header is a wrong path or
+        # format, not an empty index; a directory scan still reports 0 streams.
+        print(f"bink_index: error: {a.target}: not a Bink 2 stream or an RPF archive", file=sys.stderr)
         return 2
     probe = False
     if a.probe:
@@ -356,7 +419,8 @@ def main(argv=None):
             print(f"bink_index: error: cannot write {a.out}: {error}", file=sys.stderr)
             return 2
         print(f"{len(rows)} Bink 2 streams, {summary['bytes']} bytes, "
-              f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding")
+              f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding, "
+              f"{summary['rpf_trailer']} RPF trailer")
     else:
         if fmt == "json":
             fields = BASE_FIELDS + (PROBE_FIELDS if probe else [])
@@ -371,7 +435,8 @@ def main(argv=None):
             for row in rows:
                 writer.writerow(_flat(row, fields))
         print(f"{len(rows)} Bink 2 streams, {summary['bytes']} bytes, "
-              f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding",
+              f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding, "
+              f"{summary['rpf_trailer']} RPF trailer",
               file=sys.stderr)
     return 0
 
