@@ -70,6 +70,32 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertIn("No available targets", p.stderr)
         self.assertIn("AMDGPU target", p.stderr)
 
+    def test_undecodable_probe_error_is_reported_without_a_traceback(self):
+        # 0x81 is invalid in both UTF-8 and cp1252 (the -I locale on Windows).
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "sys.stderr.buffer.write(b'llvm-mc: \\x81\\x8d\\x8f\\x90\\x9d\\xff\\n')\n"
+                       "sys.exit(1)\n")
+        p = self.run_tool(mc, os.path.join(self.dir, "out"))
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("did not disassemble an s_endpgm: llvm-mc: ", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_undecodable_shader_error_is_reported_without_a_traceback(self):
+        mc = self.fake("import sys\n"
+                       "if sys.stdin.read().strip() == %r:\n"
+                       "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
+                       "    sys.exit(0)\n"
+                       "sys.stderr.buffer.write(b'error: \\x81\\x8d\\x8f\\x90\\x9d\\xff\\n')\n"
+                       "sys.exit(1)\n" % PROBE)
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("'failed': 1", p.stdout)
+        self.assertIn("produced no disassembly", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
     def test_empty_output_is_a_failure_and_writes_nothing(self):
         mc = self.fake("import sys\n"
                        "if sys.stdin.read().strip() == %r:\n"
