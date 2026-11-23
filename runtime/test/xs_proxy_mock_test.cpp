@@ -398,6 +398,111 @@ int check_levels() {
             EXPECT(r75 == E_NOTIMPL && !queue1 && mock->calls[75] == 0);
         }
 
+        // 133: past every PC device vtable; the retail title calls it. Refused, not a jump through a missing entry.
+        EXPECT(hr_of(raw(device, 133)) == E_NOTIMPL && mock->calls[127] == 0);
+
+        // 133 with a handler (CreatePlacedResourceX): the arguments in the title's positions (va, desc, state,
+        // clear, riid, out) reach the handler with the real device, the Xbox flag bits masked to the PC ones the host
+        // takes (0x20004 -> 0x4, and 0x200 dropped) and the buffer's Xbox layout word made ROW_MAJOR.
+        {
+            static void* seen_real = nullptr;
+            static void* seen_va = nullptr;
+            static D3D12_RESOURCE_DESC seen_desc{};
+            static GUID seen_iid{};
+            static std::uint32_t seen_layout = 0;
+            const xs::PlacedAtVaHandler handler = [](ID3D12Device* real_device, void* va,
+                                                     const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
+                                                     REFIID iid, void** out) -> HRESULT {
+                seen_layout = layout;
+                seen_real = real_device;
+                seen_va = va;
+                seen_desc = desc;
+                seen_iid = iid;
+                *out = reinterpret_cast<void*>(0x1330);
+                return S_OK;
+            };
+            xs::set_placed_at_va_handler(handler);
+            D3D12_RESOURCE_DESC xbox_desc{};
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            xbox_desc.Width = 0x10000;
+            xbox_desc.Height = xbox_desc.DepthOrArraySize = xbox_desc.MipLevels = 1;
+            xbox_desc.SampleDesc.Count = 1;
+            xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);  // the Xbox row-major word
+            xbox_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20204);
+            const GUID resource_iid = __uuidof(ID3D12Resource);
+            void* placed = nullptr;
+            void* const va = reinterpret_cast<void*>(0x7f0000000000ull);
+            const HRESULT r133 = hr_of(raw(device, 133, word(va), word(&xbox_desc), 0xFFFFFFFFull, 0,
+                                           word(&resource_iid), word(&placed)));
+            xs::set_placed_at_va_handler(nullptr);
+            EXPECT(r133 == S_OK && placed == reinterpret_cast<void*>(0x1330));
+            EXPECT(seen_real == xs::device_proxy_real_device(device) && seen_va == va);
+            EXPECT(static_cast<std::uint32_t>(seen_desc.Flags) == 0x4);
+            EXPECT(seen_desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && seen_desc.Width == 0x10000);
+            EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
+            EXPECT(seen_layout == 0xFFFFFFFFu);  // the title's third word, passed through as the barrier layout
+            EXPECT(xs::device_slot_overridden(133));
+        }
+
+        // 133 with a pages hook (set_placed_at_va_pages_hook): a buffer's range [va, va + width) is handed to it
+        // before the handler runs; a texture is not; a hook that fails still leaves the call to the handler.
+        {
+            static int order = 0;
+            static int hook_at = 0;
+            static int handler_at = 0;
+            static const void* hook_va = nullptr;
+            static std::size_t hook_bytes = 0;
+            static bool hook_result = true;
+            order = hook_at = handler_at = 0;
+            const xs::PlacedAtVaPagesHook hook = [](const void* va, std::size_t bytes) -> bool {
+                hook_at = ++order;
+                hook_va = va;
+                hook_bytes = bytes;
+                return hook_result;
+            };
+            const xs::PlacedAtVaHandler handler = [](ID3D12Device*, void*, const D3D12_RESOURCE_DESC&, std::uint32_t,
+                                                     REFIID, void** out) -> HRESULT {
+                handler_at = ++order;
+                *out = reinterpret_cast<void*>(0x1331);
+                return S_OK;
+            };
+            xs::set_placed_at_va_handler(handler);
+            xs::set_placed_at_va_pages_hook(hook);
+            D3D12_RESOURCE_DESC xbox_desc{};
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            xbox_desc.Width = 0xadf0000;
+            xbox_desc.Height = xbox_desc.DepthOrArraySize = xbox_desc.MipLevels = 1;
+            xbox_desc.SampleDesc.Count = 1;
+            xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);
+            const GUID resource_iid = __uuidof(ID3D12Resource);
+            void* placed = nullptr;
+            void* const va = reinterpret_cast<void*>(0x7f0000010000ull);
+            auto place = [&]() {
+                placed = nullptr;
+                return hr_of(raw(device, 133, word(va), word(&xbox_desc), 0xFFFFFFFFull, 0, word(&resource_iid),
+                                 word(&placed)));
+            };
+            const HRESULT buffer_hr = place();
+            EXPECT(buffer_hr == S_OK && placed == reinterpret_cast<void*>(0x1331));
+            EXPECT(hook_at == 1 && handler_at == 2 && hook_va == va && hook_bytes == 0xadf0000);
+
+            hook_result = false;
+            order = hook_at = handler_at = 0;
+            const HRESULT refused_hr = place();
+            EXPECT(refused_hr == S_OK && hook_at == 1 && handler_at == 2);
+            hook_result = true;
+
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            xbox_desc.Width = 64;
+            xbox_desc.Height = 64;
+            order = hook_at = handler_at = 0;
+            const HRESULT texture_hr = place();
+            EXPECT(texture_hr == S_OK && hook_at == 0 && handler_at == 1);
+
+            xs::set_placed_at_va_pages_hook(nullptr);
+            xs::set_placed_at_va_handler(nullptr);
+        }
+
         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
         Mock* const fence_mock = reinterpret_cast<Mock*>(real_fence);
         EXPECT(release(queue) == 0 && release(fence) == 0);
