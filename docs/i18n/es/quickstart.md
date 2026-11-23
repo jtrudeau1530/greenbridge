@@ -3,7 +3,7 @@
 > [!NOTE]
 > La documentación en inglés ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) y
 > [`docs/README.md`](../../README.md)) es **la referencia oficial**. Esta guía solo recoge las instrucciones
-> estables de instalación y compilación (sincronizada con el commit `aa2988cc`). Para el estado del proyecto, que
+> estables de instalación y compilación (sincronizada con el commit `561b65a8`). Para el estado del proyecto, que
 > cambia a diario, consulte el [`README.md`](../../../README.md).
 
 ## Qué es Leonida
@@ -55,6 +55,15 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
   más antiguos).
 - [ffmpeg](https://ffmpeg.org/download.html) en el `PATH` *(opcional: decodifica los flujos XMA2 y es obligatorio
   con `--wav`)*.
+
+**Poco espacio en disco:** los ~350 GB son para la compilación completa. Para *ejecutar* el port,
+`--stages check,shaders,runtime` necesita unos 30 GB; la etapa `assets` (~300 GB) solo es para las herramientas de
+recursos, y `--wav` añade varias veces el tamaño del Ogg Opus (la comprobación previa muestra esta elección cuando
+la etapa `assets` es la que no cabe). `--work` y `--out` pueden estar en otra unidad. El runtime asigna el paquete
+en su lugar, por lo que una unidad de solo lectura requiere `gta6rt --overlay <carpeta escribible>`; `--overlay`
+es una opción de `gta6rt`, no de `make_game.py`. Deje los archivos `.s` en `work/shaders/dxbc/disasm` donde están:
+borrarlos, junto con `work/shaders/spirv/index.json`, puede dejar la etapa de shaders aparentemente terminada con
+cero shaders. Una carpeta `disasm` que sea un enlace simbólico se rechaza cuando la etapa tiene que vaciarla.
 
 ## Compilar
 
