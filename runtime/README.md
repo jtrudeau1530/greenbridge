@@ -136,6 +136,16 @@ clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
 directory (or with an all-zero one) load normally.
 
+A `/GA` executable's code reaches its static TLS directly at index 0 (`mov r64, gs:[58h]`), but the
+loader can only get that image an index from the OS, and it need not be 0. Before the image's sections
+are protected and before any of its code runs, TLS callbacks included, the loader rewrites each such
+slot-0 read in an executable section to the same instruction reading `TEB->TlsSlots[slot]` instead
+(`patch_ga_tls_reads`), with one `TlsAlloc` slot per image; the rewrite is the same length, so nothing
+else in the image moves. It applies only to an EXE whose own TLS index is not 0 and that has a TLS
+directory; the loader's log names the image, the number of rewritten reads and the slot. Set
+`LEONIDA_TLS_GA_PATCH=0` to turn the rewrite off, for measuring what the image does without it; any other
+value, or leaving it unset, keeps it on.
+
 Current limits, by design:
 
 - `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own
