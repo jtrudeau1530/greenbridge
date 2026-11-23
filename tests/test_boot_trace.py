@@ -196,6 +196,28 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["events"], 2)
         self.assertEqual(trace["bad_lines"], 1)
 
+    def test_malformed_exit_records_preserve_the_last_valid_code(self):
+        for code in (0, -7):
+            with self.subTest(code=code):
+                self.write(self.startup, [
+                    {"kind": "trace_open", "pid": 123},
+                    {"kind": "exit", "code": code},
+                    {"kind": "exit"},
+                    {"kind": "exit", "code": "0"},
+                    {"kind": "exit", "code": True},
+                    {"kind": "exit", "code": None},
+                    {"kind": "exit", "code": 0.0},
+                    {"kind": "debug_string", "text": "synthetic"},
+                ])
+                trace = bt.parse_startup(self.startup)
+                self.assertEqual(trace["bad_lines"], 5)
+                self.assertEqual(trace["bad_line_numbers"], [3, 4, 5, 6, 7])
+                self.assertEqual(trace["events"], 3)
+                self.assertEqual(trace["kinds"]["exit"], 1)
+                self.assertIs(type(trace["exit"]), int)
+                self.assertEqual(trace["exit"], code)
+                self.assertEqual(trace["debug_strings"], 1)
+
     def test_d3d12_summary(self):
         self.write_lines(self.d3d12, D3D12)
         trace = bt.parse_d3d12(self.d3d12)
