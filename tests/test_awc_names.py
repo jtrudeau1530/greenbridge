@@ -207,6 +207,42 @@ class TestConversations(unittest.TestCase):
         # a repeated label is one variation, not two
         self.assertEqual(waves, ["yy_xau_efgh_01", "zz_rootau_abcd_01", "zz_rootau_abcd_02"])
 
+    @staticmethod
+    def pairs(*labels):
+        return [b"ZZ_ROOTAU_ABCD\x00" + label + b"\x00" for label in labels]
+
+    def carve(self, tmp, streams):
+        """A carve folder: one `<offset>.bin` per stream, laid out at 64 KiB steps as rpf9_carve.py names them."""
+        folder = os.path.join(tmp, "story000")
+        os.makedirs(folder)
+        for k, data in enumerate(streams):
+            write(os.path.join(folder, f"{k * 0x10000:012x}.bin"), data)
+        return folder
+
+    def full_stream(self, tail, head=b"PSIN" + bytes(12), size=65536):
+        """`size` bytes that start with `head` and end with `tail`."""
+        return head + b"\x01" * (size - len(head) - len(tail)) + tail
+
+    def test_pair_across_a_continuation_boundary(self):
+        # A carved stream of a whole number of 64 KiB blocks continues in the next file (docs/page_directory.md):
+        # the third pair is cut after 10 bytes and must still count, so the key has four waves (docs/audio.md).
+        one, two, three, four = self.pairs(b"ZZ_LINE_A", b"ZZ_LINE_B", b"ZZ_LINE_C", b"ZZ_LINE_D")
+        for size in (65536, 2 * 65536):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as tmp:
+                folder = self.carve(tmp, [self.full_stream(one + two + three[:10], size=size),
+                                          three[10:] + b"\x02" * 8 + four])
+                waves = sorted(A.conversation_waves([folder]))
+                self.assertEqual(waves, [f"zz_rootau_abcd_{n:02d}" for n in range(1, 5)])
+
+    def test_streams_that_do_not_continue_are_matched_apart(self):
+        # A stream short of a whole block ends its blob, and a new PSIN stream starts one: no pair is made across.
+        one, two = self.pairs(b"ZZ_LINE_A", b"ZZ_LINE_B")
+        for first, second in ((self.full_stream(one + two[:10], size=65535), two[10:]),
+                              (self.full_stream(one + two[:10]), b"PSIN" + two[10:])):
+            with self.subTest(first=len(first)), tempfile.TemporaryDirectory() as tmp:
+                folder = self.carve(tmp, [first, second])
+                self.assertEqual(A.conversation_waves([folder]), ["zz_rootau_abcd_01"])
+
 
 class TestCli(unittest.TestCase):
     def test_sources_with_same_basename_keep_separate_summaries_and_streams(self):
