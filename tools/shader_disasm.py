@@ -13,6 +13,7 @@ Set LLVM_MC to llvm-mc's path, or to a whole command such as
 """
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -27,6 +28,7 @@ import rdna2_decode  # noqa: E402
 
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
+DOT4_I8_OPCODE = 0x16         # VOP3P v_dot4_i32_i8
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
 FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
 
@@ -89,10 +91,8 @@ def probe(mcpu: str) -> None:
              f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
-def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
-    if backend == "python":
-        asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
-        return asm, bad, ""
+def run_mc(code: bytes, mcpu: str):
+    """One llvm-mc pass over `code`: (listing, invalid word count, stderr), or ("", count, reason) when it failed."""
     text = " ".join(f"0x{b:02x}" for b in code)
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
@@ -104,6 +104,82 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     if p.returncode != 0:
         return "", bad, p.stderr.strip() or f"llvm-mc exited with code {p.returncode}"
     return p.stdout, bad, p.stderr
+
+
+ENCODING = re.compile(r"; encoding: \[([^\]]*)\]")
+INVALID_AT = re.compile(r":1:(\d+): warning: invalid instruction encoding")
+
+
+def invalid_offsets(err: str) -> set:
+    """Byte offsets llvm-mc rejected: its warning names the column of the word in the one line of 5-character
+    "0xNN " tokens it was given."""
+    return {(int(col) - 1) // 5 for col in INVALID_AT.findall(err)}
+
+
+def dot4_op_sel_words(code: bytes, offsets) -> dict:
+    """{offset: (word0, word1)} of the dword pairs at `offsets` that are v_dot4_i32_i8 with op_sel 2 and op_sel_hi 5,
+    no clamp and no neg: the form 89 words of the FidelityFX upscaler's programs take (docs/fspx.md). llvm-mc has no
+    decoding for it, and a plain v_dot4_i32_i8 has op_sel 0 and op_sel_hi 7. Only this combination is recognised:
+    its result was measured on hardware (tests/semantic/test_alu_dot4_i8.py), the other op_sel values were not."""
+    found = {}
+    for at in sorted(offsets):
+        if at % 4 or at + 8 > len(code):
+            continue
+        w0, w1 = struct.unpack_from("<2I", code, at)
+        if (w0 >> 23 == 0x198 and (w0 >> 16) & 0x7F == DOT4_I8_OPCODE and (w0 >> 8) & 7 == 0     # VOP3P, neg_hi
+                and (w0 >> 11) & 7 == 2 and (w0 >> 14) & 1 == 1 and (w0 >> 15) & 1 == 0          # op_sel, hi[2], clamp
+                and (w1 >> 27) & 3 == 1 and (w1 >> 29) & 7 == 0):                                # op_sel_hi[1:0], neg_lo
+            found[at] = (w0, w1)
+    return found
+
+
+def with_dot4_op_sel(code: bytes, mcpu: str, bad: int, err: str):
+    """The listing of `code` with each rejected v_dot4_i32_i8 op_sel 2 / op_sel_hi 5 word printed as the instruction
+    it is, or None when there is none. llvm-mc rejects the pair, so it is decoded with the two fields at their
+    defaults (op_sel 0, op_sel_hi 7), and each such line gets the real fields and the real encoding back: the
+    translator then reads the instruction and checks its encoding against the blob. A word that is not printed as
+    v_dot4_i32_i8 at an instruction boundary was not an instruction (it sits in a literal or in data), so it is
+    left as it was and the pass runs again without it."""
+    words = dot4_op_sel_words(code, invalid_offsets(err))
+    while words and bad:
+        patched = bytearray(code)
+        for at, (w0, w1) in words.items():
+            struct.pack_into("<2I", patched, at, w0 & ~(7 << 11), w1 | (2 << 27))
+        asm, bad2, err2 = run_mc(bytes(patched), mcpu)
+        if not asm.strip():
+            return None
+        invalid, pos, hit, lines = invalid_offsets(err2), 0, set(), []
+        for line in asm.split("\n"):
+            enc = ENCODING.search(line)
+            if not enc:
+                lines.append(line)
+                continue
+            while pos in invalid:
+                pos += 4
+            if pos in words and line.lstrip("\t").startswith("v_dot4_i32_i8 "):
+                hit.add(pos)
+                w0, w1 = words[pos]
+                original = ",".join(f"0x{b:02x}" for b in struct.pack("<2I", w0, w1))
+                line = line[:enc.start()].rstrip() + " op_sel:[0,1,0] op_sel_hi:[1,0,1]"
+                line = f"{line:<40}; encoding: [{original}]"
+            lines.append(line)
+            pos += len(enc.group(1).split(","))
+        if hit == set(words):
+            return "\n".join(lines), bad2, err2
+        words = {at: w for at, w in words.items() if at in hit}
+    return None
+
+
+def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
+    if backend == "python":
+        asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
+        return asm, bad, ""
+    asm, bad, err = run_mc(code, mcpu)
+    if bad and asm.strip():
+        fixed = with_dot4_op_sel(code, mcpu, bad, err)
+        if fixed:
+            return fixed
+    return asm, bad, err
 
 
 MAX_DATA_DWORDS = 1 << 16
