@@ -121,7 +121,7 @@ def main(argv=None):
     names = load_names(archive, mount, use_cache=not a.no_cache)
 
     if a.list:
-        w = (a.name or "").lower()
+        w = (a.name or "").replace("\\", "/").lower()
         for path, _, width, height, frames in names:
             if w in path.lower():
                 print(f"{path}  {width}x{height}, {frames} frames")

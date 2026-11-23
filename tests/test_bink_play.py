@@ -18,6 +18,20 @@ NAMES = [
 ]
 
 
+class ListTest(unittest.TestCase):
+    def test_filter_accepts_both_path_separators_and_ignores_case(self):
+        from io import StringIO
+
+        names = [("Clips/Demo.bk2", 4096, "640", "480", "24"), *NAMES]
+        with mock.patch.object(Path, "is_file", return_value=True), \
+                mock.patch.object(bink_play, "load_names", return_value=names):
+            for query in ("Clips/Demo", r"Clips\Demo", "cLiPs/dEmO", r"cLiPs\dEmO"):
+                with self.subTest(query=query), mock.patch.object(sys, "stdout", new_callable=StringIO) as stdout:
+                    rc = bink_play.main(["--game-dir", "synthetic", "--list", query])
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(stdout.getvalue(), "Clips/Demo.bk2  640x480, 24 frames\n")
+
+
 class PickTest(unittest.TestCase):
     def test_exact_path_wins_case_insensitively_and_with_backslashes(self):
         hit, _ = bink_play.pick(NAMES, "stinger\\intro_a.BK2")
