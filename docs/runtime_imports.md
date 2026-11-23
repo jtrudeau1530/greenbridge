@@ -114,6 +114,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   or two threads opening the same file never leave a truncated copy under its name; a delete of a
   package file leaves an empty marker under `<overlay>\.gta6rt-deleted`, which reads and listings treat as gone. The
   package is never written.
+- `DeleteFileA/W` checks the visible file's `FILE_ATTRIBUTE_READONLY`: a read-only package file with no overlay is
+  refused with `ERROR_ACCESS_DENIED` before writing a deletion marker. An overlay copy supplies its own attributes,
+  so a writable overlay can still be deleted when the package file underneath is read-only. The native A/W controls
+  in `file_system_test` cover these cases and mixed hidden, system and archive attributes.
 - Reads prefer the overlay copy and then the package. `FindFirstFile` merges the two folders, the overlay winning on a
   name, and hides deleted names, the marker folder and the copy folder.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title

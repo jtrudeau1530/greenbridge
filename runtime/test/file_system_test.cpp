@@ -392,6 +392,102 @@ int main() {
               "the parent folder stays listed after deleting a nested package file");
     }
 
+    // DeleteFile checks the visible file's read-only bit. A package file is hidden by a marker instead of being
+    // passed to the host DeleteFile, but that must not bypass the same refusal. Compare each API with a real host
+    // file and keep the package and overlay attributes independent.
+    {
+        struct DeleteCase {
+            const char* name;
+            DWORD package_attributes;
+            DWORD overlay_attributes;  // zero means there is no overlay copy
+        };
+        constexpr DWORD mixed = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
+        const DeleteCase cases[] = {
+            {"package-readonly", FILE_ATTRIBUTE_READONLY, 0},
+            {"package-normal", FILE_ATTRIBUTE_NORMAL, 0},
+            {"package-mixed-readonly", FILE_ATTRIBUTE_READONLY | mixed, 0},
+            {"package-mixed-writable", mixed, 0},
+            {"readonly-package-normal-overlay", FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_NORMAL},
+            {"normal-package-readonly-overlay", FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY},
+            {"readonly-package-readonly-overlay", FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_READONLY},
+            {"readonly-package-mixed-overlay", FILE_ATTRIBUTE_READONLY, mixed},
+            {"normal-package-mixed-readonly-overlay", FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY | mixed},
+        };
+        for (const bool narrow : {false, true}) {
+            for (const auto& item : cases) {
+                const std::string leaf = std::string(narrow ? "a-" : "w-") + item.name + ".bin";
+                const std::filesystem::path relative = std::filesystem::path("delete-attributes") / leaf;
+                const auto package_file = package / relative, overlay_file = overlay / relative;
+                const auto native_file = root / "native-delete" / leaf;
+                const auto deletion_marker = overlay / ".gta6rt-deleted" / relative;
+                const bool has_overlay = item.overlay_attributes != 0;
+                const DWORD visible_attributes = has_overlay ? item.overlay_attributes : item.package_attributes;
+                const char* visible_bytes = has_overlay ? "overlay bytes" : "package bytes";
+                std::printf("DeleteFile%c case: %s\n", narrow ? 'A' : 'W', item.name);
+                write_path(package_file, "package bytes");
+                check(::SetFileAttributesW(package_file.c_str(), item.package_attributes) != FALSE,
+                      "set the synthetic package attributes");
+                const DWORD package_before = ::GetFileAttributesW(package_file.c_str());
+                if (has_overlay) {
+                    write_path(overlay_file, visible_bytes);
+                    check(::SetFileAttributesW(overlay_file.c_str(), item.overlay_attributes) != FALSE,
+                          "set the visible overlay attributes");
+                }
+                write_path(native_file, visible_bytes);
+                check(::SetFileAttributesW(native_file.c_str(), visible_attributes) != FALSE,
+                      "set the independent native file attributes");
+                std::string native_a;
+                if (narrow) {
+                    const UINT code_page = ::AreFileApisANSI() ? CP_ACP : CP_OEMCP;
+                    const int size = ::WideCharToMultiByte(code_page, 0, native_file.c_str(), -1, nullptr, 0,
+                                                           nullptr, nullptr);
+                    native_a.resize(size > 0 ? static_cast<size_t>(size) : 1);
+                    check(size > 0 && ::WideCharToMultiByte(code_page, 0, native_file.c_str(), -1, native_a.data(),
+                                                           size, nullptr, nullptr) == size,
+                          "encode the native DeleteFileA control path");
+                }
+                SetLastError(0);
+                const BOOL native_ok = narrow ? ::DeleteFileA(native_a.c_str()) : ::DeleteFileW(native_file.c_str());
+                const DWORD native_error = native_ok ? 0 : GetLastError();
+                const bool readonly = (visible_attributes & FILE_ATTRIBUTE_READONLY) != 0;
+                check((native_ok != FALSE) == !readonly && (native_ok || native_error == ERROR_ACCESS_DENIED),
+                      "native deletion rejects read-only and accepts other attribute combinations");
+                const std::wstring logical = L"GAME:\\" + relative.wstring();
+                const std::string logical_a = "GAME:\\delete-attributes\\" + leaf;
+                SetLastError(0);
+                const BOOL mapped_ok = narrow ? delete_a(logical_a.c_str()) : delete_w(logical.c_str());
+                const DWORD mapped_error = mapped_ok ? 0 : GetLastError();
+                check((mapped_ok != FALSE) == (native_ok != FALSE) && mapped_error == native_error,
+                      "shim deletion matches its native API's result and failure error");
+                check(read_path(package_file) == "package bytes" &&
+                          ::GetFileAttributesW(package_file.c_str()) == package_before,
+                      "deletion leaves package bytes and attributes unchanged");
+                check(std::filesystem::exists(deletion_marker) == !readonly,
+                      "only an accepted delete publishes a marker");
+                check(std::filesystem::exists(overlay_file) == (has_overlay && readonly),
+                      "a refused delete keeps its overlay and never copies the package up");
+                if (readonly) {
+                    check(attributes_w(logical.c_str()) == visible_attributes,
+                          "a refused delete retains the visible attributes");
+                    const HANDLE retained = create_w(logical.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                                     OPEN_EXISTING, 0, nullptr);
+                    check(retained != INVALID_HANDLE_VALUE && read_handle(retained) == visible_bytes,
+                          "a refused delete leaves the same logical bytes readable");
+                    if (retained != INVALID_HANDLE_VALUE) ::CloseHandle(retained);
+                } else {
+                    SetLastError(0);
+                    check(attributes_w(logical.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                              GetLastError() == ERROR_FILE_NOT_FOUND,
+                          "an accepted delete hides the logical file");
+                }
+                // Restore only these synthetic files, including on a failed assertion, for remove_all below.
+                ::SetFileAttributesW(package_file.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (std::filesystem::exists(overlay_file)) ::SetFileAttributesW(overlay_file.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (std::filesystem::exists(native_file)) ::SetFileAttributesW(native_file.c_str(), FILE_ATTRIBUTE_NORMAL);
+            }
+        }
+    }
+
     // Deleting one package file must not hide its folder. The overlay has never written to GAME:\pkgonly, so the
     // folder is only in the package, and its marker folder under .gta6rt-deleted is not a marker for the folder.
     {

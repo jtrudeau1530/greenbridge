@@ -890,6 +890,13 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
                 SetLastError(ERROR_ACCESS_DENIED);
                 return FALSE;
             }
+            // The overlay delete already checked its own attributes. Without an overlay, the package file's
+            // read-only bit still applies even though deletion only writes a marker instead of deleting that file.
+            if (!removed) {
+                const DWORD attributes = ::GetFileAttributesW(package_path.c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY) != 0)
+                    return fail_bool(ERROR_ACCESS_DENIED);
+            }
             // The package file stays where it is; the marker is what hides it.
             DWORD error = 0;
             if (!write_marker(marker(r.overlay, parts), error)) return fail_bool(error);
