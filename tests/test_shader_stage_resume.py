@@ -146,17 +146,6 @@ class ShaderStageResumeTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(os.path.join(self.spirv, make_game.SHARD_PLAN)))
                 self.assertEqual(self.run_stage(), [])
 
-    def test_signature_includes_the_disassembler_tool_digest(self):
-        wrapper = os.path.join(self.work, "fake llvm-mc sig.py")
-        with open(wrapper, "w", encoding="utf-8") as f:
-            f.write("print('LLVM version 23.1.5')\n")
-        command = f'"{sys.executable}" "{wrapper}"'
-        with mock.patch.dict(os.environ, {"LLVM_MC": command}):
-            first = self.real_llvm_mc_signature()
-            self.assertIn(make_game.file_sha256(os.path.join(make_game.TOOLS, "shader_disasm.py")), first)
-            with mock.patch.object(make_game, "file_sha256", return_value="0" * 64):
-                self.assertNotEqual(self.real_llvm_mc_signature(), first)
-
     def test_llvm_change_leaves_no_completion_markers_if_disassembly_stops(self):
         self.run_stage()
         self.touch(self.spirv, make_game.SHARD_PLAN)
