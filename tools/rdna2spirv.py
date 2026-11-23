@@ -4496,9 +4496,12 @@ class Gen:
         return v
 
     def lds_load(self, addr, byte_off, bound=None):
+        # Volatile: another lane's ds_write may come between two accesses of this lane, and the Vulkan memory model
+        # orders nothing between invocations without a barrier, so a driver may otherwise move this read ahead of
+        # the wave's earlier writes or merge it with another read (docs/design.md, "LDS access order within a wave").
         def f(p):
             v = self.tmp()
-            self.emit(f"{v} = OpLoad %uint {p}")
+            self.emit(f"{v} = OpLoad %uint {p} Volatile")
             return v
         return self.lds_access(addr, byte_off, f, bound)
 
@@ -4510,7 +4513,7 @@ class Gen:
         return min(self.lds_declared, self.lds_dwords) if self.lds_declared else self.lds_dwords
 
     def lds_store(self, addr, byte_off, val):
-        self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val}"))
+        self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val} Volatile"))   # as lds_load
 
     def lds_next_in_bounds(self, addr, byte_off):
         """Bool: the dword after the one at (addr + byte_off) is inside the allocation (lds_cross_bound)."""
@@ -4585,10 +4588,10 @@ class Gen:
             ptr = self.lds_ptr(addr, off)
             if op == "ds_read_addtid_b32":
                 value = self.tmp()
-                self.emit(f"{value} = OpLoad %uint {ptr}")
+                self.emit(f"{value} = OpLoad %uint {ptr} Volatile")       # as lds_load
                 self.dst(a[0], value)
             else:
-                self.emit(f"OpStore {ptr} {self.src_u(a[0])}")
+                self.emit(f"OpStore {ptr} {self.src_u(a[0])} Volatile")
         elif op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
             addr = self.src_u(a[1])
             for k in range(sizes[op.rsplit("_", 1)[1]]):
