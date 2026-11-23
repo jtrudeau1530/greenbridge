@@ -26,6 +26,7 @@
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
+#include "d3d12_xs_desc_clean.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -1653,13 +1654,14 @@ void** get_vtable();
 struct StructReturnCall {
     DeviceProxy* self;
     void* ret;
+    bool console_abi;
 };
 
 StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
     void** const vtable = get_vtable();
     if (a0 && *reinterpret_cast<void***>(a0) == vtable)  // PC form: this, return buffer
-        return {reinterpret_cast<DeviceProxy*>(a0), reinterpret_cast<void*>(a1)};
-    return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0)};  // C form: return buffer, this
+        return {reinterpret_cast<DeviceProxy*>(a0), reinterpret_cast<void*>(a1), false};
+    return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0), true};  // C form: return buffer, this
 }
 
 // The console size of a list of descriptions (d3d12_xs_alloc_size.h): the PC device's answer with every console render
@@ -1686,9 +1688,25 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     note_slot(25);
     const StructReturnCall call = struct_return_call(a0, a1);
     ID3D12Device* const real = call.self->real;
-    const UINT mask = static_cast<UINT>(visible_mask), n = static_cast<UINT>(count);
-    D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, n, descs);
-    apply_console_placement(descs, n, info, nullptr,
+    // Normalize console descriptors in a copy. PC calls can also pass the Xbox tiled layout explicitly. Otherwise
+    // their flags and layout reach the host unchanged so the host can validate them.
+    const UINT desc_count = static_cast<UINT>(count);
+    std::unique_ptr<D3D12_RESOURCE_DESC[]> clean;
+    if (descs && desc_count) {
+        clean.reset(new (std::nothrow) D3D12_RESOURCE_DESC[desc_count]);
+        if (!clean) {
+            *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = {UINT64_MAX, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+            return call.ret;
+        }
+        for (UINT i = 0; i < desc_count; ++i) {
+            const auto& desc = descs[i];
+            clean[i] = call.console_abi || desc.Layout == kXboxTiledResourceLayout ? pc_resource_desc(desc) : desc;
+        }
+        descs = clean.get();
+    }
+    const UINT mask = static_cast<UINT>(visible_mask);
+    D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
+    apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
