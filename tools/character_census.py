@@ -143,7 +143,8 @@ def model_json_files(directory: str):
 
 
 def _read_json(path: str):
-    with open(path, encoding="utf-8") as handle:
+    # utf-8-sig: a model.json or manifest saved by a Windows editor starts with a BOM, which json.load refuses.
+    with open(path, encoding="utf-8-sig") as handle:
         return json.load(handle)
 
 

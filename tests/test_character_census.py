@@ -428,6 +428,23 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(data["summary"]["models"], 1)
         self.assertEqual(data["models"][0]["name"], "synthetic_static")
 
+    def test_model_json_saved_with_a_utf8_bom_is_read(self):
+        # A model.json saved by a Windows editor starts with a UTF-8 BOM. Read as plain utf-8, json.load refuses it
+        # ("Unexpected UTF-8 BOM"), and the census counted the model as unknown with an issue instead of reading it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "models"
+            model = root / "bom" / "model.json"
+            model.parent.mkdir(parents=True)
+            model.write_bytes(b"\xef\xbb\xbf" + json.dumps(static_model()).encode("utf-8"))
+            out = pathlib.Path(tmp) / "report.json"
+            result = self.run_tool(root, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(data["summary"]["models"], 1)
+            row = data["models"][0]
+            self.assertEqual(row["name"], "synthetic_static")
+            self.assertEqual(row["issues"], [])
+
     def test_signed_and_underscore_hashes_are_not_hashes(self):
         # Python's int(text, 16) accepts a sign and underscores; the documented grammar is hex digits only.
         with tempfile.TemporaryDirectory() as tmp:
