@@ -2839,7 +2839,9 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   can replace it). `SetFrameIntervalX` takes the interval as a period in microseconds and the latency, and starts
   the vblank grid. `ScheduleFrameEventX` arms the origin event, delayed by an offset inside the frame.
   `WaitFrameEventX` returns at the next origin with the next token (1, 2, 3, ...; 0 is the null token) and does not
-  return while `latency` presented frames are still waiting for their vblank. A wait that comes late returns at once
+  return while `latency` presented frames are still waiting for their vblank. A frame presented before the origin event
+  is armed is not paced (`PresentX` does not hold it for a vblank), so it is shown at once and never waits for a vblank:
+  blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
   `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
   `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render;
