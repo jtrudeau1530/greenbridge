@@ -11858,13 +11858,16 @@ class Gen:
         self.emit(f"{mask} = OpLoad %uint {mp}")
         # One slot per turn of a loop that stops at the first match, not PROBES copies of the comparison. A shader
         # compiler inlines this function at every use, and the unrolled copies were 95% of its work on a shader
-        # with 330 lookups (117 s to compile with 8 slots unrolled, 14 s with one, 6 s with none).
+        # with 330 lookups (117 s to compile with 8 slots unrolled, 14 s with one, 6 s with none). Break directly
+        # to %dl_end on a hit with DontUnroll: overwriting %dl_k to fall out of a single-exit loop leaves %dl_idx
+        # on the loop header's phi, which Mesa ANV 26.1.6 (Intel UHD 630, CFL GT2) miscompiles in ps_table_fetch
+        # by hoisting the binding-table-index add above the loop (reading slot 0 / magenta before %dl_idx is set).
         kv, iv = "%dl_k", "%dl_idx"                  # slot number, and the result (0 until a slot matches)
         self.body[0:0] = [f"         {kv} = OpVariable %_ptr_Function_uint Function %c0",
                           f"         {iv} = OpVariable %_ptr_Function_uint Function %c0"]
         self.emit("OpBranch %dl_head")
         self.body.append("%dl_head = OpLabel")
-        self.emit("OpLoopMerge %dl_end %dl_cont None")
+        self.emit("OpLoopMerge %dl_end %dl_cont DontUnroll")
         self.emit("OpBranch %dl_body")
         self.body.append("%dl_body = OpLabel")
         k, s, slot, base = self.tmp(), self.tmp(), self.tmp(), self.tmp()
@@ -11889,8 +11892,7 @@ class Gen:
         self.emit(f"{p} = OpAccessChain %_ptr_SB_uint %desc_map %c0 {o}")
         self.emit(f"{v} = OpLoad %uint {p}")
         self.emit(f"OpStore {iv} {v}")
-        self.emit(f"OpStore {kv} {self.cu(self.PROBES)}")          # the first match ends the search
-        self.emit("OpBranch %dl_next")
+        self.emit("OpBranch %dl_end")                # the first match breaks out of the probe loop directly
         self.body.append("%dl_next = OpLabel")
         self.emit("OpBranch %dl_cont")
         self.body.append("%dl_cont = OpLabel")
