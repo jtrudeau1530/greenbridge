@@ -516,7 +516,7 @@ class MalformedSlayerTest(unittest.TestCase):
 
 class ImportTest(unittest.TestCase):
     def test_encoding_matches_the_shim(self):
-        # Same rule as encode_name() in runtime/shims/xgameruntime_services.cpp.
+        # Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp.
         self.assertEqual(saves.xgs_encode("slot 1/main"), "slot%201%2Fmain")
         self.assertEqual(saves.xgs_encode("world.dat"), "world.dat")
         self.assertEqual(saves.xgs_encode(".hidden"), "%2Ehidden")

@@ -15,7 +15,7 @@ Commands
   diff    <JSAV a> <JSAV b>      list blocks that were added, removed or changed between two saves
   import <save dir>... [--out DIR] [--map OLD=CONTAINER/BLOB]... [--with-packed] [--force] [--dry-run]
                                  copy the ASAV/JSAV payloads out of plain save folders into the on-disk layout
-                                 of the offline XGameSave shim of the open #279 (not on main yet):
+                                 of the runtime's offline XGameSave (runtime/shims/xgameruntime_gamesave.cpp):
                                  DIR/local-user/<container>/<blob>, names %-encoded the same way.
                                  DIR defaults to %LOCALAPPDATA%\\Leonida\\saves (the shim's LEONIDA_SAVE_DIR default).
                                  VERIFY: container/blob names are a guess until the executable shows them; by default
@@ -433,7 +433,7 @@ def diff(pa, pb):
 
 # ---------------------------------------------------------------------------------------------- import
 def xgs_encode(name):
-    """Same rule as encode_name() in runtime/shims/xgameruntime_services.cpp: keep
+    """Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp: keep
     [A-Za-z0-9_-] and '.' except as the first character; everything else becomes %XX (uppercase hex) per UTF-8 byte."""
     out = []
     for c in name.encode('utf-8'):
