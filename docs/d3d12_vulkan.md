@@ -1455,13 +1455,13 @@ The layer therefore owns the console VAs. It returns them from `ID3D12Resource::
 | Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture (1D, 2D or 3D) gets its own `VkDeviceMemory` and a null VA, as in D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures (D3D-191) and multisampled 2D placed textures (D3D-222) share that backing, answer `GetResourceAllocationInfo` and `GetResourceTiling`, and check heap/offset alignments. Reserved buffers can use heap tile mappings (section 4.2). |
 | Descriptor heaps | Shader-visible CBV/SRV/UAV and sampler heaps are allocated in the low 4 GB of the arena. RTV/DSV heaps are host-side only. |
 | Shader code | Each FSSM blob is uploaded to the arena; its console VA is the code base. |
-| Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**Assumption**; **measured to fail for a V#**, see below). |
+| Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**ASSUMPTION**; **measured to fail for a V#**, see below). |
 
 Non-arena buffers (upload/readback) can still be addressed by the shader without putting them in the arena: pass
 `console_va = host_bda - heap_base` (mod 2^64) in root descriptors and vertex/index/indirect views, so the shader's
 `heap_base + console_va` equals the host BDA. For descriptors, patch the V# base field the same way when the layer
 copies or scans them. This relies on the game not using the raw VA for anything except shader addressing
-(**Assumption**); if it does, the resource must move into the arena instead.
+(**ASSUMPTION**); if it does, the resource must move into the arena instead.
 
 **Measured (D3D-53, `d3d12_translated_draw_test`):** the bias works for 64-bit root arguments (`d3d12_compute_test`: a root
 CBV and a table slot that point at an upload buffer) but **not for a V#**. A V#'s base field is 48 bits
@@ -2047,6 +2047,39 @@ Pipeline creation:
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
 
+**Implemented (D3D-29): pipeline state streams, mesh PSOs and `DispatchMesh`.**
+- **Device:** `VK_EXT_mesh_shader` with `meshShader` is enabled where the GPU has it (`VulkanDeviceInfo::mesh_shader`).
+  `taskShader` is not enabled, since the corpus has no amplification shaders. `D3D12_OPTIONS7` reports
+  `MeshShaderTier` 1 only then; without the extension it reports `NOT_SUPPORTED` and mesh PSOs are `E_NOTIMPL`.
+- **Streams:** `CreatePipelineState` parses the stream in the d3dx12.h layout: a subobject type, then its
+  description at that description's alignment, each subobject pointer-aligned.
+  - Every type up to `RASTERIZER2` is read.
+  - Missing subobjects take the runtime's defaults: depth test on with `LESS`, back-face culling, no blending, sample
+    mask `0xFFFFFFFF`, one sample.
+  - The stream becomes the same descriptions `CreateGraphicsPipelineState` and `CreateComputePipelineState` take, so
+    a VS stream builds the same PSO as the classic call.
+  - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
+    tessellation or GS, CS with a graphics stage, or no stage at all.
+  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, separate front and back stencil
+    masks, view instancing.
+  - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.
+- **Mesh PSO:** the MS (`ms` index entry by FSSM hash) and PS on the mesh stage. It has no vertex input or input
+  assembly; the input layout, topology type and strip cut are ignored, as D3D12 ignores them for mesh PSOs. Topology
+  and strides are not dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065/07066). Creation
+  is refused when the index's `max_vertices`/`max_primitives` or the workgroup size exceed the device's
+  `VkPhysicalDeviceMeshShaderPropertiesEXT`.
+- **`DispatchMesh`:** recorded as a `Draw` with `mesh` set; the thread-group counts go in `count`/`instances`/`first`.
+  It takes the same state snapshot as `DrawInstanced`: render targets, root arguments, viewport, scissor, blend
+  factor, stencil references. Replay issues `vkCmdDrawMeshTasksEXT`.
+  - **Recording errors** (`Close` returns `E_INVALIDARG`): a grid above 65535 per count or 2^22 groups.
+  - **Not recorded:** an empty grid.
+  - **Execution error** (`ReplayResult::invalid_draw`): a mesh draw with a VS pipeline, or the reverse.
+- **Tests:** `d3d12_mesh_test` checks the refusals and three draws pixel by pixel on an RX 9060 XT (RADV, under
+  Wine), validation-clean.
+  - **The three draws:** a 2×2×1 and a 1×1×2 mesh grid, plus a VS PSO from a stream.
+  - **What it doesn't cover:** whether the console flattens a 3D `DispatchMesh` grid the same way. That is an open
+    question in `docs/design.md`, "Mesh shaders"; the test shader reads the workgroup ID directly.
+
 ## 4. Object model mapping
 
 | D3D12 / Xbox object | Vulkan / layer object | Notes |
@@ -2295,7 +2328,7 @@ The trace will enumerate them.
     heap reads back 0.
     `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates
     committed resources instead. Buffer mappings alone do not implement a full tiled-resources tier.
-    The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**Assumption**:
+    The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**ASSUMPTION**:
     that the console uses it for reserved resources too).
   - `GetResourceTiling`: the standard 64 KiB tile shapes, standard and packed mips (a mip stays standard while it is
     wider than half the tile or taller than the tile, depth not counting, as AMD's PC runtime does on RDNA2 and RDNA4
@@ -2341,7 +2374,7 @@ The trace will enumerate them.
     is deeper than a tile it steps at each tile depth (8x8x32 R8 takes 1 tile, 8x8x33 takes 2, 8x8x256 takes 8), even
     where the bytes would fit in fewer (16x16x128 RGBA8: 8 tiles for 3 tiles of data). Those 32 are in the test too,
     79 layouts in all, identical on both GPUs. The console is RDNA2, so the layer follows this rule (D3D-65;
-    **Assumption**: that the console's runtime splits like the PC's AMD driver).
+    **ASSUMPTION**: that the console's runtime splits like the PC's AMD driver).
   - `UpdateTileMappings` and `CopyTileMappings` bind pages in reserved buffers to default heaps from D3D-16.
     Sequential, NULL, SKIP and single-tile reuse ranges are supported. Queue timeline waits order binding between
     ordinary submissions, and the previous heap allocation is retained until an in-flight unbind completes.
@@ -2464,7 +2497,7 @@ The trace will enumerate them.
   write, those to the dependent resources among them, so the copy sees them all, as D3D12 requires. The dependent
   ranges are checked against their buffers but add nothing a global barrier does not already cover. Recording
   follows the debug layer's `ATOMICCOPYBUFFER_*` rules (IDs 1027-1040): offsets aligned to the copy size and at
-  least one dependency. **Assumption:** Vulkan promises no atomicity for a transfer, and the layer relies on a
+  least one dependency. **ASSUMPTION:** Vulkan promises no atomicity for a transfer, and the layer relies on a
   naturally aligned 4- or 8-byte copy being a single write on the GPU. This matters only to a reader racing the
   copy on another queue or on the host.
 - Clears: a full-subresource clear maps to `vkCmdClearColorImage`/`vkCmdClearDepthStencilImage` (UAV buffers to
@@ -3180,6 +3213,25 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   results still match and all 11 statistics counters are zero. Without a statistics pool (single-list `replay()` or
   a queue without the summation helper), these three commands are refused before helper scratch allocation or
   recording. The resolve fallback is unchanged: only resolves needing dispatches are refused there.
+- **Mesh draws during a pipeline-statistics query** (D3D-291). D3D12 allows `DispatchMesh` inside a statistics query
+  and reads its input-assembly, vertex, geometry and tessellation fields as 0. Vulkan forbids `vkCmdDrawMeshTasksEXT`
+  while a query with those counters is active (`VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076`), and the heap's
+  pool has all eleven. So a statistics query that holds a mesh draw is split as above, and a split before a draw stays
+  outside its rendering scope. A segment's first draw decides its pool: the submission's full pool, or a second pool
+  with only clipping invocations and primitives, fragment and compute invocations. A later draw of the other kind ends
+  the segment and begins one of its own kind; dispatches and segments without draws use the full pool, and
+  `ExecuteIndirect` draws count as vertex draws. The sum copies a mesh segment's four counters into fields 5 to 8 of
+  its record, and `statistics_sum.comp` adds them as `CInvocations`, `CPrimitives`, `PSInvocations` and
+  `CSInvocations`, so the other fields get nothing from it. A query that holds only mesh draws is one mesh segment,
+  resolved through the same sum. Without the compute helper there is no segment pool and such a list is refused
+  (`unsupported`) rather than run unsplit; so is one on the single-list `replay()` (D3D-399), whose
+  `create_segment_pool` gives no mesh pool. Overlapping statistics queries (D3D-252) split the same way inside their
+  shared segments: a draw of the other kind than the open segment's opens a new one, so every query that segment
+  belongs to sums both kinds. `replay_query_predication_test` (cases 15 and 16) checks the split points, the segment
+  kinds and the resolve plan on the CPU. `d3d12_mesh_test` resolves a query around a vertex, two mesh and a vertex
+  draw, one around a mesh draw and one around the two vertex draws: the vertex fields count only the two triangles,
+  and the mixed query has more clipping and pixel-shader invocations than the vertex-only one. On the RX 9060 XT
+  (RADV), the clipping counts add up exactly (2 + 10 = 12).
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 - **Timestamp resolves on MoltenVK.** On Apple GPUs, MoltenVK delays every `vkCmdWriteTimestamp` to the end of
@@ -3380,6 +3432,7 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Binning | The GDK topic index names Xbox binning modes (NDA content) | Should be a no-op if the game uses it only as an optimisation: it changes how a render pass uses on-chip memory, not the result. Log and ignore for the first boot; revisit for performance. **Open** whether the game relies on binning for correctness. |
 | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
 | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; 1-2 planes composed into the Vulkan swapchain (placement, filter, alpha overlay, HDR10 conversions). Call shapes known; slots/layouts **Open**. |
+| Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
 | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
 | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |
@@ -3559,7 +3612,7 @@ contract, not a runtime bug:
 
 - Only 155 shaders use code-embedded data, and a graphics pipeline has at least two stages (typically VS+PS, or
   MS+PS). If only one stage in a pipeline uses it, the layer can set that stage's code base; the other stage never
-  reads it. This probably covers the first boot. **Assumption.**
+  reads it. This probably covers the first boot. **ASSUMPTION.**
 - If both stages use it, the layer cannot satisfy both with the current contract. The clean fix is a translator
   change: give each stage its own code-base slot (for example dwords 34–35 VS, 36–37 PS, 38–39 CS, 40–41 GS/MS,
   extending the block to 168 bytes) and have each compiled shader read its stage's slot. A 168-byte push-constant

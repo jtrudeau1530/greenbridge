@@ -236,6 +236,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(file_system_test PRIVATE /OPT:NOREF)
   target_link_libraries(file_system_test PRIVATE advapi32)  # the ACL calls of the unlistable-marker-folder check
 
+  # LEONIDA_SKIP_INT3 (shims/startup_trace.h): its own executable, the variable is read once per process.
+  add_executable(int3_skip_test
+    test/int3_skip_test.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(int3_skip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(int3_skip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
+
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
@@ -612,6 +622,31 @@ if(BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       )
     endforeach()
+    # These linker-selected startup modes are specific to the MSVC CRT.
+    if(MSVC)
+      foreach(width a w)
+        foreach(mode default expand noargs)
+          set(target tiny_argv_${mode}_${width})
+          add_executable(${target} test/fixtures/tiny_argv_modes.cpp)
+          target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+          target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+          if(width STREQUAL "w")
+            target_compile_definitions(${target} PRIVATE APP_WIDE)
+          endif()
+          if(mode STREQUAL "expand")
+            if(width STREQUAL "w")
+              target_link_options(${target} PRIVATE wsetargv.obj)
+            else()
+              target_link_options(${target} PRIVATE setargv.obj)
+            endif()
+          elseif(mode STREQUAL "noargs")
+            target_link_options(${target} PRIVATE noarg.obj)
+          endif()
+          set_target_properties(${target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>")
+        endforeach()
+      endforeach()
+    endif()
     add_executable(tiny_atexit test/fixtures/tiny_atexit.cpp)
     target_compile_definitions(tiny_atexit PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8)
@@ -828,6 +863,9 @@ if(BUILD_TESTING)
     add_test(NAME xs_proxy_mock_no_reserve COMMAND xs_proxy_mock_test --fail-virtualalloc)
     add_test(NAME xs_proxy_mock_no_protect COMMAND xs_proxy_mock_test --fail-virtualprotect)
     add_test(NAME xs_proxy_mock_no_handler COMMAND xs_proxy_mock_test --fail-veh)
+    # The routes are read once per process, so each override case is its own test.
+    add_test(NAME xs_proxy_mock_env_slots COMMAND xs_proxy_mock_test --env-slots)
+    add_test(NAME xs_proxy_mock_env_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
@@ -966,6 +1004,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
   endif()
+  if(WIN32 AND TARGET int3_skip_test)
+    add_test(NAME int3_skip COMMAND int3_skip_test)
+  endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
   endif()
@@ -1043,6 +1084,16 @@ if(BUILD_TESTING)
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+    if(TARGET tiny_argv_default_a AND NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME run_argv_modes COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_argv_modes.py"
+          --loader "$<TARGET_FILE:gta6rt>" --fixtures "$<TARGET_FILE_DIR:tiny_argv_default_a>"
+          --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+        set_tests_properties(run_argv_modes PROPERTIES TIMEOUT 90)
+      endif()
+    endif()
     add_test(NAME run_startup_cmdline COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
@@ -1124,6 +1175,13 @@ if(LEONIDA_D3D12_SHIM_TESTS)
 endif()
 endif()
 
+# CPU-only: which SPIR-V capabilities make the standalone GPU tools ask for shaderInt64 (TEST-468). It includes no
+# Vulkan header, so it builds and runs without them, unlike the tools below that use it.
+add_executable(spirv_capability_test test/spirv_capability_test.cpp)
+if(BUILD_TESTING)
+  add_test(NAME spirv_capability COMMAND spirv_capability_test)
+endif()
+
 # GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
 # Nothing is downloaded unless asked: set VULKAN_SDK, install the Vulkan headers, pass
 # -DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release once at configure time
@@ -1183,8 +1241,9 @@ if(TARGET Vulkan::Headers)
     endif()
   endif()
   if(BUILD_TESTING)
-    if(WIN32)
+    if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       # Real Win32 environment and DXGI names, with D3D12 device creation stubbed: no GPU commands or game files.
+      # It includes the runtime's D3D12 shim headers, so it needs the same Windows SDK as the runtime.
       add_executable(host_adapter_test test/host_adapter_test.cpp)
       target_link_libraries(host_adapter_test PRIVATE Vulkan::Headers dxgi)
       target_compile_definitions(host_adapter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1558,6 +1617,17 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_texture_tiles PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
+    # DXR acceleration-structure prebuild and command-list recording validation parity test.
+    add_executable(d3d12_dxr_validation_test test/d3d12_dxr_validation_test.cpp)
+    target_link_libraries(d3d12_dxr_validation_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_dxr_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_dxr_validation_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_dxr_validation COMMAND d3d12_dxr_validation_test)
+    add_test(NAME d3d12_dxr_validation_khr COMMAND d3d12_dxr_validation_test)
+    set_tests_properties(d3d12_dxr_validation d3d12_dxr_validation_khr PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    set_tests_properties(d3d12_dxr_validation_khr PROPERTIES ENVIRONMENT "LEONIDA_RT_AS=khr")
+
     # D3D12 permits UpdateTileMappings on DIRECT/COPY/COMPUTE and a sparse buffer must remain
     # accessible across their selected Vulkan families. The optional API-dump check catches an
     # EXCLUSIVE VkBuffer even on drivers that happen to return correct bytes without ownership barriers.
@@ -1796,6 +1866,16 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_close_parity_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_close_parity COMMAND d3d12_close_parity_test)
     set_tests_properties(d3d12_close_parity PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ExecuteIndirect recording-time Close() parity against live WARP and hardware D3D12, plus GPU dispatch sanity.
+    add_executable(d3d12_execute_indirect_validation_test test/d3d12_execute_indirect_validation_test.cpp)
+    target_link_libraries(d3d12_execute_indirect_validation_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_execute_indirect_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_execute_indirect_validation_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_execute_indirect_validation COMMAND d3d12_execute_indirect_validation_test)
+    set_tests_properties(d3d12_execute_indirect_validation PROPERTIES
+      SKIP_RETURN_CODE 77
+      FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
     add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
@@ -2572,8 +2652,28 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_stores_atomics_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_stores_atomics COMMAND d3d12_stores_atomics_test)
       set_tests_properties(d3d12_stores_atomics PROPERTIES SKIP_RETURN_CODE 77)
+
+      # D3D-29: mesh-shader PSOs from pipeline state streams and DispatchMesh (skips without VK_EXT_mesh_shader).
+      set(LEONIDA_TEST_MS ${CMAKE_CURRENT_BINARY_DIR}/generated/ms_draw.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_MS}
+        # Vulkan 1.2 (SPIR-V 1.5), the translator's target: 1.3 would emit LocalSizeId, which needs maintenance4.
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -o ${LEONIDA_TEST_MS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
+        COMMENT "Compiling the mesh test shader ms_draw.mesh"
+        VERBATIM)
+      add_executable(d3d12_mesh_test test/d3d12_mesh_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_MS}
+                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_VS_FULLSCREEN})
+      target_link_libraries(d3d12_mesh_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_MS_SPV="${LEONIDA_TEST_MS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
+      target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
+      set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_mesh_test are not built")
     endif()
 
     # Native D3D12 SV_InnerCoverage reference; its HLSL is compiled at runtime, so glslang is not needed.
@@ -2888,4 +2988,33 @@ if(TARGET Vulkan::Headers)
 else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
   leonida_vulkan_headers_missing()
+endif()
+
+# Timed condition-variable waits on Wine 9 (#3796): every Windows executable and DLL built against the dynamic CRT
+# (/MD, the default) gets src/crt_timed_wait.cpp, which keeps msvcprt.lib's statically linked timed wait out of the
+# link so that a wait and the mutex it unlocks always use msvcp140's own layout. A target that links the CRT
+# statically (MSVC_RUNTIME_LIBRARY MultiThreaded, MultiThreadedDebug) already agrees with itself and is left alone,
+# as are the fixtures linked with /NODEFAULTLIB, which have no CRT.
+if(WIN32 AND MSVC)
+  add_library(gta6rt_crt_timed_wait OBJECT src/crt_timed_wait.cpp)
+  target_compile_definitions(gta6rt_crt_timed_wait PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(gta6rt_crt_timed_wait PRIVATE /W4 /permissive- /utf-8)
+  # A timed wait is woken by a thread that takes its mutex; shared_mutex and sleep_for still work.
+  add_executable(crt_timed_wait_test test/crt_timed_wait_test.cpp)
+  target_compile_options(crt_timed_wait_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+  add_test(NAME crt_timed_wait COMMAND crt_timed_wait_test)
+  set_tests_properties(crt_timed_wait PROPERTIES TIMEOUT 60)
+  get_property(_gta6rt_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_target IN LISTS _gta6rt_targets)
+    get_target_property(_type ${_target} TYPE)
+    if(NOT _type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
+      continue()
+    endif()
+    get_target_property(_crt ${_target} MSVC_RUNTIME_LIBRARY)
+    get_target_property(_link_options ${_target} LINK_OPTIONS)
+    if((_crt AND NOT _crt MATCHES "DLL") OR "/NODEFAULTLIB" IN_LIST _link_options)
+      continue()  # static CRT, or no CRT at all (the CRT-free fixtures)
+    endif()
+    target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)
+  endforeach()
 endif()
