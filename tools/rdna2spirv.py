@@ -262,7 +262,8 @@ class Gen:
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
         self.uses_psb = False
         self.uses_active = False
-        self.vm_latch = False      # PS: EXEC can change after a `vm` export, so that export's EXEC is kept
+        self.vm_latch = False      # PS: EXEC can change after a `vm` or color export, so EXEC at those is kept
+        self.col_latched = []      # PS with vm_latch: the color targets (mrtN) whose export EXEC is kept
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
         self.uses_tex = False
         self.uses_dynamic_sampled_index = False
@@ -13619,6 +13620,11 @@ class Gen:
         if self.vm_latch and "vm" in ins["mods"]:       # any target, null included
             self.emit(f"OpStore %vm_mask {self.active_b()}")
             self.emit("OpStore %vm_set %true")
+        if self.vm_latch and is_color_export(ins):
+            if tgt not in self.col_latched:
+                self.col_latched.append(tgt)
+            self.emit(f"OpStore %col_mask_{tgt} {self.active_b()}")
+            self.emit(f"OpStore %col_set_{tgt} %true")
         if tgt is None or tgt == "null":
             return
         if self.stage == "ms":
@@ -14550,6 +14556,9 @@ def assemble(gen):
     if gen.vm_latch:
         fn += ["%vm_mask = OpVariable %_ptr_Function_bool Function %true",
                "%vm_set = OpVariable %_ptr_Function_bool Function %false"]
+        for t in gen.col_latched:
+            fn += [f"%col_mask_{t} = OpVariable %_ptr_Function_bool Function %true",
+                   f"%col_set_{t} = OpVariable %_ptr_Function_bool Function %false"]
     if gen.emulate:
         fn += ["%x_it = OpVariable %_ptr_Function_uint Function %c0",
                "%x_bar = OpVariable %_ptr_Function_bool Function %false",
@@ -14890,14 +14899,29 @@ def assemble(gen):
               "OpBranch %ms_pend", "%ms_pend = OpLabel"]
         end_lock = "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L) + end_lock
     if gen.uses_active and gen.stage == "ps":
-        # A pixel lane off in EXEC at the last `vm` export is discarded. Without a latch EXEC can't have changed since
-        # that export, or there is none: then it is EXEC at the end.
+        # A pixel is written when its lane was on in EXEC at the last `vm` export the path ran (if it ran one) and
+        # at the last export to its color target (measured on RDNA2 with one target; docs/design.md, EXEC). With
+        # several targets the pixel stays when any of them got an export from the lane: Vulkan can't skip one
+        # attachment per pixel, so the others keep what the lane exported before (or the initial value). Without a
+        # latch EXEC can't have changed since those exports, so EXEC at the end is the same mask; a path with no
+        # export at all also goes by EXEC at the end.
         keep, latched = "%act_end", ""
         if gen.vm_latch:
             keep = "%vm_keep"
             latched = ("         %vm_was_set = OpLoad %bool %vm_set\n"
                        "         %vm_exec = OpLoad %bool %vm_mask\n"
-                       "         %vm_keep = OpSelect %bool %vm_was_set %vm_exec %act_end\n")
+                       "         %vm_part = OpSelect %bool %vm_was_set %vm_exec %true\n"
+                       "         %no_col = OpSelect %bool %vm_was_set %true %act_end\n")
+            any_set, any_on = "%false", "%false"
+            for t in gen.col_latched:
+                latched += (f"         %col_was_set_{t} = OpLoad %bool %col_set_{t}\n"
+                            f"         %col_exec_{t} = OpLoad %bool %col_mask_{t}\n"
+                            f"         %col_on_{t} = OpLogicalAnd %bool %col_was_set_{t} %col_exec_{t}\n"
+                            f"         %col_any_set_{t} = OpLogicalOr %bool {any_set} %col_was_set_{t}\n"
+                            f"         %col_any_on_{t} = OpLogicalOr %bool {any_on} %col_on_{t}\n")
+                any_set, any_on = f"%col_any_set_{t}", f"%col_any_on_{t}"
+            latched += (f"         %col_part = OpSelect %bool {any_set} {any_on} %no_col\n"
+                        "         %vm_keep = OpLogicalAnd %bool %vm_part %col_part\n")
         tail = end_lock + ("         %act_end = OpLoad %bool %active\n" + latched +
                 "         OpSelectionMerge %live None\n"
                 f"         OpBranchConditional {keep} %live %dead\n"
@@ -15113,8 +15137,17 @@ def writes_exec(ins):
     return False
 
 
+def is_color_export(ins):
+    """An `exp` to a color target (mrt0-mrt7; not mrtz, null or a position / parameter)."""
+    a = ins["args"]
+    t = a[0].get("t", "") if a and a[0]["k"] in ("target", "special") else ""
+    return base_op(ins["op"]) == "exp" and t.startswith("mrt") and t[3:].isdigit()
+
+
 def exec_changes_after_vm(blocks, succ):
-    """Whether some path writes EXEC after an `exp ... vm`. Only then does a PS need that export's EXEC kept."""
+    """Whether some path writes EXEC after an `exp ... vm` or after a color export. Only then does a PS need EXEC
+    at those exports kept: a pixel is written when its lane was on at the last `vm` export and at the last color
+    export, and with EXEC unchanged since then that is EXEC at the end."""
     after = []
     for n, blk in enumerate(blocks):
         seen_vm = False
@@ -15124,7 +15157,7 @@ def exec_changes_after_vm(blocks, succ):
                 break
             if seen_vm and writes_exec(ins):
                 return True
-            if op == "exp" and "vm" in ins["mods"]:
+            if op == "exp" and ("vm" in ins["mods"] or is_color_export(ins)):
                 seen_vm = True
         if seen_vm:
             after += succ[n]

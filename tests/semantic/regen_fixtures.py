@@ -44,6 +44,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_sm
            "ps_vint_mul24",
            "ps_vint_minmax",
            "ps_vint_minmax3",
+           "ps_exp_color_mask",   # PS color-export mask (test_export_valid_mask.py)
            "ps_vcmp_f32_nan", "ps_vcmp_64", "cs_w32_andn2_exec")   # VOPC f32 NaN / 64-bit int compares; s_andn2_saveexec/wrexec_b32
 
 
