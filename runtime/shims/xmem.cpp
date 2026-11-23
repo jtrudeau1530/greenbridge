@@ -453,19 +453,14 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
 bool unmap_page(uintptr_t address) {
+    const FaultLockExclusive lock;
     const auto it = g_mapped.find(address);
     if (it == g_mapped.end()) return true;
-    MappedPage mapped = std::move(it->second);
-    {
-        const FaultLockExclusive lock;
-        g_mapped.erase(it);
-    }
     if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
                                        MEM_PRESERVE_PLACEHOLDER)) {
-        const FaultLockExclusive lock;
-        g_mapped.emplace(address, std::move(mapped));
         return false;
     }
+    g_mapped.erase(it);
     return true;
 }
 
@@ -481,11 +476,11 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
     }
     void* const target = reinterpret_cast<void*>(address);
     if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
+    const FaultLockExclusive lock;
     void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
                                                    it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
                                                    protect, nullptr, 0);
     if (!view) return false;
-    const FaultLockExclusive lock;
     g_mapped[address] = MappedPage{page, it->second.section, it->second.offset};
     return true;
 }

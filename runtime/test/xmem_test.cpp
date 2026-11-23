@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "shims.h"
@@ -595,6 +597,63 @@ void test_commit_physical_pages(const PhysicalApi& api) {
     check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees them");
 }
 
+void test_first_touch_during_remap(const PhysicalApi& api) {
+    constexpr uint64_t kSlice = 16;
+    constexpr uint64_t kSlices = 256;
+    std::vector<uint64_t> pages(kSlice * kSlices);
+    uint64_t count = pages.size();
+    check(api.allocate(0x280, &count, pages.data()) == TRUE && count == pages.size(),
+          "4,096 physical pages for the remap race");
+    if (count != pages.size()) return;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kSlice * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(window != nullptr, "XMemVirtualAlloc reserves a window for the remap race");
+    if (!window) {
+        api.free_pages(count, pages.data());
+        return;
+    }
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> touches{0};
+    std::atomic<uint64_t> unmapped_faults{0};
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([&, t] {
+            uint64_t i = static_cast<uint64_t>(t);
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto* const word =
+                    static_cast<volatile uint32_t*>(static_cast<void*>(window + (i % kSlice) * kPage64k)) + t;
+                if (access_faults(word, true)) {
+                    unmapped_faults.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    touches.fetch_add(1, std::memory_order_relaxed);
+                }
+                ++i;
+            }
+        });
+    }
+    const ULONGLONG started = GetTickCount64();
+    bool remapped = true;
+    for (uint64_t s = 0; s < kSlices; ++s) {
+        remapped &= api.map(window, kSlice, pages.data() + s * kSlice) == window;
+        Sleep(0);
+        remapped &= api.map(window, kSlice, nullptr) == window;
+    }
+    remapped &= api.map(window, kSlice, pages.data() + (kSlices - 1) * kSlice) == window;
+    stop.store(true);
+    for (auto& writer : writers) writer.join();
+    const ULONGLONG elapsed = GetTickCount64() - started;
+    check(remapped, "256 slices map and unmap while 4 threads write into the window");
+    check(elapsed < 30000, "first-touch faults during map and unmap finish without hanging");
+    check(touches.load() > 0, "writes land while the pages are mapped");
+    std::printf("remap race: %llu writes landed, %llu hit an unmapped page, %llu ms\n",
+                static_cast<unsigned long long>(touches.load()),
+                static_cast<unsigned long long>(unmapped_faults.load()), static_cast<unsigned long long>(elapsed));
+    static_cast<volatile uint32_t*>(static_cast<void*>(window))[8] = 0x600dcafe;
+    check(read_u32(window, 32) == 0x600dcafe, "the last slice is still mapped and writable");
+    api.map(window, kSlice, nullptr);
+    check(api.free_pages(count, pages.data()) == TRUE, "XMemFreePhysicalPages frees the remap race pages");
+}
+
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
 void test_placeholders(const PhysicalApi& api) {
     auto* const base = static_cast<uint8_t*>(
@@ -875,6 +934,7 @@ int main() {
         test_physical_pages(physical);
         test_physical_pages_commit_on_touch(physical);
         test_commit_physical_pages(physical);
+        test_first_touch_during_remap(physical);
         test_placeholders(physical);
     }
 
