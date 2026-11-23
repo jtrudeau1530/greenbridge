@@ -40,7 +40,8 @@ void copy_root_signature_desc_clear_xbox_flags(const D3D12_ROOT_SIGNATURE_DESC& 
 // leaves `out` empty) when no rewrite is needed: no RTS0 chunk, no Xbox high byte, or a malformed/truncated header.
 bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<uint8_t>& out);
 
-// The DXBC container hash of `blob` (bytes 20..size), as stored at bytes 4..19. `size` must be at least 20.
+// The DXBC container hash of `blob` (bytes 20..size), as stored at bytes 4..19. Zeroes `out` when `blob` is null,
+// `size < 20`, or the hashed payload exceeds the 32-bit bit-count limit.
 void dxbc_checksum(const uint8_t* blob, size_t size, uint32_t out[4]);
 
 }  // namespace rt::d3d12_xs
