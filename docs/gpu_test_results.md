@@ -6,7 +6,8 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 
 | GPU | Driver, OS | Commit | build.py | check.py | run_gpu_tests.py | Failed | Entry |
 |---|---|---|---|---|---|---|---|
-| AMD Radeon RX 9070 GRE (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.3.1-arch3.5, Vulkan 1.4.363, CachyOS | `05961f0` | 264/264 translated and valid | 203/206 pass, 3 skipped | 218/235 passed, 16 skipped (native and emulated) | `ms_wave_info_s3`, flaky (see below) | [local note](gpu-test-results/RX9070GRE.txt) |
+| AMD Radeon RX 9070 GRE (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.3.1-arch3.5, Vulkan 1.4.363, CachyOS | `05961f0` | 264/264 translated and valid | 203/206 pass, 3 skipped | 218/235 passed, 16 skipped (native and emulated) | `ms_wave_info_s3`, flaky (see below) | [local note](../gpu-test-results/RX9070GRE.txt) |
+| AMD Radeon RX 9070 XT (RDNA4, GFX1201), subgroup 32..64 | AMD 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 26300.9550 | `5d74c27` | not run | not run | 224/241 passed, 16 skipped, 1 failed (native); 225/241 passed, 0 failed (`LEONIDA_W64_EMULATE=1`) | `ms_wave_info_s3`, every native run, flaky emulated (see below) | [local note](../gpu-test-results/RX9070XT.txt) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -31,3 +32,41 @@ Every pixel test other than the flaky mesh fixture was exact (4096/4096).
 
 AI-assisted (Hermes Agent): built `main` at `05961f0`, ran `build.py`, `check.py` and
 `run_gpu_tests.py` (native and emulated) on this GPU, and verified the isolated reruns of the one failure.
+
+## AMD Radeon RX 9070 XT — 2026-11-23
+
+```
+GPU:        AMD Radeon RX 9070 XT (RDNA4 / GFX1201, Navi 48, PCI 1002:7550), subgroup 32..64
+Driver:     AMD proprietary 26.11.2 (LLPC), Vulkan 1.4.359
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64, subgroupSizeControl)
+OS:         Windows 11, 10.0.26300.9550
+Commit:     5d74c272363f2703265d44e6aaab1a1df8ddfaf3 (main, 2026-11-23)
+Tools:      llvm-mc from ROCm/AOMP 18.0-12 (LLVM 19.0.0git), SPIRV-Tools v2026.4,
+            CMake 4.4.5, Visual Studio 17 2022 generator, MSVC 19.44.35230.0, Python 3.11.9
+run_gpu_tests.py: 247 shaders: 247 translated, 247 pass spirv-val
+            native:                 224/241 passed, 16 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  225/241 passed, 16 skipped, 0 failed
+Failed:     ms_wave_info_s3: at (0,0) got (-1,-1,-1,-1), want (0.0078,0.0078,0.5,1.0).
+            Native: 3 of 3 isolated --filter reruns failed. Emulated: the full-suite
+            run passed it, then 1 of 3 isolated reruns passed, so the emulated path
+            is flaky here while native fails every time. Same signature as #6172 /
+            #5273 and as the RTX 4060 record (#8752), where it failed 3 of 3.
+Skipped:    16 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases.
+```
+
+Setup: `cmake -S runtime -B runtime/build` (default Visual Studio 17 2022 generator) and
+`cmake --build runtime/build --config RelWithDebInfo`. The suite ran on the AMD LLPC driver with
+the project's own `vk_harness`, `vk_compute_test` and `vk_store_test` binaries; no implicit layer
+beyond the Vulkan SDK's. Every other pixel and compute case was exact.
+
+The one failure is worth a note for #6172: on this machine the native 64-wide path fails
+`ms_wave_info_s3` on every run, while `LEONIDA_W64_EMULATE=1` passes it most of the time, which is
+the shape a lane-set-dependent race takes rather than a driver-specific miscompile. It also
+reproduces with an AMD proprietary driver, so the symptom is not tied to RADV or to Mesa's shader
+cache.
+
+`build.py` and `check.py` (the D3D12-side rows in the table) were not run here; the counts above
+come from `run_gpu_tests.py`, which builds and translates the same fixtures.
+
+AI-assisted (Cline): built `main` at `5d74c27` with MSVC, ran `run_gpu_tests.py` native and under
+`LEONIDA_W64_EMULATE=1`, and reran the failure in isolation three times each way.
