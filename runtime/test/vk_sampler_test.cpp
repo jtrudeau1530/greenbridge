@@ -14,6 +14,7 @@
 #include "vulkan_loader.h"
 #include "../src/vulkan_device_filter.h"
 #include "vk_pc_tail.h"
+#include "vk_shader_fma.h"
 
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
@@ -147,9 +148,16 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.samplerAnisotropy = sampler_info.anisotropyEnable;
+    leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
+    fma.query(gipa, inst, pd);
+    // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
+    if (!fma.accepts_file(argv[1]) || !fma.accepts_file(argv[2])) return unsupported;
+    fma.link_after(&enable);
+    const char* fma_extension = fma.extension();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    if (fma.supported()) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &fma_extension; }
     VkDevice dev = VK_NULL_HANDLE;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LD(n) const auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(dev, #n))

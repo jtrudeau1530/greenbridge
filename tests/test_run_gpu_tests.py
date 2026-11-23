@@ -227,6 +227,17 @@ class NotWholeWave(unittest.TestCase):
         self.assertEqual(judge(0, dump(WANT)), (True, "55 48"))
         self.assertIs(judge(77, "unavailable\n")[0], False)
 
+    def test_a_77_with_an_unsupported_reason_is_a_skip(self):
+        """A module that needs OpFmaKHR on a device without VK_KHR_shader_fma: vk_compute_test exits 77 with a reason."""
+        msg = ("unsupported: cs_x.spv needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device lacks it; "
+               "translate with --fma glsl\n")
+        for kw in ({}, {"emulated": True}, {"partial": True}):
+            with self.subTest(**kw):
+                ok, detail = judge(77, DEVICE_32 + msg, **kw)
+                self.assertIs(ok, None)
+                self.assertTrue(detail.startswith("SKIP (cs_x.spv needs OpFmaKHR"), detail)
+        self.assertIs(judge(77, DEVICE_32 + "no reason given\n")[0], False)       # a bare 77 stays a failure
+
     def test_hex_words(self):
         ok, detail = rgt.judge_cs_dump(0, dump([0x400080FF, 7]), [0x400080FF, 7], wave64=False, partial=False,
                                        emulated=False, hexwords=True)

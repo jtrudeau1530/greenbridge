@@ -346,6 +346,10 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
     if (wave64 and rc == 77) or (no64 and rc == 0):
         return None, "SKIP (no 64-wide compute subgroup on this device)"
+    if rc == 77:   # the program refused the module: "unsupported: <why>" is a skip, as for every other missing feature
+        why = next((ln for ln in msg.splitlines() if ln.startswith("unsupported:")), None)
+        if why:
+            return None, "SKIP (" + why[len("unsupported:"):].strip() + ")"
     if rc == 0 and wave64 and "compute subgroup size: 64" not in msg.splitlines():
         return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
     words = dump_words(msg)
