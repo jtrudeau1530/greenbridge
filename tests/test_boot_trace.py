@@ -382,6 +382,35 @@ class BootTraceTests(unittest.TestCase):
         ):
             self.assertIn(needle, text)
 
+    def test_last_observed_tls_callback_in_incomplete_startup(self):
+        first = {"kind": "tls_callback", "module": "first.dll", "at": "first.dll+0x1100", "reason": 1}
+        for fields, reason, phase in (
+            ({"reason": 1}, 1, "process attach"),
+            ({"reason": 0}, 0, "process detach"),
+            ({}, None, "phase unknown"),
+        ):
+            with self.subTest(phase=phase):
+                last = {"kind": "tls_callback", "module": "fixture.exe", "at": "fixture.exe+0x2200", **fields}
+                self.write(self.startup, [STARTUP[0], first, last])
+                with open(self.startup, "a", encoding="utf-8", newline="\n") as f:
+                    f.write('{"kind":"tls_callback","at":"truncated')
+
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(bt.main([self.startup, "--json"]), 0)
+                summary = json.loads(output.getvalue())
+                startup = summary["startup"]
+                self.assertEqual(startup["tls_callbacks"], 2)
+                self.assertEqual(startup["bad_lines"], 1)
+                self.assertIsNone(startup["exit"])
+                self.assertEqual(
+                    startup["last_tls_callback"],
+                    {"module": "fixture.exe", "at": "fixture.exe+0x2200", "reason": reason},
+                )
+                text = bt.format_text(summary, 10)
+                self.assertIn("tls callbacks: 2", text)
+                self.assertIn(f"last observed TLS callback: fixture.exe+0x2200 ({phase})", text)
+
 
 if __name__ == "__main__":
     unittest.main()

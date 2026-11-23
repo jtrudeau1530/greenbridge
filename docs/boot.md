@@ -100,7 +100,9 @@ Read the startup trace first; the first event that is not the expected one is th
    deliberate failure in `runtime/shims/registry.cpp`; rerun with `LEONIDA_UNIMPLEMENTED=stop` to halt at the first
    remaining blocker.
 3. **`tls_callback` / `dllmain`** — a failed DllMain, or a TLS callback that faults, usually points at the CRT or
-   TLS index; the loader's own TLS is checked by `run_tiny_game_tls`.
+   TLS index. The summary shows the address and phase of the last observed TLS callback
+   (`last_tls_callback` in JSON). The loader records it before invoking the callback, so the record gives no
+   completion result. The loader's own TLS is checked by `run_tiny_game_tls`.
 4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
    so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it reserves
    the final slot for the last observed exception. The trace also includes handled exceptions, so the last

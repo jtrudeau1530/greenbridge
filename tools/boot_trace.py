@@ -102,6 +102,11 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 )
             elif kind == "tls_callback":
                 trace["tls_callbacks"] += 1
+                trace["last_tls_callback"] = {
+                    "module": event.get("module"),
+                    "at": event.get("at"),
+                    "reason": event.get("reason"),
+                }
             elif kind == "dllmain":
                 if event.get("result"):
                     trace["dllmain"]["ok"] += 1
@@ -213,6 +218,13 @@ def format_text(summary: dict, limit: int) -> str:
             names = [m["module"] for m in startup["modules"]]
             out.append(f"  modules ({len(names)}): {_tail(names, limit)}")
         out.append(f"  tls callbacks: {startup['tls_callbacks']}")
+        if callback := startup.get("last_tls_callback"):
+            reason = callback["reason"]
+            phase = "phase unknown"
+            if type(reason) is int:
+                phase = {0: "process detach", 1: "process attach"}.get(reason, phase)
+            at = callback["at"] or "address unknown"
+            out.append(f"    last observed TLS callback: {at} ({phase})")
         dm = startup["dllmain"]
         line = f"  dllmain: {dm['ok']} ok, {dm['failed']} failed"
         if dm["failed_modules"]:
