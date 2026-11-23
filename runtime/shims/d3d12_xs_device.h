@@ -139,6 +139,13 @@ unsigned allocator_proxy_table_size();
 std::uint64_t allocator_slot_hits(unsigned slot);
 bool allocator_slot_first_call_seen(unsigned slot);
 std::uint64_t allocator_table_overruns();
+// Command list proxies created by device slot 73 (CreateCommandListX):
+bool is_command_list_proxy(const void* list);
+ID3D12GraphicsCommandList* command_list_proxy_real_list(const void* list);
+unsigned command_list_proxy_table_size();
+std::uint64_t list_slot_hits(unsigned slot);
+bool list_slot_first_call_seen(unsigned slot);
+
 // Heap slots 0-2, 7 (GetDevice -> device proxy) and 9/10 (handle conversion).
 bool heap_slot_overridden(unsigned slot);
 
