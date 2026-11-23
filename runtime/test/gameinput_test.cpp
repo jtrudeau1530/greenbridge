@@ -1599,6 +1599,27 @@ void test_haptic_motors(IGameInput* input) {
     rt::gameinput::poll();
     check(xbox.left == 0, "haptics: releasing both leaves the trigger silent");
 
+    // A request too long for a uint64 microsecond deadline plays until it is set again: the end time saturates
+    // instead of wrapping into the past (never plays) or into the near future (stops early).
+    p.intensity = 1.0f;
+    p.playCount = 1;
+    p.duration = UINT64_MAX;
+    p.repeatDelay = 0;
+    check(dev->SetHapticMotorState(0, &p) == S_OK, "haptics: a duration of UINT64_MAX is accepted");
+    rt::gameinput::poll();
+    check(xbox.left == 65535, "haptics: and plays (its end time does not wrap into the past)");
+    p.duration = (1ull << 63) + 50'000;  // times 2 wraps to 100 ms
+    p.playCount = 2;
+    check(dev->SetHapticMotorState(1, &p) == S_OK, "haptics: duration * playCount past UINT64_MAX is accepted");
+    rt::gameinput::poll();
+    Sleep(130);
+    rt::gameinput::poll();
+    check(xbox.right == 65535, "haptics: and keeps playing (the product does not wrap to a short request)");
+    dev->SetHapticMotorState(0, nullptr);
+    dev->SetHapticMotorState(1, nullptr);
+    rt::gameinput::poll();
+    check(xbox.left == 0 && xbox.right == 0, "haptics: both long requests stop when the state is cleared");
+
     detach(xbox);
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "haptics: detached");

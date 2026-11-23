@@ -2030,10 +2030,15 @@ HRESULT Device::SetHapticMotorState(uint32_t motorIndex, const void* params) {
     if (p->waveformIndex >= haptic_motor_info[motorIndex].waveformCount) return E_INVALIDARG;
     haptic_intensity[motorIndex] = std::clamp(p->intensity, 0.0f, 1.0f);
     // duration and repeatDelay are microseconds; playCount 0 plays until the state is set again. The poll thread sends
-    // the level and drops it when the deadline passes.
+    // the level and drops it when the deadline passes. The sums saturate: a request longer than a uint64 of
+    // microseconds (a duration of UINT64_MAX, say) ends at UINT64_MAX, which the poll thread never reaches, instead of
+    // wrapping to a deadline already past or only a moment away.
+    constexpr uint64_t kMax = UINT64_MAX;
+    const auto mul = [](uint64_t a, uint64_t b) { return b && a > kMax / b ? kMax : a * b; };
+    const auto add = [](uint64_t a, uint64_t b) { return a > kMax - b ? kMax : a + b; };
     uint64_t total = p->playCount == 0 ? 0 : p->duration;
-    if (p->playCount > 1) total = p->duration * p->playCount + p->repeatDelay * (p->playCount - 1);
-    haptic_until[motorIndex] = total ? now_us() + total : 0;
+    if (p->playCount > 1) total = add(mul(p->duration, p->playCount), mul(p->repeatDelay, p->playCount - 1));
+    haptic_until[motorIndex] = total ? add(now_us(), total) : 0;
     return S_OK;
 }
 
