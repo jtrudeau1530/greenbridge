@@ -141,7 +141,7 @@ _SOPP_BRANCHES = frozenset({
 
 # SOPP instructions that take no operand at all.
 _SOPP_NO_OPERAND = frozenset({
-    "s_endpgm", "s_barrier", "s_icache_inv", "s_ttracedata", "s_ttracedata_imm",
+    "s_endpgm", "s_barrier", "s_icache_inv", "s_ttracedata",
     "s_wakeup", "s_endpgm_saved", "s_code_end", "s_endpgm_ordered_ps_done",
 })
 
@@ -1349,7 +1349,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
     return None, 4
 
 
-def _format_operand(a: dict) -> str:
+def _format_operand(a: dict, hex_imm: bool = False) -> str:
     k = a["k"]
     if k in ("vgpr", "sgpr"):
         p = "v" if k == "vgpr" else "s"
@@ -1365,7 +1365,7 @@ def _format_operand(a: dict) -> str:
         s = a["t"]
     elif k == "imm":
         v = a["v"]
-        s = f"0x{v:x}" if v >= 100 else str(v)
+        s = f"0x{v:x}" if hex_imm or v >= 100 else str(v)
     elif k == "fimm":
         v = a["v"]
         s = next((txt for code, txt in _INLINE_FLOAT_STR.items() if _INLINE_FLOAT[code] == v), repr(v))
@@ -1389,10 +1389,12 @@ def format_insn(ins: dict) -> str:
     op = ins["op"]
     args = ins["args"]
     mods = ins["mods"]
+    hex_imm = op == "s_ttracedata_imm"
     if op == "exp" and args:
-        head = f"{op} {_format_operand(args[0])} " + ", ".join(_format_operand(x) for x in args[1:])
+        head = f"{op} {_format_operand(args[0], hex_imm)} " + ", ".join(
+            _format_operand(x, hex_imm) for x in args[1:])
     elif args:
-        head = f"{op} " + ", ".join(_format_operand(x) for x in args)
+        head = f"{op} " + ", ".join(_format_operand(x, hex_imm) for x in args)
     else:
         head = op
     if mods:
