@@ -730,6 +730,17 @@ OpStore %f32_control %control
         text = HEADER + "%p = OpAccessChain %_ptr_PC_uint %pc %c0\n%res = OpLoad %uint %p\nOpStore %out %res\n" + FOOTER
         self.assertEqual(si.run_fragment(text)["%out"][0], 0)
 
+    def test_a_module_run_twice_gives_the_same_words_and_the_same_parse_error(self):
+        # run_workgroup runs one generator per invocation over one text: each must see the same module.
+        text = HEADER + "%res = OpIAdd %uint %c1 %c2\nOpStore %out %res\n" + FOOTER
+        self.assertEqual(si.run_fragment(text)["%out"][0], 3)
+        self.assertEqual(si.run_fragment(text)["%out"][0], 3)
+        broken = HEADER + "%res = OpIAdd %uint %c1 %c2\nthis is not an instruction\n" + FOOTER
+        for _ in range(2):
+            with self.assertRaises(si.UnsupportedConstruct) as ctx:
+                si.run_fragment(broken)
+            self.assertIn("this is not an instruction", str(ctx.exception))
+
 
 class AggregateValueTests(unittest.TestCase):
     HEADER = """\

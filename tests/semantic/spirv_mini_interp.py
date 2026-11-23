@@ -460,6 +460,30 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
 
 
 _TICK = ("tick", None, None, None)
+_PARSED = {}
+
+
+def _parsed_lines(text):
+    """The (result, opcode, operands, line) of each non-blank line of `text`, parsed once: run_workgroup runs one
+    generator per invocation over the same module, and parsing it for every one of them dominated the run time.
+    A line that does not parse has opcode None; the caller raises where the line is reached, as before."""
+    parsed = _PARSED.get(text)
+    if parsed is None:
+        parsed = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            m = _LINE.match(line)
+            if m:
+                res, op, rest = m.groups()
+                parsed.append((res, op, rest.split(), line))
+            else:
+                parsed.append((None, None, None, line))
+        if len(_PARSED) >= 64:
+            _PARSED.clear()
+        _PARSED[text] = parsed
+    return parsed
 
 
 def _invocation(text, inputs, push_constants, memory, step=False):
@@ -504,15 +528,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 raise UnsupportedConstruct(f"OpAccessChain into {k[0]}")
         return off, cur
 
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        m = _LINE.match(line)
-        if not m:
+    for res, op, a, line in _parsed_lines(text):
+        if op is None:
             raise UnsupportedConstruct(f"cannot parse line: {line!r}")
-        res, op, rest = m.groups()
-        a = rest.split()
         if in_body:
             body.append((res, op, a, line))
             continue
