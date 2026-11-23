@@ -2572,8 +2572,28 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_stores_atomics_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_stores_atomics COMMAND d3d12_stores_atomics_test)
       set_tests_properties(d3d12_stores_atomics PROPERTIES SKIP_RETURN_CODE 77)
+
+      # D3D-29: mesh-shader PSOs from pipeline state streams and DispatchMesh (skips without VK_EXT_mesh_shader).
+      set(LEONIDA_TEST_MS ${CMAKE_CURRENT_BINARY_DIR}/generated/ms_draw.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_MS}
+        # Vulkan 1.2 (SPIR-V 1.5), the translator's target: 1.3 would emit LocalSizeId, which needs maintenance4.
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -o ${LEONIDA_TEST_MS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
+        COMMENT "Compiling the mesh test shader ms_draw.mesh"
+        VERBATIM)
+      add_executable(d3d12_mesh_test test/d3d12_mesh_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_MS}
+                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_VS_FULLSCREEN})
+      target_link_libraries(d3d12_mesh_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_MS_SPV="${LEONIDA_TEST_MS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
+      target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
+      set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_mesh_test are not built")
     endif()
 
     # Native D3D12 SV_InnerCoverage reference; its HLSL is compiled at runtime, so glslang is not needed.

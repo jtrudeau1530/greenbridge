@@ -90,6 +90,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
     case leonida::ReplayResult::invalid_query: return "invalid query";
     case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
+    case leonida::ReplayResult::invalid_draw: return "draw kind does not match the pipeline (mesh or vertex)";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -431,6 +432,20 @@ public:
             }, true))
             return;
         record_draw(true, indices, instances, first_index, base_vertex, first_instance);
+    }
+
+    // ID3D12GraphicsCommandList6: a mesh draw. The bound graphics pipeline must have a mesh shader (checked at
+    // execution, where the pipeline is resolved). D3D12 caps each count at 65535 and their product at 2^22
+    // (D3D12_MS_DISPATCH_MAX_THREAD_GROUPS_PER_GRID); a larger grid is a recording error.
+    void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
+        if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
+        if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+        draw.mesh = true;
+        check(list_.draw(std::move(draw)));
     }
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {

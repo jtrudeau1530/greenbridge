@@ -414,9 +414,11 @@ struct DrawViews {
     std::uint32_t render_target_count = 8;
 };
 
-// DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
-// render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
-// the draw. resource 0 marks an unbound render-target slot or no depth buffer.
+// DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:
+// D3D12 reads render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the
+// list's state at the draw. resource 0 marks an unbound render-target slot or no depth buffer. A mesh draw
+// (DispatchMesh) takes its thread-group counts in count (x), instances (y) and first (z), and ignores the vertex
+// and index buffers and the topology.
 // Render targets and vertex buffer views are inlined (8 simultaneous targets, 32 input slots), eliminating heap allocations
 // during command list recording (D3D-289).
 struct Draw {
@@ -437,6 +439,7 @@ struct Draw {
     std::uint32_t first = 0;  // first vertex or first index
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
+    bool mesh = false;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -738,10 +741,11 @@ public:
         return append(dispatch);
     }
 
-    // A draw with no vertices or instances does nothing in D3D12, and is not recorded.
+    // A draw with no vertices or instances, or a mesh draw with no thread groups, does nothing in D3D12, and is
+    // not recorded.
     bool draw(const Draw& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
+        if (!draw.count || !draw.instances || (draw.mesh && !draw.first)) return !closed_;
         return append(draw);
     }
     bool draw(Draw&& draw) {
