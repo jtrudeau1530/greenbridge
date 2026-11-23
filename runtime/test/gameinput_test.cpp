@@ -1555,6 +1555,8 @@ void test_haptic_motors(IGameInput* input) {
               motors[0].waveformInfo != nullptr && motors[0].waveformInfo->isIntensitySupported,
           "haptics: they are the left and right trigger, one waveform each, an intensity");
     check(sticks_at_rest(pad_state(input, dev)), "haptics: the pad still reads normally");
+    check(motors[0].waveformInfo->isRepeatDelaySupported && motors[1].waveformInfo->isRepeatDelaySupported,
+          "haptics: both waveforms advertise repeat delay");
 
     GameInputHapticFeedbackParams p{};
     p.intensity = 0.5f;
@@ -1619,6 +1621,40 @@ void test_haptic_motors(IGameInput* input) {
     dev->SetHapticMotorState(1, nullptr);
     rt::gameinput::poll();
     check(xbox.left == 0 && xbox.right == 0, "haptics: both long requests stop when the state is cleared");
+
+    // Observe the output at the virtual pad. The left pulse plays twice over ordinary rumble; the right repeats
+    // until stopped. Poll for each transition so the test need not wake on an exact millisecond boundary.
+    dev->SetRumbleState(&rumble);
+    p.duration = 120'000;
+    p.repeatDelay = 180'000;
+    p.playCount = 2;
+    dev->SetHapticMotorState(0, &p);
+    p.playCount = 0;
+    dev->SetHapticMotorState(1, &p);
+    auto reaches = [&](uint16_t left, uint16_t right) {
+        const uint64_t deadline = input->GetCurrentTimestamp() + 900'000;
+        do {
+            rt::gameinput::poll();
+            if (xbox.left == left && xbox.right == right) return true;
+            Sleep(5);
+        } while (input->GetCurrentTimestamp() < deadline);
+        return false;
+    };
+    check(reaches(65535, 65535), "haptics: both pulse trains start at full intensity");
+    check(reaches(16384, 0), "haptics: only ordinary rumble remains between pulses");
+    check(reaches(65535, 65535), "haptics: both motors resume for the second pulse");
+    check(reaches(16384, 0), "haptics: both motors release after the second pulse");
+    check(reaches(16384, 65535), "haptics: only the indefinitely repeating motor starts a third pulse");
+    dev->SetHapticMotorState(1, nullptr);
+    dev->SetRumbleState(nullptr);
+    check(reaches(0, 0), "haptics: cancelling the repeating waveform releases the trigger");
+
+    p.duration = 80'000;
+    p.repeatDelay = UINT64_MAX - p.duration + 1;  // duration + delay would wrap to zero
+    dev->SetHapticMotorState(0, &p);
+    check(reaches(65535, 0), "haptics: an indefinitely repeated pulse accepts a very long delay");
+    check(reaches(0, 0), "haptics: the motor enters the quiet interval even if the cycle exceeds UINT64_MAX");
+    dev->SetHapticMotorState(0, nullptr);
 
     detach(xbox);
     rt::gameinput::poll();
