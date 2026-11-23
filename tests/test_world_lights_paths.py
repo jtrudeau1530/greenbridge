@@ -374,6 +374,20 @@ class ScanTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_summary_write_failure_is_one_error_line(self) -> None:
+        # --out naming a directory: IsADirectoryError/PermissionError on most systems. The input half
+        # of main already answers with one ERROR line; the write half must too.
+        target = os.path.join(self.tmp.name, "as-a-directory")
+        os.makedirs(target)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = T.main([self.rpf, "--entities", self.entities, "--out", target])
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("IsADirectoryError", err.getvalue())
+        self.assertNotIn("PermissionError", err.getvalue())
+
     def test_lights_out_uses_posn_when_position120_is_absent(self) -> None:
         archive = os.path.join(self.tmp.name, "posn-only.rpf")
         write_rpf(archive, [light_resource(posn_only=True), map_resource(posn_only=True)])
