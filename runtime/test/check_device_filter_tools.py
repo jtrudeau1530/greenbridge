@@ -6,10 +6,11 @@ ignored the filter and ran on the best-ranked GPU.
 
     python -I check_device_filter_tools.py <vk_descriptor_bench> <vk_sandbox> <work dir>
 
-Exit 0 when both tools refuse the filter, 1 when one does not, and 77 (skip) on a machine with no Vulkan device,
-where no tool can choose one. Standard library only.
+Exit 0 when both tools refuse the filter, 1 when one does not or when the device list fails for another reason, and
+77 (skip) on a machine with no Vulkan loader, driver or device, where no tool can choose one. Standard library only.
 """
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -23,6 +24,19 @@ def run(cmd, env=None):
     return p.returncode, p.stdout + p.stderr
 
 
+def no_vulkan(code, out):
+    """Why `vk_descriptor_bench --list-devices` found no Vulkan device, or "" when it did or failed otherwise. Only
+    these count as "nothing to choose from": no Vulkan loader, no driver (vkCreateInstance gives
+    VK_ERROR_INCOMPATIBLE_DRIVER, -9), or a list with no device in it."""
+    if code == 0:
+        return "" if any(line.startswith("[") for line in out.splitlines()) else "the device list is empty"
+    if code == 1 and ("could not load" in out or "has no vkGetInstanceProcAddr" in out):
+        return "no Vulkan loader"
+    if code == 1 and re.search(r"FAILED vkCreateInstance\(.*\) -> -9\b", out):
+        return "no Vulkan driver (VK_ERROR_INCOMPATIBLE_DRIVER)"
+    return ""
+
+
 def main(argv):
     if len(argv) != 4:
         print(__doc__, file=sys.stderr)
@@ -33,9 +47,13 @@ def main(argv):
     # The device list ignores the filter, so it shows whether there is any device to choose from.
     plain = {k: v for k, v in os.environ.items() if k != "LEONIDA_VK_DEVICE"}
     code, out = run([bench, "--list-devices"], env=plain)
-    if code != 0 or not any(line.startswith("[") for line in out.splitlines()):
-        print(f"SKIP: no Vulkan device to choose from ({bench} --list-devices exit {code})")
+    reason = no_vulkan(code, out)
+    if reason:
+        print(f"SKIP: no Vulkan device to choose from ({reason})")
         return UNSUPPORTED
+    if code != 0:   # anything else is a failure of the tool, not a machine without Vulkan
+        print(f"FAIL: {bench} --list-devices exit {code}:\n{out.strip()}")
+        return 1
 
     # The smallest scene vk_sandbox reads: magic, version 1, no textures, meshes or draws, and a centre.
     scene = os.path.join(work, "empty_scene.bin")
