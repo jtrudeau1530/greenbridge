@@ -500,6 +500,8 @@ over integrated, the first on a tie, `vulkan_device_rank` in `runtime/src/vulkan
 `LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`) and the layer's standalone device read it,
 and a value that matches no device fails the run instead of testing
 another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12 adapter the same way.
+Unset, the host side is the adapter behind the layer's Vulkan device (`runtime/test/host_adapter.h`; `d3d12_buffer_tiles`
+by the layer's `GetAdapterLuid()`), so on a PC with two GPUs the layer is compared with its own GPU's driver.
 The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
 `vk_device_pick.h`, and fail with a message naming the filter when it matches no device.
 
