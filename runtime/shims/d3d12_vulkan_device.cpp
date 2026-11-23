@@ -6917,10 +6917,23 @@ public:
         auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
         resource->attach_device(identity());
         const HRESULT hr = resource->create_host_buffer(address);
-        if (FAILED(hr)) {
-            log_once("a title-placed buffer (device slot 133) could not import its pages; HRESULT", int(hr));
+        if (hr == E_INVALIDARG) {
             resource->Release();
             return d3d12_trace::result(method, hr);
+        }
+        if (FAILED(hr)) {
+            // The driver would not import these pages: RADV refuses a view of a pagefile-backed section, the form
+            // xmem's physical pages take (found in review on an RX 9070 XT under Wine), and a device without
+            // VK_EXT_external_memory_host has no import at all. The boot goes on with an ordinary DEFAULT buffer
+            // of the same description, as #6915's stand-in did: the title gets a resource, but its writes at
+            // `address` do not reach it.
+            resource->Release();
+            log_once("a title-placed buffer (device slot 133) could not import its pages, so it is an ordinary buffer "
+                     "the title's writes do not reach; HRESULT",
+                     int(hr));
+            const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
+            return d3d12_trace::result(method, create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
+                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
         }
         return d3d12_trace::result(method, hand_out(resource, riid, out));
     }
