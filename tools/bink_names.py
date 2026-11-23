@@ -377,10 +377,19 @@ def main(argv=None):
         ap.error(f"--out is a folder, not a report file: {a.out}")
     if a.out:
         def unlistable(error):
-            # os.walk skips a folder it cannot list unless onerror stops it, and then an --out that is a file in
-            # that folder would pass this check and be overwritten. Refuse rather than guess.
-            ap.error(f"--out cannot be checked against the inputs: cannot list {error.filename or folder}: "
-                     f"{error.strerror or error}")
+            # os.walk skips a folder it cannot list unless onerror stops it. An --out inside that folder could then
+            # be an input this check never saw, so refuse it. Any other unlistable folder is left to the scan,
+            # which stops on it with exit 1 whether or not the report already exists.
+            locked = error.filename or folder
+            out_key = os.path.normcase(os.path.realpath(a.out))
+            locked_key = os.path.normcase(os.path.realpath(locked))
+            try:
+                inside = os.path.commonpath([out_key, locked_key]) == locked_key
+            except ValueError:  # different drives on Windows
+                inside = False
+            if inside:
+                ap.error(f"--out cannot be checked against the inputs: cannot list {locked}: "
+                         f"{error.strerror or error}")
 
         for folder in [p for p in [a.source, *a.mount] if os.path.isdir(p)]:
             manifest = os.path.join(folder, "index.json")
