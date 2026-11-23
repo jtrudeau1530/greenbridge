@@ -352,6 +352,18 @@ class TestCli(unittest.TestCase):
             self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
                              "staging and backup files must not be left behind")
 
+    def test_report_cannot_replace_the_carve_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "carve")
+            os.mkdir(source)
+            index = write(os.path.join(source, "index.json"), b'{"files": []}')
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as code:
+                T.main([source, "--tables", index])
+            self.assertEqual(code.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), b'{"files": []}')
+
     def test_two_outputs_naming_one_file_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "src")
