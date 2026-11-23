@@ -46,7 +46,7 @@ def stratum(meta):
 
 
 def pick_sample(ps, n, seed):
-    """At least min(10, size) shaders per stratum, the rest in proportion, `n` in all (fewer when the corpus is)."""
+    """At least min(10, size) shaders per stratum and the rest in proportion; `n` in all, or more when the floors alone add up to more."""
     groups = {}
     for name in sorted(ps):
         groups.setdefault(stratum(ps[name]), []).append(name)
