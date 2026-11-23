@@ -8385,6 +8385,32 @@ public:
                 fs->Support1 = D3D12_FORMAT_SUPPORT1_BUFFER;
                 return d3d12_trace::result(method, S_OK);
             }
+            // The plane formats a shader reads a depth-stencil texture through (CreateShaderResourceView takes them on
+            // R24G8/R32G8X24 and D24S8/D32S8 textures) have no image of their own, so the lookups below find nothing.
+            // The host reports them as sampled 2D and cube textures with mips, the depth plane also filtered and
+            // compared. Left out, as for the depth formats themselves: 1D, and multisample loads.
+            const bool depth_plane = fs->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                     fs->Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            if (depth_plane || fs->Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
+                fs->Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT) {
+                const bool d24 = fs->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                 fs->Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+                VkFormat family = vulkan_format(d24 ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                                                true).format;
+                if (family == VK_FORMAT_D24_UNORM_S8_UINT && !state_.depth_usable(family))
+                    family = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                VkFormatProperties props{};
+                if (state_.format_properties) state_.format_properties(state_.info.physical, family, &props);
+                if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+                    return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
+                fs->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
+                               D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_MIP;
+                if (depth_plane && (props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+                    fs->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
+                                    D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON |
+                                    D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON;
+                return d3d12_trace::result(method, S_OK);
+            }
             const Format fmt = texture_storage_format(fs->Format, false);
             const Format depth_fmt = vulkan_format(fs->Format, true);
             VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
@@ -8522,6 +8548,11 @@ public:
                 const bool block_compressed = vk_fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && vk_fmt <= VK_FORMAT_BC7_SRGB_BLOCK;
                 // Gathers read the sampled view like a sample does (OpImageGather); the host reports one with the other.
                 if (s1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) s1 |= D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
+                // Comparison sampling and gathers (SampleCmp, GatherCmp with a comparison sampler) are D3D12's for the
+                // depth-plane view formats only; R32_FLOAT and R16_UNORM are the views of D32 and D16 textures.
+                if ((s1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) &&
+                    (fs->Format == DXGI_FORMAT_R32_FLOAT || fs->Format == DXGI_FORMAT_R16_UNORM))
+                    s1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON | D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON;
                 // A mip chain where the image can have one (asked with its sampled or depth-stencil usage).
                 if (s1 & (D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D |
                           D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
