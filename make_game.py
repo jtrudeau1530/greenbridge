@@ -2579,19 +2579,17 @@ def main() -> int:
     is_game_drive_root = os.path.splitdrive(real_game)[1] in ("\\", "/")
     game_entries = []
     if is_game_drive_root:
-        try:
-            game_entries = [
-                os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
-                for e in os.listdir(real_game)
-            ]
-        except OSError:
-            game_entries = []
+        # The dump's own top-level names, from the version manifest: os.listdir(real_game) would also count an
+        # unrelated --out or --work folder on the drive, so the rerun that resumes the build was rejected.
+        top_level = {rel.replace("\\", "/").split("/", 1)[0] for rel in [v["expected_exe"], *v["files"]]}
+        game_entries = [os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
+                        for e in sorted(top_level) if e]
     for p in (out, work):
         # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
         real_destination = os.path.normcase(os.path.realpath(p))
         if is_game_drive_root:
             # If the game is at drive root (e.g. D:\), reject the drive root itself and anything
-            # inside the dump's existing top-level entries, but allow separate top-level folders.
+            # inside the dump's own top-level entries, but allow separate top-level folders.
             inside = (real_destination == real_game) or any(
                 path_is_within(real_destination, entry) for entry in game_entries
             )
