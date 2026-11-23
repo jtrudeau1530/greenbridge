@@ -444,6 +444,40 @@ std::vector<Scenario> scenarios() {
                      r.vertices(l, vb_other);
                      l->DrawInstanced(4, 1, 0, 0);
                  }, ROWS4("YYYYBBBB") " " ROWS4("BBBBYYYY")});
+    s.push_back({"scissor zero: reset existing rectangles before the next draw",
+                 [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
+                     parent_state(r, l, strip);
+                     l->SetPipelineState(r.pso_a.p);
+                     l->RSSetScissorRects(0, nullptr);
+                     l->DrawInstanced(4, 1, 0, 0);
+                 }, BLANK4 " " BLANK4});
+    s.push_back({"scissor zero then one: restores new rectangle for draw",
+                 [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
+                     parent_state(r, l, strip);
+                     l->SetPipelineState(r.pso_a.p);
+                     l->RSSetScissorRects(0, nullptr);
+                     const D3D12_RECT full{0, 0, LONG(target_px), LONG(target_px)};
+                     l->RSSetScissorRects(1, &full);
+                     l->DrawInstanced(4, 1, 0, 0);
+                 }, ROWS4("RRRRBBBB") " " BLANK4});
+    s.push_back({"scissor zero with non-null pointer still disables all rectangles",
+                 [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
+                     parent_state(r, l, strip);
+                     l->SetPipelineState(r.pso_a.p);
+                     const D3D12_RECT unused{0, 0, LONG(target_px), LONG(target_px)};
+                     l->RSSetScissorRects(0, &unused);
+                     l->DrawInstanced(4, 1, 0, 0);
+                 }, BLANK4 " " BLANK4});
+    s.push_back({"scissor zero on parent suppresses inherited bundle draw",
+                 [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
+                     auto* b = r.bundle(r.pso_a.p, [](ID3D12GraphicsCommandList* b) {
+                         b->IASetPrimitiveTopology(strip);
+                         b->DrawInstanced(4, 1, 0, 0);
+                     });
+                     parent_state(r, l, strip);
+                     l->RSSetScissorRects(0, nullptr);
+                     r.execute(l, b);
+                 }, BLANK4 " " BLANK4});
     return s;
 }
 
