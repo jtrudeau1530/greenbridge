@@ -709,6 +709,24 @@ void run_checks(const std::filesystem::path& root) {
               "and the new folder is empty: only . and ..");
     }
 
+    // Recreating a removed package directory clears its own marker, but not nested deletion markers.
+    {
+        std::filesystem::create_directories(package / "recreate_dir");
+        const auto mark = overlay / ".gta6rt-deleted" / "recreate_dir" / ".gta6rt-dir";
+        check(rmdir_w(L"GAME:\\recreate_dir") != FALSE && std::filesystem::exists(mark),
+              "removing a package directory creates its marker");
+        check(mkdir_w(L"GAME:\\recreate_dir", nullptr) != FALSE, "recreating the package directory succeeds");
+        const DWORD attrs = attributes_w(L"GAME:\\recreate_dir");
+        check(attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY), "recreated directory has directory attributes");
+        check(count(list(first_w, next_w, find_close, L"GAME:\\*"), L"recreate_dir") == 1,
+              "recreated directory is listed once");
+        check(!std::filesystem::exists(mark), "recreated directory has no removal marker");
+        check(mkdir_w(L"GAME:\\never_removed_dir", nullptr) != FALSE &&
+                  std::filesystem::is_directory(overlay / "never_removed_dir") &&
+                  !std::filesystem::exists(overlay / ".gta6rt-deleted" / "never_removed_dir"),
+              "creating a never-removed directory is unchanged");
+    }
+
     // MoveFile: the destination is in the overlay; a moved package file is deleted by a marker.
     {
         check(move_w(L"GAME:\\misc\\one.txt", L"GAME:\\misc\\moved.txt") != FALSE, "MoveFileW moves a package file");

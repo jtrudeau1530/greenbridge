@@ -986,8 +986,13 @@ BOOL create_directory(LPCWSTR template_name, LPCWSTR name, LPSECURITY_ATTRIBUTES
     std::error_code ec;
     std::filesystem::create_directories(target.parent_path(), ec);
     if (ec) return fail_bool(static_cast<DWORD>(ec.value()));
-    return template_name ? ::CreateDirectoryExW(template_path.c_str(), target.c_str(), security)
-                         : ::CreateDirectoryW(target.c_str(), security);
+    const BOOL created = template_name ? ::CreateDirectoryExW(template_path.c_str(), target.c_str(), security)
+                                       : ::CreateDirectoryW(target.c_str(), security);
+    if (created) {
+        // Keep markers for deleted children, which must remain hidden after the folder is recreated.
+        std::filesystem::remove(marker(r.overlay, parts) / kRemovedDirMarker, ec);
+    }
+    return created;
 }
 
 }  // namespace
