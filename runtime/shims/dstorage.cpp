@@ -5,9 +5,8 @@
 // for those names, the console ABI and what each method does here. In short:
 //   - OpenFile resolves kernel32.dll!CreateFileW through the shim registry, so a GAME: path goes through the
 //     runtime's console path mapping and write overlay (file_system.cpp) exactly as the title's own CreateFileW.
-//   - Each queue has one worker thread that runs its submitted entries in order: a request reads a file range or
-//     copies a memory range into the destination, a status entry, fence signal or event runs when every entry before
-//     it has. Completion is therefore in queue order, as the API guarantees.
+//   - A file queue can read and inflate two requests in parallel. A memory queue uses one worker. Results retire in
+//     order, and a status, fence or event runs after every preceding request and before the next group of requests.
 //   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
 //     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
 //     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
@@ -344,8 +343,7 @@ public:
     }
 
     // A new handle the caller closes (GENERIC_READ, FILE_SHARE_READ, as the reference describes it). ReOpenFile,
-    // not DuplicateHandle: a duplicate shares the file position with the shim's own reads, so the title's ReadFile
-    // through it would start wherever the worker's last read ended.
+    // not DuplicateHandle: a duplicate would share the shim's file position and overlapped I/O mode.
     HANDLE STDMETHODCALLTYPE GetHandle() override {
         std::lock_guard lock(mutex_);
         if (closed_ || handle_ == INVALID_HANDLE_VALUE) {
@@ -418,8 +416,9 @@ HRESULT read_error(DWORD error) {
     }
 }
 
-// Reads exactly "size" bytes at "offset" of a synchronous handle into "destination".
-HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint32_t size) {
+// Each worker has its own event and offset, including when both workers read the same file.
+HRESULT read_file_range(HANDLE handle, HANDLE event, uint64_t offset, void* destination, uint32_t size) {
+    if (!event) return E_OUTOFMEMORY;
     LARGE_INTEGER length{};
     if (!GetFileSizeEx(handle, &length)) return HRESULT_FROM_WIN32(GetLastError());
     const uint64_t file_size = static_cast<uint64_t>(length.QuadPart);
@@ -431,8 +430,13 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
         const uint64_t position = offset + done;
         at.Offset = static_cast<DWORD>(position);
         at.OffsetHigh = static_cast<DWORD>(position >> 32);
+        at.hEvent = event;
+        if (!ReadFile(handle, out + done, size - done, nullptr, &at)) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_IO_PENDING) return read_error(error);
+        }
         DWORD got = 0;
-        if (!ReadFile(handle, out + done, size - done, &got, &at)) return read_error(GetLastError());
+        if (!GetOverlappedResult(handle, &at, &got, TRUE)) return read_error(GetLastError());
         if (got == 0) return E_DSTORAGE_END_OF_FILE;  // the file shrank since the size check
         done += got;
     }
@@ -449,6 +453,8 @@ struct Entry {
     bool cancelled = false;        // CancelRequestsWithTag matched it before it started
     bool counted = false;          // a request the title passed: counted in the statistics when it is submitted
     HRESULT enqueue_error = S_OK;  // found at enqueue: reported when the entry is reached, in order
+    HRESULT result = S_OK;         // request result, published before ordered retirement
+    bool completed = false;
     StatusArray* status = nullptr;  // a reference
     IDStorageStatusArrayX* status_as_given = nullptr;
     uint32_t index = 0;
@@ -474,8 +480,11 @@ public:
         if (!error_event_) return false;
         try {
             worker_ = std::thread([this] { run(); });
+            if (desc_.SourceType == DSTORAGE_REQUEST_SOURCE_FILE)
+                parallel_worker_ = std::thread([this] { run(); });
         } catch (...) {
-            return false;
+            // A file queue can still run serially if the second thread cannot be started.
+            return worker_.joinable();
         }
         return true;
     }
@@ -583,11 +592,13 @@ public:
     // without being read (the overview: the title may no longer use its result).
     void STDMETHODCALLTYPE CancelRequestsWithTag(UINT64 mask, UINT64 value) override {
         std::lock_guard lock(mutex_);
-        for (Entry& e : entries_)
+        for (size_t i = started_; i < entries_.size(); ++i) {
+            Entry& e = entries_[i];
             if (e.type == Entry::Type::Request && (e.request.CancellationTag & mask) == value) e.cancelled = true;
+        }
     }
 
-    // Submits what is enqueued, waits until the worker has run all of it and stops the worker. Later enqueues are
+    // Submits what is enqueued, waits until the workers have retired all of it and stops them. Later enqueues are
     // dropped and recorded as E_DSTORAGE_QUEUE_CLOSED.
     void STDMETHODCALLTYPE Close() override {
         std::lock_guard close_lock(close_mutex_);
@@ -597,11 +608,12 @@ public:
             closing_ = true;
             submit_locked();
             space_.notify_all();  // an enqueue waiting for space gives up (the queue is closing)
-            idle_.wait(lock, [&] { return entries_.empty() && !in_flight_; });
+            idle_.wait(lock, [&] { return entries_.empty(); });
             closed_ = true;
             work_.notify_all();
         }
         if (worker_.joinable()) worker_.join();
+        if (parallel_worker_.joinable()) parallel_worker_.join();
     }
 
     HANDLE STDMETHODCALLTYPE GetErrorEvent() override {
@@ -657,7 +669,7 @@ private:
     size_t usable() const { return desc_.Capacity - 1u; }
     size_t half() const { return desc_.Capacity / 2u; }
     bool auto_submit() const { return !desc_.Options.AutoSubmitDisabled; }
-    size_t used_locked() const { return entries_.size() + (in_flight_ ? 1 : 0); }
+    size_t used_locked() const { return entries_.size(); }
 
     void enqueue(Entry&& e) {
         {
@@ -702,49 +714,98 @@ private:
         }
         if (entries_.size() > submitted_) {
             submitted_ = entries_.size();
-            work_.notify_one();
+            work_.notify_all();
         }
+    }
+
+    bool can_start_locked() const {
+        // A notification at the end of the started prefix prevents dispatch past it, including while it runs.
+        return started_ < submitted_ && entries_[started_].type == Entry::Type::Request &&
+               !overlaps_running_locked(entries_[started_].request);
+    }
+
+    // Requests whose destination ranges overlap write the same bytes, so the later one starts only after the earlier
+    // one has completed: the destination then holds the last request's data, as with sequential processing. Requests
+    // with disjoint destinations stay parallel.
+    bool overlaps_running_locked(const DSTORAGE_REQUEST& next) const {
+        if (next.DestinationSize == 0) return false;
+        const auto lo = reinterpret_cast<uintptr_t>(next.Destination);
+        const uintptr_t hi = lo + next.DestinationSize;
+        for (size_t i = 0; i < started_; ++i) {
+            const Entry& running = entries_[i];
+            if (running.type != Entry::Type::Request || running.completed || running.request.DestinationSize == 0)
+                continue;
+            const auto other = reinterpret_cast<uintptr_t>(running.request.Destination);
+            if (lo < other + running.request.DestinationSize && other < hi) return true;
+        }
+        return false;
+    }
+
+    bool can_retire_locked() const {
+        return !retiring_ && submitted_ != 0 &&
+               (entries_.front().type != Entry::Type::Request || entries_.front().completed);
     }
 
     void run() {
+        std::unique_ptr<void, decltype(&CloseHandle)> event(
+            desc_.SourceType == DSTORAGE_REQUEST_SOURCE_FILE ? CreateEventW(nullptr, TRUE, FALSE, nullptr) : nullptr,
+            CloseHandle);
         for (;;) {
-            Entry e;
+            Entry* e;
+            bool retire_entry;
             {
                 std::unique_lock lock(mutex_);
-                work_.wait(lock, [&] { return submitted_ > 0 || closed_; });
-                if (submitted_ == 0) return;  // closed and drained
-                e = std::move(entries_.front());
-                entries_.pop_front();
-                --submitted_;
-                in_flight_ = true;
+                work_.wait(lock, [&] { return closed_ || can_retire_locked() || can_start_locked(); });
+                if (closed_) return;
+                retire_entry = can_retire_locked();
+                // Appending to a deque and popping other entries preserve references. This entry stays in place
+                // until the FIFO retirement step, even if another worker finishes a later request first.
+                if (retire_entry) {
+                    retiring_ = true;
+                    e = &entries_.front();
+                } else {
+                    e = &entries_[started_++];
+                }
             }
-            process(e);
-            release_references(e);
-            {
+            if (retire_entry) {
+                retire(*e);
+                release_references(*e);
                 std::lock_guard lock(mutex_);
-                in_flight_ = false;
+                if (e->type == Entry::Type::Request) --started_;
+                --submitted_;
+                entries_.pop_front();
+                retiring_ = false;
                 space_.notify_all();
                 if (entries_.empty()) idle_.notify_all();
+            } else {
+                const HRESULT result = process_request(*e, event.get());
+                std::lock_guard lock(mutex_);
+                e->result = result;
+                e->completed = true;
             }
+            work_.notify_all();
         }
     }
 
-    // Runs on the worker. since_notify_ is the first failure since the last status entry or fence signal: the
-    // HRESULT a status entry reports.
-    void process(Entry& e) {
+    HRESULT process_request(const Entry& e, HANDLE event) {
+        // A cancelled request completes successfully, even if it already carried an enqueue error.
+        HRESULT hr = e.cancelled ? S_OK : e.enqueue_error;
+        if (!e.cancelled && SUCCEEDED(hr)) {
+            set_pending(+1);
+            hr = execute_request(e, event);
+            set_pending(-1);
+        }
+        if (e.file && e.file_counted) e.file->finish_pending();
+        return hr;
+    }
+
+    // One worker at a time retires entries. Status reports the first request failure since the previous status
+    // or fence, in enqueue order even when requests execute concurrently.
+    void retire(Entry& e) {
         HRESULT hr = e.enqueue_error;
         switch (e.type) {
             case Entry::Type::Request:
-                // A cancelled request is a success whatever else is wrong with it (the GDK: not counted as a failure).
-                if (e.cancelled) {
-                    hr = S_OK;
-                } else if (SUCCEEDED(hr)) {
-                    // Pending: processing has started and not completed (DSTORAGE_PRIORITY_STATS).
-                    set_pending(+1);
-                    hr = execute_request(e);
-                    set_pending(-1);
-                }
-                if (e.file && e.file_counted) e.file->finish_pending();
+                hr = e.result;
                 if (FAILED(hr) && SUCCEEDED(since_notify_)) since_notify_ = hr;
                 break;
             case Entry::Type::Status:
@@ -769,7 +830,7 @@ private:
         }
     }
 
-    HRESULT execute_request(const Entry& e) {
+    HRESULT execute_request(const Entry& e, HANDLE event) {
         const DSTORAGE_REQUEST& r = e.request;
         const uint64_t o = r.Options.AsUINT64;
         if (o & options::kReservedMask) return E_DSTORAGE_RESERVED_FIELDS;
@@ -808,10 +869,10 @@ private:
             if (!r.File) return E_INVALIDARG;
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
-        if (zlib) return inflate_request(e, memory);
+        if (zlib) return inflate_request(e, memory, event);
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
         if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
-        return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+        return read_file_range(e.file->handle(), event, r.FileOffset, r.Destination, r.SourceSize);
     }
 
     // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a
@@ -823,7 +884,7 @@ private:
     // E_DSTORAGE_ZLIB_BAD_HEADER, bad or truncated deflate data E_DSTORAGE_ZLIB_BAD_DATA, an Adler-32 mismatch
     // E_DSTORAGE_ZLIB_PARITY_FAIL, and a stream that inflates to more or fewer bytes than DestinationSize
     // E_DSTORAGE_DECOMPRESSION_ERROR (no code names a size mismatch; this is the header's generic one).
-    HRESULT inflate_request(const Entry& e, bool memory) {
+    HRESULT inflate_request(const Entry& e, bool memory, HANDLE event) {
         const DSTORAGE_REQUEST& r = e.request;
         std::vector<uint8_t> source, result;
         try {
@@ -835,7 +896,7 @@ private:
         if (r.SourceSize != 0) {
             if (memory) {
                 if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
-            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
+            } else if (const HRESULT hr = read_file_range(e.file->handle(), event, r.FileOffset, source.data(), r.SourceSize);
                        FAILED(hr)) {
                 return hr;
             }
@@ -947,15 +1008,17 @@ private:
     std::atomic<ULONG> refs_{1};
     const DSTORAGE_QUEUE_DESC1 desc_;
     std::mutex close_mutex_;  // one Close at a time
-    std::mutex mutex_;        // entries_, submitted_, in_flight_, closing_, closed_
+    std::mutex mutex_;        // queue state and publication of completed request results
     std::condition_variable work_, space_, idle_;
     std::deque<Entry> entries_;
     size_t submitted_ = 0;  // the first submitted_ entries are submitted
-    bool in_flight_ = false;
+    size_t started_ = 0;    // the first started_ entries are requests dispatched but not retired
+    bool retiring_ = false;
     bool closing_ = false;
     bool closed_ = false;
     std::thread worker_;
-    HRESULT since_notify_ = S_OK;  // worker only
+    std::thread parallel_worker_;
+    HRESULT since_notify_ = S_OK;  // accessed by the retiring worker only
     std::mutex error_mutex_;
     DSTORAGE_ERROR_RECORD record_{};
     HANDLE error_event_ = nullptr;
@@ -1026,7 +1089,7 @@ public:
         if (!path || !*path) return bad_call("IDStorageFactoryX::OpenFile", E_INVALIDARG, "null or empty path");
         if (!iid_policy().accept_creating(riid, Kind::File, "IDStorageFactoryX::OpenFile")) return E_NOINTERFACE;
         const HANDLE h = create_file_w()(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                         FILE_ATTRIBUTE_NORMAL, nullptr);
+                                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
             const DWORD error = GetLastError();
             return HRESULT_FROM_WIN32(error ? error : ERROR_FILE_NOT_FOUND);

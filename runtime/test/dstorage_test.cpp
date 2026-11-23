@@ -1061,6 +1061,163 @@ std::vector<uint8_t> stored_stream(const std::vector<uint8_t>& stored, const uin
     return z;
 }
 
+struct ParallelWrites {
+    uint8_t* pages = nullptr;
+    HANDLE first = nullptr;
+    HANDLE peer = nullptr;
+    HANDLE release = nullptr;
+};
+std::atomic<const ParallelWrites*> g_parallel_writes{nullptr};
+
+LONG CALLBACK hold_file_write(EXCEPTION_POINTERS* x) {
+    const auto* writes = g_parallel_writes.load();
+    const EXCEPTION_RECORD* e = x->ExceptionRecord;
+    if (!writes || e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2 ||
+        e->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t offset = e->ExceptionInformation[1] - reinterpret_cast<uintptr_t>(writes->pages);
+    if (offset >= 8192) return EXCEPTION_CONTINUE_SEARCH;
+    const bool first = offset < 4096;
+    DWORD old = 0;
+    if (!VirtualProtect(writes->pages + (first ? 0 : 4096), 4096, PAGE_READWRITE, &old))
+        return EXCEPTION_CONTINUE_SEARCH;
+    SetEvent(first ? writes->first : writes->peer);
+    if (first) WaitForSingleObject(writes->release, 15000);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void test_parallel_file_requests(Env& env) {
+    const int checks_before = g_checks, failures_before = g_failures;
+    const auto plain = zlib_text(4);
+    const std::vector<uint8_t> stream(std::begin(kZlibFixed), std::end(kZlibFixed));
+    write_file(env.game / L"data" / L"parallel.z", stream);
+    auto* f = open(env, L"GAME:\\data\\parallel.z");
+    auto* q = make_queue(env, 0x80, false);
+    auto* s = make_status(env, 2);
+    const ParallelWrites writes{
+        static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY)),
+        CreateEventW(nullptr, TRUE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr),
+        CreateEventW(nullptr, TRUE, FALSE, nullptr)
+    };
+    void* handler = AddVectoredExceptionHandler(1, hold_file_write);
+    const HANDLE error = q ? q->GetErrorEvent() : nullptr;
+    if (f && q && s && writes.pages && writes.first && writes.peer && writes.release && handler && error) {
+        TestFence fence;
+        int fence_checks = 0;
+        fence.on_signal = [&](UINT64) {
+            if (s->GetHResult(0) == E_DSTORAGE_END_OF_FILE &&
+                std::equal(plain.begin(), plain.end(), writes.pages) &&
+                std::equal(plain.begin(), plain.end(), writes.pages + 4096))
+                ++fence_checks;
+        };
+        auto r = file_request(f, 0, writes.pages, static_cast<uint32_t>(stream.size()));
+        r.Options.ZlibDecompress = 1;
+        r.DestinationSize = static_cast<uint32_t>(plain.size());
+        g_parallel_writes.store(&writes);
+        q->EnqueueRequest(&r);
+        q->Submit();
+        check(WaitForSingleObject(writes.first, 5000) == WAIT_OBJECT_0, "first file request reached its destination");
+
+        uint8_t rejected = 0;
+        auto bad = file_request(f, stream.size(), &rejected, 1, 41);
+        q->EnqueueRequest(&bad);
+        bad.Options.AsUINT64 |= options::kReservedMask;
+        q->EnqueueRequest(&bad);
+        r.Destination = writes.pages + 4096;
+        q->EnqueueRequest(&r);
+        q->EnqueueStatus(s, 0);
+        q->EnqueueSignal(&fence, 17);
+        uint8_t cancelled = 0;
+        r = file_request(f, 0, &cancelled, 1, 42);
+        q->EnqueueRequest(&r);
+        q->EnqueueStatus(s, 1);
+        q->Submit();
+
+        check(WaitForSingleObject(writes.peer, 3000) == WAIT_OBJECT_0,
+              "second file request reaches its destination while the first is blocked");
+        check_hr(s->GetHResult(0), E_PENDING, "status waits for the blocked request");
+        check(fence.GetCompletedValue() == 0, "fence waits for the blocked request");
+        check(WaitForSingleObject(error, 0) == WAIT_TIMEOUT, "later failures wait for the blocked request to retire");
+        q->CancelRequestsWithTag(~0ull, 42);
+        SetEvent(writes.release);
+        q->Close();
+        g_parallel_writes.store(nullptr);
+        check(fence.GetCompletedValue() == 17 && fence_checks == 1, "fence sees both writes and status's first failure");
+        DSTORAGE_ERROR_RECORD record{};
+        q->RetrieveErrorRecord(&record);
+        check(record.FailureCount == 2 && record.FirstFailure.HResult == E_DSTORAGE_END_OF_FILE,
+              "the error record reports the first failure in queue order");
+        check_hr(s->GetHResult(1), S_OK, "request cancelled behind the fence completes successfully");
+        check(cancelled == 0, "request cancelled behind the fence leaves the destination untouched");
+    } else {
+        check(false, "set up the parallel file request test");
+    }
+    if (handler) RemoveVectoredExceptionHandler(handler);
+    if (error) CloseHandle(error);
+    if (writes.peer) CloseHandle(writes.peer);
+    if (writes.release) CloseHandle(writes.release);
+    if (writes.first) CloseHandle(writes.first);
+    if (writes.pages) VirtualFree(writes.pages, 0, MEM_RELEASE);
+    if (s) s->Release();
+    if (q) q->Release();
+    if (f) f->Release();
+    std::printf("%s: parallel file requests: %d checks, %d failures\n",
+                g_failures == failures_before ? "PASS" : "FAIL", g_checks - checks_before, g_failures - failures_before);
+}
+
+void test_overlapping_destinations(Env& env) {
+    const int checks_before = g_checks, failures_before = g_failures;
+    const auto plain = zlib_text(4);
+    const std::vector<uint8_t> stream(std::begin(kZlibFixed), std::end(kZlibFixed));
+    const auto later = pattern(plain.size(), 77);
+    write_file(env.game / L"data" / L"overlap.z", stream);
+    write_file(env.game / L"data" / L"overlap.bin", later);
+    auto* zf = open(env, L"GAME:\\data\\overlap.z");
+    auto* bf = open(env, L"GAME:\\data\\overlap.bin");
+    auto* q = make_queue(env, 0x80, false);
+    auto* s = make_status(env, 1);
+    const ParallelWrites writes{
+        static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY)),
+        CreateEventW(nullptr, TRUE, FALSE, nullptr), nullptr, CreateEventW(nullptr, TRUE, FALSE, nullptr)
+    };
+    void* handler = AddVectoredExceptionHandler(1, hold_file_write);
+    if (zf && bf && q && s && writes.pages && writes.first && writes.release && handler) {
+        auto r = file_request(zf, 0, writes.pages, static_cast<uint32_t>(stream.size()));
+        r.Options.ZlibDecompress = 1;
+        r.DestinationSize = static_cast<uint32_t>(plain.size());
+        g_parallel_writes.store(&writes);
+        q->EnqueueRequest(&r);
+        q->Submit();
+        check(WaitForSingleObject(writes.first, 5000) == WAIT_OBJECT_0, "the first request reached its destination");
+        auto b = file_request(bf, 0, writes.pages, static_cast<uint32_t>(later.size()));
+        q->EnqueueRequest(&b);
+        q->EnqueueStatus(s, 0);
+        q->Submit();
+        Sleep(400);  // the later request has had time to run if nothing held it back
+        const std::vector<uint8_t> untouched(plain.size(), 0);
+        check(std::equal(untouched.begin(), untouched.end(), writes.pages),
+              "a request with an overlapping destination waits for the one writing there");
+        SetEvent(writes.release);
+        q->Close();
+        g_parallel_writes.store(nullptr);
+        check(std::equal(later.begin(), later.end(), writes.pages),
+              "overlapping destinations end with the data of the last request enqueued");
+        check_hr(s->GetHResult(0), S_OK, "the status after overlapping requests succeeds");
+    } else {
+        check(false, "set up the overlapping destination test");
+    }
+    if (handler) RemoveVectoredExceptionHandler(handler);
+    if (writes.first) CloseHandle(writes.first);
+    if (writes.release) CloseHandle(writes.release);
+    if (writes.pages) VirtualFree(writes.pages, 0, MEM_RELEASE);
+    if (s) s->Release();
+    if (q) q->Release();
+    if (bf) bf->Release();
+    if (zf) zf->Release();
+    std::printf("%s: overlapping destinations: %d checks, %d failures\n",
+                g_failures == failures_before ? "PASS" : "FAIL", g_checks - checks_before, g_failures - failures_before);
+}
+
 void test_zlib(Env& env) {
     const std::vector<uint8_t> dynamic(std::begin(kZlibDynamic), std::end(kZlibDynamic));
     const std::vector<uint8_t> fixed(std::begin(kZlibFixed), std::end(kZlibFixed));
@@ -1255,6 +1412,8 @@ int main() {
     test_stats_timing(env);
     test_stats(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
+    test_parallel_file_requests(env);
+    test_overlapping_destinations(env);
 
     fs::remove_all(env.root, ec);
     std::printf("dstorage: %d checks, %d failures\n", g_checks, g_failures);

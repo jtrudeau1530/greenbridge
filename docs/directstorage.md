@@ -3,8 +3,8 @@
 The console title reads its streamed data through Xbox DirectStorage: `DStorageGetFactory` hands out a factory, the
 factory opens files and creates queues, and a queue reads file or memory ranges into memory and reports completion
 through status arrays, `ID3D12Fence` signals and events. `runtime/shims/dstorage.cpp` serves that API on the PC:
-files open through the runtime's `GAME:` mapping and write overlay, and a worker thread per queue does the reads
-and inflates zlib requests.
+files open through the runtime's `GAME:` mapping and write overlay. File queues read and inflate up to two
+requests at once, and completion notifications run in order.
 This page records which DLL and ABI the console title is expected to use, how sure that is, and what the shim does.
 
 ## Which DLL and which ABI: the evidence
@@ -81,8 +81,12 @@ The first boot with the executable settles most of this: the dry-run report show
   holds `capacity - 1` entries; `Query` reports the empty slots and the entries left before the automatic submit,
   which happens when the entries enqueued since the last submit reach half the capacity (unless
   `DSTORAGE_QUEUE_OPTIONS::AutoSubmitDisabled`). An enqueue into a full queue waits for space, as the reference
-  says; with auto-submit disabled only a `Submit` from another thread frees it. One worker thread per queue runs
-  the submitted entries in order, so every notification follows all the entries before it.
+  says. With auto-submit disabled, a full queue with no submitted work needs a `Submit` from another thread.
+  A file queue uses two workers and overlapped reads with independent offsets, including when requests share
+  a file handle. A memory queue uses one worker. Requests between notifications can finish in either order.
+  Each request retires in enqueue order, keeping slots occupied until retirement and preserving the first
+  failure in queue order. Status, fence and event entries run after the preceding requests retire and before
+  dispatching the next group.
 - **Requests**: copied at enqueue. A file request reads `SourceSize` bytes at `FileOffset` into `Destination`; a
   memory request copies `Source` to `Destination` (`memmove`, so an overlapping pair is safe); a zlib request
   inflates those `SourceSize` bytes into `Destination` (below). Checked in this order when the worker reaches the
@@ -165,8 +169,6 @@ The first boot with the executable settles most of this: the dry-run report show
   address). An address inside memory the Vulkan layer backs will need its write routed to that memory. The destination
   is written in two places, both in `execute_request` (`read_file_range` for a file source, `guarded_move` for a
   memory source), so that change stays inside the request path.
-- **Parallel reads**: the worker reads one request at a time. Overlapped reads with in-order retirement of
-  notifications would keep the order guarantee.
 
 ## Tests
 
@@ -176,7 +178,10 @@ cancellation, auto-submit, a full queue, status arrays, fences (a CPU fence obje
 when it is signalled), events, error records, file and queue close with requests in flight, a destination the
 process cannot write, four threads enqueueing at once, the interface-id policy (unknown and system ids refused by
 `QueryInterface`, learned by creating calls), a `GetHandle` handle with its own file position, an event closed (and
-its handle value reused) before it is set, and cancelled requests that also had an enqueue error. zlib requests use
+its handle value reused) before it is set, and cancelled requests that also had an enqueue error. The parallel
+file test holds a zlib request at a read-only destination, observes a second request from the same file reach its
+own destination, then checks ordered errors, status and fence completion, and cancellation behind the fence.
+Zlib requests use
 synthetic streams only: two made with Python's `zlib` (level 9: one dynamic-Huffman block; level 1: one
 fixed-Huffman block) from text the test rebuilds, and stored-block streams the test builds, one of them a stored
 block followed by the dynamic one. They are read from a file and from memory (also in place); a bad header, a
