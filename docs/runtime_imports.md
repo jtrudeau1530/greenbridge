@@ -172,6 +172,20 @@ The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so
 again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
 unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
 
+The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`,
+`XApuEnqueueCommand`, `XApuGetResultCount`) and `chad.dll` (`XDspActivate`, `XDspConnectWithMaximumStreamLimit`,
+`XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) are served by `runtime/shims/xapu_chad.cpp`. The shapes were
+read statically from the executable's call sites: one each, four for `XApuEnqueueCommand`. Both connects succeed with
+a handle; the APU connect also returns a zeroed shared buffer the title writes stream input to and reads output from.
+Commands are accepted and not processed, so the audio stays silent. A stream open (type 1) and a stream close
+(type 2) each queue one result of the same type and slot, because the title frees a stream id only when the close
+result arrives. `XDspActivate` writes its two outputs as pointers to zeroed memory, which the title reads as "command
+done" after each `XDspSubmitCommand`. `XApuConnect` leaves its first argument, a global of the title, untouched. The
+buffer size (128 stream slots), the two results and the zeroed DSP status are hypotheses, explained in the file.
+`xapu_chad_test` calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
+`audio_queue` event.
+The table above was measured before this shim and still lists these ten as unimplemented; they are served now. The call shapes agree with `docs/audio_hal_exe_calls.md`, which was measured with `tools/import_call_sites.py`.
+
 What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
 that name exists), and an unimplemented import stops the run only if the title calls it
@@ -299,7 +313,7 @@ mostly correspond one to one to the `xgameruntime.lib` functions. The executable
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, `acphal.dll`) with a
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, `acphal.dll`, `xapu.dll`, `chad.dll`) with a
 pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
