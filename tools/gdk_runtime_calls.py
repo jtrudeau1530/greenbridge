@@ -37,7 +37,7 @@ highest of rdx/r8/r9 (xmm1-3) written, or [rsp+20h+8k] stored, between the previ
 Output: per image and class, the class and interface ids, the slots called with their method names and whether
 their thunks are referenced, the thunk count, and whether the runtime serves the class (a `constexpr GUID
 k...Class` with its id in one of runtime/shims/xgameruntime*.cpp: xgameruntime.cpp and the classes it hands on to
-xgameruntime_user.cpp, _gamesave.cpp, _store.cpp; the class only, not each slot); then the known ids present in the image that
+xgameruntime_user.cpp, _gamesave.cpp, _store.cpp, _offline.cpp; the class only, not each slot); then the known ids present in the image that
 no thunk reaches. Text by default, --json for JSON. --out DIR writes both, as <image file name>.gdk_calls.txt and
 .json (x.dll-2.gdk_calls.txt for a second input named x.dll), and prints one summary line per image instead.
 
