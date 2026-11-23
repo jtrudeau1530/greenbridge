@@ -50,6 +50,7 @@ std::uint64_t g_submission = 0;
 std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>> g_fresh;
 std::pair<std::uint64_t, std::uint64_t> g_cursor{0, 0};
 std::map<std::uint64_t, ID3D12Resource*> g_shadows;
+std::map<std::uint64_t, std::size_t> g_shadow_bytes;
 std::map<std::uint64_t, std::map<std::uint32_t, Linear>> g_shadow_dirty;
 
 bool readable(std::uint64_t p, std::uint64_t n) {
@@ -236,6 +237,18 @@ bool create_view(ID3D12Device* device, std::uint64_t resource_desc, std::uint64_
         device->CreateShaderResourceView(b.resource, &srv, dest);
         return true;
     }
+    {
+        static std::map<std::uint64_t, int> seen;
+        const std::uint64_t k = in.Width << 40 ^ std::uint64_t(in.Height) << 16 ^ std::uint64_t(in.Format) << 4 ^ in.DepthOrArraySize;
+        if (seen[k]++ < 2 && seen.size() < 200) {
+            const auto* lw = reinterpret_cast<const std::uint32_t*>(resource_desc);
+            std::uint32_t probe[4]{};
+            if (readable(va, 16)) std::memcpy(probe, reinterpret_cast<const void*>(va), 16);
+            std::fprintf(stderr, "[tex] %llux%ux%u mips %u format %d layout 0x%x flags 0x%x va 0x%llx linear %d first %08x %08x %08x %08x\n",
+                         static_cast<unsigned long long>(in.Width), in.Height, in.DepthOrArraySize, in.MipLevels, int(in.Format), lw[11], lw[12],
+                         static_cast<unsigned long long>(va), int(g_linear.count(va)), probe[0], probe[1], probe[2], probe[3]);
+        }
+    }
     Texture& t = g_textures[va];
     const D3D12_RESOURCE_DESC d = clean(in);
     if (!t.resource || std::memcmp(&t.desc, &d, sizeof(d)) != 0) {
@@ -276,6 +289,29 @@ void refresh(ID3D12Device* device) {
         if (it != g_buffers.end() && it->second.mapped)
             guarded_copy(it->second.mapped, reinterpret_cast<const void*>(key.first), static_cast<std::size_t>(it->second.size));
         ++k;
+    }
+    // Pages of a shadow written since the last submission: those subresources go to the image.
+    for (auto& [base, resource] : g_shadows) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        std::size_t& bytes = g_shadow_bytes[base];
+        if (!bytes) {
+            if (!VirtualQuery(reinterpret_cast<const void*>(base), &mbi, sizeof(mbi))) continue;
+            bytes = mbi.RegionSize;
+        }
+        void* pages[256];
+        ULONG_PTR n = 256;
+        DWORD granularity = 0;
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(base), bytes, pages, &n, &granularity) != 0 || !n) continue;
+        std::uint64_t lo = reinterpret_cast<std::uint64_t>(pages[0]) - base;
+        std::uint64_t hi = reinterpret_cast<std::uint64_t>(pages[n - 1]) - base + granularity;
+        while (n == 256) {  // more than one batch: take the whole span
+            n = 256;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(base), bytes, pages, &n, &granularity) != 0 || !n) break;
+            lo = std::min<std::uint64_t>(lo, reinterpret_cast<std::uint64_t>(pages[0]) - base);
+            hi = std::max<std::uint64_t>(hi, reinterpret_cast<std::uint64_t>(pages[n - 1]) - base + granularity);
+        }
+        const D3D12_RANGE range{static_cast<SIZE_T>(lo), static_cast<SIZE_T>(hi)};
+        resource->Unmap(0, &range);  // the layer uploads the written subresources
     }
     for (auto& [base, subs] : g_shadow_dirty) {
         const auto it = g_shadows.find(base);

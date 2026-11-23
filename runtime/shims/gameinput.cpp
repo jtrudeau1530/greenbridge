@@ -1655,7 +1655,12 @@ bool async_key_down(int vk) {
     if (from >= 0 && vk == VK_RETURN) {
         static const ULONGLONG start = GetTickCount64();
         const double t = (GetTickCount64() - start) / 1000.0 - from;
-        if (t >= 0 && t - 5.0 * static_cast<long long>(t / 5.0) < 0.2) return true;
+        static const long long count = [] {  // LEONIDA_AUTO_A_COUNT presses (default 1): never past a screen that asks for consent
+            const char* v = std::getenv("LEONIDA_AUTO_A_COUNT");
+            return v ? std::atoll(v) : 1ll;
+        }();
+        const long long k = static_cast<long long>(t / 5.0);
+        if (t >= 0 && k < count && t - 5.0 * k < 0.2) return true;
     }
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }

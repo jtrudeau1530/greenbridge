@@ -2769,7 +2769,9 @@ public:
         if (!on) return 0;
         std::call_once(shadow_once_, [this] {
             const std::uint64_t bytes = title_layout().total + 0x10000;
-            shadow_ = VirtualAlloc(nullptr, static_cast<std::size_t>(bytes), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            // Write-watched: the title keeps the pointer and writes through it at any time (a movie's planes).
+            shadow_ = VirtualAlloc(nullptr, static_cast<std::size_t>(bytes), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+            shadow_bytes_ = static_cast<std::size_t>(bytes);
             if (shadow_) rt::title_textures::register_shadow(reinterpret_cast<std::uint64_t>(shadow_), this);
             static std::atomic<int> n{0};
             if (n.fetch_add(1) < 12)
@@ -2804,6 +2806,7 @@ public:
     }
     std::once_flag shadow_once_;
     void* shadow_ = nullptr;
+    std::size_t shadow_bytes_ = 0;
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
