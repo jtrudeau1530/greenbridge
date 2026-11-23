@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from shader_ir import HDR, parse_file  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
+import fssm_unpack  # noqa: E402
 import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
 import wave64_emulate_opt  # noqa: E402
@@ -16769,6 +16771,18 @@ def shader_container(path, name):
         raise Unsupported("no shader container (signatures, PSV0)") from None
 
 
+def source_wave_size(path, name):
+    """Read the source container's wave size only when all of its FSSM payloads agree."""
+    try:
+        blobs = fssm_unpack.unpack_all(shader_container(path, name))
+    except (OSError, Unsupported, ValueError, struct.error, zlib.error):
+        return None
+    sizes = {fssm_header.wave_size(blob) for blob in blobs}
+    if len(sizes) == 1:
+        return sizes.pop()
+    return None
+
+
 def input_signature_full(path, name):
     """ISG1 elements as (system value, declared mask, read/write mask)."""
     d = shader_container(path, name)
@@ -17216,7 +17230,7 @@ def translate(path):
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
     # heuristic (+ wave64 default for NGG mesh shaders) when no FSSM sidecar is present (FSPX or
     # synthetic listings).
-    fssm_path = native_paths(path, info["name"])[0]
+    fssm_path, fspx_path, _ = native_paths(path, info["name"])
     fssm_ws = None
     try:
         with open(fssm_path, "rb") as f:
@@ -17241,6 +17255,11 @@ def translate(path):
         if fspx_ws == 64 and code_w32:
             raise Unsupported("FSPX wave64 dispatch state contradicts wave32 code")
         g.wave64 = fspx_ws == 64
+    elif (stage in ("vs", "ps") and code_w64 and code_w32 and not (w64_marks - {"s_bfm_b64"})
+          and os.path.isfile(fspx_path) and source_wave_size(path, info["name"]) == 32):
+        # A library program can use s_bfm_b64 as scalar data. Use the matching source's
+        # wave32 flags only when this program's own EXEC instructions corroborate them.
+        g.wave64 = False
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
     if stage == "gs":
