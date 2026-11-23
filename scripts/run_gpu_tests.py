@@ -860,7 +860,11 @@ def run_suite(a, work: str) -> int:
         fname = shader_source(name) + ".asm"
         disasm_path = os.path.join(disasm_dir, f"{name}.s")
         if disasm_src is not None:
-            shutil.copyfile(os.path.join(disasm_src, f"{name}.s"), disasm_path)
+            try:
+                shutil.copyfile(os.path.join(disasm_src, f"{name}.s"), disasm_path)
+            except shutil.SameFileError:
+                # A replay can use the work folder's existing listings as its source.
+                pass
         else:
             assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), disasm_path, name)
         disasm_files.append(disasm_path)
