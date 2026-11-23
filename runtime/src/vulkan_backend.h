@@ -1287,6 +1287,18 @@ public:
         return resources_.find(id) != resources_.end();
     }
 
+    // The registered buffer whose VA range holds `va`: its ID, first VA and size in bytes. False when none does (the
+    // same index buffer_at searches). Used where a console call names a buffer by VA only (Xbox device slot 70).
+    bool buffer_resource_at(std::uint64_t va, ResourceId& id, std::uint64_t& start, std::uint64_t& size) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        if (!buffer_vas_.find(va, hit)) return false;
+        id = hit.id;
+        start = hit.start;
+        size = hit.size;
+        return true;
+    }
+
     bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
     bool xdxr_acceleration_structures() const { return xdxr_ != nullptr; }
 

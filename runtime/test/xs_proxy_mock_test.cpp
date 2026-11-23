@@ -91,6 +91,7 @@ struct Mock {
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv;  // device: the description CreateShaderResourceView (slot 18) last received
 };
 
 Mock g_pool[256];
@@ -185,6 +186,8 @@ void copy_array(Mock* m, unsigned slot, std::uint64_t objects, std::uint64_t cou
 std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
     if (m->kind == Kind::device) {
+        // The description lives on the caller's stack only for the call, so it is copied while the call is active.
+        if (slot == 18 && a2) std::memcpy(&m->srv, reinterpret_cast<const void*>(a2), sizeof(m->srv));
         switch (slot) {
             case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
@@ -828,6 +831,51 @@ int run_env_slots(bool valid, bool on_slot70 = false) {
 
 // ---- 8. Device slot 70: a view from raw words, never the PC CreatePlacedResource1 ----
 
+// What the layer's resource provider knows: one buffer at [kBufferStart, kBufferStart + kBufferSize).
+Mock* g_buffer = nullptr;
+constexpr std::uint64_t kBufferStart = 0x10000, kBufferSize = 0x400;
+
+ID3D12Resource* find_buffer(ID3D12Device*, std::uint64_t va, std::uint64_t* start, std::uint64_t* size) {
+    if (!g_buffer || va < kBufferStart || va >= kBufferStart + kBufferSize) return nullptr;
+    *start = kBufferStart;
+    *size = kBufferSize;
+    ++g_buffer->refs;  // the provider hands out a reference; the proxy releases it
+    return reinterpret_cast<ID3D12Resource*>(g_buffer);
+}
+
+// The measured retail shape: a desktop buffer description, then a raw R32_TYPELESS view description with the VA right
+// after it.
+struct RawShape {
+    D3D12_RESOURCE_DESC resource;
+    struct {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        D3D12_GPU_VIRTUAL_ADDRESS va;
+    } view;
+};
+
+RawShape raw_shape(std::uint64_t va, std::uint64_t width) {
+    RawShape shape{};
+    shape.resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    shape.resource.Width = width;
+    shape.resource.Height = 1;
+    shape.resource.DepthOrArraySize = 1;
+    shape.resource.MipLevels = 1;
+    shape.resource.SampleDesc.Count = 1;
+    shape.resource.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    shape.view.view.Format = DXGI_FORMAT_R32_TYPELESS;
+    shape.view.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    shape.view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    shape.view.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    shape.view.va = va;
+    return shape;
+}
+
+bool is_null_view(const Mock* mock) {
+    return mock->args[18][0] == 0 && mock->srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+           mock->srv.Format == DXGI_FORMAT_R8G8B8A8_UNORM && mock->srv.Texture2D.MipLevels == 1 &&
+           mock->srv.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+}
+
 int check_slot70() {
     // Level 9 has the PC slot 70; level 0 does not (44 PC slots). Neither may reach CreatePlacedResource1.
     for (const int level : {9, 0}) {
@@ -840,15 +888,68 @@ int check_slot70() {
         const std::uint64_t destination = 0x7000;
         raw(device, 70, word(words), word(view), destination);
         EXPECT(mock->calls[70] == 0 && xs::device_slot_hits(70) == 1);
-        // The destination gets the PC null view: CreateShaderResourceView (slot 18) with no resource, a desc, and the
-        // destination handle unchanged.
-        EXPECT(mock->calls[18] == 1 && mock->args[18][0] == 0 && mock->args[18][1] != 0 &&
-               mock->args[18][2] == destination);
+        // Words that are not the measured shape: the destination gets the PC null view (CreateShaderResourceView, slot
+        // 18, no resource), the destination handle unchanged.
+        EXPECT(mock->calls[18] == 1 && mock->args[18][2] == destination && is_null_view(mock));
         // No destination, no write.
         raw(device, 70, word(words), word(view), 0);
         EXPECT(mock->calls[70] == 0 && mock->calls[18] == 1);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
+    return 0;
+}
+
+// A raw buffer view of a registered VA: the view is of that resource, from (va - start) / 4, as wide as the
+// description says. Every other shape, and a VA no buffer holds, still gets the null view.
+int check_slot70_raw_buffer() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    g_buffer = new_mock(Kind::resource);
+    g_buffer->refs = 1;
+    EXPECT(xs::set_device_resource_provider(device, &find_buffer));
+    const std::uint64_t destination = 0x7000;
+
+    // 0x100 bytes at +0x40 of the buffer.
+    RawShape shape = raw_shape(kBufferStart + 0x40, 0x100);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[70] == 0 && mock->calls[18] == 1 && mock->args[18][0] == word(g_buffer) &&
+           mock->args[18][2] == destination);
+    EXPECT(mock->srv.Format == DXGI_FORMAT_R32_TYPELESS && mock->srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER &&
+           (mock->srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) && mock->srv.Buffer.FirstElement == 0x10 &&
+           mock->srv.Buffer.NumElements == 0x40 && mock->srv.Buffer.StructureByteStride == 0 &&
+           mock->srv.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    EXPECT(g_buffer->refs == 1);  // the proxy released the reference the provider added
+
+    // A width that runs past the buffer is cut at its end: (0x400 - 0x3f0) / 4 elements.
+    shape = raw_shape(kBufferStart + 0x3f0, 0x1000);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 2 && mock->args[18][0] == word(g_buffer) && mock->srv.Buffer.FirstElement == 0xfc &&
+           mock->srv.Buffer.NumElements == 4);
+
+    // A VA no buffer holds: the null view, and nothing is left referenced.
+    shape = raw_shape(kBufferStart + kBufferSize + 0x40, 0x100);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 3 && is_null_view(mock) && g_buffer->refs == 1);
+
+    // A known VA but not a raw R32_TYPELESS buffer view (a typed view; a texture description): the null view.
+    shape = raw_shape(kBufferStart + 0x40, 0x100);
+    shape.view.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 4 && is_null_view(mock));
+    shape = raw_shape(kBufferStart + 0x40, 0x100);
+    shape.resource.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 5 && is_null_view(mock) && g_buffer->refs == 1);
+
+    // No provider: the null view as well.
+    EXPECT(xs::set_device_resource_provider(device, nullptr));
+    shape = raw_shape(kBufferStart + 0x40, 0x100);
+    raw(device, 70, word(&shape.resource), word(&shape.view), destination);
+    EXPECT(mock->calls[18] == 6 && is_null_view(mock) && mock->calls[70] == 0);
+
+    g_buffer = nullptr;
+    EXPECT(release(device) == 0 && mock->refs == 0);
     return 0;
 }
 
@@ -980,7 +1081,7 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_slot70())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_slot70() || check_slot70_raw_buffer())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

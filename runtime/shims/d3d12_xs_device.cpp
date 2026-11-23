@@ -29,6 +29,7 @@
 #include <windows.h>
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -60,6 +61,7 @@ struct DeviceProxy {
     // The device's IDXGIDevice1 (see "IDXGIDevice1 on the device" below): a title's IDXGIDevice1* points here.
     void** dxgi_vtable;
     DxgiAdapterProvider adapter_provider;
+    ResourceByVaProvider resource_provider;  // slot 70: a buffer by console VA; null leaves slot 70 on the null view
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
     // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
@@ -1217,23 +1219,108 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
 }
 
 // Xbox device slot 70: (texture_words, view_desc, destination), no return value. The retail executable's SRV writer
-// makes a view from raw descriptions and a GPU address with no resource object (docs/retail_boot_chain.md, stop 14,
-// measured by call shape only). The PC slot 70 is ID3D12Device8::CreatePlacedResource1, which would take the
-// destination handle for a resource description and write through it. The layout of the raw words is not measured,
-// so nothing reads them: the destination gets the PC's null shader-resource view, which a shader reads as zeros, and
-// the call returns. A view that reaches the GPU address needs that layout.
-void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words, std::uint64_t view_desc,
-                                 std::uint64_t destination) {
-    note_slot(70);
-    log_xbox_route_once(70, "CreateShaderResourceView from raw words (null view)", texture_words, view_desc,
-                        destination, 0, 0);
-    if (!destination) return;
+// makes a view from raw descriptions and a GPU address with no resource object (docs/retail_boot_chain.md, stop 14).
+// The PC slot 70 is ID3D12Device8::CreatePlacedResource1, which would take the destination handle for a resource
+// description and write through it, so it is never forwarded.
+//
+// The one measured shape (PR 7066, eugen1763, first retail call) is a raw buffer view: texture_words starts with a
+// desktop D3D12_RESOURCE_DESC (buffer), view_desc with a desktop D3D12_SHADER_RESOURCE_VIEW_DESC (R32_TYPELESS,
+// BUFFER, RAW flag) followed at once by a D3D12_GPU_VIRTUAL_ADDRESS, the console VA slot 133 registered. For that shape
+// and a VA inside a buffer the resource provider knows, the destination gets a raw view of that range: FirstElement
+// (va - resource start) / 4, NumElements the description's Width / 4, cut to the end of the resource. Anything else
+// (a texture, another dimension or format, no RAW flag, a VA no buffer holds, no provider, unreadable words) keeps the
+// PC null view, which a shader reads as zeros, with one log line saying why. Texture shapes are not measured.
+struct RawSrvShape {
+    D3D12_RESOURCE_DESC resource;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view;
+    D3D12_GPU_VIRTUAL_ADDRESS va;
+};
+
+bool readable(std::uint64_t address, std::size_t bytes) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!address || !VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info))) return false;
+    if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    const auto end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+    return address + bytes <= end;
+}
+
+// Reads the measured shape from the two words into `out`. Returns null when it parsed, else why it is not that shape.
+const char* parse_raw_srv(std::uint64_t texture_words, std::uint64_t view_desc, RawSrvShape& out) {
+    if (!readable(texture_words, sizeof(D3D12_RESOURCE_DESC)) ||
+        !readable(view_desc, sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) + sizeof(D3D12_GPU_VIRTUAL_ADDRESS)))
+        return "the words are not readable";
+    std::memcpy(&out.resource, reinterpret_cast<const void*>(texture_words), sizeof(out.resource));
+    std::memcpy(&out.view, reinterpret_cast<const void*>(view_desc), sizeof(out.view));
+    std::memcpy(&out.va, reinterpret_cast<const std::uint8_t*>(view_desc) + sizeof(out.view), sizeof(out.va));
+    if (out.resource.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return "arg1 is not a buffer description";
+    if (out.view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return "arg2 is not a buffer view";
+    if (out.view.Format != DXGI_FORMAT_R32_TYPELESS || !(out.view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW))
+        return "arg2 is not a raw R32_TYPELESS view";
+    if (!out.resource.Width || !out.va) return "no width or no address";
+    return nullptr;
+}
+
+void write_null_srv(DeviceProxy* self, std::uint64_t destination) {
     D3D12_SHADER_RESOURCE_VIEW_DESC null_view{};
     null_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     null_view.Texture2D.MipLevels = 1;
     self->real->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+}
+
+void log_slot70_null_once(const char* why, std::uint64_t texture_words, std::uint64_t view_desc) {
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 70 writes a null view: %s (args 0x%llx 0x%llx)\n", why,
+                     static_cast<unsigned long long>(texture_words), static_cast<unsigned long long>(view_desc));
+}
+
+void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words, std::uint64_t view_desc,
+                                 std::uint64_t destination) {
+    note_slot(70);
+    log_xbox_route_once(70, "CreateShaderResourceView from raw words", texture_words, view_desc, destination, 0, 0);
+    if (!destination) return;
+    // Hook point for the CPU destination: the console hands a CPU descriptor handle that the PC layer may not be able
+    // to write as it is. Translating it (#7021) goes here, on `destination`, before either write below.
+
+    RawSrvShape shape{};
+    const char* why = parse_raw_srv(texture_words, view_desc, shape);
+    if (why || !self->resource_provider) {
+        log_slot70_null_once(why ? why : "no resource provider", texture_words, view_desc);
+        write_null_srv(self, destination);
+        return;
+    }
+    std::uint64_t start = 0, size = 0;
+    ID3D12Resource* resource = self->resource_provider(self->real, shape.va, &start, &size);
+    if (!resource || shape.va < start || shape.va - start >= size) {
+        if (resource) resource->Release();
+        log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
+        write_null_srv(self, destination);
+        return;
+    }
+    const std::uint64_t offset = shape.va - start;
+    const std::uint64_t elements = std::min<std::uint64_t>(shape.resource.Width, size - offset) / 4;
+    if (offset % 4 || !elements || elements > UINT32_MAX) {
+        resource->Release();
+        log_slot70_null_once("address or width is not 4-byte aligned or too large", texture_words, view_desc);
+        write_null_srv(self, destination);
+        return;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_R32_TYPELESS;
+    view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    view.Shader4ComponentMapping = shape.view.Shader4ComponentMapping;
+    view.Buffer.FirstElement = offset / 4;
+    view.Buffer.NumElements = static_cast<UINT>(elements);
+    view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    self->real->CreateShaderResourceView(resource, &view, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+    resource->Release();
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 70 wrote a raw buffer view (va 0x%llx, first element %llu, %u elements)\n",
+                     static_cast<unsigned long long>(shape.va), static_cast<unsigned long long>(view.Buffer.FirstElement),
+                     view.Buffer.NumElements);
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
@@ -1674,6 +1761,7 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->dxgi_vtable = get_dxgi_vtable();
     proxy->adapter_provider = nullptr;
+    proxy->resource_provider = nullptr;
     proxy->gpu_thread_priority.store(0, std::memory_order_relaxed);
     proxy->max_frame_latency.store(3, std::memory_order_relaxed);
 
@@ -1714,6 +1802,17 @@ bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {
         return false;
     }
     proxy->adapter_provider = provider;
+    return true;
+}
+
+bool set_device_resource_provider(void* device, ResourceByVaProvider provider) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) {
+        std::fprintf(stderr, "[rt] d3d12_xs: set_device_resource_provider: %p is not a device proxy; no provider set\n",
+                     device);
+        return false;
+    }
+    proxy->resource_provider = provider;
     return true;
 }
 
