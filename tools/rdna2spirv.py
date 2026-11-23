@@ -6833,8 +6833,20 @@ class Gen:
             d, x = a[0], a[1]
             wide_src = op == "s_quadmask_b64"
             wide_dst = op != "s_quadmask_b32"
-            if self.is_mask_op(x) or (d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc"))):
+            if self.is_mask_op(x):
                 raise Unsupported(op + " on a lane mask")
+            if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
+                if op != "s_bitreplicate_b64_b32" or d["t"] != "exec":
+                    raise Unsupported(op + " on a lane mask")
+                # EXEC's bit for lane L comes from scalar-source bit L // 2.
+                shift, shifted, bit = (self.tmp() for _ in range(3))
+                lane = self.wave_lane()
+                word = self.src_u(x)
+                self.emit(f"{shift} = OpShiftRightLogical %uint {lane} {self.cu(1)}")
+                self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {shift}")
+                self.emit(f"{bit} = OpBitwiseAnd %uint {shifted} {self.cu(1)}")
+                self.set_exec(bit)
+                return
             if wide_src:
                 lo, hi = self.src64_data(x, op)
                 words = [lo, hi]
