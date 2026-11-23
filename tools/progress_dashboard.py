@@ -23,6 +23,7 @@ Sources, each optional and reported as missing rather than counted as zero when 
 
 No game data leaves the inputs: the page and the JSON carry counts, pass/fail, error classes and the project's
 own document text; never a shader name, a carved file name or a path into the game copy.
+Usage: `python -I tools/progress_dashboard.py --help` lists the options.
 """
 import argparse
 import base64
