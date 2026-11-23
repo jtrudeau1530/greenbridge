@@ -309,6 +309,19 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(os.path.normcase(os.path.realpath(seen["cwd"])),
                          os.path.normcase(os.path.realpath(self.artifact / "sub")))
 
+    def test_invalid_mapped_working_directory_fails_without_starting_wine(self):
+        exe = self.exiting(0)
+        (self.artifact / "file").touch()
+        for name in ("missing", "file"):
+            cwd = WINDOWS_ROOT + f"/artifact/{name}"
+            with self.subTest(cwd=cwd), mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as run:
+                entry = ctest_entry("bad_cwd", self.command_for(exe), {"WORKING_DIRECTORY": cwd})
+                status, detail = self.run_entry(entry)
+                self.assertEqual(status, "fail")
+                self.assertIn("working directory", detail)
+                self.assertIn(cwd, detail)
+                run.assert_not_called()
+
 
 @unittest.skipIf(os.name == "nt", "the runner and its dosdevices links are for Linux and macOS")
 class DriveMapTest(unittest.TestCase):

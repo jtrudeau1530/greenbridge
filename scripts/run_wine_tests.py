@@ -168,9 +168,11 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
     for a in command[1:]:
         mapped = map_path(a, args.windows_root, args.root)
         argv.append(wine_path(mapped) if mapped is not None else a)
-    cwd = props.get("WORKING_DIRECTORY")
-    cwd = map_path(cwd, args.windows_root, args.root) if cwd else os.path.dirname(exe)
-    if not cwd or not os.path.isdir(cwd):
+    listed_cwd = props.get("WORKING_DIRECTORY")
+    cwd = map_path(listed_cwd, args.windows_root, args.root) if listed_cwd else None
+    if cwd is not None and not os.path.isdir(cwd):
+        return "fail", f"CTest working directory is not a directory: {listed_cwd} (mapped to {cwd})"
+    if cwd is None:
         cwd = os.path.dirname(exe)
     assignments = props.get("ENVIRONMENT", [])
     if not isinstance(assignments, list):
