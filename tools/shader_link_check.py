@@ -285,9 +285,15 @@ def run_checks(args):
         pipelines = load_pipeline_manifest(args.manifest, args.shader_dir)
         extra_inputs = [args.manifest]
     else:
-        refs = {stage: getattr(args, stage) for stage in STAGES if getattr(args, stage) is not None}
-        pipelines = [Pipeline("pipeline", tuple(ModulePath(refs[stage], stage, args.entry)
-                                                for stage in stage_chain(refs)))]
+        refs = {}
+        for stage in STAGES:
+            path = getattr(args, stage)
+            entry = getattr(args, f"{stage}_entry")
+            if path is not None:
+                refs[stage] = ModulePath(path, stage, args.entry if entry is None else entry)
+            elif entry is not None:
+                raise ValueError(f"--{stage}-entry requires --{stage}")
+        pipelines = [Pipeline("pipeline", tuple(refs[stage] for stage in stage_chain(refs)))]
     ensure_report_is_separate(args.report, [*extra_inputs,
                                             *(module.path for pipeline in pipelines for module in pipeline.modules)])
     cache = InterfaceCache()
@@ -315,7 +321,8 @@ def main(argv=None):
     direct = commands.add_parser("check", help="check one graphics pipeline from SPIR-V file paths")
     for stage in STAGES:
         direct.add_argument("--" + stage, type=Path, metavar="SPV")
-    direct.add_argument("--entry", default="main", help="entry-point name used by all direct paths")
+        direct.add_argument(f"--{stage}-entry", metavar="NAME", help=f"override --entry for --{stage}")
+    direct.add_argument("--entry", default="main", help="default entry-point name for direct paths (default: main)")
     batch = commands.add_parser("batch", help="check a JSON list of pipelines sharing a shader directory")
     batch.add_argument("manifest", type=Path)
     batch.add_argument("--shader-dir", type=Path, required=True, help="directory holding the named .spv files")
