@@ -4095,11 +4095,8 @@ public:
                              vs_stage.entry->name.c_str(), why.c_str());
                 return E_NOTIMPL;
             }
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = words.size() * 4;
-            module_info.pCode = words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
+            const VkShaderModule module = device_.shader_modules().acquire(words);
+            if (module == VK_NULL_HANDLE) return E_FAIL;
             modules_.push_back(module);
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             info.stage = VK_SHADER_STAGE_GEOMETRY_BIT;
