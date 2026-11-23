@@ -23,6 +23,8 @@ class Int32ToFloat64(unittest.TestCase):
         float_controls = {
             "OpCapability SignedZeroInfNanPreserve", "OpCapability DenormPreserve",
             "OpExecutionMode %main SignedZeroInfNanPreserve 32", "OpExecutionMode %main DenormPreserve 16",
+            # SHADER-597 (#3290): a module that declares Float64 also preserves f64 signed zeros, infs and NaNs
+            "OpExecutionMode %main SignedZeroInfNanPreserve 64",
         }
         self.assertTrue(float_controls.issubset(line.strip() for line in default.splitlines()))
         self.assertEqual([line for line in default.splitlines() if line.strip() not in float_controls],
