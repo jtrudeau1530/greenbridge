@@ -305,6 +305,19 @@ class Outputs(unittest.TestCase):
             with open(os.path.join(out, "history.json"), encoding="utf-8") as f:
                 self.assertEqual(len(json.load(f)), 1)
 
+    def test_unmatched_test_filter_preserves_cached_results(self):
+        with tempfile.TemporaryDirectory() as out:
+            cached = os.path.join(out, "unit_results.json")
+            previous = b'{"results":[{"test":"tests/test_progress_dashboard.py","result":"pass"}]}\n'
+            with open(cached, "wb") as f:
+                f.write(previous)
+            cmd = [sys.executable, "-I", TOOL, "--out", out, "--run-tests", "--tests", "^no-such-fixture$"]
+            result = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=120)
+            self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"--tests did not match any test files", result.stderr)
+            with open(cached, "rb") as f:
+                self.assertEqual(f.read(), previous)
+
     def test_missing_logo_leaves_no_image(self):
         old = pd.LOGO
         try:

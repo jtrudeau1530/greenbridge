@@ -280,8 +280,7 @@ def code_digest():
     return h.hexdigest()[:16]
 
 
-def run_unit_tests(match, jobs, timeout):
-    files = [f for f in ci_test_files() if not match or re.search(match, f)]
+def run_unit_tests(files, jobs, timeout):
     before = code_digest()
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         results = list(pool.map(lambda f: run_one_test(f, timeout), files))
@@ -298,8 +297,8 @@ def collect_unit(col, out_dir, args):
     col.panel("tests", "Unit tests (CI selection)", "test files")
     path = os.path.join(out_dir, "unit_results.json")
     if args.run_tests:
-        print(f"running unit tests ({len(ci_test_files())} files, {args.jobs} at a time)...")
-        data = run_unit_tests(args.tests, args.jobs, args.test_timeout)
+        print(f"running unit tests ({len(args.test_files)} selected, {args.jobs} at a time)...")
+        data = run_unit_tests(args.test_files, args.jobs, args.test_timeout)
         save_text(path, dump_json(data))
     elif os.path.isfile(path):
         data = json.loads(read_utf8(path))
@@ -951,6 +950,10 @@ def main(argv=None):
     if args.work and not os.path.isdir(args.work):
         print(f"--work {args.work} is not a folder", file=sys.stderr)
         return 2
+    if args.run_tests:
+        args.test_files = [f for f in ci_test_files() if not args.tests or re.search(args.tests, f)]
+        if args.tests and not args.test_files:
+            ap.error("--tests did not match any test files")
     os.makedirs(out_dir, exist_ok=True)
     snap = build(args, out_dir)
     new = write_outputs(snap, out_dir)
