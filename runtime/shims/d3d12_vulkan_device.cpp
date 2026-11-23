@@ -4580,6 +4580,10 @@ public:
     static constexpr GUID kTag{0xc58e1d27, 0x3a96, 0x4b4f, {0x9e, 0x72, 0x6d, 0x0a, 0x8b, 0x5f, 0x3c, 0x61}};
 
     explicit Device(const VulkanDeviceInfo& info) {
+        // Every Vulkan device serves Xbox device slot 133, whichever entry made it: create_vulkan_device and the
+        // standalone device gta6rt --run uses both come through here (found in review: registering only in
+        // create_vulkan_device left the retail path without it).
+        rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -8173,7 +8177,6 @@ private:
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
     auto* device = new Device(info);
     if (!device->ok()) {
         device->Release();

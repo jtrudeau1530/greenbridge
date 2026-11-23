@@ -1339,7 +1339,9 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
     if (!handler) return E_NOTIMPL;
     if (!out || !xbox_desc || !riid) return E_POINTER;
-    constexpr auto kPcResourceFlags = static_cast<D3D12_RESOURCE_FLAGS>(0x7ff);
+    // An integer mask: a D3D12_RESOURCE_FLAGS constant past the SDK's last enumerator is not a constant expression
+    // for clang-cl with SDK 10.0.26100 (found in review). The cast is applied to the masked value at run time.
+    constexpr std::uint32_t kPcResourceFlags = 0x7ff;
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
