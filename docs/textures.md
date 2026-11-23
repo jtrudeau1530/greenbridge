@@ -189,6 +189,15 @@ mode 1/32 descriptors have a known element size (4 mode 1, 11 mode 32); all fift
 other 19 mode 1 records formerly counted as unknown-format 2D entries are two-slice 2D arrays
 (`depth = 2`, DXGI 28/71/83/98; see `docs/textures_arrays.md`).
 
+Where one descriptor's mode is still in doubt, `tools/tex_mode_probe.py <textures index.json>
+<carve dir> [--fmt BC1] [--n 12]` scores every 4 KiB and 64 KiB addrlib colour pattern of the
+element size, crossed with both placements of the top mip (at the data offset, or at the end of
+the chain, since GFX10 stores mips smallest first), by the smoothness of the decoded BC1/BC2/BC3
+average colours. It prints the best and second-best pattern with the placement and the linear
+(untiled) score per texture, then a tally of the winners and how many textures no candidate fit.
+It needs numpy, like `tests/test_tex_mode_probe.py`, which covers it on synthetic blobs with no
+game files.
+
 ### The layout is the AMD mip tail
 
 The compact profile is the Gfx10 mip chain: standalone mips are padded to whole blocks and
