@@ -737,9 +737,11 @@ def main(argv=None):
                     help="bone influences per vertex; 4 keeps the largest four, renormalised (three.js reads four)")
     ap.add_argument("--no-root-motion", action="store_true", help="leave out the mover (bone hash 0) tracks")
     ap.add_argument("--coverage", action="store_true", help="count clip bone tracks that name a skeleton joint")
-    ap.add_argument("--jobs", type=int, default=1, help="worker processes for --coverage")
+    ap.add_argument("--jobs", type=int, default=1, help="worker processes for --coverage (at least 1)")
     ap.add_argument("--report", help="write a JSON report (counts only)")
     args = ap.parse_args(argv)
+    if args.jobs < 1:
+        ap.error("--jobs must be at least 1")
     inputs = [args.archive] + ([args.anim] if args.anim else [])
     outputs = [p for p in (args.out, args.report) if p]
     for o in outputs:
