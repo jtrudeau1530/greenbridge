@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <type_traits>
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -289,6 +290,48 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
+// The blob owns its storage and implements the standard ID3D10Blob COM interface.
+class LocalBlob final : public ID3D10Blob {
+public:
+    explicit LocalBlob(void* data, SIZE_T size) : data_(data), size_(size) {}
+    ~LocalBlob() { std::free(data_); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(ID3D10Blob)) return E_NOINTERFACE;
+        *out = static_cast<ID3D10Blob*>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG remaining = --refs_;
+        if (!remaining) delete this;
+        return remaining;
+    }
+    void* STDMETHODCALLTYPE GetBufferPointer() override { return data_; }
+    SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return size_; }
+private:
+    std::atomic<ULONG> refs_{1};
+    void* data_;
+    SIZE_T size_;
+};
+
+void WINAPI zero_memory(void* dst, SIZE_T size) {
+    if (size) std::memset(dst, 0, size);
+}
+
+HRESULT WINAPI create_blob(SIZE_T size, ID3D10Blob** out) {
+    if (!out) return E_INVALIDARG;
+    *out = nullptr;
+    void* data = std::malloc(size ? size : 1);
+    if (!data) return E_OUTOFMEMORY;
+    auto* blob = new (std::nothrow) LocalBlob(data, size);
+    if (!blob) { std::free(data); return E_OUTOFMEMORY; }
+    *out = blob;
+    return S_OK;
+}
+
 // Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
 // dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
 // so the policy is accepted and ignored.
@@ -297,6 +340,8 @@ HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
 }  // namespace
 
 SHIM_TABLE(d3d12_xs,
+    {"d3d12_xs.dll", "D3D12ZeroMemoryX", reinterpret_cast<void*>(&zero_memory)},
+    {"d3d12_xs.dll", "D3D10CreateBlob", reinterpret_cast<void*>(&create_blob)},
     {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", reinterpret_cast<void*>(&serialize_root_signature)},
     {"d3d12_xs.dll", "D3D12SerializeRootSignature", reinterpret_cast<void*>(&serialize_root_signature_legacy)},
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",

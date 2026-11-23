@@ -296,6 +296,37 @@ void test_preserves_low_bits_and_unknown_versions() {
     check(unchanged, "unknown descriptor version is copied unchanged for forwarding");
 }
 
+void test_extra_exports() {
+    using ZeroFn = void (WINAPI*)(void*, SIZE_T);
+    using BlobFn = HRESULT (WINAPI*)(SIZE_T, ID3D10Blob**);
+    auto zero = reinterpret_cast<ZeroFn>(rt::shims::find("d3d12_xs.dll", "D3D12ZeroMemoryX"));
+    auto create = reinterpret_cast<BlobFn>(rt::shims::find("d3d12_xs.dll", "D3D10CreateBlob"));
+    check(zero != nullptr, "D3D12ZeroMemoryX export");
+    check(create != nullptr, "D3D10CreateBlob export");
+    if (zero) {
+        unsigned char bytes[] = {1, 2, 3, 4};
+        zero(bytes + 1, 2);
+        check(bytes[0] == 1 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 4, "zero requested range");
+    }
+    if (create) {
+        check(create(4, nullptr) == E_INVALIDARG, "blob null output rejected");
+        ID3D10Blob* blob = nullptr;
+        HRESULT hr = create(4, &blob);
+        check(hr == S_OK && blob != nullptr, "create blob");
+        if (blob) {
+            check(blob->GetBufferSize() == 4, "blob size");
+            auto* data = static_cast<unsigned char*>(blob->GetBufferPointer());
+            check(data != nullptr, "blob buffer");
+            if (data) { data[0] = 42; check(data[0] == 42, "blob writable"); }
+            void* unsupported = blob;
+            const IID unsupported_iid = {0x12345678, 0x1234, 0x5678, {0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78}};
+            hr = blob->QueryInterface(unsupported_iid, &unsupported);
+            check(hr == E_NOINTERFACE && unsupported == nullptr, "blob rejects unsupported interface and clears output");
+            check(blob->Release() == 0, "blob released");
+        }
+    }
+}
+
 void test_registered_shim(bool supports_1_2) {
     using SerializeFn =
         HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
@@ -502,6 +533,7 @@ int main() {
     test_downgrade_1_2_to_1_1(supports_1_2);
     test_legacy_entry_point();
     test_preserves_low_bits_and_unknown_versions();
+    test_extra_exports();
     test_registered_shim(supports_1_2);
     test_deserializer();
     std::printf("root_sig_test: %s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures,
