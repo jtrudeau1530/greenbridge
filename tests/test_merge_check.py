@@ -217,6 +217,29 @@ class MergeCheckTest(unittest.TestCase):
         self.git("config", "core.quotePath", "false")
         self.assertEqual(self.run_check("18=duplicated"), (code, [result]))
 
+    def test_duplicate_blocks_span_retained_blank_lines_only(self):
+        first, second, third = PARAGRAPH.splitlines(keepends=True)
+        paragraph = first + "\n" + second + third
+        intro = paragraph + "Start of the changed section.\n"
+        ending = "End of the changed section.\n"
+        duplicate = "docs/notes.md"
+        partial_edit = "docs/partial.md"
+        self.write(duplicate, intro + "\n" + ending)
+        self.write(partial_edit, intro + second + ending)
+        self.commit("Add two documents and placeholders")
+        self.git("checkout", "-q", "-b", "fill-placeholders")
+        for path in (duplicate, partial_edit):
+            self.write(path, intro + paragraph + ending)
+        self.commit("Fill placeholders")
+        self.git("checkout", "-q", "main")
+
+        # Git keeps the blank line in notes.md and the second content line in partial.md.
+        # Both split the additions into separate hunks, but only notes.md adds all three content lines.
+        code, [result] = self.run_check("20=fill-placeholders")
+        self.assertEqual((code, result["verdict"]), (1, "duplicates"))
+        self.assertEqual(result["duplicates"], {duplicate: 3})
+        self.assertEqual(result["duplicate_samples"], {duplicate: PARAGRAPH.splitlines()})
+
     def test_duplicate_blocks_use_git_line_boundaries(self):
         unicode_lines = "".join(f"Paragraph {i} begins with enough text to count as a line.\u2028"
                                 "Its continuation is also longer than forty characters.\n" for i in range(3))
