@@ -7,6 +7,7 @@
 //   4. vkGetSemaphoreCounterValue() returning VK_ERROR_DEVICE_LOST drains pending waits and marks device_lost_ instead
 //      of spinning forever.
 //   5. cancel() blocks until a callback already dispatched for that semaphore has stopped using it.
+//   6. A re-entrant cancel() for a later callback in the same ready batch skips that callback.
 // Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -35,8 +36,10 @@ PFN_vkGetSemaphoreCounterValue real_get_counter = nullptr;
 std::atomic<bool> in_wait_semaphores{false};
 std::atomic<bool> fail_counter_device_lost{false};
 std::atomic<std::uint32_t> counter_calls{0};
+std::atomic<std::uint32_t> wait_sem_count{0};
 
 VKAPI_ATTR VkResult VKAPI_CALL wait_semaphores(VkDevice device, const VkSemaphoreWaitInfo* info, std::uint64_t timeout) {
+    wait_sem_count.store(info->semaphoreCount, std::memory_order_release);
     in_wait_semaphores.store(true, std::memory_order_release);
     const VkResult res = real_wait_semaphores(device, info, timeout);
     in_wait_semaphores.store(false, std::memory_order_release);
@@ -72,6 +75,16 @@ bool wait_flag(std::mutex& mu, std::condition_variable& cv, const bool& flag, in
 bool wait_until_in_vk_wait(int timeout_ms = 2000) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (!driver::in_wait_semaphores.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+// Waits until run() has re-armed vkWaitSemaphores with exactly `count` semaphores (wakeup + N pending waits).
+bool wait_until_wait_sem_count(std::uint32_t count, int timeout_ms = 2000) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (driver::wait_sem_count.load(std::memory_order_acquire) != count) {
         if (std::chrono::steady_clock::now() >= deadline) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -305,6 +318,54 @@ int main() {
         EXPECT(used);
         cancel_thread.join();
         std::printf("fence dispatcher: cancel waits for an in-flight callback ok\n");
+    }
+
+    // 6. A re-entrant cancel() for a later callback in the same ready batch must skip that callback instead of
+    //    returning while it is still going to run with a semaphore the caller has already destroyed.
+    {
+        driver::in_wait_semaphores.store(false, std::memory_order_release);
+        driver::wait_sem_count.store(0, std::memory_order_release);
+        VulkanContext context(driver::get_device, d.device, true);
+        EXPECT(context.loaded());
+        VulkanFence fence_a(context, 0);
+        VulkanFence fence_b(context, 0);
+        const VkSemaphore sem_a = fence_a.semaphore();
+        const VkSemaphore sem_b = fence_b.semaphore();
+        EXPECT(sem_a != VK_NULL_HANDLE && sem_b != VK_NULL_HANDLE && sem_a != sem_b);
+
+        std::mutex mu;
+        std::condition_variable cv;
+        bool a_ran = false, b_ran = false, cancel_done = false;
+
+        context.enqueue_fence_callback(sem_a, 1, [&] {
+            context.cancel_fence_waits(sem_b);
+            {
+                std::lock_guard lk(mu);
+                cancel_done = true;
+            }
+            cv.notify_all();
+            std::lock_guard lk(mu);
+            a_ran = true;
+        });
+        EXPECT(wait_until_wait_sem_count(2));  // wakeup + A
+        context.enqueue_fence_callback(sem_b, 1, [&] {
+            std::lock_guard lk(mu);
+            b_ran = true;
+            cv.notify_all();
+        });
+        EXPECT(wait_until_wait_sem_count(3));  // wakeup + A + B: one ready batch
+
+        EXPECT(fence_a.signal(1));
+        EXPECT(fence_b.signal(1));
+        EXPECT(wait_flag(mu, cv, cancel_done));
+        EXPECT(a_ran);
+        // Give the dispatcher time to walk the rest of the batch.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        EXPECT(!b_ran);
+
+        context.cancel_fence_waits(sem_a);
+        context.cancel_fence_waits(sem_b);
+        std::printf("fence dispatcher: re-entrant cancel skips later callback in the same batch ok\n");
     }
 
     EXPECT(d.validation_errors() == 0);
