@@ -427,6 +427,65 @@ int check_levels() {
             EXPECT(xs::device_slot_overridden(133));
         }
 
+        // 133 with a pages hook (set_placed_at_va_pages_hook): a buffer's range [va, va + width) is handed to it
+        // before the handler runs; a texture is not; a hook that fails still leaves the call to the handler.
+        {
+            static int order = 0;
+            static int hook_at = 0;
+            static int handler_at = 0;
+            static const void* hook_va = nullptr;
+            static std::size_t hook_bytes = 0;
+            static bool hook_result = true;
+            order = hook_at = handler_at = 0;
+            const xs::PlacedAtVaPagesHook hook = [](const void* va, std::size_t bytes) -> bool {
+                hook_at = ++order;
+                hook_va = va;
+                hook_bytes = bytes;
+                return hook_result;
+            };
+            const xs::PlacedAtVaHandler handler = [](ID3D12Device*, void*, const D3D12_RESOURCE_DESC&, std::uint32_t,
+                                                     REFIID, void** out) -> HRESULT {
+                handler_at = ++order;
+                *out = reinterpret_cast<void*>(0x1331);
+                return S_OK;
+            };
+            xs::set_placed_at_va_handler(handler);
+            xs::set_placed_at_va_pages_hook(hook);
+            D3D12_RESOURCE_DESC xbox_desc{};
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            xbox_desc.Width = 0xadf0000;
+            xbox_desc.Height = xbox_desc.DepthOrArraySize = xbox_desc.MipLevels = 1;
+            xbox_desc.SampleDesc.Count = 1;
+            xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);
+            const GUID resource_iid = __uuidof(ID3D12Resource);
+            void* placed = nullptr;
+            void* const va = reinterpret_cast<void*>(0x7f0000010000ull);
+            auto place = [&]() {
+                placed = nullptr;
+                return hr_of(raw(device, 133, word(va), word(&xbox_desc), 0xFFFFFFFFull, 0, word(&resource_iid),
+                                 word(&placed)));
+            };
+            const HRESULT buffer_hr = place();
+            EXPECT(buffer_hr == S_OK && placed == reinterpret_cast<void*>(0x1331));
+            EXPECT(hook_at == 1 && handler_at == 2 && hook_va == va && hook_bytes == 0xadf0000);
+
+            hook_result = false;
+            order = hook_at = handler_at = 0;
+            const HRESULT refused_hr = place();
+            EXPECT(refused_hr == S_OK && hook_at == 1 && handler_at == 2);
+            hook_result = true;
+
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            xbox_desc.Width = 64;
+            xbox_desc.Height = 64;
+            order = hook_at = handler_at = 0;
+            const HRESULT texture_hr = place();
+            EXPECT(texture_hr == S_OK && hook_at == 0 && handler_at == 1);
+
+            xs::set_placed_at_va_pages_hook(nullptr);
+            xs::set_placed_at_va_handler(nullptr);
+        }
+
         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
         Mock* const fence_mock = reinterpret_cast<Mock*>(real_fence);
         EXPECT(release(queue) == 0 && release(fence) == 0);
