@@ -2893,8 +2893,16 @@ SDL2 `src/render/direct3d12/SDL_render_d3d12_xbox.cpp` (zlib).
     entries carry a `PlaneIndex`; display entries carry `PercentScanned`.
 11. Xbox titles do not handle `DXGI_ERROR_DEVICE_REMOVED`/`RESET`.
 
-*Not measured:* vtable slots of all `*X` methods, exact `D3D12XBOX_*` struct layouts and sizes, enum values, and
-whether the token is exactly 64 bits in the ABI. The samples give argument counts and field names only.
+*Public corroboration (not measured here).* XCL, a GPL-2.0-only compatibility layer that runs retail Xbox Series
+titles, records `PresentX` at queue slot 30 for the older runtime layout (XDefiant, Minecraft, Fortnite) and 32 for
+a newer one (Unicorn Overlord), and the four frame calls at device slots 78-81: `SetFrameIntervalX`,
+`ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` (0-based, `QueryInterface` = 0). The Apache-2.0
+ebiten Xbox binding has the same device order, declares `D3D12XBOX_PRESENT_PLANE_PARAMETERS` as a 0x48-byte x64
+struct and `D3D12XBOX_PRESENT_PARAMETERS` as 0x20 bytes, and stores the token in 64 bits. So the plane and
+present-parameter layouts and the token width in `runtime/shims/xbox_present.h` are no longer guesses; the enum
+values and the `SuspendX`/`ResumeX` slots still are. XCL returns `S_FALSE` from a timed-out `WaitFrameEventX`
+where this layer returns `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`. The full comparison is in
+[d3d12_xs_surface.md §7.1](d3d12_xs_surface.md#71-public-sources-for-the-presentation-and-device-abi).
 
 *Hypothesis (the game is not observed):* a GDKX title follows this pattern, so the DXGI swapchain shim (D3D-2)
 is probably **not** on its boot path. What is on it: `D3D12XboxCreateDevice`, `IDXGIDevice1`/`IDXGIAdapter`/
@@ -2921,10 +2929,11 @@ Layer plan:
 
 **What is implemented (the presentation core).** Everything in the plan above that does not need a slot exists as
 methods of `rt::d3d12::XboxPresentation` (`runtime/shims/xbox_present.h`), on top of the presenter of section 3.2 and
-`leonida::FramePacer` (`runtime/src/frame_pacer.h`, no Vulkan, no Windows headers). The struct layouts, constant
-values, HRESULTs and the 64-bit token are **our own provisional definitions**: the samples give call shapes and field
-names only, so the real slots, layouts and enum values are still unmeasured and the class is the surface the proxy
-will forward to. The queue-side calls ignore which queue they came on (one `VkQueue` behind all of them).
+`leonida::FramePacer` (`runtime/src/frame_pacer.h`, no Vulkan, no Windows headers). The plane and present-parameter
+layouts and the 64-bit token are confirmed on x64 by the public code cited above; the constant values and HRESULTs
+are **our own provisional definitions**, because the samples give call shapes and field names only and the enum
+values are still unmeasured. The class is the surface the proxy will forward to. The queue-side calls ignore which
+queue they came on (one `VkQueue` behind all of them).
 
 - *Frame pacing* (`FramePacer`, time from an injectable clock; real time is a steady timer, a host vblank source
   can replace it). `SetFrameIntervalX` takes the interval as a period in microseconds and the latency, and starts
@@ -3138,9 +3147,10 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   second (GameDVR) output, resolving multisampled planes, a mutable-format swapchain (an sRGB/UNORM
   alternation recreates the swapchain; `VK_KHR_swapchain_mutable_format` is not enabled on the device), a host-vblank clock (the timer drifts from the
   display; with FIFO presents the swapchain holds the queue to the real refresh anyway), render statistics,
-  `PercentScanned` of frames shown at a vblank (a scan position is never measured), and the vtable wiring. Slots to measure (all unknown): the device's `SetFrameIntervalX`,
-  `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` and the queue's `PresentX`, `SuspendX`, `ResumeX`
-  (the list is in the header).
+  `PercentScanned` of frames shown at a vblank (a scan position is never measured), and the vtable wiring. The
+  public slots are the device's `SetFrameIntervalX`/`ScheduleFrameEventX`/`WaitFrameEventX`/`GetFrameStatisticsX`
+  at 78-81 and `PresentX` at queue 30 (older runtime layout) or 32 (newer); `SuspendX`/`ResumeX` have no public
+  slot. Nothing here is wired to those slots yet, and the game's own runtime is not observed.
 - *Tests*: `frame_pacer_test` (fake clock: interval, offset, late waits, timeouts, latency blocking, tokens,
   statistics, suspend/resume, a real 10 ms timer; no GPU) and `xbox_present_test` (the Vulkan device, reading the
   swapchain image back: blank, solid, two colours, source rectangles, RGBA/BGRA/sRGB sources, 2 planes, plane composition
