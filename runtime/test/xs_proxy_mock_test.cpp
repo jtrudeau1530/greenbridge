@@ -876,10 +876,11 @@ int check_xbox_slots() {
     EXPECT(mock->array[68][0] == static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR));
     EXPECT(mock->array[68][1] == static_cast<std::uint64_t>(D3D12_RESOURCE_FLAG_NONE));
 
-    std::vector<D3D12_RESOURCE_DESC> batch1025(1025, xbox_descs[0]);
-    batch1025.back() = xbox_descs[1];
+    D3D12_RESOURCE_DESC batch1025[1025]{};
+    for (int i = 0; i < 1024; ++i) batch1025[i] = xbox_descs[0];
+    batch1025[1024] = xbox_descs[1];
     D3D12_RESOURCE_ALLOCATION_INFO batch_ret{};
-    EXPECT(call_slot108_c_abi(&batch_ret, device, 1, 1025, batch1025.data(), nullptr) == &batch_ret);
+    EXPECT(call_slot108_c_abi(&batch_ret, device, 1, 1025, batch1025, nullptr) == &batch_ret);
     EXPECT(batch_ret.SizeInBytes == 0x40000 && mock->calls[68] == 3 && xs::device_slot_hits(108) == 3);
     EXPECT(mock->array[68][0] == static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_UNKNOWN));
     EXPECT(mock->array[68][3] == ((static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR) << 32) |
