@@ -26,8 +26,11 @@ namespace driver {
 PFN_vkGetInstanceProcAddr real_instance = nullptr;
 PFN_vkGetDeviceProcAddr real_device = nullptr;
 PFN_vkGetSemaphoreCounterValue real_counter = nullptr;
+PFN_vkWaitSemaphores real_wait = nullptr;
 std::atomic<VkResult> fail_next_counter{VK_SUCCESS};
+std::atomic<VkResult> fail_next_wait{VK_SUCCESS};
 std::atomic<unsigned> failed_count{0};
+std::atomic<unsigned> failed_wait_count{0};
 DWORD test_thread = 0;
 
 VKAPI_ATTR VkResult VKAPI_CALL get_counter(VkDevice device, VkSemaphore semaphore, std::uint64_t* value) {
@@ -45,9 +48,23 @@ VKAPI_ATTR VkResult VKAPI_CALL get_counter(VkDevice device, VkSemaphore semaphor
     return real_counter(device, semaphore, value);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL wait_semaphores(VkDevice device, const VkSemaphoreWaitInfo* info,
+                                               std::uint64_t timeout) {
+    if (GetCurrentThreadId() == test_thread) {
+        const VkResult injected = fail_next_wait.exchange(VK_SUCCESS);
+        if (injected != VK_SUCCESS) {
+            failed_wait_count.fetch_add(1);
+            return injected;
+        }
+    }
+    return real_wait(device, info, timeout);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     if (std::strcmp(name, "vkGetSemaphoreCounterValue") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(get_counter);
+    if (std::strcmp(name, "vkWaitSemaphores") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(wait_semaphores);
     return real_device(device, name);
 }
 
@@ -96,6 +113,9 @@ int main() {
     driver::real_counter = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(
         driver::real_device(vk.device, "vkGetSemaphoreCounterValue"));
     if (!driver::real_counter) return 1;
+    driver::real_wait = reinterpret_cast<PFN_vkWaitSemaphores>(
+        driver::real_device(vk.device, "vkWaitSemaphores"));
+    if (!driver::real_wait) return 1;
     driver::test_thread = GetCurrentThreadId();
 
     Event pending;
@@ -142,6 +162,32 @@ int main() {
             ++failures;
         // COM releases the fence before its externally owned VkDevice; on failure the cancel
         // path still drains the pending event rather than leaving a dispatcher thread blocked.
+    }
+    // A blocking host wait can discover device loss after a successful counter query.
+    // Unlike an asynchronous wait registered with a HANDLE, it directly invokes vkWaitSemaphores.
+    {
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = driver::get_instance;
+        info.instance = vk.instance;
+        info.physical = vk.physical;
+        info.device = vk.device;
+        info.queue = vk.queue;
+        info.queue_family = vk.family;
+        Ref<ID3D12Device> device;
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p)))) return 1;
+        Ref<ID3D12Fence> fence;
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))) ||
+            fence->GetCompletedValue() != 0 || device->GetDeviceRemovedReason() != S_OK)
+            return 1;
+        driver::fail_next_wait.store(VK_ERROR_DEVICE_LOST);
+        const HRESULT blocking = fence->SetEventOnCompletion(7, nullptr);
+        const HRESULT removed = device->GetDeviceRemovedReason();
+        std::printf("Leonida Vulkan: injected VK_ERROR_DEVICE_LOST on blocking fence wait: "
+                    "wait=%08x, device_removed=%08x, interceptions=%u\n",
+                    unsigned(blocking), unsigned(removed), driver::failed_wait_count.load());
+        if (blocking == S_OK || removed != DXGI_ERROR_DEVICE_REMOVED ||
+            driver::failed_wait_count.load() != 1 || driver::fail_next_wait.load() != VK_SUCCESS)
+            ++failures;
     }
     const unsigned errors = vk.validation_errors();
     std::printf("Vulkan validation errors: %u\n", errors);

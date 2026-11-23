@@ -1411,11 +1411,19 @@ public:
     // ID3D12Fence::Signal from the CPU. Vulkan timelines only increase: a value at or below the current one is
     // ignored (D3D12 would set it), and the caller is told.
     bool signal(std::uint64_t value) {
-        if (value <= completed()) return false;
+        // The dispatcher may be testing a failed counter query. Do not call completed() here:
+        // it marks the context lost on a query error and prevents the dispatcher from waking.
+        if (context_.is_device_lost()) return false;
+        std::uint64_t current = 0;
+        if (context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore_, &current) == VK_SUCCESS &&
+            value <= current)
+            return false;
         VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
         info.semaphore = semaphore_;
         info.value = value;
-        if (context_.vk.vkSignalSemaphore(context_.device(), &info) != VK_SUCCESS) return false;
+        const VkResult result = context_.vk.vkSignalSemaphore(context_.device(), &info);
+        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+        if (result != VK_SUCCESS) return false;
         context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
         context_.holds().pump_ready();
         return true;
@@ -1427,7 +1435,9 @@ public:
         info.semaphoreCount = 1;
         info.pSemaphores = &semaphore_;
         info.pValues = &value;
-        return context_.vk.vkWaitSemaphores(context_.device(), &info, timeout_ns) == VK_SUCCESS;
+        const VkResult result = context_.vk.vkWaitSemaphores(context_.device(), &info, timeout_ns);
+        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+        return result == VK_SUCCESS;
     }
 
 private:
