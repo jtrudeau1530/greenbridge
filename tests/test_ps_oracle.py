@@ -265,6 +265,20 @@ class Cli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(P.main(["--build", d, "--show-template"]), 77)
 
+    def test_json_overwriting_an_input_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            asm = os.path.join(d, "prog.txt")
+            with open(asm, "w", encoding="utf-8") as f:
+                f.write("s_endpgm\n")
+            with self.assertRaises(SystemExit) as cm:    # the report is written after the run, so the guard comes first
+                P.main(["--build", d, "--asm", asm, "--json", asm])
+            self.assertEqual(cm.exception.code, 2)
+            with open(asm, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "s_endpgm\n")
+            with self.subTest(flag="--ps"), self.assertRaises(SystemExit) as cm:
+                P.main(["--build", d, "--asm", asm, "--ps", asm, "--json", asm])
+            self.assertEqual(cm.exception.code, 2)
+
 
 @unittest.skipUnless(os.environ.get("LEONIDA_PS_ORACLE_BUILD"), "set LEONIDA_PS_ORACLE_BUILD to a runtime build "
                      "and select an AMD GPU (LEONIDA_VK_DEVICE) to run the pixel shader on hardware")
