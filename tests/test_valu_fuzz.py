@@ -362,7 +362,7 @@ def test_gfx11_opcode_table_matches_llvm_mc():
 
 @pytest.mark.skipif(_amd_tool("clang") is None, reason="AMD clang (LEONIDA_AMD_CLANG) not found")
 @pytest.mark.parametrize("family", sorted(vf.FAMILIES))
-@pytest.mark.parametrize("arch", ["gfx1150", "gfx1030"])
+@pytest.mark.parametrize("arch", ["gfx1150", "gfx1030", "gfx1170", "gfx1201"])
 def test_hw_kernels_assemble(family, arch):
     from hw_oracle import asm
     fam = asm.family(arch)
@@ -377,8 +377,18 @@ def test_hw_kernels_assemble(family, arch):
     for p in vf.programs(family, 2, 12, (32, 64)):
         k = asm.Kernel(p.hw_lines(fam), p.wave, vf.THREADS, p.out_words(), raw=True, vgprs=vf.HW_VGPRS, sgprs=vf.HW_SGPRS)
         text = asm.module_text([k], arch, wave=p.wave)[0]
-        r = assemble(asm.true16_spelling(text) if true16 else text, p.wave)
-        assert r.returncode == 0, (arch, p.name, r.stderr[-600:])
+        if true16:                                   # what the runner assembles: the same respellings, same order
+            text = asm.true16_spelling(text)
+        if fam != "gfx10":
+            text = asm.opsel16_spelling(text)
+        r = assemble(text, p.wave)
+        if family == "mem" and fam == "gfx12":
+            # pinned: every mem kernel is rejected on GFX12, by s_waitcnt_vscnt or a buffer_load/store_b* form
+            assert r.returncode != 0, (arch, p.name)
+            assert ("s_waitcnt_vscnt" in r.stderr and "instruction not supported" in r.stderr) or \
+                   "operands are not valid for this GPU or mode" in r.stderr, (arch, p.name, r.stderr[-600:])
+        else:
+            assert r.returncode == 0, (arch, p.name, r.stderr[-600:])
 
 
 def test_oracle_hw_exits_77_without_the_tools(monkeypatch, capsys, tmp_path):
@@ -389,20 +399,61 @@ def test_oracle_hw_exits_77_without_the_tools(monkeypatch, capsys, tmp_path):
     assert "hardware oracle unavailable" in capsys.readouterr().out
 
 
-def test_oracle_hw_exits_77_on_an_rdna4_gpu(monkeypatch, capsys):
+def test_hw_family_skip_reason_is_per_family():
+    # the old blanket gate (asm.rdna23_skip_reason) refused every family on gfx1170+; the per-family one allows
+    # everything that assembles and refuses only mem on gfx12xx, naming the two rejects
+    for arch in ("gfx1030", "gfx1100", "gfx1150", "gfx1170"):
+        for family in sorted(vf.FAMILIES):
+            assert vf.hw_family_skip_reason(family, arch) is None, (family, arch)
+    assert vf.hw_family_skip_reason("f16", "gfx1201") is None
+    for arch in ("gfx1200", "gfx1201"):
+        why = vf.hw_family_skip_reason("mem", arch)
+        assert arch in why and "s_waitcnt_vscnt" in why and "buffer_load/store_b*" in why, (arch, why)
+
+
+def test_oracle_hw_exits_77_on_an_rdna4_gpu_for_mem_only(monkeypatch, capsys):
     from hw_oracle import runner
 
-    class Rdna4:
+    class Fake:
         arch, device = "gfx1201", "fake"
+
+        def run(self, kernels):
+            return ["assembler rejected: fake"] * len(kernels)
 
         def close(self):
             pass
 
-    monkeypatch.setattr(runner, "open_oracle", lambda **kw: Rdna4())
-    for family in sorted(vf.FAMILIES):
-        monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", family, "--oracle", "hw", "--programs", "2"])
-        assert vf.main() == 77
-    assert "hardware oracle unavailable: gfx1201" in capsys.readouterr().out
+    monkeypatch.setattr(runner, "open_oracle", lambda **kw: Fake())
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--oracle", "hw", "--programs", "2"])
+    assert vf.main() == 77
+    out = capsys.readouterr().out
+    assert "hardware oracle unavailable: gfx1201" in out
+    assert "s_waitcnt_vscnt" in out and "buffer_load/store_b*" in out
+
+
+def test_oracle_hw_runs_on_an_rdna4_gpu(monkeypatch, capsys):
+    # regression: the blanket gate used to exit 77 for every family on gfx1170+ ("the kernels here do not
+    # assemble for it"), which is false for f16; the run now gets past the gate (the fake oracle rejects the
+    # kernels, so the exit code is 2, not 77)
+    from hw_oracle import runner
+
+    class Fake:
+        def __init__(self, arch):
+            self.arch, self.device = arch, "fake"
+
+        def run(self, kernels):
+            return ["assembler rejected: fake"] * len(kernels)
+
+        def close(self):
+            pass
+
+    for arch in ("gfx1170", "gfx1201"):
+        monkeypatch.setattr(runner, "open_oracle", lambda **kw: Fake(arch))
+        monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--oracle", "hw", "--programs", "2"])
+        assert vf.main() == 2, arch
+        out = capsys.readouterr().out
+        assert "hardware oracle: fake" in out
+        assert "hardware oracle unavailable" not in out
 
 
 def test_oracle_option_is_validated(monkeypatch):

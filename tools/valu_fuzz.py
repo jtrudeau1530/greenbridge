@@ -19,7 +19,9 @@ Families:
 Oracles (--oracle translator|hw|translator,hw): translator (default) assembles for gfx1013, translates and runs
 vk_compute_test. hw runs the same programs natively on the AMD GPU through tools/hw_oracle/ (wave32 and native wave64,
 64 threads) and compares them with the model, so it tests the model, not the translator; it exits 77 when the tools
-are missing. The forms are the ones with the same meaning on GFX10 and GFX11; what differs is listed in
+are missing. On the hardware f16 also runs on GFX11.7 and GFX12, while mem is refused per family there (gfx12xx has no
+s_waitcnt_vscnt and rejects the buffer_load/store forms, hw_family_skip_reason names both). The forms are the ones
+with the same meaning on GFX10 and GFX11; what differs is listed in
 docs/shader_validation.md ("16-bit and memory ops on the GPU"). --negative-control checks that wrong models are caught.
 
 Each program is one 64-thread group (wave64, or two wave32s). Every thread stores 16 result VGPRs (v20..v35); the
@@ -816,6 +818,22 @@ def programs(family, seed, count, waves, skip=()):
     return [cls(seed, i, w, skip) for i in range(count) for w in waves]
 
 
+def hw_family_skip_reason(family, arch):
+    """Why --family FAMILY cannot run natively on this GPU, or None. Checked by assembling what the generator emits
+    (AMD clang, LLVM 23 / rocm-sdk-core 10.0.0): the f16 kernels assemble clean for gfx1150, gfx1170 and gfx1201
+    (300 programs per wave size each, 0 rejected), so f16 runs on GFX11.7 and GFX12 like on any GFX11; the mem
+    kernels assemble clean for gfx1150 and gfx1170 (300 programs per wave size, every op kind, 0 rejected) but
+    every one of them is rejected for gfx12xx twice over: GFX12 has no s_waitcnt_vscnt ("instruction not supported
+    on this GPU (gfx1201)") and the assembler takes none of the buffer_load/store_b32/b64/b96/b128 forms the
+    generator writes ("operands are not valid for this GPU or mode")."""
+    from hw_oracle import asm
+    if family != "mem" or asm.family(arch) != "gfx12":
+        return None
+    return (f"{arch} has no s_waitcnt_vscnt and rejects every buffer_load/store_b* form the mem kernels are "
+            'built from ("instruction not supported on this GPU", "operands are not valid for this GPU or mode"): '
+            "the family cannot be assembled for it")
+
+
 def compare(p, data):
     """Differences between the model and the dumped words. p.uncertain_words is set to how many result words had a
     half the model does not judge (so a summary can show how many comparisons were skipped)."""
@@ -1128,7 +1146,7 @@ def main():
             print(f"hardware oracle unavailable: {e}")
             return 77
         from hw_oracle import asm
-        why = asm.rdna23_skip_reason(oracle.arch)
+        why = hw_family_skip_reason(a.family, oracle.arch)
         if why:
             oracle.close()
             print(f"hardware oracle unavailable: {why}")
