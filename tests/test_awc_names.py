@@ -342,6 +342,31 @@ class TestCli(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)
 
+    def test_min_token_below_one_is_rejected(self):
+        # --min-token counts the dictionary words a token must appear in. 0 or a negative used to pass
+        # type=int and silently disable the common-token filter (every token passes tokens[t] >= min_token).
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "b.awc"), make_bank(["abc_01", "abc_02", "abc_03"]))
+            words = write(os.path.join(tmp, "w.txt"), "abc_01\nabc_02\nabc_03\n")
+            for bad in ("0", "-1", "-5"):
+                with self.subTest(min_token=bad):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as cm:
+                            A.main([bank, "--words", words, "--min-token", bad])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("at least 1", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--min-token", "x"])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertNotIn("Traceback", err.getvalue())
+            # 1 is the smallest meaningful value and still runs.
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(A.main([bank, "--words", words, "--min-token", "1"]), 0)
+
     @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
     def test_locked_words_input_reports_rc_2_without_traceback(self):
         # An exclusively locked (share-none) existing file passes the os.path.exists check, so the
