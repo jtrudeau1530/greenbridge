@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  # Each non-PR run has its own group so a queued push or dispatch cannot replace it.
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  # Coalesce superseded pending pushes per branch without canceling an active main build.
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

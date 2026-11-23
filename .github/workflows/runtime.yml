@@ -93,7 +93,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: runtime-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  # Coalesce superseded pending pushes per branch without canceling an active main build.
+  group: runtime-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
