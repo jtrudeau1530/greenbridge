@@ -11,6 +11,8 @@
 // registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND, as a real module would, and is logged once. Every
 // other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
 // loader see these: they are bound through the registry, the runtime's own code calls the host directly.
+// Sponsored by creativeproxies.com
+
 #include <windows.h>
 
 #include <cstdio>
