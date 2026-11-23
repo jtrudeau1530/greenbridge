@@ -505,6 +505,13 @@ public:
         std::function<void()> callback;
     };
 
+    // A dispatch runs outside mutex_. Its owner matters: a callback may re-entrantly call cancel() for its own
+    // semaphore, and that inner cancel must not wait for the callback it is already inside of.
+    struct InFlight {
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        std::thread::id owner;
+    };
+
     using SignalEventFn = void (*)(void* event_handle);
 
     // Longest single vkWaitSemaphores call in run(): bounds how long the thread can sit in an uninterruptible wait.
@@ -585,7 +592,8 @@ public:
     }
 
     // Completes the pending waits for `sem` (a released D3D12 fence counts as reached, as on the PC runtime) and
-    // blocks until any in-flight vkWaitSemaphores releases `sem` before the caller destroys the VkSemaphore.
+    // blocks until both a vkWaitSemaphores on `sem` and any callback already dispatched for it have finished, before
+    // the caller destroys the VkSemaphore.
     void cancel(VkSemaphore sem) {
         if (!sem) return;
         std::vector<Entry> cancelled;
@@ -603,10 +611,12 @@ public:
                 }
             }
             pending_.resize(write);
-            if (thread_.joinable() && waiting_) {
+            if (thread_.joinable() && (waiting_ || in_flight(sem))) {
                 const std::uint64_t target_epoch = epoch_ + 1;
                 signal_wakeup_locked();
-                epoch_cv_.wait(lock, [this, target_epoch] { return !waiting_ || epoch_ >= target_epoch; });
+                epoch_cv_.wait(lock, [this, sem, target_epoch] {
+                    return (!waiting_ || epoch_ >= target_epoch) && !in_flight(sem);
+                });
             }
         }
         dispatch_entries(cancelled, fn);
@@ -631,6 +641,31 @@ private:
         }
     }
 
+    bool in_flight(VkSemaphore sem) const {
+        const std::thread::id me = std::this_thread::get_id();
+        return std::any_of(dispatching_.begin(), dispatching_.end(), [&](const InFlight& d) {
+            return d.semaphore == sem && d.owner != me;
+        });
+    }
+
+    // mutex_ is held on entry and again on return. Recording the entries before unlocking closes the window where
+    // run() has taken them out of pending_ but has not started the callback, yet cancel() can return and let the
+    // caller destroy the semaphore.
+    void dispatch_outside_lock(std::unique_lock<std::mutex>& lock, std::vector<Entry>& entries, SignalEventFn fn) {
+        const std::thread::id me = std::this_thread::get_id();
+        for (const Entry& e : entries) dispatching_.push_back({e.semaphore, me});
+        lock.unlock();
+        dispatch_entries(entries, fn);
+        lock.lock();
+        for (const Entry& e : entries) {
+            const auto it = std::find_if(dispatching_.begin(), dispatching_.end(), [&](const InFlight& d) {
+                return d.semaphore == e.semaphore && d.owner == me;
+            });
+            if (it != dispatching_.end()) dispatching_.erase(it);
+        }
+        epoch_cv_.notify_all();
+    }
+
     // Only signals wakeup_sem_ when run() is actively waiting (waiting_ == true) on wakeup_val_ + 1,
     // eliminating any lost-wakeup race between snapshot construction and vkWaitSemaphores. Keep signaling even if
     // device_lost_ is already set so a blocked vkWaitSemaphores wakes cleanly for cancel()/stop().
@@ -650,9 +685,7 @@ private:
             if (device_lost_.load(std::memory_order_acquire)) {
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(drained, fn);
+                dispatch_outside_lock(lock, drained, signal_event_);
                 return;
             }
             if (stop_) return;
@@ -690,9 +723,7 @@ private:
                 device_lost_.store(true, std::memory_order_release);
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(drained, fn);
+                dispatch_outside_lock(lock, drained, signal_event_);
                 return;
             }
             if (stop_) return;
@@ -720,17 +751,12 @@ private:
                 for (Entry& e : pending_) ready.push_back(std::move(e));
                 pending_.clear();
                 device_lost_.store(true, std::memory_order_release);
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(ready, fn);
+                dispatch_outside_lock(lock, ready, signal_event_);
                 return;
             }
             pending_.resize(write);
             if (!ready.empty()) {
-                const SignalEventFn fn = signal_event_;
-                lock.unlock();
-                dispatch_entries(ready, fn);
-                lock.lock();
+                dispatch_outside_lock(lock, ready, signal_event_);
                 if (stop_) return;
             }
         }
@@ -747,6 +773,7 @@ private:
     std::condition_variable cv_;
     std::condition_variable epoch_cv_;
     std::vector<Entry> pending_;
+    std::vector<InFlight> dispatching_;  // callbacks running outside mutex_, with the thread running each one
     std::vector<VkSemaphore> semaphores_;
     std::vector<std::uint64_t> values_;
     std::uint64_t epoch_ = 0;

@@ -6,6 +6,7 @@
 //   3. mark_device_lost() wakes a blocked vkWaitSemaphores() so pending waits complete and cancel()/stop() never hang.
 //   4. vkGetSemaphoreCounterValue() returning VK_ERROR_DEVICE_LOST drains pending waits and marks device_lost_ instead
 //      of spinning forever.
+//   5. cancel() blocks until a callback already dispatched for that semaphore has stopped using it.
 // Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -254,6 +255,56 @@ int main() {
         EXPECT(observed_calls >= 1 && observed_calls <= 4);
         std::printf("fence dispatcher: vkGetSemaphoreCounterValue DEVICE_LOST drains without spin (%u calls) ok\n",
                     observed_calls);
+    }
+
+    // 5. cancel() must not return while run() is dispatching a callback that still uses the semaphore.
+    {
+        VulkanContext context(driver::get_device, d.device, true);
+        EXPECT(context.loaded());
+        VulkanFence fence(context, 0);
+        const VkSemaphore sem = fence.semaphore();
+        EXPECT(sem != VK_NULL_HANDLE);
+
+        std::mutex mu;
+        std::condition_variable cv;
+        bool entered = false, used = false, release = false, cancelled = false;
+
+        context.enqueue_fence_callback(sem, 1, [&] {
+            {
+                std::unique_lock lk(mu);
+                entered = true;
+                cv.notify_all();
+                cv.wait(lk, [&] { return release; });
+            }
+            std::uint64_t value = 0;
+            driver::real_get_counter(d.device, sem, &value);
+            std::lock_guard lk(mu);
+            used = true;
+            cv.notify_all();
+        });
+
+        EXPECT(fence.signal(1));
+        EXPECT(wait_flag(mu, cv, entered));
+
+        std::thread cancel_thread([&] {
+            context.cancel_fence_waits(sem);
+            std::lock_guard lk(mu);
+            cancelled = true;
+            cv.notify_all();
+        });
+        {
+            std::unique_lock lk(mu);
+            EXPECT(!cv.wait_for(lk, std::chrono::milliseconds(150), [&] { return cancelled; }));
+        }
+        {
+            std::lock_guard lk(mu);
+            release = true;
+        }
+        cv.notify_all();
+        EXPECT(wait_flag(mu, cv, cancelled));
+        EXPECT(used);
+        cancel_thread.join();
+        std::printf("fence dispatcher: cancel waits for an in-flight callback ok\n");
     }
 
     EXPECT(d.validation_errors() == 0);
