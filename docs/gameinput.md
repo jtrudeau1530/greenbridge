@@ -213,8 +213,9 @@ nothing for it rather than guessing.
 The trigger motors play one waveform each: an intensity, which is the one thing SDL lets the shim send on a trigger,
 through the same output as the trigger rumble — `SDL_RumbleGamepadTriggers`, or the DualSense effect block. `duration`
 and `repeatDelay` are microseconds, `playCount` 0 plays until the state is set again, and a null `params` stops the
-motor. The trigger rumble level and the haptic intensity share that one message, the stronger of the two winning, so a
-title mixing them does not get one cancel the other.
+motor. For a waveform with a duration, each repetition plays for that duration and then leaves a quiet interval of
+`repeatDelay` before the next repetition. The poll thread samples the current phase. During a pulse, the stronger of
+the haptic intensity and ordinary trigger rumble wins. During the interval, ordinary trigger rumble continues.
 
 **This is an approximation too, and a coarser one than the rumble.** A real haptic motor has a table of waveforms, each
 with its own HID usage; SDL exposes no such table — a DualSense takes one effects block and everything else takes a
