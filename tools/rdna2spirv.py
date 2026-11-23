@@ -6298,6 +6298,104 @@ class Gen:
         self.emit(f"{r} = OpExtInst %float %glsl {glsl_op} {x} {y}")
         return self._select_nan_first(r, x, nan_y, y, y_src)
 
+    _SDWA_UNUSED = ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE")
+    _F16_OMOD_MODS = ("mul:2", "mul:4", "div:2")
+
+    @staticmethod
+    def _validate_f16_opsel_mod(mod, nsrc, op):
+        if not (mod.startswith("op_sel:[") and mod.endswith("]")):
+            raise Unsupported(op + " op_sel")
+        parts = [p.strip() for p in mod[len("op_sel:["):-1].split(",")]
+        if len(parts) != nsrc + 1 or any(p not in ("0", "1") for p in parts):
+            raise Unsupported(op + " op_sel")
+
+    def _validate_f16_vop3_mods(self, mods, nsrc, op):
+        seen_clamp = False
+        seen_omod = False
+        seen_opsel = False
+        for m in mods:
+            if m == "clamp":
+                if seen_clamp:
+                    raise Unsupported(op + " duplicate clamp")
+                seen_clamp = True
+            elif m in self._F16_OMOD_MODS:
+                if seen_omod:
+                    raise Unsupported(op + " duplicate output modifier")
+                seen_omod = True
+            elif m.startswith("op_sel:"):
+                if seen_opsel:
+                    raise Unsupported(op + " duplicate op_sel")
+                self._validate_f16_opsel_mod(m, nsrc, op)
+                seen_opsel = True
+            else:
+                raise Unsupported(op + " modifier " + m)
+
+    def _validate_f16_sdwa_mods(self, mods, op):
+        seen_clamp = False
+        seen_omod = False
+        seen_keys = set()
+        for m in mods:
+            if m == "clamp":
+                if seen_clamp:
+                    raise Unsupported(op + " duplicate clamp")
+                seen_clamp = True
+            elif m in self._F16_OMOD_MODS:
+                if seen_omod:
+                    raise Unsupported(op + " duplicate output modifier")
+                seen_omod = True
+            elif ":" in m:
+                k, v = m.split(":", 1)
+                if k in ("src0_sel", "src1_sel", "dst_sel"):
+                    if k in seen_keys or v not in self.SDWA_SEL:
+                        raise Unsupported(op + " sdwa modifier " + m)
+                    seen_keys.add(k)
+                elif k == "dst_unused":
+                    if k in seen_keys or v not in self._SDWA_UNUSED:
+                        raise Unsupported(op + " sdwa modifier " + m)
+                    seen_keys.add(k)
+                else:
+                    raise Unsupported(op + " modifier " + m)
+            else:
+                raise Unsupported(op + " modifier " + m)
+
+    def _validate_f16_valu(self, ins, op, nsrc, *, allow_e32=False, allow_e64=True,
+                           allow_sdwa=False, allow_dpp=False, int_srcs=()):
+        """Validate encoding suffix, arity, operand kinds/widths/modifiers, and instruction modifiers for f16 VALU ops."""
+        raw_op, a, mods = ins["op"], ins["args"], ins["mods"]
+        allowed_suffixes = [""]
+        if allow_e32:
+            allowed_suffixes.append("_e32")
+        if allow_e64:
+            allowed_suffixes.append("_e64")
+        if allow_sdwa:
+            allowed_suffixes.append("_sdwa")
+        if allow_dpp:
+            allowed_suffixes.append("_dpp")
+        suf = raw_op[len(op):]
+        if suf not in allowed_suffixes:
+            raise Unsupported(raw_op + " encoding")
+        if len(a) != nsrc + 1:
+            raise Unsupported(op + " arity")
+        dst = a[0]
+        if dst.get("k") != "vgpr" or dst.get("n", 1) != 1 or dst.get("neg") or dst.get("abs") or dst.get("sext"):
+            raise Unsupported(op + " destination")
+        is_vop2_only = not allow_e64
+        for idx, src in enumerate(a[1:]):
+            if src.get("n", 1) != 1 or src.get("sext"):
+                raise Unsupported(op + " source")
+            if (is_vop2_only or suf == "_e32" or idx in int_srcs) and (src.get("neg") or src.get("abs")):
+                raise Unsupported(op + " source modifier")
+        if is_vop2_only or suf == "_e32":
+            if mods:
+                raise Unsupported(op + " modifier")
+        elif suf == "_sdwa":
+            self._validate_f16_sdwa_mods(mods, op)
+        elif suf == "_dpp":
+            if self.non_dpp_mods(raw_op, mods):
+                raise Unsupported(op + " dpp modifier")
+        else:
+            self._validate_f16_vop3_mods(mods, nsrc, op)
+
     def _read_f16_minmax_srcs(self, srcs, sels, mods):
         """Read f16 min/max/med3 sources and track raw modified ``src0`` half when ``clamp`` is absent."""
         if "clamp" in mods:
@@ -6506,6 +6604,8 @@ class Gen:
             raise Unsupported("DPP destination")
         if args[1].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
+        if args[1].get("sext"):
+            raise Unsupported("DPP sext")
         src = args[1]
         src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
 
@@ -8314,6 +8414,7 @@ class Gen:
             # D = S0 * S1 + K, printed `vdst, src0, vsrc1, K`. In print order both are a[1] * a[2] + a[3], as for
             # v_fmamk/fmaak_f32. K is the f16 in the literal's low 16 bits (src_h: a float literal is converted).
             # One rounding to f16, as v_fmac_f16 (SHADER-55); GFX10 f16 VOP2 writes the low half and keeps the high.
+            self._validate_f16_valu(ins, op, 3, allow_e32=True, allow_e64=False)
             vals = [self.f16_in(t) for t in a[1:4]]
             self.f16_out(a[0], self.fma_f16_odd(*vals), 0)
         elif op in ("v_add_nc_u16", "v_sub_nc_u16", "v_add_nc_i16", "v_sub_nc_i16"):
@@ -8519,6 +8620,7 @@ class Gen:
             self.emit(f"{z} = OpSelect %uint {c} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {z}")
         elif op == "v_fma_f16":
+            self._validate_f16_valu(ins, op, 3)
             sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
             vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
@@ -8738,6 +8840,7 @@ class Gen:
             else:
                 self.dst(d, v)
         elif op in ("v_med3_f16", "v_min3_f16", "v_max3_f16"):
+            self._validate_f16_valu(ins, op, 3)
             sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
             vals, all_nan, h0_mod = self._read_f16_minmax_srcs(a[1:4], sel, mods)
             if op == "v_med3_f16":
@@ -8977,6 +9080,7 @@ class Gen:
         elif op in ("v_add_f16", "v_sub_f16", "v_subrev_f16", "v_mul_f16", "v_max_f16", "v_min_f16"):
             # f16 math on the low halves (op_sel:[src0,src1,dst] in the VOP3 form); the other half of the destination
             # is kept. v_subrev_f16 is S1 - S0: op_sel still names src0 and src1, only the subtraction is swapped.
+            self._validate_f16_valu(ins, op, 2, allow_e32=True, allow_e64=True, allow_sdwa=True, allow_dpp=True)
             sel, dhi = self.opsel_bits(mods, 2)
             if op in ("v_max_f16", "v_min_f16"):
                 vals, all_nan, h0_mod = self._read_f16_minmax_srcs(a[1:3], sel, mods)
@@ -10001,9 +10105,12 @@ class Gen:
             # VOP3 mul:2/mul:4/div:2 are hardware no-ops on v_frexp_mant_f16 and v_ldexp_f16 while clamp clamps to
             # [0.0, 1.0] alone and combined with mul:*/div:*; on v_frexp_exp_i16_f16 (integer result), clamp and
             # mul:2/mul:4/div:2 are all hardware no-ops across every MODE (0x1c0, 0x100, 0x3c0).
-            bad = [m for m in mods if m not in ("clamp", "mul:2", "mul:4", "div:2") and not m.startswith("op_sel:")]
-            if bad:
-                raise Unsupported(op + " output modifier")
+            if op == "v_ldexp_f16":
+                self._validate_f16_valu(ins, op, 2, allow_e32=True, allow_e64=True, int_srcs=(1,))
+            else:
+                bad = [m for m in mods if m not in ("clamp", "mul:2", "mul:4", "div:2") and not m.startswith("op_sel:")]
+                if bad:
+                    raise Unsupported(op + " output modifier")
             nsrc = 2 if op == "v_ldexp_f16" else 1
             sel, dhi = self.opsel_bits(mods, nsrc)
             u = self.src_h(a[1])
