@@ -964,6 +964,10 @@ def write_skinned_glb(path: str, skeleton_path: str, component_paths: list[str],
         os.replace(temporary, path)
     except BaseException:
         try:
+            # The temp was chmodded to the destination's mode before replace. On Windows a
+            # read-only destination leaves a read-only temp that cannot be unlinked; restore
+            # mkstemp's private writable mode first so a failed publish cleans up after itself.
+            os.chmod(temporary, 0o600)
             os.unlink(temporary)
         except OSError:
             pass
