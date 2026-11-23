@@ -223,10 +223,10 @@ std::vector<Case> cases() {
         {"CopyTextureRegion upload, footprint RGBA8_SRGB into RGBA8", true, match,
          CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0,
                            footprint(e.upload.p, 0, 256, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB), nullptr))},
-        {"CopyTextureRegion upload with an empty box", true, stricter,
+        {"CopyTextureRegion upload with an empty box", true, match,
          CALLS(const D3D12_BOX box{4, 4, 0, 4, 8, 1};
                RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 256), &box))},
-        {"CopyTextureRegion upload with an inverted box", true, stricter,
+        {"CopyTextureRegion upload with an inverted box", true, match,
          CALLS(const D3D12_BOX box{8, 4, 0, 4, 8, 1};
                RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 256), &box))},
         {"CopyTextureRegion upload past the texture's edge (x 32 of 64)", false, looser,
@@ -245,7 +245,7 @@ std::vector<Case> cases() {
         {"CopyTextureRegion into a null location", false, match,
          CALLS(const auto s = subresource(e.tex.p, 0); e.list->CopyTextureRegion(nullptr, 0, 0, 0, &s, nullptr))},
         // CopyResource
-        {"CopyResource with the destination as the source", true, stricter,
+        {"CopyResource with the destination as the source", true, match,
          CALLS(e.list->CopyResource(e.tex.p, e.tex.p))},
         {"CopyResource buffer to texture", true, match, CALLS(e.list->CopyResource(e.tex.p, e.buffer.p))},
         {"CopyResource between buffers of different sizes", false, looser,

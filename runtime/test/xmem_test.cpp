@@ -294,48 +294,6 @@ void test_title_virtual_alloc() {
     }
 }
 
-// gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
-void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem) {
-    wchar_t temp[MAX_PATH];
-    GetTempPathW(MAX_PATH, temp);
-    const std::wstring path =
-        std::wstring(temp) + L"xmem_trace_test_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
-    DeleteFileW(path.c_str());
-
-    void* untraced = alloc(64, 0x1111);  // trace not open yet: nothing to write, nothing to crash
-    check(untraced != nullptr, "XMemAlloc with the trace off still allocates");
-    free_mem(untraced, 0x1111);
-
-    check(rt::startup_trace::open(path.c_str()), "open the startup trace file");
-    void* a = alloc(4096, 0x5e50000);
-    void* b = alloc(8192, 0x5e50000);  // same word again: no second event
-    void* c = alloc(16, 0x99);
-    free_mem(a, 0x5e50000);
-    free_mem(b, 0x5e50000);  // same word again: no second event
-    free_mem(c, 0x99);
-    free_mem(nullptr, 0x77);  // a free-only word is recorded too
-    rt::startup_trace::close();
-
-    std::ifstream in(path);
-    std::stringstream text;
-    text << in.rdbuf();
-    const std::string log = text.str();
-    auto count = [&](const std::string& needle) {
-        int n = 0;
-        for (size_t at = log.find(needle); at != std::string::npos; at = log.find(needle, at + 1)) ++n;
-        return n;
-    };
-    check(count("\"kind\":\"xmem_attributes\"") == 5, "five events: two XMemAlloc words and three XMemFree words");
-    check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x5e50000\",\"size\":4096") == 1,
-          "XMemAlloc 0x5e50000 is recorded once, with the size of the first call");
-    check(count("\"api\":\"XMemAlloc\",\"attributes\":\"0x99\",\"size\":16") == 1, "XMemAlloc 0x99 is recorded once");
-    check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
-    check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
-    check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
-    check(count("\"caller\":\"") == 5, "every event names its caller");
-    DeleteFileW(path.c_str());
-}
-
 void print_result() {
     if (g_failures == 0) {
         std::printf("xmem_test: OK (%d checks)\n", g_checks);

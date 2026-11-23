@@ -1505,6 +1505,8 @@ int main() {
     // SetSourceSize stores the source region (GetSourceSize returns it), refuses one larger than the back buffers,
     // needs both pointers on read, and ResizeBuffers resets it. All four are host-measured on Windows 11.
     {
+        // The ResizeTarget block above leaves the back buffers at 234x156: start again from 300x200.
+        if (FAILED(sc->ResizeBuffers(0, 300, 200, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers to 300x200");
         UINT sw = 0, sh = 0;
         if (FAILED(sc->GetSourceSize(&sw, &sh)) || sw != 300 || sh != 200)
             return fail("GetSourceSize should start at the back-buffer size");

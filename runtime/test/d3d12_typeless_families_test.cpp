@@ -336,11 +336,13 @@ int main() {
                 }
                 const std::size_t texel = reference.size() / 16;
                 ++compared;
-                const bool same = mine == reference;
-                failed += !same;
                 if (warp.p && render_and_read(warp.p, family.typeless, view, value, nullptr, software) &&
                     software != reference)
                     ++warp_differs;
+                // The layer rounds a normalised clear value to nearest even, as D3D does (#521): at a tie (0.5 on 8
+                // bits) NVIDIA's D3D12 driver writes one code lower than WARP and AMD, so WARP's bytes also count.
+                const bool same = mine == reference || (!software.empty() && mine == software);
+                failed += !same;
                 std::printf("typeless %d view %d clear (%g, %g, %g, %g): host %s, layer %s%s%s\n", int(family.typeless),
                             int(view), value[0], value[1], value[2], value[3], hex(reference, texel).c_str(),
                             hex(mine, texel).c_str(), same ? "" : "  MISMATCH",
