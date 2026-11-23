@@ -149,6 +149,31 @@ int main() {
               "a length that cuts the header before its colon is rejected");
         check(add_headers(request, L"X-D: b", 6, WINHTTP_ADDREQ_FLAG_ADD) != FALSE,
               "an explicit length that covers the colon is accepted");
+        check(add_headers(request, L"X-A: 1\r\nX-B: 2\r\n", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD) != FALSE,
+              "a multi-line header block with valid lines is accepted");
+        SetLastError(0);
+        check(rejects(add_headers(request, L"X-A: 1\r\nbadline\r\n", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
+              "a multi-line header block with a colon-less line is rejected");
+        SetLastError(0);
+        check(rejects(add_headers(request, L": v", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
+              "a header with an empty name is rejected");
+        SetLastError(0);
+        check(rejects(add_headers(request, L"X A: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
+              "a header with a space in its name is rejected");
+        SetLastError(0);
+        check(rejects(add_headers(request, L"X;Y: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
+              "a header with a token separator in its name is rejected");
+        SetLastError(0);
+        check(rejects(add_headers(request, L"X\u00e9: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD)),
+              "a header with a non-ASCII character in its name is rejected");
+        check(add_headers(request, L"\r\n", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD) != FALSE &&
+                  add_headers(request, L"\r\n\r\n", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD) != FALSE,
+              "blank-lines-only header blocks are accepted (matching host winhttp.dll)");
+        check(set_timeouts(session, 1000, 1000, 1000, 1000) != FALSE, "timeouts on a session handle are accepted");
+        SetLastError(0);
+        check(set_timeouts(connection, 1000, 1000, 1000, 1000) == FALSE &&
+                  GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+              "timeouts on a connect handle fail with ERROR_WINHTTP_INCORRECT_HANDLE_TYPE");
         check(set_timeouts(request, 0, 0, 0, 0) != FALSE && set_timeouts(request, -1, -1, -1, -1) != FALSE,
               "timeouts of 0 and -1 (infinite) are accepted");
         for (int field = 0; field < 4; ++field) {
@@ -207,6 +232,20 @@ int main() {
         DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
         check(set_option(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols)) != FALSE,
               "but setting them is accepted");
+        DWORD short_ctx = 0x1234;
+        SetLastError(0);
+        check(set_option(request, WINHTTP_OPTION_CONTEXT_VALUE, &short_ctx, sizeof(short_ctx)) == FALSE &&
+                  GetLastError() == ERROR_INSUFFICIENT_BUFFER,
+              "a 4-byte WINHTTP_OPTION_CONTEXT_VALUE fails with ERROR_INSUFFICIENT_BUFFER");
+        SetLastError(0);
+        check(set_option(nullptr, WINHTTP_OPTION_CONTEXT_VALUE, &value, sizeof(value)) == FALSE &&
+                  GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+              "WINHTTP_OPTION_CONTEXT_VALUE on a NULL handle fails with ERROR_WINHTTP_INCORRECT_HANDLE_TYPE");
+        SetLastError(0);
+        check(set_callback(nullptr, &on_status, WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, 0) ==
+                      WINHTTP_INVALID_STATUS_CALLBACK &&
+                  GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+              "WinHttpSetStatusCallback on a NULL handle fails with ERROR_WINHTTP_INCORRECT_HANDLE_TYPE");
 
         // Wrong handles.
         SetLastError(0);
