@@ -7,6 +7,7 @@ Tests use synthetic manifests, mock environments, and isolated temporary directo
 fast, and contain zero game data.
 """
 from collections import namedtuple
+import functools
 import io
 import json
 import os
@@ -803,6 +804,9 @@ class PathAndGameSelectionTest(PreflightTestBase):
         make_game.below_normal()
 
 
+SUBMODULE_READY = make_game.submodule_ready   # the real one, before a test patches it
+
+
 class PreflightExportedAssetsSpaceTest(PreflightTestBase):
     """A rerun over finished asset exports doesn't need room for a second copy of them."""
 
@@ -816,6 +820,9 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         patcher = mock.patch("make_game.compute_decoder_digest", return_value=self.DECODER)
         patcher.start()
         self.addCleanup(patcher.stop)
+        ready = mock.patch("make_game.submodule_ready", return_value=True)   # Core checked out, as in a source zip
+        ready.start()
+        self.addCleanup(ready.stop)
 
     def stamp(self, work, rel, fingerprint=None):
         """The decoder.sha256 assets() writes before it exports a model or texture folder; returns its size."""
@@ -1107,14 +1114,38 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
     def test_the_credit_does_not_cache_a_decoder_digest_before_the_submodule_is_fetched(self):
         # preflight credits the exports before ensure_submodule(): a digest cached then (made from a missing or
         # changed checkout) would be the one assets() compares with afterwards.
-        make_game.decoder_digest.cache_clear()
-        self.addCleanup(make_game.decoder_digest.cache_clear)
-        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work):
+        # A cached stand-in that would also match the records, so only the cache itself can tell the call happened.
+        cached = functools.cache(lambda: self.DECODER)
+        with mock.patch("make_game.decoder_digest", cached),                 tempfile.TemporaryDirectory() as work, self.mixed_resume(work):
             self.run_preflight(work, free_gb=180)
-        self.assertEqual(make_game.decoder_digest.cache_info().currsize, 0)
+        self.assertEqual(cached.cache_info().currsize, 0)
+
+    def test_nothing_is_credited_before_the_submodule_is_checked_out(self):
+        # Records that match the digest of a missing checkout (no git pin) would not match the one assets() computes
+        # after ensure_submodule() has fetched it, and assets() would delete those folders.
+        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work), \
+                mock.patch("make_game.submodule_ready", return_value=False), \
+                mock.patch("make_game.compute_decoder_digest") as digest:
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
+            self.assert_fails(self.run_preflight, work, free_gb=329, match="about 330 GB is needed")
+            digest.assert_not_called()
+
+    def test_submodule_ready_needs_a_non_empty_core(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch("make_game.ROOT", root):
+            core = os.path.join(root, "third_party", "rpf9-explorer", "Core")
+            for ready in (False, False, True):
+                if ready:
+                    with open(os.path.join(core, "x.cs"), "w", encoding="utf-8") as f:
+                        f.write("")
+                elif not os.path.isdir(core):
+                    self.assertFalse(SUBMODULE_READY())   # missing
+                    os.makedirs(core)
+                    continue
+                self.assertEqual(SUBMODULE_READY(), ready)   # empty, then non-empty (no .git needed)
 
     def test_a_decoder_that_cannot_be_hashed_credits_nothing_and_does_not_stop_preflight(self):
-        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work),                 mock.patch("make_game.compute_decoder_digest", side_effect=FileNotFoundError("Program.cs")):
+        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work), \
+                mock.patch("make_game.compute_decoder_digest", side_effect=FileNotFoundError("Program.cs")):
             self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
             self.assert_fails(self.run_preflight, work, free_gb=329, match="about 330 GB is needed")
 
