@@ -254,8 +254,8 @@ public:
         if (list_.closed()) return;
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         GraphicsCommandList* bundle = from(command_list);
-        if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->invalid_ ||
-            !bundle->list_.closed())
+        if (!bundle || bundle->attached_device() != attached_device() ||
+            bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->invalid_ || !bundle->list_.closed())
             return check(false);
         // The bundle's state calls and draws play on this list through the members the application would have
         // called, so a draw sees this list's state plus what the bundle set, and what the bundle set stays here
@@ -1433,6 +1433,7 @@ public:
 
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
     VkSemaphore semaphore() const { return fence_.semaphore(); }
+    const leonida::VulkanContext* context() const { return &context_; }
 
     // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped.
     // A queue's claim also records the value as one the GPU will signal, which a later CPU signal must not overtake.
@@ -1606,6 +1607,14 @@ public:
                 d3d12_trace::record(method, "failed");
                 return;
             }
+            if (list->attached_device() != attached_device()) {
+                std::fprintf(stderr,
+                             "[rt] d3d12: ExecuteCommandLists: list %u belongs to a different device; refusing batch\n",
+                             i);
+                last_result_ = leonida::ReplayResult::unsupported;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
             // A list runs only on a queue of its own type (the debug layer's EXECUTECOMMANDLISTS_COMMANDLISTMISMATCH,
             // message 836): a DIRECT list's draws would otherwise be recorded for a COPY queue's transfer-only
             // Vulkan family. The whole batch is refused, as for the other checks here.
@@ -1686,7 +1695,8 @@ public:
     HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override {
         constexpr auto method = "ID3D12CommandQueue::Signal";
         Fence* f = Fence::from(fence);
-        if (!f) return d3d12_trace::result(method, E_INVALIDARG);
+        if (!f || f->context() != &context_ || f->attached_device() != attached_device())
+            return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
         if (!f->claim(value, true)) return d3d12_trace::result(method, S_OK);
         return d3d12_trace::result(method, queue_.signal(f->semaphore(), value, fence_pin(fence)) ? S_OK : E_FAIL);
@@ -1695,7 +1705,8 @@ public:
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {
         constexpr auto method = "ID3D12CommandQueue::Wait";
         Fence* f = Fence::from(fence);
-        if (!f) return d3d12_trace::result(method, E_INVALIDARG);
+        if (!f || f->context() != &context_ || f->attached_device() != attached_device())
+            return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
         queue_.wait(f->semaphore(), value, fence_pin(fence));
         return d3d12_trace::result(method, S_OK);
@@ -1983,15 +1994,21 @@ HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D1
 
 HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, ID3D12Fence* const* fences,
                                                const UINT64* values, UINT count,
-                                               D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) {
+                                               D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event,
+                                               IUnknown* device) {
     if (flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL && flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY)
         return E_INVALIDARG;
     if (!count || !fences || !values) return E_INVALIDARG;  // no fences is refused, as on the host runtime
     std::vector<Fence*> objects(count);
-    for (UINT i = 0; i < count; ++i)
-        if (!(objects[i] = Fence::from(fences[i]))) return E_INVALIDARG;
+    for (UINT i = 0; i < count; ++i) {
+        Fence* const f = Fence::from(fences[i]);
+        if (!f || f->context() != &context || (device && f->attached_device() != device))
+            return E_INVALIDARG;
+        objects[i] = f;
+    }
     const bool any = flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
     if (!event) {
+        if (context.is_device_lost()) return DXGI_ERROR_DEVICE_REMOVED;
         // One vkWaitSemaphores call: VK_SEMAPHORE_WAIT_ANY_BIT is the ANY flag, no flag is ALL.
         std::vector<VkSemaphore> semaphores(count);
         for (UINT i = 0; i < count; ++i) semaphores[i] = objects[i]->semaphore();
@@ -2003,7 +2020,10 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
         const VkResult result = context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX);
         // Unlike a single fence's blocking SetEventOnCompletion, this path invokes Vulkan directly.
         // A lost device must wake its other registered fence waiters and reject later submissions.
-        if (result == VK_ERROR_DEVICE_LOST) context.mark_device_lost();
+        if (result == VK_ERROR_DEVICE_LOST) {
+            context.mark_device_lost();
+            return DXGI_ERROR_DEVICE_REMOVED;
+        }
         return result == VK_SUCCESS ? S_OK : E_FAIL;
     }
     // Each fence's own waiter thread counts the shared waiter down; no thread of its own.

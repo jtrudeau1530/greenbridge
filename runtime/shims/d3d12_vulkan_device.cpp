@@ -5333,7 +5333,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetEventOnMultipleFenceCompletion(ID3D12Fence* const* fences, const UINT64* values,
                                                                 UINT count, D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags,
                                                                 HANDLE event) override {
-        return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event);
+        return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event, identity());
     }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
         if (removed_.load(std::memory_order_acquire)) return DXGI_ERROR_DEVICE_REMOVED;
