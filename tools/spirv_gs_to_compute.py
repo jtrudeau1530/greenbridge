@@ -35,6 +35,8 @@ IN_VERTS = {"InputPoints": 1, "InputLines": 2, "InputLinesAdjacency": 4, "Triang
             "InputTrianglesAdjacency": 6}
 OUT_TOPOLOGY = {"OutputPoints": "points", "OutputLineStrip": "line_strip", "OutputTriangleStrip": "triangle_strip"}
 KEEP_BUILTINS = ("SubgroupLocalInvocationId", "SubgroupSize", "NumSubgroups", "SubgroupId")
+FLOAT_CONTROL_MODES = {"DenormPreserve", "DenormFlushToZero", "SignedZeroInfNanPreserve",
+                       "RoundingModeRTE", "RoundingModeRTZ"}
 
 
 class Unsupported(Exception):
@@ -196,7 +198,9 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             out += [f"OpEntryPoint GLCompute {m.group(1)} {m.group(2)} {' '.join(iface)}",
                     f"OpExecutionMode {m.group(1)} LocalSize {LOCAL_SIZE} 1 1"]
             continue
-        if re.match(rf"OpExecutionMode {re.escape(main)} ", s):
+        # Floating-point controls apply to compute too.
+        m = re.match(rf"OpExecutionMode {re.escape(main)} (\w+)\b", s)
+        if m and m.group(1) not in FLOAT_CONTROL_MODES:
             continue
         m = re.match(r"Op(?:Decorate|MemberDecorate|Name) (%\w+)\b", s)
         if m and m.group(1) in gone:

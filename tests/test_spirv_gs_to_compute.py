@@ -236,6 +236,36 @@ def test_cli_accepts_distinct_module_and_layout_paths(tmp_path, gs_module):
     subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(output)], check=True)
 
 
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize("controls", [
+    (),
+    ("SignedZeroInfNanPreserve 32", "DenormPreserve 16"),
+    ("DenormFlushToZero 32", "RoundingModeRTE 32", "RoundingModeRTZ 16"),
+], ids=["opt-out", "translator-default", "explicit"])
+def test_capture_preserves_float_control_modes(tmp_path: Path, controls: tuple[str, ...]) -> None:
+    capabilities = "".join(f"OpCapability {control.split()[0]}\n" for control in controls)
+    modes = [f"OpExecutionMode %main {control}" for control in controls]
+    geometry = PHI_GS.replace(
+        "OpMemoryModel", capabilities + "OpMemoryModel", 1,
+    ).replace(
+        "OpDecorate %in_pos", "".join(f"{mode}\n" for mode in modes) + "OpDecorate %in_pos", 1,
+    ).replace(
+        "OpStore %out_pos %v", "%neg = OpFNegate %v4float %v\nOpStore %out_pos %neg",
+    )
+
+    def validate(name: str, assembly: str) -> None:
+        module = tmp_path / f"{name}.spv"
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                       input=assembly, text=True, check=True)
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)], check=True)
+
+    validate("geometry", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    validate("compute", lowered)
+    execution_modes = [line for line in lowered.splitlines() if line.startswith("OpExecutionMode ")]
+    assert execution_modes == ["OpExecutionMode %main LocalSize 64 1 1", *modes]
+
+
 def test_help_is_a_clean_exit_zero(capsys):
     for flag in ("-h", "--help"):
         assert gsc.main(["spirv_gs_to_compute.py", flag]) == 0
