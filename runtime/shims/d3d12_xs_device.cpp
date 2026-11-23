@@ -2051,9 +2051,9 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             } else if constexpr (Slot == 48) {
                 // IASetVertexBuffers(start, count, views): each view's BufferLocation is a GPU VA. The views are
                 // translated in the proxy's scratch array for the same reason as the index view.
-                if (a3 && a2) {
+                if (a3 && static_cast<std::uint32_t>(a2)) {
                     const auto* in = reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(a3);
-                    self->vb_scratch.assign(in, in + a2);
+                    self->vb_scratch.assign(in, in + static_cast<std::uint32_t>(a2));  // a UINT count
                     for (auto& view : self->vb_scratch)
                         view.BufferLocation = upload_translate(self->device, view.BufferLocation);
                     return reinterpret_cast<ForwardFn>(real_vtable[pc])(
@@ -2062,9 +2062,9 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 }
             } else if constexpr (Slot == 49) {
                 // SOSetTargets(start, count, views): BufferLocation and BufferFilledSizeLocation are both VAs.
-                if (a3 && a2) {
+                if (a3 && static_cast<std::uint32_t>(a2)) {
                     const auto* in = reinterpret_cast<const D3D12_STREAM_OUTPUT_BUFFER_VIEW*>(a3);
-                    self->so_scratch.assign(in, in + a2);
+                    self->so_scratch.assign(in, in + static_cast<std::uint32_t>(a2));
                     for (auto& view : self->so_scratch) {
                         view.BufferLocation = upload_translate(self->device, view.BufferLocation);
                         view.BufferFilledSizeLocation =
@@ -2092,10 +2092,21 @@ void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>) ), ...);
 }
 
+// Console list slot 51, PC ClearDepthStencilView: its FLOAT depth arrives in XMM3, which the integer thunk does not
+// declare and note_list_slot's first-call log clobbers, so this slot gets a typed thunk (#2490 review).
+void WINAPI list_clear_depth_stencil_view(ListProxy* self, D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
+                                          FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT* rects) {
+    note_list_slot(51, view.ptr, static_cast<std::uint32_t>(flags), stencil, rect_count,
+                   self->device->console_layout.load(std::memory_order_relaxed));
+    self->real->ClearDepthStencilView(view, flags, depth, stencil, rect_count, rects);
+}
+
 void** get_list_vtable() {
     static void** vtable = [] {
         static void* storage[kListSlots];
         fill_list_vtable(storage, std::make_index_sequence<kListSlots>{});
+        static_assert(console_to_pc_list_slot(51) == 47, "console list slot 51 is PC ClearDepthStencilView");
+        storage[51] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
         return storage;
     }();
     return vtable;
