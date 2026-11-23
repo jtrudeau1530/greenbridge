@@ -256,7 +256,8 @@ def cpu_lookup(name: str):
         return None, False
     s = re.sub(r"\((?:r|tm)\)|[®™]", "", name.lower())
 
-    m = re.search(r"core\s*ultra\s*([3579])\s*(\d{3})([a-z]*)", s)
+    # Series 3 also uses X7 and X9; keep their estimates on the existing tier scale.
+    m = re.search(r"core\s*ultra\s*(?:x(?=[79]))?([3579])\s*(?:processor\s+)?(\d{3})([a-z]*)", s)
     if m:
         base = ULTRA_BASE[int(m[1])]
         return (base if "k" in m[3] else base * 0.95), False
