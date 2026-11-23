@@ -54,6 +54,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+from report_paths import same_report_path  # noqa: E402
 
 PS_SYMBOL = "_amdgpu_ps_main"
 S_CODE_END = struct.pack("<I", 0xBF9F0000)
@@ -805,6 +806,10 @@ def main(argv=None):
         ap.error("nothing to do: give --asm and/or --show-template")
     if not all(0 < n <= 4096 for n in a.size):
         ap.error("--size must be 1..4096")
+    if a.json:                       # the report is written after the run, over whatever it names
+        for flag, path in (("--asm", a.asm), ("--ps", a.ps), ("--vs", a.vs)):
+            if path and same_report_path(a.json, path):
+                ap.error(f"--json would overwrite the {flag} input: {a.json}")
     try:
         lines = read_lines(a.asm) if a.asm else None
         sets = []
