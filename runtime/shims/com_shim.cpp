@@ -22,7 +22,8 @@ namespace {
 struct ThreadComState {
     uint32_t guest_depth = 0;
     uint32_t host_inits_owned = 0;
-    DWORD first_coinit = COINIT_MULTITHREADED;
+    DWORD requested_coinit = COINIT_MULTITHREADED;
+    DWORD host_coinit = COINIT_MULTITHREADED;
     bool mismatch_absorbed = false;
 };
 
@@ -43,6 +44,17 @@ bool apartment_differs(DWORD a, DWORD b) {
     return (a & COINIT_APARTMENTTHREADED) != (b & COINIT_APARTMENTTHREADED);
 }
 
+DWORD detect_existing_host_coinit(DWORD attempted_coinit) {
+    APTTYPE apt = APTTYPE_CURRENT;
+    APTTYPEQUALIFIER qual = APTTYPEQUALIFIER_NONE;
+    DWORD base = (attempted_coinit & COINIT_APARTMENTTHREADED) ? COINIT_MULTITHREADED : COINIT_APARTMENTTHREADED;
+    if (SUCCEEDED(::CoGetApartmentType(&apt, &qual))) {
+        if (apt == APTTYPE_STA || apt == APTTYPE_MAINSTA) base = COINIT_APARTMENTTHREADED;
+        else if (apt == APTTYPE_MTA) base = COINIT_MULTITHREADED;
+    }
+    return base | (attempted_coinit & (COINIT_DISABLE_OLE1DDE | COINIT_SPEED_OVER_MEMORY));
+}
+
 HRESULT WINAPI co_initialize_ex(LPVOID reserved, DWORD coinit) {
     if (reserved != nullptr) return E_INVALIDARG;
 
@@ -54,31 +66,42 @@ HRESULT WINAPI co_initialize_ex(LPVOID reserved, DWORD coinit) {
         const HRESULT hr = ::CoInitializeEx(nullptr, coinit);
         if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return hr;
 
+        DWORD owned_mode = coinit;
+        bool absorbed = false;
+        uint32_t owned_count = 1;
+        if (hr == RPC_E_CHANGED_MODE) {
+            // Retain an actual host COM reference in the thread's existing apartment so guest COM stays alive even if
+            // the host calls CoUninitialize() while the guest still holds an active initialization.
+            owned_mode = detect_existing_host_coinit(coinit);
+            const HRESULT hold_hr = ::CoInitializeEx(nullptr, owned_mode);
+            if (FAILED(hold_hr)) return hold_hr;
+            absorbed = true;
+        }
+
         auto* created = new (std::nothrow) ThreadComState{};
         if (!created) {
-            if (SUCCEEDED(hr)) ::CoUninitialize();
+            if (owned_count) ::CoUninitialize();
             return E_OUTOFMEMORY;
         }
         created->guest_depth = 1;
-        created->first_coinit = coinit;
-        if (hr == RPC_E_CHANGED_MODE) {
-            created->host_inits_owned = 0;
-            created->mismatch_absorbed = true;
-        } else {
-            created->host_inits_owned = 1;
-            created->mismatch_absorbed = false;
-        }
+        created->host_inits_owned = owned_count;
+        created->requested_coinit = coinit;
+        created->host_coinit = owned_mode;
+        created->mismatch_absorbed = absorbed;
         TlsSetValue(slot, created);
         return S_OK;
     }
 
-    if (apartment_differs(state->first_coinit, coinit)) return RPC_E_CHANGED_MODE;
+    const bool matches_host = !apartment_differs(state->host_coinit, coinit);
+    const bool matches_absorbed_guest = state->mismatch_absorbed && !apartment_differs(state->requested_coinit, coinit);
+    if (!matches_host && !matches_absorbed_guest) return RPC_E_CHANGED_MODE;
 
-    if (!state->mismatch_absorbed) {
-        const HRESULT hr = ::CoInitializeEx(nullptr, coinit);
-        if (FAILED(hr)) return hr;
-        ++state->host_inits_owned;
-    }
+    const DWORD forward_mode =
+        matches_host ? coinit : (state->host_coinit | (coinit & (COINIT_DISABLE_OLE1DDE | COINIT_SPEED_OVER_MEMORY)));
+    const HRESULT hr = ::CoInitializeEx(nullptr, forward_mode);
+    if (FAILED(hr)) return hr;
+
+    ++state->host_inits_owned;
     ++state->guest_depth;
     return S_FALSE;
 }

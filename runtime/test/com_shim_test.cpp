@@ -72,13 +72,14 @@ void test_com_lifecycle_and_sta_isolation() {
     }).join();
     check(fresh_ok, "fresh thread balances guest COM without leaking or corrupting host apartment");
 
-    // 2. Host pre-initialized as STA: guest requests MTA -> shim absorbs RPC_E_CHANGED_MODE & protects host STA.
+    // 2. Host pre-initialized as STA: guest requests MTA -> shim absorbs RPC_E_CHANGED_MODE, retains host apartment
+    //    reference so guest outlives host teardown cleanly, and accepts matching STA on the real STA thread.
     bool mismatch_ok = false;
     std::thread([&]() {
         const HRESULT host_sta = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         const HRESULT g1 = co_init(nullptr, COINIT_MULTITHREADED);
+        const HRESULT g_sta = co_init(nullptr, COINIT_APARTMENTTHREADED);
         const HRESULT g2 = co_init(nullptr, COINIT_MULTITHREADED);
-        const HRESULT g_mix = co_init(nullptr, COINIT_APARTMENTTHREADED);
         co_uninit();
         co_uninit();
         co_uninit();
@@ -86,10 +87,34 @@ void test_com_lifecycle_and_sta_isolation() {
         const HRESULT host_still_sta = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         if (SUCCEEDED(host_still_sta)) ::CoUninitialize();
         if (SUCCEEDED(host_sta)) ::CoUninitialize();
-        mismatch_ok = (host_sta == S_OK && g1 == S_OK && g2 == S_FALSE && g_mix == RPC_E_CHANGED_MODE &&
-                       host_still_sta == S_FALSE);
+        mismatch_ok =
+            (host_sta == S_OK && g1 == S_OK && g_sta == S_FALSE && g2 == S_FALSE && host_still_sta == S_FALSE);
     }).join();
     check(mismatch_ok, "guest MTA under host STA avoids RPC_E_CHANGED_MODE and keeps host STA alive");
+
+    // 3. Host-first teardown while guest COM initialization remains active (regression for #9516 review).
+    auto create_inst = resolve<CoCreateInstFn>("CoCreateInstance");
+    bool host_first_teardown_ok = false;
+    std::thread([&]() {
+        const HRESULT host_sta = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        const HRESULT g1 = co_init(nullptr, COINIT_MULTITHREADED);
+        // Host balances its own initialization while guest depth is still 1.
+        if (SUCCEEDED(host_sta)) ::CoUninitialize();
+
+        APTTYPE apt = APTTYPE_CURRENT;
+        APTTYPEQUALIFIER qual = APTTYPEQUALIFIER_NONE;
+        const HRESULT apt_hr = ::CoGetApartmentType(&apt, &qual);
+        void* out = reinterpret_cast<void*>(1);
+        const HRESULT cls_hr = create_inst(GUID_NULL, nullptr, CLSCTX_INPROC_SERVER, IID_IUnknown, &out);
+
+        // Now guest balances; COM should become uninitialized afterwards.
+        co_uninit();
+        const HRESULT apt_after_guest = ::CoGetApartmentType(&apt, &qual);
+        host_first_teardown_ok =
+            (host_sta == S_OK && g1 == S_OK && SUCCEEDED(apt_hr) && cls_hr == REGDB_E_CLASSNOTREG && out == nullptr &&
+             apt_after_guest == CO_E_NOTINITIALIZED);
+    }).join();
+    check(host_first_teardown_ok, "guest COM stays live after host CoUninitialize and unwinds cleanly on guest balance");
 }
 
 void test_com_helpers() {
