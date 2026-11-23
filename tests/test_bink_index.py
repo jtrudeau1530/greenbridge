@@ -248,6 +248,36 @@ class TestCommandLine(unittest.TestCase):
             self.assertEqual(bink.main([missing]), 2)
         self.assertIn("no such file or directory", err.getvalue())
 
+    def test_a_named_file_that_is_not_a_stream_is_an_error(self):
+        # The scan only looks for KB2 headers, so a wrong path used to be a successful scan of 0 streams.
+        junk = os.path.join(self.tmp.name, "wrong-path.bin")
+        with open(junk, "wb") as fh:
+            fh.write(b"not a movie" * 64)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([junk]), 2)
+        self.assertEqual(err.getvalue().splitlines(),
+                         [f"bink_index: error: {junk}: not a Bink 2 stream (KB2) or an RPF archive"])
+
+    def test_an_empty_named_file_is_an_error(self):
+        empty = os.path.join(self.tmp.name, "empty.bk2")
+        with open(empty, "wb"):
+            pass
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([empty]), 2)
+        self.assertEqual(err.getvalue().splitlines(), [f"bink_index: error: {empty}: empty file"])
+
+    def test_a_named_rpf_without_a_stream_still_scans(self):
+        # An archive that holds no movie is a real answer, not a wrong path.
+        archive = os.path.join(self.tmp.name, "empty-movies.rpf")
+        with open(archive, "wb") as fh:
+            fh.write(b"9FPR" + struct.pack("<III", 0x40, 0, 0) + bytes(0x34))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([archive]), 0)
+        self.assertIn("0 Bink 2 streams", err.getvalue())
+
     def test_unreadable_directory_entry_reports_the_file_without_writing_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = os.path.join(tmp, "inputs")

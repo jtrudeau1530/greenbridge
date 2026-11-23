@@ -17,6 +17,10 @@ A single named file that is neither a Bink 2 stream nor an RPF archive is an
 error (exit 2), not an empty index; a directory scan still reports 0 streams
 when nothing matches.
 
+A single named file has to start with ``KB2`` or an RPF header; anything else
+(an empty file, a text file, a carved chunk) cannot hold a stream and is one
+error line with exit 2, which is how a wrong path shows up.
+
 In an RPF9 archive the last ``u32 +12`` bytes of the file are a block of their own
 (``docs/rpf.md``), so when the gap after the last stream reaches EOF and is at least
 that long, those bytes are counted as ``rpf_trailer`` and only the rest of the gap is
@@ -329,6 +333,21 @@ def same_output_path(first, second):
         return False
 
 
+def target_problem(path):
+    """None when a single named file is something this tool indexes, else a one-line reason.
+
+    The scan only searches the bytes for `KB2` headers, so a wrong path or a mislabelled file came back as a
+    successful scan of 0 streams. An RPF archive may hold no stream and is a real answer.
+    """
+    with open(path, "rb") as fh:
+        head = fh.read(4)
+    if not head:
+        return "empty file"
+    if head[1:4] != b"FPR" and not SIG.match(head):
+        return "not a Bink 2 stream (KB2) or an RPF archive"
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="an .rpf archive, a .bk2 file, or a directory")
@@ -355,6 +374,15 @@ def main(argv=None):
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2
+    if not os.path.isdir(a.target):
+        try:
+            problem = target_problem(a.target)
+        except OSError as error:
+            print(f"bink_index: error: cannot read {a.target}: {error.strerror or error}", file=sys.stderr)
+            return 2
+        if problem:
+            print(f"bink_index: error: {a.target}: {problem}", file=sys.stderr)
+            return 2
 
     skip_report = None
     if a.out and os.path.isfile(a.out):
