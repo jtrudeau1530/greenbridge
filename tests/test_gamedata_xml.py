@@ -352,6 +352,22 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("permission denied", err.getvalue())
 
+    @unittest.skipUnless(os.name == "posix" and getattr(os, "geteuid", lambda: 0)() != 0,
+                         "needs a POSIX filesystem and a non-root user to make a folder unlistable")
+    def test_a_real_unlistable_folder_fails_the_scan(self):
+        blocked = os.path.join(self.root, "blocked")
+        os.makedirs(blocked)
+        os.chmod(blocked, 0)
+        err = io.StringIO()
+        try:
+            with mock.patch.object(sys, "argv", ["gamedata_xml.py", self.root]), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = g.main()
+        finally:
+            os.chmod(blocked, 0o755)
+        self.assertEqual(rc, 2)
+        self.assertIn("blocked", err.getvalue())
+
     def test_unwritable_csv_or_json_is_one_error_line(self):
         doc = self.write("alpha.xml", ALPHA)
         blocker = self.write("blocker", b"x")
