@@ -39,7 +39,15 @@ endforeach()
 
 set(_xwin_compile "--target=x86_64-pc-windows-msvc /winsysroot \"${XWIN_DIR}\"")
 set(CMAKE_C_FLAGS_INIT "${_xwin_compile}")
-set(CMAKE_CXX_FLAGS_INIT "${_xwin_compile}")
+# /Zc:threadSafeInit-: Clang's thread-safe-static guard compares the guard word with the CRT's per-thread
+# _Init_thread_epoch. The loader runs the title on a thread the TLS host created, which never went through this
+# image's CRT thread-attach, so that epoch is still 0 there: every function-local static first touched on the title's
+# thread is taken as already initialized while its storage is zero. Measured on 1.0.2.1: the first GetProcAddress on
+# that thread faults in library_loader.cpp's host_module_name (`names` null) and the first XMemVirtualAlloc faults in
+# xmem.cpp's note_attributes (`seen._Myhead` null); a title thread that only reserves memory then dies in the shim.
+# Cl's own codegen does not misfire here, so this is for the cross build only, where the statics involved are the
+# loader's and the shims', each already under a mutex or on the loader thread.
+set(CMAKE_CXX_FLAGS_INIT "${_xwin_compile} /Zc:threadSafeInit-")
 foreach(_kind EXE SHARED MODULE)
   set(CMAKE_${_kind}_LINKER_FLAGS_INIT "/winsysroot:\"${XWIN_DIR}\"")
 endforeach()
