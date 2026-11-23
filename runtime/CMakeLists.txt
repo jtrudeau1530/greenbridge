@@ -237,6 +237,22 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(winhttp_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(winhttp_offline_test PRIVATE /OPT:NOREF)
 
+  # Synthetic tests for the atomic API reference lifecycle.
+  add_executable(api_ref_state_test test/api_ref_state_test.cpp)
+  target_include_directories(api_ref_state_test PRIVATE
+    ${XTASKQUEUE_DIR}/Source/Task)
+  target_compile_definitions(api_ref_state_test PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(api_ref_state_test PRIVATE
+    /W4 /permissive- /utf-8)
+  # Verify global reference accounting during task queue teardown.
+  add_executable(api_global_refs_test test/api_global_refs_test.cpp)
+  target_compile_definitions(api_global_refs_test PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(api_global_refs_test PRIVATE
+    /W4 /permissive- /utf-8)
+  target_link_libraries(api_global_refs_test PRIVATE
+    gta6rt_xtaskqueue)
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
   add_executable(xgameruntime_test
@@ -840,6 +856,51 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET api_ref_state_test)
+    add_test(NAME api_ref_state COMMAND api_ref_state_test)
+    set_tests_properties(api_ref_state PROPERTIES TIMEOUT 10)
+  endif()
+  if(WIN32 AND TARGET api_global_refs_test)
+    add_test(NAME api_global_refs COMMAND api_global_refs_test)
+    set_tests_properties(api_global_refs PROPERTIES TIMEOUT 10)
+  endif()
+  # Internal XTaskQueue context pinning and rundown regression tests.
+  if(WIN32 AND TARGET gta6rt_xtaskqueue)
+    foreach(_context_test context_pinning context_rundown context_reentrant context_concurrent_detach context_attach_detach_stress)
+      add_executable(${_context_test}_test
+        test/${_context_test}_test.cpp
+      )
+      target_include_directories(${_context_test}_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/shims/xtaskqueue
+        ${XTASKQUEUE_DIR}/Source/Task
+        ${XTASKQUEUE_DIR}/Source/Common
+      )
+      target_compile_definitions(${_context_test}_test PRIVATE
+        WIN32_LEAN_AND_MEAN NOMINMAX
+      )
+      target_compile_options(${_context_test}_test PRIVATE
+        /W4 /permissive- /utf-8 /EHsc
+      )
+      target_link_libraries(${_context_test}_test PRIVATE
+        gta6rt_xtaskqueue
+      )
+      add_test(NAME ${_context_test}
+        COMMAND ${_context_test}_test
+      )
+      set_tests_properties(${_context_test} PROPERTIES TIMEOUT 15)
+    endforeach()
+
+    add_executable(wait_registration_test test/wait_registration_test.cpp)
+    target_include_directories(wait_registration_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims/xtaskqueue ${XTASKQUEUE_DIR}/Source/Task ${XTASKQUEUE_DIR}/Source/Common)
+    target_link_libraries(wait_registration_test PRIVATE gta6rt_xtaskqueue)
+    foreach(_case unregister undispatched terminate parked self presignaled monitor close composite snapshot
+                  cross concurrent held_snapshot admission cancel_unregister reentrant_admission
+                  reentrant_vs_external_unregister multi_dispatcher_terminate multi_dispatcher_unregister_replace)
+      add_test(NAME wait_registration_${_case} COMMAND wait_registration_test ${_case})
+      set_tests_properties(wait_registration_${_case} PROPERTIES TIMEOUT 15)
+    endforeach()
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
