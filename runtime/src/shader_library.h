@@ -838,17 +838,23 @@ public:
             return false;
         };
         // Nothing here may throw into the D3D12 shim (only allocation can, and that is caught too).
+        std::filesystem::path folder;
         try {
-            if (!load_index(dir, "", fail)) return false;
+            // The modules are read when a pipeline needs them, later than this. A relative folder would follow the
+            // current directory, which the title may change (SetCurrentDirectory), so it is fixed here once.
+            std::error_code ec;
+            folder = std::filesystem::absolute(dir, ec);
+            if (ec) folder = dir;
+            if (!load_index(folder, "", fail)) return false;
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* folder : {"fspx", "bvh"}) {
+        for (const char* sub_folder : {"fspx", "bvh"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
-                const std::filesystem::path sub = dir / folder;
+                const std::filesystem::path sub = folder / sub_folder;
                 if (std::ifstream(sub / "index.json", std::ios::binary))
-                    load_index(sub, std::string(folder) + "/", ignore);
+                    load_index(sub, std::string(sub_folder) + "/", ignore);
             } catch (...) {
             }
         }
@@ -856,6 +862,8 @@ public:
     }
 
     bool loaded() const { return !dir_.empty(); }
+    // The folder load() read, made absolute; empty before.
+    const std::filesystem::path& directory() const { return dir_; }
     std::size_t size() const { return count_; }
     // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
     // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
