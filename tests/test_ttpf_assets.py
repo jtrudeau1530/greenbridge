@@ -79,7 +79,9 @@ class TextureAssets(unittest.TestCase):
         # The lower-mip file the row named is gone once the manifest names the full chain: it was kept through
         # the failed run above, and it is not stored a second time after the successful one.
         self.assertFalse(partial.exists())
-        self.assertEqual(sorted(p.name for p in self.folder.iterdir()), sorted([row["File"], "manifest.json"]))
+        # decoder.sha256 is the decoder record assets() keeps in an exported texture folder (BUILD-1228)
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir() if p.name != "decoder.sha256"),
+                         sorted([row["File"], "manifest.json"]))
         with mock.patch.object(ttpf_assets.ttpf, "Pool", side_effect=AssertionError("unexpected reopen")):
             self.build()
 
@@ -186,7 +188,8 @@ class TextureAssets(unittest.TestCase):
             self.assertEqual(ttpf_assets.remove_replaced(self.folder, replaced, rows), [])
         self.assertLessEqual(len(calls), 100, len(calls))
         # The replaced files are gone and the rows' files stay.
-        self.assertEqual(sorted(p.name for p in self.folder.iterdir()), sorted(row["File"] for row in rows))
+        self.assertEqual(sorted(p.name for p in self.folder.iterdir() if p.name != "decoder.sha256"),
+                         sorted(row["File"] for row in rows))
 
     def test_only_a_file_in_the_pool_folder_is_removed(self):
         # A row is trusted for a file name, not for a path: nothing outside the pool's folder is touched.

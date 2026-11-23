@@ -42,6 +42,10 @@ class ReadbackSizeTest(unittest.TestCase):
             with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
                   patch.object(rgt, "spirv_as"),
                   patch.object(rgt, "run_cmd", side_effect=launch),
+                  # ps_ij_computed is skipped under either PerVertexKHR fallback, which is on by default on a device
+                  # where PerVertexKHR does not compile (or with no device): this test is about its readback
+                  patch.object(rgt, "bary_fallback", return_value=False),
+                  patch.object(rgt, "f16_interp_fallback", return_value=False),
                   redirect_stdout(output)):
                 result = rgt.run_suite(args, directory)
             return result, output.getvalue()

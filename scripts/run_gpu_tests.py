@@ -714,7 +714,11 @@ def main() -> int:
 
     work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
     try:
-        os.makedirs(work, exist_ok=True)
+        try:
+            os.makedirs(work, exist_ok=True)
+        except OSError as exc:      # the same report run_suite gives for its own folders (#4544)
+            print(f"error: cannot prepare GPU test directory {work}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
         native = native_folder(work)
         if native is None:
             print(f"error: the work folder {ascii(work)} has characters outside this PC's ANSI code page and no 8.3 "
