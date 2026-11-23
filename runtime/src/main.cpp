@@ -320,6 +320,52 @@ int wmain(int argc, wchar_t** argv) {
             }, nullptr, 0, nullptr);
         }
         std::fflush(stdout);
+        // LEONIDA_PROBES=rva[,rva...] (a diagnostic): a one-shot int3 at each RVA of the main image. When one is hit,
+        // RAX/RSI/RDI and the flags are logged, the original byte is put back, and the instruction runs as it would.
+        if (const char* probes = std::getenv("LEONIDA_PROBES"); probes && *probes) {
+            static std::map<std::uint64_t, unsigned char> originals;
+            static std::uint64_t probe_base = 0;
+            probe_base = reinterpret_cast<std::uint64_t>(main_module.base);
+            std::string list(probes);
+            for (std::size_t at = 0; at < list.size();) {
+                std::size_t end = list.find(',', at);
+                if (end == std::string::npos) end = list.size();
+                const std::uint64_t rva = std::strtoull(list.substr(at, end - at).c_str(), nullptr, 16);
+                at = end + 1;
+                if (!rva || rva >= main_module.size) continue;
+                auto* p = reinterpret_cast<unsigned char*>(probe_base + rva);
+                DWORD old = 0;
+                if (!VirtualProtect(p, 1, PAGE_EXECUTE_READWRITE, &old)) continue;
+                originals[probe_base + rva] = *p;
+                *p = 0xCC;
+                VirtualProtect(p, 1, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), p, 1);
+            }
+            AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* info) -> LONG {
+                const auto at = reinterpret_cast<std::uint64_t>(info->ExceptionRecord->ExceptionAddress);
+                if (info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) return EXCEPTION_CONTINUE_SEARCH;
+                const auto it = originals.find(at);
+                if (it == originals.end()) return EXCEPTION_CONTINUE_SEARCH;
+                const CONTEXT& c = *info->ContextRecord;
+                std::fprintf(stderr, "[rt] probe main+0x%llx: rbx=0x%llx rcx=0x%llx rdx=0x%llx rsp=0x%llx\n",
+                             static_cast<unsigned long long>(at - probe_base), static_cast<unsigned long long>(c.Rbx),
+                             static_cast<unsigned long long>(c.Rcx), static_cast<unsigned long long>(c.Rdx),
+                             static_cast<unsigned long long>(c.Rsp));
+                std::fprintf(stderr, "[rt] probe main+0x%llx: rax=0x%llx rsi=0x%llx rdi=0x%llx eflags=0x%lx (ZF=%d SF=%d)\n",
+                             static_cast<unsigned long long>(at - probe_base), static_cast<unsigned long long>(c.Rax),
+                             static_cast<unsigned long long>(c.Rsi), static_cast<unsigned long long>(c.Rdi), c.EFlags,
+                             int((c.EFlags >> 6) & 1), int((c.EFlags >> 7) & 1));
+                auto* p = reinterpret_cast<unsigned char*>(at);
+                DWORD old = 0;
+                VirtualProtect(p, 1, PAGE_EXECUTE_READWRITE, &old);
+                *p = it->second;
+                VirtualProtect(p, 1, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), p, 1);
+                info->ContextRecord->Rip = at;  // the original instruction runs now
+                return EXCEPTION_CONTINUE_EXECUTION;
+            });
+            std::printf("LEONIDA_PROBES: %zu probe(s) set\n", originals.size());
+        }
         // LEONIDA_BREAKPOINTS=continue: an int3 inside the main image is stepped over, as a debugger's "continue"
         // would, and logged (address, count). The console title's asserts are an int3 followed by the code that
         // carries on; without a debugger a PC ends the process there. A diagnostic: off by default.
