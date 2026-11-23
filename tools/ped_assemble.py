@@ -163,6 +163,7 @@ class MeshPart:
     weights_0: list[tuple[float, float, float, float]] | None = None
     joints_1: list[tuple[int, int, int, int]] | None = None
     weights_1: list[tuple[float, float, float, float]] | None = None
+    joint_names: list[str] | None = None
     material: MaterialSpec | None = None
 
     def __post_init__(self) -> None:
@@ -398,6 +399,7 @@ def align_part_to_standing_space(
         weights_0=list(part.weights_0) if part.weights_0 is not None else None,
         joints_1=list(part.joints_1) if part.joints_1 is not None else None,
         weights_1=list(part.weights_1) if part.weights_1 is not None else None,
+        joint_names=list(part.joint_names) if part.joint_names is not None else None,
         material=part.material,
     )
 
@@ -611,6 +613,7 @@ def cull_part_overlap(
         weights_0=list(target.weights_0) if target.weights_0 is not None else None,
         joints_1=list(target.joints_1) if target.joints_1 is not None else None,
         weights_1=list(target.weights_1) if target.weights_1 is not None else None,
+        joint_names=list(target.joint_names) if target.joint_names is not None else None,
         material=target.material,
     )
     if compact_vertices:
@@ -652,6 +655,7 @@ def compact_part_vertices(part: MeshPart) -> MeshPart:
         weights_0=_remap(part.weights_0),
         joints_1=_remap(part.joints_1),
         weights_1=_remap(part.weights_1),
+        joint_names=list(part.joint_names) if part.joint_names is not None else None,
         material=part.material,
     )
 
@@ -944,6 +948,24 @@ def _normalize_triangles(raw_indices: list) -> list[tuple[int, int, int]]:
     ]
 
 
+def _parse_joint_names(raw: object, *, part_name: str) -> list[str] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise PedAssembleError(f"{part_name}: joint_names must be a list of strings")
+    out: list[str] = []
+    for idx, item in enumerate(raw):
+        if item is None:
+            out.append("")
+        elif isinstance(item, str):
+            out.append(item)
+        else:
+            raise PedAssembleError(
+                f"{part_name}: joint_names[{idx}] must be a string or null, got {type(item).__name__}"
+            )
+    return out
+
+
 def _part_from_dict(raw: dict, *, default_name: str, default_space: str, base_dir: str) -> MeshPart:
     name = str(raw.get("name", default_name))
     positions = [(float(p[0]), float(p[1]), float(p[2])) for p in raw.get("positions", [])]
@@ -960,6 +982,7 @@ def _part_from_dict(raw: dict, *, default_name: str, default_space: str, base_di
     weights_0 = [tuple(float(x) for x in w) for w in raw["weights_0"]] if raw.get("weights_0") else None
     joints_1 = [tuple(int(x) for x in j) for j in raw["joints_1"]] if raw.get("joints_1") else None
     weights_1 = [tuple(float(x) for x in w) for w in raw["weights_1"]] if raw.get("weights_1") else None
+    joint_names = _parse_joint_names(raw.get("joint_names", raw.get("jointNames")), part_name=name)
     trans = raw.get("translation", (0.0, 0.0, 0.0))
     return MeshPart(
         name=name,
@@ -975,6 +998,7 @@ def _part_from_dict(raw: dict, *, default_name: str, default_space: str, base_di
         weights_0=weights_0,
         joints_1=joints_1,
         weights_1=weights_1,
+        joint_names=joint_names,
         material=_parse_material_dict(raw.get("material"), base_dir),
     )
 
@@ -1028,6 +1052,8 @@ def part_to_dict(part: MeshPart) -> dict:
         out["joints_1"] = [list(j) for j in part.joints_1]
     if part.weights_1 is not None:
         out["weights_1"] = [list(w) for w in part.weights_1]
+    if part.joint_names is not None:
+        out["joint_names"] = list(part.joint_names)
     if part.material is not None:
         mat: dict = {
             "name": part.material.name,
@@ -1077,6 +1103,53 @@ def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
     return out
 
 
+def _extract_glb_skin_joint_names(
+    doc: dict,
+    skin_idx: object,
+    *,
+    path: str,
+    part_name: str,
+) -> list[str]:
+    skins = doc.get("skins", [])
+    nodes = doc.get("nodes", [])
+    if not isinstance(skin_idx, int) or isinstance(skin_idx, bool) or not (0 <= skin_idx < len(skins)):
+        raise PedAssembleError(
+            f"{path}: part {part_name!r} references invalid skin index {skin_idx!r} "
+            f"(GLB has {len(skins)} skin(s))"
+        )
+    skin = skins[skin_idx]
+    if not isinstance(skin, dict):
+        raise PedAssembleError(f"{path}: skins[{skin_idx}] must be a JSON object")
+    raw_joints = skin.get("joints")
+    if not isinstance(raw_joints, list):
+        raise PedAssembleError(f"{path}: skins[{skin_idx}].joints must be a list")
+    joint_names: list[str] = []
+    for slot, j_node_idx in enumerate(raw_joints):
+        if (
+            not isinstance(j_node_idx, int)
+            or isinstance(j_node_idx, bool)
+            or not (0 <= j_node_idx < len(nodes))
+        ):
+            raise PedAssembleError(
+                f"{path}: skins[{skin_idx}].joints[{slot}] references invalid node index {j_node_idx!r} "
+                f"(GLB has {len(nodes)} node(s))"
+            )
+        jnode = nodes[j_node_idx]
+        if not isinstance(jnode, dict):
+            raise PedAssembleError(f"{path}: nodes[{j_node_idx}] must be a JSON object")
+        raw_name = jnode.get("name")
+        if raw_name is None:
+            joint_names.append("")
+        elif isinstance(raw_name, str):
+            joint_names.append(raw_name)
+        else:
+            raise PedAssembleError(
+                f"{path}: skins[{skin_idx}].joints[{slot}] (node {j_node_idx}) "
+                f"has non-string name {raw_name!r}"
+            )
+    return joint_names
+
+
 def read_glb_parts(path: str) -> list[MeshPart]:
     """Read mesh parts from a binary glTF 2.0 (``.glb``) file (always Y-up)."""
     with open(path, "rb") as f:
@@ -1106,6 +1179,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
     nodes = doc.get("nodes", [])
     meshes = doc.get("meshes", [])
     materials = doc.get("materials", [])
+    skins = doc.get("skins", [])
     parts: list[MeshPart] = []
 
     mesh_nodes = [(n, n["mesh"]) for n in nodes if "mesh" in n]
@@ -1116,6 +1190,12 @@ def read_glb_parts(path: str) -> list[MeshPart]:
         mesh = meshes[mesh_idx]
         node_name = node.get("name") or mesh.get("name") or stem
         trans = tuple(float(v) for v in node.get("translation", (0.0, 0.0, 0.0)))
+        has_node_skin = "skin" in node and node["skin"] is not None
+        node_joint_names = (
+            _extract_glb_skin_joint_names(doc, node["skin"], path=path, part_name=node_name)
+            if has_node_skin
+            else None
+        )
         for pi, prim in enumerate(mesh.get("primitives", [])):
             attrs = prim.get("attributes", {})
             if "POSITION" not in attrs:
@@ -1157,6 +1237,28 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 [tuple(float(x) for x in w) for w in _read_glb_accessor(doc, bin_chunk, attrs["WEIGHTS_1"])]
                 if "WEIGHTS_1" in attrs else None
             )
+            pname = node_name if len(mesh.get("primitives", [])) == 1 else f"{node_name}_p{pi}"
+            has_skin_attrs = joints_0 is not None or joints_1 is not None
+            if has_node_skin:
+                part_joint_names = list(node_joint_names) if (has_skin_attrs and node_joint_names is not None) else None
+            elif has_skin_attrs:
+                if len(skins) == 1:
+                    part_joint_names = _extract_glb_skin_joint_names(
+                        doc,
+                        0,
+                        path=path,
+                        part_name=pname,
+                    )
+                elif len(skins) > 1:
+                    raise PedAssembleError(
+                        f"{path}: skinned part {pname!r} has no node 'skin' index "
+                        f"and GLB defines {len(skins)} skins (ambiguous skin binding)"
+                    )
+                else:
+                    part_joint_names = []
+            else:
+                part_joint_names = None
+
             mat_spec = None
             if "material" in prim and 0 <= prim["material"] < len(materials):
                 gm = materials[prim["material"]]
@@ -1171,7 +1273,6 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                     alpha_cutoff=float(gm["alphaCutoff"]) if "alphaCutoff" in gm else None,
                     double_sided=bool(gm.get("doubleSided", False)),
                 )
-            pname = node_name if len(mesh.get("primitives", [])) == 1 else f"{node_name}_p{pi}"
             parts.append(MeshPart(
                 name=pname,
                 positions=positions,
@@ -1185,6 +1286,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 weights_0=weights_0,
                 joints_1=joints_1,
                 weights_1=weights_1,
+                joint_names=part_joint_names,
                 material=mat_spec,
             ))
     return parts
@@ -1239,6 +1341,9 @@ def load_parts_from_path(
                             sp.name = str(entry["name"])
                         if entry.get("role"):
                             sp.role = str(entry["role"])
+                        if "joint_names" in entry or "jointNames" in entry:
+                            raw_jn = entry.get("joint_names", entry.get("jointNames"))
+                            sp.joint_names = _parse_joint_names(raw_jn, part_name=sp.name)
                         parts.append(sp)
                 elif isinstance(entry, dict):
                     parts.append(_part_from_dict(entry, default_name=f"{stem}_{idx}", default_space=default_sp, base_dir=base_dir))
@@ -1319,6 +1424,155 @@ def _pack_f32_vec(rows: list[tuple[float, ...]], comps: int) -> bytes:
     return bytes(buf)
 
 
+def remap_part_joints(
+    part: MeshPart,
+    skeleton: SkeletonSpec,
+) -> tuple[list[tuple[int, int, int, int]] | None, list[tuple[int, int, int, int]] | None]:
+    """Validate and remap ``part``'s skinning joint indices into ``skeleton.joints`` slot order.
+
+    When ``part.joint_names`` is present (for example from a skinned ``.glb`` input
+    or a manifest specifying source joint names), every non-zero-weighted influence
+    slot is resolved through ``part.joint_names[src_idx]`` and mapped to the unique
+    matching joint name in ``skeleton.joints``. Missing, unnamed, out-of-range, or
+    ambiguous (duplicate-name) correspondences raise :class:`PedAssembleError`
+    (a :class:`ValueError` subclass). Zero-weight padding slots are remapped when
+    unambiguous and otherwise reset to ``0``.
+
+    When ``part.joint_names`` is ``None`` (raw inputs authored directly in the
+    target skeleton's index space), every non-zero-weighted joint index is validated
+    to lie within ``[0, len(skeleton.joints))``.
+    """
+    if part.joints_0 is None and part.weights_0 is None and part.joints_1 is None and part.weights_1 is None:
+        return None, None
+    if (part.joints_0 is None) != (part.weights_0 is None):
+        raise PedAssembleError(f"{part.name}: joints_0 and weights_0 must both be provided")
+    if (part.joints_1 is None) != (part.weights_1 is None):
+        raise PedAssembleError(f"{part.name}: joints_1 and weights_1 must both be provided")
+    if part.joints_1 is not None and part.joints_0 is None:
+        raise PedAssembleError(f"{part.name}: joints_1/weights_1 provided without joints_0/weights_0")
+
+    n_verts = len(part.positions)
+    if part.joints_0 is not None and (len(part.joints_0) != n_verts or len(part.weights_0) != n_verts):
+        raise PedAssembleError(
+            f"{part.name}: joints_0 ({len(part.joints_0)}) / weights_0 ({len(part.weights_0)}) "
+            f"must match vertex count ({n_verts})"
+        )
+    if part.joints_1 is not None and (len(part.joints_1) != n_verts or len(part.weights_1) != n_verts):
+        raise PedAssembleError(
+            f"{part.name}: joints_1 ({len(part.joints_1)}) / weights_1 ({len(part.weights_1)}) "
+            f"must match vertex count ({n_verts})"
+        )
+
+    n_dst = len(skeleton.joints)
+    if n_dst == 0:
+        raise PedAssembleError(
+            f"{part.name}: target skeleton {skeleton.name!r} has no joints for skinned mesh"
+        )
+    if n_dst > 65536:
+        raise PedAssembleError(
+            f"{part.name}: target skeleton {skeleton.name!r} has {n_dst} joints (exceeds u16 JOINTS_n limit)"
+        )
+
+    slot_map: list[tuple[bool, int | str]] | None = None
+    if part.joint_names is not None:
+        src_by_name: dict[str, list[int]] = defaultdict(list)
+        for src_idx, sname in enumerate(part.joint_names):
+            if sname and sname.strip():
+                src_by_name[sname].append(src_idx)
+
+        dst_by_name: dict[str, list[int]] = defaultdict(list)
+        for dst_idx, joint in enumerate(skeleton.joints):
+            if joint.name and joint.name.strip():
+                dst_by_name[joint.name].append(dst_idx)
+
+        slot_map = []
+        for src_idx, sname in enumerate(part.joint_names):
+            if not sname or not sname.strip():
+                slot_map.append((
+                    False,
+                    f"source joint slot {src_idx} is unnamed and cannot be mapped to skeleton {skeleton.name!r}",
+                ))
+                continue
+            src_slots = src_by_name[sname]
+            if len(src_slots) > 1:
+                slot_map.append((
+                    False,
+                    f"source joint name {sname!r} is ambiguous in source skin (slots {src_slots})",
+                ))
+                continue
+            dst_slots = dst_by_name.get(sname)
+            if not dst_slots:
+                slot_map.append((
+                    False,
+                    f"source joint {sname!r} (slot {src_idx}) not found in target skeleton {skeleton.name!r}",
+                ))
+                continue
+            if len(dst_slots) > 1:
+                slot_map.append((
+                    False,
+                    f"target joint name {sname!r} is ambiguous in skeleton {skeleton.name!r} (slots {dst_slots})",
+                ))
+                continue
+            slot_map.append((True, dst_slots[0]))
+
+    def _remap_attr(
+        joints: list[tuple[int, int, int, int]] | None,
+        weights: list[tuple[float, float, float, float]] | None,
+        attr_name: str,
+    ) -> list[tuple[int, int, int, int]] | None:
+        if joints is None or weights is None:
+            return None
+        remapped: list[tuple[int, int, int, int]] = []
+        for vi, (j_row, w_row) in enumerate(zip(joints, weights)):
+            if len(j_row) != 4 or len(w_row) != 4:
+                raise PedAssembleError(
+                    f"{part.name}: {attr_name} vertex {vi} must have 4 joint/weight components"
+                )
+            out_row: list[int] = []
+            for comp, (src_idx, weight) in enumerate(zip(j_row, w_row)):
+                active = weight != 0.0
+                if slot_map is not None:
+                    if active:
+                        if not (0 <= src_idx < len(slot_map)):
+                            if len(slot_map) == 0:
+                                raise PedAssembleError(
+                                    f"{part.name}: {attr_name} vertex {vi}[{comp}] has weight {weight} "
+                                    f"on slot {src_idx}, but source part has no skin joints to map to "
+                                    f"skeleton {skeleton.name!r}"
+                                )
+                            raise PedAssembleError(
+                                f"{part.name}: {attr_name} vertex {vi}[{comp}] references out-of-range "
+                                f"source joint slot {src_idx} (source skin has {len(slot_map)} joint(s))"
+                            )
+                        ok, payload = slot_map[src_idx]
+                        if not ok:
+                            raise PedAssembleError(
+                                f"{part.name}: {attr_name} vertex {vi}[{comp}] (weight={weight}): {payload}"
+                            )
+                        out_row.append(int(payload))
+                    else:
+                        if 0 <= src_idx < len(slot_map) and slot_map[src_idx][0]:
+                            out_row.append(int(slot_map[src_idx][1]))
+                        else:
+                            out_row.append(0)
+                else:
+                    if active:
+                        if not (0 <= src_idx < n_dst):
+                            raise PedAssembleError(
+                                f"{part.name}: {attr_name} vertex {vi}[{comp}] references out-of-range "
+                                f"joint index {src_idx} for skeleton {skeleton.name!r} ({n_dst} joint(s))"
+                            )
+                        out_row.append(src_idx)
+                    else:
+                        out_row.append(src_idx if 0 <= src_idx < n_dst else 0)
+            remapped.append((out_row[0], out_row[1], out_row[2], out_row[3]))
+        return remapped
+
+    new_j0 = _remap_attr(part.joints_0, part.weights_0, "JOINTS_0")
+    new_j1 = _remap_attr(part.joints_1, part.weights_1, "JOINTS_1")
+    return new_j0, new_j1
+
+
 def build_assembled_glb(
     parts: list[MeshPart],
     *,
@@ -1332,7 +1586,8 @@ def build_assembled_glb(
     All mesh geometry is converted into glTF Y-up standing space. When
     ``skeleton`` is provided, joint nodes, inverse bind matrices, and a
     standing-space root wrapper node are emitted and bound to every skinned
-    mesh node.
+    mesh node. Skinned parts carrying ``joint_names`` have their ``JOINTS_0``
+    and ``JOINTS_1`` slots remapped by joint name into ``skeleton.joints`` order.
     """
     non_empty = [p for p in parts if p.positions and p.triangles]
     if not non_empty:
@@ -1435,14 +1690,25 @@ def build_assembled_glb(
             col_bv = _append_bv(bin_buf, buffer_views, col_bytes, target=TARGET_ARRAY_BUFFER)
             attrs["COLOR_0"] = _append_accessor(accessors, col_bv, COMPONENT_FLOAT, n_verts, "VEC4")
 
-        if aligned.joints_0 is not None and aligned.weights_0 is not None:
-            j0_bv = _append_bv(bin_buf, buffer_views, _pack_u16_vec4(aligned.joints_0), target=TARGET_ARRAY_BUFFER)
+        joints_0_out = aligned.joints_0
+        joints_1_out = aligned.joints_1
+        has_any_skin = (
+            aligned.joints_0 is not None
+            or aligned.weights_0 is not None
+            or aligned.joints_1 is not None
+            or aligned.weights_1 is not None
+        )
+        if has_any_skin and skeleton is not None:
+            joints_0_out, joints_1_out = remap_part_joints(aligned, skeleton)
+
+        if joints_0_out is not None and aligned.weights_0 is not None:
+            j0_bv = _append_bv(bin_buf, buffer_views, _pack_u16_vec4(joints_0_out), target=TARGET_ARRAY_BUFFER)
             w0_bv = _append_bv(bin_buf, buffer_views, _pack_f32_vec(aligned.weights_0, 4), target=TARGET_ARRAY_BUFFER)
             attrs["JOINTS_0"] = _append_accessor(accessors, j0_bv, COMPONENT_UNSIGNED_SHORT, n_verts, "VEC4")
             attrs["WEIGHTS_0"] = _append_accessor(accessors, w0_bv, COMPONENT_FLOAT, n_verts, "VEC4")
 
-        if aligned.joints_1 is not None and aligned.weights_1 is not None:
-            j1_bv = _append_bv(bin_buf, buffer_views, _pack_u16_vec4(aligned.joints_1), target=TARGET_ARRAY_BUFFER)
+        if joints_1_out is not None and aligned.weights_1 is not None:
+            j1_bv = _append_bv(bin_buf, buffer_views, _pack_u16_vec4(joints_1_out), target=TARGET_ARRAY_BUFFER)
             w1_bv = _append_bv(bin_buf, buffer_views, _pack_f32_vec(aligned.weights_1, 4), target=TARGET_ARRAY_BUFFER)
             attrs["JOINTS_1"] = _append_accessor(accessors, j1_bv, COMPONENT_UNSIGNED_SHORT, n_verts, "VEC4")
             attrs["WEIGHTS_1"] = _append_accessor(accessors, w1_bv, COMPONENT_FLOAT, n_verts, "VEC4")
