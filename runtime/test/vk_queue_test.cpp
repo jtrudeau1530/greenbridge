@@ -34,15 +34,32 @@ VKAPI_ATTR VkResult VKAPI_CALL counting_allocate_command_buffers(VkDevice device
 }
 
 // Makes the queue's first kStalls waits for room time out at once, as on a GPU that stopped making progress.
+// While hold_progress is set, timeline counter queries report 0 so a fast GPU cannot retire command buffers
+// before the loop reaches kMaxQueuedCommandBuffers; once kStalls timeouts have been injected, real progress
+// resumes and the wait completes normally.
 constexpr std::uint32_t kStalls = 3;
+PFN_vkGetSemaphoreCounterValue real_get_semaphore_counter_value = nullptr;
 PFN_vkWaitSemaphores real_wait_semaphores = nullptr;
 std::atomic<std::uint32_t> injected_stalls{0};
+std::atomic<bool> hold_progress{false};
+
+VKAPI_ATTR VkResult VKAPI_CALL holding_semaphore_counter(VkDevice device, VkSemaphore semaphore,
+                                                         std::uint64_t* value) {
+    if (hold_progress.load()) {
+        *value = 0;
+        return VK_SUCCESS;
+    }
+    return real_get_semaphore_counter_value(device, semaphore, value);
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL stalling_wait_semaphores(VkDevice device, const VkSemaphoreWaitInfo* info,
                                                         std::uint64_t timeout) {
-    if (timeout == VulkanQueue::kQueuedWaitNs && injected_stalls.load() < kStalls) {
-        ++injected_stalls;
-        return VK_TIMEOUT;
+    if (timeout == VulkanQueue::kQueuedWaitNs) {
+        if (injected_stalls.load() < kStalls) {
+            ++injected_stalls;
+            return VK_TIMEOUT;
+        }
+        hold_progress.store(false);
     }
     return real_wait_semaphores(device, info, timeout);
 }
@@ -349,12 +366,18 @@ int main() {
         const CommandList* big_lists[] = {&big_copy};
 
         real_allocate_command_buffers = context.vk.vkAllocateCommandBuffers;
+        real_get_semaphore_counter_value = context.vk.vkGetSemaphoreCounterValue;
         real_wait_semaphores = context.vk.vkWaitSemaphores;
         context.vk.vkAllocateCommandBuffers = counting_allocate_command_buffers;
+        context.vk.vkGetSemaphoreCounterValue = holding_semaphore_counter;
         context.vk.vkWaitSemaphores = stalling_wait_semaphores;
         allocated_command_buffers = 0;
+        injected_stalls.store(0);
+        hold_progress.store(true);
         for (std::uint32_t i = 0; i < kSubmits; ++i) EXPECT(direct.execute(big_lists) == ReplayResult::success);
+        hold_progress.store(false);
         context.vk.vkAllocateCommandBuffers = real_allocate_command_buffers;
+        context.vk.vkGetSemaphoreCounterValue = real_get_semaphore_counter_value;
         context.vk.vkWaitSemaphores = real_wait_semaphores;
         EXPECT(direct.signal(fence.semaphore(), 5));
         EXPECT(fence.wait(5, 20'000'000'000ull));
