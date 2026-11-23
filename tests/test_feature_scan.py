@@ -450,7 +450,8 @@ def test_typed_buffers_and_psv0():
               f"MUBUF word 3 by source, s_cmp is no write, a branch target starts a block ({tb['mubuf_word3']})")
         check(tb["mubuf_literal_formats"] == {"load 8_8_8_8_UNORM": 2, "load INVALID": 1,
                                               "store 10_11_11_FLOAT": 1}, f"literal word 3 formats ({tb['mubuf_literal_formats']})")
-        check(tb["not_in_translator"] == {"mtbuf store 10_11_11_FLOAT": 1, "mubuf_literal store 10_11_11_FLOAT": 1},
+        # 10_11_11_FLOAT stores are in rdna2spirv.Gen.FORMATS since #2022/#2432, so nothing here is outside it
+        check(tb["not_in_translator"] == {},
               f"formats outside rdna2spirv.Gen.FORMATS are listed, INVALID (reads 0) is not ({tb['not_in_translator']})")
         check(tb["shaders"] == {"mtbuf": {"cs": 1}, "mubuf": {"cs": 1, "ps": 1}, "mubuf_literal": {"cs": 1, "ps": 1},
                                 "mubuf_runtime_format": {"cs": 1, "ps": 1}}, f"shaders per stage ({tb['shaders']})")

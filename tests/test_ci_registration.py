@@ -239,6 +239,9 @@ def defines_a_test(source, require_test_case=False):
             if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
                    for item in node.body):
                 return True
+            # a mixin imported from another module (tests/semantic/f16_unary_cases.py's UnaryF16) brings its tests
+            if any(b not in bases and b not in ("TestCase", "object") for b in bases[node.name]):
+                return True
         if not require_test_case and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
                 and node.name.startswith("test"):
             return True

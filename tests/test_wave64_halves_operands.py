@@ -114,12 +114,12 @@ class Operands(unittest.TestCase):
         self.assertEqual(w64.operands(ins("v_cmp_gt_f32_e32", imm(0), v(1))),
                          ([], [imm(0), v(1)], ["vcc"], []))
 
-    def test_v_cmpx_reports_no_exec_def(self):
-        # "v_cmpx" sits in NO_DEST, so the first branch wins and the v_cmpx elif that would append "exec"
-        # never runs: operands() reports no implicit EXEC write. The transfer function dispatches on
-        # "exec" in defs (or an exec dest), so a v_cmpx narrowing of EXEC is not modelled either.
+    def test_v_cmpx_reports_its_exec_def(self):
+        # GFX10 v_cmpx has no destination operand and writes EXEC only; operands() reports that implicit EXEC
+        # write (it used to report none, which this test pinned until round 44), so the transfer function models
+        # the narrowing.
         self.assertEqual(w64.operands(ins("v_cmpx_eq_u32_e32", s(6), v(1))),
-                         ([], [s(6), v(1)], [], []))
+                         ([], [s(6), v(1)], ["exec"], []))
 
     def test_atomics_return_a_value_only_with_glc(self):
         args = (v(0), v(1), s(0, 4), imm(0))

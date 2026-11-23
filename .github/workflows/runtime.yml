@@ -526,6 +526,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DVulkan_INCLUDE_DIR="$(brew --prefix)/include"
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DLEONIDA_REQUIRE_VULKAN=ON
       - name: Build
         id: macos-build
         run: cmake --build runtime/build --parallel

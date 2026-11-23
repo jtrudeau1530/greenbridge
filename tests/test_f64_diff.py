@@ -94,8 +94,8 @@ class F64DiffTests(unittest.TestCase):
             self.assertEqual(skipped[0], "skip")
             self.assertIn("div-fixup-nan-s0", skipped[1])
             known = fd.run_one(lines, "ps_f64_fixup_known", tmp, include_known=True)
-        self.assertEqual(known[0], "mismatch")
-        self.assertEqual(fd.words_to_bits(*known[2][:2]), fd.EXP)
+        # the translator now gives the ISA's signed infinity for NaN(S0) too (#4536 was written when it kept the NaN)
+        self.assertEqual(known[0], "match")
 
     def test_compare_reference_does_not_write_v8_without_cndmask(self):
         for op in ("v_cmp_eq_f64_e64 s20, v[12:13], 0.0",
@@ -122,9 +122,9 @@ class F64DiffTests(unittest.TestCase):
         normal = self.command("--ops", "v_add_f64", "--programs", "0")
         known = self.command("--ops", "v_add_f64", "--programs", "0", "--no-sweep", "--known", "--all-failures")
         self.assertNotIn("KNOWN_DIVERGENCE", normal.stdout)
-        self.assertEqual(known.returncode, 1)
-        self.assertIn("MISMATCH:", known.stdout)
-        self.assertIn("v_div_fixup_f64", known.stdout)  # the known NaN(S0) case is actually executed
+        # the known NaN(S0) case runs and, since the translator follows the ISA there, matches
+        self.assertEqual(known.returncode, 0, known.stdout)
+        self.assertNotIn("MISMATCH:", known.stdout)
 
     def test_sabotaged_translator_mismatch_and_shrinking(self):
         lines = ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x3ff80000",

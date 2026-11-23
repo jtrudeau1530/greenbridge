@@ -124,6 +124,8 @@ class Module:
             return self.value(words[self.value(p[2], word1, index)], word1, index)
         if op == "OpGroupNonUniformBroadcastFirst":   # desc_lookup makes the descriptor word uniform: one invocation
             return self.value(a[2], word1, index)      # here, so the value itself (a[1] is the Subgroup scope)
+        if op == "OpGroupNonUniformShuffle":          # the same for a wave32 pixel shader's half (SHADER-731, #4225)
+            return self.value(a[2], word1, index)
         u = [self.value(y, word1, index) for y in a[1:]]
         if op == "OpBitcast":
             return u[0]
