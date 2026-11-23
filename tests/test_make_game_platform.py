@@ -466,9 +466,19 @@ class PipelineCheckExeTest(unittest.TestCase):
     def test_linux_prefers_the_readme_build_folder(self):
         self.assertIsNone(self.exe("posix"))
         plain = self.touch("vk_pipeline_check")
+        os.chmod(plain, 0o755)
         self.assertEqual(self.exe("posix"), plain)
         readme = self.touch("linux", "vk_pipeline_check")
+        os.chmod(readme, 0o755)
         self.assertEqual(self.exe("posix"), readme)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX execute permissions")
+    def test_non_executable_linux_checker_does_not_hide_the_fallback(self):
+        preferred = self.touch("linux", "vk_pipeline_check")
+        os.chmod(preferred, 0o644)
+        fallback = self.touch("vk_pipeline_check")
+        os.chmod(fallback, 0o755)
+        self.assertEqual(self.exe("posix"), fallback)
 
     def test_windows_finds_only_the_exe(self):
         self.touch("linux", "vk_pipeline_check")
@@ -487,6 +497,7 @@ class PipelineCheckExeTest(unittest.TestCase):
 
     def test_pipelines_off_windows_runs_the_linux_build(self):
         exe = self.touch("linux", "vk_pipeline_check")
+        os.chmod(exe, 0o755)
         self.touch("vk_pipeline_check.exe")
         work = os.path.join(self.tmp.name, "work")
         os.makedirs(os.path.join(work, "shaders", "spirv"))

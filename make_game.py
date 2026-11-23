@@ -1819,12 +1819,13 @@ def positive_int(text: str) -> int:
 def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
     """Find the checker for this host, using a supplied Windows build before the local Windows build."""
     build = os.path.join(ROOT, "runtime", "build")
-    if os.name == "nt":
+    windows = os.name == "nt"
+    if windows:
         windows_builds = (runtime_build, build) if runtime_build else (build,)
         found = [os.path.join(d, "vk_pipeline_check.exe") for d in windows_builds]
     else:
         found = [os.path.join(build, "linux", "vk_pipeline_check"), os.path.join(build, "vk_pipeline_check")]
-    return next((p for p in found if os.path.isfile(p)), None)
+    return next((p for p in found if os.path.isfile(p) and (windows or os.access(p, os.X_OK))), None)
 
 
 def require_translated_shaders(work: str) -> str:
