@@ -210,8 +210,9 @@ __declspec(noinline) bool call_reserve(std::string* why) { return rt::reserve_tl
 
 // ---- runs ----
 
-// A thread started before the reservation that runs no TLS code before it. After the move it installs the
-// executable's copy itself (install_tls_for_thread, as for any module and a thread older than load()).
+// A thread started before the reservation that runs no TLS code before it. load() gives it the executable's copy
+// in slot 0, as it gives an already-running thread every module's copy (#3671); install_tls_for_thread and
+// uninstall_tls_for_thread are no-ops there.
 struct EarlyThread {
     HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -220,12 +221,17 @@ struct EarlyThread {
     rt::Loader* loader = nullptr;
     rt::Module* module = nullptr;
     Ga ga{};
-    int host = -1, ga_installed = -1, ga_after_set = -1;
+    int host = -1, ga_before_install = -1, ga_installed = -1, ga_after_set = -1;
     bool host_at_home = false, block_in_slot0 = false, slot0_restored = false;
+    void* slot0_before_install = nullptr;
 
     static __declspec(noinline) void checks(EarlyThread* t) {
         t->host = host_value();
         t->host_at_home = host_tls_at_home();
+        // load() gave this already-running thread the executable's copy, as it does for a DLL (#3671): the /GA
+        // getter reads the template value before any install call.
+        t->slot0_before_install = module_tls_slots()[0];
+        t->ga_before_install = t->ga.get();
         void* before = module_tls_slots()[0];
         t->loader->install_tls_for_thread(*t->module);
         t->block_in_slot0 = module_tls_slots()[0] != before;
@@ -305,9 +311,12 @@ void test_first_run(const fs::path& exe, const fs::path& dll, EarlyThread& early
         WaitForSingleObject(early.done, INFINITE);
         check(early.host == 1234 && early.host_at_home,
               "a thread that existed before the reservation finds a fresh copy of this EXE's TLS at the home index");
-        check(early.block_in_slot0 && early.ga_installed == 42 && early.ga_after_set == 5,
-              "install_tls_for_thread gives that thread its own copy in slot 0");
-        check(early.slot0_restored, "uninstall_tls_for_thread puts that thread's slot 0 back");
+        check(early.ga_before_install == 42 && early.slot0_before_install != m.tls_block,
+              "load() gives a thread that was already running its own copy in slot 0: it reads 42 with no install "
+              "call");
+        check(!early.block_in_slot0 && early.ga_installed == 42 && early.ga_after_set == 5,
+              "install_tls_for_thread is a no-op there, and the thread's writes stay in its own copy");
+        check(early.slot0_restored, "uninstall_tls_for_thread leaves that thread's copy in slot 0");
 
         loader.initialise();
         check(m.initialised, "initialise() runs the executable's TLS callbacks (it has none)");

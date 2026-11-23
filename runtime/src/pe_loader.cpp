@@ -835,7 +835,7 @@ constexpr size_t kMaxEndedThreads = 1024;
 // load(): every other running thread gets its own copy of m's template. Not fatal where it cannot be done.
 void install_on_existing_threads(Module& m) {
     const uint64_t total = static_cast<uint64_t>(m.tls_raw_size) + m.tls_zero_fill;
-    if (!total || m.tls_index >= kMaxModuleTlsSlots || m.tls_slot >= kMaxMappedTlsModules) return;
+    if (!total || m.tls_index >= kMaxModuleTlsSlots || m.tls_slot >= kTlsSlotCount) return;
     // Stays ahead of the TLS lock: the first call resolves the function with GetModuleHandle and GetProcAddress, which
     // take the Windows loader lock, and a thread inside its attach event holds that lock while it waits for ours.
     if (!query_thread_fn()) return;
