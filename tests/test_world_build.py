@@ -1244,6 +1244,15 @@ def _uniform_bgra_dds(rgba, size=4):
     return make_bgra8_dds(size, size, bytes(rgba) * (size * size))
 
 
+def _half_float_dds(dxgi, texel_codes, size=4, pad=4):
+    """A DX10 R16_FLOAT (54) or R16G16B16A16_FLOAT (10) DDS of one repeated texel, rows padded by pad bytes."""
+    texel = struct.pack(f"<{len(texel_codes)}H", *texel_codes)
+    row = texel * size
+    data = bytearray(make_dx10_dds(size, size, dxgi, (row + bytes(pad)) * size))
+    struct.pack_into("<I", data, 20, len(row) + pad)  # DDSD_PITCH is already set
+    return bytes(data)
+
+
 def _param_ref(param, texture_index, id64="0000000000000000"):
     ref = {"TextureIndex": texture_index, "Name": "00000000", "Id64": id64, "Tag": "00000000"}
     if param is not None:
@@ -1358,6 +1367,24 @@ class BaseColorParamTest(unittest.TestCase):
         with self.subTest(case="no-materials"):
             # Legacy fallback maps the first sorted DDS to shader 0.
             self._assert_textured(NORMAL_RGBA, [], materials=False)
+
+    def test_half_float_textures_are_embedded(self):
+        # 0.5, 0.25, 1, 1 -> (128, 64, 255, 255); 0.75 -> 191 in red only.
+        cases = (("normal-first", "000_normal.dds", _half_float_dds(10, (0x3800, 0x3400, 0x3C00, 0x3C00)),
+                  (128, 64, 255, 255)),
+                 ("unannotated", "002_plain.dds", _half_float_dds(54, (0x3A00,)), (191, 0, 0, 255)))
+        for case, name, data, expected in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                assets_dir = os.path.join(tmp, "assets")
+                out_dir = os.path.join(tmp, "world")
+                _write_param_fixture(assets_dir, PARAM_CASES[case])
+                with open(os.path.join(assets_dir, "models", "tri_tex", name), "wb") as f:
+                    f.write(data)
+                proc = self._run_cli(assets_dir, out_dir)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                stats, _, pixel = self._read_world(out_dir)
+                self.assertEqual(stats["textures_embedded"], 1)
+                self.assertEqual(pixel, expected)
 
     def test_selected_param_picks_albedo_regardless_of_order(self):
         for case in ("normal-first", "albedo-first"):
