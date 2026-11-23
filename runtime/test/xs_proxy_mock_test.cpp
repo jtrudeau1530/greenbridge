@@ -938,6 +938,17 @@ static void no_dialogs() {
     SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 }
 
+int check_console_command_list() {
+    EXPECT(xs::console_to_pc_list_slot(14) == 14);   // Dispatch
+    EXPECT(xs::console_to_pc_list_slot(26) == 26);   // ResourceBarrier
+    EXPECT(xs::console_to_pc_list_slot(32) == 28);   // SetDescriptorHeaps
+    EXPECT(xs::console_to_pc_list_slot(33) == 29);   // SetComputeRootSignature
+    EXPECT(xs::console_to_pc_list_slot(35) == 31);   // SetComputeRootDescriptorTable
+    EXPECT(xs::console_to_pc_list_slot(61) == 59);   // ExecuteIndirect
+    EXPECT(xs::console_to_pc_list_slot(146) == 80);  // GCL7 Barrier
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -948,7 +959,7 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
