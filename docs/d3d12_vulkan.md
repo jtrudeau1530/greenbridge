@@ -2136,6 +2136,27 @@ Pipeline creation:
 - Pipeline caches: graphics and compute PSOs use one `VkPipelineCache` per device. On first use the runtime reads
   the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
+  When the device is destroyed, the runtime saves the cache, with the pipelines the session added, to
+  `pipeline_cache.user.bin` beside the executable (`LEONIDA_PIPELINE_CACHE` names another file, `off` turns the file
+  off; `LEONIDA_PIPELINE_CACHE_MAX_MB`, 1024 by default, caps its size). It also saves while the session runs, after a
+  pipeline creation, at most once every `LEONIDA_PIPELINE_CACHE_SAVE_SECONDS` (120 by default, 0 for never) and only
+  when pipelines missed the cache since the last save: a title that is killed or ends through `TerminateProcess` never
+  destroys its device, and a cold retail boot compiles about 2,700 compute pipelines at roughly one a second. The paths are resolved to absolute ones when the
+  device is made, so a change of working directory or of a link later does not move the save, and at the save the file is
+  checked once more against the build's `pipeline_cache.bin` by file identity: the seed is never written. The file is
+  the driver's data behind a 32-byte frame (magic, byte count, hash), so a file cut short or changed is ignored and
+  replaced instead of reaching the driver, which wants back exactly the bytes it gave. It is read with `ReadFile` (no
+  view that a lost network share turns into an exception), written to a staging file and renamed over the old one (for
+  up to 5 s if another process holds the old one), so an interrupted or failed save leaves the previous file and never
+  fails the run; file names are logged in UTF-8. It saves only if the session created a pipeline that missed the cache
+  (creation feedback; a pipeline without valid feedback counts as a miss; without feedback, a cache that grew), not when
+  the build's `pipeline_cache.bin` changed during the session (the next start prefers the new seed), and not when the
+  cache is over the limit (one log line says so). If another session saved the file while this one ran, its pipelines
+  are merged in (`vkMergePipelineCaches`) before this one saves. The next session starts from the file when it is whole,
+  its Vulkan header matches the device and it is at least as new as `pipeline_cache.bin` (a rebuilt seed wins), else from
+  the seed. At teardown the log says how many pipelines were created, how long they took and how many the cache already
+  had (VK_EXT_pipeline_creation_feedback). `d3d12_pipeline_cache_persist_test` and `pipeline_cache_store_test` check
+  this.
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description

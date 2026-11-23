@@ -47,8 +47,8 @@
 //                 pipelines stage's retry.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
-#include "pipeline_cache_file.h"
-#include "pipeline_cache_snapshot.h"
+#include "../src/pipeline_cache_file.h"
+#include "../src/pipeline_cache_snapshot.h"
 #include "large_module_gate.h"
 #include "pipeline_summary.h"
 #include "../src/spirv_words.h"

@@ -194,6 +194,9 @@ struct VulkanDeviceInfo {
     // minImportedHostPointerAlignment): OpenExistingHeapFromAddress backs a heap with the caller's own committed
     // memory. Zero: existing heaps stay unsupported.
     VkDeviceSize host_pointer_alignment = 0;
+    // VK_EXT_pipeline_creation_feedback is available on `device` (core in Vulkan 1.3, or the extension enabled): the
+    // device then asks each pipeline creation how long it took and whether the runtime's pipeline cache had it.
+    bool pipeline_creation_feedback = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -266,6 +269,18 @@ bool device_upload_in_vram(ID3D12Device* device);
 
 // True when the device can map reserved buffers onto its D3D12 heaps.
 bool device_sparse_buffer_tiles(ID3D12Device* device);
+
+// What the pipelines of `device` took to create (only counted with VulkanDeviceInfo::pipeline_creation_feedback): how
+// many, how many the runtime's pipeline cache already had, their total creation time, and the bytes the cache
+// started the session with. All zero if not a Vulkan device. The same numbers are logged when the device is destroyed.
+struct PipelineCacheStats {
+    std::uint32_t created = 0;  // every pipeline made, with or without feedback
+    std::uint32_t pipelines = 0;  // of those, the ones with valid feedback
+    std::uint32_t cache_hits = 0;
+    std::uint64_t create_nanoseconds = 0;
+    std::uint64_t loaded_bytes = 0;
+};
+PipelineCacheStats pipeline_cache_stats(ID3D12Device* device);
 
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
