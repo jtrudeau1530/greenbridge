@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 from typing import Callable, Optional, TextIO
@@ -235,8 +236,14 @@ def verify_manifest(
     strict: bool = False,
 ) -> ManifestReport:
     """Verifies target_dir against manifest_path, optionally in parallel."""
-    if not os.path.isdir(target_dir):
-        raise ManifestError(f"target directory does not exist: {target_dir}")
+    try:
+        mode = os.stat(target_dir).st_mode
+    except FileNotFoundError:
+        raise ManifestError(f"target directory does not exist: {target_dir}") from None
+    except OSError as err:
+        raise ManifestError(f"cannot access target directory {target_dir}: {err}") from None
+    if not stat.S_ISDIR(mode):
+        raise ManifestError(f"target path is not a directory: {target_dir}")
 
     want = load_manifest(manifest_path)
     have = dict(walk(target_dir, exclude=manifest_path))
