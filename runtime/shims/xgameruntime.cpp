@@ -862,8 +862,7 @@ static std::unordered_map<uint64_t, std::string> s_active_mounts;
 // Resolves the installation path for a specific content package identifier.
 // GDK specifies that XPackageMount is only for content packages; mounting the main game returns E_ACCESSDENIED.
 // Returns HRESULT_FROM_WIN32(ERROR_NOT_FOUND) if the package identifier is not installed.
-static HRESULT resolve_package_path(const char* packageIdentifier, char* out, size_t out_cap) {
-    if (!packageIdentifier || !out || out_cap == 0) return E_INVALIDARG;
+static std::string resolve_package_path(const char* packageIdentifier, HRESULT& result) {
 
     // Check against configured process/game package identifier; mounting the game itself is denied
     char game_id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
@@ -871,14 +870,22 @@ static HRESULT resolve_package_path(const char* packageIdentifier, char* out, si
     const char* process_id = (n > 0 && n < sizeof(game_id)) ? game_id : kDefaultPackageIdentifier;
 
     if (std::strcmp(packageIdentifier, process_id) == 0) {
-        return E_ACCESSDENIED;
+        result = E_ACCESSDENIED;
+        return {};
     }
 
     // Check optional installed content packages mapping: "id1=path1;id2=path2"
-    char mapping[1024] = {};
-    const DWORD map_len = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping, sizeof(mapping));
-    if (map_len > 0 && map_len < sizeof(mapping)) {
-        char* token = mapping;
+    DWORD capacity = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr, 0);
+    std::string mapping;
+    DWORD map_len = 0;
+    while (capacity > 0) {
+        mapping.resize(capacity);
+        map_len = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping.data(), capacity);
+        if (map_len < capacity) break;
+        capacity = map_len;
+    }
+    if (map_len > 0 && map_len < capacity) {
+        char* token = mapping.data();
         while (token && *token) {
             char* sep = std::strchr(token, ';');
             if (sep) *sep = '\0';
@@ -886,18 +893,16 @@ static HRESULT resolve_package_path(const char* packageIdentifier, char* out, si
             if (eq) {
                 *eq = '\0';
                 if (std::strcmp(token, packageIdentifier) == 0) {
-                    const char* val = eq + 1;
-                    const size_t vlen = std::strlen(val);
-                    if (vlen + 1 > out_cap) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-                    std::memcpy(out, val, vlen + 1);
-                    return S_OK;
+                    result = S_OK;
+                    return eq + 1;
                 }
             }
             token = sep ? sep + 1 : nullptr;
         }
     }
 
-    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    result = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    return {};
 }
 
 // HRESULT XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount)
@@ -907,14 +912,14 @@ HRESULT __stdcall XPackageMount(const char* packageIdentifier, XPackageMountHand
     if (!packageIdentifier || !mount) return E_INVALIDARG;
     mount->handle = 0;
 
-    char buf[MAX_PATH] = {};
-    const HRESULT hr = resolve_package_path(packageIdentifier, buf, sizeof(buf));
+    HRESULT hr;
+    const std::string path = resolve_package_path(packageIdentifier, hr);
     if (FAILED(hr)) return hr;
 
     const uint64_t id = s_next_mount_id.fetch_add(1);
     {
         std::lock_guard lock(s_mount_mutex);
-        s_active_mounts[id] = buf;
+        s_active_mounts[id] = path;
     }
     mount->handle = id;
     return S_OK;

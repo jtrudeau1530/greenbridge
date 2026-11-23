@@ -1020,6 +1020,22 @@ int main() {
           "XPackageGetMountPathSize rejects closed/stale mount handle");
     check(mount_path(dlc_mount, sizeof(mnt_path), mnt_path) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
           "XPackageGetMountPath rejects closed/stale mount handle");
+    // Mount paths are sized by the query API, and the mapping can exceed 1024 bytes.
+    const std::string long_path(300, 'p');
+    for (const std::string& mapping : {std::string("pkg=") + long_path,
+                                       std::string("unused=") + std::string(1024, 'x') + ";pkg=" + long_path}) {
+        SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping.c_str());
+        XPackageMountHandle long_mount{0};
+        const HRESULT long_hr = mount_pkg("pkg", &long_mount);
+        check(long_hr == S_OK, "XPackageMount accepts a 300-byte path in a long mapping");
+        size_t long_size = 0;
+        check(long_hr == S_OK && mount_path_size(long_mount, &long_size) == S_OK && long_size == 301,
+              "XPackageGetMountPathSize returns 301 for a 300-byte path");
+        std::string returned(long_size, '\0');
+        check(long_hr == S_OK && mount_path(long_mount, long_size, returned.data()) == S_OK &&
+                  returned == long_path + '\0', "XPackageGetMountPath returns the entire long path");
+        if (long_hr == S_OK) close_mount(long_mount);
+    }
     SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
 
     auto is_packaged = get<PackagedProcessFn>("XPackageIsPackagedProcess");
