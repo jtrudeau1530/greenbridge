@@ -906,6 +906,34 @@ class LocalExecFoldTests(unittest.TestCase):
             v7_want = partner + (1000 if (partner & 1) else 0)
             self.assertEqual(mem[tid * 4], s10_want + v7_want, f"tid {tid}")
 
+    def test_multiwave_128_guarded_ds_append_is_not_treated_as_sync_free(self):
+        # ds_append/ds_consume broadcast the old counter through an x_round (OpControlBarrier) under
+        # --wave64-emulate, so a 128-thread group must not classify their block as sync-free: that tripped
+        # "unexpected OpControlBarrier in sync-free multi-wave block" and aborted make_game.py --stages shaders.
+        insns = [
+            ("v_and_b32_e32 v2, 1, v0", 4),
+            ("v_cmp_eq_u32_e64 s[6:7], 1, v2", 8),         # odd lanes only
+            ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+            ("s_cbranch_execz 4", 4),                      # guarded append (skipped by a wave with no odd lane)
+            ("v_mov_b32_e32 v3, 0xbad", 8),
+            ("ds_append v3", 8),
+            ("s_or_b64 exec, exec, s[8:9]", 4),
+            ("v_lshlrev_b32_e32 v5, 2, v0", 4),
+            ("buffer_store_dword v3, v5, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv, _ = _translate_encoded("cs_mw128_ds_append", insns, (128, 1, 1), emulate=True)
+        mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28)
+        olds = {}
+        for tid in range(128):
+            if tid & 1:
+                olds.setdefault(tid // 64, set()).add(mem[tid * 4])
+            else:
+                self.assertEqual(mem[tid * 4], 0, f"tid {tid}")      # inactive lanes keep vD (0)
+        # Each wave's 32 active lanes add 32: the first wave to run reads 0, the second reads 32.
+        self.assertTrue(all(len(s) == 1 for s in olds.values()), olds)
+        self.assertEqual(sorted(next(iter(s)) for s in olds.values()), [0, 32])
+
     def test_folded_region_with_internal_loop_exact(self):
         # Multi-block folded s_cbranch_execz containing an internal scalar-counted loop (`sub_tree` loop path).
         # Lanes >= 32 add 5 four times (+20); lanes < 32 skip the entire loop. s15 is dead at the join.

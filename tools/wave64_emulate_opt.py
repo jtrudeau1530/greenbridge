@@ -138,6 +138,7 @@ _ALWAYS_BARRIER_OPS = frozenset({
     "s_barrier", "v_readlane_b32", "v_readfirstlane_b32",
     "v_permlane16_b32", "v_permlanex16_b32",
     "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
+    "ds_append", "ds_consume",     # one LDS atomic per wave, old value broadcast through an x_round exchange
     "s_wqm_b32", "s_wqm_b64",
 })
 
