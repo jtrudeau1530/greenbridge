@@ -28,6 +28,7 @@ Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each b
 For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
 """
 import argparse
+import functools
 import os
 import struct
 import sys
@@ -35,7 +36,7 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode  # noqa: E402
+from file_mode import new_file_mode, published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
 
 # ---- Ogg ----
@@ -139,6 +140,11 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
     return written
 
 
+@functools.cache
+def folder_file_mode(directory: str) -> int:
+    return new_file_mode(directory)
+
+
 def write_file(path: str, data: bytes) -> None:
     """Write under a private temporary name and rename into place: a stopped run or a full disk never leaves a
     short file under the final name, where a later run would keep it. The staging file is created in the
@@ -152,7 +158,7 @@ def write_file(path: str, data: bytes) -> None:
             tmp_path = f.name
             f.write(data)
         # NamedTemporaryFile creates 0600; give the staged file the mode of the file it replaces, or a new file's.
-        os.chmod(tmp_path, published_mode(out_path))
+        os.chmod(tmp_path, published_mode(out_path) if os.path.exists(out_path) else folder_file_mode(parent))
         os.replace(tmp_path, out_path)
     except BaseException:
         try:

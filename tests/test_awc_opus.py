@@ -446,6 +446,24 @@ class ExportBankTest(unittest.TestCase):
             self.assertGreater(last["granule"], 0)
             self.assertEqual(last["serial"], 3)
 
+    def test_new_outputs_in_one_folder_probe_the_file_mode_once(self):
+        fmt = format_block(1, 48000, 0, 1)
+        path = os.path.join(self.tmp.name, "many.awc")
+        with open(path, "wb") as f:
+            f.write(build_bank([(sid, fmt, struct.pack("<h", sid)) for sid in range(1, 6)]))
+        real_open = os.open
+        probes = []
+
+        def counting_open(file, *args, **kwargs):
+            if str(file).endswith(".probe"):
+                probes.append(file)
+            return real_open(file, *args, **kwargs)
+        with mock.patch.object(os, "open", counting_open):
+            counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts["pcm"], 5)
+        self.assertEqual(len(os.listdir(os.path.join(self.out, "many"))), 5)
+        self.assertEqual(len(probes), 1)
+
     def test_stereo_plain_stream_length_is_per_channel(self):
         # A stereo format tag stores interleaved samples: 3840 counts = 1920 frames per channel.
         # Three 960-frame packets carry 2880 frames per channel, so the declared 1920 trims
