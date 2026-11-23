@@ -661,3 +661,16 @@ Use the template at the top of [#166](https://github.com/ItsNotRexed/Leonida/iss
 range, OS, the commit you built, the tool versions and the counts each script printed. Post counts and pass/fail
 lines only, never shaders or logs from the game. A failure that isn't in the table above gets its own issue, linked
 from your entry.
+
+The CPU, GPU, VRAM and RAM fields come from `tools/pc_checker.py`, which compares this PC with the Xbox Series X
+reference specs (or `--profile 2` for the community 1080p Low estimate). Run it in text mode; the default form opens a
+window:
+
+```powershell
+python -I tools/pc_checker.py --cli --check    # spec lines, then exit 0 good, 1 weak, 2 unknown
+python -I tools/pc_checker.py --cli --check --json
+```
+
+`--cpu`, `--gpu` and `--ram` override the detected values when a VM or a remote session hides them. Its scores are
+rough estimates made for this tool, not benchmarks, so put the detected model names in the #166 entry, not the score.
+`python -I tests/test_pc_checker.py` checks the parsing and the comparison with the window mocked.
