@@ -15332,6 +15332,30 @@ def assemble(gen):
         for c in range(gen.cs["tid"] + 1):
             fn += [f"%li{c} = OpCompositeExtract %uint %lci {c}",
                    f"%lip{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(c)}", f"OpStore %lip{c} %li{c}"]
+        if gen.cs["tg_size"]:
+            # TG_SIZE_EN (RSRC2 bit 10): the SGPR after the workgroup ids holds the number of waves in the group in
+            # [5:0] and this wave's index in it in [11:6] (Mesa ac_nir_lower_intrinsics_to_args.c, GFX6-10:
+            # load_num_subgroups is tg_size[5:0], load_subgroup_id tg_size[11:6], and a wave64 compute shader's
+            # local invocation index is mbcnt(~0, tg_size & 0xfc0)), the wave index again in [24:20] (Mesa's GFX10.3
+            # field) and bit 31 set in the group's first wave. Measured on gfx1036 through tools/hw_oracle (#6446:
+            # 100, 128 and 133 threads, wave32 and wave64; e.g. wave32 x 128 gives 80000004 00100044 00200084
+            # 003000c4); the other bits were 0 there. One pipeline-library program reads [24:20]. Not measured on
+            # gfx1013. Thread i is in wave i / W, as for s_get_waveid_in_workgroup.
+            sx, sy, sz = gen.cs["size"]
+            w = 64 if gen.wave64 else 32
+            r = gen.cs["user"] + len(gen.cs["tgid"])
+            fn += ["%tgx = OpCompositeExtract %uint %lci 0", "%tgy = OpCompositeExtract %uint %lci 1",
+                   "%tgz = OpCompositeExtract %uint %lci 2",
+                   f"%tgyx = OpIMul %uint %tgy {gen.cu(sx)}", f"%tgzx = OpIMul %uint %tgz {gen.cu(sx * sy)}",
+                   "%tgi0 = OpIAdd %uint %tgx %tgyx", "%tgi = OpIAdd %uint %tgi0 %tgzx",
+                   f"%tgw = OpShiftRightLogical %uint %tgi {gen.cu(w.bit_length() - 1)}",
+                   f"%tgws = OpShiftLeftLogical %uint %tgw {gen.cu(6)}",
+                   f"%tgwh = OpShiftLeftLogical %uint %tgw {gen.cu(20)}",
+                   f"%tgf0 = OpIEqual %bool %tgw {gen.cu(0)}",
+                   f"%tgf = OpSelect %uint %tgf0 {gen.cu(0x80000000)} {gen.cu(0)}",
+                   f"%tgv0 = OpBitwiseOr %uint %tgws {gen.cu(-(-(sx * sy * sz) // w))}",
+                   "%tgv1 = OpBitwiseOr %uint %tgv0 %tgwh", "%tgv = OpBitwiseOr %uint %tgv1 %tgf",
+                   f"%tgp = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(r)}", "OpStore %tgp %tgv"]
     if gen.frag_inputs:
         fn += ["%fc = OpLoad %v4float %frag_coord"]
         if bary:
@@ -16659,17 +16683,16 @@ def translate(path):
         # the SGPRs all 2,689 CS read before writing: 2,540 stay inside it, the other 149 overshoot only through
         # loop-carried registers of the straight-line check; docs/design.md): USER_SGPR [5:1], TGID_X/Y/Z_EN [9:7],
         # TG_SIZE_EN [10], TIDIG_COMP_CNT [12:11]. Words 0x13C/0x140/0x144 are the thread-group size. Layout (Mesa
-        # radv_shader_args.c): s0..user-1 = user data, then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z
-        # (separate VGPRs on GFX10). An FSPX program (the FidelityFX DLL's shaders) carries the same two fields in its
+        # radv_shader_args.c): s0..user-1 = user data, then the enabled workgroup ids, then with TG_SIZE_EN the
+        # thread-group SGPR; v0, v1, v2 = thread id x, y, z (separate VGPRs on GFX10). An FSPX program (the FidelityFX
+        # DLL's shaders) and a pipeline-library program (docs/shader_library.md) carry the same two fields in their
         # kind-0 entry (docs/fspx.md).
         rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
-        if (rsrc2 >> 10) & 1:
-            raise Unsupported("CS thread-group-size SGPR")
         if not (1 <= lx * ly * lz <= 1024):
             raise Unsupported("CS group size")
         user = (rsrc2 >> 1) & 31
         g.cs = {"user": user, "tgid": [c for c in range(3) if (rsrc2 >> (7 + c)) & 1],
-                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz)}
+                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz), "tg_size": bool((rsrc2 >> 10) & 1)}
         # LDS_SIZE [23:15] in 512-byte units. All 485 LDS-using corpus CS stay inside it; a constant offset past it,
         # which RDNA2 treats as out of range, is bounds-checked below (SHADER-309).
         need = ((rsrc2 >> 15) & 0x1FF) * 128
