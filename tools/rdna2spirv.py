@@ -1809,6 +1809,13 @@ class Gen:
                 self.emit(f"{b} = OpCopyObject %bool {'%false' if cond == 'f' else '%true'}")
         elif cond not in ops:
             raise Unsupported(op)
+        elif is_float and cond == "lg":
+            # LG is ordered (false when either source is NaN), as less-or-greater. Not OpFOrdNotEqual: SPIRV-Cross
+            # (MoltenVK) writes that as `!=`, which is true on a NaN.
+            lt, gt = self.tmp(), self.tmp()
+            self.emit(f"{lt} = OpFOrdLessThan %bool {x} {y}")
+            self.emit(f"{gt} = OpFOrdGreaterThan %bool {x} {y}")
+            self.emit(f"{b} = OpLogicalOr %bool {lt} {gt}")
         else:
             self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
         if scalar and ty in ("u32", "i32") and use_wave_equal:
