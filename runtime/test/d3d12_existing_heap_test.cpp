@@ -252,9 +252,9 @@ int check_title_placed_all(ID3D12Device* device) {
     UnmapViewOfFile(view);
     CloseHandle(section);
 
-    // Not imported: a write-combined range (an RTX 5090 imported it but read wrong bytes back, found in review)
-    // falls back to an ordinary buffer, so the resource exists but is not at the pages' address; so does a range only
-    // partly committed.
+    // Cache-modified ranges are not imported (WC imports read wrong bytes on an RTX 5090 in review). Some Wine
+    // versions report a requested WC allocation as plain read-write memory; check the protection actually supplied.
+    // PAGE_NOCACHE also exercises the fallback on those hosts, rather than dropping the cache-protection check.
     const char* who = "vulkan slot-133 buffer";
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -262,14 +262,27 @@ int check_title_placed_all(ID3D12Device* device) {
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    void* combined = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE);
-    EXPECT(combined != nullptr);
-    {
-        Ref<ID3D12Resource> fallback;
-        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, combined, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
-        EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(combined));
+    for (DWORD modifier : {DWORD(PAGE_WRITECOMBINE), DWORD(PAGE_NOCACHE)}) {
+        void* pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | modifier);
+        EXPECT(pages != nullptr);
+        MEMORY_BASIC_INFORMATION region{};
+        EXPECT(VirtualQuery(pages, &region, sizeof(region)) == sizeof(region));
+        const bool cache_modified = (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) != 0;
+        {
+            Ref<ID3D12Resource> buffer;
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, IID_PPV_ARGS(&buffer.p)), S_OK);
+            if (cache_modified) {
+                EXPECT(buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+            } else {
+                EXPECT(region.Protect == PAGE_READWRITE);
+                EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+            }
+        }
+        std::printf("%s: cache modifier 0x%lx, reported protection 0x%lx: %s\n", who, modifier, region.Protect,
+                    cache_modified ? "ordinary-buffer fallback verified"
+                                   : "modifier not reported; read-write import verified");
+        VirtualFree(pages, 0, MEM_RELEASE);
     }
-    VirtualFree(combined, 0, MEM_RELEASE);
     char* partial = static_cast<char*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE));
     EXPECT(partial != nullptr && VirtualAlloc(partial, size / 2, MEM_COMMIT, PAGE_READWRITE) == partial);
     {
@@ -279,7 +292,7 @@ int check_title_placed_all(ID3D12Device* device) {
         EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(partial));
     }
     VirtualFree(partial, 0, MEM_RELEASE);
-    std::printf("%s: a write-combined range and a partly committed one fall back to an ordinary buffer\n", who);
+    std::printf("%s: a partly committed range falls back to an ordinary buffer\n", who);
     return failures;
 }
 
