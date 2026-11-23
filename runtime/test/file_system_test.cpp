@@ -879,6 +879,47 @@ int main() {
                   GetLastError() == ERROR_INVALID_NAME,
               "G:\\.. is refused with ERROR_INVALID_NAME");
 
+        int fresh_count = 0;
+        auto fresh_overlay = [&] {
+            const std::filesystem::path dir = root / ("fresh_overlay" + std::to_string(++fresh_count));
+            rt::fs::configure(package, dir);
+            return dir;
+        };
+        fresh_overlay();
+        SetLastError(0);
+        const DWORD t_root = attributes_w(L"T:\\");
+        check(t_root != INVALID_FILE_ATTRIBUTES && (t_root & FILE_ATTRIBUTE_DIRECTORY) != 0 && GetLastError() == 0,
+              "on a fresh overlay GetFileAttributesW(T:\\) is a folder, and making it leaves the last error alone");
+        fresh_overlay();
+        const std::vector<std::wstring> t_names = list(first_w, next_w, find_close, L"T:\\*");
+        check(t_names.size() == 2 && count(t_names, L".") == 1 && count(t_names, L"..") == 1,
+              "on a fresh overlay FindFirstFileW(T:\\*) lists the empty root as . and ..");
+        fresh_overlay();
+        check(mkdir_w(L"T:\\shadercache", nullptr) != FALSE,
+              "on a fresh overlay CreateDirectoryW(T:\\shadercache) succeeds");
+        std::filesystem::path fresh = fresh_overlay();
+        check(copy_w(L"GAME:\\data\\hello.txt", L"T:\\hello.tmp", FALSE) != FALSE &&
+                  read_path(fresh / ".gta6rt-temp" / "hello.tmp") == "package",
+              "on a fresh overlay CopyFileW(GAME:\\data\\hello.txt, T:\\hello.tmp) succeeds");
+        fresh = fresh_overlay();
+        SetLastError(0);
+        check(rmdir_w(L"T:\\") == FALSE && GetLastError() == ERROR_ACCESS_DENIED &&
+                  std::filesystem::is_directory(fresh / ".gta6rt-temp"),
+              "T:\\ cannot be removed, like GAME:\\");
+        fresh = fresh_overlay();
+        SetLastError(0);
+        check(move_w(L"T:\\", L"GAME:\\moved") == FALSE && GetLastError() == ERROR_ACCESS_DENIED &&
+                  attributes_w(L"GAME:\\moved") == INVALID_FILE_ATTRIBUTES &&
+                  std::filesystem::is_directory(fresh / ".gta6rt-temp"),
+              "T:\\ cannot be moved");
+        fresh_overlay();
+        attributes_w(L"T:\\");
+        SetLastError(0);
+        const BOOL removed_by_game_path = rmdir_w(L"GAME:\\.gta6rt-temp");
+        check(removed_by_game_path != FALSE || GetLastError() != ERROR_ACCESS_DENIED,
+              "only a T: path names the T:\\ root: GAME:\\.gta6rt-temp is not refused as a drive root");
+        rt::fs::configure(package, overlay);
+
         h = create_w(L"T:\\cache\\scratch.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         check(h != INVALID_HANDLE_VALUE, "CreateFileW creates a file on T: (parent folders and all)");
         if (h != INVALID_HANDLE_VALUE) {

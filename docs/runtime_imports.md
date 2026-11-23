@@ -97,6 +97,8 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   not see (RT-218; the other console layers map those two drives this way, and only the executable can say which
   spelling GTA VI uses). A path under `--game-dir` or the overlay is always a host path, so a package that sits on
   a host drive `G:` keeps working, and with no folders configured `G:` and `T:` stay host drives.
+  `T:\` is a drive root like `GAME:\`: its folder is made on the first `T:` call, so it is a folder before anything
+  is written there, and removing or moving it fails with `ERROR_ACCESS_DENIED`.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
   write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes. The copy is
   written under `<overlay>\.gta6rt-copy` and renamed into place, one copy-up at a time, so a process killed mid-copy

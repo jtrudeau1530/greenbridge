@@ -144,7 +144,14 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     const Drive drive = console_drive(path, prefix_length);
     if (drive == Drive::None) return Parsed::Host;
     parts.clear();
-    if (drive == Drive::Scratch) parts.push_back(kScratchDir);
+    if (drive == Drive::Scratch) {
+        parts.push_back(kScratchDir);
+        const std::filesystem::path overlay = roots().overlay;
+        const DWORD last_error = ::GetLastError();
+        std::error_code ec;
+        if (!overlay.empty()) std::filesystem::create_directories(overlay / kScratchDir, ec);
+        ::SetLastError(last_error);
+    }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
     auto flush = [&]() -> bool {
@@ -178,6 +185,11 @@ std::filesystem::path join(const std::filesystem::path& root, const std::vector<
     std::filesystem::path p = root;
     for (const auto& part : parts) p /= part;
     return p;
+}
+
+bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts) {
+    size_t prefix_length = 0;
+    return parts.empty() || (parts.size() == 1 && console_drive(path, prefix_length) == Drive::Scratch);
 }
 
 struct Target {
@@ -959,7 +971,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" itself stays
+    if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
@@ -996,7 +1008,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (src.empty() || dst.empty()) return fail_bool(ERROR_ACCESS_DENIED);
+    if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     const std::filesystem::path overlay_from = join(r.overlay, src), overlay_to = join(r.overlay, dst);
