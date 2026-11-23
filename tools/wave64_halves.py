@@ -145,6 +145,20 @@ def _regs(a):
         return [("v", a["r"] + i) for i in range(a.get("n", 1))]
     if k == "vlist":
         return [("v", r) for r in a["r"]]
+    if k == "slist":
+        regs = []
+        for r in a["r"]:
+            if isinstance(r, int):
+                key = ("s", r)
+            elif isinstance(r, str) and r.startswith("vcc"):
+                key = "vcc"
+            elif isinstance(r, str) and r.startswith("exec"):
+                key = "exec"
+            else:
+                continue
+            if key not in regs:
+                regs.append(key)
+        return regs
     if k == "special":
         t = a.get("t", "")
         if t.startswith("vcc"):
@@ -221,7 +235,7 @@ def operands(ins):
             dests, srcs = [a[0]], list(a[1:])
         if op.startswith("v_") and len(a) > 2 and (
                 "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) \
-                and a[1].get("k") in ("sgpr", "special"):
+                and a[1].get("k") in ("sgpr", "special", "slist"):
             dests, srcs = [a[0], a[1]], list(a[2:])
     else:
         dests, srcs = [], []

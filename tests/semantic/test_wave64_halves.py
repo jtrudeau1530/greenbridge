@@ -355,6 +355,37 @@ class Classification(unittest.TestCase):
             "s_cbranch_execz 1", "s_add_u32 s5, s5, 1", "s_or_b64 exec, exec, s[12:13]", "v_mov_b32_e32 v6, s5"]),
             "C", ["stale-scalar"])
 
+    def test_slist_taint_and_stale_tracking(self):
+        # LLVM VCCTuple scalar lists (slist, e.g. [s104,s105,vcc_lo,vcc_hi]) must propagate taint and stale defs/uses.
+        self.tier("ps_a_slist_clean", ps([
+            "buffer_store_dword v0, v1, [s104,s105,vcc_lo,vcc_hi], 0 offen"]), "A", [], [])
+        self.tier("ps_c_slist_src_taint", ps([
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s104, vcc",
+            "buffer_store_dword v0, v1, [s104,s105,vcc_lo,vcc_hi], 0 offen"]), "C", ["lane-count"])
+        self.tier("ps_c_slist_dst_taint", ps([
+            "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s4, vcc",
+            "s_load_dwordx4 [s104,s105,vcc_lo,vcc_hi], s[4:5], 0", "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v6, s104"]), "C", ["lane-count"])
+        self.tier("ps_c_slist_stale_def", ps([
+            "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_mov_b32 s104, 7",
+            "s_cbranch_execz 1", "s_load_dwordx4 [s104,s105,vcc_lo,vcc_hi], s[0:1], 0",
+            "s_or_b64 exec, exec, s[12:13]", "v_mov_b32_e32 v6, s104"]), "C", ["stale-scalar"])
+        self.tier("ps_c_slist_stale_use", ps([
+            "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_mov_b32 s104, 7",
+            "s_cbranch_execz 1", "s_add_u32 s104, s104, 1", "s_or_b64 exec, exec, s[12:13]",
+            "buffer_store_dword v0, v1, [s104,s105,vcc_lo,vcc_hi], 0 offen"]), "C", ["stale-scalar"])
+        # VOP3b scalar carry-out destination written as an slist must be classified as a destination, not a source.
+        import wave64_halves
+        ins = {"op": "v_add_co_u32_e64", "args": [
+            {"k": "vgpr", "r": 6, "n": 1},
+            {"k": "slist", "r": [105, "vcc_lo"], "n": 2},
+            {"k": "vgpr", "r": 0, "n": 1},
+            {"k": "vgpr", "r": 1, "n": 1},
+        ], "mods": []}
+        dests, srcs, _, _ = wave64_halves.operands(ins)
+        self.assertEqual([wave64_halves._regs(d) for d in dests], [[("v", 6)], [("s", 105), "vcc"]])
+        self.assertEqual([wave64_halves._regs(s) for s in srcs], [[("v", 0)], [("v", 1)]])
+
     def test_c_branch_on_count(self):
         self.tier("ps_c_brcnt", ps([
             "v_cmp_eq_u32_e32 vcc, 1, v0", "s_bcnt1_i32_b64 s6, vcc", "s_cmp_eq_u32 s6, 5", "s_cbranch_scc1 1",
