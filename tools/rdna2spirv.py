@@ -99,6 +99,16 @@ F16_HALF_TOP = 29
 OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
 
 
+# The heap base as one %ulong, in the entry block of %main: the push constants don't change during the invocation, and
+# the entry block dominates every use. Gen.host_addr adds an address to it.
+HEAP_BASE_ENTRY = ["%heap_base_lo = OpLoad %uint %ud_base_lo_p",
+                   "%heap_base_hi = OpLoad %uint %ud_base_hi_p",
+                   "%heap_base_lo64 = OpUConvert %ulong %heap_base_lo",
+                   "%heap_base_hi64 = OpUConvert %ulong %heap_base_hi",
+                   "%heap_base_hi_sh = OpShiftLeftLogical %ulong %heap_base_hi64 %c64_32",
+                   "%heap_base = OpBitwiseOr %ulong %heap_base_hi_sh %heap_base_lo64"]
+
+
 def pc_tail_chain(name, member, c):
     """`name` = pointer to push-constant tail member `member`, numbered as in %UserData (1-2 heap base, 3-4 code base,
     5-6 --mesh-compute output address): a member of the push-constant block by default, member - 1 of the uniform
@@ -1362,15 +1372,10 @@ class Gen:
 
     def host_addr(self, xbox_va):
         """Xbox GPU virtual address (ulong id) -> host buffer device address: heap base (push constant
-        dwords 32..33) + VA. The runtime maps the console's GPU address window into one host buffer."""
-        lo, hi, l64, h64, sh, base, r = (self.tmp() for _ in range(7))
-        self.emit(f"{lo} = OpLoad %uint %ud_base_lo_p")
-        self.emit(f"{hi} = OpLoad %uint %ud_base_hi_p")
-        self.emit(f"{l64} = OpUConvert %ulong {lo}")
-        self.emit(f"{h64} = OpUConvert %ulong {hi}")
-        self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
-        self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
-        self.emit(f"{r} = OpIAdd %ulong {base} {xbox_va}")
+        dwords 32..33) + VA. The runtime maps the console's GPU address window into one host buffer. The base is
+        %heap_base, built once in the entry block (HEAP_BASE_ENTRY): it was six instructions at every access."""
+        r = self.tmp()
+        self.emit(f"{r} = OpIAdd %ulong %heap_base {xbox_va}")
         self.uses_heap = True
         self.cu(1), self.cu(2)        # member indices of the push-constant block, declared before assembly
         return r
@@ -14440,7 +14445,7 @@ def assemble(gen):
     if gen.uses_heap:
         gen.consts.setdefault(1, "%c1")
         gen.consts.setdefault(2, "%c2")
-        fn += [pc_tail_chain("%ud_base_lo_p", 1, gen.cu), pc_tail_chain("%ud_base_hi_p", 2, gen.cu)]
+        fn += [pc_tail_chain("%ud_base_lo_p", 1, gen.cu), pc_tail_chain("%ud_base_hi_p", 2, gen.cu)] + HEAP_BASE_ENTRY
     if gen.uses_codebase:
         fn += [pc_tail_chain("%ud_code_lo_p", 3, gen.cu), pc_tail_chain("%ud_code_hi_p", 4, gen.cu)]
     for i in range(USER_SGPRS):

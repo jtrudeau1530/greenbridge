@@ -54,6 +54,8 @@ class GlobalBodyEvaluator:
             self._step(line.split())
 
     def _value(self, name):
+        if name == "%heap_base":          # built once in the entry block, outside the body run here
+            return self.heap_base
         if name == "%c64_32":
             return 32
         if name in self.ids:
@@ -105,10 +107,6 @@ class GlobalBodyEvaluator:
             value = ("mem", self._value(args[0]))
         elif op == "OpLoad" and ty == "%bool" and args == ["%active"]:
             value = self.active
-        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_lo_p":
-            value = self.heap_base & MASK32
-        elif op == "OpLoad" and ty == "%uint" and args[0] == "%ud_base_hi_p":
-            value = (self.heap_base >> 32) & MASK32
         elif op == "OpLoad" and ty == "%uint":
             kind, where = self._value(args[0])
             if kind in ("%sgpr", "%vgpr") and len(args) == 1:
