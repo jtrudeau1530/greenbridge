@@ -545,7 +545,7 @@ Its element tree (counts per path; no values or names):
 |---|---:|---|
 | `Presets/Item` | 10 | one preset per sea region |
 | `Presets/Item/Name`, `Id` | 10 each | region label and id |
-| `Presets/Item/Location` | 10 | `x`, `y` attributes in world units: x -7,995 to 3,183, y -4,572 to 8,645 |
+| `Presets/Item/Location` | 10 | `x`, `y`, `z` attributes in world units. The 10 elevations are distinct. Horizontal extents are x -7,995 to 3,183 and y -4,572 to 8,645. |
 | `Presets/Item/Direction` | 10 | wave direction |
 | `Presets/Item/Octaves/Item` | 30 | exactly 3 per preset |
 | `Presets/Item/Octaves/Item/ControlPoints` | 30 | 4 `(x, y)` pairs each, both in 0..1 |
@@ -560,11 +560,14 @@ The authored curves and locations provide two controls for a runtime capture.
   have strictly increasing x and endpoints at x = 0 and x = 1. Under piecewise-linear interpolation, 19
   differ by more than 0.000001 between inputs 1 and 5/6, the predictions for division by 10 and by 12.
   The other 11 are unsuitable as controls at that weather setting. The interpolation is an assumption of this test.
-- Hold the normalized input at 1. Of the 45 pairs of sites, 11 have a midpoint closer to the pair than
-  to any third site. At 49% and 51% along each of those 11 segments, the nearest site switches. In every
+- Hold the normalized input at 1. In the horizontal (XY) plane, 11 of the 45 pairs of sites have a midpoint
+  closer to the pair than to any third site. At 49% and 51% along each of those 11 segments, the nearest site switches. In every
   case at least one octave's endpoint amplitudes differ by more than 0.000001 across the pair. A hard
   nearest-site rule predicts a step there. Samples approaching the midpoint from both sides can distinguish
   that prediction from a continuous blend.
+- To test whether elevation enters the selection, hold XY at one of those midpoints. Evaluate the 3D distance
+  first at one site's elevation and then at the other's. The unique nearest site switches for all 11 pairs.
+  A selector using only XY sees identical inputs for both measurements.
 
 The ocean simulation technique has six compute programs. Four declare the same nine constant-buffer members
 in the same order and at the same byte offsets. In all four, the pipeline reflection binds one constant buffer
