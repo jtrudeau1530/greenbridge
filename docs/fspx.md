@@ -183,9 +183,17 @@ The step is redone as a whole when the DLL, the unpacking or translating tools, 
 flags change (`fspx_build.json`, written last); it never makes the game's shaders translate again. A package without
 the DLL skips it.
 
-**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when it
-is there, `<dir>/fspx/index.json`, whose entries are named `fspx/<name>`. A missing or unreadable `fspx/index.json`
-leaves the main index loaded. Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
+The executable calls slot 67 itself, for the compute pipelines of the pipeline library in `shaders.rpf`
+([shader_library.md](shader_library.md)): a compute record's state blob, blob, program and layout blob have the sizes
+and shapes of kinds 0, 1, 6 and 7. The next step of the same stage, `library_shaders`, unpacks those programs with
+`tools/shader_library.py --stages cs` (which writes each one's `.code` and its record's state as `.state`) and
+translates them into `<work>/shaders/spirv/library/`, with the same keys, the same clash check and its own
+`library_build.json`.
+
+**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when they
+are there, `<dir>/fspx/index.json` and `<dir>/library/index.json` (and `bvh/`, [embedded_shaders.md](embedded_shaders.md)),
+whose entries are named `fspx/<name>` and `library/<name>`. A missing or unreadable one leaves the others loaded.
+Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
 `compute_program()` decides what a compute PSO's bytecode is looked up by:
 
 | Bytecode | Key | Who passes it |
