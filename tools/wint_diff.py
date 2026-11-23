@@ -223,6 +223,8 @@ class Gen:
         weights = {"cmp": 12, "cmpx": 3, "cndmask": 12, "carry": 12, "mad64": 6, "op16": 10, "exec": 10, "smask": 4, "op32": 35}
         self.cats = [(c, sorted(v), weights[c]) for c, v in sorted(cats.items()) if v]
         self.last_mask = None   # the mask written last: a mask read picks it more often than chance
+        if not self.cats:
+            raise ValueError("no ops selected")
 
     def pick_mask(self):
         ms = masks(self.wave)
@@ -231,8 +233,6 @@ class Gen:
     def wrote(self, m):
         self.last_mask = m
         return m
-        if not self.cats:
-            raise ValueError("no ops selected")
 
     def vreg(self):
         return f"v{self.r.choice(DREGS + (0,))}"

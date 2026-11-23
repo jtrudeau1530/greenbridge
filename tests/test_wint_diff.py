@@ -103,6 +103,19 @@ class Generator(unittest.TestCase):
             return "exec" if dst.startswith("exec") else "vcc" if dst.startswith("vcc") else "smask"
         return re.sub(r"_e(32|64)$", "", op)
 
+    def test_empty_op_selection_raises_value_error(self):
+        for wave in (32, 64):
+            for ops in ([], ["v_nonexistent_op"]):
+                with self.subTest(call="Gen", wave=wave, ops=ops):
+                    with self.assertRaisesRegex(ValueError, r"^no ops selected$"):
+                        d.Gen(d.random.Random(0), wave, ops)
+                with self.subTest(call="generate", wave=wave, ops=ops):
+                    with self.assertRaisesRegex(ValueError, r"^no ops selected$"):
+                        d.generate(d.random.Random(0), 1, ops, wave)
+                with self.subTest(call="run_suite", wave=wave, ops=ops):
+                    with self.assertRaisesRegex(ValueError, r"^no ops selected$"):
+                        d.run_suite(1, 0, 1, ops, (wave,))
+
     def test_every_op_is_generated(self):
         for wave in (32, 64):
             seen = {self.opname(line) for line in self.lines(wave=wave)}
