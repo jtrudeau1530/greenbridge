@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -122,7 +123,7 @@ class RunTestTest(unittest.TestCase):
         missing = self.command_for(self.artifact / "missing.exe")
         for command in (built, missing, None):
             with self.subTest(command=command), \
-                    mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+                    mock.patch.object(rwt, "run_test_process", wraps=rwt.run_test_process) as launch:
                 status, detail = self.run_entry(ctest_entry("disabled", command, {"DISABLED": True}))
                 launch.assert_not_called()
                 self.assertEqual(status, "skip", detail)
@@ -196,7 +197,7 @@ class RunTestTest(unittest.TestCase):
     def test_malformed_ctest_environment_fails_before_launch(self) -> None:
         command = self.command_for(self.exiting(0))
         props = {"ENVIRONMENT": ["missing_equals"]}
-        with mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+        with mock.patch.object(rwt, "run_test_process", wraps=rwt.run_test_process) as launch:
             status, detail = self.run_entry(ctest_entry("bad_environment", command, props))
         launch.assert_not_called()
         self.assertEqual(status, "fail", detail)
@@ -253,7 +254,7 @@ class RunTestTest(unittest.TestCase):
         fake = mock.Mock(returncode=-11, stdout=b"usage: gta6rt")
         for props in ({"WILL_FAIL": True}, {"PASS_REGULAR_EXPRESSION": ["usage: gta6rt"]},
                       {"SKIP_REGULAR_EXPRESSION": ["usage: gta6rt"]}):
-            with self.subTest(props=props), mock.patch.object(rwt.subprocess, "run", return_value=fake):
+            with self.subTest(props=props), mock.patch.object(rwt, "run_test_process", return_value=fake):
                 entry = ctest_entry("segv", self.command_for(exe), props | {"SKIP_RETURN_CODE": 77})
                 status, detail = self.run_entry(entry)
                 self.assertEqual(status, "fail")
@@ -265,6 +266,50 @@ class RunTestTest(unittest.TestCase):
         status, detail = self.run_entry(ctest_entry("slow", self.command_for(slow)))
         self.assertEqual(status, "fail")
         self.assertIn("timed out after 0.2 s", detail)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups")
+    def test_timeout_stops_a_helper_even_after_the_launcher_exits(self):
+        import fcntl
+
+        guard_path = self.artifact / "helper.lock"
+        stop_path = self.artifact / "stop"
+        helper = self.program("helper.py", """
+import fcntl
+from pathlib import Path
+import time
+
+with open("helper.lock", "a") as guard:
+    fcntl.flock(guard, fcntl.LOCK_EX)
+    print("helper ready", flush=True)
+    deadline = time.monotonic() + 10
+    while not Path("stop").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+""")
+        launcher = self.program("launcher.py", f"""
+import subprocess
+import sys
+
+subprocess.Popen([sys.executable, {helper!r}])
+""")
+        self.args.timeout = 1
+        entry = ctest_entry("tree", self.command_for(launcher))
+        try:
+            status, detail = self.run_entry(entry)
+            self.assertEqual(status, "fail", detail)
+            self.assertIn("timed out", detail)
+            self.assertIn("helper ready", detail)
+            with guard_path.open("a") as guard:
+                deadline = time.monotonic() + 1
+                while True:
+                    try:
+                        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self.fail("helper still holds its lock after the test timed out")
+                        time.sleep(0.01)
+        finally:
+            stop_path.touch()
 
     def test_a_short_ctest_timeout_still_fails_a_will_fail_test(self):
         slow = self.program("slow_failure.py", "import sys, time\ntime.sleep(1)\nsys.exit(1)\n")
@@ -279,7 +324,7 @@ class RunTestTest(unittest.TestCase):
             with self.subTest(timeout=timeout):
                 entry = ctest_entry("bounded", self.command_for(exe), {"TIMEOUT": timeout})
                 result = rwt.subprocess.CompletedProcess([], 0, stdout=b"")
-                with mock.patch.object(rwt.subprocess, "run", return_value=result) as run:
+                with mock.patch.object(rwt, "run_test_process", return_value=result) as run:
                     status, detail = self.run_entry(entry)
                 self.assertEqual(status, "pass", detail)
                 self.assertEqual(run.call_args.kwargs["timeout"], self.args.timeout)
