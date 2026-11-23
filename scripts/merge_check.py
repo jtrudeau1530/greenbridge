@@ -106,9 +106,10 @@ def duplicates(repo, main, tree, min_length, block=3):
     found = {}
     hunks, path, added = {}, None, None
     new_file = False
+    # Gitlink updates describe submodule commits and have no file text to compare.
     patch = git(repo, "-c", "core.quotePath=true", "diff", "--unified=0", "--no-color", "--no-renames",
                 "--src-prefix=a/", "--dst-prefix=b/", "--no-relative", "--no-ext-diff", "--no-textconv",
-                main, tree).stdout
+                "--ignore-submodules=all", main, tree).stdout
     for line in patch.split("\n"):
         if line.startswith("diff --git "):
             path, added = None, None

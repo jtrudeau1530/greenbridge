@@ -181,6 +181,20 @@ class MergeCheckTest(unittest.TestCase):
         code, [result] = self.run_check("20=new-path")
         self.assertEqual((code, result["verdict"], result["duplicates"]), (0, "clean", {}))
 
+    def test_a_gitlink_update_needs_no_submodule_objects(self):
+        path = "deps/sample"
+        oid_length = len(self.git("rev-parse", "main"))
+        for digit, branch in (("1", "main"), ("2", "updated")):
+            if branch == "updated":
+                self.git("checkout", "-q", "-b", branch)
+            oid = digit * oid_length
+            self.git("update-index", "--add", "--cacheinfo", f"160000,{oid},{path}")
+            self.git("commit", "-q", "-m", f"Set gitlink on {branch}")
+        self.git("checkout", "-q", "main")
+
+        code, [result] = self.run_check("20=updated")
+        self.assertEqual((code, result["verdict"], result["duplicates"]), (0, "clean", {}))
+
     def test_patch_paths_and_added_header_like_lines_still_count_duplicates(self):
         paths = ("docs/quoted \u65e5\u672c\u8a9e.md", "docs/notes with spaces.md", "docs/header-like.md")
         header_like = "++ " + PARAGRAPH
