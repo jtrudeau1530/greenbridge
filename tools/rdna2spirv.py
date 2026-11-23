@@ -16866,6 +16866,51 @@ def restore_mix_literal(ins, raw, literal):
             ins["args"][1 + i] = {**ins["args"][1 + i], "v": literal}
 
 
+# The f16 bits each inline constant code stands for when llvm-mc 21 prints a v_fma_mix* literal as that constant:
+# 0..64, -1..-16, +-0.5, +-1.0, +-2.0, +-4.0 and 1/(2*pi). Measured with llvm-mc 21.1.8 (-mcpu=gfx1013) over all 65,536
+# low halves of a literal under three high halves (0x0000, 0x3f80, 0xffff): exactly these 90 low halves print as the
+# inline constant, whatever the high half; every other literal prints in full.
+MIX_INLINE_F16 = {**{0x80 + n: n for n in range(65)}, **{0xC0 + n: -n & 0xFFFF for n in range(1, 17)},
+                  0xF0: 0x3800, 0xF1: 0xB800, 0xF2: 0x3C00, 0xF3: 0xBC00, 0xF4: 0x4000, 0xF5: 0xC000,
+                  0xF6: 0x4400, 0xF7: 0xC400, 0xF8: 0x3118}
+
+
+def mix_inline_literal(raw, printed, op):
+    """The 32-bit literal of a v_fma_mix* that llvm-mc 21 printed as an inline constant, else None.
+
+    llvm-mc 21's gfx1013 decoder reads a v_fma_mix* literal as 16 bits. When those low 16 bits are the f16 value of an
+    inline constant (MIX_INLINE_F16), it prints that constant and re-encodes the instruction in 8 bytes: each SRC
+    field that held 0xff (the literal) holds the inline code instead, and the literal word is gone (0x3f800000, 1.0 as
+    an f32 source, prints as 0; 0x3c003800 as `0.5`). llvm-mc 23 prints lit(...) instead. ``raw`` is the 12 stored
+    bytes at the instruction's offset, ``printed`` the 8-byte printed encoding. Only that change is accepted: every
+    source field that differs must be 0xff in the blob and the inline code of the literal's low half in the print,
+    and the rest of the 8 bytes must match exactly (same_encoding with all three sources live)."""
+    if not op.startswith("v_fma_mix") or len(raw) != 12 or len(printed) != 8 or raw[3] != 0xCC:
+        return None
+    literal = int.from_bytes(raw[8:], "little")
+    stored, shown = int.from_bytes(raw[4:8], "little"), int.from_bytes(printed[4:8], "little")
+    patched = shown
+    for i in range(3):
+        field = (shown >> 9 * i) & 0x1FF
+        if (stored >> 9 * i) & 0x1FF == 0xFF and field != 0xFF and MIX_INLINE_F16.get(field) == literal & 0xFFFF:
+            patched = (patched & ~(0x1FF << 9 * i)) | (0xFF << 9 * i)
+    if patched == shown or not same_encoding(raw[:8], printed[:4] + patched.to_bytes(4, "little"), op, 4):
+        return None
+    return literal
+
+
+def restore_mix_inline_literal(ins, raw, literal):
+    """Give ``ins`` the stored instruction mix_inline_literal accepted: every source the blob encodes as the literal
+    (SRC field 0xff) reads the 32-bit ``literal`` with the stored neg (NEG) and abs (NEG_HI, as abs on v_fma_mix*)
+    bits, and the encoding is the 12 stored bytes, so the next instruction starts after them."""
+    w0, w1 = int.from_bytes(raw[:4], "little"), int.from_bytes(raw[4:8], "little")
+    for i in range(3):
+        if (w1 >> 9 * i) & 0x1FF == 0xFF:
+            ins["args"][1 + i] = {"k": "imm", "v": literal, "neg": bool((w1 >> (29 + i)) & 1),
+                                  "abs": bool((w0 >> (8 + i)) & 1)}
+    ins["enc"] = raw.hex()
+
+
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
     d = shader_container(path, name)
@@ -17036,7 +17081,9 @@ def check_printed_encodings(path, info):
     blob = native_blob(path, info["name"])
     if int(m.group(3), 16) > len(blob):
         return
+    shift = 0        # bytes the decoder read past the printed encodings so far (mix_inline_literal)
     for ins in info["insns"]:
+        ins["pc"] += shift
         if not ins.get("enc"):
             continue
         enc = bytes.fromhex(ins["enc"])
@@ -17045,6 +17092,12 @@ def check_printed_encodings(path, info):
             literal = mix_literal(raw, enc, base_op(ins["op"]))
             if literal is not None:
                 restore_mix_literal(ins, raw, literal)
+                continue
+            raw12 = blob[ins["pc"]:ins["pc"] + 12]
+            literal = mix_inline_literal(raw12, enc, base_op(ins["op"]))
+            if literal is not None:
+                restore_mix_inline_literal(ins, raw12, literal)
+                shift += 4
                 continue
             raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
                               f"{enc.hex()} (a field the disassembler dropped)")
@@ -17101,6 +17154,11 @@ def translate(path):
                 literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
                 if literal is not None:
                     restore_mix_literal(ins, blob[at:at + len(enc)], literal)
+                    break
+                literal = mix_inline_literal(blob[at:at + 12], enc, base_op(op))
+                if literal is not None:
+                    restore_mix_inline_literal(ins, blob[at:at + 12], literal)
+                    enc = blob[at:at + 12]          # the 12 bytes the decoder read: the next one starts after them
                     break
                 at += 4
                 skipped += 4
