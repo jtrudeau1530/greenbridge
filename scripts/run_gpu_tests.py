@@ -400,8 +400,6 @@ def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
     first = ""
     judged = 0
     for i, (lane, v1, v2, v3) in enumerate(px):
-        if lane >= 32:      # wave32 test: in a 64-wide subgroup lanes 32-63 hold values it never wrote
-            continue
         judged += 1
         w1 = lane ^ 9
         w2 = ((lane & 5) | 16) ^ 1
@@ -409,7 +407,7 @@ def check_bitmask_perm(raw_path: str, msg: str = "") -> tuple[bool | None, str]:
             if not bad:
                 first = f"at ({i%64},{i//64}) lane={lane}: got ({v1},{v2},{v3}), want ({w1},{w2},0)"
             bad += 1
-    return (bad == 0 and judged > 0), (first if bad else f"{judged}/{judged} pixels in lanes 0-31 exact")
+    return (bad == 0 and judged > 0), (first if bad else f"{judged}/{judged} pixels exact")
 
 
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as

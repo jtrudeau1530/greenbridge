@@ -110,6 +110,9 @@ instruction family per file; the list below describes some of them, not every fi
   undefined in SPIR-V (`UndefinedResult`); a "lane mod 32" model of issue #94 gives the words a 32-wide GPU
   shows (all 24 matched on an RTX 4070 SUPER, driver 610.88, without `--wave64-emulate`). Two SPIR-V sabotages (readlane lane & 31, bpermute without its half base) must change the
   64-wide result.
+- `test_wave32_pixel_subgroup64.py` translates wave32 pixel shaders with lane-specific inputs in each physical half
+  and runs them as one 64-lane subgroup and as two 32-lane subgroups. `v_readfirstlane`, `v_readlane`,
+  `v_writelane`, `ds_bpermute`, `ds_permute`, ballots, and both votes must produce the same per-half results.
 - `test_w64x_scalar_load_order.py` translates wave64 programs with `--wave64-emulate` and checks the emitted rounds:
   no case of the round loop's switch reads or writes buffer memory after a write, or writes after a read, so a
   `buffer_store` and a later `s_load` / `s_buffer_load` of the wave (and a scalar load and a later store) run in

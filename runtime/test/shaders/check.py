@@ -6,8 +6,8 @@ The test programs are vk_compute_test, vk_store_test, vk_harness, vk_texture_tes
 (runtime/build by default). With
 the Visual Studio generator they are in runtime/build/RelWithDebInfo, Release and so on: that subfolder is found by
 itself (the newest complete one if there are several) and its name is printed.
-Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm is only judged on lanes
-0-31, since a GPU with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
+Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm checks every pixel, including
+the second 32-lane half when a GPU runs fragment shaders in 64-wide subgroups.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
 The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see their .asm headers) are skipped there
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
@@ -1629,9 +1629,8 @@ def pixel_test(tools, spirv, name):
     if name == "ps_bitmask_perm":
         if skip := bitmask_perm_narrow_skip(out, px):
             return skip
-        low = [p for p in px if p[0] < 32]
-        wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in low)
-        return "" if low and not wrong else f"{wrong} of {len(low)} pixels in lanes 0-31 wrong"
+        wrong = sum(not (a == lane ^ 9 and b == ((lane & 5) | 16) ^ 1) for lane, a, b, _ in px)
+        return "" if px and not wrong else f"{wrong} of {len(px)} pixels wrong"
     if name == "ps_wqm":                               # (wqm, own, wqm, own) per pixel, ps_wqm.asm
         w = int(n ** 0.5)
         wrong = sum(p != (int(i % w % 4 < 2 and i // w % 4 >= 2), int(i % w % 4 == 1 and i // w % 4 == 2)) * 2 for i, p in

@@ -375,7 +375,7 @@ class UndefinedResult(Exception):
 
 
 def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_constants=None, memory=None,
-                  out_of_range="raise"):
+                  out_of_range="raise", return_outputs=False):
     """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
 
     Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
@@ -394,6 +394,8 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
       * OpGroupNonUniformBallot sets bit l for each running lane l whose predicate is true.
       * OpGroupNonUniformAny / All: the predicate of any / every running lane.
       * OpGroupNonUniformBitwiseOr Reduce: the OR of every running lane's value.
+
+    With `return_outputs=True`, also return each invocation's Output variables in invocation order.
     """
     if out_of_range not in ("raise", "wrap"):
         raise ValueError(f"out_of_range: {out_of_range!r}")
@@ -401,12 +403,14 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True)
             for i in range(invocations)]
     pending = [None] * invocations             # what each invocation yielded last; None once it has returned
+    invocation_outputs = [None] * invocations
 
     def advance(i, value):
         try:
             pending[i] = gens[i].send(value)
-        except StopIteration:
+        except StopIteration as done:
             pending[i] = None
+            invocation_outputs[i] = done.value
 
     for i in range(invocations):
         advance(i, None)
@@ -452,7 +456,7 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
                 raise UnsupportedConstruct(kind)
         for i in range(invocations):
             advance(i, results[i])
-    return memory
+    return (memory, invocation_outputs) if return_outputs else memory
 
 
 _TICK = ("tick", None, None, None)

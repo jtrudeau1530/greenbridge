@@ -201,7 +201,8 @@ class LaneMaskWqm32Tests(unittest.TestCase):
             ],
         )
         self.assertGreaterEqual(spv.count("OpGroupNonUniformQuadSwap %uint"), 2)
-        self.assertIn("OpGroupNonUniformAny %bool", spv)
+        self.assertIn("OpGroupNonUniformBallot %v4uint_bal", spv)
+        self.assertIn("%c20", spv)
 
 
 if __name__ == "__main__":

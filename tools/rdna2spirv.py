@@ -4630,17 +4630,47 @@ class Gen:
         self.emit(f"{r} = OpLoad %uint %sg_lane")
         return r
 
+    @property
+    def wave32_fragment(self):
+        return self.stage == "ps" and not self.wave64
+
     def wave_lane(self):
         """This invocation's hardware lane within its wave. Compute and mesh shaders: LocalInvocationIndex mod the
-        wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane, which is
-        the hardware lane when the runtime runs them with subgroup size == wave size."""
+        wave size (exact: thread i of a group is wave i / W, lane i % W). Other stages: the subgroup lane; wave32
+        pixel shaders use the lane within either 32-lane half."""
         lane = self.tmp()
         if self.stage in ("cs", "ms"):
             self.emit(f"{lane} = OpBitwiseAnd %uint {self.local_index()} {self.cu(63 if self.wave64 else 31)}")
         else:
-            self.uses_subgroup = True
-            self.emit(f"{lane} = OpLoad %uint %sg_lane")
+            subgroup_lane = self.subgroup_lane()
+            if self.wave32_fragment:
+                self.emit(f"{lane} = OpBitwiseAnd %uint {subgroup_lane} {self.cu(31)}")
+            else:
+                self.emit(f"{lane} = OpCopyObject %uint {subgroup_lane}")
         return lane
+
+    def wave_source_lane(self, lane):
+        """Map a logical wave32 lane to this fragment invocation's physical subgroup lane."""
+        if not self.wave32_fragment:
+            return lane
+        half, local, source = (self.tmp() for _ in range(3))
+        subgroup_lane = self.subgroup_lane()
+        self.emit(f"{half} = OpBitwiseAnd %uint {subgroup_lane} {self.cu(32)}")
+        self.emit(f"{local} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+        self.emit(f"{source} = OpBitwiseOr %uint {half} {local}")
+        return source
+
+    def wave32_ballot_word(self, ballot):
+        """Select this logical wave32's 32-bit word from a physical subgroup ballot."""
+        lo, hi = self.tmp(), self.tmp()
+        half, upper, word = (self.tmp() for _ in range(3))
+        self.emit(f"{lo} = OpCompositeExtract %uint {ballot} 0")
+        self.emit(f"{hi} = OpCompositeExtract %uint {ballot} 1")
+        lane = self.subgroup_lane()
+        self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
+        self.emit(f"{upper} = OpINotEqual %bool {half} {self.cu(0)}")
+        self.emit(f"{word} = OpSelect %uint {upper} {hi} {lo}")
+        return word
 
     def ballot_lsb_by_words(self, bal):
         """The lowest set bit of a subgroup ballot, from its four words with FindILsb: the lane
@@ -4999,6 +5029,21 @@ class Gen:
     def g_vote(self, r, kind, b):
         """r = OpGroupNonUniform{Any,All} of bool b over the wave."""
         if not self.emulate:
+            if self.wave32_fragment:
+                if kind == "All":
+                    inv = self.tmp()
+                    self.emit(f"{inv} = OpLogicalNot %bool {b}")
+                    b = inv
+                ballot, any_ = self.tmp(), self.tmp()
+                self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {b}")
+                word = self.wave32_ballot_word(ballot)
+                self.emit(f"{any_} = OpINotEqual %bool {word} {self.cu(0)}")
+                if kind == "Any":
+                    self.emit(f"{r} = OpCopyObject %bool {any_}")
+                else:
+                    self.emit(f"{r} = OpLogicalNot %bool {any_}")
+                self.uses_subgroup = self.uses_ballot = True
+                return
             self.emit(f"{r} = OpGroupNonUniform{kind} %bool {self.cu(3)} {b}")
             return
         if kind == "All":
@@ -5013,7 +5058,7 @@ class Gen:
     def g_shuffle(self, r, v, src):
         """r = v of lane src of this wave (OpGroupNonUniformShuffle, or any emulated lane 0-63)."""
         if not self.emulate:
-            self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {src}")
+            self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {self.wave_source_lane(src)}")
             return
         read = self.x_round(data=v)[0]
         self.emit(f"{r} = OpCopyObject %uint {read(src)}")
@@ -5027,10 +5072,11 @@ class Gen:
         else:
             # Redirect absent source lanes before the shuffle: even a masked undefined result is undefined.
             ballot, present, safe_src, shuffled, mask = (self.tmp() for _ in range(5))
+            physical_src = self.wave_source_lane(src)
             self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
-            self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {src}")
+            self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {physical_src}")
             self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
-            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {value} {safe_src}")
+            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {value} {self.wave_source_lane(safe_src)}")
             self.emit(f"{mask} = OpSelect %uint {present} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             self.emit(f"{result} = OpBitwiseAnd %uint {shuffled} {mask}")
             self.uses_subgroup = self.uses_ballot = True
@@ -5092,7 +5138,7 @@ class Gen:
         self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
         self.emit(f"{rl} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
         self.emit(f"{mine} = OpIAdd %uint {rl} {self.cu(1)}")
-        if self.wave64:
+        if self.wave64 or self.wave32_fragment:
             sgl = self.tmp()
             self.emit(f"{sgl} = OpLoad %uint %sg_lane")
             self.emit(f"{half} = OpBitwiseAnd %uint {sgl} {self.cu(32)}")
@@ -5101,7 +5147,7 @@ class Gen:
         acc = self.cu(0)
         for j in range(32):
             src = self.cu(j)
-            if self.wave64:
+            if self.wave64 or self.wave32_fragment:
                 src = self.tmp()
                 self.emit(f"{src} = OpBitwiseOr %uint {half} {self.cu(j)}")
             ex, shv, v, shd, hit, nxt = (self.tmp() for _ in range(6))
@@ -5117,7 +5163,7 @@ class Gen:
 
     def sub_lane(self, r):
         """r = the lane the subgroup shuffles above index: the subgroup lane, or the wave lane when emulated."""
-        if self.emulate:
+        if self.emulate or self.wave32_fragment:
             self.emit(f"{r} = OpCopyObject %uint {self.wave_lane()}")
         else:
             self.emit(f"{r} = OpLoad %uint %sg_lane")
@@ -5381,7 +5427,7 @@ class Gen:
         only this lane's bit (all ones or zero), so each lane puts its bit at its own position and the subgroup
         (= the wave) ORs them together. For the instructions that look at a mask as a whole: until 2026-11-21
         they saw the one lane, so the lane count of a wave was 64 or 0 and its first lane 0 or none."""
-        self.uses_subgroup = self.uses_wave_bits = True
+        self.uses_subgroup = True
         special = a["k"] == "special" and a.get("t", "").startswith("exec")
         key = None
         if self.emulate:
@@ -5403,6 +5449,13 @@ class Gen:
             if key is not None:
                 self.x_mcache[key] = res
             return res
+        if self.wave32_fragment:
+            ballot = self.tmp()
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {mine}")
+            word = self.wave32_ballot_word(ballot)
+            self.uses_ballot = True
+            return word, self.cu(0)
+        self.uses_wave_bits = True
         lane = self.wave_lane()
         low, sh, bit, b, lo_in, hi_in, lo, hi = (self.tmp() for _ in range(8))
         self.emit(f"{low} = OpULessThan %bool {lane} {self.cu(32)}")
@@ -6435,6 +6488,18 @@ class Gen:
                 # hardware reads the first lane's copy of the whole mask; here the lane's own copy is its bit.
                 self.dst(a[0], self.src_u(a[1]))
                 return
+            if self.wave32_fragment:
+                self.uses_subgroup = self.uses_ballot = True
+                v, act = self.src_u(a[1]), self.active_b()
+                ballot, any_, lsb, first, r = (self.tmp() for _ in range(5))
+                self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {act}")
+                word = self.wave32_ballot_word(ballot)
+                self.emit(f"{any_} = OpINotEqual %bool {word} {self.cu(0)}")
+                self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
+                self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+                self.g_shuffle(r, v, first)
+                self.dst(a[0], r)
+                return
             if self.emulate:
                 # The wave's active lanes as two mask words and every lane's value, in one round.
                 v, act = self.src_u(a[1]), self.active_b()
@@ -7379,8 +7444,8 @@ class Gen:
             if slot and slot[1:] in self.parked:        # somewhere a mask is fetched back from this lane: keep ours
                 self.store_reg("sgpr", self.parked[slot[1:]], val)
             me, m, eq, old, r = (self.tmp() for _ in range(5))
-            if self.stage in ("cs", "ms"):
-                # The hardware lane: lanes 32-63 of a wave64 are lanes 0-31 of a second 32-wide subgroup.
+            if self.stage in ("cs", "ms") or self.wave32_fragment:
+                # Wave32 fragments use their lane within either half of a wider Vulkan subgroup.
                 self.emit(f"{me} = OpCopyObject %uint {self.wave_lane()}")
             else:
                 self.emit(f"{me} = OpLoad %uint %sg_lane")
@@ -11199,6 +11264,10 @@ class Gen:
         self.emit(f"{r} = OpFunctionCall %uint %desc_lookup_fn " + " ".join(words))
         if self.emulate:
             return r
+        if self.wave32_fragment:
+            b = self.tmp()
+            self.g_shuffle(b, r, self.cu(0))
+            return b
         # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the
         # broadcast is an identity on every driver and makes that uniformity explicit to the compiler. Mesa ANV
         # (26.2.7, Alder Lake Xe-LP) segfaults compiling a sampler index straight from the probe loop when one
