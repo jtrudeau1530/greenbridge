@@ -1206,8 +1206,9 @@ if(TARGET Vulkan::Headers)
     endif()
   endif()
   if(BUILD_TESTING)
-    if(WIN32)
+    if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       # Real Win32 environment and DXGI names, with D3D12 device creation stubbed: no GPU commands or game files.
+      # It includes the runtime's D3D12 shim headers, so it needs the same Windows SDK as the runtime.
       add_executable(host_adapter_test test/host_adapter_test.cpp)
       target_link_libraries(host_adapter_test PRIVATE Vulkan::Headers dxgi)
       target_compile_definitions(host_adapter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
