@@ -16,9 +16,10 @@ Design rules (see tests/semantic/README.md):
     boxes; PushConstant reads can be seeded with a word list; physical-storage-buffer loads/stores (and 32-bit
     atomics, which with one invocation are read-combine-write) use a flat address -> word dictionary, so they
     must be 32-bit integers at 4-byte-aligned addresses (anything else raises). Workgroup variables (LDS) are
-    zero-initialised per invocation like Function ones, so they are only meaningful with one invocation
-    (run_workgroup does not share them between invocations); 32-bit atomics on them (and on Function variables)
-    are read-combine-write like the physical-storage-buffer ones. Images are rejected.
+    zero-initialised; run_workgroup shares them between its invocations, as a workgroup does (one invocation
+    alone has its own). 32-bit atomics on them (and on Function variables) are read-combine-write like the
+    physical-storage-buffer ones. OpControlBarrier is a point every invocation of run_workgroup must reach
+    together (run_fragment refuses it). Images are rejected.
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
 
@@ -383,7 +384,10 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     missing lanes are not running. `inputs_for(i)` gives invocation i's Input values (see run_fragment); push
     constants and the physical-address memory are shared. Every invocation must reach every subgroup operation,
     in the same order (the translator emits them in uniform control flow and models EXEC with a variable, so a
-    lane that is off in EXEC still executes them).
+    lane that is off in EXEC still executes them). Workgroup variables (LDS) are shared by all the invocations,
+    and OpControlBarrier, like a subgroup operation, must be reached by every invocation at the same point.
+    Invocations at the same instruction execute it in invocation order, so lanes racing on one LDS dword see a
+    defined interleaving (see the lockstep note below).
 
     Subgroup operations (Subgroup scope), over the running lanes of the caller's subgroup:
       * OpGroupNonUniformShuffle returns the value of lane Id. An Id at or past `subgroup_size` is undefined in
@@ -400,7 +404,9 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     if out_of_range not in ("raise", "wrap"):
         raise ValueError(f"out_of_range: {out_of_range!r}")
     memory = {} if memory is None else memory
-    gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True)
+    workgroup = {}                             # Workgroup variable id -> its box, one per workgroup
+    gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True,
+                        workgroup=workgroup)
             for i in range(invocations)]
     pending = [None] * invocations             # what each invocation yielded last; None once it has returned
     invocation_outputs = [None] * invocations
@@ -445,6 +451,8 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
                 for req in group:
                     acc |= req[2]
                 results.append(acc)
+            elif kind == "OpControlBarrier":
+                results.append(None)           # everyone is here: the "same point" check above is the barrier
             elif kind == "OpGroupNonUniformShuffle":
                 if not 0 <= ident < subgroup_size:
                     if out_of_range == "raise":
@@ -486,10 +494,11 @@ def _parsed_lines(text):
     return parsed
 
 
-def _invocation(text, inputs, push_constants, memory, step=False):
+def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None):
     """One invocation as a generator. It yields (opcode, instruction index, value, id) at each subgroup operation
-    and expects that operation's result back; with `step` it also yields _TICK before each instruction. It
-    returns run_fragment's result."""
+    and at each OpControlBarrier, and expects that operation's result back; with `step` it also yields _TICK before
+    each instruction. `workgroup` (run_workgroup's) maps a Workgroup variable id to the box all invocations
+    share; without it the invocation has its own. It returns run_fragment's result."""
     inputs = inputs or {}
     push_constants = list(push_constants or [])
     memory = {} if memory is None else memory
@@ -592,11 +601,15 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif cls == "Input":
                 init = inputs.get(res, types.zero(pointee))
                 var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
+            elif cls == "Workgroup" and workgroup is not None and res in workgroup:
+                var_box[res] = workgroup[res]          # another invocation of the workgroup made it
             elif cls in ("Function", "Output", "Workgroup", "Private"):
                 init = types.copy_value(pointee, values[a[2]]) if len(a) > 2 else types.zero(pointee)
                 var_box[res] = [init]
                 if cls == "Output":
                     outputs.append(res)
+                if cls == "Workgroup" and workgroup is not None:
+                    workgroup[res] = var_box[res]      # the first invocation's box is the workgroup's
             else:
                 raise UnsupportedConstruct(f"storage class {cls}")
             pointers[res] = ("pc", 0) if cls == "PushConstant" else (var_box[res], 0)
@@ -943,8 +956,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = val(a[1]) > val(a[2])
         elif op == "OpUGreaterThanEqual":
             values[res] = val(a[1]) >= val(a[2])
+        elif op == "OpControlBarrier":
+            # <execution scope> <memory scope> <semantics>: run_workgroup's invocations meet here (each has finished
+            # every earlier instruction, and with shared Workgroup memory sees the others' writes). run_fragment
+            # refuses it, as it does a subgroup operation: a barrier belongs to a workgroup.
+            yield (op, pc - 1, None, None)
         elif op == "OpGroupNonUniformShuffle":
-            # OpGroupNonUniformShuffle <result type> <scope> <value> <id>; the scope must be Subgroup (3).
             if types.t[a[0]][0] != "int" or val(a[1]) != 3:
                 raise UnsupportedConstruct("OpGroupNonUniformShuffle other than a Subgroup-scope integer")
             values[res] = yield (op, pc - 1, val(a[2]), val(a[3]))
