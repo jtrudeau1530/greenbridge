@@ -1,23 +1,8 @@
 # First boot: the runbook and the two traces
 
-**Status: first run done, on the only executable obtained so far.** A `game_scarlett_master.exe` (2,725,424 bytes)
-reached the loader from outside the test corpus and ran end to end: dry-run mapped it at its preferred base with
-every import bound (11 shim / 164 host, 0 unimplemented), `--init` ran its three TLS callbacks, and `--run` ran its
-entry point to a clean `exit 0`. Its debug output identifies it as a **packaging verification probe, not the
-engine** — it scans a payload root and compares file/byte/archive counts against a manifest. With the probe's own
-`GetModuleFileNameW` answered for the mapped image (see below), run against the 1.0.2.1 payload it verified
-104/104 files, 223,534,748,018 bytes, rpf 22/22, ttpf 57/57, png 5/5, dll 16/16, bad magic 0: **verdict PASS**.
-The engine binary itself still is not in the corpus (RT-5), so the D3D12 half of this page is unexercised. Nothing
-here quotes game data; a real trace stays on the player's machine.
-
-The package's own metadata agrees: `MicrosoftGame.Config` declares `Identity Name="GTA6.Probe.PC"` and its
-`ExecutableList` names `game_scarlett_master.exe` as the **only** executable, so this payload is a packaging
-verification build that carries the real payload's shape (its counts match the probe's manifest exactly) rather
-than a retail dump missing its engine. All eleven bundled DLLs also initialise cleanly through `gta6rt --init`.
-
-One shim gap the probe exposed, now closed: `GetModuleFileName` was host-bound, so a mapped image asking for its
-own path got `gta6rt.exe`'s; the bundled-module ops now expose the main image and each module's load path, and
-`GetModuleHandle(nullptr)`/`GetModuleFileNameA/W` answer for mapped images first.
+**Status: prepared, not yet run against the retail executable.** The package in the repository's test corpus does
+not contain `game_scarlett_master.exe` (RT-5), so this page is the procedure and the trace tool for the day it
+arrives. Nothing here quotes game data; a real trace stays on the player's machine.
 
 ## 1. What the first boot produces
 

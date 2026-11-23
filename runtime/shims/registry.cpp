@@ -76,11 +76,9 @@ std::vector<Lookup> g_lookups;
 //                            left out on purpose.
 //  gameinput.dll             GameInputCreate: HRESULT (gaming/gdk/docs/reference/input/gameinput/functions/
 //                            gameinputcreate). The shim implements it (runtime/shims/gameinput.cpp); the class is
-//                            listed anyway for a build or import it misses. "#1" is the same function by ordinal:
-//                            ordinal 1 is GameInputCreate in the console export inventory (docs/d3d12_vulkan.md §7).
+//                            listed anyway for a build or import it misses.
 //  xaudio2_9.dll             XAudio2Create: HRESULT (learn.microsoft.com/windows/win32/api/xaudio2/
 //  xaudio2_9redist.dll       nf-xaudio2-xaudio2create). xaudio2_9.dll is the console name (docs/d3d12_vulkan.md §7).
-//                            "#1" is XAudio2Create by ordinal, ordinal 1 verified in the same inventory.
 //  dstorage.dll              DStorageGetFactory: HRESULT (learn.microsoft.com/windows/win32/api/dstorage/
 //  dstorage_xs.dll           nf-dstorage-dstoragegetfactory). dstorage_xs.dll is the console name.
 const char* const kNotHResult[] = {
@@ -110,14 +108,9 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
             name == "DXGIDeclareAdapterRemovalSupport")
             return ReturnClass::HResult;
     } else if (dll == "xaudio2_9.dll" || dll == "xaudio2_9redist.dll") {
-        if (name == "XAudio2Create" || name == "#1") return ReturnClass::HResult;
-        // Host xaudio2_9.dll ordinals 8-10 are XAudio2CreateV2_9 / XAudio2CreateWithVersionInfo /
-        // XAudio2CreateWithSharedContexts (measured on the System32 export table); the redist's ordinal
-        // table is not confirmed, so only the system copy gets them.
-        if (dll == "xaudio2_9.dll" && (name == "#8" || name == "#9" || name == "#10"))
-            return ReturnClass::HResult;
+        if (name == "XAudio2Create") return ReturnClass::HResult;
     } else if (dll == "gameinput.dll") {
-        if (name == "GameInputCreate" || name == "#1") return ReturnClass::HResult;
+        if (name == "GameInputCreate") return ReturnClass::HResult;
     } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
@@ -459,20 +452,6 @@ bool owns_bundled_module_handle(void* module) {
     for (const auto& entry : snapshot_bundled_loaders())
         if (entry.ops->owns_handle(entry.ctx, module)) return true;
     return false;
-}
-
-void* bundled_main_module() {
-    for (const auto& entry : snapshot_bundled_loaders())
-        if (entry.ops->main_module)
-            if (void* h = entry.ops->main_module(entry.ctx)) return h;
-    return nullptr;
-}
-
-const std::filesystem::path* bundled_module_path(void* module) {
-    for (const auto& entry : snapshot_bundled_loaders())
-        if (entry.ops->module_path)
-            if (const std::filesystem::path* p = entry.ops->module_path(entry.ctx, module)) return p;
-    return nullptr;
 }
 
 Table::Table(const Entry* entries, size_t count) {

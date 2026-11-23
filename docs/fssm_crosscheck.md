@@ -44,8 +44,7 @@ The short version:
 
 ### The duplicate-XBCH exception (the important one)
 
-`tools/fssm_unpack.py` read the entries last-wins, dropping all but the last payload of a
-repeated tag:
+`tools/fssm_unpack.py` does:
 
 ```python
 ents = {}

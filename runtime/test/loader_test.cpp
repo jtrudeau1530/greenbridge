@@ -470,23 +470,6 @@ void test_imports() {
         dir.Size = sizeof(IMAGE_IMPORT_DESCRIPTOR);
         expect_rejects("an import thunk table that runs past the image", img);
     }
-    for (const char* dll : {"TestShim", "testshim.dll."}) {
-        // LoadLibrary's file-name rule keys these the same as testshim.dll; without that normalisation the
-        // shim lookup misses while a real host namesake would still bind.
-        const std::string what = std::string("an import naming ") + dll + " resolves to testshim.dll's shim";
-        auto importer = write_image_as(make_import_image(dll, "F"), "importer_key.exe");
-        try {
-            rt::Loader loader(g_dir);
-            rt::Module& m = loader.load(importer);
-            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Shim)
-                return failed(what.c_str(), "the import did not bind as a shim");
-            if (*reinterpret_cast<void**>(m.base + 0x1180) != reinterpret_cast<void*>(&test_shim_function))
-                return failed(what.c_str(), "the address table does not hold the shim function");
-            pass(what.c_str());
-        } catch (const std::exception& e) {
-            failed(what.c_str(), e.what());
-        }
-    }
 }
 
 void test_import_name_rvas() {

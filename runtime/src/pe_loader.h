@@ -118,10 +118,6 @@ public:
     void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
-    // The first image load() mapped (the exe), for GetModuleHandle(nullptr); the path a mapped module was loaded
-    // from (nullptr for the main image), for GetModuleFileName. Null when the handle is not this loader's.
-    void* main_module() const;
-    const std::filesystem::path* module_path_for(void* module_handle) const;
 
 private:
     void initialise(Module& m);

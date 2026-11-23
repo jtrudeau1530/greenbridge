@@ -2,7 +2,6 @@
 // Add a DLL by writing a shims/<dll>.cpp with a SHIM_TABLE and listing it in CMakeLists.txt.
 #pragma once
 #include <cstdint>
-#include <filesystem>
 #include <string>
 
 namespace rt::shims {
@@ -66,11 +65,6 @@ struct BundledModuleOps {
     void* (*load_bundled)(void* ctx, const std::string& dll_lower, uint32_t flags, bool& handled);
     void* (*get_proc)(void* ctx, void* module, const std::string& sym, bool& owns_handle);
     bool (*owns_handle)(void* ctx, void* module);
-    // The handle of the first image the loader mapped (the exe), for GetModuleHandle(nullptr). Null if none.
-    void* (*main_module)(void* ctx);
-    // The path a mapped module was loaded from, for GetModuleFileName: `module` nullptr asks for the main image,
-    // a handle asks for that module; null when the handle is not the loader's (or it has no main image).
-    const std::filesystem::path* (*module_path)(void* ctx, void* module);
 };
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
@@ -79,8 +73,6 @@ void* find_loaded_bundled_module(const std::string& dll_lower);
 void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& handled);
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);
-void* bundled_main_module();
-const std::filesystem::path* bundled_module_path(void* module);
 
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).

@@ -870,21 +870,11 @@ bool bundled_owns_handle(void* ctx, void* module) {
     return static_cast<Loader*>(ctx)->owns_module_handle(module);
 }
 
-void* bundled_main_module(void* ctx) {
-    return static_cast<Loader*>(ctx)->main_module();
-}
-
-const std::filesystem::path* bundled_module_path(void* ctx, void* module) {
-    return static_cast<Loader*>(ctx)->module_path_for(module);
-}
-
 const shims::BundledModuleOps kBundledOps{
     &bundled_find_loaded,
     &bundled_load,
     &bundled_get_proc,
     &bundled_owns_handle,
-    &bundled_main_module,
-    &bundled_module_path,
 };
 }  // namespace
 
@@ -1065,19 +1055,6 @@ bool Loader::owns_module_handle(void* module_handle) const {
     for (const Module* m : order_)
         if (m->base == module_handle) return true;
     return false;
-}
-
-void* Loader::main_module() const {
-    std::lock_guard lock(mutex_);
-    return order_.empty() ? nullptr : static_cast<void*>(order_.front()->base);
-}
-
-const std::filesystem::path* Loader::module_path_for(void* module_handle) const {
-    std::lock_guard lock(mutex_);
-    if (!module_handle) return order_.empty() ? nullptr : &order_.front()->path;
-    for (Module* m : order_)
-        if (m->base == module_handle) return &m->path;
-    return nullptr;
 }
 
 // x64 has no frame-pointer chain to fall back on: without its .pdata registered, an exception raised in (or passing
@@ -1402,19 +1379,6 @@ void Loader::parse_exports(Module& m) {
     }
 }
 
-// The file-name rule LoadLibrary applies to a bare module name, the same normalisation library_loader.cpp's
-// module_name() uses: lower-case, a trailing '.' dropped, ".dll" added when there is no extension. Without it an
-// import naming "GameInput" or "gameinput.dll." misses the shim and owns_dll lookups while LoadLibraryExA still
-// binds the real System32 module.
-std::string dll_key(std::string name) {
-    const size_t slash = name.find_last_of("\\/");
-    if (slash != std::string::npos) name.erase(0, slash + 1);
-    name = lower(name);
-    if (!name.empty() && name.back() == '.') name.pop_back();
-    else if (name.find('.') == std::string::npos) name += ".dll";
-    return name;
-}
-
 // Follows a forwarder string to the module and export it names. Bundled modules are searched first, with or without
 // the extension, because a forwarder may point at another mapped module; system DLLs go through LoadLibraryEx, whose
 // own GetProcAddress already follows its forwarders. Errors are "not found": the caller decides what to bind.
@@ -1426,7 +1390,8 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
 
     // A forwarder can name a module the loader shims. Shims take precedence over a bundled or host copy, exactly as
     // they do for a direct import in resolve(); without this, a forwarded xmem or d3d12_xs call becomes a failure thunk.
-    std::string shim_key = dll_key(module);
+    std::string shim_key = lower(module);
+    if (shim_key.size() < 4 || shim_key.compare(shim_key.size() - 4, 4, ".dll") != 0) shim_key += ".dll";
     if (void* p = shims::find(shim_key, symbol)) {
         binding = Binding::Shim;
         return p;
@@ -1458,24 +1423,18 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
         return nullptr;  // the bundled module exists and does not export it; don't look for a host namesake
     }
 
-    // A module the shims own (xgameruntime.dll, gameinput.dll, d3d12_xs.dll, xmem.dll) never binds to a host
-    // namesake: xgameruntime.dll and gameinput.dll exist on the PC too, and a call into the real Gaming Services
-    // runtime would bypass the offline shims the same way a direct host load would (owns_dll, registry.cpp).
-    if (!shims::owns_dll(shim_key)) {
-        HMODULE h = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!h) return nullptr;
-        if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
-        FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
-        if (!p) return nullptr;
-        if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
-        binding = Binding::Host;
-        return reinterpret_cast<void*>(p);
-    }
-    return nullptr;
+    HMODULE h = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) return nullptr;
+    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
+    FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
+    if (!p) return nullptr;
+    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
+    binding = Binding::Host;
+    return reinterpret_cast<void*>(p);
 }
 
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {
-    std::string key = dll_key(dll);
+    std::string key = lower(dll);
     std::string sym = by_ordinal ? "#" + std::to_string(ordinal) : name;
 
     if (void* p = shims::find(key, sym)) {
@@ -1499,18 +1458,13 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         }
     }
     // Host Windows: system DLLs and API sets. LOAD_LIBRARY_SEARCH_SYSTEM32 keeps the game folder out of the search.
-    // A shim-owned module is skipped: xgameruntime.dll and gameinput.dll have real PC namesakes in System32, and an
-    // unregistered import must end unimplemented, exactly as GetProcAddress on the pseudo-handle returns NULL
-    // (library_loader.cpp). Binding it to Gaming Services would also leave the process online-capable.
-    if (!shims::owns_dll(key)) {
-        if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
-            if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
-            FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
-            if (p) {
-                if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
-                m.imports.push_back({dll, sym, Binding::Host});
-                return reinterpret_cast<void*>(p);
-            }
+    if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
+        FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
+        if (p) {
+            if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
+            m.imports.push_back({dll, sym, Binding::Host});
+            return reinterpret_cast<void*>(p);
         }
     }
     m.imports.push_back({dll, sym, Binding::Unimplemented});

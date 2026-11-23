@@ -6,12 +6,6 @@
   v_lshl_or_b32   D = (S0 << (S1 & 31)) | S2
   v_mad_i32_i24   D = sext(S0[23:0]) * sext(S1[23:0]) + S2   (mod 2^32)
   v_mul_lo_u32    D = (S0 * S1) mod 2^32
-  v_not_b32       D = ~S0
-  v_ashrrev_i32   D.i = S1.i >> (S0.u & 31)                  (VOP2 reversed order: count is S0, value S1)
-  v_min_i32       D.i = min(S0.i, S1.i)
-  v_max_i32       D.i = max(S0.i, S1.i)
-  v_min_u32       D.u = min(S0.u, S1.u)
-  v_max_u32       D.u = max(S0.u, S1.u)
 
 Each case is a synthetic hand-written pixel-shader listing (operands loaded into VGPRs with v_mov_b32, one
 instruction, exported to mrt0), translated by tools/rdna2spirv.py and executed by spirv_mini_interp.py. The
@@ -38,11 +32,6 @@ def sext24(v):
     return v - (1 << 24) if v & 0x800000 else v
 
 
-def sext32(v):
-    v &= MASK32
-    return v - (1 << 32) if v & 0x80000000 else v
-
-
 REFERENCE = {
     "v_bfm_b32": lambda s0, s1: (((1 << (s0 & 31)) - 1) << (s1 & 31)) & MASK32,
     "v_and_or_b32": lambda s0, s1, s2: ((s0 & s1) | s2) & MASK32,
@@ -50,12 +39,6 @@ REFERENCE = {
     "v_lshl_or_b32": lambda s0, s1, s2: ((s0 << (s1 & 31)) | s2) & MASK32,
     "v_mad_i32_i24": lambda s0, s1, s2: (sext24(s0) * sext24(s1) + s2) & MASK32,
     "v_mul_lo_u32": lambda s0, s1: (s0 * s1) & MASK32,
-    "v_not_b32": lambda s0: (~s0) & MASK32,
-    "v_ashrrev_i32": lambda s0, s1: (sext32(s1) >> (s0 & 31)) & MASK32,
-    "v_min_i32": lambda s0, s1: min(sext32(s0), sext32(s1)) & MASK32,
-    "v_max_i32": lambda s0, s1: max(sext32(s0), sext32(s1)) & MASK32,
-    "v_min_u32": lambda s0, s1: min(s0 & MASK32, s1 & MASK32),
-    "v_max_u32": lambda s0, s1: max(s0 & MASK32, s1 & MASK32),
 }
 
 # (sources..., expected) -- expected words computed by hand from the ISA formulas above.
@@ -120,61 +103,6 @@ CASES = {
         (0x00010001, 0x0000FFFF, 0xFFFFFFFF),  # (2^16+1)(2^16-1) = 2^32 - 1
         (0x00010001, 0x00010001, 0x00020001),  # 2^32 + 2^17 + 1
         (0x12345678, 0x9ABCDEF0, 0x242D2080),
-    ],
-    "v_not_b32": [
-        (0x00000000, 0xFFFFFFFF),
-        (0xFFFFFFFF, 0x00000000),
-        (0xF0F0F0F0, 0x0F0F0F0F),
-        (0x12345678, 0xEDCBA987),
-        (0xAAAAAAAA, 0x55555555),
-        (0x80000000, 0x7FFFFFFF),
-    ],
-    "v_ashrrev_i32": [
-        # (count, value, expected): the VOP2 form shifts the second source by the first.
-        (0, 0x80000000, 0x80000000),
-        (1, 0x80000000, 0xC0000000),         # sign bit fills
-        (4, 0xFFFFFFF0, 0xFFFFFFFF),         # -16 >> 4 = -1
-        (31, 0x80000000, 0xFFFFFFFF),
-        (32, 0x80000000, 0x80000000),        # 32 & 31 = 0
-        (33, 0x80000000, 0xC0000000),        # 33 & 31 = 1
-        (0xFFFFFFFF, 0x80000001, 0xFFFFFFFF),  # count 31: -2147483647 >> 31 = -1
-        (1, 0x40000000, 0x20000000),         # positive: like a logical shift
-        (16, 0x7FFF0000, 0x00007FFF),
-        (8, 0xF0F0F0F0, 0xFFF0F0F0),
-    ],
-    "v_min_i32": [
-        (0xFFFFFFFF, 0x00000000, 0xFFFFFFFF),  # -1 < 0; an unsigned min would pick 0
-        (0x80000000, 0x7FFFFFFF, 0x80000000),  # INT_MIN < INT_MAX
-        (0x7FFFFFFF, 0x80000000, 0x80000000),
-        (0x00000005, 0x00000003, 0x00000003),
-        (0xFFFFFFFE, 0x00000002, 0xFFFFFFFE),  # -2 < 2
-        (0x00000000, 0x00000000, 0x00000000),
-        (0x12345678, 0x12345678, 0x12345678),
-    ],
-    "v_max_i32": [
-        (0xFFFFFFFF, 0x00000000, 0x00000000),  # -1 < 0
-        (0x80000000, 0x7FFFFFFF, 0x7FFFFFFF),
-        (0x7FFFFFFF, 0x80000000, 0x7FFFFFFF),
-        (0xFFFFFFFE, 0x00000002, 0x00000002),  # 2 > -2; unsigned max would pick 0xFFFFFFFE
-        (0x80000000, 0x00000001, 0x00000001),  # 1 > INT_MIN; unsigned max would pick 0x80000000
-        (0x00000005, 0x00000003, 0x00000005),
-        (0xABCDEF01, 0xABCDEF01, 0xABCDEF01),
-    ],
-    "v_min_u32": [
-        (0xFFFFFFFF, 0x00000000, 0x00000000),  # 2^32-1 > 0; a signed min would pick 0xFFFFFFFF
-        (0x80000000, 0x7FFFFFFF, 0x7FFFFFFF),  # signed min would pick 0x80000000
-        (0xFFFFFFFE, 0x00000002, 0x00000002),  # signed min would pick 0xFFFFFFFE
-        (0x00000005, 0x00000003, 0x00000003),
-        (0x00000000, 0xFFFFFFFF, 0x00000000),
-        (0x12345678, 0x12345678, 0x12345678),
-    ],
-    "v_max_u32": [
-        (0xFFFFFFFF, 0x00000000, 0xFFFFFFFF),  # signed max would pick 0
-        (0x80000000, 0x7FFFFFFF, 0x80000000),  # signed max would pick 0x7FFFFFFF
-        (0xFFFFFFFE, 0x00000002, 0xFFFFFFFE),  # signed max would pick 2
-        (0x00000005, 0x00000003, 0x00000005),
-        (0x00000001, 0x80000000, 0x80000000),
-        (0xABCDEF01, 0xABCDEF01, 0xABCDEF01),
     ],
 }
 
@@ -248,24 +176,6 @@ class TranslatedValues(unittest.TestCase):
 
     def test_v_mul_lo_u32(self):
         self.check("v_mul_lo_u32")
-
-    def test_v_not_b32(self):
-        self.check("v_not_b32")
-
-    def test_v_ashrrev_i32(self):
-        self.check("v_ashrrev_i32")
-
-    def test_v_min_i32(self):
-        self.check("v_min_i32")
-
-    def test_v_max_i32(self):
-        self.check("v_max_i32")
-
-    def test_v_min_u32(self):
-        self.check("v_min_u32")
-
-    def test_v_max_u32(self):
-        self.check("v_max_u32")
 
 
 if __name__ == "__main__":

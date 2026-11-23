@@ -1,9 +1,7 @@
 # Design notes
 
 Groundwork for running the Xbox Series build of GTA VI natively on Windows. The work that does not need the
-executable is in place; booting can start as soon as the engine image is available (the
-`game_scarlett_master.exe` obtained so far is a packaging verification probe, not the engine — see
-docs/boot.md).
+executable is in place; booting can start as soon as `game_scarlett_master.exe` is available.
 
 ## Ground rules
 

@@ -14,9 +14,7 @@
 #include <windows.h>
 
 #include <cstdio>
-#include <cstring>
 #include <deque>
-#include <filesystem>
 #include <map>
 #include <mutex>
 #include <set>
@@ -171,85 +169,24 @@ HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
 // GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), and for any
 // bundled package module already mapped by the native loader.
 HMODULE WINAPI get_module_handle_a(LPCSTR name) {
-    if (!name) {
-        if (void* h = bundled_main_module()) return reinterpret_cast<HMODULE>(h);
-        return GetModuleHandleA(name);
+    if (name) {
+        if (HMODULE h = owned_handle(name)) return h;
+        const std::string dll = module_name(name);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
     }
-    if (HMODULE h = owned_handle(name)) return h;
-    const std::string dll = module_name(name);
-    if (!dll.empty())
-        if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
     return GetModuleHandleA(name);
 }
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
-    if (!name) {
-        // The process's own image: the mapped exe, not gta6rt.
-        if (void* h = bundled_main_module()) return reinterpret_cast<HMODULE>(h);
-        return GetModuleHandleW(name);
+    if (name) {
+        const std::string path = narrow(name);
+        if (HMODULE h = owned_handle(path)) return h;
+        const std::string dll = module_name(path);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
     }
-    const std::string path = narrow(name);
-    if (HMODULE h = owned_handle(path)) return h;
-    const std::string dll = module_name(path);
-    if (!dll.empty())
-        if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
     return GetModuleHandleW(name);
-}
-
-// The Win32 spelling of a stored module path: backslashes throughout, and a unix-absolute path (a leading "/", only
-// possible under Wine) becomes Z:\..., the drive Wine maps at the filesystem root. A relative stored path is made
-// absolute through the host first, so the result is always drive-qualified.
-std::wstring windows_form(const std::filesystem::path& p) {
-    std::wstring s = p.native();
-    for (auto& c : s)
-        if (c == L'/') c = L'\\';
-    if (s.size() >= 2 && s[1] != L':' && s[0] == L'\\' && s[1] != L'\\') s.insert(0, L"Z:");
-    if (s.size() < 2 || s[1] != L':') {
-        std::error_code ec;
-        s = std::filesystem::absolute(s, ec).native();
-        for (auto& c : s)
-            if (c == L'/') c = L'\\';
-        if (s.size() >= 2 && s[1] != L':' && s[0] == L'\\' && s[1] != L'\\') s.insert(0, L"Z:");
-    }
-    return s;
-}
-
-// GetModuleFileName answers for the mapped images: nullptr is the process's own image (the exe the loader mapped,
-// not gta6rt.exe) and a bundled module's handle names that module. Host modules fall through.
-DWORD WINAPI get_module_file_name_w(HMODULE module, LPWSTR buffer, DWORD size) {
-    const std::filesystem::path* p = bundled_module_path(module);
-    if (!p) return GetModuleFileNameW(module, buffer, size);
-    if (!buffer || !size) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return 0;
-    }
-    const std::wstring s = windows_form(*p);
-    if (s.size() >= size) {
-        std::wmemcpy(buffer, s.c_str(), size - 1);
-        buffer[size - 1] = 0;
-        SetLastError(ERROR_INSUFFICIENT_BUFFER);
-        return size;
-    }
-    std::wmemcpy(buffer, s.c_str(), s.size() + 1);
-    return static_cast<DWORD>(s.size());
-}
-
-DWORD WINAPI get_module_file_name_a(HMODULE module, LPSTR buffer, DWORD size) {
-    const std::filesystem::path* p = bundled_module_path(module);
-    if (!p) return GetModuleFileNameA(module, buffer, size);
-    if (!buffer || !size) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return 0;
-    }
-    const std::string s = narrow(windows_form(*p).c_str());
-    if (s.size() >= size) {
-        std::memcpy(buffer, s.c_str(), size - 1);
-        buffer[size - 1] = 0;
-        SetLastError(ERROR_INSUFFICIENT_BUFFER);
-        return size;
-    }
-    std::memcpy(buffer, s.c_str(), s.size() + 1);
-    return static_cast<DWORD>(s.size());
 }
 
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
@@ -323,8 +260,6 @@ BOOL WINAPI disable_thread_calls(HMODULE module) {
     {dll, "LoadLibraryExW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_ex_w)},                   \
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
-    {dll, "GetModuleFileNameA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_a)},          \
-    {dll, "GetModuleFileNameW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_w)},          \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
     {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                           \
     {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}

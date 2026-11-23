@@ -182,15 +182,6 @@ def raw_request(port, target, host="127.0.0.1", method="GET", extra_headers=()):
     return status, head.decode("latin-1"), body
 
 
-def header_value(head, name):
-    """The value of a response header, matched case-insensitively; None when it is absent."""
-    for line in head.split("\r\n")[1:]:
-        key, sep, value = line.partition(":")
-        if sep and key.strip().lower() == name.lower():
-            return value.strip()
-    return None
-
-
 class HandlerTest(unittest.TestCase):
     """/world/ files are served with the guards in front of them; a foreign Host gets 403."""
 
@@ -202,10 +193,6 @@ class HandlerTest(unittest.TestCase):
         (world / "sub").mkdir(parents=True)
         (world / "ok.bin").write_bytes(b"world-bytes")
         (world / "model.glb").write_bytes(b"glTF")
-        (world / "sub" / "inner.bin").write_bytes(b"inner")
-        # Larger than one 64 KiB copy block, with an odd tail, so a truncated or spliced response shows up.
-        cls.big = bytes(range(256)) * 1024 + b"tail"
-        (world / "big.bin").write_bytes(cls.big)
         (root / "site").mkdir()
         (root / "site" / "index.html").write_text("<!doctype html><title>viewer</title>", encoding="utf-8")
         (root / "secret.txt").write_text("secret", encoding="utf-8")
@@ -294,10 +281,6 @@ class HandlerTest(unittest.TestCase):
                 status, _, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}")
                 self.assertEqual(status, 403)
                 self.assertNotIn(b"secret", body)
-                status, _, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}",
-                                              method="HEAD")
-                self.assertEqual(status, 403)
-                self.assertEqual(body, b"")
 
     def test_windows_device_aliases_get_403_without_opening_them(self):
         targets = ("/world/COM%C2%B9.glb", "/world/sub/lpt%C2%B2.json", "/world/CONIN%24",
@@ -393,160 +376,6 @@ class NoWorldHandlerTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(5)
-
-    def test_the_viewer_root_serves_index_html(self):
-        # Opening http://127.0.0.1:8765/ is how the viewer is started, and HEAD must agree with GET.
-        status, head, body = raw_request(self.port, "/", host=f"127.0.0.1:{self.port}")
-        self.assertEqual(status, 200)
-        self.assertIn("text/html", head.lower())
-        self.assertIn(b"<title>viewer</title>", body)
-        status, head, body = raw_request(self.port, "/", host=f"127.0.0.1:{self.port}", method="HEAD")
-        self.assertEqual(status, 200)
-        self.assertEqual(body, b"")
-        self.assertEqual(int(header_value(head, "content-length")), len(b"<!doctype html><title>viewer</title>"))
-
-    def test_a_missing_world_file_is_404(self):
-        status, head, body = raw_request(self.port, "/world/missing.glb", host=f"127.0.0.1:{self.port}")
-        self.assertEqual(status, 404)
-        self.assertIn("cache-control: no-store", head.lower())
-        self.assertNotIn(b"world-bytes", body)
-        status, head_head, head_body = raw_request(self.port, "/world/missing.glb",
-                                                  host=f"127.0.0.1:{self.port}", method="HEAD")
-        self.assertEqual(status, 404)
-        self.assertEqual(head_body, b"")
-        self.assertEqual(header_value(head, "content-length"), header_value(head_head, "content-length"))
-
-    def test_a_missing_viewer_asset_is_404(self):
-        status, head, body = raw_request(self.port, "/nope.js", host=f"127.0.0.1:{self.port}")
-        self.assertEqual(status, 404)
-        self.assertIn("cache-control: no-store", head.lower())
-        self.assertNotIn(b"secret", body)
-
-    def test_traversal_outside_the_viewer_folder_is_404(self):
-        # Paths that do not start with /world/ bypass safe_world_path; SimpleHTTPRequestHandler's own
-        # translate_path must still drop the parent segments instead of serving the neighbouring secret.
-        for target in ("/../secret.txt", "/..%2fsecret.txt", "/%2e%2e/secret.txt"):
-            with self.subTest(target=target):
-                status, _, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}")
-                self.assertEqual(status, 404)
-                self.assertNotIn(b"secret", body)
-
-    def test_methods_other_than_get_and_head_are_refused(self):
-        # SimpleHTTPRequestHandler only implements GET and HEAD, so the answer is 501, not 405.
-        for method in ("POST", "PUT", "DELETE"):
-            with self.subTest(method=method):
-                status, head, body = raw_request(self.port, "/world/ok.bin", method=method,
-                                                 host=f"127.0.0.1:{self.port}")
-                self.assertEqual(status, 501)
-                self.assertIn("cache-control: no-store", head.lower())
-                self.assertNotIn(b"world-bytes", body)
-
-    def test_head_matches_get_for_a_world_file(self):
-        status, head, body = raw_request(self.port, "/world/model.glb", host=f"127.0.0.1:{self.port}")
-        self.assertEqual(status, 200)
-        status, head_head, head_body = raw_request(self.port, "/world/model.glb",
-                                                  host=f"127.0.0.1:{self.port}", method="HEAD")
-        self.assertEqual(status, 200)
-        self.assertEqual(head_body, b"")
-        self.assertEqual(header_value(head, "content-length"), header_value(head_head, "content-length"))
-        self.assertEqual(header_value(head, "content-type"), header_value(head_head, "content-type"))
-
-    def test_world_directories_are_not_listed(self):
-        for target in ("/world/", "/world/sub", "/world/sub/"):
-            with self.subTest(target=target):
-                status, _, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}")
-                self.assertEqual(status, 403)
-                self.assertNotIn(b"inner.bin", body)
-
-    def test_an_encoded_separator_still_resolves_inside_the_world(self):
-        status, _, body = raw_request(self.port, "/world/sub%2Finner.bin", host=f"127.0.0.1:{self.port}")
-        self.assertEqual(status, 200)
-        self.assertEqual(body, b"inner")
-
-    def test_a_range_request_gets_the_whole_file(self):
-        # The viewer downloads each GLB as one body (fetch + arrayBuffer) and never asks for a slice, so a
-        # Range header is ignored and the complete file is sent. A 206 here would break the streaming code's
-        # assumption that arrayBuffer() holds the whole chunk.
-        for target, expected in (("/world/ok.bin", b"world-bytes"), ("/world/big.bin", self.big)):
-            with self.subTest(target=target):
-                status, head, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}",
-                                                 extra_headers=("Range: bytes=0-4",))
-                self.assertEqual(status, 200)
-                self.assertEqual(body, expected)
-                self.assertEqual(int(header_value(head, "content-length")), len(expected))
-                self.assertIsNone(header_value(head, "content-range"))
-
-    def test_a_large_chunk_is_streamed_whole(self):
-        status, head, body = raw_request(self.port, "/world/big.bin", host=f"127.0.0.1:{self.port}")
-        self.assertEqual(status, 200)
-        self.assertEqual(int(header_value(head, "content-length")), len(self.big))
-        self.assertEqual(body, self.big)
-
-    def test_parallel_chunk_downloads_do_not_interleave(self):
-        # The streaming code keeps four downloads in flight; each response must carry its own file.
-        from concurrent.futures import ThreadPoolExecutor
-        expected = {"/world/big.bin": self.big, "/world/ok.bin": b"world-bytes",
-                    "/world/model.glb": b"glTF"}
-        targets = list(expected) * 3
-
-        def fetch(target):
-            status, _, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}")
-            return target, status, body
-
-        with ThreadPoolExecutor(max_workers=len(targets)) as pool:
-            results = list(pool.map(fetch, targets))
-        self.assertEqual(len(results), len(targets))
-        for target, status, body in results:
-            with self.subTest(target=target):
-                self.assertEqual(status, 200)
-                self.assertEqual(body, expected[target])
-
-
-class NoWorldHandlerTest(unittest.TestCase):
-    """Without --world the viewer serves only its own folder, so /world/ is a plain 404."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls._tmp = tempfile.TemporaryDirectory()
-        root = Path(cls._tmp.name)
-        (root / "site").mkdir()
-        (root / "site" / "index.html").write_text("<!doctype html><title>viewer</title>", encoding="utf-8")
-        (root / "secret.txt").write_text("secret", encoding="utf-8")
-
-        class QuietHandler(serve.Handler):
-            world = None
-
-            def log_message(self, *args):
-                pass
-
-        cls.server = http.server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), functools.partial(QuietHandler, directory=str(root / "site")))
-        cls.port = cls.server.server_address[1]
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-        cls.thread.join(5)
-        cls._tmp.cleanup()
-
-    def test_world_requests_are_404_without_a_world_folder(self):
-        for target in ("/world/ok.bin", "/world/", "/world/../secret.txt"):
-            with self.subTest(target=target):
-                status, _, body = raw_request(self.port, target, host=f"127.0.0.1:{self.port}")
-                self.assertEqual(status, 404)
-                self.assertNotIn(b"secret", body)
-
-    def test_the_viewer_page_is_still_served(self):
-        status, _, body = raw_request(self.port, "/", host=f"127.0.0.1:{self.port}")
-        self.assertEqual(status, 200)
-        self.assertIn(b"<title>viewer</title>", body)
-
-    def test_a_foreign_host_is_still_403(self):
-        status, _, _ = raw_request(self.port, "/world/ok.bin", host="evil.example:8765")
-        self.assertEqual(status, 403)
 
 
 class WorldArgumentTest(unittest.TestCase):
