@@ -25,9 +25,11 @@ class DocsEncoding(unittest.TestCase):
     def test_no_cp1252_mojibake_in_docs(self):
         paths = [os.path.join(ROOT, "README.md")]
         docs = os.path.join(ROOT, "docs")
-        for name in os.listdir(docs):
-            if name.endswith(".md"):
-                paths.append(os.path.join(docs, name))
+        for dirpath, dirnames, filenames in os.walk(docs):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if name.endswith(".md"):
+                    paths.append(os.path.join(dirpath, name))
         self.assertGreater(len(paths), 1)
         for path in paths:
             with self.subTest(path=os.path.basename(path)):
