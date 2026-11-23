@@ -236,11 +236,13 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertIn("not-a-charset", p.stdout)
 
     def test_comments_in_a_document_that_does_not_parse_are_counted(self):
-        # A truncated or tail-only document stops the parser at the error; its comments still count, and
-        # comment-like text in CDATA (closed or cut off) still doesn't.
+        # The fallback must respect the context of each delimiter after the parser stops.
         cases = {"open.xml": (b"<a><!--x--><!--y-->", 2),
                  "tail.xml": (b"</b><!--x--></a><!--y-->", 2),
-                 "cdata.xml": (b"<a><!--x--><![CDATA[<!--no-->]]><b><![CDATA[<!--cut", 1)}
+                 "cdata.xml": (b"<a><!--x--><![CDATA[<!--no-->]]><b><![CDATA[<!--cut", 1),
+                 "cdata-in-comment.xml": (b"<a></b><!--literal <![CDATA[--><!--later-->", 2),
+                 "comment-in-pi.xml": (b"<a></b><?step literal <!-- ?> <!--later-->", 1),
+                 "unfinished-comment.xml": (b"<a><!--unfinished <![CDATA[", 1)}
         for name, (body, want) in cases.items():
             with self.subTest(name=name):
                 doc = self.write(name, body)
