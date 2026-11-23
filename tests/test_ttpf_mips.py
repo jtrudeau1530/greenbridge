@@ -2560,5 +2560,108 @@ class UnmappedSentinelSpanTest(unittest.TestCase):
                 self.assertEqual(total["chunk_metadata_ok"], len(mapped_indices))
 
 
+class DetileFastPathTest(unittest.TestCase):
+    def test_coalesce_x_runs_merges_contiguous_blocks(self):
+        self.assertEqual(ttpf._coalesce_x_runs([], 16), [])
+        self.assertEqual(ttpf._coalesce_x_runs([0, 16, 32, 128, 144, 64], 16),
+                         [(0, 48), (128, 32), (64, 16)])
+
+    def test_detile_matches_reference_formula_across_all_element_sizes_and_tiles(self):
+        def ref_detile(layout, mip, tiled):
+            pat = (ttpf.PATTERNS_4K if layout["tile"] == 4096 else ttpf.PATTERNS_64K)[
+                {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
+            bw, bh = layout["block_w"], layout["block_h"]
+            eb = layout["element_bytes"]
+            out = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
+            for y in range(mip["blocks_h"]):
+                for x in range(mip["blocks_w"]):
+                    off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
+                    for bit, s in enumerate(pat):
+                        if s > 0:
+                            off |= (((x + mip["tile_x"]) >> (s - 1)) & 1) << bit
+                        elif s < 0:
+                            off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
+                    at = (y * mip["blocks_w"] + x) * eb
+                    out[at:at + eb] = tiled[off:off + eb]
+            return bytes(out)
+
+        for fmt, eb in ((61, 1), (49, 2), (28, 4), (71, 8), (98, 16)):
+            for tile in (4096, 65536):
+                layout = ttpf.surface_layout(60, 44, fmt, 4, tile=tile)
+                for idx, mip in enumerate(layout["mips"]):
+                    nbytes = max(mip["padded_w"] * mip["padded_h"] * eb, tile)
+                    tiled = bytes((i * 131 + 17) & 255 for i in range(nbytes))
+                    with self.subTest(fmt=fmt, tile=tile, level=idx):
+                        self.assertEqual(ttpf.detile(layout, mip, tiled), ref_detile(layout, mip, tiled))
+
+        # Truncated input falls back to the exact slice behavior without raising ValueError.
+        layout_t = ttpf.surface_layout(64, 64, 98, 1, tile=4096)
+        mip_t = layout_t["mips"][0]
+        short_tiled = bytes(range(200))
+        self.assertEqual(ttpf.detile(layout_t, mip_t, short_tiled), ref_detile(layout_t, mip_t, short_tiled))
+
+
+    @staticmethod
+    def _ref_detile(layout, mip, tiled):
+        pat = (ttpf.PATTERNS_4K if layout["tile"] == 4096 else ttpf.PATTERNS_64K)[
+            {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
+        bw, bh, eb = layout["block_w"], layout["block_h"], layout["element_bytes"]
+        out = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
+        for y in range(mip["blocks_h"]):
+            for x in range(mip["blocks_w"]):
+                off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
+                for bit, s in enumerate(pat):
+                    if s > 0:
+                        off |= (((x + mip["tile_x"]) >> (s - 1)) & 1) << bit
+                    elif s < 0:
+                        off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
+                at = (y * mip["blocks_w"] + x) * eb
+                out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    def test_narrow_shapes_stream_and_match_reference(self):
+        for w, h in ((16384, 1), (1, 16384), (1, 1), (3, 1), (1, 3)):
+            for tile in (4096, 65536):
+                layout = ttpf.surface_layout(w, h, 28, 1, tile=tile)
+                mip = layout["mips"][0]
+                nbytes = max(mip["padded_w"] * mip["padded_h"] * 4, tile)
+                full = bytes((i * 131 + 17) & 255 for i in range(nbytes))
+                for tiled in (full, full[:nbytes // 3 + 5]):  # complete and truncated input
+                    with self.subTest(w=w, h=h, tile=tile, size=len(tiled)):
+                        self.assertEqual(ttpf.detile(layout, mip, tiled),
+                                         self._ref_detile(layout, mip, tiled))
+
+    def test_volume_slice_nonzero_z_truncated_matches_reference(self):
+        layout = ttpf.volume_surface_layout(16, 8, 8, 1, 2)
+        w, h, d = (layout["mips"][0][k] for k in ("blocks_w", "blocks_h", "blocks_d"))
+        linear = bytes((i * 7 + 3) & 255 for i in range(w * h * d * 2))
+        tiled = retile_volume(layout, linear)
+        for z in (0, 3, 7):
+            self.assertEqual(ttpf.detile_volume_slice(layout, tiled, z),
+                             linear[z * w * h * 2:(z + 1) * w * h * 2])
+        # Truncated allocation: the exact slice-copy fallback must match a per-element reference.
+        eb = layout["element_bytes"]
+        pat = ttpf.VOLUME_PATTERNS_4K[{1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
+        bw, bh, bd = layout["block_w"], layout["block_h"], layout["block_d"]
+        tiles_x = layout["mips"][0]["padded_w"] // bw
+        cut = tiled[:len(tiled) // 2 + 3]
+        for z in (1, 5):
+            ref = bytearray(w * h * eb)
+            for y in range(h):
+                for x in range(w):
+                    off = (z // bd) * layout["z_tile_stride"] + ((y // bh) * tiles_x + x // bw) * layout["tile"]
+                    for bit, s in enumerate(pat):
+                        if s >= 101:
+                            off |= ((z >> (s - 101)) & 1) << bit
+                        elif s < 0:
+                            off |= ((y >> (-s - 1)) & 1) << bit
+                        elif 0 < s < 100:
+                            off |= ((x >> (s - 1)) & 1) << bit
+                    at = (y * w + x) * eb
+                    ref[at:at + eb] = cut[off:off + eb]
+            self.assertEqual(ttpf.detile_volume_slice(layout, cut, z), bytes(ref))
+        self.assertEqual(ttpf.detile_volume_slice(layout, tiled, 0), linear[:w * h * 2])
+
+
 if __name__ == "__main__":
     unittest.main()

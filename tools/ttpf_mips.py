@@ -214,54 +214,161 @@ def surface_layout(width, height, fmt, mips, tile=4096):
         raise LayoutError(str(exc)) from exc
 
 
+def _coalesce_x_runs(x_offs, eb):
+    """Merge consecutive contiguous X offsets into (start_offset, byte_len) runs."""
+    if not x_offs:
+        return []
+    runs = []
+    start = x_offs[0]
+    run_len = eb
+    for xo in x_offs[1:]:
+        if xo == start + run_len:
+            run_len += eb
+        else:
+            runs.append((start, run_len))
+            start = xo
+            run_len = eb
+    runs.append((start, run_len))
+    return runs
+
+
 def detile(layout, mip, tiled):
     """Copy the mip's elements out of the tiled allocation into block-linear order."""
-    pat = (PATTERNS_4K if layout["tile"] == 4096 else PATTERNS_64K)[
-        {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[layout["element_bytes"]]]
-    bw, bh = layout["block_w"], layout["block_h"]
+    tile = layout["tile"]
     eb = layout["element_bytes"]
-    out = bytearray(mip["blocks_w"] * mip["blocks_h"] * eb)
-    for y in range(mip["blocks_h"]):
-        for x in range(mip["blocks_w"]):
-            off = ((y // bh) * (mip["padded_w"] // bw) + x // bw) * layout["tile"]
-            for bit, s in enumerate(pat):
-                if s > 0:
-                    off |= (((x + mip["tile_x"]) >> (s - 1)) & 1) << bit
-                elif s < 0:
-                    off |= (((y + mip["tile_y"]) >> (-s - 1)) & 1) << bit
-            at = (y * mip["blocks_w"] + x) * eb
+    pat = (PATTERNS_4K if tile == 4096 else PATTERNS_64K)[
+        {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
+    bw, bh = layout["block_w"], layout["block_h"]
+    w, h = mip["blocks_w"], mip["blocks_h"]
+    out = bytearray(w * h * eb)
+    if w == 0 or h == 0:
+        return bytes(out)
+    tx, ty = mip["tile_x"], mip["tile_y"]
+    tiles_x = mip["padded_w"] // bw
+    x_bits = [(1 << bit, s - 1) for bit, s in enumerate(pat) if s > 0]
+    y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
+
+    row_stride = tiles_x * tile
+
+    def y_base_of(y):
+        o = (y // bh) * row_stride
+        yy = y + ty
+        for mask, shift in y_bits:
+            if (yy >> shift) & 1:
+                o |= mask
+        return o
+
+    def x_off_of(x):
+        o = (x // bw) * tile
+        xx = x + tx
+        for mask, shift in x_bits:
+            if (xx >> shift) & 1:
+                o |= mask
+        return o
+
+    if h == 1:
+        # A single row has no X-table reuse: stream it, allocating no per-column or per-row tables.
+        y_base = y_base_of(0)
+        for x in range(w):
+            off = y_base + x_off_of(x)
+            at = x * eb
             out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    x_offs = [x_off_of(x) for x in range(w)]
+    max_x = max(x_offs)
+    max_y = max(map(y_base_of, range(h)))
+
+    if len(tiled) >= max_y + max_x + eb:
+        x_runs = _coalesce_x_runs(x_offs, eb)
+        src = memoryview(tiled)
+        dst = memoryview(out)
+        at = 0
+        for y in range(h):
+            y_base = y_base_of(y)
+            for xo, run in x_runs:
+                off = y_base + xo
+                dst[at:at + run] = src[off:off + run]
+                at += run
+    else:
+        for y in range(h):
+            y_base = y_base_of(y)
+            row_at = y * w * eb
+            for x, xo in enumerate(x_offs):
+                off = y_base + xo
+                at = row_at + x * eb
+                out[at:at + eb] = tiled[off:off + eb]
     return bytes(out)
 
 
 def detile_volume_slice(layout, tiled, z):
     """Copy one Z slice out of a 3D SW_4KB_S tiled volume into row-major linear order."""
+    tile = layout["tile"]
     eb = layout["element_bytes"]
     pat = VOLUME_PATTERNS_4K[{1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[eb]]
     bw, bh, bd = layout["block_w"], layout["block_h"], layout["block_d"]
     mip = layout["mips"][0]
     w, h = mip["blocks_w"], mip["blocks_h"]
+    out = bytearray(w * h * eb)
+    if w == 0 or h == 0:
+        return bytes(out)
     tiles_x = mip["padded_w"] // bw
     z_base = (z // bd) * layout["z_tile_stride"]
     z_in_tile = 0
     for bit, s in enumerate(pat):
         if s >= 101:
             z_in_tile |= ((z >> (s - 101)) & 1) << bit
-    out = bytearray(w * h * eb)
-    for y in range(h):
-        y_tile = (y // bh) * tiles_x
-        y_in_tile = z_in_tile
-        for bit, s in enumerate(pat):
-            if s < 0:
-                y_in_tile |= ((y >> (-s - 1)) & 1) << bit
-        row_at = y * w * eb
+    x_bits = [(1 << bit, s - 1) for bit, s in enumerate(pat) if 0 < s < 100]
+    y_bits = [(1 << bit, -s - 1) for bit, s in enumerate(pat) if s < 0]
+
+    row_stride = tiles_x * tile
+
+    def y_base_of(y):
+        o = z_base + (y // bh) * row_stride + z_in_tile
+        for mask, shift in y_bits:
+            if (y >> shift) & 1:
+                o |= mask
+        return o
+
+    def x_off_of(x):
+        o = (x // bw) * tile
+        for mask, shift in x_bits:
+            if (x >> shift) & 1:
+                o |= mask
+        return o
+
+    if h == 1:
+        # A single row has no X-table reuse: stream it, allocating no per-column or per-row tables.
+        y_base = y_base_of(0)
         for x in range(w):
-            off = z_base + (y_tile + x // bw) * layout["tile"] + y_in_tile
-            for bit, s in enumerate(pat):
-                if 0 < s < 100:
-                    off |= ((x >> (s - 1)) & 1) << bit
-            at = row_at + x * eb
+            off = y_base + x_off_of(x)
+            at = x * eb
             out[at:at + eb] = tiled[off:off + eb]
+        return bytes(out)
+
+    x_offs = [x_off_of(x) for x in range(w)]
+    max_x = max(x_offs)
+    max_y = max(map(y_base_of, range(h)))
+
+    if len(tiled) >= max_y + max_x + eb:
+        x_runs = _coalesce_x_runs(x_offs, eb)
+        src = memoryview(tiled)
+        dst = memoryview(out)
+        at = 0
+        for y in range(h):
+            y_base = y_base_of(y)
+            for xo, run in x_runs:
+                off = y_base + xo
+                dst[at:at + run] = src[off:off + run]
+                at += run
+    else:
+        for y in range(h):
+            y_base = y_base_of(y)
+            row_at = y * w * eb
+            for x, xo in enumerate(x_offs):
+                off = y_base + xo
+                at = row_at + x * eb
+                out[at:at + eb] = tiled[off:off + eb]
     return bytes(out)
 
 
