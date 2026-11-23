@@ -3,7 +3,7 @@
 // It creates the proxy through the registered d3d12_xs!D3D12XboxCreateDevice shim, then calls the measured Xbox
 // slots exactly as the guest would (raw function pointers, not the C++ interface):
 //   slot 14  CreateDescriptorHeap (returns a heap proxy)
-//   slot 26  GetCustomHeapProperties with the struct's buffer in RCX and the device in RDX
+//   slot 25/26 GetResourceAllocationInfo/GetCustomHeapProperties in the title's C form (return buffer first)
 //   heap 9/10 GetCPU/GetGPUDescriptorHandleForHeapStart (Xbox: 8-byte handle in RAX; the PC heap uses the
 //             hidden return pointer in RDX, so slot 14 wraps it)
 //   slot 62  CreateComputePipelineState
@@ -200,6 +200,30 @@ int main(int argc, char** argv) {
     const LUID real_luid = real ? real->GetAdapterLuid() : LUID{};
     check(proxy_luid.LowPart == real_luid.LowPart && proxy_luid.HighPart == real_luid.HighPart,
           "slot 43 forwards GetAdapterLuid (struct return)");
+    // Slot 25 returns a struct wider than 8 bytes. The console title calls it with the C ABI: the hidden
+    // return pointer first (RCX), then the device (RDX), then the arguments, and the buffer comes back in RAX
+    // (measured for slot 26 on the retail executable). Call slot 25 that way through a raw function pointer and compare
+    // with the PC device's own answer.
+    check(rt::d3d12_xs::device_slot_overridden(25), "device slot 25 is the C-ABI GetResourceAllocationInfo override");
+    if (real) {
+        using AllocInfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                                     const D3D12_RESOURCE_DESC*);
+        auto get_alloc_info = reinterpret_cast<AllocInfoFn>(proxy_vtbl[25]);
+        const D3D12_RESOURCE_DESC desc = buffer_desc();
+        D3D12_RESOURCE_ALLOCATION_INFO got{~0ull, ~0ull};
+        D3D12_RESOURCE_ALLOCATION_INFO* returned = get_alloc_info(&got, device.Get(), 0, 1, &desc);
+        const D3D12_RESOURCE_ALLOCATION_INFO want = real->GetResourceAllocationInfo(0, 1, &desc);
+        check(returned == &got, "slot 25 returns the caller's buffer in RAX");
+        check(got.SizeInBytes == want.SizeInBytes && got.Alignment == want.Alignment,
+              "slot 25 (C ABI) writes the PC device's GetResourceAllocationInfo into the caller's buffer");
+
+        // The runtime's own code calls the proxy through d3d12.h (PC form: this, then the return buffer). Slot 25
+        // still answers that form.
+        const D3D12_RESOURCE_ALLOCATION_INFO pc_info = device->GetResourceAllocationInfo(0, 1, &desc);
+        check(pc_info.SizeInBytes == want.SizeInBytes && pc_info.Alignment == want.Alignment,
+              "slot 25 still answers the PC (C++) form");
+    }
+
     D3D12_RESOURCE_DESC reserved_desc = buffer_desc();
     reserved_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> reserved;
