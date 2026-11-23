@@ -384,6 +384,11 @@ exported, and no body or other unrequested component is assembled. No game data 
 GLB is stored in the repository; `tests/test_skinned_glb.py` builds its own skeleton, skin
 buffer and GLB.
 
+`python -I tools/glb_inspect.py out.glb` reads the written file back with no glTF library and
+prints its mesh, skin (joint count) and animation counts, the POSITION bounding box and any
+field the exporter dropped; [models.md](models.md#skinned-glb-export) lists what the rest of
+the report carries.
+
 ## Texture parameter split
 
 The character material blocks carry several 32-bit parameter hashes before each 64-bit asset

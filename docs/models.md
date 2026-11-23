@@ -801,6 +801,20 @@ head (8,983 v) and biker jacket (9,818 v) produce one skin with 596 ped joints (
 jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconstruction error is
 6e-8 m. `python -I tests/test_skinned_glb.py` runs 19 synthetic tests and needs no game files.
 
+`tools/glb_inspect.py` reads such a GLB back without a library, so an export can be checked
+before it is opened in a viewer:
+
+```
+python -I tools/glb_inspect.py out.glb [--json report.json]
+```
+
+It prints the chunk layout and padding, the `counts` of scenes, nodes, meshes, materials, images,
+skins and animations, each mesh's primitive, vertex and triangle counts, each material's
+`baseColorTexture`, each skin's joint count, each animation's channels and duration, and the
+POSITION bounding box (marked `partial` when a POSITION accessor has no `min`/`max`). It reports
+what the JSON chunk says — a field the exporter dropped reads `(missing)` — and never infers
+geometry from the BIN chunk. Standard library only; no game files.
+
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
