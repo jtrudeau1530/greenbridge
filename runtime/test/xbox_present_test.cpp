@@ -863,20 +863,29 @@ int main() {
                 EXPECT(frame_matches(frame, &href, 1, false, 203.0, 2));
                 std::printf("compose: HDR10 plane to an SDR swapchain (tone mapped to SDR, white = 203 nits, peak 1000): within 2 levels of the model\n");
             } else {
-                // A real HDR10 swapchain: the 10-bit codes come out as they went in (plane 0, point, 1:1 PQ).
+                // A real HDR10 swapchain: the 10-bit codes come out as they went in (plane 0, point, 1:1 PQ). Vulkan packing:
+                // A2B10G10R10 has R in bits 0-9 and B in 20-29, A2R10G10B10 the reverse; G is bits 10-19 in both.
                 EXPECT(frame.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || frame.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+                const bool abgr = frame.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
                 bool ok = true;
                 for (UINT y = 0; y < height && ok; y += 7)
                     for (UINT x = 0; x < width && ok; x += 5) {
                         std::uint32_t word;
                         std::memcpy(&word, &frame.bytes[(std::size_t(y) * frame.extent.width + x) * 4], 4);
-                        const bool abgr = frame.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-                        const int r = int(abgr ? (word & 1023) : ((word >> 20) & 1023));
-                        const auto want = hdr.tex.px[std::size_t(y / 4) * 80 + x / 4];
-                        ok = std::abs(r - int(std::lround(want[0] * 1023.0))) <= 1;
+                        const int lo = int(word & 1023), g = int((word >> 10) & 1023), hi = int((word >> 20) & 1023);
+                        const int got[3] = {abgr ? lo : hi, g, abgr ? hi : lo};
+                        const auto src = hdr.tex.px[std::size_t(y / 4) * 80 + x / 4];
+                        int want[3];
+                        for (int c = 0; c < 3; ++c) {
+                            want[c] = int(std::lround(src[c] * 1023.0));
+                            ok = ok && std::abs(got[c] - want[c]) <= 1;
+                        }
+                        if (!ok)
+                            std::fprintf(stderr, "HDR10 pixel %u,%u is %d,%d,%d, expected %d,%d,%d\n", x, y, got[0], got[1], got[2],
+                                         want[0], want[1], want[2]);
                     }
                 EXPECT(ok);
-                std::printf("compose: HDR10 plane to an HDR10 (ST.2084) swapchain: codes within 1 of the source: ok\n");
+                std::printf("compose: HDR10 plane to an HDR10 (ST.2084) swapchain: R, G and B codes within 1 of the source: ok\n");
             }
             // Same plane, conversions to the PQ encoding of an 8-bit swapchain (test hook): an SDR overlay over it.
             xbox.presenter().force_hdr_encoding(true);
