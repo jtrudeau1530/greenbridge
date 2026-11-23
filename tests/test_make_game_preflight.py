@@ -868,6 +868,23 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             self.assertFalse(make_game.assets_exported(work))
             self.assert_fails(self.run_preflight, work, free_gb=220, match="about 330 GB is needed")
 
+    def test_stopped_export_counts_what_it_already_wrote(self):
+        # Before: a stopped export that had written 277 GB still asked for all 300 GB free, so it couldn't resume.
+        with tempfile.TemporaryDirectory() as work:
+            with mock.patch("make_game.tree_bytes", return_value=277 * 2**30):
+                self.run_preflight(work, free_gb=60)  # 30 for the shaders + 300 - 277
+                self.assert_fails(self.run_preflight, work, free_gb=40, match="about 53 GB is needed")
+
+    def test_tree_bytes_sums_files_under_the_folder(self):
+        with tempfile.TemporaryDirectory() as work:
+            sub = os.path.join(work, "a", "b")
+            os.makedirs(sub)
+            for p, n in ((os.path.join(work, "x"), 3), (os.path.join(sub, "y"), 5)):
+                with open(p, "wb") as f:
+                    f.write(b"\0" * n)
+            self.assertEqual(make_game.tree_bytes(work), 8)
+            self.assertEqual(make_game.tree_bytes(os.path.join(work, "missing")), 0)
+
     def test_marker_with_other_contents_does_not_count(self):
         for ogg, xma in (("", self.XMA), (self.OGG, "something else\n"), (self.XMA, self.OGG)):
             with self.subTest(ogg=ogg, xma=xma), tempfile.TemporaryDirectory() as work:
