@@ -402,7 +402,7 @@ to a half in most cases).
   archetype has a stream in both places. The data area also holds 1,282 `9FPR` tags after the file's own (1,281 of
   them 16-byte aligned), which read as nested packs: taking each tag as the start of one, the first 10 streams are
   the whole first nested pack, and the other 121 lie in 31 other packs, up to 19 in one; one archetype has streams
-  in two of them.
+  in two of those 31 packs.
 * **The light proxy.** 21 streams fit its 2-triangle drawable, 20 of them with the same header, one of which is
   stream 4; a quad of that size cannot be told from another drawable's.
 * **No BLAS.** Of the 16 exported archetypes without one, 11 have only geometries whose shaders the matched drawables
