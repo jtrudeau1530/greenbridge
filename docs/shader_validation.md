@@ -1829,6 +1829,55 @@ on k + 0.5, the error's sign gives floor(p) + 1 or floor(p), and a zero error ke
 probe then exits 0 on the same iGPU: all 134 words equal the translator's in all ten runs (wave32 and wave64, five
 MODEs), including the 28 near ties.
 
+### Division fixup (`tools/div_fixup_diff.py`)
+
+No other fuzzer generates `v_div_fixup_f16`, `v_div_fixup_f32` or `v_div_fixup_f64`. `tools/div_fixup_diff.py`
+runs them through the translator and `tests/semantic/spirv_mini_interp.py`, against a model of the `docs/design.md`
+rows that works on the operand bits and shares no code with the translator, and compares the four exported words bit
+for bit. The model:
+
+- `abs` then `neg` act on the sign bit of S0, S1 and S2, NaNs included.
+- f32 reads an S1 or S2 denormal as a zero of its sign and keeps an S0 denormal. f16 and f64 keep every denormal.
+- The first rule that holds gives the result: NaN(S2), NaN(S1), 0/0 or inf/inf (the negative quiet NaN), a zero
+  numerator or an inf denominator (zero), a zero denominator or an inf numerator (inf), the exponent cutoff
+  (`exp(S2) - exp(S1)` at most -151 on f32 and -1076 on f64, none on f16; zero), NaN(S0) (inf), S0's magnitude.
+  The sign is sign(S1) ^ sign(S2).
+- On f32, `mul:2`/`mul:4`/`div:2` scale the result, then `clamp` takes a NaN or any negative value to +0.
+- On f16 and f64, `mul:2`/`mul:4`/`div:2` change nothing: the `docs/design.md` row (#6314, measured on gfx1036 with
+  `tools/f64_omod_probe.py`) drops the scaling under `denorm_mode_16_64 = 3`, the game's `MODE`, while an f16 `clamp`
+  still saturates. The measured inputs are normal values; the reference applies the row to every result.
+
+`tests/test_div_fixup_diff.py` pins the model to the 73 gfx1036 rows of `tests/semantic/test_alu_div_fixup_f32.py`
+and to the f16 and f64 rows of `test_alu_div_fixup.py`, the measured exponent cutoffs among them.
+
+Sources are VGPRs, SGPRs, a literal (not on f64) and integer and float inline constants, within the GFX10 literal and
+constant-bus limits. An f64 source is a VGPR pair (odd first registers too), an SGPR pair or an inline constant, and
+`0.15915494309189532` is the binary64 1/(2 pi). Modifiers are `neg`/`abs`, `op_sel` on the f16 register sources and
+the destination, `clamp` on f16 and f32, and the output multipliers on all three. Not generated: a literal on f64
+(#3791 moves it to bits 63:32) and `clamp` on f64 (the translation needs Float64, which the interpreter does not run).
+
+An f32 NaN that went through an output multiplier matches any NaN. Some programs are counted as not judged, with the
+reason:
+- an f64 exponent cutoff that depends on how a denormal's exponent counts (only normal operands were measured);
+- an output multiplier on -0 without `clamp` (the hardware gives +0, not modelled), or on an f32 denormal;
+- `clamp` of a positive f32 denormal, of an f16 -0 or of an f16 NaN (`FClamp` of a NaN is undefined);
+- reading part of an f32 NaN whose payload is not modelled.
+
+Stages:
+1. A sweep of every encodable source-kind combination of each op.
+2. An edge grid: special values as S1 and S2 under five S0 values, the exponent cutoff one below, at and one above
+   (also against a NaN or inf S0, and on f64 with a denormal numerator), `abs`/`neg` on every kind of value, and
+   the output modifiers on each rule's result (f16 multipliers in both destination halves, with and without `clamp`).
+3. Random seeded programs, which read earlier results, f64 halves as f32 or f16 values included.
+
+A translator skip exits 1, as a mismatch does.
+
+```
+python -I tools/div_fixup_diff.py --programs 3000 --seed 11 --max-ops 8
+python -I tools/div_fixup_diff.py --ops v_div_fixup_f64 --programs 1000
+python -I tests/test_div_fixup_diff.py
+```
+
 ### `v_mad_f32`, `v_mac_f32`, `v_mad_legacy_f32` denormal flush on RDNA1 (`tools/mad_denorm_probe.py`, SHADER-340)
 
 `docs/design.md` ("Denormal flush in `v_mad_f32`, `v_mac_f32`, `v_mad_legacy_f32`") had no hardware measurement: GFX10.3+
