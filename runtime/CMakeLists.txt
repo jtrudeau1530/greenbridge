@@ -2664,6 +2664,10 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME d3d12_indirect_rt COMMAND d3d12_indirect_rt_test)
     set_tests_properties(d3d12_indirect_rt PROPERTIES SKIP_RETURN_CODE 77)
+    # Upload heaps in system memory, as on a GPU without Resizable BAR: their VAs can lie below the arena and wrap.
+    add_test(NAME d3d12_indirect_rt_upload_sysmem COMMAND d3d12_indirect_rt_test)
+    set_tests_properties(d3d12_indirect_rt_upload_sysmem PROPERTIES SKIP_RETURN_CODE 77
+                         ENVIRONMENT "LEONIDA_UPLOAD_SYSMEM=1")
 
     # The compute path: root signature, compute PSO from a translator-style index, root arguments, dispatch. Its
     # shader is GLSL written to the translator's push-constant/address contract, compiled here.
