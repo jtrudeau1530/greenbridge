@@ -1281,8 +1281,60 @@ interpreter that quiets the NaN. That form is left out unless `--known` (`class-
 ```
 python -I tools/fmisc_diff.py --programs 3000 --seed 11 --max-ops 8
 python -I tools/fmisc_diff.py --oracle hw --programs 500 --seed 1
+python -I tools/fmisc_diff.py --oracle hw,vk --programs 600 --seed 11 --max-ops 8 [--wave 64]
 python -I tests/test_fmisc_diff.py
 ```
+
+`--oracle hw,vk` also runs the translated programs on a real Vulkan GPU (`tools/vk_fuzz_run.py`: llvm-mc for gfx1013,
+`rdna2spirv.py`, `runtime/build/vk_compute_test`, `LEONIDA_VK_DEVICE`, `--build DIR`) as one wave of 32 or, with
+`--wave 64`, 64 identical lanes (the lane masks as 64-bit pairs; the hardware kernels run in the same wave size), and
+judges lane 0's four words against the hardware's, not the reference's: the interpreter cannot see a driver's denormal,
+NaN and rounding rules. The seeds are computed from the buffer fill at run time (`--vk-constants` keeps them as
+literals), because the AMD Windows driver (26.10.1) folds an ordered compare of a literal NaN to true in a wave32
+pipeline (`v_cmp_lt_f32 vcc_lo, -10.0, NaN`, fine in wave64 and on the RTX 5080; with run-time operands it is right).
+Differences are `denormal` (the reference declines the program for a denormal: f32 denormals are left to the driver),
+`omod_neg_zero` (an output modifier made the hardware's -0 a +0, the translated -0 stayed; #1281) and `mismatch`,
+which fails the run. Seeds 11 to 13, 600 programs each, up to 8 ops: Radeon gfx1036 wave32 597 match, 3 omod_neg_zero;
+wave64 593 match, 3 denormal, 4 omod_neg_zero; RTX 5080 wave32 595 match, 3 omod_neg_zero, 2 denormal; no mismatch.
+
+### Translated programs on a Vulkan GPU: `--oracle hw,vk` of `pk16_diff`, `vint_diff`, `wint_diff`, `sdwa_diff` (and `fmisc_diff`, `f32_fuzz`)
+
+These fuzzers judge the translator in `spirv_mini_interp`, which cannot see what a driver does with the SPIR-V. With
+`--oracle hw,vk` each program also runs through llvm-mc (gfx1013), `rdna2spirv.py` and `runtime/build/vk_compute_test`
+(`tools/vk_fuzz_run.py`; `--build DIR`, `--work DIR`, `LEONIDA_VK_DEVICE`) as one wave, and its words are judged against
+the hardware's words from a kernel run in the same wave size (`--wave 32` or `--wave 64`; wave64 needs native 64-wide
+subgroups, so the Radeon and not the RTX 5080). `pk16_diff`, `vint_diff` and `fmisc_diff` run identical lanes and judge
+lane 0, `sdwa_diff` too (its VCC seed differs per lane), `wint_diff` runs its per-lane programs in the wave size they were
+generated for and judges every lane. The `v_mov_b32 vN, K` seeds of the lane-identical tools become `K ^ 0xEEEEEEEE`
+xor the buffer fill vk_compute_test leaves in the output (`--vk-constants` keeps literals): the AMD Windows driver
+(26.10.1) folds an ordered compare of a literal NaN to true in a wave32 pipeline, which says nothing about a shader given
+a NaN at run time.
+
+```
+python -I tools/pk16_diff.py --oracle hw,vk --programs 500 --seed 201 --max-ops 8 [--wave 64]
+python -I tools/vint_diff.py --oracle hw,vk --programs 500 --seed 203
+python -I tools/sdwa_diff.py --oracle hw,vk --family f16 --programs 500 --seed 211
+python -I tools/wint_diff.py --oracle hw,vk --wave both --programs 400 --seed 221
+```
+
+Fresh seeds, 400 to 500 programs each (AMD Radeon iGPU gfx1036, driver 26.10.1, and NVIDIA GeForce RTX 5080, driver
+616.92; the f16 SDWA programs also count `nan`: the reference declines an f16 NaN, the hardware kernels run with IEEE on):
+
+| tool | Radeon wave32 | Radeon wave64 | RTX 5080 wave32 |
+|---|---|---|---|
+| `pk16_diff` | 492 match, 8 mismatch | 492 match, 8 mismatch | 500 match |
+| `vint_diff` | 500 match | 500 match | 500 match |
+| `sdwa_diff --family int` | 500 match | 498 match, 2 mismatch | 500 match |
+| `sdwa_diff --family f16` | 499 match, 1 nan | 498 match, 2 mismatch | 490 match, 10 nan |
+| `wint_diff` | 398 match, 2 mismatch (wave32 and wave64 programs together) | | 400 match |
+
+The pk16 mismatches were `v_med3_i16` with a constant operand (seven of eight on wave64, five of eight on wave32; the
+rest `v_pk_*` or `v_min_i16`): the AMD driver returned a bound instead of the middle value for the translated
+min/max/clamp median (fixed by the sum-minus-min-and-max form, GPU test `cs_med3_i16`). The others are Radeon-only and
+not fixable in the translator as far as measured: `v_not_b32_sdwa v4, v3 dst_sel:WORD_0 dst_unused:UNUSED_PAD
+src0_sel:BYTE_0` with v3 = 0xffff gives 0xffffff00 where the hardware gives 0x0000ff00 in a wave64 pipeline (the same
+with the field extracts written as shifts and a mask), and `v_cvt_f32_f16_sdwa ... dst_sel:WORD_1` of an f16 denormal
+differs in the low bits of the result.
 
 ### binary64 VALU on the CPU and Vulkan (`tools/f64_diff.py`, FUZZ-55)
 
