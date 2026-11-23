@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -575,6 +576,50 @@ class SkinnedGlbTest(unittest.TestCase):
             skinned_glb.infer_ped_parent("GM_TEST_L_UpperArm_O", jset.ped_by_name, jset._by_name),
             4,
         )
+
+    def test_write_uses_unique_temp_when_fixed_name_is_a_directory(self):
+        source_root = os.path.join(self.root, "stale")
+        skeleton = _skeleton_dir(source_root)
+        component = _component(source_root)
+        out = os.path.join(self.root, "nested", "out.glb")
+        stale = out + ".tmp"
+        os.makedirs(stale)
+        saved = skinned_glb._np
+        try:
+            skinned_glb._np = None
+            stats = skinned_glb.write_skinned_glb(out, skeleton, [component])
+        finally:
+            skinned_glb._np = saved
+        self.assertEqual(stats["joints"], 4)
+        self.assertTrue(os.path.isfile(out))
+        with open(out, "rb") as handle:
+            self.assertEqual(handle.read(4), b"glTF")
+        self.assertTrue(os.path.isdir(stale))
+        self.assertEqual([n for n in os.listdir(os.path.dirname(out)) if n.startswith("out.glb.")],
+                         ["out.glb.tmp"])
+
+    def test_failed_replace_leaves_no_readonly_temp(self):
+        source_root = os.path.join(self.root, "locked")
+        skeleton = _skeleton_dir(source_root)
+        component = _component(source_root)
+        out = os.path.join(self.root, "locked.glb")
+        with open(out, "wb") as handle:
+            handle.write(b"old")
+        os.chmod(out, 0o444)
+        saved = skinned_glb._np
+        try:
+            skinned_glb._np = None
+            with mock.patch.object(skinned_glb.os, "replace", side_effect=OSError("replace denied")):
+                with self.assertRaises(OSError):
+                    skinned_glb.write_skinned_glb(out, skeleton, [component])
+        finally:
+            skinned_glb._np = saved
+            os.chmod(out, 0o644)
+        leftovers = [n for n in os.listdir(self.root)
+                     if n.startswith("locked.glb.") and n.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+        with open(out, "rb") as handle:
+            self.assertEqual(handle.read(), b"old")
 
     def test_cli_returns_nonzero_for_bad_input(self):
         result = subprocess.run(
