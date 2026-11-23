@@ -368,6 +368,7 @@ public:
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
         render_targets_.fill({});
         render_target_count_ = count;
+        draw_views_stale_ = true;
         for (UINT i = 0; i < count && targets; ++i) {
             const SIZE_T handle = single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr;
             if (handle) render_targets_[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
@@ -989,6 +990,10 @@ private:
     leonida::Rect scissor_{};
     std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets_{};
     UINT render_target_count_ = 0;
+    // One block shared by every draw that keeps the same targets and buffers, rebuilt when either changes, so a
+    // run of draws does not allocate per draw.
+    std::shared_ptr<const leonida::DrawViews> draw_views_;
+    bool draw_views_stale_ = true;
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
 
@@ -1053,12 +1058,14 @@ private:
         scissor_ = {};
         render_targets_.fill({});
         render_target_count_ = 0;
+        draw_views_stale_ = true;
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
         set_pipeline(state);
     }
 
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
+        if (count) draw_views_stale_ = true;
         for (UINT i = 0; i < count; ++i)
             vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
                                                                           views[i].StrideInBytes}
@@ -1075,16 +1082,28 @@ private:
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
 
+    // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
+    const std::shared_ptr<const leonida::DrawViews>& draw_views() {
+        if (draw_views_stale_ || !draw_views_) {
+            auto views = std::make_shared<leonida::DrawViews>();
+            views->render_targets = render_targets_;
+            views->vertex_buffers = vertex_buffers_;
+            views->render_target_count = render_target_count_;
+            draw_views_ = std::move(views);
+            draw_views_stale_ = false;
+        }
+        return draw_views_;
+    }
+
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
-                           vertex_buffers_, index_, topology_, viewport_, scissor_,
-                           blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
-                           base_vertex, first_instance, render_target_count_};
+        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
+                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
+                           first, base_vertex, first_instance};
         check(list_.draw(std::move(draw)));
     }
 };
@@ -1542,8 +1561,11 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
 }
 
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device) {
-    if (!out) return E_POINTER;
-    *out = nullptr;
+    // The host runtime's order (d3d12_vulkan_device_test, compare_invalid_arguments "command allocator:"): a type
+    // past VIDEO_ENCODE is E_INVALIDARG, then a null output is E_UNEXPECTED.
+    if (out) *out = nullptr;
+    if (UINT(type) > UINT(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)) return E_INVALIDARG;
+    if (!out) return E_UNEXPECTED;
     auto* object = new CommandAllocator(type);
     object->attach_device(device);
     return hand_out(object, riid, out);
@@ -1551,12 +1573,13 @@ HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void
 
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
                             void** out, IUnknown* device, ID3D12PipelineState* initial_state) {
-    if (!out) return E_POINTER;
-    *out = nullptr;
+    if (out) *out = nullptr;
     CommandAllocator* command_allocator = CommandAllocator::from(allocator);
     if (!command_allocator || command_allocator->type() != type) return E_INVALIDARG;
     // A list is created open, so the allocator must be free: E_INVALIDARG as on the PC runtime (D3D-51).
     if (command_allocator->recording()) return E_INVALIDARG;
+    // A null output only after the arguments, as the host runtime answers ("command list:" cases).
+    if (!out) return E_UNEXPECTED;
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
         type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY)
         stub("create_command_list(non-direct type)");

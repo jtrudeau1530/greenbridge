@@ -628,6 +628,38 @@ class ImportTest(unittest.TestCase):
 class MalformedJsavTest(unittest.TestCase):
     """A truncated or lying JSAV is one error line, not a struct.error traceback."""
 
+    def test_excessive_json_body_nesting_is_a_validation_error(self):
+        # Linux CPython 3.12 can accept 6,000 levels; exercise the C decoder's higher limit too.
+        block = b'{"nested":' + b'[' * 100_000 + b'0' + b']' * 100_000 + b'}'
+        data = saves.build_jsav(3, 1, [1], [1], [block])
+        with self.assertRaisesRegex(ValueError, r"JSAV body is not valid UTF-8 JSON"):
+            saves.parse_jsav(data)
+
+    def test_all_read_commands_refuse_excessive_nesting_without_changing_exports(self):
+        block = b'{"nested":' + b'[' * 100_000 + b'0' + b']' * 100_000 + b'}'
+        data = saves.build_jsav(3, 1, [1], [1], [block])
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "deep.jsav"), os.path.join(tmp, "export")
+            index = os.path.join(out, "index.json")
+            prior_block = os.path.join(out, "blocks", "previous.json")
+            write(source, data)
+            write(index, b"previous complete index")
+            write(prior_block, b"previous complete block")
+            for args in (("info", source), ("verify", source),
+                         ("diff", source, source), ("extract", source, out)):
+                with self.subTest(command=args[0]):
+                    result = subprocess.run([sys.executable, "-I", TOOL, *args],
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("ERROR: JSAV body is not valid UTF-8 JSON", result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(rd(source), data)
+                    self.assertEqual(rd(index), b"previous complete index")
+                    self.assertEqual(rd(prior_block), b"previous complete block")
+                    self.assertEqual(sorted(os.listdir(out)), ["blocks", "index.json"])
+                    self.assertEqual(os.listdir(os.path.join(out, "blocks")), ["previous.json"])
+
     def test_entry_ranges_must_stay_inside_the_json_body(self):
         original, _, _ = make_jsav()
         header, entries = saves.parse_jsav(original)
@@ -821,6 +853,27 @@ class PackIndexValidationTest(unittest.TestCase):
                     saves.pack_from_dir(self.extracted)
                 self.assertIn(self.index_path, str(error.exception))
                 self.assertIn("invalid JSON", str(error.exception))
+
+    def test_excessive_json_nesting_names_the_index(self):
+        # The C decoder's limit differs by platform; Linux CPython 3.12 accepts 6,000 levels.
+        write(self.index_path, b"[" * 100_000 + b"0" + b"]" * 100_000)
+        with self.assertRaises(ValueError) as error:
+            saves.pack_from_dir(self.extracted)
+        self.assertIn(self.index_path, str(error.exception))
+        self.assertIn("invalid JSON", str(error.exception))
+
+    def test_cli_excessive_json_nesting_preserves_existing_output(self):
+        write(self.index_path, b"[" * 100_000 + b"0" + b"]" * 100_000)
+        out = os.path.join(self.tmp.name, "packed.jsav")
+        write(out, b"previous complete output")
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertIn(self.index_path, result.stderr)
+        self.assertIn("invalid JSON", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(rd(out), b"previous complete output")
 
     def test_valid_editable_metadata_still_round_trips(self):
         self.index["header"]["note"] = "extra metadata is ignored"

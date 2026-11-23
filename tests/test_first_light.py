@@ -201,6 +201,184 @@ class ShaderPreparationTests(unittest.TestCase):
                 self.assertEqual(manifest[stage]["fssm_sha256"], stage + "-fixture")
 
 
+LINK_KINDS = ("symlink", "junction") if os.name == "nt" else ("symlink",)
+
+
+def link_folder(kind: str, link: Path, target: Path) -> bool:
+    """Make a directory symlink or a Windows junction; False where this machine does not allow it."""
+    if kind == "junction":
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+        return made.returncode == 0
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+class RunFolderTests(unittest.TestCase):
+    """first_light/dxbc and first_light/spirv hold one run's pair, whatever an earlier run left there.
+
+    Fully synthetic: the containers are a few hand-written bytes, and the unpacker, the disassembler and the
+    translator are replaced by stand-ins that, like the real tools, take every file in the folder they are given.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="first-light-run-folders-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.work = self.tmp / "work"
+        self.staged = self.work / "first_light" / "dxbc"
+        self.spirv = self.work / "first_light" / "spirv"
+        carved = self.work / "shaders" / "dxbc"
+        carved.mkdir(parents=True)
+        entries = [
+            {"name": "vertex", "file": "vertex.dxbc", "stage": "vs"},
+            {"name": "first", "file": "first.dxbc", "stage": "ps"},
+            {"name": "second", "file": "second.dxbc", "stage": "ps"},
+        ]
+        (carved / "index.json").write_text(json.dumps(entries), encoding="utf-8", newline="\n")
+        for entry in entries:
+            (carved / entry["file"]).write_bytes(entry["name"].encode("ascii"))
+        self.handed = []  # per translator run: the listings it was given
+
+    def tools(self, argv: list[str]) -> None:
+        tool = Path(argv[0]).name
+        src = Path(argv[1])
+        if tool == "fssm_unpack.py":
+            (src / "fssm").mkdir(exist_ok=True)
+            for container in sorted(src.glob("*.dxbc")):
+                (src / "fssm" / f"{container.stem}.fssm").write_bytes(container.read_bytes())
+            return
+        out = Path(argv[argv.index("--out") + 1])
+        out.mkdir(exist_ok=True)
+        if tool == "shader_disasm.py":
+            for blob in sorted(src.glob("*.fssm")):
+                (out / f"{blob.stem}.s").write_bytes(blob.read_bytes())
+            return
+        self.assertEqual(tool, "rdna2spirv.py")
+        stages = {Path(e["file"]).stem: e["stage"]
+                  for e in json.loads((src.parent / "index.json").read_text(encoding="utf-8"))}
+        index_path = out / "index.json"  # the translator merges a small run into an index it finds
+        index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.is_file() else {}
+        listings = sorted(src.glob("*.s"))
+        for listing in listings:
+            (out / f"{listing.stem}.spv").write_bytes(b"spv " + listing.read_bytes())
+            index[listing.stem] = {"stage": stages.get(listing.stem, "?"), "fssm_sha256": listing.stem}
+        index_path.write_text(json.dumps(index), encoding="utf-8", newline="\n")
+        self.handed.append([listing.stem for listing in listings])
+
+    def prepare(self, ps: str, *extra: str) -> None:
+        with patch.object(fl, "run", side_effect=self.tools), redirect_stdout(io.StringIO()):
+            self.assertEqual(fl.main(["--game", str(self.tmp), "--work", str(self.work), "--no-fit",
+                                      "--vs", "vertex", "--ps", ps, *extra]), 0)
+
+    def files(self, folder: Path) -> list[str]:
+        return sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file())
+
+    def test_a_second_run_holds_only_its_own_pair(self) -> None:
+        other_out = self.work / "first_light" / "out_first"
+        self.prepare("first", "--out", str(other_out))
+        self.assertEqual(self.handed, [["first", "vertex"]])
+        (self.staged / "leftover.dxbc").write_bytes(b"leftover")  # a container no run selected
+        (self.spirv / "leftover.spvasm").write_bytes(b"leftover")
+        carved_before = {name: (self.work / "shaders" / "dxbc" / name).read_bytes()
+                         for name in self.files(self.work / "shaders" / "dxbc")}
+        other_out_before = {name: (other_out / name).read_bytes() for name in self.files(other_out)}
+
+        self.prepare("second")
+
+        self.assertEqual(self.handed[1], ["second", "vertex"])
+        self.assertEqual(self.files(self.staged),
+                         ["disasm/second.s", "disasm/vertex.s", "fssm/second.fssm", "fssm/vertex.fssm",
+                          "index.json", "second.dxbc", "vertex.dxbc"])
+        self.assertEqual(self.files(self.spirv), ["index.json", "second.spv", "vertex.spv"])
+        translated = json.loads((self.spirv / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual({stem: meta["stage"] for stem, meta in translated.items()},
+                         {"second": "ps", "vertex": "vs"})
+        out = self.work / "first_light" / "out"
+        self.assertEqual((out / "ps.dxbc").read_bytes(), b"second")
+        self.assertEqual((out / "ps.spv").read_bytes(), b"spv second")
+        # Only the two run folders are emptied: the carve and the other run's --out are as they were.
+        self.assertEqual({name: (self.work / "shaders" / "dxbc" / name).read_bytes()
+                          for name in self.files(self.work / "shaders" / "dxbc")}, carved_before)
+        self.assertEqual({name: (other_out / name).read_bytes() for name in self.files(other_out)},
+                         other_out_before)
+        self.assertEqual((other_out / "ps.dxbc").read_bytes(), b"first")
+
+    def linked(self, kind: str, where: str) -> tuple[Path, Path]:
+        """A work folder whose first_light/<where> is a link of this kind to a folder outside it."""
+        work, outside = self.tmp / kind / "work", self.tmp / kind / "outside"
+        (outside / "dxbc").mkdir(parents=True)
+        for keep in (outside / "keep.dxbc", outside / "dxbc" / "keep.dxbc"):
+            keep.write_bytes(b"keep")
+        link = work / "first_light" / where
+        link.parent.mkdir(parents=True)
+        if not link_folder(kind, link, outside):
+            self.skipTest(f"cannot create a {kind} here")
+        return work, outside
+
+    def test_a_link_inside_a_run_folder_is_removed_not_followed(self) -> None:
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.linked(kind, os.path.join("dxbc", "link"))
+                staged = work / "first_light" / "dxbc"
+                self.assertEqual(fl.reset_run_folders(str(work)), str(staged))
+                self.assertEqual(os.listdir(staged), [])
+                self.assertEqual(self.files(outside), ["dxbc/keep.dxbc", "keep.dxbc"])
+
+    def test_a_run_folder_that_is_a_link_is_refused(self) -> None:
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.linked(kind, "spirv")
+                staged = work / "first_light" / "dxbc"
+                staged.mkdir()
+                (staged / "earlier.dxbc").write_bytes(b"earlier")
+                with self.assertRaises(SystemExit) as refused:
+                    fl.reset_run_folders(str(work))
+                self.assertIn(str(work / "first_light" / "spirv"), str(refused.exception))
+                self.assertNotIn("\n", str(refused.exception))
+                self.assertEqual(self.files(outside), ["dxbc/keep.dxbc", "keep.dxbc"])
+                self.assertEqual(os.listdir(staged), ["earlier.dxbc"])  # refused before anything is removed
+
+    def test_a_first_light_folder_that_is_a_link_is_refused(self) -> None:
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.linked(kind, "")
+                with self.assertRaises(SystemExit) as refused:
+                    fl.reset_run_folders(str(work))
+                self.assertIn(str(work / "first_light"), str(refused.exception))
+                self.assertNotIn("\n", str(refused.exception))
+                self.assertEqual(self.files(outside), ["dxbc/keep.dxbc", "keep.dxbc"])
+
+    def test_a_linked_first_light_with_no_run_folders_is_refused_too(self) -> None:
+        # Nothing stale lies behind the link, so only the check of first_light itself can refuse it; without that
+        # check the new dxbc was created in the folder the link points to, outside the work folder.
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.tmp / kind / "work", self.tmp / kind / "outside"
+                outside.mkdir(parents=True)
+                work.mkdir()
+                if not link_folder(kind, work / "first_light", outside):
+                    self.skipTest(f"cannot create a {kind} here")
+                with self.assertRaises(SystemExit) as refused:
+                    fl.reset_run_folders(str(work))
+                self.assertIn(str(work / "first_light"), str(refused.exception))
+                self.assertNotIn("\n", str(refused.exception))
+                self.assertEqual(os.listdir(outside), [])
+
+    def test_a_file_that_cannot_be_removed_stops_the_run(self) -> None:
+        self.prepare("first")
+        held = self.staged / "first.dxbc"
+        denied = PermissionError(13, "Permission denied", str(held))
+        with patch.object(fl.shutil, "rmtree", side_effect=denied), self.assertRaises(SystemExit) as stopped:
+            self.prepare("second")
+        self.assertIn(str(held), str(stopped.exception))
+        self.assertIn("Permission denied", str(stopped.exception))
+        self.assertNotIn("\n", str(stopped.exception))
+        self.assertEqual(self.handed, [["first", "vertex"]])  # nothing was translated from the stale folder
+
+
 class OracleTests(unittest.TestCase):
     """The readback oracle on synthetic images: the controls run without a GPU or a game package."""
 
@@ -315,6 +493,13 @@ class TexturedOracleTests(unittest.TestCase):
         pixels[1 * 4 + 1] = list(probe)
         return struct.pack("<64f", *(v for pixel in pixels for v in pixel))
 
+    @staticmethod
+    def _make_raw(width: int, height: int, overrides: dict[tuple[int, int], tuple[float, float, float, float]]) -> bytes:
+        pixels = [[CLEAR] * 4 for _ in range(width * height)]
+        for (x, y), rgba in overrides.items():
+            pixels[y * width + x] = list(rgba)
+        return struct.pack(f"<{width * height * 4}f", *(v for pixel in pixels for v in pixel))
+
     def test_accepts_expected_textured_image(self):
         check_image(self.image(), self.manifest)
 
@@ -406,6 +591,107 @@ class TexturedOracleTests(unittest.TestCase):
                 blob = f.read()
             self.assertEqual(blob[:8], struct.pack("<II", 2, 2))
             self.assertEqual(blob[8:], pixels)
+
+    def test_off_centre_default_uv_triangle_gets_probes_and_rejects_magenta(self):
+        # Off-centre triangle in the top-left quadrant with default (0, 0) UVs: centre_uv is None
+        # and uv_probes() is empty (|u - v| == 0). rgba_probes_for_mesh() must still pick covered
+        # pixels so a magenta fallback draw is rejected when red is expected.
+        verts = [
+            (-0.9, -0.9, 0.5, 0.0, 0.0),
+            (-0.2, -0.9, 0.5, 0.0, 0.0),
+            (-0.9, -0.2, 0.5, 0.0, 0.0),
+        ]
+        indices = [0, 1, 2]
+        self.assertIsNone(fl.uv_at(verts, indices, 16, 16, 32, 32))
+        self.assertEqual(fl.uv_probes(verts, indices, 32, 32), [])
+        red_tex = bytes([255, 0, 0, 255])
+        probes = fl.rgba_probes_for_mesh(verts, indices, 32, 32, 1, 1, red_tex, uv_probe_list=[])
+        self.assertTrue(len(probes) >= 1)
+        manifest = {
+            "width": 32,
+            "height": 32,
+            "min_coverage": 0.01,
+            "max_coverage": 0.99,
+            "clear_pixel": [31, 31],
+            "clear": -1.0,
+            "texture": {"width": 1, "height": 1},
+            "rgba_tolerance": 0.02,
+            "rgba_probes": probes,
+        }
+        # Build synthetic image: covered pixels in the triangle set to red vs magenta fallback.
+        covered_pixels = {
+            (px, py)
+            for py in range(32)
+            for px in range(32)
+            if fl.uv_at(verts, indices, px, py, 32, 32) is not None
+        }
+        self.assertTrue(len(covered_pixels) > 0)
+        red_img = self._make_raw(
+            32, 32,
+            {pos: (1.0, 0.0, 0.0, 1.0) for pos in covered_pixels},
+        )
+        res = fl.check_image(red_img, manifest)
+        self.assertEqual(res["covered"], len(covered_pixels))
+        magenta_img = self._make_raw(
+            32, 32,
+            {pos: (1.0, 0.0, 1.0, 1.0) for pos in covered_pixels},
+        )
+        with self.assertRaises(AssertionError):
+            fl.check_image(magenta_img, manifest)
+        # Empty-probe textured manifest and fallback-indistinguishable expected colour are both rejected.
+        empty_manifest = dict(manifest, rgba_probes=[])
+        with self.assertRaises(AssertionError):
+            fl.check_image(magenta_img, empty_manifest)
+        magenta_manifest = dict(
+            manifest,
+            rgba_probes=[{"pixel": probes[0]["pixel"], "uv": [0.0, 0.0], "rgba": [1.0, 0.0, 1.0, 1.0]}],
+        )
+        with self.assertRaises(AssertionError):
+            fl.check_image(magenta_img, magenta_manifest)
+
+    def test_nan_channels_rejected(self):
+        nan = float("nan")
+        # NaN in centre_rgba must fail (abs(NaN) > tol is False without an explicit finiteness check).
+        with self.assertRaises(AssertionError):
+            fl.check_image(self.image(centre=(nan, 0.4, 0.6, 1.0)), self.manifest)
+        # NaN in rgba_probes must fail.
+        with self.assertRaises(AssertionError):
+            fl.check_image(self.image(probe=(0.8, nan, 0.1, 1.0)), self.manifest)
+        # NaN in clear_pixel must fail.
+        raw_clear_nan = self._make_raw(
+            4, 4,
+            {
+                (0, 0): (nan, -1.0, -1.0, -1.0),
+                (1, 1): (0.8, 0.2, 0.1, 1.0),
+                (2, 1): (0.2, 0.4, 0.6, 1.0),
+                (1, 2): (0.2, 0.4, 0.6, 1.0),
+                (2, 2): (0.2, 0.4, 0.6, 1.0),
+            },
+        )
+        with self.assertRaises(AssertionError):
+            fl.check_image(raw_clear_nan, self.manifest)
+
+    def test_transparent_unorm_fragments_counted_as_covered(self):
+        # Valid transparent-red UNORM fragments (alpha == 0.0) must be counted as covered by
+        # distinguishing them from the -1.0 clear sentinel rather than requiring alpha > 0.5.
+        manifest = {
+            "width": 4,
+            "height": 4,
+            "min_coverage": 0.2,
+            "max_coverage": 0.9,
+            "centre_pixel": [2, 2],
+            "centre_rgba": [1.0, 0.0, 0.0, 0.0],
+            "clear_pixel": [0, 0],
+            "clear": -1.0,
+            "texture": {"width": 1, "height": 1},
+            "rgba_tolerance": 0.02,
+            "rgba_probes": [{"pixel": [1, 1], "uv": [0.0, 0.0], "rgba": [1.0, 0.0, 0.0, 0.0]}],
+        }
+        overrides = {(x, y): (1.0, 0.0, 0.0, 0.0) for x in (1, 2) for y in (1, 2)}
+        raw = self._make_raw(4, 4, overrides)
+        res = fl.check_image(raw, manifest)
+        self.assertEqual(res["covered"], 4)
+        self.assertAlmostEqual(res["ratio"], 0.25)
 
 
 if __name__ == "__main__":

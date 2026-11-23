@@ -19,6 +19,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -26,6 +27,8 @@
 #include <vector>
 
 #include "base_reservation.h"
+#include "code_hooks.h"
+#include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
@@ -56,16 +59,19 @@ extern "C" __declspec(allocate(".CRT$XCT")) void(__cdecl* const gta6rt_reserve_t
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--trace FILE]\n"
-                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
+                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
     return 2;
 }
 
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    std::filesystem::path image, game_dir, overlay_dir;
+    std::filesystem::path image, game_dir, overlay_dir, mods_dir;
+    uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
+    int archetype_lookup_arg = 0;
+    uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     std::wstring trace_file;
@@ -82,6 +88,22 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--trace" && i + 1 < argc) trace_file = argv[++i];
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
+        else if (a == L"--mods" && i + 1 < argc) mods_dir = argv[++i];
+        else if (a == L"--view-mode-getter" && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const unsigned long rva = std::wcstoul(argv[++i], &end, 16);
+            if (!end || *end || rva == 0) return usage();
+            view_mode_getter_rva = static_cast<uint32_t>(rva);
+        }
+        else if (a == L"--archetype-lookup" && i + 1 < argc) {
+            const std::wstring v = argv[++i];
+            const auto comma = v.find(L',');
+            wchar_t* end = nullptr;
+            const unsigned long rva = std::wcstoul(v.substr(0, comma).c_str(), &end, 16);
+            if (!end || *end || rva == 0) return usage();
+            archetype_lookup_rva = static_cast<uint32_t>(rva);
+            if (comma != std::wstring::npos) archetype_lookup_arg = v.substr(comma + 1) == L"1" ? 1 : 0;
+        }
         else if (image.empty()) image = a;
         else return usage();
     }
@@ -105,6 +127,34 @@ int wmain(int argc, wchar_t** argv) {
     // GAME: paths read under --game-dir; whatever a title writes lands in the overlay, never in the package.
     if (overlay_dir.empty()) overlay_dir = game_dir / "overlay";
     rt::fs::configure(game_dir, overlay_dir);
+    // Mods (docs/modding.md): <folder of gta6rt.exe>\mods unless --mods names another. Loaded and reported here;
+    // the archetype swaps take effect once the game's archetype lookup is hooked for this executable version.
+    if (mods_dir.empty()) {
+        std::wstring self(32768, L'\0');
+        const DWORD n = GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size()));
+        if (n && n < self.size()) mods_dir = std::filesystem::path(self.substr(0, n)).parent_path() / L"mods";
+    }
+    {
+        const leonida::mods::LoadResult mods = leonida::mods::load_mods(mods_dir);
+        for (const std::string& e : mods.errors) std::fprintf(stderr, "[rt] mods: skipped %s\n", e.c_str());
+        for (const auto& m : mods.mods) {
+            std::fprintf(stderr, "[rt] mods: %s%s\n", m.name.c_str(), m.enabled ? "" : " (disabled)");
+            for (const auto& sw : m.archetype_swaps)
+                std::fprintf(stderr, "[rt] mods:   archetype %s (0x%08X) -> %s (0x%08X)\n", sw.from_name.c_str(),
+                             sw.from, sw.to_name.c_str(), sw.to);
+        }
+        leonida::mods::set_active(leonida::mods::ArchetypeSwaps(mods.mods));
+        const leonida::mods::CameraView camera = leonida::mods::camera_of(mods.mods);
+        leonida::mods::set_active_camera(camera);
+        if (camera.first_person)
+            std::fprintf(stderr, "[rt] mods: first-person view (value %u) for %s%s\n", camera.first_person_value,
+                         camera.contexts.empty() ? "every context" : "the listed contexts",
+                         view_mode_getter_rva ? "" : "; not applied: no --view-mode-getter RVA for this executable");
+        if (leonida::mods::active().size())
+            std::fprintf(stderr, archetype_lookup_rva ? "[rt] mods: %zu archetype swap(s) loaded\n"
+                                 : "[rt] mods: %zu archetype swap(s) loaded; not applied: no --archetype-lookup RVA for "
+                                   "this executable (docs/modding.md)\n", leonida::mods::active().size());
+    }
     rt::d3d12_trace::set_enabled(trace_d3d12);
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
@@ -128,6 +178,29 @@ int wmain(int argc, wchar_t** argv) {
                          "another module's TLS through slot 0, so it is not run\n",
                          main_module.name.c_str(), why.c_str());
             return 1;
+        }
+        // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
+        // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
+        if (view_mode_getter_rva) {
+            const auto r = leonida::hooks::hook_image_results(main_module.base, view_mode_getter_rva,
+                                                              &leonida::mods::override_view_mode);
+            if (r.ok)
+                std::fprintf(stderr, "[rt] mods: view-mode getter at RVA 0x%X hooked: %zu direct call(s) redirected\n",
+                             view_mode_getter_rva, r.redirected);
+            else
+                std::fprintf(stderr, "[rt] mods: view-mode getter at RVA 0x%X not hooked: %s\n", view_mode_getter_rva,
+                             r.error);
+        }
+        if (archetype_lookup_rva) {
+            const auto r = leonida::hooks::hook_image_calls(
+                main_module.base, archetype_lookup_rva,
+                [](uint32_t hash) { return leonida::mods::active().remap(hash); }, archetype_lookup_arg);
+            if (r.ok)
+                std::fprintf(stderr, "[rt] mods: archetype lookup at RVA 0x%X hooked (argument %d): %zu direct "
+                                     "call(s) redirected\n", archetype_lookup_rva, archetype_lookup_arg, r.redirected);
+            else
+                std::fprintf(stderr, "[rt] mods: archetype lookup at RVA 0x%X not hooked: %s\n", archetype_lookup_rva,
+                             r.error);
         }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
         if (init || run) {

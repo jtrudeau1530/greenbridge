@@ -309,6 +309,31 @@ class MeshWorkgroupChecks(unittest.TestCase):
         pixels[6], pixels[2] = pixels[2], pixels[6]
         self.assertIn("2/24 mismatches; first (0,1,0)", check.check_mesh_v5(b"".join(pixels)))
         self.assertIn("384 bytes", check.check_mesh_v5(b"".join(pixels[:-1])))
+
+    def test_a_previous_groups_file_cannot_pass_the_mesh_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp)
+            (spirv / "ms_v5_workgroup.spv").touch()
+            (spirv / "fs_passthru.spv").touch()
+            raw = spirv / "groups.raw"
+            raw.write_bytes(b"".join(struct.pack("<4f", 32 * g, 32 * g + 1, 32 * g + 31, 1)
+                                     for g in range(24)))
+            with patch.object(check, "run", return_value=(0, "")):
+                self.assertIn("missing readback: groups.raw", check.mesh_v5_test(tmp, spirv, raw))
+            self.assertFalse(raw.exists())
+
+    def test_readback_cleanup_failure_does_not_start_the_harness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "groups.raw"
+            raw.mkdir()
+            with patch.object(check, "run") as launch:
+                status, message = check.run_readback(raw, launch, "unused")
+                launch.assert_not_called()
+            self.assertEqual(status, 1)
+            self.assertIn("could not remove the previous readback", message)
+            self.assertTrue(raw.is_dir())
+
+
 class PixelDeviceLimits(unittest.TestCase):
     """pixel_test with a fake harness: the device's limits decide SKIP instead of a failure."""
 
@@ -880,6 +905,26 @@ class Wave32LaneDumps(unittest.TestCase):
                 out = "device: gpu (subgroup 8..32)\ncompute subgroup size: 32\n"
                 self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
                 self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
+
+    def test_judged_when_32_lanes_are_observed(self):
+        # MoltenVK: no compute stage in requiredSubgroupSizeStages, but vk_compute_test's cs_wave_probe saw 32 lanes.
+        out = "device: Apple M3 Max (subgroup 4..32)\ncompute subgroup size: 32 (observed: all 64 invocations of a " \
+              "64x1x1 group, full subgroups)\n"
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name):
+                self.assertEqual(self.run_dump(name, 0, out + self.words(name)), "")
+                problem = self.run_dump(name, 0, out + self.words(name, flip=True))
+                self.assertTrue(problem)
+                self.assertNotIsInstance(problem, check.Skip)
+
+    def test_failed_when_the_observed_size_is_wrong(self):
+        out = ("device: gpu (subgroup 4..32)\ncompute subgroup size: 32 observed wrong in 64 of 64 invocations; "
+               "invocation 0 has SubgroupSize 32, lane 0, subgroup 0, a ballot of 16 lanes\n")
+        for name in check.WAVE32_LANE_DUMPS:
+            with self.subTest(name=name):
+                problem = self.run_dump(name, 1, out)
+                self.assertNotIsInstance(problem, check.Skip)
+                self.assertIn("observed wrong", problem)
 
 
 class SamplerMipChecks(unittest.TestCase):

@@ -822,15 +822,7 @@ bool reserve_tls_index0(std::string* why) {
 
 namespace {
 bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t& rva) {
-    for (const Module* m : static_cast<Loader*>(ctx)->modules()) {
-        const auto base = reinterpret_cast<uint64_t>(m->base);
-        if (m->base && address >= base && address - base < m->size) {
-            module = m->name;
-            rva = static_cast<uint32_t>(address - base);
-            return true;
-        }
-    }
-    return false;
+    return static_cast<Loader*>(ctx)->find_address(address, module, rva);
 }
 
 void* bundled_find_loaded(void* ctx, const std::string& dll_lower) {
@@ -1015,6 +1007,18 @@ void* Loader::resolve_module_export(void* module_handle, const std::string& sym,
     return nullptr;
 }
 
+bool Loader::find_address(uint64_t address, std::string& module, uint32_t& rva) const {
+    std::shared_lock lock(ranges_mutex_);
+    for (const MappedRange& r : ranges_) {
+        if (address >= r.base && address - r.base < r.size) {
+            module = r.name;
+            rva = static_cast<uint32_t>(address - r.base);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Loader::owns_module_handle(void* module_handle) const {
     if (!module_handle) return false;
     std::lock_guard lock(mutex_);
@@ -1142,6 +1146,12 @@ Module& Loader::map_image(const std::filesystem::path& path) {
             throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
         m->base = static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
+    }
+    {
+        // From here an address inside the image names it. The memory stays until ~Loader, which unregisters the
+        // lookup first.
+        std::unique_lock lock(ranges_mutex_);
+        ranges_.push_back({reinterpret_cast<uint64_t>(m->base), m->size, m->name});
     }
 
     std::memcpy(m->base, file.data(), oh.SizeOfHeaders);

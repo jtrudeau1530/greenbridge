@@ -999,12 +999,15 @@ int run_runner_child(const char* mode, unsigned long bytes) {
 int check_child_runner() {
     const char* label = "child runner";
     ChildResult report;
-    ChildRun run = run_self(L"--child-flood 0", 30000);
-    EXPECT(run.end == ChildEnd::exited && run.exit_code == 0 && parse_diff_report(run.tail, report));
-    EXPECT(report.ran == 1 && report.hr == 0 && report.removed == 0 && report.validation == 0);
-    // The first start and the first failed start make Windows load what it keeps for them (a failed CreateProcessW
-    // leaves 42 handles the first time on Windows 11 26200, none on every later one): both run once before the handle
-    // count is taken, and every case after it must leave the count as it was.
+    ChildRun run;
+    // The first two successful starts and the first failed start make Windows load and cache their persistent process
+    // handles (on Windows 11 26200, a second CreateProcessW caches the HKCU root key and a failed CreateProcessW keeps
+    // 41-42 AppCompat/PCA handles; later starts add none). Warm up both before reading handles_before.
+    for (int warmup = 0; warmup < 2; ++warmup) {
+        run = run_self(L"--child-flood 0", 30000);
+        EXPECT(run.end == ChildEnd::exited && run.exit_code == 0 && parse_diff_report(run.tail, report));
+        EXPECT(report.ran == 1 && report.hr == 0 && report.removed == 0 && report.validation == 0);
+    }
     std::fprintf(stderr, "child runner: the next four errors are expected\n");
     const std::wstring missing = self_path() + L".missing.exe";
     run = run_process(missing.c_str(), L"", 5000);

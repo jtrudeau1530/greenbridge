@@ -10,6 +10,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -176,6 +177,62 @@ class Cli(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = fspx_unpack.main(list(argv))
         return code, out.getvalue(), err.getvalue()
+
+    def disassemble(self, body):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        src = os.path.join(tmp.name, "one.fspx")
+        with open(src, "wb") as f:
+            f.write(make_fspx([(0, kind0()), (6, program())]))
+        mc = os.path.join(tmp.name, "fake_mc.py")
+        with open(mc, "w", encoding="utf-8", newline="\n") as f:
+            f.write(body)
+        out = os.path.join(tmp.name, "out")
+        env = dict(os.environ, LLVM_MC=f'"{sys.executable}" "{mc}"')
+        result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "fspx_unpack.py"),
+                                 src, "--out", out, "--disasm"], capture_output=True, text=True, env=env)
+        return result, out
+
+    def test_disassembly_error_writes_no_listing(self):
+        result, out = self.disassemble("import sys\n"
+                                       "print('\\ts_endpgm')\n"
+                                       "sys.stderr.write('error: disassembly stopped\\nextra detail\\n')\n"
+                                       "sys.exit(23)\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["one: error: disassembly stopped"])
+        self.assertIn("1 input(s) failed", result.stdout)
+        self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
+        self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
+        with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), [])
+
+    def test_empty_disassembly_writes_no_listing(self):
+        result, out = self.disassemble("print('   ')\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["one: no output"])
+        self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
+        self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
+
+    def test_disassembly_with_invalid_words_keeps_listing(self):
+        result, out = self.disassemble("import sys\n"
+                                       "print('\\ts_endpgm')\n"
+                                       "sys.stderr.write('warning: invalid instruction encoding\\n')\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
+            listing = f.read()
+        self.assertIn("1 invalid words", listing)
+        self.assertIn("\ts_endpgm", listing)
+        self.assertIn("warning: invalid instruction encoding", listing)
+
+    def test_clean_disassembly_keeps_listing(self):
+        result, out = self.disassemble("print('\\ts_endpgm')\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
+            listing = f.read()
+        self.assertIn("0 invalid words", listing)
+        self.assertIn("\ts_endpgm", listing)
 
     def test_dll_like_file(self):
         c = Containers().container()

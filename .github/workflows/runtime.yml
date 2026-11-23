@@ -3,11 +3,13 @@
 name: Runtime
 
 on:
-  # What can break this build: the runtime and its vendored queue, the scripts the jobs run, this workflow, and
-  # everything the tools those scripts read depend on - their sibling imports, the data files they load by name
-  # (gfx10_formats.json is one a .py-only scan misses) and the hw_oracle directory. Any other file under tools/
-  # used to start a full Windows and Wine build it cannot break (BUILD-856); paths-ignore cannot say "everything
-  # under tools/ except these", so the event lists what triggers it.
+  # What can break this build: the runtime and its vendored queue, the scripts the jobs run, this workflow, the
+  # line endings every checkout gets (.gitattributes), and everything the tools those scripts read depend on -
+  # their sibling imports, the data files they load by name (gfx10_formats.json is one a .py-only scan misses) and
+  # the hw_oracle directory. Any other file under tools/ used to start a full Windows and Wine build it cannot break
+  # (BUILD-856); paths-ignore cannot say "everything under tools/ except these", so the event lists what triggers
+  # it. tests/test_runtime_paths.py recomputes the tools/ part and fails when an entry is missing; keep the two
+  # lists identical.
   push:
     branches: [main]
     paths:
@@ -15,6 +17,7 @@ on:
       - "third_party/**"
       - "scripts/**"
       - ".github/workflows/runtime.yml"
+      - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
       - "tools/cf_diff.py"
@@ -32,6 +35,7 @@ on:
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
       - "tools/rdna2spirv.py"
+      - "tools/report_paths.py"
       - "tools/shader_carve.py"
       - "tools/shader_disasm.py"
       - "tools/shader_ir.py"
@@ -39,8 +43,10 @@ on:
       - "tools/shader_stage_manifest.py"
       - "tools/spirv_asm.py"
       - "tools/spirv_asm_tables.py"
+      - "tools/spirv_opt.py"
       - "tools/spirv_stubs.py"
       - "tools/vk_subgroup_info.py"
+      - "tools/wave64_emulate_opt.py"
       - "tools/wave64_halves.py"
       - "tools/xdxr_bvh.py"
   pull_request:
@@ -49,6 +55,7 @@ on:
       - "third_party/**"
       - "scripts/**"
       - ".github/workflows/runtime.yml"
+      - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
       - "tools/cf_diff.py"
@@ -66,6 +73,7 @@ on:
       - "tools/mc_command.py"
       - "tools/mesh_compute_vs.py"
       - "tools/rdna2spirv.py"
+      - "tools/report_paths.py"
       - "tools/shader_carve.py"
       - "tools/shader_disasm.py"
       - "tools/shader_ir.py"
@@ -73,8 +81,10 @@ on:
       - "tools/shader_stage_manifest.py"
       - "tools/spirv_asm.py"
       - "tools/spirv_asm_tables.py"
+      - "tools/spirv_opt.py"
       - "tools/spirv_stubs.py"
       - "tools/vk_subgroup_info.py"
+      - "tools/wave64_emulate_opt.py"
       - "tools/wave64_halves.py"
       - "tools/xdxr_bvh.py"
   workflow_dispatch:
@@ -190,8 +200,13 @@ jobs:
   # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary
   # shows the rest.
   # Two Wines: Ubuntu's own (9.0) and WineHQ's current stable, which is closer to what Proton users run.
+  # Not on pull requests: in 188 sampled pull request runs these two jobs never failed when the Windows job had passed,
+  # yet they took about a quarter of the account's 20 concurrent runner slots. They run on every push to main that
+  # touches these paths, and on demand from the Actions tab (workflow_dispatch). Pull requests still build and test the
+  # Windows runtime natively and upload runtime-windows for testers.
   wine:
     needs: windows
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:

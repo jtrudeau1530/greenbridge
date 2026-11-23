@@ -236,8 +236,12 @@ def census(root, disasm=None):
         state_path = os.path.join(root, "fspx", name + ".json")
         user_sgprs = None
         if os.path.exists(state_path):
-            with open(state_path, encoding="utf-8") as fh:
-                user_sgprs = json.load(fh).get("user_sgprs")
+            try:
+                with open(state_path, encoding="utf-8") as fh:
+                    user_sgprs = json.load(fh).get("user_sgprs")
+            except (ValueError, AttributeError) as e:
+                errors.append(f"{state_path}: {e}")
+                continue
         if b"RTS0" not in chunks:
             rows.append({"name": name, "error": "no RTS0 part", "user_sgprs": user_sgprs})
             continue

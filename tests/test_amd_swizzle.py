@@ -1,6 +1,6 @@
 """amd_swizzle.load: parses addrlib's pattern tables without evaluating them as Python.
 
-    python -I tests/test_amd_swizzle.py
+    python -m pytest tests/test_amd_swizzle.py
 """
 import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
 

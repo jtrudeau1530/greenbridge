@@ -607,9 +607,9 @@ class TestMainAndCLI(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "nope")
             code, out, err = self._call_main(["bary_fallback_gs.py", missing])
-            self.assertEqual(code, 1)
+            self.assertEqual(code, 2)
             self.assertEqual(out, "")
-            self.assertIn("not a directory", err)
+            self.assertIn("does not exist", err)
 
             file_path = os.path.join(tmp, "not_a_dir.txt")
             with open(file_path, "w", encoding="utf-8") as f:
@@ -711,6 +711,20 @@ class TestMainAndCLI(unittest.TestCase):
                     self.assertEqual(out, "")
                     self.assertIn("translation index must be a JSON object", err)
 
+    def test_main_pair_rejects_non_object_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = os.path.join(tmp, "index.json")
+            good = {"vs": {"stage": "vs"}, "ps": {"stage": "ps", "bary_fallback_input": {"location": 1}}}
+            for bad in ([], 1, None, "vs"):
+                for name in ("vs", "ps"):
+                    with self.subTest(entry=name, value=bad):
+                        with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+                            json.dump({**good, name: bad}, f)
+                        code, out, err = self._call_main(["bary_fallback_gs.py", tmp, "--pair", "vs", "ps"])
+                        self.assertEqual(code, 1)
+                        self.assertEqual(out, "")
+                        self.assertEqual(err, f"{index_path}: index entry {name!r} must be a JSON object\n")
+
     def test_cli_subprocess_isolated_mode(self):
         def run_cli(*args):
             return subprocess.run(
@@ -735,9 +749,9 @@ class TestMainAndCLI(unittest.TestCase):
 
             missing = os.path.join(tmp, "missing")
             p = run_cli(missing)
-            self.assertEqual(p.returncode, 1)
+            self.assertEqual(p.returncode, 2)
             self.assertEqual(p.stdout, "")
-            self.assertIn("not a directory", p.stderr)
+            self.assertIn("does not exist", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
 
             # Empty directory (no index.json) succeeds silently without spirv-as/spirv-val.

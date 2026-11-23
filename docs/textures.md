@@ -985,8 +985,18 @@ their first 4 KiB, and the large ones are high-entropy (7.3 to 7.7 bits per byte
 one at 4.1). They are left as opaque raw data here; matching them to the `data/ttdb` texture pools is the
 obvious next check.
 
-Not measured here (hypothesis): what the 1,313 texture pairs are keyed by, and whether the format codes are
-DXGI values (the exact-size match supports it).
+**Measured keying and format codes (ASSET-274):**
+All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing descriptor pointers and a 32-bit
+`joaat32` hash table:
+- **Format codes are 1:1 DXGI format enums:**
+  - `0x5f` (95) = `DXGI_FORMAT_BC6H_UF16` (1,313 pairs, 128 x 128).
+  - `0x62` (98) = `DXGI_FORMAT_BC7_UNORM` (1 pair, 172 x 172: UI switch portraits `switch_jason` and `switch_lucia`).
+  - `0x4d` (77) = `DXGI_FORMAT_BC3_UNORM` (1 pair, 512 x 512: UI indicators `qrcode_logo` and `busy_spinner`).
+- **Keying:** Each dictionary indexes textures by the lower-case ASCII asset name hash (`joaat32`).
+  - The 1,313 pairs are each keyed by `waterfog2` (`0x9b9b31df`) and `waterfog` (`0xf1389e16`).
+  - The count of 1,313 matches the water-bearing cells of the 36 x 41 (1,476 total) world streaming grid
+    (`StreamingDesc/NumberOfTilesX, Y` in `docs/world.md:361`); whether the remaining 163 cells are inland/dry
+    cells with no waterfog dictionary is a hypothesis.
 
 ## Next step
 

@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,11 @@ public:
 
     const std::vector<Module*>& modules() const { return order_; }
 
+    // The mapped module `address` lies in, with its RVA there. Safe from any thread at any time, also while another
+    // thread is in load(): it is what the shim registry asks for a caller's module (rt::shims::mapped_image_base on
+    // every C++ throw from a mapped image, and the trace and stop lines), and it reads its own table, not modules().
+    bool find_address(uint64_t address, std::string& module, uint32_t& rva) const;
+
     // The order initialise() runs modules in: each module after every module it imports (a cycle is broken at the
     // module that closed it). modules() is mapping order, which puts an importer before its imports.
     const std::vector<Module*>& initialisation_order() const { return init_order_; }
@@ -133,6 +139,17 @@ private:
     std::map<std::string, Module*> by_name_;  // lower-case file name
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
+
+    // What find_address reads: one entry per mapped image, added once its memory exists. Under ranges_mutex_, a leaf
+    // lock: mutex_ is held while image code runs and the registry holds its own lock around the lookup, so the
+    // lookup must not wait for either.
+    struct MappedRange {
+        uint64_t base = 0;
+        uint32_t size = 0;
+        std::string name;
+    };
+    mutable std::shared_mutex ranges_mutex_;  // shared in find_address: lookups on different threads do not queue
+    std::vector<MappedRange> ranges_;
 };
 
 // Frees the TLS helper clones load() created and deletes their files (Module::tls_index background). load()

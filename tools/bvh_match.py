@@ -255,6 +255,8 @@ def main(argv=None):
             src = f.read()
         with open(a.manifest, encoding="utf-8") as f:
             manifest = json.load(f)
+        if not isinstance(manifest, dict):
+            raise ValueError("%s is not a JSON object (got %s)" % (a.manifest, type(manifest).__name__))
         items = manifest.get("Items") or []
         if not items:
             raise ValueError("%s has no Items: the export found no model in its window, so there is nothing to match "

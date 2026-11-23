@@ -489,6 +489,64 @@ class CpuRefTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             cpu_ref.run(path, {"sgprs": {0: 1}})
 
+    def test_bit_and_vop3_integer_ops(self):
+        r = self.execute("""
+            v_mov_b32 v0, 0x00ff0001
+            v_not_b32 v1, v0
+            v_bfrev_b32 v2, 0x12345678
+            v_ffbl_b32 v3, 0x00010100
+            v_ffbh_u32 v4, 0x00010000
+            v_ffbh_i32 v5, 0xfffffff0
+            v_mov_b32 v15, 0x00ff00ff
+            v_xnor_b32 v6, 0x0f0f0f0f, v15
+            v_bcnt_u32_b32 v7, 0xf0f0f0f0, 3
+            v_add3_u32 v8, 10, 20, 30
+            v_lshl_add_u32 v9, 3, 2, 5
+            v_add_lshl_u32 v10, 3, 5, 2
+            v_lshl_or_b32 v11, 3, 4, 1
+            v_and_or_b32 v12, 0xf0, 0x3c, 1
+            v_or3_b32 v13, 1, 2, 4
+            v_xad_u32 v14, 0x5, 0x3, 10
+            ; Edge cases: zero/all-ones, positive ffbh_i32, shift > 31, 32-bit overflow, overlapping or3/lshl_or
+            v_ffbl_b32 v16, 0
+            v_ffbh_u32 v17, 0
+            v_ffbh_i32 v18, 0
+            v_ffbh_i32 v19, -1
+            v_ffbh_i32 v20, 0x00100000
+            v_lshl_add_u32 v21, 3, 33, 5
+            v_add_lshl_u32 v22, 3, 5, 34
+            v_lshl_or_b32 v23, 3, 33, 2
+            v_add3_u32 v24, 0xffffffff, 2, 3
+            v_bcnt_u32_b32 v25, 0xffffffff, 0xfffffffe
+            v_or3_b32 v26, 3, 6, 12
+            s_endpgm
+        """)
+        self.assertEqual(self.vgpr(r, 1), 0xFF00FFFE)
+        self.assertEqual(self.vgpr(r, 2), 0x1E6A2C48)
+        self.assertEqual(self.vgpr(r, 3), 8)
+        self.assertEqual(self.vgpr(r, 4), 15)
+        self.assertEqual(self.vgpr(r, 5), 28)
+        self.assertEqual(self.vgpr(r, 6), 0xF00FF00F)
+        self.assertEqual(self.vgpr(r, 7), 19)
+        self.assertEqual(self.vgpr(r, 8), 60)
+        self.assertEqual(self.vgpr(r, 9), 17)
+        self.assertEqual(self.vgpr(r, 10), 32)
+        self.assertEqual(self.vgpr(r, 11), 49)
+        self.assertEqual(self.vgpr(r, 12), 0x31)
+        self.assertEqual(self.vgpr(r, 13), 7)
+        self.assertEqual(self.vgpr(r, 14), 16)
+        self.assertEqual(self.vgpr(r, 16), 0xFFFFFFFF)
+        self.assertEqual(self.vgpr(r, 17), 0xFFFFFFFF)
+        self.assertEqual(self.vgpr(r, 18), 0xFFFFFFFF)
+        self.assertEqual(self.vgpr(r, 19), 0xFFFFFFFF)
+        self.assertEqual(self.vgpr(r, 20), 11)
+        self.assertEqual(self.vgpr(r, 21), 11)   # (3 << (33 & 31)) + 5
+        self.assertEqual(self.vgpr(r, 22), 32)   # 8 << (34 & 31)
+        self.assertEqual(self.vgpr(r, 23), 6)    # (3 << 1) | 2 (overlapping bit 1, differs from +)
+        self.assertEqual(self.vgpr(r, 24), 4)    # wrapped 32-bit sum
+        self.assertEqual(self.vgpr(r, 25), 30)   # 32 + 0xfffffffe mod 2^32 (differs from 32 ^ 0xfffffffe)
+        self.assertEqual(self.vgpr(r, 26), 15)   # overlapping 3 | 6 | 12 (differs from 3 ^ 6 ^ 12)
+
     def test_malformed_register_assignments_are_cli_errors(self):
         path = self.write("s_endpgm")
         for option, assignment, flags in (

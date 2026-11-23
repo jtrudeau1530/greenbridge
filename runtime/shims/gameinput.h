@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "../src/active_input.h"  // leonida::InputFamily (and std::optional) for Config::prompts and active_input()
+
 namespace rt::gameinput {
 
 // How the impulse-trigger motors (GameInputRumbleParams::leftTrigger/rightTrigger) reach a DualSense.
@@ -15,6 +17,10 @@ enum class DsTriggerMode { Off, Rumble, Resistance };
 enum class KeyboardPadMode { Off, Focused, Always };
 
 struct Config {
+    // LEONIDA_PROMPTS=auto|xbox|playstation|ps5|ps4|ps3|nintendo|keyboard: a family that active_input() reports
+    // whatever is in use; unset or auto follows the devices.
+    std::optional<leonida::InputFamily> prompts;
+    uint32_t prompts_switch_ms = 300;  // LEONIDA_PROMPTS_SWITCH_MS, 0..2000: shortest time between two changes
     DsTriggerMode ds_triggers = DsTriggerMode::Rumble;  // LEONIDA_DS_TRIGGERS=off|rumble|resistance
     float ds_trigger_gain = 1.0f;                       // LEONIDA_DS_TRIGGER_GAIN, 0..4, scales the effect strength
     float mouse_sensitivity = 1.0f;                     // LEONIDA_MOUSE_SENSITIVITY, 0.1..10, scales mouse movement
@@ -39,6 +45,17 @@ void poll();
 
 // Number of gamepads currently open by the backend (tests, gameinput_probe).
 int connected_count();
+
+// The kind of device the player used last (src/active_input.h has the rules), or the one LEONIDA_PROMPTS forces.
+// The title is told every pad is an Xbox One pad; this is for the runtime's own use, such as button prompt glyphs.
+// Safe from any thread. `generation` goes up by one with each change of `family`, so a reader can check it every
+// frame and act only when it moved. Xbox, generation 0, until the first deliberate input.
+struct ActiveInput {
+    leonida::InputFamily family = leonida::InputFamily::Xbox;
+    uint64_t generation = 0;
+    bool forced = false;  // LEONIDA_PROMPTS set the family
+};
+ActiveInput active_input();
 
 // The SDL haptic calls the shim makes, one entry per call, so a test can stand in for them: SDL's virtual joysticks
 // report no haptics, and a pad that does is the only other way to reach this path. `joystick` is the SDL_Joystick the

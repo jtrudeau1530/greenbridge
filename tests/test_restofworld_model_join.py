@@ -479,6 +479,31 @@ class ModelJoinTests(unittest.TestCase):
             sys3 + gfx3,
         ]
 
+    def test_joins_a_short_declared_final_system_page(self):
+        system, graphics = make_standalone_drawable_1x1()
+        first = bytearray(system[0].ljust(65536, b"\0"))
+        _write_page_map(first, 65536 - 64, sys_pages=2, gfx_pages=1)
+        struct.pack_into("<Q", first, 168, SYS_BASE + 65536 + 8)
+        last = b"\0" * 8 + b"synth_tail\0".ljust(40, b"\0")
+        archive, recorded = pack_synthetic_rpf([[b"unrelated".ljust(48, b"\0")], [bytes(first), last, *graphics]])
+        rpf = os.path.join(self.root, "short_system.rpf")
+        with open(rpf, "wb") as fh:
+            fh.write(archive)
+
+        resources, summary = joiner.scan_rpf(rpf)
+        self.assertEqual(summary["joined_resources"], 1)
+        self.assertEqual(summary["zlib_streams"], 3)
+        self.assertEqual([s["offset"] for s in resources[0]["system_streams"]], recorded[1][0][:2])
+        self.assertEqual(resources[0]["system_streams"][1]["size"], 48)
+
+        invalid = bytearray(archive)
+        checksum_end = recorded[1][0][1] + len(zlib.compress(last))
+        invalid[checksum_end - 1] ^= 1
+        with open(rpf, "wb") as fh:
+            fh.write(invalid)
+        _, rejected = joiner.scan_rpf(rpf)
+        self.assertEqual(rejected["joined_resources"], 0)
+
     def test_joins_1x1_drawable_1x2_dict_and_2x2_fragment_in_rpf(self):
         archive_bytes, recorded = pack_synthetic_rpf(self._build_full_corpus_entries())
         rpf_path = os.path.join(self.root, "models.rpf")

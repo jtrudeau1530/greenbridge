@@ -362,6 +362,15 @@ int main() {
                            .compare = CompareFunction::greater, .max_lod = 9.0f, .unnormalized = true});
     CHECK(info.unnormalizedCoordinates == VK_TRUE && info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST);
     CHECK(info.maxLod == 0.0f && info.anisotropyEnable == VK_FALSE && info.compareEnable == VK_FALSE);
+    // Unnormalised: U and V clamp (wrap, the default S# mode, would be invalid: VUID ...-01075), border stays border,
+    // W is free; min and mag filter agree (VUID ...-01072).
+    CHECK(info.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
+          info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
+          info.addressModeW == VK_SAMPLER_ADDRESS_MODE_REPEAT && info.minFilter == info.magFilter);
+    info = vulkan_sampler({.address_u = AddressMode::clamp_border, .address_v = AddressMode::mirror,
+                           .min_filter = Filter::bilinear, .unnormalized = true});
+    CHECK(info.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER &&
+          info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.minFilter == VK_FILTER_NEAREST);
     CHECK(vulkan_address_mode(AddressMode::mirror) == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT);
     CHECK(vulkan_address_mode(AddressMode::mirror_once_last_texel) == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE);
     CHECK(vulkan_address_mode(AddressMode::clamp_half_border) == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);

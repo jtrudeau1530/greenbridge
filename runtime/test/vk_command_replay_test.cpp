@@ -7,7 +7,8 @@
 // Part F (D3D-26) runs immediate buffer writes, atomic copies and discards. Part G copies one subresource twice in one
 // list, which D3D12 orders on the queue and needs an explicit dependency for on Vulkan. Part H copies depth to colour
 // and back (D32_FLOAT <-> R32_FLOAT), which the replay stages through a scratch buffer. Part I resolves a depth
-// rectangle (MIN) and checks that the texels around it keep their values.
+// rectangle (MIN) and checks that the texels around it keep their values. Part J copies between disjoint regions
+// of one texture subresource.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -1188,6 +1189,82 @@ int part_i(vktest::Device& d) {
     return 0;
 }
 
+int part_j(vktest::Device& d) {
+    constexpr std::uint32_t width = 4, height = 2, pitch = texture_data_pitch_alignment;
+    constexpr VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    const VkImage image = d.image(format, width, height, 1, 0);
+    void* upload_data = nullptr;
+    const VkBuffer upload = d.buffer(pitch * height, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &upload_data);
+    void* readback_data = nullptr;
+    const VkBuffer readback = d.buffer(width * height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback_data);
+    EXPECT(image && upload && readback);
+    for (std::uint32_t y = 0; y < height; ++y)
+        std::memcpy(static_cast<std::uint8_t*>(upload_data) + pitch * y, (y ? green : red).data(), 4);
+
+    constexpr ResourceId image_id = 40, upload_id = 41;
+    ResourceBinding image_binding{}, upload_binding{};
+    image_binding.image = image;
+    image_binding.format = format;
+    image_binding.width = width;
+    image_binding.height = height;
+    upload_binding.buffer = upload;
+    upload_binding.size = pitch * height;
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        if (id == image_id) return &image_binding;
+        if (id == upload_id) return &upload_binding;
+        return nullptr;
+    };
+    LayoutTracker tracker;
+    tracker.track(image_id, image_binding, VK_IMAGE_LAYOUT_UNDEFINED);
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.pipeline_barrier2 = d.fn<PFN_vkCmdPipelineBarrier2>("vkCmdPipelineBarrier2");
+    vk.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+
+    namespace a = d3d12_access;
+    namespace l = d3d12_layout;
+    namespace y = d3d12_sync;
+    const CopyLocation texture{image_id, false, 0, 0, 0, 0, 0, 0};
+    const CopyLocation footprint{upload_id, true, 0, 0, 1, height, 1, pitch};
+    const CopyBox column{0, 0, 0, 1, height, 1};
+    const BarrierSubresourceRange all{all_subresources, 0, 0, 0, 0, 0};
+    CommandList first;
+    EXPECT(first.copy_texture({texture, 2, 0, 0, texture, true, column}));
+    EXPECT(first.close());
+    CommandList list;
+    EXPECT(list.barrier(TextureBarrier{y::copy, y::copy, a::copy_dest, a::copy_dest,
+                                       l::common, l::copy_dest, image_id, all, 0}));
+    EXPECT(list.copy_texture({texture, 0, 0, 0, footprint, false, {}}));
+    EXPECT(list.barrier(TextureBarrier{y::copy, y::copy, a::copy_dest, a::copy_source | a::copy_dest,
+                                       l::copy_dest, l::common, image_id, all, 0}));
+    EXPECT(list.copy_texture({texture, 1, 0, 0, texture, true, column}));  // touching edges, not overlapping
+    EXPECT(list.barrier(TextureBarrier{y::copy, y::copy, a::copy_dest, a::copy_source,
+                                       l::common, l::copy_source, image_id, all, 0}));
+    EXPECT(list.close());
+    CommandList overlap;
+    EXPECT(overlap.copy_texture({texture, 1, 0, 0, texture, true, {0, 0, 0, 2, height, 1}}));
+    EXPECT(overlap.close());
+    EXPECT(d.run([&](VkCommandBuffer cb) {
+        if (replay(overlap, cb, resolve, vk, &tracker) != ReplayResult::invalid_copy) return false;
+        if (replay(first, cb, resolve, vk, &tracker) != ReplayResult::success ||
+            tracker.layout(image_id, 0) != VK_IMAGE_LAYOUT_GENERAL) return false;
+        if (replay(list, cb, resolve, vk, &tracker) != ReplayResult::success) return false;
+        d.read_back(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, width, height, 1,
+                    readback, 0);
+        return true;
+    }));
+    const auto* pixels = static_cast<const std::uint8_t*>(readback_data);
+    for (std::uint32_t y = 0; y < height; ++y)
+        for (std::uint32_t x = 0; x < width; ++x)
+            expect_rgba("J self-copy", pixels, y * width + x, x < 2 ? (y ? green : red) : Rgba{});
+    std::printf("J: disjoint same-subresource copies, overlapping copy rejected\n");
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -1199,7 +1276,7 @@ int main() {
     }
     EXPECT(status == vktest::DeviceStatus::ready);
     if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device) ||
-        part_g(device) || part_h(device) || part_i(device))
+        part_g(device) || part_h(device) || part_i(device) || part_j(device))
         return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {

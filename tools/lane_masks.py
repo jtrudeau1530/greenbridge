@@ -122,6 +122,12 @@ def put(state, a, k):
             state[r] = k
 
 
+def _maskable_b32(x):
+    return x["k"] in ("sgpr", "imm") or (
+        x["k"] == "special" and (x.get("t", "").startswith(("exec", "vcc")) or x.get("t") == "null")
+    )
+
+
 def lane_slot(vgpr, lane):
     """State key for a mask parked in one lane of a VGPR, or None unless both operands are plain."""
     if vgpr["k"] != "vgpr" or lane["k"] != "imm":
@@ -200,22 +206,37 @@ def step(state, ins):
             # VGPR (SHADER-21 part 2). Only per-lane mask computations take the all-lanes store,
             # because whole-wave readers (wave_mask, v_readfirstlane) read every lane's bit.
             return op != "v_mov_b32"
-    if "_saveexec_b" in op or "_wrexec_b" in op or op == "s_bfm_b64":
+    if "_saveexec_b" in op or "_wrexec_b" in op:
+        put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
+    elif op == "s_bfm_b64":
         put(state, a[0], MASK)
     elif op.startswith(COPIES) and len(a) > 1:
         k = kind(state, a[1])
-        if k is None and op.endswith("b64") and a[0]["k"] == "special" and a[0].get("t") in ("vcc", "vcc_lo") and \
-                a[1]["k"] == "imm":
+        dst_t = a[0].get("t") if a[0]["k"] == "special" else None
+        if k in (None, EITHER) and op.endswith("b64") and dst_t in ("vcc", "vcc_lo") and a[1]["k"] == "imm":
             k = MASK
+        elif op == "s_not_b32" and dst_t in ("vcc", "vcc_lo") and _maskable_b32(a[1]):
+            k = MASK
+        elif op == "s_not_b32" and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and _maskable_b32(a[1]):
+            return
         put(state, a[0], k)
     elif op.startswith(BITWISE):
         kinds = [kind(state, x) for x in a[1:]]
         ms = {k for k in kinds if k in MASK_KINDS}
+        dst_t = a[0].get("t") if a[0]["k"] == "special" else None
         if None not in kinds:
-            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else EITHER)
-        elif op.endswith("b64") and (ms or (a[0]["k"] == "special" and a[0].get("t") in ("vcc", "vcc_lo"))) and \
+            if op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS:
+                return
+            fallback = MASK if op.endswith("b64") and dst_t in ("vcc", "vcc_lo") else EITHER
+            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else fallback)
+        elif op.endswith("b64") and (ms or dst_t in ("vcc", "vcc_lo")) and \
                 all(k is not None or x["k"] == "imm" for k, x in zip(kinds, a[1:])):
             put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK)
+        elif op.endswith("b32") and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in a[1:]):
+            put(state, a[0], MASK)
+        elif op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and \
+                all(_maskable_b32(x) for x in a[1:]):
+            return
         else:
             put(state, a[0], None)
     else:

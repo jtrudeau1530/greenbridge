@@ -673,13 +673,20 @@ def _unwrap_known_pc_guards(tree, out_pcs, entry_pc=0):
     stack = [[collections.deque(tree), root_out, {entry_pc}, None]]
     while stack:
         frame = stack[-1]
-        q, dst, cur_pc, _ = frame
+        q, dst, cur_pc, tag = frame
         if not q:
+            if len(stack) > 1 and tag[0] == "guard" and len(cur_pc) == 1:
+                nxt_g = next(iter(cur_pc))
+                skip_pc = tag[3]
+                parent_q = stack[-2][0]
+                if parent_q and parent_q[0][0] == "guard" and parent_q[0][1] == nxt_g and nxt_g not in skip_pc:
+                    for child in reversed(parent_q.popleft()[2]):
+                        q.appendleft(child)
+                    continue
             stack.pop()
             if not stack:
                 break
             parent = stack[-1]
-            tag = frame[3]
             if tag[0] == "guard":
                 _, g, child_dst, skip_pc = tag
                 parent[1].append(("guard", g, child_dst))

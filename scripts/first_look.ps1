@@ -24,8 +24,24 @@ Write-Host "`n== PE inspection"
 python -I (Join-Path $root "tools\pe_inspect.py") $Exe --game-dir $GameDir --out $out
 if ($LASTEXITCODE -ne 0) { throw "pe_inspect failed" }
 
+Write-Host "`n== GDK runtime classes and slots called through xgameruntime.lib (read from the file)"
+python -I (Join-Path $root "tools\gdk_runtime_calls.py") $Exe --out $out
+if ($LASTEXITCODE -ne 0) { Write-Warning "gdk_runtime_calls could not read all of $Exe; its report may be incomplete" }
+
+Write-Host "`n== Archetype lookup candidates for mods (docs/modding.md; pass the top RVA to gta6rt --archetype-lookup)"
+python -I (Join-Path $root "tools\find_hash_lookup.py") $Exe --json (Join-Path $out "hash_lookup.json")
+if ($LASTEXITCODE -ne 0) { Write-Warning "find_hash_lookup could not scan $Exe" }
+
 $rt = Join-Path $root "runtime\build\gta6rt.exe"
-if (-not (Test-Path $rt)) { & (Join-Path $PSScriptRoot "build_runtime.ps1") }
+# A gta6rt.exe older than the runtime sources (a pull since the last build) would report the old shim table, so it
+# is rebuilt then too, not only when missing.
+$sources = @("runtime\src", "runtime\shims", "runtime\CMakeLists.txt") | ForEach-Object { Join-Path $root $_ } |
+    Where-Object { Test-Path $_ }
+$newest = $sources | Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$stale = (Test-Path $rt) -and $newest -and ($newest.LastWriteTime -gt (Get-Item $rt).LastWriteTime)
+if ($stale) { Write-Host "runtime\build\gta6rt.exe is older than $($newest.Name): rebuilding it first" }
+if (-not (Test-Path $rt) -or $stale) { & (Join-Path $PSScriptRoot "build_runtime.ps1") }
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 & {
     # Keep native stderr in the report without letting Windows PowerShell stop the dry run on it.

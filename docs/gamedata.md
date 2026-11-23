@@ -257,6 +257,15 @@ fallback names match an item name or its joaat hash, and ten `prefix + x + y + s
 2,112 tiles match nothing in three atlases and one hash in the fourth. The tile textures are therefore either
 outside the scanned archives or named another way; this is unresolved.
 
+In the 1.0.2.1 exports, one content change set lists four grid metadata registrations and three candidate
+archive paths as siblings. The list gives no per-grid archive assignment. The two fog grids share a tile
+prefix, while the shore-wave and water-height grids each have a distinct prefix. A case-insensitive search
+of the 30,516 other plain export blobs (30,520 total, excluding the four grid documents) found none of the
+three prefixes or the grids' global or sector fallback names in ASCII or UTF-16LE. None of the three
+archive filenames appeared as a loose file in the local package. The single catalog hash match above
+remains uncorroborated. The tile payloads and the mapping from tile coordinates to archive entries remain
+unverified.
+
 A fifth grid uses the same base fields: one `TextureGridInfo` document has `origin`, `width`, `height`,
 `tileSize`, `streamRadius` and `zInflation`, plus a low- and a high-detail fallback name, but no sector
 overrides. It is 32,768 x 32,768 units with the same 512 tile, so **64 x 64 tiles**, the same 512 stream
@@ -925,6 +934,9 @@ Four representative roots in the world/navigation/map category (826,397 B across
   - `InteriorNames/Item` × 1,358, holding `2,280` nested `<Item>` records with `{Name, Pos}`. Their 2,280 3D positions
     span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — 100% inside the world bounds of the
     `PAMH` heightmap and `GridAtlasInfo` grids above.
+    span `x = -9,673.0..4,705.3`, `y = -7,308.0..8,589.9`, `z = -78.0..820.9` — their 2D `x`/`y` coordinates fall 100%
+    inside the `x`/`y` extent of the `PAMH` heightmap (`-13,312..5,120`, `-9,728..11,264`) and `GridAtlasInfo` grids
+    above, while `z` reaches `820.9` (above the `PAMH` `404` m ceiling).
   - `RoadNames/Item` × 409 (`Name` on all 409) and `RiverNames/Item` × 66.
 - **`PathingStyleData` (1 document, 5,993 B, 1 stream):** `StyleProfiles/Item` × 12 (`key=`), each defining
   `CurvatureStyle`, `CorneringStyle`, `ApproachStyle`, `ContinuityStyle`, `SlowdownStyle`, `SplineConfig`, and

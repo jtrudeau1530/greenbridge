@@ -138,17 +138,19 @@ class DivFixupF16Tests(unittest.TestCase):
         cases = (
             ("normal_pos", H_HALF, H_ONE, H_ONE, H_HALF),
             ("normal_neg_sign_fix", H_HALF, H_NEG2, H_ONE, H_HALF | 0x8000),
-            ("nan_s2_priority", H_ONE, H_SNAN1, H_QNAN2, H_QNAN2 | 0x0200),
-            ("nan_s1_quieted", H_ONE, H_SNAN1, H_ONE, H_SNAN1 | 0x0200),
+            ("nan_s2_priority", H_ONE, H_SNAN1, H_QNAN2, H_QNAN2),
+            ("nan_s1_snan_ieee0", H_ONE, H_SNAN1, H_ONE, H_SNAN1),
+            ("nan_s2_snan_ieee0", H_ONE, H_ONE, 0x7C01, 0x7C01),
             ("zero_div_zero", H_ONE, H_POS0, H_NEG0, H_CANON_NAN),
             ("inf_div_inf", H_ONE, H_INF, H_NINF, H_CANON_NAN),
             ("finite_div_inf_neg", H_ONE, H_NINF, H_ONE, H_NEG0),
             ("zero_div_finite_pos", H_ONE, H_NEG2, H_NEG0, H_POS0),
             ("finite_div_zero_neg", H_ONE, H_NEG0, H_ONE, H_NINF),
             ("inf_div_finite_pos", H_ONE, H_NEG2, H_NINF, H_INF),
-            ("nan_quot_signed_passthrough", 0x7E35, H_NEG2, H_ONE, 0xFE35),
-            ("exp_underflow_to_zero", H_ONE, 0x7800, 0x0400, H_POS0),     # 2^-14 / 2^15 = 2^-29 -> +0
-            ("exp_overflow_to_inf", H_ONE, 0x0400, 0x7800, H_INF),        # 2^15 / 2^-14 = 2^29 -> +inf
+            ("nan_quot_to_pos_inf", 0x7E35, H_ONE, H_ONE, H_INF),
+            ("nan_quot_to_neg_inf", 0x7E35, H_NEG2, H_ONE, H_NINF),
+            ("f16_no_exp_underflow", H_ONE, 0x7800, 0x0400, H_ONE),       # gfx1036: e2-e1=-29 keeps S0
+            ("f16_no_exp_overflow", H_ONE, 0x0400, 0x7800, H_ONE),        # gfx1036: e2-e1=+29 keeps S0
         )
         for name, s0, s1, s2, want in cases:
             with self.subTest(case=name):
@@ -183,17 +185,21 @@ class DivFixupF64Tests(unittest.TestCase):
         cases = (
             ("normal_pos", D_THREE, D_ONE, D_ONE, D_THREE),
             ("normal_neg_sign_fix", D_THREE, D_NEG2, D_ONE, D_THREE | (1 << 63)),
-            ("nan_s2_priority", D_ONE, D_SNAN1, D_QNAN2, D_QNAN2 | (0x00080000 << 32)),
-            ("nan_s1_quieted", D_ONE, D_SNAN1, D_ONE, D_SNAN1 | (0x00080000 << 32)),
+            ("nan_s2_priority", D_ONE, D_SNAN1, D_QNAN2, D_QNAN2),
+            ("nan_s1_snan_ieee0", D_ONE, D_SNAN1, D_ONE, D_SNAN1),
+            ("nan_s2_snan_ieee0", D_ONE, D_ONE, 0x7FF0000000000001, 0x7FF0000000000001),
             ("zero_div_zero", D_ONE, D_POS0, D_NEG0, D_CANON_NAN),
             ("inf_div_inf", D_ONE, D_INF, D_NINF, D_CANON_NAN),
             ("finite_div_inf_neg", D_ONE, D_NINF, D_ONE, D_NEG0),
             ("zero_div_finite_pos", D_ONE, D_NEG2, D_NEG0, D_POS0),
             ("finite_div_zero_neg", D_ONE, D_NEG0, D_ONE, D_NINF),
             ("inf_div_finite_pos", D_ONE, D_NEG2, D_NINF, D_INF),
-            ("nan_quot_signed_passthrough", 0xFFF8123456789ABC, D_NEG2 & ~(1 << 63), D_ONE, 0x7FF8123456789ABC),
-            ("exp_underflow_to_zero", D_ONE, 0x4630000000000000, 0x0010000000000000, D_POS0),  # 2^-1022 / 2^100
-            ("exp_overflow_to_inf", D_ONE, 0x0010000000000000, 0x4630000000000000, D_INF),     # 2^100 / 2^-1022
+            ("nan_quot_to_pos_inf", 0xFFF8123456789ABC, D_NEG2 & ~(1 << 63), D_ONE, D_INF),
+            ("nan_quot_to_neg_inf", 0x7FF8123456789ABC, D_NEG2, D_ONE, D_NINF),
+            ("exp_diff_m1075_keeps_s0", D_ONE, 2046 << 52, 971 << 52, D_ONE),    # gfx1036: e2-e1=-1075 keeps S0
+            ("exp_diff_m1076_to_zero", D_ONE, 2046 << 52, 970 << 52, D_POS0),    # gfx1036: e2-e1=-1076 -> +0
+            ("exp_underflow_m1122", D_ONE, 1123 << 52, 1 << 52, D_POS0),         # gfx1036: 2^-1022 / 2^100 -> +0
+            ("f64_no_exp_overflow", D_ONE, 1 << 52, 1025 << 52, D_ONE),          # gfx1036: e2-e1=+1024 keeps S0
         )
         for name, s0, s1, s2, want in cases:
             with self.subTest(case=name):

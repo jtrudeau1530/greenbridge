@@ -116,8 +116,12 @@ def load_banks(source: str) -> dict:
                 grouped[label].append(int(row["stream"], 16) & M29)
             return dict(grouped)
         banks = doc.get("Banks", doc) if isinstance(doc, dict) else doc
+        if not isinstance(banks, list):
+            raise ValueError("expected a list of banks")
         out = {}
         for bank in banks:
+            if not isinstance(bank, dict):
+                raise ValueError(f"expected each bank to be an object, got {type(bank).__name__}")
             out[bank["Path"]] = [int(s["Id"], 16) & M29 for s in bank.get("Streams") or []]
         return out
     if os.path.isfile(source):
@@ -217,14 +221,15 @@ def family_ok(names) -> bool:
     return len(nums) == 2 and nums[1] - nums[0] == 1
 
 
-def attack(dictionary: Dictionary, bases: list, index: Index, salt: str) -> dict:
-    """{(bank number, id): (name, rule, family size)}; ``salt`` != '' is the control run."""
-    found = {}
+def _attack_split(dictionary: Dictionary, bases: list, index: Index, salt: str) -> tuple:
+    """Separate dialogue and best family hits per (bank number, id) before control filtering."""
+    dialogue_hits = {}
     for w in dictionary.words:
         if DIALOGUE.match(w):
             name = salt + w
-            for b in index.by_id.get(joaat(name) & M29, ()):
-                found[(b, joaat(name) & M29)] = (name, "dialogue", 99)
+            h = joaat(name) & M29
+            for b in index.by_id.get(h, ()):
+                dialogue_hits[(b, h)] = (name, "dialogue", 99)
     suffix_bytes = [_enc(s) for s in SUFFIXES]
     families = collections.defaultdict(dict)     # (bank, base) -> {id: (name, verbatim)}
     by_id = index.by_id
@@ -237,11 +242,21 @@ def attack(dictionary: Dictionary, bases: list, index: Index, salt: str) -> dict
                 verbatim = (base + s) in dictionary.wordset
                 for b in banks:
                     families[(b, base)][i] = (salt + base + s, verbatim)
+    family_hits = {}
     for (b, _base), members in families.items():
         if family_ok(n for n, _v in members.values()) and any(v for _n, v in members.values()):
+            size = len(members)
             for i, (name, _v) in members.items():
-                found.setdefault((b, i), (name, "family", len(members)))
-    return found
+                prev = family_hits.get((b, i))
+                if prev is None or size > prev[2]:
+                    family_hits[(b, i)] = (name, "family", size)
+    return dialogue_hits, family_hits
+
+
+def attack(dictionary: Dictionary, bases: list, index: Index, salt: str) -> dict:
+    """{(bank number, id): (name, rule, family size)}; ``salt`` != '' is the control run."""
+    dialogue_hits, family_hits = _attack_split(dictionary, bases, index, salt)
+    return {**family_hits, **dialogue_hits}
 
 
 def _distinct(found: dict, rule: str, kmin: int = 0) -> int:
@@ -250,21 +265,28 @@ def _distinct(found: dict, rule: str, kmin: int = 0) -> int:
 
 def name_source(dictionary: Dictionary, bases: list, index: Index) -> tuple:
     """Accepted names and the per-source statistics, after the salted control picks the thresholds."""
-    real = attack(dictionary, bases, index, "")
-    control = attack(dictionary, bases, index, SALT)
-    keep_dialogue = _distinct(control, "dialogue") < CONTROL_LIMIT * max(_distinct(real, "dialogue"), 1)
+    real_dlg, real_fam = _attack_split(dictionary, bases, index, "")
+    ctrl_dlg, ctrl_fam = _attack_split(dictionary, bases, index, SALT)
+    keep_dialogue = _distinct(ctrl_dlg, "dialogue") < CONTROL_LIMIT * max(_distinct(real_dlg, "dialogue"), 1)
     kmin = None
     for k in FAMILY_SIZES:
-        r, c = _distinct(real, "family", k), _distinct(control, "family", k)
+        r, c = _distinct(real_fam, "family", k), _distinct(ctrl_fam, "family", k)
         if r and c < CONTROL_LIMIT * r:
             kmin = k
             break
 
-    def keep(v):
-        return (v[1] == "dialogue" and keep_dialogue) or (v[1] == "family" and kmin is not None and v[2] >= kmin)
+    def combine(dlg, fam):
+        accepted = {}
+        if kmin is not None:
+            for key, val in fam.items():
+                if val[2] >= kmin:
+                    accepted[key] = val
+        if keep_dialogue:
+            accepted.update(dlg)
+        return accepted
 
-    real = {k: v for k, v in real.items() if keep(v)}
-    control = {k: v for k, v in control.items() if keep(v)}
+    real = combine(real_dlg, real_fam)
+    control = combine(ctrl_dlg, ctrl_fam)
     stats = {
         "banks": len(index.labels),
         "streams": index.streams,

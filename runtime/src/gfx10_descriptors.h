@@ -630,6 +630,15 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
     }
     if (sampler.unnormalized) {
         info.unnormalizedCoordinates = VK_TRUE;
+        // VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01075: U and V clamp to the edge or the border (a
+        // repeating mode would wrap at a texel count the sampler cannot know); -01072: one filter for min and mag.
+        // The S# allows any address mode with FORCE_UNNORMALIZED, and WRAP is its default (word 0 = 0).
+        const auto clamp_or_border = [](VkSamplerAddressMode m) {
+            return m == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ? m : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        };
+        info.addressModeU = clamp_or_border(info.addressModeU);
+        info.addressModeV = clamp_or_border(info.addressModeV);
+        info.minFilter = info.magFilter;
         info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         info.minLod = info.maxLod = 0.0f;
         info.anisotropyEnable = VK_FALSE;

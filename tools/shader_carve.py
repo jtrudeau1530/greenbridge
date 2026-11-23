@@ -86,7 +86,10 @@ def main(argv=None) -> int:
         ap.error(f"{src} is empty")
     if os.path.isfile(out):
         ap.error(f"{out} is a file, not a folder")
-    os.makedirs(out, exist_ok=True)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as e:  # a regular file where a parent folder is expected
+        ap.error(f"cannot create {out}: {e.strerror or e}")
     index, seen, used, bad = [], {}, set(), 0
     with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         pos = 0

@@ -15,6 +15,47 @@ are offset-based (`recovered/...`), not the original paths.
   `story000.rpf` and `shared_minigame000.rpf` is non-zlib. Unread bytes are recorded as ranges (the `unread`
   list in `rpf9_carve.py`'s `index.json`), never guessed.
 
+## Whole-package name coverage (reported in #1790)
+
+The recovery view names streams by offset, but some original paths can be read from the payload itself:
+mount XMLs and similar text in the data area list them in plain text, directory form included. #1790 ran one
+name-recovery walker over all 22 archives of a retail package (150.2 GiB) and reports how far that gets. These
+counts are as reported there; they were not re-run for this page.
+
+| | Count |
+|---|---:|
+| Streams | 1,489,677 |
+| Streams with a name | 177,087 (11.89%) |
+| Unique paths | 155,214 |
+| Unique identifiers | 200,184 |
+| Path mentions | 526,581 |
+
+| Stream type (walker's classes) | Named / streams | Share |
+|---|---:|---:|
+| `sgd5_shader_dxbc` | 25,043 / 25,043 | 100.00% |
+| `xml` | 191 / 332 | 57.53% |
+| `rsc50` | 123,889 / 531,370 | 23.32% |
+| `xml_chunk` | 109 / 504 | 21.63% |
+| raw | 26,766 / 690,003 | 3.88% |
+| `PSIN` | 465 / 15,380 | 3.02% |
+| `0DRP` | 624 / 227,045 | 0.27% |
+
+Three findings from the same run:
+
+- The paths come from the payload, not the TOC. One 8 KB stream in `common.head.bin` declares 473 `.bk2` paths on its
+  own.
+- Stream alignment is not universal. Inflated streams sit on 4 KiB boundaries in `data.rpf` (295 of 301 checked)
+  but not in `levels.rpf` (8 of 26), `packs.rpf` (0 of 301) or `textures.rpf` (0 of 3), so a walker that assumes
+  4 KiB steps misses most streams in three of those four. `tools/rpf9_carve.py` does not assume an alignment: it
+  continues after the bytes each stream consumed.
+- `anim.rpf` is the richest archive for names (64,785 named streams, 367,190 path mentions, almost all `.clip`).
+  `movies.rpf` produced no zlib streams, and `script.rpf` and `story000_script.rpf` no names.
+
+The 11.89% is the ceiling of this method, not a progress figure: the rest of the names are in the encrypted TOC,
+which this project does not decode. #1790 also confirms the TOC is not ECB (no duplicate 16-byte blocks in 62,487).
+The full name index is not published; the issue offers salted hashes of the paths and identifiers so that another
+run can be compared without publishing a name.
+
 ## Stream roles
 
 In the measured carve indexes, a resource's system prefix can be separated from its graphics pages without

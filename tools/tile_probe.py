@@ -39,8 +39,10 @@ def block_feature(blocks, bpe):
     """One RGB value per compressed block, from its first colour endpoint."""
     if bpe == 8:
         c = blocks[:, 0].astype(np.uint32) | (blocks[:, 1].astype(np.uint32) << 8)       # BC1 color0 (565)
-    else:
+    elif bpe == 16:
         c = blocks[:, 8].astype(np.uint32) | (blocks[:, 9].astype(np.uint32) << 8)       # BC3 color0 (565)
+    else:
+        raise ValueError(f"unsupported block size bpe={bpe} (expected 8 or 16)")
     r = ((c >> 11) & 31) * 255 // 31
     g = ((c >> 5) & 63) * 255 // 63
     b = (c & 31) * 255 // 31
@@ -115,6 +117,8 @@ def render(data, offset, bpe, wpx, mode, out):
         # only the preview needs Pillow; -I does not see a --user install of it
         raise SystemExit("--out needs Pillow: the scan runs without it, but the preview cannot be written "
                          "(run without -I, or install Pillow where this interpreter can see it)")
+    if bpe not in (8, 16):
+        raise ValueError(f"unsupported block size bpe={bpe} (expected 8 or 16)")
     wb = wpx // 4
     raw = np.frombuffer(data[offset:offset + (len(data) - offset) // bpe * bpe], np.uint8).reshape(-1, bpe)
     hb = min(len(raw) // wb, wb)
@@ -123,19 +127,21 @@ def render(data, offset, bpe, wpx, mode, out):
         hb = hb // th * th
     n = wb * hb
     pos = layout(n, wb, mode, bpe)
+    if n == 0 or pos is None:
+        raise ValueError(f"layout does not fit: wpx={wpx}, mode={mode!r}, bpe={bpe}")
     lin = np.zeros((n, bpe), np.uint8)
     lin[pos] = raw[:n]
     w, h = wb * 4, hb * 4
     hdr = bytearray(128)
     hdr[0:4] = b"DDS "
     struct.pack_into("<IIIIIII", hdr, 4, 124, 0x1007, h, w, n * bpe, 0, 1)
+    struct.pack_into("<I", hdr, 108, 0x1000)
     if bpe == 8:
         struct.pack_into("<II4s", hdr, 76, 32, 4, b"DXT1")
         body = bytes(hdr)
     else:
         struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
         body = bytes(hdr) + struct.pack("<IIIII", 98, 3, 0, 1, 0)  # BC7_UNORM, TEXTURE2D
-    struct.pack_into("<I", hdr, 108, 0x1000)
     im = Image.open(io.BytesIO(body + lin.tobytes())).convert("RGB")
     im.save(out)
     return im.size
@@ -164,6 +170,9 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--out")
     a = ap.parse_args()
+    if not os.path.exists(a.blob):
+        print(f"ERROR: {a.blob}: does not exist", file=sys.stderr)
+        return 2
     if a.out:
         check_preview_path(a.out, a.blob)
     try:

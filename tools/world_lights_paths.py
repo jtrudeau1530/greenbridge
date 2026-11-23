@@ -395,7 +395,8 @@ def graph_stats(nodes, links, junctions):
     s["node_keys_unique"] = len(by_key)
     edges = []
     firsts = [n["first_link"] for n in nodes]
-    ranges_ok = all(firsts[i] is not None and firsts[i] <= firsts[i + 1] for i in range(len(firsts) - 1))
+    ranges_ok = (all(v is not None for v in firsts)
+                 and all(firsts[i] <= firsts[i + 1] for i in range(len(firsts) - 1)))
     s["first_link_monotonic"] = int(ranges_ok)
     for i, n in enumerate(nodes):
         a = n["first_link"]

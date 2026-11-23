@@ -329,14 +329,23 @@ def collect_skeletons_dir(path):
     out = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")) or os.path.getsize(full) > 16384:
+        if not os.path.isfile(full) or name.lower().endswith((".json", ".csv")):
             continue
+        size = os.path.getsize(full)
         with open(full, "rb") as f:
-            data = f.read()
+            head = f.read(5)
+            if size > 16384 and head != b"SKEL_":
+                continue
+            data = head + f.read()
+        m = re.match(r"([0-9a-fA-F]{6,})", name)
+        offset = int(m.group(1), 16) if m else 0
+        sig = classify(data, offset, len(data))["signature"]
+        if not (sig == "skeleton-names" or (size <= 16384 and sig.startswith("raw:"))):
+            continue
         if b"SKEL_" in data or b"PH_" in data:
-            m = re.match(r"([0-9a-fA-F]{6,})", name)
-            record = parse_skel_names(data, int(m.group(1), 16) if m else 0)
-            record["kind"] = "motion-matcher" if b"motionmatcher" in data else "bone-table"
+            record = parse_skel_names(data, offset)
+            record["kind"] = ("plain-bone-table" if sig == "skeleton-names"
+                              else ("motion-matcher" if b"motionmatcher" in data else "bone-table"))
             if record["distinct"] or record["hashes_present"]:
                 out.append(record)
     return out

@@ -41,10 +41,10 @@ Known divergences (KNOWN_DIVERGENCES): by default the generator leaves out the f
 differ from the hardware, so that a run shows new problems only; --known puts them back (a hardware-only run always
 has them):
   * a constant shift amount (inline constant or seeded SGPR) for v_lshlrev_b32 / v_lshrrev_b32 / v_ashrrev_i32 with
-    src0_sel other than DWORD or sext(): the translator's constant fold shifted by the whole constant (#2005);
-  * a 16-bit result with dst_sel:DWORD: the translator keeps the destination's high half (finding in #1902);
-  * a float inline constant with a src_sel other than DWORD in an f16 op: the translator reads the whole constant
-    (finding in #1902).
+    src0_sel other than DWORD or sext(): the translator's constant fold shifted by the whole constant (#2005).
+Two forms that used to be listed here are generated in every run again now that main translates them: a 16-bit
+result with dst_sel:DWORD (the high half zeroed, #2187) and a float inline constant with a src_sel other than DWORD
+in an f16 op (the selection made from the f16 value, #2209).
 
 With --oracle hw the same programs also run natively on an AMD GPU (tools/hw_oracle/) and the hardware's four words
 are compared with the reference: that validates the reference itself. SDWA exists on GFX9 and GFX10 only, so the
@@ -506,10 +506,6 @@ SHIFTS = ("v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32")
 KNOWN_DIVERGENCES = {
     "shift-const-sel": "a constant shift amount (inline or seeded SGPR) with src0_sel or sext(): until #2005 the "
                        "translator shifts by the whole constant",
-    "dword-16bit": "a 16-bit result (f16 ops, v_cvt_{u16,i16}_f16, v_cvt_f16_{u16,i16}) with dst_sel:DWORD: the "
-                   "hardware zeroes the high half, the translator keeps it",
-    "f16-const-sel": "a float inline constant with a src_sel other than DWORD in an f16 op: the hardware selects from "
-                     "the f16 value (0x3c00 for 1.0), the translator reads the whole constant",
 }
 
 
@@ -533,11 +529,6 @@ def emit(rng, name):
         inner = a[5:-1] if a.startswith("sext(") else a
         if name in SHIFTS and inner[0] != "v":
             s0, a = "DWORD", inner
-        if family == "f16":
-            s0 = "DWORD" if a in FLOAT_CONSTS else s0
-            s1 = "DWORD" if b in FLOAT_CONSTS and name != "v_cmp_class_f16" else s1
-        if form != "vopc" and width == 16 and dsel == "DWORD":
-            dsel = rng.choice(sels[:-1])
     if form == "vopc":
         return f"{name}_sdwa vcc_lo, {a}, {b} src0_sel:{s0} src1_sel:{s1}"
     tail = f"{clamp} dst_sel:{dsel} dst_unused:{unused} src0_sel:{s0}"

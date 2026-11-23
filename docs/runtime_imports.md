@@ -114,7 +114,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   `ERROR_ACCESS_DENIED` (as deleting one does), a move between `GAME:` and a host path with `ERROR_NOT_SAME_DEVICE`, and
   `MOVEFILE_DELAY_UNTIL_REBOOT` with `ERROR_INVALID_PARAMETER`.
 - `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
-  overlay; fail-if-exists counts a name only the package has. Either side can be a host path.
+  overlay; fail-if-exists counts a name only the package has. Either side can be a host path. Where the host has no
+  `CopyFile2` (Wine 9, whose loader binds the import to a stub that aborts the process), the shim copies with
+  `CopyFileExW` instead: the flags both calls define and the cancel flag are passed on, CopyFile2-only hints are
+  dropped, and a `COPYFILE2` progress routine is not called.
 - `SetFileAttributes*` sets the attributes on the overlay copy, copying a package file up (or mirroring a package
   folder) first, so the package keeps its own.
 
@@ -162,7 +165,8 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XUserImpl` from xgameruntime-docs' layout
+(below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
@@ -194,7 +198,18 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 | `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`), 3-20 (`libHttpClient.GDK.dll`, each in its documented argument shape, e.g. 18-20 (enum, u64 pointer / u64 / pointer)) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool). Served offline, asked for with `IXNetworkingImpl2`'s id |
 | `XSystemImpl` (`IXSystemImpl5`, slots 3-8 known) | 3-8 (`libHttpClient.GDK.dll`) | 3-5 `XSystemGetConsoleId` / `GetXboxLiveSandboxId` / `GetAppSpecificDeviceId` (size, pointer, pointer each), 6 `XSystemHandleTrack` (two pointers, IXSystemImpl3), 7 `XSystemIsHandleValid` (pointer), 8 `XSystemAllowFullDownloadBandwidth` (bool, IXSystemImpl4); IXSystemImpl2 and 5 add no known method. Served offline |
 | `XPersistentLocalStorageImpl` (`IXPersistentLocalStorageImpl3`, slots 3-8) | none called (the table of ids only) | slots 3-7 are `XPersistentLocalStorageGetPathSize` / `GetPath` / `GetSpaceInfo` / `PromptUserForSpaceAsync` / `PromptUserForSpaceResult`, slot 8 `XPersistentLocalStorageMountForPackage` (IXPersistentLocalStorageImpl3). Slots from the public xgameruntime-docs and Wine IDL, not measured in a caller. Served offline: the folder is `<overlay>\persistent`, the quota is the 2048 MB of `MicrosoftGame.Config`, a prompt for space the quota holds succeeds, and `MountForPackage` is `E_NOTIMPL` |
-| `XPackageImpl` (`IXPackageImpl3`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2. Not served yet |
+| `XPackageImpl` (`IXPackageImpl3`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2. Served offline: 3 identifier, 4 packaged process, 11 user locale, 24-26 mount path size / path / close; the rest log once and return `E_NOTIMPL` |
+| `XGameImpl` (`IXGameImpl3`, slots 3-5) | none in the package's DLLs (`libHttpClient.GDK.dll` holds its id only in the linked id table); the executable's requests are unmeasured | from the xgameruntime IDL: 3 `XGameGetXboxTitleId` (pointer), 4 `XLaunchNewGame` (two strings and a user handle, `void`), 5 `XLaunchRestartOnCrash` (string, u32). Served offline: the title id is `MicrosoftGame.Config`'s `<TitleId>` (`E_FAIL` without one), a new game launch is logged and ignored, a crash restart succeeds with nothing registered |
+
+**Two layout sources, and where they differ.** Besides xgameruntime-docs (GPL; facts only), the LGPL
+`include/*.idl` of xodus-gaming/xgameruntime (from the Wine project) declares each interface with its methods in
+order. Compared class by class, the two agree exactly wherever the docs list no `_unknown_` slot: `XGameSaveImpl`'s 30
+methods, `XGameImpl`'s 3, `XStoreImpl`'s 81 (to `IXStoreImpl6`). Where the docs list one, the IDL is not consistent:
+for `XErrorImpl` it keeps the slot as `HRESULT __PADDING__()`, so the two still line up, but for `XUserImpl` (the
+docs' slot 15) and `XDisplayImpl` (slot 3) it has no entry at all, and every later method sits one slot earlier than
+the docs put it. Take a layout from the IDL only where it matches the docs' slot count, and read an IDL interface that
+skips one of the docs' unknown slots as missing it, not as proof the slot doesn't exist. The measured slots in the
+table above all follow the docs.
 
 `XThreadingImpl` forwards each slot to `third_party/xtaskqueue`, the same implementation the named exports use;
 `XThreadSetTimeSensitive`/`XThreadIsTimeSensitive` keep a per-thread flag and the two private slots log once and
@@ -205,18 +220,94 @@ connectivity (level None), the port and URL security-information queries fail wi
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
+`XUserImpl` (`runtime/shims/xgameruntime_user.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
+calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table), so its slots are **not measured** yet.
+The executable's first boot confirms them, or names the slots that differ.
+- **Interfaces:** the class id doubles as `IXUserImpl`'s; `IXUserImpl2`-`6` answer with the same 50-slot vtable;
+  `IXUserGamertagImpl` (`XUserGetGamertag`) is a second interface.
+- **The user:** one offline local user, always signed in. `XUserAddAsync` adds it with or without
+  `AddDefaultUserSilently` (with `AllowGuests` as well, it's `E_INVALIDARG`, as documented). It has fixed non-zero user
+  and local ids, is not a guest, is an adult, and has every privilege. Its gamertag comes from `LEONIDA_GAMERTAG` (15
+  printable ASCII characters at most), `Player` otherwise.
+- **Handles:** each one is its own allocation, closed once by `XUserCloseHandle`. `XUserCompare` is 0 for any two
+  handles, since they all name the one user.
+- **Not available offline:** token, gamer-picture, MSA-token and resolve-issue requests fail synchronously before
+  starting (`E_GAMEUSER_FAILED_TO_GET_TOKEN`, `E_FAIL`, `E_GAMEUSER_FAILED_TO_RESOLVE`), so no `XAsyncBlock` waits.
+  `XUserGetSignOutDeferral` is `E_GAMEUSER_DEFERRAL_NOT_AVAILABLE`, and change callbacks are only tracked as tokens,
+  because the user never changes.
+- **Logged on first use:** the docs' unknown slot 15 (answers `E_NOTIMPL`, so nothing reads outputs it didn't
+  write), the PC-only `IXUserImpl5` slots and `IXUserImpl6`'s undocumented sign-out trio (`XUserIsSignOutPresent`, a
+  bool, answers false).
+- **Validity:** handles are looked up in a live set, never read, so a closed or foreign pointer is refused without
+  touching its memory, and a double close does nothing. Unregistering a change callback is never pending, so it
+  returns true for any token. `XUserIsStoreUser` is true, as documented for console.
+
+`xgameruntime_user_test` calls every served slot with the documented arguments.
+
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
 
 | Module | Runtime classes referenced (highest interface id present) |
 |---|---|
 | `XCurl.dll` | `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl` (`IXNetworkingImpl2`) |
-| `libHttpClient.GDK.dll` | 24 of the 24 documented classes, each GUID once. Five are called through thunks ("Class layouts, measured" below): `XThreadingImpl` (27 thunks), `XPackageImpl` (30), `XNetworkingImpl` (18), `XSystemImpl` (6), `XErrorImpl` (3); the others are referenced only by the id table. Highest interfaces: `IXSystemImpl5`, `IXUserImpl5` (not 6), `IXGameImpl3`, `IXStoreImpl6`, `IXPackageImpl3` (not 4), `IXGameUiImpl4`, `IXGameSaveImpl3`, `IXGameStreamingImpl3`, `IXPersistentLocalStorageImpl3`, `IXUserDeviceImpl2`, `IXNetworkingImpl2` |
+| `libHttpClient.GDK.dll` | 23 of the 24 documented classes (not `XGameActivationImpl`), each GUID once: the ids of the `xgameruntime.lib` thunks the incremental link kept, 404 of them. `XThreadingImpl` (27 thunks), `XPackageImpl` (30), `XNetworkingImpl` (18) and `XSystemImpl` (6) are the ones read by hand above; `XErrorImpl` (3) and 18 more classes have thunks too. Only `XThreadingImpl`'s and `XErrorImpl`'s are called ([below](#measuring-which-runtime-classes-a-binary-calls)). Highest interfaces: `IXSystemImpl5`, `IXUserImpl5` (not 6), `IXGameImpl3`, `IXStoreImpl6`, `IXPackageImpl3` (not 4), `IXGameUiImpl4`, `IXGameSaveImpl3`, `IXGameStreamingImpl3`, `IXPersistentLocalStorageImpl3`, `IXUserDeviceImpl2`, `IXNetworkingImpl2` |
 | every other `.dll` | none |
 
 So `XCurl.dll` needs threading, error reporting and networking from the runtime, and the interface versions in
 `libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
-`IXUserImpl6`. The executable's own set is still unmeasured. `QueryApiImpl`'s log gives it on the first boot.
+`IXUserImpl6`. The executable's own set is still unmeasured. `tools/gdk_runtime_calls.py` gives it from the file
+(below), and `QueryApiImpl`'s log on the first boot.
+
+### Measuring which runtime classes a binary calls
+
+`tools/gdk_runtime_calls.py` lists, from the file alone, the runtime classes, interface ids and vtable slots an image
+calls through `xgameruntime.lib`'s thunks, so the executable's list is known before it first runs.
+`scripts/first_look.ps1` runs it on the executable.
+
+```powershell
+python -I tools/gdk_runtime_calls.py "$game\XCurl.dll" "$game\libHttpClient.GDK.dll"   # text; --json for JSON
+python -I tools/gdk_runtime_calls.py <exe> --out <dir>    # writes <exe>.gdk_calls.txt and .json, prints a summary
+```
+
+It finds the helper the thunks share (the call a known id's `lea` feeds, after which a vtable slot past IUnknown is
+called), takes every call to it as a thunk, reads the class and interface ids loaded into `rcx` and `rdx` (an id the
+table doesn't know is listed as unknown) and records each slot called up to `Release`, within the thunk's
+`.pdata` function or a byte window without one. The slots are named from `tools/gdk_runtime_classes.json`: the ids,
+inheritance and method order of xodus-gaming/xgameruntime-docs (GPL-3.0; facts only), made with
+`python -I tools/gen_gdk_runtime_classes.py <docs clone>`. An interface's slot table is its chain's methods, base
+first, from slot 3. For each class the report says whether `runtime/shims/xgameruntime.cpp` has its class id (a
+`constexpr GUID k...Class`), and for each thunk whether anything in the image reaches it: a call, tail jump, address
+load or pointer in data, directly or through an incremental-link `jmp` stub, a call from another thunk counting only
+when that thunk is reached. The argument count it prints is an estimate from the registers and stack slots written
+before the call.
+
+Measured on the package's DLLs (counts and slots only):
+
+| Image | Thunks (referenced) | Classes and slots |
+|---|---:|---|
+| `XCurl.dll` | 16 (16) | `XThreadingImpl` 3, 5, 12, 16-18, 22, 29; `XErrorImpl` 3; `XNetworkingImpl` as `IXNetworkingImpl2` 11-17, as in the table above. The estimated argument counts match the documented signatures for all 16 |
+| `libHttpClient.GDK.dll` | 404 (15) | 23 classes through one helper. `XThreadingImpl` 3-7, 9-30, `XNetworkingImpl` as `IXNetworkingImpl2` 3-20, `XSystemImpl` as `IXSystemImpl5` 3-8 and `XPackageImpl` as `IXPackageImpl3` 3-19, 22, 24-27, 30, 32-34, 37-40 match the slots read by hand; the other 19 classes have thunks too. Referenced: `XThreadingImpl` 3, 5, 7, 9-15, 17, 19, 22, 29 and `XErrorImpl` 3 only |
+| the other 14 DLLs | 0 | none |
+
+`libHttpClient.GDK.dll` is incrementally linked (its entry point is a `jmp rel32` stub), and an incremental link
+doesn't remove unreferenced functions (`/INCREMENTAL` turns `/OPT:REF` off): it carries 404 thunks and calls 15. Two
+interface ids its thunks ask for are not in xgameruntime-docs: one of `XGameSaveImpl` (slots 33-49, after the 30 of
+`IXGameSaveImpl3`'s chain) and one of `XGameStreamingImpl` (slots 3-6). The report prints them.
+
+Limits:
+
+- x86-64 only, and the thunk shape measured here: the class id loaded with a RIP-relative `lea` into `rcx` and the
+  interface id into `rdx` (or the class id copied there), the vtable read with `mov r,[r]` and the slot with
+  `mov r,[r+disp]` and a call (the CFG dispatch, or `call r`) or `call [r+disp]`, register copies followed. A
+  `QueryApiImpl` call outside the library's thunks is found only when it has that shape; helper calls it can't
+  follow to a slot are listed.
+- Static: a referenced thunk may never run, and a reference through a computed address or from another module is
+  not seen.
+- "Served" means the shim has the class id. It doesn't say that each slot does more than log, nor that
+  `QueryApiImpl` accepts the interface id the thunk passes; the report marks each request whose interface id is not
+  the class id.
+- Names are as complete as xgameruntime-docs: an *unknown* entry keeps its slot unnamed, and a slot past an interface
+  without a documented layout is unknown.
 
 A title that calls `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` or `FreeLibrary` on one of the package's
 bundled DLLs (`Bink2Scarlett.dll`, `XboxBvhBuilder.dll`, the FidelityFX DLLs) is routed through `rt::Loader` instead of
@@ -240,8 +331,9 @@ end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMem
   no error callback.
 - Reading a response and `WinHttpWriteData` fail with `ERROR_WINHTTP_INCORRECT_HANDLE_STATE`. Options, timeouts and
   headers are accepted; `WINHTTP_OPTION_CONTEXT_VALUE` and `WINHTTP_OPTION_HANDLE_TYPE` can be queried.
-- A status callback is inherited by child handles, which report `HANDLE_CREATED`; every handle reports
-  `HANDLE_CLOSING` once, last. `WinHttpCrackUrl` only parses, so it is the host's.
+- A status callback is inherited by child handles, and so is the parent's `WINHTTP_OPTION_CONTEXT_VALUE` as it is
+  when the child is made (measured on the host's `winhttp.dll`). Child handles report `HANDLE_CREATED`; every
+  handle reports `HANDLE_CLOSING` once, last. `WinHttpCrackUrl` only parses, so it is the host's.
 - Because the shims own the module, a title's `LoadLibrary("winhttp.dll")` gets a pseudo-handle too, and a WinHTTP
   function outside these 16 resolves to `NULL` (logged), never to the host.
 

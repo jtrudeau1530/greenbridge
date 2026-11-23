@@ -13,10 +13,18 @@ sys.path.insert(0, os.path.join(ROOT, "tools", "hw_oracle"))
 
 import sampler_lod_probe as p  # noqa: E402
 
-# What gfx1036 (Radeon iGPU, AMD 26.10.1) read for these rows: tools/sampler_lod_probe.py --oracle hw.
-MEASURED = {"s_min2_lz": 2, "s_bias+2_lz": 2, "s_bias+2_max3_l3": 3, "l1.5": 2, "l0.5": 1, "l1.49": 1,
-            "s_min1.5_l0": 2, "t_min2.25_l0": 2, "t_min2.5_l0": 3, "t_min2.75_l0": 3, "base1_t_min2_l0": 2,
-            "mipnone_min2_l0": 0, "mipnone_t_min2.5": 2, "mipnone_base1_tmin3": 3}
+# What gfx1036 (Radeon iGPU, AMD 26.10.1) read for every row, wave32 and wave64 alike:
+# tools/sampler_lod_probe.py --oracle hw. All 43 are pinned, so a change to rdna2_level shows without a GPU.
+MEASURED = {
+    "calib_lod0": 0, "calib_lod1": 1, "calib_lod2": 2, "calib_lod3": 3, "calib_lod4": 4, "calib_lod5": 5,
+    "calib_lod6": 6, "lz": 0, "s_min2_l0": 2, "s_min2_lz": 2, "s_max1_l4": 1, "s_max0_l3": 0, "s_bias+2_l1": 3,
+    "s_bias+2_lz": 2, "s_bias-1_l3": 2, "s_bias+2_max3_l3": 3, "s_bias+0.5_l1": 2, "l1.25": 1, "l1.5": 2,
+    "l1.75": 2, "mipnone_l3": 0, "mipnone_min2_l0": 0, "mipnone_t_min3_l0": 3, "mipnone_t_min2.25": 2,
+    "mipnone_t_min2.5": 2, "mipnone_base1_tmin3": 3, "t_min3_l1": 3, "t_min3_lz": 3, "t_min3_l5": 5,
+    "t_min2.5_l0": 3, "t_min2.5_l2.6": 3, "t_min2.25_l0": 2, "t_min2.75_l0": 3, "t_min2.25_lz": 2, "l0.5": 1,
+    "l2.5": 3, "s_min1.5_l0": 2, "s_max1.5_l4": 2, "l1.49": 1, "base1_l0": 1, "base1_s_min1_l0": 2,
+    "base1_t_min2_l0": 2, "base1_t_min2_lz": 2,
+}
 
 
 def field(word, lo, width):
@@ -52,6 +60,7 @@ class RowsTest(unittest.TestCase):
 
     def test_model_gives_the_measured_levels(self):
         by_name = {r[0]: r for r in p.rows()}
+        self.assertEqual(set(MEASURED), set(by_name), "every row is pinned to its measured level")
         for name, level in MEASURED.items():
             _n, instr, lod, s, t = by_name[name]
             with self.subTest(name):

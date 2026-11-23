@@ -206,15 +206,33 @@ class CvtNormF16Tests(unittest.TestCase):
         want = (ref_norm16(float_to_f16(0.5), False) << 16) | ref_norm16(float_to_f16(0.5), True)
         self.assertEqual(got, want)
 
-    def test_rejects_output_modifiers(self):
-        for line in (
-            "v_cvt_norm_i16_f16_e64 v0, v1 clamp",
-            "v_cvt_norm_u16_f16_e64 v0, v1 mul:2",
-            "v_cvt_norm_i16_f16_e64 v0, v1 div:2",
+    def test_output_modifiers_match_plain_and_reject_invalid_forms(self):
+        h = float_to_f16(0.5)
+        for op, snorm in (("v_cvt_norm_i16_f16", True), ("v_cvt_norm_u16_f16", False)):
+            want = (SEED_DST & 0xFFFF0000) | ref_norm16(h, snorm)
+            for mod in ("clamp", "mul:2", "mul:4", "div:2"):
+                with self.subTest(op=op, mod=mod):
+                    got = run_lines([
+                        f"v_mov_b32 v1, {h:#x}",
+                        f"v_mov_b32 v0, {SEED_DST:#x}",
+                        f"{op}_e64 v0, v1 {mod}",
+                    ])
+                    self.assertEqual(got, want)
+            with self.subTest(op=op, form="sdwa_clamp"):
+                got_sdwa = run_lines([
+                    f"v_mov_b32 v1, {(h << 16):#x}",
+                    f"v_mov_b32 v0, {SEED_DST:#x}",
+                    f"{op}_sdwa v0, v1 clamp dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+                ])
+                self.assertEqual(got_sdwa, (ref_norm16(h, snorm) << 16) | (SEED_DST & 0xFFFF))
+        for bad_line in (
+            "v_cvt_norm_i16_f16_e64 v0, v1 mul:8",
+            "v_cvt_norm_u16_f16_sdwa v0, v1 mul:2 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+            "v_cvt_norm_i16_f16_e32 v0, v1 clamp",
         ):
-            with self.subTest(line=line):
+            with self.subTest(line=bad_line):
                 with self.assertRaises(rdna2spirv.Unsupported):
-                    translate_lines([line])
+                    translate_lines([bad_line])
 
 
 if __name__ == "__main__":
