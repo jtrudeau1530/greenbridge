@@ -27,10 +27,21 @@ specification. Do not paste even a small function "to save time".
 
 A **GPL-2.0-only** fork of [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), on its `xbox-series` branch. It
 recompiles the same Xbox Series shaders and has run the package's DLLs against a PC D3D12 device behind an Xbox-ABI
-proxy.
+proxy. Since 2026-11-22 its pull requests are limited to collaborators and its README points contributors here.
 
-**Licence:** GPL-2.0-only is **incompatible with GPL-3.0-or-later**. GPLv2-only code cannot be combined into a
-GPLv3 work, so **no code may be copied**, and there is no "just this one file" exception.
+**Licence:** the repository is **GPL-2.0-only** (`LICENSE`), which is **incompatible with GPL-3.0-or-later**: GPLv2-only
+code cannot be combined into a GPLv3 work, so none of it may be copied, and there is no "just this one file" exception.
+Since 2026-11-22 its `REUSE.toml` on `xbox-series` (commit `f1c25d72`) lists **88 files under MIT**, each relicensed with
+the agreement of everyone who wrote lines in it ([realdody/americas-recomp#179](https://github.com/realdody/americas-recomp/issues/179),
+still open, so the list can change): 35 files at the top of its tools/xbox directory, 30 in tools/xbox/platform (for
+example `xbox_dxil_lower.py`, `d3d12_xs.cpp`, `xmem.cpp`, `xbox_device_proxy.h`), one each under tools/xbox/msvc and
+tools/xbox/platform/xgr, its 20 tools/tests/test_xbox_*.py tests and `docs/xbox/BVH_CONTAINER.md`. Everything else,
+including the recompiler in its core directory and the `xgameruntime` stand-in sources, stays GPL-2.0-only.
+
+**Rule until the maintainer decides:** **no americas-recomp code is copied into Leonida**, MIT-listed or not. MIT is
+compatible with GPL-3.0-or-later, so the listed files could be used the way `third_party/xtaskqueue` is (per file, only
+paths listed in `REUSE.toml` at the commit used, the MIT notice kept); whether Leonida does that is the maintainer's
+decision, not a contributor's.
 
 **What we use it for:** the measured ABI facts only. The useful findings are summarised in
 [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi): the Xbox device entry point, the slot
