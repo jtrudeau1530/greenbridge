@@ -197,6 +197,22 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
+            case 68: {                                                      // GetResourceAllocationInfo2
+                auto* ret = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1);
+                const auto count = static_cast<std::uint32_t>(a3);
+                const auto* descs = reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a4);
+                auto* info1 = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(words[4]);
+                if (descs && count > 0) {
+                    m->array[68][0] = static_cast<std::uint64_t>(descs[0].Layout);
+                    m->array[68][1] = static_cast<std::uint64_t>(descs[0].Flags);
+                    m->array[68][2] = descs[0].SamplerFeedbackMipRegion.Width |
+                                      descs[0].SamplerFeedbackMipRegion.Height |
+                                      descs[0].SamplerFeedbackMipRegion.Depth;
+                }
+                if (ret) *ret = {0x40000, 0x10000};
+                if (info1 && count > 0) info1[0] = {0, 0x10000, 0x40000};
+                return a1;
+            }
             default: break;
         }
         return S_OK;
@@ -379,6 +395,35 @@ int check_levels() {
             EXPECT(release(queue1) == 0 && mock->last_child->refs == 0);
         } else {
             EXPECT(r75 == E_NOTIMPL && !queue1 && mock->calls[75] == 0);
+        }
+
+        // 86: Xbox CreatePipelineState -> PC slot 47 (ID3D12Device2)
+        void* pso_out = reinterpret_cast<void*>(1);
+        const HRESULT r86 = hr_of(raw(device, 86, 0, word(&kUnknownIid), word(&pso_out)));
+        if (l.level >= 2) {
+            EXPECT(r86 == S_OK && mock->calls[47] == 1 && mock->calls[86] == 0);
+        } else {
+            EXPECT(r86 == E_NOTIMPL && !pso_out && mock->calls[47] == 0 && mock->calls[86] == 0);
+        }
+
+        // 101: Xbox CreateStateObject -> PC slot 62 (ID3D12Device5)
+        void* so_out = reinterpret_cast<void*>(1);
+        const HRESULT r101 = hr_of(raw(device, 101, 0, word(&kUnknownIid), word(&so_out)));
+        if (l.level >= 5) {
+            EXPECT(r101 == S_OK && mock->calls[62] == 1 && mock->calls[101] == 0);
+        } else {
+            EXPECT(r101 == E_NOTIMPL && !so_out && mock->calls[62] == 0 && mock->calls[101] == 0);
+        }
+
+        // 108: Xbox GetResourceAllocationInfo2 -> PC slot 68 (ID3D12Device8)
+        D3D12_RESOURCE_ALLOCATION_INFO alloc_info{1, 1};
+        const std::uint64_t r108 = raw(device, 108, word(&alloc_info), 1, 0, 0, 0);
+        if (l.level >= 8) {
+            EXPECT(r108 == word(&alloc_info) && alloc_info.SizeInBytes == 0x40000 && alloc_info.Alignment == 0x10000 &&
+                   mock->calls[68] == 1 && mock->calls[108] == 0);
+        } else {
+            EXPECT(r108 == word(&alloc_info) && alloc_info.SizeInBytes == UINT64_MAX && alloc_info.Alignment == 0 &&
+                   mock->calls[68] == 0 && mock->calls[108] == 0);
         }
 
         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
@@ -753,7 +798,76 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), 0)) == E_POINTER);
 
     EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
-           xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
+           xs::device_slot_overridden(79) && xs::device_slot_overridden(80) && xs::device_slot_overridden(86) &&
+           xs::device_slot_overridden(101) && xs::device_slot_overridden(108));
+
+    // 86 CreatePipelineState(desc, riid, out) -> PC slot 47 (ID3D12Device2::CreatePipelineState).
+    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{};
+    const IID pso_iid = __uuidof(ID3D12PipelineState);
+    void* pso_stream_out = nullptr;
+    EXPECT(hr_of(raw(device, 86, word(&stream_desc), word(&pso_iid), word(&pso_stream_out))) == S_OK);
+    EXPECT(mock->calls[86] == 0 && mock->calls[47] == 1 && xs::device_slot_hits(86) == 1);
+    EXPECT(mock->args[47][0] == word(&stream_desc) && mock->args[47][1] == word(&pso_iid) &&
+           mock->args[47][2] == word(&pso_stream_out));
+    pso_stream_out = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 86, word(&stream_desc), 0, word(&pso_stream_out))) == E_POINTER && !pso_stream_out);
+
+    // 101 CreateStateObject(desc, riid, out) -> PC slot 62 (ID3D12Device5::CreateStateObject).
+    D3D12_STATE_OBJECT_DESC state_obj_desc{};
+    const IID so_iid = __uuidof(ID3D12StateObject);
+    void* so_out = nullptr;
+    EXPECT(hr_of(raw(device, 101, word(&state_obj_desc), word(&so_iid), word(&so_out))) == S_OK);
+    EXPECT(mock->calls[101] == 0 && mock->calls[62] == 1 && xs::device_slot_hits(101) == 1);
+    EXPECT(mock->args[62][0] == word(&state_obj_desc) && mock->args[62][1] == word(&so_iid) &&
+           mock->args[62][2] == word(&so_out));
+    so_out = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 101, word(&state_obj_desc), 0, word(&so_out))) == E_POINTER && !so_out);
+
+    // 108 GetResourceAllocationInfo2 -> PC slot 68 (ID3D12Device8::GetResourceAllocationInfo2), called with the
+    // retail executable's C-ABI struct return (return buffer in RCX, device proxy in RDX) and an Xbox layout/flag
+    // word, as well as the PC C++ argument order.
+    void* const* proxy_vtable = *reinterpret_cast<void* const* const*>(device);
+    using CAbiSlot108Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
+        D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
+        D3D12_RESOURCE_ALLOCATION_INFO1*);
+    const auto call_slot108_c_abi = reinterpret_cast<CAbiSlot108Fn>(proxy_vtable[108]);
+    D3D12_RESOURCE_DESC1 xbox_rt_desc{};
+    xbox_rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    xbox_rt_desc.Width = 3840;
+    xbox_rt_desc.Height = 2160;
+    xbox_rt_desc.DepthOrArraySize = 1;
+    xbox_rt_desc.MipLevels = 1;
+    xbox_rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    xbox_rt_desc.SampleDesc.Count = 1;
+    xbox_rt_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    xbox_rt_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | 0x300000u);
+    xbox_rt_desc.SamplerFeedbackMipRegion = {4, 4, 1};
+    D3D12_RESOURCE_ALLOCATION_INFO ret_info{};
+    D3D12_RESOURCE_ALLOCATION_INFO1 detail_info{};
+    EXPECT(call_slot108_c_abi(&ret_info, device, 1, 1, &xbox_rt_desc, &detail_info) == &ret_info);
+    EXPECT(ret_info.SizeInBytes == 0x40000 && ret_info.Alignment == 0x10000);
+    EXPECT(detail_info.SizeInBytes == 0x40000 && detail_info.Alignment == 0x10000);
+    EXPECT(mock->calls[108] == 0 && mock->calls[68] == 1 && xs::device_slot_hits(108) == 1);
+    EXPECT(mock->array[68][0] == static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_UNKNOWN));
+    EXPECT(mock->array[68][1] == static_cast<std::uint64_t>(
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    EXPECT(mock->array[68][2] == 0);
+
+    D3D12_RESOURCE_DESC1 xbox_buf_desc{};
+    xbox_buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    xbox_buf_desc.Width = 4096;
+    xbox_buf_desc.Height = 1;
+    xbox_buf_desc.DepthOrArraySize = 1;
+    xbox_buf_desc.MipLevels = 1;
+    xbox_buf_desc.SampleDesc.Count = 1;
+    xbox_buf_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    xbox_buf_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x200000u);
+    D3D12_RESOURCE_ALLOCATION_INFO buf_ret{};
+    EXPECT(raw(device, 108, word(&buf_ret), 1, 1, word(&xbox_buf_desc), 0) == word(&buf_ret));
+    EXPECT(buf_ret.SizeInBytes == 0x40000 && mock->calls[68] == 2 && xs::device_slot_hits(108) == 2);
+    EXPECT(mock->array[68][0] == static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR));
+    EXPECT(mock->array[68][1] == static_cast<std::uint64_t>(D3D12_RESOURCE_FLAG_NONE));
 
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
