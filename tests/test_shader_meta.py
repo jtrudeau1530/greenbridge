@@ -156,6 +156,17 @@ class DxbcMetaTests(unittest.TestCase):
                 self.assertNotIn("input_signature", meta)
                 self.assertTrue(meta["sfi0_resource_heap_directly_indexed"])
 
+    def test_invalid_second_name_drops_whole_signature(self):
+        tag, payload = isg1_chunk([("POSITION", 0, 0, 7, 7, 0, 3), ("TEXCOORD", 0, 1, 3, 3, 0, 3)])
+        second_name = struct.unpack_from("<I", payload, 8 + 32 + 4)[0]
+        for offset, data in ((8, payload), (len(payload), payload), (second_name, payload[:-1])):
+            with self.subTest(offset=offset):
+                malformed = bytearray(data)
+                struct.pack_into("<I", malformed, 8 + 32 + 4, offset)
+                meta = M.read_dxbc_meta(make_dxbc([(tag, malformed), sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING)]))
+                self.assertNotIn("input_signature", meta)
+                self.assertTrue(meta["sfi0_resource_heap_directly_indexed"])
+
     def test_sfi0_both_heaps_and_empty_dxbc(self):
         dxbc = make_dxbc([sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING | M.SFI0_SAMPLER_DESCRIPTOR_HEAP_INDEXING)])
         got = M.read_dxbc_meta(dxbc)
