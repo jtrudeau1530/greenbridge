@@ -168,10 +168,16 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
     current, started, last = None, time.monotonic(), time.monotonic()
     done_names = []
     events.put(("start", run.label, " ".join(str(c) for c in cmd)))
+    eof = False
     while True:
         try:
+            if eof:
+                # EOF ends the output stream. The title can still be running.
+                remaining = timeout - (time.monotonic() - last)
+                proc.wait(timeout=max(0.0, min(0.25, remaining)))
+                break
             line = lines.get(timeout=0.25)
-        except queue.Empty:
+        except (queue.Empty, subprocess.TimeoutExpired):
             if time.monotonic() - last > timeout:
                 hung = current or next((n for n in known if n not in done_names), "(before the first check)")
                 stacks = thread_stacks(cdb, proc.pid)
@@ -184,7 +190,8 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
             events.put(("tick", run.label, current, time.monotonic() - started))
             continue
         if line is None:
-            break
+            eof = True
+            continue
         last = time.monotonic()
         if out:
             out.write(line + "\n")
@@ -210,7 +217,6 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
             done_names.append(name)
             events.put(("check", run.label, name))
             current, started = None, time.monotonic()
-    proc.wait()
     run.exit_code = proc.returncode
     if current and run.checks.get(current, {}).get("status") == "RUNNING":
         run.set(current, status="FAIL", reason="the title exited during this check (exit code %s)" % proc.returncode)

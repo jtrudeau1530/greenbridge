@@ -110,6 +110,31 @@ class Sink:
         pass
 
 
+class OutputEOF(unittest.TestCase):
+    def run_closed_pipe(self, after_close):
+        script = ("import os, time\n"
+                  "print('[RUN] probe', flush=True)\n"
+                  "os.close(1)\n"
+                  "os.close(2)\n" + after_close)
+        run = xc.Run("synthetic")
+        with tempfile.TemporaryDirectory() as tmp:
+            hung = xc.run_title([sys.executable, "-I", "-c", script], os.environ, tmp, run,
+                                ["probe"], 1, None, Sink(), [])
+        return hung, run
+
+    def test_live_title_after_eof_returns_hung_check_for_restart(self):
+        hung, run = self.run_closed_pipe("time.sleep(3)")
+        self.assertEqual(hung, "probe")
+        self.assertEqual(run.checks["probe"]["status"], "HANG")
+        self.assertEqual(run.checks["probe"]["reason"], "no output for 1 s")
+
+    def test_exit_after_eof_keeps_exit_code(self):
+        hung, run = self.run_closed_pipe("raise SystemExit(7)")
+        self.assertIsNone(hung)
+        self.assertEqual(run.exit_code, 7)
+        self.assertEqual(run.checks["probe"]["status"], "FAIL")
+
+
 # A stand-in title: checks a, b and c; b hangs unless XCL_TESTTITLE_SKIP names it (or HONOUR_SKIP is 0).
 FAKE_TITLE = """
 import os, sys, time
