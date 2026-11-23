@@ -800,9 +800,11 @@ def analyze_edge_topology(
     Returns counts of total unique welded edges, boundary edges (incident to
     1 triangle), manifold interior edges (incident to 2 triangles), and
     non-manifold edges (incident to >2 triangles — typically caused by
-    double-drawn coplanar overlap bands).
+    double-drawn coplanar overlap bands). Triangles with fewer than three
+    distinct welded corners are counted separately; they no longer form faces.
     """
     edge_counts: dict[tuple[tuple[int, int, int], tuple[int, int, int]], int] = defaultdict(int)
+    collapsed = 0
     for part in parts:
         ox, oy, oz = part.translation
         qpts = [
@@ -811,9 +813,10 @@ def analyze_edge_topology(
         ]
         for a, b, c in part.triangles:
             qa, qb, qc = qpts[a], qpts[b], qpts[c]
+            if qa == qb or qb == qc or qc == qa:
+                collapsed += 1
+                continue
             for u, v in ((qa, qb), (qb, qc), (qc, qa)):
-                if u == v:
-                    continue
                 edge = (u, v) if u < v else (v, u)
                 edge_counts[edge] += 1
 
@@ -833,6 +836,7 @@ def analyze_edge_topology(
         "boundary_edges": boundary,
         "manifold_edges": manifold,
         "non_manifold_edges": non_manifold,
+        "collapsed_triangles": collapsed,
     }
 
 
@@ -1308,7 +1312,11 @@ def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
     def read_row(offset):
         vals = unpack(bin_chunk, offset)
         if denom is not None:
-            vals = tuple(v / denom for v in vals)
+            if ctype in (COMPONENT_BYTE, COMPONENT_SHORT):
+                # Both signed minimum encodings represent -1 in glTF's normalized range.
+                vals = tuple(max(v, -denom) / denom for v in vals)
+            else:
+                vals = tuple(v / denom for v in vals)
         return vals[0] if n_comp == 1 else vals
 
     def start_of(section):
@@ -1574,7 +1582,7 @@ def load_parts_from_path(
         return parts, None
 
     if ext == ".json":
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
         if isinstance(data, dict) and "parts" in data:
             skel = _skeleton_from_dict(data.get("skeleton"), default_space=data.get("coord_space", source_space))
@@ -2282,6 +2290,7 @@ def _cmd_inspect_seams(args: argparse.Namespace) -> int:
         f"inspect-seams: {report['part_count']} part(s), "
         f"edges={topo['unique_edges']} (manifold={topo['manifold_edges']}, "
         f"boundary={topo['boundary_edges']}, non_manifold={topo['non_manifold_edges']}), "
+        f"collapsed_triangles={topo['collapsed_triangles']}, "
         f"overlapping_pairs={len(report['pairwise_overlaps'])}"
     )
     for p in report["parts"]:
