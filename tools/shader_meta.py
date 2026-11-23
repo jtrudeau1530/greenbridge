@@ -318,6 +318,10 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 new_scale[d] = scale[s]
             if s in ptr_stride:
                 new_pstride[d] = ptr_stride[s]
+    elif op == "s_brev_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+        c = _const_of(sym, a[1])
+        if c is not None:
+            new_sym[a[0]["r"]] = ("const", int(f"{c & 0xFFFFFFFF:032b}"[::-1], 2))
     elif op == "s_movk_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1 and a[1]["k"] == "imm":
         v = a[1]["v"] & 0xFFFF
         if v & 0x8000:

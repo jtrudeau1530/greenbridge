@@ -508,6 +508,39 @@ class OperandClassificationTests(unittest.TestCase):
         self.assertEqual(meta["descriptor_strides"], [32])
         self.assertEqual(meta["literal_samplers"], [[0x92, 0xFFFFFFFF, 0, 0]])
 
+    def test_s_brev_b32_constant_folding(self):
+        # A literal S# with one dword bit-reversed by s_brev_b32 from an immediate or a known SGPR.
+        lines = [
+            "s_mov_b32 s12, 0x92",
+            "s_brev_b32 s13, 1",
+            "s_mov_b32 s20, 0x3",
+            "s_brev_b32 s14, s20",
+            "s_mov_b32 s15, 0",
+            "v_mov_b32_e32 v0, 0.5",
+            "v_mov_b32_e32 v1, 0.5",
+            "image_sample v[4:7], v[0:1], s[0:7], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_brev_meta", lines)
+        self.assertEqual(meta["literal_samplers"], [[0x92, 0x80000000, 0xC0000000, 0]])
+
+    def test_s_brev_b32_of_unknown_source_is_not_a_literal(self):
+        # s_brev_b32 of a user SGPR leaves its destination unknown, so no literal S# is recorded.
+        lines = [
+            "s_mov_b32 s12, 0x92",
+            "s_brev_b32 s13, s2",
+            "s_mov_b32 s14, 0",
+            "s_mov_b32 s15, 0",
+            "v_mov_b32_e32 v0, 0.5",
+            "v_mov_b32_e32 v1, 0.5",
+            "image_sample v[4:7], v[0:1], s[0:7], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_brev_user_meta", lines)
+        self.assertNotIn("literal_samplers", meta)
+
     def test_scalar_store_pointer_and_vsharp(self):
         # s_store_dword* classifies its 2-SGPR pointer pair without marking table_loads,
         # and s_buffer_store_dword* classifies its 4-SGPR resource descriptor as vsharp.
