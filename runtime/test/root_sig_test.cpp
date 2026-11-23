@@ -578,6 +578,35 @@ void test_deserializer() {
                   out.empty(),
               "blob helper refuses an unknown RTS0 header version");
     }
+
+    // 5. Malformed non-RTS0 chunk-table entry (before or after a valid RTS0 chunk) must fail closed.
+    {
+        uint32_t orig_rts_off = 0, orig_rts_sz = 0;
+        std::memcpy(&orig_rts_off, tampered.data() + 32, 4);
+        std::memcpy(&orig_rts_sz, tampered.data() + orig_rts_off + 4, 4);
+        const uint32_t rts_bytes = 8 + orig_rts_sz;
+        for (int bad_first = 0; bad_first < 2; ++bad_first) {
+            // Header (32) + 2 chunk offsets (8) + valid RTS0 chunk.
+            std::vector<uint8_t> bad_table(40 + rts_bytes, 0);
+            std::memcpy(bad_table.data(), "DXBC", 4);
+            const uint32_t version = 1, total = static_cast<uint32_t>(bad_table.size()), nchunks = 2;
+            const uint32_t good_off = 40, bad_off = 16;  // bad_off < min_chunk_off (40)
+            std::memcpy(bad_table.data() + 20, &version, 4);
+            std::memcpy(bad_table.data() + 24, &total, 4);
+            std::memcpy(bad_table.data() + 28, &nchunks, 4);
+            std::memcpy(bad_table.data() + 32, bad_first ? &bad_off : &good_off, 4);
+            std::memcpy(bad_table.data() + 36, bad_first ? &good_off : &bad_off, 4);
+            std::memcpy(bad_table.data() + good_off, tampered.data() + orig_rts_off, rts_bytes);
+            uint32_t h[4];
+            rt::d3d12_xs::dxbc_checksum(bad_table.data(), bad_table.size(), h);
+            std::memcpy(bad_table.data() + 4, h, sizeof(h));
+            std::vector<uint8_t> out;
+            check(!rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(bad_table.data(), bad_table.size(), out) &&
+                      out.empty(),
+                  bad_first ? "blob helper fails closed on a malformed chunk entry before RTS0"
+                            : "blob helper fails closed on a malformed chunk entry after RTS0");
+        }
+    }
 }
 
 void test_dxbc_checksum_guards() {
