@@ -525,6 +525,48 @@ def test_emulated_wave64_is_compared_at_any_subgroup_size(monkeypatch, capsys, t
     assert "MISMATCH" in out and "0 skipped" in out
 
 
+def test_gpu_timeout_is_a_harness_error_and_next_program_runs(monkeypatch, capsys, tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / ("vk_compute_test" + (".exe" if os.name == "nt" else ""))).touch()
+    progs = vf.programs("f16", 1, 2, (32,))
+    attempted = []
+
+    def translate(progs, work, _emulate):
+        (work / "spirv").mkdir()
+        for p in progs:
+            (work / "spirv" / (p.name + ".spv")).touch()
+        return {p.name: {} for p in progs}, ""
+
+    def run(cmd, *, env, timeout, **kwargs):
+        assert timeout == 0.25
+        name = os.path.splitext(os.path.basename(cmd[1]))[0]
+        attempted.append(name)
+        if name == progs[0].name:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        with open(env["VKC_DUMP"], "wb") as dump:
+            dump.write(bytes(4 * progs[1].out_words()))
+        return subprocess.CompletedProcess(cmd, 0, "compute subgroup size: 32", "")
+
+    def compare(prog, data):
+        prog.uncertain_words = 0
+        return []
+
+    monkeypatch.setenv("LEONIDA_GPU_TEST_TIMEOUT", "0.25")
+    monkeypatch.delenv("LEONIDA_PC_TAIL_UBO", raising=False)
+    monkeypatch.setattr(vf, "translate", translate)
+    monkeypatch.setattr(vf.subprocess, "run", run)
+    monkeypatch.setattr(vf, "compare", compare)
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--programs", "2", "--wave", "32",
+                                      "--build", str(build), "--work", str(tmp_path)])
+
+    assert vf.main() == 2
+    assert attempted == [p.name for p in progs]
+    out = capsys.readouterr().out
+    assert f"ERROR {progs[0].name}" in out and "timed out after 0.25 s" in out
+    assert "1/1 programs that ran match" in out and "1 harness errors" in out
+
+
 def test_pc_tail_ubo_forwarded_to_translator_and_vk_compute_test(monkeypatch, tmp_path):
     cmds = []
 
