@@ -114,6 +114,65 @@ In strict mode, exit 1 means at least one result other than `exact` or `partitio
 Invalid inputs or an unavailable Vulkan probe exit 2. This checks width fidelity from metadata.
 Vulkan pipeline creation and drawing still need their own tests. See [Wave64 graphics in the
 translator contract](design.md) for how the tiers are assigned.
+## Test Mesa pipeline compilation without a physical GPU
+
+On Linux, Mesa's DRM shims expose GPU profiles to its Vulkan drivers. This lets `vk_pipeline_check`
+measure shader compile time and reproduce compiler failures on a machine without that hardware.
+Readback and dispatch correctness still require a Vulkan device that executes commands.
+See the [Mesa DRM shim guide](https://docs.mesa3d.org/ci/drm-shim.html).
+
+From the Leonida root, build the checker and translate a synthetic fixture. The fixture build needs
+`spirv-as`, `spirv-val` and LLVM 21 or later with the AMDGPU target. Set `LLVM_MC` if the assembler
+has a versioned name.
+
+```sh
+cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build runtime/build --target vk_pipeline_check
+fixtures=$(mktemp -d)
+python3 -I runtime/test/shaders/build.py "$fixtures" cs_buf_fmt8
+```
+
+### AMD RADV
+
+Build Mesa with `-Dvulkan-drivers=amd -Dtools=drm-shim`. Set `mesa_build` to that build directory
+and `radv_icd` to the absolute path of the matching RADV Vulkan ICD manifest.
+
+```sh
+AMDGPU_GPU_ID=gfx1201 \
+LD_PRELOAD="$mesa_build/src/amd/drm-shim/libamdgpu_noop_drm_shim.so" \
+VK_DRIVER_FILES="$radv_icd" MESA_SHADER_CACHE_DISABLE=true \
+  runtime/build/vk_pipeline_check "$fixtures/spirv" --jobs 1 --slow 0
+```
+
+The checker should select a device whose name includes `RADV GFX1201` and report one compute pipeline
+compiled. For comparisons, use the same Mesa version, GPU profile and translation flags each time.
+Run each comparison in a fresh process and leave the pipeline cache filename out.
+
+Mesa 25.0.7 also supports a null device directly through the installed RADV ICD. On Debian 13
+this runs the same compile check with the distro driver.
+
+```sh
+RADV_FORCE_FAMILY=GFX1201 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json \
+MESA_SHADER_CACHE_DISABLE=true runtime/build/vk_pipeline_check "$fixtures/spirv" --jobs 1 --slow 0
+```
+
+### Intel ANV
+
+Build the Intel shim with `-Dtools=drm-shim,intel` and use an ANV ICD from the same Mesa version.
+When using a prebuilt driver, the shim can be built with `-Dvulkan-drivers= -Dgallium-drivers=`.
+Set `intel_icd` to the absolute path of its ANV manifest and `intel_shim_build` to the shim's
+Mesa build directory.
+
+```sh
+INTEL_STUB_GPU_PLATFORM=bmg \
+LD_PRELOAD="$intel_shim_build/src/intel/tools/libintel_noop_drm_shim.so" \
+VK_DRIVER_FILES="$intel_icd" MESA_SHADER_CACHE_DISABLE=true \
+  runtime/build/vk_pipeline_check "$fixtures/spirv" --jobs 1 --slow 0
+```
+
+The example selects a Battlemage profile. Use `dg2` for an Alchemist profile or `adl` for Alder Lake.
+On Mesa 26.1.6 all three compiled the example, including when it was rebuilt with
+`LEONIDA_PC_TAIL_UBO=1` to move the push-constant tail to a uniform buffer.
 
 ## Corpus
 
