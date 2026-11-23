@@ -21,12 +21,13 @@ constexpr std::uint32_t kPcResourceFlagsMask =
     D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY |
     D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
 
-constexpr auto kXboxTiledResourceLayout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+// A word, not a D3D12_TEXTURE_LAYOUT: 0x101 is outside the enum's range, which clang-cl rejects in a constant.
+constexpr std::uint32_t kXboxTiledResourceLayout = 0x101;
 
 // Strip Xbox-only flags and translate the Xbox tiled layout. Preserve all other layouts so the host can validate them.
 inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
     D3D12_RESOURCE_DESC pc = xbox;
-    if (pc.Layout == kXboxTiledResourceLayout) {
+    if (static_cast<std::uint32_t>(pc.Layout) == kXboxTiledResourceLayout) {
         pc.Layout = pc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                    : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }

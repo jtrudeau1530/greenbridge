@@ -2475,7 +2475,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
         }
         for (UINT i = 0; i < desc_count; ++i) {
             const auto& desc = descs[i];
-            clean[i] = call.console_abi || desc.Layout == kXboxTiledResourceLayout ? pc_resource_desc(desc) : desc;
+            clean[i] = call.console_abi || static_cast<std::uint32_t>(desc.Layout) == kXboxTiledResourceLayout ? pc_resource_desc(desc) : desc;
         }
         descs = clean.get();
     }
