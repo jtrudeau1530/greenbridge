@@ -125,6 +125,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/dstorage.cpp
     shims/host_stall.cpp
     shims/com_shim.cpp
+    shims/bcrypt_rng.cpp
   )
   # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with
   # __try. MSVC always catches it; clang-cl only with asynchronous exceptions (as for tiny_dll below). A source file
@@ -371,6 +372,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(com_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(com_shim_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(com_shim_test PRIVATE /OPT:NOREF)
+  # BCrypt RNG and algorithm provider shims.
+  add_executable(bcrypt_rng_test
+    test/bcrypt_rng_test.cpp
+    shims/bcrypt_rng.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(bcrypt_rng_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(bcrypt_rng_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(bcrypt_rng_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(bcrypt_rng_test PRIVATE /OPT:NOREF)
 
   # Synthetic tests for the atomic API reference lifecycle.
   add_executable(api_ref_state_test test/api_ref_state_test.cpp)
@@ -1262,6 +1273,11 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)
+  endif()
+  if(WIN32 AND TARGET bcrypt_rng_test)
+    add_test(NAME bcrypt_rng COMMAND bcrypt_rng_test)
+    add_test(NAME bcrypt_rng_seeded COMMAND bcrypt_rng_test --seeded)
+    set_tests_properties(bcrypt_rng_seeded PROPERTIES ENVIRONMENT "LEONIDA_RNG_SEED=0x123456789abcdef0")
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
