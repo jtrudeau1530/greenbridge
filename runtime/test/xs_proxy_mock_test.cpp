@@ -392,9 +392,11 @@ int check_levels() {
             static void* seen_va = nullptr;
             static D3D12_RESOURCE_DESC seen_desc{};
             static GUID seen_iid{};
+            static std::uint32_t seen_layout = 0;
             const xs::PlacedAtVaHandler handler = [](ID3D12Device* real_device, void* va,
-                                                     const D3D12_RESOURCE_DESC& desc, REFIID iid,
-                                                     void** out) -> HRESULT {
+                                                     const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
+                                                     REFIID iid, void** out) -> HRESULT {
+                seen_layout = layout;
                 seen_real = real_device;
                 seen_va = va;
                 seen_desc = desc;
@@ -421,6 +423,7 @@ int check_levels() {
             EXPECT(static_cast<std::uint32_t>(seen_desc.Flags) == 0x4);
             EXPECT(seen_desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && seen_desc.Width == 0x10000);
             EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
+            EXPECT(seen_layout == 0xFFFFFFFFu);  // the title's third word, passed through as the barrier layout
             EXPECT(xs::device_slot_overridden(133));
         }
 

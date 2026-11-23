@@ -228,7 +228,7 @@ bool device_supports_ray_tracing(ID3D12Device* device);
 // what the GPU reads. A buffer description only; E_NOTIMPL on a device that is not the Vulkan layer, without the
 // extension, or for a texture.
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
-                                      REFIID riid, void** out);
+                                      std::uint32_t layout, REFIID riid, void** out);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 

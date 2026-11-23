@@ -1521,7 +1521,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                      va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
                      xbox_flags, state);
     }
-    return handler(self->real, va, pc_desc, *riid, out);
+    return handler(self->real, va, pc_desc, state, *riid, out);
 }
 
 template <unsigned Slot>

@@ -182,7 +182,7 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     Ref<ID3D12Resource> buffer;
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, IID_PPV_ARGS(&buffer.p)), S_OK);
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
     EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
     auto* bytes = static_cast<std::uint8_t*>(pages);
     for (UINT64 i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(i * 131u + 7u);
@@ -224,11 +224,11 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     // A texture isn't placed on the pages yet: the title gets an ordinary committed texture instead of a refusal.
     Ref<ID3D12Resource> placed_texture;
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, IID_PPV_ARGS(&placed_texture.p)), S_OK);
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, 0x6u, IID_PPV_ARGS(&placed_texture.p)), S_OK);
     EXPECT(placed_texture.p != nullptr && placed_texture->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
     // An address off the buffer alignment can't be bound inside the import: the ordinary-buffer fallback answers.
     Ref<ID3D12Resource> fallback;
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
     EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(bytes + 1));
     std::printf("%s: %s, %llu bytes: GPU VA is the address, a GPU copy reads the CPU's writes\n", who, kind,
                 static_cast<unsigned long long>(size));
@@ -270,7 +270,7 @@ int check_title_placed_all(ID3D12Device* device) {
         const bool cache_modified = (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) != 0;
         {
             Ref<ID3D12Resource> buffer;
-            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, IID_PPV_ARGS(&buffer.p)), S_OK);
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
             if (cache_modified) {
                 EXPECT(buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
             } else {
@@ -288,7 +288,7 @@ int check_title_placed_all(ID3D12Device* device) {
     {
         // Pages not committed yet (xmem commits on first touch) are not imported either: the fallback answers.
         Ref<ID3D12Resource> fallback;
-        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
         EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(partial));
     }
     VirtualFree(partial, 0, MEM_RELEASE);
