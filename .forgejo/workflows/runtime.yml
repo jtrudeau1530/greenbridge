@@ -109,7 +109,7 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "false"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # sccache-action's post step needs a github.com token Forgejo cannot supply; install the release binary.
       - name: Install sccache
         run: |
@@ -118,20 +118,20 @@ jobs:
           sccache --version
       - name: Cache Vulkan headers
         id: vulkan-headers-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: https://github.com/actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .vulkan-headers/include
           key: vulkan-headers-6802bb4733b63ed5efd3adb308a6c885ef180ea1
       - name: Checkout Vulkan headers (vulkan-sdk-1.4.363.0)
         if: steps.vulkan-headers-cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: KhronosGroup/Vulkan-Headers
-          github-server-url: https://github.com
-          ref: 6802bb4733b63ed5efd3adb308a6c885ef180ea1 # vulkan-sdk-1.4.363.0
-          path: .vulkan-headers
-          sparse-checkout: include
-          persist-credentials: false
+        # actions/checkout sends the instance's token to github.com, which rejects it; fetch anonymously instead.
+        run: |
+          git init -q .vulkan-headers
+          cd .vulkan-headers
+          git remote add origin https://github.com/KhronosGroup/Vulkan-Headers
+          git sparse-checkout set include
+          git fetch -q --depth 1 origin 6802bb4733b63ed5efd3adb308a6c885ef180ea1 # vulkan-sdk-1.4.363.0
+          git checkout -q FETCH_HEAD
       - name: Install llvmpipe, llvm-mc and SPIRV-Tools
         run: |
           pkgs=(libvulkan-dev mesa-vulkan-drivers vulkan-tools spirv-tools)
