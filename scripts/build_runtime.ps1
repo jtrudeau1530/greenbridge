@@ -76,13 +76,15 @@ call "$cmake" --build "$out" -j $jobs || exit /b 1
     $opt = if ($Debug) { "/Od /MDd" } else { "/O2 /MD" }
     $body = @"
 cd /d "$out" || exit /b 1
-cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /Zi $opt /MP$jobs /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE $includes $($files -join ' ') $($xtaskqueueFiles -join ' ') /Fe:gta6rt.exe /link /OPT:NOREF psapi.lib ole32.lib || exit /b 1
+rem BUILD-1457: a game thread with the default stack size gets this program's reserve, and drivers compile on it. The same number as in CMakeLists.txt.
+cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /Zi $opt /MP$jobs /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE $includes $($files -join ' ') $($xtaskqueueFiles -join ' ') /Fe:gta6rt.exe /link /OPT:NOREF /STACK:8388608 psapi.lib ole32.lib || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /MT /DWIN32_LEAN_AND_MEAN /DNOMINMAX "$src\src\tls_host.cpp" /LD /Fe:gta6rt_tls_host.dll || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" "$src\shims\d3d12_xs_rootsig.cpp" "$src\shims\registry.cpp" "$src\shims\d3d12_xs.cpp" "$src\shims\d3d12_xs_device.cpp" "$src\test\root_sig_test.cpp" /Fe:root_sig_test.exe /link d3d12.lib || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" "$src\shims\d3d12_xs_rootsig.cpp" "$src\shims\registry.cpp" "$src\shims\d3d12_xs.cpp" "$src\shims\d3d12_xs_device.cpp" "$src\test\device_proxy_test.cpp" /Fe:device_proxy_test.exe /link d3d12.lib dxgi.lib || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\src" "$src\test\descriptor_table_test.cpp" /Fe:descriptor_table_test.exe /link /OPT:NOREF || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\src" "$src\test\command_list_test.cpp" /Fe:command_list_test.exe /link /OPT:NOREF || exit /b 1
-if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" "$src\test\vk_pipeline_check.cpp" /Fe:vk_pipeline_check.exe || exit /b 1
+rem BUILD-1457: drivers compile on the checker's threads, and 1 MB of stack is too little for AMD's. The same number as in CMakeLists.txt.
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" "$src\test\vk_pipeline_check.cpp" /Fe:vk_pipeline_check.exe /link /STACK:8388608 || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_texture_test.cpp" /Fe:vk_texture_test.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_sampler_test.cpp" /Fe:vk_sampler_test.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\gfx10_descriptors_test.cpp" /Fe:gfx10_descriptors_test.exe || exit /b 1
