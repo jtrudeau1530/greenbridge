@@ -84,7 +84,8 @@ def main():
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"),
                     help="CMake build directory or a configuration directory such as RelWithDebInfo")
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
-    ap.add_argument("--groups", type=positive_int, default=65536)
+    # Vulkan guarantees support for at least 65,535 groups along X in one dispatch.
+    ap.add_argument("--groups", type=positive_int, default=65535)
     ap.add_argument("--reps", type=positive_int, default=30)
     ap.add_argument("--procs", type=positive_int, default=5)
     ap.add_argument("--shader", default="cs_bench_mix")

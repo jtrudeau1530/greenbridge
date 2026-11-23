@@ -42,6 +42,7 @@ class PartialFailure(unittest.TestCase):
     def test_every_process_ran(self):
         code, out = bench({})
         self.assertEqual(code, 0, out)
+        self.assertIn("65535 workgroups", out)
         self.assertIn("emulated output equals the reference", out)
 
     def test_emulated_config_fails_on_its_second_process(self):

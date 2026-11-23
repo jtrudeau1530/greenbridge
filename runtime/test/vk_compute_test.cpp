@@ -126,7 +126,14 @@ static int run(int argc, char** argv) {
         std::fprintf(stderr, "workgroup_yz expects a 2x3x4 dispatch\n");
         return 2;
     }
-    const uint32_t groups = workgroup_yz ? 2u : uint32_t(atoi(argv[2]));
+    uint32_t groups = 2;
+    if (!workgroup_yz) {
+        const char* count = argv[2];
+        if (!parse_u32(count, groups) || *count || !groups) {
+            std::fprintf(stderr, "groups: expected a positive 32-bit workgroup count, got \"%s\"\n", argv[2]);
+            return 2;
+        }
+    }
     const uint32_t groups_y = workgroup_yz ? 3u : 1u, groups_z = workgroup_yz ? 4u : 1u;
     const uint32_t yz_bins = (groups_y + 1) * (groups_z + 1);
     const uint32_t origins = workgroup_yz ? groups * groups_y * groups_z : 0;
@@ -224,6 +231,12 @@ static int run(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    const uint32_t max_groups_x = props.limits.maxComputeWorkGroupCount[0];
+    if (groups > max_groups_x) {
+        std::fprintf(stderr, "groups: %u exceeds the X dispatch limit of %u on %s\n",
+                     groups, max_groups_x, props.deviceName);
+        return 2;
+    }
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     subgroup.pNext = &sgProps;
