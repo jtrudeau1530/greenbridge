@@ -1134,6 +1134,23 @@ Not fully readable: the 8.6% unread span, the two opaque binary blobs, and the m
 tail-only documents (their retained tails are readable but incomplete). The encrypted table of contents is
 outside this work by rule; names and exact file boundaries stay unknown until a documented table reader exists.
 
+## Text and binary tables (`tools/gamedata_blobs.py`)
+
+`tools/gamedata_blobs.py` decodes all five non-XML text and binary payloads in `common.rpf` (counts and structural
+bounds only; zero names or raw bytes):
+
+| Payload | Inflated B (streams) | Format & measured structure |
+|---|---:|---|
+| `0x64e000` (`.fx` preload list 0) | 24,285 (1) | `965` unique `<effect>.fx` lines (`0` comments, `0` folder separators): all **910 of 910** `shaders.rpf` `SGD5` Database 0 effect records appear in exact index order (`0..909`), plus `55` unshipped `.fx` names |
+| `0x64f1c0` (`.fx` preload list 1) | 575 (1) | `22` unique `<effect>.fx` lines (`0` comments): all **22 of 22** match `SGD5` Database 1 (`0x10289C81`) in exact index order (`0..21`) |
+| `0x640000` (`VFX_SETTINGS_FILE` `.dat`) | 117,176 (2) | `3,198` lines: `2,566` data lines (`2,537` `<dotted.key> <scalar>` pairs, `2` `key = value` lines, `27` multi-value rows of `5..24` tokens), `248` comments, `384` blanks (`13` of `122` distinct key prefixes, `381` data lines, match an `SGD5` Database 0 effect name) |
+| `0xad000` (fixed table) | 1,038,100 (16) | `u32 count = 801` followed by `801 x 1,296` B records to EOF (`4 + 801 x 1,296 = 1,038,100` B, `0` trailing bytes). Every record opens with `{u32 w0, u32 w1, u32 w2, u32 w3}` where `(w0, w1) == (w2, w3)` in **801 of 801** (`801` distinct pairs) before an undecoded `1,280`-byte record body (arithmetic permits `64 x 20` B; sub-record layout is not decoded by the tool) |
+| `0x23c000` (3-region spatial grid) | 3,274,036 (50) | **Region 1** (`0x000000..0x07FFFF`, `131,072` `u32` cells): `32` empty `0xC0000000` sentinels and `131,040` populated cells whose low 23 bits point (`131,040 / 131,040` aligned) into **Region 3** (`0x166934..0x31F533`, EOF `0x31F534`, `451,328` `u32` words partitioned by the `46,019` distinct cell offsets into spans of `1..24` words); located as the trailing run of 4-byte-aligned offsets matching `min(cell_offs)` (`0x166934`), with every word (`451,328 of 451,328`) falling in **Region 2** (`0x080000..0x166933`, `944,436` B partitioned with zero gaps into `21,662` records: `21,273` of `44` B, `313` of `24` B, `76` of `12` B) |
+
+```powershell
+python -I tools/gamedata_blobs.py <work>\carve\common --shaders shaders.rpf --json blobs.json
+```
+
 ## Dirt and canned colours (`CGraphicsDefinitionsData`)
 
 One `CGraphicsDefinitionsData` document holds the dirt/grime presets for peds, vehicles and props and the
