@@ -616,7 +616,13 @@ python -I scripts/run_guest_scene.py --loader path/to/gta6rt.exe --guest path/to
     --shaders path/to/m15_shaders --out new-scene-run --negative-controls
 ```
 
-For Wine, add `--wine path/to/wine`. The runner launches the mapped guest for an
+For Wine, add `--wine path/to/wine`. With a Linux cross-build, CTest also registers
+`d3d12_guest_scene` when CMake finds the shader tools and has a Wine command in
+`CMAKE_CROSSCOMPILING_EMULATOR`. Build the `tiny_guest_draw` target, then run
+`ctest --test-dir <build> -R '^d3d12_guest_scene$' --output-on-failure`.
+On a headless host, prefix that CTest command with `xvfb-run -a` so the scene runner
+keeps guest stdout and stderr separate while checking the frame-count marker.
+The runner launches the mapped guest for an
 uninterrupted 600-frame run, a 300-frame save, and a fresh process that restores the
 checkpoint. This opt-in build links a fixture input source into the loader. Scripted keyboard changes feed the SDL virtual pad. GameInput readings
 drive the position of one quad. The guest streams ten 16-byte synthetic palette pages from
