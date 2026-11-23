@@ -1453,6 +1453,8 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+void refresh_title_gpu_memory();
+
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
     // Pass zero-extended UINT in 64-bit RDX so both 32-bit PC implementations and 64-bit mock thunks see clean count.
     // Each list proxy (#2490) is replaced by its real list, as the generic slot-10 path does.
@@ -3098,6 +3100,8 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 // Device slots 17-24 write or copy descriptors using CPU handles. When a title supplies its own descriptor-heap base
 // via __XMemAllocationHooks__, those handles fall in [custom_start, custom_end) and must be translated back to the
 // underlying PC/Vulkan heap before forwarding.
+DXGI_FORMAT castable_view_format(ID3D12Resource* resource, D3D12_RESOURCE_DESC* out_desc = nullptr);
+
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
@@ -3666,7 +3670,7 @@ DXGI_FORMAT castable_texture_format(const D3D12_RESOURCE_DESC& d) {
 }
 
 // The UNORM format a view of a TYPELESS RGBA8/BGRA8 texture takes when the title names none, else UNKNOWN.
-DXGI_FORMAT castable_view_format(ID3D12Resource* resource, D3D12_RESOURCE_DESC* out_desc = nullptr) {
+DXGI_FORMAT castable_view_format(ID3D12Resource* resource, D3D12_RESOURCE_DESC* out_desc) {
     if (!resource) return DXGI_FORMAT_UNKNOWN;
     const D3D12_RESOURCE_DESC d = resource->GetDesc();
     if (out_desc) *out_desc = d;

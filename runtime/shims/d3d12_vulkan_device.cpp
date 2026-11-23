@@ -2767,19 +2767,19 @@ public:
             return v && *v == '1';
         }();
         if (!on) return 0;
-        std::call_once(shadow_once_, [this] {
+        std::call_once(texture_shadow_once_, [this] {
             const std::uint64_t bytes = title_layout().total + 0x10000;
             // Write-watched: the title keeps the pointer and writes through it at any time (a movie's planes).
-            shadow_ = VirtualAlloc(nullptr, static_cast<std::size_t>(bytes), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+            texture_shadow_ = VirtualAlloc(nullptr, static_cast<std::size_t>(bytes), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
             shadow_bytes_ = static_cast<std::size_t>(bytes);
-            if (shadow_) rt::title_textures::register_shadow(reinterpret_cast<std::uint64_t>(shadow_), this);
+            if (texture_shadow_) rt::title_textures::register_shadow(reinterpret_cast<std::uint64_t>(texture_shadow_), this);
             static std::atomic<int> n{0};
             if (n.fetch_add(1) < 12)
                 std::fprintf(stderr, "[title] texture %llux%u format %d asked for its address: shadow %p (%llu bytes)\n",
-                             static_cast<unsigned long long>(desc_.Width), desc_.Height, int(desc_.Format), shadow_,
+                             static_cast<unsigned long long>(desc_.Width), desc_.Height, int(desc_.Format), texture_shadow_,
                              static_cast<unsigned long long>(bytes));
         });
-        return reinterpret_cast<std::uint64_t>(shadow_);
+        return reinterpret_cast<std::uint64_t>(texture_shadow_);
     }
     rt::title_textures::LinearLayout title_layout() const {
         return rt::title_textures::linear_layout(static_cast<std::uint32_t>(desc_.Dimension), desc_.Width, desc_.Height,
@@ -2787,9 +2787,9 @@ public:
     }
     // Unmap of a texture the title wrote through its shadow: every subresource the written range touches goes to the image.
     void upload_shadow(const D3D12_RANGE* written) {
-        if (!shadow_) return;
+        if (!texture_shadow_) return;
         const auto l = title_layout();
-        const auto* bytes = static_cast<const std::uint8_t*>(shadow_);
+        const auto* bytes = static_cast<const std::uint8_t*>(texture_shadow_);
         for (std::uint32_t layer = 0; layer < l.layers; ++layer) {
             for (std::uint32_t m = 0; m < l.mips.size(); ++m) {
                 const auto& k = l.mips[m];
@@ -2804,8 +2804,8 @@ public:
             }
         }
     }
-    std::once_flag shadow_once_;
-    void* shadow_ = nullptr;
+    std::once_flag texture_shadow_once_;
+    void* texture_shadow_ = nullptr;
     std::size_t shadow_bytes_ = 0;
 
     //
