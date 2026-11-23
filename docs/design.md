@@ -574,6 +574,22 @@ ids 0/1 and the API ids 4/5 are not in the corpus; the rest of a record is not d
 `tools/pal_stages.py` prints the records of an FSSM or a container (every tag-0x0D payload);
 `tests/test_pal_stages.py` covers the layout with synthetic blobs.
 
+## PAL stage descriptors
+
+The FSSM header starts a table of 0x88-byte hardware-stage records at offset 0x100. A record's first qword is
+`0x000000C0_0002_AAHH`: `HH` (byte 0) is the PAL hardware stage and `AA` (byte 1) the API stage. Record k
+starts at `0x100 + 0x88*k`; the table ends at the first zero or non-tag qword. On the 26,503-blob corpus
+26,308 blobs carry one record and 195 (all GS) carry two, the second at 0x188 being the same shader's VS
+copy. API ids: 0 VS (2,236), 1 PS (12,101), 2 GS (195), 3 CS (2,689), 6 MS (9,282), each equal to the carve
+index's stage. Hardware ids: 2 ES (the first tag-0x0D payload of the 195 two-payload VS containers), 3 GS
+(195), 4 VS (2,431, the 195 GS copies included), 5 PS (12,101), 6 CS (2,689) and 7 (9,282, every mesh
+shader: the NGG/primitive path). Unused record fields are zero in 25,643 records; 1,055 records (860 blobs,
+the 195 GS pairs included) carry paired `0xDEADBEEFDEADBEEF` qwords, a lone 32-bit `0xDEADBEEF` never
+occurs, and those 860 are the blobs whose 0x120/0x12C/0x130 directory words are `0xDEADBEEF`. The hardware
+ids 0/1 and the API ids 4/5 are not in the corpus; the rest of a record is not decoded.
+`tools/pal_stages.py` prints the records of an FSSM or a container (every tag-0x0D payload);
+`tests/test_pal_stages.py` covers the layout with synthetic blobs.
+
 ## Pixel-shader inputs
 
 `tools/fssm_header.py` decodes the FSSM input table: 8-byte records from 0x138 while the first byte is 6.
