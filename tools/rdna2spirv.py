@@ -6394,6 +6394,73 @@ class Gen:
         # f16 destination under default MODE (denorm16_64=3): omod ignored by silicon, clamp kept.
         return self.clamp_mods(v, mods, allow_omod=False)
 
+    def _validate_unary_f16(self, op, raw_op, a, mods):
+        """Validate operands, encoding suffix, and modifiers for unary f16 VOP1/VOP3/SDWA ops."""
+        if len(a) != 2:
+            raise Unsupported(f"{op} operands")
+        dst, src = a
+        if (dst.get("k") != "vgpr" or dst.get("n", 1) != 1
+                or dst.get("neg") or dst.get("abs") or dst.get("sext")):
+            raise Unsupported(f"{op} destination")
+        if src.get("n", 1) != 1 or src.get("sext"):
+            raise Unsupported(f"{op} source")
+        if raw_op.endswith("_dpp"):
+            raise Unsupported(f"{op} _dpp")
+        if raw_op.endswith("_e32"):
+            if src.get("neg") or src.get("abs"):
+                raise Unsupported(f"{op} _e32 source modifier")
+            if mods:
+                raise Unsupported(f"{op} _e32 modifier")
+            return
+        if raw_op.endswith("_sdwa"):
+            seen_clamp = False
+            seen_omod = False
+            seen_keys = set()
+            for m in mods:
+                if m == "clamp":
+                    if seen_clamp:
+                        raise Unsupported(f"{op} duplicate clamp")
+                    seen_clamp = True
+                elif m in ("mul:2", "mul:4", "div:2"):
+                    if seen_omod:
+                        raise Unsupported(f"{op} duplicate omod")
+                    seen_omod = True
+                elif ":" in m:
+                    key, val = m.split(":", 1)
+                    if key in seen_keys:
+                        raise Unsupported(f"{op} duplicate {key}")
+                    if key in ("src0_sel", "dst_sel") and val in self.SDWA_SEL:
+                        seen_keys.add(key)
+                    elif key == "dst_unused" and val in ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"):
+                        seen_keys.add(key)
+                    else:
+                        raise Unsupported(f"{op} _sdwa modifier")
+                else:
+                    raise Unsupported(f"{op} _sdwa modifier")
+            return
+        # VOP3 (_e64 or bare)
+        seen_clamp = False
+        seen_omod = False
+        seen_opsel = False
+        for m in mods:
+            if m == "clamp":
+                if seen_clamp:
+                    raise Unsupported(f"{op} duplicate clamp")
+                seen_clamp = True
+            elif m in ("mul:2", "mul:4", "div:2"):
+                if seen_omod:
+                    raise Unsupported(f"{op} duplicate omod")
+                seen_omod = True
+            elif m.startswith("op_sel:"):
+                if seen_opsel or not (m.startswith("op_sel:[") and m.endswith("]")):
+                    raise Unsupported(f"{op} op_sel")
+                raw_parts = m[len("op_sel:["):-1].split(",")
+                if not raw_parts or len(raw_parts) > 2 or any(p not in ("0", "1") for p in raw_parts):
+                    raise Unsupported(f"{op} op_sel")
+                seen_opsel = True
+            else:
+                raise Unsupported(f"{op} modifier")
+
     def flush_f32(self, f):
         """v_mad_f32, v_mac_f32, v_mad_legacy_f32 and default-mode v_mul_legacy_f32 flush f32 denormals:
         a subnormal operand or result
@@ -7236,16 +7303,15 @@ class Gen:
                     "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
-            u = self.src_h(a[1])
-            v2, f, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
-            f = self.modify_f(f, a[1])
+            self._validate_unary_f16(op, ins["op"], a, mods)
+            sel, dhi = self.opsel_bits(mods, 1)
+            f = self.f16_in(a[1], sel[0])
             t = self.turn_angle(f)
+            r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.trig_exact_zero(op, f, r)
             r = self.clamp_f16(r, mods)
-            self.write_lo16(a[0], self.f16_bits(r))    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
+            self.f16_out(a[0], r, dhi, mode=False)    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
         elif op in ("v_pk_add_u16", "v_pk_add_i16", "v_pk_sub_u16", "v_pk_sub_i16", "v_pk_mul_lo_u16",
                     "v_pk_mad_u16", "v_pk_mad_i16", "v_pk_max_u16", "v_pk_max_i16", "v_pk_min_u16", "v_pk_min_i16"):
             # Packed 16-bit integer ops (VOP3P, RDNA2 ISA): result half 0 takes each source's half from op_sel[i],
@@ -9171,6 +9237,7 @@ class Gen:
                     "v_ceil_f16", "v_trunc_f16", "v_rndne_f16"):
             # f16 unary on the low half (op_sel:[src,dst] picks the high half of the source / of the destination);
             # the other half of the destination is kept.
+            self._validate_unary_f16(op, ins["op"], a, mods)
             sel, dhi = self.opsel_bits(mods, 1)
             f = self.f16_in(a[1], sel[0])
             r = self.tmp()
