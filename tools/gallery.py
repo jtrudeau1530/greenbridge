@@ -339,11 +339,17 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+class GalleryListenError(OSError):
+    """The gallery could not listen on a local port."""
+
+
 def start_server(
     port: int = 8080,
     models_dir: str | None = None,
     textures_dir: str | None = None,
     open_browser: bool = True,
+    *,
+    retry_next_port: bool = True,
 ) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(here)
@@ -400,10 +406,15 @@ def start_server(
         daemon_threads = True
 
     try:
-        httpd = ThreadingServer(addr, StudioHandler)
-    except OSError:
-        addr = ("127.0.0.1", port + 1)
-        httpd = ThreadingServer(addr, StudioHandler)
+        try:
+            httpd = ThreadingServer(addr, StudioHandler)
+        except OSError:
+            if not retry_next_port or not 0 < port < 65535:
+                raise
+            addr = ("127.0.0.1", port + 1)
+            httpd = ThreadingServer(addr, StudioHandler)
+    except OSError as error:
+        raise GalleryListenError(f"can't listen on port {addr[1]}: {error}") from error
 
     url = f"http://localhost:{addr[1]}"
     print(f"======================================================")
@@ -427,18 +438,26 @@ def start_server(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Leonida 3D Asset Studio local web gallery.")
-    parser.add_argument("--port", type=int, default=8080, help="HTTP port (default 8080)")
+    parser.add_argument("--port", type=int,
+                        help="HTTP port from 0 to 65535 (default 8080, or 8081 if unavailable)")
     parser.add_argument("--models-dir", type=str, default=None, help="Directory containing .glb models")
     parser.add_argument("--textures-dir", type=str, default=None, help="Directory containing textures")
     parser.add_argument("--no-browser", action="store_true", help="Do not open browser automatically")
 
     args = parser.parse_args(argv)
-    start_server(
-        port=args.port,
-        models_dir=args.models_dir,
-        textures_dir=args.textures_dir,
-        open_browser=not args.no_browser,
-    )
+    port = 8080 if args.port is None else args.port
+    if not 0 <= port <= 65535:
+        parser.error("--port must be between 0 and 65535")
+    try:
+        start_server(
+            port=port,
+            models_dir=args.models_dir,
+            textures_dir=args.textures_dir,
+            open_browser=not args.no_browser,
+            retry_next_port=args.port is None,
+        )
+    except GalleryListenError as error:
+        parser.error(str(error))
     return 0
 
 
