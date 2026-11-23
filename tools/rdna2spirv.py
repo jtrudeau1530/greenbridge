@@ -513,6 +513,16 @@ class Gen:
             u = g
         return u
 
+    def src_f_sign_mods(self, a):
+        """Read a float source with VOP3 abs/neg applied as raw sign-bit moves.
+
+        Min/max-family instructions preserve NaN payload and signaling state
+        when their source modifiers are applied. OpFNegate/OpFAbs can quiet a
+        signaling NaN before the min/max operation sees it, so these operations
+        must bitcast the integer sign-bit result instead.
+        """
+        return self.tof(self.src_u_sign_mods(a))
+
     def modify(self, v, a):
         if a.get("abs") or a.get("neg"):
             f = self.tof(v)
@@ -6767,7 +6777,7 @@ class Gen:
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
-            x, y, z = (self.src_f(t) for t in a[1:4])
+            x, y, z = (self.src_f_sign_mods(t) for t in a[1:4])
             f = "NMax" if "max" in op else "NMin"      # RDNA2: f(f(s0, s1), s2) keeping S0 on all-NaN
             m = self.nminmax_f32(f, x, y, y_src=a[2])
             r = self.nminmax_f32(f, m, z, y_src=a[3])
@@ -10719,7 +10729,8 @@ class Gen:
             self.emit(f"{r} = OpFDiv %float %f1 {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
-            x, y = self.src_f(a[1]), self.src_f(a[2])
+            read_source = self.src_f_sign_mods if F2[op] in ("max", "min") else self.src_f
+            x, y = read_source(a[1]), read_source(a[2])
             r = self.tmp()
             if F2[op] in ("max", "min"):
                 r = self.nminmax_f32("NMax" if F2[op] == "max" else "NMin", x, y, y_src=a[2])
@@ -10740,7 +10751,7 @@ class Gen:
             elif op == "v_fmac_f32":
                 x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
             else:
-                r = self.med3_f([self.src_f(t) for t in a[1:4]], a[1:4])
+                r = self.med3_f([self.src_f_sign_mods(t) for t in a[1:4]], a[1:4])
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
                 return
             r = self.tmp()
