@@ -752,6 +752,20 @@ void check_run_time_load() {
                   (std::strcmp(locale, "zz-ZZ") == 0 || std::strcmp(locale, "xx-YY") == 0) &&
                   reinterpret_cast<Locale>(slot(pk, 11))(pk, 3, locale) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
               "slot 11 gives one of the package's declared locales, not the host's; a short buffer is refused");
+        // Only ww-WW is declared: the commented-out entries, <ResourceGroup> and DefaultLanguage are not, and the real
+        // entry has whitespace around '=' (valid XML). With one declared locale the answer is that one on any host.
+        if (FILE* f = std::fopen((game + "\\MicrosoftGame.Config").c_str(), "wb")) {
+            std::fputs("<Game><!-- <Resource Language=\"fr-FR\"/> --><Resources>\r\n"
+                       "  <ResourceGroup Language=\"aa-AA\"/>\r\n"
+                       "  <Resource Id=\"one\" DefaultLanguage='bb-BB' Language = \"ww-WW\" />\r\n"
+                       "</Resources></Game><!-- unterminated <Resource Language=\"cc-CC\"/>",
+                       f);
+            std::fclose(f);
+        }
+        std::memset(locale, 'z', sizeof(locale));
+        check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(locale), locale) == S_OK &&
+                  std::strcmp(locale, "ww-WW") == 0,
+              "slot 11 skips commented-out resources, other elements and attributes, and allows spaces around '='");
         DeleteFileA((game + "\\MicrosoftGame.Config").c_str());
         RemoveDirectoryA(game.c_str());
         SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
