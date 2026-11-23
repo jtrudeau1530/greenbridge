@@ -240,6 +240,9 @@ def defines_a_test(source, require_test_case=False):
                     case_aliases.discard(name)
         elif isinstance(node, ast.Assign):
             case_aliases.difference_update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None and isinstance(node.target, ast.Name):
+            # A bare annotation does not change the imported binding.
+            case_aliases.discard(node.target.id)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             case_aliases.discard(node.name)
 
@@ -380,6 +383,9 @@ class RepositoryRegistrationTest(unittest.TestCase):
             ("relative import", "from .unittest import TestCase as Parent\n" + direct, False),
             ("qualified name", import_alias + test_class.format(base="other.Parent"), False),
             ("reassigned", import_alias + "Parent = object\n" + direct, False),
+            ("annotated assignment before class", import_alias + "Parent: type = object\n" + direct, False),
+            ("annotation only", import_alias + "Parent: type\n" + direct, True),
+            ("annotated assignment after class", import_alias + direct + "Parent: type = object\n", True),
             ("local shadow", import_alias + "class Parent: pass\n" + direct, False),
             ("reimported", import_alias + "from types import SimpleNamespace as Parent\n" + direct, False),
         )
