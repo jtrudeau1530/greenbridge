@@ -255,6 +255,59 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertNotIn("--skip-file", self.calls[0])
         self.assertTrue(any("has no --inflight-file" in m for m in logs), logs)
 
+    def make_bvh(self):
+        bvh = os.path.join(self.spirv, "bvh")
+        os.makedirs(bvh, exist_ok=True)
+        with open(os.path.join(bvh, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"LoadInstances": {}}, f)
+        return bvh
+
+    def test_the_bvh_builder_programs_go_into_the_cache_first(self):
+        # The builder watchdog (RT-5): the runtime must find them in pipeline_cache.bin, which it seeds from.
+        bvh = self.make_bvh()
+        failed, logs = self.stage(lambda args, n: 0)
+        self.assertIsNone(failed)
+        self.assertEqual(len(self.calls), 2)
+        cache = os.path.join(self.out, "pipeline_cache.bin")
+        self.assertEqual(self.calls[0][1:3], [bvh, cache])
+        self.assertEqual(self.calls[1][1:3], [self.spirv, cache])
+        self.assertIn("pipelines: done", logs)
+
+    def test_no_bvh_index_is_no_extra_call(self):
+        failed, logs = self.stage(lambda args, n: 0)
+        self.assertIsNone(failed)
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(any("no translated XboxBvhBuilder programs" in m for m in logs), logs)
+
+    def test_a_failing_bvh_program_fails_the_stage_after_the_corpus(self):
+        bvh = self.make_bvh()
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            failed, _ = self.stage(lambda args, n: 1 if args[1] == bvh else 0)
+        self.assertIsNotNone(failed)
+        self.assertEqual(len(self.calls), 2)   # the corpus is still checked and cached
+        self.assertIn("XboxBvhBuilder", err.getvalue())
+
+    def test_a_bvh_checker_error_or_a_stop_ends_the_stage_at_once(self):
+        bvh = self.make_bvh()
+        for code in (2, 0xC000013A):
+            self.calls.clear()
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                failed, _ = self.stage(lambda args, n, code=code: code if args[1] == bvh else 0)
+            self.assertIsNotNone(failed)
+            self.assertEqual(len(self.calls), 1, code)   # the corpus is not started
+            self.assertIn("XboxBvhBuilder", err.getvalue())
+
+    def test_an_older_checker_leaves_the_bvh_programs_out_and_says_so(self):
+        # Such a checker may write the cache without seeding from the existing file, so the corpus pass would drop
+        # them: no builder pass, and the log says they are not cached.
+        self.make_bvh()
+        failed, logs = self.stage(lambda args, n: 0, supports=False)
+        self.assertIsNone(failed)
+        self.assertEqual([c[1] for c in self.calls], [self.spirv])
+        self.assertTrue(any("left out of pipeline_cache.bin" in m for m in logs), logs)
+
     def test_support_is_read_from_the_usage_line(self):
         new = "usage: vk_pipeline_check <spirv dir> ... [--inflight-file F] [--skip-file F]\n"
         old = "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--isolate [--isolate-batch N]]\n"

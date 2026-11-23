@@ -2695,6 +2695,11 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         # pipeline_inflight.txt and exit 0. Run it as before: a module that kills it stops the stage.
         log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
             "crashes the driver is skipped instead of stopping the stage")
+        # Such a checker may predate seeding from an existing cache (0aa984002), so the corpus pass could drop
+        # what a builder pass wrote: say so instead of claiming they are cached.
+        if os.path.isfile(os.path.join(work, "shaders", "spirv", "bvh", "index.json")):
+            log("pipelines: the XboxBvhBuilder programs are left out of pipeline_cache.bin with this vk_pipeline_check; "
+                "rebuild the runtime stage to include them")
         run(base)
         log("pipelines: done")
         return
@@ -2745,7 +2750,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
              + ", ".join(crashed))
 
-    code = 0
+    bvh_code = pipelines_bvh(exe, work, cache, jobs)
+    if bvh_code == 2 or interrupted(bvh_code):
+        fail(f"vk_pipeline_check exited with {exit_label(bvh_code)} on the XboxBvhBuilder programs")
+    code = bvh_code   # a failed builder program fails the stage too, after the corpus has been checked
     ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
               for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
     for start, count in ranges:
@@ -2762,8 +2770,24 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     if code != 0:
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
             if crashed else ""
+        if bvh_code:
+            why += f"; the XboxBvhBuilder programs' check exited with {exit_label(bvh_code)}"
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     log("pipelines: done")
+
+
+def pipelines_bvh(exe: str, work: str, cache: str, jobs: "int | None") -> int:
+    """XboxBvhBuilder.dll's compute programs (the shaders stage's bvh step) into pipeline_cache.bin, before the corpus.
+    The title creates them one after another through device slot 62 while another title thread ends the process about
+    30 s after the first one, so a driver that needs longer stops the boot there unless the runtime finds them in the
+    cache it seeds from (docs/embedded_shaders.md, "Compile time against the title's limit"). They live in <work>/shaders/spirv/bvh with an index of their own, which the
+    corpus pass never reads. Returns vk_pipeline_check's exit code, 0 when there are none."""
+    bvh = os.path.join(work, "shaders", "spirv", "bvh")
+    if not os.path.isfile(os.path.join(bvh, "index.json")):
+        log("pipelines: no translated XboxBvhBuilder programs, so none go into pipeline_cache.bin")
+        return 0
+    log("pipelines: creating the XboxBvhBuilder programs first, so the runtime finds them in pipeline_cache.bin")
+    return run([exe, bvh, cache, *(["--jobs", str(jobs)] if jobs else [])], check=False)
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the

@@ -183,7 +183,10 @@ Stages: `check` always runs first; then `shaders`, `assets` and `runtime` run to
 depend on each other). `pipelines` starts once the translated shaders are ready and, when this run includes runtime,
 that stage has finished rebuilding `vk_pipeline_check`, so it can overlap the rest of assets; it creates every
 translated shader on your GPU driver, reports any it has to skip, and saves a pipeline cache to `pipeline_cache.bin`
-in `--out` (the runtime doesn't load that cache yet, so it doesn't speed up the first boot). The shader translation
+in `--out`, beside `gta6rt.exe`, which seeds its Vulkan pipeline cache from it. The `XboxBvhBuilder` programs go in
+first: the title ends the process about 30 s after it starts creating them, so on a GPU whose driver needs longer
+the boot stops at the builder without that cache ([embedded_shaders.md](docs/embedded_shaders.md), "Compile time
+against the title's limit"). The shader translation
 is the longest CPU step: it runs on `--jobs` processes (half the CPU threads by default). When shaders and assets
 share the machine, that budget is split between them and passed to `rpf9dump` as `--jobs`; a solo assets run still
 lets `rpf9dump` use every core. Progress lines include percent and a rough ETA for translation shards, asset steps,
