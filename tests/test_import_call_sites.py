@@ -41,8 +41,8 @@ def rel32(from_end, target):
     return struct.pack("<i", target - from_end)
 
 
-def build_image(callers):
-    """A PE32+ with one import descriptor (xmem.dll: XMemFoo, XMemBar, #7) and the given `.text` callers."""
+def build_image(callers, dll=b"xmem.dll"):
+    """A PE32+ with one import descriptor (`dll`: XMemFoo, XMemBar, #7) and the given `.text` callers."""
     buf = bytearray(0x3000)
     buf[0:2] = b"MZ"
     struct.pack_into("<I", buf, 0x3C, 0x40)
@@ -74,7 +74,8 @@ def build_image(callers):
         struct.pack_into("<Q", buf, IAT_FOO + i * 8, value)
     buf[names + 2:names + 2 + 8] = b"XMemFoo\0"
     buf[names + 0x10 + 2:names + 0x10 + 2 + 8] = b"XMemBar\0"
-    buf[IDATA_RVA + 0xD0:IDATA_RVA + 0xD0 + 9] = b"xmem.dll\0"
+    assert len(dll) < 0x10  # the module name sits in 0xD0..0xDF, before OTHER_IAT_RVA
+    buf[IDATA_RVA + 0xD0:IDATA_RVA + 0xD0 + len(dll) + 1] = dll + b"\0"
 
     # .text: the thunks are `jmp qword [rip+disp32]` to the address-table slots.
     for thunk, slot in ((THUNK_FOO, IAT_FOO), (THUNK_BAR, IAT_BAR), (THUNK_ORD, IAT_ORD)):
@@ -119,6 +120,15 @@ class ImportCallSitesTest(unittest.TestCase):
         self.assertEqual(list(out), ["xmem.dll!XMemFoo"])
         self.assertEqual(len(import_call_sites.call_sites(self.data, dlls={"XMem.dll"})["imports"]), 3)
         self.assertEqual(import_call_sites.call_sites(self.data, dlls={"other.dll"})["imports"], {})
+
+    def test_a_dll_name_with_a_bang_is_selected_whole(self):
+        # The dll and the function are kept apart, not re-split at the first '!' of "dll!name".
+        data = build_image(self.callers, dll=b"x!em.dll")
+        self.assertEqual(len(import_call_sites.call_sites(data, dlls={"x!em.dll"})["imports"]), 3)
+        self.assertEqual(import_call_sites.call_sites(data, dlls={"x"})["imports"], {})
+        out = import_call_sites.call_sites(data, wanted={"X!EM.DLL!xmemfoo"})["imports"]
+        self.assertEqual(list(out), ["x!em.dll!XMemFoo"])
+        self.assertEqual(out["x!em.dll!XMemFoo"]["call"], [TEXT_RVA + 0x100, TEXT_RVA + 0x110])
 
     def test_a_call_is_not_counted_for_a_different_thunk(self):
         data = build_image([(TEXT_RVA + 0x100, 0xE8, THUNK_BAR)])
