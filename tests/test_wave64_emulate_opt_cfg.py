@@ -18,7 +18,7 @@ test come from the module's own docstrings:
 translator builds; they are exercised end to end by the semantic suite running under
 `--wave64-emulate` (tests/semantic/test_wave64_halves.py), not duplicated here.
 
-    python -I tests/test_wave64_emulate_opt.py
+    python -I tests/test_wave64_emulate_opt_cfg.py
 """
 import os
 import sys

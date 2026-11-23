@@ -302,7 +302,7 @@ def known_folders() -> list:
 
 
 def discovery_roots(home: str) -> list:
-    """Where find_dumps() starts looking. Windows: the known folders, the home folder and every drive letter. Else:
+    r"""Where find_dumps() starts looking. Windows: the known folders, the home folder and every drive letter. Else:
     the same folders plus the usual mount points, because that is where a copy on another disk or on a network share
     shows up (/Volumes is where macOS mounts both, /run/media is where Fedora and openSUSE mount removable media).
     A Windows share path (\\server\share\...) can't be listed at all; --game takes it directly."""
