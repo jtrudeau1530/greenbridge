@@ -119,10 +119,10 @@ def kernel(arch, dim, rows):
     return out + tsharp._longs(texture(dim))
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", choices=("rule", "hw"), default="rule")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.oracle == "rule":
         for name, dim, start, off in ROWS:
             print(f"{name:16} offset 0x{off:06x} rule {expected(dim, start, off):.0f}")
@@ -130,30 +130,33 @@ def main():
     import asm
     import runner
     try:
-        oracle = runner.Oracle()
+        oracle = runner.open_oracle()
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
-    print(f"device: {oracle.device}")
-    bad = 0
-    for dim in ("2d", "3d"):
-        rows = [r for r in ROWS if r[1] == dim]
-        got = {}
-        for wave in (32, 64):
-            res = oracle.run([asm.Kernel(kernel(oracle.arch, dim, rows), wave=wave, threads=1, words=len(rows),
-                                         raw=True, vgprs=16, sgprs=24)])[0]
-            if isinstance(res, str):
-                print(f"{dim} wave{wave}: kernel rejected: {res}")
-                return 2
-            got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] for w in res]
-        for i, (name, _d, start, off) in enumerate(rows):
-            want = expected(dim, start, off)
-            g32, g64 = got[32][i], got[64][i]
-            ok = g32 == want and g64 == want
-            bad += not ok
-            extra = "" if g32 == g64 else f" (wave64 {g64:.0f})"
-            print(f"{name:16} offset 0x{off:06x} hw {g32:6.0f}{extra:14} rule {want:6.0f}  {'ok' if ok else 'DIFFERS'}")
-    return 1 if bad else 0
+    try:
+        print(f"device: {oracle.device}")
+        bad = 0
+        for dim in ("2d", "3d"):
+            rows = [r for r in ROWS if r[1] == dim]
+            got = {}
+            for wave in (32, 64):
+                res = oracle.run([asm.Kernel(kernel(oracle.arch, dim, rows), wave=wave, threads=1, words=len(rows),
+                                             raw=True, vgprs=16, sgprs=24)])[0]
+                if isinstance(res, str):
+                    print(f"{dim} wave{wave}: kernel rejected: {res}")
+                    return 2
+                got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] for w in res]
+            for i, (name, _d, start, off) in enumerate(rows):
+                want = expected(dim, start, off)
+                g32, g64 = got[32][i], got[64][i]
+                ok = g32 == want and g64 == want
+                bad += not ok
+                extra = "" if g32 == g64 else f" (wave64 {g64:.0f})"
+                print(f"{name:16} offset 0x{off:06x} hw {g32:6.0f}{extra:14} rule {want:6.0f}  {'ok' if ok else 'DIFFERS'}")
+        return 1 if bad else 0
+    finally:
+        oracle.close()
 
 
 if __name__ == "__main__":

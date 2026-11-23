@@ -4,13 +4,16 @@ import contextlib
 import fnmatch
 import io
 import os
+from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
+sys.path[:0] = [os.path.join(ROOT, "scripts"), os.path.join(ROOT, "tools")]
 import bench_wave64  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 
 def bench(fail):
@@ -100,6 +103,32 @@ class DriverSelectors(unittest.TestCase):
             self.assertTrue(self._matches(selector, manifest), f"{selector!r} should match {manifest!r}")
         for other in ("amd-vulkan64.json", "radeon_icd.x86_64.json", "igvk64.json", "intel_icd.x86_64.json"):
             self.assertFalse(self._matches(selector, other), f"{selector!r} must not match {other!r}")
+
+
+class SchedulerSegments(unittest.TestCase):
+    def setUp(self) -> None:
+        self.spirv = Path(self.enterContext(tempfile.TemporaryDirectory())) / "shader.spv"
+
+    def measure(self, assembly: str) -> tuple[int, int] | None:
+        self.spirv.with_suffix(".spvasm").write_text(assembly, encoding="utf-8", newline="\n")
+        return bench_wave64.segments(str(self.spirv))
+
+    def test_unpartitioned_scheduler(self) -> None:
+        assembly = "OpSwitch %pcv %sw_default 0 %blk0 1 %blk1 3 %blk3\n"
+        self.assertEqual(self.measure(assembly), (3, 1))
+
+    def test_partitioned_scheduler(self) -> None:
+        cases = " ".join(f"{case} %blk{case}" for case in (*range(16_383), 16_384))
+        assembly = rdna2spirv.split_big_switch(
+            "%zero = OpConstant %uint 0\n"
+            "OpSelectionMerge %sw_merge None\n"
+            f"OpSwitch %pcv %sw_default {cases}\n"
+            "%sw_default = OpLabel\n"
+            "OpBranch %sw_merge\n"
+        )
+        self.assertIn("OpSwitch %pcc %sw_default", assembly)
+        self.assertEqual(assembly.count("OpSwitch %pcv %swm"), 2)
+        self.assertEqual(self.measure(assembly), (16_384, 1))
 
 
 if __name__ == "__main__":

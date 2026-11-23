@@ -188,6 +188,30 @@ class DisasmInputTest(unittest.TestCase):
         self.assertEqual(shader_disasm.code_range(b"FSSM"), (None, None, "scan"))
         self.assertEqual(shader_disasm.code_range(b""), (None, None, "scan"))
 
+    def test_code_range_stops_before_a_constant_data_block(self):
+        """s_endpgm, count N, N dwords, s_endpgm, s_code_end padding: the block is data, not code."""
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        try:
+            import shader_disasm
+        finally:
+            sys.path.pop(0)
+        endpgm = b"\x00\x00\x81\xbf"
+        code_end = b"\x00\x00\x9f\xbf"
+        for n in (0, 1, 8, 32):
+            data = n.to_bytes(4, "little") + bytes(range(1, 1 + 4 * n))
+            blob = bytearray(fssm())
+            blob[0x12C:0x12C + 4 + len(data) + 4 + 8] = endpgm + data + endpgm + code_end * 2
+            start, end, how = shader_disasm.code_range(bytes(blob))
+            self.assertEqual((start, end, how), (0x128, 0x128 + len(CODE), "header"), n)
+        # A count that does not match the distance to the closing s_endpgm is not a data block.
+        blob = bytearray(fssm())
+        blob[0x12C:0x12C + 16] = endpgm + (3).to_bytes(4, "little") + b"\x01\x00\x00\x00" + endpgm
+        self.assertEqual(shader_disasm.code_range(bytes(blob))[1], 0x12C + 16)
+        # Ordinary code (a second program after the first) is kept whole.
+        blob = bytearray(fssm())
+        blob[0x12C:0x12C + 8] = b"\x00\x00\x80\xbf" + endpgm
+        self.assertEqual(shader_disasm.code_range(bytes(blob))[1], 0x12C + 8)
+
     def test_a_short_blob_does_not_stop_the_others(self):
         self.write("a_good.fssm", fssm())
         self.write("b_short.fssm", b"FSSM" + CODE)   # 12 bytes: no room for the code offset at 0xC0
@@ -298,8 +322,8 @@ class DisasmInputTest(unittest.TestCase):
 
     def test_a_missing_source_is_an_error(self):
         p = self.run_tool(os.path.join(self.dir, "nope"), "--out", os.path.join(self.dir, "out"))
-        self.assertEqual(p.returncode, 1, p.stderr)
-        self.assertIn("is not a file or folder", p.stderr)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("does not exist", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
     def test_an_out_that_is_a_file_is_an_error(self):

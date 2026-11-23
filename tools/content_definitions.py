@@ -204,7 +204,13 @@ def main() -> int:
         counts["included_sets"] += len(doc.included_sets)
         counts["groups"] += len(doc.change_set_groups)
 
+    status = 0
     for path in args.inputs:
+        if not os.path.exists(path):
+            print(f"ERROR: {path}: does not exist", file=sys.stderr)
+            counts["failed_inputs"] += 1
+            status = 2
+            continue
         try:
             if os.path.isdir(path):
                 for _, _, doc in carve_documents(path):
@@ -214,8 +220,9 @@ def main() -> int:
                     add(parse_content(file_chunks(stream)))
         except (OSError, ContentError, ValueError, KeyError, TypeError):
             counts["failed_inputs"] += 1
+            status = max(status, 1)
     print(json.dumps(counts, sort_keys=True))
-    return int(bool(counts["failed_inputs"]))
+    return status
 
 
 if __name__ == "__main__":

@@ -9,7 +9,9 @@
 // The shader (test/glsl/cs_user_data.comp) is written to the translator's push-constant and address contract.
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/cached_pso.h"
@@ -203,9 +205,11 @@ std::vector<HRESULT> cached_pso_cases(Device* device, D3D12_COMPUTE_PIPELINE_STA
 }
 
 // The same cases on the PC runtime, with an empty compute shader from d3dcompiler_47: the default adapter, then WARP.
-// Empty when the host has no D3D12 device or no compiler (Wine), which the caller reports as a skip.
+// Empty when the host has no D3D12 device or no compiler, or is Wine's, which the caller reports as a skip: vkd3d has
+// both, but its GetCachedBlob is a stub, so every host answered nothing and the comparison failed on each run.
 std::vector<std::vector<HRESULT>> host_cached_pso_cases(const std::vector<std::uint8_t>& root_blob,
                                                         const std::vector<std::uint8_t>& other_root_blob) {
+    if (hostwine::host_is_wine()) return {};
     using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT,
                                        ID3DBlob**, ID3DBlob**);
     using CreateDeviceFn = decltype(&::D3D12CreateDevice);
@@ -268,10 +272,9 @@ int main() {
     for (std::uint32_t i = 0; i < 14; ++i) put32(fssm, 0xbf810000u + i);  // filler, s_endpgm-like words
     const auto container = shader_container(fssm);
     EXPECT(leonida::fssm_program(container) == fssm);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_compute_test";
-    std::filesystem::create_directories(library);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv",
-                               std::filesystem::copy_options::overwrite_existing);
+    const testfiles::ScratchDir scratch("leonida_compute_test");
+    const auto& library = scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "cs_user_data.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         // An entry for the same program with set-0 bindings comes first, as in one group of the corpus: the PSO
@@ -387,7 +390,9 @@ int main() {
                                                    E_INVALIDARG, E_INVALIDARG, S_OK};
             EXPECT(layer == expected);
             const auto hosts = host_cached_pso_cases(root_blob, other_root_blob);
-            if (hosts.empty()) std::printf("SKIP: no host D3D12 device or compiler for the CachedPSO comparison\n");
+            if (hosts.empty())
+                std::printf("SKIP: no host D3D12 reference (Wine, or no device or compiler) for the CachedPSO "
+                            "comparison\n");
             for (const auto& host : hosts) EXPECT(host == layer);
             if (!hosts.empty()) std::printf("cached PSO: %zu host adapter(s) gave the same %d answers\n", hosts.size(), cached_case_count);
 
@@ -889,7 +894,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     unsigned mismatches = 0;
     for (std::uint32_t i = 0; i < elements; ++i) {

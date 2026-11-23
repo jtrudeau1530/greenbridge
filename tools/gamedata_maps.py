@@ -499,6 +499,9 @@ def main() -> int:
     ap.add_argument("carve_dir", help="rpf9_carve.py output directory")
     ap.add_argument("--json", help="write the decoded header and grid summary to this JSON")
     a = ap.parse_args()
+    if not os.path.exists(a.carve_dir):
+        print(f"ERROR: {a.carve_dir}: does not exist", file=sys.stderr)
+        return 2
 
     try:
         if a.json:

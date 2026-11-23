@@ -342,6 +342,31 @@ class ClipChannelTest(unittest.TestCase):
         self.assertNotIn(("mover", "translation"), out)
         self.assertEqual(tally["tracks_mover_skipped"], 1)
 
+    def test_single_frame_pose_window_keeps_only_that_frame(self):
+        anim_clips.decode_animation = lambda _s, _anim: (
+            {0: [(float(k), 0.0, 0.0, 1.0) for k in range(5)],
+             1: [(float(k * 10), 0.0, 0.0) for k in range(5)]},
+            5,
+        )
+        out, _ = self.channels(2 / 30, 2 / 30, 1.0)
+        self.assertEqual(out[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
+        # Off-grid start == end windows pick the nearest frame instead of falling back to frame 0.
+        out_mid, _ = self.channels(0.075, 0.075, 1.0)
+        self.assertEqual(out_mid[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
+        out_hi, _ = self.channels(0.095, 0.095, 1.0)
+        self.assertEqual(out_hi[("mover", "translation")], [(0.0, (30.0, 0.0, 0.0))])
+
+    def test_select_clips_handles_non_hex_0x_names_and_bad_selectors(self):
+        d = {
+            "clips": [
+                {"kind": "clip", "name": "other.clip", "hash": 0x11111111},
+                {"kind": "clip", "name": "0x_intro.clip", "hash": 0x22222222},
+            ]
+        }
+        self.assertEqual([c["hash"] for c in anim_glb.select_clips(d, ["0x_intro"])], [0x22222222])
+        with self.assertRaisesRegex(anim_glb.ExportError, "0xbad"):
+            anim_glb.select_clips(d, ["0xbad"])
+
 
 class SamplerTimeTest(unittest.TestCase):
     def test_fractional_time_bounds_match_the_binary_accessor(self) -> None:

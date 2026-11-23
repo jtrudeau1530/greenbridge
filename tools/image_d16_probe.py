@@ -29,8 +29,8 @@ Usage:
     python -I tools/image_d16_probe.py --self-test        # the rules, T# words and kernels, no GPU
 
 Exit 0 when the sweep ran (which rule the hardware follows is a finding, not a failure), 1 when image_load and
-image_load_mip disagree, 2 on a harness error (a control word did not read back), 77 when the hardware oracle is
-unavailable or the GPU is not GFX10. Nothing here reads game files.
+image_load_mip disagree, 2 on a harness, CLI, or report write error (a control word did not read back), 77 when the
+hardware oracle is unavailable or the GPU is not GFX10. Nothing here reads game files.
 """
 import argparse
 import json
@@ -242,6 +242,43 @@ def self_test():
     return 1 if fails else 0
 
 
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, report):
+    """Create missing parent directories and write `report` as LF-terminated JSON, or return an error string."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return f"cannot create directory for --json {path}: {e.strerror or e}"
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dims", default=",".join(DIMS))
@@ -257,6 +294,11 @@ def main(argv=None):
     bad = [d for d in dims if d not in DIMS] + [f for f in fmts if f not in FORMATS]
     if bad or not dims or not fmts:
         ap.error("unknown or empty: " + ", ".join(bad or ["--dims/--formats"]))
+    if a.json is not None:
+        err = validate_json_path(a.json)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
@@ -301,9 +343,11 @@ def main(argv=None):
         return 2
     finally:
         oracle.close()
-    if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+    if a.json is not None:
+        err = write_json_report(a.json, report)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     return rc
 
 

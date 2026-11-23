@@ -236,6 +236,7 @@ addEventListener("keyup", e => keys.delete(e.code));
 
 // ---------- chunk streaming ----------
 const LOAD_R = 1400, UNLOAD_R = 2000, MAX_INFLIGHT = 4;
+const CHUNK_DOWNLOAD_TIMEOUT_MS = 30_000;
 // Three total attempts per chunk, with 1s/2s backoff. Failed chunks keep their budget
 // when leaving and returning; successfully loaded chunks start fresh after unloading.
 const MAX_LOAD_ATTEMPTS = 3, RETRY_DELAY_MS = 1000;
@@ -325,10 +326,17 @@ async function loadChunk(entry) {
   const { def, controller } = entry;
   inflight++;
   try {
-    const response = await fetch(def.url, { signal: controller.signal });
-    if (!response.ok) throw new Error(`Chunk request failed: ${response.status}`);
-    const bytes = await response.arrayBuffer();
-    if (controller.signal.aborted) return;
+    let response, bytes;
+    const timer = setTimeout(() => controller.abort(), CHUNK_DOWNLOAD_TIMEOUT_MS);
+    try {
+      response = await fetch(def.url, { signal: controller.signal });
+      if (!response.ok) throw new Error(`Chunk request failed: ${response.status}`);
+      bytes = await response.arrayBuffer();
+      controller.signal.throwIfAborted();
+    } finally {
+      // Bound both headers and body, but not the non-cancellable GLB parse.
+      clearTimeout(timer);
+    }
     const url = response.url || def.url;
     const resourcePath = THREE.LoaderUtils.extractUrlBase(url.split(/[?#]/, 1)[0]);
     const g = await loader.parseAsync(bytes, resourcePath);
@@ -408,7 +416,7 @@ renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
   camera.getWorldDirection(fwd); right.crossVectors(fwd, up).normalize();
-  const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") ? 0.2 : 1);
+  const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") || keys.has("ControlRight") ? 0.2 : 1);
   if (keys.has("KeyW")) v.add(fwd); if (keys.has("KeyS")) v.sub(fwd);
   if (keys.has("KeyD")) v.add(right); if (keys.has("KeyA")) v.sub(right);
   if (keys.has("KeyE")) v.y += 1; if (keys.has("KeyQ")) v.y -= 1;

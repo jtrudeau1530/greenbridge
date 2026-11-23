@@ -6,7 +6,9 @@ here line by line, so the test needs no game files, no dumpbin and no third-part
     python -I tests/test_inline_scan.py
 """
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -148,6 +150,41 @@ class InlineScanTests(unittest.TestCase):
         text = inline_scan.summarize(sites(GUARDED) + sites(UNGUARDED))
         self.assertIn("checked 1, UNCHECKED 1", text)
         self.assertIn("+0x28 x1", text)
+
+    def test_scan_counts_the_instructions_it_read(self):
+        stats = {}
+        sites = list(inline_scan.scan(listing(*GUARDED), stats))
+        self.assertEqual(stats["instructions"], len(GUARDED))
+        self.assertIn(f"instructions scanned: {len(GUARDED)}", inline_scan.summarize(sites, stats["instructions"]))
+
+
+class InlineScanCliTests(unittest.TestCase):
+    """An input with no instructions must not read as a clean image ("UNCHECKED 0")."""
+
+    def run_cli(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "listing.txt")
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            return subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "inline_scan.py"), path],
+                                  capture_output=True, text=True)
+
+    def test_empty_input_exits_2_without_a_summary(self):
+        proc = self.run_cli("")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("no instructions found", proc.stderr)
+        self.assertNotIn("UNCHECKED", proc.stdout)
+
+    def test_text_that_is_not_a_listing_exits_2(self):
+        proc = self.run_cli("Microsoft (R) COFF/PE Dumper\nnot a disassembly\n")
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn("UNCHECKED", proc.stdout)
+
+    def test_a_listing_with_instructions_but_no_site_still_passes(self):
+        proc = self.run_cli("".join(listing("mov rax,rcx", "ret")))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("instructions scanned: 2", proc.stdout)
+        self.assertIn("checked 0, UNCHECKED 0", proc.stdout)
 
 
 if __name__ == "__main__":

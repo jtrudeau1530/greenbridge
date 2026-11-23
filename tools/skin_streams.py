@@ -118,7 +118,11 @@ def resource_kind(b):
         return None
     if sys_ptr(u64(b, 8)) and sys_ptr(u64(b, 32)) and sys_ptr(u64(b, 48)) and 0 < u16(b, 56) <= 4096 \
             and u16(b, 56) == u16(b, 58) == u16(b, 40) == u16(b, 42):
-        return "dictionary"
+        # DrawableDictionaryCheckBytes also reads the first child when its pointer array is inside
+        # the prefix; beyond it the decoder accepts the header without that read.
+        values = u64(b, 48) - 0x50000000
+        if values > len(b) - 8 or sys_ptr(u64(b, values)):
+            return "dictionary"
     if all(sys_ptr(u64(b, at)) for at in (8, 24, 168)) \
             and all(p == 0 or sys_ptr(p) for p in (u64(b, 16), u64(b, 32), u64(b, 40))) \
             and 0 < u16(b, 48) <= 4096 and u16(b, 50) <= 4096 \

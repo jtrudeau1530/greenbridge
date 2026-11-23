@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import struct
@@ -58,6 +59,51 @@ def run(argv, **kwargs):
     cmd = [sys.executable, "-I"] + argv
     print("+ " + " ".join(cmd), file=sys.stderr)
     subprocess.run(cmd, check=True, **kwargs)
+
+
+def reset_run_folders(work: str) -> str:
+    """Remove <work>/first_light/dxbc and spirv as an earlier run left them; return a new, empty dxbc.
+
+    The unpacker, the disassembler and the translator each take every file in the folder they are given, and the
+    translator merges into an index.json it finds, so a container staged by an earlier run would be translated
+    again beside this run's pair. Both folders hold only copies from <work>/shaders and files derived from them,
+    so they are removed whole; first_light/out, another --out and <work>/shaders are not touched. A folder that
+    is a symlink or a junction, or is reached through one at first_light, is refused: nothing outside the work
+    folder is removed. shutil.rmtree unlinks a link inside a folder without entering it.
+    """
+    base = os.path.join(work, "first_light")
+    real_base = os.path.join(os.path.realpath(work), "first_light")
+    # first_light itself is checked first: when it is a link to a folder with no dxbc or spirv in it, there is
+    # nothing stale to judge below, and the new dxbc would be created on the far side of the link.
+    if os.path.lexists(base) and (
+        not os.path.isdir(base) or os.path.normcase(os.path.realpath(base)) != os.path.normcase(real_base)
+    ):
+        raise SystemExit(
+            f"{base} is a symlink, a junction or a file: each run removes and creates folders under it and does "
+            "not follow a link to do it; remove it and run again"
+        )
+    stale = [os.path.join(base, name) for name in ("dxbc", "spirv") if os.path.lexists(os.path.join(base, name))]
+    for folder in stale:  # both are checked before either is removed
+        real = os.path.join(real_base, os.path.basename(folder))
+        if not os.path.isdir(folder) or os.path.normcase(os.path.realpath(folder)) != os.path.normcase(real):
+            raise SystemExit(
+                f"{folder} is a symlink, a junction or a file, or first_light above it is a link: each run "
+                "removes this folder and does not follow a link to do it; remove it and run again"
+            )
+    for folder in stale:
+        try:
+            shutil.rmtree(folder)
+        except OSError as e:
+            raise SystemExit(
+                f"cannot remove {e.filename or folder} left by an earlier run ({e.strerror or e}); "
+                f"close what holds it or delete {folder}, then run again"
+            ) from e
+    dxbc = os.path.join(base, "dxbc")
+    try:
+        os.makedirs(dxbc)
+    except OSError as e:
+        raise SystemExit(f"cannot create {dxbc}: {e.strerror or e}") from e
+    return dxbc
 
 
 def carve_index(work: str) -> str:
@@ -93,8 +139,7 @@ def choose(index_path: str, vs: str, ps: str) -> list[dict]:
 def translate(work: str, picked: list[dict]) -> dict:
     """Translate just the two chosen containers, in the layout rdna2spirv.py reads."""
     base = os.path.join(work, "first_light")
-    dxbc = os.path.join(base, "dxbc")
-    os.makedirs(dxbc, exist_ok=True)
+    dxbc = reset_run_folders(work)
     index = []
     for entry in picked:
         shutil.copy(
@@ -407,6 +452,70 @@ def find_harness(explicit: str | None) -> str:
 
 
 CLEAR = -1.0
+FALLBACK_RGBA = (1.0, 0.0, 1.0, 1.0)
+
+
+def _close(got: float, want: float, tol: float) -> bool:
+    return math.isfinite(got) and abs(got - want) <= tol
+
+
+def _distinguishable_from_fallback(rgba: list[float] | tuple[float, ...], tol: float) -> bool:
+    return any(abs(c - m) > tol for c, m in zip(rgba, FALLBACK_RGBA))
+
+
+def rgba_probes_for_mesh(
+    vertices,
+    indices,
+    width: int,
+    height: int,
+    tw: int,
+    th: int,
+    rgba: bytes,
+    uv_probe_list: list[dict] | None = None,
+    tol: float = 0.02,
+    limit: int = 4,
+) -> list[dict]:
+    """Select covered RGBA probes for textured verification.
+
+    Starts from ``uv_probe_list`` when available; if that is empty (e.g. an off-centre mesh with
+    default (0, 0) UVs), scans covered pixels so textured draws always have at least one covered
+    RGBA probe. Prefers samples whose expected colour differs from the harness's magenta fallback.
+    """
+    candidates = list(uv_probe_list) if uv_probe_list else []
+    if not candidates and vertices:
+        step = max(1, min(width, height) // 16)
+        for py in range(step // 2, height, step):
+            for px in range(step // 2, width, step):
+                uv = uv_at(vertices, indices, px, py, width, height)
+                if uv is not None:
+                    candidates.append(
+                        {"pixel": [px, py], "uv": [round(uv[0], 6), round(uv[1], 6)]}
+                    )
+        if not candidates:
+            for py in range(height):
+                for px in range(width):
+                    uv = uv_at(vertices, indices, px, py, width, height)
+                    if uv is not None:
+                        candidates.append(
+                            {"pixel": [px, py], "uv": [round(uv[0], 6), round(uv[1], 6)]}
+                        )
+                        if len(candidates) >= limit * 4:
+                            break
+                if len(candidates) >= limit * 4:
+                    break
+    sampled = [
+        {
+            "pixel": p["pixel"],
+            "uv": p["uv"],
+            "rgba": sample_rgba_bilinear(tw, th, rgba, p["uv"][0], p["uv"][1]),
+        }
+        for p in candidates
+    ]
+    distinct = [p for p in sampled if _distinguishable_from_fallback(p["rgba"], tol)]
+    pool = distinct if distinct else sampled
+    if len(pool) > limit:
+        pool = [pool[int(i * len(pool) / limit)] for i in range(limit)]
+    return pool
 
 
 def check_image(data: bytes, manifest: dict) -> dict:
@@ -420,7 +529,22 @@ def check_image(data: bytes, manifest: dict) -> dict:
             f"raw is {len(data)} bytes, expected {width * height * 16}"
         )
     pixels = struct.unpack(f"<{len(data) // 4}f", data)
-    covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
+    clear_val = manifest.get("clear", CLEAR)
+    textured = (
+        manifest.get("texture") is not None
+        or manifest.get("centre_rgba") is not None
+        or manifest.get("rgba_probes") is not None
+    )
+    if textured:
+        # UNORM texels can have any alpha in [0, 1] (including 0.0), so distinguish covered fragments
+        # from the harness clear sentinel (-1.0) instead of testing alpha > 0.5.
+        covered = sum(
+            1
+            for i in range(0, len(pixels), 4)
+            if not all(_close(pixels[i + c], clear_val, 1e-5) for c in range(4))
+        )
+    else:
+        covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
     ratio = covered / (width * height)
     if (
         not manifest.get("min_coverage", 0.0)
@@ -433,17 +557,31 @@ def check_image(data: bytes, manifest: dict) -> dict:
         )
     if (clear := manifest.get("clear_pixel")) is not None:
         i = (clear[1] * width + clear[0]) * 4
-        want = manifest.get("clear", CLEAR)
-        if any(abs(pixels[i + c] - want) > 1e-5 for c in range(4)):
+        if any(not _close(pixels[i + c], clear_val, 1e-5) for c in range(4)):
             raise AssertionError(
-                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {want}"
+                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {clear_val}"
+            )
+    if textured:
+        tol = manifest.get("rgba_tolerance", 0.02)
+        expected_rgbas = []
+        if (rgba := manifest.get("centre_rgba")) is not None:
+            expected_rgbas.append(rgba)
+        for probe in manifest.get("rgba_probes") or []:
+            expected_rgbas.append(probe["rgba"])
+        if not expected_rgbas:
+            raise AssertionError(
+                "textured manifest has no covered RGBA samples (centre_rgba or rgba_probes)"
+            )
+        if not any(_distinguishable_from_fallback(r, tol) for r in expected_rgbas):
+            raise AssertionError(
+                f"textured manifest has no expected colour distinguishable from fallback {FALLBACK_RGBA} (tol {tol})"
             )
     if (rgba := manifest.get("centre_rgba")) is not None:
         centre = manifest.get("centre_pixel") or [width // 2, height // 2]
         i = (centre[1] * width + centre[0]) * 4
         tol = manifest.get("rgba_tolerance", 0.02)
         for c, want in enumerate(rgba):
-            if abs(pixels[i + c] - want) > tol:
+            if not _close(pixels[i + c], want, tol):
                 raise AssertionError(
                     f"centre {centre} is {pixels[i : i + 4]}, expected {rgba} (tol {tol})"
                 )
@@ -451,7 +589,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
         centre = manifest.get("centre_pixel") or [width // 2, height // 2]
         i = (centre[1] * width + centre[0]) * 4
         for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
-            if abs(pixels[i + c] - want) > 2e-3:
+            if not _close(pixels[i + c], want, 2e-3):
                 raise AssertionError(
                     f"centre {centre} is {pixels[i : i + 4]}, expected {want} at {c}"
                 )
@@ -462,7 +600,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
             i = (py * width + px) * 4
             want_rgba = probe["rgba"]
             for c, want in enumerate(want_rgba):
-                if abs(pixels[i + c] - want) > tol:
+                if not _close(pixels[i + c], want, tol):
                     raise AssertionError(
                         f"RGBA probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want_rgba} (tol {tol})"
                     )
@@ -472,7 +610,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
             i = (py * width + px) * 4
             u, v = probe["uv"]
             for c, want in enumerate((u, v, 0.0, 1.0)):
-                if abs(pixels[i + c] - want) > 2e-3:
+                if not _close(pixels[i + c], want, 2e-3):
                     raise AssertionError(
                         f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
                     )
@@ -493,6 +631,8 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
 
 
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
+    if manifest.get("vertex_count") == 0 or manifest.get("index_count") == 0:
+        raise SystemExit("first-light draw requires an OBJ with faces. Prepare this output with --obj before drawing.")
     harness = find_harness(args.harness)
     raw = os.path.join(out_dir, "image.raw")
     if os.path.exists(raw):
@@ -682,6 +822,11 @@ def main(argv=None) -> int:
         if not a.no_fit:
             vertices = fit(vertices, a.width, a.height, True, not a.keep_z)
         write_mesh(os.path.join(out_dir, "mesh.bin"), vertices, indices)
+    else:  # a run without a model must not draw the mesh an earlier run left in the folder
+        try:
+            os.unlink(os.path.join(out_dir, "mesh.bin"))
+        except FileNotFoundError:
+            pass
     centre_pixel = [a.width // 2, a.height // 2]
     centre_uv = (
         uv_at(vertices, indices, centre_pixel[0], centre_pixel[1], a.width, a.height)
@@ -752,15 +897,19 @@ def main(argv=None) -> int:
             manifest["centre_rgba"] = sample_rgba_bilinear(
                 tw, th, rgba, centre_uv[0], centre_uv[1]
             )
-        if probes:
-            manifest["rgba_probes"] = [
-                {
-                    "pixel": p["pixel"],
-                    "uv": p["uv"],
-                    "rgba": sample_rgba_bilinear(tw, th, rgba, p["uv"][0], p["uv"][1]),
-                }
-                for p in probes
-            ]
+        tex_probes = rgba_probes_for_mesh(
+            vertices,
+            indices,
+            a.width,
+            a.height,
+            tw,
+            th,
+            rgba,
+            uv_probe_list=probes,
+            tol=manifest["rgba_tolerance"],
+        )
+        if tex_probes:
+            manifest["rgba_probes"] = tex_probes
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")

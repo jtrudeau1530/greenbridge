@@ -223,7 +223,7 @@ def stage_index(path):
 
     The index is the one `make_game.py` writes next to the carved `.dxbc` files.  Both the `fssm`
     directory (parent holds index.json) and a directory that contains index.json are accepted.
-    Prefer the local index when it has rows.
+    Prefer the local index when it has stage rows.
     """
     base = path if os.path.isdir(path) else (os.path.dirname(path) or ".")
     for candidate in (os.path.join(base, "index.json"), os.path.join(base, "..", "index.json")):
@@ -235,15 +235,25 @@ def stage_index(path):
                 continue
             if not isinstance(rows, list):
                 continue
-            stages = {
-                stem: stage
-                for row in rows
-                if isinstance(row, dict)
-                and isinstance(file := row.get("file"), str)
-                and (stem := os.path.splitext(os.path.basename(file))[0])
-                and isinstance(stage := row.get("stage"), str)
-                and stage
-            }
+            stages = {}
+            ambiguous = set()
+            for row in rows:
+                if not (
+                    isinstance(row, dict)
+                    and isinstance(file := row.get("file"), str)
+                    and (stem := os.path.splitext(os.path.basename(file.replace("\\", "/")))[0])
+                    and isinstance(stage := row.get("stage"), str)
+                    and stage
+                ):
+                    continue
+                if stem in ambiguous:
+                    continue
+                prev = stages.get(stem)
+                if prev is not None and prev != stage:
+                    del stages[stem]
+                    ambiguous.add(stem)
+                else:
+                    stages[stem] = stage
             if stages:
                 return stages
     return {}
@@ -377,7 +387,8 @@ def main(argv=None):
     label = "PS entry counts" if total["entry_counts_scope"] == "ps" else "entry counts"
     print(label + ": " + ", ".join(f"{k}:{v}" for k, v in total["entry_counts"].items()))
     if total["stage_source"] == "table-only":
-        print("(no index.json found: counted every blob with a non-empty table as a PS)")
+        why = "no inspected blob in index.json" if stages else "no index.json found"
+        print(f"({why}: counted every blob with a non-empty table as a PS)")
     if args.bindings:
         parsed = [row for row in rows if row["bindings"]]
         records = sum(row["bindings"]["records"] for row in parsed)

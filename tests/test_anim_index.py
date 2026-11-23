@@ -502,6 +502,29 @@ class RigArchiveTest(unittest.TestCase):
         self.assertEqual(r["summary"]["rigsets"], 3)
         self.assertEqual(r["summary"]["entries"], 3)
 
+    def test_collect_skeletons_dir_matches_archive_classification(self):
+        carved = os.path.join(self.root, "carved_skels")
+        os.makedirs(carved)
+        big_skel = b"SKEL_Large\x00" + b"SKEL_Other\x00" + b"\x00" * 20000
+        rbf0_with_skel = b"RBF0" + b"\x00" * 16 + b"SKEL_NotASkeleton\x00" + b"\x00" * 32
+        with open(os.path.join(carved, "000000000100.bin"), "wb") as f:
+            f.write(self.skel)
+        with open(os.path.join(carved, "000000000200.bin"), "wb") as f:
+            f.write(big_skel)
+        with open(os.path.join(carved, "000000000300.bin"), "wb") as f:
+            f.write(self.front)
+        with open(os.path.join(carved, "000000000400.bin"), "wb") as f:
+            f.write(rbf0_with_skel)
+        got = anim_index.collect_skeletons_dir(carved)
+        self.assertEqual(
+            [(r["offset"], r["kind"], r["names"]) for r in got],
+            [
+                (0x100, "plain-bone-table", ["SKEL_Second", "SKEL_Synthetic"]),
+                (0x200, "plain-bone-table", ["SKEL_Large", "SKEL_Other"]),
+                (0x300, "bone-table", ["SKEL_Front"]),
+            ],
+        )
+
     def test_cli_rejects_a_shared_rig_destination(self):
         out = os.path.join(self.root, "index.json")
         alias = os.path.join(self.root, ".", "index.json")

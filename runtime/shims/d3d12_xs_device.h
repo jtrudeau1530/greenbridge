@@ -49,6 +49,24 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out);
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);
 
+// IDXGIDevice1 on the device. A GDKX title asks its device for IDXGIDevice1, then GetAdapter and EnumOutputs(0),
+// to find the output it gives SetFrameIntervalX (docs/d3d12_vulkan.md section 4.5). The proxy answers IDXGIObject,
+// IDXGIDevice and IDXGIDevice1 itself, as one COM object with the device (same reference count, QueryInterface
+// both ways). GetAdapter and GetParent return the adapter of the device behind the proxy: by default the host DXGI
+// adapter with that device's LUID. A provider replaces that: `real` is the device behind the proxy, and it returns
+// the adapter as `riid`. rt::d3d12::set_device_outer sets one for the Vulkan-backed device (the layer's own adapter).
+//
+// A title may ask D3D12XboxCreateDevice (so create_device_proxy) for IDXGIDevice1 directly. What comes back then is
+// the proxy's DXGI pointer, not the proxy: is_device_proxy is false for it. Code that takes "the proxy" from a
+// creation call goes through device_proxy_primary first.
+using DxgiAdapterProvider = HRESULT (*)(ID3D12Device* real, REFIID riid, void** out);
+// `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither: nothing is set then.
+bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
+// The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.
+void* device_proxy_from_dxgi_device(void* dxgi_device);
+// The device proxy itself, given the proxy or its DXGI pointer; null for anything else.
+void* device_proxy_primary(void* device);
+
 // True when `heap` is a descriptor-heap proxy created by device slot 14.
 bool is_heap_proxy(const void* heap);
 ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap);

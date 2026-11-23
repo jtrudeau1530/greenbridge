@@ -8,6 +8,7 @@ repository. The script runs as itself, through its own command line.
 """
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,10 @@ CAUGHT = [
     ("model.json", b"glTF" + (2).to_bytes(4, "little") + bytes(8), "glTF binary"),
     ("game.txt", pe_header(), "PE executable"),
     ("far_pe.txt", pe_header(0x400), "PE executable"),
+    # e_lfanew around the end of the first bytes read (0x208): before, straddling and after it
+    *((f"pe_{n}.txt", pe_header(n), "PE executable") for n in range(0x204, 0x20A)),
+    ("pe_1mib.txt", pe_header(1 << 20), "PE executable"),
+    ("pe_1mib_plus.txt", pe_header((1 << 20) + 4), "PE executable"),
     ("image.bin", bytes(0x200) + b"msft-xvd" + bytes(8), "XVD image"),
 ]
 
@@ -55,7 +60,21 @@ PASSED = [
     ("metadata.txt", b"METADATA ADAT later in the line\n"),
     ("riff.bin", b"RIFF" + bytes(4) + b"AVI LIST"),
     ("empty.txt", b""),
+    ("mz_past_end.txt", pe_header(0x80)[:0x40]),  # e_lfanew points past the end of the file
+    ("mz_cut_signature.txt", pe_header(0x300)[:-2]),  # only "PE" of the signature is there
+    ("mz_not_pe.txt", pe_header(0x80)[:-4] + b"NE\0\0"),
 ]
+
+
+def rmtree(path):
+    """shutil.rmtree that also removes read-only files (Git's objects on Windows)."""
+    def retry(func, p, _):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=retry)
 
 
 def run(args, cwd=None):
@@ -65,7 +84,7 @@ def run(args, cwd=None):
 class CheckNoGameData(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.dir)
+        self.addCleanup(rmtree, self.dir)
 
     def write(self, name, data):
         path = os.path.join(self.dir, name)

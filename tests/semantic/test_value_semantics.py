@@ -825,6 +825,8 @@ class MeasuredBoundsShaders(unittest.TestCase):
         "cs_smem_stride_align": [0x5EED0010, 0, 0, 0x5EED0000, 0x5EED0000, 0x5EED0000, 0x5EED0000, 0x5EED0004],
         "cs_smem_sload_neg": [0x5EED0004, 0x5EED0000, 0x5EED0004, 0x5EED0004, 0x5EED0008, 0x5EED000C,
                               0xEEEEEEEE, 0xEEEEEEEE],
+        # SHADER-328: constant and run-time SGPR offsets agree; out[4..7] are not written (heap fill)
+        "cs_smem_sconst_off": [0, 0x5EED0018, 0x5EED0018, 0x5EED0014, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE],
         "cs_buf_tail": [0, 0x5EED000C, 0x5EED0008, 0x5EED000C, 0, 0, 0x5EED0010, 0],
         "cs_oob_select": [0x5EED000C, 0, 0x5EED0014, 0, 0x5EED0018, 0xEEEEEEEE, 0, 0],
         "cs_oob_tail": [0, 0, 0x5EED0010, 0, 0xBEEF0000, 0xEEEEEEEE, 0, 0x5EED0010],

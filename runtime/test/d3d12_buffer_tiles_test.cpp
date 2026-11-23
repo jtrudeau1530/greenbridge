@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
@@ -170,25 +172,55 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
 
     EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
     const auto* data = static_cast<const std::uint32_t*>(mapped);
+    // Every word of every tile, with the first wrong word of each tile printed, so a failure says which side,
+    // snapshot and tile differ and what was read there.
+    UINT wrong_tiles = 0;
     for (UINT i = 0; i < snapshots; ++i) {
         for (UINT tile = 0; tile < tiles_per_buffer; ++tile) {
             const auto* first = data + (i * tiles_per_buffer + tile) * words_per_tile;
             result[i][tile] = *first;
-            EXPECT(std::all_of(first, first + words_per_tile, [&](auto word) { return word == expected[i][tile]; }));
+            const auto* bad = std::find_if(first, first + words_per_tile, [&](auto word) { return word != expected[i][tile]; });
+            if (bad == first + words_per_tile) continue;
+            ++wrong_tiles;
+            const auto wrong_words = std::count_if(bad, first + words_per_tile,
+                                                   [&](auto word) { return word != expected[i][tile]; });
+            std::fprintf(stderr, "%s snapshot %u tile %u: word %u reads %#010x, want %#010x (%lld of %llu words wrong)\n",
+                         layer ? "Vulkan layer" : "native D3D12", i, tile, unsigned(bad - first), unsigned(*bad),
+                         unsigned(expected[i][tile]), static_cast<long long>(wrong_words),
+                         static_cast<unsigned long long>(words_per_tile));
         }
     }
     readback->Unmap(0, &empty);
+    EXPECT(wrong_tiles == 0);
     return true;
 }
 
+// The host adapter for the native half. LEONIDA_HOST_ADAPTER picks it as in d3d12_copy_compare.h: "warp", or part of
+// an adapter name (case-insensitive); a value that names no adapter with tiled resources tier 2 skips the native half
+// rather than testing another GPU. Unset: the first hardware adapter with tier 2 or more.
 ComPtr<ID3D12Device> native_device() {
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return {};
+    char want[128] = {};
+    GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", want, sizeof(want));
+    std::string needle(want);
+    std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return char(std::tolower(c)); });
     for (UINT i = 0;; ++i) {
         ComPtr<IDXGIAdapter1> adapter;
-        if (factory->EnumAdapters1(i, &adapter) != S_OK) return {};
+        if (needle == "warp") {
+            if (i > 0 || FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))) break;
+        } else if (factory->EnumAdapters1(i, &adapter) != S_OK) {
+            break;
+        }
         DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
+        if (FAILED(adapter->GetDesc1(&desc))) continue;
+        if (needle.empty()) {
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        } else if (needle != "warp") {
+            std::string name;
+            for (const wchar_t* c = desc.Description; *c; ++c) name += char(std::tolower(*c < 128 ? *c : '?'));
+            if (name.find(needle) == std::string::npos) continue;
+        }
         ComPtr<ID3D12Device> device;
         if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) continue;
         D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
@@ -197,6 +229,10 @@ ComPtr<ID3D12Device> native_device() {
         std::printf("Native D3D12: %ls, tiled resources tier %u\n", desc.Description, unsigned(options.TiledResourcesTier));
         return device;
     }
+    if (!needle.empty())
+        std::printf("Native D3D12: no adapter matching LEONIDA_HOST_ADAPTER=%s with tiled resources tier 2 or more; "
+                    "native half skipped\n", want);
+    return {};
 }
 
 }  // namespace

@@ -1395,6 +1395,38 @@ class StructuredEmulationTests(unittest.TestCase):
             v4 += 31
             self.assertEqual(mem[l * 4], v4, f"lane {l}")
 
+        # 2) Guard-spine coalescing after an early-exit branch (0 -> [1 (end), 2]) and inside a header-exit loop:
+        #    cfg_structure.structure hoists spine guards into the enclosing list where skip_pc holds the early-exit
+        #    target. _unwrap_known_pc_guards must coalesce and unwrap all hoisted post-dominating spine guards.
+        import cfg_structure
+        succ_early = [[1, 2], []]  # block 0 -> early exit 1 or main body 2
+        cur = 2
+        for _ in range(10):
+            succ_early.append([cur + 1, cur + 2])
+            succ_early.append([cur + 2])
+            cur += 2
+        succ_early.append([])
+        raw_tree = cfg_structure.structure(succ_early)
+        out_pcs = {b: (frozenset(s) if s else frozenset({-1})) for b, s in enumerate(succ_early)}
+        unwrapped_tree = wave64_emulate_opt._unwrap_known_pc_guards(raw_tree, out_pcs, 0)
+
+        def count_guards(t):
+            c = 0
+            st = [t]
+            while st:
+                for item in st.pop():
+                    if item[0] == "guard":
+                        c += 1
+                        st.append(item[2])
+                    elif item[0] == "loop":
+                        st.append(item[2])
+            return c
+
+        # Raw tree has 22 guards (guard 1, guard 2, plus 10 arm guards and 10 hoisted spine guards);
+        # coalesced unwrap removes all 10 hoisted spine guards -> 12 guards.
+        self.assertEqual(count_guards(raw_tree), 22)
+        self.assertEqual(count_guards(unwrapped_tree), 12)
+
 
 if __name__ == "__main__":
     unittest.main()

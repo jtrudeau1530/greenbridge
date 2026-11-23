@@ -283,13 +283,14 @@ def main() -> int:
     all_stats, status = [], 0
     for path in args.inputs:
         if not os.path.exists(path):
-            print(f"ERROR: {path} does not exist", file=sys.stderr)
-            status = 1
+            # A missing input is a usage error (2); a folder that exists but is not an archive is a read error (1).
+            print(f"ERROR: {path}: does not exist", file=sys.stderr)
+            status = max(status, 2)
             continue
         if not os.path.isfile(path):
             # A folder passed for an archive used to reach open() and end the whole run with PermissionError.
             print(f"ERROR: {path} is not a file", file=sys.stderr)
-            status = 1
+            status = max(status, 1)
             continue
         print(f"Processing {path}...")
         try:
@@ -298,6 +299,10 @@ def main() -> int:
             # A truncated archive or a bad data offset otherwise looks like an empty successful scan.
             print(f"ERROR: {e}", file=sys.stderr)
             status = 1
+            continue
+        except OSError as e:
+            print(f"ERROR: cannot read {path}: {e.strerror or e}", file=sys.stderr)
+            status = max(status, 1)
             continue
         all_stats.append(stats)
         

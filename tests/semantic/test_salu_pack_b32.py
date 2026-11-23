@@ -310,10 +310,6 @@ class TestSaluPackB32PermutationsAndRouting(unittest.TestCase):
                 self.assertEqual(scc_out, scc_in)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestSaluPackB32BoundariesAliasingAndNegativeControls(unittest.TestCase):
     """Tests boundary extremes (zeros, ones, sign bits), register aliasing, and negative controls."""
 
@@ -369,3 +365,7 @@ class TestSaluPackB32BoundariesAliasingAndNegativeControls(unittest.TestCase):
         ]
         with self.assertRaises(Exception):
             run_assembly_lines(bad_lines)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -15,7 +15,8 @@
 //     WinHttpWriteData fail with ERROR_WINHTTP_INCORRECT_HANDLE_STATE: no request ever got that far.
 //   - Options, timeouts and request headers are accepted. WINHTTP_OPTION_CONTEXT_VALUE is kept per handle and
 //     WINHTTP_OPTION_HANDLE_TYPE answered; WinHttpQueryOption reports ERROR_WINHTTP_INVALID_OPTION for the rest.
-//   - A status callback set on a handle is inherited by the handles created under it, as in WinHTTP.
+//   - A status callback set on a handle is inherited by the handles created under it, as in WinHTTP, and so is
+//     the handle's WINHTTP_OPTION_CONTEXT_VALUE as it is when the child is made.
 //     WINHTTP_CALLBACK_STATUS_HANDLE_CREATED is reported when a child handle is made, and
 //     WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING once per handle, last, after WinHttpCloseHandle and any callback still
 //     running for it.
@@ -122,10 +123,12 @@ HINTERNET make_handle(Kind kind, Handle* parent, bool async) {
     h->parent = parent;
     h->async = async;
     if (parent) {
-        // A callback set on a handle is inherited by the handles created under it.
+        // A callback set on a handle is inherited by the handles created under it, and so is the context value
+        // (WINHTTP_OPTION_CONTEXT_VALUE), as the host's winhttp.dll does: what the parent has at this moment.
         std::lock_guard lock(parent->mutex);
         h->callback = parent->callback;
         h->notifications = parent->notifications;
+        h->context = parent->context;
     }
     {
         std::lock_guard lock(live_mutex());
