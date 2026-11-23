@@ -38,6 +38,7 @@ namespace rt::shims {
 bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
 bool xgameruntime_gamesave_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
 bool xgameruntime_store_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
+bool xgameruntime_offline_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
 }
 
 namespace {
@@ -507,6 +508,7 @@ HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** ou
         if (rt::shims::xgameruntime_gamesave_query(*class_id, interface_id, out, &hr))   // xgameruntime_gamesave.cpp
             return hr;
         if (rt::shims::xgameruntime_store_query(*class_id, interface_id, out, &hr)) return hr;   // xgameruntime_store.cpp
+        if (rt::shims::xgameruntime_offline_query(*class_id, interface_id, out, &hr)) return hr;   // xgameruntime_offline.cpp
     }
     char cls[40], iid[40];
     print_guid(cls, class_id);
