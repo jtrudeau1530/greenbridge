@@ -195,7 +195,7 @@ is fixed and was identical in all 269,106 records (and in all 1,233 records of t
 |---|---|
 | `0x00` | zero `u64` |
 | `0x08` | `0x50000080`, zero high word |
-| `0x10` | `1` |
+| `0x10` | `1`: the slot count N of §3.2a |
 | `0x18` | `0x500000A0` |
 | `0x20` | `0x60000000` |
 | `0x28` | `0x500000B0` |
@@ -203,20 +203,132 @@ is fixed and was identical in all 269,106 records (and in all 1,233 records of t
 | `0x38` | `0x50000050` |
 | `0x40` | 64-bit object key (235,533 distinct values in core) |
 | `0x50` | 3x4 float transform (last column zero; identity in 178,867 of 269,106): the geometry transform the BLAS was built with, §4a |
-| `0x88` | `0x00000101` |
-| `0xA0` | 64-byte-aligned offset within the following chunk, equal to the declared node end plus 0, 64, 128 or 192 |
-| `0xA4` | two `u16` counts, high and low; multiples of 256 and 64 in the sample |
+| `0x88` | `0x00000101`, the page word of the 32-byte block at `0x80` (§3.2a) |
+| `0xA0` | the size of the following BLAS: its declared end rounded up to 256 bytes, so the declared node end plus 0, 64, 128 or 192 (269,106/269,106, §3.2a) |
+| `0xA4` | high word of the entry at `0xA0`, undecoded; its low `u16` is a multiple of 64 (§3.2a) |
 
 The `0x5000xxxx` words are constant across records and point at offsets inside the same 208-byte template
-(`0x50`, `0x80`, `0xa0`, `0xb0`, `0xc0`). They behave like serialized GPU virtual addresses built on a fixed
-`0x50000000` base, but that reading is **speculative**. They are not per-object pointers: the same constants occur
-in every record.
+(`0x50`, `0x80`, `0xa0`, `0xb0`, `0xc0`). They behave like serialized virtual addresses built on a fixed
+`0x50000000` base, and `0x60000000` at `0x20` like the base of a second (physical) segment. That reading is a
+**hypothesis** (the RAGE resource convention); what is measured is that every such pointer resolves inside its own
+stream, and §3.2a measures what the template does. They are not per-object pointers: the same constants occur in
+every record.
 
-The 24,832 "other descriptor" streams are the same family at other sizes (160, 192, 256, 272, 368, ... bytes):
-first eight bytes zero, a `0x5000xxxx` word at `0x08`, and zero at `0x0C`. Some carry a full 4x4 matrix instead of
-the 3x4 transform; the larger ones (e.g. 272 and 368 bytes) contain several 8-byte keys followed by a table of
-`0x5000xxxx` self-pointers. 2,528 of them are immediately followed by a BVH buffer. Their exact grouping semantics
-are **Open**.
+### 3.2a Descriptor templates and grouping (ASSET-321)
+
+**Status: measured** on all 24,832 "other descriptor" streams of `core_bvh4.rpf` and all 85 of
+`shared_minigame000_bvh4.rpf`, with `tools/bvh_groups.py` (below). Counts, offsets and widths only.
+
+All of them start with a zero `u64` and a `0x5000xxxx` word at `0x08`, as the 208-byte record does. That word
+points at a 32-byte block inside the stream whose `u32` at `+8` (the "page word") is `0x101` or `0x1`; the other
+28 bytes are zero. The streams fall into exactly two templates, and the page word separates them:
+
+| template | page word | streams (core) | sizes (bytes) | count field | followed by |
+|---|---|---:|---|---|---|
+| instance, N = 1 (`instance208`) | `0x101` | 269,106 | 208 | N = 1 | `bvh4` 269,096, `bvh4-chunk` 10 |
+| instance, N > 1 | `0x101` | 2,531 | 256 to 6,544 (9 sizes) | N = 2 to 89 | `bvh4` 2,531 |
+| table | `0x1` | 22,301 | 160 to 10,096 | K = 1 to 227 | descriptor 22,183, `instance208` 118 |
+
+2,531 + 22,301 = 24,832. N is 2 in 1,972 streams, 3 in 263, 6 in 249, 4 in 32, 5 in 8, 89 in 3, 13 in 2, and 7
+and 25 in one each. Every stream with page word `0x101` is followed by a BVH stream (271,637/271,637) and no stream
+with `0x1` is (0/22,301). Read with the hypothesis above, `0x101` is one virtual and one physical page and `0x1`
+one virtual page only: the BVH buffer is the physical segment, and a table stream has none.
+
+**Instance template.** The 208-byte record is its N = 1 case. The N > 1 streams are the census's "4x4 matrix"
+streams: they hold N 3x4 matrices back to back. Pointers, not fixed offsets, place the regions after `0x50`; each
+region is padded to 16 bytes, and matrices, entries, the two arrays and the map block tile the stream with no gap
+or overlap in 2,531/2,531 N > 1 streams and 269,106/269,106 records. The order is matrices, map, entries, arrays in
+269,106 + 1,972 streams and matrices, entries, arrays, map in 559.
+
+| offset | width | contents | value range (core) |
+|---|---|---|---|
+| `0x00` | `u64` | zero | constant |
+| `0x08` | `u64` | `0x5000xxxx` pointer to the 32-byte map block | page word `0x101` at `+8` |
+| `0x10` | `u64` | N, the number of BLAS slots | 1 to 89 |
+| `0x18` | `u64` | pointer to N `u64` entries | |
+| `0x20` | `u64` | `0x60000000` | constant |
+| `0x28`, `0x30` | `u64` each | pointers to two N x `u64` arrays | every element zero in all 271,637 streams |
+| `0x38` | `u64` | pointer to the N matrices | `0x50000050` in all 271,637 |
+| `0x40` | `u64` | key | 2,469 distinct in the 2,531 N > 1 streams |
+| `0x48` | `u64` | zero | constant |
+| `0x50` | N x 48 | N 3x4 `f32` matrices | |
+| entry | `u64` | low `u32`: BLAS size in bytes, 0 for an empty slot; high `u32`: undecoded | low `u16` of the high word a multiple of 64, 256 to 38,976, in all 275,807 non-zero entries |
+
+**Grouping rule (decoded).** The stream after an instance descriptor holds the BLAS of its non-zero entries back
+to back. The first starts at offset 0, each next one where the previous non-zero entry's low `u32` ends, and each
+non-zero low `u32` equals that BLAS's declared end (`u32@0x20` of its own wrapper, §3.1) rounded up to 256 bytes.
+Each BLAS found there has the full §3.1 signature at its own offset (`0x81020006` at `+0x100`,
+`0x140 + 64*n == u32@+0x20`, `u32@+0x28 == u32@+0x20 - 0x100`), and the bytes after the last one are zero.
+
+* N > 1: 2,531/2,531 descriptors pass, which ties **6,701 BLAS** in 2,531 buffers to their descriptor. 13 of the
+  descriptors have empty slots (19 entries whose low `u32` is 0; in 11 of the 13 an empty entry keeps a non-zero
+  high word). With the empty entries skipped they pass like the rest. All 2,531 following streams were inflated whole for this check.
+* N = 1: the low `u32` of the entry at `0xA0` equals the declared end of the following BLAS rounded up to 256 in
+  269,106/269,106 records (the "declared node end plus 0, 64, 128 or 192" of the table in §3.2).
+
+Before this the 2,531 were tied to their buffers only as "followed by". The census counted 2,528 plus 3 preceded
+by other streams; this walk, with `bvh_index.classify`, finds all 2,531 followed by a `bvh4`, and all 271,637 BVH
+streams preceded by an instance descriptor (269,106 + 2,531). The 3 are not reproduced. What is new is what such a
+buffer holds: N BLAS, not one. 4,170 of the 6,701 BLAS sit past the first header of their stream, where an index
+that reads only the first `0x140` bytes of each stream does not see them. The matrices pair with the slots by
+position; that each is the geometry transform of the BLAS in its slot, as §4a measured for N = 1, is a
+**hypothesis** for N > 1 that needs the source geometry to test.
+
+**Table template** (22,301 streams in core, 81 in the shared pack). Two arrays, each a pointer followed by a
+`u16 count, u16 capacity` pair:
+
+| offset | width | contents | value range (core) |
+|---|---|---|---|
+| `0x00` | `u64` | zero | constant |
+| `0x08` | `u64` | pointer to the 32-byte map block | page word `0x1` at `+8` |
+| `0x10` | `u64` | zero | constant |
+| `0x18` | `u64` | 1 | constant |
+| `0x20` | `u64` | pointer to K `u32` values | |
+| `0x28` | `u16`, `u16` | K, capacity | count = capacity, 1 to 227 |
+| `0x30` | `u64` | pointer to K item pointers | |
+| `0x38` | `u16`, `u16` | K, capacity | equal to `0x28` in 22,301/22,301 |
+| item | 32 bytes | a `u64` at `+0x10`; the other 24 bytes zero | both halves of the `u64` non-zero |
+
+In all 22,301 streams the K values are strictly ascending, the K pointers address items exactly 32 bytes apart in
+pointer order, and the items, the map block, the pointer array and the value array (each padded to 16 bytes) tile
+`0x40` to the end of the stream. A larger stream is a larger K: the census's "8-byte keys followed by a table of
+self-pointers" are the items and the pointer array. There are 130,179 items; K is 4 in 11,953 streams, 1 in 3,888,
+2 in 1,953 and 16 in 846. The 22,301 streams are all distinct, the 130,179 item `u64`s are distinct across the
+pack, and each of their 64 bits is set in 50% of them.
+
+**What does not tie a table stream to anything (tested over the whole pack).** For random 32-bit values the
+expected number of matches between two sets is `|A| * |B| / 2^32`; a relation only counts if it beats that.
+
+| candidate | observed | expected by chance |
+|---|---:|---:|
+| a table value (104,795 distinct) equals a BLAS `crc32` (199,615 distinct) | 7 | 4.9 |
+| a table value equals a half of an instance key (475,168 distinct halves) | 6 | 11.6 |
+| an item `u64` equals an instance key at `0x40` (238,000 distinct) | 0 | 0 |
+| a half of an item `u64` (260,357 distinct) equals a BLAS `crc32` | 17 | 12.1 |
+| a half of an item `u64` equals a half of an instance key | 30 | 28.8 |
+| K equals the number of instance descriptors after or before the run | 0 of 119 runs | |
+
+A BVH stream carries no key to match: in all 271,637 the first `0x100` bytes are zero except the wrapper words at
+`0x20` and `0x28`. In archive order the table streams sit in 119 runs (15 of them 277 streams long, the longest
+2,152); every run follows a `bvh4` stream and is followed by an `instance208` (118) or an N > 1 descriptor (1).
+That is position, not a link.
+
+**Open:** what the table streams map (a sorted `u32` lookup to a 64-bit value; both look like hashes, and names are
+only in the encrypted TOC, so that is not tested here); the high `u32` of an instance entry; what the two zero
+arrays of the instance template hold when they are not zero; whether the N matrices are the per-slot geometry
+transforms. None of the 22,301 table streams can be tied to a BVH buffer with what the pack shows, and by the page
+word they own none.
+
+```powershell
+python -I tools/bvh_groups.py <core_bvh4.rpf> --json <temp>/groups.json   # the template, page word and buffer counts
+python -I tests/test_bvh_groups.py
+```
+
+The tool walks the archive with `bvh_index`'s own decompressor and classifier, parses each descriptor, inflates the
+stream after each instance descriptor and checks it against the entries. Its rows and summary hold offsets, sizes,
+counts and check results, never a key, value or payload byte. The chance table, the duplicate counts, the region
+orders, the run lengths and the preamble count came from scratch scripts over the same parse and are not in the
+tool.
 
 ### 3.3 Fill and node occupancy
 
@@ -389,8 +501,9 @@ into three 64 KiB/26 KiB chunks. These list the per-tile BVH packs; they are the
 2. **Concatenate split files.** A `bvh4-chunk` (10 in core) is the first 8 MiB of a larger payload; append the
    following continuation chunks until the declared `u32@0x20` end is reached before reading nodes.
 3. **Pair descriptor to buffer.** The 208-byte descriptor precedes its BVH chunk in stream order in
-   269,106/269,106 cases. The other descriptor sizes account for 2,528 more BVH buffers; 3 more are preceded by
-   other streams.
+   269,106/269,106 cases. The 2,531 instance descriptors with N > 1 precede the other 2,531 BVH streams, each of
+   which holds N BLAS back to back at the offsets the descriptor's entries give (§3.2a); read all of them, not only
+   the header at `0x100`. The 22,301 table descriptors own no BVH buffer.
 4. **Parse the header, then stop guessing.** The exact header table, node pointer encoding and runtime
    `Node16`/`Node32`/`Leaf` records are in section 3.1, and the dehydrated element and box packing in §4a; do not
    infer a runtime child array from the `0x140` slot space.
@@ -430,6 +543,10 @@ template, XML and XML fragments, the two-stream advance bug and CSV/JSON output.
 
 Measured with the tool on `shared_minigame000_bvh4.rpf`: 2,560 streams, 59,142,787 stored, 970,044,012 inflated,
 1,237 complete `bvh4`, 1,233 `instance208`, 85 descriptors, 5 XML. That matches the carver summary exactly.
+
+`tools/bvh_groups.py` (standard library only) parses the descriptor streams into the two templates of §3.2a and
+checks every instance descriptor against the BVH stream after it: N BLAS at the offsets its entries give. On the
+shared pack it reports 1,233 + 4 instance descriptors (1,233 + 8 BLAS tied) and 81 table streams with 317 items.
 
 `tools/bvh_rehydrate.py` (standard library only) turns a dehydrated BLAS back into the runtime layout on the CPU,
 from float3 vertices, `uint16`/`uint32` or no indices and an optional 3x4 geometry transform, following the packing
