@@ -78,6 +78,25 @@ class GuestSceneReferenceTest(unittest.TestCase):
                     self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
                     self.assertNotIn(b"UnicodeEncodeError", result.stderr)
 
+    def test_uncreatable_output_reports_clean_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "spirv").mkdir()
+            placeholder = root / "placeholder.txt"
+            placeholder.write_bytes(b"synthetic input")
+            out = placeholder / "output"
+            result = subprocess.run(
+                [sys.executable, "-I", str(path), "--wine", sys.executable,
+                 "--loader", str(placeholder), "--guest", str(placeholder),
+                 "--shaders", str(root), "--out", str(out)],
+                capture_output=True, encoding="utf-8", errors="replace", timeout=20,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(f"could not create output directory {out.resolve()}", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(placeholder.read_bytes(), b"synthetic input")
+
     def test_launch_failure_preserves_run_record_and_logs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
