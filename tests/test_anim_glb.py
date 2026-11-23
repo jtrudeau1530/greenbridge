@@ -670,6 +670,14 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
         self.assertTrue(r.stderr.startswith("ERROR:"), r.stderr)
 
+    def test_a_missing_archive_prints_its_path_without_repr_escaping(self):
+        missing = os.path.join(self.tmp.name, "missing", "packs.rpf")
+        r = self.run_tool(missing, os.path.join(self.tmp.name, "x.glb"),
+                          "--skeleton", "0x1000", "--part", "0x1000")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stderr.strip(), f"ERROR: {missing}: {os.strerror(2)}")
+        self.assertEqual(r.stdout, "")
+
 
 if __name__ == "__main__":
     unittest.main()

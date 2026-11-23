@@ -761,7 +761,10 @@ def main(argv=None):
             ap.error("--anim needs --dictionary")
     try:
         report = coverage(args) if args.coverage else export(args)
-    except (ExportError, anim_clips.DecodeError, struct.error, OSError, ValueError) as e:
+    except OSError as e:
+        print(f"ERROR: {e.filename or args.archive}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    except (ExportError, anim_clips.DecodeError, struct.error, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     if args.report:
