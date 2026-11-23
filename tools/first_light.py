@@ -246,9 +246,16 @@ def read_obj(
                 if len(p) < 3:
                     raise SystemExit(f"{path}: short texture-coordinate line: {line.strip()!r}")
                 try:
-                    uvs.append(tuple(float(x) for x in p[1:3]))
+                    u, v = map(float, p[1:3])
                 except ValueError:
                     raise SystemExit(f"{path}: invalid texture coordinates: {line.strip()!r}") from None
+                if not (math.isfinite(u) and math.isfinite(v)):
+                    raise SystemExit(f"{path}: non-finite texture coordinates: {line.strip()!r}")
+                try:
+                    struct.pack("<2f", u, v)  # Validate the mesh encoding before opening the output.
+                except OverflowError:
+                    raise SystemExit(f"{path}: texture coordinates exceed the binary32 range: {line.strip()!r}") from None
+                uvs.append((u, v))
             elif p[0] == "f":
                 face = []
                 for word in p[1:]:

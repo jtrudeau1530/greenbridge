@@ -511,6 +511,33 @@ class ReadObjTests(unittest.TestCase):
             f.write(text)
         return path
 
+    def test_requires_finite_texture_coordinates(self):
+        def triangle(u, v):
+            return self._write_obj(
+                "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+                f"vt {u} {v}\n"
+                "f 1/1 2/1 3/1\n"
+            )
+
+        vertices, indices = fl.read_obj(triangle("-0.25", "1.5"))
+        self.assertEqual(indices, [0, 1, 2])
+        self.assertEqual([vertex[3:] for vertex in vertices], [(-0.25, 1.5)] * 3)
+        for u, v in (("nan", "0.75"), ("0.25", "inf"), ("-inf", "0.75"), ("0.25", "1e999")):
+            with self.subTest(u=u, v=v):
+                with self.assertRaisesRegex(SystemExit, "non-finite texture coordinates"):
+                    fl.read_obj(triangle(u, v))
+
+        large_finite = triangle("1e38", "-1e38")
+        mesh = Path(large_finite).with_suffix(".bin")
+        fl.write_mesh(str(mesh), *fl.read_obj(large_finite))
+        previous = mesh.read_bytes()
+        self.assertEqual(len(previous), 80)
+        for u, v in (("1e39", "0.75"), ("0.25", "-1e39")):
+            with self.subTest(u=u, v=v):
+                with self.assertRaisesRegex(SystemExit, "texture coordinates exceed the binary32 range"):
+                    fl.write_mesh(str(mesh), *fl.read_obj(triangle(u, v)))
+                self.assertEqual(mesh.read_bytes(), previous)
+
     def test_negative_relative_indices_inline_comments_and_continuations(self):
         positive = self._write_obj(
             "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
